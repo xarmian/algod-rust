@@ -101,6 +101,7 @@ dependencies = [
  "algo-error",
  "algo-types",
  "ed25519-dalek",
+ "hex",
  "rmpv",
  "serde_bytes",
  "sha2",
