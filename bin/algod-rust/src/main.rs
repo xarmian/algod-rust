@@ -29,10 +29,18 @@ async fn main() -> anyhow::Result<()> {
             algod_token,
             start,
             end,
+            fail_fast,
             report,
         } => {
-            commands::validate::run(&algod_url, &algod_token, start, end, report.as_deref())
-                .await?;
+            commands::validate::run(
+                &algod_url,
+                &algod_token,
+                start,
+                end,
+                fail_fast,
+                report.as_deref(),
+            )
+            .await?;
         }
         Commands::Follow {
             algod_url,

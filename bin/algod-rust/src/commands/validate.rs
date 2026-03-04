@@ -1,16 +1,17 @@
 use std::path::Path;
 
-use algo_conformance::{compare_block, ConformanceReport};
+use algo_conformance::{compare_block, ComparisonStatus, ConformanceReport};
 use algo_rest_client::{AlgodClient, BlockSource};
 use algo_types::Round;
 use chrono::Utc;
-use tracing::info;
+use tracing::{info, error};
 
 pub async fn run(
     algod_url: &str,
     algod_token: &str,
     start: u64,
     end: Option<u64>,
+    fail_fast: bool,
     report_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let client = AlgodClient::new(algod_url, algod_token);
@@ -23,7 +24,7 @@ pub async fn run(
         }
     };
 
-    info!(start, end, "validating blocks");
+    info!(start, end, fail_fast, "validating blocks");
 
     let started_at = Utc::now().to_rfc3339();
     let mut results = Vec::new();
@@ -38,7 +39,12 @@ pub async fn run(
             mismatches = result.mismatches.len(),
             duration_ms = result.duration_ms,
         );
+        let failed = result.status == ComparisonStatus::Fail;
         results.push(result);
+        if fail_fast && failed {
+            error!(round, "fail-fast: stopping on first failure");
+            break;
+        }
         round += 1;
     }
 

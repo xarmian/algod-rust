@@ -1,33 +1,145 @@
+use std::time::Duration;
+
 use algo_codec::decode_block_response;
 use algo_error::{AlgoError, Result};
 use algo_types::{BlockResponse, Round};
 use async_trait::async_trait;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{BlockSource, NodeStatus};
+
+/// Configuration for the REST client.
+#[derive(Debug, Clone)]
+pub struct ClientConfig {
+    /// Request timeout for normal requests (default: 30s).
+    pub timeout: Duration,
+    /// Request timeout for long-poll requests like wait_for_round (default: 5min).
+    pub long_poll_timeout: Duration,
+    /// Maximum number of retry attempts (default: 3).
+    pub max_retries: u32,
+    /// Initial backoff duration, doubled each retry (default: 100ms).
+    pub initial_backoff: Duration,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            long_poll_timeout: Duration::from_secs(300),
+            max_retries: 3,
+            initial_backoff: Duration::from_millis(100),
+        }
+    }
+}
 
 /// REST API client for a go-algorand node.
 pub struct AlgodClient {
     base_url: String,
     token: String,
     http: reqwest::Client,
+    long_poll_http: reqwest::Client,
+    config: ClientConfig,
 }
 
 impl AlgodClient {
-    /// Create a new client with the given base URL and API token.
+    /// Create a new client with default configuration.
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
+        Self::with_config(base_url, token, ClientConfig::default())
+    }
+
+    /// Create a new client with custom configuration.
+    pub fn with_config(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        config: ClientConfig,
+    ) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(config.timeout)
+            .build()
+            .expect("failed to build HTTP client");
+
+        let long_poll_http = reqwest::Client::builder()
+            .timeout(config.long_poll_timeout)
+            .build()
+            .expect("failed to build long-poll HTTP client");
+
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
-            http: reqwest::Client::new(),
+            http,
+            long_poll_http,
+            config,
         }
     }
 
-    fn request(&self, path: &str) -> reqwest::RequestBuilder {
-        self.http
-            .get(format!("{}{}", self.base_url, path))
-            .header("X-Algo-API-Token", &self.token)
+    /// Execute a GET request with retry and exponential backoff.
+    ///
+    /// Retries on connection errors, timeouts, and 5xx responses.
+    /// Does not retry on 4xx responses.
+    async fn get_with_retry(&self, path: &str, client: &reqwest::Client) -> Result<reqwest::Response> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut backoff = self.config.initial_backoff;
+
+        for attempt in 0..=self.config.max_retries {
+            let result = client
+                .get(&url)
+                .header("X-Algo-API-Token", &self.token)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return Ok(resp);
+                    }
+                    if status.is_server_error() && attempt < self.config.max_retries {
+                        warn!(
+                            attempt = attempt + 1,
+                            max = self.config.max_retries,
+                            status = %status,
+                            path,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "server error, retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff *= 2;
+                        continue;
+                    }
+                    // 4xx or exhausted retries on 5xx — return the error response
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(AlgoError::Conformance {
+                        message: format!("GET {path} returned {status}: {body}"),
+                    });
+                }
+                Err(e) if is_retryable(&e) && attempt < self.config.max_retries => {
+                    warn!(
+                        attempt = attempt + 1,
+                        max = self.config.max_retries,
+                        error = %e,
+                        path,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "transient error, retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+                Err(e) => {
+                    return Err(AlgoError::RestClient {
+                        source: Box::new(e),
+                        context: format!("GET {path}"),
+                    });
+                }
+            }
+        }
+
+        unreachable!("retry loop should always return")
     }
+}
+
+/// Check if a reqwest error is transient and worth retrying.
+fn is_retryable(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout() || err.is_request()
 }
 
 #[async_trait]
@@ -35,22 +147,8 @@ impl BlockSource for AlgodClient {
     async fn get_block_raw(&self, round: Round) -> Result<Vec<u8>> {
         debug!(round = %round, "fetching block (msgpack)");
 
-        let resp = self
-            .request(&format!("/v2/blocks/{}?format=msgpack", round))
-            .send()
-            .await
-            .map_err(|e| AlgoError::RestClient {
-                source: Box::new(e),
-                context: format!("GET /v2/blocks/{round}"),
-            })?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(AlgoError::Conformance {
-                message: format!("GET /v2/blocks/{round} returned {status}: {body}"),
-            });
-        }
+        let path = format!("/v2/blocks/{}?format=msgpack", round);
+        let resp = self.get_with_retry(&path, &self.http).await?;
 
         resp.bytes()
             .await
@@ -69,14 +167,7 @@ impl BlockSource for AlgodClient {
     async fn get_status(&self) -> Result<NodeStatus> {
         debug!("fetching node status");
 
-        let resp = self
-            .request("/v2/status")
-            .send()
-            .await
-            .map_err(|e| AlgoError::RestClient {
-                source: Box::new(e),
-                context: "GET /v2/status".into(),
-            })?;
+        let resp = self.get_with_retry("/v2/status", &self.http).await?;
 
         resp.json::<NodeStatus>()
             .await
@@ -89,14 +180,8 @@ impl BlockSource for AlgodClient {
     async fn wait_for_round(&self, round: Round) -> Result<NodeStatus> {
         debug!(round = %round, "waiting for round");
 
-        let resp = self
-            .request(&format!("/v2/status/wait-for-block-after/{}", round))
-            .send()
-            .await
-            .map_err(|e| AlgoError::RestClient {
-                source: Box::new(e),
-                context: format!("GET /v2/status/wait-for-block-after/{round}"),
-            })?;
+        let path = format!("/v2/status/wait-for-block-after/{}", round);
+        let resp = self.get_with_retry(&path, &self.long_poll_http).await?;
 
         resp.json::<NodeStatus>()
             .await

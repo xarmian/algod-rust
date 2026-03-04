@@ -100,6 +100,22 @@ pub struct Block {
     /// Payset: the list of signed transactions in this block.
     #[serde(rename = "txns", default, skip_serializing_if = "Vec::is_empty")]
     pub payset: Vec<SignedTransaction>,
+
+    // ── Known fields NOT yet modeled (silently ignored by serde) ──
+    //
+    // These fields appear in go-algorand blocks but are not decoded in Phase 0.
+    // They are safely ignored by rmp-serde because Block does not use
+    // `#[serde(deny_unknown_fields)]`.
+    //
+    // - `bi`      (BlockIntervalHistory): participation key interval tracking
+    // - `fc`      (FeesCollected): total fees collected in this block (consensus v39+)
+    // - `prev512` (SHA512_256 of previous block): 512-bit hash of the previous block
+    // - `txn256`  (TransactionCommitments): SHA256 merkle root of the payset
+    // - `txn512`  (TransactionCommitments): SHA512_256 merkle root variant
+    // - `spt`     (StateProofTracking): state proof tracking map with integer keys
+    //             e.g. {0: {n: 512}} — tracks state proof parameters per type
+    //
+    // These will be modeled when needed for Phase 1+ (hashing, state proofs).
 }
 
 /// The top-level response from `GET /v2/blocks/{round}?format=msgpack`.

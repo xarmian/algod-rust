@@ -58,6 +58,10 @@ pub enum Commands {
         #[arg(long)]
         end: Option<u64>,
 
+        /// Stop on the first failed round.
+        #[arg(long)]
+        fail_fast: bool,
+
         /// Path to write the conformance report JSON.
         #[arg(long)]
         report: Option<PathBuf>,

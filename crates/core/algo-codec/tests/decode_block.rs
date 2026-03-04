@@ -17,3 +17,111 @@ fn decode_real_block_response() {
     assert_eq!(br.block.payset.len(), 1);
     assert_eq!(br.block.payset[0].txn.txn_type, "pay");
 }
+
+/// Decode all captured fixtures and verify basic structural properties.
+macro_rules! fixture_decode_test {
+    ($name:ident, $file:expr, $expected_round:expr) => {
+        #[test]
+        fn $name() {
+            let bytes = include_bytes!(concat!("fixtures/", $file));
+
+            // Decode
+            let br: BlockResponse =
+                algo_codec::decode_block_response(bytes).expect("decode should succeed");
+
+            // Round matches expected
+            assert_eq!(br.block.round.0, $expected_round, "round mismatch");
+
+            // Header fields are populated
+            assert!(!br.block.genesis_id.is_empty(), "genesis_id should be set");
+            assert!(!br.block.genesis_hash.is_empty(), "genesis_hash should be set");
+            assert!(!br.block.current_protocol.is_empty(), "protocol should be set");
+
+            // Round-trip: encode then decode again
+            let re_encoded =
+                algo_codec::encode_block(&br.block).expect("re-encode should succeed");
+            let re_decoded =
+                algo_codec::decode_block(&re_encoded).expect("re-decode should succeed");
+
+            assert_eq!(re_decoded.round, br.block.round, "round-trip round mismatch");
+            assert_eq!(
+                re_decoded.payset.len(),
+                br.block.payset.len(),
+                "round-trip txn count mismatch"
+            );
+            assert_eq!(
+                re_decoded.genesis_id, br.block.genesis_id,
+                "round-trip genesis_id mismatch"
+            );
+            assert_eq!(
+                re_decoded.timestamp, br.block.timestamp,
+                "round-trip timestamp mismatch"
+            );
+            assert_eq!(
+                re_decoded.fee_sink, br.block.fee_sink,
+                "round-trip fee_sink mismatch"
+            );
+            assert_eq!(
+                re_decoded.rewards_pool, br.block.rewards_pool,
+                "round-trip rewards_pool mismatch"
+            );
+
+            // Per-txn field round-trip
+            for (i, (orig, rt)) in br
+                .block
+                .payset
+                .iter()
+                .zip(re_decoded.payset.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    orig.txn.txn_type, rt.txn.txn_type,
+                    "txn[{i}] type mismatch"
+                );
+                assert_eq!(
+                    orig.txn.sender, rt.txn.sender,
+                    "txn[{i}] sender mismatch"
+                );
+                assert_eq!(orig.txn.fee, rt.txn.fee, "txn[{i}] fee mismatch");
+                assert_eq!(
+                    orig.txn.amount, rt.txn.amount,
+                    "txn[{i}] amount mismatch"
+                );
+                assert_eq!(
+                    orig.txn.receiver, rt.txn.receiver,
+                    "txn[{i}] receiver mismatch"
+                );
+            }
+        }
+    };
+}
+
+fixture_decode_test!(decode_block_1, "block_1.msgpack", 1);
+fixture_decode_test!(decode_block_2, "block_2.msgpack", 2);
+fixture_decode_test!(decode_block_3, "block_3.msgpack", 3);
+fixture_decode_test!(decode_block_4, "block_4.msgpack", 4);
+fixture_decode_test!(decode_block_5, "block_5.msgpack", 5);
+
+/// Verify that all blocks contain exactly 1 payment transaction (known from fixture capture).
+#[test]
+fn all_fixtures_have_pay_txns() {
+    let fixtures: &[(&[u8], u64)] = &[
+        (include_bytes!("fixtures/block_1.msgpack"), 1),
+        (include_bytes!("fixtures/block_2.msgpack"), 2),
+        (include_bytes!("fixtures/block_3.msgpack"), 3),
+        (include_bytes!("fixtures/block_4.msgpack"), 4),
+        (include_bytes!("fixtures/block_5.msgpack"), 5),
+    ];
+
+    for (bytes, round) in fixtures {
+        let br: BlockResponse =
+            algo_codec::decode_block_response(bytes).unwrap_or_else(|e| {
+                panic!("failed to decode block {round}: {e}")
+            });
+        assert_eq!(br.block.payset.len(), 1, "block {round} should have 1 txn");
+        assert_eq!(
+            br.block.payset[0].txn.txn_type, "pay",
+            "block {round} txn should be pay"
+        );
+    }
+}
