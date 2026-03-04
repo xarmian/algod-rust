@@ -15,10 +15,16 @@ pub struct SignedTransaction {
     pub sig: ByteBuf,
 
     /// Multisig metadata (captured as opaque value for Phase 0).
+    /// IMPORTANT: When promoting to a typed struct, also add a corresponding
+    /// canonical_encode_multisig() function in algo-codec/canonical.rs and
+    /// remove the add_option_rmpv call. See P1 note there.
     #[serde(rename = "msig", default, skip_serializing_if = "Option::is_none")]
     pub msig: Option<rmpv::Value>,
 
     /// Logic signature (captured as opaque value for Phase 0).
+    /// IMPORTANT: When promoting to a typed struct, also add a corresponding
+    /// canonical_encode_logicsig() function in algo-codec/canonical.rs and
+    /// remove the add_option_rmpv call. See P1 note there.
     #[serde(rename = "lsig", default, skip_serializing_if = "Option::is_none")]
     pub lsig: Option<rmpv::Value>,
 

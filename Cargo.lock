@@ -17,9 +17,12 @@ version = "0.1.0"
 dependencies = [
  "algo-error",
  "algo-types",
+ "hex",
+ "rmp",
  "rmp-serde",
  "rmpv",
  "serde",
+ "serde_bytes",
  "serde_json",
 ]
 
