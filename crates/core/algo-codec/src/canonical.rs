@@ -9,7 +9,10 @@
 // 6. Strings use msgpack String format (fixstr/str8/str16)
 // 7. Deterministic — identical inputs always produce identical bytes
 
-use algo_types::{Address, Block, BlockHeader, SignedTransaction, Transaction};
+use algo_types::{
+    Address, AssetParams, Block, BlockHeader, BoxRef, SignedTransaction, StateSchema, Transaction,
+};
+use serde_bytes::ByteBuf;
 
 /// A builder for canonical msgpack maps.
 ///
@@ -78,7 +81,8 @@ impl CanonicalMap {
     fn add_map(&mut self, key: &'static str, val: Vec<u8>) {
         // Skip empty maps. Our encoder always produces fixmap(0) = 0x80 for
         // zero-entry maps, but we also handle map16/map32 representations.
-        let is_empty = matches!(val.as_slice(),
+        let is_empty = matches!(
+            val.as_slice(),
             [0x80] | [0xDE, 0x00, 0x00] | [0xDF, 0x00, 0x00, 0x00, 0x00]
         );
         if !is_empty {
@@ -123,11 +127,77 @@ impl CanonicalMap {
         }
     }
 
+    fn add_option_bytes(&mut self, key: &'static str, val: &Option<ByteBuf>) {
+        if let Some(b) = val {
+            self.add_bytes(key, b);
+        }
+    }
+
+    fn add_option_map(&mut self, key: &'static str, val: Option<Vec<u8>>) {
+        if let Some(encoded) = val {
+            self.add_map(key, encoded);
+        }
+    }
+
+    fn add_option_vec_bytes(&mut self, key: &'static str, val: &Option<Vec<ByteBuf>>) {
+        if let Some(items) = val {
+            if !items.is_empty() {
+                let mut buf = Vec::new();
+                rmp::encode::write_array_len(&mut buf, items.len() as u32).unwrap();
+                for item in items {
+                    rmp::encode::write_bin(&mut buf, item).unwrap();
+                }
+                self.fields.push((key, buf));
+            }
+        }
+    }
+
+    fn add_option_vec_address(&mut self, key: &'static str, val: &Option<Vec<Address>>) {
+        if let Some(addrs) = val {
+            if !addrs.is_empty() {
+                let mut buf = Vec::new();
+                rmp::encode::write_array_len(&mut buf, addrs.len() as u32).unwrap();
+                for addr in addrs {
+                    rmp::encode::write_bin(&mut buf, &addr.0).unwrap();
+                }
+                self.fields.push((key, buf));
+            }
+        }
+    }
+
+    fn add_option_vec_u64(&mut self, key: &'static str, val: &Option<Vec<u64>>) {
+        if let Some(vals) = val {
+            if !vals.is_empty() {
+                let mut buf = Vec::new();
+                rmp::encode::write_array_len(&mut buf, vals.len() as u32).unwrap();
+                for &v in vals {
+                    write_uint(&mut buf, v);
+                }
+                self.fields.push((key, buf));
+            }
+        }
+    }
+
+    fn add_option_vec_box_refs(&mut self, key: &'static str, val: &Option<Vec<BoxRef>>) {
+        if let Some(refs) = val {
+            if !refs.is_empty() {
+                let maps: Vec<Vec<u8>> = refs.iter().map(canonical_encode_box_ref).collect();
+                let mut buf = Vec::new();
+                rmp::encode::write_array_len(&mut buf, maps.len() as u32).unwrap();
+                for m in &maps {
+                    buf.extend_from_slice(m);
+                }
+                self.fields.push((key, buf));
+            }
+        }
+    }
+
     /// Sort fields by key in lexicographic order (raw UTF-8 bytes).
     ///
     /// Go's go-codec sorts struct field codec tags alphabetically.
     fn encode(mut self) -> Vec<u8> {
-        self.fields.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        self.fields
+            .sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
         let mut buf = Vec::new();
         rmp::encode::write_map_len(&mut buf, self.fields.len() as u32).unwrap();
@@ -201,9 +271,62 @@ fn is_rmpv_empty(v: &rmpv::Value) -> bool {
 pub fn canonical_encode_transaction(tx: &Transaction) -> Vec<u8> {
     let mut m = CanonicalMap::new();
 
-    // Payment fields
+    // All fields go into the SAME map so they sort correctly in a single
+    // namespace (Go behavior). The keys are the serde rename values.
+
+    // Asset transfer (axfer)
+    m.add_u64("aamt", tx.asset_amount);
+    m.add_option_address("aclose", &tx.asset_close_to);
+
+    // Asset freeze (afrz)
+    m.add_bool("afrz", tx.asset_frozen);
+
+    // Payment
     m.add_u64("amt", tx.amount);
+
+    // Application call (appl)
+    m.add_option_vec_bytes("apaa", &tx.app_arguments);
+    m.add_u64("apan", tx.on_completion);
+    m.add_option_bytes("apap", &tx.approval_program);
+    m.add_option_vec_u64("apas", &tx.foreign_assets);
+    m.add_option_vec_address("apat", &tx.accounts);
+    m.add_option_vec_box_refs("apbx", &tx.boxes);
+    m.add_u64("apep", tx.extra_program_pages);
+    m.add_option_vec_u64("apfa", &tx.foreign_apps);
+    m.add_option_map(
+        "apgs",
+        tx.global_state_schema
+            .as_ref()
+            .map(canonical_encode_state_schema),
+    );
+    m.add_u64("apid", tx.application_id);
+    m.add_option_map(
+        "apls",
+        tx.local_state_schema
+            .as_ref()
+            .map(canonical_encode_state_schema),
+    );
+    m.add_option_bytes("apsu", &tx.clear_state_program);
+
+    // Asset config (acfg)
+    m.add_option_map(
+        "apar",
+        tx.asset_params.as_ref().map(canonical_encode_asset_params),
+    );
+
+    // Asset transfer (axfer)
+    m.add_option_address("arcv", &tx.asset_receiver);
+    m.add_option_address("asnd", &tx.asset_sender);
+
+    // Asset config (acfg)
+    m.add_u64("caid", tx.config_asset);
+
+    // Payment
     m.add_address("close", &tx.close_remainder_to);
+
+    // Asset freeze (afrz)
+    m.add_option_address("fadd", &tx.freeze_account);
+    m.add_u64("faid", tx.freeze_asset);
 
     // Header fields
     m.add_u64("fee", tx.fee);
@@ -213,11 +336,34 @@ pub fn canonical_encode_transaction(tx: &Transaction) -> Vec<u8> {
     m.add_bytes("grp", &tx.group);
     m.add_u64("lv", tx.last_valid.0);
     m.add_bytes("lx", &tx.lease);
+
+    // Key registration (keyreg)
+    m.add_bool("nonpart", tx.non_participation);
+
     m.add_bytes("note", &tx.note);
     m.add_address("rcv", &tx.receiver);
     m.add_option_address("rekey", &tx.rekey_to);
+
+    // Key registration (keyreg)
+    m.add_option_bytes("selkey", &tx.selection_pk);
+
     m.add_address("snd", &tx.sender);
+
+    // State proof (stpf)
+    m.add_option_rmpv("sp", &tx.state_proof);
+    m.add_u64("sptype", tx.state_proof_type);
+    m.add_option_bytes("sprfkey", &tx.state_proof_pk);
+
     m.add_string("type", &tx.txn_type);
+
+    // Key registration (keyreg)
+    m.add_u64("votefst", tx.vote_first);
+    m.add_option_bytes("votekey", &tx.vote_pk);
+    m.add_u64("votekd", tx.vote_key_dilution);
+    m.add_u64("votelst", tx.vote_last);
+
+    // Asset transfer (axfer)
+    m.add_u64("xaid", tx.xaid);
 
     m.encode()
 }
@@ -324,6 +470,45 @@ pub fn canonical_encode_block_header(header: &BlockHeader) -> Vec<u8> {
     m.encode()
 }
 
+/// Canonically encode AssetParams as a nested msgpack map.
+pub fn canonical_encode_asset_params(apar: &AssetParams) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    m.add_option_bytes("am", &apar.metadata_hash);
+    m.add_string("an", &apar.asset_name);
+    m.add_string("au", &apar.url);
+    m.add_option_address("c", &apar.clawback);
+    m.add_u64("dc", apar.decimals);
+    m.add_bool("df", apar.default_frozen);
+    m.add_option_address("f", &apar.freeze);
+    m.add_option_address("m", &apar.manager);
+    m.add_option_address("r", &apar.reserve);
+    m.add_u64("t", apar.total);
+    m.add_string("un", &apar.unit_name);
+
+    m.encode()
+}
+
+/// Canonically encode StateSchema as a nested msgpack map.
+pub fn canonical_encode_state_schema(schema: &StateSchema) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    m.add_u64("nbs", schema.num_byte_slice);
+    m.add_u64("nui", schema.num_uint);
+
+    m.encode()
+}
+
+/// Canonically encode BoxRef as a nested msgpack map.
+pub fn canonical_encode_box_ref(bref: &BoxRef) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    m.add_u64("i", bref.index);
+    m.add_option_bytes("n", &bref.name);
+
+    m.encode()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,22 +517,7 @@ mod tests {
 
     #[test]
     fn test_empty_transaction_produces_minimal_map() {
-        let tx = Transaction {
-            txn_type: String::new(),
-            sender: Address::ZERO,
-            fee: 0,
-            first_valid: Round(0),
-            last_valid: Round(0),
-            note: ByteBuf::new(),
-            genesis_id: String::new(),
-            genesis_hash: ByteBuf::new(),
-            group: ByteBuf::new(),
-            lease: ByteBuf::new(),
-            rekey_to: None,
-            amount: 0,
-            receiver: Address::ZERO,
-            close_remainder_to: Address::ZERO,
-        };
+        let tx = Transaction::default();
 
         let encoded = canonical_encode_transaction(&tx);
         // All fields are zero/empty → empty map
@@ -362,15 +532,9 @@ mod tests {
             fee: 1000,
             first_valid: Round(100),
             last_valid: Round(200),
-            note: ByteBuf::new(),
-            genesis_id: String::new(),
-            genesis_hash: ByteBuf::new(),
-            group: ByteBuf::new(),
-            lease: ByteBuf::new(),
-            rekey_to: None,
             amount: 5000,
             receiver: Address([2u8; 32]),
-            close_remainder_to: Address::ZERO,
+            ..Default::default()
         };
 
         let encoded = canonical_encode_transaction(&tx);
@@ -389,10 +553,7 @@ mod tests {
             assert_eq!(keys, sorted, "keys must be in lexicographic order");
 
             // Expected keys for this transaction (non-zero fields)
-            assert_eq!(
-                keys,
-                vec!["amt", "fee", "fv", "lv", "rcv", "snd", "type"]
-            );
+            assert_eq!(keys, vec!["amt", "fee", "fv", "lv", "rcv", "snd", "type"]);
         } else {
             panic!("expected map");
         }
@@ -452,17 +613,8 @@ mod tests {
             txn_type: "pay".into(),
             sender: Address([1u8; 32]),
             fee: 1000,
-            first_valid: Round(0), // zero — should be omitted
             last_valid: Round(200),
-            note: ByteBuf::new(), // empty — should be omitted
-            genesis_id: String::new(), // empty — should be omitted
-            genesis_hash: ByteBuf::new(),
-            group: ByteBuf::new(),
-            lease: ByteBuf::new(),
-            rekey_to: None,
-            amount: 0, // zero — should be omitted
-            receiver: Address::ZERO, // zero — should be omitted
-            close_remainder_to: Address::ZERO,
+            ..Default::default()
         };
 
         let encoded = canonical_encode_transaction(&tx);
@@ -486,25 +638,17 @@ mod tests {
         let tx = Transaction {
             txn_type: "pay".into(),
             sender: addr,
-            fee: 0,
-            first_valid: Round(0),
-            last_valid: Round(0),
-            note: ByteBuf::new(),
-            genesis_id: String::new(),
-            genesis_hash: ByteBuf::new(),
-            group: ByteBuf::new(),
-            lease: ByteBuf::new(),
-            rekey_to: None,
-            amount: 0,
-            receiver: Address::ZERO,
-            close_remainder_to: Address::ZERO,
+            ..Default::default()
         };
 
         let encoded = canonical_encode_transaction(&tx);
         let val = rmpv::decode::read_value(&mut &encoded[..]).unwrap();
         if let rmpv::Value::Map(pairs) = val {
             // Find the "snd" field
-            let snd = pairs.iter().find(|(k, _)| k.as_str() == Some("snd")).unwrap();
+            let snd = pairs
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("snd"))
+                .unwrap();
             // Should be binary, 32 bytes
             if let rmpv::Value::Binary(b) = &snd.1 {
                 assert_eq!(b.len(), 32);
@@ -524,15 +668,9 @@ mod tests {
                 fee: 1000,
                 first_valid: Round(1),
                 last_valid: Round(100),
-                note: ByteBuf::new(),
-                genesis_id: String::new(),
-                genesis_hash: ByteBuf::new(),
-                group: ByteBuf::new(),
-                lease: ByteBuf::new(),
-                rekey_to: None,
                 amount: 5000,
                 receiver: Address([2u8; 32]),
-                close_remainder_to: Address::ZERO,
+                ..Default::default()
             },
             sig: ByteBuf::from(vec![0xDE; 64]),
             msig: None,
@@ -553,7 +691,10 @@ mod tests {
             assert_eq!(keys, vec!["sig", "txn"]);
 
             // Verify txn is a nested map
-            let txn = pairs.iter().find(|(k, _)| k.as_str() == Some("txn")).unwrap();
+            let txn = pairs
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("txn"))
+                .unwrap();
             assert!(matches!(txn.1, rmpv::Value::Map(_)));
         }
     }
@@ -567,15 +708,9 @@ mod tests {
                 fee: 1000,
                 first_valid: Round(1),
                 last_valid: Round(100),
-                note: ByteBuf::new(),
-                genesis_id: String::new(),
-                genesis_hash: ByteBuf::new(),
-                group: ByteBuf::new(),
-                lease: ByteBuf::new(),
-                rekey_to: None,
                 amount: 5000,
                 receiver: Address([2u8; 32]),
-                close_remainder_to: Address::ZERO,
+                ..Default::default()
             },
             sig: ByteBuf::from(vec![0xDE; 64]),
             msig: None,

@@ -16,6 +16,36 @@ make test               # Run all tests
 make validate           # Runtime conformance check
 ```
 
+## Generating Diverse Transaction Fixtures
+
+To generate fixtures covering all supported transaction types (not just payments):
+
+```bash
+make fixtures-diverse
+```
+
+This does:
+1. Starts the localnet (`make localnet-up`)
+2. Runs `generate-diverse-txns.sh` which creates:
+   - **pay** -- Payment transaction
+   - **acfg** -- ASA create (with freeze/clawback addresses)
+   - **axfer** -- ASA opt-in and transfer
+   - **afrz** -- ASA freeze
+   - **appl** -- Application create and call
+   - **keyreg** -- Participation key generation + register online
+3. Sends one extra transaction so the final block digest can be extracted
+4. Captures blocks as msgpack fixtures
+5. Runs the Go canonical-extract tool to generate reference hex files
+
+You can also run the diverse transaction generator standalone against a running localnet:
+
+```bash
+make localnet-up
+make generate-diverse-txns
+```
+
+The `DIVERSE_FIXTURE_BLOCKS` variable controls how many blocks are captured (default 12).
+
 ## Starting the Localnet
 
 ```bash

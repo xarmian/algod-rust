@@ -37,18 +37,14 @@ macro_rules! canonical_txn_test {
             let rust_bytes = canonical_encode_transaction(tx);
 
             // Load Go reference bytes
-            let go_bytes = load_canonical_hex(&format!(
-                "block_{}_txn_{}.canonical.hex",
-                $round, $txn_idx
-            ));
+            let go_bytes =
+                load_canonical_hex(&format!("block_{}_txn_{}.canonical.hex", $round, $txn_idx));
 
             // Byte-level comparison
             if rust_bytes != go_bytes {
                 // Decode both for debugging
-                let rust_val =
-                    rmpv::decode::read_value(&mut &rust_bytes[..]).unwrap();
-                let go_val =
-                    rmpv::decode::read_value(&mut &go_bytes[..]).unwrap();
+                let rust_val = rmpv::decode::read_value(&mut &rust_bytes[..]).unwrap();
+                let go_val = rmpv::decode::read_value(&mut &go_bytes[..]).unwrap();
 
                 panic!(
                     "Canonical txn encoding mismatch for block {} txn {}!\n\
@@ -75,6 +71,10 @@ canonical_txn_test!(canonical_txn_block_2, 2, 0);
 canonical_txn_test!(canonical_txn_block_3, 3, 0);
 canonical_txn_test!(canonical_txn_block_4, 4, 0);
 canonical_txn_test!(canonical_txn_block_5, 5, 0);
+canonical_txn_test!(canonical_txn_block_6_appl_create, 6, 0);
+canonical_txn_test!(canonical_txn_block_7_appl_call, 7, 0);
+canonical_txn_test!(canonical_txn_block_8_keyreg, 8, 0);
+canonical_txn_test!(canonical_txn_block_9_pay, 9, 0);
 
 // ── SignedTransaction canonical encoding comparison ─────────────
 
@@ -86,16 +86,12 @@ macro_rules! canonical_stxn_test {
             let stxn = &br.block.payset[$txn_idx];
 
             let rust_bytes = canonical_encode_signed_transaction(stxn);
-            let go_bytes = load_canonical_hex(&format!(
-                "block_{}_stxn_{}.canonical.hex",
-                $round, $txn_idx
-            ));
+            let go_bytes =
+                load_canonical_hex(&format!("block_{}_stxn_{}.canonical.hex", $round, $txn_idx));
 
             if rust_bytes != go_bytes {
-                let rust_val =
-                    rmpv::decode::read_value(&mut &rust_bytes[..]).unwrap();
-                let go_val =
-                    rmpv::decode::read_value(&mut &go_bytes[..]).unwrap();
+                let rust_val = rmpv::decode::read_value(&mut &rust_bytes[..]).unwrap();
+                let go_val = rmpv::decode::read_value(&mut &go_bytes[..]).unwrap();
 
                 panic!(
                     "Canonical stxn encoding mismatch for block {} stxn {}!\n\
@@ -122,27 +118,25 @@ canonical_stxn_test!(canonical_stxn_block_2, 2, 0);
 canonical_stxn_test!(canonical_stxn_block_3, 3, 0);
 canonical_stxn_test!(canonical_stxn_block_4, 4, 0);
 canonical_stxn_test!(canonical_stxn_block_5, 5, 0);
+canonical_stxn_test!(canonical_stxn_block_6_appl_create, 6, 0);
+canonical_stxn_test!(canonical_stxn_block_7_appl_call, 7, 0);
+canonical_stxn_test!(canonical_stxn_block_8_keyreg, 8, 0);
+canonical_stxn_test!(canonical_stxn_block_9_pay, 9, 0);
 
 // ── Property-based tests ────────────────────────────────────────
 
 #[test]
 fn canonical_keys_are_sorted_in_all_fixture_txns() {
-    for round in 1..=5 {
+    for round in 1..=9 {
         let br = load_block(round);
         for (i, stxn) in br.block.payset.iter().enumerate() {
             let encoded = canonical_encode_transaction(&stxn.txn);
             let val = rmpv::decode::read_value(&mut &encoded[..]).unwrap();
             if let rmpv::Value::Map(pairs) = val {
-                let keys: Vec<&str> = pairs
-                    .iter()
-                    .map(|(k, _)| k.as_str().unwrap())
-                    .collect();
+                let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str().unwrap()).collect();
                 let mut sorted = keys.clone();
                 sorted.sort();
-                assert_eq!(
-                    keys, sorted,
-                    "keys not sorted in block {round} txn {i}"
-                );
+                assert_eq!(keys, sorted, "keys not sorted in block {round} txn {i}");
             }
         }
     }
@@ -150,7 +144,7 @@ fn canonical_keys_are_sorted_in_all_fixture_txns() {
 
 #[test]
 fn canonical_no_zero_fields_in_fixture_txns() {
-    for round in 1..=5 {
+    for round in 1..=9 {
         let br = load_block(round);
         for (i, stxn) in br.block.payset.iter().enumerate() {
             let encoded = canonical_encode_transaction(&stxn.txn);
@@ -180,9 +174,7 @@ fn canonical_no_zero_fields_in_fixture_txns() {
                             );
                         }
                         rmpv::Value::Boolean(false) => {
-                            panic!(
-                                "block {round} txn {i}: key '{key}' has false boolean"
-                            );
+                            panic!("block {round} txn {i}: key '{key}' has false boolean");
                         }
                         _ => {}
                     }

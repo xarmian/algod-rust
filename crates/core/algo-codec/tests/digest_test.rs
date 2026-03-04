@@ -61,10 +61,7 @@ macro_rules! txn_id_test {
             let rust_id = compute_txn_id(tx);
 
             let go_id_bytes = require_fixture!(
-                load_hex_fixture(&format!(
-                    "block_{}_txn_{}.txid.hex",
-                    $round, $txn_idx
-                )),
+                load_hex_fixture(&format!("block_{}_txn_{}.txid.hex", $round, $txn_idx)),
                 concat!("block ", stringify!($round), " txid fixture missing")
             );
 
@@ -86,6 +83,9 @@ txn_id_test!(txn_id_block_2, 2, 0);
 txn_id_test!(txn_id_block_3, 3, 0);
 txn_id_test!(txn_id_block_4, 4, 0);
 txn_id_test!(txn_id_block_5, 5, 0);
+txn_id_test!(txn_id_block_6_appl_create, 6, 0);
+txn_id_test!(txn_id_block_7_appl_call, 7, 0);
+txn_id_test!(txn_id_block_8_keyreg, 8, 0);
 
 // ── Block digest tests ──────────────────────────────────────────
 
@@ -122,6 +122,9 @@ block_digest_test!(block_digest_block_2, 2);
 block_digest_test!(block_digest_block_3, 3);
 block_digest_test!(block_digest_block_4, 4);
 block_digest_test!(block_digest_block_5, 5);
+block_digest_test!(block_digest_block_6, 6);
+block_digest_test!(block_digest_block_7, 7);
+block_digest_test!(block_digest_block_8, 8);
 
 // ── Corruption test ─────────────────────────────────────────────
 
@@ -154,5 +157,7 @@ fn txn_id_display_is_base32_nopad() {
     // Base32 of 32 bytes = ceil(32*8/5) = 52 chars, no padding
     assert_eq!(display.len(), 52);
     // Should only contain A-Z and 2-7
-    assert!(display.chars().all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)));
+    assert!(display
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)));
 }
