@@ -108,6 +108,9 @@ impl AlgodClient {
                     }
                     // 4xx or exhausted retries on 5xx — return the error response
                     let body = resp.text().await.unwrap_or_default();
+                    if status == reqwest::StatusCode::NOT_FOUND {
+                        return Err(AlgoError::NotFound(format!("GET {path}: {body}")));
+                    }
                     return Err(AlgoError::Conformance {
                         message: format!("GET {path} returned {status}: {body}"),
                     });

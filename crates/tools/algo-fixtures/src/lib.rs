@@ -67,6 +67,10 @@ pub async fn capture_block(
 }
 
 /// Capture a range of block fixtures.
+///
+/// If a block is not found (404), capture stops and returns the blocks
+/// captured so far. This is expected in DEV_MODE where the chain may
+/// not have reached the requested end round yet.
 pub async fn capture_range(
     source: &dyn BlockSource,
     start: Round,
@@ -77,8 +81,18 @@ pub async fn capture_range(
     let mut paths = Vec::new();
     let mut round = start;
     while round <= end {
-        let path = capture_block(source, round, dir, source_url).await?;
-        paths.push(path);
+        match capture_block(source, round, dir, source_url).await {
+            Ok(path) => paths.push(path),
+            Err(algo_error::AlgoError::NotFound(_)) => {
+                info!(
+                    round = %round,
+                    captured = paths.len(),
+                    "block not found, treating as end of chain"
+                );
+                break;
+            }
+            Err(e) => return Err(e),
+        }
         round = round.next();
     }
     Ok(paths)

@@ -31,8 +31,8 @@ pub enum Commands {
         #[arg(long, default_value = "1")]
         start: u64,
 
-        /// Last round to capture.
-        #[arg(long, default_value = "100")]
+        /// Last round to capture (stops early if block not found).
+        #[arg(long, default_value = "5")]
         end: u64,
 
         /// Output directory for fixtures.
