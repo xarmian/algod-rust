@@ -95,6 +95,36 @@ pub struct BlockHeader {
     /// Transaction counter.
     #[serde(rename = "tc", default, skip_serializing_if = "is_zero_u64")]
     pub txn_counter: u64,
+
+    // ── Additional header fields (needed for block digest) ───
+
+    /// Fees collected in this block (consensus v39+).
+    #[serde(rename = "fc", default, skip_serializing_if = "is_zero_u64")]
+    pub fees_collected: u64,
+
+    /// Bonus (block incentive bonus, consensus v39+).
+    #[serde(rename = "bi", default, skip_serializing_if = "is_zero_u64")]
+    pub bonus: u64,
+
+    /// Proposer payout (consensus v39+).
+    #[serde(rename = "pp", default, skip_serializing_if = "is_zero_u64")]
+    pub proposer_payout: u64,
+
+    /// SHA512/256 digest of the previous block header.
+    #[serde(rename = "prev512", default, skip_serializing_if = "is_empty_bytes")]
+    pub prev512: ByteBuf,
+
+    /// SHA256 merkle root of the payset.
+    #[serde(rename = "txn256", default, skip_serializing_if = "is_empty_bytes")]
+    pub txn256: ByteBuf,
+
+    /// SHA512/256 merkle root variant of the payset.
+    #[serde(rename = "txn512", default, skip_serializing_if = "is_empty_bytes")]
+    pub txn512: ByteBuf,
+
+    /// State proof tracking (opaque — uses integer map keys).
+    #[serde(rename = "spt", default, skip_serializing_if = "Option::is_none")]
+    pub state_proof_tracking: Option<rmpv::Value>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {

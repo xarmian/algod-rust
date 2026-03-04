@@ -96,26 +96,40 @@ pub struct Block {
     #[serde(rename = "tc", default, skip_serializing_if = "is_zero_u64")]
     pub txn_counter: u64,
 
+    // ── Additional header fields (needed for block digest) ───
+
+    /// Fees collected in this block (consensus v39+).
+    #[serde(rename = "fc", default, skip_serializing_if = "is_zero_u64")]
+    pub fees_collected: u64,
+
+    /// Bonus (block incentive bonus, consensus v39+).
+    #[serde(rename = "bi", default, skip_serializing_if = "is_zero_u64")]
+    pub bonus: u64,
+
+    /// Proposer payout (consensus v39+).
+    #[serde(rename = "pp", default, skip_serializing_if = "is_zero_u64")]
+    pub proposer_payout: u64,
+
+    /// SHA512/256 digest of the previous block header.
+    #[serde(rename = "prev512", default, skip_serializing_if = "is_empty_bytes")]
+    pub prev512: ByteBuf,
+
+    /// SHA256 merkle root of the payset.
+    #[serde(rename = "txn256", default, skip_serializing_if = "is_empty_bytes")]
+    pub txn256: ByteBuf,
+
+    /// SHA512/256 merkle root variant of the payset.
+    #[serde(rename = "txn512", default, skip_serializing_if = "is_empty_bytes")]
+    pub txn512: ByteBuf,
+
+    /// State proof tracking (opaque — uses integer map keys).
+    #[serde(rename = "spt", default, skip_serializing_if = "Option::is_none")]
+    pub state_proof_tracking: Option<rmpv::Value>,
+
     // ── Payset ────────────────────────────────────────────────
     /// Payset: the list of signed transactions in this block.
     #[serde(rename = "txns", default, skip_serializing_if = "Vec::is_empty")]
     pub payset: Vec<SignedTransaction>,
-
-    // ── Known fields NOT yet modeled (silently ignored by serde) ──
-    //
-    // These fields appear in go-algorand blocks but are not decoded in Phase 0.
-    // They are safely ignored by rmp-serde because Block does not use
-    // `#[serde(deny_unknown_fields)]`.
-    //
-    // - `bi`      (BlockIntervalHistory): participation key interval tracking
-    // - `fc`      (FeesCollected): total fees collected in this block (consensus v39+)
-    // - `prev512` (SHA512_256 of previous block): 512-bit hash of the previous block
-    // - `txn256`  (TransactionCommitments): SHA256 merkle root of the payset
-    // - `txn512`  (TransactionCommitments): SHA512_256 merkle root variant
-    // - `spt`     (StateProofTracking): state proof tracking map with integer keys
-    //             e.g. {0: {n: 512}} — tracks state proof parameters per type
-    //
-    // These will be modeled when needed for Phase 1+ (hashing, state proofs).
 }
 
 /// The top-level response from `GET /v2/blocks/{round}?format=msgpack`.

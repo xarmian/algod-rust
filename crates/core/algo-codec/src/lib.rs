@@ -1,10 +1,12 @@
 mod canonical;
+mod digest;
 
 pub use canonical::{
     canonical_encode_block_header, canonical_encode_block_header_from_block,
     canonical_encode_signed_transaction, canonical_encode_signed_txn_in_block,
     canonical_encode_transaction,
 };
+pub use digest::{compute_block_digest, compute_txn_id};
 
 use algo_error::{AlgoError, Result};
 use algo_types::{Block, BlockResponse};
