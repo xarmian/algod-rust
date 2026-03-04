@@ -111,6 +111,16 @@ fn verify_multisig_subsigs(msig: &MultisigSig, msg: &[u8], context: &str) -> Res
 
     let mut valid_count: u16 = 0;
     for subsig in &msig.subsigs {
+        // Validate public key length for all subsigs, even unsigned ones.
+        if subsig.public_key.len() != 32 {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "invalid {context} subsig public key length: expected 32 bytes, got {}",
+                    subsig.public_key.len()
+                ),
+            });
+        }
+
         if subsig.signature.is_empty() {
             continue;
         }
@@ -222,6 +232,13 @@ fn verify_logicsig_multisig(
 ///
 /// TEAL program evaluation is deferred to Phase 3.
 pub fn verify_logicsig(stx: &SignedTransaction, lsig: &LogicSig) -> Result<(), AlgoError> {
+    // LogicSig sig and msig are mutually exclusive.
+    if !lsig.sig.is_empty() && lsig.msig.is_some() {
+        return Err(AlgoError::Validation {
+            message: "logicsig has both sig and msig set; expected at most one".into(),
+        });
+    }
+
     // Build program message: "Program" || logic
     let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
     program_msg.extend_from_slice(PROGRAM_PREFIX);
@@ -855,6 +872,88 @@ mod tests {
         assert!(
             err.to_string().contains("exactly one signature type"),
             "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_logicsig_both_sig_and_msig_fails() {
+        let key = test_signing_key();
+        let pk = key.verifying_key();
+        let sender = Address(pk.to_bytes());
+
+        let logic = vec![0x06, 0x81, 0x01];
+        let sig = sign_program(&key, &logic);
+
+        // Build a logicsig that has BOTH sig and msig — should be rejected.
+        let keys: Vec<SigningKey> = (20u8..23).map(signing_key_from_seed).collect();
+        let subsigs: Vec<MultisigSubsig> = keys
+            .iter()
+            .map(|k| MultisigSubsig {
+                public_key: ByteBuf::from(k.verifying_key().to_bytes().to_vec()),
+                signature: ByteBuf::new(),
+            })
+            .collect();
+        let msig = MultisigSig {
+            version: 1,
+            threshold: 2,
+            subsigs,
+        };
+
+        let txn = minimal_pay_txn(sender);
+        let lsig = LogicSig {
+            logic: ByteBuf::from(logic),
+            sig: ByteBuf::from(sig),
+            msig: Some(msig),
+            args: None,
+        };
+
+        let stx = SignedTransaction {
+            txn,
+            sig: ByteBuf::new(),
+            msig: None,
+            lsig: Some(lsig),
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+        };
+
+        let err = verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("both sig and msig"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_multisig_invalid_pk_length_fails() {
+        let keys: Vec<SigningKey> = (10u8..13).map(signing_key_from_seed).collect();
+        let txn = minimal_pay_txn(Address([0; 32])); // placeholder sender
+
+        let mut msig = build_multisig(&keys, &[0, 1], 2, &txn);
+        // Corrupt the third subsig's public key to be wrong length (unsigned subsig).
+        msig.subsigs[2].public_key = ByteBuf::from(vec![0u8; 16]); // 16 bytes instead of 32
+
+        // Compute the address from the corrupted msig so the address check passes.
+        let msig_addr = compute_multisig_address(&msig);
+        let txn = minimal_pay_txn(msig_addr);
+        // Rebuild signatures for keys 0 and 1 with the correct txn.
+        msig.subsigs[0].signature = ByteBuf::from(sign_txn(&keys[0], &txn));
+        msig.subsigs[1].signature = ByteBuf::from(sign_txn(&keys[1], &txn));
+
+        let stx = SignedTransaction {
+            txn,
+            sig: ByteBuf::new(),
+            msig: Some(msig),
+            lsig: None,
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+        };
+
+        let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("public key length"),
+            "expected public key length error, got: {err}"
         );
     }
 }
