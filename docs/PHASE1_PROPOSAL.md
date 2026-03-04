@@ -150,6 +150,7 @@ Epic 8 is the critical path — everything else depends on having all transactio
 
 - **Full lease enforcement**: Epic 10 validates lease uniqueness within transaction groups only. Cross-block lease enforcement (no duplicate sender+lease within the validity window) requires ledger state and is deferred to Phase 2.
 - **Transaction size limit**: Per-transaction byte size is not enforced individually. Go-algorand uses `MaxTxnBytesPerBlock` as a block-level aggregate limit, checked in Epic 11.
+- **Fee pooling**: Epic 10 enforces minimum fee per-transaction. Algorand allows fee pooling in atomic groups (one txn overpays to cover others, as long as total group fee >= N × MinTxnFee). Group-level fee validation to be added in Epic 12 when testing against mainnet blocks that use fee pooling.
 
 ---
 

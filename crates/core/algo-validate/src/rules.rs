@@ -17,7 +17,9 @@ pub const MAX_LEASE_SIZE: usize = 32;
 /// Validate individual transaction rules (fee, round window, note size,
 /// lease size, group size). Does NOT validate group membership or signatures.
 pub fn validate_transaction_rules(txn: &Transaction) -> Result<(), AlgoError> {
-    // Fee must meet minimum.
+    // Fee must meet minimum (per-txn check). NOTE: Algorand allows fee pooling
+    // in atomic groups where one txn overpays for others. Group-level fee
+    // validation is deferred — see Known Limitations in PHASE1_PROPOSAL.md.
     if txn.fee < MIN_TXN_FEE {
         return Err(AlgoError::Validation {
             message: format!(
