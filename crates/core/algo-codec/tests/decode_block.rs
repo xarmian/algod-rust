@@ -34,16 +34,24 @@ macro_rules! fixture_decode_test {
 
             // Header fields are populated
             assert!(!br.block.genesis_id.is_empty(), "genesis_id should be set");
-            assert!(!br.block.genesis_hash.is_empty(), "genesis_hash should be set");
-            assert!(!br.block.current_protocol.is_empty(), "protocol should be set");
+            assert!(
+                !br.block.genesis_hash.is_empty(),
+                "genesis_hash should be set"
+            );
+            assert!(
+                !br.block.current_protocol.is_empty(),
+                "protocol should be set"
+            );
 
             // Round-trip: encode then decode again
-            let re_encoded =
-                algo_codec::encode_block(&br.block).expect("re-encode should succeed");
+            let re_encoded = algo_codec::encode_block(&br.block).expect("re-encode should succeed");
             let re_decoded =
                 algo_codec::decode_block(&re_encoded).expect("re-decode should succeed");
 
-            assert_eq!(re_decoded.round, br.block.round, "round-trip round mismatch");
+            assert_eq!(
+                re_decoded.round, br.block.round,
+                "round-trip round mismatch"
+            );
             assert_eq!(
                 re_decoded.payset.len(),
                 br.block.payset.len(),
@@ -74,19 +82,10 @@ macro_rules! fixture_decode_test {
                 .zip(re_decoded.payset.iter())
                 .enumerate()
             {
-                assert_eq!(
-                    orig.txn.txn_type, rt.txn.txn_type,
-                    "txn[{i}] type mismatch"
-                );
-                assert_eq!(
-                    orig.txn.sender, rt.txn.sender,
-                    "txn[{i}] sender mismatch"
-                );
+                assert_eq!(orig.txn.txn_type, rt.txn.txn_type, "txn[{i}] type mismatch");
+                assert_eq!(orig.txn.sender, rt.txn.sender, "txn[{i}] sender mismatch");
                 assert_eq!(orig.txn.fee, rt.txn.fee, "txn[{i}] fee mismatch");
-                assert_eq!(
-                    orig.txn.amount, rt.txn.amount,
-                    "txn[{i}] amount mismatch"
-                );
+                assert_eq!(orig.txn.amount, rt.txn.amount, "txn[{i}] amount mismatch");
                 assert_eq!(
                     orig.txn.receiver, rt.txn.receiver,
                     "txn[{i}] receiver mismatch"
@@ -114,10 +113,8 @@ fn all_fixtures_have_pay_txns() {
     ];
 
     for (bytes, round) in fixtures {
-        let br: BlockResponse =
-            algo_codec::decode_block_response(bytes).unwrap_or_else(|e| {
-                panic!("failed to decode block {round}: {e}")
-            });
+        let br: BlockResponse = algo_codec::decode_block_response(bytes)
+            .unwrap_or_else(|e| panic!("failed to decode block {round}: {e}"));
         assert_eq!(br.block.payset.len(), 1, "block {round} should have 1 txn");
         assert_eq!(
             br.block.payset[0].txn.txn_type, "pay",

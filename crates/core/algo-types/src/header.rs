@@ -97,7 +97,6 @@ pub struct BlockHeader {
     pub txn_counter: u64,
 
     // ── Additional header fields (needed for block digest) ───
-
     /// Fees collected in this block (consensus v39+).
     #[serde(rename = "fc", default, skip_serializing_if = "is_zero_u64")]
     pub fees_collected: u64,

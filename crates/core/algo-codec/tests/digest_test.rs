@@ -61,10 +61,7 @@ macro_rules! txn_id_test {
             let rust_id = compute_txn_id(tx);
 
             let go_id_bytes = require_fixture!(
-                load_hex_fixture(&format!(
-                    "block_{}_txn_{}.txid.hex",
-                    $round, $txn_idx
-                )),
+                load_hex_fixture(&format!("block_{}_txn_{}.txid.hex", $round, $txn_idx)),
                 concat!("block ", stringify!($round), " txid fixture missing")
             );
 
@@ -154,5 +151,7 @@ fn txn_id_display_is_base32_nopad() {
     // Base32 of 32 bytes = ceil(32*8/5) = 52 chars, no padding
     assert_eq!(display.len(), 52);
     // Should only contain A-Z and 2-7
-    assert!(display.chars().all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)));
+    assert!(display
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)));
 }

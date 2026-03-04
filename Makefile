@@ -5,6 +5,7 @@ COMPOSE := docker compose -f docker/docker-compose.yml
 .PHONY: build test fmt fmt-check clippy lint deny ci clean
 .PHONY: localnet-up localnet-down localnet-status localnet-logs
 .PHONY: capture validate validate-only generate-txns fixtures help
+.PHONY: generate-diverse-txns fixtures-diverse
 
 ## ── Build & Test ──────────────────────────────────────────────
 
@@ -71,6 +72,9 @@ generate-txns:
 	done; \
 	echo "$(N) transactions sent."
 
+generate-diverse-txns:
+	docker exec algod-go bash /scripts/generate-diverse-txns.sh
+
 ## ── Fixture Pipeline ────────────────────────────────────────
 
 FIXTURE_BLOCKS ?= 5
@@ -90,6 +94,28 @@ fixtures: localnet-up
 	@echo "==> Extracting Go canonical references..."
 	$(MAKE) canonical-extract
 	@echo "==> Fixtures regenerated successfully."
+
+DIVERSE_FIXTURE_BLOCKS ?= 12
+
+fixtures-diverse: localnet-up
+	@echo "==> Generating diverse transactions (all types)..."
+	$(MAKE) generate-diverse-txns
+	@echo "==> Sending one extra txn for final block digest extraction..."
+	@FROM=$$(docker exec algod-go goal account list -d /algod/data 2>/dev/null | head -1 | awk '{print $$2}'); \
+	TO=$$(docker exec algod-go goal account list -d /algod/data 2>/dev/null | tail -1 | awk '{print $$2}'); \
+	docker exec algod-go goal clerk send -a 1000 -f "$$FROM" -t "$$TO" -d /algod/data -n "digest-tail"
+	@echo "==> Capturing blocks 1-$(DIVERSE_FIXTURE_BLOCKS)..."
+	cargo run --bin algod-rust -- capture \
+		--algod-url $(ALGOD_URL) --algod-token $(ALGOD_TOKEN) \
+		--start 1 --end $(DIVERSE_FIXTURE_BLOCKS) --out ./fixtures
+	@echo "==> Copying fixtures to test directory..."
+	@mkdir -p crates/core/algo-codec/tests/fixtures
+	@for i in $$(seq 1 $(DIVERSE_FIXTURE_BLOCKS)); do \
+		cp fixtures/block_$$i.msgpack crates/core/algo-codec/tests/fixtures/; \
+	done
+	@echo "==> Extracting Go canonical references..."
+	$(MAKE) canonical-extract
+	@echo "==> Diverse fixtures regenerated successfully."
 
 ## ── Canonical Reference Extraction ───────────────────────────
 
@@ -144,11 +170,14 @@ help:
 	@echo "  make localnet-logs    Tail algod-go logs"
 	@echo ""
 	@echo "Transaction Generation:"
-	@echo "  make generate-txns    Send N test transactions (default N=6)"
+	@echo "  make generate-txns          Send N payment transactions (default N=6)"
+	@echo "  make generate-diverse-txns  Send diverse txn types (pay/axfer/acfg/afrz/appl/keyreg)"
 	@echo ""
 	@echo "Fixtures:"
-	@echo "  make fixtures         Full fixture regeneration pipeline"
-	@echo "                        (localnet-up + txns + capture + extract)"
+	@echo "  make fixtures               Full fixture regeneration (payments only)"
+	@echo "                              (localnet-up + txns + capture + extract)"
+	@echo "  make fixtures-diverse       Fixture regeneration with all txn types"
+	@echo "                              (localnet-up + diverse txns + capture + extract)"
 	@echo "  make capture          Capture block fixtures from algod"
 	@echo "  make canonical-extract  Run Go tool to extract reference bytes"
 	@echo ""

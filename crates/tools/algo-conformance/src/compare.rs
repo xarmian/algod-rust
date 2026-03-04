@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use algo_types::Round;
 use serde::Serialize;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Result of comparing a Rust-decoded block against the raw reference bytes.
 #[derive(Debug, Clone, Serialize)]
@@ -235,7 +235,10 @@ pub fn compare_block(raw_bytes: &[u8], round: Round) -> ComparisonResult {
                         &hex::encode(&rt.txn.note),
                     );
 
-                    // Step 5b: Verify computed txn IDs are consistent across round-trip
+                    // Step 5b: Type-specific field comparisons
+                    compare_txn_type_fields(&mut mismatches, i, &orig.txn, &rt.txn);
+
+                    // Step 5c: Verify computed txn IDs are consistent across round-trip
                     let orig_txn_id = algo_codec::compute_txn_id(&orig.txn);
                     let rt_txn_id = algo_codec::compute_txn_id(&rt.txn);
                     compare_field(
@@ -305,5 +308,401 @@ fn compare_field<T: std::fmt::Display + PartialEq>(
             expected: expected.to_string(),
             actual: actual.to_string(),
         });
+    }
+}
+
+/// Compare optional Address fields.
+fn compare_opt_address(
+    mismatches: &mut Vec<Mismatch>,
+    path: &str,
+    expected: &Option<algo_types::Address>,
+    actual: &Option<algo_types::Address>,
+) {
+    match (expected, actual) {
+        (Some(e), Some(a)) => compare_field(mismatches, path, e, a),
+        (None, None) => {}
+        (e, a) => {
+            mismatches.push(Mismatch::FieldMismatch {
+                path: path.into(),
+                expected: format!("{e:?}"),
+                actual: format!("{a:?}"),
+            });
+        }
+    }
+}
+
+/// Compare optional ByteBuf fields as hex strings.
+fn compare_opt_bytes_hex(
+    mismatches: &mut Vec<Mismatch>,
+    path: &str,
+    expected: &Option<serde_bytes::ByteBuf>,
+    actual: &Option<serde_bytes::ByteBuf>,
+) {
+    let e_hex = expected.as_ref().map(|b| hex::encode(b.as_slice()));
+    let a_hex = actual.as_ref().map(|b| hex::encode(b.as_slice()));
+    if e_hex != a_hex {
+        mismatches.push(Mismatch::FieldMismatch {
+            path: path.into(),
+            expected: e_hex.unwrap_or_else(|| "None".into()),
+            actual: a_hex.unwrap_or_else(|| "None".into()),
+        });
+    }
+}
+
+/// Compare optional Vec lengths.
+fn compare_opt_vec_len<T>(
+    mismatches: &mut Vec<Mismatch>,
+    path: &str,
+    expected: &Option<Vec<T>>,
+    actual: &Option<Vec<T>>,
+) {
+    let e_len = expected.as_ref().map(|v| v.len());
+    let a_len = actual.as_ref().map(|v| v.len());
+    if e_len != a_len {
+        mismatches.push(Mismatch::FieldMismatch {
+            path: path.into(),
+            expected: format!("{e_len:?}"),
+            actual: format!("{a_len:?}"),
+        });
+    }
+}
+
+/// Compare type-specific transaction fields based on the transaction type.
+fn compare_txn_type_fields(
+    mismatches: &mut Vec<Mismatch>,
+    idx: usize,
+    orig: &algo_types::Transaction,
+    rt: &algo_types::Transaction,
+) {
+    let prefix = format!("round-trip txns[{idx}]");
+
+    match orig.txn_type.as_str() {
+        "pay" => {
+            // Pay fields already compared in the common section (amount, receiver).
+            compare_field(
+                mismatches,
+                &format!("{prefix}.close_remainder_to"),
+                &orig.close_remainder_to,
+                &rt.close_remainder_to,
+            );
+        }
+        "axfer" => {
+            compare_field(mismatches, &format!("{prefix}.xaid"), &orig.xaid, &rt.xaid);
+            compare_field(
+                mismatches,
+                &format!("{prefix}.asset_amount"),
+                &orig.asset_amount,
+                &rt.asset_amount,
+            );
+            compare_opt_address(
+                mismatches,
+                &format!("{prefix}.asset_sender"),
+                &orig.asset_sender,
+                &rt.asset_sender,
+            );
+            compare_opt_address(
+                mismatches,
+                &format!("{prefix}.asset_receiver"),
+                &orig.asset_receiver,
+                &rt.asset_receiver,
+            );
+            compare_opt_address(
+                mismatches,
+                &format!("{prefix}.asset_close_to"),
+                &orig.asset_close_to,
+                &rt.asset_close_to,
+            );
+        }
+        "acfg" => {
+            compare_field(
+                mismatches,
+                &format!("{prefix}.config_asset"),
+                &orig.config_asset,
+                &rt.config_asset,
+            );
+            // Compare asset params if present
+            match (&orig.asset_params, &rt.asset_params) {
+                (Some(ep), Some(ap)) => {
+                    compare_field(
+                        mismatches,
+                        &format!("{prefix}.apar.total"),
+                        &ep.total,
+                        &ap.total,
+                    );
+                    compare_field(
+                        mismatches,
+                        &format!("{prefix}.apar.decimals"),
+                        &ep.decimals,
+                        &ap.decimals,
+                    );
+                    compare_field(
+                        mismatches,
+                        &format!("{prefix}.apar.default_frozen"),
+                        &ep.default_frozen,
+                        &ap.default_frozen,
+                    );
+                    compare_field(
+                        mismatches,
+                        &format!("{prefix}.apar.unit_name"),
+                        &ep.unit_name,
+                        &ap.unit_name,
+                    );
+                    compare_field(
+                        mismatches,
+                        &format!("{prefix}.apar.asset_name"),
+                        &ep.asset_name,
+                        &ap.asset_name,
+                    );
+                    compare_field(mismatches, &format!("{prefix}.apar.url"), &ep.url, &ap.url);
+                    compare_opt_bytes_hex(
+                        mismatches,
+                        &format!("{prefix}.apar.metadata_hash"),
+                        &ep.metadata_hash,
+                        &ap.metadata_hash,
+                    );
+                    compare_opt_address(
+                        mismatches,
+                        &format!("{prefix}.apar.manager"),
+                        &ep.manager,
+                        &ap.manager,
+                    );
+                    compare_opt_address(
+                        mismatches,
+                        &format!("{prefix}.apar.reserve"),
+                        &ep.reserve,
+                        &ap.reserve,
+                    );
+                    compare_opt_address(
+                        mismatches,
+                        &format!("{prefix}.apar.freeze"),
+                        &ep.freeze,
+                        &ap.freeze,
+                    );
+                    compare_opt_address(
+                        mismatches,
+                        &format!("{prefix}.apar.clawback"),
+                        &ep.clawback,
+                        &ap.clawback,
+                    );
+                }
+                (None, None) => {}
+                (e, a) => {
+                    mismatches.push(Mismatch::FieldMismatch {
+                        path: format!("{prefix}.asset_params"),
+                        expected: (if e.is_some() { "Some" } else { "None" }).to_string(),
+                        actual: (if a.is_some() { "Some" } else { "None" }).to_string(),
+                    });
+                }
+            }
+        }
+        "afrz" => {
+            compare_field(
+                mismatches,
+                &format!("{prefix}.freeze_asset"),
+                &orig.freeze_asset,
+                &rt.freeze_asset,
+            );
+            compare_opt_address(
+                mismatches,
+                &format!("{prefix}.freeze_account"),
+                &orig.freeze_account,
+                &rt.freeze_account,
+            );
+            compare_field(
+                mismatches,
+                &format!("{prefix}.asset_frozen"),
+                &orig.asset_frozen,
+                &rt.asset_frozen,
+            );
+        }
+        "appl" => {
+            compare_field(
+                mismatches,
+                &format!("{prefix}.application_id"),
+                &orig.application_id,
+                &rt.application_id,
+            );
+            compare_field(
+                mismatches,
+                &format!("{prefix}.on_completion"),
+                &orig.on_completion,
+                &rt.on_completion,
+            );
+            compare_field(
+                mismatches,
+                &format!("{prefix}.extra_program_pages"),
+                &orig.extra_program_pages,
+                &rt.extra_program_pages,
+            );
+            compare_opt_bytes_hex(
+                mismatches,
+                &format!("{prefix}.approval_program"),
+                &orig.approval_program,
+                &rt.approval_program,
+            );
+            compare_opt_bytes_hex(
+                mismatches,
+                &format!("{prefix}.clear_state_program"),
+                &orig.clear_state_program,
+                &rt.clear_state_program,
+            );
+            compare_opt_vec_len(
+                mismatches,
+                &format!("{prefix}.app_arguments.len"),
+                &orig.app_arguments,
+                &rt.app_arguments,
+            );
+            compare_opt_vec_len(
+                mismatches,
+                &format!("{prefix}.accounts.len"),
+                &orig.accounts,
+                &rt.accounts,
+            );
+            compare_opt_vec_len(
+                mismatches,
+                &format!("{prefix}.foreign_apps.len"),
+                &orig.foreign_apps,
+                &rt.foreign_apps,
+            );
+            compare_opt_vec_len(
+                mismatches,
+                &format!("{prefix}.foreign_assets.len"),
+                &orig.foreign_assets,
+                &rt.foreign_assets,
+            );
+            compare_opt_vec_len(
+                mismatches,
+                &format!("{prefix}.boxes.len"),
+                &orig.boxes,
+                &rt.boxes,
+            );
+            // Global state schema
+            match (&orig.global_state_schema, &rt.global_state_schema) {
+                (Some(es), Some(as_)) => {
+                    compare_field(
+                        mismatches,
+                        &format!("{prefix}.apgs.num_uint"),
+                        &es.num_uint,
+                        &as_.num_uint,
+                    );
+                    compare_field(
+                        mismatches,
+                        &format!("{prefix}.apgs.num_byte_slice"),
+                        &es.num_byte_slice,
+                        &as_.num_byte_slice,
+                    );
+                }
+                (None, None) => {}
+                (e, a) => {
+                    mismatches.push(Mismatch::FieldMismatch {
+                        path: format!("{prefix}.global_state_schema"),
+                        expected: (if e.is_some() { "Some" } else { "None" }).to_string(),
+                        actual: (if a.is_some() { "Some" } else { "None" }).to_string(),
+                    });
+                }
+            }
+            // Local state schema
+            match (&orig.local_state_schema, &rt.local_state_schema) {
+                (Some(es), Some(as_)) => {
+                    compare_field(
+                        mismatches,
+                        &format!("{prefix}.apls.num_uint"),
+                        &es.num_uint,
+                        &as_.num_uint,
+                    );
+                    compare_field(
+                        mismatches,
+                        &format!("{prefix}.apls.num_byte_slice"),
+                        &es.num_byte_slice,
+                        &as_.num_byte_slice,
+                    );
+                }
+                (None, None) => {}
+                (e, a) => {
+                    mismatches.push(Mismatch::FieldMismatch {
+                        path: format!("{prefix}.local_state_schema"),
+                        expected: (if e.is_some() { "Some" } else { "None" }).to_string(),
+                        actual: (if a.is_some() { "Some" } else { "None" }).to_string(),
+                    });
+                }
+            }
+        }
+        "keyreg" => {
+            compare_field(
+                mismatches,
+                &format!("{prefix}.vote_first"),
+                &orig.vote_first,
+                &rt.vote_first,
+            );
+            compare_field(
+                mismatches,
+                &format!("{prefix}.vote_last"),
+                &orig.vote_last,
+                &rt.vote_last,
+            );
+            compare_field(
+                mismatches,
+                &format!("{prefix}.vote_key_dilution"),
+                &orig.vote_key_dilution,
+                &rt.vote_key_dilution,
+            );
+            compare_field(
+                mismatches,
+                &format!("{prefix}.non_participation"),
+                &orig.non_participation,
+                &rt.non_participation,
+            );
+            compare_opt_bytes_hex(
+                mismatches,
+                &format!("{prefix}.vote_pk"),
+                &orig.vote_pk,
+                &rt.vote_pk,
+            );
+            compare_opt_bytes_hex(
+                mismatches,
+                &format!("{prefix}.selection_pk"),
+                &orig.selection_pk,
+                &rt.selection_pk,
+            );
+            compare_opt_bytes_hex(
+                mismatches,
+                &format!("{prefix}.state_proof_pk"),
+                &orig.state_proof_pk,
+                &rt.state_proof_pk,
+            );
+        }
+        "stpf" => {
+            compare_field(
+                mismatches,
+                &format!("{prefix}.state_proof_type"),
+                &orig.state_proof_type,
+                &rt.state_proof_type,
+            );
+            // Compare state proof body presence
+            if orig.state_proof.is_some() != rt.state_proof.is_some() {
+                mismatches.push(Mismatch::FieldMismatch {
+                    path: format!("{prefix}.state_proof"),
+                    expected: (if orig.state_proof.is_some() {
+                        "Some"
+                    } else {
+                        "None"
+                    })
+                    .to_string(),
+                    actual: (if rt.state_proof.is_some() {
+                        "Some"
+                    } else {
+                        "None"
+                    })
+                    .to_string(),
+                });
+            }
+        }
+        other => {
+            warn!(
+                txn_index = idx,
+                txn_type = other,
+                "unknown transaction type, skipping type-specific field comparison"
+            );
+        }
     }
 }

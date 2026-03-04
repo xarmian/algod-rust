@@ -10,6 +10,7 @@ services:
       - "4001:8080"
     volumes:
       - algod-data:/algod/data
+      - ./scripts:/scripts:ro
     healthcheck:
       test:
         [

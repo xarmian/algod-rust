@@ -76,7 +76,11 @@ impl AlgodClient {
     ///
     /// Retries on connection errors, timeouts, and 5xx responses.
     /// Does not retry on 4xx responses.
-    async fn get_with_retry(&self, path: &str, client: &reqwest::Client) -> Result<reqwest::Response> {
+    async fn get_with_retry(
+        &self,
+        path: &str,
+        client: &reqwest::Client,
+    ) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.base_url, path);
         let mut backoff = self.config.initial_backoff;
 

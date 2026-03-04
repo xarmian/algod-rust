@@ -13,6 +13,7 @@ serde_json.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 hex.workspace = true
+serde_bytes.workspace = true
 
 [dev-dependencies]
 rmp-serde.workspace = true

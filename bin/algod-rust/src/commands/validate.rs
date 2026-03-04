@@ -4,7 +4,7 @@ use algo_conformance::{compare_block, ComparisonStatus, ConformanceReport};
 use algo_rest_client::{AlgodClient, BlockSource};
 use algo_types::Round;
 use chrono::Utc;
-use tracing::{info, error};
+use tracing::{error, info};
 
 pub async fn run(
     algod_url: &str,
