@@ -14,19 +14,13 @@ pub struct SignedTransaction {
     #[serde(rename = "sig", default, skip_serializing_if = "is_empty_bytes")]
     pub sig: ByteBuf,
 
-    /// Multisig metadata (captured as opaque value for Phase 0).
-    /// IMPORTANT: When promoting to a typed struct, also add a corresponding
-    /// canonical_encode_multisig() function in algo-codec/canonical.rs and
-    /// remove the add_option_rmpv call. See P1 note there.
+    /// Multisig signature.
     #[serde(rename = "msig", default, skip_serializing_if = "Option::is_none")]
-    pub msig: Option<rmpv::Value>,
+    pub msig: Option<MultisigSig>,
 
-    /// Logic signature (captured as opaque value for Phase 0).
-    /// IMPORTANT: When promoting to a typed struct, also add a corresponding
-    /// canonical_encode_logicsig() function in algo-codec/canonical.rs and
-    /// remove the add_option_rmpv call. See P1 note there.
+    /// Logic signature.
     #[serde(rename = "lsig", default, skip_serializing_if = "Option::is_none")]
-    pub lsig: Option<rmpv::Value>,
+    pub lsig: Option<LogicSig>,
 
     /// Auth address for rekeyed accounts.
     #[serde(rename = "sgnr", default, skip_serializing_if = "Option::is_none")]
@@ -258,6 +252,54 @@ fn is_zero_u64(v: &u64) -> bool {
 
 fn is_false(v: &bool) -> bool {
     !v
+}
+
+/// Multisig subsignature.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MultisigSubsig {
+    /// Public key.
+    #[serde(rename = "pk")]
+    pub public_key: ByteBuf,
+
+    /// Signature (empty if this subsigner hasn't signed).
+    #[serde(rename = "s", default, skip_serializing_if = "is_empty_bytes")]
+    pub signature: ByteBuf,
+}
+
+/// Multisig signature.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MultisigSig {
+    /// Version.
+    #[serde(rename = "v")]
+    pub version: u8,
+
+    /// Threshold.
+    #[serde(rename = "thr")]
+    pub threshold: u8,
+
+    /// Subsignatures.
+    #[serde(rename = "subsig")]
+    pub subsigs: Vec<MultisigSubsig>,
+}
+
+/// Logic signature.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LogicSig {
+    /// TEAL program bytes.
+    #[serde(rename = "l")]
+    pub logic: ByteBuf,
+
+    /// Delegated signature (optional).
+    #[serde(rename = "sig", default, skip_serializing_if = "is_empty_bytes")]
+    pub sig: ByteBuf,
+
+    /// Delegated multisig (optional).
+    #[serde(rename = "msig", default, skip_serializing_if = "Option::is_none")]
+    pub msig: Option<MultisigSig>,
+
+    /// Arguments (optional).
+    #[serde(rename = "arg", default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<ByteBuf>>,
 }
 
 /// Asset parameters for asset config transactions.

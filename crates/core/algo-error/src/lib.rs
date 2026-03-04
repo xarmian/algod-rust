@@ -27,6 +27,9 @@ pub enum AlgoError {
 
     #[error("config error: {0}")]
     Config(String),
+
+    #[error("validation error: {message}")]
+    Validation { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, AlgoError>;

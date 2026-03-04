@@ -7,6 +7,7 @@ members = [
     "crates/node/algo-rest-client",
     "crates/tools/algo-fixtures",
     "crates/tools/algo-conformance",
+    "crates/core/algo-validate",
     "bin/algod-rust",
 ]
 
@@ -41,6 +42,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 # Crypto
+ed25519-dalek = { version = "2", features = ["std"] }
 sha2 = "0.10"
 hex = "0.4"
 serde_bytes = "0.11"
@@ -56,3 +58,4 @@ algo-codec = { path = "crates/core/algo-codec" }
 algo-rest-client = { path = "crates/node/algo-rest-client" }
 algo-fixtures = { path = "crates/tools/algo-fixtures" }
 algo-conformance = { path = "crates/tools/algo-conformance" }
+algo-validate = { path = "crates/core/algo-validate" }

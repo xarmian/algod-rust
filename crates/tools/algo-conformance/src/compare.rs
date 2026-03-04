@@ -34,6 +34,10 @@ pub enum Mismatch {
         expected: usize,
         actual: usize,
     },
+    SignatureInvalid {
+        txn_index: usize,
+        error: String,
+    },
 }
 
 /// Compare a block by decoding raw msgpack bytes and verifying structural consistency.
@@ -268,6 +272,27 @@ pub fn compare_block(raw_bytes: &[u8], round: Round) -> ComparisonResult {
         Err(e) => {
             mismatches.push(Mismatch::DecodeFailed {
                 error: format!("re-encode failed: {e}"),
+            });
+        }
+    }
+
+    // Step 7: Verify transaction signatures
+    // Transactions in a block have genesis_id stripped when hgi=true, and
+    // genesis_hash is ALWAYS stripped (redundant with block header). We must
+    // restore them before signature verification since the signature covers
+    // the full transaction including these fields.
+    for (i, stx) in block.payset.iter().enumerate() {
+        let mut stx_full = stx.clone();
+        if stx.has_genesis_id && stx_full.txn.genesis_id.is_empty() {
+            stx_full.txn.genesis_id.clone_from(&block.genesis_id);
+        }
+        if stx_full.txn.genesis_hash.is_empty() {
+            stx_full.txn.genesis_hash = block.genesis_hash.clone();
+        }
+        if let Err(e) = algo_validate::verify_transaction_signature(&stx_full) {
+            mismatches.push(Mismatch::SignatureInvalid {
+                txn_index: i,
+                error: e.to_string(),
             });
         }
     }
