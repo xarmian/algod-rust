@@ -1,0 +1,59 @@
+services:
+  algod-go:
+    image: algorand/algod:4.5.1-stable
+    container_name: algod-go
+    environment:
+      - DEV_MODE=1
+      - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    ports:
+      - "4001:8080"
+    volumes:
+      - algod-data:/algod/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "-H",
+          "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "http://localhost:8080/v2/status",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  txn-generator:
+    image: algorand/algod:4.5.1-stable
+    container_name: txn-generator
+    depends_on:
+      algod-go:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/scripts/generate-txns.sh"]
+    volumes:
+      - ./scripts/generate-txns.sh:/scripts/generate-txns.sh:ro
+    environment:
+      - ALGOD_URL=http://algod-go:8080
+      - ALGOD_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+  algod-rust:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: algod-rust
+    depends_on:
+      algod-go:
+        condition: service_healthy
+    environment:
+      - ALGOD_URL=http://algod-go:8080
+      - ALGOD_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    volumes:
+      - ../fixtures:/app/fixtures
+      - ../reports:/app/reports
+    profiles:
+      - rust
+
+volumes:
+  algod-data:

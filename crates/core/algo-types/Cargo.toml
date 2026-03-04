@@ -1,0 +1,12 @@
+[package]
+name = "algo-types"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+algo-error.workspace = true
+serde.workspace = true
+rmpv.workspace = true
+hex.workspace = true
+serde_bytes.workspace = true

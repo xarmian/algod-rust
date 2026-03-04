@@ -1,0 +1,9 @@
+/target/
+.claude/
+fixtures/
+reports/
+docker/data/
+*.swp
+*.swo
+.DS_Store
+.env
