@@ -1,6 +1,6 @@
 /target/
 .claude/
-fixtures/
+/fixtures/
 reports/
 docker/data/
 *.swp

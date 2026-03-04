@@ -53,6 +53,14 @@ localnet-status:
 localnet-logs:
 	$(COMPOSE) logs -f algod-go
 
+## ── Canonical Reference Extraction ───────────────────────────
+
+canonical-extract:
+	cd docker/scripts/canonical-extract && go run . \
+		-algod-url $(ALGOD_URL) \
+		-algod-token $(ALGOD_TOKEN) \
+		-output-dir ../../../crates/core/algo-codec/tests/fixtures/canonical
+
 ## ── Conformance Tools ─────────────────────────────────────────
 
 capture:
