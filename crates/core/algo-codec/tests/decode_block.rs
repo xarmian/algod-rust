@@ -100,25 +100,36 @@ fixture_decode_test!(decode_block_2, "block_2.msgpack", 2);
 fixture_decode_test!(decode_block_3, "block_3.msgpack", 3);
 fixture_decode_test!(decode_block_4, "block_4.msgpack", 4);
 fixture_decode_test!(decode_block_5, "block_5.msgpack", 5);
+fixture_decode_test!(decode_block_6_appl_create, "block_6.msgpack", 6);
+fixture_decode_test!(decode_block_7_appl_call, "block_7.msgpack", 7);
+fixture_decode_test!(decode_block_8_keyreg, "block_8.msgpack", 8);
+fixture_decode_test!(decode_block_9_pay, "block_9.msgpack", 9);
 
-/// Verify that all blocks contain exactly 1 payment transaction (known from fixture capture).
+/// Verify that all blocks contain at least one transaction and the expected type.
 #[test]
-fn all_fixtures_have_pay_txns() {
-    let fixtures: &[(&[u8], u64)] = &[
-        (include_bytes!("fixtures/block_1.msgpack"), 1),
-        (include_bytes!("fixtures/block_2.msgpack"), 2),
-        (include_bytes!("fixtures/block_3.msgpack"), 3),
-        (include_bytes!("fixtures/block_4.msgpack"), 4),
-        (include_bytes!("fixtures/block_5.msgpack"), 5),
+fn all_fixtures_have_expected_txn_types() {
+    let fixtures: &[(&[u8], u64, &str)] = &[
+        (include_bytes!("fixtures/block_1.msgpack"), 1, "pay"),
+        (include_bytes!("fixtures/block_2.msgpack"), 2, "acfg"),
+        (include_bytes!("fixtures/block_3.msgpack"), 3, "axfer"),
+        (include_bytes!("fixtures/block_4.msgpack"), 4, "axfer"),
+        (include_bytes!("fixtures/block_5.msgpack"), 5, "afrz"),
+        (include_bytes!("fixtures/block_6.msgpack"), 6, "appl"),
+        (include_bytes!("fixtures/block_7.msgpack"), 7, "appl"),
+        (include_bytes!("fixtures/block_8.msgpack"), 8, "keyreg"),
+        (include_bytes!("fixtures/block_9.msgpack"), 9, "pay"),
     ];
 
-    for (bytes, round) in fixtures {
+    for (bytes, round, expected_type) in fixtures {
         let br: BlockResponse = algo_codec::decode_block_response(bytes)
             .unwrap_or_else(|e| panic!("failed to decode block {round}: {e}"));
-        assert_eq!(br.block.payset.len(), 1, "block {round} should have 1 txn");
+        assert!(
+            !br.block.payset.is_empty(),
+            "block {round} should have at least 1 txn"
+        );
         assert_eq!(
-            br.block.payset[0].txn.txn_type, "pay",
-            "block {round} txn should be pay"
+            br.block.payset[0].txn.txn_type, *expected_type,
+            "block {round} txn should be {expected_type}"
         );
     }
 }

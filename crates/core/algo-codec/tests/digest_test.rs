@@ -83,6 +83,9 @@ txn_id_test!(txn_id_block_2, 2, 0);
 txn_id_test!(txn_id_block_3, 3, 0);
 txn_id_test!(txn_id_block_4, 4, 0);
 txn_id_test!(txn_id_block_5, 5, 0);
+txn_id_test!(txn_id_block_6_appl_create, 6, 0);
+txn_id_test!(txn_id_block_7_appl_call, 7, 0);
+txn_id_test!(txn_id_block_8_keyreg, 8, 0);
 
 // ── Block digest tests ──────────────────────────────────────────
 
@@ -119,6 +122,9 @@ block_digest_test!(block_digest_block_2, 2);
 block_digest_test!(block_digest_block_3, 3);
 block_digest_test!(block_digest_block_4, 4);
 block_digest_test!(block_digest_block_5, 5);
+block_digest_test!(block_digest_block_6, 6);
+block_digest_test!(block_digest_block_7, 7);
+block_digest_test!(block_digest_block_8, 8);
 
 // ── Corruption test ─────────────────────────────────────────────
 

@@ -114,15 +114,18 @@ fixtures-diverse: localnet-up
 		cp fixtures/block_$$i.msgpack crates/core/algo-codec/tests/fixtures/; \
 	done
 	@echo "==> Extracting Go canonical references..."
-	$(MAKE) canonical-extract
+	$(MAKE) canonical-extract CANONICAL_ROUNDS=1-$(DIVERSE_FIXTURE_BLOCKS)
 	@echo "==> Diverse fixtures regenerated successfully."
 
 ## ── Canonical Reference Extraction ───────────────────────────
+
+CANONICAL_ROUNDS ?= 1-5
 
 canonical-extract:
 	cd docker/scripts/canonical-extract && go run . \
 		-algod-url $(ALGOD_URL) \
 		-algod-token $(ALGOD_TOKEN) \
+		-rounds $(CANONICAL_ROUNDS) \
 		-output-dir ../../../crates/core/algo-codec/tests/fixtures/canonical
 
 ## ── Conformance Tools ─────────────────────────────────────────

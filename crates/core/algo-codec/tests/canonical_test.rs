@@ -71,6 +71,10 @@ canonical_txn_test!(canonical_txn_block_2, 2, 0);
 canonical_txn_test!(canonical_txn_block_3, 3, 0);
 canonical_txn_test!(canonical_txn_block_4, 4, 0);
 canonical_txn_test!(canonical_txn_block_5, 5, 0);
+canonical_txn_test!(canonical_txn_block_6_appl_create, 6, 0);
+canonical_txn_test!(canonical_txn_block_7_appl_call, 7, 0);
+canonical_txn_test!(canonical_txn_block_8_keyreg, 8, 0);
+canonical_txn_test!(canonical_txn_block_9_pay, 9, 0);
 
 // ── SignedTransaction canonical encoding comparison ─────────────
 
@@ -114,12 +118,16 @@ canonical_stxn_test!(canonical_stxn_block_2, 2, 0);
 canonical_stxn_test!(canonical_stxn_block_3, 3, 0);
 canonical_stxn_test!(canonical_stxn_block_4, 4, 0);
 canonical_stxn_test!(canonical_stxn_block_5, 5, 0);
+canonical_stxn_test!(canonical_stxn_block_6_appl_create, 6, 0);
+canonical_stxn_test!(canonical_stxn_block_7_appl_call, 7, 0);
+canonical_stxn_test!(canonical_stxn_block_8_keyreg, 8, 0);
+canonical_stxn_test!(canonical_stxn_block_9_pay, 9, 0);
 
 // ── Property-based tests ────────────────────────────────────────
 
 #[test]
 fn canonical_keys_are_sorted_in_all_fixture_txns() {
-    for round in 1..=5 {
+    for round in 1..=9 {
         let br = load_block(round);
         for (i, stxn) in br.block.payset.iter().enumerate() {
             let encoded = canonical_encode_transaction(&stxn.txn);
@@ -136,7 +144,7 @@ fn canonical_keys_are_sorted_in_all_fixture_txns() {
 
 #[test]
 fn canonical_no_zero_fields_in_fixture_txns() {
-    for round in 1..=5 {
+    for round in 1..=9 {
         let br = load_block(round);
         for (i, stxn) in br.block.payset.iter().enumerate() {
             let encoded = canonical_encode_transaction(&stxn.txn);

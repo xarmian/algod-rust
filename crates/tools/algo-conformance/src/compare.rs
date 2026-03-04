@@ -349,21 +349,45 @@ fn compare_opt_bytes_hex(
     }
 }
 
-/// Compare optional Vec lengths.
-fn compare_opt_vec_len<T>(
+/// Compare optional Vec elements using a formatter function.
+/// First compares lengths, then compares each element via `fmt`.
+fn compare_opt_vec_elements<T>(
     mismatches: &mut Vec<Mismatch>,
     path: &str,
     expected: &Option<Vec<T>>,
     actual: &Option<Vec<T>>,
+    fmt: impl Fn(&T) -> String,
 ) {
-    let e_len = expected.as_ref().map(|v| v.len());
-    let a_len = actual.as_ref().map(|v| v.len());
-    if e_len != a_len {
-        mismatches.push(Mismatch::FieldMismatch {
-            path: path.into(),
-            expected: format!("{e_len:?}"),
-            actual: format!("{a_len:?}"),
-        });
+    match (expected, actual) {
+        (None, None) => {}
+        (Some(ev), Some(av)) => {
+            if ev.len() != av.len() {
+                mismatches.push(Mismatch::FieldMismatch {
+                    path: format!("{path}.len"),
+                    expected: ev.len().to_string(),
+                    actual: av.len().to_string(),
+                });
+                return;
+            }
+            for (i, (e, a)) in ev.iter().zip(av.iter()).enumerate() {
+                let e_str = fmt(e);
+                let a_str = fmt(a);
+                if e_str != a_str {
+                    mismatches.push(Mismatch::FieldMismatch {
+                        path: format!("{path}[{i}]"),
+                        expected: e_str,
+                        actual: a_str,
+                    });
+                }
+            }
+        }
+        (e, a) => {
+            mismatches.push(Mismatch::FieldMismatch {
+                path: format!("{path}.len"),
+                expected: format!("{:?}", e.as_ref().map(|v| v.len())),
+                actual: format!("{:?}", a.as_ref().map(|v| v.len())),
+            });
+        }
     }
 }
 
@@ -546,35 +570,52 @@ fn compare_txn_type_fields(
                 &orig.clear_state_program,
                 &rt.clear_state_program,
             );
-            compare_opt_vec_len(
+            // app_arguments: compare each element as hex bytes
+            compare_opt_vec_elements(
                 mismatches,
-                &format!("{prefix}.app_arguments.len"),
+                &format!("{prefix}.app_arguments"),
                 &orig.app_arguments,
                 &rt.app_arguments,
+                |e| hex::encode(e.as_slice()),
             );
-            compare_opt_vec_len(
+            // accounts: compare each element
+            compare_opt_vec_elements(
                 mismatches,
-                &format!("{prefix}.accounts.len"),
+                &format!("{prefix}.accounts"),
                 &orig.accounts,
                 &rt.accounts,
+                |e| e.to_string(),
             );
-            compare_opt_vec_len(
+            // foreign_apps: compare each element
+            compare_opt_vec_elements(
                 mismatches,
-                &format!("{prefix}.foreign_apps.len"),
+                &format!("{prefix}.foreign_apps"),
                 &orig.foreign_apps,
                 &rt.foreign_apps,
+                |e| e.to_string(),
             );
-            compare_opt_vec_len(
+            // foreign_assets: compare each element
+            compare_opt_vec_elements(
                 mismatches,
-                &format!("{prefix}.foreign_assets.len"),
+                &format!("{prefix}.foreign_assets"),
                 &orig.foreign_assets,
                 &rt.foreign_assets,
+                |e| e.to_string(),
             );
-            compare_opt_vec_len(
+            // boxes: compare each element's index and name
+            compare_opt_vec_elements(
                 mismatches,
-                &format!("{prefix}.boxes.len"),
+                &format!("{prefix}.boxes"),
                 &orig.boxes,
                 &rt.boxes,
+                |b| {
+                    let name_hex = b
+                        .name
+                        .as_ref()
+                        .map(|n| hex::encode(n.as_slice()))
+                        .unwrap_or_default();
+                    format!("{{i:{},n:{}}}", b.index, name_hex)
+                },
             );
             // Global state schema
             match (&orig.global_state_schema, &rt.global_state_schema) {

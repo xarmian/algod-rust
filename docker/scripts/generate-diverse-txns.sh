@@ -79,7 +79,7 @@ goal asset freeze \
     --assetid "${ASSET_ID}" \
     --freezer "${FROM}" \
     --account "${TO}" \
-    --freeze true \
+    --freeze \
     -d "${ALGOD_DATA}"
 echo "  ASA freeze complete."
 
@@ -129,7 +129,7 @@ echo "  Current round: ${CURRENT_ROUND}"
 echo "  Key validity: ${FIRST_VALID} - ${LAST_VALID}"
 
 goal account addpartkey \
-    --account "${FROM}" \
+    --address "${FROM}" \
     --roundFirstValid "${FIRST_VALID}" \
     --roundLastValid "${LAST_VALID}" \
     -d "${ALGOD_DATA}"
@@ -138,8 +138,8 @@ echo "  Participation key generated."
 # ── 9. Register online (keyreg with all fields) ─────────────────
 echo "[9/9] Registering account online (keyreg)..."
 goal account changeonlinestatus \
-    --account "${FROM}" \
-    --online=true \
+    --address "${FROM}" \
+    --online \
     -d "${ALGOD_DATA}"
 echo "  Account registered online."
 
