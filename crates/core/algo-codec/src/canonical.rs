@@ -10,7 +10,8 @@
 // 7. Deterministic — identical inputs always produce identical bytes
 
 use algo_types::{
-    Address, AssetParams, Block, BlockHeader, BoxRef, SignedTransaction, StateSchema, Transaction,
+    Address, AssetParams, Block, BlockHeader, BoxRef, LogicSig, MultisigSig, MultisigSubsig,
+    SignedTransaction, StateSchema, Transaction,
 };
 use serde_bytes::ByteBuf;
 
@@ -375,8 +376,12 @@ pub fn canonical_encode_signed_transaction(stx: &SignedTransaction) -> Vec<u8> {
 
     // Note: hgi and hgh are NOT part of SignedTxn in go-algorand.
     // They belong to SignedTxnInBlock (the block payset wrapper).
-    m.add_option_rmpv("lsig", &stx.lsig);
-    m.add_option_rmpv("msig", &stx.msig);
+    if let Some(ref lsig) = stx.lsig {
+        m.fields.push(("lsig", canonical_encode_logicsig(lsig)));
+    }
+    if let Some(ref msig) = stx.msig {
+        m.fields.push(("msig", canonical_encode_multisig(msig)));
+    }
     m.add_bytes("sig", &stx.sig);
     m.add_option_address("sgnr", &stx.auth_addr);
     m.add_map("txn", canonical_encode_transaction(&stx.txn));
@@ -391,8 +396,12 @@ pub fn canonical_encode_signed_txn_in_block(stx: &SignedTransaction) -> Vec<u8> 
 
     m.add_bool("hgh", stx.has_genesis_hash);
     m.add_bool("hgi", stx.has_genesis_id);
-    m.add_option_rmpv("lsig", &stx.lsig);
-    m.add_option_rmpv("msig", &stx.msig);
+    if let Some(ref lsig) = stx.lsig {
+        m.fields.push(("lsig", canonical_encode_logicsig(lsig)));
+    }
+    if let Some(ref msig) = stx.msig {
+        m.fields.push(("msig", canonical_encode_multisig(msig)));
+    }
     m.add_bytes("sig", &stx.sig);
     m.add_option_address("sgnr", &stx.auth_addr);
     m.add_map("txn", canonical_encode_transaction(&stx.txn));
@@ -505,6 +514,72 @@ pub fn canonical_encode_box_ref(bref: &BoxRef) -> Vec<u8> {
 
     m.add_u64("i", bref.index);
     m.add_option_bytes("n", &bref.name);
+
+    m.encode()
+}
+
+/// Canonically encode a MultisigSubsig as a nested msgpack map.
+/// Sorted fields: "pk", "s" (alphabetical). "s" omitted if empty.
+pub fn canonical_encode_multisig_subsig(subsig: &MultisigSubsig) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    m.add_bytes("pk", &subsig.public_key);
+    m.add_bytes("s", &subsig.signature);
+
+    m.encode()
+}
+
+/// Canonically encode a MultisigSig as a nested msgpack map.
+/// Sorted fields: "subsig", "thr", "v" (alphabetical).
+pub fn canonical_encode_multisig(msig: &MultisigSig) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    // "subsig" — array of encoded subsigs
+    if !msig.subsigs.is_empty() {
+        let maps: Vec<Vec<u8>> = msig
+            .subsigs
+            .iter()
+            .map(canonical_encode_multisig_subsig)
+            .collect();
+        let mut buf = Vec::new();
+        rmp::encode::write_array_len(&mut buf, maps.len() as u32).unwrap();
+        for map in &maps {
+            buf.extend_from_slice(map);
+        }
+        m.fields.push(("subsig", buf));
+    }
+
+    m.add_u64("thr", msig.threshold as u64);
+    m.add_u64("v", msig.version as u64);
+
+    m.encode()
+}
+
+/// Canonically encode a LogicSig as a nested msgpack map.
+/// Sorted fields: "arg", "l", "msig", "sig" (alphabetical).
+/// Only includes non-empty/non-None fields.
+pub fn canonical_encode_logicsig(lsig: &LogicSig) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    // "arg" — optional array of byte arrays
+    if let Some(ref args) = lsig.args {
+        if !args.is_empty() {
+            let mut buf = Vec::new();
+            rmp::encode::write_array_len(&mut buf, args.len() as u32).unwrap();
+            for arg in args {
+                rmp::encode::write_bin(&mut buf, arg).unwrap();
+            }
+            m.fields.push(("arg", buf));
+        }
+    }
+
+    m.add_bytes("l", &lsig.logic);
+
+    if let Some(ref msig) = lsig.msig {
+        m.fields.push(("msig", canonical_encode_multisig(msig)));
+    }
+
+    m.add_bytes("sig", &lsig.sig);
 
     m.encode()
 }

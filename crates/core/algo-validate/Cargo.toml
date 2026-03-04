@@ -1,5 +1,5 @@
 [package]
-name = "algo-conformance"
+name = "algo-validate"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -8,13 +8,11 @@ rust-version.workspace = true
 algo-types.workspace = true
 algo-codec.workspace = true
 algo-error.workspace = true
-algo-validate.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tracing.workspace = true
-chrono.workspace = true
-hex.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
 serde_bytes.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-rmp-serde.workspace = true
+algo-codec.workspace = true
+rmpv.workspace = true

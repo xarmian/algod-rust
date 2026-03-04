@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// A 32-byte Algorand address (Ed25519 public key hash).
+/// A 32-byte Algorand address (Ed25519 public key for single-sig accounts).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Address(#[serde(with = "serde_bytes")] pub [u8; 32]);

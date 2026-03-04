@@ -10,4 +10,7 @@ pub use block::{Block, BlockResponse};
 pub use digest::Digest;
 pub use header::BlockHeader;
 pub use round::Round;
-pub use transaction::{AssetParams, BoxRef, SignedTransaction, StateSchema, Transaction};
+pub use transaction::{
+    AssetParams, BoxRef, LogicSig, MultisigSig, MultisigSubsig, SignedTransaction, StateSchema,
+    Transaction,
+};
