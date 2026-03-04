@@ -234,7 +234,27 @@ pub fn compare_block(raw_bytes: &[u8], round: Round) -> ComparisonResult {
                         &hex::encode(&orig.txn.note),
                         &hex::encode(&rt.txn.note),
                     );
+
+                    // Step 5b: Verify computed txn IDs are consistent across round-trip
+                    let orig_txn_id = algo_codec::compute_txn_id(&orig.txn);
+                    let rt_txn_id = algo_codec::compute_txn_id(&rt.txn);
+                    compare_field(
+                        &mut mismatches,
+                        &format!("round-trip txns[{i}].computed_txid"),
+                        &hex::encode(orig_txn_id.as_bytes()),
+                        &hex::encode(rt_txn_id.as_bytes()),
+                    );
                 }
+
+                // Step 6: Verify block digest is consistent across round-trip
+                let orig_digest = algo_codec::compute_block_digest(&block_resp.block);
+                let rt_digest = algo_codec::compute_block_digest(&re_decoded);
+                compare_field(
+                    &mut mismatches,
+                    "round-trip header.computed_digest",
+                    &hex::encode(orig_digest.as_bytes()),
+                    &hex::encode(rt_digest.as_bytes()),
+                );
             }
             Err(e) => {
                 mismatches.push(Mismatch::DecodeFailed {

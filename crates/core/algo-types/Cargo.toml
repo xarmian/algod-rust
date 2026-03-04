@@ -10,3 +10,4 @@ serde.workspace = true
 rmpv.workspace = true
 hex.workspace = true
 serde_bytes.workspace = true
+data-encoding.workspace = true

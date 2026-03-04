@@ -123,7 +123,9 @@ impl CanonicalMap {
         }
     }
 
-    /// Sort fields by key and encode as a msgpack map.
+    /// Sort fields by key in lexicographic order (raw UTF-8 bytes).
+    ///
+    /// Go's go-codec sorts struct field codec tags alphabetically.
     fn encode(mut self) -> Vec<u8> {
         self.fields.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
@@ -253,14 +255,12 @@ pub fn canonical_encode_signed_txn_in_block(stx: &SignedTransaction) -> Vec<u8> 
 }
 
 /// Canonically encode a BlockHeader (from a Block, excluding payset).
-///
-/// Note: This encoding may not match Go byte-for-byte if the Go block
-/// contains fields we don't model (bi, fc, prev512, txn256, txn512, spt).
-/// For blocks where those fields are zero/absent, it will match.
 pub fn canonical_encode_block_header_from_block(block: &Block) -> Vec<u8> {
     let mut m = CanonicalMap::new();
 
+    m.add_u64("bi", block.bonus);
     m.add_u64("earn", block.rewards_level);
+    m.add_u64("fc", block.fees_collected);
     m.add_address("fees", &block.fee_sink);
     m.add_u64("frac", block.rewards_residue);
     m.add_string("gen", &block.genesis_id);
@@ -269,7 +269,9 @@ pub fn canonical_encode_block_header_from_block(block: &Block) -> Vec<u8> {
     m.add_string("nextproto", &block.next_protocol);
     m.add_u64("nextswitch", block.next_protocol_switch_on.0);
     m.add_u64("nextyes", block.next_protocol_approvals);
+    m.add_u64("pp", block.proposer_payout);
     m.add_bytes("prev", &block.branch);
+    m.add_bytes("prev512", &block.prev512);
     m.add_string("proto", &block.current_protocol);
     m.add_address("prp", &block.proposer);
     m.add_u64("rate", block.rewards_rate);
@@ -277,9 +279,12 @@ pub fn canonical_encode_block_header_from_block(block: &Block) -> Vec<u8> {
     m.add_address("rwd", &block.rewards_pool);
     m.add_u64("rwcalr", block.rewards_recalculation_round.0);
     m.add_bytes("seed", &block.seed);
+    m.add_option_rmpv("spt", &block.state_proof_tracking);
     m.add_u64("tc", block.txn_counter);
     m.add_i64("ts", block.timestamp);
     m.add_bytes("txn", &block.txn_commitment);
+    m.add_bytes("txn256", &block.txn256);
+    m.add_bytes("txn512", &block.txn512);
 
     m.encode()
 }
@@ -288,7 +293,9 @@ pub fn canonical_encode_block_header_from_block(block: &Block) -> Vec<u8> {
 pub fn canonical_encode_block_header(header: &BlockHeader) -> Vec<u8> {
     let mut m = CanonicalMap::new();
 
+    m.add_u64("bi", header.bonus);
     m.add_u64("earn", header.rewards_level);
+    m.add_u64("fc", header.fees_collected);
     m.add_address("fees", &header.fee_sink);
     m.add_u64("frac", header.rewards_residue);
     m.add_string("gen", &header.genesis_id);
@@ -297,7 +304,9 @@ pub fn canonical_encode_block_header(header: &BlockHeader) -> Vec<u8> {
     m.add_string("nextproto", &header.next_protocol);
     m.add_u64("nextswitch", header.next_protocol_switch_on.0);
     m.add_u64("nextyes", header.next_protocol_approvals);
+    m.add_u64("pp", header.proposer_payout);
     m.add_bytes("prev", &header.branch);
+    m.add_bytes("prev512", &header.prev512);
     m.add_string("proto", &header.current_protocol);
     m.add_address("prp", &header.proposer);
     m.add_u64("rate", header.rewards_rate);
@@ -305,9 +314,12 @@ pub fn canonical_encode_block_header(header: &BlockHeader) -> Vec<u8> {
     m.add_address("rwd", &header.rewards_pool);
     m.add_u64("rwcalr", header.rewards_recalculation_round.0);
     m.add_bytes("seed", &header.seed);
+    m.add_option_rmpv("spt", &header.state_proof_tracking);
     m.add_u64("tc", header.txn_counter);
     m.add_i64("ts", header.timestamp);
     m.add_bytes("txn", &header.txn_commitment);
+    m.add_bytes("txn256", &header.txn256);
+    m.add_bytes("txn512", &header.txn512);
 
     m.encode()
 }
