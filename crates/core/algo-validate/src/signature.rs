@@ -453,6 +453,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         assert!(verify_single_sig(&stx).is_ok());
@@ -478,6 +479,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         let err = verify_single_sig(&stx).unwrap_err();
@@ -498,6 +500,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         // Sender 0xAA..AA is not a valid ed25519 public key, so this should fail.
@@ -519,6 +522,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         let err = verify_transaction_signature(&stx).unwrap_err();
@@ -544,6 +548,7 @@ mod tests {
             auth_addr: Some(auth),
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         assert!(verify_single_sig(&stx).is_ok());
@@ -568,6 +573,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         assert!(verify_multisig(&stx, stx.msig.as_ref().unwrap()).is_ok());
@@ -591,6 +597,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
@@ -614,6 +621,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
@@ -652,6 +660,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         assert!(verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).is_ok());
@@ -678,6 +687,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         let err = verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
@@ -709,6 +719,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         assert!(verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).is_ok());
@@ -762,6 +773,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         assert!(verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).is_ok());
@@ -786,6 +798,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
@@ -813,6 +826,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
@@ -837,6 +851,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
@@ -866,6 +881,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         let err = verify_transaction_signature(&stx).unwrap_err();
@@ -915,6 +931,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         let err = verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
@@ -948,6 +965,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: false,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();

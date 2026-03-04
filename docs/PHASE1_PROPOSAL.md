@@ -151,6 +151,8 @@ Epic 8 is the critical path — everything else depends on having all transactio
 - **Full lease enforcement**: Epic 10 validates lease uniqueness within transaction groups only. Cross-block lease enforcement (no duplicate sender+lease within the validity window) requires ledger state and is deferred to Phase 2.
 - **Transaction size limit**: Per-transaction byte size is not enforced individually. Go-algorand uses `MaxTxnBytesPerBlock` as a block-level aggregate limit, checked in Epic 11.
 - **Fee pooling**: Epic 10 enforces minimum fee per-transaction. Algorand allows fee pooling in atomic groups (one txn overpays to cover others, as long as total group fee >= N × MinTxnFee). Group-level fee validation to be added in Epic 12 when testing against mainnet blocks that use fee pooling.
+- **Payset commitment (txn256/txn512)**: Epic 11 validates the primary payset commitment (`txn` field, SHA512/256 Merkle tree). The `txn256` and `txn512` fields (SHA256 and SHA512 vector commitment trees) use different algorithms and are deferred to Epic 12 when testing against mainnet blocks that may require them.
+- **Payset Merkle tree fallback**: If the Merkle tree commitment computation cannot achieve byte-identical conformance with go-algorand during Epic 11, commitment verification will be logged as a warning rather than a validation failure, with full conformance targeted for Epic 12's mainnet replay testing.
 
 ---
 
