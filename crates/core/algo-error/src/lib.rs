@@ -19,6 +19,9 @@ pub enum AlgoError {
     #[error("conformance error: {message}")]
     Conformance { message: String },
 
+    #[error("not found: {0}")]
+    NotFound(String),
+
     #[error("I/O error")]
     Io(#[from] std::io::Error),
 

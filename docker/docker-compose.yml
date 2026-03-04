@@ -34,9 +34,11 @@ services:
     entrypoint: ["/bin/bash", "/scripts/generate-txns.sh"]
     volumes:
       - ./scripts/generate-txns.sh:/scripts/generate-txns.sh:ro
+      - algod-data:/algod/data
     environment:
-      - ALGOD_URL=http://algod-go:8080
-      - ALGOD_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ALGOD_DATA=/algod/data
+      - TXN_INTERVAL=5
+      - TXN_BATCH_SIZE=1
 
   algod-rust:
     build:
