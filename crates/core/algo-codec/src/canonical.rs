@@ -10,8 +10,8 @@
 // 7. Deterministic — identical inputs always produce identical bytes
 
 use algo_types::{
-    Address, AssetParams, Block, BlockHeader, BoxRef, LogicSig, MultisigSig, MultisigSubsig,
-    SignedTransaction, StateSchema, Transaction,
+    Address, AssetParams, Block, BlockHeader, BoxRef, Digest, LogicSig, MultisigSig,
+    MultisigSubsig, SignedTransaction, StateSchema, Transaction,
 };
 use serde_bytes::ByteBuf;
 
@@ -555,6 +555,26 @@ pub fn canonical_encode_multisig(msig: &MultisigSig) -> Vec<u8> {
     m.encode()
 }
 
+/// Canonically encode a TxGroup struct (for group ID computation).
+///
+/// Encodes a msgpack map with a single key `"txlist"` containing an array of
+/// 32-byte binary digests (the transaction hashes). The group ID is then:
+/// `SHA512/256("TG" || canonical_encode_tx_group(hashes))`
+pub fn canonical_encode_tx_group(hashes: &[Digest]) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    if !hashes.is_empty() {
+        let mut buf = Vec::new();
+        rmp::encode::write_array_len(&mut buf, hashes.len() as u32).unwrap();
+        for h in hashes {
+            rmp::encode::write_bin(&mut buf, h.as_bytes()).unwrap();
+        }
+        m.fields.push(("txlist", buf));
+    }
+
+    m.encode()
+}
+
 /// Canonically encode a LogicSig as a nested msgpack map.
 /// Sorted fields: "arg", "l", "msig", "sig" (alphabetical).
 /// Only includes non-empty/non-None fields.
@@ -771,6 +791,55 @@ mod tests {
                 .find(|(k, _)| k.as_str() == Some("txn"))
                 .unwrap();
             assert!(matches!(txn.1, rmpv::Value::Map(_)));
+        }
+    }
+
+    #[test]
+    fn test_tx_group_encoding() {
+        use algo_types::Digest;
+
+        let h1 = Digest([0xAA; 32]);
+        let h2 = Digest([0xBB; 32]);
+        let encoded = canonical_encode_tx_group(&[h1, h2]);
+
+        // Parse back to verify structure
+        let val = rmpv::decode::read_value(&mut &encoded[..]).unwrap();
+        if let rmpv::Value::Map(pairs) = val {
+            assert_eq!(pairs.len(), 1, "TxGroup map should have exactly 1 key");
+            let (key, value) = &pairs[0];
+            assert_eq!(key.as_str().unwrap(), "txlist");
+
+            if let rmpv::Value::Array(arr) = value {
+                assert_eq!(arr.len(), 2);
+                assert_eq!(arr[0].as_slice().unwrap(), &[0xAA; 32]);
+                assert_eq!(arr[1].as_slice().unwrap(), &[0xBB; 32]);
+            } else {
+                panic!("expected array for txlist value");
+            }
+        } else {
+            panic!("expected map");
+        }
+    }
+
+    #[test]
+    fn test_tx_group_single_hash() {
+        use algo_types::Digest;
+
+        let h = Digest([0x42; 32]);
+        let encoded = canonical_encode_tx_group(&[h]);
+
+        let val = rmpv::decode::read_value(&mut &encoded[..]).unwrap();
+        if let rmpv::Value::Map(pairs) = val {
+            assert_eq!(pairs.len(), 1);
+            let (_, value) = &pairs[0];
+            if let rmpv::Value::Array(arr) = value {
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0].as_slice().unwrap(), &[0x42; 32]);
+            } else {
+                panic!("expected array");
+            }
+        } else {
+            panic!("expected map");
         }
     }
 

@@ -83,6 +83,7 @@ Validate entire blocks as a unit.
 - Timestamp bounds (within acceptable range of previous block)
 - Protocol version is known/supported
 - Payset commitment matches recomputed value
+- Transaction size limit (`MaxTxnBytesPerBlock`) — deferred from Epic 10 as this is a block-level aggregate check
 - Wire into `make validate` — report block-level validation results alongside existing conformance checks
 
 ### Epic 12 — Mainnet Block Replay
@@ -142,6 +143,14 @@ Per PROJECT_SCOPE.md: Phase 1 estimated at 3-4 months for a small team.
 | 12 — Mainnet Block Replay | Medium | Epics 8-11 |
 
 Epic 8 is the critical path — everything else depends on having all transaction types modeled.
+
+---
+
+## Known Limitations / Deferred Items
+
+- **Full lease enforcement**: Epic 10 validates lease uniqueness within transaction groups only. Cross-block lease enforcement (no duplicate sender+lease within the validity window) requires ledger state and is deferred to Phase 2.
+- **Transaction size limit**: Per-transaction byte size is not enforced individually. Go-algorand uses `MaxTxnBytesPerBlock` as a block-level aggregate limit, checked in Epic 11.
+- **Fee pooling**: Epic 10 enforces minimum fee per-transaction. Algorand allows fee pooling in atomic groups (one txn overpays to cover others, as long as total group fee >= N × MinTxnFee). Group-level fee validation to be added in Epic 12 when testing against mainnet blocks that use fee pooling.
 
 ---
 

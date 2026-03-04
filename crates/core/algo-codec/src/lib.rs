@@ -5,7 +5,7 @@ pub use canonical::{
     canonical_encode_block_header, canonical_encode_block_header_from_block,
     canonical_encode_logicsig, canonical_encode_multisig, canonical_encode_multisig_subsig,
     canonical_encode_signed_transaction, canonical_encode_signed_txn_in_block,
-    canonical_encode_transaction,
+    canonical_encode_transaction, canonical_encode_tx_group,
 };
 pub use digest::{compute_block_digest, compute_txn_id};
 
