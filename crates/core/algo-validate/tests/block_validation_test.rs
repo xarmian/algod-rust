@@ -95,7 +95,7 @@ macro_rules! full_validation_test {
 
             // Use prev_timestamp=None to skip timestamp bounds check (we don't
             // have the real previous timestamp in isolated fixture tests).
-            let result = algo_validate::validate_block(block, None, genesis_id, &genesis_hash);
+            let result = algo_validate::validate_block(block, None, genesis_id, &genesis_hash, None);
 
             // Filter out any errors we expect to tolerate:
             // - SignatureVerificationFailed: fixture txns may have been signed

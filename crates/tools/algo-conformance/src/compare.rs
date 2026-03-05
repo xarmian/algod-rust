@@ -304,8 +304,12 @@ pub fn compare_block(
 
     // Step 7+8 (merged): Block-level validation includes signature verification,
     // protocol checks, timestamps, commitments, and aggregate size.
+    // Extract raw payset blobs for commitment verification.
+    // On extraction failure, fall back to None (warn-only commitments).
+    let raw_blobs = algo_codec::extract_raw_payset_blobs(raw_bytes).ok();
+    let raw_blobs_ref = raw_blobs.as_deref();
     let validation_result =
-        algo_validate::validate_block(block, prev_timestamp, genesis_id, genesis_hash);
+        algo_validate::validate_block(block, prev_timestamp, genesis_id, genesis_hash, raw_blobs_ref);
     if !validation_result.is_valid {
         for err in &validation_result.errors {
             // Map signature errors to SignatureInvalid for backwards compatibility.
