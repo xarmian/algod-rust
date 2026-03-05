@@ -28,6 +28,13 @@ const TX_PREFIX: &[u8] = b"TX";
 /// Domain separation prefix for SignedTxnInBlock hashing.
 const STIB_PREFIX: &[u8] = b"STIB";
 
+/// Domain separation prefix for vector commitment bottom (padding) leaves.
+///
+/// go-algorand: `protocol.MerkleVectorCommitmentBottomLeaf = "MB"`.
+/// Padded positions in a vector commitment tree hash to H("MB") rather than
+/// being zero or empty. This ensures position-binding even for unfilled slots.
+const MB_PREFIX: &[u8] = b"MB";
+
 /// A 32-byte hash digest.
 type Hash = [u8; 32];
 
@@ -204,7 +211,8 @@ pub fn compute_payset_flat_commitment(payset: &[SignedTransaction]) -> Hash {
 // Differences from the primary Merkle tree (`txn` field):
 //   - Hash function is SHA-256 (32-byte) or SHA-512 (64-byte) instead of
 //     SHA-512/256.
-//   - Leaf count is padded to the next power of 2 with zero-hash leaves.
+//   - Leaf count is padded to the next power of 2 with "bottom element"
+//     leaves that hash to H("MB") (protocol.MerkleVectorCommitmentBottomLeaf).
 //   - Leaves are reordered by bit-reversal permutation before tree
 //     construction (`merkleTreeToVectorCommitmentIndex`).
 //   - Same domain separation prefixes: "TL" (leaf), "MA" (internal).
@@ -303,7 +311,10 @@ pub fn compute_vector_commitment(block: &Block, algo: HashAlgo) -> Vec<u8> {
 
     let n = block.payset.len();
 
-    // Compute leaf hashes (txid and stib_hash using the SELECTED hash algo).
+    // Compute leaf hashes.
+    // go-algorand uses the SAME hash algorithm for txid, stib_hash, AND tree
+    // construction. For SHA512/256: txn.ID() + stib.Hash(). For SHA-256:
+    // txn.IDSha256() + stib.HashSHA256(). See data/bookkeeping/txn_merkle.go.
     let leaf_hashes: Vec<Vec<u8>> = block
         .payset
         .iter()
@@ -332,7 +343,11 @@ pub fn compute_vector_commitment(block: &Block, algo: HashAlgo) -> Vec<u8> {
     let depth = padded_len.trailing_zeros(); // log2(padded_len)
 
     // Build padded array with bit-reversal permutation.
-    let mut layer: Vec<Vec<u8>> = vec![zero.clone(); padded_len];
+    // Padded positions use H("MB") — the "bottom element" hash from go-algorand's
+    // vectorCommitmentArray. This is NOT zero or empty; it's a real hash that
+    // ensures position-binding for unfilled slots in the tree.
+    let bottom_hash = vc_hash(algo, &[MB_PREFIX]);
+    let mut layer: Vec<Vec<u8>> = vec![bottom_hash; padded_len];
     for (i, leaf) in leaf_hashes.into_iter().enumerate() {
         let vc_index = bit_reverse(i, depth);
         layer[vc_index] = leaf;
@@ -341,6 +356,168 @@ pub fn compute_vector_commitment(block: &Block, algo: HashAlgo) -> Vec<u8> {
     // Build tree bottom-up.
     while layer.len() > 1 {
         let parent_count = layer.len() / 2; // always power of 2
+        let mut parents = Vec::with_capacity(parent_count);
+        for i in 0..parent_count {
+            let left = &layer[i * 2];
+            let right = &layer[i * 2 + 1];
+            parents.push(vc_internal_hash(algo, left, right));
+        }
+        layer = parents;
+    }
+
+    layer.into_iter().next().unwrap()
+}
+
+// ── Raw-passthrough variants (Epic 12a) ─────────────────────────────
+//
+// These functions use the raw msgpack bytes of each SignedTxnInBlock as
+// extracted from the block response, rather than re-encoding from typed
+// Rust structs. This preserves any fields our structs don't model,
+// producing byte-identical STIB hashes to go-algorand.
+
+/// Compute the STIB hash from raw msgpack bytes: SHA512/256("STIB" || raw_blob).
+pub fn compute_stib_hash_raw(raw_blob: &[u8]) -> Hash {
+    let mut hasher = Sha512_256::new();
+    hasher.update(STIB_PREFIX);
+    hasher.update(raw_blob);
+    hasher.finalize().into()
+}
+
+/// Compute the payset Merkle root using raw STIB blobs for STIB hashing
+/// and typed structs for txid computation.
+///
+/// `raw_blobs` must have the same length as `block.payset` and correspond
+/// 1:1 to the payset entries.
+pub fn compute_payset_merkle_root_raw(block: &Block, raw_blobs: &[Vec<u8>]) -> Hash {
+    assert_eq!(
+        block.payset.len(),
+        raw_blobs.len(),
+        "raw_blobs length must match payset length"
+    );
+
+    if block.payset.is_empty() {
+        return ZERO_HASH;
+    }
+
+    let mut layer: Vec<Hash> = block
+        .payset
+        .iter()
+        .zip(raw_blobs.iter())
+        .map(|(stx, raw_blob)| {
+            // Restore genesis fields for txid computation (same as typed path).
+            let mut restored_txn = stx.txn.clone();
+            if stx.has_genesis_id && restored_txn.genesis_id.is_empty() {
+                restored_txn.genesis_id.clone_from(&block.genesis_id);
+            }
+            if restored_txn.genesis_hash.is_empty() {
+                restored_txn.genesis_hash = block.genesis_hash.clone();
+            }
+
+            let txid = compute_txid(&restored_txn);
+            let stib_hash = compute_stib_hash_raw(raw_blob);
+            compute_leaf_hash(&txid, &stib_hash)
+        })
+        .collect();
+
+    while layer.len() > 1 {
+        layer = build_next_layer(&layer);
+    }
+
+    layer[0]
+}
+
+/// Compute the flat payset commitment using raw STIB blobs.
+///
+/// SHA512/256("PF" || msgpack_array_of_raw_blobs)
+///
+/// For an empty payset, encodes nil (0xc0) matching go-algorand.
+pub fn compute_payset_flat_commitment_raw(raw_blobs: &[Vec<u8>]) -> Hash {
+    let mut hasher = Sha512_256::new();
+    hasher.update(b"PF");
+
+    if raw_blobs.is_empty() {
+        hasher.update([0xc0]);
+    } else {
+        let mut buf = Vec::new();
+        rmp::encode::write_array_len(
+            &mut buf,
+            u32::try_from(raw_blobs.len()).expect("payset length fits in u32"),
+        )
+        .unwrap();
+        for blob in raw_blobs {
+            buf.extend_from_slice(blob);
+        }
+        hasher.update(&buf);
+    }
+
+    hasher.finalize().into()
+}
+
+/// Compute the vector commitment root using raw STIB blobs.
+///
+/// Same algorithm as `compute_vector_commitment` but uses raw bytes for
+/// STIB hashing instead of re-encoding from typed structs.
+pub fn compute_vector_commitment_raw(
+    block: &Block,
+    algo: HashAlgo,
+    raw_blobs: &[Vec<u8>],
+) -> Vec<u8> {
+    assert_eq!(
+        block.payset.len(),
+        raw_blobs.len(),
+        "raw_blobs length must match payset length"
+    );
+
+    let zero = vc_zero_hash(algo);
+
+    if block.payset.is_empty() {
+        return zero;
+    }
+
+    let n = block.payset.len();
+
+    // go-algorand uses the SAME hash algo for txid, stib_hash, AND tree
+    // construction. See data/bookkeeping/txn_merkle.go RawLeaf().
+    let leaf_hashes: Vec<Vec<u8>> = block
+        .payset
+        .iter()
+        .zip(raw_blobs.iter())
+        .map(|(stx, raw_blob)| {
+            // Restore genesis fields for txid (same as typed path).
+            let mut restored_txn = stx.txn.clone();
+            if stx.has_genesis_id && restored_txn.genesis_id.is_empty() {
+                restored_txn.genesis_id.clone_from(&block.genesis_id);
+            }
+            if restored_txn.genesis_hash.is_empty() {
+                restored_txn.genesis_hash = block.genesis_hash.clone();
+            }
+
+            let txn_canonical = canonical_encode_transaction(&restored_txn);
+            let txid = vc_hash(algo, &[TX_PREFIX, &txn_canonical]);
+
+            // Use raw blob for stib_hash (preserves unknown fields).
+            let stib_hash = vc_hash(algo, &[STIB_PREFIX, raw_blob]);
+
+            vc_leaf_hash(algo, &txid, &stib_hash)
+        })
+        .collect();
+
+    // Pad to next power of 2.
+    let padded_len = n.next_power_of_two();
+    let depth = padded_len.trailing_zeros();
+
+    // Build padded array with bit-reversal permutation.
+    // Padded positions use H("MB") — see compute_vector_commitment.
+    let bottom_hash = vc_hash(algo, &[MB_PREFIX]);
+    let mut layer: Vec<Vec<u8>> = vec![bottom_hash; padded_len];
+    for (i, leaf) in leaf_hashes.into_iter().enumerate() {
+        let vc_index = bit_reverse(i, depth);
+        layer[vc_index] = leaf;
+    }
+
+    // Build tree bottom-up.
+    while layer.len() > 1 {
+        let parent_count = layer.len() / 2;
         let mut parents = Vec::with_capacity(parent_count);
         for i in 0..parent_count {
             let left = &layer[i * 2];

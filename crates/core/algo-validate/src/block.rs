@@ -19,7 +19,9 @@ use algo_codec::canonical_encode_signed_txn_in_block;
 use algo_types::{Block, SignedTransaction};
 
 use crate::merkle::{
-    compute_payset_flat_commitment, compute_payset_merkle_root, compute_vector_commitment, HashAlgo,
+    compute_payset_flat_commitment, compute_payset_flat_commitment_raw,
+    compute_payset_merkle_root, compute_payset_merkle_root_raw, compute_vector_commitment,
+    compute_vector_commitment_raw, HashAlgo,
 };
 use crate::rules::{
     has_payset_commit_merkle, has_txn256, has_txn512, max_txn_bytes_per_block,
@@ -194,6 +196,7 @@ pub fn validate_block(
     prev_timestamp: Option<i64>,
     genesis_id: &str,
     genesis_hash: &[u8; 32],
+    raw_payset_blobs: Option<&[Vec<u8>]>,
 ) -> BlockValidationResult {
     let mut errors = Vec::new();
     let round = block.round.0;
@@ -345,63 +348,113 @@ pub fn validate_block(
     // The `txn` field in the block header is the commitment over the payset.
     // For v26+ this uses a Merkle tree; for older versions it uses a flat hash.
     //
-    // Commitment verification is warn-only until Epic 12a implements raw-passthrough
-    // encoding for STIB hashing. Mainnet blocks contain fields our Rust structs don't
-    // model, so re-encoding produces different bytes than go-algorand.
+    // When raw_payset_blobs is provided, we use the raw bytes directly for STIB
+    // hashing (preserving unknown fields), and commitment mismatches are errors.
+    // When None (unit tests, backward compat), we use typed re-encoding and
+    // mismatches are warn-only.
     let version = &block.current_protocol;
+    // Only use raw blobs if the count matches the payset; otherwise fall back
+    // to warn-only typed path to avoid panics on malformed input.
+    let raw_payset_blobs = raw_payset_blobs
+        .filter(|blobs| blobs.len() == block.payset.len());
+    let has_raw = raw_payset_blobs.is_some();
     if !block.txn_commitment.is_empty() || !block.payset.is_empty() {
         if has_payset_commit_merkle(version) {
             // Merkle tree commitment (v26+).
-            let computed_root = compute_payset_merkle_root(block);
+            let computed_root = if let Some(raw_blobs) = raw_payset_blobs {
+                compute_payset_merkle_root_raw(block, raw_blobs)
+            } else {
+                compute_payset_merkle_root(block)
+            };
             let expected = block.txn_commitment.as_ref();
             if expected != computed_root.as_slice() {
-                eprintln!(
-                    "WARNING: round {}: payset commitment mismatch: header={}, computed={}",
-                    round,
-                    hex::encode(expected),
-                    hex::encode(computed_root),
-                );
+                if has_raw {
+                    errors.push(BlockValidationError::PaysetCommitmentMismatch {
+                        expected: hex::encode(expected),
+                        computed: hex::encode(computed_root),
+                    });
+                } else {
+                    eprintln!(
+                        "WARNING: round {}: payset commitment mismatch: header={}, computed={}",
+                        round,
+                        hex::encode(expected),
+                        hex::encode(computed_root),
+                    );
+                }
             }
         } else {
             // Flat commitment (pre-v26).
-            let computed_flat = compute_payset_flat_commitment(&block.payset);
+            let computed_flat = if let Some(raw_blobs) = raw_payset_blobs {
+                compute_payset_flat_commitment_raw(raw_blobs)
+            } else {
+                compute_payset_flat_commitment(&block.payset)
+            };
             let expected = block.txn_commitment.as_ref();
             if expected != computed_flat.as_slice() {
-                eprintln!(
-                    "WARNING: round {}: payset commitment mismatch: header={}, computed={}",
-                    round,
-                    hex::encode(expected),
-                    hex::encode(computed_flat),
-                );
+                if has_raw {
+                    errors.push(BlockValidationError::PaysetCommitmentMismatch {
+                        expected: hex::encode(expected),
+                        computed: hex::encode(computed_flat),
+                    });
+                } else {
+                    eprintln!(
+                        "WARNING: round {}: payset commitment mismatch: header={}, computed={}",
+                        round,
+                        hex::encode(expected),
+                        hex::encode(computed_flat),
+                    );
+                }
             }
         }
     }
 
     // 7b. Vector commitment: txn256 (SHA-256, v34+).
-    // Warn-only until Epic 12a (see comment above).
     if has_txn256(version) && !block.txn256.is_empty() {
-        let computed = compute_vector_commitment(block, HashAlgo::Sha256);
+        let computed = if let Some(raw_blobs) = raw_payset_blobs {
+            compute_vector_commitment_raw(block, HashAlgo::Sha256, raw_blobs)
+        } else {
+            compute_vector_commitment(block, HashAlgo::Sha256)
+        };
         if block.txn256.as_ref() != computed.as_slice() {
-            eprintln!(
-                "WARNING: round {}: txn256 vector commitment mismatch: header={}, computed={}",
-                round,
-                hex::encode(&block.txn256),
-                hex::encode(&computed),
-            );
+            if has_raw {
+                errors.push(BlockValidationError::VectorCommitmentMismatch {
+                    field: "txn256".into(),
+                    expected: hex::encode(&block.txn256),
+                    computed: hex::encode(&computed),
+                });
+            } else {
+                eprintln!(
+                    "WARNING: round {}: txn256 vector commitment mismatch: header={}, computed={}",
+                    round,
+                    hex::encode(&block.txn256),
+                    hex::encode(&computed),
+                );
+            }
         }
     }
 
     // 7c. Vector commitment: txn512 (SHA-512, v41+).
-    // Warn-only until Epic 12a (see comment above).
     if has_txn512(version) && !block.txn512.is_empty() {
-        let computed = compute_vector_commitment(block, HashAlgo::Sha512);
+        let computed = if let Some(raw_blobs) = raw_payset_blobs {
+            compute_vector_commitment_raw(block, HashAlgo::Sha512, raw_blobs)
+        } else {
+            compute_vector_commitment(block, HashAlgo::Sha512)
+        };
         if block.txn512.as_ref() != computed.as_slice() {
-            eprintln!(
-                "WARNING: round {}: txn512 vector commitment mismatch: header={}, computed={}",
-                round,
-                hex::encode(&block.txn512),
-                hex::encode(&computed),
-            );
+            if has_raw {
+                errors.push(BlockValidationError::VectorCommitmentMismatch {
+                    field: "txn512".into(),
+                    expected: hex::encode(&block.txn512),
+                    computed: hex::encode(&computed),
+                });
+            } else {
+                eprintln!(
+                    "WARNING: round {}: txn512 vector commitment mismatch: header={}, computed={}",
+                    round,
+                    hex::encode(&block.txn512),
+                    hex::encode(&computed),
+                );
+            }
         }
     }
 
@@ -528,7 +581,7 @@ mod tests {
     #[test]
     fn empty_block_valid() {
         let block = empty_block();
-        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash());
+        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
         assert!(
             result.is_valid,
             "empty block should be valid, errors: {:?}",
@@ -542,7 +595,7 @@ mod tests {
     fn unknown_protocol_version_error() {
         let mut block = empty_block();
         block.current_protocol = "v99-nonexistent".into();
-        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash());
+        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
         assert!(!result.is_valid);
         assert!(result
             .errors
@@ -554,7 +607,7 @@ mod tests {
     fn empty_protocol_version_error() {
         let mut block = empty_block();
         block.current_protocol = String::new();
-        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash());
+        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
         assert!(!result.is_valid);
         assert!(result
             .errors
@@ -566,7 +619,7 @@ mod tests {
     fn timestamp_too_old_error() {
         let mut block = empty_block();
         block.timestamp = 50;
-        let result = validate_block(&block, Some(100), "test-v1", &test_genesis_hash());
+        let result = validate_block(&block, Some(100), "test-v1", &test_genesis_hash(), None);
         assert!(!result.is_valid);
         assert!(result
             .errors
@@ -578,7 +631,7 @@ mod tests {
     fn timestamp_too_new_error() {
         let mut block = empty_block();
         block.timestamp = 200;
-        let result = validate_block(&block, Some(100), "test-v1", &test_genesis_hash());
+        let result = validate_block(&block, Some(100), "test-v1", &test_genesis_hash(), None);
         assert!(!result.is_valid);
         assert!(result
             .errors
@@ -590,7 +643,7 @@ mod tests {
     fn timestamp_skip_for_genesis() {
         let mut block = empty_block();
         block.timestamp = -1; // would fail vs any positive prev, but genesis skips check
-        let result = validate_block(&block, None, "test-v1", &test_genesis_hash());
+        let result = validate_block(&block, None, "test-v1", &test_genesis_hash(), None);
         // Should not have timestamp errors (genesis skip).
         assert!(!result.errors.iter().any(|e| matches!(
             e,
@@ -610,7 +663,7 @@ mod tests {
         let root = compute_payset_merkle_root(&block);
         block.txn_commitment = ByteBuf::from(root.to_vec());
 
-        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash());
+        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
         assert!(
             result.is_valid,
             "block with valid txn should pass, errors: {:?}",
@@ -632,7 +685,7 @@ mod tests {
         // encoding for STIB hashing.
         block.txn_commitment = ByteBuf::from(vec![0xFF; 32]);
 
-        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash());
+        let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
         assert!(
             result.is_valid,
             "commitment mismatch should be warn-only, but got errors: {:?}",
@@ -649,7 +702,7 @@ mod tests {
         let mut block = empty_block();
         block.current_protocol = "v99-bad".into();
         block.timestamp = 50; // too old vs prev=100
-        let result = validate_block(&block, Some(100), "test-v1", &test_genesis_hash());
+        let result = validate_block(&block, Some(100), "test-v1", &test_genesis_hash(), None);
         assert!(!result.is_valid);
         // Should have at least 2 errors.
         assert!(
