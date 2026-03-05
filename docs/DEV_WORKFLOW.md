@@ -1,7 +1,9 @@
 # Developer Workflow Guide
 
+> **Phase 1 is complete.** See [PHASE1_VALIDATION.md](PHASE1_VALIDATION.md) for the validation report.
+>
 > **Phase 0 is complete.** See [PHASE0_VALIDATION.md](PHASE0_VALIDATION.md) for the validation report
-> and [PHASE1_PROPOSAL.md](PHASE1_PROPOSAL.md) for the next phase roadmap.
+> and [PHASE1_PROPOSAL.md](PHASE1_PROPOSAL.md) for the Phase 1 roadmap (now completed).
 
 ## Quick Reference
 
