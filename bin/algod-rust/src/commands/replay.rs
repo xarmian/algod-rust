@@ -38,6 +38,10 @@ pub async fn run(
     fail_fast: bool,
     report_path: Option<&Path>,
 ) -> anyhow::Result<()> {
+    if start > end {
+        anyhow::bail!("invalid range: start ({start}) must be <= end ({end})");
+    }
+
     let client = AlgodClient::new(algod_url, algod_token);
 
     info!(

@@ -254,7 +254,7 @@ pub fn validate_block(
         // per-txn rules and signature verification for these; their validity
         // is ensured by the state proof verification layer (out of scope for
         // stateless validation).
-        if stx.txn.txn_type == "stpf" {
+        if stx.txn.txn_type == "stpf" && stx.txn.state_proof.is_some() {
             // Still accumulate encoded size for aggregate block size check.
             let encoded = canonical_encode_signed_txn_in_block(&block.payset[idx]);
             total_txn_bytes += encoded.len();
