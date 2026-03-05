@@ -122,12 +122,11 @@ pub fn extract_raw_payset_blobs(response_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
 
         if is_txns {
             // Read the array length
-            let array_len = rmp::decode::read_array_len(&mut block_cursor).map_err(|e| {
-                AlgoError::Codec {
+            let array_len =
+                rmp::decode::read_array_len(&mut block_cursor).map_err(|e| AlgoError::Codec {
                     source: Box::new(e),
                     context: "failed to read txns array length".into(),
-                }
-            })?;
+                })?;
 
             let mut blobs = Vec::with_capacity(array_len as usize);
             for _ in 0..array_len {

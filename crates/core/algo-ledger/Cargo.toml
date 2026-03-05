@@ -1,0 +1,11 @@
+[package]
+name = "algo-ledger"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+algo-types = { workspace = true }
+algo-error = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+data-encoding = { workspace = true }

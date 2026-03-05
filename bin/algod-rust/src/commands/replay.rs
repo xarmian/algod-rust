@@ -143,8 +143,13 @@ pub async fn run(
         let raw_blobs_ref = raw_blobs.as_deref();
 
         // Validate
-        let result =
-            algo_validate::validate_block(block, prev_timestamp, &genesis_id, &genesis_hash, raw_blobs_ref);
+        let result = algo_validate::validate_block(
+            block,
+            prev_timestamp,
+            &genesis_id,
+            &genesis_hash,
+            raw_blobs_ref,
+        );
 
         if result.is_valid {
             blocks_passed += 1;

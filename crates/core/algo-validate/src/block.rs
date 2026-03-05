@@ -19,9 +19,9 @@ use algo_codec::canonical_encode_signed_txn_in_block;
 use algo_types::{Block, SignedTransaction};
 
 use crate::merkle::{
-    compute_payset_flat_commitment, compute_payset_flat_commitment_raw,
-    compute_payset_merkle_root, compute_payset_merkle_root_raw, compute_vector_commitment,
-    compute_vector_commitment_raw, HashAlgo,
+    compute_payset_flat_commitment, compute_payset_flat_commitment_raw, compute_payset_merkle_root,
+    compute_payset_merkle_root_raw, compute_vector_commitment, compute_vector_commitment_raw,
+    HashAlgo,
 };
 use crate::rules::{
     has_payset_commit_merkle, has_txn256, has_txn512, max_txn_bytes_per_block,
@@ -355,8 +355,7 @@ pub fn validate_block(
     let version = &block.current_protocol;
     // Only use raw blobs if the count matches the payset; otherwise fall back
     // to warn-only typed path to avoid panics on malformed input.
-    let raw_payset_blobs = raw_payset_blobs
-        .filter(|blobs| blobs.len() == block.payset.len());
+    let raw_payset_blobs = raw_payset_blobs.filter(|blobs| blobs.len() == block.payset.len());
     let has_raw = raw_payset_blobs.is_some();
     if !block.txn_commitment.is_empty() || !block.payset.is_empty() {
         if has_payset_commit_merkle(version) {
