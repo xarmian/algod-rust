@@ -4,7 +4,7 @@ use serde_bytes::ByteBuf;
 use crate::{Address, Round};
 
 /// A signed transaction as it appears in a block's payset.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SignedTransaction {
     /// The transaction body.
     #[serde(rename = "txn")]
@@ -33,6 +33,49 @@ pub struct SignedTransaction {
     /// Has genesis hash flag.
     #[serde(rename = "hgh", default, skip_serializing_if = "is_false")]
     pub has_genesis_hash: bool,
+
+    // ── ApplyData fields (from SignedTxnWithAD in go-algorand) ─────
+    // These are part of SignedTxnInBlock's embedded ApplyData struct.
+    // They record the results of transaction execution (closing amounts,
+    // rewards, created asset/app IDs). Needed for STIB hash computation.
+    /// Closing amount for payment transactions (ApplyData.ca).
+    #[serde(rename = "ca", default, skip_serializing_if = "is_zero_u64")]
+    pub closing_amount: u64,
+
+    /// Closing amount for asset transfer transactions (ApplyData.aca).
+    #[serde(rename = "aca", default, skip_serializing_if = "is_zero_u64")]
+    pub asset_closing_amount: u64,
+
+    /// Sender rewards (ApplyData.rs).
+    #[serde(rename = "rs", default, skip_serializing_if = "is_zero_u64")]
+    pub sender_rewards: u64,
+
+    /// Receiver rewards (ApplyData.rr).
+    #[serde(rename = "rr", default, skip_serializing_if = "is_zero_u64")]
+    pub receiver_rewards: u64,
+
+    /// Close rewards (ApplyData.rc).
+    #[serde(rename = "rc", default, skip_serializing_if = "is_zero_u64")]
+    pub close_rewards: u64,
+
+    /// Eval delta — application state changes (ApplyData.dt).
+    /// Opaque passthrough; uses rmpv::Value since EvalDelta contains
+    /// recursive inner transactions and complex state deltas.
+    #[serde(rename = "dt", default, skip_serializing_if = "Option::is_none")]
+    pub eval_delta: Option<rmpv::Value>,
+
+    /// Created/configured asset ID from ApplyData (ApplyData.caid).
+    /// Set when an acfg create transaction is executed.
+    /// Note: this is DISTINCT from Transaction.config_asset (txn.caid) —
+    /// this field is at the SignedTxnInBlock level, not inside the "txn" map.
+    #[serde(rename = "caid", default, skip_serializing_if = "is_zero_u64")]
+    pub apply_data_config_asset: u64,
+
+    /// Created application ID from ApplyData (ApplyData.apid).
+    /// Set when an appl create transaction is executed.
+    /// Note: this is DISTINCT from Transaction.application_id (txn.apid).
+    #[serde(rename = "apid", default, skip_serializing_if = "is_zero_u64")]
+    pub apply_data_application_id: u64,
 }
 
 /// Core transaction fields.

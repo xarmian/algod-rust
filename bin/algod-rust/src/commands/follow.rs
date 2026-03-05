@@ -22,6 +22,18 @@ pub async fn run(
     let mut results = Vec::new();
     let started_at = Utc::now().to_rfc3339();
 
+    // Fetch genesis info and prev_timestamp from the current round's block.
+    let init_raw = client.get_block_raw(current_round).await?;
+    let init_br = algo_codec::decode_block_response(&init_raw)?;
+    let genesis_id = init_br.block.genesis_id.clone();
+    let genesis_hash: [u8; 32] = init_br
+        .block
+        .genesis_hash
+        .as_ref()
+        .try_into()
+        .expect("genesis hash must be 32 bytes");
+    let mut prev_timestamp: Option<i64> = Some(init_br.block.timestamp);
+
     info!(round = %current_round, "starting follow mode");
 
     loop {
@@ -35,7 +47,13 @@ pub async fn run(
 
             match client.get_block_raw(current_round).await {
                 Ok(raw) => {
-                    let result = compare_block(&raw, current_round);
+                    let result = compare_block(
+                        &raw,
+                        current_round,
+                        prev_timestamp,
+                        &genesis_id,
+                        &genesis_hash,
+                    );
                     info!(
                         round = %current_round,
                         status = ?result.status,
@@ -45,6 +63,12 @@ pub async fn run(
                             .unwrap_or(0),
                         duration_ms = result.duration_ms,
                     );
+                    // Only update prev_timestamp when the block decoded successfully (Some).
+                    // On decode failure block_timestamp is None, preserving the last known
+                    // good timestamp to avoid cascading false failures.
+                    if let Some(ts) = result.block_timestamp {
+                        prev_timestamp = Some(ts);
+                    }
                     results.push(result);
                 }
                 Err(e) => {

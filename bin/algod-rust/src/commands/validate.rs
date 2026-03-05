@@ -26,19 +26,59 @@ pub async fn run(
 
     info!(start, end, fail_fast, "validating blocks");
 
+    // Determine prev_timestamp and genesis info for block validation.
+    // For start <= 1, use prev_timestamp = 0 (genesis). Otherwise fetch
+    // the block at start-1 to get its timestamp.
+    let mut prev_timestamp: Option<i64> = None;
+    let (genesis_id, genesis_hash) = if start > 1 {
+        let prev_raw = client.get_block_raw(Round(start - 1)).await?;
+        let prev_br = algo_codec::decode_block_response(&prev_raw)?;
+        prev_timestamp = Some(prev_br.block.timestamp);
+        let hash: [u8; 32] = prev_br
+            .block
+            .genesis_hash
+            .as_ref()
+            .try_into()
+            .expect("genesis hash must be 32 bytes");
+        (prev_br.block.genesis_id.clone(), hash)
+    } else {
+        // For round 0 or 1, fetch the start block itself to get genesis info.
+        let first_raw = client.get_block_raw(Round(start)).await?;
+        let first_br = algo_codec::decode_block_response(&first_raw)?;
+        let hash: [u8; 32] = first_br
+            .block
+            .genesis_hash
+            .as_ref()
+            .try_into()
+            .expect("genesis hash must be 32 bytes");
+        (first_br.block.genesis_id.clone(), hash)
+    };
+
     let started_at = Utc::now().to_rfc3339();
     let mut results = Vec::new();
 
     let mut round = start;
     while round <= end {
         let raw = client.get_block_raw(Round(round)).await?;
-        let result = compare_block(&raw, Round(round));
+        let result = compare_block(
+            &raw,
+            Round(round),
+            prev_timestamp,
+            &genesis_id,
+            &genesis_hash,
+        );
         info!(
             round,
             status = ?result.status,
             mismatches = result.mismatches.len(),
             duration_ms = result.duration_ms,
         );
+        // Only update prev_timestamp when the block decoded successfully (Some).
+        // On decode failure block_timestamp is None, preserving the last known
+        // good timestamp to avoid cascading false failures.
+        if let Some(ts) = result.block_timestamp {
+            prev_timestamp = Some(ts);
+        }
         let failed = result.status == ComparisonStatus::Fail;
         results.push(result);
         if fail_fast && failed {

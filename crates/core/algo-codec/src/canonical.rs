@@ -389,19 +389,36 @@ pub fn canonical_encode_signed_transaction(stx: &SignedTransaction) -> Vec<u8> {
     m.encode()
 }
 
-/// Canonically encode a SignedTxnInBlock (includes hgi/hgh wrapper fields).
-/// This is the encoding used in block payset arrays.
+/// Canonically encode a SignedTxnInBlock (includes hgi/hgh wrapper fields
+/// and ApplyData fields).
+/// This is the encoding used in block payset arrays and for STIB hash computation.
 pub fn canonical_encode_signed_txn_in_block(stx: &SignedTransaction) -> Vec<u8> {
     let mut m = CanonicalMap::new();
 
+    // ApplyData fields (flattened from SignedTxnWithAD → ApplyData)
+    m.add_u64("aca", stx.asset_closing_amount);
+    m.add_u64("apid", stx.apply_data_application_id);
+    m.add_u64("ca", stx.closing_amount);
+    m.add_u64("caid", stx.apply_data_config_asset);
+    m.add_option_rmpv("dt", &stx.eval_delta);
+
+    // SignedTxnInBlock wrapper fields
     m.add_bool("hgh", stx.has_genesis_hash);
     m.add_bool("hgi", stx.has_genesis_id);
+
+    // SignedTxn fields
     if let Some(ref lsig) = stx.lsig {
         m.fields.push(("lsig", canonical_encode_logicsig(lsig)));
     }
     if let Some(ref msig) = stx.msig {
         m.fields.push(("msig", canonical_encode_multisig(msig)));
     }
+
+    // ApplyData rewards fields
+    m.add_u64("rc", stx.close_rewards);
+    m.add_u64("rr", stx.receiver_rewards);
+    m.add_u64("rs", stx.sender_rewards);
+
     m.add_bytes("sig", &stx.sig);
     m.add_option_address("sgnr", &stx.auth_addr);
     m.add_map("txn", canonical_encode_transaction(&stx.txn));
@@ -773,6 +790,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: true,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         let encoded = canonical_encode_signed_transaction(&stx);
@@ -862,6 +880,7 @@ mod tests {
             auth_addr: None,
             has_genesis_id: true,
             has_genesis_hash: false,
+            ..Default::default()
         };
 
         let encoded = canonical_encode_signed_txn_in_block(&stx);

@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use algo_types::Round;
 use serde::Serialize;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Result of comparing a Rust-decoded block against the raw reference bytes.
 #[derive(Debug, Clone, Serialize)]
@@ -11,6 +11,9 @@ pub struct ComparisonResult {
     pub status: ComparisonStatus,
     pub mismatches: Vec<Mismatch>,
     pub duration_ms: u64,
+    /// The block's timestamp (None if decode failed), so callers can track
+    /// prev_timestamp for the next block without cascading false failures.
+    pub block_timestamp: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -38,6 +41,9 @@ pub enum Mismatch {
         txn_index: usize,
         error: String,
     },
+    BlockValidationFailed {
+        error: String,
+    },
 }
 
 /// Compare a block by decoding raw msgpack bytes and verifying structural consistency.
@@ -47,7 +53,25 @@ pub enum Mismatch {
 /// 2. Does decode → re-decode produce the same structural result?
 /// 3. Round number, txn count, genesis ID match between decode passes.
 /// 4. Field-level comparison of header fields and per-transaction fields.
-pub fn compare_block(raw_bytes: &[u8], round: Round) -> ComparisonResult {
+///
+/// Phase 1 checks (Epic 11):
+/// 8. Block-level validation (protocol, timestamps, commitments, aggregate size).
+///
+/// # Arguments
+///
+/// * `raw_bytes` - The raw msgpack bytes of the block response.
+/// * `round` - The expected round number.
+/// * `prev_timestamp` - The previous block's timestamp, or `None` for genesis /
+///   round-0 (skips timestamp validation).
+/// * `genesis_id` - The expected genesis ID string.
+/// * `genesis_hash` - The expected 32-byte genesis hash.
+pub fn compare_block(
+    raw_bytes: &[u8],
+    round: Round,
+    prev_timestamp: Option<i64>,
+    genesis_id: &str,
+    genesis_hash: &[u8; 32],
+) -> ComparisonResult {
     let start = Instant::now();
     let mut mismatches = Vec::new();
 
@@ -62,6 +86,7 @@ pub fn compare_block(raw_bytes: &[u8], round: Round) -> ComparisonResult {
                     error: e.to_string(),
                 }],
                 duration_ms: start.elapsed().as_millis() as u64,
+                block_timestamp: None,
             };
         }
     };
@@ -276,26 +301,38 @@ pub fn compare_block(raw_bytes: &[u8], round: Round) -> ComparisonResult {
         }
     }
 
-    // Step 7: Verify transaction signatures
-    // Transactions in a block have genesis_id stripped when hgi=true, and
-    // genesis_hash is ALWAYS stripped (redundant with block header). We must
-    // restore them before signature verification since the signature covers
-    // the full transaction including these fields.
-    for (i, stx) in block.payset.iter().enumerate() {
-        let mut stx_full = stx.clone();
-        if stx.has_genesis_id && stx_full.txn.genesis_id.is_empty() {
-            stx_full.txn.genesis_id.clone_from(&block.genesis_id);
-        }
-        if stx_full.txn.genesis_hash.is_empty() {
-            stx_full.txn.genesis_hash = block.genesis_hash.clone();
-        }
-        if let Err(e) = algo_validate::verify_transaction_signature(&stx_full) {
-            mismatches.push(Mismatch::SignatureInvalid {
-                txn_index: i,
-                error: e.to_string(),
-            });
+    // Step 7+8 (merged): Block-level validation includes signature verification,
+    // protocol checks, timestamps, commitments, and aggregate size.
+    let validation_result =
+        algo_validate::validate_block(block, prev_timestamp, genesis_id, genesis_hash);
+    if !validation_result.is_valid {
+        for err in &validation_result.errors {
+            // Map signature errors to SignatureInvalid for backwards compatibility.
+            match err {
+                algo_validate::BlockValidationError::SignatureVerificationFailed {
+                    txn_index,
+                    error,
+                } => {
+                    mismatches.push(Mismatch::SignatureInvalid {
+                        txn_index: *txn_index,
+                        error: error.clone(),
+                    });
+                }
+                _ => {
+                    mismatches.push(Mismatch::BlockValidationFailed {
+                        error: err.to_string(),
+                    });
+                }
+            }
         }
     }
+    info!(
+        round = round.0,
+        txn_count = validation_result.txn_count,
+        total_txn_bytes = validation_result.total_txn_bytes,
+        block_valid = validation_result.is_valid,
+        "block validation complete"
+    );
 
     let duration = start.elapsed();
     let status = if mismatches.is_empty() {
@@ -317,6 +354,7 @@ pub fn compare_block(raw_bytes: &[u8], round: Round) -> ComparisonResult {
         status,
         mismatches,
         duration_ms: duration.as_millis() as u64,
+        block_timestamp: Some(block.timestamp),
     }
 }
 
