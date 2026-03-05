@@ -74,7 +74,7 @@ macro_rules! rules_test {
 
             // Validate individual transaction rules.
             for (i, stx) in txns.iter().enumerate() {
-                validate_transaction_rules(&stx.txn).unwrap_or_else(|e| {
+                validate_transaction_rules(&stx.txn, false).unwrap_or_else(|e| {
                     panic!(
                         "transaction rules failed for block {} txn {}: {e}",
                         $round, i
@@ -119,7 +119,7 @@ fn rules_validate_all_blocks() {
 
         let txns = restore_genesis_fields(&br);
         for (i, stx) in txns.iter().enumerate() {
-            validate_transaction_rules(&stx.txn).unwrap_or_else(|e| {
+            validate_transaction_rules(&stx.txn, false).unwrap_or_else(|e| {
                 panic!("transaction rules failed for block {round} txn {i}: {e}")
             });
         }

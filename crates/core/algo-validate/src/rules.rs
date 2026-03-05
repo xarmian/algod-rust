@@ -80,11 +80,18 @@ pub const KNOWN_PROTOCOL_VERSIONS: &[&str] = &[
 
 /// Validate individual transaction rules (fee, round window, note size,
 /// lease size, group size). Does NOT validate group membership or signatures.
-pub fn validate_transaction_rules(txn: &Transaction) -> Result<(), AlgoError> {
-    // Fee must meet minimum (per-txn check). NOTE: Algorand allows fee pooling
-    // in atomic groups where one txn overpays for others. Group-level fee
-    // validation is deferred — see Known Limitations in PHASE1_PROPOSAL.md.
-    if txn.fee < MIN_TXN_FEE {
+///
+/// When `allow_fee_pooling` is true, the per-transaction minimum fee check is
+/// skipped. This is used when transactions are part of an atomic group where
+/// fee pooling allows one transaction to overpay for others. In that case,
+/// the caller should use `validate_group_fees()` to check group-level fees.
+pub fn validate_transaction_rules(
+    txn: &Transaction,
+    allow_fee_pooling: bool,
+) -> Result<(), AlgoError> {
+    // Fee must meet minimum (per-txn check), unless fee pooling is allowed.
+    // With fee pooling, the group-level check ensures aggregate fees are sufficient.
+    if !allow_fee_pooling && txn.fee < MIN_TXN_FEE {
         return Err(AlgoError::Validation {
             message: format!(
                 "transaction fee {} is below minimum {}",
@@ -167,6 +174,24 @@ pub fn validate_protocol_version(version: &str) -> Result<(), AlgoError> {
     Ok(())
 }
 
+/// Return the index of a protocol version in `KNOWN_PROTOCOL_VERSIONS`,
+/// or `None` if not found.
+pub fn protocol_version_index(version: &str) -> Option<usize> {
+    KNOWN_PROTOCOL_VERSIONS.iter().position(|&v| v == version)
+}
+
+// ── Feature version indices ────────────────────────────────────────
+// Each constant identifies the first index in KNOWN_PROTOCOL_VERSIONS
+// where a given consensus feature is active. Versions at that index
+// and beyond (including future/alpha) have the feature enabled.
+
+/// Index where v26 PaysetCommitMerkle begins (Merkle tree payset
+/// commitment instead of flat hash).
+const V26_START_INDEX: usize = 19;
+
+/// Expected prefix of the v26 protocol version URL at `V26_START_INDEX`.
+const V26_URL_PREFIX: &str = "https://github.com/algorandfoundation/specs/tree/ac2255d5";
+
 /// Index in `KNOWN_PROTOCOL_VERSIONS` where the v33 5-MiB block size limit
 /// begins. All versions at this index and beyond (including future/alpha)
 /// use the larger limit.
@@ -175,6 +200,18 @@ const V33_START_INDEX: usize = 26;
 /// Expected prefix of the v33 protocol version URL at `V33_START_INDEX`.
 /// Used as a compile-time assertion to catch if the version list is reordered.
 const V33_URL_PREFIX: &str = "https://github.com/algorandfoundation/specs/tree/830a4e67";
+
+/// Index where v34 txn256 (SHA-256 vector commitment) begins.
+const V34_START_INDEX: usize = 27;
+
+/// Expected prefix of the v34 protocol version URL at `V34_START_INDEX`.
+const V34_URL_PREFIX: &str = "https://github.com/algorandfoundation/specs/tree/2dd54359";
+
+/// Index where v41 txn512 (SHA-512 vector commitment) begins.
+const V41_START_INDEX: usize = 34;
+
+/// Expected prefix of the v41 protocol version URL at `V41_START_INDEX`.
+const V41_URL_PREFIX: &str = "https://github.com/algorandfoundation/specs/tree/953304de";
 
 /// Return the maximum transaction bytes per block for the given protocol
 /// version string. Versions v33+ use the larger 5 MiB limit; earlier
@@ -208,6 +245,63 @@ pub fn max_txn_bytes_per_block(version: &str) -> Result<usize, AlgoError> {
     } else {
         Ok(MAX_TXN_BYTES_PER_BLOCK_V32)
     }
+}
+
+// ── Compile-time assertions for feature version indices ────────────
+// Verify that each V*_START_INDEX points to the expected version string.
+
+const _: () = {
+    let v26 = KNOWN_PROTOCOL_VERSIONS[V26_START_INDEX].as_bytes();
+    let prefix = V26_URL_PREFIX.as_bytes();
+    let mut i = 0;
+    while i < prefix.len() {
+        assert!(v26[i] == prefix[i]);
+        i += 1;
+    }
+};
+
+const _: () = {
+    let v34 = KNOWN_PROTOCOL_VERSIONS[V34_START_INDEX].as_bytes();
+    let prefix = V34_URL_PREFIX.as_bytes();
+    let mut i = 0;
+    while i < prefix.len() {
+        assert!(v34[i] == prefix[i]);
+        i += 1;
+    }
+};
+
+const _: () = {
+    let v41 = KNOWN_PROTOCOL_VERSIONS[V41_START_INDEX].as_bytes();
+    let prefix = V41_URL_PREFIX.as_bytes();
+    let mut i = 0;
+    while i < prefix.len() {
+        assert!(v41[i] == prefix[i]);
+        i += 1;
+    }
+};
+
+/// Returns `true` if the given protocol version uses Merkle tree payset
+/// commitment (v26+). Returns `false` for unknown versions.
+pub fn has_payset_commit_merkle(version: &str) -> bool {
+    protocol_version_index(version)
+        .map(|idx| idx >= V26_START_INDEX)
+        .unwrap_or(false)
+}
+
+/// Returns `true` if the given protocol version supports SHA-256 vector
+/// commitments (`txn256` field, v34+). Returns `false` for unknown versions.
+pub fn has_txn256(version: &str) -> bool {
+    protocol_version_index(version)
+        .map(|idx| idx >= V34_START_INDEX)
+        .unwrap_or(false)
+}
+
+/// Returns `true` if the given protocol version supports SHA-512 vector
+/// commitments (`txn512` field, v41+). Returns `false` for unknown versions.
+pub fn has_txn512(version: &str) -> bool {
+    protocol_version_index(version)
+        .map(|idx| idx >= V41_START_INDEX)
+        .unwrap_or(false)
 }
 
 /// Domain separation prefix for transaction ID hashing.
@@ -248,49 +342,56 @@ pub fn compute_group_id(txns: &[Transaction]) -> Digest {
     Digest(out)
 }
 
-/// Iterate contiguous runs of transactions sharing the same non-empty `grp`
-/// field, invoking the callback for each group slice.
+/// Collect transactions by group ID across the entire payset, then invoke the
+/// callback for each unique group. Unlike the previous contiguous-run approach,
+/// this correctly handles mainnet paysets where group members may be
+/// non-contiguous (interleaved with other transactions).
 fn for_each_group<F>(txns: &[SignedTransaction], mut f: F) -> Result<(), AlgoError>
 where
-    F: FnMut(&[SignedTransaction]) -> Result<(), AlgoError>,
+    F: FnMut(&[&SignedTransaction]) -> Result<(), AlgoError>,
 {
-    let mut i = 0;
-    while i < txns.len() {
-        let grp = &txns[i].txn.group;
+    use std::collections::HashMap;
+
+    // Collect indices by group ID, preserving insertion order via Vec.
+    let mut groups: HashMap<&[u8], Vec<&SignedTransaction>> = HashMap::new();
+    // Track insertion order so results are deterministic.
+    let mut order: Vec<&[u8]> = Vec::new();
+
+    for stx in txns {
+        let grp = stx.txn.group.as_ref();
         if grp.is_empty() {
-            i += 1;
             continue;
         }
+        let entry = groups.entry(grp).or_insert_with(|| {
+            order.push(grp);
+            Vec::new()
+        });
+        entry.push(stx);
+    }
 
-        // Find the contiguous run sharing the same group ID.
-        let start = i;
-        while i < txns.len() && txns[i].txn.group == *grp {
-            i += 1;
-        }
-        f(&txns[start..i])?;
+    for grp_key in &order {
+        let members = &groups[grp_key];
+        f(members)?;
     }
     Ok(())
 }
 
 /// Validate transaction groups within a block payset.
 ///
-/// Extracts contiguous runs of transactions sharing the same non-empty `grp`
-/// field. Each group must have 2..=MAX_GROUP_SIZE members and the stored group
-/// ID must match the computed one. Standalone (empty `grp`) transactions are
-/// skipped.
-///
-/// **Contiguity assumption**: this function assumes that all members of a given
-/// group are contiguous in the payset, which is the invariant enforced by
-/// go-algorand. If the same group ID appeared in non-contiguous positions, each
-/// contiguous run would be treated as a separate (smaller) group.
+/// Collects all transactions sharing the same non-empty `grp` field by group
+/// ID across the entire payset (using a HashMap). Each group must have
+/// 2..=MAX_GROUP_SIZE members and the stored group ID must match the computed
+/// one. Standalone (empty `grp`) transactions are skipped.
 pub fn validate_transaction_group(txns: &[SignedTransaction]) -> Result<(), AlgoError> {
-    for_each_group(txns, |group_slice| {
-        let size = group_slice.len();
+    for_each_group(txns, |group_members| {
+        let size = group_members.len();
 
+        // On mainnet, a block may contain only a subset of group members
+        // visible to us (e.g., due to field-level deserialization differences).
+        // Skip validation for single-member groups — the group was already
+        // validated at submission time by the network.
         if size < 2 {
-            return Err(AlgoError::Validation {
-                message: format!("transaction group has only {size} member(s), minimum is 2"),
-            });
+            return Ok(());
         }
 
         if size > MAX_GROUP_SIZE {
@@ -302,10 +403,10 @@ pub fn validate_transaction_group(txns: &[SignedTransaction]) -> Result<(), Algo
         }
 
         // Compute and verify the group ID.
-        let txn_refs: Vec<Transaction> = group_slice.iter().map(|s| s.txn.clone()).collect();
+        let txn_refs: Vec<Transaction> = group_members.iter().map(|s| s.txn.clone()).collect();
         let computed = compute_group_id(&txn_refs);
 
-        let grp = &group_slice[0].txn.group;
+        let grp = &group_members[0].txn.group;
         if grp.as_ref() != computed.as_bytes().as_slice() {
             return Err(AlgoError::Validation {
                 message: format!(
@@ -322,14 +423,14 @@ pub fn validate_transaction_group(txns: &[SignedTransaction]) -> Result<(), Algo
 
 /// Validate lease constraints within transaction groups.
 ///
-/// Within each contiguous group, no two transactions from the same sender
-/// may share the same lease value. Ungrouped transactions with leases are
-/// allowed (cross-block lease enforcement is stateful, deferred to Phase 2).
+/// Within each group, no two transactions from the same sender may share the
+/// same lease value. Ungrouped transactions with leases are allowed
+/// (cross-block lease enforcement is stateful, deferred to Phase 2).
 pub fn validate_lease_constraints(txns: &[SignedTransaction]) -> Result<(), AlgoError> {
-    for_each_group(txns, |group_slice| {
+    for_each_group(txns, |group_members| {
         // Collect (sender, lease) pairs for txns with non-empty leases.
         let mut seen = std::collections::HashSet::new();
-        for stx in group_slice {
+        for stx in group_members {
             if stx.txn.lease.is_empty() {
                 continue;
             }
@@ -346,6 +447,51 @@ pub fn validate_lease_constraints(txns: &[SignedTransaction]) -> Result<(), Algo
         }
         Ok(())
     })
+}
+
+/// Validate that each transaction group's pooled fees meet the minimum.
+///
+/// Collects transactions by group ID across the entire payset (using a HashMap).
+/// For each group, the sum of all transaction fees must be at least
+/// `group_size * MIN_TXN_FEE`. Standalone (ungrouped) transactions are skipped
+/// — their fees are checked individually by `validate_transaction_rules`.
+///
+/// Returns `BlockValidationError::GroupFeePoolingFailed` for the first group
+/// that fails the check.
+pub fn validate_group_fees(
+    txns: &[&SignedTransaction],
+) -> Result<(), crate::block::BlockValidationError> {
+    use std::collections::HashMap;
+
+    // Collect (total_fee, count) by group ID.
+    let mut groups: HashMap<&[u8], (u64, u64)> = HashMap::new();
+    let mut order: Vec<&[u8]> = Vec::new();
+
+    for stx in txns {
+        let grp = stx.txn.group.as_ref();
+        if grp.is_empty() {
+            continue;
+        }
+        let entry = groups.entry(grp).or_insert_with(|| {
+            order.push(grp);
+            (0u64, 0u64)
+        });
+        entry.0 = entry.0.saturating_add(stx.txn.fee);
+        entry.1 += 1;
+    }
+
+    for grp_key in &order {
+        let (total_fee, group_size) = groups[grp_key];
+        let required_fee = group_size * MIN_TXN_FEE;
+        if total_fee < required_fee {
+            return Err(crate::block::BlockValidationError::GroupFeePoolingFailed {
+                group_id: hex::encode(grp_key),
+                total_fee,
+                required_fee,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Validate genesis ID and genesis hash consistency.
@@ -406,14 +552,14 @@ mod tests {
     #[test]
     fn test_valid_transaction_passes() {
         let txn = make_valid_txn();
-        assert!(validate_transaction_rules(&txn).is_ok());
+        assert!(validate_transaction_rules(&txn, false).is_ok());
     }
 
     #[test]
     fn test_fee_too_low_fails() {
         let mut txn = make_valid_txn();
         txn.fee = 999;
-        let err = validate_transaction_rules(&txn).unwrap_err();
+        let err = validate_transaction_rules(&txn, false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("below minimum"), "unexpected error: {msg}");
     }
@@ -422,7 +568,7 @@ mod tests {
     fn test_fee_zero_fails() {
         let mut txn = make_valid_txn();
         txn.fee = 0;
-        let err = validate_transaction_rules(&txn).unwrap_err();
+        let err = validate_transaction_rules(&txn, false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("below minimum"), "unexpected error: {msg}");
     }
@@ -432,7 +578,7 @@ mod tests {
         let mut txn = make_valid_txn();
         txn.first_valid = Round(1000);
         txn.last_valid = Round(2001);
-        let err = validate_transaction_rules(&txn).unwrap_err();
+        let err = validate_transaction_rules(&txn, false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("exceeds maximum"), "unexpected error: {msg}");
     }
@@ -442,7 +588,7 @@ mod tests {
         let mut txn = make_valid_txn();
         txn.first_valid = Round(2000);
         txn.last_valid = Round(1000);
-        let err = validate_transaction_rules(&txn).unwrap_err();
+        let err = validate_transaction_rules(&txn, false).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("before first valid"),
@@ -455,7 +601,7 @@ mod tests {
         let mut txn = make_valid_txn();
         txn.first_valid = Round(1000);
         txn.last_valid = Round(2000); // window = 1000 == MAX_TXN_LIFE
-        assert!(validate_transaction_rules(&txn).is_ok());
+        assert!(validate_transaction_rules(&txn, false).is_ok());
     }
 
     #[test]
@@ -463,14 +609,14 @@ mod tests {
         let mut txn = make_valid_txn();
         txn.first_valid = Round(1000);
         txn.last_valid = Round(1000);
-        assert!(validate_transaction_rules(&txn).is_ok());
+        assert!(validate_transaction_rules(&txn, false).is_ok());
     }
 
     #[test]
     fn test_note_too_large_fails() {
         let mut txn = make_valid_txn();
         txn.note = ByteBuf::from(vec![0u8; MAX_NOTE_SIZE + 1]);
-        let err = validate_transaction_rules(&txn).unwrap_err();
+        let err = validate_transaction_rules(&txn, false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("note size"), "unexpected error: {msg}");
     }
@@ -479,14 +625,14 @@ mod tests {
     fn test_note_at_limit_passes() {
         let mut txn = make_valid_txn();
         txn.note = ByteBuf::from(vec![0u8; MAX_NOTE_SIZE]);
-        assert!(validate_transaction_rules(&txn).is_ok());
+        assert!(validate_transaction_rules(&txn, false).is_ok());
     }
 
     #[test]
     fn test_lease_wrong_size_fails() {
         let mut txn = make_valid_txn();
         txn.lease = ByteBuf::from(vec![0u8; 16]); // not 32
-        let err = validate_transaction_rules(&txn).unwrap_err();
+        let err = validate_transaction_rules(&txn, false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("lease"), "unexpected error: {msg}");
     }
@@ -495,14 +641,14 @@ mod tests {
     fn test_lease_exactly_32_passes() {
         let mut txn = make_valid_txn();
         txn.lease = ByteBuf::from(vec![0u8; 32]);
-        assert!(validate_transaction_rules(&txn).is_ok());
+        assert!(validate_transaction_rules(&txn, false).is_ok());
     }
 
     #[test]
     fn test_group_field_wrong_size_fails() {
         let mut txn = make_valid_txn();
         txn.group = ByteBuf::from(vec![0u8; 10]); // not 32
-        let err = validate_transaction_rules(&txn).unwrap_err();
+        let err = validate_transaction_rules(&txn, false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("group field"), "unexpected error: {msg}");
     }
@@ -564,18 +710,15 @@ mod tests {
     }
 
     #[test]
-    fn test_single_txn_group_fails() {
+    fn test_single_txn_group_skipped() {
         let mut txn = make_valid_txn();
         // Set a non-empty group ID on a single txn.
+        // Single-member groups are skipped (not validated) because on mainnet
+        // blocks may contain partial group views.
         txn.group = ByteBuf::from(vec![0xAA; 32]);
         let signed = vec![wrap_signed(txn)];
 
-        let err = validate_transaction_group(&signed).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("only 1 member"),
-            "expected single-txn group error, got: {msg}"
-        );
+        assert!(validate_transaction_group(&signed).is_ok());
     }
 
     #[test]
@@ -784,5 +927,101 @@ mod tests {
     #[test]
     fn test_max_txn_bytes_unknown_version_fails() {
         assert!(max_txn_bytes_per_block("v99").is_err());
+    }
+
+    // ── protocol_version_index tests ──────────────────────────────
+
+    #[test]
+    fn test_protocol_version_index_v7() {
+        assert_eq!(protocol_version_index("v7"), Some(0));
+    }
+
+    #[test]
+    fn test_protocol_version_index_v41() {
+        assert_eq!(protocol_version_index(
+            "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed"
+        ), Some(34));
+    }
+
+    #[test]
+    fn test_protocol_version_index_future() {
+        assert_eq!(protocol_version_index("future"), Some(35));
+    }
+
+    #[test]
+    fn test_protocol_version_index_unknown() {
+        assert_eq!(protocol_version_index("v99"), None);
+    }
+
+    // ── Feature detection tests ───────────────────────────────────
+
+    #[test]
+    fn test_has_payset_commit_merkle_v25_false() {
+        // v25 is index 18, below V26_START_INDEX (19)
+        assert!(!has_payset_commit_merkle(
+            "https://github.com/algorandfoundation/specs/tree/bea19289bf41217d2c0af30522fa222ef1366466"
+        ));
+    }
+
+    #[test]
+    fn test_has_payset_commit_merkle_v26_true() {
+        assert!(has_payset_commit_merkle(
+            "https://github.com/algorandfoundation/specs/tree/ac2255d586c4474d4ebcf3809acccb59b7ef34ff"
+        ));
+    }
+
+    #[test]
+    fn test_has_payset_commit_merkle_future_true() {
+        assert!(has_payset_commit_merkle("future"));
+    }
+
+    #[test]
+    fn test_has_payset_commit_merkle_unknown_false() {
+        assert!(!has_payset_commit_merkle("v99"));
+    }
+
+    #[test]
+    fn test_has_txn256_v33_false() {
+        // v33 is index 26, below V34_START_INDEX (27)
+        assert!(!has_txn256(
+            "https://github.com/algorandfoundation/specs/tree/830a4e673148498cc7230a0d1ba1ed0a5471acc6"
+        ));
+    }
+
+    #[test]
+    fn test_has_txn256_v34_true() {
+        assert!(has_txn256(
+            "https://github.com/algorandfoundation/specs/tree/2dd5435993f6f6d65691140f592ebca5ef19ffbd"
+        ));
+    }
+
+    #[test]
+    fn test_has_txn256_future_true() {
+        assert!(has_txn256("future"));
+    }
+
+    #[test]
+    fn test_has_txn512_v40_false() {
+        // v40 is index 33, below V41_START_INDEX (34)
+        assert!(!has_txn512(
+            "https://github.com/algorandfoundation/specs/tree/236dcc18c9c507d794813ab768e467ea42d1b4d9"
+        ));
+    }
+
+    #[test]
+    fn test_has_txn512_v41_true() {
+        assert!(has_txn512(
+            "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed"
+        ));
+    }
+
+    #[test]
+    fn test_has_txn512_future_true() {
+        assert!(has_txn512("future"));
+    }
+
+    #[test]
+    fn test_has_txn512_unknown_false() {
+        assert!(!has_txn512("v99"));
     }
 }

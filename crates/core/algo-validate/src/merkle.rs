@@ -14,7 +14,7 @@
 
 use algo_codec::{canonical_encode_signed_txn_in_block, canonical_encode_transaction};
 use algo_types::{Block, SignedTransaction};
-use sha2::{Digest as _, Sha512_256};
+use sha2::{Digest as _, Sha256, Sha512, Sha512_256};
 
 /// Domain separation prefix for Merkle array internal nodes.
 const MA_PREFIX: &[u8] = b"MA";
@@ -193,6 +193,164 @@ pub fn compute_payset_flat_commitment(payset: &[SignedTransaction]) -> Hash {
     }
 
     hasher.finalize().into()
+}
+
+// ── Vector commitment (txn256 / txn512) ─────────────────────────────
+//
+// Implements go-algorand's `crypto/merklearray/vectorCommitmentArray`
+// construction used for the `txn256` (SHA-256) and `txn512` (SHA-512)
+// block header fields.
+//
+// Differences from the primary Merkle tree (`txn` field):
+//   - Hash function is SHA-256 (32-byte) or SHA-512 (64-byte) instead of
+//     SHA-512/256.
+//   - Leaf count is padded to the next power of 2 with zero-hash leaves.
+//   - Leaves are reordered by bit-reversal permutation before tree
+//     construction (`merkleTreeToVectorCommitmentIndex`).
+//   - Same domain separation prefixes: "TL" (leaf), "MA" (internal).
+//
+// References:
+//   - go-algorand/crypto/merklearray/merkle.go (Build, merkleTreeToVectorCommitmentIndex)
+//   - go-algorand/crypto/compactcert/builder.go (for SHA-512 usage)
+
+/// Which hash function to use for vector commitment computation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashAlgo {
+    /// SHA-256 (32-byte output) — used for `txn256`.
+    Sha256,
+    /// SHA-512 (64-byte output) — used for `txn512`.
+    Sha512,
+}
+
+/// Reverse the `depth` least-significant bits of `index`.
+///
+/// This implements go-algorand's `merkleTreeToVectorCommitmentIndex`
+/// which converts a standard Merkle tree index to a vector commitment
+/// index via bit-reversal permutation.
+///
+/// Example (depth=3): index 1 (001) → 4 (100), index 3 (011) → 6 (110).
+pub fn bit_reverse(index: usize, depth: u32) -> usize {
+    if depth == 0 {
+        return 0;
+    }
+    let mut result: usize = 0;
+    let mut val = index;
+    for _ in 0..depth {
+        result = (result << 1) | (val & 1);
+        val >>= 1;
+    }
+    result
+}
+
+/// Generic hash helper that dispatches to SHA-256 or SHA-512.
+///
+/// Returns a `Vec<u8>` of 32 bytes (SHA-256) or 64 bytes (SHA-512).
+fn vc_hash(algo: HashAlgo, parts: &[&[u8]]) -> Vec<u8> {
+    match algo {
+        HashAlgo::Sha256 => {
+            let mut h = Sha256::new();
+            for p in parts {
+                h.update(p);
+            }
+            h.finalize().to_vec()
+        }
+        HashAlgo::Sha512 => {
+            let mut h = Sha512::new();
+            for p in parts {
+                h.update(p);
+            }
+            h.finalize().to_vec()
+        }
+    }
+}
+
+/// Return the zero hash for the given algorithm (all-zero bytes of the
+/// appropriate digest size).
+fn vc_zero_hash(algo: HashAlgo) -> Vec<u8> {
+    match algo {
+        HashAlgo::Sha256 => vec![0u8; 32],
+        HashAlgo::Sha512 => vec![0u8; 64],
+    }
+}
+
+/// Compute a vector commitment leaf: H("TL" || txid || stib_hash).
+fn vc_leaf_hash(algo: HashAlgo, txid: &[u8], stib_hash: &[u8]) -> Vec<u8> {
+    vc_hash(algo, &[TL_PREFIX, txid, stib_hash])
+}
+
+/// Compute a vector commitment internal node: H("MA" || left || right).
+fn vc_internal_hash(algo: HashAlgo, left: &[u8], right: &[u8]) -> Vec<u8> {
+    vc_hash(algo, &[MA_PREFIX, left, right])
+}
+
+/// Compute the vector commitment root for a block's payset.
+///
+/// This implements go-algorand's vector commitment tree used for the
+/// `txn256` and `txn512` block header fields.
+///
+/// `stib_encodings` is the list of canonical STIB encodings for each
+/// transaction in the payset (same encodings used by the primary Merkle
+/// tree). The caller is responsible for producing these.
+///
+/// Returns 32 bytes for SHA-256 or 64 bytes for SHA-512.
+/// An empty payset returns the zero hash of the appropriate size.
+pub fn compute_vector_commitment(block: &Block, algo: HashAlgo) -> Vec<u8> {
+    let zero = vc_zero_hash(algo);
+
+    if block.payset.is_empty() {
+        return zero;
+    }
+
+    let n = block.payset.len();
+
+    // Compute leaf hashes (txid and stib_hash using the SELECTED hash algo).
+    let leaf_hashes: Vec<Vec<u8>> = block
+        .payset
+        .iter()
+        .map(|stx| {
+            // Restore genesis fields for txid (same as primary Merkle tree).
+            let mut restored_txn = stx.txn.clone();
+            if stx.has_genesis_id && restored_txn.genesis_id.is_empty() {
+                restored_txn.genesis_id.clone_from(&block.genesis_id);
+            }
+            if restored_txn.genesis_hash.is_empty() {
+                restored_txn.genesis_hash = block.genesis_hash.clone();
+            }
+
+            let txn_canonical = canonical_encode_transaction(&restored_txn);
+            let txid = vc_hash(algo, &[TX_PREFIX, &txn_canonical]);
+
+            let stib_canonical = canonical_encode_signed_txn_in_block(stx);
+            let stib_hash = vc_hash(algo, &[STIB_PREFIX, &stib_canonical]);
+
+            vc_leaf_hash(algo, &txid, &stib_hash)
+        })
+        .collect();
+
+    // Pad to next power of 2.
+    let padded_len = n.next_power_of_two();
+    let depth = padded_len.trailing_zeros(); // log2(padded_len)
+
+    // Build padded array with bit-reversal permutation.
+    let mut layer: Vec<Vec<u8>> = vec![zero.clone(); padded_len];
+    for (i, leaf) in leaf_hashes.into_iter().enumerate() {
+        let vc_index = bit_reverse(i, depth);
+        layer[vc_index] = leaf;
+    }
+
+    // Build tree bottom-up.
+    while layer.len() > 1 {
+        let parent_count = layer.len() / 2; // always power of 2
+        let mut parents = Vec::with_capacity(parent_count);
+        for i in 0..parent_count {
+            let left = &layer[i * 2];
+            let right = &layer[i * 2 + 1];
+            parents.push(vc_internal_hash(algo, left, right));
+        }
+        layer = parents;
+    }
+
+    layer.into_iter().next().unwrap()
 }
 
 #[cfg(test)]
@@ -375,5 +533,149 @@ mod tests {
         let h1 = compute_payset_flat_commitment(std::slice::from_ref(&stx));
         let h2 = compute_payset_flat_commitment(std::slice::from_ref(&stx));
         assert_eq!(h1, h2);
+    }
+
+    // ── Vector commitment tests ─────────────────────────────────────
+
+    #[test]
+    fn bit_reverse_depth_zero() {
+        assert_eq!(bit_reverse(0, 0), 0);
+        assert_eq!(bit_reverse(5, 0), 0);
+    }
+
+    #[test]
+    fn bit_reverse_depth_one() {
+        assert_eq!(bit_reverse(0, 1), 0);
+        assert_eq!(bit_reverse(1, 1), 1);
+    }
+
+    #[test]
+    fn bit_reverse_depth_three() {
+        // depth=3: 3 bits
+        // 0 (000) → 0 (000)
+        // 1 (001) → 4 (100)
+        // 2 (010) → 2 (010)
+        // 3 (011) → 6 (110)
+        // 4 (100) → 1 (001)
+        // 5 (101) → 5 (101)
+        // 6 (110) → 3 (011)
+        // 7 (111) → 7 (111)
+        assert_eq!(bit_reverse(0, 3), 0);
+        assert_eq!(bit_reverse(1, 3), 4);
+        assert_eq!(bit_reverse(2, 3), 2);
+        assert_eq!(bit_reverse(3, 3), 6);
+        assert_eq!(bit_reverse(4, 3), 1);
+        assert_eq!(bit_reverse(5, 3), 5);
+        assert_eq!(bit_reverse(6, 3), 3);
+        assert_eq!(bit_reverse(7, 3), 7);
+    }
+
+    #[test]
+    fn bit_reverse_is_involution() {
+        // Applying bit_reverse twice should return the original index.
+        for depth in 0..6 {
+            let size = 1usize << depth;
+            for i in 0..size {
+                assert_eq!(
+                    bit_reverse(bit_reverse(i, depth), depth),
+                    i,
+                    "involution failed for i={i}, depth={depth}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vc_empty_payset_sha256() {
+        let block = minimal_block(vec![]);
+        let root = compute_vector_commitment(&block, HashAlgo::Sha256);
+        assert_eq!(root.len(), 32);
+        assert_eq!(root, vec![0u8; 32]);
+    }
+
+    #[test]
+    fn vc_empty_payset_sha512() {
+        let block = minimal_block(vec![]);
+        let root = compute_vector_commitment(&block, HashAlgo::Sha512);
+        assert_eq!(root.len(), 64);
+        assert_eq!(root, vec![0u8; 64]);
+    }
+
+    #[test]
+    fn vc_single_txn_sha256() {
+        let stx = minimal_signed_txn(1000);
+        let block = minimal_block(vec![stx]);
+        let root = compute_vector_commitment(&block, HashAlgo::Sha256);
+        assert_eq!(root.len(), 32);
+        // Single txn → padded to 1 (power of 2), depth=0, no bit-reversal needed.
+        // Root is just the leaf hash itself.
+        assert_ne!(root, vec![0u8; 32]);
+    }
+
+    #[test]
+    fn vc_single_txn_sha512() {
+        let stx = minimal_signed_txn(1000);
+        let block = minimal_block(vec![stx]);
+        let root = compute_vector_commitment(&block, HashAlgo::Sha512);
+        assert_eq!(root.len(), 64);
+        assert_ne!(root, vec![0u8; 64]);
+    }
+
+    #[test]
+    fn vc_deterministic_sha256() {
+        let stx = minimal_signed_txn(42);
+        let block = minimal_block(vec![stx]);
+        let r1 = compute_vector_commitment(&block, HashAlgo::Sha256);
+        let r2 = compute_vector_commitment(&block, HashAlgo::Sha256);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn vc_deterministic_sha512() {
+        let stx = minimal_signed_txn(42);
+        let block = minimal_block(vec![stx]);
+        let r1 = compute_vector_commitment(&block, HashAlgo::Sha512);
+        let r2 = compute_vector_commitment(&block, HashAlgo::Sha512);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn vc_sha256_and_sha512_differ() {
+        let stx = minimal_signed_txn(1000);
+        let block = minimal_block(vec![stx]);
+        let r256 = compute_vector_commitment(&block, HashAlgo::Sha256);
+        let r512 = compute_vector_commitment(&block, HashAlgo::Sha512);
+        // Different hash algorithms must produce different-length outputs.
+        assert_ne!(r256.len(), r512.len());
+    }
+
+    #[test]
+    fn vc_two_txn_uses_bit_reversal() {
+        // With 2 txns, padded_len=2, depth=1.
+        // bit_reverse(0,1)=0, bit_reverse(1,1)=1 — no change for depth=1.
+        // So the tree is just MA(leaf0, leaf1).
+        let stx1 = minimal_signed_txn(1000);
+        let stx2 = minimal_signed_txn(2000);
+        let block = minimal_block(vec![stx1, stx2]);
+        let root = compute_vector_commitment(&block, HashAlgo::Sha256);
+        assert_eq!(root.len(), 32);
+        assert_ne!(root, vec![0u8; 32]);
+    }
+
+    #[test]
+    fn vc_three_txn_pads_to_four() {
+        // 3 txns → padded to 4, depth=2.
+        // bit_reverse mappings (depth=2):
+        //   0 (00) → 0 (00)
+        //   1 (01) → 2 (10)
+        //   2 (10) → 1 (01)
+        // So leaf order becomes: [leaf0, leaf2, leaf1, zero]
+        let stx1 = minimal_signed_txn(1000);
+        let stx2 = minimal_signed_txn(2000);
+        let stx3 = minimal_signed_txn(3000);
+        let block = minimal_block(vec![stx1, stx2, stx3]);
+        let root = compute_vector_commitment(&block, HashAlgo::Sha256);
+        assert_eq!(root.len(), 32);
+        assert_ne!(root, vec![0u8; 32]);
     }
 }
