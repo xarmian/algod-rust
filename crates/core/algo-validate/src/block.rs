@@ -17,7 +17,6 @@ use std::fmt;
 
 use algo_codec::canonical_encode_signed_txn_in_block;
 use algo_types::Block;
-use serde_bytes::ByteBuf;
 
 use crate::merkle::compute_payset_merkle_root;
 use crate::rules::{
@@ -196,13 +195,18 @@ pub fn validate_block(
     // The block strips genesis_id (when hgi=true) and genesis_hash (always) from
     // transactions for space efficiency. We must restore them before verifying
     // signatures since the signed message includes these fields.
+    //
+    // IMPORTANT: Restore from the block header's own genesis fields, NOT from the
+    // caller-supplied expected values. This ensures signatures are verified against
+    // what the block actually claims, and the separate genesis consistency check
+    // (step 5) can detect if the block's genesis fields differ from expected.
     let mut restored_payset = block.payset.clone();
     for stx in &mut restored_payset {
         if stx.has_genesis_id && stx.txn.genesis_id.is_empty() {
             stx.txn.genesis_id.clone_from(&block.genesis_id);
         }
         if stx.txn.genesis_hash.is_empty() {
-            stx.txn.genesis_hash = ByteBuf::from(genesis_hash.to_vec());
+            stx.txn.genesis_hash.clone_from(&block.genesis_hash);
         }
     }
 
@@ -239,8 +243,32 @@ pub fn validate_block(
         });
     }
 
-    // 5. Genesis consistency.
-    if let Err(e) = validate_genesis_consistency(&restored_payset, genesis_id, genesis_hash) {
+    // 5. Genesis consistency — two levels:
+    // 5a. Block header's genesis fields must match the expected (caller-supplied) values.
+    //     This detects cross-network blocks or header corruption.
+    if !block.genesis_id.is_empty() && block.genesis_id != genesis_id {
+        errors.push(BlockValidationError::GenesisConsistencyFailed {
+            error: format!(
+                "block header genesis ID '{}' does not match expected '{}'",
+                block.genesis_id, genesis_id
+            ),
+        });
+    }
+    if !block.genesis_hash.is_empty() && block.genesis_hash.as_ref() != genesis_hash {
+        errors.push(BlockValidationError::GenesisConsistencyFailed {
+            error: format!(
+                "block header genesis hash {} does not match expected {}",
+                hex::encode(&block.genesis_hash),
+                hex::encode(genesis_hash)
+            ),
+        });
+    }
+    // 5b. Per-txn genesis fields (restored from block header) must be self-consistent.
+    if let Err(e) = validate_genesis_consistency(
+        &restored_payset,
+        &block.genesis_id,
+        block.genesis_hash.as_ref(),
+    ) {
         errors.push(BlockValidationError::GenesisConsistencyFailed {
             error: e.to_string(),
         });

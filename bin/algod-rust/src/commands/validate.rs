@@ -73,7 +73,12 @@ pub async fn run(
             mismatches = result.mismatches.len(),
             duration_ms = result.duration_ms,
         );
-        prev_timestamp = Some(result.block_timestamp);
+        // Only update prev_timestamp when the block decoded successfully.
+        // On decode failure, block_timestamp is 0, which would cause cascading
+        // false timestamp-bound failures on subsequent valid blocks.
+        if result.block_timestamp != 0 {
+            prev_timestamp = Some(result.block_timestamp);
+        }
         let failed = result.status == ComparisonStatus::Fail;
         results.push(result);
         if fail_fast && failed {

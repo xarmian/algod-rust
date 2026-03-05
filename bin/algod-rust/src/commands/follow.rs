@@ -63,7 +63,12 @@ pub async fn run(
                             .unwrap_or(0),
                         duration_ms = result.duration_ms,
                     );
-                    prev_timestamp = Some(result.block_timestamp);
+                    // Only update prev_timestamp when the block decoded successfully.
+                    // On decode failure, block_timestamp is 0, which would cause cascading
+                    // false timestamp-bound failures on subsequent valid blocks.
+                    if result.block_timestamp != 0 {
+                        prev_timestamp = Some(result.block_timestamp);
+                    }
                     results.push(result);
                 }
                 Err(e) => {
