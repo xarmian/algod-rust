@@ -11,8 +11,9 @@ pub struct ComparisonResult {
     pub status: ComparisonStatus,
     pub mismatches: Vec<Mismatch>,
     pub duration_ms: u64,
-    /// The block's timestamp, so callers can track prev_timestamp for the next block.
-    pub block_timestamp: i64,
+    /// The block's timestamp (None if decode failed), so callers can track
+    /// prev_timestamp for the next block without cascading false failures.
+    pub block_timestamp: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -85,7 +86,7 @@ pub fn compare_block(
                     error: e.to_string(),
                 }],
                 duration_ms: start.elapsed().as_millis() as u64,
-                block_timestamp: 0,
+                block_timestamp: None,
             };
         }
     };
@@ -333,8 +334,6 @@ pub fn compare_block(
         "block validation complete"
     );
 
-    let block_timestamp = block.timestamp;
-
     let duration = start.elapsed();
     let status = if mismatches.is_empty() {
         ComparisonStatus::Pass
@@ -355,7 +354,7 @@ pub fn compare_block(
         status,
         mismatches,
         duration_ms: duration.as_millis() as u64,
-        block_timestamp,
+        block_timestamp: Some(block.timestamp),
     }
 }
 
