@@ -30,6 +30,9 @@ pub enum AlgoError {
 
     #[error("validation error: {message}")]
     Validation { message: String },
+
+    #[error("ledger error: {message}")]
+    Ledger { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, AlgoError>;

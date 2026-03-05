@@ -308,8 +308,13 @@ pub fn compare_block(
     // On extraction failure, fall back to None (warn-only commitments).
     let raw_blobs = algo_codec::extract_raw_payset_blobs(raw_bytes).ok();
     let raw_blobs_ref = raw_blobs.as_deref();
-    let validation_result =
-        algo_validate::validate_block(block, prev_timestamp, genesis_id, genesis_hash, raw_blobs_ref);
+    let validation_result = algo_validate::validate_block(
+        block,
+        prev_timestamp,
+        genesis_id,
+        genesis_hash,
+        raw_blobs_ref,
+    );
     if !validation_result.is_valid {
         for err in &validation_result.errors {
             // Map signature errors to SignatureInvalid for backwards compatibility.

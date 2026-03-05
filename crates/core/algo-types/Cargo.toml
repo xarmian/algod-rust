@@ -11,3 +11,4 @@ rmpv.workspace = true
 hex.workspace = true
 serde_bytes.workspace = true
 data-encoding.workspace = true
+sha2 = { workspace = true }

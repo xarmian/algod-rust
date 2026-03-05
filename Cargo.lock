@@ -67,6 +67,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "algo-ledger"
+version = "0.1.0"
+dependencies = [
+ "algo-error",
+ "algo-types",
+ "data-encoding",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "algo-rest-client"
 version = "0.1.0"
 dependencies = [
@@ -91,6 +102,7 @@ dependencies = [
  "rmpv",
  "serde",
  "serde_bytes",
+ "sha2",
 ]
 
 [[package]]
