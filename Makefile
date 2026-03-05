@@ -162,10 +162,10 @@ REPLAY_START ?= 44000000
 REPLAY_BLOCKS ?= 100
 
 replay-mainnet:
-	cargo run --release --bin algod-rust -- replay --network mainnet --start $(REPLAY_START) --end $$(( $(REPLAY_START) + $(REPLAY_BLOCKS) )) --report ./reports/mainnet-replay.json
+	cargo run --release --bin algod-rust -- replay --network mainnet --start $(REPLAY_START) --end $$(( $(REPLAY_START) + $(REPLAY_BLOCKS) - 1 )) --report ./reports/mainnet-replay.json
 
 replay-testnet:
-	cargo run --release --bin algod-rust -- replay --network testnet --start $(REPLAY_START) --end $$(( $(REPLAY_START) + $(REPLAY_BLOCKS) )) --report ./reports/testnet-replay.json
+	cargo run --release --bin algod-rust -- replay --network testnet --start $(REPLAY_START) --end $$(( $(REPLAY_START) + $(REPLAY_BLOCKS) - 1 )) --report ./reports/testnet-replay.json
 
 ## ── Help ─────────────────────────────────────────────────────
 

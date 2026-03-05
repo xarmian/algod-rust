@@ -97,6 +97,9 @@ pub async fn run(
                     error!(round, "fail-fast: stopping on fetch failure");
                     break;
                 }
+                // Clear prev_timestamp so the next block doesn't get a false
+                // TimestampTooNew error from comparing non-adjacent rounds.
+                prev_timestamp = None;
                 round += 1;
                 continue;
             }
@@ -115,6 +118,7 @@ pub async fn run(
                     error!(round, "fail-fast: stopping on decode failure");
                     break;
                 }
+                prev_timestamp = None;
                 round += 1;
                 continue;
             }
