@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::time::Instant;
 
-use algo_types::Round;
+use algo_types::{Block, Round};
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
@@ -355,6 +356,38 @@ pub fn compare_block(
         mismatches,
         duration_ms: duration.as_millis() as u64,
         block_timestamp: Some(block.timestamp),
+    }
+}
+
+/// Transaction type coverage: maps txn type strings (e.g. "pay", "axfer") to counts.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TxnTypeCoverage {
+    pub counts: HashMap<String, usize>,
+    pub total: usize,
+}
+
+impl TxnTypeCoverage {
+    /// Count transaction types from a block's payset.
+    pub fn from_block(block: &Block) -> Self {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for stxn in &block.payset {
+            let ttype = if stxn.txn.txn_type.is_empty() {
+                "unknown".to_string()
+            } else {
+                stxn.txn.txn_type.clone()
+            };
+            *counts.entry(ttype).or_insert(0) += 1;
+        }
+        let total = block.payset.len();
+        Self { counts, total }
+    }
+
+    /// Merge another coverage into this one.
+    pub fn merge(&mut self, other: &TxnTypeCoverage) {
+        for (k, v) in &other.counts {
+            *self.counts.entry(k.clone()).or_insert(0) += v;
+        }
+        self.total += other.total;
     }
 }
 

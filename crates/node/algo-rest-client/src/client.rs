@@ -85,11 +85,14 @@ impl AlgodClient {
         let mut backoff = self.config.initial_backoff;
 
         for attempt in 0..=self.config.max_retries {
-            let result = client
-                .get(&url)
-                .header("X-Algo-API-Token", &self.token)
-                .send()
-                .await;
+            let mut request = client.get(&url);
+
+            // Only add the API token header if the token is not empty
+            if !self.token.is_empty() {
+                request = request.header("X-Algo-API-Token", &self.token);
+            }
+
+            let result = request.send().await;
 
             match result {
                 Ok(resp) => {

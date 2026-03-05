@@ -3,6 +3,7 @@ ALGOD_URL := http://localhost:4001
 COMPOSE := docker compose -f docker/docker-compose.yml
 
 .PHONY: build test fmt fmt-check clippy lint deny ci clean
+.PHONY: replay-mainnet replay-testnet
 .PHONY: localnet-up localnet-down localnet-status localnet-logs
 .PHONY: capture validate validate-only generate-txns fixtures help
 .PHONY: generate-diverse-txns fixtures-diverse
@@ -154,6 +155,17 @@ validate-only:
 		--algod-url $(ALGOD_URL) \
 		--algod-token $(ALGOD_TOKEN) \
 		--report ./reports/conformance.json
+
+## ── Replay (Mainnet / Testnet) ───────────────────────────────
+
+REPLAY_START ?= 44000000
+REPLAY_BLOCKS ?= 100
+
+replay-mainnet:
+	cargo run --release --bin algod-rust -- replay --network mainnet --start $(REPLAY_START) --end $$(( $(REPLAY_START) + $(REPLAY_BLOCKS) )) --report ./reports/mainnet-replay.json
+
+replay-testnet:
+	cargo run --release --bin algod-rust -- replay --network testnet --start $(REPLAY_START) --end $$(( $(REPLAY_START) + $(REPLAY_BLOCKS) )) --report ./reports/testnet-replay.json
 
 ## ── Help ─────────────────────────────────────────────────────
 

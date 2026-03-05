@@ -67,6 +67,37 @@ pub enum Commands {
         report: Option<PathBuf>,
     },
 
+    /// Replay blocks from a remote algod endpoint with stateless validation.
+    Replay {
+        /// Network preset (mainnet, testnet, or custom).
+        #[arg(long, default_value = "custom")]
+        network: String,
+
+        /// Base URL of the algod REST API (required for custom network).
+        #[arg(long)]
+        algod_url: Option<String>,
+
+        /// API token for the algod node (required for custom network).
+        #[arg(long, default_value = "")]
+        algod_token: String,
+
+        /// First round to replay.
+        #[arg(long)]
+        start: u64,
+
+        /// Last round to replay.
+        #[arg(long)]
+        end: u64,
+
+        /// Stop on the first validation failure.
+        #[arg(long)]
+        fail_fast: bool,
+
+        /// Path to write the replay report JSON.
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
+
     /// Follow mode: continuously validate new blocks as they arrive.
     Follow {
         /// Base URL of the algod REST API.

@@ -42,6 +42,50 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
+        Commands::Replay {
+            network,
+            algod_url,
+            algod_token,
+            start,
+            end,
+            fail_fast,
+            report,
+        } => {
+            let (resolved_url, resolved_token, net_name) = match network.as_str() {
+                "mainnet" => (
+                    "https://mainnet-api.4160.nodely.dev".to_string(),
+                    String::new(),
+                    "mainnet",
+                ),
+                "testnet" => (
+                    "https://testnet-api.4160.nodely.dev".to_string(),
+                    String::new(),
+                    "testnet",
+                ),
+                "custom" => {
+                    let url = algod_url.ok_or_else(|| {
+                        anyhow::anyhow!("--algod-url is required when --network=custom")
+                    })?;
+                    (url, algod_token, "custom")
+                }
+                other => {
+                    anyhow::bail!(
+                        "unknown network '{}': use mainnet, testnet, or custom",
+                        other
+                    );
+                }
+            };
+            commands::replay::run(
+                net_name,
+                &resolved_url,
+                &resolved_token,
+                start,
+                end,
+                fail_fast,
+                report.as_deref(),
+            )
+            .await?;
+        }
         Commands::Follow {
             algod_url,
             algod_token,
