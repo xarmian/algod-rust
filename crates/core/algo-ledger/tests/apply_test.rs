@@ -70,8 +70,13 @@ fn minimal_block(fee_sink: Address, round: u64, payset: Vec<SignedTransaction>) 
 fn test_reward_dedup_sender_eq_receiver() {
     let addr = Address([1u8; 32]);
     let fee_sink = Address([3u8; 32]);
+    let rewards_pool = Address([4u8; 32]);
 
-    let mut state = make_state(&[(addr, 5_000_000), (fee_sink, 0)], fee_sink);
+    let mut state = make_state(
+        &[(addr, 5_000_000), (fee_sink, 0), (rewards_pool, 10_000_000)],
+        fee_sink,
+    );
+    state.rewards_pool = rewards_pool;
     // Set rewards_base so there are pending rewards.
     state.get_or_default_account(&addr).rewards_base = 0;
     state.get_or_default_account(&addr).status = AccountStatus::Online;

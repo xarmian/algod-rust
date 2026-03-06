@@ -147,8 +147,17 @@ pub fn apply_transaction(
 
     // Debit rewards pool for distributed rewards.
     if total_rewards > 0 {
-        let pool = state.get_or_default_account(&state.rewards_pool.clone());
-        pool.micro_algos = pool.micro_algos.saturating_sub(total_rewards);
+        let rewards_pool_addr = state.rewards_pool;
+        let pool = state.get_or_default_account(&rewards_pool_addr);
+        if pool.micro_algos < total_rewards {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "rewards pool balance {} insufficient for {} in rewards",
+                    pool.micro_algos, total_rewards,
+                ),
+            });
+        }
+        pool.micro_algos -= total_rewards;
     }
 
     // Handle rekey_to.
