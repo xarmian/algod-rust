@@ -190,7 +190,11 @@ pub fn apply_eval_delta(
                     })?
                 };
 
-                // Ensure local state entry exists.
+                // Get or create local state entry. For recorded block replay,
+                // the account should already be opted in. If not (e.g. opt-in
+                // happened in an inner txn earlier in this call), create a
+                // placeholder — the OptIn branch in apply_appl will fix up
+                // the schema and counter afterward.
                 let local = state
                     .app_local_states
                     .entry((addr, app_id))

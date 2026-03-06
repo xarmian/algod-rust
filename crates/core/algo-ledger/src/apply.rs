@@ -803,6 +803,13 @@ fn apply_appl(
         txn.application_id
     };
 
+    // For non-create calls, verify the app exists in state.
+    if !is_create && !state.app_params.contains_key(&app_id) {
+        return Err(AlgoError::Ledger {
+            message: format!("appl: app {} does not exist", app_id),
+        });
+    }
+
     if is_create {
         // App creation: create AppParams entry.
         if app_id == 0 {
@@ -902,6 +909,17 @@ fn apply_appl(
             }
         }
         ON_COMPLETION_DELETE => {
+            // Only the creator can delete the app.
+            if let Some(existing) = state.app_params.get(&app_id) {
+                if txn.sender != existing.creator {
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "appl delete: sender {} is not the creator of app {}",
+                            txn.sender, app_id,
+                        ),
+                    });
+                }
+            }
             // Remove the app — decrement the CREATOR's counters, not sender's.
             if let Some(params) = state.app_params.remove(&app_id) {
                 let creator = params.creator;
@@ -914,6 +932,17 @@ fn apply_appl(
             }
         }
         ON_COMPLETION_UPDATE => {
+            // Only the creator can update the app programs.
+            if let Some(existing) = state.app_params.get(&app_id) {
+                if txn.sender != existing.creator {
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "appl update: sender {} is not the creator of app {}",
+                            txn.sender, app_id,
+                        ),
+                    });
+                }
+            }
             // Update the app programs only — extra_program_pages are immutable
             // post-creation in go-algorand.
             if let Some(app) = state.app_params.get_mut(&app_id) {
