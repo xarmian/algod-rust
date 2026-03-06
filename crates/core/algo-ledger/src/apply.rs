@@ -132,6 +132,14 @@ pub fn apply_transaction(
             touched.push(fa);
         }
     }
+    // Application accounts array: EvalDelta local deltas can mutate these.
+    if let Some(ref accounts) = txn.accounts {
+        for acct in accounts {
+            if !acct.is_zero() && !touched.contains(acct) {
+                touched.push(*acct);
+            }
+        }
+    }
 
     // Determine asset/app IDs to snapshot for rollback.
     let mut asset_ids_to_snap = Vec::new();
@@ -823,6 +831,12 @@ fn apply_appl(
         sender_account.total_extra_app_pages += extra_pages;
     }
 
+    // Record whether local state exists BEFORE EvalDelta, so the OptIn branch
+    // can correctly detect a new opt-in even if EvalDelta creates a placeholder entry.
+    let had_local_state = state
+        .app_local_states
+        .contains_key(&(txn.sender, app_id));
+
     // Apply EvalDelta BEFORE on_completion structural changes (matching go-algorand).
     // TEAL executes first (writing global/local state), then the runtime performs
     // structural close-out/delete. This ordering prevents EvalDelta from recreating
@@ -834,23 +848,30 @@ fn apply_appl(
 
     match txn.on_completion {
         ON_COMPLETION_OPT_IN => {
-            // Create local state for sender if not already present.
-            let local_schema = if is_create {
-                txn.local_state_schema.clone().unwrap_or_default()
-            } else {
-                state
-                    .app_params
-                    .get(&app_id)
-                    .map(|p| p.local_state_schema.clone())
-                    .unwrap_or_default()
-            };
+            // Create local state for sender if not already present before EvalDelta.
+            // EvalDelta may have created a placeholder entry with a default schema,
+            // so we use the pre-EvalDelta flag rather than Entry::Vacant.
+            if !had_local_state {
+                let local_schema = if is_create {
+                    txn.local_state_schema.clone().unwrap_or_default()
+                } else {
+                    state
+                        .app_params
+                        .get(&app_id)
+                        .map(|p| p.local_state_schema.clone())
+                        .unwrap_or_default()
+                };
 
-            use std::collections::hash_map::Entry;
-            if let Entry::Vacant(e) = state.app_local_states.entry((txn.sender, app_id)) {
-                e.insert(AppLocalState {
-                    schema: local_schema,
-                    key_value: std::collections::BTreeMap::new(),
-                });
+                // Insert or update with the correct schema (EvalDelta may have
+                // already created a placeholder with default schema).
+                state
+                    .app_local_states
+                    .entry((txn.sender, app_id))
+                    .and_modify(|ls| ls.schema = local_schema.clone())
+                    .or_insert(AppLocalState {
+                        schema: local_schema,
+                        key_value: std::collections::BTreeMap::new(),
+                    });
                 let sender_account = state.get_or_default_account(&txn.sender);
                 sender_account.total_apps_opted_in += 1;
             }
