@@ -195,7 +195,7 @@ pub fn apply_transaction(
             "acfg" => apply_acfg(state, stx, ctx)?,
             "axfer" => apply_axfer(state, stx, ctx)?,
             "afrz" => apply_afrz(state, stx, ctx)?,
-            "appl" => apply_appl(state, stx, ctx)?,
+            "appl" => apply_appl(state, stx, ctx, depth)?,
             _ => {
                 // Placeholder for future epics (keyreg, etc.):
                 // debit fee from sender and credit fee_sink, then check min balance.
@@ -203,11 +203,14 @@ pub fn apply_transaction(
             }
         }
 
-        // Apply EvalDelta if present (mainly for appl, but any type can have it
-        // due to inner transactions in recorded blocks).
-        if let Some(ref dt) = stx.eval_delta {
-            let delta = parse_eval_delta(dt)?;
-            apply_eval_delta(stx, &delta, state, ctx, depth)?;
+        // Apply EvalDelta if present. For "appl" transactions, EvalDelta is
+        // already applied inside apply_appl() before on_completion structural
+        // changes, so we skip it here to avoid double-application.
+        if txn.txn_type != "appl" {
+            if let Some(ref dt) = stx.eval_delta {
+                let delta = parse_eval_delta(dt)?;
+                apply_eval_delta(stx, &delta, state, ctx, depth)?;
+            }
         }
 
         // Debit rewards pool for distributed rewards.
@@ -481,6 +484,11 @@ fn apply_acfg(
             }
 
             // Remove asset params and creator holding.
+            // NOTE: This intentionally does NOT remove other accounts' zero-balance
+            // holdings for this asset. In go-algorand, asset destruction only removes
+            // the creator's holding and the asset params. Other opted-in accounts with
+            // zero balance keep their stale holdings — they must explicitly close-out
+            // via an axfer with asset_close_to to reclaim their min-balance.
             state.asset_params.remove(&asset_id);
             state.asset_holdings.remove(&(creator, asset_id));
 
@@ -752,12 +760,15 @@ const ON_COMPLETION_DELETE: u64 = 5;
 /// Apply an application call transaction.
 ///
 /// Handles creation, opt-in, close-out, clear-state, update, delete, and no-op.
-/// The primary state effects (global/local state changes) come from the EvalDelta,
-/// which is applied separately after the type-specific dispatch.
+/// EvalDelta is applied BEFORE the on_completion structural changes (matching
+/// go-algorand ordering): TEAL executes first (writing state via EvalDelta),
+/// then the runtime performs close-out/delete cleanup. This prevents EvalDelta's
+/// `or_insert_with` calls from recreating entries that close-out/delete removed.
 fn apply_appl(
     state: &mut LedgerState,
     stx: &SignedTransaction,
     ctx: &ApplyContext,
+    depth: u32,
 ) -> Result<(), AlgoError> {
     let txn = &stx.txn;
 
@@ -810,6 +821,15 @@ fn apply_appl(
         let sender_account = state.get_or_default_account(&txn.sender);
         sender_account.total_created_apps += 1;
         sender_account.total_extra_app_pages += extra_pages;
+    }
+
+    // Apply EvalDelta BEFORE on_completion structural changes (matching go-algorand).
+    // TEAL executes first (writing global/local state), then the runtime performs
+    // structural close-out/delete. This ordering prevents EvalDelta from recreating
+    // entries that close-out or delete would remove.
+    if let Some(ref dt) = stx.eval_delta {
+        let delta = parse_eval_delta(dt)?;
+        apply_eval_delta(stx, &delta, state, ctx, depth)?;
     }
 
     match txn.on_completion {

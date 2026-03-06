@@ -101,12 +101,13 @@ impl LedgerState {
 
     /// Compute schema-aware minimum balance for an account.
     ///
-    /// Extends the flat min-balance with per-app schema costs by looking up
-    /// AppLocalState (for opted-in apps) in the ledger state.
+    /// Extends the flat min-balance with per-app schema costs:
+    /// - Local state schema costs for apps the account has opted into.
+    /// - Global state schema costs for apps the account has created.
     ///
-    /// Created-app global schema costs will be added when apply_appl tracks
-    /// creator->app mappings. Flat costs (APP_FLAT_PARAMS_MIN_BALANCE) already
-    /// apply for created apps via the base `min_balance()`.
+    /// Flat costs (APP_FLAT_PARAMS_MIN_BALANCE per created app,
+    /// APP_FLAT_OPT_IN_MIN_BALANCE per opted-in app) are already included
+    /// via the base `min_balance()`.
     pub fn min_balance_with_state(&self, addr: &Address, account: &AccountData) -> u64 {
         let flat = crate::params::min_balance(account);
         let mut extra: u64 = 0;
@@ -115,6 +116,13 @@ impl LedgerState {
         for ((a, _app_id), local_state) in &self.app_local_states {
             if a == addr {
                 extra += schema_min_balance(&local_state.schema);
+            }
+        }
+
+        // Created apps: add global state schema cost.
+        for app in self.app_params.values() {
+            if app.creator == *addr {
+                extra += schema_min_balance(&app.global_state_schema);
             }
         }
 
