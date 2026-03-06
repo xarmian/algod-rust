@@ -94,6 +94,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sha2",
  "tracing",
 ]
 
@@ -156,6 +157,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

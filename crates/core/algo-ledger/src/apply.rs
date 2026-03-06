@@ -84,6 +84,7 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
 
     store.set_current_round(block.round);
     store.purge_expired_leases(block.round.0);
+
     Ok(())
 }
 
@@ -293,6 +294,17 @@ pub fn apply_transaction<L: crate::store_trait::LedgerStore>(
 
         // Record lease on success (no-op for empty/zero leases).
         store.record_lease(&txn.sender, &lease_arr, txn.last_valid.0);
+
+        // Set update_round on all touched accounts (including fee_sink).
+        // This tracks which round last modified each account, used by the
+        // Merkle trie V6 hash builder as affinity bytes.
+        for addr in &snapshot_addrs {
+            let mut account = store.get_or_default_account(addr);
+            if account.update_round < ctx.round {
+                account.update_round = ctx.round;
+                store.set_account(addr, account);
+            }
+        }
 
         Ok(())
     })();

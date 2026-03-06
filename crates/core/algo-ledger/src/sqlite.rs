@@ -63,6 +63,11 @@ CREATE TABLE IF NOT EXISTS algod_rust_meta (
     key   TEXT PRIMARY KEY,
     value BLOB
 );
+
+CREATE TABLE IF NOT EXISTS merkle_trie (
+    id   INTEGER PRIMARY KEY CHECK (id = 0),
+    data BLOB NOT NULL
+);
 ";
 
 // Resource ctype constants
@@ -70,14 +75,14 @@ const CTYPE_ASSET: i64 = 1;
 const CTYPE_APP: i64 = 2;
 
 // Resource flags bitmask (stored in the "y" field of resource blobs)
-const RESOURCE_FLAGS_HOLDING: u64 = 0x01; // bit 0: has local state / holding data
-const RESOURCE_FLAGS_OWNERSHIP: u64 = 0x04; // bit 2: has creator/params data
+pub(crate) const RESOURCE_FLAGS_HOLDING: u64 = 0x01; // bit 0: has local state / holding data
+pub(crate) const RESOURCE_FLAGS_OWNERSHIP: u64 = 0x04; // bit 2: has creator/params data
 
 // ---------------------------------------------------------------------------
 // Msgpack encode/decode helpers for AccountData (Go-compatible codec keys)
 // ---------------------------------------------------------------------------
 
-fn encode_account_data(acct: &AccountData) -> Vec<u8> {
+pub(crate) fn encode_account_data(acct: &AccountData) -> Vec<u8> {
     let mut map: Vec<(&str, rmpv::Value)> = Vec::new();
 
     // "a" = status
@@ -178,6 +183,11 @@ fn encode_account_data(acct: &AccountData) -> Vec<u8> {
         map.push(("F", rmpv::Value::Binary(sp.to_vec())));
     }
 
+    // "z" = update_round
+    if acct.update_round != 0 {
+        map.push(("z", rmpv::Value::from(acct.update_round)));
+    }
+
     // Build the msgpack map (sorted by key — Go's canonical encoding)
     map.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -262,6 +272,7 @@ fn decode_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
                     }
                 }
             }
+            "z" => acct.update_round = v.as_u64().unwrap_or(0),
             _ => {} // ignore unknown fields
         }
     }
@@ -273,7 +284,7 @@ fn decode_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
 // Resource msgpack helpers
 // ---------------------------------------------------------------------------
 
-fn encode_asset_holding(h: &AssetHolding) -> Vec<u8> {
+pub(crate) fn encode_asset_holding(h: &AssetHolding) -> Vec<u8> {
     let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
     if h.amount != 0 {
         pairs.push((rmpv::Value::String("l".into()), rmpv::Value::from(h.amount)));
@@ -315,7 +326,7 @@ fn decode_asset_holding(data: &[u8]) -> Result<AssetHolding, AlgoError> {
     Ok(h)
 }
 
-fn encode_asset_params(p: &AssetParams, creator: &Address) -> Vec<u8> {
+pub(crate) fn encode_asset_params(p: &AssetParams, creator: &Address) -> Vec<u8> {
     let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
 
     if p.total != 0 {
@@ -477,7 +488,7 @@ fn decode_asset_params(data: &[u8]) -> Result<AssetParams, AlgoError> {
     Ok(p)
 }
 
-fn encode_teal_key_value(kv: &BTreeMap<Vec<u8>, TealValue>) -> rmpv::Value {
+pub(crate) fn encode_teal_key_value(kv: &BTreeMap<Vec<u8>, TealValue>) -> rmpv::Value {
     if kv.is_empty() {
         return rmpv::Value::Map(vec![]);
     }
@@ -548,7 +559,7 @@ fn decode_teal_key_value(val: &rmpv::Value) -> BTreeMap<Vec<u8>, TealValue> {
     result
 }
 
-fn encode_app_params(p: &AppParams) -> Vec<u8> {
+pub(crate) fn encode_app_params(p: &AppParams) -> Vec<u8> {
     let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
 
     if !p.approval_program.is_empty() {
@@ -686,7 +697,7 @@ fn decode_app_params(data: &[u8], creator: Address) -> Result<AppParams, AlgoErr
     Ok(p)
 }
 
-fn encode_app_local_state(s: &AppLocalState) -> Vec<u8> {
+pub(crate) fn encode_app_local_state(s: &AppLocalState) -> Vec<u8> {
     let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
 
     // Schema
@@ -1065,9 +1076,12 @@ const ASSET_HOLDING_KEYS: &[&str] = &["l", "m"];
 
 /// Merge asset holding fields into an existing params blob, producing a
 /// combined blob with both ownership and holding flags set.
-fn merge_asset_holding_into_params(existing_params_blob: &[u8], new_holding: &AssetHolding) -> Vec<u8> {
-    let existing_val: rmpv::Value =
-        rmpv::decode::read_value(&mut &existing_params_blob[..]).unwrap_or(rmpv::Value::Map(vec![]));
+fn merge_asset_holding_into_params(
+    existing_params_blob: &[u8],
+    new_holding: &AssetHolding,
+) -> Vec<u8> {
+    let existing_val: rmpv::Value = rmpv::decode::read_value(&mut &existing_params_blob[..])
+        .unwrap_or(rmpv::Value::Map(vec![]));
 
     let mut merged: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
 
@@ -1087,7 +1101,10 @@ fn merge_asset_holding_into_params(existing_params_blob: &[u8], new_holding: &As
 
     // Add holding fields
     if new_holding.amount != 0 {
-        merged.push((rmpv::Value::String("l".into()), rmpv::Value::from(new_holding.amount)));
+        merged.push((
+            rmpv::Value::String("l".into()),
+            rmpv::Value::from(new_holding.amount),
+        ));
     }
     if new_holding.frozen {
         merged.push((rmpv::Value::String("m".into()), rmpv::Value::Boolean(true)));
@@ -1107,9 +1124,13 @@ fn merge_asset_holding_into_params(existing_params_blob: &[u8], new_holding: &As
 
 /// Merge asset params fields into an existing holding blob, producing a
 /// combined blob with both ownership and holding flags set.
-fn merge_asset_params_into_holding(existing_holding_blob: &[u8], new_params: &AssetParams, creator: &Address) -> Vec<u8> {
-    let existing_val: rmpv::Value =
-        rmpv::decode::read_value(&mut &existing_holding_blob[..]).unwrap_or(rmpv::Value::Map(vec![]));
+fn merge_asset_params_into_holding(
+    existing_holding_blob: &[u8],
+    new_params: &AssetParams,
+    creator: &Address,
+) -> Vec<u8> {
+    let existing_val: rmpv::Value = rmpv::decode::read_value(&mut &existing_holding_blob[..])
+        .unwrap_or(rmpv::Value::Map(vec![]));
 
     let mut merged: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
 
@@ -1129,10 +1150,16 @@ fn merge_asset_params_into_holding(existing_holding_blob: &[u8], new_params: &As
 
     // Add params fields (same encoding as encode_asset_params but without the "y" flag)
     if new_params.total != 0 {
-        merged.push((rmpv::Value::String("a".into()), rmpv::Value::from(new_params.total)));
+        merged.push((
+            rmpv::Value::String("a".into()),
+            rmpv::Value::from(new_params.total),
+        ));
     }
     if new_params.decimals != 0 {
-        merged.push((rmpv::Value::String("b".into()), rmpv::Value::from(new_params.decimals)));
+        merged.push((
+            rmpv::Value::String("b".into()),
+            rmpv::Value::from(new_params.decimals),
+        ));
     }
     if new_params.default_frozen {
         merged.push((rmpv::Value::String("c".into()), rmpv::Value::Boolean(true)));
@@ -1344,6 +1371,22 @@ fn set_meta_string(conn: &Connection, key: &str, val: &str) -> Result<(), AlgoEr
 /// Uses a Go-compatible schema (matching go-algorand's trackerdb) for
 /// account and resource storage. Chain-level metadata is stored in an
 /// `algod_rust_meta` table.
+/// Pre-mutation record for SQLite trie tracking.
+enum SqlitePreMutation {
+    Account {
+        addr: Address,
+        old_data: Option<Box<AccountData>>,
+        old_affinity: u32,
+    },
+    Resource {
+        addr: Address,
+        index: u64,
+        old_blob: Option<Vec<u8>>,
+        ctype: i64,
+        old_affinity: u32,
+    },
+}
+
 pub struct SqliteLedger {
     conn: Connection,
     /// In-memory lease table (leases are short-lived, no persistence needed).
@@ -1363,6 +1406,10 @@ pub struct SqliteLedger {
     savepoint_counter: AtomicU64,
     /// Whether we are inside a begin_block/commit_block transaction.
     in_block: bool,
+    /// Merkle trie for account/resource state tracking.
+    trie: Option<crate::merkle_trie::MerkleTrie>,
+    /// Pre-mutation records for trie updates.
+    pre_mutations: Vec<SqlitePreMutation>,
 }
 
 impl SqliteLedger {
@@ -1448,7 +1495,166 @@ impl SqliteLedger {
             protocol,
             savepoint_counter: AtomicU64::new(0),
             in_block: false,
+            trie: None,
+            pre_mutations: Vec::new(),
         })
+    }
+
+    /// Load the trie from the `merkle_trie` table or rebuild from DB contents.
+    ///
+    /// If the table contains a serialized trie, it is deserialized.
+    /// Otherwise the trie is rebuilt from all accounts and resources in the DB.
+    pub fn load_trie(&mut self) -> Result<(), AlgoError> {
+        use crate::trie_hash::ELEMENT_SIZE;
+
+        let stored: Option<Vec<u8>> = self
+            .conn
+            .query_row("SELECT data FROM merkle_trie WHERE id = 0", [], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("load trie error: {e}"),
+            })?;
+
+        let trie = match stored {
+            Some(data) => crate::merkle_trie::MerkleTrie::deserialize(&data, ELEMENT_SIZE)?,
+            None => self.rebuild_trie_from_db()?,
+        };
+
+        self.trie = Some(trie);
+        self.pre_mutations.clear();
+        Ok(())
+    }
+
+    /// Rebuild the trie from all accounts and resources currently in the DB.
+    fn rebuild_trie_from_db(&self) -> Result<crate::merkle_trie::MerkleTrie, AlgoError> {
+        use crate::trie_hash::{
+            account_hash_v6, compute_affinity, resource_hash_v6_with_kind, HashKind, ELEMENT_SIZE,
+        };
+
+        let mut trie = crate::merkle_trie::MerkleTrie::new(ELEMENT_SIZE);
+
+        // 1. Process all accounts from accountbase.
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT address, data FROM accountbase")
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("prepare accounts for trie rebuild: {e}"),
+                })?;
+
+            let rows = stmt
+                .query_map([], |row| {
+                    let addr_bytes: Vec<u8> = row.get(0)?;
+                    let data: Vec<u8> = row.get(1)?;
+                    Ok((addr_bytes, data))
+                })
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("query accounts for trie rebuild: {e}"),
+                })?;
+
+            for row in rows {
+                let (addr_bytes, data) = row.map_err(|e| AlgoError::Ledger {
+                    message: format!("read account row: {e}"),
+                })?;
+                if addr_bytes.len() != 32 {
+                    continue;
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&addr_bytes);
+                let addr = Address(arr);
+                let acct = decode_account_data(&data)?;
+                let elem = account_hash_v6(&addr, &acct);
+                trie.add(&elem).map_err(|e| AlgoError::Ledger {
+                    message: format!("trie add account: {e}"),
+                })?;
+            }
+        }
+
+        // 2. Process all resources.
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT r.addrid, r.aidx, r.ctype, r.data, a.address, a.data \
+                     FROM resources r \
+                     JOIN accountbase a ON a.rowid = r.addrid",
+                )
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("prepare resources for trie rebuild: {e}"),
+                })?;
+
+            let rows = stmt
+                .query_map([], |row| {
+                    let _addrid: i64 = row.get(0)?;
+                    let aidx: i64 = row.get(1)?;
+                    let ctype: i64 = row.get(2)?;
+                    let rdata: Vec<u8> = row.get(3)?;
+                    let addr_bytes: Vec<u8> = row.get(4)?;
+                    let acct_data: Vec<u8> = row.get(5)?;
+                    Ok((aidx, ctype, rdata, addr_bytes, acct_data))
+                })
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("query resources for trie rebuild: {e}"),
+                })?;
+
+            for row in rows {
+                let (aidx, ctype, rdata, addr_bytes, acct_data) =
+                    row.map_err(|e| AlgoError::Ledger {
+                        message: format!("read resource row: {e}"),
+                    })?;
+                if addr_bytes.len() != 32 {
+                    continue;
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&addr_bytes);
+                let addr = Address(arr);
+
+                let acct = decode_account_data(&acct_data).unwrap_or_default();
+                let affinity = compute_affinity(&acct);
+
+                let kind = if ctype == CTYPE_APP {
+                    HashKind::App
+                } else {
+                    HashKind::Asset
+                };
+
+                let elem = resource_hash_v6_with_kind(&addr, aidx as u64, &rdata, affinity, kind);
+                trie.add(&elem).map_err(|e| AlgoError::Ledger {
+                    message: format!("trie add resource: {e}"),
+                })?;
+            }
+        }
+
+        Ok(trie)
+    }
+
+    /// Record the old resource blob before mutation, for trie tracking.
+    fn record_resource_pre_mutation(&mut self, addr: &Address, index: u64, ctype: i64) {
+        if self.trie.is_some() {
+            let old_blob = self.get_rowid(addr).and_then(|rowid| {
+                self.conn
+                    .query_row(
+                        "SELECT data FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
+                        params![rowid, index as i64, ctype],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()
+                    .unwrap_or(None)
+            });
+            let old_affinity = self
+                .get_account(addr)
+                .map(|a| crate::trie_hash::compute_affinity(&a))
+                .unwrap_or(0);
+            self.pre_mutations.push(SqlitePreMutation::Resource {
+                addr: *addr,
+                index,
+                old_blob,
+                ctype,
+                old_affinity,
+            });
+        }
     }
 
     /// Begin a block-level transaction.
@@ -1467,6 +1673,19 @@ impl SqliteLedger {
         // Flush chain-level state to meta table.
         self.flush_chain_state()?;
 
+        // Persist the trie if enabled.
+        if let Some(ref trie) = self.trie {
+            let data = trie.serialize();
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO merkle_trie (id, data) VALUES (0, ?1)",
+                    params![data],
+                )
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("persist trie error: {e}"),
+                })?;
+        }
+
         self.conn
             .execute_batch("COMMIT")
             .map_err(|e| AlgoError::Ledger {
@@ -1479,12 +1698,21 @@ impl SqliteLedger {
     /// Rollback the current block-level transaction, discarding all changes
     /// made since `begin_block`. Used by the replay CLI when `apply_block` fails.
     pub fn rollback_block(&mut self) -> Result<(), AlgoError> {
+        // Clear pre-mutation records — they are for the rolled-back block.
+        self.pre_mutations.clear();
+
         self.conn
             .execute_batch("ROLLBACK")
             .map_err(|e| AlgoError::Ledger {
                 message: format!("rollback block error: {e}"),
             })?;
         self.in_block = false;
+
+        // Reload the trie from the last committed state (DB was rolled back).
+        if self.trie.is_some() {
+            self.load_trie()?;
+        }
+
         Ok(())
     }
 
@@ -1653,6 +1881,18 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_account(&mut self, addr: &Address, account: AccountData) {
+        if self.trie.is_some() {
+            let old = self.get_account(addr);
+            let old_affinity = old
+                .as_ref()
+                .map(crate::trie_hash::compute_affinity)
+                .unwrap_or(0);
+            self.pre_mutations.push(SqlitePreMutation::Account {
+                addr: *addr,
+                old_data: old.map(Box::new),
+                old_affinity,
+            });
+        }
         let data = encode_account_data(&account);
         // normalizedonlinebalance: Go uses this for sortition; we compute a
         // placeholder value (0 for offline/notpart, micro_algos for online).
@@ -1669,6 +1909,18 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_account(&mut self, addr: &Address) {
+        if self.trie.is_some() {
+            let old = self.get_account(addr);
+            let old_affinity = old
+                .as_ref()
+                .map(crate::trie_hash::compute_affinity)
+                .unwrap_or(0);
+            self.pre_mutations.push(SqlitePreMutation::Account {
+                addr: *addr,
+                old_data: old.map(Box::new),
+                old_affinity,
+            });
+        }
         // Also remove all resources for this account.
         if let Some(rowid) = self.get_rowid(addr) {
             let _ = self
@@ -1708,6 +1960,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_asset_holding(&mut self, addr: &Address, asset_id: u64, holding: AssetHolding) {
+        self.record_resource_pre_mutation(addr, asset_id, CTYPE_ASSET);
         let rowid = self.get_or_insert_rowid(addr).expect("get_or_insert_rowid");
 
         // Check if an existing blob has ownership (params) flag set; if so, merge.
@@ -1732,6 +1985,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_asset_holding(&mut self, addr: &Address, asset_id: u64) {
+        self.record_resource_pre_mutation(addr, asset_id, CTYPE_ASSET);
         if let Some(rowid) = self.get_rowid(addr) {
             // Check if the blob also has ownership (asset params) data.
             if let Some(existing) = self.get_asset_resource_blob(rowid, asset_id) {
@@ -1791,6 +2045,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_asset_params(&mut self, asset_id: u64, record: AssetParamsRecord) {
+        self.record_resource_pre_mutation(&record.creator, asset_id, CTYPE_ASSET);
         let rowid = self
             .get_or_insert_rowid(&record.creator)
             .expect("get_or_insert_rowid");
@@ -1826,6 +2081,12 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_asset_params(&mut self, asset_id: u64) {
+        // Record pre-mutation for trie tracking.
+        if self.trie.is_some() {
+            if let Some(creator) = self.get_creator_from_assetcreators(asset_id) {
+                self.record_resource_pre_mutation(&creator, asset_id, CTYPE_ASSET);
+            }
+        }
         // Get creator to find the rowid.
         if let Some(creator) = self.get_creator_from_assetcreators(asset_id) {
             if let Some(rowid) = self.get_rowid(&creator) {
@@ -1898,6 +2159,7 @@ impl LedgerStore for SqliteLedger {
 
     fn set_app_params(&mut self, app_id: u64, params: AppParams) {
         let creator = params.creator;
+        self.record_resource_pre_mutation(&creator, app_id, CTYPE_APP);
         let rowid = self
             .get_or_insert_rowid(&creator)
             .expect("get_or_insert_rowid");
@@ -1931,6 +2193,12 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_app_params(&mut self, app_id: u64) {
+        // Record pre-mutation for trie tracking.
+        if self.trie.is_some() {
+            if let Some(creator) = self.get_creator_from_assetcreators(app_id) {
+                self.record_resource_pre_mutation(&creator, app_id, CTYPE_APP);
+            }
+        }
         if let Some(creator) = self.get_creator_from_assetcreators(app_id) {
             if let Some(rowid) = self.get_rowid(&creator) {
                 // Check if the blob also has holding (local state) data.
@@ -2035,6 +2303,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_app_local_state(&mut self, addr: &Address, app_id: u64, local_state: AppLocalState) {
+        self.record_resource_pre_mutation(addr, app_id, CTYPE_APP);
         let rowid = self.get_or_insert_rowid(addr).expect("get_or_insert_rowid");
 
         // Check if an app-params blob already exists at this key; if so, merge.
@@ -2059,6 +2328,7 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_app_local_state(&mut self, addr: &Address, app_id: u64) {
+        self.record_resource_pre_mutation(addr, app_id, CTYPE_APP);
         if let Some(rowid) = self.get_rowid(addr) {
             // Check if the blob also has ownership (app params) data.
             if let Some(existing) = self.get_app_resource_blob(rowid, app_id) {
@@ -2275,6 +2545,150 @@ impl LedgerStore for SqliteLedger {
         }
 
         flat + extra
+    }
+
+    // ---- Trie integration ----
+
+    fn enable_trie(&mut self) {
+        // Try to load persisted trie from DB; fall back to empty on error.
+        if self.load_trie().is_err() {
+            self.trie = Some(crate::merkle_trie::MerkleTrie::new(
+                crate::trie_hash::ELEMENT_SIZE,
+            ));
+        }
+        self.pre_mutations.clear();
+    }
+
+    fn trie_enabled(&self) -> bool {
+        self.trie.is_some()
+    }
+
+    fn finalize_trie_updates(&mut self) -> Option<[u8; 32]> {
+        use crate::trie_hash::{
+            account_hash_v6, compute_affinity, resource_hash_v6_with_kind, HashKind,
+        };
+
+        // Take the trie out of self to avoid borrow conflicts.
+        let mut trie = self.trie.take()?;
+        let mutations = std::mem::take(&mut self.pre_mutations);
+
+        // Track addresses whose affinity changed for resource cascade (H2).
+        let mut affinity_changed: Vec<(Address, u32, u32)> = Vec::new();
+
+        for mutation in mutations {
+            match mutation {
+                SqlitePreMutation::Account {
+                    addr,
+                    old_data,
+                    old_affinity,
+                } => {
+                    // Delete old element.
+                    if let Some(ref old) = old_data {
+                        let old_elem = account_hash_v6(&addr, old);
+                        if let Err(e) = trie.delete(&old_elem) {
+                            tracing::warn!("trie delete account failed: {}", e);
+                        }
+                    }
+                    // Add new element if account still exists.
+                    if let Some(new_data) = self.get_account(&addr) {
+                        let new_affinity = compute_affinity(&new_data);
+                        let new_elem = account_hash_v6(&addr, &new_data);
+                        if let Err(e) = trie.add(&new_elem) {
+                            tracing::warn!("trie add account failed: {}", e);
+                        }
+                        if old_affinity != new_affinity {
+                            affinity_changed.push((addr, old_affinity, new_affinity));
+                        }
+                    }
+                }
+                SqlitePreMutation::Resource {
+                    addr,
+                    index,
+                    old_blob,
+                    ctype,
+                    old_affinity,
+                } => {
+                    let kind = if ctype == CTYPE_APP {
+                        HashKind::App
+                    } else {
+                        HashKind::Asset
+                    };
+
+                    // Delete old element using captured old_affinity.
+                    if let Some(ref old) = old_blob {
+                        let old_elem =
+                            resource_hash_v6_with_kind(&addr, index, old, old_affinity, kind);
+                        if let Err(e) = trie.delete(&old_elem) {
+                            tracing::warn!("trie delete resource failed: {}", e);
+                        }
+                    }
+
+                    // Get current affinity for new element.
+                    let new_affinity = self
+                        .get_account(&addr)
+                        .map(|a| compute_affinity(&a))
+                        .unwrap_or(0);
+
+                    // Read current blob from DB and add new element.
+                    let new_blob = self.get_rowid(&addr).and_then(|rowid| {
+                        self.conn
+                            .query_row(
+                                "SELECT data FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
+                                params![rowid, index as i64, ctype],
+                                |row| row.get::<_, Vec<u8>>(0),
+                            )
+                            .optional()
+                            .unwrap_or(None)
+                    });
+                    if let Some(ref new) = new_blob {
+                        let new_elem =
+                            resource_hash_v6_with_kind(&addr, index, new, new_affinity, kind);
+                        if let Err(e) = trie.add(&new_elem) {
+                            tracing::warn!("trie add resource failed: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // H2: Cascade affinity changes to resources not already mutated.
+        for (addr, old_aff, new_aff) in &affinity_changed {
+            if let Some(rowid) = self.get_rowid(addr) {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT aidx, data, ctype FROM resources WHERE addrid = ?1")
+                    .expect("prepare resource query");
+                let rows: Vec<(i64, Vec<u8>, i64)> = stmt
+                    .query_map(params![rowid], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .expect("query resources")
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                for (aidx, blob, ctype) in rows {
+                    let kind = if ctype == CTYPE_APP {
+                        HashKind::App
+                    } else {
+                        HashKind::Asset
+                    };
+                    let old_elem =
+                        resource_hash_v6_with_kind(addr, aidx as u64, &blob, *old_aff, kind);
+                    if let Err(e) = trie.delete(&old_elem) {
+                        tracing::warn!("trie delete (affinity cascade) failed: {}", e);
+                    }
+                    let new_elem =
+                        resource_hash_v6_with_kind(addr, aidx as u64, &blob, *new_aff, kind);
+                    if let Err(e) = trie.add(&new_elem) {
+                        tracing::warn!("trie add (affinity cascade) failed: {}", e);
+                    }
+                }
+            }
+        }
+
+        let root = trie.root_hash();
+        self.trie = Some(trie);
+        Some(root)
     }
 }
 
@@ -2583,6 +2997,7 @@ mod tests {
             total_extra_app_pages: 2,
             total_box_bytes: 100,
             total_boxes: 5,
+            update_round: 42,
         };
         let encoded = encode_account_data(&acct);
         let decoded = decode_account_data(&encoded).unwrap();
@@ -2851,5 +3266,145 @@ mod tests {
         // Account should not exist after rollback.
         assert!(ledger.get_account(&addr).is_none());
         assert!(!ledger.in_block);
+    }
+
+    #[test]
+    fn test_trie_persist_and_load() {
+        use crate::store_trait::LedgerStore;
+
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.enable_trie();
+        assert!(ledger.trie_enabled());
+
+        // Add some accounts.
+        let addr1 = Address([20u8; 32]);
+        let addr2 = Address([21u8; 32]);
+        ledger.set_account(
+            &addr1,
+            AccountData {
+                micro_algos: 1_000_000,
+                update_round: 1,
+                ..Default::default()
+            },
+        );
+        ledger.set_account(
+            &addr2,
+            AccountData {
+                micro_algos: 2_000_000,
+                update_round: 1,
+                ..Default::default()
+            },
+        );
+
+        // Finalize trie and get root hash.
+        let root1 = ledger.finalize_trie_updates().unwrap();
+        assert_ne!(root1, [0u8; 32]);
+
+        // Persist trie via commit_block.
+        ledger.begin_block().unwrap();
+        ledger.commit_block().unwrap();
+
+        // Load trie from DB.
+        ledger.load_trie().unwrap();
+        let trie = ledger.trie.as_mut().unwrap();
+        let root2 = trie.root_hash();
+        assert_eq!(root1, root2);
+    }
+
+    #[test]
+    fn test_trie_rebuild_from_db() {
+        use crate::store_trait::LedgerStore;
+
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+
+        // Add accounts without trie enabled first.
+        let addr1 = Address([30u8; 32]);
+        let addr2 = Address([31u8; 32]);
+        ledger.set_account(
+            &addr1,
+            AccountData {
+                micro_algos: 500_000,
+                update_round: 5,
+                ..Default::default()
+            },
+        );
+        ledger.set_account(
+            &addr2,
+            AccountData {
+                micro_algos: 750_000,
+                update_round: 5,
+                ..Default::default()
+            },
+        );
+
+        // Now enable trie — should rebuild from DB since no persisted trie exists.
+        ledger.enable_trie();
+        assert!(ledger.trie_enabled());
+
+        let trie = ledger.trie.as_mut().unwrap();
+        let root = trie.root_hash();
+        // With 2 accounts in DB, trie should be non-empty.
+        assert_ne!(root, [0u8; 32]);
+        assert_eq!(trie.len(), 2);
+    }
+
+    #[test]
+    fn test_trie_rollback_reloads() {
+        use crate::store_trait::LedgerStore;
+
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.enable_trie();
+
+        // Add an account and commit.
+        let addr = Address([40u8; 32]);
+        ledger.begin_block().unwrap();
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 100,
+                update_round: 1,
+                ..Default::default()
+            },
+        );
+        let _ = ledger.finalize_trie_updates();
+        ledger.commit_block().unwrap();
+
+        let root_after_commit = ledger.trie.as_mut().unwrap().root_hash();
+
+        // Start a new block, mutate, then rollback.
+        ledger.begin_block().unwrap();
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 999,
+                update_round: 2,
+                ..Default::default()
+            },
+        );
+        let _ = ledger.finalize_trie_updates();
+
+        // Trie hash should differ after mutation.
+        let root_during_block = ledger.trie.as_mut().unwrap().root_hash();
+        assert_ne!(root_after_commit, root_during_block);
+
+        // Rollback should reload trie to committed state.
+        ledger.rollback_block().unwrap();
+        let root_after_rollback = ledger.trie.as_mut().unwrap().root_hash();
+        assert_eq!(root_after_commit, root_after_rollback);
+    }
+
+    #[test]
+    fn test_merkle_trie_table_created() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        // Verify the merkle_trie table exists.
+        let count: i64 = ledger
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='merkle_trie'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

@@ -14,4 +14,5 @@ rmpv = { workspace = true }
 rmp-serde = { workspace = true }
 rmp = { workspace = true }
 rusqlite = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
