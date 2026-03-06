@@ -286,6 +286,240 @@ impl Default for LedgerState {
     }
 }
 
+impl crate::store_trait::LedgerStore for LedgerState {
+    type Snapshot = StateSnapshot;
+
+    // ---- Accounts ----
+
+    fn get_account(&self, addr: &Address) -> Option<AccountData> {
+        self.accounts.get(addr).cloned()
+    }
+
+    fn set_account(&mut self, addr: &Address, account: AccountData) {
+        self.accounts.insert(*addr, account);
+    }
+
+    fn remove_account(&mut self, addr: &Address) {
+        self.accounts.remove(addr);
+    }
+
+    // ---- Asset Holdings ----
+
+    fn get_asset_holding(&self, addr: &Address, asset_id: u64) -> Option<AssetHolding> {
+        self.asset_holdings.get(&(*addr, asset_id)).cloned()
+    }
+
+    fn set_asset_holding(&mut self, addr: &Address, asset_id: u64, holding: AssetHolding) {
+        self.asset_holdings.insert((*addr, asset_id), holding);
+    }
+
+    fn remove_asset_holding(&mut self, addr: &Address, asset_id: u64) {
+        self.asset_holdings.remove(&(*addr, asset_id));
+    }
+
+    fn has_asset_holding(&self, addr: &Address, asset_id: u64) -> bool {
+        self.asset_holdings.contains_key(&(*addr, asset_id))
+    }
+
+    // ---- Asset Params ----
+
+    fn get_asset_params(&self, asset_id: u64) -> Option<AssetParamsRecord> {
+        self.asset_params.get(&asset_id).cloned()
+    }
+
+    fn set_asset_params(&mut self, asset_id: u64, record: AssetParamsRecord) {
+        self.asset_params.insert(asset_id, record);
+    }
+
+    fn remove_asset_params(&mut self, asset_id: u64) {
+        self.asset_params.remove(&asset_id);
+    }
+
+    fn has_asset_params(&self, asset_id: u64) -> bool {
+        self.asset_params.contains_key(&asset_id)
+    }
+
+    // ---- App Params ----
+
+    fn get_app_params(&self, app_id: u64) -> Option<AppParams> {
+        self.app_params.get(&app_id).cloned()
+    }
+
+    fn set_app_params(&mut self, app_id: u64, params: AppParams) {
+        self.app_params.insert(app_id, params);
+    }
+
+    fn remove_app_params(&mut self, app_id: u64) {
+        self.app_params.remove(&app_id);
+    }
+
+    fn has_app_params(&self, app_id: u64) -> bool {
+        self.app_params.contains_key(&app_id)
+    }
+
+    fn app_params_created_by(&self, creator: &Address) -> Vec<AppParams> {
+        self.app_params
+            .values()
+            .filter(|p| p.creator == *creator)
+            .cloned()
+            .collect()
+    }
+
+    // ---- App Local States ----
+
+    fn get_app_local_state(&self, addr: &Address, app_id: u64) -> Option<AppLocalState> {
+        self.app_local_states.get(&(*addr, app_id)).cloned()
+    }
+
+    fn set_app_local_state(&mut self, addr: &Address, app_id: u64, local_state: AppLocalState) {
+        self.app_local_states.insert((*addr, app_id), local_state);
+    }
+
+    fn remove_app_local_state(&mut self, addr: &Address, app_id: u64) {
+        self.app_local_states.remove(&(*addr, app_id));
+    }
+
+    fn has_app_local_state(&self, addr: &Address, app_id: u64) -> bool {
+        self.app_local_states.contains_key(&(*addr, app_id))
+    }
+
+    fn app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)> {
+        self.app_local_states
+            .iter()
+            .filter(|((a, _), _)| a == addr)
+            .map(|((_, app_id), state)| (*app_id, state.clone()))
+            .collect()
+    }
+
+    // ---- Leases ----
+
+    fn check_lease(
+        &self,
+        sender: &Address,
+        lease: &[u8; 32],
+        current_round: u64,
+    ) -> Result<(), algo_error::AlgoError> {
+        self.lease_table.check(sender, lease, current_round)
+    }
+
+    fn record_lease(&mut self, sender: &Address, lease: &[u8; 32], last_valid: u64) {
+        self.lease_table.record(sender, lease, last_valid);
+    }
+
+    fn purge_expired_leases(&mut self, current_round: u64) {
+        self.lease_table.purge_expired(current_round);
+    }
+
+    // ---- Chain-level state (getters) ----
+
+    fn current_round(&self) -> Round {
+        self.current_round
+    }
+
+    fn rewards_level(&self) -> u64 {
+        self.rewards_level
+    }
+
+    fn rewards_rate(&self) -> u64 {
+        self.rewards_rate
+    }
+
+    fn rewards_residue(&self) -> u64 {
+        self.rewards_residue
+    }
+
+    fn rewards_recalculation_round(&self) -> u64 {
+        self.rewards_recalculation_round
+    }
+
+    fn fee_sink(&self) -> Address {
+        self.fee_sink
+    }
+
+    fn rewards_pool(&self) -> Address {
+        self.rewards_pool
+    }
+
+    fn genesis_id(&self) -> &str {
+        &self.genesis_id
+    }
+
+    fn genesis_hash(&self) -> &[u8; 32] {
+        &self.genesis_hash
+    }
+
+    fn protocol(&self) -> &str {
+        &self.protocol
+    }
+
+    // ---- Chain-level state (setters) ----
+
+    fn set_current_round(&mut self, round: Round) {
+        self.current_round = round;
+    }
+
+    fn set_rewards_level(&mut self, level: u64) {
+        self.rewards_level = level;
+    }
+
+    fn set_rewards_rate(&mut self, rate: u64) {
+        self.rewards_rate = rate;
+    }
+
+    fn set_rewards_residue(&mut self, residue: u64) {
+        self.rewards_residue = residue;
+    }
+
+    fn set_rewards_recalculation_round(&mut self, round: u64) {
+        self.rewards_recalculation_round = round;
+    }
+
+    fn set_fee_sink(&mut self, addr: Address) {
+        self.fee_sink = addr;
+    }
+
+    fn set_rewards_pool(&mut self, addr: Address) {
+        self.rewards_pool = addr;
+    }
+
+    fn set_genesis_id(&mut self, id: String) {
+        self.genesis_id = id;
+    }
+
+    fn set_genesis_hash(&mut self, hash: [u8; 32]) {
+        self.genesis_hash = hash;
+    }
+
+    fn set_protocol(&mut self, protocol: String) {
+        self.protocol = protocol;
+    }
+
+    // ---- Snapshot / Restore ----
+
+    fn snapshot(&self, addrs: &[Address]) -> StateSnapshot {
+        LedgerState::snapshot(self, addrs)
+    }
+
+    fn snapshot_with_ids(
+        &self,
+        addrs: &[Address],
+        asset_ids: &[u64],
+        app_ids: &[u64],
+    ) -> StateSnapshot {
+        LedgerState::snapshot_with_ids(self, addrs, asset_ids, app_ids)
+    }
+
+    fn restore_snapshot(&mut self, snapshot: StateSnapshot) {
+        LedgerState::restore_snapshot(self, snapshot);
+    }
+
+    // ---- Min balance ----
+
+    fn min_balance_with_state(&self, addr: &Address, account: &AccountData) -> u64 {
+        LedgerState::min_balance_with_state(self, addr, account)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

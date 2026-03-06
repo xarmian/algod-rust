@@ -5,7 +5,7 @@ use algo_types::{AccountData, AccountStatus, Address};
 use data_encoding::BASE64;
 use serde::Deserialize;
 
-use crate::LedgerState;
+use crate::state::LedgerState;
 
 /// Parsed genesis.json representation.
 #[derive(Debug, Deserialize)]
@@ -43,6 +43,72 @@ pub struct GenesisAccountState {
     pub stprf: Option<String>,
 }
 
+/// Populate any `LedgerStore` backend from parsed genesis data.
+///
+/// Sets fee_sink, rewards_pool, genesis_id, protocol, and all account
+/// allocations. Can be used with both in-memory `LedgerState` and future
+/// SQLite backends.
+///
+/// TODO: go-algorand computes genesis hash as SHA512/256("GE" || canonical_msgpack(genesis)).
+/// For now, genesis_hash is left as [0u8; 32] — the real hash is available from block
+/// headers during replay and can be set/verified then.
+pub fn populate_store<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    genesis: &GenesisJson,
+) -> Result<(), AlgoError> {
+    let fee_sink = Address::from_algorand_string(&genesis.fees).map_err(|e| AlgoError::Ledger {
+        message: format!("invalid fee sink address '{}': {e}", genesis.fees),
+    })?;
+    let rewards_pool =
+        Address::from_algorand_string(&genesis.rwd).map_err(|e| AlgoError::Ledger {
+            message: format!("invalid rewards pool address '{}': {e}", genesis.rwd),
+        })?;
+
+    store.set_fee_sink(fee_sink);
+    store.set_rewards_pool(rewards_pool);
+    store.set_genesis_id(format!("{}-{}", genesis.network, genesis.id));
+    store.set_protocol(genesis.proto.clone());
+
+    // Process allocations
+    for alloc in &genesis.alloc {
+        let addr = Address::from_algorand_string(&alloc.addr).map_err(|e| AlgoError::Ledger {
+            message: format!("invalid allocation address '{}': {e}", alloc.addr),
+        })?;
+
+        let status = match alloc.state.onl {
+            Some(v) => AccountStatus::from(v),
+            None => AccountStatus::Offline,
+        };
+
+        let vote_id = decode_key_32(&alloc.state.vote, "vote")?;
+        let selection_id = decode_key_32(&alloc.state.sel, "sel")?;
+        let state_proof_id = decode_key_64(&alloc.state.stprf, "stprf")?;
+
+        let account = AccountData {
+            micro_algos: alloc.state.algo,
+            status,
+            vote_id,
+            selection_id,
+            state_proof_id,
+            vote_first_valid: alloc.state.vote_fst.unwrap_or(0),
+            vote_last_valid: alloc.state.vote_lst.unwrap_or(0),
+            vote_key_dilution: alloc.state.vote_kd.unwrap_or(0),
+            ..Default::default()
+        };
+
+        store.set_account(&addr, account);
+    }
+
+    Ok(())
+}
+
+/// Parse genesis JSON string into its typed representation.
+pub fn parse_genesis_json(json_str: &str) -> Result<GenesisJson, AlgoError> {
+    serde_json::from_str(json_str).map_err(|e| AlgoError::Ledger {
+        message: format!("failed to parse genesis JSON: {e}"),
+    })
+}
+
 impl LedgerState {
     /// Load ledger state from a genesis.json file on disk.
     pub fn from_genesis(path: &Path) -> Result<LedgerState, AlgoError> {
@@ -56,62 +122,10 @@ impl LedgerState {
     ///
     /// Populates accounts from allocations, sets fee_sink, rewards_pool,
     /// genesis_id, and protocol version.
-    ///
-    /// TODO: go-algorand computes genesis hash as SHA512/256("GE" || canonical_msgpack(genesis)).
-    /// For now, genesis_hash is left as [0u8; 32] — the real hash is available from block
-    /// headers during replay and can be set/verified then.
     pub fn from_genesis_json(json_str: &str) -> Result<LedgerState, AlgoError> {
-        let genesis: GenesisJson =
-            serde_json::from_str(json_str).map_err(|e| AlgoError::Ledger {
-                message: format!("failed to parse genesis JSON: {e}"),
-            })?;
-
+        let genesis = parse_genesis_json(json_str)?;
         let mut state = LedgerState::new();
-
-        // Fee sink and rewards pool
-        state.fee_sink =
-            Address::from_algorand_string(&genesis.fees).map_err(|e| AlgoError::Ledger {
-                message: format!("invalid fee sink address '{}': {e}", genesis.fees),
-            })?;
-        state.rewards_pool =
-            Address::from_algorand_string(&genesis.rwd).map_err(|e| AlgoError::Ledger {
-                message: format!("invalid rewards pool address '{}': {e}", genesis.rwd),
-            })?;
-
-        state.genesis_id = format!("{}-{}", genesis.network, genesis.id);
-        state.protocol = genesis.proto;
-
-        // Process allocations
-        for alloc in &genesis.alloc {
-            let addr =
-                Address::from_algorand_string(&alloc.addr).map_err(|e| AlgoError::Ledger {
-                    message: format!("invalid allocation address '{}': {e}", alloc.addr),
-                })?;
-
-            let status = match alloc.state.onl {
-                Some(v) => AccountStatus::from(v),
-                None => AccountStatus::Offline,
-            };
-
-            let vote_id = decode_key_32(&alloc.state.vote, "vote")?;
-            let selection_id = decode_key_32(&alloc.state.sel, "sel")?;
-            let state_proof_id = decode_key_64(&alloc.state.stprf, "stprf")?;
-
-            let account = AccountData {
-                micro_algos: alloc.state.algo,
-                status,
-                vote_id,
-                selection_id,
-                state_proof_id,
-                vote_first_valid: alloc.state.vote_fst.unwrap_or(0),
-                vote_last_valid: alloc.state.vote_lst.unwrap_or(0),
-                vote_key_dilution: alloc.state.vote_kd.unwrap_or(0),
-                ..Default::default()
-            };
-
-            state.accounts.insert(addr, account);
-        }
-
+        populate_store(&mut state, &genesis)?;
         Ok(state)
     }
 }

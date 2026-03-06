@@ -54,6 +54,7 @@ remain, and preparation for the next phase.
    - Identify specific Phase 3 requirements based on Phase 2 experience
    - Document EvalDelta fields that need full modeling
    - Document inner transaction patterns encountered during mainnet replay
+   - Improve `collect_touched_addresses` to walk EvalDelta inner transactions, extracting all addresses mutated by inner txns for `--compare` conformance (currently only outer txn fields + accounts array are collected)
    - Estimate AVM opcode coverage needed
 
 ### Key context

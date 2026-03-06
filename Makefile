@@ -3,7 +3,8 @@ ALGOD_URL := http://localhost:4001
 COMPOSE := docker compose -f docker/docker-compose.yml
 
 .PHONY: build test fmt fmt-check clippy lint deny ci clean
-.PHONY: replay-mainnet replay-testnet
+.PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful
+.PHONY: archival-up archival-down
 .PHONY: localnet-up localnet-down localnet-status localnet-logs
 .PHONY: capture validate validate-only generate-txns fixtures help
 .PHONY: generate-diverse-txns fixtures-diverse
@@ -160,12 +161,45 @@ validate-only:
 
 REPLAY_START ?= 44000000
 REPLAY_BLOCKS ?= 100
+START_ROUND ?= 44000000
+COUNT ?= 100
 
 replay-mainnet:
 	cargo run --release --bin algod-rust -- replay --network mainnet --start $(REPLAY_START) --end $$(( $(REPLAY_START) + $(REPLAY_BLOCKS) - 1 )) --report ./reports/mainnet-replay.json
 
 replay-testnet:
 	cargo run --release --bin algod-rust -- replay --network testnet --start $(REPLAY_START) --end $$(( $(REPLAY_START) + $(REPLAY_BLOCKS) - 1 )) --report ./reports/testnet-replay.json
+
+replay-stateful: ## Run stateful replay against localnet
+	cargo run --bin algod-rust -- replay \
+		--stateful \
+		--genesis docker/genesis/genesis.json \
+		--network custom \
+		--algod-url http://localhost:4001 \
+		--algod-token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+		--start 1 \
+		--end 100 \
+		--db ./ledger-localnet.sqlite
+
+replay-mainnet-stateful: ## Run stateful replay against mainnet archival node
+	cargo run --bin algod-rust -- replay \
+		--stateful \
+		--genesis crates/core/algo-ledger/tests/fixtures/mainnet-genesis.json \
+		--network mainnet \
+		--start $(START_ROUND) \
+		--end $$(( $(START_ROUND) + $(COUNT) - 1 )) \
+		--compare \
+		--compare-url http://localhost:4002 \
+		--compare-token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+		--db ./ledger-mainnet.sqlite
+
+## ── Archival Node ───────────────────────────────────────────
+
+archival-up: ## Start archival Go node
+	docker compose -f docker/docker-compose.yml --profile archival up -d
+
+archival-down: ## Stop archival Go node
+	docker compose -f docker/docker-compose.yml --profile archival down
 
 ## ── Help ─────────────────────────────────────────────────────
 
@@ -200,3 +234,12 @@ help:
 	@echo "  make validate         End-to-end: build + localnet + txns + validate"
 	@echo "                        (writes ./reports/conformance.json)"
 	@echo "  make validate-only    Validate against already-running localnet"
+	@echo ""
+	@echo "Stateful Replay:"
+	@echo "  make replay-stateful           Stateful replay against localnet (rounds 1-100)"
+	@echo "  make replay-mainnet-stateful   Stateful replay against mainnet archival node"
+	@echo "                                 (START_ROUND=$(START_ROUND), COUNT=$(COUNT))"
+	@echo ""
+	@echo "Archival Node:"
+	@echo "  make archival-up      Start archival Go node (docker)"
+	@echo "  make archival-down    Stop archival Go node"

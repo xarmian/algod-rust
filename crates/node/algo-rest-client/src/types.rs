@@ -53,4 +53,16 @@ pub struct AccountInfo {
     pub min_balance: u64,
     /// Round at which this information was current.
     pub round: u64,
+    /// Total number of assets this account has opted into.
+    #[serde(rename = "total-assets-opted-in", default)]
+    pub total_assets_opted_in: u64,
+    /// Total number of assets created by this account.
+    #[serde(rename = "total-created-assets", default)]
+    pub total_created_assets: u64,
+    /// Total number of apps this account has opted into.
+    #[serde(rename = "total-apps-opted-in", default)]
+    pub total_apps_opted_in: u64,
+    /// Total number of apps created by this account.
+    #[serde(rename = "total-created-apps", default)]
+    pub total_created_apps: u64,
 }

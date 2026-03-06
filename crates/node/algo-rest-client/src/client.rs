@@ -148,7 +148,7 @@ impl AlgodClient {
 }
 
 impl AlgodClient {
-    /// Fetch account information for the given address.
+    /// Fetch account information for the given address at the latest round.
     pub async fn get_account(&self, addr: &algo_types::Address) -> algo_error::Result<AccountInfo> {
         let path = format!("/v2/accounts/{}", addr.to_algorand_string());
         let resp = self.get_with_retry(&path, &self.http).await?;
@@ -157,6 +157,29 @@ impl AlgodClient {
             .map_err(|e| AlgoError::RestClient {
                 source: Box::new(e),
                 context: format!("parsing account info for {}", addr.to_algorand_string()),
+            })
+    }
+
+    /// Fetch account information for the given address at a specific round.
+    ///
+    /// Requires the node to have historical data for the requested round
+    /// (i.e., an archival node or a node that hasn't pruned that round yet).
+    pub async fn get_account_at_round(
+        &self,
+        addr: &algo_types::Address,
+        round: u64,
+    ) -> algo_error::Result<AccountInfo> {
+        let path = format!("/v2/accounts/{}?round={}", addr.to_algorand_string(), round);
+        let resp = self.get_with_retry(&path, &self.http).await?;
+        resp.json::<AccountInfo>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!(
+                    "parsing account info for {} at round {}",
+                    addr.to_algorand_string(),
+                    round
+                ),
             })
     }
 }

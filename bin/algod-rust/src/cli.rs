@@ -96,6 +96,34 @@ pub enum Commands {
         /// Path to write the replay report JSON.
         #[arg(long)]
         report: Option<PathBuf>,
+
+        /// Enable stateful replay with ledger state tracking.
+        #[arg(long)]
+        stateful: bool,
+
+        /// Path to genesis.json file (required for stateful replay without existing DB).
+        #[arg(long)]
+        genesis: Option<PathBuf>,
+
+        /// Enable conformance comparison against a Go node.
+        #[arg(long)]
+        compare: bool,
+
+        /// Go node URL for conformance comparison.
+        #[arg(long, default_value = "http://localhost:4002")]
+        compare_url: String,
+
+        /// Go node API token for conformance comparison.
+        #[arg(long, default_value = "")]
+        compare_token: String,
+
+        /// Compare every Nth block (default: 1).
+        #[arg(long, default_value = "1")]
+        sample_rate: u64,
+
+        /// SQLite database path for stateful replay.
+        #[arg(long, default_value = "./ledger.sqlite")]
+        db: PathBuf,
     },
 
     /// Follow mode: continuously validate new blocks as they arrive.

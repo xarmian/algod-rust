@@ -86,6 +86,10 @@ parameter for historical state queries.
 - `make replay-stateful` passes end-to-end
 - All existing tests still pass
 
+### Known limitations
+- **Inner transaction address coverage**: `collect_touched_addresses` extracts addresses from transaction fields and the `accounts` array, but does not walk EvalDelta inner transactions. Accounts mutated only by inner txns (e.g., app-to-app calls crediting a third-party address) are not included in `--compare` conformance checks. Full inner-txn address extraction deferred to Epic 18 or Phase 3.
+- **`normalizedonlinebalance`**: Stored as raw `micro_algos` for Online accounts, not Go's sortition-weighted value. Acceptable for Phase 2; would need fixing for consensus participation.
+
 Read docs/ for architecture and conformance strategy.
 Start by defining the SQLite schema and implementing the storage trait,
 then build the conformance comparison pipeline.
