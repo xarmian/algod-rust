@@ -729,7 +729,97 @@ impl crate::store_trait::LedgerStore for LedgerState {
     // ---- Trie integration ----
 
     fn enable_trie(&mut self) {
-        self.trie = Some(MerkleTrie::new(ELEMENT_SIZE));
+        use std::collections::HashSet;
+
+        let mut trie = MerkleTrie::new(ELEMENT_SIZE);
+
+        // 1. Add all existing accounts to the trie.
+        for (addr, acct) in &self.accounts {
+            let elem = account_hash_v6(addr, acct);
+            if let Err(e) = trie.add(&elem) {
+                tracing::warn!("enable_trie: add account failed: {}", e);
+            }
+        }
+
+        // 2. Add asset resources (merged holding + params where co-located).
+        // Track (addr, asset_id) pairs already added to avoid double-adding.
+        let mut added_asset_resources: HashSet<(Address, u64)> = HashSet::new();
+
+        // Iterate asset holdings; merge with co-located params if creator == addr.
+        for (&(addr, asset_id), holding) in &self.asset_holdings {
+            let params = self
+                .asset_params
+                .get(&asset_id)
+                .filter(|r| r.creator == addr);
+            let blob = encode_merged_asset_resource(
+                Some(holding),
+                params.map(|r| (&r.params, &r.creator)),
+            );
+            let affinity = self.accounts.get(&addr).map(compute_affinity).unwrap_or(0);
+            let elem =
+                resource_hash_v6_with_kind(&addr, asset_id, &blob, affinity, HashKind::Asset);
+            if let Err(e) = trie.add(&elem) {
+                tracing::warn!("enable_trie: add asset holding failed: {}", e);
+            }
+            added_asset_resources.insert((addr, asset_id));
+        }
+
+        // Iterate asset params not already covered via holdings (params-only, no holding).
+        for (&asset_id, record) in &self.asset_params {
+            let creator = record.creator;
+            if added_asset_resources.contains(&(creator, asset_id)) {
+                continue;
+            }
+            let blob =
+                encode_merged_asset_resource(None, Some((&record.params, &record.creator)));
+            let affinity = self
+                .accounts
+                .get(&creator)
+                .map(compute_affinity)
+                .unwrap_or(0);
+            let elem =
+                resource_hash_v6_with_kind(&creator, asset_id, &blob, affinity, HashKind::Asset);
+            if let Err(e) = trie.add(&elem) {
+                tracing::warn!("enable_trie: add asset params failed: {}", e);
+            }
+        }
+
+        // 3. Add app resources (merged local state + params where co-located).
+        let mut added_app_resources: HashSet<(Address, u64)> = HashSet::new();
+
+        // Iterate app local states; merge with co-located params if creator == addr.
+        for (&(addr, app_id), local) in &self.app_local_states {
+            let params = self.app_params.get(&app_id).filter(|p| p.creator == addr);
+            let blob = encode_merged_app_resource(Some(local), params);
+            let affinity = self.accounts.get(&addr).map(compute_affinity).unwrap_or(0);
+            let elem =
+                resource_hash_v6_with_kind(&addr, app_id, &blob, affinity, HashKind::App);
+            if let Err(e) = trie.add(&elem) {
+                tracing::warn!("enable_trie: add app local state failed: {}", e);
+            }
+            added_app_resources.insert((addr, app_id));
+        }
+
+        // Iterate app params not already covered via local states (params-only).
+        for (&app_id, params) in &self.app_params {
+            let creator = params.creator;
+            if added_app_resources.contains(&(creator, app_id)) {
+                continue;
+            }
+            let blob = encode_merged_app_resource(None, Some(params));
+            let affinity = self
+                .accounts
+                .get(&creator)
+                .map(compute_affinity)
+                .unwrap_or(0);
+            let elem =
+                resource_hash_v6_with_kind(&creator, app_id, &blob, affinity, HashKind::App);
+            if let Err(e) = trie.add(&elem) {
+                tracing::warn!("enable_trie: add app params failed: {}", e);
+            }
+        }
+
+        self.trie = Some(trie);
         self.pre_mutations.clear();
     }
 

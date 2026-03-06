@@ -419,6 +419,8 @@ pub async fn run_stateful(
     let mut total_mismatches: u64 = 0;
     let mut total_skipped: u64 = 0;
     let mut trie_mismatches: u64 = 0;
+    let mut last_trie_root: Option<[u8; 32]> = None;
+    let mut last_trie_round: u64 = 0;
 
     let mut round = effective_start;
     while round <= end {
@@ -488,46 +490,12 @@ pub async fn run_stateful(
                 store.commit_block()?;
                 blocks_passed += 1;
 
-                // Log and optionally compare trie root.
+                // Log trie root and remember last value for final comparison.
                 if let Some(root) = trie_root {
                     let hex_root = root.iter().map(|b| format!("{b:02x}")).collect::<String>();
                     info!(round = block.round.0, root = %hex_root, "trie root");
-
-                    // Conformance: compare against Go's tracker.db.
-                    if let Some(ref go_db) = go_trie_db {
-                        match read_go_trie_root(go_db, block.round.0) {
-                            Ok(Some(go_root)) => {
-                                if root == go_root {
-                                    info!(round = block.round.0, "trie root matches Go");
-                                } else {
-                                    let go_hex = go_root
-                                        .iter()
-                                        .map(|b| format!("{b:02x}"))
-                                        .collect::<String>();
-                                    warn!(
-                                        round = block.round.0,
-                                        rust_root = %hex_root,
-                                        go_root = %go_hex,
-                                        "trie root MISMATCH with Go"
-                                    );
-                                    trie_mismatches += 1;
-                                }
-                            }
-                            Ok(None) => {
-                                warn!(
-                                    round = block.round.0,
-                                    "no trie root found in Go tracker.db for this round"
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    round = block.round.0,
-                                    error = %e,
-                                    "failed to read Go trie root"
-                                );
-                            }
-                        }
-                    }
+                    last_trie_root = Some(root);
+                    last_trie_round = block.round.0;
                 }
             }
             Err(e) => {
@@ -585,6 +553,45 @@ pub async fn run_stateful(
         }
 
         round += 1;
+    }
+
+    // Conformance: compare final trie root against Go's tracker.db.
+    // Go's catchpointstate stores a single trie root (not per-round), so we
+    // can only meaningfully compare at the final round of the replay.
+    if let (Some(root), Some(ref go_db)) = (last_trie_root, &go_trie_db) {
+        let hex_root = root.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        match read_go_trie_root(go_db, last_trie_round) {
+            Ok(Some(go_root)) => {
+                if root == go_root {
+                    info!(round = last_trie_round, "final trie root matches Go");
+                } else {
+                    let go_hex = go_root
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>();
+                    warn!(
+                        round = last_trie_round,
+                        rust_root = %hex_root,
+                        go_root = %go_hex,
+                        "final trie root MISMATCH with Go"
+                    );
+                    trie_mismatches += 1;
+                }
+            }
+            Ok(None) => {
+                warn!(
+                    round = last_trie_round,
+                    "no trie root found in Go tracker.db"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    round = last_trie_round,
+                    error = %e,
+                    "failed to read Go trie root"
+                );
+            }
+        }
     }
 
     let elapsed = timer.elapsed().as_secs_f64();
