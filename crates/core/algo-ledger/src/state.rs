@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use algo_types::{AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParamsRecord};
+use algo_types::{
+    AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParamsRecord, Round,
+};
 
 /// In-memory ledger state holding all account data, asset/app state, and
 /// chain-level parameters (rewards tracking, genesis info).
@@ -11,6 +13,9 @@ pub struct LedgerState {
     pub app_local_states: HashMap<(Address, u64), AppLocalState>,
     pub asset_params: HashMap<u64, AssetParamsRecord>,
     pub app_params: HashMap<u64, AppParams>,
+
+    // Current round
+    pub current_round: Round,
 
     // Rewards tracking
     pub rewards_level: u64,
@@ -35,6 +40,7 @@ impl LedgerState {
             app_local_states: HashMap::new(),
             asset_params: HashMap::new(),
             app_params: HashMap::new(),
+            current_round: Round(0),
             rewards_level: 0,
             rewards_rate: 0,
             rewards_residue: 0,

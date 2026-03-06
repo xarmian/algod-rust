@@ -6,7 +6,7 @@ use algo_types::{BlockResponse, Round};
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
-use crate::{BlockSource, NodeStatus};
+use crate::{AccountInfo, BlockSource, NodeStatus};
 
 /// Configuration for the REST client.
 #[derive(Debug, Clone)]
@@ -144,6 +144,20 @@ impl AlgodClient {
         }
 
         unreachable!("retry loop should always return")
+    }
+}
+
+impl AlgodClient {
+    /// Fetch account information for the given address.
+    pub async fn get_account(&self, addr: &algo_types::Address) -> algo_error::Result<AccountInfo> {
+        let path = format!("/v2/accounts/{}", addr.to_algorand_string());
+        let resp = self.get_with_retry(&path, &self.http).await?;
+        resp.json::<AccountInfo>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("parsing account info for {}", addr.to_algorand_string()),
+            })
     }
 }
 
