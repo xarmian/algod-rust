@@ -30,17 +30,21 @@ pub fn apply_block(state: &mut LedgerState, block: &Block) -> Result<(), AlgoErr
         });
     }
 
-    // Save rewards state for rollback on error.
+    // Save rewards state and addresses for rollback on error.
     let prev_rewards_level = state.rewards_level;
     let prev_rewards_rate = state.rewards_rate;
     let prev_rewards_residue = state.rewards_residue;
     let prev_rewards_recalc = state.rewards_recalculation_round;
+    let prev_fee_sink = state.fee_sink;
+    let prev_rewards_pool = state.rewards_pool;
 
-    // Update rewards state from block header.
+    // Update rewards state and reward addresses from block header.
     state.rewards_level = block.rewards_level;
     state.rewards_rate = block.rewards_rate;
     state.rewards_residue = block.rewards_residue;
     state.rewards_recalculation_round = block.rewards_recalculation_round.0;
+    state.fee_sink = block.fee_sink;
+    state.rewards_pool = block.rewards_pool;
 
     let ctx = ApplyContext {
         rewards_level: block.rewards_level,
@@ -55,11 +59,13 @@ pub fn apply_block(state: &mut LedgerState, block: &Block) -> Result<(), AlgoErr
     })();
 
     if result.is_err() {
-        // Restore rewards state on failure.
+        // Restore rewards state and addresses on failure.
         state.rewards_level = prev_rewards_level;
         state.rewards_rate = prev_rewards_rate;
         state.rewards_residue = prev_rewards_residue;
         state.rewards_recalculation_round = prev_rewards_recalc;
+        state.fee_sink = prev_fee_sink;
+        state.rewards_pool = prev_rewards_pool;
         return result;
     }
 
@@ -253,7 +259,7 @@ fn apply_pay(
     if !txn.close_remainder_to.is_zero() {
         let sender = state.get_or_default_account(&txn.sender);
 
-        // Cannot close account with opted-in assets or apps.
+        // Cannot close account with opted-in or created assets/apps.
         if sender.total_assets_opted_in > 0 {
             return Err(AlgoError::Ledger {
                 message: format!(
@@ -262,11 +268,27 @@ fn apply_pay(
                 ),
             });
         }
+        if sender.total_created_assets > 0 {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "sender {} cannot close: has {} created assets",
+                    txn.sender, sender.total_created_assets,
+                ),
+            });
+        }
         if sender.total_apps_opted_in > 0 {
             return Err(AlgoError::Ledger {
                 message: format!(
                     "sender {} cannot close: has {} opted-in apps",
                     txn.sender, sender.total_apps_opted_in,
+                ),
+            });
+        }
+        if sender.total_created_apps > 0 {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "sender {} cannot close: has {} created apps",
+                    txn.sender, sender.total_created_apps,
                 ),
             });
         }
