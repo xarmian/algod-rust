@@ -9,3 +9,6 @@ algo-error = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 data-encoding = { workspace = true }
+
+[dev-dependencies]
+serde_bytes = { workspace = true }

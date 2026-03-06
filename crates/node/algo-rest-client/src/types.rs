@@ -35,3 +35,22 @@ pub struct NodeStatus {
     #[serde(rename = "stopped-at-unsupported-round", default)]
     pub stopped_at_unsupported_round: bool,
 }
+
+/// Account information as returned by `GET /v2/accounts/{addr}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountInfo {
+    pub address: String,
+    pub amount: u64,
+    #[serde(rename = "amount-without-pending-rewards")]
+    pub amount_without_pending_rewards: u64,
+    #[serde(rename = "pending-rewards")]
+    pub pending_rewards: u64,
+    pub rewards: u64,
+    pub status: String,
+    #[serde(rename = "auth-addr", default)]
+    pub auth_addr: Option<String>,
+    #[serde(rename = "min-balance", default)]
+    pub min_balance: u64,
+    /// Round at which this information was current.
+    pub round: u64,
+}

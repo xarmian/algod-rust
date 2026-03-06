@@ -74,6 +74,7 @@ dependencies = [
  "algo-types",
  "data-encoding",
  "serde",
+ "serde_bytes",
  "serde_json",
 ]
 
