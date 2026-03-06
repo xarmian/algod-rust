@@ -675,13 +675,16 @@ fn compare_txn_type_fields(
                 &orig.clear_state_program,
                 &rt.clear_state_program,
             );
-            // app_arguments: compare each element as hex bytes
+            // app_arguments: compare each element as hex bytes (elements may be nil)
             compare_opt_vec_elements(
                 mismatches,
                 &format!("{prefix}.app_arguments"),
                 &orig.app_arguments,
                 &rt.app_arguments,
-                |e| hex::encode(e.as_slice()),
+                |e| match e {
+                    Some(bytes) => hex::encode(bytes.as_slice()),
+                    None => "nil".to_string(),
+                },
             );
             // accounts: compare each element
             compare_opt_vec_elements(

@@ -63,11 +63,9 @@ All prior conformance layers remain intact:
 
 - 1000 consecutive mainnet blocks: rounds 44,000,000 through 44,000,999.
 - 43,325 transactions processed.
-- 992 blocks passed stateless validation (99.2%).
-- 8 blocks failed:
-  - 4 commitment mismatches (without raw-blob passthrough; known limitation when not using `--stateful` mode which provides raw blobs).
-  - 4 decode errors (unknown msgpack fields in edge-case transactions).
-- Transaction type coverage: pay (7,852), axfer (16,199), appl (19,087), acfg (183), stpf (4).
+- 996 blocks passed stateless validation (99.6%).
+- 4 blocks failed with commitment mismatches (without raw-blob passthrough; known limitation when not using `--stateful` mode which provides raw blobs). These same blocks pass in stateful mode.
+- Transaction type coverage: pay (7,868), axfer (16,271), appl (19,195), acfg (183), stpf (4).
 
 ### Merkle Trie State Root (Epic 17b)
 
@@ -133,7 +131,6 @@ Test breakdown by crate:
 | Box storage deep verification | Min-balance impact modeled; deep box state verification needs AVM. | Phase 3 |
 | `normalizedonlinebalance` | Placeholder (uses micro_algos, not Go's sortition-weighted value). | Phase 3+ |
 | Stateful mainnet replay from genesis | Requires sequential replay from round 0 (44M+ blocks). Catchpoint sync would enable mid-chain start. | Phase 4 |
-| 4 decode errors in 1000-block replay | Unknown msgpack fields in edge-case mainnet transactions. Likely new fields added in recent protocol versions. | Phase 3+ |
 | 4 commitment mismatches in stateless mode | Expected: stateless mode does not provide raw blobs for STIB encoding. Use `--stateful` mode for raw-blob commitment verification. | N/A (by design) |
 | Fuzz target coverage | Fuzz targets use msgpack deserialization of random bytes; most inputs fail early. Structured fuzzing (`Arbitrary` on full types) would improve coverage. | Future |
 

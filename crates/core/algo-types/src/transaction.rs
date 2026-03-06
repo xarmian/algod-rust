@@ -216,7 +216,7 @@ pub struct Transaction {
 
     /// Application arguments.
     #[serde(rename = "apaa", default, skip_serializing_if = "Option::is_none")]
-    pub app_arguments: Option<Vec<ByteBuf>>,
+    pub app_arguments: Option<Vec<Option<ByteBuf>>>,
 
     /// Accounts referenced by the application call.
     #[serde(rename = "apat", default, skip_serializing_if = "Option::is_none")]
