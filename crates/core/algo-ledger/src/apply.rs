@@ -141,13 +141,20 @@ pub fn apply_transaction(
         }
     }
 
-    // Determine asset/app IDs to snapshot for rollback.
+    // Determine asset/app IDs to snapshot for rollback, and include
+    // creator addresses that may differ from the transaction sender.
     let mut asset_ids_to_snap = Vec::new();
     let mut app_ids_to_snap = Vec::new();
     match txn.txn_type.as_str() {
         "acfg" => {
             if txn.config_asset != 0 {
                 asset_ids_to_snap.push(txn.config_asset);
+                // Snapshot the asset creator for destroy/reconfig rollback.
+                if let Some(params) = state.asset_params.get(&txn.config_asset) {
+                    if !touched.contains(&params.creator) {
+                        touched.push(params.creator);
+                    }
+                }
             }
             if stx.apply_data_config_asset != 0 {
                 asset_ids_to_snap.push(stx.apply_data_config_asset);
@@ -166,6 +173,12 @@ pub fn apply_transaction(
         "appl" => {
             if txn.application_id != 0 {
                 app_ids_to_snap.push(txn.application_id);
+                // Snapshot the app creator for delete rollback.
+                if let Some(params) = state.app_params.get(&txn.application_id) {
+                    if !touched.contains(&params.creator) {
+                        touched.push(params.creator);
+                    }
+                }
             }
             if stx.apply_data_application_id != 0 {
                 app_ids_to_snap.push(stx.apply_data_application_id);
