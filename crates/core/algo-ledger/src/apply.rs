@@ -878,10 +878,16 @@ fn apply_appl(
 
     match txn.on_completion {
         ON_COMPLETION_OPT_IN => {
-            // Create local state for sender if not already present before EvalDelta.
-            // EvalDelta may have created a placeholder entry with a default schema,
-            // so we use the pre-EvalDelta flag rather than Entry::Vacant.
-            if !had_local_state {
+            // Reject duplicate opt-in.
+            if had_local_state {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "appl opt-in: {} is already opted into app {}",
+                        txn.sender, app_id,
+                    ),
+                });
+            }
+            {
                 let local_schema = if is_create {
                     txn.local_state_schema.clone().unwrap_or_default()
                 } else {
@@ -906,8 +912,26 @@ fn apply_appl(
                 sender_account.total_apps_opted_in += 1;
             }
         }
-        ON_COMPLETION_CLOSE_OUT | ON_COMPLETION_CLEAR_STATE => {
-            // Remove sender's local state for this app.
+        ON_COMPLETION_CLOSE_OUT => {
+            // CloseOut requires the sender to be opted in.
+            if state
+                .app_local_states
+                .remove(&(txn.sender, app_id))
+                .is_none()
+            {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "appl close-out: {} is not opted into app {}",
+                        txn.sender, app_id,
+                    ),
+                });
+            }
+            let sender_account = state.get_or_default_account(&txn.sender);
+            sender_account.total_apps_opted_in =
+                sender_account.total_apps_opted_in.saturating_sub(1);
+        }
+        ON_COMPLETION_CLEAR_STATE => {
+            // ClearState removes local state if present (does not fail if absent).
             if state
                 .app_local_states
                 .remove(&(txn.sender, app_id))
