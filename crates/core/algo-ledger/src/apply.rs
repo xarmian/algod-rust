@@ -1122,6 +1122,21 @@ fn apply_keyreg(
             None
         };
 
+        // Validate participation parameters.
+        if txn.vote_key_dilution == 0 {
+            return Err(AlgoError::Ledger {
+                message: "keyreg online: vote_key_dilution must be > 0".to_string(),
+            });
+        }
+        if txn.vote_last < txn.vote_first {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "keyreg online: vote_last {} < vote_first {}",
+                    txn.vote_last, txn.vote_first
+                ),
+            });
+        }
+
         let account = state.get_or_default_account(&txn.sender);
         account.status = AccountStatus::Online;
         account.vote_id = Some(vote_id);
@@ -2767,5 +2782,53 @@ mod tests {
         // After becoming NotParticipating, compute_pending_rewards returns 0.
         let pending_after = compute_pending_rewards(acct, 20);
         assert_eq!(pending_after, 0);
+    }
+
+    #[test]
+    fn test_keyreg_online_zero_dilution_rejected() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+            round: 1,
+        };
+
+        let mut stx = keyreg_online_txn(sender, 1_000);
+        stx.txn.vote_key_dilution = 0;
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("vote_key_dilution"),
+            "error should mention vote_key_dilution"
+        );
+        // Balance unchanged (rollback).
+        assert_eq!(state.get_account(&sender).unwrap().micro_algos, 1_000_000);
+    }
+
+    #[test]
+    fn test_keyreg_online_vote_last_before_first_rejected() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+            round: 1,
+        };
+
+        let mut stx = keyreg_online_txn(sender, 1_000);
+        stx.txn.vote_first = 200;
+        stx.txn.vote_last = 100;
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("vote_last"),
+            "error should mention vote_last"
+        );
+        assert_eq!(state.get_account(&sender).unwrap().micro_algos, 1_000_000);
     }
 }
