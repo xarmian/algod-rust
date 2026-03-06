@@ -1053,6 +1053,216 @@ fn strip_holding_from_blob(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
+// Asset resource blob merging helpers
+// ---------------------------------------------------------------------------
+
+/// Asset params field keys: "a" through "k" (total, decimals, default_frozen,
+/// unit_name, asset_name, url, metadata_hash, manager, reserve, freeze, clawback).
+const ASSET_PARAMS_KEYS: &[&str] = &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"];
+
+/// Asset holding field keys: "l" (amount), "m" (frozen).
+const ASSET_HOLDING_KEYS: &[&str] = &["l", "m"];
+
+/// Merge asset holding fields into an existing params blob, producing a
+/// combined blob with both ownership and holding flags set.
+fn merge_asset_holding_into_params(existing_params_blob: &[u8], new_holding: &AssetHolding) -> Vec<u8> {
+    let existing_val: rmpv::Value =
+        rmpv::decode::read_value(&mut &existing_params_blob[..]).unwrap_or(rmpv::Value::Map(vec![]));
+
+    let mut merged: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
+
+    // Preserve existing params fields (a-k), skip y and any holding fields
+    if let rmpv::Value::Map(pairs) = existing_val {
+        for (k, v) in pairs {
+            let key_str = k.as_str().unwrap_or("");
+            if key_str == "y" {
+                continue;
+            }
+            if ASSET_HOLDING_KEYS.contains(&key_str) {
+                continue;
+            }
+            merged.push((k, v));
+        }
+    }
+
+    // Add holding fields
+    if new_holding.amount != 0 {
+        merged.push((rmpv::Value::String("l".into()), rmpv::Value::from(new_holding.amount)));
+    }
+    if new_holding.frozen {
+        merged.push((rmpv::Value::String("m".into()), rmpv::Value::Boolean(true)));
+    }
+
+    // Combined flags
+    merged.push((
+        rmpv::Value::String("y".into()),
+        rmpv::Value::from(RESOURCE_FLAGS_HOLDING | RESOURCE_FLAGS_OWNERSHIP),
+    ));
+
+    let val = rmpv::Value::Map(merged);
+    let mut buf = Vec::new();
+    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
+    buf
+}
+
+/// Merge asset params fields into an existing holding blob, producing a
+/// combined blob with both ownership and holding flags set.
+fn merge_asset_params_into_holding(existing_holding_blob: &[u8], new_params: &AssetParams, creator: &Address) -> Vec<u8> {
+    let existing_val: rmpv::Value =
+        rmpv::decode::read_value(&mut &existing_holding_blob[..]).unwrap_or(rmpv::Value::Map(vec![]));
+
+    let mut merged: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
+
+    // Preserve existing holding fields (l, m), skip y and any params fields
+    if let rmpv::Value::Map(pairs) = existing_val {
+        for (k, v) in pairs {
+            let key_str = k.as_str().unwrap_or("");
+            if key_str == "y" {
+                continue;
+            }
+            if ASSET_PARAMS_KEYS.contains(&key_str) {
+                continue;
+            }
+            merged.push((k, v));
+        }
+    }
+
+    // Add params fields (same encoding as encode_asset_params but without the "y" flag)
+    if new_params.total != 0 {
+        merged.push((rmpv::Value::String("a".into()), rmpv::Value::from(new_params.total)));
+    }
+    if new_params.decimals != 0 {
+        merged.push((rmpv::Value::String("b".into()), rmpv::Value::from(new_params.decimals)));
+    }
+    if new_params.default_frozen {
+        merged.push((rmpv::Value::String("c".into()), rmpv::Value::Boolean(true)));
+    }
+    if !new_params.unit_name.is_empty() {
+        merged.push((
+            rmpv::Value::String("d".into()),
+            rmpv::Value::String(new_params.unit_name.clone().into()),
+        ));
+    }
+    if !new_params.asset_name.is_empty() {
+        merged.push((
+            rmpv::Value::String("e".into()),
+            rmpv::Value::String(new_params.asset_name.clone().into()),
+        ));
+    }
+    if !new_params.url.is_empty() {
+        merged.push((
+            rmpv::Value::String("f".into()),
+            rmpv::Value::String(new_params.url.clone().into()),
+        ));
+    }
+    if let Some(ref mh) = new_params.metadata_hash {
+        merged.push((
+            rmpv::Value::String("g".into()),
+            rmpv::Value::Binary(mh.to_vec()),
+        ));
+    }
+    if let Some(ref addr) = new_params.manager {
+        merged.push((
+            rmpv::Value::String("h".into()),
+            rmpv::Value::Binary(addr.0.to_vec()),
+        ));
+    }
+    if let Some(ref addr) = new_params.reserve {
+        merged.push((
+            rmpv::Value::String("i".into()),
+            rmpv::Value::Binary(addr.0.to_vec()),
+        ));
+    }
+    if let Some(ref addr) = new_params.freeze {
+        merged.push((
+            rmpv::Value::String("j".into()),
+            rmpv::Value::Binary(addr.0.to_vec()),
+        ));
+    }
+    if let Some(ref addr) = new_params.clawback {
+        merged.push((
+            rmpv::Value::String("k".into()),
+            rmpv::Value::Binary(addr.0.to_vec()),
+        ));
+    }
+
+    // Combined flags
+    merged.push((
+        rmpv::Value::String("y".into()),
+        rmpv::Value::from(RESOURCE_FLAGS_HOLDING | RESOURCE_FLAGS_OWNERSHIP),
+    ));
+
+    let val = rmpv::Value::Map(merged);
+    let mut buf = Vec::new();
+    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
+    // Suppress unused variable warning — creator is stored in assetcreators table
+    let _ = creator;
+    buf
+}
+
+/// Strip asset holding fields from a combined blob, keeping only params fields.
+/// Returns the params-only blob with ownership flag, or None if nothing remains.
+fn strip_asset_holding_from_blob(data: &[u8]) -> Option<Vec<u8>> {
+    let val: rmpv::Value = rmpv::decode::read_value(&mut &data[..]).ok()?;
+
+    let mut params_pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
+
+    if let rmpv::Value::Map(pairs) = val {
+        for (k, v) in pairs {
+            let key_str = k.as_str().unwrap_or("");
+            match key_str {
+                "l" | "m" => continue, // holding fields — strip
+                "y" => continue,       // will be rewritten
+                _ => params_pairs.push((k, v)),
+            }
+        }
+    }
+
+    // Add ownership-only flag
+    params_pairs.push((
+        rmpv::Value::String("y".into()),
+        rmpv::Value::from(RESOURCE_FLAGS_OWNERSHIP),
+    ));
+
+    let val = rmpv::Value::Map(params_pairs);
+    let mut buf = Vec::new();
+    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
+    Some(buf)
+}
+
+/// Strip asset params fields from a combined blob, keeping only holding fields.
+/// Returns the holding-only blob with holding flag, or None if nothing remains.
+fn strip_asset_params_from_blob(data: &[u8]) -> Option<Vec<u8>> {
+    let val: rmpv::Value = rmpv::decode::read_value(&mut &data[..]).ok()?;
+
+    let mut holding_pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
+
+    if let rmpv::Value::Map(pairs) = val {
+        for (k, v) in pairs {
+            let key_str = k.as_str().unwrap_or("");
+            if ASSET_PARAMS_KEYS.contains(&key_str) {
+                continue; // params fields — strip
+            }
+            if key_str == "y" {
+                continue; // will be rewritten
+            }
+            holding_pairs.push((k, v));
+        }
+    }
+
+    // Add holding-only flag
+    holding_pairs.push((
+        rmpv::Value::String("y".into()),
+        rmpv::Value::from(RESOURCE_FLAGS_HOLDING),
+    ));
+
+    let val = rmpv::Value::Map(holding_pairs);
+    let mut buf = Vec::new();
+    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
+    Some(buf)
+}
+
+// ---------------------------------------------------------------------------
 // Chain-level meta helpers
 // ---------------------------------------------------------------------------
 
@@ -1373,6 +1583,22 @@ impl SqliteLedger {
             })
     }
 
+    /// Read the raw resource blob for an asset resource (ctype=CTYPE_ASSET) at the given rowid/aidx.
+    /// Returns None if no row exists.
+    fn get_asset_resource_blob(&self, rowid: i64, asset_id: u64) -> Option<Vec<u8>> {
+        self.conn
+            .query_row(
+                "SELECT data FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
+                params![rowid, asset_id as i64, CTYPE_ASSET],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                tracing::warn!("SQLite error reading asset resource blob: {}", e);
+                None
+            })
+    }
+
     /// Query the creator address from assetcreators for a given asset/app id.
     fn get_creator_from_assetcreators(&self, id: u64) -> Option<Address> {
         let result: Option<Vec<u8>> = self
@@ -1471,12 +1697,32 @@ impl LedgerStore for SqliteLedger {
                 tracing::warn!("SQLite error querying asset holding: {}", e);
                 None
             })?;
+
+        // Check that the blob has the holding flag set (could be params-only).
+        let flags = extract_resource_flags(&data);
+        if flags & RESOURCE_FLAGS_HOLDING == 0 {
+            return None;
+        }
+
         decode_asset_holding(&data).ok()
     }
 
     fn set_asset_holding(&mut self, addr: &Address, asset_id: u64, holding: AssetHolding) {
         let rowid = self.get_or_insert_rowid(addr).expect("get_or_insert_rowid");
-        let data = encode_asset_holding(&holding);
+
+        // Check if an existing blob has ownership (params) flag set; if so, merge.
+        let data = if let Some(existing) = self.get_asset_resource_blob(rowid, asset_id) {
+            let flags = extract_resource_flags(&existing);
+            if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
+                // Existing blob has asset params — merge holding into it.
+                merge_asset_holding_into_params(&existing, &holding)
+            } else {
+                encode_asset_holding(&holding)
+            }
+        } else {
+            encode_asset_holding(&holding)
+        };
+
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO resources (addrid, aidx, data, ctype) VALUES (?1, ?2, ?3, ?4)",
@@ -1487,26 +1733,30 @@ impl LedgerStore for SqliteLedger {
 
     fn remove_asset_holding(&mut self, addr: &Address, asset_id: u64) {
         if let Some(rowid) = self.get_rowid(addr) {
-            let _ = self.conn.execute(
-                "DELETE FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
-                params![rowid, asset_id as i64, CTYPE_ASSET],
-            );
+            // Check if the blob also has ownership (asset params) data.
+            if let Some(existing) = self.get_asset_resource_blob(rowid, asset_id) {
+                let flags = extract_resource_flags(&existing);
+                if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
+                    // Both flags set — strip holding, keep asset params.
+                    if let Some(stripped) = strip_asset_holding_from_blob(&existing) {
+                        let _ = self.conn.execute(
+                            "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
+                            params![stripped, rowid, asset_id as i64, CTYPE_ASSET],
+                        );
+                    }
+                } else {
+                    // Only holding — delete the whole row.
+                    let _ = self.conn.execute(
+                        "DELETE FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
+                        params![rowid, asset_id as i64, CTYPE_ASSET],
+                    );
+                }
+            }
         }
     }
 
     fn has_asset_holding(&self, addr: &Address, asset_id: u64) -> bool {
-        let Some(rowid) = self.get_rowid(addr) else {
-            return false;
-        };
-        let count: i64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
-                params![rowid, asset_id as i64, CTYPE_ASSET],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        count > 0
+        self.get_asset_holding(addr, asset_id).is_some()
     }
 
     // ---- Asset Params ----
@@ -1530,6 +1780,12 @@ impl LedgerStore for SqliteLedger {
                 None
             })?;
 
+        // Check that the blob has the ownership flag set.
+        let flags = extract_resource_flags(&data);
+        if flags & RESOURCE_FLAGS_OWNERSHIP == 0 {
+            return None;
+        }
+
         let params = decode_asset_params(&data).ok()?;
         Some(AssetParamsRecord { params, creator })
     }
@@ -1538,7 +1794,19 @@ impl LedgerStore for SqliteLedger {
         let rowid = self
             .get_or_insert_rowid(&record.creator)
             .expect("get_or_insert_rowid");
-        let data = encode_asset_params(&record.params, &record.creator);
+
+        // Check if an existing blob has holding flag set; if so, merge.
+        let data = if let Some(existing) = self.get_asset_resource_blob(rowid, asset_id) {
+            let flags = extract_resource_flags(&existing);
+            if flags & RESOURCE_FLAGS_HOLDING != 0 {
+                // Existing blob has asset holding — merge params into it.
+                merge_asset_params_into_holding(&existing, &record.params, &record.creator)
+            } else {
+                encode_asset_params(&record.params, &record.creator)
+            }
+        } else {
+            encode_asset_params(&record.params, &record.creator)
+        };
 
         // Upsert into resources.
         self.conn
@@ -1561,12 +1829,28 @@ impl LedgerStore for SqliteLedger {
         // Get creator to find the rowid.
         if let Some(creator) = self.get_creator_from_assetcreators(asset_id) {
             if let Some(rowid) = self.get_rowid(&creator) {
-                let _ = self.conn.execute(
-                    "DELETE FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
-                    params![rowid, asset_id as i64, CTYPE_ASSET],
-                );
+                // Check if the blob also has holding data.
+                if let Some(existing) = self.get_asset_resource_blob(rowid, asset_id) {
+                    let flags = extract_resource_flags(&existing);
+                    if flags & RESOURCE_FLAGS_HOLDING != 0 {
+                        // Both flags set — strip params, keep holding.
+                        if let Some(stripped) = strip_asset_params_from_blob(&existing) {
+                            let _ = self.conn.execute(
+                                "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
+                                params![stripped, rowid, asset_id as i64, CTYPE_ASSET],
+                            );
+                        }
+                    } else {
+                        // Only ownership — delete the whole row.
+                        let _ = self.conn.execute(
+                            "DELETE FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
+                            params![rowid, asset_id as i64, CTYPE_ASSET],
+                        );
+                    }
+                }
             }
         }
+        // Always remove from assetcreators.
         let _ = self.conn.execute(
             "DELETE FROM assetcreators WHERE asset = ?1",
             params![asset_id as i64],
@@ -2436,6 +2720,117 @@ mod tests {
 
         let loaded_local2 = ledger.get_app_local_state(&addr, 60).unwrap();
         assert_eq!(loaded_local2.schema.num_uint, 3);
+    }
+
+    #[test]
+    fn test_asset_params_and_holding_same_address_merge() {
+        // Scenario: address is both the creator of asset 70 AND holds asset 70.
+        // Both write to resources(addrid=same_rowid, aidx=70, ctype=1).
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([14u8; 32]);
+        ledger.set_account(&addr, AccountData::default());
+
+        let params = AssetParams {
+            total: 1_000_000,
+            decimals: 6,
+            unit_name: "TEST".into(),
+            asset_name: "TestAsset".into(),
+            manager: Some(addr),
+            ..Default::default()
+        };
+
+        let holding = AssetHolding {
+            amount: 500_000,
+            frozen: false,
+        };
+
+        // Set params first, then holding.
+        ledger.set_asset_params(
+            70,
+            AssetParamsRecord {
+                params: params.clone(),
+                creator: addr,
+            },
+        );
+        ledger.set_asset_holding(&addr, 70, holding.clone());
+
+        // Both should be retrievable.
+        let loaded_params = ledger.get_asset_params(70).unwrap();
+        assert_eq!(loaded_params.params.total, 1_000_000);
+        assert_eq!(loaded_params.params.decimals, 6);
+        assert_eq!(loaded_params.params.unit_name, "TEST");
+        assert_eq!(loaded_params.params.asset_name, "TestAsset");
+        assert_eq!(loaded_params.params.manager, Some(addr));
+        assert_eq!(loaded_params.creator, addr);
+
+        let loaded_holding = ledger.get_asset_holding(&addr, 70).unwrap();
+        assert_eq!(loaded_holding.amount, 500_000);
+        assert!(!loaded_holding.frozen);
+
+        // Verify has_* methods work.
+        assert!(ledger.has_asset_params(70));
+        assert!(ledger.has_asset_holding(&addr, 70));
+
+        // Remove holding — asset params should survive.
+        ledger.remove_asset_holding(&addr, 70);
+        assert!(ledger.has_asset_params(70));
+        assert!(!ledger.has_asset_holding(&addr, 70));
+
+        let loaded_params2 = ledger.get_asset_params(70).unwrap();
+        assert_eq!(loaded_params2.params.total, 1_000_000);
+        assert_eq!(loaded_params2.params.unit_name, "TEST");
+    }
+
+    #[test]
+    fn test_asset_params_and_holding_reverse_order() {
+        // Same as above but set holding first, then params.
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let addr = Address([15u8; 32]);
+        ledger.set_account(&addr, AccountData::default());
+
+        let holding = AssetHolding {
+            amount: 999,
+            frozen: true,
+        };
+
+        let params = AssetParams {
+            total: 10_000,
+            decimals: 2,
+            unit_name: "REV".into(),
+            asset_name: "Reverse".into(),
+            ..Default::default()
+        };
+
+        // Holding first, then params.
+        ledger.set_asset_holding(&addr, 80, holding.clone());
+        ledger.set_asset_params(
+            80,
+            AssetParamsRecord {
+                params: params.clone(),
+                creator: addr,
+            },
+        );
+
+        assert!(ledger.has_asset_params(80));
+        assert!(ledger.has_asset_holding(&addr, 80));
+
+        let loaded_params = ledger.get_asset_params(80).unwrap();
+        assert_eq!(loaded_params.params.total, 10_000);
+        assert_eq!(loaded_params.params.decimals, 2);
+        assert_eq!(loaded_params.params.unit_name, "REV");
+
+        let loaded_holding = ledger.get_asset_holding(&addr, 80).unwrap();
+        assert_eq!(loaded_holding.amount, 999);
+        assert!(loaded_holding.frozen);
+
+        // Remove params — holding should survive.
+        ledger.remove_asset_params(80);
+        assert!(!ledger.has_asset_params(80));
+        assert!(ledger.has_asset_holding(&addr, 80));
+
+        let loaded_holding2 = ledger.get_asset_holding(&addr, 80).unwrap();
+        assert_eq!(loaded_holding2.amount, 999);
+        assert!(loaded_holding2.frozen);
     }
 
     #[test]

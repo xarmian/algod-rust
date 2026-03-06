@@ -346,7 +346,12 @@ pub async fn run_stateful(
             );
             resume
         } else {
-            // DB exists but no committed round — treat as fresh.
+            // DB exists but no committed round — stale/partial DB from a
+            // previous aborted run. Delete and recreate to avoid stale state.
+            warn!("existing DB has no committed round — recreating");
+            drop(store);
+            std::fs::remove_file(db_path)?;
+            store = algo_ledger::SqliteLedger::open(db_path)?;
             load_genesis_into_store(&mut store, genesis_path)?;
             start
         }
