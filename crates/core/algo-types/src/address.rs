@@ -7,6 +7,7 @@ use std::str::FromStr;
 
 /// A 32-byte Algorand address (Ed25519 public key for single-sig accounts).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[serde(transparent)]
 pub struct Address(#[serde(with = "serde_bytes")] pub [u8; 32]);
 

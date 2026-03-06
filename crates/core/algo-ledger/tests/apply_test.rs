@@ -981,3 +981,340 @@ fn test_lease_different_senders_ok() {
     );
     assert_eq!(state.get_account(&receiver).unwrap().micro_algos, 3_000);
 }
+
+// ---------------------------------------------------------------------------
+// 18. Rewards recalculation round — rate drops to 0
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rewards_recalculation_rate_drops_to_zero() {
+    let sender = Address([1u8; 32]);
+    let receiver = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let rewards_pool = Address([4u8; 32]);
+
+    let mut state = make_state(
+        &[
+            (sender, 10_000_000),
+            (receiver, 5_000_000),
+            (fee_sink, 0),
+            (rewards_pool, 100_000_000),
+        ],
+        fee_sink,
+    );
+    state.rewards_pool = rewards_pool;
+
+    // Set initial rewards state: rate=100, level=10, base=10 for both accounts.
+    state.rewards_level = 10;
+    state.rewards_rate = 100;
+    state.get_or_default_account(&sender).rewards_base = 10;
+    state.get_or_default_account(&receiver).rewards_base = 10;
+
+    // Block 1: rewards_level rises to 20 (rate still 100).
+    let mut block1 = minimal_block(fee_sink, 1, vec![]);
+    block1.rewards_level = 20;
+    block1.rewards_rate = 100;
+    block1.rewards_pool = rewards_pool;
+    apply_block(&mut state, &block1).unwrap();
+
+    // Block 2: recalculation round reached, rate drops to 0, level stays 20.
+    let stx = pay_txn(sender, receiver, 1_000, 1_000);
+    let mut block2 = minimal_block(fee_sink, 2, vec![stx]);
+    block2.rewards_level = 20;
+    block2.rewards_rate = 0;
+    block2.rewards_recalculation_round = Round(2);
+    block2.rewards_pool = rewards_pool;
+    apply_block(&mut state, &block2).unwrap();
+
+    // Sender pending rewards: (20 - 10) * (10_000_000 / 1_000_000) = 100
+    // Sender after rewards: 10_000_100, then -1_000 (amount) -1_000 (fee) = 9_998_100
+    assert_eq!(state.get_account(&sender).unwrap().micro_algos, 9_998_100);
+    // Receiver pending rewards: (20 - 10) * (5_000_000 / 1_000_000) = 50
+    // Receiver after rewards: 5_000_050, then +1_000 = 5_001_050
+    assert_eq!(state.get_account(&receiver).unwrap().micro_algos, 5_001_050,);
+    // Both accounts' rewards_base updated to 20.
+    assert_eq!(state.get_account(&sender).unwrap().rewards_base, 20);
+    assert_eq!(state.get_account(&receiver).unwrap().rewards_base, 20);
+
+    // Now rate is 0, so block 3 with level still 20: no new rewards.
+    let stx2 = pay_txn(sender, receiver, 500, 1_000);
+    let mut block3 = minimal_block(fee_sink, 3, vec![stx2]);
+    block3.rewards_level = 20;
+    block3.rewards_rate = 0;
+    block3.rewards_pool = rewards_pool;
+    apply_block(&mut state, &block3).unwrap();
+
+    // No new rewards: (20 - 20) * ... = 0
+    // Sender: 9_998_100 - 500 - 1_000 = 9_996_600
+    assert_eq!(state.get_account(&sender).unwrap().micro_algos, 9_996_600);
+    // Receiver: 5_001_050 + 500 = 5_001_550
+    assert_eq!(state.get_account(&receiver).unwrap().micro_algos, 5_001_550,);
+    assert_eq!(state.rewards_rate, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 19. Zero-balance / min-balance enforcement with opted-in assets
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_min_balance_enforcement_with_assets() {
+    let sender = Address([1u8; 32]);
+    let creator = Address([5u8; 32]);
+    let receiver = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    // Sender starts with 300_000 — just enough for base min (100k) + 1 asset opt-in (100k).
+    let mut state = make_state(
+        &[
+            (sender, 300_000),
+            (creator, 50_000_000),
+            (receiver, 0),
+            (fee_sink, 0),
+        ],
+        fee_sink,
+    );
+    let ctx = ApplyContext {
+        rewards_level: 0,
+        fee_sink,
+        round: 1,
+    };
+
+    // Create asset from creator.
+    let params = AssetParams {
+        total: 1_000,
+        manager: Some(creator),
+        ..Default::default()
+    };
+    let create = acfg_create_txn(creator, 1_000, 42, params);
+    apply_transaction(&mut state, &create, &ctx, 0).unwrap();
+
+    // Sender opts in to asset.
+    let optin = axfer_optin_txn(sender, 1_000, 42);
+    apply_transaction(&mut state, &optin, &ctx, 0).unwrap();
+
+    // Sender balance: 300_000 - 1_000 (fee) = 299_000
+    // Min balance: 100_000 (base) + 100_000 (1 asset opt-in) = 200_000
+    assert_eq!(state.get_account(&sender).unwrap().micro_algos, 299_000);
+    assert_eq!(
+        algo_ledger::min_balance(state.get_account(&sender).unwrap()),
+        200_000
+    );
+
+    // Try to pay 100_000 which would leave sender at 299_000 - 100_000 - 1_000 = 198_000 < 200_000.
+    let stx = pay_txn(sender, receiver, 100_000, 1_000);
+    let result = apply_transaction(&mut state, &stx, &ctx, 0);
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("below minimum balance"),
+        "expected min-balance error, got: {}",
+        err_msg,
+    );
+
+    // A smaller payment that keeps sender above min balance should succeed.
+    let stx2 = pay_txn(sender, receiver, 97_000, 1_000);
+    apply_transaction(&mut state, &stx2, &ctx, 0).unwrap();
+    // 299_000 - 97_000 - 1_000 = 201_000 >= 200_000
+    assert_eq!(state.get_account(&sender).unwrap().micro_algos, 201_000);
+}
+
+// ---------------------------------------------------------------------------
+// 20. Account close + re-create in the same block
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_close_and_recreate_same_block() {
+    let addr = Address([1u8; 32]);
+    let receiver = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(
+        &[(addr, 1_000_000), (receiver, 500_000), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    // Txn 1: Close addr, sending remainder to receiver.
+    let mut close_txn = pay_txn(addr, receiver, 0, 1_000);
+    close_txn.txn.close_remainder_to = receiver;
+
+    // Txn 2: Send 200_000 from receiver back to addr (re-creating the account).
+    let fund_txn = pay_txn(receiver, addr, 200_000, 1_000);
+
+    let block = minimal_block(fee_sink, 1, vec![close_txn, fund_txn]);
+    apply_block(&mut state, &block).unwrap();
+
+    // addr was closed (remainder = 1_000_000 - 1_000 = 999_000 to receiver),
+    // then re-created with 200_000.
+    assert_eq!(state.get_account(&addr).unwrap().micro_algos, 200_000);
+    // receiver: 500_000 + 999_000 - 200_000 - 1_000 = 1_298_000
+    assert_eq!(state.get_account(&receiver).unwrap().micro_algos, 1_298_000,);
+    // fee_sink: 1_000 + 1_000 = 2_000
+    assert_eq!(state.get_account(&fee_sink).unwrap().micro_algos, 2_000);
+}
+
+// ---------------------------------------------------------------------------
+// 21. Fee pooling + stateful (fee=0 txn applied via apply_block)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fee_pooling_stateful_apply_block() {
+    let a = Address([1u8; 32]);
+    let b = Address([2u8; 32]);
+    let receiver = Address([5u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(
+        &[(a, 5_000_000), (b, 5_000_000), (receiver, 0), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    // Txn from A: fee=0, amount=100_000
+    let mut txn_a = pay_txn(a, receiver, 100_000, 0);
+    // Give them the same group ID to represent an atomic group.
+    txn_a.txn.group = ByteBuf::from(vec![0xAA; 32]);
+
+    // Txn from B: fee=2000, amount=50_000
+    let mut txn_b = pay_txn(b, receiver, 50_000, 2_000);
+    txn_b.txn.group = ByteBuf::from(vec![0xAA; 32]);
+
+    let block = minimal_block(fee_sink, 1, vec![txn_a, txn_b]);
+    apply_block(&mut state, &block).unwrap();
+
+    // A: 5_000_000 - 100_000 - 0 (fee) = 4_900_000
+    assert_eq!(state.get_account(&a).unwrap().micro_algos, 4_900_000);
+    // B: 5_000_000 - 50_000 - 2_000 = 4_948_000
+    assert_eq!(state.get_account(&b).unwrap().micro_algos, 4_948_000);
+    // receiver: 100_000 + 50_000 = 150_000
+    assert_eq!(state.get_account(&receiver).unwrap().micro_algos, 150_000,);
+    // fee_sink: 0 + 2_000 = 2_000
+    assert_eq!(state.get_account(&fee_sink).unwrap().micro_algos, 2_000);
+}
+
+// ---------------------------------------------------------------------------
+// 22. Rekey chain: A→B then A→C
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rekey_chain() {
+    let a = Address([1u8; 32]);
+    let b = Address([2u8; 32]);
+    let c = Address([4u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(&[(a, 5_000_000), (b, 0), (c, 0), (fee_sink, 0)], fee_sink);
+    let ctx = ApplyContext {
+        rewards_level: 0,
+        fee_sink,
+        round: 1,
+    };
+
+    // Step 1: A rekeys to B.
+    let mut stx1 = pay_txn(a, a, 0, 1_000);
+    stx1.txn.rekey_to = Some(b);
+    apply_transaction(&mut state, &stx1, &ctx, 0).unwrap();
+
+    assert_eq!(state.get_account(&a).unwrap().auth_addr, Some(b));
+
+    // Step 2: A rekeys to C (overwriting B).
+    let mut stx2 = pay_txn(a, a, 0, 1_000);
+    stx2.txn.rekey_to = Some(c);
+    apply_transaction(&mut state, &stx2, &ctx, 0).unwrap();
+
+    assert_eq!(state.get_account(&a).unwrap().auth_addr, Some(c));
+
+    // Step 3: A rekeys back to self (clearing auth_addr).
+    let mut stx3 = pay_txn(a, a, 0, 1_000);
+    stx3.txn.rekey_to = Some(a);
+    apply_transaction(&mut state, &stx3, &ctx, 0).unwrap();
+
+    assert_eq!(state.get_account(&a).unwrap().auth_addr, None);
+
+    // Total fees: 3 * 1_000 = 3_000
+    assert_eq!(state.get_account(&a).unwrap().micro_algos, 4_997_000);
+}
+
+// ---------------------------------------------------------------------------
+// 23. Asset close-out with pending rewards
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_asset_close_out_with_rewards() {
+    let holder = Address([1u8; 32]);
+    let creator = Address([5u8; 32]);
+    let close_to = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let rewards_pool = Address([4u8; 32]);
+
+    let mut state = make_state(
+        &[
+            (holder, 10_000_000),
+            (creator, 50_000_000),
+            (close_to, 50_000_000),
+            (fee_sink, 0),
+            (rewards_pool, 100_000_000),
+        ],
+        fee_sink,
+    );
+    state.rewards_pool = rewards_pool;
+
+    // Set up holder with pending rewards: base=0, current level will be 10.
+    state.get_or_default_account(&holder).rewards_base = 0;
+    state.get_or_default_account(&holder).status = AccountStatus::Online;
+
+    let ctx_no_rewards = ApplyContext {
+        rewards_level: 0,
+        fee_sink,
+        round: 1,
+    };
+
+    // Create asset from creator.
+    let params = AssetParams {
+        total: 1_000,
+        manager: Some(creator),
+        ..Default::default()
+    };
+    let create = acfg_create_txn(creator, 1_000, 42, params);
+    apply_transaction(&mut state, &create, &ctx_no_rewards, 0).unwrap();
+
+    // Holder opts in (no rewards context yet).
+    let optin = axfer_optin_txn(holder, 1_000, 42);
+    apply_transaction(&mut state, &optin, &ctx_no_rewards, 0).unwrap();
+    // holder: 10_000_000 - 1_000 = 9_999_000
+
+    // Transfer 500 units to holder.
+    let xfer = axfer_transfer_txn(creator, holder, 500, 1_000, 42);
+    apply_transaction(&mut state, &xfer, &ctx_no_rewards, 0).unwrap();
+
+    assert_eq!(state.get_asset_holding(&holder, 42).unwrap().amount, 500,);
+
+    // Reset holder rewards_base to 0 so there are pending rewards at level 10.
+    state.get_or_default_account(&holder).rewards_base = 0;
+    let holder_balance_before = state.get_account(&holder).unwrap().micro_algos;
+    // holder_balance_before = 9_999_000
+
+    // Close-to also opts in to the asset so they can receive the close-out.
+    let optin2 = axfer_optin_txn(close_to, 1_000, 42);
+    apply_transaction(&mut state, &optin2, &ctx_no_rewards, 0).unwrap();
+
+    // Now close out holder's asset holding with rewards_level=10.
+    let ctx_rewards = ApplyContext {
+        rewards_level: 10,
+        fee_sink,
+        round: 2,
+    };
+
+    let close = axfer_close_txn(holder, close_to, close_to, 0, 1_000, 42);
+    apply_transaction(&mut state, &close, &ctx_rewards, 0).unwrap();
+
+    // Pending rewards: (10 - 0) * (9_999_000 / 1_000_000) = 10 * 9 = 90
+    // Holder Algo balance: 9_999_000 + 90 (rewards) - 1_000 (fee) = 9_998_090
+    let holder_acct = state.get_account(&holder).unwrap();
+    assert_eq!(holder_acct.micro_algos, holder_balance_before + 90 - 1_000);
+    assert_eq!(holder_acct.rewards_base, 10);
+
+    // Asset holding should be removed from holder.
+    assert!(state.get_asset_holding(&holder, 42).is_none());
+
+    // close_to should have received the 500 asset units.
+    assert_eq!(state.get_asset_holding(&close_to, 42).unwrap().amount, 500,);
+}

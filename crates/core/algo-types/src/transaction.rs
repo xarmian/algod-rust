@@ -216,7 +216,7 @@ pub struct Transaction {
 
     /// Application arguments.
     #[serde(rename = "apaa", default, skip_serializing_if = "Option::is_none")]
-    pub app_arguments: Option<Vec<ByteBuf>>,
+    pub app_arguments: Option<Vec<Option<ByteBuf>>>,
 
     /// Accounts referenced by the application call.
     #[serde(rename = "apat", default, skip_serializing_if = "Option::is_none")]
@@ -395,6 +395,7 @@ pub struct AssetParams {
 
 /// State schema for application calls.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct StateSchema {
     /// Number of uint values.
     #[serde(rename = "nui", default, skip_serializing_if = "is_zero_u64")]

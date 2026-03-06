@@ -140,13 +140,20 @@ impl CanonicalMap {
         }
     }
 
-    fn add_option_vec_bytes(&mut self, key: &'static str, val: &Option<Vec<ByteBuf>>) {
+    fn add_option_vec_bytes(
+        &mut self,
+        key: &'static str,
+        val: &Option<Vec<Option<ByteBuf>>>,
+    ) {
         if let Some(items) = val {
             if !items.is_empty() {
                 let mut buf = Vec::new();
                 rmp::encode::write_array_len(&mut buf, items.len() as u32).unwrap();
                 for item in items {
-                    rmp::encode::write_bin(&mut buf, item).unwrap();
+                    match item {
+                        Some(bytes) => rmp::encode::write_bin(&mut buf, bytes).unwrap(),
+                        None => rmp::encode::write_nil(&mut buf).unwrap(),
+                    }
                 }
                 self.fields.push((key, buf));
             }

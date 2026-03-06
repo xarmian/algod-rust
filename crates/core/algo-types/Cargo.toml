@@ -4,6 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+fuzzing = ["arbitrary"]
+
 [dependencies]
 algo-error.workspace = true
 serde.workspace = true
@@ -12,3 +15,4 @@ hex.workspace = true
 serde_bytes.workspace = true
 data-encoding.workspace = true
 sha2 = { workspace = true }
+arbitrary = { version = "1", features = ["derive"], optional = true }

@@ -11,6 +11,7 @@ members = [
     "crates/core/algo-ledger",
     "bin/algod-rust",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2021"

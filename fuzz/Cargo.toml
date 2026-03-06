@@ -1,0 +1,29 @@
+[package]
+name = "algo-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+algo-types = { path = "../crates/core/algo-types", features = ["fuzzing"] }
+algo-ledger = { path = "../crates/core/algo-ledger" }
+algo-codec = { path = "../crates/core/algo-codec" }
+rmp-serde = "1"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_apply_transaction"
+path = "fuzz_targets/fuzz_apply_transaction.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_account_roundtrip"
+path = "fuzz_targets/fuzz_account_roundtrip.rs"
+doc = false

@@ -770,8 +770,7 @@ impl crate::store_trait::LedgerStore for LedgerState {
             if added_asset_resources.contains(&(creator, asset_id)) {
                 continue;
             }
-            let blob =
-                encode_merged_asset_resource(None, Some((&record.params, &record.creator)));
+            let blob = encode_merged_asset_resource(None, Some((&record.params, &record.creator)));
             let affinity = self
                 .accounts
                 .get(&creator)
@@ -792,8 +791,7 @@ impl crate::store_trait::LedgerStore for LedgerState {
             let params = self.app_params.get(&app_id).filter(|p| p.creator == addr);
             let blob = encode_merged_app_resource(Some(local), params);
             let affinity = self.accounts.get(&addr).map(compute_affinity).unwrap_or(0);
-            let elem =
-                resource_hash_v6_with_kind(&addr, app_id, &blob, affinity, HashKind::App);
+            let elem = resource_hash_v6_with_kind(&addr, app_id, &blob, affinity, HashKind::App);
             if let Err(e) = trie.add(&elem) {
                 tracing::warn!("enable_trie: add app local state failed: {}", e);
             }
@@ -812,8 +810,7 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 .get(&creator)
                 .map(compute_affinity)
                 .unwrap_or(0);
-            let elem =
-                resource_hash_v6_with_kind(&creator, app_id, &blob, affinity, HashKind::App);
+            let elem = resource_hash_v6_with_kind(&creator, app_id, &blob, affinity, HashKind::App);
             if let Err(e) = trie.add(&elem) {
                 tracing::warn!("enable_trie: add app params failed: {}", e);
             }
