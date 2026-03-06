@@ -98,40 +98,45 @@ pub fn apply_transaction(
         return Ok(());
     }
 
-    // Collect unique touched addresses for reward application.
-    let mut touched = Vec::with_capacity(6);
-    touched.push(txn.sender);
+    // Collect addresses for reward application (only actual transaction participants
+    // per go-algorand: sender, receiver, close-to, asset participants, freeze target).
+    let mut reward_addrs = Vec::with_capacity(6);
+    reward_addrs.push(txn.sender);
     if !txn.receiver.is_zero() && txn.receiver != txn.sender {
-        touched.push(txn.receiver);
+        reward_addrs.push(txn.receiver);
     }
     if !txn.close_remainder_to.is_zero()
         && txn.close_remainder_to != txn.sender
         && txn.close_remainder_to != txn.receiver
     {
-        touched.push(txn.close_remainder_to);
+        reward_addrs.push(txn.close_remainder_to);
     }
     // Asset transfer: receiver, sender (clawback source), close-to.
     if let Some(ar) = txn.asset_receiver {
-        if !ar.is_zero() && !touched.contains(&ar) {
-            touched.push(ar);
+        if !ar.is_zero() && !reward_addrs.contains(&ar) {
+            reward_addrs.push(ar);
         }
     }
     if let Some(asnd) = txn.asset_sender {
-        if !asnd.is_zero() && !touched.contains(&asnd) {
-            touched.push(asnd);
+        if !asnd.is_zero() && !reward_addrs.contains(&asnd) {
+            reward_addrs.push(asnd);
         }
     }
     if let Some(ac) = txn.asset_close_to {
-        if !ac.is_zero() && !touched.contains(&ac) {
-            touched.push(ac);
+        if !ac.is_zero() && !reward_addrs.contains(&ac) {
+            reward_addrs.push(ac);
         }
     }
     // Asset freeze: target account.
     if let Some(fa) = txn.freeze_account {
-        if !fa.is_zero() && !touched.contains(&fa) {
-            touched.push(fa);
+        if !fa.is_zero() && !reward_addrs.contains(&fa) {
+            reward_addrs.push(fa);
         }
     }
+
+    // Extend with additional addresses needed for snapshot/rollback only
+    // (these do NOT receive rewards — only transaction participants do).
+    let mut touched = reward_addrs.clone();
     // Application accounts array: EvalDelta local deltas can mutate these.
     if let Some(ref accounts) = txn.accounts {
         for acct in accounts {
@@ -203,9 +208,9 @@ pub fn apply_transaction(
     // (fee, type-specific, EvalDelta, rewards-pool debit, rekey) triggers
     // a full rollback via restore_snapshot.
     let result = (|| -> Result<(), AlgoError> {
-        // Apply rewards to all touched accounts before processing the transaction.
+        // Apply rewards to transaction participants only (not snapshot-only addresses).
         let mut total_rewards: u64 = 0;
-        for addr in &touched {
+        for addr in &reward_addrs {
             let account = state.get_or_default_account(addr);
             total_rewards += apply_rewards(account, ctx.rewards_level);
         }
