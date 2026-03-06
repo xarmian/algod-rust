@@ -3,7 +3,7 @@ ALGOD_URL := http://localhost:4001
 COMPOSE := docker compose -f docker/docker-compose.yml
 
 .PHONY: build test fmt fmt-check clippy lint deny ci clean
-.PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful
+.PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful replay-mainnet-1k
 .PHONY: archival-up archival-down
 .PHONY: localnet-up localnet-down localnet-status localnet-logs
 .PHONY: capture validate validate-only generate-txns fixtures help
@@ -181,6 +181,15 @@ replay-stateful: ## Run stateful replay against localnet
 		--end 100 \
 		--db ./ledger-localnet.sqlite
 
+replay-mainnet-1k: ## Run 1000-block stateful mainnet replay (no compare)
+	cargo run --release --bin algod-rust -- replay \
+		--stateful \
+		--genesis crates/core/algo-ledger/tests/fixtures/mainnet-genesis.json \
+		--network mainnet \
+		--start $(START_ROUND) \
+		--end $$(( $(START_ROUND) + 999 )) \
+		--db ./ledger-mainnet-1k.sqlite
+
 replay-mainnet-stateful: ## Run stateful replay against mainnet archival node
 	cargo run --bin algod-rust -- replay \
 		--stateful \
@@ -237,6 +246,7 @@ help:
 	@echo ""
 	@echo "Stateful Replay:"
 	@echo "  make replay-stateful           Stateful replay against localnet (rounds 1-100)"
+	@echo "  make replay-mainnet-1k         1000-block stateful mainnet replay (no compare)"
 	@echo "  make replay-mainnet-stateful   Stateful replay against mainnet archival node"
 	@echo "                                 (START_ROUND=$(START_ROUND), COUNT=$(COUNT))"
 	@echo ""

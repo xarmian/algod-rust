@@ -250,7 +250,8 @@ pub async fn run(
 }
 
 /// Extract the set of addresses "touched" by a block (sender, receiver,
-/// close-to, asset sender/close-to, fee sink, rewards pool).
+/// close-to, asset sender/close-to, fee sink, rewards pool), including
+/// addresses from EvalDelta inner transactions (recursively).
 fn collect_touched_addresses(block: &algo_types::Block) -> Vec<Address> {
     let mut addrs = HashSet::new();
 
@@ -263,48 +264,81 @@ fn collect_touched_addresses(block: &algo_types::Block) -> Vec<Address> {
     }
 
     for stxn in &block.payset {
-        let txn = &stxn.txn;
-        if !txn.sender.is_zero() {
-            addrs.insert(txn.sender);
+        collect_txn_addresses(stxn, &mut addrs);
+    }
+
+    addrs.into_iter().collect()
+}
+
+/// Extract address fields from a single signed transaction and, if it has an
+/// EvalDelta with inner transactions, recurse into those as well.
+fn collect_txn_addresses(stxn: &algo_types::SignedTransaction, addrs: &mut HashSet<Address>) {
+    let txn = &stxn.txn;
+
+    // Direct address fields on the transaction.
+    if !txn.sender.is_zero() {
+        addrs.insert(txn.sender);
+    }
+    if !txn.receiver.is_zero() {
+        addrs.insert(txn.receiver);
+    }
+    if !txn.close_remainder_to.is_zero() {
+        addrs.insert(txn.close_remainder_to);
+    }
+    if let Some(ref a) = txn.asset_sender {
+        if !a.is_zero() {
+            addrs.insert(*a);
         }
-        if !txn.receiver.is_zero() {
-            addrs.insert(txn.receiver);
+    }
+    if let Some(ref a) = txn.asset_receiver {
+        if !a.is_zero() {
+            addrs.insert(*a);
         }
-        if !txn.close_remainder_to.is_zero() {
-            addrs.insert(txn.close_remainder_to);
+    }
+    if let Some(ref a) = txn.asset_close_to {
+        if !a.is_zero() {
+            addrs.insert(*a);
         }
-        if let Some(ref a) = txn.asset_sender {
-            if !a.is_zero() {
-                addrs.insert(*a);
-            }
+    }
+    if let Some(ref a) = txn.freeze_account {
+        if !a.is_zero() {
+            addrs.insert(*a);
         }
-        if let Some(ref a) = txn.asset_receiver {
-            if !a.is_zero() {
-                addrs.insert(*a);
-            }
-        }
-        if let Some(ref a) = txn.asset_close_to {
-            if !a.is_zero() {
-                addrs.insert(*a);
-            }
-        }
-        if let Some(ref a) = txn.freeze_account {
-            if !a.is_zero() {
-                addrs.insert(*a);
-            }
-        }
-        // Application accounts array: these can be mutated by EvalDelta
-        // and inner transactions.
-        if let Some(ref accounts) = txn.accounts {
-            for acct in accounts {
-                if !acct.is_zero() {
-                    addrs.insert(*acct);
-                }
+    }
+    // Application accounts array: these can be mutated by EvalDelta
+    // and inner transactions.
+    if let Some(ref accounts) = txn.accounts {
+        for acct in accounts {
+            if !acct.is_zero() {
+                addrs.insert(*acct);
             }
         }
     }
 
-    addrs.into_iter().collect()
+    // Recursively walk EvalDelta inner transactions.
+    if let Some(ref eval_delta_val) = stxn.eval_delta {
+        match algo_ledger::parse_eval_delta(eval_delta_val) {
+            Ok(ed) => {
+                collect_eval_delta_addresses(&ed, addrs);
+            }
+            Err(e) => {
+                warn!(
+                    sender = %txn.sender.to_algorand_string(),
+                    error = %e,
+                    "failed to parse eval_delta for address collection; inner txn addresses may be missed"
+                );
+            }
+        }
+    }
+}
+
+/// Recursively extract addresses from a parsed EvalDelta's inner transactions.
+fn collect_eval_delta_addresses(ed: &algo_ledger::EvalDelta, addrs: &mut HashSet<Address>) {
+    if let Some(ref inner_txns) = ed.inner_txns {
+        for inner_stx in inner_txns {
+            collect_txn_addresses(inner_stx, addrs);
+        }
+    }
 }
 
 /// Stateful replay: applies blocks to a ledger and optionally compares against

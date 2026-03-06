@@ -4,6 +4,7 @@ use std::fmt;
 ///
 /// Displayed as base32 (RFC 4648, no padding) to match Go's transaction ID format.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct Digest(pub [u8; 32]);
 
 impl Digest {

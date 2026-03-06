@@ -4,6 +4,7 @@ use std::fmt;
 use crate::{Address, AssetParams, StateSchema};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[repr(u8)]
 pub enum AccountStatus {
     #[default]
@@ -34,6 +35,7 @@ impl From<u8> for AccountStatus {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct AccountData {
     pub micro_algos: u64,
     pub rewards_base: u64,
@@ -58,6 +60,7 @@ pub struct AccountData {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct AssetHolding {
     pub amount: u64,
     pub frozen: bool,

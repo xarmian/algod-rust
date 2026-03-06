@@ -395,6 +395,7 @@ pub struct AssetParams {
 
 /// State schema for application calls.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct StateSchema {
     /// Number of uint values.
     #[serde(rename = "nui", default, skip_serializing_if = "is_zero_u64")]
