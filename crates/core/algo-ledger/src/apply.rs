@@ -1,5 +1,5 @@
 use algo_error::AlgoError;
-use algo_types::{Address, Block, Round, SignedTransaction};
+use algo_types::{AccountData, Address, Block, Round, SignedTransaction};
 
 use crate::params::min_balance;
 use crate::rewards::apply_rewards;
@@ -15,6 +15,10 @@ pub struct ApplyContext {
 ///
 /// Updates rewards parameters from the block header, then applies each
 /// transaction in payset order. Finally updates `current_round`.
+///
+/// On error, rewards state is restored to its pre-block values.
+/// In practice, committed blocks should never produce errors — the checks
+/// here are defensive safety nets.
 pub fn apply_block(state: &mut LedgerState, block: &Block) -> Result<(), AlgoError> {
     // Validate round monotonicity.
     let expected = Round(state.current_round.0 + 1);
@@ -23,6 +27,12 @@ pub fn apply_block(state: &mut LedgerState, block: &Block) -> Result<(), AlgoErr
             message: format!("expected round {}, got {}", expected, block.round),
         });
     }
+
+    // Save rewards state for rollback on error.
+    let prev_rewards_level = state.rewards_level;
+    let prev_rewards_rate = state.rewards_rate;
+    let prev_rewards_residue = state.rewards_residue;
+    let prev_rewards_recalc = state.rewards_recalculation_round;
 
     // Update rewards state from block header.
     state.rewards_level = block.rewards_level;
@@ -35,8 +45,20 @@ pub fn apply_block(state: &mut LedgerState, block: &Block) -> Result<(), AlgoErr
         fee_sink: block.fee_sink,
     };
 
-    for stx in &block.payset {
-        apply_transaction(state, stx, &ctx)?;
+    let result = (|| {
+        for stx in &block.payset {
+            apply_transaction(state, stx, &ctx)?;
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        // Restore rewards state on failure.
+        state.rewards_level = prev_rewards_level;
+        state.rewards_rate = prev_rewards_rate;
+        state.rewards_residue = prev_rewards_residue;
+        state.rewards_recalculation_round = prev_rewards_recalc;
+        return result;
     }
 
     state.current_round = block.round;
@@ -45,10 +67,12 @@ pub fn apply_block(state: &mut LedgerState, block: &Block) -> Result<(), AlgoErr
 
 /// Apply a single signed transaction to the ledger state.
 ///
-/// 1. Apply rewards to all uniquely touched accounts (sender, receiver,
-///    close_remainder_to).
+/// 1. Snapshot touched accounts, then apply rewards.
 /// 2. Dispatch by transaction type.
 /// 3. Handle rekey_to if present.
+/// 4. Debit rewards pool for any rewards distributed.
+///
+/// On error, touched account data is restored to pre-reward state.
 pub fn apply_transaction(
     state: &mut LedgerState,
     stx: &SignedTransaction,
@@ -75,20 +99,44 @@ pub fn apply_transaction(
         touched.push(txn.close_remainder_to);
     }
 
+    // Snapshot touched accounts before applying rewards (for rollback on error).
+    let snapshots: Vec<(Address, AccountData)> = touched
+        .iter()
+        .map(|addr| {
+            let data = state.get_or_default_account(addr).clone();
+            (*addr, data)
+        })
+        .collect();
+
     // Apply rewards to all touched accounts before processing the transaction.
+    let mut total_rewards: u64 = 0;
     for addr in &touched {
         let account = state.get_or_default_account(addr);
-        apply_rewards(account, ctx.rewards_level);
+        total_rewards += apply_rewards(account, ctx.rewards_level);
     }
 
-    // Dispatch by transaction type.
-    match txn.txn_type.as_str() {
-        "pay" => apply_pay(state, stx, ctx)?,
+    // Dispatch by transaction type, with rollback on error.
+    let result = match txn.txn_type.as_str() {
+        "pay" => apply_pay(state, stx, ctx),
         _ => {
             // Placeholder for future epics (axfer, acfg, afrz, appl, keyreg):
-            // just debit fee from sender and credit fee_sink.
-            apply_fee(state, &txn.sender, txn.fee, &ctx.fee_sink)?;
+            // debit fee from sender and credit fee_sink, then check min balance.
+            apply_fee_with_min_balance(state, &txn.sender, txn.fee, &ctx.fee_sink)
         }
+    };
+
+    if result.is_err() {
+        // Restore touched accounts to pre-reward state.
+        for (addr, data) in snapshots {
+            state.accounts.insert(addr, data);
+        }
+        return result;
+    }
+
+    // Debit rewards pool for distributed rewards.
+    if total_rewards > 0 {
+        let pool = state.get_or_default_account(&state.rewards_pool.clone());
+        pool.micro_algos = pool.micro_algos.saturating_sub(total_rewards);
     }
 
     // Handle rekey_to.
@@ -124,6 +172,29 @@ fn apply_fee(
 
     let fee_sink_account = state.get_or_default_account(fee_sink);
     fee_sink_account.micro_algos += fee;
+
+    Ok(())
+}
+
+/// Debit fee from sender, credit fee_sink, and validate min balance.
+fn apply_fee_with_min_balance(
+    state: &mut LedgerState,
+    sender: &Address,
+    fee: u64,
+    fee_sink: &Address,
+) -> Result<(), AlgoError> {
+    apply_fee(state, sender, fee, fee_sink)?;
+
+    let sender_account = state.get_or_default_account(sender);
+    let min_bal = min_balance(sender_account);
+    if sender_account.micro_algos < min_bal {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "sender {} balance {} below minimum balance {} after fee",
+                sender, sender_account.micro_algos, min_bal,
+            ),
+        });
+    }
 
     Ok(())
 }
@@ -279,6 +350,8 @@ mod tests {
 
         let result = apply_transaction(&mut state, &stx, &ctx);
         assert!(result.is_err());
+        // Verify state was not mutated (rollback).
+        assert_eq!(state.get_account(&sender).unwrap().micro_algos, 100);
     }
 
     #[test]
@@ -416,5 +489,103 @@ mod tests {
         apply_transaction(&mut state, &stx, &ctx).unwrap();
         assert_eq!(state.get_account(&sender).unwrap().micro_algos, 998_000);
         assert_eq!(state.get_account(&fee_sink).unwrap().micro_algos, 2_000);
+    }
+
+    #[test]
+    fn test_non_pay_min_balance_check() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        // Sender at exactly min_balance (100_000). Fee of 1_000 drops below.
+        let mut state = make_state_with_accounts(&[(sender, 100_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+        };
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "acfg".to_string();
+        stx.txn.sender = sender;
+        stx.txn.fee = 1_000;
+
+        let result = apply_transaction(&mut state, &stx, &ctx);
+        assert!(result.is_err());
+        // Verify rollback — sender balance unchanged.
+        assert_eq!(state.get_account(&sender).unwrap().micro_algos, 100_000);
+    }
+
+    #[test]
+    fn test_rewards_pool_debited() {
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([4u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[
+                (sender, 5_000_000),
+                (receiver, 0),
+                (fee_sink, 0),
+                (rewards_pool, 10_000_000),
+            ],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+
+        let ctx = ApplyContext {
+            rewards_level: 10,
+            fee_sink,
+        };
+        let stx = pay_txn(sender, receiver, 1_000, 1_000);
+
+        apply_transaction(&mut state, &stx, &ctx).unwrap();
+
+        // Sender had 5 Algos = 5 reward units. Pending = (10 - 0) * 5 = 50.
+        // Rewards pool should be debited by 50.
+        assert_eq!(
+            state.get_account(&rewards_pool).unwrap().micro_algos,
+            10_000_000 - 50
+        );
+    }
+
+    #[test]
+    fn test_error_rollback_with_rewards() {
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([4u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[
+                (sender, 5_000_000),
+                (receiver, 0),
+                (fee_sink, 0),
+                (rewards_pool, 10_000_000),
+            ],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+
+        let ctx = ApplyContext {
+            rewards_level: 10,
+            fee_sink,
+        };
+        // Sender has 5M but tries to send 10M — will fail.
+        // Rewards would have been applied (50) bumping to 5_000_050, still < 10M.
+        let stx = pay_txn(sender, receiver, 10_000_000, 1_000);
+
+        let result = apply_transaction(&mut state, &stx, &ctx);
+        assert!(result.is_err());
+
+        // Verify full rollback — sender balance and rewards_base unchanged.
+        let acct = state.get_account(&sender).unwrap();
+        assert_eq!(acct.micro_algos, 5_000_000);
+        assert_eq!(acct.rewards_base, 0);
+        assert_eq!(acct.rewarded_micro_algos, 0);
+
+        // Rewards pool should NOT have been debited.
+        assert_eq!(
+            state.get_account(&rewards_pool).unwrap().micro_algos,
+            10_000_000
+        );
     }
 }
