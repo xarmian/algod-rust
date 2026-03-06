@@ -12,6 +12,13 @@ pub struct BalanceMismatch {
     pub actual: String,   // from Rust ledger
 }
 
+/// Result of a comparison round.
+pub struct CompareResult {
+    pub mismatches: Vec<BalanceMismatch>,
+    /// Number of accounts that could not be compared (e.g. Go node errors).
+    pub skipped: usize,
+}
+
 /// Compare accounts touched in a block against a Go node.
 ///
 /// For each address, queries the Go node for account state at the given round
@@ -22,12 +29,16 @@ pub async fn compare_accounts(
     client: &AlgodClient,
     round: u64,
     sample_rate: u64,
-) -> Vec<BalanceMismatch> {
+) -> CompareResult {
     if sample_rate > 0 && round % sample_rate != 0 {
-        return Vec::new();
+        return CompareResult {
+            mismatches: Vec::new(),
+            skipped: 0,
+        };
     }
 
     let mut mismatches = Vec::new();
+    let mut skipped = 0;
 
     for addr in touched {
         let go_info = match client.get_account_at_round(addr, round).await {
@@ -39,6 +50,7 @@ pub async fn compare_accounts(
                     error = %e,
                     "failed to fetch Go account state for comparison"
                 );
+                skipped += 1;
                 continue;
             }
         };
@@ -118,5 +130,8 @@ pub async fn compare_accounts(
         }
     }
 
-    mismatches
+    CompareResult {
+        mismatches,
+        skipped,
+    }
 }

@@ -393,6 +393,7 @@ pub async fn run_stateful(
     let mut txn_type_counts: HashMap<String, u64> = HashMap::new();
     let mut failures: Vec<ReplayFailure> = Vec::new();
     let mut total_mismatches: u64 = 0;
+    let mut total_skipped: u64 = 0;
 
     let mut round = effective_start;
     while round <= end {
@@ -473,7 +474,7 @@ pub async fn run_stateful(
         // Conformance comparison against Go node.
         if let Some(ref cmp_client) = compare_client {
             let touched = collect_touched_addresses(block);
-            let mismatches = algo_conformance::compare_accounts(
+            let result = algo_conformance::compare_accounts(
                 &touched,
                 &store,
                 cmp_client,
@@ -482,8 +483,10 @@ pub async fn run_stateful(
             )
             .await;
 
-            if !mismatches.is_empty() {
-                for m in &mismatches {
+            total_skipped += result.skipped as u64;
+
+            if !result.mismatches.is_empty() {
+                for m in &result.mismatches {
                     warn!(
                         round = m.round,
                         addr = %m.address.to_algorand_string(),
@@ -493,7 +496,7 @@ pub async fn run_stateful(
                         "state mismatch"
                     );
                 }
-                total_mismatches += mismatches.len() as u64;
+                total_mismatches += result.mismatches.len() as u64;
             }
         }
 
@@ -526,6 +529,9 @@ pub async fn run_stateful(
     println!("Total txns:       {total_txns}");
     if compare {
         println!("State mismatches: {total_mismatches}");
+        if total_skipped > 0 {
+            println!("Accounts skipped: {total_skipped} (Go node errors)");
+        }
     }
     println!("Elapsed:          {elapsed:.1}s ({blocks_per_sec:.1} blocks/sec)");
 
@@ -573,6 +579,16 @@ pub async fn run_stateful(
 
     if blocks_failed > 0 {
         anyhow::bail!("{blocks_failed} blocks failed apply");
+    }
+
+    if compare && total_mismatches > 0 {
+        anyhow::bail!("{total_mismatches} state mismatches found during conformance comparison");
+    }
+
+    if compare && total_skipped > 0 {
+        anyhow::bail!(
+            "{total_skipped} accounts could not be compared (Go node errors) — conformance result is incomplete"
+        );
     }
 
     Ok(())
