@@ -1,7 +1,7 @@
 use algo_error::AlgoError;
 use algo_types::{
-    Address, AppLocalState, AppParams, AssetHolding, AssetParams, AssetParamsRecord, Block, Round,
-    SignedTransaction,
+    AccountStatus, Address, AppLocalState, AppParams, AssetHolding, AssetParams, AssetParamsRecord,
+    Block, Round, SignedTransaction,
 };
 
 use crate::eval_delta::{apply_eval_delta, parse_eval_delta};
@@ -12,6 +12,7 @@ use crate::state::LedgerState;
 pub struct ApplyContext {
     pub rewards_level: u64,
     pub fee_sink: Address,
+    pub round: u64,
 }
 
 /// Apply a full block to the ledger state.
@@ -52,6 +53,7 @@ pub fn apply_block(state: &mut LedgerState, block: &Block) -> Result<(), AlgoErr
     let ctx = ApplyContext {
         rewards_level: block.rewards_level,
         fee_sink: block.fee_sink,
+        round: block.round.0,
     };
 
     let result = (|| {
@@ -73,6 +75,7 @@ pub fn apply_block(state: &mut LedgerState, block: &Block) -> Result<(), AlgoErr
     }
 
     state.current_round = block.round;
+    state.lease_table.purge_expired(state.current_round.0);
     Ok(())
 }
 
@@ -97,6 +100,20 @@ pub fn apply_transaction(
     if txn.txn_type == "stpf" {
         return Ok(());
     }
+
+    // Convert lease bytes to [u8; 32] for lease table operations.
+    let lease_arr: [u8; 32] = if txn.lease.is_empty() {
+        [0u8; 32]
+    } else {
+        <[u8; 32]>::try_from(txn.lease.as_ref()).map_err(|_| AlgoError::Ledger {
+            message: format!("invalid lease length {}, expected 32", txn.lease.len()),
+        })?
+    };
+
+    // Check lease before any state changes.
+    state
+        .lease_table
+        .check(&txn.sender, &lease_arr, ctx.round)?;
 
     // Collect addresses for reward application (only actual transaction participants
     // per go-algorand: sender, receiver, close-to, asset participants, freeze target).
@@ -222,10 +239,11 @@ pub fn apply_transaction(
             "axfer" => apply_axfer(state, stx, ctx)?,
             "afrz" => apply_afrz(state, stx, ctx)?,
             "appl" => apply_appl(state, stx, ctx, depth)?,
-            _ => {
-                // Placeholder for future epics (keyreg, etc.):
-                // debit fee from sender and credit fee_sink, then check min balance.
-                apply_fee_with_min_balance(state, &txn.sender, txn.fee, &ctx.fee_sink)?;
+            "keyreg" => apply_keyreg(state, stx, ctx)?,
+            other => {
+                return Err(AlgoError::Ledger {
+                    message: format!("unknown transaction type: {}", other),
+                });
             }
         }
 
@@ -264,6 +282,11 @@ pub fn apply_transaction(
             }
         }
 
+        // Record lease on success (no-op for empty/zero leases).
+        state
+            .lease_table
+            .record(&txn.sender, &lease_arr, txn.last_valid.0);
+
         Ok(())
     })();
 
@@ -295,18 +318,6 @@ fn apply_fee(
     let fee_sink_account = state.get_or_default_account(fee_sink);
     fee_sink_account.micro_algos += fee;
 
-    Ok(())
-}
-
-/// Debit fee from sender, credit fee_sink, and validate min balance.
-fn apply_fee_with_min_balance(
-    state: &mut LedgerState,
-    sender: &Address,
-    fee: u64,
-    fee_sink: &Address,
-) -> Result<(), AlgoError> {
-    apply_fee(state, sender, fee, fee_sink)?;
-    check_min_balance(state, sender, "after fee")?;
     Ok(())
 }
 
@@ -582,10 +593,7 @@ fn apply_axfer(
     // ── Clawback cannot use close-to (go-algorand: "cannot close asset by clawback") ──
     if is_clawback && txn.asset_close_to.is_some_and(|a| !a.is_zero()) {
         return Err(AlgoError::Ledger {
-            message: format!(
-                "axfer: cannot close asset by clawback (asset {})",
-                asset_id,
-            ),
+            message: format!("axfer: cannot close asset by clawback (asset {})", asset_id,),
         });
     }
 
@@ -666,7 +674,10 @@ fn apply_axfer(
                 message: format!("axfer: {} has no holding for asset {}", from_addr, asset_id),
             });
         }
-        if !state.asset_holdings.contains_key(&(asset_receiver, asset_id)) {
+        if !state
+            .asset_holdings
+            .contains_key(&(asset_receiver, asset_id))
+        {
             return Err(AlgoError::Ledger {
                 message: format!(
                     "axfer: receiver {} has no holding for asset {} (not opted in)",
@@ -892,9 +903,7 @@ fn apply_appl(
 
     // Record whether local state exists BEFORE EvalDelta, so the OptIn branch
     // can correctly detect a new opt-in even if EvalDelta creates a placeholder entry.
-    let had_local_state = state
-        .app_local_states
-        .contains_key(&(txn.sender, app_id));
+    let had_local_state = state.app_local_states.contains_key(&(txn.sender, app_id));
 
     // Apply EvalDelta BEFORE on_completion structural changes (matching go-algorand).
     // TEAL executes first (writing global/local state), then the runtime performs
@@ -1033,6 +1042,127 @@ fn apply_appl(
     Ok(())
 }
 
+/// Apply a key registration transaction.
+///
+/// Transitions account participation status:
+/// - `non_participation == true`: set NotParticipating (irreversible), clear all keys
+/// - `vote_pk` present with non-empty bytes: go Online, copy key material
+/// - Otherwise (offline keyreg): go Offline, clear all keys
+///
+/// Fee is already handled by the caller (`apply_transaction` deducts fee before dispatch).
+fn apply_keyreg(
+    state: &mut LedgerState,
+    stx: &SignedTransaction,
+    ctx: &ApplyContext,
+) -> Result<(), AlgoError> {
+    let txn = &stx.txn;
+
+    // Debit fee first.
+    apply_fee(state, &txn.sender, txn.fee, &ctx.fee_sink)?;
+
+    // Guard: NotParticipating is irreversible.
+    {
+        let account = state.get_or_default_account(&txn.sender);
+        if account.status == AccountStatus::NotParticipating {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "keyreg: account {} has status NotParticipating (irreversible)",
+                    txn.sender,
+                ),
+            });
+        }
+    }
+
+    if txn.non_participation {
+        // ── Mark non-participating (irreversible) ──
+        let account = state.get_or_default_account(&txn.sender);
+        account.status = AccountStatus::NotParticipating;
+        account.vote_id = None;
+        account.selection_id = None;
+        account.state_proof_id = None;
+        account.vote_first_valid = 0;
+        account.vote_last_valid = 0;
+        account.vote_key_dilution = 0;
+    } else if txn.vote_pk.as_ref().is_some_and(|pk| !pk.is_empty()) {
+        // ── Online keyreg ──
+        let vote_bytes = txn.vote_pk.as_ref().unwrap();
+        if vote_bytes.len() != 32 {
+            return Err(AlgoError::Ledger {
+                message: format!("keyreg: vote_pk length {} != 32", vote_bytes.len(),),
+            });
+        }
+        let mut vote_id = [0u8; 32];
+        vote_id.copy_from_slice(vote_bytes);
+
+        let sel_bytes = txn.selection_pk.as_ref().ok_or_else(|| AlgoError::Ledger {
+            message: "keyreg online: selection_pk is missing".to_string(),
+        })?;
+        if sel_bytes.len() != 32 {
+            return Err(AlgoError::Ledger {
+                message: format!("keyreg: selection_pk length {} != 32", sel_bytes.len(),),
+            });
+        }
+        let mut selection_id = [0u8; 32];
+        selection_id.copy_from_slice(sel_bytes);
+
+        let state_proof_id = if let Some(ref sp_bytes) = txn.state_proof_pk {
+            if !sp_bytes.is_empty() {
+                if sp_bytes.len() != 64 {
+                    return Err(AlgoError::Ledger {
+                        message: format!("keyreg: state_proof_pk length {} != 64", sp_bytes.len(),),
+                    });
+                }
+                let mut sp_id = [0u8; 64];
+                sp_id.copy_from_slice(sp_bytes);
+                Some(sp_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Validate participation parameters.
+        if txn.vote_key_dilution == 0 {
+            return Err(AlgoError::Ledger {
+                message: "keyreg online: vote_key_dilution must be > 0".to_string(),
+            });
+        }
+        if txn.vote_last < txn.vote_first {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "keyreg online: vote_last {} < vote_first {}",
+                    txn.vote_last, txn.vote_first
+                ),
+            });
+        }
+
+        let account = state.get_or_default_account(&txn.sender);
+        account.status = AccountStatus::Online;
+        account.vote_id = Some(vote_id);
+        account.selection_id = Some(selection_id);
+        account.state_proof_id = state_proof_id;
+        account.vote_first_valid = txn.vote_first;
+        account.vote_last_valid = txn.vote_last;
+        account.vote_key_dilution = txn.vote_key_dilution;
+    } else {
+        // ── Offline keyreg ──
+        let account = state.get_or_default_account(&txn.sender);
+        account.status = AccountStatus::Offline;
+        account.vote_id = None;
+        account.selection_id = None;
+        account.state_proof_id = None;
+        account.vote_first_valid = 0;
+        account.vote_last_valid = 0;
+        account.vote_key_dilution = 0;
+    }
+
+    // Check min balance for sender after fee.
+    check_min_balance(state, &txn.sender, "after keyreg fee")?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1070,6 +1200,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
         let stx = pay_txn(sender, receiver, 200_000, 1_000);
 
@@ -1090,6 +1221,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
         let stx = pay_txn(sender, receiver, 200, 1_000);
 
@@ -1118,6 +1250,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
         let mut stx = pay_txn(sender, receiver, 100_000, 1_000);
         stx.txn.close_remainder_to = close_to;
@@ -1144,6 +1277,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
         let mut stx = pay_txn(sender, receiver, 0, 1_000);
         stx.txn.close_remainder_to = close_to;
@@ -1162,6 +1296,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
         // Try to send 100_000 + 1_000 fee, leaving 99_000 < min_balance (100_000)
         let stx = pay_txn(sender, receiver, 100_000, 1_000);
@@ -1181,6 +1316,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
         let mut stx = pay_txn(sender, receiver, 1_000, 1_000);
         stx.txn.rekey_to = Some(auth);
@@ -1205,6 +1341,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
         let mut stx = SignedTransaction::default();
         stx.txn.txn_type = "stpf".to_string();
@@ -1217,7 +1354,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_type_debits_fee() {
+    fn test_unknown_type_returns_error() {
         let sender = Address([1u8; 32]);
         let fee_sink = Address([3u8; 32]);
 
@@ -1225,6 +1362,29 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
+        };
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "bogus".to_string();
+        stx.txn.sender = sender;
+        stx.txn.fee = 2_000;
+
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(result.is_err());
+        // Balance unchanged — unknown type is rejected.
+        assert_eq!(state.get_account(&sender).unwrap().micro_algos, 1_000_000);
+    }
+
+    #[test]
+    fn test_keyreg_offline_debits_fee() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+            round: 1,
         };
         let mut stx = SignedTransaction::default();
         stx.txn.txn_type = "keyreg".to_string();
@@ -1234,6 +1394,10 @@ mod tests {
         apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
         assert_eq!(state.get_account(&sender).unwrap().micro_algos, 998_000);
         assert_eq!(state.get_account(&fee_sink).unwrap().micro_algos, 2_000);
+        assert_eq!(
+            state.get_account(&sender).unwrap().status,
+            AccountStatus::Offline,
+        );
     }
 
     #[test]
@@ -1246,6 +1410,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
         let mut stx = SignedTransaction::default();
         stx.txn.txn_type = "keyreg".to_string();
@@ -1279,6 +1444,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 10,
             fee_sink,
+            round: 1,
         };
         let stx = pay_txn(sender, receiver, 1_000, 1_000);
 
@@ -1313,6 +1479,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 10,
             fee_sink,
+            round: 1,
         };
         // Sender has 5M but tries to send 10M — will fail.
         // Rewards would have been applied (50) bumping to 5_000_050, still < 10M.
@@ -1347,6 +1514,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
         let mut stx = pay_txn(sender, receiver, 0, 1_000);
         stx.txn.close_remainder_to = close_to;
@@ -1403,6 +1571,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -1450,6 +1619,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -1477,6 +1647,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let mut stx = SignedTransaction::default();
@@ -1500,6 +1671,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         // Create asset first.
@@ -1543,6 +1715,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         // Create asset with total=1000.
@@ -1592,6 +1765,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -1642,6 +1816,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -1676,6 +1851,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -1737,6 +1913,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         // Create asset with default_frozen = true.
@@ -1781,6 +1958,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -1820,6 +1998,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -1867,6 +2046,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -1913,6 +2093,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -1955,6 +2136,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -2012,6 +2194,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -2066,6 +2249,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -2135,6 +2319,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -2186,6 +2371,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -2233,6 +2419,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -2286,6 +2473,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -2336,6 +2524,7 @@ mod tests {
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
+            round: 1,
         };
 
         let params = AssetParams {
@@ -2358,5 +2547,288 @@ mod tests {
         let result = apply_transaction(&mut state, &stx, &ctx, 0);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no holding"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Key Registration (keyreg) tests
+    // -----------------------------------------------------------------------
+
+    fn keyreg_online_txn(sender: Address, fee: u64) -> SignedTransaction {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "keyreg".to_string();
+        stx.txn.sender = sender;
+        stx.txn.fee = fee;
+        stx.txn.vote_pk = Some(serde_bytes::ByteBuf::from(vec![1u8; 32]));
+        stx.txn.selection_pk = Some(serde_bytes::ByteBuf::from(vec![2u8; 32]));
+        stx.txn.state_proof_pk = Some(serde_bytes::ByteBuf::from(vec![3u8; 64]));
+        stx.txn.vote_first = 100;
+        stx.txn.vote_last = 200;
+        stx.txn.vote_key_dilution = 10;
+        stx
+    }
+
+    fn keyreg_offline_txn(sender: Address, fee: u64) -> SignedTransaction {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "keyreg".to_string();
+        stx.txn.sender = sender;
+        stx.txn.fee = fee;
+        // No keys, non_participation=false => offline
+        stx
+    }
+
+    fn keyreg_nonpart_txn(sender: Address, fee: u64) -> SignedTransaction {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "keyreg".to_string();
+        stx.txn.sender = sender;
+        stx.txn.fee = fee;
+        stx.txn.non_participation = true;
+        stx
+    }
+
+    #[test]
+    fn test_keyreg_online() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+            round: 1,
+        };
+
+        let stx = keyreg_online_txn(sender, 1_000);
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        let acct = state.get_account(&sender).unwrap();
+        assert_eq!(acct.status, AccountStatus::Online);
+        assert_eq!(acct.vote_id, Some([1u8; 32]));
+        assert_eq!(acct.selection_id, Some([2u8; 32]));
+        assert_eq!(acct.state_proof_id, Some([3u8; 64]));
+        assert_eq!(acct.vote_first_valid, 100);
+        assert_eq!(acct.vote_last_valid, 200);
+        assert_eq!(acct.vote_key_dilution, 10);
+        // Fee deducted.
+        assert_eq!(acct.micro_algos, 999_000);
+    }
+
+    #[test]
+    fn test_keyreg_offline() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        // Set account to Online with keys first.
+        {
+            let acct = state.get_or_default_account(&sender);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.selection_id = Some([2u8; 32]);
+            acct.state_proof_id = Some([3u8; 64]);
+            acct.vote_first_valid = 100;
+            acct.vote_last_valid = 200;
+            acct.vote_key_dilution = 10;
+        }
+        let ctx = ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+            round: 1,
+        };
+
+        let stx = keyreg_offline_txn(sender, 1_000);
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        let acct = state.get_account(&sender).unwrap();
+        assert_eq!(acct.status, AccountStatus::Offline);
+        assert_eq!(acct.vote_id, None);
+        assert_eq!(acct.selection_id, None);
+        assert_eq!(acct.state_proof_id, None);
+        assert_eq!(acct.vote_first_valid, 0);
+        assert_eq!(acct.vote_last_valid, 0);
+        assert_eq!(acct.vote_key_dilution, 0);
+    }
+
+    #[test]
+    fn test_keyreg_nonpart() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+            round: 1,
+        };
+
+        let stx = keyreg_nonpart_txn(sender, 1_000);
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        let acct = state.get_account(&sender).unwrap();
+        assert_eq!(acct.status, AccountStatus::NotParticipating);
+        assert_eq!(acct.vote_id, None);
+        assert_eq!(acct.selection_id, None);
+        assert_eq!(acct.state_proof_id, None);
+    }
+
+    #[test]
+    fn test_keyreg_nonpart_irreversible() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        // Set account to NotParticipating.
+        state.get_or_default_account(&sender).status = AccountStatus::NotParticipating;
+
+        let ctx = ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+            round: 1,
+        };
+
+        // Attempt online keyreg — should fail.
+        let stx = keyreg_online_txn(sender, 1_000);
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("NotParticipating"),
+            "expected NotParticipating error, got: {}",
+            err_msg,
+        );
+
+        // Account should be unchanged (rollback).
+        let acct = state.get_account(&sender).unwrap();
+        assert_eq!(acct.status, AccountStatus::NotParticipating);
+        assert_eq!(acct.micro_algos, 1_000_000); // fee rolled back
+    }
+
+    #[test]
+    fn test_keyreg_online_then_offline() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+            round: 1,
+        };
+
+        // Go online.
+        let stx_on = keyreg_online_txn(sender, 1_000);
+        apply_transaction(&mut state, &stx_on, &ctx, 0).unwrap();
+        assert_eq!(
+            state.get_account(&sender).unwrap().status,
+            AccountStatus::Online
+        );
+        assert!(state.get_account(&sender).unwrap().vote_id.is_some());
+
+        // Go offline.
+        let stx_off = keyreg_offline_txn(sender, 1_000);
+        apply_transaction(&mut state, &stx_off, &ctx, 0).unwrap();
+
+        let acct = state.get_account(&sender).unwrap();
+        assert_eq!(acct.status, AccountStatus::Offline);
+        assert_eq!(acct.vote_id, None);
+        assert_eq!(acct.selection_id, None);
+        assert_eq!(acct.state_proof_id, None);
+        assert_eq!(acct.vote_first_valid, 0);
+        assert_eq!(acct.vote_last_valid, 0);
+        assert_eq!(acct.vote_key_dilution, 0);
+        // Two fees deducted.
+        assert_eq!(acct.micro_algos, 998_000);
+    }
+
+    #[test]
+    fn test_keyreg_rewards_stop_for_nonpart() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([4u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[
+                (sender, 5_000_000),
+                (fee_sink, 0),
+                (rewards_pool, 10_000_000),
+            ],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+
+        // Set account Online with rewards_base=0.
+        {
+            let acct = state.get_or_default_account(&sender);
+            acct.status = AccountStatus::Online;
+            acct.rewards_base = 0;
+        }
+
+        // Verify pending rewards are > 0 at rewards_level=10.
+        use crate::rewards::compute_pending_rewards;
+        let pending = compute_pending_rewards(state.get_account(&sender).unwrap(), 10);
+        assert!(pending > 0, "expected pending rewards > 0, got {}", pending);
+
+        // Apply nonpart keyreg.
+        let ctx = ApplyContext {
+            rewards_level: 10,
+            fee_sink,
+            round: 1,
+        };
+        let stx = keyreg_nonpart_txn(sender, 1_000);
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        let acct = state.get_account(&sender).unwrap();
+        assert_eq!(acct.status, AccountStatus::NotParticipating);
+
+        // After becoming NotParticipating, compute_pending_rewards returns 0.
+        let pending_after = compute_pending_rewards(acct, 20);
+        assert_eq!(pending_after, 0);
+    }
+
+    #[test]
+    fn test_keyreg_online_zero_dilution_rejected() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+            round: 1,
+        };
+
+        let mut stx = keyreg_online_txn(sender, 1_000);
+        stx.txn.vote_key_dilution = 0;
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("vote_key_dilution"),
+            "error should mention vote_key_dilution"
+        );
+        // Balance unchanged (rollback).
+        assert_eq!(state.get_account(&sender).unwrap().micro_algos, 1_000_000);
+    }
+
+    #[test]
+    fn test_keyreg_online_vote_last_before_first_rejected() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+            round: 1,
+        };
+
+        let mut stx = keyreg_online_txn(sender, 1_000);
+        stx.txn.vote_first = 200;
+        stx.txn.vote_last = 100;
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("vote_last"),
+            "error should mention vote_last"
+        );
+        assert_eq!(state.get_account(&sender).unwrap().micro_algos, 1_000_000);
     }
 }

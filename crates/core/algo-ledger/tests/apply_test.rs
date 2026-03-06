@@ -84,6 +84,7 @@ fn test_reward_dedup_sender_eq_receiver() {
     let ctx = ApplyContext {
         rewards_level: 10,
         fee_sink,
+        round: 1,
     };
 
     // sender == receiver: rewards should be applied once, not twice.
@@ -174,6 +175,7 @@ fn test_close_remainder_sender_eq_close_to() {
     let ctx = ApplyContext {
         rewards_level: 0,
         fee_sink,
+        round: 1,
     };
 
     // close_remainder_to == sender: after paying amount+fee, remainder goes
@@ -204,6 +206,7 @@ fn test_payment_to_self_fee_deducted() {
     let ctx = ApplyContext {
         rewards_level: 0,
         fee_sink,
+        round: 1,
     };
 
     // Pay 200_000 to self with 1_000 fee.
@@ -230,6 +233,7 @@ fn test_stpf_zero_fee_no_error() {
     let ctx = ApplyContext {
         rewards_level: 0,
         fee_sink,
+        round: 1,
     };
 
     let mut stx = SignedTransaction::default();
@@ -253,6 +257,7 @@ fn test_stpf_nonzero_fee_still_noop() {
     let ctx = ApplyContext {
         rewards_level: 0,
         fee_sink,
+        round: 1,
     };
 
     let mut stx = SignedTransaction::default();
@@ -281,6 +286,7 @@ fn test_rekey_on_acfg_txn() {
     let ctx = ApplyContext {
         rewards_level: 0,
         fee_sink,
+        round: 1,
     };
 
     // Use acfg create with proper apply_data_config_asset to test rekey on non-pay.
@@ -311,6 +317,7 @@ fn test_rekey_clear_on_non_pay() {
     let ctx = ApplyContext {
         rewards_level: 0,
         fee_sink,
+        round: 1,
     };
 
     // Rekey back to self on a keyreg txn.
@@ -342,6 +349,7 @@ fn test_close_with_opted_in_apps_fails() {
     let ctx = ApplyContext {
         rewards_level: 0,
         fee_sink,
+        round: 1,
     };
     let mut stx = pay_txn(sender, receiver, 0, 1_000);
     stx.txn.close_remainder_to = close_to;
@@ -582,6 +590,7 @@ fn test_min_balance_tracks_assets() {
     let ctx = ApplyContext {
         rewards_level: 0,
         fee_sink,
+        round: 1,
     };
 
     // Base min balance for user (no assets/apps): 100_000
@@ -646,6 +655,7 @@ fn test_appl_create_and_optin() {
     let ctx = ApplyContext {
         rewards_level: 0,
         fee_sink,
+        round: 1,
     };
 
     let app_id = 200u64;
@@ -693,6 +703,7 @@ fn test_eval_delta_global_state() {
     let ctx = ApplyContext {
         rewards_level: 0,
         fee_sink,
+        round: 1,
     };
 
     let app_id = 300u64;
@@ -752,6 +763,7 @@ fn test_eval_delta_inner_txns() {
     let ctx = ApplyContext {
         rewards_level: 0,
         fee_sink,
+        round: 1,
     };
 
     let app_id = 400u64;
@@ -792,4 +804,180 @@ fn test_eval_delta_inner_txns() {
     // Creator should have been debited: outer fee + inner (amount + fee).
     let creator_after = state.get_account(&creator).unwrap().micro_algos;
     assert_eq!(creator_before - creator_after, 1_000 + 100_000 + 1_000);
+}
+
+// ---------------------------------------------------------------------------
+// 14. Keyreg in block — integration
+// ---------------------------------------------------------------------------
+
+fn keyreg_online_txn(sender: Address, fee: u64) -> SignedTransaction {
+    let mut stx = SignedTransaction::default();
+    stx.txn.txn_type = "keyreg".to_string();
+    stx.txn.sender = sender;
+    stx.txn.fee = fee;
+    stx.txn.vote_pk = Some(ByteBuf::from(vec![0xAA; 32]));
+    stx.txn.selection_pk = Some(ByteBuf::from(vec![0xBB; 32]));
+    stx.txn.state_proof_pk = Some(ByteBuf::from(vec![0xCC; 64]));
+    stx.txn.vote_first = 100;
+    stx.txn.vote_last = 300;
+    stx.txn.vote_key_dilution = 10;
+    stx
+}
+
+#[test]
+fn test_keyreg_in_block() {
+    let sender = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
+
+    let stx = keyreg_online_txn(sender, 1_000);
+    let block = minimal_block(fee_sink, 1, vec![stx]);
+    apply_block(&mut state, &block).unwrap();
+
+    let acct = state.get_account(&sender).unwrap();
+    assert_eq!(acct.status, AccountStatus::Online);
+    assert_eq!(acct.vote_id, Some([0xAA; 32]));
+    assert_eq!(acct.selection_id, Some([0xBB; 32]));
+    assert_eq!(acct.state_proof_id, Some([0xCC; 64]));
+    assert_eq!(acct.vote_first_valid, 100);
+    assert_eq!(acct.vote_last_valid, 300);
+    assert_eq!(acct.vote_key_dilution, 10);
+    assert_eq!(acct.micro_algos, 9_999_000);
+    assert_eq!(state.current_round, Round(1));
+}
+
+// ---------------------------------------------------------------------------
+// 15. Lease across blocks — duplicate rejected
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_lease_across_blocks() {
+    let sender = Address([1u8; 32]);
+    let receiver = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(
+        &[(sender, 10_000_000), (receiver, 0), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    let lease_val = ByteBuf::from(vec![0xDD; 32]);
+
+    // Block 1 at round 1: txn with lease, last_valid = round + 5 = 6.
+    let mut stx1 = pay_txn(sender, receiver, 1_000, 1_000);
+    stx1.txn.lease = lease_val.clone();
+    stx1.txn.last_valid = Round(6);
+    let block1 = minimal_block(fee_sink, 1, vec![stx1]);
+    apply_block(&mut state, &block1).unwrap();
+
+    // Block 2 at round 2: same sender, same lease — should be rejected.
+    let mut stx2 = pay_txn(sender, receiver, 1_000, 1_000);
+    stx2.txn.lease = lease_val.clone();
+    stx2.txn.last_valid = Round(7);
+    let block2 = minimal_block(fee_sink, 2, vec![stx2]);
+    let result = apply_block(&mut state, &block2);
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("duplicate lease"),
+        "expected duplicate lease error, got: {}",
+        err_msg,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 16. Lease expired — second txn succeeds
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_lease_expired_across_blocks() {
+    let sender = Address([1u8; 32]);
+    let receiver = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(
+        &[(sender, 10_000_000), (receiver, 0), (fee_sink, 0)],
+        fee_sink,
+    );
+
+    let lease_val = ByteBuf::from(vec![0xEE; 32]);
+
+    // Block 1 at round 1: txn with lease, last_valid = 1 (expires at round 1).
+    let mut stx1 = pay_txn(sender, receiver, 1_000, 1_000);
+    stx1.txn.lease = lease_val.clone();
+    stx1.txn.last_valid = Round(1);
+    let block1 = minimal_block(fee_sink, 1, vec![stx1]);
+    apply_block(&mut state, &block1).unwrap();
+
+    // Advance through rounds 2-4 with empty blocks to let the lease expire.
+    // purge_expired is called at end of apply_block with current_round.
+    // The lease has last_valid=1, so it's purged when current_round > 1.
+    for r in 2..=4 {
+        let empty_block = minimal_block(fee_sink, r, vec![]);
+        apply_block(&mut state, &empty_block).unwrap();
+    }
+
+    // Block 5 at round 5: same sender, same lease — should succeed (lease expired).
+    let mut stx2 = pay_txn(sender, receiver, 1_000, 1_000);
+    stx2.txn.lease = lease_val.clone();
+    stx2.txn.last_valid = Round(10);
+    let block5 = minimal_block(fee_sink, 5, vec![stx2]);
+    apply_block(&mut state, &block5).unwrap();
+
+    // Both txns succeeded: 2 * (1_000 + 1_000) = 4_000 deducted total.
+    assert_eq!(
+        state.get_account(&sender).unwrap().micro_algos,
+        10_000_000 - 4_000
+    );
+    assert_eq!(state.get_account(&receiver).unwrap().micro_algos, 2_000);
+}
+
+// ---------------------------------------------------------------------------
+// 17. Different senders, same lease — both succeed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_lease_different_senders_ok() {
+    let sender_a = Address([1u8; 32]);
+    let sender_b = Address([2u8; 32]);
+    let receiver = Address([5u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut state = make_state(
+        &[
+            (sender_a, 10_000_000),
+            (sender_b, 10_000_000),
+            (receiver, 0),
+            (fee_sink, 0),
+        ],
+        fee_sink,
+    );
+
+    let lease_val = ByteBuf::from(vec![0xFF; 32]);
+
+    // Block 1: sender_a uses the lease.
+    let mut stx1 = pay_txn(sender_a, receiver, 1_000, 1_000);
+    stx1.txn.lease = lease_val.clone();
+    stx1.txn.last_valid = Round(10);
+    let block1 = minimal_block(fee_sink, 1, vec![stx1]);
+    apply_block(&mut state, &block1).unwrap();
+
+    // Block 2: sender_b uses the same lease value — should succeed (different sender).
+    let mut stx2 = pay_txn(sender_b, receiver, 2_000, 1_000);
+    stx2.txn.lease = lease_val.clone();
+    stx2.txn.last_valid = Round(10);
+    let block2 = minimal_block(fee_sink, 2, vec![stx2]);
+    apply_block(&mut state, &block2).unwrap();
+
+    // Both succeeded.
+    assert_eq!(
+        state.get_account(&sender_a).unwrap().micro_algos,
+        10_000_000 - 2_000
+    );
+    assert_eq!(
+        state.get_account(&sender_b).unwrap().micro_algos,
+        10_000_000 - 3_000
+    );
+    assert_eq!(state.get_account(&receiver).unwrap().micro_algos, 3_000);
 }

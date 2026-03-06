@@ -5,6 +5,7 @@ use algo_types::{
     StateSchema,
 };
 
+use crate::lease::LeaseTable;
 use crate::params::{
     SCHEMA_BYTES_MIN_BALANCE, SCHEMA_MIN_BALANCE_PER_ENTRY, SCHEMA_UINT_MIN_BALANCE,
 };
@@ -30,6 +31,9 @@ pub struct LedgerState {
     pub app_local_states: HashMap<(Address, u64), AppLocalState>,
     pub asset_params: HashMap<u64, AssetParamsRecord>,
     pub app_params: HashMap<u64, AppParams>,
+
+    // Lease tracking
+    pub lease_table: LeaseTable,
 
     // Current round
     pub current_round: Round,
@@ -57,6 +61,7 @@ impl LedgerState {
             app_local_states: HashMap::new(),
             asset_params: HashMap::new(),
             app_params: HashMap::new(),
+            lease_table: LeaseTable::new(),
             current_round: Round(0),
             rewards_level: 0,
             rewards_rate: 0,
