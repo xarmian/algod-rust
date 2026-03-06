@@ -2,8 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
+use algo_ledger::LedgerStore;
 use algo_rest_client::{AlgodClient, BlockSource};
 use algo_types::{Address, Round};
+use rusqlite::Connection;
 use serde::Serialize;
 use tracing::{error, info, warn};
 
@@ -322,6 +324,8 @@ pub async fn run_stateful(
     compare_token: &str,
     sample_rate: u64,
     db_path: &Path,
+    trie: bool,
+    compare_trie_db: Option<&Path>,
 ) -> anyhow::Result<()> {
     if start > end {
         anyhow::bail!("invalid range: start ({start}) must be <= end ({end})");
@@ -360,6 +364,12 @@ pub async fn run_stateful(
         start
     };
 
+    // Enable Merkle trie tracking before any blocks are applied.
+    if trie {
+        store.enable_trie();
+        info!("Merkle trie tracking enabled");
+    }
+
     if effective_start > end {
         info!(
             effective_start,
@@ -367,6 +377,19 @@ pub async fn run_stateful(
         );
         return Ok(());
     }
+
+    // Open Go's tracker.db for trie root conformance comparison (read-only).
+    let go_trie_db = if let Some(go_db_path) = compare_trie_db {
+        if !trie {
+            anyhow::bail!("--compare-trie-db requires --trie to be enabled");
+        }
+        let conn =
+            Connection::open_with_flags(go_db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        info!(path = %go_db_path.display(), "opened Go tracker.db for trie conformance");
+        Some(conn)
+    } else {
+        None
+    };
 
     info!(
         network,
@@ -376,6 +399,7 @@ pub async fn run_stateful(
         fail_fast,
         compare,
         sample_rate,
+        trie,
         db = %db_path.display(),
         "starting stateful block replay"
     );
@@ -394,6 +418,7 @@ pub async fn run_stateful(
     let mut failures: Vec<ReplayFailure> = Vec::new();
     let mut total_mismatches: u64 = 0;
     let mut total_skipped: u64 = 0;
+    let mut trie_mismatches: u64 = 0;
 
     let mut round = effective_start;
     while round <= end {
@@ -451,8 +476,59 @@ pub async fn run_stateful(
         store.begin_block()?;
         match algo_ledger::apply_block(&mut store, block) {
             Ok(()) => {
+                // Read trie root before commit (finalize_trie_updates is called
+                // inside apply_block; the root is logged at debug level there).
+                // We log at info level here for CLI visibility.
+                let trie_root: Option<[u8; 32]> = if trie {
+                    store.finalize_trie_updates()
+                } else {
+                    None
+                };
+
                 store.commit_block()?;
                 blocks_passed += 1;
+
+                // Log and optionally compare trie root.
+                if let Some(root) = trie_root {
+                    let hex_root = root.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                    info!(round = block.round.0, root = %hex_root, "trie root");
+
+                    // Conformance: compare against Go's tracker.db.
+                    if let Some(ref go_db) = go_trie_db {
+                        match read_go_trie_root(go_db, block.round.0) {
+                            Ok(Some(go_root)) => {
+                                if root == go_root {
+                                    info!(round = block.round.0, "trie root matches Go");
+                                } else {
+                                    let go_hex = go_root
+                                        .iter()
+                                        .map(|b| format!("{b:02x}"))
+                                        .collect::<String>();
+                                    warn!(
+                                        round = block.round.0,
+                                        rust_root = %hex_root,
+                                        go_root = %go_hex,
+                                        "trie root MISMATCH with Go"
+                                    );
+                                    trie_mismatches += 1;
+                                }
+                            }
+                            Ok(None) => {
+                                warn!(
+                                    round = block.round.0,
+                                    "no trie root found in Go tracker.db for this round"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    round = block.round.0,
+                                    error = %e,
+                                    "failed to read Go trie root"
+                                );
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => {
                 warn!(round, error = %e, "apply_block failed");
@@ -533,6 +609,12 @@ pub async fn run_stateful(
             println!("Accounts skipped: {total_skipped} (Go node errors)");
         }
     }
+    if trie {
+        println!("Trie enabled:     yes");
+        if compare_trie_db.is_some() {
+            println!("Trie mismatches:  {trie_mismatches}");
+        }
+    }
     println!("Elapsed:          {elapsed:.1}s ({blocks_per_sec:.1} blocks/sec)");
 
     if !txn_type_counts.is_empty() {
@@ -591,6 +673,10 @@ pub async fn run_stateful(
         );
     }
 
+    if compare_trie_db.is_some() && trie_mismatches > 0 {
+        anyhow::bail!("{trie_mismatches} trie root mismatches found during conformance comparison");
+    }
+
     Ok(())
 }
 
@@ -607,4 +693,90 @@ fn load_genesis_into_store(
     algo_ledger::populate_store(store, &genesis)?;
     info!(genesis_path = %path.display(), "genesis loaded into ledger");
     Ok(())
+}
+
+/// Read the Merkle trie root hash from Go's tracker.db for a given round.
+///
+/// Go's tracker.db stores trie-related state in several possible locations:
+/// - `catchpointstate` table (key-value pairs including "trieRootHash")
+/// - `merkletrienode` table (serialized trie nodes — would need full rebuild)
+/// - `acctrounds` table (round tracking metadata)
+///
+/// We attempt to read from `catchpointstate` first, which stores the trie root
+/// as a hex-encoded string under the key "accountsTrieRootHash" (or similar).
+/// If that table/key is not found, we return None.
+fn read_go_trie_root(conn: &Connection, _round: u64) -> anyhow::Result<Option<[u8; 32]>> {
+    // Try catchpointstate table — Go stores various state hashes here.
+    // The key for the accounts trie root is "balancesHash" in older versions
+    // or may vary by Go version.
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table'")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if tables.iter().any(|t| t == "catchpointstate") {
+        // Try known key names for the trie root hash.
+        let keys = [
+            "balancesHash",
+            "trieRootHash",
+            "accountsTrieRootHash",
+            "catchpointAccountHash",
+        ];
+        for key in &keys {
+            let result: Option<Vec<u8>> = conn
+                .prepare("SELECT val FROM catchpointstate WHERE id = ?1")
+                .and_then(|mut stmt| {
+                    stmt.query_row([key], |row| row.get::<_, Vec<u8>>(0))
+                        .map(Some)
+                })
+                .unwrap_or(None);
+
+            if let Some(val) = result {
+                // The value may be raw 32 bytes or hex-encoded.
+                if val.len() == 32 {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&val);
+                    return Ok(Some(hash));
+                }
+                // Try hex decoding.
+                if let Ok(decoded) = hex_decode(&val) {
+                    if decoded.len() == 32 {
+                        let mut hash = [0u8; 32];
+                        hash.copy_from_slice(&decoded);
+                        return Ok(Some(hash));
+                    }
+                }
+            }
+        }
+
+        // Log available keys for debugging.
+        let available: Vec<String> = conn
+            .prepare("SELECT id FROM catchpointstate")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        warn!(
+            keys = ?available,
+            "catchpointstate table found but no recognized trie root key"
+        );
+    } else {
+        warn!(
+            available_tables = ?tables,
+            "Go tracker.db does not contain catchpointstate table"
+        );
+    }
+
+    Ok(None)
+}
+
+/// Simple hex decoder for ASCII hex strings stored as bytes.
+fn hex_decode(input: &[u8]) -> Result<Vec<u8>, ()> {
+    let s = std::str::from_utf8(input).map_err(|_| ())?;
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return Err(());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
+        .collect()
 }

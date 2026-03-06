@@ -57,6 +57,8 @@ async fn main() -> anyhow::Result<()> {
             compare_token,
             sample_rate,
             db,
+            trie,
+            compare_trie_db,
         } => {
             let (resolved_url, resolved_token, net_name) = match network.as_str() {
                 "mainnet" => (
@@ -98,6 +100,8 @@ async fn main() -> anyhow::Result<()> {
                     &compare_token,
                     sample_rate,
                     &db,
+                    trie,
+                    compare_trie_db.as_deref(),
                 )
                 .await?;
             } else {

@@ -2,11 +2,13 @@ pub mod apply;
 pub mod eval_delta;
 pub mod genesis;
 pub mod lease;
+pub mod merkle_trie;
 pub mod params;
 pub mod rewards;
 pub mod sqlite;
 pub mod state;
 pub mod store_trait;
+pub mod trie_hash;
 
 pub use apply::{apply_block, apply_transaction, ApplyContext};
 pub use eval_delta::{parse_eval_delta, DeltaAction, EvalDelta, ValueDelta};

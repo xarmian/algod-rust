@@ -53,6 +53,8 @@ pub struct AccountData {
     pub total_extra_app_pages: u32,
     pub total_box_bytes: u64,
     pub total_boxes: u64,
+    /// Round at which this account was last modified (Go codec key "z").
+    pub update_round: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

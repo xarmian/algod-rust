@@ -188,4 +188,24 @@ pub trait LedgerStore {
     /// Compute the minimum balance for an account, including schema-based
     /// costs from opted-in and created apps.
     fn min_balance_with_state(&self, addr: &Address, account: &AccountData) -> u64;
+
+    // ---- Trie integration ----
+
+    /// Enable Merkle trie tracking for this store.
+    ///
+    /// When enabled, mutations to accounts and resources are tracked so that
+    /// the trie can be incrementally updated after each block.
+    fn enable_trie(&mut self) {}
+
+    /// Check whether trie tracking is enabled.
+    fn trie_enabled(&self) -> bool {
+        false
+    }
+
+    /// After a block is applied, process all recorded mutations and update the
+    /// Merkle trie. Returns the new trie root hash, or `None` if the trie is
+    /// not enabled.
+    fn finalize_trie_updates(&mut self) -> Option<[u8; 32]> {
+        None
+    }
 }

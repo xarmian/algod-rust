@@ -6,8 +6,12 @@ use algo_types::{
 };
 
 use crate::lease::LeaseTable;
+use crate::merkle_trie::MerkleTrie;
 use crate::params::{
     SCHEMA_BYTES_MIN_BALANCE, SCHEMA_MIN_BALANCE_PER_ENTRY, SCHEMA_UINT_MIN_BALANCE,
+};
+use crate::trie_hash::{
+    account_hash_v6, compute_affinity, resource_hash_v6_with_kind, HashKind, ELEMENT_SIZE,
 };
 
 /// Compute the min-balance cost for a single state schema.
@@ -20,6 +24,41 @@ pub fn schema_min_balance(schema: &StateSchema) -> u64 {
     SCHEMA_MIN_BALANCE_PER_ENTRY * num_entries
         + SCHEMA_UINT_MIN_BALANCE * schema.num_uint
         + SCHEMA_BYTES_MIN_BALANCE * schema.num_byte_slice
+}
+
+/// Record of state before a mutation, used for trie delta computation.
+enum PreMutation {
+    Account {
+        addr: Address,
+        old_data: Option<AccountData>,
+        old_affinity: u32,
+    },
+    AssetHolding {
+        addr: Address,
+        asset_id: u64,
+        old_holding: Option<AssetHolding>,
+        old_params: Option<AssetParamsRecord>,
+        old_affinity: u32,
+    },
+    AssetParams {
+        asset_id: u64,
+        old_record: Option<AssetParamsRecord>,
+        old_holding: Option<(Address, AssetHolding)>,
+        old_affinity: u32,
+    },
+    AppParams {
+        app_id: u64,
+        old_params: Option<AppParams>,
+        old_local: Option<(Address, AppLocalState)>,
+        old_affinity: u32,
+    },
+    AppLocalState {
+        addr: Address,
+        app_id: u64,
+        old_local: Option<AppLocalState>,
+        old_params: Option<AppParams>,
+        old_affinity: u32,
+    },
 }
 
 /// In-memory ledger state holding all account data, asset/app state, and
@@ -50,6 +89,10 @@ pub struct LedgerState {
     pub genesis_id: String,
     pub genesis_hash: [u8; 32],
     pub protocol: String,
+
+    // Merkle trie tracking
+    trie: Option<MerkleTrie>,
+    pre_mutations: Vec<PreMutation>,
 }
 
 impl LedgerState {
@@ -72,6 +115,8 @@ impl LedgerState {
             genesis_id: String::new(),
             genesis_hash: [0u8; 32],
             protocol: String::new(),
+            trie: None,
+            pre_mutations: Vec::new(),
         }
     }
 
@@ -296,10 +341,28 @@ impl crate::store_trait::LedgerStore for LedgerState {
     }
 
     fn set_account(&mut self, addr: &Address, account: AccountData) {
+        if self.trie.is_some() {
+            let old = self.accounts.get(addr).cloned();
+            let old_affinity = old.as_ref().map(compute_affinity).unwrap_or(0);
+            self.pre_mutations.push(PreMutation::Account {
+                addr: *addr,
+                old_data: old,
+                old_affinity,
+            });
+        }
         self.accounts.insert(*addr, account);
     }
 
     fn remove_account(&mut self, addr: &Address) {
+        if self.trie.is_some() {
+            let old = self.accounts.get(addr).cloned();
+            let old_affinity = old.as_ref().map(compute_affinity).unwrap_or(0);
+            self.pre_mutations.push(PreMutation::Account {
+                addr: *addr,
+                old_data: old,
+                old_affinity,
+            });
+        }
         self.accounts.remove(addr);
     }
 
@@ -310,10 +373,43 @@ impl crate::store_trait::LedgerStore for LedgerState {
     }
 
     fn set_asset_holding(&mut self, addr: &Address, asset_id: u64, holding: AssetHolding) {
+        if self.trie.is_some() {
+            let old_holding = self.asset_holdings.get(&(*addr, asset_id)).cloned();
+            // Capture co-located asset params if creator matches this addr.
+            let old_params = self
+                .asset_params
+                .get(&asset_id)
+                .filter(|r| r.creator == *addr)
+                .cloned();
+            let old_affinity = self.accounts.get(addr).map(compute_affinity).unwrap_or(0);
+            self.pre_mutations.push(PreMutation::AssetHolding {
+                addr: *addr,
+                asset_id,
+                old_holding,
+                old_params,
+                old_affinity,
+            });
+        }
         self.asset_holdings.insert((*addr, asset_id), holding);
     }
 
     fn remove_asset_holding(&mut self, addr: &Address, asset_id: u64) {
+        if self.trie.is_some() {
+            let old_holding = self.asset_holdings.get(&(*addr, asset_id)).cloned();
+            let old_params = self
+                .asset_params
+                .get(&asset_id)
+                .filter(|r| r.creator == *addr)
+                .cloned();
+            let old_affinity = self.accounts.get(addr).map(compute_affinity).unwrap_or(0);
+            self.pre_mutations.push(PreMutation::AssetHolding {
+                addr: *addr,
+                asset_id,
+                old_holding,
+                old_params,
+                old_affinity,
+            });
+        }
         self.asset_holdings.remove(&(*addr, asset_id));
     }
 
@@ -328,10 +424,49 @@ impl crate::store_trait::LedgerStore for LedgerState {
     }
 
     fn set_asset_params(&mut self, asset_id: u64, record: AssetParamsRecord) {
+        if self.trie.is_some() {
+            let old_record = self.asset_params.get(&asset_id).cloned();
+            // Capture co-located holding if creator holds this asset.
+            let old_holding = old_record.as_ref().and_then(|r| {
+                self.asset_holdings
+                    .get(&(r.creator, asset_id))
+                    .map(|h| (r.creator, h.clone()))
+            });
+            let old_affinity = old_record
+                .as_ref()
+                .and_then(|r| self.accounts.get(&r.creator))
+                .map(compute_affinity)
+                .unwrap_or(0);
+            self.pre_mutations.push(PreMutation::AssetParams {
+                asset_id,
+                old_record,
+                old_holding,
+                old_affinity,
+            });
+        }
         self.asset_params.insert(asset_id, record);
     }
 
     fn remove_asset_params(&mut self, asset_id: u64) {
+        if self.trie.is_some() {
+            let old_record = self.asset_params.get(&asset_id).cloned();
+            let old_holding = old_record.as_ref().and_then(|r| {
+                self.asset_holdings
+                    .get(&(r.creator, asset_id))
+                    .map(|h| (r.creator, h.clone()))
+            });
+            let old_affinity = old_record
+                .as_ref()
+                .and_then(|r| self.accounts.get(&r.creator))
+                .map(compute_affinity)
+                .unwrap_or(0);
+            self.pre_mutations.push(PreMutation::AssetParams {
+                asset_id,
+                old_record,
+                old_holding,
+                old_affinity,
+            });
+        }
         self.asset_params.remove(&asset_id);
     }
 
@@ -346,10 +481,49 @@ impl crate::store_trait::LedgerStore for LedgerState {
     }
 
     fn set_app_params(&mut self, app_id: u64, params: AppParams) {
+        if self.trie.is_some() {
+            let old_params = self.app_params.get(&app_id).cloned();
+            // Capture co-located local state if creator has opted in.
+            let old_local = old_params.as_ref().and_then(|p| {
+                self.app_local_states
+                    .get(&(p.creator, app_id))
+                    .map(|s| (p.creator, s.clone()))
+            });
+            let old_affinity = old_params
+                .as_ref()
+                .and_then(|p| self.accounts.get(&p.creator))
+                .map(compute_affinity)
+                .unwrap_or(0);
+            self.pre_mutations.push(PreMutation::AppParams {
+                app_id,
+                old_params,
+                old_local,
+                old_affinity,
+            });
+        }
         self.app_params.insert(app_id, params);
     }
 
     fn remove_app_params(&mut self, app_id: u64) {
+        if self.trie.is_some() {
+            let old_params = self.app_params.get(&app_id).cloned();
+            let old_local = old_params.as_ref().and_then(|p| {
+                self.app_local_states
+                    .get(&(p.creator, app_id))
+                    .map(|s| (p.creator, s.clone()))
+            });
+            let old_affinity = old_params
+                .as_ref()
+                .and_then(|p| self.accounts.get(&p.creator))
+                .map(compute_affinity)
+                .unwrap_or(0);
+            self.pre_mutations.push(PreMutation::AppParams {
+                app_id,
+                old_params,
+                old_local,
+                old_affinity,
+            });
+        }
         self.app_params.remove(&app_id);
     }
 
@@ -372,10 +546,43 @@ impl crate::store_trait::LedgerStore for LedgerState {
     }
 
     fn set_app_local_state(&mut self, addr: &Address, app_id: u64, local_state: AppLocalState) {
+        if self.trie.is_some() {
+            let old_local = self.app_local_states.get(&(*addr, app_id)).cloned();
+            // Capture co-located app params if creator matches this addr.
+            let old_params = self
+                .app_params
+                .get(&app_id)
+                .filter(|p| p.creator == *addr)
+                .cloned();
+            let old_affinity = self.accounts.get(addr).map(compute_affinity).unwrap_or(0);
+            self.pre_mutations.push(PreMutation::AppLocalState {
+                addr: *addr,
+                app_id,
+                old_local,
+                old_params,
+                old_affinity,
+            });
+        }
         self.app_local_states.insert((*addr, app_id), local_state);
     }
 
     fn remove_app_local_state(&mut self, addr: &Address, app_id: u64) {
+        if self.trie.is_some() {
+            let old_local = self.app_local_states.get(&(*addr, app_id)).cloned();
+            let old_params = self
+                .app_params
+                .get(&app_id)
+                .filter(|p| p.creator == *addr)
+                .cloned();
+            let old_affinity = self.accounts.get(addr).map(compute_affinity).unwrap_or(0);
+            self.pre_mutations.push(PreMutation::AppLocalState {
+                addr: *addr,
+                app_id,
+                old_local,
+                old_params,
+                old_affinity,
+            });
+        }
         self.app_local_states.remove(&(*addr, app_id));
     }
 
@@ -517,6 +724,515 @@ impl crate::store_trait::LedgerStore for LedgerState {
 
     fn min_balance_with_state(&self, addr: &Address, account: &AccountData) -> u64 {
         LedgerState::min_balance_with_state(self, addr, account)
+    }
+
+    // ---- Trie integration ----
+
+    fn enable_trie(&mut self) {
+        self.trie = Some(MerkleTrie::new(ELEMENT_SIZE));
+        self.pre_mutations.clear();
+    }
+
+    fn trie_enabled(&self) -> bool {
+        self.trie.is_some()
+    }
+
+    fn finalize_trie_updates(&mut self) -> Option<[u8; 32]> {
+        let trie = self.trie.as_mut()?;
+
+        // Process all recorded pre-mutations.
+        let mutations = std::mem::take(&mut self.pre_mutations);
+
+        // Track addresses whose affinity changed, so we can cascade to resources (H2).
+        let mut affinity_changed: HashMap<Address, (u32, u32)> = HashMap::new();
+
+        for mutation in mutations {
+            match mutation {
+                PreMutation::Account {
+                    addr,
+                    old_data,
+                    old_affinity,
+                } => {
+                    // Delete old element if it existed.
+                    if let Some(ref old) = old_data {
+                        let old_elem = account_hash_v6(&addr, old);
+                        if let Err(e) = trie.delete(&old_elem) {
+                            tracing::warn!("trie delete account failed: {}", e);
+                        }
+                    }
+                    // Add new element if account still exists.
+                    if let Some(new_data) = self.accounts.get(&addr) {
+                        let new_affinity = compute_affinity(new_data);
+                        let new_elem = account_hash_v6(&addr, new_data);
+                        if let Err(e) = trie.add(&new_elem) {
+                            tracing::warn!("trie add account failed: {}", e);
+                        }
+                        // Track affinity change for resource cascade (H2).
+                        if old_affinity != new_affinity {
+                            affinity_changed.insert(addr, (old_affinity, new_affinity));
+                        }
+                    }
+                }
+                PreMutation::AssetHolding {
+                    addr,
+                    asset_id,
+                    old_holding,
+                    old_params,
+                    old_affinity,
+                } => {
+                    // Delete old resource element.
+                    if old_holding.is_some() || old_params.is_some() {
+                        let old_blob = encode_merged_asset_resource(
+                            old_holding.as_ref(),
+                            old_params.as_ref().map(|r| (&r.params, &r.creator)),
+                        );
+                        let old_elem = resource_hash_v6_with_kind(
+                            &addr,
+                            asset_id,
+                            &old_blob,
+                            old_affinity,
+                            HashKind::Asset,
+                        );
+                        if let Err(e) = trie.delete(&old_elem) {
+                            tracing::warn!("trie delete asset holding failed: {}", e);
+                        }
+                    }
+
+                    // Add new resource element.
+                    let new_holding = self.asset_holdings.get(&(addr, asset_id));
+                    let new_params = self
+                        .asset_params
+                        .get(&asset_id)
+                        .filter(|r| r.creator == addr);
+                    if new_holding.is_some() || new_params.is_some() {
+                        let new_affinity =
+                            self.accounts.get(&addr).map(compute_affinity).unwrap_or(0);
+                        let new_blob = encode_merged_asset_resource(
+                            new_holding,
+                            new_params.map(|r| (&r.params, &r.creator)),
+                        );
+                        let new_elem = resource_hash_v6_with_kind(
+                            &addr,
+                            asset_id,
+                            &new_blob,
+                            new_affinity,
+                            HashKind::Asset,
+                        );
+                        if let Err(e) = trie.add(&new_elem) {
+                            tracing::warn!("trie add asset holding failed: {}", e);
+                        }
+                    }
+                }
+                PreMutation::AssetParams {
+                    asset_id,
+                    old_record,
+                    old_holding,
+                    old_affinity,
+                } => {
+                    if let Some(ref old_rec) = old_record {
+                        let creator = old_rec.creator;
+                        let old_blob = encode_merged_asset_resource(
+                            old_holding.as_ref().map(|(_, h)| h),
+                            Some((&old_rec.params, &old_rec.creator)),
+                        );
+                        let old_elem = resource_hash_v6_with_kind(
+                            &creator,
+                            asset_id,
+                            &old_blob,
+                            old_affinity,
+                            HashKind::Asset,
+                        );
+                        if let Err(e) = trie.delete(&old_elem) {
+                            tracing::warn!("trie delete asset params failed: {}", e);
+                        }
+                    }
+
+                    // Add new element.
+                    let new_record = self.asset_params.get(&asset_id);
+                    if let Some(new_rec) = new_record {
+                        let creator = new_rec.creator;
+                        let new_holding = self.asset_holdings.get(&(creator, asset_id));
+                        let new_affinity = self
+                            .accounts
+                            .get(&creator)
+                            .map(compute_affinity)
+                            .unwrap_or(0);
+                        let new_blob = encode_merged_asset_resource(
+                            new_holding,
+                            Some((&new_rec.params, &new_rec.creator)),
+                        );
+                        let new_elem = resource_hash_v6_with_kind(
+                            &creator,
+                            asset_id,
+                            &new_blob,
+                            new_affinity,
+                            HashKind::Asset,
+                        );
+                        if let Err(e) = trie.add(&new_elem) {
+                            tracing::warn!("trie add asset params failed: {}", e);
+                        }
+                    } else if let Some((creator, _)) = old_holding {
+                        let new_h = self.asset_holdings.get(&(creator, asset_id));
+                        if let Some(h) = new_h {
+                            let new_affinity = self
+                                .accounts
+                                .get(&creator)
+                                .map(compute_affinity)
+                                .unwrap_or(0);
+                            let new_blob = encode_merged_asset_resource(Some(h), None);
+                            let new_elem = resource_hash_v6_with_kind(
+                                &creator,
+                                asset_id,
+                                &new_blob,
+                                new_affinity,
+                                HashKind::Asset,
+                            );
+                            if let Err(e) = trie.add(&new_elem) {
+                                tracing::warn!(
+                                    "trie add asset holding (post-params-remove) failed: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+                PreMutation::AppParams {
+                    app_id,
+                    old_params,
+                    old_local,
+                    old_affinity,
+                } => {
+                    if let Some(ref old_p) = old_params {
+                        let creator = old_p.creator;
+                        let old_blob = encode_merged_app_resource(
+                            old_local.as_ref().map(|(_, s)| s),
+                            Some(old_p),
+                        );
+                        let old_elem = resource_hash_v6_with_kind(
+                            &creator,
+                            app_id,
+                            &old_blob,
+                            old_affinity,
+                            HashKind::App,
+                        );
+                        if let Err(e) = trie.delete(&old_elem) {
+                            tracing::warn!("trie delete app params failed: {}", e);
+                        }
+                    }
+
+                    let new_params = self.app_params.get(&app_id);
+                    if let Some(new_p) = new_params {
+                        let creator = new_p.creator;
+                        let new_local = self.app_local_states.get(&(creator, app_id));
+                        let new_affinity = self
+                            .accounts
+                            .get(&creator)
+                            .map(compute_affinity)
+                            .unwrap_or(0);
+                        let new_blob = encode_merged_app_resource(new_local, Some(new_p));
+                        let new_elem = resource_hash_v6_with_kind(
+                            &creator,
+                            app_id,
+                            &new_blob,
+                            new_affinity,
+                            HashKind::App,
+                        );
+                        if let Err(e) = trie.add(&new_elem) {
+                            tracing::warn!("trie add app params failed: {}", e);
+                        }
+                    } else if let Some((creator, _)) = old_local {
+                        let new_l = self.app_local_states.get(&(creator, app_id));
+                        if let Some(l) = new_l {
+                            let new_affinity = self
+                                .accounts
+                                .get(&creator)
+                                .map(compute_affinity)
+                                .unwrap_or(0);
+                            let new_blob = encode_merged_app_resource(Some(l), None);
+                            let new_elem = resource_hash_v6_with_kind(
+                                &creator,
+                                app_id,
+                                &new_blob,
+                                new_affinity,
+                                HashKind::App,
+                            );
+                            if let Err(e) = trie.add(&new_elem) {
+                                tracing::warn!(
+                                    "trie add app local (post-params-remove) failed: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+                PreMutation::AppLocalState {
+                    addr,
+                    app_id,
+                    old_local,
+                    old_params,
+                    old_affinity,
+                } => {
+                    if old_local.is_some() || old_params.is_some() {
+                        let old_blob =
+                            encode_merged_app_resource(old_local.as_ref(), old_params.as_ref());
+                        let old_elem = resource_hash_v6_with_kind(
+                            &addr,
+                            app_id,
+                            &old_blob,
+                            old_affinity,
+                            HashKind::App,
+                        );
+                        if let Err(e) = trie.delete(&old_elem) {
+                            tracing::warn!("trie delete app local state failed: {}", e);
+                        }
+                    }
+
+                    let new_local = self.app_local_states.get(&(addr, app_id));
+                    let new_params = self.app_params.get(&app_id).filter(|p| p.creator == addr);
+                    if new_local.is_some() || new_params.is_some() {
+                        let new_affinity =
+                            self.accounts.get(&addr).map(compute_affinity).unwrap_or(0);
+                        let new_blob = encode_merged_app_resource(new_local, new_params);
+                        let new_elem = resource_hash_v6_with_kind(
+                            &addr,
+                            app_id,
+                            &new_blob,
+                            new_affinity,
+                            HashKind::App,
+                        );
+                        if let Err(e) = trie.add(&new_elem) {
+                            tracing::warn!("trie add app local state failed: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // H2: Cascade affinity changes to resources not already mutated.
+        // When an account's affinity changed (e.g. update_round bumped by a payment),
+        // all resource trie elements for that address use the account's affinity in
+        // bytes 0..4. If the resources themselves weren't mutated, they are stale.
+        for (addr, (old_aff, new_aff)) in &affinity_changed {
+            // Re-hash asset holdings for this address.
+            for (&(ref a, asset_id), holding) in &self.asset_holdings {
+                if a != addr {
+                    continue;
+                }
+                let params = self
+                    .asset_params
+                    .get(&asset_id)
+                    .filter(|r| r.creator == *addr);
+                let blob = encode_merged_asset_resource(
+                    Some(holding),
+                    params.map(|r| (&r.params, &r.creator)),
+                );
+                // Delete old element with old affinity.
+                let old_elem =
+                    resource_hash_v6_with_kind(addr, asset_id, &blob, *old_aff, HashKind::Asset);
+                if let Err(e) = trie.delete(&old_elem) {
+                    tracing::warn!("trie delete (affinity cascade asset) failed: {}", e);
+                }
+                // Add new element with new affinity.
+                let new_elem =
+                    resource_hash_v6_with_kind(addr, asset_id, &blob, *new_aff, HashKind::Asset);
+                if let Err(e) = trie.add(&new_elem) {
+                    tracing::warn!("trie add (affinity cascade asset) failed: {}", e);
+                }
+            }
+            // Re-hash asset params where this address is creator.
+            for (&asset_id, record) in &self.asset_params {
+                if record.creator != *addr {
+                    continue;
+                }
+                // Skip if already covered by asset_holdings iteration above.
+                if self.asset_holdings.contains_key(&(*addr, asset_id)) {
+                    continue;
+                }
+                let blob =
+                    encode_merged_asset_resource(None, Some((&record.params, &record.creator)));
+                let old_elem =
+                    resource_hash_v6_with_kind(addr, asset_id, &blob, *old_aff, HashKind::Asset);
+                if let Err(e) = trie.delete(&old_elem) {
+                    tracing::warn!("trie delete (affinity cascade asset params) failed: {}", e);
+                }
+                let new_elem =
+                    resource_hash_v6_with_kind(addr, asset_id, &blob, *new_aff, HashKind::Asset);
+                if let Err(e) = trie.add(&new_elem) {
+                    tracing::warn!("trie add (affinity cascade asset params) failed: {}", e);
+                }
+            }
+            // Re-hash app local states for this address.
+            for (&(ref a, app_id), local) in &self.app_local_states {
+                if a != addr {
+                    continue;
+                }
+                let params = self.app_params.get(&app_id).filter(|p| p.creator == *addr);
+                let blob = encode_merged_app_resource(Some(local), params);
+                let old_elem =
+                    resource_hash_v6_with_kind(addr, app_id, &blob, *old_aff, HashKind::App);
+                if let Err(e) = trie.delete(&old_elem) {
+                    tracing::warn!("trie delete (affinity cascade app local) failed: {}", e);
+                }
+                let new_elem =
+                    resource_hash_v6_with_kind(addr, app_id, &blob, *new_aff, HashKind::App);
+                if let Err(e) = trie.add(&new_elem) {
+                    tracing::warn!("trie add (affinity cascade app local) failed: {}", e);
+                }
+            }
+            // Re-hash app params where this address is creator.
+            for (&app_id, params) in &self.app_params {
+                if params.creator != *addr {
+                    continue;
+                }
+                // Skip if already covered by app_local_states iteration above.
+                if self.app_local_states.contains_key(&(*addr, app_id)) {
+                    continue;
+                }
+                let blob = encode_merged_app_resource(None, Some(params));
+                let old_elem =
+                    resource_hash_v6_with_kind(addr, app_id, &blob, *old_aff, HashKind::App);
+                if let Err(e) = trie.delete(&old_elem) {
+                    tracing::warn!("trie delete (affinity cascade app params) failed: {}", e);
+                }
+                let new_elem =
+                    resource_hash_v6_with_kind(addr, app_id, &blob, *new_aff, HashKind::App);
+                if let Err(e) = trie.add(&new_elem) {
+                    tracing::warn!("trie add (affinity cascade app params) failed: {}", e);
+                }
+            }
+        }
+
+        Some(trie.root_hash())
+    }
+}
+
+/// Encode a merged asset resource blob (holding + params) matching Go's format.
+///
+/// Combines holding fields (l, m) with params fields (a..k) and the resource
+/// flags field (y) into a single msgpack map blob.
+fn encode_merged_asset_resource(
+    holding: Option<&AssetHolding>,
+    params: Option<(&algo_types::AssetParams, &Address)>,
+) -> Vec<u8> {
+    use crate::sqlite::{encode_asset_holding, encode_asset_params};
+
+    match (holding, params) {
+        (Some(h), Some((p, creator))) => {
+            // Merge both into one blob — combine fields from both encodings.
+            // The simplest correct approach: decode both, merge maps, re-encode.
+            let h_bytes = encode_asset_holding(h);
+            let p_bytes = encode_asset_params(p, creator);
+
+            let h_val: rmpv::Value =
+                rmpv::decode::read_value(&mut &h_bytes[..]).unwrap_or(rmpv::Value::Map(vec![]));
+            let p_val: rmpv::Value =
+                rmpv::decode::read_value(&mut &p_bytes[..]).unwrap_or(rmpv::Value::Map(vec![]));
+
+            let mut merged: std::collections::BTreeMap<String, rmpv::Value> =
+                std::collections::BTreeMap::new();
+
+            if let rmpv::Value::Map(m) = p_val {
+                for (k, v) in m {
+                    if let Some(key) = k.as_str() {
+                        // Skip the "y" flags from params — we'll set our own.
+                        if key != "y" {
+                            merged.insert(key.to_string(), v);
+                        }
+                    }
+                }
+            }
+            if let rmpv::Value::Map(m) = h_val {
+                for (k, v) in m {
+                    if let Some(key) = k.as_str() {
+                        if key != "y" {
+                            merged.insert(key.to_string(), v);
+                        }
+                    }
+                }
+            }
+
+            // Set combined flags: holding (0x01) | ownership (0x04) = 0x05
+            merged.insert(
+                "y".to_string(),
+                rmpv::Value::from(
+                    crate::sqlite::RESOURCE_FLAGS_HOLDING | crate::sqlite::RESOURCE_FLAGS_OWNERSHIP,
+                ),
+            );
+
+            let pairs: Vec<(rmpv::Value, rmpv::Value)> = merged
+                .into_iter()
+                .map(|(k, v)| (rmpv::Value::String(k.into()), v))
+                .collect();
+            let val = rmpv::Value::Map(pairs);
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
+            buf
+        }
+        (Some(h), None) => encode_asset_holding(h),
+        (None, Some((p, creator))) => encode_asset_params(p, creator),
+        (None, None) => Vec::new(),
+    }
+}
+
+/// Encode a merged app resource blob (local state + params) matching Go's format.
+fn encode_merged_app_resource(
+    local_state: Option<&AppLocalState>,
+    params: Option<&AppParams>,
+) -> Vec<u8> {
+    use crate::sqlite::{encode_app_local_state, encode_app_params};
+
+    match (local_state, params) {
+        (Some(s), Some(p)) => {
+            let s_bytes = encode_app_local_state(s);
+            let p_bytes = encode_app_params(p);
+
+            let s_val: rmpv::Value =
+                rmpv::decode::read_value(&mut &s_bytes[..]).unwrap_or(rmpv::Value::Map(vec![]));
+            let p_val: rmpv::Value =
+                rmpv::decode::read_value(&mut &p_bytes[..]).unwrap_or(rmpv::Value::Map(vec![]));
+
+            let mut merged: std::collections::BTreeMap<String, rmpv::Value> =
+                std::collections::BTreeMap::new();
+
+            if let rmpv::Value::Map(m) = p_val {
+                for (k, v) in m {
+                    if let Some(key) = k.as_str() {
+                        if key != "y" {
+                            merged.insert(key.to_string(), v);
+                        }
+                    }
+                }
+            }
+            if let rmpv::Value::Map(m) = s_val {
+                for (k, v) in m {
+                    if let Some(key) = k.as_str() {
+                        if key != "y" {
+                            merged.insert(key.to_string(), v);
+                        }
+                    }
+                }
+            }
+
+            // Combined flags: holding (0x01) | ownership (0x04) = 0x05
+            merged.insert(
+                "y".to_string(),
+                rmpv::Value::from(
+                    crate::sqlite::RESOURCE_FLAGS_HOLDING | crate::sqlite::RESOURCE_FLAGS_OWNERSHIP,
+                ),
+            );
+
+            let pairs: Vec<(rmpv::Value, rmpv::Value)> = merged
+                .into_iter()
+                .map(|(k, v)| (rmpv::Value::String(k.into()), v))
+                .collect();
+            let val = rmpv::Value::Map(pairs);
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
+            buf
+        }
+        (Some(s), None) => encode_app_local_state(s),
+        (None, Some(p)) => encode_app_params(p),
+        (None, None) => Vec::new(),
     }
 }
 

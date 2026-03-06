@@ -124,6 +124,14 @@ pub enum Commands {
         /// SQLite database path for stateful replay.
         #[arg(long, default_value = "./ledger.sqlite")]
         db: PathBuf,
+
+        /// Enable Merkle trie state root computation.
+        #[arg(long)]
+        trie: bool,
+
+        /// Path to Go's tracker.db for trie root conformance comparison.
+        #[arg(long)]
+        compare_trie_db: Option<PathBuf>,
     },
 
     /// Follow mode: continuously validate new blocks as they arrive.
