@@ -62,7 +62,6 @@ services:
     image: algorand/algod:4.5.1-stable
     container_name: algod-archival
     environment:
-      - DEV_MODE=1
       - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     ports:

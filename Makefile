@@ -177,8 +177,8 @@ replay-stateful: ## Run stateful replay against localnet
 		--network custom \
 		--algod-url http://localhost:4001 \
 		--algod-token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-		--start-round 1 \
-		--count 100 \
+		--start 1 \
+		--end 100 \
 		--db ./ledger-localnet.sqlite
 
 replay-mainnet-stateful: ## Run stateful replay against mainnet archival node
@@ -186,8 +186,8 @@ replay-mainnet-stateful: ## Run stateful replay against mainnet archival node
 		--stateful \
 		--genesis crates/core/algo-ledger/tests/fixtures/mainnet-genesis.json \
 		--network mainnet \
-		--start-round $(START_ROUND) \
-		--count $(COUNT) \
+		--start $(START_ROUND) \
+		--end $$(( $(START_ROUND) + $(COUNT) - 1 )) \
 		--compare \
 		--compare-url http://localhost:4002 \
 		--compare-token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \

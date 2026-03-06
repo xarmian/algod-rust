@@ -291,6 +291,15 @@ fn collect_touched_addresses(block: &algo_types::Block) -> Vec<Address> {
                 addrs.insert(*a);
             }
         }
+        // Application accounts array: these can be mutated by EvalDelta
+        // and inner transactions.
+        if let Some(ref accounts) = txn.accounts {
+            for acct in accounts {
+                if !acct.is_zero() {
+                    addrs.insert(*acct);
+                }
+            }
+        }
     }
 
     addrs.into_iter().collect()
@@ -321,6 +330,9 @@ pub async fn run_stateful(
     let client = AlgodClient::new(algod_url, algod_token);
 
     // Open or create the SQLite ledger.
+    // NOTE: On resume, in-memory leases from the previous session are lost.
+    // This is acceptable because committed blocks are already validated —
+    // lease violations cannot occur during replay of valid chain history.
     let db_exists = db_path.exists();
     let mut store = algo_ledger::SqliteLedger::open(db_path)?;
 
