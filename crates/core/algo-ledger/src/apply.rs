@@ -988,8 +988,13 @@ fn apply_appl(
                 }
             }
         }
-        _ => {
-            // NoOp (0) or unknown — no structural state changes beyond EvalDelta.
+        0 => {
+            // NoOp — no structural state changes beyond EvalDelta.
+        }
+        other => {
+            return Err(AlgoError::Ledger {
+                message: format!("appl: unknown on_completion value {}", other),
+            });
         }
     }
 
