@@ -661,19 +661,30 @@ fn apply_axfer(
 
         // ── Transfer ──
         // Both sender and receiver must be opted in, even for zero-amount transfers.
-        {
-            if !state.asset_holdings.contains_key(&(from_addr, asset_id)) {
-                return Err(AlgoError::Ledger {
-                    message: format!("axfer: {} has no holding for asset {}", from_addr, asset_id),
-                });
-            }
-            if !state.asset_holdings.contains_key(&(asset_receiver, asset_id)) {
-                return Err(AlgoError::Ledger {
-                    message: format!(
-                        "axfer: receiver {} has no holding for asset {} (not opted in)",
-                        asset_receiver, asset_id,
-                    ),
-                });
+        if !state.asset_holdings.contains_key(&(from_addr, asset_id)) {
+            return Err(AlgoError::Ledger {
+                message: format!("axfer: {} has no holding for asset {}", from_addr, asset_id),
+            });
+        }
+        if !state.asset_holdings.contains_key(&(asset_receiver, asset_id)) {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "axfer: receiver {} has no holding for asset {} (not opted in)",
+                    asset_receiver, asset_id,
+                ),
+            });
+        }
+        // Check receiver frozen (non-clawback only, matching go-algorand).
+        if !is_clawback {
+            if let Some(recv_holding) = state.asset_holdings.get(&(asset_receiver, asset_id)) {
+                if recv_holding.frozen {
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "axfer: receiver {} holding for asset {} is frozen",
+                            asset_receiver, asset_id,
+                        ),
+                    });
+                }
             }
         }
         if txn.asset_amount > 0 {
