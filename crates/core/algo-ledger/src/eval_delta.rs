@@ -225,6 +225,11 @@ pub fn apply_eval_delta(
     }
 
     // Recursively apply inner transactions.
+    // NOTE: Inner txn recipients are not in the outer transaction's snapshot,
+    // so if the outer call fails after inner txns execute, those side-effects
+    // won't roll back. This is acceptable for committed block replay (blocks
+    // are valid by definition). For independent validation, inner txn addresses
+    // would need to be collected and added to the outer snapshot.
     if let Some(ref inner_txns) = delta.inner_txns {
         if depth >= MAX_INNER_TXN_DEPTH {
             return Err(AlgoError::Ledger {

@@ -574,6 +574,16 @@ fn apply_axfer(
     let from_addr = clawback_source.unwrap_or(txn.sender);
     let is_clawback = clawback_source.is_some();
 
+    // ── Clawback cannot use close-to (go-algorand: "cannot close asset by clawback") ──
+    if is_clawback && txn.asset_close_to.is_some_and(|a| !a.is_zero()) {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "axfer: cannot close asset by clawback (asset {})",
+                asset_id,
+            ),
+        });
+    }
+
     // ── Clawback authorization ──
     if is_clawback {
         let params = state
@@ -679,9 +689,9 @@ fn apply_axfer(
         // ── Close-to ──
         if let Some(close_to) = txn.asset_close_to {
             if !close_to.is_zero() {
-                // Get remaining balance from sender (the from_addr for non-clawback is txn.sender).
-                // For close-to, the "from" is always the txn sender, not the clawback source.
-                let close_from = txn.sender;
+                // Close the source account's holding. For non-clawback, from_addr == txn.sender.
+                // (Clawback + close-to is rejected above, so from_addr is always txn.sender here.)
+                let close_from = from_addr;
                 let remaining = state
                     .asset_holdings
                     .get(&(close_from, asset_id))
