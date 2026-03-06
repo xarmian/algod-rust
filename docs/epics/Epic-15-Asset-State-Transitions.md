@@ -33,11 +33,14 @@ replay, these recorded deltas must be applied even though we don't re-execute TE
    - Increase creator's min-balance by 100,000 microAlgos (asset holding)
 
 2. **Asset reconfigure** (`acfg` with config_asset!=0)
-   - Verify sender is current manager (or fail)
-   - Update manager, reserve, freeze, clawback addresses
-   - Only specified addresses change; unspecified remain (Go semantics: empty = clear)
+   - Verify sender is current manager; if manager is zero (cleared), reject (asset is immutable)
+   - Only update a role if it is currently non-zero in the ledger (cleared roles are permanently locked)
+   - Zero address in txn = clear that role; absence from msgpack = zero address (equivalent)
+   - Only the 4 address roles (manager, reserve, freeze, clawback) are mutable post-creation
+   - Non-address fields (total, decimals, default_frozen, unit_name, etc.) are NOT updated on reconfig
 
-3. **Asset destroy** (`acfg` with config_asset!=0, empty params)
+3. **Asset destroy** (`acfg` with config_asset!=0, all-zero AssetParams)
+   - Detection: `txn.asset_params == AssetParams::default()` (all fields zero/absent)
    - Verify creator holds full supply (all units returned)
    - Remove asset params from global state
    - Remove creator's holding
@@ -64,9 +67,14 @@ replay, these recorded deltas must be applied even though we don't re-execute TE
    - 100,000 microAlgos per created asset
    - 100,000 microAlgos per opted-in app
    - 100,000 microAlgos per created app
-   - 28,500 microAlgos per extra app page
-   - Additional per schema entry: 25,000 per uint, 25,000 per byte-slice
-   - `compute_min_balance(account) -> u64` function
+   - 100,000 microAlgos per extra app page (= AppFlatParamsMinBalance)
+   - Per schema entry (three-tier costing from go-algorand):
+     - SchemaMinBalancePerEntry: 25,000 per slot (uint or byte-slice)
+     - SchemaUintMinBalance: 3,500 additive per uint slot (total: 28,500/uint)
+     - SchemaBytesMinBalance: 25,000 additive per byte-slice slot (total: 50,000/byte-slice)
+   - Schema-aware `compute_min_balance(account, &LedgerState) -> u64` that looks up
+     per-app global/local schemas to compute exact schema cost
+   - `compute_min_balance(account) -> u64` simple version (no schema) retained for tests
 
 8. **Minimal EvalDelta parsing**
    - Model `EvalDelta` struct (replacing opaque `rmpv::Value`):

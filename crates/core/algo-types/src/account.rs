@@ -81,6 +81,7 @@ pub struct AppLocalState {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppParams {
+    pub creator: Address,
     pub approval_program: Vec<u8>,
     pub clear_state_program: Vec<u8>,
     pub global_state: BTreeMap<Vec<u8>, TealValue>,

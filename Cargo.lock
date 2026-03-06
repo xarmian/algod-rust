@@ -73,6 +73,8 @@ dependencies = [
  "algo-error",
  "algo-types",
  "data-encoding",
+ "rmp-serde",
+ "rmpv",
  "serde",
  "serde_bytes",
  "serde_json",
