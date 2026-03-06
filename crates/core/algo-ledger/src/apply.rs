@@ -16,9 +16,11 @@ pub struct ApplyContext {
 /// Updates rewards parameters from the block header, then applies each
 /// transaction in payset order. Finally updates `current_round`.
 ///
-/// On error, rewards state is restored to its pre-block values.
-/// In practice, committed blocks should never produce errors — the checks
-/// here are defensive safety nets.
+/// On error, rewards state is restored to its pre-block values. Note that
+/// account mutations from earlier successful transactions in the payset are
+/// NOT rolled back — the caller should treat the state as corrupted on error.
+/// In practice, committed blocks are already validated and should never
+/// produce errors — the checks here are defensive safety nets.
 pub fn apply_block(state: &mut LedgerState, block: &Block) -> Result<(), AlgoError> {
     // Validate round monotonicity.
     let expected = Round(state.current_round.0 + 1);
@@ -99,8 +101,12 @@ pub fn apply_transaction(
         touched.push(txn.close_remainder_to);
     }
 
-    // Snapshot touched accounts before applying rewards (for rollback on error).
-    let snapshots: Vec<(Address, AccountData)> = touched
+    // Snapshot all accounts that may be mutated (touched + fee_sink) for rollback.
+    let mut snapshot_addrs = touched.clone();
+    if !snapshot_addrs.contains(&ctx.fee_sink) {
+        snapshot_addrs.push(ctx.fee_sink);
+    }
+    let snapshots: Vec<(Address, AccountData)> = snapshot_addrs
         .iter()
         .map(|addr| {
             let data = state.get_or_default_account(addr).clone();
@@ -587,5 +593,32 @@ mod tests {
             state.get_account(&rewards_pool).unwrap().micro_algos,
             10_000_000
         );
+    }
+
+    #[test]
+    fn test_fee_sink_rolled_back_on_close_failure() {
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let close_to = Address([4u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 100)], fee_sink);
+        state.get_or_default_account(&sender).total_assets_opted_in = 1;
+
+        let ctx = ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+        };
+        let mut stx = pay_txn(sender, receiver, 0, 1_000);
+        stx.txn.close_remainder_to = close_to;
+
+        // This fails because sender has opted-in assets.
+        let result = apply_transaction(&mut state, &stx, &ctx);
+        assert!(result.is_err());
+
+        // Fee sink should be rolled back — fee was credited inside apply_pay
+        // but the close check failed, so the whole transaction is reverted.
+        assert_eq!(state.get_account(&fee_sink).unwrap().micro_algos, 100);
+        assert_eq!(state.get_account(&sender).unwrap().micro_algos, 1_000_000);
     }
 }
