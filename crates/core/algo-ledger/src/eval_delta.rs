@@ -4,7 +4,9 @@ use algo_error::AlgoError;
 use algo_types::{AppLocalState, AppParams, SignedTransaction, StateSchema, TealValue};
 
 use crate::apply::{apply_transaction, ApplyContext};
-use crate::state::LedgerState;
+
+// NOTE: LedgerStore is referenced via full path in function bounds rather
+// than imported at module level. See apply.rs for rationale.
 
 /// Action types for state delta changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,10 +119,10 @@ const MAX_INNER_TXN_DEPTH: u32 = 256;
 /// Apply a parsed EvalDelta to the ledger state.
 ///
 /// Updates global state, local state, and recursively applies inner transactions.
-pub fn apply_eval_delta(
+pub fn apply_eval_delta<L: crate::store_trait::LedgerStore>(
     stx: &SignedTransaction,
     delta: &EvalDelta,
-    state: &mut LedgerState,
+    store: &mut L,
     ctx: &ApplyContext,
     depth: u32,
 ) -> Result<(), AlgoError> {
@@ -138,7 +140,7 @@ pub fn apply_eval_delta(
     if let Some(ref gd) = delta.global_delta {
         if app_id != 0 {
             // Ensure app_params entry exists.
-            let app = state.app_params.entry(app_id).or_insert_with(|| AppParams {
+            let mut app = store.get_or_insert_app_params(app_id, || AppParams {
                 creator: txn.sender,
                 approval_program: Vec::new(),
                 clear_state_program: Vec::new(),
@@ -163,6 +165,8 @@ pub fn apply_eval_delta(
                     }
                 }
             }
+
+            store.set_app_params(app_id, app);
         }
     }
 
@@ -195,10 +199,8 @@ pub fn apply_eval_delta(
                 // happened in an inner txn earlier in this call), create a
                 // placeholder — the OptIn branch in apply_appl will fix up
                 // the schema and counter afterward.
-                let local = state
-                    .app_local_states
-                    .entry((addr, app_id))
-                    .or_insert_with(|| AppLocalState {
+                let mut local =
+                    store.get_or_insert_app_local_state(&addr, app_id, || AppLocalState {
                         schema: StateSchema::default(),
                         key_value: std::collections::BTreeMap::new(),
                     });
@@ -220,6 +222,8 @@ pub fn apply_eval_delta(
                         }
                     }
                 }
+
+                store.set_app_local_state(&addr, app_id, local);
             }
         }
     }
@@ -240,7 +244,7 @@ pub fn apply_eval_delta(
             });
         }
         for inner_stx in inner_txns {
-            apply_transaction(state, inner_stx, ctx, depth + 1)?;
+            apply_transaction(store, inner_stx, ctx, depth + 1)?;
         }
     }
 

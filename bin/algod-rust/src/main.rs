@@ -50,6 +50,13 @@ async fn main() -> anyhow::Result<()> {
             end,
             fail_fast,
             report,
+            stateful,
+            genesis,
+            compare,
+            compare_url,
+            compare_token,
+            sample_rate,
+            db,
         } => {
             let (resolved_url, resolved_token, net_name) = match network.as_str() {
                 "mainnet" => (
@@ -75,16 +82,36 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             };
-            commands::replay::run(
-                net_name,
-                &resolved_url,
-                &resolved_token,
-                start,
-                end,
-                fail_fast,
-                report.as_deref(),
-            )
-            .await?;
+
+            if stateful {
+                commands::replay::run_stateful(
+                    net_name,
+                    &resolved_url,
+                    &resolved_token,
+                    start,
+                    end,
+                    fail_fast,
+                    report.as_deref(),
+                    genesis.as_deref(),
+                    compare,
+                    &compare_url,
+                    &compare_token,
+                    sample_rate,
+                    &db,
+                )
+                .await?;
+            } else {
+                commands::replay::run(
+                    net_name,
+                    &resolved_url,
+                    &resolved_token,
+                    start,
+                    end,
+                    fail_fast,
+                    report.as_deref(),
+                )
+                .await?;
+            }
         }
         Commands::Follow {
             algod_url,

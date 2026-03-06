@@ -8,9 +8,10 @@ algo-types = { workspace = true }
 algo-error = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_bytes = { workspace = true }
 data-encoding = { workspace = true }
 rmpv = { workspace = true }
 rmp-serde = { workspace = true }
-
-[dev-dependencies]
-serde_bytes = { workspace = true }
+rmp = { workspace = true }
+rusqlite = { workspace = true }
+tracing = { workspace = true }
