@@ -225,6 +225,7 @@ Epic 13 is the critical path — everything else depends on having the account m
 - **State root verification**: Epic 17b (Merkle trie state root) is a stretch goal. go-algorand's `merkletrie` is page-based and compressed. If too complex, defer to Phase 2.5 or Phase 3.
 - **Box storage**: Full box storage accounting (min-balance impact, per-box costs) is modeled but deep box state verification may require Phase 3 AVM support.
 - **Min-balance edge cases**: The min-balance formula depends on opted-in assets, apps, schema sizes, boxes, and extra pages. Formula must match exactly — edge cases may surface during mainnet replay.
+- **Conformance comparison address coverage**: The `--compare` flag in stateful replay collects touched addresses from transaction fields and the `accounts` array, but does not walk inner transactions from EvalDelta to discover additional addresses mutated by inner txns. Accounts only reachable via inner transactions (e.g., app-to-app calls crediting a third-party address) will not be compared. Full inner-txn address extraction should be added in Epic 18 or Phase 3 when EvalDelta modeling is more complete.
 
 ---
 
