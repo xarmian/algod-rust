@@ -660,14 +660,28 @@ fn apply_axfer(
         }
 
         // ── Transfer ──
+        // Both sender and receiver must be opted in, even for zero-amount transfers.
+        {
+            if !state.asset_holdings.contains_key(&(from_addr, asset_id)) {
+                return Err(AlgoError::Ledger {
+                    message: format!("axfer: {} has no holding for asset {}", from_addr, asset_id),
+                });
+            }
+            if !state.asset_holdings.contains_key(&(asset_receiver, asset_id)) {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "axfer: receiver {} has no holding for asset {} (not opted in)",
+                        asset_receiver, asset_id,
+                    ),
+                });
+            }
+        }
         if txn.asset_amount > 0 {
             // Debit from.
             let from_holding = state
                 .asset_holdings
                 .get_mut(&(from_addr, asset_id))
-                .ok_or_else(|| AlgoError::Ledger {
-                    message: format!("axfer: {} has no holding for asset {}", from_addr, asset_id,),
-                })?;
+                .unwrap();
             if from_holding.amount < txn.asset_amount {
                 return Err(AlgoError::Ledger {
                     message: format!(
@@ -682,12 +696,7 @@ fn apply_axfer(
             let recv_holding = state
                 .asset_holdings
                 .get_mut(&(asset_receiver, asset_id))
-                .ok_or_else(|| AlgoError::Ledger {
-                    message: format!(
-                        "axfer: receiver {} has no holding for asset {} (not opted in)",
-                        asset_receiver, asset_id,
-                    ),
-                })?;
+                .unwrap();
             recv_holding.amount += txn.asset_amount;
         }
 
@@ -819,7 +828,11 @@ fn apply_appl(
     };
 
     // For non-create calls, verify the app exists in state.
-    if !is_create && !state.app_params.contains_key(&app_id) {
+    // Exception: ClearState always succeeds even if app is deleted (lets users reclaim local state).
+    if !is_create
+        && txn.on_completion != ON_COMPLETION_CLEAR_STATE
+        && !state.app_params.contains_key(&app_id)
+    {
         return Err(AlgoError::Ledger {
             message: format!("appl: app {} does not exist", app_id),
         });
