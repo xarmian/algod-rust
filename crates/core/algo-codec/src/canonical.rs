@@ -140,11 +140,7 @@ impl CanonicalMap {
         }
     }
 
-    fn add_option_vec_bytes(
-        &mut self,
-        key: &'static str,
-        val: &Option<Vec<Option<ByteBuf>>>,
-    ) {
+    fn add_option_vec_bytes(&mut self, key: &'static str, val: &Option<Vec<Option<ByteBuf>>>) {
         if let Some(items) = val {
             if !items.is_empty() {
                 let mut buf = Vec::new();
