@@ -86,6 +86,8 @@ pub struct AvmMachine {
     pub pass: bool,
     /// Pre-built map from byte offset to instruction index for O(1) branch resolution.
     pub(crate) offset_to_index: HashMap<usize, usize>,
+    /// Byte offset just past the last instruction (valid branch-to-end target).
+    pub(crate) end_of_program_offset: usize,
 }
 
 impl AvmMachine {
@@ -102,6 +104,13 @@ impl AvmMachine {
         for (idx, instr) in program.instructions.iter().enumerate() {
             offset_to_index.insert(instr.offset, idx);
         }
+        // Compute end-of-program byte offset (after last instruction + its immediates).
+        let end_of_program_offset = if let Some(last) = program.instructions.last() {
+            let imm_len = crate::validator::immediate_byte_len(&last.immediates);
+            last.offset + 1 + imm_len
+        } else {
+            0
+        };
         AvmMachine {
             stack: Vec::new(),
             call_stack: Vec::new(),
@@ -116,6 +125,7 @@ impl AvmMachine {
             finished: false,
             pass: false,
             offset_to_index,
+            end_of_program_offset,
         }
     }
 
@@ -239,14 +249,21 @@ impl AvmMachine {
         let after_instr = instr.offset + 1 + imm_len;
         let target_offset = (after_instr as isize + offset as isize) as usize;
 
-        self.offset_to_index
-            .get(&target_offset)
-            .copied()
-            .ok_or_else(|| AlgoError::Avm {
-                message: format!(
-                    "branch target byte offset {target_offset} does not match any instruction"
-                ),
-            })
+        // Check if target is an instruction boundary.
+        if let Some(&idx) = self.offset_to_index.get(&target_offset) {
+            return Ok(idx);
+        }
+
+        // Allow branching to end-of-program (triggers implicit termination).
+        if target_offset == self.end_of_program_offset {
+            return Ok(self.program.instructions.len());
+        }
+
+        Err(AlgoError::Avm {
+            message: format!(
+                "branch target byte offset {target_offset} does not match any instruction"
+            ),
+        })
     }
 
     /// Push a frame onto the call stack.

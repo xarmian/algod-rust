@@ -256,15 +256,20 @@ fn resolve_label(
     let after_instr = instruction.offset + 1 + imm_len;
     let target_byte_offset = (after_instr as isize + label_offset as isize) as usize;
 
-    machine
-        .offset_to_index
-        .get(&target_byte_offset)
-        .copied()
-        .ok_or_else(|| AlgoError::Avm {
-            message: format!(
-                "switch/match: branch target byte offset {target_byte_offset} does not match any instruction"
-            ),
-        })
+    if let Some(&idx) = machine.offset_to_index.get(&target_byte_offset) {
+        return Ok(idx);
+    }
+
+    // Allow targeting end-of-program.
+    if target_byte_offset == machine.end_of_program_offset {
+        return Ok(machine.program.instructions.len());
+    }
+
+    Err(AlgoError::Avm {
+        message: format!(
+            "switch/match: branch target byte offset {target_byte_offset} does not match any instruction"
+        ),
+    })
 }
 
 /// Helper: resolve Int16 branch offset and set PC.
