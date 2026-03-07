@@ -9,6 +9,7 @@ members = [
     "crates/tools/algo-conformance",
     "crates/core/algo-validate",
     "crates/core/algo-ledger",
+    "crates/core/algo-avm",
     "bin/algod-rust",
 ]
 exclude = ["fuzz"]
@@ -65,3 +66,5 @@ algo-fixtures = { path = "crates/tools/algo-fixtures" }
 algo-conformance = { path = "crates/tools/algo-conformance" }
 algo-validate = { path = "crates/core/algo-validate" }
 algo-ledger = { path = "crates/core/algo-ledger" }
+algo-avm = { path = "crates/core/algo-avm" }
+num-bigint = "0.4"
