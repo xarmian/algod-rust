@@ -242,9 +242,9 @@ pub struct Transaction {
     #[serde(rename = "apls", default, skip_serializing_if = "Option::is_none")]
     pub local_state_schema: Option<StateSchema>,
 
-    /// Extra program pages.
-    #[serde(rename = "apep", default, skip_serializing_if = "is_zero_u64")]
-    pub extra_program_pages: u64,
+    /// Extra program pages (uint32 in Go).
+    #[serde(rename = "apep", default, skip_serializing_if = "is_zero_u32")]
+    pub extra_program_pages: u32,
 
     // ── Key Registration (keyreg) fields ──────────────────────
     /// Vote public key.
@@ -280,20 +280,24 @@ pub struct Transaction {
     #[serde(rename = "sptype", default, skip_serializing_if = "is_zero_u64")]
     pub state_proof_type: u64,
 
-    /// State proof body (opaque, passthrough encoding).
+    /// State proof body.
     #[serde(rename = "sp", default, skip_serializing_if = "Option::is_none")]
-    pub state_proof: Option<rmpv::Value>,
+    pub state_proof: Option<StateProofBody>,
 
-    /// State proof message (opaque, passthrough encoding).
+    /// State proof message.
     #[serde(rename = "spmsg", default, skip_serializing_if = "Option::is_none")]
-    pub state_proof_message: Option<rmpv::Value>,
+    pub state_proof_message: Option<StateProofMessage>,
 
     // ── Heartbeat (hb) fields ───────────────────────────────────
-    /// Heartbeat fields (opaque nested sub-map, passthrough encoding).
+    /// Heartbeat fields.
     #[serde(rename = "hb", default, skip_serializing_if = "Option::is_none")]
-    pub heartbeat: Option<rmpv::Value>,
+    pub heartbeat: Option<HeartbeatTxnFields>,
 
     // ── Application Call extended fields ────────────────────────
+    /// Access list (V41+ unified resource references).
+    #[serde(rename = "al", default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<Vec<ResourceRef>>,
+
     /// Reject version for application calls.
     #[serde(rename = "aprv", default, skip_serializing_if = "is_zero_u64")]
     pub reject_version: u64,
@@ -304,6 +308,18 @@ fn is_empty_bytes(v: &ByteBuf) -> bool {
 }
 
 fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
+}
+
+fn is_zero_u8(v: &u8) -> bool {
     *v == 0
 }
 
@@ -370,9 +386,9 @@ pub struct AssetParams {
     #[serde(rename = "t", default, skip_serializing_if = "is_zero_u64")]
     pub total: u64,
 
-    /// Number of decimals.
-    #[serde(rename = "dc", default, skip_serializing_if = "is_zero_u64")]
-    pub decimals: u64,
+    /// Number of decimals (uint32 in Go).
+    #[serde(rename = "dc", default, skip_serializing_if = "is_zero_u32")]
+    pub decimals: u32,
 
     /// Default frozen.
     #[serde(rename = "df", default, skip_serializing_if = "is_false")]
@@ -434,4 +450,266 @@ pub struct BoxRef {
     /// Box name.
     #[serde(rename = "n", default, skip_serializing_if = "Option::is_none")]
     pub name: Option<ByteBuf>,
+}
+
+// ── Heartbeat types ────────────────────────────────────────────
+
+/// Heartbeat proof (crypto.HeartbeatProof in Go).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HeartbeatProof {
+    /// Ed25519 signature ([64]byte).
+    #[serde(rename = "s", default, skip_serializing_if = "is_empty_bytes")]
+    pub sig: ByteBuf,
+
+    /// Ephemeral public key ([32]byte).
+    #[serde(rename = "p", default, skip_serializing_if = "is_empty_bytes")]
+    pub pk: ByteBuf,
+
+    /// Second ephemeral public key ([32]byte).
+    #[serde(rename = "p2", default, skip_serializing_if = "is_empty_bytes")]
+    pub pk2: ByteBuf,
+
+    /// PK1 signature ([64]byte).
+    #[serde(rename = "p1s", default, skip_serializing_if = "is_empty_bytes")]
+    pub pk1_sig: ByteBuf,
+
+    /// PK2 signature ([64]byte).
+    #[serde(rename = "p2s", default, skip_serializing_if = "is_empty_bytes")]
+    pub pk2_sig: ByteBuf,
+}
+
+/// Heartbeat transaction fields.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HeartbeatTxnFields {
+    /// Heartbeat address ([32]byte).
+    #[serde(rename = "a", default, skip_serializing_if = "Address::is_zero")]
+    pub address: Address,
+
+    /// Heartbeat proof.
+    #[serde(rename = "prf", default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<HeartbeatProof>,
+
+    /// Seed ([32]byte).
+    #[serde(rename = "sd", default, skip_serializing_if = "is_empty_bytes")]
+    pub seed: ByteBuf,
+
+    /// Vote ID ([32]byte).
+    #[serde(rename = "vid", default, skip_serializing_if = "is_empty_bytes")]
+    pub vote_id: ByteBuf,
+
+    /// Key dilution.
+    #[serde(rename = "kd", default, skip_serializing_if = "is_zero_u64")]
+    pub key_dilution: u64,
+}
+
+// ── State Proof types ──────────────────────────────────────────
+
+/// Hash factory (crypto.HashFactory in Go).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HashFactory {
+    /// Hash type (uint16 in Go).
+    #[serde(rename = "t", default, skip_serializing_if = "is_zero_u16")]
+    pub hash_type: u16,
+}
+
+/// Merkle array proof (merklearray.Proof in Go).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MerkleProof {
+    /// Proof path — array of generic digests ([]byte each).
+    #[serde(rename = "pth", default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<Vec<Option<ByteBuf>>>,
+
+    /// Hash factory.
+    #[serde(rename = "hsh", default, skip_serializing_if = "Option::is_none")]
+    pub hash_factory: Option<HashFactory>,
+
+    /// Tree depth.
+    #[serde(rename = "td", default, skip_serializing_if = "is_zero_u8")]
+    pub tree_depth: u8,
+}
+
+/// Falcon verifier (crypto.FalconVerifier in Go).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FalconVerifier {
+    /// Falcon public key ([1793]byte in Go, variable-length bytes here).
+    #[serde(rename = "k", default, skip_serializing_if = "is_empty_bytes")]
+    pub public_key: ByteBuf,
+}
+
+/// Merkle signature (merklesignature.Signature in Go).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MerkleSignature {
+    /// Falcon signature (variable length).
+    #[serde(rename = "sig", default, skip_serializing_if = "is_empty_bytes")]
+    pub signature: ByteBuf,
+
+    /// Vector commitment index.
+    #[serde(rename = "idx", default, skip_serializing_if = "is_zero_u64")]
+    pub vector_commitment_index: u64,
+
+    /// Single leaf proof.
+    #[serde(rename = "prf", default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<MerkleProof>,
+
+    /// Falcon verifying key.
+    #[serde(rename = "vkey", default, skip_serializing_if = "Option::is_none")]
+    pub verifying_key: Option<FalconVerifier>,
+}
+
+/// Signature slot commit (stateproof.sigslotCommit in Go).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SigSlotCommit {
+    /// Merkle signature.
+    #[serde(rename = "s", default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<MerkleSignature>,
+
+    /// L value.
+    #[serde(rename = "l", default, skip_serializing_if = "is_zero_u64")]
+    pub l: u64,
+}
+
+/// Merkle signature verifier (merklesignature.Verifier in Go).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MerkleSignatureVerifier {
+    /// Commitment ([64]byte).
+    #[serde(rename = "cmt", default, skip_serializing_if = "is_empty_bytes")]
+    pub commitment: ByteBuf,
+
+    /// Key lifetime.
+    #[serde(rename = "lf", default, skip_serializing_if = "is_zero_u64")]
+    pub key_lifetime: u64,
+}
+
+/// State proof participant (basics.Participant in Go).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Participant {
+    /// Verifier.
+    #[serde(rename = "p", default, skip_serializing_if = "Option::is_none")]
+    pub pk: Option<MerkleSignatureVerifier>,
+
+    /// Weight.
+    #[serde(rename = "w", default, skip_serializing_if = "is_zero_u64")]
+    pub weight: u64,
+}
+
+/// State proof reveal (stateproof.Reveal in Go).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Reveal {
+    /// Signature slot.
+    #[serde(rename = "s", default, skip_serializing_if = "Option::is_none")]
+    pub sig_slot: Option<SigSlotCommit>,
+
+    /// Participant.
+    #[serde(rename = "p", default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<Participant>,
+}
+
+/// State proof body (stateproof.StateProof in Go).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StateProofBody {
+    /// Signature commitment (GenericDigest = []byte).
+    #[serde(rename = "c", default, skip_serializing_if = "is_empty_bytes")]
+    pub sig_commit: ByteBuf,
+
+    /// Signed weight.
+    #[serde(rename = "w", default, skip_serializing_if = "is_zero_u64")]
+    pub signed_weight: u64,
+
+    /// Signature proofs.
+    #[serde(rename = "S", default, skip_serializing_if = "Option::is_none")]
+    pub sig_proofs: Option<MerkleProof>,
+
+    /// Participant proofs.
+    #[serde(rename = "P", default, skip_serializing_if = "Option::is_none")]
+    pub part_proofs: Option<MerkleProof>,
+
+    /// Merkle signature salt version.
+    #[serde(rename = "v", default, skip_serializing_if = "is_zero_u8")]
+    pub merkle_signature_salt_version: u8,
+
+    /// Reveals (map from uint64 position to Reveal).
+    #[serde(rename = "r", default, skip_serializing_if = "Option::is_none")]
+    pub reveals: Option<std::collections::BTreeMap<u64, Reveal>>,
+
+    /// Positions to reveal.
+    #[serde(rename = "pr", default, skip_serializing_if = "Option::is_none")]
+    pub positions_to_reveal: Option<Vec<u64>>,
+}
+
+/// State proof message (stateproofmsg.Message in Go).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StateProofMessage {
+    /// Block headers commitment ([]byte, max 32).
+    #[serde(rename = "b", default, skip_serializing_if = "is_empty_bytes")]
+    pub block_headers_commitment: ByteBuf,
+
+    /// Voters commitment ([]byte, max 64).
+    #[serde(rename = "v", default, skip_serializing_if = "is_empty_bytes")]
+    pub voters_commitment: ByteBuf,
+
+    /// Ln proven weight.
+    #[serde(rename = "P", default, skip_serializing_if = "is_zero_u64")]
+    pub ln_proven_weight: u64,
+
+    /// First attested round.
+    #[serde(rename = "f", default, skip_serializing_if = "is_zero_u64")]
+    pub first_attested_round: u64,
+
+    /// Last attested round.
+    #[serde(rename = "l", default, skip_serializing_if = "is_zero_u64")]
+    pub last_attested_round: u64,
+}
+
+// ── Access / Resource Reference types (V41+) ───────────────────
+
+/// Holding reference (index-based, within Access list).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HoldingRef {
+    /// Address index (0=Sender, n-1=1-based index into Access list).
+    #[serde(rename = "d", default, skip_serializing_if = "is_zero_u64")]
+    pub address: u64,
+
+    /// Asset index (n-1=1-based index into Access list).
+    #[serde(rename = "s", default, skip_serializing_if = "is_zero_u64")]
+    pub asset: u64,
+}
+
+/// Locals reference (index-based, within Access list).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LocalsRef {
+    /// Address index (0=Sender, n-1=1-based index into Access list).
+    #[serde(rename = "d", default, skip_serializing_if = "is_zero_u64")]
+    pub address: u64,
+
+    /// App index (0=ApplicationID, n-1=1-based index into Access list).
+    #[serde(rename = "p", default, skip_serializing_if = "is_zero_u64")]
+    pub app: u64,
+}
+
+/// Unified resource reference (V41+ Access list entry).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResourceRef {
+    /// Direct address reference.
+    #[serde(rename = "d", default, skip_serializing_if = "Address::is_zero")]
+    pub address: Address,
+
+    /// Direct asset reference.
+    #[serde(rename = "s", default, skip_serializing_if = "is_zero_u64")]
+    pub asset: u64,
+
+    /// Direct app reference.
+    #[serde(rename = "p", default, skip_serializing_if = "is_zero_u64")]
+    pub app: u64,
+
+    /// Holding reference.
+    #[serde(rename = "h", default, skip_serializing_if = "Option::is_none")]
+    pub holding: Option<HoldingRef>,
+
+    /// Locals reference.
+    #[serde(rename = "l", default, skip_serializing_if = "Option::is_none")]
+    pub locals: Option<LocalsRef>,
+
+    /// Box reference.
+    #[serde(rename = "b", default, skip_serializing_if = "Option::is_none")]
+    pub box_ref: Option<BoxRef>,
 }

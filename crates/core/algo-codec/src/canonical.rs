@@ -10,8 +10,11 @@
 // 7. Deterministic — identical inputs always produce identical bytes
 
 use algo_types::{
-    Address, AssetParams, Block, BlockHeader, BoxRef, Digest, LogicSig, MultisigSig,
-    MultisigSubsig, SignedTransaction, StateSchema, Transaction,
+    Address, AssetParams, Block, BlockHeader, BoxRef, Digest, FalconVerifier, HashFactory,
+    HeartbeatProof, HeartbeatTxnFields, HoldingRef, LocalsRef, LogicSig, MerkleProof,
+    MerkleSignature, MerkleSignatureVerifier, MultisigSig, MultisigSubsig, Participant,
+    ResourceRef, Reveal, SigSlotCommit, SignedTransaction, StateProofBody, StateProofMessage,
+    StateSchema, Transaction,
 };
 use serde_bytes::ByteBuf;
 
@@ -280,6 +283,19 @@ pub fn canonical_encode_transaction(tx: &Transaction) -> Vec<u8> {
 
     // Asset transfer (axfer)
     m.add_u64("aamt", tx.asset_amount);
+
+    // Access list (V41+)
+    if let Some(ref access) = tx.access {
+        if !access.is_empty() {
+            let maps: Vec<Vec<u8>> = access.iter().map(canonical_encode_resource_ref).collect();
+            let mut buf = Vec::new();
+            rmp::encode::write_array_len(&mut buf, maps.len() as u32).unwrap();
+            for map in &maps {
+                buf.extend_from_slice(map);
+            }
+            m.fields.push(("al", buf));
+        }
+    }
     m.add_option_address("aclose", &tx.asset_close_to);
 
     // Asset freeze (afrz)
@@ -295,7 +311,7 @@ pub fn canonical_encode_transaction(tx: &Transaction) -> Vec<u8> {
     m.add_option_vec_u64("apas", &tx.foreign_assets);
     m.add_option_vec_address("apat", &tx.accounts);
     m.add_option_vec_box_refs("apbx", &tx.boxes);
-    m.add_u64("apep", tx.extra_program_pages);
+    m.add_u64("apep", tx.extra_program_pages as u64);
     m.add_option_vec_u64("apfa", &tx.foreign_apps);
     m.add_option_map(
         "apgs",
@@ -339,7 +355,9 @@ pub fn canonical_encode_transaction(tx: &Transaction) -> Vec<u8> {
     m.add_string("gen", &tx.genesis_id);
     m.add_bytes("gh", &tx.genesis_hash);
     m.add_bytes("grp", &tx.group);
-    m.add_option_rmpv("hb", &tx.heartbeat);
+    if let Some(ref hb) = tx.heartbeat {
+        m.add_map("hb", canonical_encode_heartbeat(hb));
+    }
     m.add_u64("lv", tx.last_valid.0);
     m.add_bytes("lx", &tx.lease);
 
@@ -356,8 +374,12 @@ pub fn canonical_encode_transaction(tx: &Transaction) -> Vec<u8> {
     m.add_address("snd", &tx.sender);
 
     // State proof (stpf)
-    m.add_option_rmpv("sp", &tx.state_proof);
-    m.add_option_rmpv("spmsg", &tx.state_proof_message);
+    if let Some(ref sp) = tx.state_proof {
+        m.add_map("sp", canonical_encode_state_proof_body(sp));
+    }
+    if let Some(ref msg) = tx.state_proof_message {
+        m.add_map("spmsg", canonical_encode_state_proof_message(msg));
+    }
     m.add_u64("sptype", tx.state_proof_type);
     m.add_option_bytes("sprfkey", &tx.state_proof_pk);
 
@@ -520,7 +542,7 @@ pub fn canonical_encode_asset_params(apar: &AssetParams) -> Vec<u8> {
     m.add_string("an", &apar.asset_name);
     m.add_string("au", &apar.url);
     m.add_option_address("c", &apar.clawback);
-    m.add_u64("dc", apar.decimals);
+    m.add_u64("dc", apar.decimals as u64);
     m.add_bool("df", apar.default_frozen);
     m.add_option_address("f", &apar.freeze);
     m.add_option_address("m", &apar.manager);
@@ -638,6 +660,203 @@ pub fn canonical_encode_logicsig(lsig: &LogicSig) -> Vec<u8> {
 
     m.add_bytes("sig", &lsig.sig);
 
+    m.encode()
+}
+
+/// Canonically encode a HeartbeatProof.
+pub fn canonical_encode_heartbeat_proof(proof: &HeartbeatProof) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_bytes("p", &proof.pk);
+    m.add_bytes("p1s", &proof.pk1_sig);
+    m.add_bytes("p2", &proof.pk2);
+    m.add_bytes("p2s", &proof.pk2_sig);
+    m.add_bytes("s", &proof.sig);
+    m.encode()
+}
+
+/// Canonically encode HeartbeatTxnFields.
+pub fn canonical_encode_heartbeat(hb: &HeartbeatTxnFields) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_address("a", &hb.address);
+    m.add_u64("kd", hb.key_dilution);
+    if let Some(ref proof) = hb.proof {
+        m.add_map("prf", canonical_encode_heartbeat_proof(proof));
+    }
+    m.add_bytes("sd", &hb.seed);
+    m.add_bytes("vid", &hb.vote_id);
+    m.encode()
+}
+
+/// Canonically encode a HashFactory.
+pub fn canonical_encode_hash_factory(hf: &HashFactory) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_u64("t", hf.hash_type as u64);
+    m.encode()
+}
+
+/// Canonically encode a MerkleProof.
+pub fn canonical_encode_merkle_proof(proof: &MerkleProof) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    if let Some(ref hf) = proof.hash_factory {
+        m.add_map("hsh", canonical_encode_hash_factory(hf));
+    }
+    if let Some(ref path) = proof.path {
+        if !path.is_empty() {
+            let mut buf = Vec::new();
+            rmp::encode::write_array_len(&mut buf, path.len() as u32).unwrap();
+            for item in path {
+                match item {
+                    Some(b) => rmp::encode::write_bin(&mut buf, b).unwrap(),
+                    None => rmp::encode::write_nil(&mut buf).unwrap(),
+                }
+            }
+            m.fields.push(("pth", buf));
+        }
+    }
+    m.add_u64("td", proof.tree_depth as u64);
+    m.encode()
+}
+
+/// Canonically encode a FalconVerifier.
+pub fn canonical_encode_falcon_verifier(fv: &FalconVerifier) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_bytes("k", &fv.public_key);
+    m.encode()
+}
+
+/// Canonically encode a MerkleSignature.
+pub fn canonical_encode_merkle_signature(sig: &MerkleSignature) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_u64("idx", sig.vector_commitment_index);
+    if let Some(ref proof) = sig.proof {
+        m.add_map("prf", canonical_encode_merkle_proof(proof));
+    }
+    m.add_bytes("sig", &sig.signature);
+    if let Some(ref vkey) = sig.verifying_key {
+        m.add_map("vkey", canonical_encode_falcon_verifier(vkey));
+    }
+    m.encode()
+}
+
+/// Canonically encode a SigSlotCommit.
+pub fn canonical_encode_sig_slot_commit(slot: &SigSlotCommit) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_u64("l", slot.l);
+    if let Some(ref sig) = slot.sig {
+        m.add_map("s", canonical_encode_merkle_signature(sig));
+    }
+    m.encode()
+}
+
+/// Canonically encode a MerkleSignatureVerifier.
+pub fn canonical_encode_merkle_sig_verifier(v: &MerkleSignatureVerifier) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_bytes("cmt", &v.commitment);
+    m.add_u64("lf", v.key_lifetime);
+    m.encode()
+}
+
+/// Canonically encode a Participant.
+pub fn canonical_encode_participant(p: &Participant) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    if let Some(ref pk) = p.pk {
+        m.add_map("p", canonical_encode_merkle_sig_verifier(pk));
+    }
+    m.add_u64("w", p.weight);
+    m.encode()
+}
+
+/// Canonically encode a Reveal.
+pub fn canonical_encode_reveal(r: &Reveal) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    if let Some(ref part) = r.part {
+        m.add_map("p", canonical_encode_participant(part));
+    }
+    if let Some(ref sig_slot) = r.sig_slot {
+        m.add_map("s", canonical_encode_sig_slot_commit(sig_slot));
+    }
+    m.encode()
+}
+
+/// Canonically encode a StateProofBody.
+pub fn canonical_encode_state_proof_body(sp: &StateProofBody) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    if let Some(ref pp) = sp.part_proofs {
+        m.add_map("P", canonical_encode_merkle_proof(pp));
+    }
+    if let Some(ref sp_proofs) = sp.sig_proofs {
+        m.add_map("S", canonical_encode_merkle_proof(sp_proofs));
+    }
+    m.add_bytes("c", &sp.sig_commit);
+    if let Some(ref positions) = sp.positions_to_reveal {
+        if !positions.is_empty() {
+            let mut buf = Vec::new();
+            rmp::encode::write_array_len(&mut buf, positions.len() as u32).unwrap();
+            for pos in positions {
+                write_uint(&mut buf, *pos);
+            }
+            m.fields.push(("pr", buf));
+        }
+    }
+    if let Some(ref reveals) = sp.reveals {
+        if !reveals.is_empty() {
+            let mut buf = Vec::new();
+            rmp::encode::write_map_len(&mut buf, reveals.len() as u32).unwrap();
+            for (key, reveal) in reveals {
+                write_uint(&mut buf, *key);
+                let encoded = canonical_encode_reveal(reveal);
+                buf.extend_from_slice(&encoded);
+            }
+            m.fields.push(("r", buf));
+        }
+    }
+    m.add_u64("v", sp.merkle_signature_salt_version as u64);
+    m.add_u64("w", sp.signed_weight);
+    m.encode()
+}
+
+/// Canonically encode a StateProofMessage.
+pub fn canonical_encode_state_proof_message(msg: &StateProofMessage) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_u64("P", msg.ln_proven_weight);
+    m.add_bytes("b", &msg.block_headers_commitment);
+    m.add_u64("f", msg.first_attested_round);
+    m.add_u64("l", msg.last_attested_round);
+    m.add_bytes("v", &msg.voters_commitment);
+    m.encode()
+}
+
+/// Canonically encode a HoldingRef.
+pub fn canonical_encode_holding_ref(hr: &HoldingRef) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_u64("d", hr.address);
+    m.add_u64("s", hr.asset);
+    m.encode()
+}
+
+/// Canonically encode a LocalsRef.
+pub fn canonical_encode_locals_ref(lr: &LocalsRef) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_u64("d", lr.address);
+    m.add_u64("p", lr.app);
+    m.encode()
+}
+
+/// Canonically encode a ResourceRef.
+pub fn canonical_encode_resource_ref(rr: &ResourceRef) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    if let Some(ref br) = rr.box_ref {
+        m.add_map("b", canonical_encode_box_ref(br));
+    }
+    m.add_address("d", &rr.address);
+    if let Some(ref hr) = rr.holding {
+        m.add_map("h", canonical_encode_holding_ref(hr));
+    }
+    if let Some(ref lr) = rr.locals {
+        m.add_map("l", canonical_encode_locals_ref(lr));
+    }
+    m.add_u64("p", rr.app);
+    m.add_u64("s", rr.asset);
     m.encode()
 }
 
