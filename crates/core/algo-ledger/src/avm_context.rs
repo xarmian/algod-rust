@@ -16,6 +16,15 @@ use sha2::{Digest, Sha512_256};
 use crate::params;
 use crate::store_trait::LedgerStore;
 
+/// Maximum byte string length in the AVM (matches go-algorand `maxStringSize`).
+/// Used for program page chunking.
+const MAX_STRING_SIZE: usize = 4096;
+
+/// Integer division rounding up: `DivCeil(n, d)`.
+fn div_ceil(n: usize, d: usize) -> usize {
+    n.div_ceil(d)
+}
+
 // ---------------------------------------------------------------------------
 // Helper: transaction type string -> TypeEnum integer
 // ---------------------------------------------------------------------------
@@ -564,12 +573,16 @@ fn read_txn_field(
             let args = txn.app_arguments.as_deref().unwrap_or(&[]);
             Ok(TealValue::Uint(args.len() as u64))
         }
-        // Accounts (array)
+        // Accounts (array) — index 0 = sender, 1+ = accounts[i-1]
+        // Per go-algorand: Accounts[0] is the sender, foreign accounts start at 1.
+        // NumAccounts (when array_index is None) = len(apat), not including sender.
         27 => {
             let accts = txn.accounts.as_deref().unwrap_or(&[]);
             match array_index {
+                Some(0) => Ok(TealValue::Bytes(txn.sender.0.to_vec())),
                 Some(i) => {
-                    if i >= accts.len() {
+                    let idx = i - 1;
+                    if idx >= accts.len() {
                         Err(AlgoError::Avm {
                             message: format!(
                                 "Accounts index {} out of range (len={})",
@@ -578,7 +591,7 @@ fn read_txn_field(
                             ),
                         })
                     } else {
-                        Ok(TealValue::Bytes(accts[i].0.to_vec()))
+                        Ok(TealValue::Bytes(accts[idx].0.to_vec()))
                     }
                 }
                 None => Ok(TealValue::Uint(accts.len() as u64)),
@@ -724,12 +737,16 @@ fn read_txn_field(
             let assets = txn.foreign_assets.as_deref().unwrap_or(&[]);
             Ok(TealValue::Uint(assets.len() as u64))
         }
-        // Applications (foreign apps array)
+        // Applications (foreign apps array) — index 0 = current app ID, 1+ = foreign_apps[i-1]
+        // Per go-algorand: Applications[0] is the current ApplicationID.
+        // NumApplications (when array_index is None) = len(apfa), not including current app.
         49 => {
             let apps = txn.foreign_apps.as_deref().unwrap_or(&[]);
             match array_index {
+                Some(0) => Ok(TealValue::Uint(txn.application_id)),
                 Some(i) => {
-                    if i >= apps.len() {
+                    let idx = i - 1;
+                    if idx >= apps.len() {
                         Err(AlgoError::Avm {
                             message: format!(
                                 "Applications index {} out of range (len={})",
@@ -738,7 +755,7 @@ fn read_txn_field(
                             ),
                         })
                     } else {
-                        Ok(TealValue::Uint(apps[i]))
+                        Ok(TealValue::Uint(apps[idx]))
                     }
                 }
                 None => Ok(TealValue::Uint(apps.len() as u64)),
@@ -819,53 +836,70 @@ fn read_txn_field(
                 .map(|b| b.to_vec())
                 .unwrap_or_default(),
         )),
-        // ApprovalProgramPages (array)
+        // ApprovalProgramPages (array) — per go-algorand, pages are 4096-byte chunks.
+        // maxStringSize = 4096; page_count = DivCeil(len, 4096); OOB index is an error.
         63 => {
-            // The approval program is a single blob; paging is for display.
-            // For a single-page program, index 0 returns the whole program.
             let program = txn
                 .approval_program
                 .as_ref()
-                .map(|b| b.to_vec())
-                .unwrap_or_default();
+                .map(|b| b.as_slice())
+                .unwrap_or(&[]);
+            let page_count = div_ceil(program.len(), MAX_STRING_SIZE);
             match array_index {
-                Some(0) => Ok(TealValue::Bytes(program)),
-                Some(_) => Ok(TealValue::Bytes(Vec::new())),
-                None => {
-                    // count of pages
-                    let pages = if program.is_empty() { 0u64 } else { 1 };
-                    Ok(TealValue::Uint(pages))
+                Some(i) => {
+                    if i >= page_count {
+                        Err(AlgoError::Avm {
+                            message: format!("invalid ApprovalProgramPages index {i}"),
+                        })
+                    } else {
+                        let first = i * MAX_STRING_SIZE;
+                        let last = (first + MAX_STRING_SIZE).min(program.len());
+                        Ok(TealValue::Bytes(program[first..last].to_vec()))
+                    }
                 }
+                None => Ok(TealValue::Uint(page_count as u64)),
             }
         }
         // NumApprovalProgramPages
         64 => {
-            let has_program = txn.approval_program.as_ref().is_some_and(|b| !b.is_empty());
-            Ok(TealValue::Uint(if has_program { 1 } else { 0 }))
+            let len = txn
+                .approval_program
+                .as_ref()
+                .map(|b| b.len())
+                .unwrap_or(0);
+            Ok(TealValue::Uint(div_ceil(len, MAX_STRING_SIZE) as u64))
         }
-        // ClearStateProgramPages (array)
+        // ClearStateProgramPages (array) — same 4096-byte paging as approval.
         65 => {
             let program = txn
                 .clear_state_program
                 .as_ref()
-                .map(|b| b.to_vec())
-                .unwrap_or_default();
+                .map(|b| b.as_slice())
+                .unwrap_or(&[]);
+            let page_count = div_ceil(program.len(), MAX_STRING_SIZE);
             match array_index {
-                Some(0) => Ok(TealValue::Bytes(program)),
-                Some(_) => Ok(TealValue::Bytes(Vec::new())),
-                None => {
-                    let pages = if program.is_empty() { 0u64 } else { 1 };
-                    Ok(TealValue::Uint(pages))
+                Some(i) => {
+                    if i >= page_count {
+                        Err(AlgoError::Avm {
+                            message: format!("invalid ClearStateProgramPages index {i}"),
+                        })
+                    } else {
+                        let first = i * MAX_STRING_SIZE;
+                        let last = (first + MAX_STRING_SIZE).min(program.len());
+                        Ok(TealValue::Bytes(program[first..last].to_vec()))
+                    }
                 }
+                None => Ok(TealValue::Uint(page_count as u64)),
             }
         }
         // NumClearStateProgramPages
         66 => {
-            let has_program = txn
+            let len = txn
                 .clear_state_program
                 .as_ref()
-                .is_some_and(|b| !b.is_empty());
-            Ok(TealValue::Uint(if has_program { 1 } else { 0 }))
+                .map(|b| b.len())
+                .unwrap_or(0);
+            Ok(TealValue::Uint(div_ceil(len, MAX_STRING_SIZE) as u64))
         }
         _ => Err(AlgoError::Avm {
             message: format!("unknown TxnField index: {field}"),
@@ -1711,17 +1745,24 @@ mod tests {
         let mut store = LedgerState::new();
         let ctx = make_context(&mut store, vec![txn]);
 
-        // NumAccounts
+        // NumAccounts = len(apat), not including sender
         let num = ctx.txn_field(0, 28, None).unwrap();
         assert_eq!(num, TealValue::Uint(2));
 
-        // Accounts[0]
+        // Accounts[0] = sender (per go-algorand semantics)
         let a0 = ctx.txn_field(0, 27, Some(0)).unwrap();
-        assert_eq!(a0, TealValue::Bytes(acct1.0.to_vec()));
+        assert_eq!(a0, TealValue::Bytes(sender.to_vec()));
 
-        // Accounts[1]
+        // Accounts[1] = apat[0]
         let a1 = ctx.txn_field(0, 27, Some(1)).unwrap();
-        assert_eq!(a1, TealValue::Bytes(acct2.0.to_vec()));
+        assert_eq!(a1, TealValue::Bytes(acct1.0.to_vec()));
+
+        // Accounts[2] = apat[1]
+        let a2 = ctx.txn_field(0, 27, Some(2)).unwrap();
+        assert_eq!(a2, TealValue::Bytes(acct2.0.to_vec()));
+
+        // Accounts[3] = out of range
+        assert!(ctx.txn_field(0, 27, Some(3)).is_err());
     }
 
     #[test]
@@ -1731,15 +1772,31 @@ mod tests {
         let mut store = LedgerState::new();
         let ctx = make_context(&mut store, vec![txn]);
 
-        // NumApplications
+        // NumApplications = len(apfa), not including current app
         assert_eq!(ctx.txn_field(0, 50, None).unwrap(), TealValue::Uint(2));
-        // Applications[0]
-        assert_eq!(ctx.txn_field(0, 49, Some(0)).unwrap(), TealValue::Uint(100));
+        // Applications[0] = current ApplicationID (per go-algorand semantics)
+        assert_eq!(ctx.txn_field(0, 49, Some(0)).unwrap(), TealValue::Uint(42));
+        // Applications[1] = apfa[0]
+        assert_eq!(
+            ctx.txn_field(0, 49, Some(1)).unwrap(),
+            TealValue::Uint(100)
+        );
+        // Applications[2] = apfa[1]
+        assert_eq!(
+            ctx.txn_field(0, 49, Some(2)).unwrap(),
+            TealValue::Uint(200)
+        );
+        // Applications[3] = out of range
+        assert!(ctx.txn_field(0, 49, Some(3)).is_err());
 
-        // NumAssets
+        // NumAssets (0-based, no special index 0)
         assert_eq!(ctx.txn_field(0, 48, None).unwrap(), TealValue::Uint(2));
-        // Assets[1]
+        // Assets[0] = foreign_assets[0]
+        assert_eq!(ctx.txn_field(0, 47, Some(0)).unwrap(), TealValue::Uint(50));
+        // Assets[1] = foreign_assets[1]
         assert_eq!(ctx.txn_field(0, 47, Some(1)).unwrap(), TealValue::Uint(60));
+        // Assets[2] = out of range
+        assert!(ctx.txn_field(0, 47, Some(2)).is_err());
     }
 
     // ---- global_field tests ----
@@ -2331,5 +2388,151 @@ mod tests {
         assert!(ctx.is_app_mode());
         assert_eq!(ctx.current_app_id(), 42);
         assert_eq!(ctx.program_hash(), [2u8; 32]);
+    }
+
+    // ---- Accounts[0] = sender edge cases ----
+
+    #[test]
+    fn txn_field_accounts_zero_is_sender_empty_accounts() {
+        // Even when there are no foreign accounts, Accounts[0] should return the sender.
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        let a0 = ctx.txn_field(0, 27, Some(0)).unwrap();
+        assert_eq!(a0, TealValue::Bytes(sender.to_vec()));
+
+        // NumAccounts = 0 (no foreign accounts)
+        assert_eq!(ctx.txn_field(0, 28, None).unwrap(), TealValue::Uint(0));
+
+        // Accounts[1] should fail (no foreign accounts)
+        assert!(ctx.txn_field(0, 27, Some(1)).is_err());
+    }
+
+    // ---- Applications[0] = current app edge cases ----
+
+    #[test]
+    fn txn_field_applications_zero_is_current_app_empty_foreign() {
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![], vec![]);
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        // Applications[0] = current ApplicationID even with no foreign apps
+        let a0 = ctx.txn_field(0, 49, Some(0)).unwrap();
+        assert_eq!(a0, TealValue::Uint(42));
+
+        // NumApplications = 0
+        assert_eq!(ctx.txn_field(0, 50, None).unwrap(), TealValue::Uint(0));
+
+        // Applications[1] should fail
+        assert!(ctx.txn_field(0, 49, Some(1)).is_err());
+    }
+
+    // ---- Program page tests ----
+
+    #[test]
+    fn program_pages_single_page() {
+        let sender = [10u8; 32];
+        let program = vec![0x06, 0x81, 0x01]; // short program (3 bytes < 4096)
+        let mut txn = make_pay_txn(sender, [20u8; 32], 5000);
+        txn.txn.txn_type = "appl".to_string();
+        txn.txn.approval_program = Some(serde_bytes::ByteBuf::from(program.clone()));
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        // NumApprovalProgramPages = 1
+        assert_eq!(ctx.txn_field(0, 64, None).unwrap(), TealValue::Uint(1));
+
+        // ApprovalProgramPages[0] = entire program
+        assert_eq!(
+            ctx.txn_field(0, 63, Some(0)).unwrap(),
+            TealValue::Bytes(program)
+        );
+
+        // ApprovalProgramPages[1] = out of range → error
+        assert!(ctx.txn_field(0, 63, Some(1)).is_err());
+    }
+
+    #[test]
+    fn program_pages_multi_page() {
+        let sender = [10u8; 32];
+        // Create a program that spans 2 pages (4097 bytes)
+        let program: Vec<u8> = (0..4097u16).map(|i| (i % 256) as u8).collect();
+        let mut txn = make_pay_txn(sender, [20u8; 32], 5000);
+        txn.txn.txn_type = "appl".to_string();
+        txn.txn.approval_program = Some(serde_bytes::ByteBuf::from(program.clone()));
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        // NumApprovalProgramPages = 2 (4097 / 4096 = 2)
+        assert_eq!(ctx.txn_field(0, 64, None).unwrap(), TealValue::Uint(2));
+
+        // Page 0 = first 4096 bytes
+        assert_eq!(
+            ctx.txn_field(0, 63, Some(0)).unwrap(),
+            TealValue::Bytes(program[..4096].to_vec())
+        );
+
+        // Page 1 = remaining 1 byte
+        assert_eq!(
+            ctx.txn_field(0, 63, Some(1)).unwrap(),
+            TealValue::Bytes(program[4096..].to_vec())
+        );
+
+        // Page 2 = out of range
+        assert!(ctx.txn_field(0, 63, Some(2)).is_err());
+    }
+
+    #[test]
+    fn program_pages_empty_program() {
+        let sender = [10u8; 32];
+        let mut txn = make_pay_txn(sender, [20u8; 32], 5000);
+        txn.txn.txn_type = "appl".to_string();
+        txn.txn.approval_program = None;
+        txn.txn.clear_state_program = None;
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        // NumApprovalProgramPages = 0 for empty/None program
+        assert_eq!(ctx.txn_field(0, 64, None).unwrap(), TealValue::Uint(0));
+        // NumClearStateProgramPages = 0
+        assert_eq!(ctx.txn_field(0, 66, None).unwrap(), TealValue::Uint(0));
+
+        // Page 0 on empty program = error (0 pages, index 0 is OOB)
+        assert!(ctx.txn_field(0, 63, Some(0)).is_err());
+        assert!(ctx.txn_field(0, 65, Some(0)).is_err());
+    }
+
+    #[test]
+    fn program_pages_exact_page_boundary() {
+        let sender = [10u8; 32];
+        // Exactly 4096 bytes = 1 page, not 2
+        let program = vec![0xAA; 4096];
+        let mut txn = make_pay_txn(sender, [20u8; 32], 5000);
+        txn.txn.txn_type = "appl".to_string();
+        txn.txn.approval_program = Some(serde_bytes::ByteBuf::from(program.clone()));
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        assert_eq!(ctx.txn_field(0, 64, None).unwrap(), TealValue::Uint(1));
+        assert_eq!(
+            ctx.txn_field(0, 63, Some(0)).unwrap(),
+            TealValue::Bytes(program)
+        );
+        assert!(ctx.txn_field(0, 63, Some(1)).is_err());
+    }
+
+    // ---- div_ceil helper test ----
+
+    #[test]
+    fn test_div_ceil() {
+        assert_eq!(super::div_ceil(0, 4096), 0);
+        assert_eq!(super::div_ceil(1, 4096), 1);
+        assert_eq!(super::div_ceil(4096, 4096), 1);
+        assert_eq!(super::div_ceil(4097, 4096), 2);
+        assert_eq!(super::div_ceil(8192, 4096), 2);
+        assert_eq!(super::div_ceil(8193, 4096), 3);
     }
 }
