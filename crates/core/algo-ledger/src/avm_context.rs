@@ -46,6 +46,22 @@ fn app_address(app_id: u64) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: extract logs from a SignedTransaction's eval_delta
+// ---------------------------------------------------------------------------
+
+/// Extract log entries from a `SignedTransaction`'s `eval_delta` (the `dt` field).
+/// Returns an empty vec if there is no eval_delta or no logs.
+fn extract_logs_from_eval_delta(stxn: &SignedTransaction) -> Vec<Vec<u8>> {
+    let Some(ref dt) = stxn.eval_delta else {
+        return Vec::new();
+    };
+    match crate::eval_delta::parse_eval_delta(dt) {
+        Ok(ed) => ed.logs.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // InnerTxnBuilder — accumulates fields for an itxn being built
 // ---------------------------------------------------------------------------
 
@@ -514,10 +530,8 @@ fn read_txn_field(
         // TxID
         22 => {
             // TxID = SHA512/256("TX" || canonical_encode(txn))
-            // For now return a placeholder; full canonical encoding requires
-            // algo-codec which is not a dependency here. A real implementation
-            // would compute the actual txid.
-            Ok(TealValue::Bytes(vec![0u8; 32]))
+            let digest = algo_codec::compute_txn_id(txn);
+            Ok(TealValue::Bytes(digest.0.to_vec()))
         }
         // ApplicationID
         23 => Ok(TealValue::Uint(txn.application_id)),
@@ -766,21 +780,37 @@ fn read_txn_field(
         55 => Ok(TealValue::Uint(txn.extra_program_pages)),
         // Nonparticipation
         56 => Ok(TealValue::Uint(txn.non_participation as u64)),
-        // Logs (array) — from eval delta or context logs; for outer txns
-        // this would come from ApplyData, for inner txns from execution.
-        // Return empty for now; real log data is in the context.
-        57 => match array_index {
-            Some(_i) => Ok(TealValue::Bytes(Vec::new())),
-            None => Ok(TealValue::Uint(0)),
-        },
+        // Logs (array) — extracted from ApplyData eval_delta ("dt.lg").
+        57 => {
+            let logs = extract_logs_from_eval_delta(stxn);
+            match array_index {
+                Some(i) => {
+                    if i >= logs.len() {
+                        Err(AlgoError::Avm {
+                            message: format!("Logs index {} out of range (len={})", i, logs.len()),
+                        })
+                    } else {
+                        Ok(TealValue::Bytes(logs[i].clone()))
+                    }
+                }
+                None => Ok(TealValue::Uint(logs.len() as u64)),
+            }
+        }
         // NumLogs
-        58 => Ok(TealValue::Uint(0)),
+        58 => {
+            let logs = extract_logs_from_eval_delta(stxn);
+            Ok(TealValue::Uint(logs.len() as u64))
+        }
         // CreatedAssetID (from ApplyData)
         59 => Ok(TealValue::Uint(stxn.apply_data_config_asset)),
         // CreatedApplicationID (from ApplyData)
         60 => Ok(TealValue::Uint(stxn.apply_data_application_id)),
-        // LastLog
-        61 => Ok(TealValue::Bytes(Vec::new())),
+        // LastLog — the last entry in the eval_delta logs, or empty bytes.
+        61 => {
+            let logs = extract_logs_from_eval_delta(stxn);
+            let last = logs.last().cloned().unwrap_or_default();
+            Ok(TealValue::Bytes(last))
+        }
         // StateProofPK
         62 => Ok(TealValue::Bytes(
             txn.state_proof_pk
@@ -916,7 +946,8 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 };
                 Ok(TealValue::Bytes(group_id))
             }
-            // OpcodeBudget — placeholder; real budget tracking is in the VM.
+            // OpcodeBudget — handled directly in op_global (reads machine.budget);
+            // this fallback returns 0 but should not normally be reached.
             12 => Ok(TealValue::Uint(0)),
             // CallerApplicationID — 0 when not called from another app
             13 => Ok(TealValue::Uint(0)),
@@ -980,11 +1011,13 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     fn resolve_asset(&self, index: u64) -> Result<u64, AlgoError> {
         let txn = &self.current_txn().txn;
         if index == 0 {
-            // Index 0 = the "implied" asset: xfer_asset or config_asset
+            // Index 0 = the "implied" asset: xfer_asset, config_asset, or freeze_asset
             let id = if txn.xaid != 0 {
                 txn.xaid
-            } else {
+            } else if txn.config_asset != 0 {
                 txn.config_asset
+            } else {
+                txn.freeze_asset
             };
             if id == 0 {
                 return Err(AlgoError::Avm {

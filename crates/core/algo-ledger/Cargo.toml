@@ -7,6 +7,7 @@ edition = "2021"
 algo-types = { workspace = true }
 algo-error = { workspace = true }
 algo-avm = { workspace = true }
+algo-codec = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_bytes = { workspace = true }

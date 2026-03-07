@@ -5,7 +5,7 @@ use algo_error::AlgoError;
 use crate::bytecode::Instruction;
 use crate::context::AvmContext;
 use crate::fields::GlobalField;
-use crate::machine::AvmMachine;
+use crate::machine::{AvmMachine, AvmValue};
 
 use super::helpers::{get_uint8, teal_to_avm};
 
@@ -21,6 +21,18 @@ pub fn op_global(
 
     // Validate the field index is known.
     let _field = GlobalField::from_u8(field_byte)?;
+
+    // OpcodeBudget (field 12): read directly from the machine's remaining
+    // budget rather than routing through the context, which has no access
+    // to the VM's budget counter.
+    if field_byte == 12 {
+        let remaining = if machine.budget > 0 {
+            machine.budget as u64
+        } else {
+            0
+        };
+        return machine.push(AvmValue::Uint64(remaining));
+    }
 
     // Delegate to the context for the actual value.
     let value = ctx.global_field(field_byte)?;
