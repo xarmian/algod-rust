@@ -331,14 +331,15 @@ pub fn validate_transaction_wellformed(
     // ── Fee check ─────────────────────────────────────────────────
     // State proof txns are always fee-exempt.
     // Free heartbeats (checked above) are also fee-exempt.
-    // With fee pooling enabled, the per-txn minimum is skipped (group check
-    // handles it). Without fee pooling, each txn must individually meet the
-    // minimum.
+    // When `allow_fee_pooling` is true (caller signals txn is in a group),
+    // the per-txn minimum is skipped — group-level validation handles it.
+    // Ungrouped txns must always individually meet the minimum, regardless
+    // of whether the protocol version enables fee pooling (Go checks this
+    // in TxnGroup for both pooled and non-pooled modes).
     let is_stpf = txn.txn_type == "stpf";
     if !is_stpf
         && !is_free_heartbeat
         && !allow_fee_pooling
-        && !params.enable_fee_pooling
         && txn.fee < params.min_txn_fee
     {
         return Err(AlgoError::Validation {
