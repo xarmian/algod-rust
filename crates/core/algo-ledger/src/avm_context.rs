@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 
 use algo_avm::context::AvmContext;
+use algo_avm::MAX_AVM_VERSION;
 use algo_error::AlgoError;
 use algo_types::{Address, SignedTransaction, TealValue, Transaction};
 use sha2::{Digest, Sha512_256};
@@ -921,7 +922,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             // GroupSize
             4 => Ok(TealValue::Uint(self.group.len() as u64)),
             // LogicSigVersion
-            5 => Ok(TealValue::Uint(11)),
+            5 => Ok(TealValue::Uint(MAX_AVM_VERSION as u64)),
             // Round
             6 => Ok(TealValue::Uint(self.round)),
             // LatestTimestamp
@@ -1410,7 +1411,17 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             });
         }
         let builders = std::mem::take(&mut self.inner_building);
-        let txns: Vec<SignedTransaction> = builders.iter().map(|b| b.build()).collect();
+        let default_sender = Address(app_address(self.app_id));
+        let txns: Vec<SignedTransaction> = builders
+            .iter()
+            .map(|b| {
+                let mut stxn = b.build();
+                if stxn.txn.sender == Address::ZERO {
+                    stxn.txn.sender = default_sender;
+                }
+                stxn
+            })
+            .collect();
         self.inner_txns.push(txns);
         Ok(())
     }

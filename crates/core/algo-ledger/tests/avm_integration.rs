@@ -400,7 +400,7 @@ fn global_latest_timestamp() {
     assert!(result, "global LatestTimestamp should be 50000");
 }
 
-/// global LogicSigVersion; int 11; ==; return
+/// global LogicSigVersion; int 10; ==; return
 #[test]
 fn global_logicsig_version() {
     let sender = [0xAA; 32];
@@ -410,12 +410,12 @@ fn global_logicsig_version() {
 
     let code: &[u8] = &[
         0x32, 0x05, // global LogicSigVersion (field 5)
-        0x81, 0x0B, // pushint 11
+        0x81, 0x0A, // pushint 10 (MAX_AVM_VERSION)
         0x12, // ==
         0x43, // return
     ];
     let result = run_with_context(6, code, &mut ctx).unwrap();
-    assert!(result, "global LogicSigVersion should be 11");
+    assert!(result, "global LogicSigVersion should match MAX_AVM_VERSION (10)");
 }
 
 // ===========================================================================
