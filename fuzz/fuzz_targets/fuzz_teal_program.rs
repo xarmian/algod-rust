@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 
 use algo_avm::opcode::Mode;
-use algo_avm::{check_program, parse, AvmMachine, ExecMode};
+use algo_avm::{check_program, parse, AvmMachine, ExecMode, NullContext};
 
 fuzz_target!(|data: &[u8]| {
     // Try parsing
@@ -17,5 +17,5 @@ fuzz_target!(|data: &[u8]| {
 
     // Try executing with limited budget (prevent infinite loops)
     let mut machine = AvmMachine::new(program, ExecMode::LogicSig, 20_000);
-    let _ = machine.run(); // Must not panic
+    let _ = machine.run(&mut NullContext); // Must not panic
 });

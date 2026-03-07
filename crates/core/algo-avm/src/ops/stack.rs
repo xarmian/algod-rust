@@ -203,6 +203,7 @@ fn get_uint8(instruction: &Instruction) -> Result<u8, AlgoError> {
 #[cfg(test)]
 mod tests {
     use crate::bytecode;
+    use crate::context::NullContext;
     use crate::machine::{AvmMachine, AvmValue, ExecMode};
 
     /// Build raw program bytes from version + code.
@@ -217,7 +218,7 @@ mod tests {
         let raw = prog(version, code);
         let program = bytecode::parse(&raw)?;
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 20000);
-        m.run()?;
+        m.run(&mut NullContext)?;
         Ok(m)
     }
 
@@ -226,7 +227,7 @@ mod tests {
         let raw = prog(version, code);
         let program = bytecode::parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 20000);
-        let _ = m.run();
+        let _ = m.run(&mut NullContext);
         m
     }
 
@@ -246,7 +247,7 @@ mod tests {
         let raw = prog(3, &[0x48]);
         let program = bytecode::parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 20000);
-        assert!(m.run().is_err());
+        assert!(m.run(&mut NullContext).is_err());
     }
 
     // ---- dup ----
@@ -295,7 +296,7 @@ mod tests {
         let raw = prog(3, &[0x81, 0x01, 0x4b, 0x01]);
         let program = bytecode::parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 20000);
-        assert!(m.run().is_err());
+        assert!(m.run(&mut NullContext).is_err());
     }
 
     // ---- swap ----

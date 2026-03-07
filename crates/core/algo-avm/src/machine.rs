@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use algo_error::AlgoError;
 
 use crate::bytecode::Program;
+use crate::context::AvmContext;
 use crate::opcode::{self, CostKind};
 use crate::ops;
 
@@ -130,7 +131,10 @@ impl AvmMachine {
     }
 
     /// Execute one instruction and advance the PC.
-    pub fn step(&mut self) -> Result<(), AlgoError> {
+    ///
+    /// `ctx` provides external state access (transaction fields, app state, etc.).
+    /// Pure-opcode tests can pass `&mut NullContext`.
+    pub fn step(&mut self, ctx: &mut dyn AvmContext) -> Result<(), AlgoError> {
         if self.finished {
             return Err(AlgoError::Avm {
                 message: "step called after execution finished".to_string(),
@@ -155,7 +159,7 @@ impl AvmMachine {
         }
 
         // Dispatch to opcode handler.
-        ops::dispatch(self, &instr)?;
+        ops::dispatch(self, &instr, ctx)?;
 
         // If the handler didn't change the PC (no branch), advance by 1.
         if !self.finished && self.pc == old_pc {
@@ -166,9 +170,12 @@ impl AvmMachine {
     }
 
     /// Run the program to completion. Returns `true` for pass, `false` for reject.
-    pub fn run(&mut self) -> Result<bool, AlgoError> {
+    ///
+    /// `ctx` provides external state access (transaction fields, app state, etc.).
+    /// Pure-opcode tests can pass `&mut NullContext`.
+    pub fn run(&mut self, ctx: &mut dyn AvmContext) -> Result<bool, AlgoError> {
         while !self.finished {
-            self.step()?;
+            self.step(ctx)?;
         }
         Ok(self.pass)
     }
@@ -297,6 +304,7 @@ impl AvmMachine {
 mod tests {
     use super::*;
     use crate::bytecode::parse;
+    use crate::context::NullContext;
 
     /// Helper: build a raw program from version + code bytes.
     fn prog(version: u8, code: &[u8]) -> Vec<u8> {
@@ -412,7 +420,7 @@ mod tests {
             instructions: vec![],
         };
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
-        let result = m.run().unwrap();
+        let result = m.run(&mut NullContext).unwrap();
         assert!(!result);
     }
 
@@ -423,8 +431,8 @@ mod tests {
             instructions: vec![],
         };
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
-        m.run().unwrap();
-        assert!(m.step().is_err());
+        m.run(&mut NullContext).unwrap();
+        assert!(m.step(&mut NullContext).is_err());
     }
 
     #[test]
@@ -433,7 +441,7 @@ mod tests {
         let raw = prog(1, &[0x00]);
         let program = parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
-        let result = m.run();
+        let result = m.run(&mut NullContext);
         assert!(result.is_err());
     }
 
@@ -443,7 +451,7 @@ mod tests {
         let raw = prog(2, &[0x20, 0x01, 0x01, 0x22, 0x43]);
         let program = parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
-        let result = m.run().unwrap();
+        let result = m.run(&mut NullContext).unwrap();
         assert!(result);
     }
 
@@ -453,7 +461,7 @@ mod tests {
         let raw = prog(2, &[0x20, 0x01, 0x00, 0x22, 0x43]);
         let program = parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
-        let result = m.run().unwrap();
+        let result = m.run(&mut NullContext).unwrap();
         assert!(!result);
     }
 
@@ -465,7 +473,7 @@ mod tests {
         let raw = prog(3, &[0x81, 0x01, 0x44]);
         let program = parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
-        let result = m.run().unwrap();
+        let result = m.run(&mut NullContext).unwrap();
         // After assert, stack is empty, program ends -> reject.
         assert!(!result);
     }
@@ -476,6 +484,6 @@ mod tests {
         let raw = prog(3, &[0x81, 0x00, 0x44]);
         let program = parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
-        assert!(m.run().is_err());
+        assert!(m.run(&mut NullContext).is_err());
     }
 }
