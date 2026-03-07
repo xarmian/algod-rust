@@ -631,7 +631,7 @@ fn read_txn_field(
         )),
         // ConfigAssetDecimals
         34 => Ok(TealValue::Uint(
-            txn.asset_params.as_ref().map(|p| p.decimals).unwrap_or(0),
+            txn.asset_params.as_ref().map(|p| p.decimals as u64).unwrap_or(0),
         )),
         // ConfigAssetDefaultFrozen
         35 => Ok(TealValue::Uint(
@@ -795,7 +795,7 @@ fn read_txn_field(
                 .unwrap_or(0),
         )),
         // ExtraProgramPages
-        55 => Ok(TealValue::Uint(txn.extra_program_pages)),
+        55 => Ok(TealValue::Uint(txn.extra_program_pages as u64)),
         // Nonparticipation
         56 => Ok(TealValue::Uint(txn.non_participation as u64)),
         // Logs (array) — extracted from ApplyData eval_delta ("dt.lg").
@@ -1237,7 +1237,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     // AssetTotal
                     0 => TealValue::Uint(p.total),
                     // AssetDecimals
-                    1 => TealValue::Uint(p.decimals),
+                    1 => TealValue::Uint(p.decimals as u64),
                     // AssetDefaultFrozen
                     2 => TealValue::Uint(p.default_frozen as u64),
                     // AssetUnitName

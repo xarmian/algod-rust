@@ -335,7 +335,7 @@ pub(crate) fn encode_asset_params(p: &AssetParams, creator: &Address) -> Vec<u8>
     if p.decimals != 0 {
         pairs.push((
             rmpv::Value::String("b".into()),
-            rmpv::Value::from(p.decimals),
+            rmpv::Value::from(p.decimals as u64),
         ));
     }
     if p.default_frozen {
@@ -424,7 +424,7 @@ fn decode_asset_params(data: &[u8]) -> Result<AssetParams, AlgoError> {
     for (k, v) in map {
         match k.as_str().unwrap_or("") {
             "a" => p.total = v.as_u64().unwrap_or(0),
-            "b" => p.decimals = v.as_u64().unwrap_or(0),
+            "b" => p.decimals = v.as_u64().unwrap_or(0) as u32,
             "c" => p.default_frozen = v.as_bool().unwrap_or(false),
             "d" => {
                 if let Some(s) = v.as_str() {
@@ -1158,7 +1158,7 @@ fn merge_asset_params_into_holding(
     if new_params.decimals != 0 {
         merged.push((
             rmpv::Value::String("b".into()),
-            rmpv::Value::from(new_params.decimals),
+            rmpv::Value::from(new_params.decimals as u64),
         ));
     }
     if new_params.default_frozen {

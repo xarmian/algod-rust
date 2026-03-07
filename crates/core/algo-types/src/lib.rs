@@ -16,6 +16,8 @@ pub use digest::Digest;
 pub use header::BlockHeader;
 pub use round::Round;
 pub use transaction::{
-    AssetParams, BoxRef, LogicSig, MultisigSig, MultisigSubsig, SignedTransaction, StateSchema,
-    Transaction,
+    AssetParams, BoxRef, FalconVerifier, HashFactory, HeartbeatProof, HeartbeatTxnFields,
+    HoldingRef, LocalsRef, LogicSig, MerkleProof, MerkleSignature, MerkleSignatureVerifier,
+    MultisigSig, MultisigSubsig, Participant, ResourceRef, Reveal, SigSlotCommit,
+    SignedTransaction, StateProofBody, StateProofMessage, StateSchema, Transaction,
 };

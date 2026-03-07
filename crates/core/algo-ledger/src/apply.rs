@@ -903,7 +903,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
 
         let global_schema = txn.global_state_schema.clone().unwrap_or_default();
         let local_schema = txn.local_state_schema.clone().unwrap_or_default();
-        let extra_pages = txn.extra_program_pages as u32;
+        let extra_pages = txn.extra_program_pages;
 
         store.set_app_params(
             app_id,
