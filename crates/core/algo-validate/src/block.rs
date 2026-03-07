@@ -24,11 +24,12 @@ use crate::merkle::{
     HashAlgo,
 };
 use crate::rules::{
-    has_payset_commit_merkle, has_txn256, has_txn512, max_txn_bytes_per_block,
-    validate_genesis_consistency, validate_group_fees, validate_lease_constraints,
-    validate_transaction_group, validate_transaction_rules, MAX_TIMESTAMP_INCREMENT,
+    consensus_params_for_version, has_payset_commit_merkle, has_txn256, has_txn512,
+    max_txn_bytes_per_block, validate_genesis_consistency, validate_group_fees_with_params,
+    validate_lease_constraints, validate_transaction_group, validate_transaction_wellformed,
+    SpecialAddresses, MAX_TIMESTAMP_INCREMENT,
 };
-use crate::signature::verify_transaction_signature;
+use crate::signature::{verify_auth_addr_sender_diff, verify_transaction_signature};
 
 /// Result of validating a complete block.
 #[derive(Debug, Clone)]
@@ -175,7 +176,8 @@ impl fmt::Display for BlockValidationError {
 ///
 /// * `block` - The block to validate.
 /// * `prev_timestamp` - The previous block's timestamp, or `None` for genesis /
-///   round-0 (skips timestamp validation).
+///   round-0 (skips timestamp validation). When `Some(t)` where `t <= 0`,
+///   timestamp bounds are also skipped, matching Go's `prev.TimeStamp > 0` guard.
 /// * `genesis_id` - The expected genesis ID string (from the block header or network config).
 /// * `genesis_hash` - The expected 32-byte genesis hash.
 ///
@@ -211,20 +213,26 @@ pub fn validate_block(
         });
     }
 
-    // 2. Timestamp bounds (skip when prev_timestamp is None, i.e. genesis).
+    // 2. Timestamp bounds.
+    // Go (block.go PreCheck): only checks timestamp when prev.TimeStamp > 0.
+    // A zero or negative previous timestamp means we're in the prefix of the
+    // chain where timestamps haven't been established yet — skip the check.
+    // We also skip when prev_timestamp is None (genesis / round-0).
     if let Some(prev_ts) = prev_timestamp {
-        if block.timestamp < prev_ts {
-            errors.push(BlockValidationError::TimestampTooOld {
-                current: block.timestamp,
-                previous: prev_ts,
-            });
-        }
-        if block.timestamp > prev_ts + MAX_TIMESTAMP_INCREMENT {
-            errors.push(BlockValidationError::TimestampTooNew {
-                current: block.timestamp,
-                previous: prev_ts,
-                max_increment: MAX_TIMESTAMP_INCREMENT,
-            });
+        if prev_ts > 0 {
+            if block.timestamp < prev_ts {
+                errors.push(BlockValidationError::TimestampTooOld {
+                    current: block.timestamp,
+                    previous: prev_ts,
+                });
+            }
+            if block.timestamp > prev_ts + MAX_TIMESTAMP_INCREMENT {
+                errors.push(BlockValidationError::TimestampTooNew {
+                    current: block.timestamp,
+                    previous: prev_ts,
+                    max_increment: MAX_TIMESTAMP_INCREMENT,
+                });
+            }
         }
     }
 
@@ -238,6 +246,13 @@ pub fn validate_block(
     // caller-supplied expected values. This ensures signatures are verified against
     // what the block actually claims, and the separate genesis consistency check
     // (step 5) can detect if the block's genesis fields differ from expected.
+    // Resolve version-aware consensus params for this block's protocol.
+    let params = consensus_params_for_version(&block.current_protocol).unwrap_or_default();
+    let spec = SpecialAddresses {
+        fee_sink: block.fee_sink,
+        rewards_pool: block.rewards_pool,
+    };
+
     let mut restored_payset = block.payset.clone();
     for stx in &mut restored_payset {
         if stx.has_genesis_id && stx.txn.genesis_id.is_empty() {
@@ -268,8 +283,11 @@ pub fn validate_block(
         // If the transaction is part of a group, allow fee pooling so the
         // per-txn minimum fee check is skipped. Group-level fee validation
         // happens after the group ID check (step 4b).
+        // Free heartbeats (ungrouped, fee < min, v40+) are also fee-exempt.
         let allow_fee_pooling = !stx.txn.group.is_empty();
-        if let Err(e) = validate_transaction_rules(&stx.txn, allow_fee_pooling) {
+        if let Err(e) =
+            validate_transaction_wellformed(&stx.txn, allow_fee_pooling, &params, Some(&spec))
+        {
             errors.push(BlockValidationError::TransactionValidationFailed {
                 txn_index: idx,
                 error: e.to_string(),
@@ -279,6 +297,14 @@ pub fn validate_block(
         // Signature verification.
         if let Err(e) = verify_transaction_signature(stx) {
             errors.push(BlockValidationError::SignatureVerificationFailed {
+                txn_index: idx,
+                error: e.to_string(),
+            });
+        }
+
+        // AuthAddr != Sender check (Go: EnforceAuthAddrSenderDiff, future only).
+        if let Err(e) = verify_auth_addr_sender_diff(stx, params.enforce_auth_addr_sender_diff) {
+            errors.push(BlockValidationError::TransactionValidationFailed {
                 txn_index: idx,
                 error: e.to_string(),
             });
@@ -299,9 +325,10 @@ pub fn validate_block(
     }
 
     // 4b. Group fee pooling — verify each group's total fees meet the minimum.
+    // Uses version-aware params for heartbeat exemption and min fee.
     {
         let txn_refs: Vec<&SignedTransaction> = restored_payset.iter().collect();
-        if let Err(e) = validate_group_fees(&txn_refs) {
+        if let Err(e) = validate_group_fees_with_params(&txn_refs, &params) {
             errors.push(e);
         }
     }
@@ -641,6 +668,68 @@ mod tests {
             .errors
             .iter()
             .any(|e| matches!(e, BlockValidationError::TimestampTooNew { .. })));
+    }
+
+    #[test]
+    fn timestamp_skip_when_prev_is_zero() {
+        // Go: prev.TimeStamp > 0 guard means a zero previous timestamp skips
+        // the bounds check entirely. Even an "unreasonable" current timestamp
+        // should not produce timestamp errors.
+        let mut block = empty_block();
+        block.timestamp = 999_999_999; // would be "too new" vs a positive prev
+        let result = validate_block(&block, Some(0), "test-v1", &test_genesis_hash(), None);
+        assert!(
+            !result.errors.iter().any(|e| matches!(
+                e,
+                BlockValidationError::TimestampTooOld { .. }
+                    | BlockValidationError::TimestampTooNew { .. }
+            )),
+            "timestamp bounds should be skipped when prev_timestamp=0, errors: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn timestamp_skip_when_prev_is_negative() {
+        // Negative previous timestamps also skip the check (Go uses > 0).
+        let mut block = empty_block();
+        block.timestamp = 1;
+        let result = validate_block(&block, Some(-5), "test-v1", &test_genesis_hash(), None);
+        assert!(
+            !result.errors.iter().any(|e| matches!(
+                e,
+                BlockValidationError::TimestampTooOld { .. }
+                    | BlockValidationError::TimestampTooNew { .. }
+            )),
+            "timestamp bounds should be skipped when prev_timestamp is negative, errors: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn timestamp_enforced_when_prev_positive() {
+        // When prev_timestamp > 0, bounds ARE enforced.
+        let mut block = empty_block();
+        block.timestamp = 50; // before prev=100
+        let result = validate_block(&block, Some(100), "test-v1", &test_genesis_hash(), None);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| matches!(e, BlockValidationError::TimestampTooOld { .. })),
+            "timestamp too old should be caught when prev_timestamp > 0"
+        );
+
+        let mut block2 = empty_block();
+        block2.timestamp = 200; // beyond prev + MAX_TIMESTAMP_INCREMENT (25)
+        let result2 = validate_block(&block2, Some(100), "test-v1", &test_genesis_hash(), None);
+        assert!(
+            result2
+                .errors
+                .iter()
+                .any(|e| matches!(e, BlockValidationError::TimestampTooNew { .. })),
+            "timestamp too new should be caught when prev_timestamp > 0"
+        );
     }
 
     #[test]

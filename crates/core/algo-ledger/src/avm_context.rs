@@ -631,7 +631,10 @@ fn read_txn_field(
         )),
         // ConfigAssetDecimals
         34 => Ok(TealValue::Uint(
-            txn.asset_params.as_ref().map(|p| p.decimals as u64).unwrap_or(0),
+            txn.asset_params
+                .as_ref()
+                .map(|p| p.decimals as u64)
+                .unwrap_or(0),
         )),
         // ConfigAssetDefaultFrozen
         35 => Ok(TealValue::Uint(
@@ -862,11 +865,7 @@ fn read_txn_field(
         }
         // NumApprovalProgramPages
         64 => {
-            let len = txn
-                .approval_program
-                .as_ref()
-                .map(|b| b.len())
-                .unwrap_or(0);
+            let len = txn.approval_program.as_ref().map(|b| b.len()).unwrap_or(0);
             Ok(TealValue::Uint(div_ceil(len, MAX_STRING_SIZE) as u64))
         }
         // ClearStateProgramPages (array) — same 4096-byte paging as approval.
@@ -1777,15 +1776,9 @@ mod tests {
         // Applications[0] = current ApplicationID (per go-algorand semantics)
         assert_eq!(ctx.txn_field(0, 49, Some(0)).unwrap(), TealValue::Uint(42));
         // Applications[1] = apfa[0]
-        assert_eq!(
-            ctx.txn_field(0, 49, Some(1)).unwrap(),
-            TealValue::Uint(100)
-        );
+        assert_eq!(ctx.txn_field(0, 49, Some(1)).unwrap(), TealValue::Uint(100));
         // Applications[2] = apfa[1]
-        assert_eq!(
-            ctx.txn_field(0, 49, Some(2)).unwrap(),
-            TealValue::Uint(200)
-        );
+        assert_eq!(ctx.txn_field(0, 49, Some(2)).unwrap(), TealValue::Uint(200));
         // Applications[3] = out of range
         assert!(ctx.txn_field(0, 49, Some(3)).is_err());
 

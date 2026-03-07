@@ -13,6 +13,10 @@ const MSIG_ADDR_PREFIX: &[u8] = b"MultisigAddr";
 /// Domain separation prefix for logic signature / program hashing.
 const PROGRAM_PREFIX: &[u8] = b"Program";
 
+/// Domain separation prefix for logic multisig program (lmsig) hashing.
+/// Used when verifying LMsig delegation: `"MsigProgram" || addr || program`.
+const MSIG_PROGRAM_PREFIX: &[u8] = b"MsigProgram";
+
 /// Verify a single ed25519 signature on a signed transaction.
 ///
 /// The signed message is `b"TX" || canonical_encode(txn)`.
@@ -225,27 +229,86 @@ fn verify_logicsig_multisig(
 
 /// Verify a logic signature on a signed transaction.
 ///
-/// Three modes:
+/// Four modes (exactly one of sig/msig/lmsig must be set, or none for contract account):
 /// 1. Delegated (sig present): verify ed25519 signature on "Program" || logic
 /// 2. Delegated multisig (msig present): verify multisig on "Program" || logic
-/// 3. Contract account: sender = SHA512/256("Program" || logic)
+/// 3. Delegated logic-multisig (lmsig present): verify multisig on "MsigProgram" || addr || logic
+/// 4. Contract account (no sig/msig/lmsig): sender = SHA512/256("Program" || logic)
 ///
 /// TEAL program evaluation is deferred to Phase 3.
+/// Default LogicSig maximum size (logic bytes + args bytes).
+/// Matches go-algorand `config/consensus.go` v18+ `LogicSigMaxSize = 1000`.
+/// This value has not changed across any consensus version.
+pub const LOGICSIG_MAX_SIZE: u64 = 1000;
+
 pub fn verify_logicsig(stx: &SignedTransaction, lsig: &LogicSig) -> Result<(), AlgoError> {
-    // LogicSig sig and msig are mutually exclusive.
-    if !lsig.sig.is_empty() && lsig.msig.is_some() {
+    // ── Structural sanity checks (Go: logicSigSanityCheckBatchPrep) ──
+    // Empty program is always invalid.
+    if lsig.logic.is_empty() {
         return Err(AlgoError::Validation {
-            message: "logicsig has both sig and msig set; expected at most one".into(),
+            message: "LogicSig.Logic empty".into(),
         });
     }
 
-    // Build program message: "Program" || logic
-    let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
-    program_msg.extend_from_slice(PROGRAM_PREFIX);
-    program_msg.extend_from_slice(&lsig.logic);
+    // Size check: len(logic) + sum(len(args[i])) must not exceed LogicSigMaxSize.
+    // Go checks this when EnableLogicSigSizePooling is false (which is the
+    // common case for individual txn validation). We use the constant 1000
+    // which has been stable since v18.
+    let mut lsig_len: u64 = lsig.logic.len() as u64;
+    if let Some(ref args) = lsig.args {
+        for arg in args {
+            lsig_len += arg.len() as u64;
+        }
+    }
+    if lsig_len > LOGICSIG_MAX_SIZE {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "LogicSig too long: {} bytes exceeds maximum {}",
+                lsig_len, LOGICSIG_MAX_SIZE
+            ),
+        });
+    }
 
-    if !lsig.sig.is_empty() {
-        // Mode 1: Delegated single-sig
+    // Count how many of sig/msig/lmsig are set — must be 0 or 1 (matches Go).
+    let has_sig = !lsig.sig.is_empty();
+    let has_msig = lsig.msig.is_some();
+    let has_lmsig = lsig.lmsig.is_some();
+    let num_sigs = has_sig as u8 + has_msig as u8 + has_lmsig as u8;
+
+    if num_sigs > 1 {
+        return Err(AlgoError::Validation {
+            message: "LogicSig should only have one of Sig, Msig, or LMsig but has more than one"
+                .into(),
+        });
+    }
+
+    // The authorizer is auth_addr if set, otherwise sender.
+    let authorizer = match &stx.auth_addr {
+        Some(addr) => addr,
+        None => &stx.txn.sender,
+    };
+
+    if num_sigs == 0 {
+        // Mode 4: Contract account — authorizer should be SHA512/256("Program" || logic)
+        let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
+        program_msg.extend_from_slice(PROGRAM_PREFIX);
+        program_msg.extend_from_slice(&lsig.logic);
+        let hash = Sha512_256::digest(&program_msg);
+        let mut expected = [0u8; 32];
+        expected.copy_from_slice(&hash);
+        let expected_addr = Address(expected);
+
+        if *authorizer != expected_addr {
+            return Err(AlgoError::Validation {
+                message: "logicsig contract account: sender does not match program hash".into(),
+            });
+        }
+    } else if has_sig {
+        // Mode 1: Delegated single-sig — verify signature on "Program" || logic
+        let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
+        program_msg.extend_from_slice(PROGRAM_PREFIX);
+        program_msg.extend_from_slice(&lsig.logic);
+
         let sig_bytes: [u8; 64] = lsig.sig[..].try_into().map_err(|_| AlgoError::Validation {
             message: format!(
                 "invalid logicsig signature length: expected 64 bytes, got {}",
@@ -254,14 +317,8 @@ pub fn verify_logicsig(stx: &SignedTransaction, lsig: &LogicSig) -> Result<(), A
         })?;
         let signature = Signature::from_bytes(&sig_bytes);
 
-        // The signer is the sender (or auth_addr if rekeyed).
-        let pk_bytes = match &stx.auth_addr {
-            Some(addr) => addr.0,
-            None => stx.txn.sender.0,
-        };
-
         let verifying_key =
-            VerifyingKey::from_bytes(&pk_bytes).map_err(|e| AlgoError::Validation {
+            VerifyingKey::from_bytes(&authorizer.0).map_err(|e| AlgoError::Validation {
                 message: format!("invalid logicsig delegated public key: {e}"),
             })?;
 
@@ -271,28 +328,45 @@ pub fn verify_logicsig(stx: &SignedTransaction, lsig: &LogicSig) -> Result<(), A
                 message: format!("logicsig delegated signature verification failed: {e}"),
             })?;
     } else if let Some(msig) = &lsig.msig {
-        // Mode 2: Delegated multisig
+        // Mode 2: Delegated multisig — verify multisig on "Program" || logic
+        let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
+        program_msg.extend_from_slice(PROGRAM_PREFIX);
+        program_msg.extend_from_slice(&lsig.logic);
         verify_logicsig_multisig(stx, msig, &program_msg)?;
-    } else {
-        // Mode 3: Contract account — sender should be SHA512/256("Program" || logic)
-        let hash = Sha512_256::digest(&program_msg);
-        let mut expected = [0u8; 32];
-        expected.copy_from_slice(&hash);
-        let expected_addr = Address(expected);
+    } else if let Some(lmsig) = &lsig.lmsig {
+        // Mode 3: Delegated logic-multisig (lmsig)
+        // Signed data: "MsigProgram" || authorizer_addr || program
+        // This matches Go's MultisigProgram{Addr: Digest(authorizer), Program: logic}.ToBeHashed()
+        let mut lmsig_msg = Vec::with_capacity(MSIG_PROGRAM_PREFIX.len() + 32 + lsig.logic.len());
+        lmsig_msg.extend_from_slice(MSIG_PROGRAM_PREFIX);
+        lmsig_msg.extend_from_slice(&authorizer.0);
+        lmsig_msg.extend_from_slice(&lsig.logic);
+        verify_logicsig_multisig(stx, lmsig, &lmsig_msg)?;
+    }
 
-        let sender = match &stx.auth_addr {
-            Some(addr) => addr,
-            None => &stx.txn.sender,
-        };
+    tracing::trace!("TEAL program evaluation skipped (deferred to Phase 3)");
+    Ok(())
+}
 
-        if *sender != expected_addr {
+/// Check that AuthAddr (if non-zero) is different from Sender.
+///
+/// Matches Go's `EnforceAuthAddrSenderDiff` consensus parameter check.
+/// This is currently only enabled for `future` consensus versions in Go,
+/// but we implement it gated on a boolean parameter for forward compatibility.
+pub fn verify_auth_addr_sender_diff(
+    stx: &SignedTransaction,
+    enforce: bool,
+) -> Result<(), AlgoError> {
+    if !enforce {
+        return Ok(());
+    }
+    if let Some(auth_addr) = &stx.auth_addr {
+        if *auth_addr == stx.txn.sender {
             return Err(AlgoError::Validation {
-                message: "logicsig contract account: sender does not match program hash".into(),
+                message: "AuthAddr must be different from Sender".into(),
             });
         }
     }
-
-    tracing::debug!("TEAL program evaluation skipped (deferred to Phase 3)");
     Ok(())
 }
 
@@ -941,7 +1015,8 @@ mod tests {
 
         let err = verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
         assert!(
-            err.to_string().contains("both sig and msig"),
+            err.to_string()
+                .contains("only have one of Sig, Msig, or LMsig"),
             "expected mutual exclusivity error, got: {err}"
         );
     }
@@ -978,5 +1053,268 @@ mod tests {
             err.to_string().contains("public key length"),
             "expected public key length error, got: {err}"
         );
+    }
+
+    // ---- LMsig (logic multisig) tests ----
+
+    /// Build the lmsig message: "MsigProgram" || addr || program
+    fn build_lmsig_msg(addr: &Address, logic: &[u8]) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(MSIG_PROGRAM_PREFIX.len() + 32 + logic.len());
+        msg.extend_from_slice(MSIG_PROGRAM_PREFIX);
+        msg.extend_from_slice(&addr.0);
+        msg.extend_from_slice(logic);
+        msg
+    }
+
+    /// Sign an lmsig message with a key.
+    fn sign_lmsig_msg(key: &SigningKey, addr: &Address, logic: &[u8]) -> Vec<u8> {
+        use ed25519_dalek::Signer;
+        let msg = build_lmsig_msg(addr, logic);
+        let sig = key.sign(&msg);
+        sig.to_bytes().to_vec()
+    }
+
+    #[test]
+    fn verify_logicsig_delegated_lmsig() {
+        let keys: Vec<SigningKey> = (30u8..33).map(signing_key_from_seed).collect();
+        let msig_addr = compute_msig_addr(&keys, 1, 2);
+
+        let logic = vec![0x06, 0x81, 0x01];
+
+        // Build lmsig with keys 0 and 1 signing "MsigProgram" || msig_addr || logic
+        let subsigs: Vec<MultisigSubsig> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let pk = key.verifying_key();
+                let signature = if i < 2 {
+                    ByteBuf::from(sign_lmsig_msg(key, &msig_addr, &logic))
+                } else {
+                    ByteBuf::new()
+                };
+                MultisigSubsig {
+                    public_key: ByteBuf::from(pk.to_bytes().to_vec()),
+                    signature,
+                }
+            })
+            .collect();
+
+        let lmsig = MultisigSig {
+            version: 1,
+            threshold: 2,
+            subsigs,
+        };
+
+        let txn = minimal_pay_txn(msig_addr);
+        let lsig = LogicSig {
+            logic: ByteBuf::from(logic),
+            sig: ByteBuf::new(),
+            msig: None,
+            args: None,
+            lmsig: Some(lmsig),
+        };
+
+        let stx = SignedTransaction {
+            txn,
+            sig: ByteBuf::new(),
+            msig: None,
+            lsig: Some(lsig),
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        assert!(verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).is_ok());
+        assert!(verify_transaction_signature(&stx).is_ok());
+    }
+
+    #[test]
+    fn verify_logicsig_lmsig_wrong_addr_fails() {
+        let keys: Vec<SigningKey> = (30u8..33).map(signing_key_from_seed).collect();
+        let msig_addr = compute_msig_addr(&keys, 1, 2);
+
+        let logic = vec![0x06, 0x81, 0x01];
+
+        // Sign with a DIFFERENT address in the lmsig message
+        let wrong_addr = Address([0xEE; 32]);
+        let subsigs: Vec<MultisigSubsig> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let pk = key.verifying_key();
+                let signature = if i < 2 {
+                    // Signed with wrong_addr, but the txn sender is msig_addr
+                    ByteBuf::from(sign_lmsig_msg(key, &wrong_addr, &logic))
+                } else {
+                    ByteBuf::new()
+                };
+                MultisigSubsig {
+                    public_key: ByteBuf::from(pk.to_bytes().to_vec()),
+                    signature,
+                }
+            })
+            .collect();
+
+        let lmsig = MultisigSig {
+            version: 1,
+            threshold: 2,
+            subsigs,
+        };
+
+        let txn = minimal_pay_txn(msig_addr);
+        let lsig = LogicSig {
+            logic: ByteBuf::from(logic),
+            sig: ByteBuf::new(),
+            msig: None,
+            args: None,
+            lmsig: Some(lmsig),
+        };
+
+        let stx = SignedTransaction {
+            txn,
+            sig: ByteBuf::new(),
+            msig: None,
+            lsig: Some(lsig),
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        // Should fail because lmsig signatures were made with wrong_addr
+        let err = verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("verification failed"),
+            "expected verification failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_logicsig_sig_and_lmsig_fails() {
+        let key = test_signing_key();
+        let pk = key.verifying_key();
+        let sender = Address(pk.to_bytes());
+
+        let logic = vec![0x06, 0x81, 0x01];
+        let sig = sign_program(&key, &logic);
+
+        let keys: Vec<SigningKey> = (30u8..33).map(signing_key_from_seed).collect();
+        let subsigs: Vec<MultisigSubsig> = keys
+            .iter()
+            .map(|k| MultisigSubsig {
+                public_key: ByteBuf::from(k.verifying_key().to_bytes().to_vec()),
+                signature: ByteBuf::new(),
+            })
+            .collect();
+        let lmsig = MultisigSig {
+            version: 1,
+            threshold: 2,
+            subsigs,
+        };
+
+        let txn = minimal_pay_txn(sender);
+        let lsig = LogicSig {
+            logic: ByteBuf::from(logic),
+            sig: ByteBuf::from(sig),
+            msig: None,
+            args: None,
+            lmsig: Some(lmsig),
+        };
+
+        let stx = SignedTransaction {
+            txn,
+            sig: ByteBuf::new(),
+            msig: None,
+            lsig: Some(lsig),
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        let err = verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only have one of Sig, Msig, or LMsig"),
+            "expected mutual exclusivity error, got: {err}"
+        );
+    }
+
+    // ---- AuthAddr == Sender rejection tests ----
+
+    #[test]
+    fn verify_auth_addr_equals_sender_rejected_when_enforced() {
+        let key = test_signing_key();
+        let pk = key.verifying_key();
+        let sender = Address(pk.to_bytes());
+        let txn = minimal_pay_txn(sender);
+        let sig = sign_txn(&key, &txn);
+
+        let stx = SignedTransaction {
+            txn,
+            sig: ByteBuf::from(sig),
+            msig: None,
+            lsig: None,
+            auth_addr: Some(sender), // Same as sender
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        // With enforcement enabled, should fail.
+        let err = verify_auth_addr_sender_diff(&stx, true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("AuthAddr must be different from Sender"),
+            "expected auth addr error, got: {err}"
+        );
+
+        // With enforcement disabled, should pass.
+        assert!(verify_auth_addr_sender_diff(&stx, false).is_ok());
+    }
+
+    #[test]
+    fn verify_auth_addr_different_from_sender_passes() {
+        let key = test_signing_key();
+        let pk = key.verifying_key();
+        let sender = Address(pk.to_bytes());
+        let txn = minimal_pay_txn(sender);
+        let sig = sign_txn(&key, &txn);
+
+        let stx = SignedTransaction {
+            txn,
+            sig: ByteBuf::from(sig),
+            msig: None,
+            lsig: None,
+            auth_addr: Some(Address([0xFF; 32])), // Different from sender
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        assert!(verify_auth_addr_sender_diff(&stx, true).is_ok());
+    }
+
+    #[test]
+    fn verify_auth_addr_none_passes() {
+        let key = test_signing_key();
+        let pk = key.verifying_key();
+        let sender = Address(pk.to_bytes());
+        let txn = minimal_pay_txn(sender);
+        let sig = sign_txn(&key, &txn);
+
+        let stx = SignedTransaction {
+            txn,
+            sig: ByteBuf::from(sig),
+            msig: None,
+            lsig: None,
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+
+        assert!(verify_auth_addr_sender_diff(&stx, true).is_ok());
     }
 }
