@@ -80,7 +80,8 @@ pub fn op_retsub(machine: &mut AvmMachine, _instruction: &Instruction) -> Result
 }
 
 /// `proto a r` (0x8a): declare subroutine expects `a` args and returns `r` values.
-/// Minimal implementation: validate that the stack has at least `a` values above frame pointer.
+/// In go-algorand, callsub sets frame_pointer = stack.len() *before* entering the
+/// callee, so the callee's arguments live *below* frame_pointer.
 pub fn op_proto(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(), AlgoError> {
     let (num_args, _num_returns) = if let Immediates::Uint8Pair(a, r) = instruction.immediates {
         (a as usize, r as usize)
@@ -90,7 +91,7 @@ pub fn op_proto(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(
         });
     };
 
-    // Validate stack has at least num_args values above frame pointer.
+    // Arguments were pushed before callsub, so they live below the frame pointer.
     let frame_pointer = if let Some(frame) = machine.call_stack.last() {
         frame.frame_pointer
     } else {
@@ -99,11 +100,10 @@ pub fn op_proto(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(
         });
     };
 
-    let stack_above = machine.stack.len().saturating_sub(frame_pointer);
-    if stack_above < num_args {
+    if frame_pointer < num_args {
         return Err(AlgoError::Avm {
             message: format!(
-                "proto: expected {num_args} args above frame pointer, but only {stack_above} values"
+                "proto: expected {num_args} args below frame pointer, but frame pointer is {frame_pointer}"
             ),
         });
     }

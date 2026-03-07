@@ -250,10 +250,15 @@ fn check_stack_depth(program: &Program) -> Result<(), AlgoError> {
         // Compute net stack effect.
         let pops = if spec.stack_pops < 0 {
             // Use actual pop count from immediates when available.
-            match &instr.immediates {
-                Immediates::Uint8(n) if instr.opcode == 0x46 /* popn */ => *n as i32,
-                Immediates::Labels(labels) if instr.opcode == 0x8e /* match */ => {
-                    labels.len() as i32 + 1 // n match values + target
+            match instr.opcode {
+                0x46 /* popn */ => {
+                    if let Immediates::Uint8(n) = &instr.immediates { *n as i32 } else { 1 }
+                }
+                0x4b /* dig */ | 0x4e /* cover */ | 0x4f /* uncover */ => 0, // these rearrange, net effect handled in pushes
+                0x8e /* match */ => {
+                    if let Immediates::Labels(labels) = &instr.immediates {
+                        labels.len() as i32 + 1
+                    } else { 1 }
                 }
                 _ => 1, // conservative
             }
@@ -263,11 +268,17 @@ fn check_stack_depth(program: &Program) -> Result<(), AlgoError> {
 
         let pushes = if spec.stack_pushes < 0 {
             // Use actual push count from immediates when available.
-            match &instr.immediates {
-                Immediates::PushInts(vals) => vals.len() as i32,
-                Immediates::PushBytess(vals) => vals.len() as i32,
-                Immediates::Uint8(n) if instr.opcode == 0x47 /* dupn */ => {
-                    *n as i32 + 1 // dupn n produces n+1 copies (original + n dups)
+            match instr.opcode {
+                0x47 /* dupn */ => {
+                    if let Immediates::Uint8(n) = &instr.immediates { *n as i32 + 1 } else { 1 }
+                }
+                0x4b /* dig */ => 1, // dig copies one value onto top (net +1)
+                0x4e /* cover */ | 0x4f /* uncover */ => 0, // rearrange only, no net growth
+                0x83 /* pushints */ => {
+                    if let Immediates::PushInts(vals) = &instr.immediates { vals.len() as i32 } else { 1 }
+                }
+                0x82 /* pushbytess */ => {
+                    if let Immediates::PushBytess(vals) = &instr.immediates { vals.len() as i32 } else { 1 }
                 }
                 _ => 1, // conservative
             }
