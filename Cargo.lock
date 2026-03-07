@@ -93,6 +93,8 @@ dependencies = [
 name = "algo-ledger"
 version = "0.1.0"
 dependencies = [
+ "algo-avm",
+ "algo-codec",
  "algo-error",
  "algo-types",
  "data-encoding",

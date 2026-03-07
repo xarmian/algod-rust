@@ -165,9 +165,9 @@ pub fn op_extract3(machine: &mut AvmMachine, _instruction: &Instruction) -> Resu
     let l = machine.pop_uint()? as usize;
     let s = machine.pop_uint()? as usize;
     let a = machine.pop_bytes()?;
-    let end = s.checked_add(l).ok_or_else(|| {
-        avm_err(format!("extract3: start {s} + length {l} overflows"))
-    })?;
+    let end = s
+        .checked_add(l)
+        .ok_or_else(|| avm_err(format!("extract3: start {s} + length {l} overflows")))?;
     if end > a.len() {
         return Err(avm_err(format!(
             "extract3: start {s} + length {l} > byte length {}",
@@ -246,7 +246,10 @@ pub fn op_replace2(machine: &mut AvmMachine, instruction: &Instruction) -> Resul
     let b = machine.pop_bytes()?;
     let mut a = machine.pop_bytes()?;
     let end = s.checked_add(b.len()).ok_or_else(|| {
-        avm_err(format!("replace2: start {s} + replacement length {} overflows", b.len()))
+        avm_err(format!(
+            "replace2: start {s} + replacement length {} overflows",
+            b.len()
+        ))
     })?;
     if end > a.len() {
         return Err(avm_err(format!(
@@ -265,7 +268,10 @@ pub fn op_replace3(machine: &mut AvmMachine, _instruction: &Instruction) -> Resu
     let s = machine.pop_uint()? as usize;
     let mut a = machine.pop_bytes()?;
     let end = s.checked_add(b.len()).ok_or_else(|| {
-        avm_err(format!("replace3: start {s} + replacement length {} overflows", b.len()))
+        avm_err(format!(
+            "replace3: start {s} + replacement length {} overflows",
+            b.len()
+        ))
     })?;
     if end > a.len() {
         return Err(avm_err(format!(

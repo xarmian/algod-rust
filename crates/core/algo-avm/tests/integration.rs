@@ -2,7 +2,7 @@
 //!
 //! Each test assembles raw bytecode, parses, and runs through the full machine pipeline.
 
-use algo_avm::{parse, AvmMachine, ExecMode};
+use algo_avm::{parse, AvmMachine, ExecMode, NullContext};
 
 /// Helper: prepend version byte, parse, and run. Returns Ok(true) for pass, Ok(false) for reject.
 fn run_program(version: u8, code: &[u8]) -> Result<bool, algo_error::AlgoError> {
@@ -10,7 +10,7 @@ fn run_program(version: u8, code: &[u8]) -> Result<bool, algo_error::AlgoError> 
     raw.extend_from_slice(code);
     let program = parse(&raw)?;
     let mut machine = AvmMachine::new(program, ExecMode::LogicSig, 20_000);
-    machine.run()
+    machine.run(&mut NullContext)
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +289,7 @@ fn test_budget_exhaustion() {
     ]);
     let program = parse(&raw).unwrap();
     let mut machine = AvmMachine::new(program, ExecMode::LogicSig, 100); // small budget
-    let result = machine.run();
+    let result = machine.run(&mut NullContext);
     assert!(result.is_err(), "should exhaust cost budget");
     let err_msg = format!("{}", result.unwrap_err());
     assert!(
@@ -517,7 +517,7 @@ fn test_stores_out_of_range() {
     raw.extend_from_slice(code);
     let program = parse(&raw).unwrap();
     let mut machine = AvmMachine::new(program, ExecMode::LogicSig, 20_000);
-    let result = machine.run();
+    let result = machine.run(&mut NullContext);
     assert!(result.is_err(), "stores with index 256 should error");
 }
 

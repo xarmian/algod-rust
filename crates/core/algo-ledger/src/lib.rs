@@ -1,4 +1,5 @@
 pub mod apply;
+pub mod avm_context;
 pub mod eval_delta;
 pub mod genesis;
 pub mod lease;
@@ -11,6 +12,7 @@ pub mod store_trait;
 pub mod trie_hash;
 
 pub use apply::{apply_block, apply_transaction, ApplyContext};
+pub use avm_context::{type_enum, LedgerAvmContext};
 pub use eval_delta::{parse_eval_delta, DeltaAction, EvalDelta, ValueDelta};
 pub use genesis::{parse_genesis_json, populate_store, GenesisAllocation, GenesisJson};
 pub use lease::LeaseTable;

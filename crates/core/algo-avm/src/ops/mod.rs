@@ -7,19 +7,29 @@ pub mod arithmetic;
 pub mod bytes;
 pub mod constants;
 pub mod flow;
+pub mod global;
+pub mod helpers;
+pub mod itxn;
 pub mod logic;
 pub mod stack;
+pub mod state;
+pub mod txn;
 
 use algo_error::AlgoError;
 
 use crate::bytecode::Instruction;
+use crate::context::AvmContext;
 use crate::machine::AvmMachine;
 
-/// Type alias for an opcode handler function.
-pub type OpcodeHandler = fn(&mut AvmMachine, &Instruction) -> Result<(), AlgoError>;
-
 /// Dispatch an instruction to its handler.
-pub fn dispatch(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(), AlgoError> {
+///
+/// The `ctx` parameter provides external state access.  Existing pure-opcode
+/// handlers ignore it; future state-access opcodes will use it.
+pub fn dispatch(
+    machine: &mut AvmMachine,
+    instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
     match instruction.opcode {
         // ---- Error ----
         0x00 => flow::op_err(machine, instruction),
@@ -42,6 +52,29 @@ pub fn dispatch(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(
         0x82 => constants::op_pushbytess(machine, instruction),
         0x83 => constants::op_pushints(machine, instruction),
 
+        // ---- LogicSig arguments ----
+        0x2c => txn::op_arg(machine, instruction, ctx),
+        0x2d => txn::op_arg_n(machine, instruction, ctx), // arg_0
+        0x2e => txn::op_arg_n(machine, instruction, ctx), // arg_1
+        0x2f => txn::op_arg_n(machine, instruction, ctx), // arg_2
+        0x30 => txn::op_arg_n(machine, instruction, ctx), // arg_3
+
+        // ---- Txn / Gtxn field access ----
+        0x31 => txn::op_txn(machine, instruction, ctx),
+        // ---- Global field access ----
+        0x32 => global::op_global(machine, instruction, ctx),
+        0x33 => txn::op_gtxn(machine, instruction, ctx),
+        0x36 => txn::op_txna(machine, instruction, ctx),
+        0x37 => txn::op_gtxna(machine, instruction, ctx),
+        0x38 => txn::op_gtxns(machine, instruction, ctx),
+        0x39 => txn::op_gtxnsa(machine, instruction, ctx),
+
+        // ---- Dynamic txn array access (v5+) ----
+        0xc0 => txn::op_txnas(machine, instruction, ctx),
+        0xc1 => txn::op_gtxnas(machine, instruction, ctx),
+        0xc2 => txn::op_gtxnsas(machine, instruction, ctx),
+        0xc3 => txn::op_args(machine, instruction, ctx),
+
         // ---- Logic / bitwise ----
         0x10 => logic::op_and(machine, instruction),
         0x11 => logic::op_or(machine, instruction),
@@ -53,6 +86,8 @@ pub fn dispatch(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(
         // ---- Scratch space ----
         0x34 => stack::op_load(machine, instruction),
         0x35 => stack::op_store(machine, instruction),
+        0x3a => state::op_gload(machine, instruction, ctx),
+        0x3b => state::op_gloads(machine, instruction, ctx),
         0x3e => stack::op_loads(machine, instruction),
         0x3f => stack::op_stores(machine, instruction),
 
@@ -128,6 +163,27 @@ pub fn dispatch(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(
         0x5c => bytes::op_replace2(machine, instruction),
         0x5d => bytes::op_replace3(machine, instruction),
 
+        // ---- App state ----
+        0x60 => state::op_balance(machine, instruction, ctx),
+        0x61 => state::op_app_opted_in(machine, instruction, ctx),
+        0x62 => state::op_app_local_get(machine, instruction, ctx),
+        0x63 => state::op_app_local_get_ex(machine, instruction, ctx),
+        0x64 => state::op_app_global_get(machine, instruction, ctx),
+        0x65 => state::op_app_global_get_ex(machine, instruction, ctx),
+        0x66 => state::op_app_local_put(machine, instruction, ctx),
+        0x67 => state::op_app_global_put(machine, instruction, ctx),
+        0x68 => state::op_app_local_del(machine, instruction, ctx),
+        0x69 => state::op_app_global_del(machine, instruction, ctx),
+
+        // ---- Asset / App / Account queries ----
+        0x70 => state::op_asset_holding_get(machine, instruction, ctx),
+        0x71 => state::op_asset_params_get(machine, instruction, ctx),
+        0x72 => state::op_app_params_get(machine, instruction, ctx),
+        0x73 => state::op_acct_params_get(machine, instruction, ctx),
+
+        // ---- Min balance ----
+        0x78 => state::op_min_balance(machine, instruction, ctx),
+
         // ---- Big-integer byte-math ----
         0x96 => bytes::op_bsqrt(machine, instruction),
         0xa0 => bytes::op_badd(machine, instruction),
@@ -146,6 +202,23 @@ pub fn dispatch(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(
         0xad => bytes::op_bbitwise_xor(machine, instruction),
         0xae => bytes::op_bbitwise_not(machine, instruction),
         0xaf => bytes::op_bzero(machine, instruction),
+
+        // ---- Logging ----
+        0xb0 => state::op_log(machine, instruction, ctx),
+
+        // ---- Inner transactions ----
+        0xb1 => itxn::op_itxn_begin(machine, instruction, ctx),
+        0xb2 => itxn::op_itxn_field(machine, instruction, ctx),
+        0xb3 => itxn::op_itxn_submit(machine, instruction, ctx),
+        0xb4 => itxn::op_itxn(machine, instruction, ctx),
+        0xb5 => itxn::op_itxna(machine, instruction, ctx),
+        0xb6 => itxn::op_itxn_next(machine, instruction, ctx),
+        0xb7 => itxn::op_gitxn(machine, instruction, ctx),
+        0xb8 => itxn::op_gitxna(machine, instruction, ctx),
+
+        // ---- Dynamic inner txn array access (v6+) ----
+        0xc5 => itxn::op_itxnas(machine, instruction, ctx),
+        0xc6 => itxn::op_gitxnas(machine, instruction, ctx),
 
         // ---- Everything else: not yet implemented ----
         _ => {
