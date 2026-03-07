@@ -127,7 +127,11 @@ pub struct BlockHeader {
 
     // ── Upgrade Vote fields ─────────────────────────────────────
     /// Proposed upgrade protocol version.
-    #[serde(rename = "upgradeprop", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "upgradeprop",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub upgrade_propose: String,
 
     /// Proposed upgrade delay (rounds).
@@ -140,11 +144,19 @@ pub struct BlockHeader {
 
     // ── Participation Updates fields ────────────────────────────
     /// Expired participation accounts (removed from participation).
-    #[serde(rename = "partupdrmv", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "partupdrmv",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub expired_participation_accounts: Option<Vec<Address>>,
 
     /// Absent participation accounts.
-    #[serde(rename = "partupdabs", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "partupdabs",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub absent_participation_accounts: Option<Vec<Address>>,
 }
 

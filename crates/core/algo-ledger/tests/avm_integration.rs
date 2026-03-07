@@ -415,7 +415,10 @@ fn global_logicsig_version() {
         0x43, // return
     ];
     let result = run_with_context(6, code, &mut ctx).unwrap();
-    assert!(result, "global LogicSigVersion should match MAX_AVM_VERSION (10)");
+    assert!(
+        result,
+        "global LogicSigVersion should match MAX_AVM_VERSION (10)"
+    );
 }
 
 // ===========================================================================

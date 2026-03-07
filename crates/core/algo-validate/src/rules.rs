@@ -1,13 +1,16 @@
 // Epic 10: Stateless protocol rules (fees, rounds, groups)
+// Conformance review (#34): version-aware consensus params, zero-sender /
+// rewards-pool-sender checks, heartbeat fee exemption.
 
 use algo_codec::{canonical_encode_transaction, canonical_encode_tx_group};
 use algo_error::AlgoError;
-use algo_types::{Digest, SignedTransaction, Transaction};
+use algo_types::{Address, Digest, SignedTransaction, Transaction};
 use serde_bytes::ByteBuf;
 use sha2::{Digest as _, Sha512_256};
 
 // Consensus defaults — stable across all protocol versions to date.
-// Future: load from consensus params.
+// These constants are kept for backward compatibility and as the default
+// values used by `ConsensusParams::default()`.
 pub const MIN_TXN_FEE: u64 = 1000;
 pub const MAX_TXN_LIFE: u64 = 1000;
 pub const MAX_NOTE_SIZE: usize = 1024;
@@ -24,6 +27,110 @@ pub const MAX_TXN_BYTES_PER_BLOCK_V32: usize = 1_000_000;
 
 /// Maximum total transaction bytes per block (v33+).
 pub const MAX_TXN_BYTES_PER_BLOCK_V33: usize = 5 * 1024 * 1024;
+
+// ── ConsensusParams ────────────────────────────────────────────────
+// Version-aware consensus parameters, mirroring go-algorand's
+// `config.ConsensusParams` struct. Parameters are derived from the
+// protocol version string using `consensus_params_for_version()`.
+
+/// Version-aware consensus parameters for stateless validation.
+///
+/// Mirrors the subset of go-algorand `config.ConsensusParams` that is
+/// relevant to stateless transaction/block validation.
+#[derive(Debug, Clone)]
+pub struct ConsensusParams {
+    /// Minimum transaction fee in microAlgos (Go: `MinTxnFee`).
+    pub min_txn_fee: u64,
+    /// Maximum transaction lifetime in rounds (Go: `MaxTxnLife`).
+    pub max_txn_life: u64,
+    /// Maximum note field size in bytes (Go: `MaxTxnNoteBytes`).
+    pub max_txn_note_bytes: usize,
+    /// Maximum transactions per group (Go: `MaxTxGroupSize`).
+    pub max_tx_group_size: usize,
+    /// Whether fee pooling across groups is enabled (Go: `EnableFeePooling`, v28+).
+    pub enable_fee_pooling: bool,
+    /// Whether transaction groups are supported (Go: `SupportTxGroups`, v18+).
+    pub support_tx_groups: bool,
+    /// Whether transaction leases are supported (Go: `SupportTransactionLeases`, v18+).
+    pub support_transaction_leases: bool,
+    /// Whether account rekeying is supported (Go: `SupportRekeying`, v24+).
+    pub support_rekeying: bool,
+    /// Whether heartbeat transactions are enabled (Go: `Heartbeat`, v40+).
+    pub enable_heartbeat: bool,
+    /// Whether AuthAddr must differ from Sender (Go: `EnforceAuthAddrSenderDiff`, future only).
+    pub enforce_auth_addr_sender_diff: bool,
+    /// Maximum total transaction bytes per block.
+    pub max_txn_bytes_per_block: usize,
+}
+
+impl Default for ConsensusParams {
+    /// Default params match the latest consensus (V41) values.
+    fn default() -> Self {
+        Self {
+            min_txn_fee: MIN_TXN_FEE,
+            max_txn_life: MAX_TXN_LIFE,
+            max_txn_note_bytes: MAX_NOTE_SIZE,
+            max_tx_group_size: MAX_GROUP_SIZE,
+            enable_fee_pooling: true,
+            support_tx_groups: true,
+            support_transaction_leases: true,
+            support_rekeying: true,
+            enable_heartbeat: true,
+            enforce_auth_addr_sender_diff: false,
+            max_txn_bytes_per_block: MAX_TXN_BYTES_PER_BLOCK_V33,
+        }
+    }
+}
+
+/// Special addresses for validation (fee sink and rewards pool).
+///
+/// Mirrors go-algorand's `transactions.SpecialAddresses`.
+#[derive(Debug, Clone, Default)]
+pub struct SpecialAddresses {
+    pub fee_sink: Address,
+    pub rewards_pool: Address,
+}
+
+/// Return consensus parameters for the given protocol version string.
+///
+/// Derives parameters from the version index in `KNOWN_PROTOCOL_VERSIONS`.
+/// All values match go-algorand `config/consensus.go` at tag v4.5.1-stable.
+///
+/// Returns `None` for unknown protocol versions.
+pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
+    let idx = protocol_version_index(version)?;
+
+    // Feature activation indices (from go-algorand config/consensus.go):
+    //   v7 (idx 0):  base version — groups=false, leases=false, rekeying=false
+    //   v18 (idx 11): SupportTxGroups=true, MaxTxGroupSize=16, SupportTransactionLeases=true
+    //   v24 (idx 17): SupportRekeying=true
+    //   v28 (idx 21): EnableFeePooling=true
+    //   v33 (idx 26): MaxTxnBytesPerBlock=5*1024*1024
+    //   v40 (idx 33): Heartbeat=true
+    const V18_INDEX: usize = 11; // v18
+    const V24_INDEX: usize = 17; // v24
+    const V28_INDEX: usize = 21; // v28
+
+    Some(ConsensusParams {
+        min_txn_fee: MIN_TXN_FEE,
+        max_txn_life: MAX_TXN_LIFE,
+        max_txn_note_bytes: MAX_NOTE_SIZE,
+        max_tx_group_size: if idx >= V18_INDEX { MAX_GROUP_SIZE } else { 1 },
+        enable_fee_pooling: idx >= V28_INDEX,
+        support_tx_groups: idx >= V18_INDEX,
+        support_transaction_leases: idx >= V18_INDEX,
+        support_rekeying: idx >= V24_INDEX,
+        enable_heartbeat: idx >= V40_START_INDEX,
+        // Go only enables this for `future` consensus (idx 35+, which covers
+        // future and alpha* versions).
+        enforce_auth_addr_sender_diff: version == "future" || version.starts_with("alpha"),
+        max_txn_bytes_per_block: if idx >= V33_START_INDEX {
+            MAX_TXN_BYTES_PER_BLOCK_V33
+        } else {
+            MAX_TXN_BYTES_PER_BLOCK_V32
+        },
+    })
+}
 
 // ── Known protocol versions ─────────────────────────────────────────
 // Mirrors go-algorand `protocol/consensus.go` at tag v4.5.1-stable.
@@ -85,17 +192,159 @@ pub const KNOWN_PROTOCOL_VERSIONS: &[&str] = &[
 /// skipped. This is used when transactions are part of an atomic group where
 /// fee pooling allows one transaction to overpay for others. In that case,
 /// the caller should use `validate_group_fees()` to check group-level fees.
+///
+/// This is the backward-compatible entry point using default consensus
+/// params and no special-address checks. Fee pooling is NOT enabled in the
+/// default params here (unlike V41 defaults) to preserve the original
+/// per-txn fee check behavior. For version-aware validation, use
+/// `validate_transaction_wellformed()`.
 pub fn validate_transaction_rules(
     txn: &Transaction,
     allow_fee_pooling: bool,
 ) -> Result<(), AlgoError> {
-    // Fee must meet minimum (per-txn check), unless fee pooling is allowed.
-    // With fee pooling, the group-level check ensures aggregate fees are sufficient.
-    if !allow_fee_pooling && txn.fee < MIN_TXN_FEE {
+    // Use params with enable_fee_pooling=false so per-txn fee checks work
+    // as the old callers expect. The `allow_fee_pooling` parameter from the
+    // caller controls whether THIS specific call skips the fee check.
+    let params = ConsensusParams {
+        enable_fee_pooling: false,
+        ..ConsensusParams::default()
+    };
+    validate_transaction_wellformed(txn, allow_fee_pooling, &params, None)
+}
+
+/// Version-aware transaction well-formedness check.
+///
+/// Mirrors go-algorand's `Transaction.WellFormed()` plus the fee/round/note/
+/// lease/group checks from the outer validation layer. When `spec` is
+/// provided, also checks for zero sender and rewards-pool sender.
+///
+/// # Checks performed
+///
+/// 1. Sender must not be zero (Go: `tx.Sender.IsZero()`)
+/// 2. Sender must not be the rewards pool (Go: `tx.Sender == spec.RewardsPool`)
+/// 3. Fee minimum (unless fee pooling or state proof or free heartbeat)
+/// 4. Round window (last_valid >= first_valid, window <= max_txn_life)
+/// 5. Note size limit
+/// 6. Lease format (empty or 32 bytes; rejected if leases not supported)
+/// 7. Group format (empty or 32 bytes; rejected if groups not supported)
+/// 8. Rekey-to rejected if rekeying not supported
+/// 9. Heartbeat-specific well-formedness (free heartbeat restrictions)
+pub fn validate_transaction_wellformed(
+    txn: &Transaction,
+    allow_fee_pooling: bool,
+    params: &ConsensusParams,
+    spec: Option<&SpecialAddresses>,
+) -> Result<(), AlgoError> {
+    // ── Sender checks (Go: WellFormed in transaction.go) ──────────
+    // Order matches Go: rewards-pool check first, then zero-sender.
+    // Go checks `tx.Sender == spec.RewardsPool` unconditionally (no
+    // zero-guard on the pool address).
+    if let Some(sp) = spec {
+        if txn.sender == sp.rewards_pool {
+            return Err(AlgoError::Validation {
+                message: "transaction from incentive pool is invalid".to_string(),
+            });
+        }
+    }
+
+    // Zero sender is always invalid.
+    if txn.sender.is_zero() {
+        return Err(AlgoError::Validation {
+            message: "transaction cannot have zero sender".to_string(),
+        });
+    }
+
+    // ── Heartbeat-specific checks (Go: HeartbeatTxnFields.wellFormed) ──
+    // Ungrouped heartbeat transactions with fee < MinTxnFee are "free"
+    // heartbeats. Go exempts them from the fee check entirely but
+    // requires they have no note, no lease, and no rekey-to.
+    let is_free_heartbeat = txn.txn_type == "hb"
+        && txn.group.is_empty()
+        && txn.fee < params.min_txn_fee
+        && params.enable_heartbeat;
+
+    if is_free_heartbeat {
+        if !txn.note.is_empty() {
+            let kind = if txn.fee > 0 { "cheap" } else { "free" };
+            return Err(AlgoError::Validation {
+                message: format!("tx.Note is set in {kind} heartbeat"),
+            });
+        }
+        if !txn.lease.is_empty() {
+            let kind = if txn.fee > 0 { "cheap" } else { "free" };
+            return Err(AlgoError::Validation {
+                message: format!("tx.Lease is set in {kind} heartbeat"),
+            });
+        }
+        if txn.rekey_to.as_ref().is_some_and(|a| !a.is_zero()) {
+            let kind = if txn.fee > 0 { "cheap" } else { "free" };
+            return Err(AlgoError::Validation {
+                message: format!("tx.RekeyTo is set in {kind} heartbeat"),
+            });
+        }
+    }
+
+    // Heartbeat well-formedness: proof, seed, vote_id, key_dilution must be
+    // non-empty. Full HbProof cryptographic verification (falcon signature)
+    // is not yet implemented — it requires falcon key-tree infrastructure.
+    // TODO(#34): implement full HbProof verification when falcon crypto is added.
+    if txn.txn_type == "hb" {
+        if let Some(ref hb) = txn.heartbeat {
+            if hb.proof.is_none()
+                || hb
+                    .proof
+                    .as_ref()
+                    .is_some_and(|p| p.sig.is_empty() && p.pk.is_empty())
+            {
+                return Err(AlgoError::Validation {
+                    message: "tx.HbProof is empty".to_string(),
+                });
+            }
+            if hb.seed.is_empty() {
+                return Err(AlgoError::Validation {
+                    message: "tx.HbSeed is empty".to_string(),
+                });
+            }
+            if hb.vote_id.is_empty() {
+                return Err(AlgoError::Validation {
+                    message: "tx.HbVoteID is empty".to_string(),
+                });
+            }
+            if hb.key_dilution == 0 {
+                return Err(AlgoError::Validation {
+                    message: "tx.HbKeyDilution is zero".to_string(),
+                });
+            }
+        } else if !params.enable_heartbeat {
+            return Err(AlgoError::Validation {
+                message: "heartbeat transaction not supported".to_string(),
+            });
+        } else {
+            // heartbeat is None but heartbeats are enabled — Go's
+            // tx.HeartbeatTxnFields.wellFormed() would fail on zero fields.
+            return Err(AlgoError::Validation {
+                message: "heartbeat transaction missing HeartbeatTxnFields".to_string(),
+            });
+        }
+    }
+
+    // ── Fee check ─────────────────────────────────────────────────
+    // State proof txns are always fee-exempt.
+    // Free heartbeats (checked above) are also fee-exempt.
+    // With fee pooling enabled, the per-txn minimum is skipped (group check
+    // handles it). Without fee pooling, each txn must individually meet the
+    // minimum.
+    let is_stpf = txn.txn_type == "stpf";
+    if !is_stpf
+        && !is_free_heartbeat
+        && !allow_fee_pooling
+        && !params.enable_fee_pooling
+        && txn.fee < params.min_txn_fee
+    {
         return Err(AlgoError::Validation {
             message: format!(
                 "transaction fee {} is below minimum {}",
-                txn.fee, MIN_TXN_FEE
+                txn.fee, params.min_txn_fee
             ),
         });
     }
@@ -110,46 +359,69 @@ pub fn validate_transaction_rules(
         });
     }
 
-    // Round window must not exceed MAX_TXN_LIFE.
+    // Round window must not exceed max_txn_life.
     let window = txn.last_valid.0 - txn.first_valid.0;
-    if window > MAX_TXN_LIFE {
+    if window > params.max_txn_life {
         return Err(AlgoError::Validation {
             message: format!(
                 "transaction validity window {} exceeds maximum {}",
-                window, MAX_TXN_LIFE
+                window, params.max_txn_life
             ),
         });
     }
 
-    // Note must not exceed MAX_NOTE_SIZE.
-    if txn.note.len() > MAX_NOTE_SIZE {
+    // Note must not exceed max_txn_note_bytes.
+    if txn.note.len() > params.max_txn_note_bytes {
         return Err(AlgoError::Validation {
             message: format!(
                 "note size {} exceeds maximum {}",
                 txn.note.len(),
-                MAX_NOTE_SIZE
+                params.max_txn_note_bytes
             ),
         });
     }
 
     // Lease must be empty or exactly 32 bytes.
-    if !txn.lease.is_empty() && txn.lease.len() != MAX_LEASE_SIZE {
-        return Err(AlgoError::Validation {
-            message: format!(
-                "lease must be empty or exactly {} bytes, got {}",
-                MAX_LEASE_SIZE,
-                txn.lease.len()
-            ),
-        });
+    // If leases are not supported, any non-empty lease is rejected.
+    if !txn.lease.is_empty() {
+        if !params.support_transaction_leases {
+            return Err(AlgoError::Validation {
+                message: "transaction tried to acquire lease but protocol does not support transaction leases".to_string(),
+            });
+        }
+        if txn.lease.len() != MAX_LEASE_SIZE {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "lease must be empty or exactly {} bytes, got {}",
+                    MAX_LEASE_SIZE,
+                    txn.lease.len()
+                ),
+            });
+        }
     }
 
     // Group must be empty or exactly 32 bytes.
-    if !txn.group.is_empty() && txn.group.len() != 32 {
+    // If groups are not supported, any non-empty group is rejected.
+    if !txn.group.is_empty() {
+        if !params.support_tx_groups {
+            return Err(AlgoError::Validation {
+                message: "transaction has group but groups not yet enabled".to_string(),
+            });
+        }
+        if txn.group.len() != 32 {
+            return Err(AlgoError::Validation {
+                message: format!(
+                    "group field must be empty or exactly 32 bytes, got {}",
+                    txn.group.len()
+                ),
+            });
+        }
+    }
+
+    // Rekey-to is rejected if rekeying is not supported.
+    if !params.support_rekeying && txn.rekey_to.as_ref().is_some_and(|a| !a.is_zero()) {
         return Err(AlgoError::Validation {
-            message: format!(
-                "group field must be empty or exactly 32 bytes, got {}",
-                txn.group.len()
-            ),
+            message: "transaction has RekeyTo set but rekeying not yet enabled".to_string(),
         });
     }
 
@@ -207,6 +479,12 @@ const V34_START_INDEX: usize = 27;
 /// Expected prefix of the v34 protocol version URL at `V34_START_INDEX`.
 const V34_URL_PREFIX: &str = "https://github.com/algorandfoundation/specs/tree/2dd54359";
 
+/// Index where v40 heartbeat transactions begin.
+const V40_START_INDEX: usize = 33;
+
+/// Expected prefix of the v40 protocol version URL at `V40_START_INDEX`.
+const V40_URL_PREFIX: &str = "https://github.com/algorandfoundation/specs/tree/236dcc18";
+
 /// Index where v41 txn512 (SHA-512 vector commitment) begins.
 const V41_START_INDEX: usize = 34;
 
@@ -234,11 +512,9 @@ pub fn max_txn_bytes_per_block(version: &str) -> Result<usize, AlgoError> {
         }
     };
 
-    validate_protocol_version(version)?;
-    let idx = KNOWN_PROTOCOL_VERSIONS
-        .iter()
-        .position(|&v| v == version)
-        .expect("validate_protocol_version already checked");
+    let idx = protocol_version_index(version).ok_or_else(|| AlgoError::Validation {
+        message: format!("unknown protocol version: {version}"),
+    })?;
     if idx >= V33_START_INDEX {
         // v33+ or special versions (future/alpha inherit latest params)
         Ok(MAX_TXN_BYTES_PER_BLOCK_V33)
@@ -266,6 +542,16 @@ const _: () = {
     let mut i = 0;
     while i < prefix.len() {
         assert!(v34[i] == prefix[i]);
+        i += 1;
+    }
+};
+
+const _: () = {
+    let v40 = KNOWN_PROTOCOL_VERSIONS[V40_START_INDEX].as_bytes();
+    let prefix = V40_URL_PREFIX.as_bytes();
+    let mut i = 0;
+    while i < prefix.len() {
+        assert!(v40[i] == prefix[i]);
         i += 1;
     }
 };
@@ -302,6 +588,23 @@ pub fn has_txn512(version: &str) -> bool {
     protocol_version_index(version)
         .map(|idx| idx >= V41_START_INDEX)
         .unwrap_or(false)
+}
+
+/// Returns `true` if the given protocol version supports heartbeat
+/// transactions (`hb` type, v40+). Returns `false` for unknown versions.
+pub fn has_heartbeat(version: &str) -> bool {
+    protocol_version_index(version)
+        .map(|idx| idx >= V40_START_INDEX)
+        .unwrap_or(false)
+}
+
+/// Returns `true` if the given transaction is a free/cheap heartbeat that
+/// is exempt from fee checks (ungrouped `hb` with fee < min, v40+).
+pub fn is_free_heartbeat(txn: &Transaction, params: &ConsensusParams) -> bool {
+    txn.txn_type == "hb"
+        && txn.group.is_empty()
+        && txn.fee < params.min_txn_fee
+        && params.enable_heartbeat
 }
 
 /// Domain separation prefix for transaction ID hashing.
@@ -453,17 +756,33 @@ pub fn validate_lease_constraints(txns: &[SignedTransaction]) -> Result<(), Algo
 ///
 /// Collects transactions by group ID across the entire payset (using a HashMap).
 /// For each group, the sum of all transaction fees must be at least
-/// `group_size * MIN_TXN_FEE`. Standalone (ungrouped) transactions are skipped
-/// — their fees are checked individually by `validate_transaction_rules`.
+/// `min_fee_count * min_txn_fee`, where `min_fee_count` excludes:
+///   - State proof transactions (`stpf`) — always fee-exempt
+///   - Ungrouped heartbeat transactions (`hb` with empty group) — fee-exempt
+///     when `enable_heartbeat` is true (v40+)
+///
+/// Standalone (ungrouped) transactions are skipped — their fees are checked
+/// individually by `validate_transaction_rules`.
 ///
 /// Returns `BlockValidationError::GroupFeePoolingFailed` for the first group
 /// that fails the check.
 pub fn validate_group_fees(
     txns: &[&SignedTransaction],
 ) -> Result<(), crate::block::BlockValidationError> {
+    validate_group_fees_with_params(txns, &ConsensusParams::default())
+}
+
+/// Version-aware group fee validation.
+///
+/// Like `validate_group_fees` but uses the provided `ConsensusParams` for
+/// the minimum fee value and heartbeat exemption gating.
+pub fn validate_group_fees_with_params(
+    txns: &[&SignedTransaction],
+    params: &ConsensusParams,
+) -> Result<(), crate::block::BlockValidationError> {
     use std::collections::HashMap;
 
-    // Collect (total_fee, count) by group ID.
+    // Collect (total_fee, min_fee_count) by group ID.
     let mut groups: HashMap<&[u8], (u64, u64)> = HashMap::new();
     let mut order: Vec<&[u8]> = Vec::new();
 
@@ -477,12 +796,23 @@ pub fn validate_group_fees(
             (0u64, 0u64)
         });
         entry.0 = entry.0.saturating_add(stx.txn.fee);
+
+        // State proofs are always fee-exempt (don't increment min_fee_count).
+        if stx.txn.txn_type == "stpf" {
+            continue;
+        }
+        // Ungrouped heartbeat txns are fee-exempt (v40+). Within a group,
+        // heartbeats are NOT exempt per Go's verify/txn.go — the exemption
+        // only applies when `Group.IsZero()`. Since we're inside the grouped
+        // branch here (grp is non-empty), heartbeats in groups count normally.
+        // (This matches Go: `stxn.Txn.Type == protocol.HeartbeatTx && stxn.Txn.Group.IsZero()`)
+
         entry.1 += 1;
     }
 
     for grp_key in &order {
-        let (total_fee, group_size) = groups[grp_key];
-        let required_fee = group_size * MIN_TXN_FEE;
+        let (total_fee, min_fee_count) = groups[grp_key];
+        let required_fee = min_fee_count * params.min_txn_fee;
         if total_fee < required_fee {
             return Err(crate::block::BlockValidationError::GroupFeePoolingFailed {
                 group_id: hex::encode(grp_key),
@@ -529,14 +859,17 @@ pub fn validate_genesis_consistency(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use algo_types::{Address, Round};
+    use algo_types::{Address, HeartbeatProof, HeartbeatTxnFields, Round};
     use serde_bytes::ByteBuf;
+
+    /// A non-zero sender address for tests.
+    const TEST_SENDER: Address = Address([1u8; 32]);
 
     /// Build a minimal valid transaction for testing.
     fn make_valid_txn() -> Transaction {
         Transaction {
             txn_type: "pay".to_string(),
-            sender: Address::default(),
+            sender: TEST_SENDER,
             fee: MIN_TXN_FEE,
             first_valid: Round(1000),
             last_valid: Round(1100),
@@ -651,6 +984,291 @@ mod tests {
         let err = validate_transaction_rules(&txn, false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("group field"), "unexpected error: {msg}");
+    }
+
+    // ── Zero sender / rewards pool sender tests ──────────────────
+
+    #[test]
+    fn test_zero_sender_rejected() {
+        let mut txn = make_valid_txn();
+        txn.sender = Address::ZERO;
+        let err = validate_transaction_rules(&txn, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("zero sender"),
+            "expected zero sender rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_rewards_pool_sender_rejected() {
+        let rewards_pool = Address([0xBB; 32]);
+        let spec = SpecialAddresses {
+            fee_sink: Address::ZERO,
+            rewards_pool,
+        };
+        let mut txn = make_valid_txn();
+        txn.sender = rewards_pool;
+        let err =
+            validate_transaction_wellformed(&txn, false, &ConsensusParams::default(), Some(&spec))
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("incentive pool"),
+            "expected rewards pool rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_non_rewards_pool_sender_passes() {
+        let rewards_pool = Address([0xBB; 32]);
+        let spec = SpecialAddresses {
+            fee_sink: Address::ZERO,
+            rewards_pool,
+        };
+        let txn = make_valid_txn(); // sender is TEST_SENDER, not rewards_pool
+        assert!(validate_transaction_wellformed(
+            &txn,
+            false,
+            &ConsensusParams::default(),
+            Some(&spec)
+        )
+        .is_ok());
+    }
+
+    // ── Heartbeat fee exemption tests ────────────────────────────
+
+    /// Build a minimal valid heartbeat transaction.
+    fn make_heartbeat_txn(fee: u64) -> Transaction {
+        Transaction {
+            txn_type: "hb".to_string(),
+            sender: TEST_SENDER,
+            fee,
+            first_valid: Round(1000),
+            last_valid: Round(1100),
+            heartbeat: Some(HeartbeatTxnFields {
+                address: Address([2u8; 32]),
+                proof: Some(HeartbeatProof {
+                    sig: ByteBuf::from(vec![0xAA; 64]),
+                    pk: ByteBuf::from(vec![0xBB; 32]),
+                    pk2: ByteBuf::from(vec![0xCC; 32]),
+                    pk1_sig: ByteBuf::from(vec![0xDD; 64]),
+                    pk2_sig: ByteBuf::from(vec![0xEE; 64]),
+                }),
+                seed: ByteBuf::from(vec![0x11; 32]),
+                vote_id: ByteBuf::from(vec![0x22; 32]),
+                key_dilution: 10000,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_free_heartbeat_ungrouped_passes() {
+        // Ungrouped heartbeat with fee=0 should pass (fee-exempt in v40+).
+        let txn = make_heartbeat_txn(0);
+        let params = ConsensusParams::default(); // enable_heartbeat=true
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_cheap_heartbeat_ungrouped_passes() {
+        // Ungrouped heartbeat with fee < min (but > 0) should also pass.
+        let txn = make_heartbeat_txn(500);
+        let params = ConsensusParams::default();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_free_heartbeat_with_note_rejected() {
+        let mut txn = make_heartbeat_txn(0);
+        txn.note = ByteBuf::from(vec![0x42; 10]);
+        let params = ConsensusParams::default();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Note is set in free heartbeat"),
+            "expected note rejection in free heartbeat, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_cheap_heartbeat_with_lease_rejected() {
+        let mut txn = make_heartbeat_txn(500);
+        txn.lease = ByteBuf::from(vec![0x42; 32]);
+        let params = ConsensusParams::default();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Lease is set in cheap heartbeat"),
+            "expected lease rejection in cheap heartbeat, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_free_heartbeat_with_rekey_rejected() {
+        let mut txn = make_heartbeat_txn(0);
+        txn.rekey_to = Some(Address([0x99; 32]));
+        let params = ConsensusParams::default();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RekeyTo is set in free heartbeat"),
+            "expected rekey rejection in free heartbeat, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_with_full_fee_allows_note() {
+        // Heartbeat with fee >= min should allow note (not "free").
+        let mut txn = make_heartbeat_txn(MIN_TXN_FEE);
+        txn.note = ByteBuf::from(vec![0x42; 10]);
+        let params = ConsensusParams::default();
+        assert!(validate_transaction_wellformed(&txn, false, &params, None).is_ok());
+    }
+
+    #[test]
+    fn test_heartbeat_empty_proof_rejected() {
+        let mut txn = make_heartbeat_txn(MIN_TXN_FEE);
+        txn.heartbeat.as_mut().unwrap().proof = Some(HeartbeatProof::default());
+        let params = ConsensusParams::default();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(err.to_string().contains("HbProof is empty"));
+    }
+
+    #[test]
+    fn test_heartbeat_empty_seed_rejected() {
+        let mut txn = make_heartbeat_txn(MIN_TXN_FEE);
+        txn.heartbeat.as_mut().unwrap().seed = ByteBuf::new();
+        let params = ConsensusParams::default();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(err.to_string().contains("HbSeed is empty"));
+    }
+
+    #[test]
+    fn test_heartbeat_zero_key_dilution_rejected() {
+        let mut txn = make_heartbeat_txn(MIN_TXN_FEE);
+        txn.heartbeat.as_mut().unwrap().key_dilution = 0;
+        let params = ConsensusParams::default();
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(err.to_string().contains("HbKeyDilution is zero"));
+    }
+
+    #[test]
+    fn test_is_free_heartbeat_helper() {
+        let params = ConsensusParams::default();
+        let txn = make_heartbeat_txn(0);
+        assert!(is_free_heartbeat(&txn, &params));
+
+        let txn_with_fee = make_heartbeat_txn(MIN_TXN_FEE);
+        assert!(!is_free_heartbeat(&txn_with_fee, &params));
+
+        let mut grouped_hb = make_heartbeat_txn(0);
+        grouped_hb.group = ByteBuf::from(vec![0xFF; 32]);
+        assert!(!is_free_heartbeat(&grouped_hb, &params));
+
+        let mut params_no_hb = params.clone();
+        params_no_hb.enable_heartbeat = false;
+        let txn2 = make_heartbeat_txn(0);
+        assert!(!is_free_heartbeat(&txn2, &params_no_hb));
+    }
+
+    // ── Version-aware consensus params tests ─────────────────────
+
+    #[test]
+    fn test_consensus_params_v7_no_groups() {
+        let params = consensus_params_for_version("v7").unwrap();
+        assert!(!params.support_tx_groups);
+        assert!(!params.support_transaction_leases);
+        assert!(!params.support_rekeying);
+        assert!(!params.enable_fee_pooling);
+        assert!(!params.enable_heartbeat);
+        assert_eq!(params.max_tx_group_size, 1);
+        assert_eq!(params.min_txn_fee, 1000);
+    }
+
+    #[test]
+    fn test_consensus_params_v41() {
+        // v41 URL
+        let params = consensus_params_for_version(
+            "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed",
+        )
+        .unwrap();
+        assert!(params.support_tx_groups);
+        assert!(params.support_transaction_leases);
+        assert!(params.support_rekeying);
+        assert!(params.enable_fee_pooling);
+        assert!(params.enable_heartbeat);
+        assert_eq!(params.max_tx_group_size, MAX_GROUP_SIZE);
+        assert_eq!(params.min_txn_fee, MIN_TXN_FEE);
+        assert_eq!(params.max_txn_bytes_per_block, MAX_TXN_BYTES_PER_BLOCK_V33);
+    }
+
+    #[test]
+    fn test_consensus_params_future() {
+        let params = consensus_params_for_version("future").unwrap();
+        assert!(params.enable_heartbeat);
+        assert!(params.enable_fee_pooling);
+    }
+
+    #[test]
+    fn test_consensus_params_unknown_returns_none() {
+        assert!(consensus_params_for_version("v99").is_none());
+    }
+
+    #[test]
+    fn test_lease_rejected_pre_v18() {
+        let params = consensus_params_for_version("v7").unwrap(); // no leases
+        let mut txn = make_valid_txn();
+        txn.lease = ByteBuf::from(vec![0x42; 32]);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not support transaction leases"));
+    }
+
+    #[test]
+    fn test_group_rejected_pre_v18() {
+        let params = consensus_params_for_version("v7").unwrap(); // no groups
+        let mut txn = make_valid_txn();
+        txn.group = ByteBuf::from(vec![0xFF; 32]);
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(err.to_string().contains("groups not yet enabled"));
+    }
+
+    #[test]
+    fn test_rekey_rejected_pre_v24() {
+        // v18 URL (index 11) — has groups/leases but not rekeying
+        let params = consensus_params_for_version(
+            "https://github.com/algorandfoundation/specs/tree/6c6bd668be0ab14098e51b37e806c509f7b7e31f",
+        )
+        .unwrap();
+        assert!(!params.support_rekeying);
+        let mut txn = make_valid_txn();
+        txn.rekey_to = Some(Address([0x99; 32]));
+        let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
+        assert!(err.to_string().contains("rekeying not yet enabled"));
+    }
+
+    // ── has_heartbeat feature detection ──────────────────────────
+
+    #[test]
+    fn test_has_heartbeat_v39_false() {
+        assert!(!has_heartbeat(
+            "https://github.com/algorandfoundation/specs/tree/925a46433742afb0b51bb939354bd907fa88bf95"
+        ));
+    }
+
+    #[test]
+    fn test_has_heartbeat_v40_true() {
+        assert!(has_heartbeat(
+            "https://github.com/algorandfoundation/specs/tree/236dcc18c9c507d794813ab768e467ea42d1b4d9"
+        ));
+    }
+
+    #[test]
+    fn test_has_heartbeat_future_true() {
+        assert!(has_heartbeat("future"));
     }
 
     // ── Group validation tests ──────────────────────────────────

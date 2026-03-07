@@ -8,11 +8,14 @@ use algo_validate::{
 };
 use serde_bytes::ByteBuf;
 
+/// A non-zero sender address for tests.
+const TEST_SENDER: Address = Address([1u8; 32]);
+
 /// Build a minimal valid transaction for testing.
 fn make_txn(fee: u64, amount: u64) -> Transaction {
     Transaction {
         txn_type: "pay".to_string(),
-        sender: Address::default(),
+        sender: TEST_SENDER,
         fee,
         first_valid: Round(1000),
         last_valid: Round(1100),

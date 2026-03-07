@@ -274,6 +274,7 @@ fn vc_hash(algo: HashAlgo, parts: &[&[u8]]) -> Vec<u8> {
 
 /// Return the zero hash for the given algorithm (all-zero bytes of the
 /// appropriate digest size).
+#[allow(dead_code)]
 fn vc_zero_hash(algo: HashAlgo) -> Vec<u8> {
     match algo {
         HashAlgo::Sha256 => vec![0u8; 32],
@@ -303,10 +304,11 @@ fn vc_internal_hash(algo: HashAlgo, left: &[u8], right: &[u8]) -> Vec<u8> {
 /// Returns 32 bytes for SHA-256 or 64 bytes for SHA-512.
 /// An empty payset returns the zero hash of the appropriate size.
 pub fn compute_vector_commitment(block: &Block, algo: HashAlgo) -> Vec<u8> {
-    let zero = vc_zero_hash(algo);
-
     if block.payset.is_empty() {
-        return zero;
+        // go-algorand's generateVectorCommitmentArray returns paddedLen=1 for
+        // arrayLen=0, creating a single bottomElement leaf that hashes to H("MB").
+        // The tree root is just that one leaf hash.
+        return vc_hash(algo, &[MB_PREFIX]);
     }
 
     let n = block.payset.len();
@@ -468,10 +470,10 @@ pub fn compute_vector_commitment_raw(
         "raw_blobs length must match payset length"
     );
 
-    let zero = vc_zero_hash(algo);
-
     if block.payset.is_empty() {
-        return zero;
+        // go-algorand's generateVectorCommitmentArray returns paddedLen=1 for
+        // arrayLen=0, creating a single bottomElement leaf that hashes to H("MB").
+        return vc_hash(algo, &[MB_PREFIX]);
     }
 
     let n = block.payset.len();
@@ -769,18 +771,34 @@ mod tests {
 
     #[test]
     fn vc_empty_payset_sha256() {
+        // go-algorand: empty payset produces a tree with 1 bottomElement leaf,
+        // so the root is SHA256("MB"), NOT zeros.
         let block = minimal_block(vec![]);
         let root = compute_vector_commitment(&block, HashAlgo::Sha256);
         assert_eq!(root.len(), 32);
-        assert_eq!(root, vec![0u8; 32]);
+        let expected = vc_hash(HashAlgo::Sha256, &[MB_PREFIX]);
+        assert_eq!(root, expected);
+        assert_ne!(
+            root,
+            vec![0u8; 32],
+            "empty VC root should be H(MB), not zeros"
+        );
     }
 
     #[test]
     fn vc_empty_payset_sha512() {
+        // go-algorand: empty payset produces a tree with 1 bottomElement leaf,
+        // so the root is SHA512("MB"), NOT zeros.
         let block = minimal_block(vec![]);
         let root = compute_vector_commitment(&block, HashAlgo::Sha512);
         assert_eq!(root.len(), 64);
-        assert_eq!(root, vec![0u8; 64]);
+        let expected = vc_hash(HashAlgo::Sha512, &[MB_PREFIX]);
+        assert_eq!(root, expected);
+        assert_ne!(
+            root,
+            vec![0u8; 64],
+            "empty VC root should be H(MB), not zeros"
+        );
     }
 
     #[test]
