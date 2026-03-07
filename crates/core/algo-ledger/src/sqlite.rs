@@ -424,7 +424,12 @@ fn decode_asset_params(data: &[u8]) -> Result<AssetParams, AlgoError> {
     for (k, v) in map {
         match k.as_str().unwrap_or("") {
             "a" => p.total = v.as_u64().unwrap_or(0),
-            "b" => p.decimals = v.as_u64().unwrap_or(0) as u32,
+            "b" => {
+                let raw = v.as_u64().unwrap_or(0);
+                p.decimals = u32::try_from(raw).map_err(|_| AlgoError::Ledger {
+                    message: format!("asset decimals {raw} exceeds u32::MAX"),
+                })?;
+            }
             "c" => p.default_frozen = v.as_bool().unwrap_or(false),
             "d" => {
                 if let Some(s) = v.as_str() {
@@ -689,7 +694,12 @@ fn decode_app_params(data: &[u8], creator: Address) -> Result<AppParams, AlgoErr
                     }
                 }
             }
-            "v" => p.extra_program_pages = v.as_u64().unwrap_or(0) as u32,
+            "v" => {
+                let raw = v.as_u64().unwrap_or(0);
+                p.extra_program_pages = u32::try_from(raw).map_err(|_| AlgoError::Ledger {
+                    message: format!("extra_program_pages {raw} exceeds u32::MAX"),
+                })?;
+            }
             _ => {}
         }
     }
