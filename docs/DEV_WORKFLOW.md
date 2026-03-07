@@ -154,6 +154,32 @@ make validate
 The validate command compares Rust block decoding against live Go blocks and
 writes a report to `./reports/conformance.json`.
 
+## go-algorand Reference Source
+
+The go-algorand source is available at `../go-algorand`, pinned to `v4.5.1-stable`:
+
+```bash
+cd ../go-algorand
+git log --oneline -1   # should show v4.5.1-stable tag
+```
+
+Use this as the authoritative reference when implementing AVM opcodes, consensus
+params, field indices, and protocol semantics. Key files:
+
+| File | Contents |
+|------|----------|
+| `data/transactions/logic/opcodes.go` | Opcode table, version gating, OpSpec |
+| `data/transactions/logic/eval.go` | Opcode implementations (opTxn, opGlobal, etc.) |
+| `data/transactions/logic/resources.go` | Reference resolution, resource tracking |
+| `data/transactions/logic/fields.go` | TxnField, GlobalField, AssetHoldingField enums |
+| `config/consensus.go` | Consensus params per protocol version |
+| `protocol/consensus.go` | Version constants (`ConsensusCurrentVersion = V41`) |
+
+go-algorand 4.5.1 consensus versions → AVM versions:
+- V39 → AVM 10
+- V40 → AVM 11 (mimc opcode, consensus incentives)
+- V41 → AVM 12 (falcon_verify, app versioning) — **this is ConsensusCurrentVersion**
+
 ## Docker Image
 
 - Image: `algorand/algod:4.5.1-stable` (no `v` prefix)
