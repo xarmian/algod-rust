@@ -27,14 +27,10 @@ fn avm_err(msg: impl Into<String>) -> AlgoError {
     }
 }
 
-/// Convert a BigUint to bytes with leading zeros stripped (at least 1 byte).
+/// Convert a BigUint to big-endian bytes. Zero produces empty bytes,
+/// matching Go's `big.Int.Bytes()` semantics used by the AVM.
 fn biguint_to_bytes(v: &BigUint) -> Vec<u8> {
-    let bytes = v.to_bytes_be();
-    if bytes.is_empty() {
-        vec![0]
-    } else {
-        bytes
-    }
+    v.to_bytes_be()
 }
 
 /// Check that a byte result does not exceed `max_len`.
