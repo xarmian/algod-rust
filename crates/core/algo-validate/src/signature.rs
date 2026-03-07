@@ -650,6 +650,7 @@ mod tests {
             sig: ByteBuf::new(),
             msig: None,
             args: None,
+            lmsig: None,
         };
 
         let stx = SignedTransaction {
@@ -677,6 +678,7 @@ mod tests {
             sig: ByteBuf::new(),
             msig: None,
             args: None,
+            lmsig: None,
         };
 
         let stx = SignedTransaction {
@@ -709,6 +711,7 @@ mod tests {
             sig: ByteBuf::from(sig),
             msig: None,
             args: None,
+            lmsig: None,
         };
 
         let stx = SignedTransaction {
@@ -763,6 +766,7 @@ mod tests {
             sig: ByteBuf::new(),
             msig: Some(msig),
             args: None,
+            lmsig: None,
         };
 
         let stx = SignedTransaction {
@@ -921,6 +925,7 @@ mod tests {
             sig: ByteBuf::from(sig),
             msig: Some(msig),
             args: None,
+            lmsig: None,
         };
 
         let stx = SignedTransaction {

@@ -310,6 +310,7 @@ pub fn canonical_encode_transaction(tx: &Transaction) -> Vec<u8> {
             .as_ref()
             .map(canonical_encode_state_schema),
     );
+    m.add_u64("aprv", tx.reject_version);
     m.add_option_bytes("apsu", &tx.clear_state_program);
 
     // Asset config (acfg)
@@ -338,6 +339,7 @@ pub fn canonical_encode_transaction(tx: &Transaction) -> Vec<u8> {
     m.add_string("gen", &tx.genesis_id);
     m.add_bytes("gh", &tx.genesis_hash);
     m.add_bytes("grp", &tx.group);
+    m.add_option_rmpv("hb", &tx.heartbeat);
     m.add_u64("lv", tx.last_valid.0);
     m.add_bytes("lx", &tx.lease);
 
@@ -355,6 +357,7 @@ pub fn canonical_encode_transaction(tx: &Transaction) -> Vec<u8> {
 
     // State proof (stpf)
     m.add_option_rmpv("sp", &tx.state_proof);
+    m.add_option_rmpv("spmsg", &tx.state_proof_message);
     m.add_u64("sptype", tx.state_proof_type);
     m.add_option_bytes("sprfkey", &tx.state_proof_pk);
 
@@ -444,6 +447,8 @@ pub fn canonical_encode_block_header_from_block(block: &Block) -> Vec<u8> {
     m.add_string("nextproto", &block.next_protocol);
     m.add_u64("nextswitch", block.next_protocol_switch_on.0);
     m.add_u64("nextyes", block.next_protocol_approvals);
+    m.add_option_vec_address("partupdabs", &block.absent_participation_accounts);
+    m.add_option_vec_address("partupdrmv", &block.expired_participation_accounts);
     m.add_u64("pp", block.proposer_payout);
     m.add_bytes("prev", &block.branch);
     m.add_bytes("prev512", &block.prev512);
@@ -460,6 +465,9 @@ pub fn canonical_encode_block_header_from_block(block: &Block) -> Vec<u8> {
     m.add_bytes("txn", &block.txn_commitment);
     m.add_bytes("txn256", &block.txn256);
     m.add_bytes("txn512", &block.txn512);
+    m.add_u64("upgradedelay", block.upgrade_delay);
+    m.add_string("upgradeprop", &block.upgrade_propose);
+    m.add_bool("upgradeyes", block.upgrade_approve);
 
     m.encode()
 }
@@ -479,6 +487,8 @@ pub fn canonical_encode_block_header(header: &BlockHeader) -> Vec<u8> {
     m.add_string("nextproto", &header.next_protocol);
     m.add_u64("nextswitch", header.next_protocol_switch_on.0);
     m.add_u64("nextyes", header.next_protocol_approvals);
+    m.add_option_vec_address("partupdabs", &header.absent_participation_accounts);
+    m.add_option_vec_address("partupdrmv", &header.expired_participation_accounts);
     m.add_u64("pp", header.proposer_payout);
     m.add_bytes("prev", &header.branch);
     m.add_bytes("prev512", &header.prev512);
@@ -495,6 +505,9 @@ pub fn canonical_encode_block_header(header: &BlockHeader) -> Vec<u8> {
     m.add_bytes("txn", &header.txn_commitment);
     m.add_bytes("txn256", &header.txn256);
     m.add_bytes("txn512", &header.txn512);
+    m.add_u64("upgradedelay", header.upgrade_delay);
+    m.add_string("upgradeprop", &header.upgrade_propose);
+    m.add_bool("upgradeyes", header.upgrade_approve);
 
     m.encode()
 }
@@ -614,6 +627,10 @@ pub fn canonical_encode_logicsig(lsig: &LogicSig) -> Vec<u8> {
     }
 
     m.add_bytes("l", &lsig.logic);
+
+    if let Some(ref lmsig) = lsig.lmsig {
+        m.fields.push(("lmsig", canonical_encode_multisig(lmsig)));
+    }
 
     if let Some(ref msig) = lsig.msig {
         m.fields.push(("msig", canonical_encode_multisig(msig)));

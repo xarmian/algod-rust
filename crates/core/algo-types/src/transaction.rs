@@ -283,6 +283,20 @@ pub struct Transaction {
     /// State proof body (opaque, passthrough encoding).
     #[serde(rename = "sp", default, skip_serializing_if = "Option::is_none")]
     pub state_proof: Option<rmpv::Value>,
+
+    /// State proof message (opaque, passthrough encoding).
+    #[serde(rename = "spmsg", default, skip_serializing_if = "Option::is_none")]
+    pub state_proof_message: Option<rmpv::Value>,
+
+    // ── Heartbeat (hb) fields ───────────────────────────────────
+    /// Heartbeat fields (opaque nested sub-map, passthrough encoding).
+    #[serde(rename = "hb", default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat: Option<rmpv::Value>,
+
+    // ── Application Call extended fields ────────────────────────
+    /// Reject version for application calls.
+    #[serde(rename = "aprv", default, skip_serializing_if = "is_zero_u64")]
+    pub reject_version: u64,
 }
 
 fn is_empty_bytes(v: &ByteBuf) -> bool {
@@ -343,6 +357,10 @@ pub struct LogicSig {
     /// Arguments (optional).
     #[serde(rename = "arg", default, skip_serializing_if = "Option::is_none")]
     pub args: Option<Vec<ByteBuf>>,
+
+    /// Delegated logic multisig (optional).
+    #[serde(rename = "lmsig", default, skip_serializing_if = "Option::is_none")]
+    pub lmsig: Option<MultisigSig>,
 }
 
 /// Asset parameters for asset config transactions.
