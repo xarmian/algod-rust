@@ -1,0 +1,10 @@
+[package]
+name = "algo-avm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+algo-error.workspace = true
+algo-types.workspace = true
+num-bigint.workspace = true

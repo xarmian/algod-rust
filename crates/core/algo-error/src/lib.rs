@@ -33,6 +33,9 @@ pub enum AlgoError {
 
     #[error("ledger error: {message}")]
     Ledger { message: String },
+
+    #[error("AVM: {message}")]
+    Avm { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, AlgoError>;

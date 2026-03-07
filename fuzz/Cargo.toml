@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 algo-types = { path = "../crates/core/algo-types", features = ["fuzzing"] }
 algo-ledger = { path = "../crates/core/algo-ledger" }
 algo-codec = { path = "../crates/core/algo-codec" }
+algo-avm = { path = "../crates/core/algo-avm" }
 rmp-serde = "1"
 
 # Prevent this from interfering with workspaces
@@ -26,4 +27,9 @@ doc = false
 [[bin]]
 name = "fuzz_account_roundtrip"
 path = "fuzz_targets/fuzz_account_roundtrip.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_teal_program"
+path = "fuzz_targets/fuzz_teal_program.rs"
 doc = false
