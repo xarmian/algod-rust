@@ -594,6 +594,11 @@ mod tests {
             txn256: ByteBuf::new(),
             txn512: ByteBuf::new(),
             state_proof_tracking: None,
+            upgrade_propose: String::new(),
+            upgrade_delay: 0,
+            upgrade_approve: false,
+            expired_participation_accounts: None,
+            absent_participation_accounts: None,
             payset,
         }
     }

@@ -58,6 +58,11 @@ fn minimal_block(fee_sink: Address, round: u64, payset: Vec<SignedTransaction>) 
         txn256: ByteBuf::from(vec![]),
         txn512: ByteBuf::from(vec![]),
         state_proof_tracking: None,
+        upgrade_propose: String::new(),
+        upgrade_delay: 0,
+        upgrade_approve: false,
+        expired_participation_accounts: None,
+        absent_participation_accounts: None,
         payset,
     }
 }

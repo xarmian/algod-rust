@@ -125,6 +125,28 @@ pub struct Block {
     #[serde(rename = "spt", default, skip_serializing_if = "Option::is_none")]
     pub state_proof_tracking: Option<rmpv::Value>,
 
+    // ── Upgrade Vote fields ─────────────────────────────────────
+    /// Proposed upgrade protocol version.
+    #[serde(rename = "upgradeprop", default, skip_serializing_if = "String::is_empty")]
+    pub upgrade_propose: String,
+
+    /// Proposed upgrade delay (rounds).
+    #[serde(rename = "upgradedelay", default, skip_serializing_if = "is_zero_u64")]
+    pub upgrade_delay: u64,
+
+    /// Whether this block votes to approve the current upgrade proposal.
+    #[serde(rename = "upgradeyes", default, skip_serializing_if = "is_false")]
+    pub upgrade_approve: bool,
+
+    // ── Participation Updates fields ────────────────────────────
+    /// Expired participation accounts (removed from participation).
+    #[serde(rename = "partupdrmv", default, skip_serializing_if = "Option::is_none")]
+    pub expired_participation_accounts: Option<Vec<Address>>,
+
+    /// Absent participation accounts.
+    #[serde(rename = "partupdabs", default, skip_serializing_if = "Option::is_none")]
+    pub absent_participation_accounts: Option<Vec<Address>>,
+
     // ── Payset ────────────────────────────────────────────────
     /// Payset: the list of signed transactions in this block.
     #[serde(rename = "txns", default, skip_serializing_if = "Vec::is_empty")]
@@ -150,4 +172,8 @@ fn is_zero_u64(v: &u64) -> bool {
 
 fn is_empty_bytes(v: &ByteBuf) -> bool {
     v.is_empty()
+}
+
+fn is_false(v: &bool) -> bool {
+    !v
 }
