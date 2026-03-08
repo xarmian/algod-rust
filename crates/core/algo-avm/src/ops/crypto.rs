@@ -82,11 +82,19 @@ pub fn op_base64_decode(
     let encoding_byte = get_uint8(instruction)?;
     let encoding = Base64Encoding::from_u8(encoding_byte)?;
 
-    let encoded = machine.pop_bytes()?;
+    let raw_encoded = machine.pop_bytes()?;
 
     // Charge dynamic cost: 1 + DivCeil(len, 16)
-    let cost = 1 + encoded.len().div_ceil(16);
+    let cost = 1 + raw_encoded.len().div_ceil(16);
     machine.charge_cost(cost as u64)?;
+
+    // Strip CR/LF before decoding — Go's base64 decoder silently tolerates
+    // newlines, but the Rust `base64` crate rejects them as InvalidByte.
+    let encoded: Vec<u8> = raw_encoded
+        .iter()
+        .copied()
+        .filter(|&b| b != b'\n' && b != b'\r')
+        .collect();
 
     // Determine the base64 engine based on encoding and padding.
     use base64::engine::general_purpose;
@@ -1048,6 +1056,44 @@ mod tests {
         code.extend_from_slice(&[0x80, 0x00, 0x12, 0x43]);
         let result = run_prog(7, &code);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_base64_decode_with_newlines() {
+        // Go's base64 decoder silently strips CR/LF — verify we do too.
+        // "aGVs\nbG8=" is "hello" with an embedded newline.
+        let encoded = b"aGVs\nbG8=";
+        let mut code = vec![0x80, encoded.len() as u8];
+        code.extend_from_slice(encoded);
+        code.push(0x5e); // base64_decode
+        code.push(0x01); // StdEncoding
+        // pushbytes "hello", ==, return
+        let expected = b"hello";
+        code.push(0x80);
+        code.push(expected.len() as u8);
+        code.extend_from_slice(expected);
+        code.push(0x12); // ==
+        code.push(0x43); // return
+        let m = run_prog(7, &code).unwrap();
+        assert!(m.pass, "base64 with embedded newline should decode to 'hello'");
+    }
+
+    #[test]
+    fn test_base64_decode_with_crlf() {
+        // Verify CR+LF are also stripped.
+        let encoded = b"aGVs\r\nbG8=";
+        let mut code = vec![0x80, encoded.len() as u8];
+        code.extend_from_slice(encoded);
+        code.push(0x5e); // base64_decode
+        code.push(0x01); // StdEncoding
+        let expected = b"hello";
+        code.push(0x80);
+        code.push(expected.len() as u8);
+        code.extend_from_slice(expected);
+        code.push(0x12); // ==
+        code.push(0x43); // return
+        let m = run_prog(7, &code).unwrap();
+        assert!(m.pass, "base64 with CRLF should decode to 'hello'");
     }
 
     // -----------------------------------------------------------------------
