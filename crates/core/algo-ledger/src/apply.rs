@@ -218,10 +218,18 @@ pub fn apply_transaction<L: crate::store_trait::LedgerStore>(
         _ => {}
     }
 
-    // Snapshot all accounts that may be mutated (touched + fee_sink) for rollback.
+    // Snapshot all accounts that may be mutated (touched + fee_sink + rewards_pool)
+    // for rollback. The rewards pool must be included because it is debited for
+    // distributed rewards, and a later min-balance check failure must restore it.
     let mut snapshot_addrs = touched.clone();
     if !snapshot_addrs.contains(&ctx.fee_sink) {
         snapshot_addrs.push(ctx.fee_sink);
+    }
+    {
+        let rp = store.rewards_pool();
+        if !snapshot_addrs.contains(&rp) {
+            snapshot_addrs.push(rp);
+        }
     }
 
     let snapshot = if asset_ids_to_snap.is_empty() && app_ids_to_snap.is_empty() {
