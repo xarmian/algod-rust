@@ -7,6 +7,7 @@ pub mod arithmetic;
 pub mod bytes;
 pub mod constants;
 pub mod crypto;
+pub mod falcon;
 pub mod flow;
 pub mod global;
 pub mod helpers;
@@ -22,6 +23,15 @@ use algo_error::AlgoError;
 use crate::bytecode::Instruction;
 use crate::context::AvmContext;
 use crate::machine::AvmMachine;
+
+/// Shared hex decoder for test code across ops sub-modules.
+#[cfg(test)]
+pub(crate) fn hex_decode(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
 
 /// Dispatch an instruction to its handler.
 ///
