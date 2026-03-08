@@ -15,6 +15,7 @@ pub mod logic;
 pub mod stack;
 pub mod state;
 pub mod txn;
+pub mod vrf;
 
 use algo_error::AlgoError;
 

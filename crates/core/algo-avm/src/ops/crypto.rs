@@ -1,6 +1,6 @@
 //! Crypto opcodes: sha256, keccak256, sha512_256, sha3_256, ed25519verify,
 //! ed25519verify_bare, ecdsa_verify, ecdsa_pk_decompress, ecdsa_pk_recover,
-//! base64_decode, json_ref, vrf_verify (stub), falcon_verify (stub).
+//! base64_decode, json_ref, vrf_verify, falcon_verify (stub).
 
 use std::collections::HashMap;
 
@@ -10,7 +10,7 @@ use sha3::{Keccak256, Sha3_256};
 
 use crate::bytecode::Instruction;
 use crate::context::AvmContext;
-use crate::fields::{Base64Encoding, EcdsaCurve, JSONRefType};
+use crate::fields::{Base64Encoding, EcdsaCurve, JSONRefType, VrfStandard};
 use crate::machine::{AvmMachine, AvmValue};
 use crate::ops::helpers::get_uint8;
 
@@ -786,10 +786,8 @@ fn ecdsa_recover_secp256k1(
 ) -> Result<(Vec<u8>, Vec<u8>), AlgoError> {
     use k256::ecdsa::{RecoveryId, VerifyingKey};
 
-    let r_padded =
-        pad_to_32(sig_r).ok_or_else(|| avm_err("pubkey recover failed: r too long"))?;
-    let s_padded =
-        pad_to_32(sig_s).ok_or_else(|| avm_err("pubkey recover failed: s too long"))?;
+    let r_padded = pad_to_32(sig_r).ok_or_else(|| avm_err("pubkey recover failed: r too long"))?;
+    let s_padded = pad_to_32(sig_s).ok_or_else(|| avm_err("pubkey recover failed: s too long"))?;
     let mut sig_bytes = [0u8; 64];
     sig_bytes[..32].copy_from_slice(&r_padded);
     sig_bytes[32..].copy_from_slice(&s_padded);
@@ -837,26 +835,54 @@ fn pad_to_32(input: &[u8]) -> Option<[u8; 32]> {
 }
 
 // ---------------------------------------------------------------------------
-// VRF verify stub (opcode 0xd0, AVM v7+)
+// VRF verify (opcode 0xd0, AVM v7+)
 // ---------------------------------------------------------------------------
 
 /// `vrf_verify` (0xd0): pop pubkey (32 bytes), proof (80 bytes), data (bytes).
 ///
-/// This is a stub — full implementation is tracked in issue #42.
-/// Pops the correct number of stack arguments for consistency, then returns
-/// an error.
-pub fn op_vrf_verify(
-    machine: &mut AvmMachine,
-    _instruction: &Instruction,
-) -> Result<(), AlgoError> {
-    // Pop the three arguments in reverse stack order (top first).
-    let _pubkey = machine.pop_bytes()?; // 32-byte VRF public key
-    let _proof = machine.pop_bytes()?; // 80-byte VRF proof
-    let _data = machine.pop_bytes()?; // arbitrary data
+/// Verifies an ECVRF-ED25519-SHA512-Elligator2 proof (draft-irtf-cfrg-vrf-03).
+/// Stack: ..., A (data), B (proof 80 bytes), C (pubkey 32 bytes) -> ..., X (output 64 bytes), Y (verified flag)
+/// Cost: 5700 (static, charged by dispatch).
+pub fn op_vrf_verify(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(), AlgoError> {
+    let std_byte = get_uint8(instruction)?;
+    let _std = VrfStandard::from_u8(std_byte)?;
 
-    Err(AlgoError::Avm {
-        message: "vrf_verify not yet implemented (see issue #42)".into(),
-    })
+    // VrfStandard version gating: VrfAlgorand requires AVM v7, which is the
+    // same version that introduces the vrf_verify opcode itself. Since the
+    // opcode dispatch already rejects versions < 7, no additional field-level
+    // version check is needed here (unlike ECDSA curves where Secp256r1 was
+    // added in a later version than the ecdsa_verify opcode).
+
+    // Pop the three arguments in reverse stack order (top first).
+    let pubkey_bytes = machine.pop_bytes()?;
+    let proof_bytes = machine.pop_bytes()?;
+    let data = machine.pop_bytes()?;
+
+    // Validate sizes (matching go-algorand's error messages).
+    if proof_bytes.len() != 80 {
+        return Err(avm_err(format!(
+            "vrf proof wrong size {} != 80",
+            proof_bytes.len()
+        )));
+    }
+    if pubkey_bytes.len() != 32 {
+        return Err(avm_err(format!(
+            "vrf pubkey wrong size {} != 32",
+            pubkey_bytes.len()
+        )));
+    }
+
+    let pk: [u8; 32] = pubkey_bytes.try_into().unwrap();
+    let pi: [u8; 80] = proof_bytes.try_into().unwrap();
+
+    let (output, verified) = match super::vrf::vrf_verify(&pk, &pi, &data) {
+        Some(output) => (output.to_vec(), 1u64),
+        None => (vec![0u8; 64], 0u64),
+    };
+
+    // Push output bytes first, then verified flag on top.
+    machine.push(AvmValue::Bytes(output))?;
+    machine.push(AvmValue::Uint64(verified))
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,7 +1093,7 @@ mod tests {
         code.extend_from_slice(encoded);
         code.push(0x5e); // base64_decode
         code.push(0x01); // StdEncoding
-        // pushbytes "hello", ==, return
+                         // pushbytes "hello", ==, return
         let expected = b"hello";
         code.push(0x80);
         code.push(expected.len() as u8);
@@ -1075,7 +1101,10 @@ mod tests {
         code.push(0x12); // ==
         code.push(0x43); // return
         let m = run_prog(7, &code).unwrap();
-        assert!(m.pass, "base64 with embedded newline should decode to 'hello'");
+        assert!(
+            m.pass,
+            "base64 with embedded newline should decode to 'hello'"
+        );
     }
 
     #[test]
@@ -1975,16 +2004,109 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // vrf_verify stub tests
+    // vrf_verify opcode tests
     // -----------------------------------------------------------------------
 
+    fn hex_to_vec(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Test VRF verify with go-algorand test vector 1 (empty message).
     #[test]
-    fn test_vrf_verify_stub_returns_unimplemented() {
-        // Push data, proof (80 bytes), pubkey (32 bytes), then call vrf_verify.
+    fn test_vrf_verify_opcode_vector1() {
+        let pk = hex_to_vec("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+        let pi = hex_to_vec(
+            "b6b4699f87d56126c9117a7da55bd0085246f4c56dbc95d20172612e9d38e8d7\
+             ca65e573a126ed88d4e30a46f80a666854d675cf3ba81de0de043c3774f061560\
+             f55edc256a787afe701677c0f602900",
+        );
+        let beta = hex_to_vec(
+            "5b49b554d05c0cd5a5325376b3387de59d924fd1e13ded44648ab33c21349a60\
+             3f25b84ec5ed887995b33da5e3bfcb87cd2f64521c4c62cf825cffabbe5d31cc",
+        );
+        let data: &[u8] = b""; // empty message
+
+        let mut code = Vec::new();
+        pushbytes(&mut code, data); // data
+        pushbytes(&mut code, &pi); // proof (80 bytes)
+        pushbytes(&mut code, &pk); // pubkey (32 bytes)
+        code.push(0xd0); // vrf_verify
+        code.push(0x00); // VrfAlgorand
+                         // Stack now: output (64 bytes), verified flag (uint64)
+                         // assert verified == 1
+        code.push(0x44); // assert (pops top, fails if 0)
+                         // Stack now: output (64 bytes)
+                         // Compare with expected output
+        pushbytes(&mut code, &beta);
+        code.extend_from_slice(&[0x12, 0x43]); // ==, return
+
+        let m = run_prog(7, &code).unwrap();
+        assert!(m.pass, "VRF verify TV1 should pass via opcode");
+    }
+
+    /// Test VRF verify with go-algorand test vector 2 (message = 0x72).
+    #[test]
+    fn test_vrf_verify_opcode_vector2() {
+        let pk = hex_to_vec("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c");
+        let pi = hex_to_vec(
+            "ae5b66bdf04b4c010bfe32b2fc126ead2107b697634f6f7337b9bff8785ee111\
+             200095ece87dde4dbe87343f6df3b107d91798c8a7eb1245d3bb9c5aafb093358\
+             c13e6ae1111a55717e895fd15f99f07",
+        );
+        let beta = hex_to_vec(
+            "94f4487e1b2fec954309ef1289ecb2e15043a2461ecc7b2ae7d4470607ef82eb\
+             1cfa97d84991fe4a7bfdfd715606bc27e2967a6c557cfb5875879b671740b7d8",
+        );
+        let data: &[u8] = &[0x72]; // message = 0x72
+
+        let mut code = Vec::new();
+        pushbytes(&mut code, data);
+        pushbytes(&mut code, &pi);
+        pushbytes(&mut code, &pk);
+        code.push(0xd0); // vrf_verify
+        code.push(0x00); // VrfAlgorand
+        code.push(0x44); // assert
+        pushbytes(&mut code, &beta);
+        code.extend_from_slice(&[0x12, 0x43]); // ==, return
+
+        let m = run_prog(7, &code).unwrap();
+        assert!(m.pass, "VRF verify TV2 should pass via opcode");
+    }
+
+    /// Test VRF verify with zero proof and zero pubkey: should return verified=0.
+    #[test]
+    fn test_vrf_verify_opcode_invalid_returns_zero() {
         let mut code = Vec::new();
         pushbytes(&mut code, b"some data"); // data
-        pushbytes(&mut code, &[0u8; 80]); // proof (80 bytes)
-        pushbytes(&mut code, &[0u8; 32]); // pubkey (32 bytes)
+        pushbytes(&mut code, &[0u8; 80]); // zero proof
+        pushbytes(&mut code, &[0u8; 32]); // zero pubkey (small order)
+        code.push(0xd0); // vrf_verify
+        code.push(0x00); // VrfAlgorand
+                         // Stack: output (64 zero bytes), verified (0)
+                         // Negate the verified flag: !0 = 1
+        code.push(0x14); // ! (logical not, opcode 0x14)
+        code.push(0x44); // assert (verified must be 0, so !0 = 1 passes)
+                         // Now check output is 64 zero bytes
+        pushbytes(&mut code, &[0u8; 64]);
+        code.extend_from_slice(&[0x12, 0x43]); // ==, return
+
+        let m = run_prog(7, &code).unwrap();
+        assert!(
+            m.pass,
+            "VRF verify with zero inputs should return verified=0 and 64 zero bytes"
+        );
+    }
+
+    /// Test VRF verify rejects wrong proof size.
+    #[test]
+    fn test_vrf_verify_opcode_wrong_proof_size() {
+        let mut code = Vec::new();
+        pushbytes(&mut code, b"data");
+        pushbytes(&mut code, &[0u8; 79]); // wrong size (79 instead of 80)
+        pushbytes(&mut code, &[0u8; 32]);
         code.push(0xd0); // vrf_verify
         code.push(0x00); // VrfAlgorand
         code.push(0x43); // return
@@ -1992,17 +2114,37 @@ mod tests {
         let result = run_prog(7, &code);
         match result {
             Err(e) => {
-                let err_msg = e.to_string();
+                let err = e.to_string();
                 assert!(
-                    err_msg.contains("vrf_verify not yet implemented"),
-                    "error should mention vrf_verify: {err_msg}"
-                );
-                assert!(
-                    err_msg.contains("issue #42"),
-                    "error should reference issue #42: {err_msg}"
+                    err.contains("vrf proof wrong size"),
+                    "error should mention proof size: {err}"
                 );
             }
-            Ok(_) => panic!("vrf_verify stub should return an error"),
+            Ok(_) => panic!("vrf_verify should error on wrong proof size"),
+        }
+    }
+
+    /// Test VRF verify rejects wrong pubkey size.
+    #[test]
+    fn test_vrf_verify_opcode_wrong_pubkey_size() {
+        let mut code = Vec::new();
+        pushbytes(&mut code, b"data");
+        pushbytes(&mut code, &[0u8; 80]); // correct proof size
+        pushbytes(&mut code, &[0u8; 31]); // wrong pubkey size
+        code.push(0xd0); // vrf_verify
+        code.push(0x00); // VrfAlgorand
+        code.push(0x43); // return
+
+        let result = run_prog(7, &code);
+        match result {
+            Err(e) => {
+                let err = e.to_string();
+                assert!(
+                    err.contains("vrf pubkey wrong size"),
+                    "error should mention pubkey size: {err}"
+                );
+            }
+            Ok(_) => panic!("vrf_verify should error on wrong pubkey size"),
         }
     }
 
