@@ -265,6 +265,12 @@ impl InnerTxnBuilder {
                         txn.non_participation = *v != 0;
                     }
                 }
+                // RejectVersion
+                68 => {
+                    if let TealValue::Uint(v) = value {
+                        txn.reject_version = *v;
+                    }
+                }
                 _ => {
                     // Silently ignore unknown fields for forward-compatibility
                 }
@@ -478,8 +484,10 @@ fn read_txn_field(
         // FirstValid
         2 => Ok(TealValue::Uint(txn.first_valid.0)),
         // FirstValidTime — timestamp of block(FirstValid-1). AVM v7+.
-        // TODO: requires block timestamp lookup; return 0 for now.
-        3 => Ok(TealValue::Uint(0)),
+        // Requires block history access which is not yet implemented.
+        3 => Err(AlgoError::Avm {
+            message: "FirstValidTime not yet supported (requires block history access)".to_string(),
+        }),
         // LastValid
         4 => Ok(TealValue::Uint(txn.last_valid.0)),
         // Note
@@ -903,8 +911,8 @@ fn read_txn_field(
                 .unwrap_or(0);
             Ok(TealValue::Uint(div_ceil(len, MAX_STRING_SIZE) as u64))
         }
-        // RejectVersion — AVM v12+. Returns 0 (not set on existing transactions).
-        68 => Ok(TealValue::Uint(0)),
+        // RejectVersion — AVM v12+.
+        68 => Ok(TealValue::Uint(txn.reject_version)),
         _ => Err(AlgoError::Avm {
             message: format!("unknown TxnField index: {field}"),
         }),
