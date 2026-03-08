@@ -797,6 +797,11 @@ fn execute_inner_appl<L: LedgerStore>(
         // Update creator's account counters.
         let mut creator_acct = store.get_or_default_account(&sender);
         creator_acct.total_created_apps += 1;
+        creator_acct.total_extra_app_pages += stxn.txn.extra_program_pages;
+        // Update aggregate schema: creator stores global state.
+        creator_acct.total_app_schema = creator_acct
+            .total_app_schema
+            .add_schema(&stxn.txn.global_state_schema.clone().unwrap_or_default());
         store.set_account(&sender, creator_acct);
 
         // Record the created app ID on the SignedTransaction.
@@ -825,6 +830,8 @@ fn execute_inner_appl<L: LedgerStore>(
             // Update account counters.
             let mut acct = store.get_or_default_account(&sender);
             acct.total_apps_opted_in += 1;
+            // Update aggregate schema: sender stores local state.
+            acct.total_app_schema = acct.total_app_schema.add_schema(&app.local_state_schema);
             store.set_account(&sender, acct);
         }
     }
@@ -981,58 +988,74 @@ fn execute_inner_appl<L: LedgerStore>(
         1 => {} // OptInOC — local state was already created above
         2 => {
             // CloseOutOC — remove local state
+            let local_schema = store
+                .get_app_local_state(&sender, effective_app_id)
+                .map(|ls| ls.schema.clone())
+                .unwrap_or_default();
             store.remove_app_local_state(&sender, effective_app_id);
             let mut acct = store.get_or_default_account(&sender);
-            if acct.total_apps_opted_in > 0 {
-                acct.total_apps_opted_in -= 1;
-            }
+            acct.total_apps_opted_in = acct.total_apps_opted_in.saturating_sub(1);
+            // Subtract local schema from aggregate.
+            acct.total_app_schema = acct.total_app_schema.sub_schema(&local_schema);
             store.set_account(&sender, acct);
         }
         3 => {
             // ClearStateOC — always clear local state regardless of program result
-            if store.has_app_local_state(&sender, effective_app_id) {
+            if let Some(local_state) = store.get_app_local_state(&sender, effective_app_id) {
+                let local_schema = local_state.schema.clone();
                 store.remove_app_local_state(&sender, effective_app_id);
                 let mut acct = store.get_or_default_account(&sender);
-                if acct.total_apps_opted_in > 0 {
-                    acct.total_apps_opted_in -= 1;
-                }
+                acct.total_apps_opted_in = acct.total_apps_opted_in.saturating_sub(1);
+                // Subtract local schema from aggregate.
+                acct.total_app_schema = acct.total_app_schema.sub_schema(&local_schema);
                 store.set_account(&sender, acct);
             }
         }
         4 => {
-            // UpdateApplicationOC — update the program
-            let approval = stxn
-                .txn
-                .approval_program
-                .as_ref()
-                .map(|b| b.to_vec())
-                .unwrap_or_default();
-            let clear = stxn
-                .txn
-                .clear_state_program
-                .as_ref()
-                .map(|b| b.to_vec())
-                .unwrap_or_default();
+            // UpdateApplicationOC — only the creator can update the app programs.
             if let Some(mut app) = store.get_app_params(effective_app_id) {
-                if !approval.is_empty() {
-                    app.approval_program = approval;
+                if sender != app.creator {
+                    return Err(AlgoError::Avm {
+                        message: format!(
+                            "inner appl update: sender {} is not the creator of app {}",
+                            sender, effective_app_id,
+                        ),
+                    });
                 }
-                if !clear.is_empty() {
-                    app.clear_state_program = clear;
+                if let Some(ref approval) = stxn.txn.approval_program {
+                    app.approval_program = approval.to_vec();
+                }
+                if let Some(ref clear) = stxn.txn.clear_state_program {
+                    app.clear_state_program = clear.to_vec();
                 }
                 store.set_app_params(effective_app_id, app);
             }
         }
         5 => {
-            // DeleteApplicationOC — remove the app
-            store.remove_app_params(effective_app_id);
-            // Update creator's account counters.
-            let creator_addr = Address(creator);
-            let mut creator_acct = store.get_or_default_account(&creator_addr);
-            if creator_acct.total_created_apps > 0 {
-                creator_acct.total_created_apps -= 1;
+            // DeleteApplicationOC — only the creator can delete the app.
+            if let Some(existing) = store.get_app_params(effective_app_id) {
+                if sender != existing.creator {
+                    return Err(AlgoError::Avm {
+                        message: format!(
+                            "inner appl delete: sender {} is not the creator of app {}",
+                            sender, effective_app_id,
+                        ),
+                    });
+                }
+                let creator_addr = existing.creator;
+                let global_schema = existing.global_state_schema.clone();
+                store.remove_app_params(effective_app_id);
+                // Update creator's account counters.
+                let mut creator_acct = store.get_or_default_account(&creator_addr);
+                creator_acct.total_created_apps = creator_acct.total_created_apps.saturating_sub(1);
+                creator_acct.total_extra_app_pages = creator_acct
+                    .total_extra_app_pages
+                    .saturating_sub(existing.extra_program_pages);
+                // Subtract global schema from aggregate.
+                creator_acct.total_app_schema =
+                    creator_acct.total_app_schema.sub_schema(&global_schema);
+                store.set_account(&creator_addr, creator_acct);
             }
-            store.set_account(&creator_addr, creator_acct);
         }
         _ => {
             return Err(AlgoError::Avm {
@@ -4193,29 +4216,36 @@ mod tests {
     #[test]
     fn inner_appl_delete() {
         // Inner appl with OnCompletion=DeleteApplication should delete the app.
+        // The inner txn sender is app 42's address, so the called app's creator
+        // must be app 42's address for the creator check to pass.
         let mut store = LedgerState::new();
         setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
-        setup_app(
-            &mut store,
+
+        let app_addr = Address(app_address(42));
+        // Create app 100 with creator = app 42's address (the inner txn sender).
+        store.set_app_params(
             100,
-            make_program(6, true),
-            make_program(6, true),
-        );
-        // Set the creator of app 100 (must exist for counter update).
-        let creator = Address([1u8; 32]);
-        store.set_account(
-            &creator,
-            AccountData {
-                micro_algos: 1_000_000,
-                total_created_apps: 1,
-                ..Default::default()
+            AppParams {
+                creator: app_addr,
+                approval_program: make_program(6, true),
+                clear_state_program: make_program(6, true),
+                global_state: std::collections::BTreeMap::new(),
+                local_state_schema: StateSchema {
+                    num_uint: 4,
+                    num_byte_slice: 4,
+                },
+                global_state_schema: StateSchema {
+                    num_uint: 4,
+                    num_byte_slice: 4,
+                },
+                extra_program_pages: 0,
             },
         );
-        let app_addr = Address(app_address(42));
         store.set_account(
             &app_addr,
             AccountData {
                 micro_algos: 10_000_000,
+                total_created_apps: 1,
                 ..Default::default()
             },
         );
@@ -4237,8 +4267,8 @@ mod tests {
 
         // After delete, app should be gone.
         assert!(!store.has_app_params(100));
-        // Creator's counter should be decremented.
-        let creator_acct = store.get_account(&creator).unwrap();
+        // Creator's (app 42's address) counter should be decremented.
+        let creator_acct = store.get_account(&app_addr).unwrap();
         assert_eq!(creator_acct.total_created_apps, 0);
     }
 
@@ -5314,28 +5344,35 @@ mod tests {
         let mut store = LedgerState::new();
         setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
 
-        // App 100 will be deleted. Its creator is [1u8; 32] (set by setup_app).
-        setup_app(
-            &mut store,
-            100,
-            make_program(6, true),
-            make_program(6, true),
-        );
-
         let app_addr = Address(app_address(42));
-        store.set_account(
-            &app_addr,
-            AccountData {
-                micro_algos: 10_000_000,
-                ..Default::default()
+
+        // App 100 will be deleted. Its creator must be app 42's address
+        // (the inner txn sender) to pass the creator check.
+        store.set_app_params(
+            100,
+            AppParams {
+                creator: app_addr,
+                approval_program: make_program(6, true),
+                clear_state_program: make_program(6, true),
+                global_state: std::collections::BTreeMap::new(),
+                local_state_schema: StateSchema {
+                    num_uint: 4,
+                    num_byte_slice: 4,
+                },
+                global_state_schema: StateSchema {
+                    num_uint: 4,
+                    num_byte_slice: 4,
+                },
+                extra_program_pages: 0,
             },
         );
 
-        // The creator of app 100 is [1u8; 32] (set by setup_app).
-        let creator_addr = Address([1u8; 32]);
+        // The creator of app 100 is app 42's address.
+        let creator_addr = app_addr;
         store.set_account(
             &creator_addr,
             AccountData {
+                micro_algos: 10_000_000,
                 total_created_apps: 2,
                 ..Default::default()
             },
@@ -5753,5 +5790,555 @@ mod tests {
             sink_acct.micro_algos, 2000,
             "fee_sink should receive the inner txn fee"
         );
+    }
+
+    // ---- P1-1: Inner update/delete creator checks ----
+
+    #[test]
+    fn inner_appl_update_by_non_creator_fails() {
+        // App 100 was created by [1u8;32] (setup_app default).
+        // The inner txn sender (app 42's address) is NOT [1u8;32].
+        // An inner update (on_completion=4) should fail with a creator check error.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
+        ctx.itxn_field(25, TealValue::Uint(4)).unwrap(); // OnCompletion = UpdateApplication
+        ctx.itxn_field(30, TealValue::Bytes(make_program(6, true)))
+            .unwrap(); // ApprovalProgram
+        ctx.itxn_field(31, TealValue::Bytes(make_program(6, true)))
+            .unwrap(); // ClearStateProgram
+        let result = ctx.itxn_submit();
+
+        assert!(result.is_err(), "non-creator update should fail");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("not the creator"),
+            "expected creator check error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn inner_appl_update_by_creator_succeeds() {
+        // App 100 was created by [1u8;32]. We make app 42's address == [1u8;32]
+        // so the inner txn sender IS the creator. But setup_app uses Address([1u8;32])
+        // as creator, so we need a different approach: create app 100 with creator = app 42's address.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        // Create app 100 with creator = app 42's address (the inner txn sender).
+        let app42_addr = Address(app_address(42));
+        store.set_app_params(
+            100,
+            AppParams {
+                creator: app42_addr,
+                approval_program: make_program(6, true),
+                clear_state_program: make_program(6, true),
+                global_state: std::collections::BTreeMap::new(),
+                local_state_schema: StateSchema::default(),
+                global_state_schema: StateSchema::default(),
+                extra_program_pages: 0,
+            },
+        );
+
+        store.set_account(
+            &app42_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        let new_program = make_program(6, true);
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
+        ctx.itxn_field(25, TealValue::Uint(4)).unwrap(); // OnCompletion = UpdateApplication
+        ctx.itxn_field(30, TealValue::Bytes(new_program.clone()))
+            .unwrap(); // ApprovalProgram
+        ctx.itxn_field(31, TealValue::Bytes(new_program.clone()))
+            .unwrap(); // ClearStateProgram
+        ctx.itxn_submit().unwrap();
+        drop(ctx);
+
+        // Update should succeed — verify the app still exists.
+        assert!(store.has_app_params(100));
+    }
+
+    #[test]
+    fn inner_appl_delete_by_non_creator_fails() {
+        // App 100 created by [1u8;32], inner sender is app 42's address.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
+        ctx.itxn_field(25, TealValue::Uint(5)).unwrap(); // OnCompletion = DeleteApplication
+        let result = ctx.itxn_submit();
+
+        assert!(result.is_err(), "non-creator delete should fail");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("not the creator"),
+            "expected creator check error, got: {msg}"
+        );
+        drop(ctx);
+        // App should still exist.
+        assert!(store.has_app_params(100));
+    }
+
+    #[test]
+    fn inner_appl_delete_by_creator_succeeds() {
+        // Create app 100 with creator = app 42's address.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        let app42_addr = Address(app_address(42));
+        store.set_app_params(
+            100,
+            AppParams {
+                creator: app42_addr,
+                approval_program: make_program(6, true),
+                clear_state_program: make_program(6, true),
+                global_state: std::collections::BTreeMap::new(),
+                local_state_schema: StateSchema::default(),
+                global_state_schema: StateSchema::default(),
+                extra_program_pages: 0,
+            },
+        );
+
+        store.set_account(
+            &app42_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
+        ctx.itxn_field(25, TealValue::Uint(5)).unwrap(); // OnCompletion = DeleteApplication
+        ctx.itxn_submit().unwrap();
+        drop(ctx);
+
+        // App should be deleted.
+        assert!(!store.has_app_params(100));
+    }
+
+    // ---- P1-2: Inner app create/delete schema & extra pages accounting ----
+
+    #[test]
+    fn inner_appl_create_updates_schema_and_extra_pages() {
+        // Inner app creation should update the creator's total_extra_app_pages
+        // and total_app_schema (global schema).
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        // Record creator's counters before.
+        let before = store.get_or_default_account(&app_addr);
+        let before_created = before.total_created_apps;
+        let before_extra_pages = before.total_extra_app_pages;
+        let before_schema = before.total_app_schema.clone();
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+        ctx.txn_counter = 200;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(0)).unwrap(); // ApplicationID = 0 (create)
+        ctx.itxn_field(30, TealValue::Bytes(make_program(6, true)))
+            .unwrap(); // ApprovalProgram
+        ctx.itxn_field(31, TealValue::Bytes(make_program(6, true)))
+            .unwrap(); // ClearStateProgram
+        ctx.itxn_field(52, TealValue::Uint(3)).unwrap(); // GlobalNumUint = 3
+        ctx.itxn_field(53, TealValue::Uint(2)).unwrap(); // GlobalNumByteSlice = 2
+        ctx.itxn_field(56, TealValue::Uint(1)).unwrap(); // ExtraProgramPages = 1
+        ctx.itxn_submit().unwrap();
+        drop(ctx);
+
+        // Check creator's counters after.
+        let after = store.get_or_default_account(&app_addr);
+        assert_eq!(
+            after.total_created_apps,
+            before_created + 1,
+            "total_created_apps should be incremented"
+        );
+        assert_eq!(
+            after.total_extra_app_pages,
+            before_extra_pages + 1,
+            "total_extra_app_pages should be incremented by extra_program_pages"
+        );
+        assert_eq!(
+            after.total_app_schema.num_uint,
+            before_schema.num_uint + 3,
+            "total_app_schema.num_uint should include global schema"
+        );
+        assert_eq!(
+            after.total_app_schema.num_byte_slice,
+            before_schema.num_byte_slice + 2,
+            "total_app_schema.num_byte_slice should include global schema"
+        );
+    }
+
+    #[test]
+    fn inner_appl_delete_reverses_schema_and_extra_pages() {
+        // Inner app delete should decrement the creator's total_extra_app_pages
+        // and total_app_schema (global schema).
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        let app42_addr = Address(app_address(42));
+
+        // Create app 100 with creator = app 42's address, with known schema and extra pages.
+        store.set_app_params(
+            100,
+            AppParams {
+                creator: app42_addr,
+                approval_program: make_program(6, true),
+                clear_state_program: make_program(6, true),
+                global_state: std::collections::BTreeMap::new(),
+                local_state_schema: StateSchema {
+                    num_uint: 2,
+                    num_byte_slice: 1,
+                },
+                global_state_schema: StateSchema {
+                    num_uint: 5,
+                    num_byte_slice: 3,
+                },
+                extra_program_pages: 2,
+            },
+        );
+
+        // Set the creator's account with counters reflecting the created app.
+        store.set_account(
+            &app42_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                total_created_apps: 1,
+                total_extra_app_pages: 2,
+                total_app_schema: StateSchema {
+                    num_uint: 5,
+                    num_byte_slice: 3,
+                },
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
+        ctx.itxn_field(25, TealValue::Uint(5)).unwrap(); // OnCompletion = DeleteApplication
+        ctx.itxn_submit().unwrap();
+        drop(ctx);
+
+        // App should be deleted.
+        assert!(!store.has_app_params(100));
+
+        // Creator's counters should be decremented.
+        let after = store.get_or_default_account(&app42_addr);
+        assert_eq!(
+            after.total_created_apps, 0,
+            "total_created_apps should be decremented"
+        );
+        assert_eq!(
+            after.total_extra_app_pages, 0,
+            "total_extra_app_pages should be decremented by app's extra_program_pages"
+        );
+        assert_eq!(
+            after.total_app_schema.num_uint, 0,
+            "total_app_schema.num_uint should be decremented by global schema"
+        );
+        assert_eq!(
+            after.total_app_schema.num_byte_slice, 0,
+            "total_app_schema.num_byte_slice should be decremented by global schema"
+        );
+    }
+
+    // ---- P1-3: Inner opt-in/close-out/clear local schema accounting ----
+
+    #[test]
+    fn inner_appl_optin_updates_local_schema() {
+        // Inner opt-in should update the sender's total_app_schema with local schema.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        // App 100 with known local schema.
+        let app42_addr = Address(app_address(42));
+        store.set_app_params(
+            100,
+            AppParams {
+                creator: Address([1u8; 32]),
+                approval_program: make_program(6, true),
+                clear_state_program: make_program(6, true),
+                global_state: std::collections::BTreeMap::new(),
+                local_state_schema: StateSchema {
+                    num_uint: 4,
+                    num_byte_slice: 3,
+                },
+                global_state_schema: StateSchema::default(),
+                extra_program_pages: 0,
+            },
+        );
+
+        store.set_account(
+            &app42_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        // Verify counters before.
+        let before = store.get_or_default_account(&app42_addr);
+        assert_eq!(before.total_apps_opted_in, 0);
+        assert_eq!(before.total_app_schema.num_uint, 0);
+        assert_eq!(before.total_app_schema.num_byte_slice, 0);
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
+        ctx.itxn_field(25, TealValue::Uint(1)).unwrap(); // OnCompletion = OptIn
+        ctx.itxn_submit().unwrap();
+        drop(ctx);
+
+        let after = store.get_or_default_account(&app42_addr);
+        assert_eq!(after.total_apps_opted_in, 1, "should be opted in");
+        assert_eq!(
+            after.total_app_schema.num_uint, 4,
+            "total_app_schema.num_uint should include local schema"
+        );
+        assert_eq!(
+            after.total_app_schema.num_byte_slice, 3,
+            "total_app_schema.num_byte_slice should include local schema"
+        );
+    }
+
+    #[test]
+    fn inner_appl_closeout_reverses_local_schema() {
+        // Inner close-out should subtract local schema from sender's total_app_schema.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        let app42_addr = Address(app_address(42));
+        store.set_app_params(
+            100,
+            AppParams {
+                creator: Address([1u8; 32]),
+                approval_program: make_program(6, true),
+                clear_state_program: make_program(6, true),
+                global_state: std::collections::BTreeMap::new(),
+                local_state_schema: StateSchema {
+                    num_uint: 4,
+                    num_byte_slice: 3,
+                },
+                global_state_schema: StateSchema::default(),
+                extra_program_pages: 0,
+            },
+        );
+
+        // Pre-opt-in: set the sender as already opted in with local state.
+        let local_schema = StateSchema {
+            num_uint: 4,
+            num_byte_slice: 3,
+        };
+        store.set_app_local_state(
+            &app42_addr,
+            100,
+            AppLocalState {
+                schema: local_schema.clone(),
+                key_value: BTreeMap::new(),
+            },
+        );
+        store.set_account(
+            &app42_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                total_apps_opted_in: 1,
+                total_app_schema: local_schema.clone(),
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
+        ctx.itxn_field(25, TealValue::Uint(2)).unwrap(); // OnCompletion = CloseOut
+        ctx.itxn_submit().unwrap();
+        drop(ctx);
+
+        let after = store.get_or_default_account(&app42_addr);
+        assert_eq!(after.total_apps_opted_in, 0, "should no longer be opted in");
+        assert_eq!(
+            after.total_app_schema.num_uint, 0,
+            "total_app_schema.num_uint should be decremented"
+        );
+        assert_eq!(
+            after.total_app_schema.num_byte_slice, 0,
+            "total_app_schema.num_byte_slice should be decremented"
+        );
+        // Local state should be removed.
+        assert!(!store.has_app_local_state(&app42_addr, 100));
+    }
+
+    #[test]
+    fn inner_appl_clearstate_reverses_local_schema() {
+        // Inner clear-state should subtract local schema from sender's total_app_schema.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        let app42_addr = Address(app_address(42));
+        store.set_app_params(
+            100,
+            AppParams {
+                creator: Address([1u8; 32]),
+                approval_program: make_program(6, true),
+                clear_state_program: make_program(6, true),
+                global_state: std::collections::BTreeMap::new(),
+                local_state_schema: StateSchema {
+                    num_uint: 2,
+                    num_byte_slice: 5,
+                },
+                global_state_schema: StateSchema::default(),
+                extra_program_pages: 0,
+            },
+        );
+
+        // Pre-opt-in: set the sender as already opted in.
+        let local_schema = StateSchema {
+            num_uint: 2,
+            num_byte_slice: 5,
+        };
+        store.set_app_local_state(
+            &app42_addr,
+            100,
+            AppLocalState {
+                schema: local_schema.clone(),
+                key_value: BTreeMap::new(),
+            },
+        );
+        store.set_account(
+            &app42_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                total_apps_opted_in: 1,
+                total_app_schema: local_schema.clone(),
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
+        ctx.itxn_field(25, TealValue::Uint(3)).unwrap(); // OnCompletion = ClearState
+        ctx.itxn_submit().unwrap();
+        drop(ctx);
+
+        let after = store.get_or_default_account(&app42_addr);
+        assert_eq!(after.total_apps_opted_in, 0, "should no longer be opted in");
+        assert_eq!(
+            after.total_app_schema.num_uint, 0,
+            "total_app_schema.num_uint should be decremented"
+        );
+        assert_eq!(
+            after.total_app_schema.num_byte_slice, 0,
+            "total_app_schema.num_byte_slice should be decremented"
+        );
+        // Local state should be removed.
+        assert!(!store.has_app_local_state(&app42_addr, 100));
     }
 }
