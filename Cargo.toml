@@ -46,6 +46,7 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 # Crypto
 ed25519-dalek = { version = "2", features = ["std"] }
+curve25519-dalek = { version = "4", features = ["alloc"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
