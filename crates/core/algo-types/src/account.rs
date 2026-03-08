@@ -55,6 +55,15 @@ pub struct AccountData {
     pub total_extra_app_pages: u32,
     pub total_box_bytes: u64,
     pub total_boxes: u64,
+    /// Aggregate of all app schemas (global for created apps, local for opted-in apps).
+    /// Used for min-balance computation without iterating per-app schemas.
+    pub total_app_schema: StateSchema,
+    /// V40+ block payouts eligibility.
+    pub incentive_eligible: bool,
+    /// Last round this account proposed a block.
+    pub last_proposed: u64,
+    /// Last heartbeat round.
+    pub last_heartbeat: u64,
     /// Round at which this account was last modified (Go codec key "z").
     pub update_round: u64,
 }

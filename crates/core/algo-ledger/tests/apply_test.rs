@@ -611,10 +611,11 @@ fn test_min_balance_tracks_assets() {
     let stx = acfg_create_txn(creator, 1_000, 42, params);
     apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
 
-    // Creator: min_balance increases for created asset + opted-in holding.
+    // Creator: min_balance increases for opted-in holding (which includes creator holding).
+    // total_assets_opted_in already counts creator holdings, so no separate created-asset cost.
     let creator_min = algo_ledger::min_balance(state.get_account(&creator).unwrap());
-    // base + 1 created asset * 100k + 1 opted-in * 100k = 300_000
-    assert_eq!(creator_min, 300_000);
+    // base + 1 opted-in * 100k = 200_000
+    assert_eq!(creator_min, 200_000);
 
     // User opts in.
     let optin = axfer_optin_txn(user, 1_000, 42);
@@ -823,7 +824,8 @@ fn keyreg_online_txn(sender: Address, fee: u64) -> SignedTransaction {
     stx.txn.vote_pk = Some(ByteBuf::from(vec![0xAA; 32]));
     stx.txn.selection_pk = Some(ByteBuf::from(vec![0xBB; 32]));
     stx.txn.state_proof_pk = Some(ByteBuf::from(vec![0xCC; 64]));
-    stx.txn.vote_first = 100;
+    // vote_first <= round+1 and vote_last > round to pass keyreg coherency checks.
+    stx.txn.vote_first = 1;
     stx.txn.vote_last = 300;
     stx.txn.vote_key_dilution = 10;
     stx
@@ -845,7 +847,7 @@ fn test_keyreg_in_block() {
     assert_eq!(acct.vote_id, Some([0xAA; 32]));
     assert_eq!(acct.selection_id, Some([0xBB; 32]));
     assert_eq!(acct.state_proof_id, Some([0xCC; 64]));
-    assert_eq!(acct.vote_first_valid, 100);
+    assert_eq!(acct.vote_first_valid, 1);
     assert_eq!(acct.vote_last_valid, 300);
     assert_eq!(acct.vote_key_dilution, 10);
     assert_eq!(acct.micro_algos, 9_999_000);
@@ -863,7 +865,7 @@ fn test_lease_across_blocks() {
     let fee_sink = Address([3u8; 32]);
 
     let mut state = make_state(
-        &[(sender, 10_000_000), (receiver, 0), (fee_sink, 0)],
+        &[(sender, 10_000_000), (receiver, 100_000), (fee_sink, 0)],
         fee_sink,
     );
 
@@ -902,7 +904,7 @@ fn test_lease_expired_across_blocks() {
     let fee_sink = Address([3u8; 32]);
 
     let mut state = make_state(
-        &[(sender, 10_000_000), (receiver, 0), (fee_sink, 0)],
+        &[(sender, 10_000_000), (receiver, 100_000), (fee_sink, 0)],
         fee_sink,
     );
 
@@ -935,7 +937,10 @@ fn test_lease_expired_across_blocks() {
         state.get_account(&sender).unwrap().micro_algos,
         10_000_000 - 4_000
     );
-    assert_eq!(state.get_account(&receiver).unwrap().micro_algos, 2_000);
+    assert_eq!(
+        state.get_account(&receiver).unwrap().micro_algos,
+        100_000 + 2_000
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -953,7 +958,7 @@ fn test_lease_different_senders_ok() {
         &[
             (sender_a, 10_000_000),
             (sender_b, 10_000_000),
-            (receiver, 0),
+            (receiver, 100_000),
             (fee_sink, 0),
         ],
         fee_sink,
@@ -984,7 +989,10 @@ fn test_lease_different_senders_ok() {
         state.get_account(&sender_b).unwrap().micro_algos,
         10_000_000 - 3_000
     );
-    assert_eq!(state.get_account(&receiver).unwrap().micro_algos, 3_000);
+    assert_eq!(
+        state.get_account(&receiver).unwrap().micro_algos,
+        100_000 + 3_000
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,7 +1081,7 @@ fn test_min_balance_enforcement_with_assets() {
         &[
             (sender, 300_000),
             (creator, 50_000_000),
-            (receiver, 0),
+            (receiver, 100_000),
             (fee_sink, 0),
         ],
         fee_sink,

@@ -337,11 +337,7 @@ pub fn validate_transaction_wellformed(
     // of whether the protocol version enables fee pooling (Go checks this
     // in TxnGroup for both pooled and non-pooled modes).
     let is_stpf = txn.txn_type == "stpf";
-    if !is_stpf
-        && !is_free_heartbeat
-        && !allow_fee_pooling
-        && txn.fee < params.min_txn_fee
-    {
+    if !is_stpf && !is_free_heartbeat && !allow_fee_pooling && txn.fee < params.min_txn_fee {
         return Err(AlgoError::Validation {
             message: format!(
                 "transaction fee {} is below minimum {}",
