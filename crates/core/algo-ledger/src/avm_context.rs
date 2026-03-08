@@ -78,10 +78,10 @@ fn extract_logs_from_eval_delta(stxn: &SignedTransaction) -> Vec<Vec<u8>> {
 /// Field indices that are array-valued and should accumulate across
 /// multiple `itxn_field` calls rather than being overwritten.
 const ARRAY_FIELD_INDICES: &[u8] = &[
-    25, // ApplicationArgs
-    27, // Accounts
-    47, // Assets (foreign assets)
-    49, // Applications (foreign apps)
+    26, // ApplicationArgs
+    28, // Accounts
+    48, // Assets (foreign assets)
+    50, // Applications (foreign apps)
 ];
 
 /// Accumulates field values while an inner transaction is being constructed
@@ -140,7 +140,7 @@ impl InnerTxnBuilder {
                     }
                 }
                 // Receiver
-                6 => {
+                7 => {
                     if let TealValue::Bytes(b) = value {
                         if b.len() == 32 {
                             let mut addr = [0u8; 32];
@@ -150,13 +150,13 @@ impl InnerTxnBuilder {
                     }
                 }
                 // Amount
-                7 => {
+                8 => {
                     if let TealValue::Uint(v) = value {
                         txn.amount = *v;
                     }
                 }
                 // CloseRemainderTo
-                8 => {
+                9 => {
                     if let TealValue::Bytes(b) = value {
                         if b.len() == 32 {
                             let mut addr = [0u8; 32];
@@ -166,13 +166,13 @@ impl InnerTxnBuilder {
                     }
                 }
                 // Type (string)
-                14 => {
+                15 => {
                     if let TealValue::Bytes(b) = value {
                         txn.txn_type = String::from_utf8_lossy(b).to_string();
                     }
                 }
                 // TypeEnum
-                15 => {
+                16 => {
                     if let TealValue::Uint(v) = value {
                         txn.txn_type = match v {
                             1 => "pay",
@@ -188,19 +188,19 @@ impl InnerTxnBuilder {
                     }
                 }
                 // XferAsset
-                16 => {
+                17 => {
                     if let TealValue::Uint(v) = value {
                         txn.xaid = *v;
                     }
                 }
                 // AssetAmount
-                17 => {
+                18 => {
                     if let TealValue::Uint(v) = value {
                         txn.asset_amount = *v;
                     }
                 }
                 // AssetReceiver
-                19 => {
+                20 => {
                     if let TealValue::Bytes(b) = value {
                         if b.len() == 32 {
                             let mut addr = [0u8; 32];
@@ -210,7 +210,7 @@ impl InnerTxnBuilder {
                     }
                 }
                 // AssetCloseTo
-                20 => {
+                21 => {
                     if let TealValue::Bytes(b) = value {
                         if b.len() == 32 {
                             let mut addr = [0u8; 32];
@@ -220,31 +220,31 @@ impl InnerTxnBuilder {
                     }
                 }
                 // ApplicationID
-                23 => {
+                24 => {
                     if let TealValue::Uint(v) = value {
                         txn.application_id = *v;
                     }
                 }
                 // OnCompletion
-                24 => {
+                25 => {
                     if let TealValue::Uint(v) = value {
                         txn.on_completion = *v;
                     }
                 }
                 // ConfigAsset
-                32 => {
+                33 => {
                     if let TealValue::Uint(v) = value {
                         txn.config_asset = *v;
                     }
                 }
                 // FreezeAsset
-                44 => {
+                45 => {
                     if let TealValue::Uint(v) = value {
                         txn.freeze_asset = *v;
                     }
                 }
                 // FreezeAssetAccount
-                45 => {
+                46 => {
                     if let TealValue::Bytes(b) = value {
                         if b.len() == 32 {
                             let mut addr = [0u8; 32];
@@ -254,13 +254,13 @@ impl InnerTxnBuilder {
                     }
                 }
                 // FreezeAssetFrozen
-                46 => {
+                47 => {
                     if let TealValue::Uint(v) = value {
                         txn.asset_frozen = *v != 0;
                     }
                 }
                 // Nonparticipation
-                56 => {
+                57 => {
                     if let TealValue::Uint(v) = value {
                         txn.non_participation = *v != 0;
                     }
@@ -275,7 +275,7 @@ impl InnerTxnBuilder {
         for (&field, values) in &self.array_fields {
             match field {
                 // ApplicationArgs
-                25 => {
+                26 => {
                     let args: Vec<Option<serde_bytes::ByteBuf>> = values
                         .iter()
                         .map(|v| match v {
@@ -290,7 +290,7 @@ impl InnerTxnBuilder {
                     }
                 }
                 // Accounts
-                27 => {
+                28 => {
                     let accts: Vec<Address> = values
                         .iter()
                         .filter_map(|v| {
@@ -309,7 +309,7 @@ impl InnerTxnBuilder {
                     }
                 }
                 // Assets (foreign assets)
-                47 => {
+                48 => {
                     let assets: Vec<u64> = values
                         .iter()
                         .filter_map(|v| {
@@ -325,7 +325,7 @@ impl InnerTxnBuilder {
                     }
                 }
                 // Applications (foreign apps)
-                49 => {
+                50 => {
                     let apps: Vec<u64> = values
                         .iter()
                         .filter_map(|v| {
@@ -477,78 +477,81 @@ fn read_txn_field(
         1 => Ok(TealValue::Uint(txn.fee)),
         // FirstValid
         2 => Ok(TealValue::Uint(txn.first_valid.0)),
+        // FirstValidTime — timestamp of block(FirstValid-1). AVM v7+.
+        // TODO: requires block timestamp lookup; return 0 for now.
+        3 => Ok(TealValue::Uint(0)),
         // LastValid
-        3 => Ok(TealValue::Uint(txn.last_valid.0)),
+        4 => Ok(TealValue::Uint(txn.last_valid.0)),
         // Note
-        4 => Ok(TealValue::Bytes(txn.note.to_vec())),
+        5 => Ok(TealValue::Bytes(txn.note.to_vec())),
         // Lease
-        5 => Ok(TealValue::Bytes(txn.lease.to_vec())),
+        6 => Ok(TealValue::Bytes(txn.lease.to_vec())),
         // Receiver
-        6 => Ok(TealValue::Bytes(txn.receiver.0.to_vec())),
+        7 => Ok(TealValue::Bytes(txn.receiver.0.to_vec())),
         // Amount
-        7 => Ok(TealValue::Uint(txn.amount)),
+        8 => Ok(TealValue::Uint(txn.amount)),
         // CloseRemainderTo
-        8 => Ok(TealValue::Bytes(txn.close_remainder_to.0.to_vec())),
+        9 => Ok(TealValue::Bytes(txn.close_remainder_to.0.to_vec())),
         // VotePK
-        9 => Ok(TealValue::Bytes(
+        10 => Ok(TealValue::Bytes(
             txn.vote_pk.as_ref().map(|b| b.to_vec()).unwrap_or_default(),
         )),
         // SelectionPK
-        10 => Ok(TealValue::Bytes(
+        11 => Ok(TealValue::Bytes(
             txn.selection_pk
                 .as_ref()
                 .map(|b| b.to_vec())
                 .unwrap_or_default(),
         )),
         // VoteFirst
-        11 => Ok(TealValue::Uint(txn.vote_first)),
+        12 => Ok(TealValue::Uint(txn.vote_first)),
         // VoteLast
-        12 => Ok(TealValue::Uint(txn.vote_last)),
+        13 => Ok(TealValue::Uint(txn.vote_last)),
         // VoteKeyDilution
-        13 => Ok(TealValue::Uint(txn.vote_key_dilution)),
+        14 => Ok(TealValue::Uint(txn.vote_key_dilution)),
         // Type
-        14 => Ok(TealValue::Bytes(txn.txn_type.as_bytes().to_vec())),
+        15 => Ok(TealValue::Bytes(txn.txn_type.as_bytes().to_vec())),
         // TypeEnum
-        15 => Ok(TealValue::Uint(type_enum(&txn.txn_type))),
+        16 => Ok(TealValue::Uint(type_enum(&txn.txn_type))),
         // XferAsset
-        16 => Ok(TealValue::Uint(txn.xaid)),
+        17 => Ok(TealValue::Uint(txn.xaid)),
         // AssetAmount
-        17 => Ok(TealValue::Uint(txn.asset_amount)),
+        18 => Ok(TealValue::Uint(txn.asset_amount)),
         // AssetSender
-        18 => Ok(TealValue::Bytes(
+        19 => Ok(TealValue::Bytes(
             txn.asset_sender
                 .as_ref()
                 .map(|a| a.0.to_vec())
                 .unwrap_or_else(|| vec![0u8; 32]),
         )),
         // AssetReceiver
-        19 => Ok(TealValue::Bytes(
+        20 => Ok(TealValue::Bytes(
             txn.asset_receiver
                 .as_ref()
                 .map(|a| a.0.to_vec())
                 .unwrap_or_else(|| vec![0u8; 32]),
         )),
         // AssetCloseTo
-        20 => Ok(TealValue::Bytes(
+        21 => Ok(TealValue::Bytes(
             txn.asset_close_to
                 .as_ref()
                 .map(|a| a.0.to_vec())
                 .unwrap_or_else(|| vec![0u8; 32]),
         )),
         // GroupIndex
-        21 => Ok(TealValue::Uint(group_index_val as u64)),
+        22 => Ok(TealValue::Uint(group_index_val as u64)),
         // TxID
-        22 => {
+        23 => {
             // TxID = SHA512/256("TX" || canonical_encode(txn))
             let digest = algo_codec::compute_txn_id(txn);
             Ok(TealValue::Bytes(digest.0.to_vec()))
         }
         // ApplicationID
-        23 => Ok(TealValue::Uint(txn.application_id)),
+        24 => Ok(TealValue::Uint(txn.application_id)),
         // OnCompletion
-        24 => Ok(TealValue::Uint(txn.on_completion)),
+        25 => Ok(TealValue::Uint(txn.on_completion)),
         // ApplicationArgs (array)
-        25 => {
+        26 => {
             let args = txn.app_arguments.as_deref().unwrap_or(&[]);
             match array_index {
                 Some(i) => {
@@ -569,14 +572,14 @@ fn read_txn_field(
             }
         }
         // NumAppArgs
-        26 => {
+        27 => {
             let args = txn.app_arguments.as_deref().unwrap_or(&[]);
             Ok(TealValue::Uint(args.len() as u64))
         }
         // Accounts (array) — index 0 = sender, 1+ = accounts[i-1]
         // Per go-algorand: Accounts[0] is the sender, foreign accounts start at 1.
         // NumAccounts (when array_index is None) = len(apat), not including sender.
-        27 => {
+        28 => {
             let accts = txn.accounts.as_deref().unwrap_or(&[]);
             match array_index {
                 Some(0) => Ok(TealValue::Bytes(txn.sender.0.to_vec())),
@@ -598,74 +601,74 @@ fn read_txn_field(
             }
         }
         // NumAccounts
-        28 => {
+        29 => {
             let accts = txn.accounts.as_deref().unwrap_or(&[]);
             Ok(TealValue::Uint(accts.len() as u64))
         }
         // ApprovalProgram
-        29 => Ok(TealValue::Bytes(
+        30 => Ok(TealValue::Bytes(
             txn.approval_program
                 .as_ref()
                 .map(|b| b.to_vec())
                 .unwrap_or_default(),
         )),
         // ClearStateProgram
-        30 => Ok(TealValue::Bytes(
+        31 => Ok(TealValue::Bytes(
             txn.clear_state_program
                 .as_ref()
                 .map(|b| b.to_vec())
                 .unwrap_or_default(),
         )),
         // RekeyTo
-        31 => Ok(TealValue::Bytes(
+        32 => Ok(TealValue::Bytes(
             txn.rekey_to
                 .as_ref()
                 .map(|a| a.0.to_vec())
                 .unwrap_or_else(|| vec![0u8; 32]),
         )),
         // ConfigAsset
-        32 => Ok(TealValue::Uint(txn.config_asset)),
+        33 => Ok(TealValue::Uint(txn.config_asset)),
         // ConfigAssetTotal
-        33 => Ok(TealValue::Uint(
+        34 => Ok(TealValue::Uint(
             txn.asset_params.as_ref().map(|p| p.total).unwrap_or(0),
         )),
         // ConfigAssetDecimals
-        34 => Ok(TealValue::Uint(
+        35 => Ok(TealValue::Uint(
             txn.asset_params
                 .as_ref()
                 .map(|p| p.decimals as u64)
                 .unwrap_or(0),
         )),
         // ConfigAssetDefaultFrozen
-        35 => Ok(TealValue::Uint(
+        36 => Ok(TealValue::Uint(
             txn.asset_params
                 .as_ref()
                 .map(|p| p.default_frozen as u64)
                 .unwrap_or(0),
         )),
         // ConfigAssetUnitName
-        36 => Ok(TealValue::Bytes(
+        37 => Ok(TealValue::Bytes(
             txn.asset_params
                 .as_ref()
                 .map(|p| p.unit_name.as_bytes().to_vec())
                 .unwrap_or_default(),
         )),
         // ConfigAssetName
-        37 => Ok(TealValue::Bytes(
+        38 => Ok(TealValue::Bytes(
             txn.asset_params
                 .as_ref()
                 .map(|p| p.asset_name.as_bytes().to_vec())
                 .unwrap_or_default(),
         )),
         // ConfigAssetURL
-        38 => Ok(TealValue::Bytes(
+        39 => Ok(TealValue::Bytes(
             txn.asset_params
                 .as_ref()
                 .map(|p| p.url.as_bytes().to_vec())
                 .unwrap_or_default(),
         )),
         // ConfigAssetMetadataHash
-        39 => Ok(TealValue::Bytes(
+        40 => Ok(TealValue::Bytes(
             txn.asset_params
                 .as_ref()
                 .and_then(|p| p.metadata_hash.as_ref())
@@ -673,7 +676,7 @@ fn read_txn_field(
                 .unwrap_or_default(),
         )),
         // ConfigAssetManager
-        40 => Ok(TealValue::Bytes(
+        41 => Ok(TealValue::Bytes(
             txn.asset_params
                 .as_ref()
                 .and_then(|p| p.manager.as_ref())
@@ -681,7 +684,7 @@ fn read_txn_field(
                 .unwrap_or_else(|| vec![0u8; 32]),
         )),
         // ConfigAssetReserve
-        41 => Ok(TealValue::Bytes(
+        42 => Ok(TealValue::Bytes(
             txn.asset_params
                 .as_ref()
                 .and_then(|p| p.reserve.as_ref())
@@ -689,7 +692,7 @@ fn read_txn_field(
                 .unwrap_or_else(|| vec![0u8; 32]),
         )),
         // ConfigAssetFreeze
-        42 => Ok(TealValue::Bytes(
+        43 => Ok(TealValue::Bytes(
             txn.asset_params
                 .as_ref()
                 .and_then(|p| p.freeze.as_ref())
@@ -697,7 +700,7 @@ fn read_txn_field(
                 .unwrap_or_else(|| vec![0u8; 32]),
         )),
         // ConfigAssetClawback
-        43 => Ok(TealValue::Bytes(
+        44 => Ok(TealValue::Bytes(
             txn.asset_params
                 .as_ref()
                 .and_then(|p| p.clawback.as_ref())
@@ -705,18 +708,18 @@ fn read_txn_field(
                 .unwrap_or_else(|| vec![0u8; 32]),
         )),
         // FreezeAsset
-        44 => Ok(TealValue::Uint(txn.freeze_asset)),
+        45 => Ok(TealValue::Uint(txn.freeze_asset)),
         // FreezeAssetAccount
-        45 => Ok(TealValue::Bytes(
+        46 => Ok(TealValue::Bytes(
             txn.freeze_account
                 .as_ref()
                 .map(|a| a.0.to_vec())
                 .unwrap_or_else(|| vec![0u8; 32]),
         )),
         // FreezeAssetFrozen
-        46 => Ok(TealValue::Uint(txn.asset_frozen as u64)),
+        47 => Ok(TealValue::Uint(txn.asset_frozen as u64)),
         // Assets (foreign assets array)
-        47 => {
+        48 => {
             let assets = txn.foreign_assets.as_deref().unwrap_or(&[]);
             match array_index {
                 Some(i) => {
@@ -736,14 +739,14 @@ fn read_txn_field(
             }
         }
         // NumAssets
-        48 => {
+        49 => {
             let assets = txn.foreign_assets.as_deref().unwrap_or(&[]);
             Ok(TealValue::Uint(assets.len() as u64))
         }
         // Applications (foreign apps array) — index 0 = current app ID, 1+ = foreign_apps[i-1]
         // Per go-algorand: Applications[0] is the current ApplicationID.
         // NumApplications (when array_index is None) = len(apfa), not including current app.
-        49 => {
+        50 => {
             let apps = txn.foreign_apps.as_deref().unwrap_or(&[]);
             match array_index {
                 Some(0) => Ok(TealValue::Uint(txn.application_id)),
@@ -765,44 +768,44 @@ fn read_txn_field(
             }
         }
         // NumApplications
-        50 => {
+        51 => {
             let apps = txn.foreign_apps.as_deref().unwrap_or(&[]);
             Ok(TealValue::Uint(apps.len() as u64))
         }
         // GlobalNumUint
-        51 => Ok(TealValue::Uint(
+        52 => Ok(TealValue::Uint(
             txn.global_state_schema
                 .as_ref()
                 .map(|s| s.num_uint)
                 .unwrap_or(0),
         )),
         // GlobalNumByteSlice
-        52 => Ok(TealValue::Uint(
+        53 => Ok(TealValue::Uint(
             txn.global_state_schema
                 .as_ref()
                 .map(|s| s.num_byte_slice)
                 .unwrap_or(0),
         )),
         // LocalNumUint
-        53 => Ok(TealValue::Uint(
+        54 => Ok(TealValue::Uint(
             txn.local_state_schema
                 .as_ref()
                 .map(|s| s.num_uint)
                 .unwrap_or(0),
         )),
         // LocalNumByteSlice
-        54 => Ok(TealValue::Uint(
+        55 => Ok(TealValue::Uint(
             txn.local_state_schema
                 .as_ref()
                 .map(|s| s.num_byte_slice)
                 .unwrap_or(0),
         )),
         // ExtraProgramPages
-        55 => Ok(TealValue::Uint(txn.extra_program_pages as u64)),
+        56 => Ok(TealValue::Uint(txn.extra_program_pages as u64)),
         // Nonparticipation
-        56 => Ok(TealValue::Uint(txn.non_participation as u64)),
+        57 => Ok(TealValue::Uint(txn.non_participation as u64)),
         // Logs (array) — extracted from ApplyData eval_delta ("dt.lg").
-        57 => {
+        58 => {
             let logs = extract_logs_from_eval_delta(stxn);
             match array_index {
                 Some(i) => {
@@ -818,22 +821,22 @@ fn read_txn_field(
             }
         }
         // NumLogs
-        58 => {
+        59 => {
             let logs = extract_logs_from_eval_delta(stxn);
             Ok(TealValue::Uint(logs.len() as u64))
         }
         // CreatedAssetID (from ApplyData)
-        59 => Ok(TealValue::Uint(stxn.apply_data_config_asset)),
+        60 => Ok(TealValue::Uint(stxn.apply_data_config_asset)),
         // CreatedApplicationID (from ApplyData)
-        60 => Ok(TealValue::Uint(stxn.apply_data_application_id)),
+        61 => Ok(TealValue::Uint(stxn.apply_data_application_id)),
         // LastLog — the last entry in the eval_delta logs, or empty bytes.
-        61 => {
+        62 => {
             let logs = extract_logs_from_eval_delta(stxn);
             let last = logs.last().cloned().unwrap_or_default();
             Ok(TealValue::Bytes(last))
         }
         // StateProofPK
-        62 => Ok(TealValue::Bytes(
+        63 => Ok(TealValue::Bytes(
             txn.state_proof_pk
                 .as_ref()
                 .map(|b| b.to_vec())
@@ -841,7 +844,7 @@ fn read_txn_field(
         )),
         // ApprovalProgramPages (array) — per go-algorand, pages are 4096-byte chunks.
         // maxStringSize = 4096; page_count = DivCeil(len, 4096); OOB index is an error.
-        63 => {
+        64 => {
             let program = txn
                 .approval_program
                 .as_ref()
@@ -864,12 +867,12 @@ fn read_txn_field(
             }
         }
         // NumApprovalProgramPages
-        64 => {
+        65 => {
             let len = txn.approval_program.as_ref().map(|b| b.len()).unwrap_or(0);
             Ok(TealValue::Uint(div_ceil(len, MAX_STRING_SIZE) as u64))
         }
         // ClearStateProgramPages (array) — same 4096-byte paging as approval.
-        65 => {
+        66 => {
             let program = txn
                 .clear_state_program
                 .as_ref()
@@ -892,7 +895,7 @@ fn read_txn_field(
             }
         }
         // NumClearStateProgramPages
-        66 => {
+        67 => {
             let len = txn
                 .clear_state_program
                 .as_ref()
@@ -900,6 +903,8 @@ fn read_txn_field(
                 .unwrap_or(0);
             Ok(TealValue::Uint(div_ceil(len, MAX_STRING_SIZE) as u64))
         }
+        // RejectVersion — AVM v12+. Returns 0 (not set on existing transactions).
+        68 => Ok(TealValue::Uint(0)),
         _ => Err(AlgoError::Avm {
             message: format!("unknown TxnField index: {field}"),
         }),
@@ -1406,6 +1411,67 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         Ok(self.scratch[group_index][slot as usize].clone())
     }
 
+    // ---- Group created IDs (gaid/gaids) ----
+
+    fn created_id(&self, group_index: usize) -> Result<u64, AlgoError> {
+        if group_index >= self.group.len() {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "gaid: group_index {} out of range (group size={})",
+                    group_index,
+                    self.group.len()
+                ),
+            });
+        }
+        if group_index > self.group_index {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "gaid: can't get creatable ID of txn ahead of the current one (index {} > current {})",
+                    group_index, self.group_index
+                ),
+            });
+        }
+        if group_index == self.group_index {
+            return Err(AlgoError::Avm {
+                message: "gaid: is only for accessing creatable IDs of previous txns, use `global CurrentApplicationID` instead".to_string(),
+            });
+        }
+        let stxn = &self.group[group_index];
+        let txn_type = stxn.txn.txn_type.as_str();
+        if txn_type != "appl" && txn_type != "acfg" {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "gaid: txn at index {} is not an app call or asset config (type='{}')",
+                    group_index, txn_type
+                ),
+            });
+        }
+        // Check ApplyData fields for created asset/app IDs.
+        // These are set at the SignedTxnInBlock level (not inside the "txn" map).
+        if stxn.apply_data_config_asset != 0 {
+            return Ok(stxn.apply_data_config_asset);
+        }
+        if stxn.apply_data_application_id != 0 {
+            return Ok(stxn.apply_data_application_id);
+        }
+        Err(AlgoError::Avm {
+            message: format!("gaid: txn at index {} did not create anything", group_index),
+        })
+    }
+
+    // ---- Block field access ----
+
+    fn block_field(&self, round: u64, field: u8) -> Result<algo_avm::machine::AvmValue, AlgoError> {
+        // Block field access requires block history which is not yet available
+        // in this implementation. Return a descriptive error.
+        Err(AlgoError::Avm {
+            message: format!(
+                "block field access not yet supported (round={}, field={})",
+                round, field
+            ),
+        })
+    }
+
     // ---- Inner transactions ----
 
     fn itxn_begin(&mut self) -> Result<(), AlgoError> {
@@ -1647,10 +1713,10 @@ mod tests {
         let mut store = LedgerState::new();
         let ctx = make_context(&mut store, vec![txn]);
 
-        let type_val = ctx.txn_field(0, 14, None).unwrap(); // Type
+        let type_val = ctx.txn_field(0, 15, None).unwrap(); // Type
         assert_eq!(type_val, TealValue::Bytes(b"pay".to_vec()));
 
-        let type_enum_val = ctx.txn_field(0, 15, None).unwrap(); // TypeEnum
+        let type_enum_val = ctx.txn_field(0, 16, None).unwrap(); // TypeEnum
         assert_eq!(type_enum_val, TealValue::Uint(1));
     }
 
@@ -1662,10 +1728,10 @@ mod tests {
         let mut store = LedgerState::new();
         let ctx = make_context(&mut store, vec![txn]);
 
-        let amount = ctx.txn_field(0, 7, None).unwrap(); // Amount
+        let amount = ctx.txn_field(0, 8, None).unwrap(); // Amount
         assert_eq!(amount, TealValue::Uint(5000));
 
-        let rcv = ctx.txn_field(0, 6, None).unwrap(); // Receiver
+        let rcv = ctx.txn_field(0, 7, None).unwrap(); // Receiver
         assert_eq!(rcv, TealValue::Bytes(receiver.to_vec()));
     }
 
@@ -1678,7 +1744,7 @@ mod tests {
         let fv = ctx.txn_field(0, 2, None).unwrap(); // FirstValid
         assert_eq!(fv, TealValue::Uint(100));
 
-        let lv = ctx.txn_field(0, 3, None).unwrap(); // LastValid
+        let lv = ctx.txn_field(0, 4, None).unwrap(); // LastValid
         assert_eq!(lv, TealValue::Uint(200));
     }
 
@@ -1688,7 +1754,7 @@ mod tests {
         let mut store = LedgerState::new();
         let ctx = make_context(&mut store, vec![txn]);
 
-        let note = ctx.txn_field(0, 4, None).unwrap(); // Note
+        let note = ctx.txn_field(0, 5, None).unwrap(); // Note
         assert_eq!(note, TealValue::Bytes(b"hello".to_vec()));
     }
 
@@ -1698,7 +1764,7 @@ mod tests {
         let mut store = LedgerState::new();
         let ctx = make_context(&mut store, vec![txn]);
 
-        let gi = ctx.txn_field(0, 21, None).unwrap(); // GroupIndex
+        let gi = ctx.txn_field(0, 22, None).unwrap(); // GroupIndex
         assert_eq!(gi, TealValue::Uint(0));
     }
 
@@ -1720,19 +1786,19 @@ mod tests {
         let ctx = make_context(&mut store, vec![txn]);
 
         // NumAppArgs
-        let num = ctx.txn_field(0, 26, None).unwrap();
+        let num = ctx.txn_field(0, 27, None).unwrap();
         assert_eq!(num, TealValue::Uint(2));
 
         // ApplicationArgs[0]
-        let arg0 = ctx.txn_field(0, 25, Some(0)).unwrap();
+        let arg0 = ctx.txn_field(0, 26, Some(0)).unwrap();
         assert_eq!(arg0, TealValue::Bytes(b"arg0".to_vec()));
 
         // ApplicationArgs[1]
-        let arg1 = ctx.txn_field(0, 25, Some(1)).unwrap();
+        let arg1 = ctx.txn_field(0, 26, Some(1)).unwrap();
         assert_eq!(arg1, TealValue::Bytes(b"arg1".to_vec()));
 
         // Out-of-range
-        assert!(ctx.txn_field(0, 25, Some(2)).is_err());
+        assert!(ctx.txn_field(0, 26, Some(2)).is_err());
     }
 
     #[test]
@@ -1745,23 +1811,23 @@ mod tests {
         let ctx = make_context(&mut store, vec![txn]);
 
         // NumAccounts = len(apat), not including sender
-        let num = ctx.txn_field(0, 28, None).unwrap();
+        let num = ctx.txn_field(0, 29, None).unwrap();
         assert_eq!(num, TealValue::Uint(2));
 
         // Accounts[0] = sender (per go-algorand semantics)
-        let a0 = ctx.txn_field(0, 27, Some(0)).unwrap();
+        let a0 = ctx.txn_field(0, 28, Some(0)).unwrap();
         assert_eq!(a0, TealValue::Bytes(sender.to_vec()));
 
         // Accounts[1] = apat[0]
-        let a1 = ctx.txn_field(0, 27, Some(1)).unwrap();
+        let a1 = ctx.txn_field(0, 28, Some(1)).unwrap();
         assert_eq!(a1, TealValue::Bytes(acct1.0.to_vec()));
 
         // Accounts[2] = apat[1]
-        let a2 = ctx.txn_field(0, 27, Some(2)).unwrap();
+        let a2 = ctx.txn_field(0, 28, Some(2)).unwrap();
         assert_eq!(a2, TealValue::Bytes(acct2.0.to_vec()));
 
         // Accounts[3] = out of range
-        assert!(ctx.txn_field(0, 27, Some(3)).is_err());
+        assert!(ctx.txn_field(0, 28, Some(3)).is_err());
     }
 
     #[test]
@@ -1772,24 +1838,24 @@ mod tests {
         let ctx = make_context(&mut store, vec![txn]);
 
         // NumApplications = len(apfa), not including current app
-        assert_eq!(ctx.txn_field(0, 50, None).unwrap(), TealValue::Uint(2));
+        assert_eq!(ctx.txn_field(0, 51, None).unwrap(), TealValue::Uint(2));
         // Applications[0] = current ApplicationID (per go-algorand semantics)
-        assert_eq!(ctx.txn_field(0, 49, Some(0)).unwrap(), TealValue::Uint(42));
+        assert_eq!(ctx.txn_field(0, 50, Some(0)).unwrap(), TealValue::Uint(42));
         // Applications[1] = apfa[0]
-        assert_eq!(ctx.txn_field(0, 49, Some(1)).unwrap(), TealValue::Uint(100));
+        assert_eq!(ctx.txn_field(0, 50, Some(1)).unwrap(), TealValue::Uint(100));
         // Applications[2] = apfa[1]
-        assert_eq!(ctx.txn_field(0, 49, Some(2)).unwrap(), TealValue::Uint(200));
+        assert_eq!(ctx.txn_field(0, 50, Some(2)).unwrap(), TealValue::Uint(200));
         // Applications[3] = out of range
-        assert!(ctx.txn_field(0, 49, Some(3)).is_err());
+        assert!(ctx.txn_field(0, 50, Some(3)).is_err());
 
         // NumAssets (0-based, no special index 0)
-        assert_eq!(ctx.txn_field(0, 48, None).unwrap(), TealValue::Uint(2));
+        assert_eq!(ctx.txn_field(0, 49, None).unwrap(), TealValue::Uint(2));
         // Assets[0] = foreign_assets[0]
-        assert_eq!(ctx.txn_field(0, 47, Some(0)).unwrap(), TealValue::Uint(50));
+        assert_eq!(ctx.txn_field(0, 48, Some(0)).unwrap(), TealValue::Uint(50));
         // Assets[1] = foreign_assets[1]
-        assert_eq!(ctx.txn_field(0, 47, Some(1)).unwrap(), TealValue::Uint(60));
+        assert_eq!(ctx.txn_field(0, 48, Some(1)).unwrap(), TealValue::Uint(60));
         // Assets[2] = out of range
-        assert!(ctx.txn_field(0, 47, Some(2)).is_err());
+        assert!(ctx.txn_field(0, 48, Some(2)).is_err());
     }
 
     // ---- global_field tests ----
@@ -2309,22 +2375,22 @@ mod tests {
         assert_eq!(ctx.num_inner_txns(), 0);
 
         ctx.itxn_begin().unwrap();
-        ctx.itxn_field(15, TealValue::Uint(1)).unwrap(); // TypeEnum = pay
-        ctx.itxn_field(6, TealValue::Bytes([30u8; 32].to_vec()))
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // TypeEnum = pay
+        ctx.itxn_field(7, TealValue::Bytes([30u8; 32].to_vec()))
             .unwrap(); // Receiver
-        ctx.itxn_field(7, TealValue::Uint(999)).unwrap(); // Amount
+        ctx.itxn_field(8, TealValue::Uint(999)).unwrap(); // Amount
         ctx.itxn_submit().unwrap();
 
         assert_eq!(ctx.num_inner_txns(), 1);
 
         // Read back fields from last inner txn
-        let type_val = ctx.last_itxn_field(14, None).unwrap(); // Type
+        let type_val = ctx.last_itxn_field(15, None).unwrap(); // Type
         assert_eq!(type_val, TealValue::Bytes(b"pay".to_vec()));
 
-        let amount_val = ctx.last_itxn_field(7, None).unwrap(); // Amount
+        let amount_val = ctx.last_itxn_field(8, None).unwrap(); // Amount
         assert_eq!(amount_val, TealValue::Uint(999));
 
-        let rcv_val = ctx.last_itxn_field(6, None).unwrap(); // Receiver
+        let rcv_val = ctx.last_itxn_field(7, None).unwrap(); // Receiver
         assert_eq!(rcv_val, TealValue::Bytes([30u8; 32].to_vec()));
     }
 
@@ -2335,22 +2401,22 @@ mod tests {
         let mut ctx = make_context(&mut store, vec![txn]);
 
         ctx.itxn_begin().unwrap();
-        ctx.itxn_field(15, TealValue::Uint(1)).unwrap(); // pay
-        ctx.itxn_field(7, TealValue::Uint(100)).unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // pay
+        ctx.itxn_field(8, TealValue::Uint(100)).unwrap();
 
         ctx.itxn_next().unwrap();
-        ctx.itxn_field(15, TealValue::Uint(4)).unwrap(); // axfer
-        ctx.itxn_field(17, TealValue::Uint(200)).unwrap(); // AssetAmount
+        ctx.itxn_field(16, TealValue::Uint(4)).unwrap(); // axfer
+        ctx.itxn_field(18, TealValue::Uint(200)).unwrap(); // AssetAmount
 
         ctx.itxn_submit().unwrap();
 
         assert_eq!(ctx.num_inner_txns(), 2);
 
         // Read from the group
-        let val = ctx.last_itxn_group_field(0, 7, None).unwrap(); // Amount of first
+        let val = ctx.last_itxn_group_field(0, 8, None).unwrap(); // Amount of first
         assert_eq!(val, TealValue::Uint(100));
 
-        let val = ctx.last_itxn_group_field(1, 17, None).unwrap(); // AssetAmount of second
+        let val = ctx.last_itxn_group_field(1, 18, None).unwrap(); // AssetAmount of second
         assert_eq!(val, TealValue::Uint(200));
     }
 
@@ -2393,14 +2459,14 @@ mod tests {
         let mut store = LedgerState::new();
         let ctx = make_context(&mut store, vec![txn]);
 
-        let a0 = ctx.txn_field(0, 27, Some(0)).unwrap();
+        let a0 = ctx.txn_field(0, 28, Some(0)).unwrap();
         assert_eq!(a0, TealValue::Bytes(sender.to_vec()));
 
         // NumAccounts = 0 (no foreign accounts)
-        assert_eq!(ctx.txn_field(0, 28, None).unwrap(), TealValue::Uint(0));
+        assert_eq!(ctx.txn_field(0, 29, None).unwrap(), TealValue::Uint(0));
 
         // Accounts[1] should fail (no foreign accounts)
-        assert!(ctx.txn_field(0, 27, Some(1)).is_err());
+        assert!(ctx.txn_field(0, 28, Some(1)).is_err());
     }
 
     // ---- Applications[0] = current app edge cases ----
@@ -2413,14 +2479,14 @@ mod tests {
         let ctx = make_context(&mut store, vec![txn]);
 
         // Applications[0] = current ApplicationID even with no foreign apps
-        let a0 = ctx.txn_field(0, 49, Some(0)).unwrap();
+        let a0 = ctx.txn_field(0, 50, Some(0)).unwrap();
         assert_eq!(a0, TealValue::Uint(42));
 
         // NumApplications = 0
-        assert_eq!(ctx.txn_field(0, 50, None).unwrap(), TealValue::Uint(0));
+        assert_eq!(ctx.txn_field(0, 51, None).unwrap(), TealValue::Uint(0));
 
         // Applications[1] should fail
-        assert!(ctx.txn_field(0, 49, Some(1)).is_err());
+        assert!(ctx.txn_field(0, 50, Some(1)).is_err());
     }
 
     // ---- Program page tests ----
@@ -2436,16 +2502,16 @@ mod tests {
         let ctx = make_context(&mut store, vec![txn]);
 
         // NumApprovalProgramPages = 1
-        assert_eq!(ctx.txn_field(0, 64, None).unwrap(), TealValue::Uint(1));
+        assert_eq!(ctx.txn_field(0, 65, None).unwrap(), TealValue::Uint(1));
 
         // ApprovalProgramPages[0] = entire program
         assert_eq!(
-            ctx.txn_field(0, 63, Some(0)).unwrap(),
+            ctx.txn_field(0, 64, Some(0)).unwrap(),
             TealValue::Bytes(program)
         );
 
         // ApprovalProgramPages[1] = out of range → error
-        assert!(ctx.txn_field(0, 63, Some(1)).is_err());
+        assert!(ctx.txn_field(0, 64, Some(1)).is_err());
     }
 
     #[test]
@@ -2460,22 +2526,22 @@ mod tests {
         let ctx = make_context(&mut store, vec![txn]);
 
         // NumApprovalProgramPages = 2 (4097 / 4096 = 2)
-        assert_eq!(ctx.txn_field(0, 64, None).unwrap(), TealValue::Uint(2));
+        assert_eq!(ctx.txn_field(0, 65, None).unwrap(), TealValue::Uint(2));
 
         // Page 0 = first 4096 bytes
         assert_eq!(
-            ctx.txn_field(0, 63, Some(0)).unwrap(),
+            ctx.txn_field(0, 64, Some(0)).unwrap(),
             TealValue::Bytes(program[..4096].to_vec())
         );
 
         // Page 1 = remaining 1 byte
         assert_eq!(
-            ctx.txn_field(0, 63, Some(1)).unwrap(),
+            ctx.txn_field(0, 64, Some(1)).unwrap(),
             TealValue::Bytes(program[4096..].to_vec())
         );
 
         // Page 2 = out of range
-        assert!(ctx.txn_field(0, 63, Some(2)).is_err());
+        assert!(ctx.txn_field(0, 64, Some(2)).is_err());
     }
 
     #[test]
@@ -2489,13 +2555,13 @@ mod tests {
         let ctx = make_context(&mut store, vec![txn]);
 
         // NumApprovalProgramPages = 0 for empty/None program
-        assert_eq!(ctx.txn_field(0, 64, None).unwrap(), TealValue::Uint(0));
+        assert_eq!(ctx.txn_field(0, 65, None).unwrap(), TealValue::Uint(0));
         // NumClearStateProgramPages = 0
-        assert_eq!(ctx.txn_field(0, 66, None).unwrap(), TealValue::Uint(0));
+        assert_eq!(ctx.txn_field(0, 67, None).unwrap(), TealValue::Uint(0));
 
         // Page 0 on empty program = error (0 pages, index 0 is OOB)
-        assert!(ctx.txn_field(0, 63, Some(0)).is_err());
-        assert!(ctx.txn_field(0, 65, Some(0)).is_err());
+        assert!(ctx.txn_field(0, 64, Some(0)).is_err());
+        assert!(ctx.txn_field(0, 66, Some(0)).is_err());
     }
 
     #[test]
@@ -2509,12 +2575,12 @@ mod tests {
         let mut store = LedgerState::new();
         let ctx = make_context(&mut store, vec![txn]);
 
-        assert_eq!(ctx.txn_field(0, 64, None).unwrap(), TealValue::Uint(1));
+        assert_eq!(ctx.txn_field(0, 65, None).unwrap(), TealValue::Uint(1));
         assert_eq!(
-            ctx.txn_field(0, 63, Some(0)).unwrap(),
+            ctx.txn_field(0, 64, Some(0)).unwrap(),
             TealValue::Bytes(program)
         );
-        assert!(ctx.txn_field(0, 63, Some(1)).is_err());
+        assert!(ctx.txn_field(0, 64, Some(1)).is_err());
     }
 
     // ---- div_ceil helper test ----

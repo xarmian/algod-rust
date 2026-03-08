@@ -325,6 +325,71 @@ pub fn op_gloads(
     machine.push(teal_to_avm(value))
 }
 
+/// `gloadss` (0xc4): Pop slot (uint64) and group_index (uint64) from stack.
+/// Push scratch value. AVM v6+, Application mode only.
+pub fn op_gloadss(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let slot_raw = machine.pop_uint()?;
+    let group_index_raw = machine.pop_uint()?;
+    if slot_raw >= 256 {
+        return Err(AlgoError::Avm {
+            message: format!("gloadss scratch index >= 256 ({})", slot_raw),
+        });
+    }
+    let value = ctx.gload(group_index_raw as usize, slot_raw as u8)?;
+    machine.push(teal_to_avm(value))
+}
+
+// ---------------------------------------------------------------------------
+// Group created IDs (gaid / gaids)
+// ---------------------------------------------------------------------------
+
+/// `gaid` (0x3c): 1 immediate (group_index). Push created asset/app ID.
+/// AVM v4+, Application mode only.
+pub fn op_gaid(
+    machine: &mut AvmMachine,
+    instruction: &Instruction,
+    ctx: &dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let group_index = get_uint8(instruction)? as usize;
+    let id = ctx.created_id(group_index)?;
+    machine.push(AvmValue::Uint64(id))
+}
+
+/// `gaids` (0x3d): Pop group_index from stack. Push created asset/app ID.
+/// AVM v4+, Application mode only.
+pub fn op_gaids(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let group_index = machine.pop_uint()? as usize;
+    let id = ctx.created_id(group_index)?;
+    machine.push(AvmValue::Uint64(id))
+}
+
+// ---------------------------------------------------------------------------
+// Block field access
+// ---------------------------------------------------------------------------
+
+/// `block` (0xd1): 1 immediate (BlockField). Pop round from stack.
+/// Push the requested block field value. AVM v7+.
+pub fn op_block(
+    machine: &mut AvmMachine,
+    instruction: &Instruction,
+    ctx: &dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let field_byte = get_uint8(instruction)?;
+    // Validate the field index is a known BlockField
+    let _field = crate::fields::BlockField::from_u8(field_byte)?;
+    let round = machine.pop_uint()?;
+    let value = ctx.block_field(round, field_byte)?;
+    machine.push(value)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -370,6 +435,14 @@ mod tests {
         logs: Vec<Vec<u8>>,
         /// Group scratch: (group_index, slot) -> TealValue
         group_scratch: HashMap<(usize, u8), TealValue>,
+        /// Created IDs: group_index -> created asset/app ID
+        created_ids: HashMap<usize, u64>,
+        /// Block fields: (round, field) -> AvmValue
+        block_fields: HashMap<(u64, u8), AvmValue>,
+        /// Group size override (for gaid tests).
+        group_size_val: usize,
+        /// Group index of the current transaction (for gaid tests).
+        group_index_val: usize,
     }
 
     impl TestStateContext {
@@ -388,13 +461,21 @@ mod tests {
                 acct_params: HashMap::new(),
                 logs: Vec::new(),
                 group_scratch: HashMap::new(),
+                created_ids: HashMap::new(),
+                block_fields: HashMap::new(),
+                group_size_val: 1,
+                group_index_val: 0,
             }
         }
     }
 
     impl AvmContext for TestStateContext {
         fn group_size(&self) -> usize {
-            1
+            self.group_size_val
+        }
+
+        fn group_index(&self) -> usize {
+            self.group_index_val
         }
 
         fn resolve_account(&self, index: u64) -> Result<[u8; 32], AlgoError> {
@@ -549,6 +630,27 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| AlgoError::Avm {
                     message: format!("gload: slot {} from group {} not found", slot, group_index),
+                })
+        }
+
+        fn created_id(&self, group_index: usize) -> Result<u64, AlgoError> {
+            self.created_ids
+                .get(&group_index)
+                .copied()
+                .ok_or_else(|| AlgoError::Avm {
+                    message: format!("gaid: index {} did not create anything", group_index),
+                })
+        }
+
+        fn block_field(&self, round: u64, field: u8) -> Result<AvmValue, AlgoError> {
+            self.block_fields
+                .get(&(round, field))
+                .cloned()
+                .ok_or_else(|| AlgoError::Avm {
+                    message: format!(
+                        "block field access not available (round={}, field={})",
+                        round, field
+                    ),
                 })
         }
 
@@ -1141,5 +1243,180 @@ mod tests {
         assert_eq!(m.stack.len(), 2);
         assert_eq!(m.stack[0], AvmValue::Uint64(55));
         assert_eq!(m.stack[1], AvmValue::Uint64(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // gaid / gaids tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gaid() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.group_size_val = 3;
+        ctx.group_index_val = 2;
+        ctx.created_ids.insert(0, 42);
+        // gaid 0 (immediate group_index=0)
+        let code = vec![0x3c, 0x00];
+        let raw = prog(4, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 1).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Uint64(42));
+    }
+
+    #[test]
+    fn test_gaid_not_found() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.group_size_val = 3;
+        ctx.group_index_val = 2;
+        // No created IDs inserted
+        let code = vec![0x3c, 0x00];
+        let raw = prog(4, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let result = m.step(&mut ctx);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("did not create anything"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_gaids() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.group_size_val = 3;
+        ctx.group_index_val = 2;
+        ctx.created_ids.insert(1, 999);
+        // pushint 1, gaids (pop group_index=1)
+        let code = vec![0x81, 0x01, 0x3d];
+        let raw = prog(4, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Uint64(999));
+    }
+
+    #[test]
+    fn test_gaids_not_found() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.group_size_val = 3;
+        ctx.group_index_val = 2;
+        // pushint 0, gaids
+        let code = vec![0x81, 0x00, 0x3d];
+        let raw = prog(4, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 1).unwrap(); // pushint succeeds
+        let result = m.step(&mut ctx);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("did not create anything"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // gloadss tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gloadss() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.group_scratch.insert((1, 7), TealValue::Uint(12345));
+        // pushint 1 (group_index), pushint 7 (slot), gloadss
+        let code = vec![0x81, 0x01, 0x81, 0x07, 0xc4];
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Uint64(12345));
+    }
+
+    #[test]
+    fn test_gloadss_bytes_value() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.group_scratch
+            .insert((0, 3), TealValue::Bytes(b"hello".to_vec()));
+        // pushint 0 (group_index), pushint 3 (slot), gloadss
+        let code = vec![0x81, 0x00, 0x81, 0x03, 0xc4];
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Bytes(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn test_gloadss_slot_too_large() {
+        let mut ctx = TestStateContext::new(100);
+        // pushint 0 (group_index), pushint 256 (slot >= 256 -> error), gloadss
+        // 256 = 0x80 0x02 in varuint encoding
+        let code = vec![0x81, 0x80, 0x02, 0x81, 0x00, 0x4c, 0xc4]; // pushint 256, pushint 0, swap, gloadss
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        // pushint 256, pushint 0, swap (now stack = [0, 256])
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        let result = m.step(&mut ctx); // gloadss
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("scratch index >= 256"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // block tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_block_timestamp() {
+        let mut ctx = TestStateContext::new(100);
+        // BlkTimestamp = field 1
+        ctx.block_fields
+            .insert((99, 1), AvmValue::Uint64(1700000000));
+        // pushint 99 (round), block 1 (BlkTimestamp)
+        let code = vec![0x81, 99, 0xd1, 0x01];
+        let raw = prog(7, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Uint64(1700000000));
+    }
+
+    #[test]
+    fn test_block_seed() {
+        let mut ctx = TestStateContext::new(100);
+        let seed = vec![0xAB; 32];
+        // BlkSeed = field 0
+        ctx.block_fields
+            .insert((50, 0), AvmValue::Bytes(seed.clone()));
+        // pushint 50 (round), block 0 (BlkSeed)
+        let code = vec![0x81, 50, 0xd1, 0x00];
+        let raw = prog(7, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Bytes(seed));
+    }
+
+    #[test]
+    fn test_block_not_available() {
+        let mut ctx = TestStateContext::new(100);
+        // No block fields inserted -> error
+        // pushint 10 (round), block 0 (BlkSeed)
+        let code = vec![0x81, 10, 0xd1, 0x00];
+        let raw = prog(7, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        m.step(&mut ctx).unwrap(); // pushint succeeds
+        let result = m.step(&mut ctx); // block fails
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("block field access not available"),
+            "got: {msg}"
+        );
     }
 }

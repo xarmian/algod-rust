@@ -1,10 +1,10 @@
-//! Complete AVM opcode table covering all opcodes from AVM v1 through v10.
+//! Complete AVM opcode table covering all opcodes from AVM v1 through v12.
 //!
 //! This table matches go-algorand v4.5.1's `data/transactions/logic/opcodes.go`.
 //! Each opcode has metadata for parsing, validation, and (future) execution.
 
 /// Maximum supported AVM version.
-pub const MAX_AVM_VERSION: u8 = 10;
+pub const MAX_AVM_VERSION: u8 = 12;
 
 /// Execution mode for an opcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,7 +341,7 @@ static OPCODE_TABLE: [Option<OpSpec>; 256] = {
 
     // ---- Crypto (v7+) ----
     op!(0x84, "ed25519verify_bare", 7, Static(1900), 3, 1, Any, None);
-    // 0x85 falcon_verify is v12, beyond our v10 scope but include for completeness
+    op!(0x85, "falcon_verify", 12, Static(1700), 3, 1, Any, None);
     // 0x86 sumhash512 is v13
     // 0x87 sha512 is v13
 
@@ -436,6 +436,9 @@ static OPCODE_TABLE: [Option<OpSpec>; 256] = {
     op!(0xe3, "ec_multi_scalar_mul", 10, Dynamic, 2, 1, Any, Uint8);
     op!(0xe4, "ec_subgroup_check", 10, Dynamic, 1, 1, Any, Uint8);
     op!(0xe5, "ec_map_to", 10, Dynamic, 1, 1, Any, Uint8);
+
+    // ---- MiMC hash (v11) ----
+    op!(0xe6, "mimc", 11, Dynamic, 1, 1, Any, Uint8);
 
     table
 };

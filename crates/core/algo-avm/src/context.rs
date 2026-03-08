@@ -11,6 +11,8 @@
 use algo_error::AlgoError;
 use algo_types::TealValue;
 
+use crate::machine::AvmValue;
+
 /// Trait providing external state access to the AVM.
 ///
 /// Passed as `&mut dyn AvmContext` to `step()` / `run()` so the machine
@@ -237,6 +239,27 @@ pub trait AvmContext {
     fn gload(&self, group_index: usize, slot: u8) -> Result<TealValue, AlgoError> {
         Err(AlgoError::Avm {
             message: "context unavailable: gload".into(),
+        })
+    }
+
+    // ---- Group created IDs (gaid/gaids) ----
+
+    /// Get the created asset or app ID from a prior transaction in the group.
+    /// Used by `gaid` (0x3c) and `gaids` (0x3d).
+    fn created_id(&self, group_index: usize) -> Result<u64, AlgoError> {
+        Err(AlgoError::Avm {
+            message: "context unavailable: created_id".into(),
+        })
+    }
+
+    // ---- Block field access ----
+
+    /// Get a field from a past block header.
+    /// Used by `block` (0xd1).
+    /// `field` values: 0=BlkSeed, 1=BlkTimestamp, etc.
+    fn block_field(&self, round: u64, field: u8) -> Result<AvmValue, AlgoError> {
+        Err(AlgoError::Avm {
+            message: "context unavailable: block_field".into(),
         })
     }
 

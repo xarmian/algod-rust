@@ -23,13 +23,23 @@ const MAX_PROGRAM_SIZE_V4_PLUS: usize = 2048;
 ///
 /// `program_len` is the total byte length of the raw program (including the version byte).
 ///
+/// `extra_pages` is the number of extra program pages granted to an Application program
+/// (from the transaction's `ExtraProgramPages` field). This allows the max program size
+/// to be `2048 * (1 + extra_pages)` for Application programs. LogicSig programs always
+/// use the base limit (no extra pages). Pass `0` for the default behavior.
+///
 /// Checks performed:
 /// - Program size limits
 /// - Mode restrictions (LogicSig-only vs Application-only opcodes)
 /// - Branch target validity (must land on instruction boundaries)
 /// - Basic linear stack depth analysis
-pub fn check_program(program: &Program, mode: Mode, program_len: usize) -> Result<(), AlgoError> {
-    check_size(program, mode, program_len)?;
+pub fn check_program(
+    program: &Program,
+    mode: Mode,
+    program_len: usize,
+    extra_pages: u32,
+) -> Result<(), AlgoError> {
+    check_size(program, mode, program_len, extra_pages)?;
     check_mode(program, mode)?;
     check_branch_targets(program)?;
     check_stack_depth(program)?;
@@ -37,11 +47,23 @@ pub fn check_program(program: &Program, mode: Mode, program_len: usize) -> Resul
 }
 
 /// Enforce per-program size limits.
-fn check_size(program: &Program, mode: Mode, program_len: usize) -> Result<(), AlgoError> {
+///
+/// For LogicSig programs, extra_pages is ignored (always uses the base limit).
+/// For Application programs with v4+, the limit is `2048 * (1 + extra_pages)`.
+fn check_size(
+    program: &Program,
+    mode: Mode,
+    program_len: usize,
+    extra_pages: u32,
+) -> Result<(), AlgoError> {
     let limit = if mode == Mode::LogicSig && program.version <= 3 {
         MAX_LOGICSIG_SIZE_V1_V3
-    } else {
+    } else if mode == Mode::LogicSig {
+        // LogicSig v4+ always uses the base limit, no extra pages.
         MAX_PROGRAM_SIZE_V4_PLUS
+    } else {
+        // Application programs: allow extra pages.
+        MAX_PROGRAM_SIZE_V4_PLUS * (1 + extra_pages as usize)
     };
 
     if program_len > limit {
@@ -324,7 +346,7 @@ mod tests {
         // intcblock [1], intc_0, return
         let raw = prog(2, &[0x20, 0x01, 0x01, 0x22, 0x43]);
         let program = parse(&raw).unwrap();
-        assert!(check_program(&program, Mode::Any, raw.len()).is_ok());
+        assert!(check_program(&program, Mode::Any, raw.len(), 0).is_ok());
     }
 
     #[test]
@@ -337,7 +359,7 @@ mod tests {
         //   offset 6: pushint 1 (0x81 0x01) -> 2 bytes
         let raw = prog(3, &[0x81, 0x01, 0x40, 0x00, 0x01, 0x00, 0x81, 0x01]);
         let program = parse(&raw).unwrap();
-        assert!(check_program(&program, Mode::Any, raw.len()).is_ok());
+        assert!(check_program(&program, Mode::Any, raw.len(), 0).is_ok());
     }
 
     #[test]
@@ -345,7 +367,7 @@ mod tests {
         // pushint 1, bnz +99 (targets offset that doesn't exist as instruction boundary)
         let raw = prog(3, &[0x81, 0x01, 0x40, 0x00, 0x63]);
         let program = parse(&raw).unwrap();
-        let result = check_program(&program, Mode::Any, raw.len());
+        let result = check_program(&program, Mode::Any, raw.len(), 0);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("not a valid instruction boundary"), "{msg}");
@@ -358,7 +380,7 @@ mod tests {
         // pushint 0, balance
         let raw = prog(3, &[0x81, 0x00, 0x60]);
         let program = parse(&raw).unwrap();
-        let result = check_program(&program, Mode::LogicSig, raw.len());
+        let result = check_program(&program, Mode::LogicSig, raw.len(), 0);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("Application-only"), "{msg}");
@@ -369,7 +391,7 @@ mod tests {
         // arg (0x2c) is LogicSig-only; running in Application mode should fail.
         let raw = prog(1, &[0x2c, 0x00]);
         let program = parse(&raw).unwrap();
-        let result = check_program(&program, Mode::Application, raw.len());
+        let result = check_program(&program, Mode::Application, raw.len(), 0);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("LogicSig-only"), "{msg}");
@@ -385,6 +407,7 @@ mod tests {
             },
             Mode::LogicSig,
             1001,
+            0,
         );
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
@@ -401,6 +424,7 @@ mod tests {
             },
             Mode::LogicSig,
             1500,
+            0,
         );
         assert!(result.is_ok());
     }
@@ -414,6 +438,7 @@ mod tests {
             },
             Mode::Application,
             2049,
+            0,
         );
         assert!(result.is_err());
     }
@@ -425,7 +450,7 @@ mod tests {
         // offset 2: b (0x42) +0 -> target = 2 + 3 + 0 = 5, which is end-of-program
         let raw = prog(3, &[0x81, 0x01, 0x42, 0x00, 0x00]);
         let program = parse(&raw).unwrap();
-        assert!(check_program(&program, Mode::Any, raw.len()).is_ok());
+        assert!(check_program(&program, Mode::Any, raw.len(), 0).is_ok());
     }
 
     #[test]
@@ -447,7 +472,7 @@ mod tests {
             ],
         );
         let program = parse(&raw).unwrap();
-        assert!(check_program(&program, Mode::Any, raw.len()).is_ok());
+        assert!(check_program(&program, Mode::Any, raw.len(), 0).is_ok());
     }
 
     #[test]
@@ -461,7 +486,7 @@ mod tests {
             ],
         );
         let program = parse(&raw).unwrap();
-        let result = check_program(&program, Mode::Any, raw.len());
+        let result = check_program(&program, Mode::Any, raw.len(), 0);
         assert!(result.is_err());
     }
 
@@ -471,7 +496,7 @@ mod tests {
         // arg (LogicSig-only) at offset 0
         let raw = prog(1, &[0x2c, 0x00]);
         let program = parse(&raw).unwrap();
-        assert!(check_program(&program, Mode::Any, raw.len()).is_ok());
+        assert!(check_program(&program, Mode::Any, raw.len(), 0).is_ok());
     }
 
     #[test]
@@ -480,7 +505,66 @@ mod tests {
             version: 1,
             instructions: vec![],
         };
-        assert!(check_program(&program, Mode::Any, 1).is_ok());
+        assert!(check_program(&program, Mode::Any, 1, 0).is_ok());
+    }
+
+    #[test]
+    fn test_extra_pages_allows_larger_application() {
+        // With extra_pages=1, application programs can be up to 2048*2 = 4096 bytes.
+        let result = check_program(
+            &Program {
+                version: 6,
+                instructions: vec![],
+            },
+            Mode::Application,
+            4096,
+            1,
+        );
+        assert!(result.is_ok());
+
+        // 4097 still exceeds with 1 extra page.
+        let result = check_program(
+            &Program {
+                version: 6,
+                instructions: vec![],
+            },
+            Mode::Application,
+            4097,
+            1,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extra_pages_three() {
+        // With extra_pages=3, application programs can be up to 2048*4 = 8192 bytes.
+        let result = check_program(
+            &Program {
+                version: 6,
+                instructions: vec![],
+            },
+            Mode::Application,
+            8192,
+            3,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_extra_pages_ignored_for_logicsig() {
+        // LogicSig v4+ always uses base 2048, extra_pages has no effect.
+        let result = check_program(
+            &Program {
+                version: 4,
+                instructions: vec![],
+            },
+            Mode::LogicSig,
+            2049,
+            3,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("exceeds limit 2048"), "{msg}");
     }
 
     #[test]

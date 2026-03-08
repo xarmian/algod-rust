@@ -235,7 +235,7 @@ fn txn_type_enum_appl() {
     let mut ctx = make_context(&mut store, vec![txn]);
 
     let code: &[u8] = &[
-        0x31, 0x0F, // txn TypeEnum (field 15)
+        0x31, 0x10, // txn TypeEnum (field 16)
         0x81, 0x06, // pushint 6
         0x12, // ==
         0x43, // return
@@ -254,7 +254,7 @@ fn txna_application_args() {
     let mut ctx = make_context(&mut store, vec![txn]);
 
     let code: &[u8] = &[
-        0x36, 25, 0x00, // txna ApplicationArgs 0
+        0x36, 26, 0x00, // txna ApplicationArgs 0 (field 26)
         0x80, 0x05, b'h', b'e', b'l', b'l', b'o', // pushbytes "hello"
         0x12, // ==
         0x43, // return
@@ -276,7 +276,7 @@ fn txn_first_last_valid() {
         0x31, 0x02, // txn FirstValid
         0x81, 0x64, // pushint 100
         0x12, // ==
-        0x31, 0x03, // txn LastValid
+        0x31, 0x04, // txn LastValid (field 4)
         0x81, 0xC8, 0x01, // pushint 200
         0x12, // ==
         0x10, // &&
@@ -295,7 +295,7 @@ fn txn_application_id() {
     let mut ctx = make_context(&mut store, vec![txn]);
 
     let code: &[u8] = &[
-        0x31, 23, // txn ApplicationID (field 23)
+        0x31, 24, // txn ApplicationID (field 24)
         0x81, 0x2A, // pushint 42
         0x12, // ==
         0x43, // return
@@ -400,7 +400,7 @@ fn global_latest_timestamp() {
     assert!(result, "global LatestTimestamp should be 50000");
 }
 
-/// global LogicSigVersion; int 10; ==; return
+/// global LogicSigVersion; int 12; ==; return
 #[test]
 fn global_logicsig_version() {
     let sender = [0xAA; 32];
@@ -410,14 +410,14 @@ fn global_logicsig_version() {
 
     let code: &[u8] = &[
         0x32, 0x05, // global LogicSigVersion (field 5)
-        0x81, 0x0A, // pushint 10 (MAX_AVM_VERSION)
+        0x81, 0x0C, // pushint 12 (MAX_AVM_VERSION)
         0x12, // ==
         0x43, // return
     ];
     let result = run_with_context(6, code, &mut ctx).unwrap();
     assert!(
         result,
-        "global LogicSigVersion should match MAX_AVM_VERSION (10)"
+        "global LogicSigVersion should match MAX_AVM_VERSION (12)"
     );
 }
 
@@ -860,7 +860,7 @@ fn itxn_basic_construction() {
     let code: &[u8] = &[
         0xb1, // itxn_begin
         0x81, 0x01, // pushint 1  (TypeEnum for "pay")
-        0xb2, 15,   // itxn_field TypeEnum (field 15)
+        0xb2, 16,   // itxn_field TypeEnum (field 16)
         0xb3, // itxn_submit
         0x81, 0x01, // pushint 1
         0x43, // return
@@ -894,17 +894,17 @@ fn itxn_with_multiple_fields() {
 
     // TypeEnum = 1 (pay)
     code.extend_from_slice(&[0x81, 0x01]); // pushint 1
-    code.extend_from_slice(&[0xb2, 15]); // itxn_field TypeEnum
+    code.extend_from_slice(&[0xb2, 16]); // itxn_field TypeEnum (field 16)
 
     // Receiver
     code.push(0x80); // pushbytes
     code.push(32); // length
     code.extend_from_slice(&receiver);
-    code.extend_from_slice(&[0xb2, 6]); // itxn_field Receiver (field 6)
+    code.extend_from_slice(&[0xb2, 7]); // itxn_field Receiver (field 7)
 
     // Amount = 5000
     code.extend_from_slice(&[0x81, 0x88, 0x27]); // pushint 5000
-    code.extend_from_slice(&[0xb2, 7]); // itxn_field Amount (field 7)
+    code.extend_from_slice(&[0xb2, 8]); // itxn_field Amount (field 8)
 
     code.push(0xb3); // itxn_submit
     code.extend_from_slice(&[0x81, 0x01]); // pushint 1

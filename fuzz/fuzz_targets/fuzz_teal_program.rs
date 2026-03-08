@@ -13,7 +13,7 @@ fuzz_target!(|data: &[u8]| {
     };
 
     // Try validating
-    let _ = check_program(&program, Mode::Any, data.len());
+    let _ = check_program(&program, Mode::Any, data.len(), 0);
 
     // Try executing with limited budget (prevent infinite loops)
     let mut machine = AvmMachine::new(program, ExecMode::LogicSig, 20_000);
