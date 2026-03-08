@@ -2359,6 +2359,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             if let Some(ref acl) = stxn.txn.asset_close_to {
                 snapshot_addrs.push(*acl);
             }
+            // P1-1: Include the clawback source (asset_sender) so its holding
+            // can be restored if a later inner txn in this group fails.
+            if let Some(ref asnd) = stxn.txn.asset_sender {
+                snapshot_addrs.push(*asnd);
+            }
             if let Some(ref fa) = stxn.txn.freeze_account {
                 snapshot_addrs.push(*fa);
             }
@@ -2470,7 +2475,13 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         for (i, stxn) in txns.iter_mut().enumerate() {
             // Deduct fee from sender to fee_sink (matches go-algorand takeFee).
             let fee = stxn.txn.fee;
-            if fee > 0 && !fee_sink.is_zero() {
+            if fee > 0 {
+                if fee_sink.is_zero() {
+                    self.store.restore_snapshot(snapshot);
+                    return Err(AlgoError::Avm {
+                        message: format!("inner tx {}: fee_sink not configured (zero address)", i,),
+                    });
+                }
                 let mut sender_acct = self.store.get_or_default_account(&stxn.txn.sender);
                 if sender_acct.micro_algos < fee {
                     self.store.restore_snapshot(snapshot);
@@ -3547,6 +3558,7 @@ mod tests {
         );
 
         let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
 
         assert_eq!(ctx.num_inner_txns(), 0);
 
@@ -3633,6 +3645,7 @@ mod tests {
         );
 
         let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
 
         ctx.itxn_begin().unwrap();
         ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // pay
@@ -5523,6 +5536,222 @@ mod tests {
         assert_eq!(
             correct_nested_id.0, correct_nested_id2.0,
             "nested inner txn ID computation should be deterministic"
+        );
+    }
+
+    // ---- P1-1: clawback source (asset_sender) snapshot rollback ----
+
+    #[test]
+    fn clawback_source_rolled_back_on_later_inner_failure() {
+        // When an inner group has a clawback axfer followed by a txn that fails,
+        // the clawback source account's asset holding must be restored.
+        use algo_types::{AssetHolding as AH, AssetParams as AP, AssetParamsRecord as APR};
+
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+
+        let app_addr = Address(app_address(42));
+        let clawback_source = Address([50u8; 32]);
+        let asset_receiver = Address([60u8; 32]);
+
+        // Fund the app address (sender of inner txns).
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                total_assets_opted_in: 1,
+                ..Default::default()
+            },
+        );
+
+        // Create asset 88 with the app as the clawback address.
+        store.set_asset_params(
+            88,
+            APR {
+                params: AP {
+                    total: 1_000_000,
+                    clawback: Some(app_addr),
+                    ..Default::default()
+                },
+                creator: app_addr,
+            },
+        );
+
+        // Clawback source holds 500 units of asset 88.
+        store.set_account(
+            &clawback_source,
+            AccountData {
+                micro_algos: 100_000,
+                total_assets_opted_in: 1,
+                ..Default::default()
+            },
+        );
+        store.set_asset_holding(
+            &clawback_source,
+            88,
+            AH {
+                amount: 500,
+                frozen: false,
+            },
+        );
+
+        // Asset receiver is opted in with 0 units.
+        store.set_account(
+            &asset_receiver,
+            AccountData {
+                micro_algos: 100_000,
+                total_assets_opted_in: 1,
+                ..Default::default()
+            },
+        );
+        store.set_asset_holding(
+            &asset_receiver,
+            88,
+            AH {
+                amount: 0,
+                frozen: false,
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        // Give fee credit so fees don't cause failures.
+        ctx.fee_credit = 100_000;
+
+        // Build inner group: clawback axfer (succeeds), then a pay to a zero
+        // address which will fail because the receiver is the zero address.
+        ctx.itxn_begin().unwrap();
+        // First txn: clawback axfer of 200 units from clawback_source to asset_receiver.
+        ctx.itxn_field(16, TealValue::Uint(4)).unwrap(); // TypeEnum = axfer
+        ctx.itxn_field(17, TealValue::Uint(88)).unwrap(); // XferAsset
+        ctx.itxn_field(18, TealValue::Uint(200)).unwrap(); // AssetAmount
+        ctx.itxn_field(19, TealValue::Bytes(clawback_source.0.to_vec()))
+            .unwrap(); // AssetSender (clawback source)
+        ctx.itxn_field(20, TealValue::Bytes(asset_receiver.0.to_vec()))
+            .unwrap(); // AssetReceiver
+
+        // Second txn: pay that deliberately fails (send to receiver
+        // with amount exceeding app balance to trigger insufficient balance).
+        ctx.itxn_next().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // TypeEnum = pay
+        ctx.itxn_field(7, TealValue::Bytes([70u8; 32].to_vec()))
+            .unwrap(); // Receiver
+        ctx.itxn_field(8, TealValue::Uint(999_999_999)).unwrap(); // Amount > app balance
+
+        let result = ctx.itxn_submit();
+        assert!(
+            result.is_err(),
+            "inner group should fail on insufficient balance"
+        );
+
+        // Verify rollback: clawback source should still have its original 500 units.
+        let source_holding = store.get_asset_holding(&clawback_source, 88).unwrap();
+        assert_eq!(
+            source_holding.amount, 500,
+            "clawback source holding should be rolled back to 500"
+        );
+
+        // Receiver should still have 0 units (the clawback was rolled back).
+        let rcv_holding = store.get_asset_holding(&asset_receiver, 88).unwrap();
+        assert_eq!(
+            rcv_holding.amount, 0,
+            "asset receiver holding should be rolled back to 0"
+        );
+    }
+
+    // ---- P1-2: fee deduction with zero fee_sink errors ----
+
+    #[test]
+    fn inner_txn_fee_deduction_errors_when_fee_sink_is_zero() {
+        // When fee_sink is Address::ZERO, inner txn submission with fee > 0
+        // should error rather than silently skipping fee deduction.
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        // Do NOT set fee_sink — it stays as Address::ZERO.
+        ctx.fee_credit = 100_000; // ensure fee credit check passes
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // TypeEnum = pay
+        ctx.itxn_field(7, TealValue::Bytes([30u8; 32].to_vec()))
+            .unwrap(); // Receiver
+        ctx.itxn_field(8, TealValue::Uint(100)).unwrap(); // Amount
+
+        let result = ctx.itxn_submit();
+        assert!(
+            result.is_err(),
+            "itxn_submit should fail when fee_sink is zero"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("fee_sink not configured"),
+            "error should mention fee_sink: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn inner_txn_fees_properly_deducted_with_fee_sink_set() {
+        // Verify that inner txn fees are deducted from sender and credited to fee_sink.
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+
+        let app_addr = Address(app_address(42));
+        let fee_sink_addr = Address([0xFEu8; 32]);
+
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        store.set_account(
+            &fee_sink_addr,
+            AccountData {
+                micro_algos: 0,
+                ..Default::default()
+            },
+        );
+
+        let initial_app_balance = 10_000_000u64;
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = fee_sink_addr;
+        ctx.fee_credit = 100_000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // TypeEnum = pay
+        ctx.itxn_field(7, TealValue::Bytes([30u8; 32].to_vec()))
+            .unwrap(); // Receiver
+        ctx.itxn_field(8, TealValue::Uint(100)).unwrap(); // Amount
+        ctx.itxn_field(1, TealValue::Uint(2000)).unwrap(); // Fee = 2000
+
+        ctx.itxn_submit().unwrap();
+
+        // Fee (2000) should be deducted from the app address (sender of inner txn).
+        let app_acct = store.get_account(&app_addr).unwrap();
+        assert_eq!(
+            app_acct.micro_algos,
+            initial_app_balance - 2000 - 100, // fee + pay amount
+            "sender should have fee and payment deducted"
+        );
+
+        // Fee should be credited to fee_sink.
+        let sink_acct = store.get_account(&fee_sink_addr).unwrap();
+        assert_eq!(
+            sink_acct.micro_algos, 2000,
+            "fee_sink should receive the inner txn fee"
         );
     }
 }

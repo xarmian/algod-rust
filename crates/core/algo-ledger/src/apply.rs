@@ -1198,6 +1198,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                         ph,
                         ctx.genesis_hash,
                     );
+                    avm_ctx.fee_sink = ctx.fee_sink;
                     let result = run_clear_state_program(&clear_program, &mut avm_ctx);
                     if !result.approved {
                         // ClearState rejection: roll back any state changes the
@@ -1238,6 +1239,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     ph,
                     ctx.genesis_hash,
                 );
+                avm_ctx.fee_sink = ctx.fee_sink;
 
                 // Use the group budget if provided, otherwise create a single-call budget.
                 let mut fallback_budget = GroupBudget::new(1);
