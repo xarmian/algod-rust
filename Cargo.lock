@@ -30,6 +30,7 @@ dependencies = [
  "algo-error",
  "algo-types",
  "base64",
+ "cc",
  "curve25519-dalek",
  "ed25519-dalek",
  "k256",

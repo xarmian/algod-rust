@@ -1,6 +1,6 @@
 //! Crypto opcodes: sha256, keccak256, sha512_256, sha3_256, ed25519verify,
 //! ed25519verify_bare, ecdsa_verify, ecdsa_pk_decompress, ecdsa_pk_recover,
-//! base64_decode, json_ref, vrf_verify, falcon_verify (stub).
+//! base64_decode, json_ref, vrf_verify, falcon_verify.
 
 use std::collections::HashMap;
 
@@ -886,26 +886,53 @@ pub fn op_vrf_verify(machine: &mut AvmMachine, instruction: &Instruction) -> Res
 }
 
 // ---------------------------------------------------------------------------
-// Falcon verify stub (opcode 0x85, AVM v12+)
+// Falcon verify (opcode 0x85, AVM v12+)
 // ---------------------------------------------------------------------------
 
-/// `falcon_verify` (0x85): pop pubkey (1793 bytes), signature (<=1232 bytes), data (bytes).
+/// `falcon_verify` (opcode 0x85, AVM v12+ / consensus V41).
 ///
-/// This is a stub — full implementation is tracked in issue #43.
-/// Pops the correct number of stack arguments for consistency, then returns
-/// an error.
+/// Stack: ..., data, signature, pubkey -> ..., bool
+///
+/// Verifies a deterministic Falcon-1024 compressed-format signature using
+/// Algorand's custom deterministic Falcon variant (NOT standard NIST Falcon).
+/// Returns 1 if the signature is valid, 0 if verification fails.
+///
+/// Following Go's `opFalconVerify` semantics:
+/// - Invalid pubkey size (not 1793 bytes) is a **hard error** (program fails).
+/// - Invalid signature size or verification failure pushes 0 (program continues).
+///
+/// Cost: 1700 (static, charged by dispatch).
 pub fn op_falcon_verify(
     machine: &mut AvmMachine,
     _instruction: &Instruction,
 ) -> Result<(), AlgoError> {
-    // Pop the three arguments in reverse stack order (top first).
-    let _pubkey = machine.pop_bytes()?; // 1793-byte Falcon public key
-    let _sig = machine.pop_bytes()?; // Falcon signature (<=1232 bytes)
-    let _data = machine.pop_bytes()?; // arbitrary data
+    use super::falcon;
 
-    Err(AlgoError::Avm {
-        message: "falcon_verify not yet implemented (see issue #43)".into(),
-    })
+    // Pop the three arguments in reverse stack order (top first):
+    // pubkey on top, then signature, then data on bottom.
+    let pubkey = machine.pop_bytes()?;
+    let sig = machine.pop_bytes()?;
+    let data = machine.pop_bytes()?;
+
+    // Invalid pubkey size is a hard error, matching Go's opFalconVerify which
+    // returns fmt.Errorf("invalid public key size %d != %d", ...).
+    if pubkey.len() != falcon::FALCON_DET1024_PUBKEY_SIZE {
+        return Err(avm_err(format!(
+            "invalid falcon pubkey size {} != {}",
+            pubkey.len(),
+            falcon::FALCON_DET1024_PUBKEY_SIZE,
+        )));
+    }
+
+    // Attempt verification. Any failure (bad sig, wrong data, bad sig size)
+    // results in pushing 0, matching Go behavior where VerifyBytes error
+    // maps to boolToSV(false).
+    let verified = match falcon::falcon_verify(&pubkey, &sig, &data) {
+        Ok(true) => 1u64,
+        Ok(false) | Err(_) => 0u64,
+    };
+
+    machine.push(AvmValue::Uint64(verified))
 }
 
 #[cfg(test)]
@@ -1400,6 +1427,9 @@ mod tests {
         code.extend_from_slice(&encode_varuint(data.len()));
         code.extend_from_slice(data);
     }
+
+    // Use the shared hex_decode helper from the parent ops module.
+    use super::super::hex_decode;
 
     // -----------------------------------------------------------------------
     // ed25519verify_bare tests
@@ -2149,16 +2179,152 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // falcon_verify stub tests
+    // falcon_verify tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_falcon_verify_stub_returns_unimplemented() {
-        // Push data, signature, pubkey (1793 bytes), then call falcon_verify.
+    /// Helper: generate a Falcon-1024 keypair from a zero seed and sign a
+    /// message, returning (pubkey, signature, message).
+    fn falcon_test_keygen_sign(msg: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use super::super::falcon;
+        let seed = [0u8; falcon::FALCON_SEED_SIZE];
+        let (pubkey, privkey) = falcon::falcon_keygen(&seed).expect("keygen");
+        let sig = falcon::falcon_sign(&privkey, msg).expect("sign");
+        (pubkey, sig, msg.to_vec())
+    }
+
+    /// Helper: build AVM bytecode that pushes data, sig, pubkey, calls
+    /// falcon_verify, then asserts the result equals `expected` (0 or 1).
+    fn falcon_verify_code(data: &[u8], sig: &[u8], pubkey: &[u8]) -> Vec<u8> {
         let mut code = Vec::new();
-        pushbytes(&mut code, b"some data"); // data
-        pushbytes(&mut code, &[0u8; 1232]); // signature (max 1232 bytes)
-        pushbytes(&mut code, &[0u8; 1793]); // pubkey (1793 bytes)
+        pushbytes(&mut code, data); // data (bottom)
+        pushbytes(&mut code, sig); // signature (middle)
+        pushbytes(&mut code, pubkey); // pubkey (top)
+        code.push(0x85); // falcon_verify
+        code.push(0x43); // return
+        code
+    }
+
+    #[test]
+    fn test_falcon_verify_valid_signature() {
+        let msg = b"hello falcon opcode";
+        let (pubkey, sig, data) = falcon_test_keygen_sign(msg);
+
+        let code = falcon_verify_code(&data, &sig, &pubkey);
+        let m = run_prog(12, &code).unwrap();
+        assert!(m.pass, "valid falcon signature should verify (push 1)");
+    }
+
+    #[test]
+    fn test_falcon_verify_go_test_vector() {
+        // Matches go-algorand's TestFalconVerify: seed = all-zeros,
+        // msg = hex "62fdfc072182654f163f5f0f9a621d729566c74d0aa413bf009c9800418c19cd"
+        use super::super::falcon;
+
+        let seed = [0u8; falcon::FALCON_SEED_SIZE];
+        let (pubkey, privkey) = falcon::falcon_keygen(&seed).expect("keygen");
+        let msg = hex_decode("62fdfc072182654f163f5f0f9a621d729566c74d0aa413bf009c9800418c19cd");
+        let sig = falcon::falcon_sign(&privkey, &msg).expect("sign");
+
+        let code = falcon_verify_code(&msg, &sig, &pubkey);
+        let m = run_prog(12, &code).unwrap();
+        assert!(m.pass, "go-algorand test vector should verify");
+    }
+
+    #[test]
+    fn test_falcon_verify_wrong_pubkey() {
+        // Use a different seed to get a different pubkey.
+        use super::super::falcon;
+
+        let seed0 = [0u8; falcon::FALCON_SEED_SIZE];
+        let (_, privkey0) = falcon::falcon_keygen(&seed0).expect("keygen");
+        let msg = b"test message";
+        let sig = falcon::falcon_sign(&privkey0, msg).expect("sign");
+
+        let seed1 = [1u8; falcon::FALCON_SEED_SIZE];
+        let (pubkey1, _) = falcon::falcon_keygen(&seed1).expect("keygen");
+
+        // Build code that does NOT assert — we check the stack value directly.
+        let mut code = Vec::new();
+        pushbytes(&mut code, msg.as_slice());
+        pushbytes(&mut code, &sig);
+        pushbytes(&mut code, &pubkey1);
+        code.push(0x85); // falcon_verify — pushes 0 for wrong pubkey
+        code.push(0x43); // return — pass = false since TOS is 0
+
+        let m = run_prog(12, &code).unwrap();
+        assert!(
+            !m.pass,
+            "wrong pubkey should result in verification failure (push 0)"
+        );
+    }
+
+    #[test]
+    fn test_falcon_verify_corrupted_signature() {
+        let msg = b"test corrupted sig";
+        let (pubkey, mut sig, data) = falcon_test_keygen_sign(msg);
+
+        // Flip a byte in the signature.
+        sig[0] ^= 0xff;
+
+        let code = falcon_verify_code(&data, &sig, &pubkey);
+        let m = run_prog(12, &code).unwrap();
+        assert!(
+            !m.pass,
+            "corrupted signature should fail verification (push 0)"
+        );
+    }
+
+    #[test]
+    fn test_falcon_verify_wrong_message() {
+        // Sign one message, verify with a different message.
+        // Matches go-algorand test: flip first nibble of msg hex.
+        let msg = b"correct message";
+        let (pubkey, sig, _) = falcon_test_keygen_sign(msg);
+
+        let wrong_msg = b"wrong message";
+        let code = falcon_verify_code(wrong_msg, &sig, &pubkey);
+        let m = run_prog(12, &code).unwrap();
+        assert!(!m.pass, "wrong message should fail verification (push 0)");
+    }
+
+    #[test]
+    fn test_falcon_verify_empty_signature() {
+        // Empty signature — falcon_verify wrapper returns Err(InvalidSignatureSize),
+        // which the opcode catches and pushes 0 (matching Go's REJECT behavior).
+        use super::super::falcon;
+
+        let seed = [0u8; falcon::FALCON_SEED_SIZE];
+        let (pubkey, _) = falcon::falcon_keygen(&seed).expect("keygen");
+
+        let empty_sig: &[u8] = &[];
+        let code = falcon_verify_code(b"data", empty_sig, &pubkey);
+        let m = run_prog(12, &code).unwrap();
+        assert!(!m.pass, "empty signature should fail verification (push 0)");
+    }
+
+    #[test]
+    fn test_falcon_verify_truncated_signature() {
+        // Truncated signature (remove first byte) — matches Go's "short sig" test.
+        let msg = b"test truncated sig";
+        let (pubkey, sig, data) = falcon_test_keygen_sign(msg);
+
+        let truncated_sig = &sig[1..];
+        let code = falcon_verify_code(&data, truncated_sig, &pubkey);
+        let m = run_prog(12, &code).unwrap();
+        assert!(
+            !m.pass,
+            "truncated signature should fail verification (push 0)"
+        );
+    }
+
+    #[test]
+    fn test_falcon_verify_wrong_pubkey_size_is_hard_error() {
+        // Invalid pubkey size should be a hard error (matching Go's
+        // `return fmt.Errorf("invalid public key size ...")`) — NOT a push of 0.
+        let mut code = Vec::new();
+        pushbytes(&mut code, b"data");
+        pushbytes(&mut code, &[0u8; 100]); // some signature bytes
+        pushbytes(&mut code, &[0u8; 100]); // wrong pubkey size (not 1793)
         code.push(0x85); // falcon_verify
         code.push(0x43); // return
 
@@ -2167,15 +2333,123 @@ mod tests {
             Err(e) => {
                 let err_msg = e.to_string();
                 assert!(
-                    err_msg.contains("falcon_verify not yet implemented"),
-                    "error should mention falcon_verify: {err_msg}"
-                );
-                assert!(
-                    err_msg.contains("issue #43"),
-                    "error should reference issue #43: {err_msg}"
+                    err_msg.contains("invalid falcon pubkey size"),
+                    "error should mention invalid pubkey size: {err_msg}"
                 );
             }
-            Ok(_) => panic!("falcon_verify stub should return an error"),
+            Ok(_) => panic!("wrong pubkey size should be a hard error"),
+        }
+    }
+
+    #[test]
+    fn test_falcon_verify_truncated_pubkey_is_hard_error() {
+        // Pubkey with one byte missing — hard error.
+        use super::super::falcon;
+
+        let seed = [0u8; falcon::FALCON_SEED_SIZE];
+        let (pubkey, privkey) = falcon::falcon_keygen(&seed).expect("keygen");
+        let msg = b"test truncated pk";
+        let sig = falcon::falcon_sign(&privkey, msg).expect("sign");
+
+        // Truncate pubkey (remove last byte).
+        let truncated_pk = &pubkey[..pubkey.len() - 1];
+
+        let mut code = Vec::new();
+        pushbytes(&mut code, msg.as_slice());
+        pushbytes(&mut code, &sig);
+        pushbytes(&mut code, truncated_pk);
+        code.push(0x85); // falcon_verify
+        code.push(0x43); // return
+
+        let result = run_prog(12, &code);
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("invalid falcon pubkey size"),
+                    "error should mention invalid pubkey size: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("truncated pubkey should be a hard error"),
+        }
+    }
+
+    #[test]
+    fn test_falcon_verify_random_pubkey_correct_size() {
+        // Random bytes as pubkey (correct size 1793) — should push 0, not error.
+        use super::super::falcon;
+
+        let seed = [0u8; falcon::FALCON_SEED_SIZE];
+        let (_, privkey) = falcon::falcon_keygen(&seed).expect("keygen");
+        let msg = b"test random pk";
+        let sig = falcon::falcon_sign(&privkey, msg).expect("sign");
+
+        // Fill a 1793-byte pubkey with pattern bytes (not a valid key).
+        let random_pk: Vec<u8> = (0..falcon::FALCON_DET1024_PUBKEY_SIZE)
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        let code = falcon_verify_code(msg, &sig, &random_pk);
+        let m = run_prog(12, &code).unwrap();
+        assert!(!m.pass, "random pubkey should fail verification (push 0)");
+    }
+
+    #[test]
+    fn test_falcon_verify_empty_message() {
+        // Signing and verifying an empty message should work.
+        use super::super::falcon;
+
+        let seed = [0u8; falcon::FALCON_SEED_SIZE];
+        let (pubkey, privkey) = falcon::falcon_keygen(&seed).expect("keygen");
+        let msg: &[u8] = b"";
+        let sig = falcon::falcon_sign(&privkey, msg).expect("sign");
+
+        let code = falcon_verify_code(msg, &sig, &pubkey);
+        let m = run_prog(12, &code).unwrap();
+        assert!(
+            m.pass,
+            "empty message with valid sig should verify (push 1)"
+        );
+    }
+
+    #[test]
+    fn test_falcon_verify_oversized_signature() {
+        // Signature larger than 1423 bytes should result in verification failure
+        // (push 0), not a hard error — matching Go's behavior where falcon_verify
+        // catches the InvalidSignatureSize error and maps it to boolToSV(false).
+        use super::super::falcon;
+
+        let seed = [0u8; falcon::FALCON_SEED_SIZE];
+        let (pubkey, _) = falcon::falcon_keygen(&seed).expect("keygen");
+
+        let oversized_sig = vec![0xBAu8; falcon::FALCON_DET1024_SIG_COMPRESSED_MAXSIZE + 1];
+        let code = falcon_verify_code(b"data", &oversized_sig, &pubkey);
+        let m = run_prog(12, &code).unwrap();
+        assert!(
+            !m.pass,
+            "oversized signature should fail verification (push 0)"
+        );
+    }
+
+    #[test]
+    fn test_falcon_verify_rejects_pre_v12() {
+        // falcon_verify (0x85) requires AVM v12. Running it with v11 should
+        // fail at the parse/bytecode level, not at execution.
+        let msg = b"test";
+        let (pubkey, sig, data) = falcon_test_keygen_sign(msg);
+
+        let code = falcon_verify_code(&data, &sig, &pubkey);
+        let raw = prog(11, &code);
+        let result = parse(&raw);
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("requires AVM v12"),
+                    "error should mention AVM v12 requirement: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("falcon_verify should be rejected on AVM v11"),
         }
     }
 
