@@ -1,9 +1,13 @@
+use algo_avm::eval::{run_approval_program, run_clear_state_program};
+use algo_avm::group::GroupBudget;
 use algo_error::AlgoError;
 use algo_types::{
     AccountStatus, Address, AppLocalState, AppParams, AssetHolding, AssetParams, AssetParamsRecord,
     Block, Round, SignedTransaction,
 };
+use sha2::{Digest, Sha512_256};
 
+use crate::avm_context::LedgerAvmContext;
 use crate::eval_delta::{apply_eval_delta, parse_eval_delta};
 use crate::rewards::apply_rewards;
 
@@ -13,11 +17,42 @@ use crate::rewards::apply_rewards;
 // which would shadow LedgerState's inherent `get_or_default_account(&mut self)
 // -> &mut AccountData` with the trait's `get_or_default_account(&self) -> AccountData`.
 
+/// Determines whether the ledger replays recorded block data or actively
+/// executes AVM programs to produce results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyMode {
+    /// Use recorded EvalDelta from block data (backward compatible).
+    Replay,
+    /// Run AVM programs to produce results.
+    Execute,
+}
+
 /// Context derived from the block header, passed to transaction application.
 pub struct ApplyContext {
     pub rewards_level: u64,
     pub fee_sink: Address,
     pub round: u64,
+    /// Controls whether EvalDeltas come from block data or AVM execution.
+    pub mode: ApplyMode,
+    /// Latest confirmed timestamp (for AVM context).
+    pub latest_timestamp: u64,
+    /// Genesis hash (for AVM context).
+    pub genesis_hash: [u8; 32],
+}
+
+impl ApplyContext {
+    /// Create a Replay-mode context with zero timestamp and genesis hash.
+    /// Primarily for tests and backward compatibility.
+    pub fn new_replay(rewards_level: u64, fee_sink: Address, round: u64) -> Self {
+        Self {
+            rewards_level,
+            fee_sink,
+            round,
+            mode: ApplyMode::Replay,
+            latest_timestamp: 0,
+            genesis_hash: [0u8; 32],
+        }
+    }
 }
 
 /// Apply a full block to the ledger state.
@@ -58,15 +93,54 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
     store.set_fee_sink(block.fee_sink);
     store.set_rewards_pool(block.rewards_pool);
 
+    let mut gh = [0u8; 32];
+    if block.genesis_hash.len() == 32 {
+        gh.copy_from_slice(&block.genesis_hash);
+    }
+
     let ctx = ApplyContext {
         rewards_level: block.rewards_level,
         fee_sink: block.fee_sink,
         round: block.round.0,
+        mode: ApplyMode::Replay,
+        latest_timestamp: block.timestamp as u64,
+        genesis_hash: gh,
     };
 
     let result = (|| {
-        for stx in &block.payset {
-            apply_transaction(store, stx, &ctx, 0)?;
+        match ctx.mode {
+            ApplyMode::Replay => {
+                // Replay mode: process transactions individually (no AVM execution).
+                for stx in &block.payset {
+                    apply_transaction(store, stx, &ctx, 0)?;
+                }
+            }
+            ApplyMode::Execute => {
+                // Execute mode: detect transaction groups, create group budgets,
+                // and pass them through to apply_appl for AVM execution.
+                let groups = detect_transaction_groups(&block.payset);
+                for group in &groups {
+                    let num_app_calls = group
+                        .iter()
+                        .filter(|stx| stx.txn.txn_type == "appl")
+                        .count();
+                    let mut group_budget = GroupBudget::new(num_app_calls);
+
+                    for stx in group {
+                        if stx.txn.txn_type == "appl" {
+                            apply_transaction_with_budget(
+                                store,
+                                stx,
+                                &ctx,
+                                0,
+                                Some(&mut group_budget),
+                            )?;
+                        } else {
+                            apply_transaction(store, stx, &ctx, 0)?;
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     })();
@@ -88,6 +162,49 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
     Ok(())
 }
 
+/// Detect transaction groups within a block's payset.
+///
+/// Consecutive transactions sharing the same non-empty `group` hash form an
+/// atomic group. Transactions with an empty group hash are treated as their
+/// own single-transaction group.
+fn detect_transaction_groups(payset: &[SignedTransaction]) -> Vec<Vec<&SignedTransaction>> {
+    let mut groups: Vec<Vec<&SignedTransaction>> = Vec::new();
+    let mut i = 0;
+    while i < payset.len() {
+        let stx = &payset[i];
+        if stx.txn.group.is_empty() {
+            // Standalone transaction.
+            groups.push(vec![stx]);
+            i += 1;
+        } else {
+            // Atomic group: collect consecutive transactions with the same group hash.
+            let group_hash = &stx.txn.group;
+            let mut group = vec![stx];
+            i += 1;
+            while i < payset.len() && payset[i].txn.group == *group_hash {
+                group.push(&payset[i]);
+                i += 1;
+            }
+            groups.push(group);
+        }
+    }
+    groups
+}
+
+/// Apply a single signed transaction with a group budget for AVM execution.
+///
+/// Same as `apply_transaction` but threads the group budget through to
+/// `apply_appl` for Execute-mode pooled budget accounting.
+fn apply_transaction_with_budget<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    stx: &SignedTransaction,
+    ctx: &ApplyContext,
+    depth: u32,
+    group_budget: Option<&mut GroupBudget>,
+) -> Result<(), AlgoError> {
+    apply_transaction_inner(store, stx, ctx, depth, group_budget)
+}
+
 /// Apply a single signed transaction to the ledger state.
 ///
 /// Matches go-algorand's `applyTransaction` ordering:
@@ -98,11 +215,29 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
 /// 5. Check min balance for all touched accounts.
 ///
 /// On error, touched account data is restored to pre-reward state.
+///
+/// **Note:** This per-transaction API passes `None` for the group budget,
+/// so each app call in Execute mode gets an isolated `GroupBudget(1)` (700
+/// opcodes). For correct pooled-budget semantics across atomic groups, use
+/// `apply_block()` which detects groups and threads a shared `GroupBudget`.
+/// A public group-aware API (`apply_group()`) is planned for Epic 23 (#27).
 pub fn apply_transaction<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     stx: &SignedTransaction,
     ctx: &ApplyContext,
     depth: u32,
+) -> Result<(), AlgoError> {
+    apply_transaction_inner(store, stx, ctx, depth, None)
+}
+
+/// Core transaction application logic, shared by `apply_transaction` and
+/// `apply_transaction_with_budget`.
+fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    stx: &SignedTransaction,
+    ctx: &ApplyContext,
+    depth: u32,
+    group_budget: Option<&mut GroupBudget>,
 ) -> Result<(), AlgoError> {
     let txn = &stx.txn;
 
@@ -268,7 +403,7 @@ pub fn apply_transaction<L: crate::store_trait::LedgerStore>(
             "acfg" => apply_acfg(store, stx, ctx)?,
             "axfer" => apply_axfer(store, stx, ctx)?,
             "afrz" => apply_afrz(store, stx, ctx)?,
-            "appl" => apply_appl(store, stx, ctx, depth)?,
+            "appl" => apply_appl(store, stx, ctx, depth, group_budget)?,
             "keyreg" => apply_keyreg(store, stx, ctx)?,
             other => {
                 return Err(AlgoError::Ledger {
@@ -908,6 +1043,14 @@ const ON_COMPLETION_CLEAR_STATE: u64 = 3;
 const ON_COMPLETION_UPDATE: u64 = 4;
 const ON_COMPLETION_DELETE: u64 = 5;
 
+/// Compute SHA-512/256 hash of program bytes for AVM context.
+fn program_hash(program: &[u8]) -> [u8; 32] {
+    let mut h = Sha512_256::new();
+    h.update(b"Program");
+    h.update(program);
+    h.finalize().into()
+}
+
 /// Apply an application call transaction.
 ///
 /// Handles creation, opt-in, close-out, clear-state, update, delete, and no-op.
@@ -915,11 +1058,16 @@ const ON_COMPLETION_DELETE: u64 = 5;
 /// go-algorand ordering): TEAL executes first (writing state via EvalDelta),
 /// then the runtime performs close-out/delete cleanup. This prevents EvalDelta's
 /// `or_insert_with` calls from recreating entries that close-out/delete removed.
+///
+/// In `Execute` mode, the AVM programs are run to produce state changes
+/// directly. In `Replay` mode, the recorded EvalDelta from the block is used.
+/// The optional `group_budget` is consumed only in `Execute` mode.
 fn apply_appl<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     stx: &SignedTransaction,
     ctx: &ApplyContext,
     depth: u32,
+    group_budget: Option<&mut GroupBudget>,
 ) -> Result<(), AlgoError> {
     let txn = &stx.txn;
 
@@ -991,13 +1139,126 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
     // can correctly detect a new opt-in even if EvalDelta creates a placeholder entry.
     let had_local_state = store.has_app_local_state(&txn.sender, app_id);
 
-    // Apply EvalDelta BEFORE on_completion structural changes (matching go-algorand).
-    // TEAL executes first (writing global/local state), then the runtime performs
-    // structural close-out/delete. This ordering prevents EvalDelta from recreating
-    // entries that close-out or delete would remove.
-    if let Some(ref dt) = stx.eval_delta {
-        let delta = parse_eval_delta(dt)?;
-        apply_eval_delta(stx, &delta, store, ctx, depth)?;
+    // EvalDelta sourcing: Replay uses recorded block data, Execute runs AVM.
+    match ctx.mode {
+        ApplyMode::Replay => {
+            // Apply EvalDelta BEFORE on_completion structural changes (matching go-algorand).
+            // TEAL executes first (writing global/local state), then the runtime performs
+            // structural close-out/delete. This ordering prevents EvalDelta from recreating
+            // entries that close-out or delete would remove.
+            if let Some(ref dt) = stx.eval_delta {
+                let delta = parse_eval_delta(dt)?;
+                apply_eval_delta(stx, &delta, store, ctx, depth)?;
+            }
+        }
+        ApplyMode::Execute => {
+            // Look up app params to get the program bytes.
+            let app_params = store.get_app_params(app_id);
+            let creator = app_params
+                .as_ref()
+                .map(|p| p.creator.0)
+                .unwrap_or([0u8; 32]);
+
+            if txn.on_completion == ON_COMPLETION_CLEAR_STATE {
+                // ClearState: run clear-state program with isolated budget.
+                // If program rejects or errors, roll back any store mutations
+                // made during AVM execution (IsolateClearState semantics), then
+                // proceed to the on-completion branch which clears local state.
+                let clear_program = app_params
+                    .map(|p| p.clear_state_program.clone())
+                    .unwrap_or_default();
+
+                if !clear_program.is_empty() {
+                    let ph = program_hash(&clear_program);
+
+                    // Snapshot store BEFORE AVM execution so we can roll back
+                    // any state mutations if the program rejects/errors.
+                    // We snapshot the sender, any accounts in the txn's accounts
+                    // array, and the app's global state (via app_ids).
+                    let mut cs_addrs = vec![txn.sender];
+                    if let Some(ref accounts) = txn.accounts {
+                        for acct in accounts {
+                            if !acct.is_zero() && !cs_addrs.contains(acct) {
+                                cs_addrs.push(*acct);
+                            }
+                        }
+                    }
+                    let cs_snapshot = store.snapshot_with_ids(&cs_addrs, &[], &[app_id]);
+
+                    let group = vec![stx.clone()];
+                    let mut avm_ctx = LedgerAvmContext::new(
+                        store,
+                        group,
+                        0, // group_index (single-txn group for now)
+                        ctx.round,
+                        ctx.latest_timestamp,
+                        app_id,
+                        creator,
+                        true, // app_mode
+                        ph,
+                        ctx.genesis_hash,
+                    );
+                    let result = run_clear_state_program(&clear_program, &mut avm_ctx);
+                    if !result.approved {
+                        // ClearState rejection: roll back any state changes the
+                        // program made during execution. The on-completion branch
+                        // below will still clear local state regardless.
+                        store.restore_snapshot(cs_snapshot);
+                    }
+                }
+            } else {
+                // Non-ClearState: run approval program.
+                //
+                // No separate snapshot is needed here: if the program rejects,
+                // apply_appl returns Err, which propagates to apply_transaction_inner's
+                // closure. That outer closure's error path restores the snapshot
+                // taken at the top of apply_transaction_inner, reverting all state
+                // changes (including any AVM writes) for the entire transaction.
+                let approval_program = app_params
+                    .map(|p| p.approval_program.clone())
+                    .unwrap_or_default();
+
+                if approval_program.is_empty() {
+                    return Err(AlgoError::Ledger {
+                        message: format!("appl execute: app {} has empty approval program", app_id),
+                    });
+                }
+
+                let ph = program_hash(&approval_program);
+                let group = vec![stx.clone()];
+                let mut avm_ctx = LedgerAvmContext::new(
+                    store,
+                    group,
+                    0, // group_index
+                    ctx.round,
+                    ctx.latest_timestamp,
+                    app_id,
+                    creator,
+                    true, // app_mode
+                    ph,
+                    ctx.genesis_hash,
+                );
+
+                // Use the group budget if provided, otherwise create a single-call budget.
+                let mut fallback_budget = GroupBudget::new(1);
+                let budget = group_budget.unwrap_or(&mut fallback_budget);
+                let result = run_approval_program(&approval_program, &mut avm_ctx, budget)?;
+
+                if !result.approved {
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "appl execute: app {} approval program rejected transaction{}",
+                            app_id,
+                            result
+                                .error
+                                .as_ref()
+                                .map(|e| format!(": {}", e))
+                                .unwrap_or_default()
+                        ),
+                    });
+                }
+            }
+        }
     }
 
     match txn.on_completion {
@@ -1329,11 +1590,7 @@ mod tests {
             &[(sender, 1_000_000), (receiver, 500_000), (fee_sink, 0)],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let stx = pay_txn(sender, receiver, 200_000, 1_000);
 
         apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
@@ -1350,11 +1607,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 100), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let stx = pay_txn(sender, receiver, 200, 1_000);
 
         let result = apply_transaction(&mut state, &stx, &ctx, 0);
@@ -1379,11 +1632,7 @@ mod tests {
             ],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let mut stx = pay_txn(sender, receiver, 100_000, 1_000);
         stx.txn.close_remainder_to = close_to;
 
@@ -1406,11 +1655,7 @@ mod tests {
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
         state.get_or_default_account(&sender).total_assets_opted_in = 1;
 
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let mut stx = pay_txn(sender, receiver, 0, 1_000);
         stx.txn.close_remainder_to = close_to;
 
@@ -1425,11 +1670,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 200_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         // Try to send 100_000 + 1_000 fee, leaving 99_000 < min_balance (100_000)
         let stx = pay_txn(sender, receiver, 100_000, 1_000);
 
@@ -1448,11 +1689,7 @@ mod tests {
             &[(sender, 1_000_000), (receiver, 100_000), (fee_sink, 0)],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let mut stx = pay_txn(sender, receiver, 1_000, 1_000);
         stx.txn.rekey_to = Some(auth);
 
@@ -1473,11 +1710,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let mut stx = SignedTransaction::default();
         stx.txn.txn_type = "stpf".to_string();
         stx.txn.sender = sender;
@@ -1494,11 +1727,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let mut stx = SignedTransaction::default();
         stx.txn.txn_type = "bogus".to_string();
         stx.txn.sender = sender;
@@ -1516,11 +1745,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let mut stx = SignedTransaction::default();
         stx.txn.txn_type = "keyreg".to_string();
         stx.txn.sender = sender;
@@ -1542,11 +1767,7 @@ mod tests {
 
         // Sender at exactly min_balance (100_000). Fee of 1_000 drops below.
         let mut state = make_state_with_accounts(&[(sender, 100_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let mut stx = SignedTransaction::default();
         stx.txn.txn_type = "keyreg".to_string();
         stx.txn.sender = sender;
@@ -1576,11 +1797,7 @@ mod tests {
         );
         state.rewards_pool = rewards_pool;
 
-        let ctx = ApplyContext {
-            rewards_level: 10,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(10, fee_sink, 1);
         let stx = pay_txn(sender, receiver, 1_000, 1_000);
 
         apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
@@ -1611,11 +1828,7 @@ mod tests {
         );
         state.rewards_pool = rewards_pool;
 
-        let ctx = ApplyContext {
-            rewards_level: 10,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(10, fee_sink, 1);
         // Sender has 5M but tries to send 10M — will fail.
         // Rewards would have been applied (50) bumping to 5_000_050, still < 10M.
         let stx = pay_txn(sender, receiver, 10_000_000, 1_000);
@@ -1646,11 +1859,7 @@ mod tests {
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 100)], fee_sink);
         state.get_or_default_account(&sender).total_assets_opted_in = 1;
 
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let mut stx = pay_txn(sender, receiver, 0, 1_000);
         stx.txn.close_remainder_to = close_to;
 
@@ -1703,11 +1912,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000_000,
@@ -1751,11 +1956,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 500,
@@ -1779,11 +1980,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let mut stx = SignedTransaction::default();
         stx.txn.txn_type = "acfg".to_string();
@@ -1803,11 +2000,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         // Create asset first.
         let params = AssetParams {
@@ -1847,11 +2040,7 @@ mod tests {
             &[(sender, 10_000_000), (other, 10_000_000), (fee_sink, 0)],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         // Create asset with total=1000.
         let params = AssetParams {
@@ -1897,11 +2086,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000,
@@ -1948,11 +2133,7 @@ mod tests {
             &[(creator, 10_000_000), (attacker, 10_000_000), (fee_sink, 0)],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000,
@@ -1983,11 +2164,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000,
@@ -2045,11 +2222,7 @@ mod tests {
             &[(creator, 10_000_000), (user, 10_000_000), (fee_sink, 0)],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         // Create asset with default_frozen = true.
         let params = AssetParams {
@@ -2090,11 +2263,7 @@ mod tests {
             &[(creator, 10_000_000), (user, 10_000_000), (fee_sink, 0)],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000,
@@ -2131,11 +2300,7 @@ mod tests {
             &[(creator, 10_000_000), (user, 10_000_000), (fee_sink, 0)],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000,
@@ -2179,11 +2344,7 @@ mod tests {
             &[(creator, 10_000_000), (user, 10_000_000), (fee_sink, 0)],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000,
@@ -2226,11 +2387,7 @@ mod tests {
             &[(creator, 10_000_000), (user, 10_000_000), (fee_sink, 0)],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000,
@@ -2269,11 +2426,7 @@ mod tests {
             ],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000,
@@ -2327,11 +2480,7 @@ mod tests {
             ],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000,
@@ -2382,11 +2531,7 @@ mod tests {
             ],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000,
@@ -2452,11 +2597,7 @@ mod tests {
             &[(creator, 10_000_000), (user, 10_000_000), (fee_sink, 0)],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000,
@@ -2504,11 +2645,7 @@ mod tests {
             &[(creator, 10_000_000), (user, 10_000_000), (fee_sink, 0)],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000,
@@ -2552,11 +2689,7 @@ mod tests {
             &[(creator, 10_000_000), (user, 10_000_000), (fee_sink, 0)],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000,
@@ -2606,11 +2739,7 @@ mod tests {
             ],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000,
@@ -2657,11 +2786,7 @@ mod tests {
             &[(creator, 10_000_000), (user, 10_000_000), (fee_sink, 0)],
             fee_sink,
         );
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let params = AssetParams {
             total: 1_000,
@@ -2729,11 +2854,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let stx = keyreg_online_txn(sender, 1_000);
         apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
@@ -2771,11 +2892,7 @@ mod tests {
             acct.vote_last_valid = 200;
             acct.vote_key_dilution = 10;
         }
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let stx = keyreg_offline_txn(sender, 1_000);
         apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
@@ -2796,11 +2913,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let stx = keyreg_nonpart_txn(sender, 1_000);
         apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
@@ -2821,11 +2934,7 @@ mod tests {
         // Set account to NotParticipating.
         state.get_or_default_account(&sender).status = AccountStatus::NotParticipating;
 
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         // Attempt online keyreg — should fail.
         let stx = keyreg_online_txn(sender, 1_000);
@@ -2850,11 +2959,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         // Go online.
         let stx_on = keyreg_online_txn(sender, 1_000);
@@ -2910,11 +3015,7 @@ mod tests {
         assert!(pending > 0, "expected pending rewards > 0, got {}", pending);
 
         // Apply nonpart keyreg.
-        let ctx = ApplyContext {
-            rewards_level: 10,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(10, fee_sink, 1);
         let stx = keyreg_nonpart_txn(sender, 1_000);
         apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
 
@@ -2932,11 +3033,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let mut stx = keyreg_online_txn(sender, 1_000);
         stx.txn.vote_key_dilution = 0;
@@ -2959,11 +3056,7 @@ mod tests {
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext {
-            rewards_level: 0,
-            fee_sink,
-            round: 1,
-        };
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
         let mut stx = keyreg_online_txn(sender, 1_000);
         stx.txn.vote_first = 200;
@@ -2975,5 +3068,111 @@ mod tests {
             "error should mention vote_last"
         );
         assert_eq!(state.get_account(&sender).unwrap().micro_algos, 1_000_000);
+    }
+
+    #[test]
+    fn test_detect_transaction_groups() {
+        // Build a payset with mixed standalone and grouped transactions:
+        // [standalone_A, group_B1, group_B2, group_B3, standalone_C]
+
+        let mut standalone_a = SignedTransaction::default();
+        standalone_a.txn.txn_type = "pay".to_string();
+        standalone_a.txn.sender = Address([1u8; 32]);
+        // Empty group hash => standalone.
+
+        let group_hash = serde_bytes::ByteBuf::from(vec![42u8; 32]);
+
+        let mut group_b1 = SignedTransaction::default();
+        group_b1.txn.txn_type = "appl".to_string();
+        group_b1.txn.sender = Address([2u8; 32]);
+        group_b1.txn.group = group_hash.clone();
+
+        let mut group_b2 = SignedTransaction::default();
+        group_b2.txn.txn_type = "pay".to_string();
+        group_b2.txn.sender = Address([3u8; 32]);
+        group_b2.txn.group = group_hash.clone();
+
+        let mut group_b3 = SignedTransaction::default();
+        group_b3.txn.txn_type = "axfer".to_string();
+        group_b3.txn.sender = Address([4u8; 32]);
+        group_b3.txn.group = group_hash.clone();
+
+        let mut standalone_c = SignedTransaction::default();
+        standalone_c.txn.txn_type = "pay".to_string();
+        standalone_c.txn.sender = Address([5u8; 32]);
+
+        let payset = vec![standalone_a, group_b1, group_b2, group_b3, standalone_c];
+        let groups = detect_transaction_groups(&payset);
+
+        // Should produce 3 groups: [standalone_A], [B1, B2, B3], [standalone_C].
+        assert_eq!(groups.len(), 3, "expected 3 groups, got {}", groups.len());
+
+        // First group: standalone A.
+        assert_eq!(groups[0].len(), 1);
+        assert_eq!(groups[0][0].txn.sender, Address([1u8; 32]));
+
+        // Second group: atomic group of 3.
+        assert_eq!(groups[1].len(), 3);
+        assert_eq!(groups[1][0].txn.sender, Address([2u8; 32]));
+        assert_eq!(groups[1][1].txn.sender, Address([3u8; 32]));
+        assert_eq!(groups[1][2].txn.sender, Address([4u8; 32]));
+
+        // Third group: standalone C.
+        assert_eq!(groups[2].len(), 1);
+        assert_eq!(groups[2][0].txn.sender, Address([5u8; 32]));
+    }
+
+    #[test]
+    fn test_detect_transaction_groups_empty() {
+        let groups = detect_transaction_groups(&[]);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_detect_transaction_groups_all_standalone() {
+        let mut stx1 = SignedTransaction::default();
+        stx1.txn.sender = Address([1u8; 32]);
+        let mut stx2 = SignedTransaction::default();
+        stx2.txn.sender = Address([2u8; 32]);
+
+        let payset = vec![stx1, stx2];
+        let groups = detect_transaction_groups(&payset);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 1);
+        assert_eq!(groups[1].len(), 1);
+    }
+
+    #[test]
+    fn test_detect_transaction_groups_two_different_groups() {
+        let group_a = serde_bytes::ByteBuf::from(vec![10u8; 32]);
+        let group_b = serde_bytes::ByteBuf::from(vec![20u8; 32]);
+
+        let mut a1 = SignedTransaction::default();
+        a1.txn.sender = Address([1u8; 32]);
+        a1.txn.group = group_a.clone();
+
+        let mut a2 = SignedTransaction::default();
+        a2.txn.sender = Address([2u8; 32]);
+        a2.txn.group = group_a.clone();
+
+        let mut b1 = SignedTransaction::default();
+        b1.txn.sender = Address([3u8; 32]);
+        b1.txn.group = group_b.clone();
+
+        let mut b2 = SignedTransaction::default();
+        b2.txn.sender = Address([4u8; 32]);
+        b2.txn.group = group_b.clone();
+
+        let payset = vec![a1, a2, b1, b2];
+        let groups = detect_transaction_groups(&payset);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[0][0].txn.sender, Address([1u8; 32]));
+        assert_eq!(groups[0][1].txn.sender, Address([2u8; 32]));
+        assert_eq!(groups[1].len(), 2);
+        assert_eq!(groups[1][0].txn.sender, Address([3u8; 32]));
+        assert_eq!(groups[1][1].txn.sender, Address([4u8; 32]));
     }
 }

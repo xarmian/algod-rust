@@ -42,11 +42,7 @@ fuzz_target!(|data: &[u8]| {
             });
     }
 
-    let ctx = ApplyContext {
-        rewards_level: 0,
-        fee_sink,
-        round: 1000,
-    };
+    let ctx = ApplyContext::new_replay(0, fee_sink, 1000);
 
     // Run the transaction. Errors are expected and fine — we only care about panics.
     let _ = apply_transaction(&mut state, &stx, &ctx, 0);
