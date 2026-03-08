@@ -1591,6 +1591,12 @@ pub struct InnerApplyData {
     /// Final transaction counter after inner app call execution.
     /// Propagated back so the parent can sync its txn_counter.
     pub txn_counter: u64,
+    /// All asset IDs created by this inner app call and any nested inner txns.
+    /// Used by the parent to track resources for snapshot rollback (P1-3).
+    pub nested_created_assets: Vec<u64>,
+    /// All app IDs created by this inner app call and any nested inner txns.
+    /// Used by the parent to track resources for snapshot rollback (P1-3).
+    pub nested_created_apps: Vec<u64>,
 }
 
 /// Apply an inner payment transaction (core state mutation only).

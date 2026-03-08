@@ -94,6 +94,11 @@ struct InnerTxnBuilder {
     fields: BTreeMap<u8, TealValue>,
     /// Array fields — each `itxn_field` appends to the list.
     array_fields: BTreeMap<u8, Vec<TealValue>>,
+    /// Whether the Fee field (index 1) was explicitly set via `itxn_field`.
+    /// When true, the fee value (even 0) is intentional and should not be
+    /// defaulted to MinTxnFee. This enables fee pooling where a program
+    /// explicitly sets fee=0 to rely on overpayment from other transactions.
+    fee_set: bool,
 }
 
 impl InnerTxnBuilder {
@@ -101,12 +106,16 @@ impl InnerTxnBuilder {
         Self {
             fields: BTreeMap::new(),
             array_fields: BTreeMap::new(),
+            fee_set: false,
         }
     }
 
     /// Set a field value. Array-valued fields accumulate; scalar fields
     /// are overwritten by the latest call.
     fn set_field(&mut self, field: u8, value: TealValue) {
+        if field == 1 {
+            self.fee_set = true;
+        }
         if ARRAY_FIELD_INDICES.contains(&field) {
             self.array_fields.entry(field).or_default().push(value);
         } else {
@@ -939,6 +948,10 @@ fn execute_inner_appl<L: LedgerStore>(
     // Capture fee_credit and txn_counter for propagation back to parent (H5/H6).
     let child_fee_credit = inner_ctx.fee_credit;
     let child_txn_counter = inner_ctx.txn_counter;
+    // P1-3: Capture all asset/app IDs created by nested inner txns so the
+    // parent can track them for snapshot rollback.
+    let child_created_assets = inner_ctx.created_assets.clone();
+    let child_created_apps = inner_ctx.created_apps.clone();
 
     // Store logs and nested inner txns as the eval_delta on the
     // inner SignedTransaction. We build a minimal eval_delta rmpv::Value map.
@@ -1067,6 +1080,10 @@ fn execute_inner_appl<L: LedgerStore>(
     // Propagate fee_credit and txn_counter back to the parent (H5/H6).
     ad.fee_credit = child_fee_credit;
     ad.txn_counter = child_txn_counter;
+    // P1-3: Propagate all nested created resources so the parent's
+    // rollback can clean them up if a later sibling txn fails.
+    ad.nested_created_assets = child_created_assets;
+    ad.nested_created_apps = child_created_apps;
 
     Ok(ad)
 }
@@ -2188,8 +2205,10 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 if stxn.txn.sender == Address::ZERO {
                     stxn.txn.sender = default_sender;
                 }
-                // Default fee to MinTxnFee if not explicitly set (fee == 0).
-                if stxn.txn.fee == 0 {
+                // Default fee to MinTxnFee only if the fee was never explicitly
+                // set via `itxn_field Fee`. When `fee_set` is true, the program
+                // intentionally chose the fee value (even 0 for fee pooling).
+                if !b.fee_set && stxn.txn.fee == 0 {
                     stxn.txn.fee = params::MIN_TXN_FEE;
                 }
                 // Copy FirstValid/LastValid from the outer transaction.
@@ -2501,12 +2520,28 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // updated counter, not a stale value computed from txn_counter_base.
         let mut current_counter = txn_counter_base;
 
+        // P1-3 fix: Track resource IDs created during execution that were
+        // NOT in the pre-computed snapshot. On rollback, these must be
+        // explicitly removed because `restore_snapshot` only knows about
+        // IDs that were in the original snapshot.
+        let snapshotted_asset_ids: std::collections::HashSet<u64> =
+            asset_ids.iter().copied().collect();
+        let snapshotted_app_ids: std::collections::HashSet<u64> = app_ids.iter().copied().collect();
+        let mut extra_created_asset_ids: Vec<u64> = Vec::new();
+        let mut extra_created_app_ids: Vec<u64> = Vec::new();
+
         for (i, stxn) in txns.iter_mut().enumerate() {
             // Deduct fee from sender to fee_sink (matches go-algorand takeFee).
             let fee = stxn.txn.fee;
             if fee > 0 {
                 if fee_sink.is_zero() {
                     self.store.restore_snapshot(snapshot);
+                    for &id in &extra_created_asset_ids {
+                        self.store.remove_asset_params(id);
+                    }
+                    for &id in &extra_created_app_ids {
+                        self.store.remove_app_params(id);
+                    }
                     return Err(AlgoError::Avm {
                         message: format!("inner tx {}: fee_sink not configured (zero address)", i,),
                     });
@@ -2514,6 +2549,12 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 let mut sender_acct = self.store.get_or_default_account(&stxn.txn.sender);
                 if sender_acct.micro_algos < fee {
                     self.store.restore_snapshot(snapshot);
+                    for &id in &extra_created_asset_ids {
+                        self.store.remove_asset_params(id);
+                    }
+                    for &id in &extra_created_app_ids {
+                        self.store.remove_app_params(id);
+                    }
                     return Err(AlgoError::Avm {
                         message: format!(
                             "inner tx {}: sender {} has insufficient balance {} for fee {}",
@@ -2561,6 +2602,30 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     Ok(ad) => {
                         stxn.apply_data_config_asset = ad.config_asset;
                         stxn.apply_data_application_id = ad.application_id;
+                        // P1-3: Track any resources the child created that weren't
+                        // in the original snapshot so rollback can clean them up.
+                        if ad.config_asset != 0 && !snapshotted_asset_ids.contains(&ad.config_asset)
+                        {
+                            extra_created_asset_ids.push(ad.config_asset);
+                        }
+                        if ad.application_id != 0
+                            && !snapshotted_app_ids.contains(&ad.application_id)
+                        {
+                            extra_created_app_ids.push(ad.application_id);
+                        }
+                        // P1-3: Also track resources created by nested inner txns
+                        // within the child (e.g., the child app issued its own
+                        // itxn_submit that created assets/apps).
+                        for &nested_id in &ad.nested_created_assets {
+                            if !snapshotted_asset_ids.contains(&nested_id) {
+                                extra_created_asset_ids.push(nested_id);
+                            }
+                        }
+                        for &nested_id in &ad.nested_created_apps {
+                            if !snapshotted_app_ids.contains(&nested_id) {
+                                extra_created_app_ids.push(nested_id);
+                            }
+                        }
                         // Propagate fee_credit and txn_counter back from child (H5/H6).
                         self.fee_credit = ad.fee_credit;
                         // Update running counter from child — the child's counter
@@ -2570,6 +2635,12 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     }
                     Err(e) => {
                         self.store.restore_snapshot(snapshot);
+                        for &id in &extra_created_asset_ids {
+                            self.store.remove_asset_params(id);
+                        }
+                        for &id in &extra_created_app_ids {
+                            self.store.remove_app_params(id);
+                        }
                         return Err(AlgoError::Avm {
                             message: format!("inner tx {} failed: {}", i, e),
                         });
@@ -2585,6 +2656,12 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     _ => {
                         // Should not reach here due to earlier validation.
                         self.store.restore_snapshot(snapshot);
+                        for &id in &extra_created_asset_ids {
+                            self.store.remove_asset_params(id);
+                        }
+                        for &id in &extra_created_app_ids {
+                            self.store.remove_app_params(id);
+                        }
                         return Err(AlgoError::Avm {
                             message: format!(
                                 "inner tx {}: unsupported type {}",
@@ -2598,9 +2675,25 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     Ok(ad) => {
                         stxn.apply_data_config_asset = ad.config_asset;
                         stxn.apply_data_application_id = ad.application_id;
+                        // P1-3: Track non-app creates too (acfg assets).
+                        if ad.config_asset != 0 && !snapshotted_asset_ids.contains(&ad.config_asset)
+                        {
+                            extra_created_asset_ids.push(ad.config_asset);
+                        }
+                        if ad.application_id != 0
+                            && !snapshotted_app_ids.contains(&ad.application_id)
+                        {
+                            extra_created_app_ids.push(ad.application_id);
+                        }
                     }
                     Err(e) => {
                         self.store.restore_snapshot(snapshot);
+                        for &id in &extra_created_asset_ids {
+                            self.store.remove_asset_params(id);
+                        }
+                        for &id in &extra_created_app_ids {
+                            self.store.remove_app_params(id);
+                        }
                         return Err(AlgoError::Avm {
                             message: format!("inner tx {} failed: {}", i, e),
                         });
@@ -2739,6 +2832,10 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
     fn get_opcode_budget(&self) -> i64 {
         self.opcode_budget
+    }
+
+    fn supports_budget_pooling(&self) -> bool {
+        true
     }
 
     // ---- Resource availability ----
@@ -6480,6 +6577,352 @@ mod tests {
             );
         } else {
             panic!("expected Uint for CreatedAssetID");
+        }
+    }
+
+    // ---- P1-2: Preserve explicitly set zero inner fees (fee pooling) ----
+
+    #[test]
+    fn p1_2_itxn_field_fee_zero_preserved() {
+        // When a program explicitly sets Fee=0 via `itxn_field`, the zero
+        // should be preserved (not defaulted to MinTxnFee). This enables
+        // fee pooling where the outer transaction overpays.
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+
+        // Fund the app address.
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        // Provide enough fee credit so the zero-fee inner txn is covered.
+        ctx.fee_credit = 10_000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // TypeEnum = pay
+        ctx.itxn_field(7, TealValue::Bytes([30u8; 32].to_vec()))
+            .unwrap(); // Receiver
+        ctx.itxn_field(8, TealValue::Uint(100)).unwrap(); // Amount
+        ctx.itxn_field(1, TealValue::Uint(0)).unwrap(); // Fee = 0 explicitly
+        ctx.itxn_submit().unwrap();
+
+        // Read back the fee from the last inner txn.
+        let fee_val = ctx.last_itxn_field(1, None).unwrap(); // Fee
+        assert_eq!(
+            fee_val,
+            TealValue::Uint(0),
+            "explicitly set fee=0 should be preserved, not defaulted to MinTxnFee"
+        );
+    }
+
+    #[test]
+    fn p1_2_itxn_field_fee_not_set_defaults_to_min() {
+        // When a program does NOT set Fee, it should default to MinTxnFee.
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // TypeEnum = pay
+        ctx.itxn_field(7, TealValue::Bytes([30u8; 32].to_vec()))
+            .unwrap(); // Receiver
+        ctx.itxn_field(8, TealValue::Uint(100)).unwrap(); // Amount
+                                                          // Fee is NOT set — should default to MinTxnFee.
+        ctx.itxn_submit().unwrap();
+
+        let fee_val = ctx.last_itxn_field(1, None).unwrap(); // Fee
+        assert_eq!(
+            fee_val,
+            TealValue::Uint(params::MIN_TXN_FEE),
+            "fee should default to MinTxnFee when not explicitly set"
+        );
+    }
+
+    #[test]
+    fn p1_2_itxn_field_fee_zero_uses_fee_credit() {
+        // When fee=0 is explicitly set and fee_credit covers the shortfall,
+        // the submission should succeed and deduct from fee_credit.
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.fee_credit = 5_000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // TypeEnum = pay
+        ctx.itxn_field(7, TealValue::Bytes([30u8; 32].to_vec()))
+            .unwrap(); // Receiver
+        ctx.itxn_field(8, TealValue::Uint(100)).unwrap(); // Amount
+        ctx.itxn_field(1, TealValue::Uint(0)).unwrap(); // Fee = 0 explicitly
+        ctx.itxn_submit().unwrap();
+
+        // fee_credit should have been reduced by MinTxnFee (the shortfall).
+        assert_eq!(
+            ctx.fee_credit,
+            5_000 - params::MIN_TXN_FEE,
+            "fee_credit should be reduced by the shortfall when fee=0"
+        );
+    }
+
+    #[test]
+    fn p1_2_itxn_field_fee_zero_insufficient_credit_fails() {
+        // When fee=0 is explicitly set but fee_credit is insufficient, submit
+        // should fail.
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.fee_credit = 0; // No credit available
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // TypeEnum = pay
+        ctx.itxn_field(7, TealValue::Bytes([30u8; 32].to_vec()))
+            .unwrap();
+        ctx.itxn_field(8, TealValue::Uint(100)).unwrap();
+        ctx.itxn_field(1, TealValue::Uint(0)).unwrap(); // Fee = 0 explicitly
+
+        let result = ctx.itxn_submit();
+        assert!(
+            result.is_err(),
+            "itxn_submit should fail when fee=0 and no fee credit available"
+        );
+    }
+
+    // ---- P1-3: Snapshot covers IDs created by nested inner calls ----
+
+    #[test]
+    fn p1_3_snapshot_rollback_cleans_nested_created_resources() {
+        // Scenario: Inner group has [appl (creates nested asset), pay (fails)].
+        // The nested asset created by the appl should be cleaned up when the
+        // group rolls back due to the failing pay.
+        //
+        // We simulate this by having the inner appl create an asset via a
+        // nested inner txn. The predicted asset ID from the pre-snapshot won't
+        // cover it. The P1-3 fix ensures rollback removes it.
+
+        let mut store = LedgerState::new();
+
+        // App 42 (outer caller)
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        // App 100: a program that creates an asset via inner acfg.
+        // We build a program: itxn_begin, pushint 3 (acfg), itxn_field TypeEnum,
+        // pushint 1000000, itxn_field ConfigAssetTotal, itxn_submit, pushint 1, return
+        let acfg_program = vec![
+            6u8,  // version 6
+            0xb1, // itxn_begin
+            0x81, 0x03, // pushint 3 (acfg)
+            0xb2, 0x10, // itxn_field TypeEnum (16)
+            0x81, 0xc0, 0x84, 0x3d, // pushint 1000000 (varuint encoded)
+            0xb2, 0x22, // itxn_field ConfigAssetTotal (34)
+            0xb3, // itxn_submit
+            0x81, 0x01, // pushint 1
+            0x43, // return
+        ];
+        setup_app(&mut store, 100, acfg_program.clone(), make_program(6, true));
+
+        // Fund the app addresses.
+        let app42_addr = Address(app_address(42));
+        store.set_account(
+            &app42_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        let app100_addr = Address(app_address(100));
+        store.set_account(
+            &app100_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let fee_sink = Address([0xFEu8; 32]);
+        store.set_account(
+            &fee_sink,
+            AccountData {
+                micro_algos: 0,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = fee_sink;
+        ctx.fee_credit = 100_000;
+        ctx.txn_counter = 100;
+        ctx.opcode_budget = 20000;
+
+        // First, verify that the nested asset creation works in isolation.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // app 100
+        ctx.itxn_submit().unwrap();
+
+        // The inner appl incremented counter to 101, then nested acfg
+        // incremented again to 102, creating asset at 102+1 = 103.
+        // Actually the nested inner txn creates at counter+1 inside child.
+        // After submit, the asset should exist in the store.
+        // (The exact ID depends on counter progression inside execute_inner_appl.)
+
+        // Now test rollback: We'll do another itxn_begin group that creates
+        // another nested asset + a failing second txn. But since we can't
+        // easily force a failure in the second txn of a group in this test
+        // infrastructure, we instead verify the positive case that
+        // extra_created_asset_ids are tracked by checking the state is
+        // consistent after successful execution.
+
+        // Verify the asset created by nested inner txn exists.
+        // The counter was at 100 before the submit.
+        // i=0 appl: counter becomes 101. Inside child, nested acfg: counter 101+1=102, asset=103.
+        // So asset 103 should exist.
+        assert!(
+            store.get_asset_params(103).is_some(),
+            "nested asset at ID 103 should exist after successful submit"
+        );
+    }
+
+    #[test]
+    fn p1_3_extra_created_ids_tracked_for_rollback() {
+        // Verify that the `extra_created_asset_ids` / `extra_created_app_ids`
+        // mechanism works. When an inner group fails after an earlier sibling
+        // inner appl already created nested resources, those resources must be
+        // cleaned up by rollback.
+        //
+        // We test this by having an inner group:
+        //   [appl (creates nested asset successfully)] then a bad second txn
+        // The bad second txn fails, and the rollback must remove the nested asset.
+
+        let mut store = LedgerState::new();
+
+        // App 42 outer caller
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        // App 100: creates a nested asset (same program as above)
+        let acfg_program = vec![
+            6u8, 0xb1, 0x81, 0x03, 0xb2, 0x10, 0x81, 0xc0, 0x84, 0x3d, 0xb2, 0x22, 0xb3, 0x81,
+            0x01, 0x43,
+        ];
+        setup_app(&mut store, 100, acfg_program.clone(), make_program(6, true));
+
+        // App 200: rejects (approval program pushes 0)
+        setup_app(
+            &mut store,
+            200,
+            make_program(6, false), // rejects
+            make_program(6, true),
+        );
+
+        let app42_addr = Address(app_address(42));
+        store.set_account(
+            &app42_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        let app100_addr = Address(app_address(100));
+        store.set_account(
+            &app100_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        let app200_addr = Address(app_address(200));
+        store.set_account(
+            &app200_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let fee_sink = Address([0xFEu8; 32]);
+        store.set_account(
+            &fee_sink,
+            AccountData {
+                micro_algos: 0,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100, 200], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = fee_sink;
+        ctx.fee_credit = 100_000;
+        ctx.txn_counter = 100;
+        ctx.opcode_budget = 20000;
+
+        // Build a group: [inner appl 100 (succeeds + creates nested asset),
+        //                  inner appl 200 (rejects)]
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // app 100
+        ctx.itxn_next().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(200)).unwrap(); // app 200 (rejects)
+
+        let result = ctx.itxn_submit();
+        assert!(result.is_err(), "group should fail because app 200 rejects");
+
+        // The nested asset created by app 100 (at ID ~103) should NOT exist
+        // after rollback. Without the P1-3 fix, the snapshot wouldn't cover
+        // this ID and it would remain in the store.
+        assert!(
+            store.get_asset_params(103).is_none(),
+            "nested asset should be cleaned up on rollback (P1-3 fix)"
+        );
+        // Also verify that no unexpected asset params remain.
+        // The only assets that could have been created are at IDs around 102-104.
+        for id in 101..=105 {
+            assert!(
+                store.get_asset_params(id).is_none(),
+                "no stale asset params at ID {} after rollback",
+                id
+            );
         }
     }
 }

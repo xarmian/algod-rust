@@ -303,6 +303,17 @@ pub trait AvmContext {
         0
     }
 
+    /// Whether this context implements real budget pooling.
+    ///
+    /// When `true`, `op_itxn_submit` always reads back the budget from
+    /// `get_opcode_budget()` after inner execution — even if the result is 0
+    /// (legitimate exhaustion). When `false` (the default), `op_itxn_submit`
+    /// preserves the machine's pre-submit budget so that stub contexts that
+    /// return 0 from `get_opcode_budget()` don't accidentally zero the budget.
+    fn supports_budget_pooling(&self) -> bool {
+        false
+    }
+
     /// Read a field from the last submitted inner transaction.
     fn last_itxn_field(
         &self,
