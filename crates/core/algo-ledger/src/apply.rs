@@ -90,10 +90,12 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
 
 /// Apply a single signed transaction to the ledger state.
 ///
+/// Matches go-algorand's `applyTransaction` ordering:
 /// 1. Snapshot touched accounts, then apply rewards.
-/// 2. Dispatch by transaction type.
-/// 3. Handle rekey_to if present.
+/// 2. Handle rekey_to (before type-specific dispatch).
+/// 3. Dispatch by transaction type (fee + type-specific logic).
 /// 4. Debit rewards pool for any rewards distributed.
+/// 5. Check min balance for all touched accounts.
 ///
 /// On error, touched account data is restored to pre-reward state.
 pub fn apply_transaction<L: crate::store_trait::LedgerStore>(
@@ -216,10 +218,18 @@ pub fn apply_transaction<L: crate::store_trait::LedgerStore>(
         _ => {}
     }
 
-    // Snapshot all accounts that may be mutated (touched + fee_sink) for rollback.
+    // Snapshot all accounts that may be mutated (touched + fee_sink + rewards_pool)
+    // for rollback. The rewards pool must be included because it is debited for
+    // distributed rewards, and a later min-balance check failure must restore it.
     let mut snapshot_addrs = touched.clone();
     if !snapshot_addrs.contains(&ctx.fee_sink) {
         snapshot_addrs.push(ctx.fee_sink);
+    }
+    {
+        let rp = store.rewards_pool();
+        if !snapshot_addrs.contains(&rp) {
+            snapshot_addrs.push(rp);
+        }
     }
 
     let snapshot = if asset_ids_to_snap.is_empty() && app_ids_to_snap.is_empty() {
@@ -238,6 +248,18 @@ pub fn apply_transaction<L: crate::store_trait::LedgerStore>(
             let mut account = store.get_or_default_account(addr);
             total_rewards += apply_rewards(&mut account, ctx.rewards_level);
             store.set_account(addr, account);
+        }
+
+        // Handle rekey_to BEFORE type-specific apply (matching Go's ordering:
+        // rewards -> rekey -> type-specific dispatch).
+        if let Some(rekey_addr) = txn.rekey_to {
+            let mut account = store.get_or_default_account(&txn.sender);
+            if rekey_addr == txn.sender || rekey_addr.is_zero() {
+                account.auth_addr = None;
+            } else {
+                account.auth_addr = Some(rekey_addr);
+            }
+            store.set_account(&txn.sender, account);
         }
 
         // Dispatch by transaction type.
@@ -281,15 +303,32 @@ pub fn apply_transaction<L: crate::store_trait::LedgerStore>(
             store.set_account(&rewards_pool_addr, pool);
         }
 
-        // Handle rekey_to.
-        if let Some(rekey_addr) = txn.rekey_to {
-            let mut account = store.get_or_default_account(&txn.sender);
-            if rekey_addr == txn.sender || rekey_addr.is_zero() {
-                account.auth_addr = None;
-            } else {
-                account.auth_addr = Some(rekey_addr);
+        // Check min balance for all touched accounts after the transaction.
+        // Go checks all modified accounts per-transaction (skipping FeeSink,
+        // RewardsPool, StateProofSender, and zeroed-out accounts).
+        {
+            let rewards_pool_addr = store.rewards_pool();
+            for addr in &snapshot_addrs {
+                // Skip special accounts that are exempt from min balance checks.
+                if *addr == ctx.fee_sink || *addr == rewards_pool_addr {
+                    continue;
+                }
+                if let Some(account) = store.get_account(addr) {
+                    // Zeroed-out accounts (will be deleted) are OK.
+                    if account == algo_types::AccountData::default() {
+                        continue;
+                    }
+                    let min_bal = store.min_balance_with_state(addr, &account);
+                    if account.micro_algos < min_bal {
+                        return Err(AlgoError::Ledger {
+                            message: format!(
+                                "account {} balance {} below minimum balance {}",
+                                addr, account.micro_algos, min_bal,
+                            ),
+                        });
+                    }
+                }
             }
-            store.set_account(&txn.sender, account);
         }
 
         // Record lease on success (no-op for empty/zero leases).
@@ -342,26 +381,6 @@ fn apply_fee<L: crate::store_trait::LedgerStore>(
     Ok(())
 }
 
-/// Check that sender's balance meets the schema-aware minimum balance.
-fn check_min_balance<L: crate::store_trait::LedgerStore>(
-    store: &L,
-    addr: &Address,
-    context: &str,
-) -> Result<(), AlgoError> {
-    if let Some(account) = store.get_account(addr) {
-        let min_bal = store.min_balance_with_state(addr, &account);
-        if account.micro_algos < min_bal {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "sender {} balance {} below minimum balance {} {}",
-                    addr, account.micro_algos, min_bal, context,
-                ),
-            });
-        }
-    }
-    Ok(())
-}
-
 /// Apply a payment transaction.
 ///
 /// Debits `amount + fee` from sender, credits `amount` to receiver,
@@ -411,7 +430,7 @@ fn apply_pay<L: crate::store_trait::LedgerStore>(
 
     // Handle close_remainder_to.
     if !txn.close_remainder_to.is_zero() {
-        let mut sender = store.get_or_default_account(&txn.sender);
+        let sender = store.get_or_default_account(&txn.sender);
 
         // Cannot close account with opted-in or created assets/apps.
         if sender.total_assets_opted_in > 0 {
@@ -446,18 +465,31 @@ fn apply_pay<L: crate::store_trait::LedgerStore>(
                 ),
             });
         }
+        if sender.total_boxes > 0 {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "sender {} cannot close: has {} outstanding boxes",
+                    txn.sender, sender.total_boxes,
+                ),
+            });
+        }
+        if sender.total_box_bytes > 0 {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "sender {} cannot close: has {} outstanding box bytes",
+                    txn.sender, sender.total_box_bytes,
+                ),
+            });
+        }
 
         let close_amount = sender.micro_algos;
-        sender.micro_algos = 0;
-        sender.rewards_base = 0;
-        store.set_account(&txn.sender, sender);
+        // Go calls CloseAccount() which zeros the entire account record.
+        // Reset to default to match that behavior.
+        store.set_account(&txn.sender, algo_types::AccountData::default());
 
         let mut close_to = store.get_or_default_account(&txn.close_remainder_to);
         close_to.micro_algos += close_amount;
         store.set_account(&txn.close_remainder_to, close_to);
-    } else {
-        // Validate minimum balance when not closing.
-        check_min_balance(store, &txn.sender, "after payment")?;
     }
 
     Ok(())
@@ -590,9 +622,6 @@ fn apply_acfg<L: crate::store_trait::LedgerStore>(
         }
     }
 
-    // Check min balance for sender after the operation.
-    check_min_balance(store, &txn.sender, "after acfg operation")?;
-
     Ok(())
 }
 
@@ -654,32 +683,29 @@ fn apply_axfer<L: crate::store_trait::LedgerStore>(
         && txn.asset_close_to.is_none();
 
     if is_optin {
-        // Check if already opted in.
         if store.has_asset_holding(&txn.sender, asset_id) {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "axfer opt-in: {} already opted in to asset {}",
-                    txn.sender, asset_id,
-                ),
-            });
+            // Go does NOT error on duplicate opt-in — it falls through to the
+            // transfer path which is a 0-amount self-transfer no-op. Match that
+            // behavior by simply returning Ok.
+        } else {
+            let params = store
+                .get_asset_params(asset_id)
+                .ok_or_else(|| AlgoError::Ledger {
+                    message: format!("axfer opt-in: asset {} does not exist", asset_id),
+                })?;
+            let default_frozen = params.params.default_frozen;
+            store.set_asset_holding(
+                &txn.sender,
+                asset_id,
+                AssetHolding {
+                    amount: 0,
+                    frozen: default_frozen,
+                },
+            );
+            let mut sender_account = store.get_or_default_account(&txn.sender);
+            sender_account.total_assets_opted_in += 1;
+            store.set_account(&txn.sender, sender_account);
         }
-        let params = store
-            .get_asset_params(asset_id)
-            .ok_or_else(|| AlgoError::Ledger {
-                message: format!("axfer opt-in: asset {} does not exist", asset_id),
-            })?;
-        let default_frozen = params.params.default_frozen;
-        store.set_asset_holding(
-            &txn.sender,
-            asset_id,
-            AssetHolding {
-                amount: 0,
-                frozen: default_frozen,
-            },
-        );
-        let mut sender_account = store.get_or_default_account(&txn.sender);
-        sender_account.total_assets_opted_in += 1;
-        store.set_account(&txn.sender, sender_account);
     } else {
         // ── Frozen check (only for non-clawback) ──
         if !is_clawback {
@@ -752,13 +778,45 @@ fn apply_axfer<L: crate::store_trait::LedgerStore>(
                 // Close the source account's holding. For non-clawback, from_addr == txn.sender.
                 // (Clawback + close-to is rejected above, so from_addr is always txn.sender here.)
                 let close_from = from_addr;
-                let remaining = store
-                    .get_asset_holding(&close_from, asset_id)
-                    .map(|h| h.amount)
-                    .unwrap_or(0);
+
+                // The creator of the asset cannot close their holding.
+                // Go: HasAssetParams(source, ct.XferAsset) -> "cannot close asset ID in allocating account"
+                // Also determine if we bypass frozen checks: allowed when closing
+                // to the asset creator (go-algorand: bypassFreeze = HasAssetParams(closeTo)).
+                let bypass_freeze = if let Some(params_record) = store.get_asset_params(asset_id) {
+                    if params_record.creator == close_from {
+                        return Err(AlgoError::Ledger {
+                            message: "cannot close asset ID in allocating account".to_string(),
+                        });
+                    }
+                    params_record.creator == close_to
+                } else {
+                    false
+                };
+
+                let from_holding =
+                    store
+                        .get_asset_holding(&close_from, asset_id)
+                        .ok_or_else(|| AlgoError::Ledger {
+                            message: format!(
+                                "axfer close: {} has no holding for asset {}",
+                                close_from, asset_id,
+                            ),
+                        })?;
+                let remaining = from_holding.amount;
+
+                // Check frozen on the sender's holding (unless bypassed).
+                if from_holding.frozen && !bypass_freeze {
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "axfer close: {} holding for asset {} is frozen",
+                            close_from, asset_id,
+                        ),
+                    });
+                }
 
                 if remaining > 0 {
-                    // Credit close-to.
+                    // Check frozen on close-to's holding (unless bypassed).
                     let mut close_holding = store
                         .get_asset_holding(&close_to, asset_id)
                         .ok_or_else(|| AlgoError::Ledger {
@@ -767,6 +825,14 @@ fn apply_axfer<L: crate::store_trait::LedgerStore>(
                                 close_to, asset_id,
                             ),
                         })?;
+                    if close_holding.frozen && !bypass_freeze {
+                        return Err(AlgoError::Ledger {
+                            message: format!(
+                                "axfer close: receiver {} holding for asset {} is frozen",
+                                close_to, asset_id,
+                            ),
+                        });
+                    }
                     close_holding.amount += remaining;
                     store.set_asset_holding(&close_to, asset_id, close_holding);
                 }
@@ -781,9 +847,6 @@ fn apply_axfer<L: crate::store_trait::LedgerStore>(
             }
         }
     }
-
-    // Check min balance for sender after the operation.
-    check_min_balance(store, &txn.sender, "after axfer operation")?;
 
     Ok(())
 }
@@ -834,9 +897,6 @@ fn apply_afrz<L: crate::store_trait::LedgerStore>(
             })?;
     holding.frozen = txn.asset_frozen;
     store.set_asset_holding(&target, asset_id, holding);
-
-    // Check min balance for sender after fee.
-    check_min_balance(store, &txn.sender, "after afrz fee")?;
 
     Ok(())
 }
@@ -913,7 +973,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 clear_state_program: clear,
                 global_state: std::collections::BTreeMap::new(),
                 local_state_schema: local_schema,
-                global_state_schema: global_schema,
+                global_state_schema: global_schema.clone(),
                 extra_program_pages: extra_pages,
             },
         );
@@ -921,6 +981,9 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
         let mut sender_account = store.get_or_default_account(&txn.sender);
         sender_account.total_created_apps += 1;
         sender_account.total_extra_app_pages += extra_pages;
+        // Update aggregate schema: creator stores global state.
+        sender_account.total_app_schema =
+            sender_account.total_app_schema.add_schema(&global_schema);
         store.set_account(&txn.sender, sender_account);
     }
 
@@ -966,37 +1029,48 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                         schema: local_schema.clone(),
                         key_value: std::collections::BTreeMap::new(),
                     });
-                local.schema = local_schema;
+                local.schema = local_schema.clone();
                 store.set_app_local_state(&txn.sender, app_id, local);
 
                 let mut sender_account = store.get_or_default_account(&txn.sender);
                 sender_account.total_apps_opted_in += 1;
+                // Update aggregate schema: sender stores local state.
+                sender_account.total_app_schema =
+                    sender_account.total_app_schema.add_schema(&local_schema);
                 store.set_account(&txn.sender, sender_account);
             }
         }
         ON_COMPLETION_CLOSE_OUT => {
             // CloseOut requires the sender to be opted in.
-            if !store.has_app_local_state(&txn.sender, app_id) {
-                return Err(AlgoError::Ledger {
+            let local_state = store
+                .get_app_local_state(&txn.sender, app_id)
+                .ok_or_else(|| AlgoError::Ledger {
                     message: format!(
                         "appl close-out: {} is not opted into app {}",
                         txn.sender, app_id,
                     ),
-                });
-            }
+                })?;
+            let local_schema = local_state.schema.clone();
             store.remove_app_local_state(&txn.sender, app_id);
             let mut sender_account = store.get_or_default_account(&txn.sender);
             sender_account.total_apps_opted_in =
                 sender_account.total_apps_opted_in.saturating_sub(1);
+            // Subtract local schema from aggregate.
+            sender_account.total_app_schema =
+                sender_account.total_app_schema.sub_schema(&local_schema);
             store.set_account(&txn.sender, sender_account);
         }
         ON_COMPLETION_CLEAR_STATE => {
             // ClearState removes local state if present (does not fail if absent).
-            if store.has_app_local_state(&txn.sender, app_id) {
+            if let Some(local_state) = store.get_app_local_state(&txn.sender, app_id) {
+                let local_schema = local_state.schema.clone();
                 store.remove_app_local_state(&txn.sender, app_id);
                 let mut sender_account = store.get_or_default_account(&txn.sender);
                 sender_account.total_apps_opted_in =
                     sender_account.total_apps_opted_in.saturating_sub(1);
+                // Subtract local schema from aggregate.
+                sender_account.total_app_schema =
+                    sender_account.total_app_schema.sub_schema(&local_schema);
                 store.set_account(&txn.sender, sender_account);
             }
         }
@@ -1013,6 +1087,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 }
                 // Remove the app — decrement the CREATOR's counters, not sender's.
                 let creator = existing.creator;
+                let global_schema = existing.global_state_schema.clone();
                 store.remove_app_params(app_id);
                 let mut creator_account = store.get_or_default_account(&creator);
                 creator_account.total_created_apps =
@@ -1020,6 +1095,9 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 creator_account.total_extra_app_pages = creator_account
                     .total_extra_app_pages
                     .saturating_sub(existing.extra_program_pages);
+                // Subtract global schema from aggregate.
+                creator_account.total_app_schema =
+                    creator_account.total_app_schema.sub_schema(&global_schema);
                 store.set_account(&creator, creator_account);
             }
         }
@@ -1055,9 +1133,6 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
         }
     }
 
-    // Check min balance for sender after the operation.
-    check_min_balance(store, &txn.sender, "after appl operation")?;
-
     Ok(())
 }
 
@@ -1092,10 +1167,19 @@ fn apply_keyreg<L: crate::store_trait::LedgerStore>(
         }
     }
 
-    if txn.non_participation {
-        // ── Mark non-participating (irreversible) ──
+    // Go checks: if VotePK.IsEmpty() || SelectionPK.IsEmpty() -> offline/nonpart,
+    // else -> online.  We must check BOTH keys to determine online vs offline.
+    let vote_pk_empty = !txn.vote_pk.as_ref().is_some_and(|pk| !pk.is_empty());
+    let selection_pk_empty = !txn.selection_pk.as_ref().is_some_and(|pk| !pk.is_empty());
+
+    if vote_pk_empty || selection_pk_empty {
+        // ── Offline or non-participating ──
         let mut account = store.get_or_default_account(&txn.sender);
-        account.status = AccountStatus::NotParticipating;
+        if txn.non_participation {
+            account.status = AccountStatus::NotParticipating;
+        } else {
+            account.status = AccountStatus::Offline;
+        }
         account.vote_id = None;
         account.selection_id = None;
         account.state_proof_id = None;
@@ -1157,6 +1241,26 @@ fn apply_keyreg<L: crate::store_trait::LedgerStore>(
             });
         }
 
+        // D14: Round-based keyreg coherency check (Go: EnableKeyregCoherencyCheck, enabled since v28).
+        // VoteLast must be beyond the current round, and VoteFirst must start by next round.
+        let round = ctx.round;
+        if txn.vote_last <= round {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "keyreg online: vote_last {} <= current round {} (expired participation key)",
+                    txn.vote_last, round,
+                ),
+            });
+        }
+        if txn.vote_first > round + 1 {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "keyreg online: vote_first {} > round+1 {} (first voting round too far in future)",
+                    txn.vote_first, round + 1,
+                ),
+            });
+        }
+
         let mut account = store.get_or_default_account(&txn.sender);
         account.status = AccountStatus::Online;
         account.vote_id = Some(vote_id);
@@ -1165,22 +1269,27 @@ fn apply_keyreg<L: crate::store_trait::LedgerStore>(
         account.vote_first_valid = txn.vote_first;
         account.vote_last_valid = txn.vote_last;
         account.vote_key_dilution = txn.vote_key_dilution;
-        store.set_account(&txn.sender, account);
-    } else {
-        // ── Offline keyreg ──
-        let mut account = store.get_or_default_account(&txn.sender);
-        account.status = AccountStatus::Offline;
-        account.vote_id = None;
-        account.selection_id = None;
-        account.state_proof_id = None;
-        account.vote_first_valid = 0;
-        account.vote_last_valid = 0;
-        account.vote_key_dilution = 0;
+
+        // D15: Incentive eligibility and last heartbeat (Go: Payouts.Enabled, since v40).
+        // Go sets IncentiveEligible = true when fee >= Payouts.GoOnlineFee && Payouts.Enabled.
+        // Go sets LastHeartbeat = round + lookback when Payouts.Enabled.
+        // Payouts.GoOnlineFee = 2_000_000 (2 Algos), Payouts.Enabled since v40.
+        // lookback = 2 * SeedRefreshInterval * SeedLookback = 2 * 80 * 2 = 320.
+        const PAYOUTS_GO_ONLINE_FEE: u64 = 2_000_000;
+        const BALANCE_LOOKBACK: u64 = 320; // 2 * SeedRefreshInterval(80) * SeedLookback(2)
+
+        // TODO(conformance): Gate on Payouts.Enabled once consensus params are version-aware.
+        // Currently assumes v40+ where Payouts is enabled.
+        account.last_heartbeat = round + BALANCE_LOOKBACK;
+
+        // TODO(conformance): Gate on Payouts.Enabled once consensus params are version-aware.
+        // Currently assumes v40+ where Payouts is enabled.
+        if txn.fee >= PAYOUTS_GO_ONLINE_FEE {
+            account.incentive_eligible = true;
+        }
+
         store.set_account(&txn.sender, account);
     }
-
-    // Check min balance for sender after fee.
-    check_min_balance(store, &txn.sender, "after keyreg fee")?;
 
     Ok(())
 }
@@ -1335,7 +1444,10 @@ mod tests {
         let auth = Address([5u8; 32]);
         let fee_sink = Address([3u8; 32]);
 
-        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (receiver, 100_000), (fee_sink, 0)],
+            fee_sink,
+        );
         let ctx = ApplyContext {
             rewards_level: 0,
             fee_sink,
@@ -1456,7 +1568,7 @@ mod tests {
         let mut state = make_state_with_accounts(
             &[
                 (sender, 5_000_000),
-                (receiver, 0),
+                (receiver, 100_000),
                 (fee_sink, 0),
                 (rewards_pool, 10_000_000),
             ],
@@ -2002,10 +2114,11 @@ mod tests {
 
         apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
 
-        // Second opt-in fails.
-        let result = apply_transaction(&mut state, &stx, &ctx, 0);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("already opted in"));
+        // Second opt-in is a no-op (matches Go behavior — no error).
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+        // Holding unchanged, count unchanged.
+        assert_eq!(state.get_asset_holding(&user, 42).unwrap().amount, 0);
+        assert_eq!(state.get_account(&user).unwrap().total_assets_opted_in, 1);
     }
 
     #[test]
@@ -2584,7 +2697,9 @@ mod tests {
         stx.txn.vote_pk = Some(serde_bytes::ByteBuf::from(vec![1u8; 32]));
         stx.txn.selection_pk = Some(serde_bytes::ByteBuf::from(vec![2u8; 32]));
         stx.txn.state_proof_pk = Some(serde_bytes::ByteBuf::from(vec![3u8; 64]));
-        stx.txn.vote_first = 100;
+        // vote_first <= round+1 and vote_last > round to pass coherency checks.
+        // Tests use round=1, so vote_first=1, vote_last=200.
+        stx.txn.vote_first = 1;
         stx.txn.vote_last = 200;
         stx.txn.vote_key_dilution = 10;
         stx
@@ -2628,11 +2743,15 @@ mod tests {
         assert_eq!(acct.vote_id, Some([1u8; 32]));
         assert_eq!(acct.selection_id, Some([2u8; 32]));
         assert_eq!(acct.state_proof_id, Some([3u8; 64]));
-        assert_eq!(acct.vote_first_valid, 100);
+        assert_eq!(acct.vote_first_valid, 1);
         assert_eq!(acct.vote_last_valid, 200);
         assert_eq!(acct.vote_key_dilution, 10);
         // Fee deducted.
         assert_eq!(acct.micro_algos, 999_000);
+        // D15: last_heartbeat = round(1) + lookback(320) = 321.
+        assert_eq!(acct.last_heartbeat, 321);
+        // Fee < 2_000_000, so incentive_eligible remains false.
+        assert!(!acct.incentive_eligible);
     }
 
     #[test]

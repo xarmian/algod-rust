@@ -18,21 +18,31 @@ pub const BOX_BYTE_MIN_BALANCE: u64 = 400;
 pub const REWARDS_RATE_REFRESH_INTERVAL: u64 = 500_000;
 
 /// Compute minimum balance for an account based on its opted-in assets,
-/// created assets, created apps, opted-in apps, extra app pages, and boxes.
+/// created assets, created apps, opted-in apps, extra app pages, boxes,
+/// and aggregate app schema.
 ///
-/// TODO: Schema-based min balance (SCHEMA_UINT_MIN_BALANCE, SCHEMA_BYTES_MIN_BALANCE)
-/// requires knowing the actual local/global schemas for each opted-in/created app.
-/// AccountData only tracks aggregate counts, not per-app schemas. Add schema-based
-/// min balance when per-app state tracking is available.
+/// Schema cost matches Go's three-tier formula:
+///   SCHEMA_MIN_BALANCE_PER_ENTRY * (num_uint + num_byte_slice)
+///   + SCHEMA_UINT_MIN_BALANCE * num_uint
+///   + SCHEMA_BYTES_MIN_BALANCE * num_byte_slice
 pub fn min_balance(account: &AccountData) -> u64 {
+    // NOTE: total_assets_opted_in already includes creator holdings (incremented
+    // on asset create), matching Go's single `TotalAssets` counter. Do NOT add
+    // total_created_assets separately — that would double-count.
+    let schema = &account.total_app_schema;
+    let num_entries = schema.num_uint + schema.num_byte_slice;
+    let schema_cost = SCHEMA_MIN_BALANCE_PER_ENTRY * num_entries
+        + SCHEMA_UINT_MIN_BALANCE * schema.num_uint
+        + SCHEMA_BYTES_MIN_BALANCE * schema.num_byte_slice;
+
     MIN_BALANCE
         + account.total_assets_opted_in * ASSET_OPT_IN_MIN_BALANCE
-        + account.total_created_assets * ASSET_OPT_IN_MIN_BALANCE
         + account.total_created_apps * APP_FLAT_PARAMS_MIN_BALANCE
         + account.total_apps_opted_in * APP_FLAT_OPT_IN_MIN_BALANCE
         + account.total_extra_app_pages as u64 * APP_FLAT_PARAMS_MIN_BALANCE
         + account.total_boxes * BOX_FLAT_MIN_BALANCE
         + account.total_box_bytes * BOX_BYTE_MIN_BALANCE
+        + schema_cost
 }
 
 #[cfg(test)]

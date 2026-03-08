@@ -111,11 +111,15 @@ pub(crate) fn encode_account_data(acct: &AccountData) -> Vec<u8> {
         map.push(("e", rmpv::Value::Binary(auth.0.to_vec())));
     }
 
-    // "f" = total_app_schema_num_uint (total across all opted-in apps — not tracked separately,
-    //        write 0 for now; go-algorand tracks this in TotalAppSchema)
-    // We don't have a separate field for this; skip (omitempty).
+    // "f" = total_app_schema_num_uint
+    if acct.total_app_schema.num_uint != 0 {
+        map.push(("f", rmpv::Value::from(acct.total_app_schema.num_uint)));
+    }
 
-    // "g" = total_app_schema_num_byte_slice — same as above
+    // "g" = total_app_schema_num_byte_slice
+    if acct.total_app_schema.num_byte_slice != 0 {
+        map.push(("g", rmpv::Value::from(acct.total_app_schema.num_byte_slice)));
+    }
 
     // "h" = total_extra_app_pages
     if acct.total_extra_app_pages != 0 {
@@ -150,6 +154,21 @@ pub(crate) fn encode_account_data(acct: &AccountData) -> Vec<u8> {
     // "n" = total_box_bytes
     if acct.total_box_bytes != 0 {
         map.push(("n", rmpv::Value::from(acct.total_box_bytes)));
+    }
+
+    // "o" = incentive_eligible
+    if acct.incentive_eligible {
+        map.push(("o", rmpv::Value::Boolean(true)));
+    }
+
+    // "p" = last_proposed
+    if acct.last_proposed != 0 {
+        map.push(("p", rmpv::Value::from(acct.last_proposed)));
+    }
+
+    // "q" = last_heartbeat
+    if acct.last_heartbeat != 0 {
+        map.push(("q", rmpv::Value::from(acct.last_heartbeat)));
     }
 
     // Participation keys
@@ -235,6 +254,8 @@ fn decode_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
                     }
                 }
             }
+            "f" => acct.total_app_schema.num_uint = v.as_u64().unwrap_or(0),
+            "g" => acct.total_app_schema.num_byte_slice = v.as_u64().unwrap_or(0),
             "h" => acct.total_extra_app_pages = v.as_u64().unwrap_or(0) as u32,
             "i" => acct.total_created_assets = v.as_u64().unwrap_or(0),
             "j" => acct.total_assets_opted_in = v.as_u64().unwrap_or(0),
@@ -242,6 +263,9 @@ fn decode_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
             "l" => acct.total_apps_opted_in = v.as_u64().unwrap_or(0),
             "m" => acct.total_boxes = v.as_u64().unwrap_or(0),
             "n" => acct.total_box_bytes = v.as_u64().unwrap_or(0),
+            "o" => acct.incentive_eligible = v.as_bool().unwrap_or(false),
+            "p" => acct.last_proposed = v.as_u64().unwrap_or(0),
+            "q" => acct.last_heartbeat = v.as_u64().unwrap_or(0),
             "A" => {
                 if let Some(bytes) = v.as_slice() {
                     if bytes.len() == 32 {
@@ -3005,6 +3029,13 @@ mod tests {
             total_apps_opted_in: 3,
             total_created_apps: 1,
             total_extra_app_pages: 2,
+            total_app_schema: StateSchema {
+                num_uint: 4,
+                num_byte_slice: 2,
+            },
+            incentive_eligible: true,
+            last_proposed: 10,
+            last_heartbeat: 15,
             total_box_bytes: 100,
             total_boxes: 5,
             update_round: 42,

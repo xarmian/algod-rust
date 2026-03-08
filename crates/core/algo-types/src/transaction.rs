@@ -440,6 +440,24 @@ pub struct StateSchema {
     pub num_byte_slice: u64,
 }
 
+impl StateSchema {
+    /// Add two StateSchemas together (saturating).
+    pub fn add_schema(&self, other: &StateSchema) -> StateSchema {
+        StateSchema {
+            num_uint: self.num_uint.saturating_add(other.num_uint),
+            num_byte_slice: self.num_byte_slice.saturating_add(other.num_byte_slice),
+        }
+    }
+
+    /// Subtract one StateSchema from another (saturating).
+    pub fn sub_schema(&self, other: &StateSchema) -> StateSchema {
+        StateSchema {
+            num_uint: self.num_uint.saturating_sub(other.num_uint),
+            num_byte_slice: self.num_byte_slice.saturating_sub(other.num_byte_slice),
+        }
+    }
+}
+
 /// Box reference for application calls.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BoxRef {
