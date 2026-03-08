@@ -46,10 +46,14 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 # Crypto
 ed25519-dalek = { version = "2", features = ["std"] }
+k256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
+sha3 = "0.10"
 hex = "0.4"
 serde_bytes = "0.11"
 data-encoding = "2"
+base64 = "0.22"
 
 # Storage
 rusqlite = { version = "0.31", features = ["bundled"] }

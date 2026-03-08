@@ -6,6 +6,7 @@
 pub mod arithmetic;
 pub mod bytes;
 pub mod constants;
+pub mod crypto;
 pub mod flow;
 pub mod global;
 pub mod helpers;
@@ -33,6 +34,15 @@ pub fn dispatch(
     match instruction.opcode {
         // ---- Error ----
         0x00 => flow::op_err(machine, instruction),
+
+        // ---- Crypto / Hash ----
+        0x01 => crypto::op_sha256(machine, instruction),
+        0x02 => crypto::op_keccak256(machine, instruction),
+        0x03 => crypto::op_sha512_256(machine, instruction),
+        0x04 => crypto::op_ed25519verify(machine, instruction, ctx),
+        0x05 => crypto::op_ecdsa_verify(machine, instruction),
+        0x06 => crypto::op_ecdsa_pk_decompress(machine, instruction),
+        0x07 => crypto::op_ecdsa_pk_recover(machine, instruction),
 
         // ---- Constants ----
         0x20 => constants::op_intcblock(machine, instruction),
@@ -113,6 +123,8 @@ pub fn dispatch(
         0x42 => flow::op_b(machine, instruction),
         0x43 => flow::op_return(machine, instruction),
         0x44 => flow::op_assert(machine, instruction),
+        0x84 => crypto::op_ed25519verify_bare(machine, instruction),
+        0x85 => crypto::op_falcon_verify(machine, instruction),
         0x88 => flow::op_callsub(machine, instruction),
         0x89 => flow::op_retsub(machine, instruction),
         0x8a => flow::op_proto(machine, instruction),
@@ -150,6 +162,7 @@ pub fn dispatch(
         0x94 => arithmetic::op_exp(machine, instruction),
         0x95 => arithmetic::op_expw(machine, instruction),
         0x97 => arithmetic::op_divw(machine, instruction),
+        0x98 => crypto::op_sha3_256(machine, instruction),
 
         // ---- Byte string operations ----
         0x15 => bytes::op_len(machine, instruction),
@@ -165,6 +178,10 @@ pub fn dispatch(
         0x5b => bytes::op_extract_uint64(machine, instruction),
         0x5c => bytes::op_replace2(machine, instruction),
         0x5d => bytes::op_replace3(machine, instruction),
+
+        // ---- Encoding / JSON ----
+        0x5e => crypto::op_base64_decode(machine, instruction),
+        0x5f => crypto::op_json_ref(machine, instruction),
 
         // ---- App state ----
         0x60 => state::op_balance(machine, instruction, ctx),
@@ -223,7 +240,8 @@ pub fn dispatch(
         0xc5 => itxn::op_itxnas(machine, instruction, ctx),
         0xc6 => itxn::op_gitxnas(machine, instruction, ctx),
 
-        // ---- Block field access (v7+) ----
+        // ---- VRF / Block field access (v7+) ----
+        0xd0 => crypto::op_vrf_verify(machine, instruction),
         0xd1 => state::op_block(machine, instruction, ctx),
 
         // ---- Everything else: not yet implemented ----
