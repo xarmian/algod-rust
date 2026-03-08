@@ -86,11 +86,7 @@ fn test_reward_dedup_sender_eq_receiver() {
     state.get_or_default_account(&addr).rewards_base = 0;
     state.get_or_default_account(&addr).status = AccountStatus::Online;
 
-    let ctx = ApplyContext {
-        rewards_level: 10,
-        fee_sink,
-        round: 1,
-    };
+    let ctx = ApplyContext::new_replay(10, fee_sink, 1);
 
     // sender == receiver: rewards should be applied once, not twice.
     let stx = pay_txn(addr, addr, 0, 1_000);
@@ -177,11 +173,7 @@ fn test_close_remainder_sender_eq_close_to() {
         &[(sender, 1_000_000), (receiver, 0), (fee_sink, 0)],
         fee_sink,
     );
-    let ctx = ApplyContext {
-        rewards_level: 0,
-        fee_sink,
-        round: 1,
-    };
+    let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
     // close_remainder_to == sender: after paying amount+fee, remainder goes
     // back to sender. The close logic zeroes sender first, then credits close_to.
@@ -208,11 +200,7 @@ fn test_payment_to_self_fee_deducted() {
     let fee_sink = Address([3u8; 32]);
 
     let mut state = make_state(&[(addr, 1_000_000), (fee_sink, 0)], fee_sink);
-    let ctx = ApplyContext {
-        rewards_level: 0,
-        fee_sink,
-        round: 1,
-    };
+    let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
     // Pay 200_000 to self with 1_000 fee.
     let stx = pay_txn(addr, addr, 200_000, 1_000);
@@ -235,11 +223,7 @@ fn test_stpf_zero_fee_no_error() {
     let fee_sink = Address([3u8; 32]);
 
     let mut state = make_state(&[(sender, 500_000), (fee_sink, 0)], fee_sink);
-    let ctx = ApplyContext {
-        rewards_level: 0,
-        fee_sink,
-        round: 1,
-    };
+    let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
     let mut stx = SignedTransaction::default();
     stx.txn.txn_type = "stpf".to_string();
@@ -259,11 +243,7 @@ fn test_stpf_nonzero_fee_still_noop() {
     let fee_sink = Address([3u8; 32]);
 
     let mut state = make_state(&[(sender, 500_000), (fee_sink, 0)], fee_sink);
-    let ctx = ApplyContext {
-        rewards_level: 0,
-        fee_sink,
-        round: 1,
-    };
+    let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
     let mut stx = SignedTransaction::default();
     stx.txn.txn_type = "stpf".to_string();
@@ -288,11 +268,7 @@ fn test_rekey_on_acfg_txn() {
     let fee_sink = Address([3u8; 32]);
 
     let mut state = make_state(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
-    let ctx = ApplyContext {
-        rewards_level: 0,
-        fee_sink,
-        round: 1,
-    };
+    let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
     // Use acfg create with proper apply_data_config_asset to test rekey on non-pay.
     let mut stx = SignedTransaction::default();
@@ -319,11 +295,7 @@ fn test_rekey_clear_on_non_pay() {
     let mut state = make_state(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
     state.get_or_default_account(&sender).auth_addr = Some(auth);
 
-    let ctx = ApplyContext {
-        rewards_level: 0,
-        fee_sink,
-        round: 1,
-    };
+    let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
     // Rekey back to self on a keyreg txn.
     let mut stx = SignedTransaction::default();
@@ -351,11 +323,7 @@ fn test_close_with_opted_in_apps_fails() {
     let mut state = make_state(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
     state.get_or_default_account(&sender).total_apps_opted_in = 2;
 
-    let ctx = ApplyContext {
-        rewards_level: 0,
-        fee_sink,
-        round: 1,
-    };
+    let ctx = ApplyContext::new_replay(0, fee_sink, 1);
     let mut stx = pay_txn(sender, receiver, 0, 1_000);
     stx.txn.close_remainder_to = close_to;
 
@@ -592,11 +560,7 @@ fn test_min_balance_tracks_assets() {
         &[(creator, 50_000_000), (user, 50_000_000), (fee_sink, 0)],
         fee_sink,
     );
-    let ctx = ApplyContext {
-        rewards_level: 0,
-        fee_sink,
-        round: 1,
-    };
+    let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
     // Base min balance for user (no assets/apps): 100_000
     let base_min = algo_ledger::min_balance(state.get_account(&user).unwrap());
@@ -658,11 +622,7 @@ fn test_appl_create_and_optin() {
         &[(creator, 50_000_000), (user, 50_000_000), (fee_sink, 0)],
         fee_sink,
     );
-    let ctx = ApplyContext {
-        rewards_level: 0,
-        fee_sink,
-        round: 1,
-    };
+    let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
     let app_id = 200u64;
 
@@ -706,11 +666,7 @@ fn test_eval_delta_global_state() {
     let fee_sink = Address([3u8; 32]);
 
     let mut state = make_state(&[(creator, 50_000_000), (fee_sink, 0)], fee_sink);
-    let ctx = ApplyContext {
-        rewards_level: 0,
-        fee_sink,
-        round: 1,
-    };
+    let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
     let app_id = 300u64;
 
@@ -766,11 +722,7 @@ fn test_eval_delta_inner_txns() {
         &[(creator, 50_000_000), (receiver, 0), (fee_sink, 0)],
         fee_sink,
     );
-    let ctx = ApplyContext {
-        rewards_level: 0,
-        fee_sink,
-        round: 1,
-    };
+    let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
     let app_id = 400u64;
 
@@ -1086,11 +1038,7 @@ fn test_min_balance_enforcement_with_assets() {
         ],
         fee_sink,
     );
-    let ctx = ApplyContext {
-        rewards_level: 0,
-        fee_sink,
-        round: 1,
-    };
+    let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
     // Create asset from creator.
     let params = AssetParams {
@@ -1215,11 +1163,7 @@ fn test_rekey_chain() {
     let fee_sink = Address([3u8; 32]);
 
     let mut state = make_state(&[(a, 5_000_000), (b, 0), (c, 0), (fee_sink, 0)], fee_sink);
-    let ctx = ApplyContext {
-        rewards_level: 0,
-        fee_sink,
-        round: 1,
-    };
+    let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
     // Step 1: A rekeys to B.
     let mut stx1 = pay_txn(a, a, 0, 1_000);
@@ -1274,11 +1218,7 @@ fn test_asset_close_out_with_rewards() {
     state.get_or_default_account(&holder).rewards_base = 0;
     state.get_or_default_account(&holder).status = AccountStatus::Online;
 
-    let ctx_no_rewards = ApplyContext {
-        rewards_level: 0,
-        fee_sink,
-        round: 1,
-    };
+    let ctx_no_rewards = ApplyContext::new_replay(0, fee_sink, 1);
 
     // Create asset from creator.
     let params = AssetParams {
@@ -1310,11 +1250,7 @@ fn test_asset_close_out_with_rewards() {
     apply_transaction(&mut state, &optin2, &ctx_no_rewards, 0).unwrap();
 
     // Now close out holder's asset holding with rewards_level=10.
-    let ctx_rewards = ApplyContext {
-        rewards_level: 10,
-        fee_sink,
-        round: 2,
-    };
+    let ctx_rewards = ApplyContext::new_replay(10, fee_sink, 2);
 
     let close = axfer_close_txn(holder, close_to, close_to, 0, 1_000, 42);
     apply_transaction(&mut state, &close, &ctx_rewards, 0).unwrap();

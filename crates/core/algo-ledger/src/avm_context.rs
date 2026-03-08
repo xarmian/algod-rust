@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 
 use algo_avm::context::AvmContext;
+use algo_avm::eval::AvmResult;
 use algo_avm::MAX_AVM_VERSION;
 use algo_error::AlgoError;
 use algo_types::{Address, SignedTransaction, TealValue, Transaction};
@@ -458,6 +459,34 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// Completed inner transaction groups.
     pub fn inner_txns(&self) -> &[Vec<SignedTransaction>] {
         &self.inner_txns
+    }
+
+    /// Extract accumulated execution results into an `AvmResult`.
+    ///
+    /// Collects logs and inner transactions from the context. State deltas
+    /// (global and local) are not tracked separately — the context writes
+    /// directly to the store during execution. The returned `AvmResult`
+    /// therefore has empty deltas; callers should rely on the store state
+    /// rather than the delta maps.
+    ///
+    /// TODO: Track global/local deltas independently so that ClearState
+    /// rejection can discard state changes without store rollback.
+    pub fn to_avm_result(&self, approved: bool) -> AvmResult {
+        // Flatten inner transaction groups into a single list.
+        let inner_transactions: Vec<SignedTransaction> = self
+            .inner_txns
+            .iter()
+            .flat_map(|g| g.iter().cloned())
+            .collect();
+
+        AvmResult {
+            global_delta: std::collections::HashMap::new(),
+            local_deltas: std::collections::HashMap::new(),
+            inner_transactions,
+            logs: self.logs.clone(),
+            approved,
+            error: None,
+        }
     }
 }
 

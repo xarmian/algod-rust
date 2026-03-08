@@ -22,7 +22,8 @@ use algo_error::AlgoError;
 
 use crate::bytecode::Instruction;
 use crate::context::AvmContext;
-use crate::machine::AvmMachine;
+use crate::machine::{AvmMachine, ExecMode};
+use crate::opcode::{self, Mode};
 
 /// Shared hex decoder for test code across ops sub-modules.
 #[cfg(test)]
@@ -31,6 +32,31 @@ pub(crate) fn hex_decode(s: &str) -> Vec<u8> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
         .collect()
+}
+
+/// Check that the opcode is allowed in the current execution mode.
+///
+/// This is a defense-in-depth runtime check. The validator's `check_mode()`
+/// already rejects mode-incompatible opcodes at parse time, but we enforce
+/// again at dispatch time to match go-algorand's eval loop behavior.
+fn check_runtime_mode(machine: &AvmMachine, opcode_byte: u8) -> Result<(), AlgoError> {
+    if let Some(spec) = opcode::lookup(opcode_byte) {
+        match (machine.mode, spec.mode) {
+            (_, Mode::Any) | (ExecMode::Application, Mode::Application) => {}
+            (ExecMode::LogicSig, Mode::Application) => {
+                return Err(AlgoError::Avm {
+                    message: format!("opcode {} not allowed in LogicSig mode", spec.name),
+                });
+            }
+            (ExecMode::Application, Mode::LogicSig) => {
+                return Err(AlgoError::Avm {
+                    message: format!("opcode {} not allowed in Application mode", spec.name),
+                });
+            }
+            (ExecMode::LogicSig, Mode::LogicSig) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Dispatch an instruction to its handler.
@@ -42,6 +68,9 @@ pub fn dispatch(
     instruction: &Instruction,
     ctx: &mut dyn AvmContext,
 ) -> Result<(), AlgoError> {
+    // Defense-in-depth: enforce mode restrictions at runtime.
+    check_runtime_mode(machine, instruction.opcode)?;
+
     match instruction.opcode {
         // ---- Error ----
         0x00 => flow::op_err(machine, instruction),
@@ -266,6 +295,194 @@ pub fn dispatch(
                     name, instruction.opcode
                 ),
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bytecode;
+    use crate::context::NullContext;
+    use crate::machine::{AvmMachine, ExecMode};
+
+    /// Build a raw program from version byte + code bytes.
+    fn prog(version: u8, code: &[u8]) -> Vec<u8> {
+        let mut p = vec![version];
+        p.extend_from_slice(code);
+        p
+    }
+
+    /// Step the machine N times.
+    fn step_n(m: &mut AvmMachine, ctx: &mut dyn AvmContext, n: usize) -> Result<(), AlgoError> {
+        for _ in 0..n {
+            m.step(ctx)?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Runtime mode enforcement: app-only opcodes in LogicSig mode must fail
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_app_global_put_rejected_in_logicsig_mode() {
+        // pushbytes "key", pushint 42, app_global_put (0x67)
+        // app_global_put is Application-only
+        let raw = prog(
+            5,
+            &[
+                0x80, 0x03, b'k', b'e', b'y', // pushbytes "key"
+                0x81, 0x2a, // pushint 42
+                0x67, // app_global_put
+            ],
+        );
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 20000);
+        // Step past pushbytes and pushint, then app_global_put should fail
+        let result = step_n(&mut m, &mut NullContext, 3);
+        assert!(
+            result.is_err(),
+            "app_global_put should fail in LogicSig mode"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("not allowed in LogicSig mode"),
+            "expected 'not allowed in LogicSig mode', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_log_rejected_in_logicsig_mode() {
+        // pushbytes "hello", log (0xb0)
+        // log is Application-only
+        let raw = prog(
+            5,
+            &[
+                0x80, 0x05, b'h', b'e', b'l', b'l', b'o', // pushbytes "hello"
+                0xb0, // log
+            ],
+        );
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 20000);
+        let result = step_n(&mut m, &mut NullContext, 2);
+        assert!(result.is_err(), "log should fail in LogicSig mode");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("not allowed in LogicSig mode"),
+            "expected 'not allowed in LogicSig mode', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_itxn_begin_rejected_in_logicsig_mode() {
+        // itxn_begin (0xb1) is Application-only
+        let raw = prog(5, &[0xb1]);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 20000);
+        let result = m.step(&mut NullContext);
+        assert!(result.is_err(), "itxn_begin should fail in LogicSig mode");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("not allowed in LogicSig mode"),
+            "expected 'not allowed in LogicSig mode', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_balance_rejected_in_logicsig_mode() {
+        // pushint 0, balance (0x60) is Application-only
+        let raw = prog(5, &[0x81, 0x00, 0x60]);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 20000);
+        let result = step_n(&mut m, &mut NullContext, 2);
+        assert!(result.is_err(), "balance should fail in LogicSig mode");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("not allowed in LogicSig mode"),
+            "expected 'not allowed in LogicSig mode', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_gload_rejected_in_logicsig_mode() {
+        // gload 0 0 (0x3a) is Application-only
+        let raw = prog(5, &[0x3a, 0x00, 0x00]);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 20000);
+        let result = m.step(&mut NullContext);
+        assert!(result.is_err(), "gload should fail in LogicSig mode");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("not allowed in LogicSig mode"),
+            "expected 'not allowed in LogicSig mode', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_still_works_in_logicsig_mode() {
+        // pushint 3, pushint 4, + => 7 on stack, then pushint 1 for pass
+        let raw = prog(
+            3,
+            &[
+                0x81, 0x03, // pushint 3
+                0x81, 0x04, // pushint 4
+                0x08, // +
+                0x81, 0x01, // pushint 1 (for truthy top of stack)
+            ],
+        );
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 20000);
+        // Run the first 3 instructions: pushint 3, pushint 4, add
+        step_n(&mut m, &mut NullContext, 3).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], crate::machine::AvmValue::Uint64(7));
+    }
+
+    #[test]
+    fn test_crypto_still_works_in_logicsig_mode() {
+        // pushbytes "hello", sha256 => hash on stack
+        let raw = prog(
+            3,
+            &[
+                0x80, 0x05, b'h', b'e', b'l', b'l', b'o', // pushbytes "hello"
+                0x01, // sha256
+            ],
+        );
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 20000);
+        step_n(&mut m, &mut NullContext, 2).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        // sha256("hello") should produce 32 bytes
+        if let crate::machine::AvmValue::Bytes(b) = &m.stack[0] {
+            assert_eq!(b.len(), 32);
+        } else {
+            panic!("expected bytes on stack after sha256");
+        }
+    }
+
+    #[test]
+    fn test_app_only_opcodes_work_in_application_mode() {
+        // Verify that app_global_put does NOT get rejected in Application mode.
+        // It may still fail due to NullContext, but NOT due to mode restriction.
+        let raw = prog(
+            5,
+            &[
+                0x80, 0x03, b'k', b'e', b'y', // pushbytes "key"
+                0x81, 0x2a, // pushint 42
+                0x67, // app_global_put
+            ],
+        );
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let result = step_n(&mut m, &mut NullContext, 3);
+        // It may fail for other reasons (NullContext), but not mode restriction
+        if let Err(e) = &result {
+            let msg = format!("{e}");
+            assert!(
+                !msg.contains("not allowed in"),
+                "should not get mode error in Application mode, got: {msg}"
+            );
         }
     }
 }
