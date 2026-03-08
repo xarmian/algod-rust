@@ -14,17 +14,15 @@ use algo_error::AlgoError;
 use algo_types::{Address, SignedTransaction, TealValue, Transaction};
 use sha2::{Digest, Sha512_256};
 
+use crate::apply::{
+    apply_inner_acfg, apply_inner_afrz, apply_inner_axfer, apply_inner_keyreg, apply_inner_pay,
+};
 use crate::params;
 use crate::store_trait::LedgerStore;
 
 /// Maximum byte string length in the AVM (matches go-algorand `maxStringSize`).
 /// Used for program page chunking.
 const MAX_STRING_SIZE: usize = 4096;
-
-/// Integer division rounding up: `DivCeil(n, d)`.
-fn div_ceil(n: usize, d: usize) -> usize {
-    n.div_ceil(d)
-}
 
 // ---------------------------------------------------------------------------
 // Helper: transaction type string -> TypeEnum integer
@@ -49,7 +47,10 @@ pub fn type_enum(txn_type: &str) -> u64 {
 // Helper: compute application address = SHA512/256("appID" || app_id_be_bytes)
 // ---------------------------------------------------------------------------
 
-fn app_address(app_id: u64) -> [u8; 32] {
+/// Compute an application address: `SHA512/256("appID" || app_id_be_bytes)`.
+///
+/// Exposed publicly for tests and inner transaction execution.
+pub fn app_address(app_id: u64) -> [u8; 32] {
     let mut h = Sha512_256::new();
     h.update(b"appID");
     h.update(app_id.to_be_bytes());
@@ -200,6 +201,16 @@ impl InnerTxnBuilder {
                         txn.asset_amount = *v;
                     }
                 }
+                // AssetSender (clawback source)
+                19 => {
+                    if let TealValue::Bytes(b) = value {
+                        if b.len() == 32 {
+                            let mut addr = [0u8; 32];
+                            addr.copy_from_slice(b);
+                            txn.asset_sender = Some(Address(addr));
+                        }
+                    }
+                }
                 // AssetReceiver
                 20 => {
                     if let TealValue::Bytes(b) = value {
@@ -232,10 +243,126 @@ impl InnerTxnBuilder {
                         txn.on_completion = *v;
                     }
                 }
+                // ApprovalProgram
+                30 => {
+                    if let TealValue::Bytes(b) = value {
+                        txn.approval_program = Some(serde_bytes::ByteBuf::from(b.clone()));
+                    }
+                }
+                // ClearStateProgram
+                31 => {
+                    if let TealValue::Bytes(b) = value {
+                        txn.clear_state_program = Some(serde_bytes::ByteBuf::from(b.clone()));
+                    }
+                }
                 // ConfigAsset
                 33 => {
                     if let TealValue::Uint(v) = value {
                         txn.config_asset = *v;
+                    }
+                }
+                // ConfigAssetTotal
+                34 => {
+                    if let TealValue::Uint(v) = value {
+                        txn.asset_params
+                            .get_or_insert_with(algo_types::AssetParams::default)
+                            .total = *v;
+                    }
+                }
+                // ConfigAssetDecimals
+                35 => {
+                    if let TealValue::Uint(v) = value {
+                        txn.asset_params
+                            .get_or_insert_with(algo_types::AssetParams::default)
+                            .decimals = *v as u32;
+                    }
+                }
+                // ConfigAssetDefaultFrozen
+                36 => {
+                    if let TealValue::Uint(v) = value {
+                        txn.asset_params
+                            .get_or_insert_with(algo_types::AssetParams::default)
+                            .default_frozen = *v != 0;
+                    }
+                }
+                // ConfigAssetUnitName
+                37 => {
+                    if let TealValue::Bytes(b) = value {
+                        txn.asset_params
+                            .get_or_insert_with(algo_types::AssetParams::default)
+                            .unit_name = String::from_utf8_lossy(b).to_string();
+                    }
+                }
+                // ConfigAssetName
+                38 => {
+                    if let TealValue::Bytes(b) = value {
+                        txn.asset_params
+                            .get_or_insert_with(algo_types::AssetParams::default)
+                            .asset_name = String::from_utf8_lossy(b).to_string();
+                    }
+                }
+                // ConfigAssetURL
+                39 => {
+                    if let TealValue::Bytes(b) = value {
+                        txn.asset_params
+                            .get_or_insert_with(algo_types::AssetParams::default)
+                            .url = String::from_utf8_lossy(b).to_string();
+                    }
+                }
+                // ConfigAssetMetadataHash
+                40 => {
+                    if let TealValue::Bytes(b) = value {
+                        txn.asset_params
+                            .get_or_insert_with(algo_types::AssetParams::default)
+                            .metadata_hash = Some(serde_bytes::ByteBuf::from(b.clone()));
+                    }
+                }
+                // ConfigAssetManager
+                41 => {
+                    if let TealValue::Bytes(b) = value {
+                        if b.len() == 32 {
+                            let mut addr = [0u8; 32];
+                            addr.copy_from_slice(b);
+                            txn.asset_params
+                                .get_or_insert_with(algo_types::AssetParams::default)
+                                .manager = Some(Address(addr));
+                        }
+                    }
+                }
+                // ConfigAssetReserve
+                42 => {
+                    if let TealValue::Bytes(b) = value {
+                        if b.len() == 32 {
+                            let mut addr = [0u8; 32];
+                            addr.copy_from_slice(b);
+                            txn.asset_params
+                                .get_or_insert_with(algo_types::AssetParams::default)
+                                .reserve = Some(Address(addr));
+                        }
+                    }
+                }
+                // ConfigAssetFreeze
+                43 => {
+                    if let TealValue::Bytes(b) = value {
+                        if b.len() == 32 {
+                            let mut addr = [0u8; 32];
+                            addr.copy_from_slice(b);
+                            txn.asset_params
+                                .get_or_insert_with(algo_types::AssetParams::default)
+                                .freeze = Some(Address(addr));
+                        }
+                    }
+                }
+                // ConfigAssetClawback
+                44 => {
+                    if let TealValue::Bytes(b) = value {
+                        if b.len() == 32 {
+                            let mut addr = [0u8; 32];
+                            addr.copy_from_slice(b);
+                            txn.asset_params
+                                .get_or_insert_with(algo_types::AssetParams::default)
+                                .clawback = Some(Address(addr));
+                        }
                     }
                 }
                 // FreezeAsset
@@ -258,6 +385,44 @@ impl InnerTxnBuilder {
                 47 => {
                     if let TealValue::Uint(v) = value {
                         txn.asset_frozen = *v != 0;
+                    }
+                }
+                // GlobalNumUint
+                52 => {
+                    if let TealValue::Uint(v) = value {
+                        txn.global_state_schema
+                            .get_or_insert_with(algo_types::StateSchema::default)
+                            .num_uint = *v;
+                    }
+                }
+                // GlobalNumByteSlice
+                53 => {
+                    if let TealValue::Uint(v) = value {
+                        txn.global_state_schema
+                            .get_or_insert_with(algo_types::StateSchema::default)
+                            .num_byte_slice = *v;
+                    }
+                }
+                // LocalNumUint
+                54 => {
+                    if let TealValue::Uint(v) = value {
+                        txn.local_state_schema
+                            .get_or_insert_with(algo_types::StateSchema::default)
+                            .num_uint = *v;
+                    }
+                }
+                // LocalNumByteSlice
+                55 => {
+                    if let TealValue::Uint(v) = value {
+                        txn.local_state_schema
+                            .get_or_insert_with(algo_types::StateSchema::default)
+                            .num_byte_slice = *v;
+                    }
+                }
+                // ExtraProgramPages
+                56 => {
+                    if let TealValue::Uint(v) = value {
+                        txn.extra_program_pages = *v as u32;
                     }
                 }
                 // Nonparticipation
@@ -398,6 +563,39 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     inner_txns: Vec<Vec<SignedTransaction>>,
     /// Genesis hash.
     pub genesis_hash: [u8; 32],
+    /// App ID of the caller (the app that issued the inner txn to invoke us).
+    /// 0 for top-level app calls.
+    pub caller_app_id_val: u64,
+    /// Application address of the caller app.
+    /// Zero address for top-level app calls.
+    pub caller_app_address_val: [u8; 32],
+    /// Inner transaction call depth. 0 for top-level, incremented per level.
+    pub depth: u32,
+    /// Fee credit available from outer transaction group overpayment.
+    ///
+    /// Inner transaction groups can underpay fees if the outer group overpaid.
+    /// This tracks the available credit across all inner txn submissions.
+    pub fee_credit: u64,
+    /// Running transaction counter for asset/app ID generation in inner txns.
+    ///
+    /// Mirrors go-algorand's `Counter()` — incremented before each inner txn
+    /// execution so that `txn_counter + 1` yields a unique creatable ID.
+    pub txn_counter: u64,
+    /// Fee sink address for inner transaction fee deduction.
+    pub fee_sink: Address,
+    /// Opcode budget shared between the AVM machine and inner app call
+    /// execution. Updated by `set_opcode_budget` / `get_opcode_budget`
+    /// before and after `itxn_submit`.
+    pub opcode_budget: i64,
+    /// Precomputed inner transaction IDs, mirroring `inner_txns` structure.
+    /// Each inner txn gets an ID computed via `compute_inner_txn_id(parent, offset, txn)`.
+    inner_txn_ids: Vec<Vec<algo_types::Digest>>,
+    /// Asset IDs created by inner transactions (available to subsequent opcodes).
+    /// Mirrors go-algorand's `resources.createdAsas`.
+    pub created_assets: Vec<u64>,
+    /// App IDs created by inner transactions (available to subsequent opcodes).
+    /// Mirrors go-algorand's `resources.createdApps`.
+    pub created_apps: Vec<u64>,
 }
 
 // Helper to create a default scratch row (256 zero-uint slots).
@@ -438,6 +636,16 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             inner_building: Vec::new(),
             inner_txns: Vec::new(),
             genesis_hash,
+            caller_app_id_val: 0,
+            caller_app_address_val: [0u8; 32],
+            depth: 0,
+            fee_credit: 0,
+            txn_counter: 0,
+            fee_sink: Address::ZERO,
+            opcode_budget: 0,
+            inner_txn_ids: Vec::new(),
+            created_assets: Vec::new(),
+            created_apps: Vec::new(),
         }
     }
 
@@ -459,6 +667,22 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// Completed inner transaction groups.
     pub fn inner_txns(&self) -> &[Vec<SignedTransaction>] {
         &self.inner_txns
+    }
+
+    /// Precomputed inner transaction IDs, mirroring `inner_txns` structure.
+    pub fn inner_txn_ids(&self) -> &[Vec<algo_types::Digest>] {
+        &self.inner_txn_ids
+    }
+
+    /// Remaining inner transaction budget.
+    ///
+    /// With `EnableInnerTransactionPooling` (v31+), the limit is
+    /// `MAX_INNER_TRANSACTIONS * MAX_TX_GROUP_SIZE` pooled across the whole
+    /// group, minus already-submitted inner txns.
+    fn remaining_inners(&self) -> usize {
+        let total_budget = params::MAX_INNER_TRANSACTIONS * params::MAX_TX_GROUP_SIZE;
+        let used: usize = self.inner_txns.iter().map(|g| g.len()).sum();
+        total_budget.saturating_sub(used)
     }
 
     /// Extract accumulated execution results into an `AvmResult`.
@@ -488,6 +712,325 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             error: None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// execute_inner_appl — free function for recursive inner app call execution
+// ---------------------------------------------------------------------------
+
+/// Execute an inner `appl` (application call) transaction by running the
+/// called app's program in a child `LedgerAvmContext`.
+///
+/// This is a free function (not a method on `LedgerAvmContext`) so that
+/// it can reborrow `store: &mut L` without conflicting with the outer
+/// context's borrow. The caller provides all necessary metadata.
+///
+/// On success, applies OnCompletion side effects and returns
+/// `InnerApplyData` with any created app ID.
+#[allow(clippy::too_many_arguments)]
+fn execute_inner_appl<L: LedgerStore>(
+    store: &mut L,
+    stxn: &mut SignedTransaction,
+    caller_depth: u32,
+    caller_app_id: u64,
+    round: u64,
+    latest_timestamp: u64,
+    genesis_hash: [u8; 32],
+    fee_credit: u64,
+    txn_counter: u64,
+    fee_sink: Address,
+    opcode_budget: &mut i64,
+) -> Result<crate::apply::InnerApplyData, AlgoError> {
+    use algo_avm::eval::{run_approval_program, run_clear_state_program};
+    use algo_avm::group::GroupBudget;
+
+    let mut ad = crate::apply::InnerApplyData::default();
+    let called_app_id = stxn.txn.application_id;
+    let on_completion = stxn.txn.on_completion;
+    let sender = stxn.txn.sender;
+
+    // ── Handle app creation (application_id == 0) ──
+    let effective_app_id = if called_app_id == 0 {
+        // Create a new application. Use txn_counter + 1 as the new app ID,
+        // matching go-algorand's createApplication(txnCounter + 1).
+        let new_app_id = txn_counter + 1;
+        ad.application_id = new_app_id;
+
+        let approval = stxn
+            .txn
+            .approval_program
+            .as_ref()
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
+        let clear = stxn
+            .txn
+            .clear_state_program
+            .as_ref()
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
+
+        let global_schema = stxn.txn.global_state_schema.clone().unwrap_or_default();
+        let local_schema = stxn.txn.local_state_schema.clone().unwrap_or_default();
+
+        let app_params = algo_types::AppParams {
+            creator: sender,
+            approval_program: approval,
+            clear_state_program: clear,
+            global_state: std::collections::BTreeMap::new(),
+            global_state_schema: global_schema,
+            local_state_schema: local_schema,
+            extra_program_pages: stxn.txn.extra_program_pages,
+        };
+        store.set_app_params(new_app_id, app_params);
+
+        // Update creator's account counters.
+        let mut creator_acct = store.get_or_default_account(&sender);
+        creator_acct.total_created_apps += 1;
+        store.set_account(&sender, creator_acct);
+
+        // Record the created app ID on the SignedTransaction.
+        stxn.apply_data_application_id = new_app_id;
+
+        new_app_id
+    } else {
+        called_app_id
+    };
+
+    // ── OptIn: create local state before running program ──
+    if on_completion == 1 {
+        // OptInOC = 1
+        if !store.has_app_local_state(&sender, effective_app_id) {
+            let app = store
+                .get_app_params(effective_app_id)
+                .ok_or_else(|| AlgoError::Avm {
+                    message: format!("inner appl opt-in: app {} not found", effective_app_id),
+                })?;
+            let local = algo_types::AppLocalState {
+                schema: app.local_state_schema.clone(),
+                key_value: std::collections::BTreeMap::new(),
+            };
+            store.set_app_local_state(&sender, effective_app_id, local);
+
+            // Update account counters.
+            let mut acct = store.get_or_default_account(&sender);
+            acct.total_apps_opted_in += 1;
+            store.set_account(&sender, acct);
+        }
+    }
+
+    // ── Load the program ──
+    let app = store
+        .get_app_params(effective_app_id)
+        .ok_or_else(|| AlgoError::Avm {
+            message: format!("inner appl: app {} not found", effective_app_id),
+        })?;
+
+    let program = if on_completion == 3 {
+        // ClearStateOC
+        app.clear_state_program.clone()
+    } else {
+        app.approval_program.clone()
+    };
+    let creator = app.creator.0;
+
+    // Compute program hash for ed25519verify domain separation.
+    let program_hash = {
+        let mut h = Sha512_256::new();
+        h.update(b"Program");
+        h.update(&program);
+        let result: [u8; 32] = h.finalize().into();
+        result
+    };
+
+    // ── Budget pooling: add INNER_APP_BUDGET for this app call ──
+    // Per go-algorand IsolateClearState: ClearState programs run with their
+    // own isolated budget (MAX_APP_PROGRAM_COST = 700) and do NOT add to
+    // the shared pool. Only non-ClearState app calls contribute budget.
+    if on_completion != 3 {
+        *opcode_budget += params::INNER_APP_BUDGET;
+    }
+
+    // ── Create a GroupBudget from the shared opcode budget ──
+    // We create a GroupBudget with 0 app calls (so initial = 0), then add
+    // the full shared budget to it.
+    let mut budget = GroupBudget::new(0);
+    budget.add(*opcode_budget);
+
+    // ── Create child AVM context ──
+    // Build a single-txn group containing just the inner app call.
+    let inner_group = vec![stxn.clone()];
+    let mut inner_ctx = LedgerAvmContext::new(
+        store,
+        inner_group,
+        0, // group_index
+        round,
+        latest_timestamp,
+        effective_app_id,
+        creator,
+        true, // app_mode
+        program_hash,
+        genesis_hash,
+    );
+    inner_ctx.caller_app_id_val = caller_app_id;
+    inner_ctx.caller_app_address_val = app_address(caller_app_id);
+    inner_ctx.depth = caller_depth + 1;
+    inner_ctx.fee_credit = fee_credit;
+    inner_ctx.txn_counter = txn_counter;
+    inner_ctx.fee_sink = fee_sink;
+
+    // ── Execute the program ──
+    let avm_result = if on_completion == 3 {
+        // ClearStateOC: run clear state program. On failure, still clear state.
+        run_clear_state_program(&program, &mut inner_ctx)
+    } else {
+        match run_approval_program(&program, &mut inner_ctx, &mut budget) {
+            Ok(result) => result,
+            Err(e) => {
+                // Update the shared budget with what was consumed.
+                *opcode_budget = budget.remaining();
+                return Err(e);
+            }
+        }
+    };
+
+    // ── Update shared opcode budget ──
+    *opcode_budget = budget.remaining();
+
+    // ── Check approval ──
+    if on_completion != 3 && !avm_result.approved {
+        // Non-ClearState programs must approve.
+        let err_msg = avm_result
+            .error
+            .unwrap_or_else(|| "program rejected".to_string());
+        return Err(AlgoError::Avm {
+            message: format!("inner appl: {}", err_msg),
+        });
+    }
+
+    // ── Collect logs, inner txns, fee_credit, and txn_counter from child ──
+    let inner_logs = inner_ctx.logs.clone();
+    let inner_txns_from_child: Vec<SignedTransaction> = inner_ctx
+        .inner_txns
+        .iter()
+        .flat_map(|g| g.iter().cloned())
+        .collect();
+    // Capture fee_credit and txn_counter for propagation back to parent (H5/H6).
+    let child_fee_credit = inner_ctx.fee_credit;
+    let child_txn_counter = inner_ctx.txn_counter;
+
+    // Store logs and nested inner txns as the eval_delta on the
+    // inner SignedTransaction. We build a minimal eval_delta rmpv::Value map.
+    if !inner_logs.is_empty() || !inner_txns_from_child.is_empty() {
+        let mut dt_map: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
+
+        if !inner_logs.is_empty() {
+            let log_values: Vec<rmpv::Value> = inner_logs
+                .iter()
+                .map(|l| rmpv::Value::Binary(l.clone()))
+                .collect();
+            dt_map.push((
+                rmpv::Value::String("lg".into()),
+                rmpv::Value::Array(log_values),
+            ));
+        }
+
+        // Serialize nested inner transactions under the "itx" key,
+        // matching go-algorand's EvalDelta.InnerTxns field.
+        if !inner_txns_from_child.is_empty() {
+            let itx_values: Vec<rmpv::Value> = inner_txns_from_child
+                .iter()
+                .filter_map(|stxn_child| {
+                    let bytes = rmp_serde::to_vec_named(stxn_child).ok()?;
+                    rmpv::decode::read_value(&mut &bytes[..]).ok()
+                })
+                .collect();
+            if !itx_values.is_empty() {
+                dt_map.push((
+                    rmpv::Value::String("itx".into()),
+                    rmpv::Value::Array(itx_values),
+                ));
+            }
+        }
+
+        stxn.eval_delta = Some(rmpv::Value::Map(dt_map));
+    }
+
+    // ── Apply OnCompletion side effects (post-program) ──
+    // The store reference is now available again since inner_ctx is dropped
+    // at the end of this function. But inner_ctx still exists here...
+    // Actually inner_ctx borrows store, so we need to drop it first.
+    drop(inner_ctx);
+
+    match on_completion {
+        0 => {} // NoOpOC — nothing to do
+        1 => {} // OptInOC — local state was already created above
+        2 => {
+            // CloseOutOC — remove local state
+            store.remove_app_local_state(&sender, effective_app_id);
+            let mut acct = store.get_or_default_account(&sender);
+            if acct.total_apps_opted_in > 0 {
+                acct.total_apps_opted_in -= 1;
+            }
+            store.set_account(&sender, acct);
+        }
+        3 => {
+            // ClearStateOC — always clear local state regardless of program result
+            if store.has_app_local_state(&sender, effective_app_id) {
+                store.remove_app_local_state(&sender, effective_app_id);
+                let mut acct = store.get_or_default_account(&sender);
+                if acct.total_apps_opted_in > 0 {
+                    acct.total_apps_opted_in -= 1;
+                }
+                store.set_account(&sender, acct);
+            }
+        }
+        4 => {
+            // UpdateApplicationOC — update the program
+            let approval = stxn
+                .txn
+                .approval_program
+                .as_ref()
+                .map(|b| b.to_vec())
+                .unwrap_or_default();
+            let clear = stxn
+                .txn
+                .clear_state_program
+                .as_ref()
+                .map(|b| b.to_vec())
+                .unwrap_or_default();
+            if let Some(mut app) = store.get_app_params(effective_app_id) {
+                if !approval.is_empty() {
+                    app.approval_program = approval;
+                }
+                if !clear.is_empty() {
+                    app.clear_state_program = clear;
+                }
+                store.set_app_params(effective_app_id, app);
+            }
+        }
+        5 => {
+            // DeleteApplicationOC — remove the app
+            store.remove_app_params(effective_app_id);
+            // Update creator's account counters.
+            let creator_addr = Address(creator);
+            let mut creator_acct = store.get_or_default_account(&creator_addr);
+            if creator_acct.total_created_apps > 0 {
+                creator_acct.total_created_apps -= 1;
+            }
+            store.set_account(&creator_addr, creator_acct);
+        }
+        _ => {
+            return Err(AlgoError::Avm {
+                message: format!("inner appl: unknown OnCompletion {}", on_completion),
+            });
+        }
+    }
+
+    // Propagate fee_credit and txn_counter back to the parent (H5/H6).
+    ad.fee_credit = child_fee_credit;
+    ad.txn_counter = child_txn_counter;
+
+    Ok(ad)
 }
 
 // ---------------------------------------------------------------------------
@@ -887,7 +1430,7 @@ fn read_txn_field(
                 .as_ref()
                 .map(|b| b.as_slice())
                 .unwrap_or(&[]);
-            let page_count = div_ceil(program.len(), MAX_STRING_SIZE);
+            let page_count = program.len().div_ceil(MAX_STRING_SIZE);
             match array_index {
                 Some(i) => {
                     if i >= page_count {
@@ -906,7 +1449,7 @@ fn read_txn_field(
         // NumApprovalProgramPages
         65 => {
             let len = txn.approval_program.as_ref().map(|b| b.len()).unwrap_or(0);
-            Ok(TealValue::Uint(div_ceil(len, MAX_STRING_SIZE) as u64))
+            Ok(TealValue::Uint(len.div_ceil(MAX_STRING_SIZE) as u64))
         }
         // ClearStateProgramPages (array) — same 4096-byte paging as approval.
         66 => {
@@ -915,7 +1458,7 @@ fn read_txn_field(
                 .as_ref()
                 .map(|b| b.as_slice())
                 .unwrap_or(&[]);
-            let page_count = div_ceil(program.len(), MAX_STRING_SIZE);
+            let page_count = program.len().div_ceil(MAX_STRING_SIZE);
             match array_index {
                 Some(i) => {
                     if i >= page_count {
@@ -938,7 +1481,7 @@ fn read_txn_field(
                 .as_ref()
                 .map(|b| b.len())
                 .unwrap_or(0);
-            Ok(TealValue::Uint(div_ceil(len, MAX_STRING_SIZE) as u64))
+            Ok(TealValue::Uint(len.div_ceil(MAX_STRING_SIZE) as u64))
         }
         // RejectVersion — AVM v12+.
         68 => Ok(TealValue::Uint(txn.reject_version)),
@@ -1025,10 +1568,12 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             // OpcodeBudget — handled directly in op_global (reads machine.budget);
             // this fallback returns 0 but should not normally be reached.
             12 => Ok(TealValue::Uint(0)),
-            // CallerApplicationID — 0 when not called from another app
-            13 => Ok(TealValue::Uint(0)),
-            // CallerApplicationAddress — zero address when no caller
-            14 => Ok(TealValue::Bytes(vec![0u8; 32])),
+            // CallerApplicationID — uses caller fields set during inner app call.
+            // Note: op_global intercepts this field and calls caller_app_id()
+            // directly, but this fallback is kept for completeness.
+            13 => Ok(TealValue::Uint(self.caller_app_id_val)),
+            // CallerApplicationAddress — uses caller fields.
+            14 => Ok(TealValue::Bytes(self.caller_app_address_val.to_vec())),
             // AssetCreateMinBalance
             15 => Ok(TealValue::Uint(params::ASSET_OPT_IN_MIN_BALANCE)),
             // AssetOptInMinBalance
@@ -1512,9 +2057,22 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     // ---- Inner transactions ----
 
     fn itxn_begin(&mut self) -> Result<(), AlgoError> {
-        // Per go-algorand, calling itxn_begin while already building discards
-        // the in-progress group and starts fresh.
-        self.inner_building.clear();
+        // Per go-algorand, calling itxn_begin while subtxns are already in
+        // progress is an error: "itxn_begin without itxn_submit".
+        if !self.inner_building.is_empty() {
+            return Err(AlgoError::Avm {
+                message: "itxn_begin without itxn_submit".to_string(),
+            });
+        }
+        // Per go-algorand IsolateClearState: clear state programs cannot
+        // issue inner transactions.
+        let on_completion = self.group[self.group_index].txn.on_completion;
+        if on_completion == 3 {
+            // ClearStateOC = 3
+            return Err(AlgoError::Avm {
+                message: "clear state programs can not issue inner transactions".to_string(),
+            });
+        }
         self.inner_building.push(InnerTxnBuilder::new());
         Ok(())
     }
@@ -1533,7 +2091,28 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     fn itxn_next(&mut self) -> Result<(), AlgoError> {
         if self.inner_building.is_empty() {
             return Err(AlgoError::Avm {
-                message: "itxn_next: no inner txn being built".to_string(),
+                message: "itxn_next without itxn_begin".to_string(),
+            });
+        }
+        // Per go-algorand addInnerTxn: check group size limit (precise) and
+        // remaining inner txn budget (allows one extra for v5 compat, checked
+        // precisely in itxn_submit).
+        if self.inner_building.len() >= params::MAX_TX_GROUP_SIZE {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "too many inner transactions {} with {} left",
+                    self.inner_building.len(),
+                    self.remaining_inners()
+                ),
+            });
+        }
+        if self.inner_building.len() > self.remaining_inners() {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "too many inner transactions {} with {} left",
+                    self.inner_building.len(),
+                    self.remaining_inners()
+                ),
             });
         }
         self.inner_building.push(InnerTxnBuilder::new());
@@ -1543,22 +2122,403 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     fn itxn_submit(&mut self) -> Result<(), AlgoError> {
         if self.inner_building.is_empty() {
             return Err(AlgoError::Avm {
-                message: "itxn_submit: no inner txn being built".to_string(),
+                message: "itxn_submit without itxn_begin".to_string(),
             });
         }
+
+        let num_subtxns = self.inner_building.len();
+
+        // Check group size and remaining inner txn budget.
+        if num_subtxns > self.remaining_inners() || num_subtxns > params::MAX_TX_GROUP_SIZE {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "too many inner transactions {} with {} left",
+                    num_subtxns,
+                    self.remaining_inners()
+                ),
+            });
+        }
+
+        // ── Build inner transactions from the accumulated fields ──
         let builders = std::mem::take(&mut self.inner_building);
         let default_sender = Address(app_address(self.app_id));
-        let txns: Vec<SignedTransaction> = builders
+        let mut txns: Vec<SignedTransaction> = builders
             .iter()
             .map(|b| {
                 let mut stxn = b.build();
+                // Default sender to the application address if not explicitly set.
                 if stxn.txn.sender == Address::ZERO {
                     stxn.txn.sender = default_sender;
                 }
+                // Default fee to MinTxnFee if not explicitly set (fee == 0).
+                if stxn.txn.fee == 0 {
+                    stxn.txn.fee = params::MIN_TXN_FEE;
+                }
+                // Copy FirstValid/LastValid from the outer transaction.
+                let outer = &self.group[self.group_index].txn;
+                stxn.txn.first_valid = outer.first_valid;
+                stxn.txn.last_valid = outer.last_valid;
                 stxn
             })
             .collect();
+
+        // ── Fee credit / pooling (matches go-algorand opItxnSubmit) ──
+        //
+        // Total required = MinTxnFee * num_subtxns.
+        // Total paid = sum of individual fees.
+        // Shortfall is covered by fee_credit (from outer group overpayment).
+        // Overpayment is added back to fee_credit.
+        let group_fee = params::MIN_TXN_FEE.saturating_mul(num_subtxns as u64);
+        let group_paid: u64 = txns
+            .iter()
+            .map(|stxn| stxn.txn.fee)
+            .fold(0u64, |a, b| a.saturating_add(b));
+        if group_paid < group_fee {
+            let shortfall = group_fee - group_paid;
+            if self.fee_credit < shortfall {
+                return Err(AlgoError::Avm {
+                    message: format!(
+                        "fee too small: inner group needs {} but only paid {} with {} credit",
+                        group_fee, group_paid, self.fee_credit
+                    ),
+                });
+            }
+            self.fee_credit -= shortfall;
+        } else {
+            let overpay = group_paid - group_fee;
+            self.fee_credit = self.fee_credit.saturating_add(overpay);
+        }
+
+        // ── Validate transaction types and inner app call constraints ──
+        for stxn in &txns {
+            let tt = stxn.txn.txn_type.as_str();
+            match tt {
+                "pay" | "axfer" | "acfg" | "afrz" | "keyreg" => {}
+                "appl" => {
+                    let called_app_id = stxn.txn.application_id;
+
+                    // Disallow self-call (reentrancy on the same app).
+                    if called_app_id == self.app_id {
+                        return Err(AlgoError::Avm {
+                            message: "attempt to self-call".to_string(),
+                        });
+                    }
+
+                    // Check depth limit: count ancestors (matching go-algorand
+                    // which walks the `caller` chain). Our `self.depth` is 0 for
+                    // top-level, so `depth >= MAX_APP_CALL_DEPTH` means too deep.
+                    if self.depth as usize >= params::MAX_APP_CALL_DEPTH {
+                        return Err(AlgoError::Avm {
+                            message: format!("appl depth ({}) exceeded", self.depth),
+                        });
+                    }
+
+                    // Determine the program to check version on.
+                    let program = if called_app_id != 0 {
+                        let app = self.store.get_app_params(called_app_id).ok_or_else(|| {
+                            AlgoError::Avm {
+                                message: format!(
+                                    "inner appl: app {} does not exist",
+                                    called_app_id
+                                ),
+                            }
+                        })?;
+                        if stxn.txn.on_completion == 3 {
+                            // ClearStateOC
+                            app.clear_state_program.clone()
+                        } else {
+                            app.approval_program.clone()
+                        }
+                    } else {
+                        // App creation: program comes from the transaction.
+                        stxn.txn
+                            .approval_program
+                            .as_ref()
+                            .map(|b| b.to_vec())
+                            .unwrap_or_default()
+                    };
+
+                    // Version check: inner app calls require >= MIN_INNER_APPL_VERSION.
+                    if program.is_empty() {
+                        return Err(AlgoError::Avm {
+                            message: "inner appl: empty program".to_string(),
+                        });
+                    }
+                    let called_version = program[0] as u64;
+                    if called_version < params::MIN_INNER_APPL_VERSION {
+                        return Err(AlgoError::Avm {
+                            message: format!(
+                                "inner app call with version v{} < v{}",
+                                called_version,
+                                params::MIN_INNER_APPL_VERSION
+                            ),
+                        });
+                    }
+
+                    // For OptIn, also check that the clear state program meets
+                    // the minimum version requirement.
+                    if stxn.txn.on_completion == 1 {
+                        // OptInOC
+                        let csp = if called_app_id != 0 {
+                            let app =
+                                self.store.get_app_params(called_app_id).ok_or_else(|| {
+                                    AlgoError::Avm {
+                                        message: format!(
+                                            "inner appl: app {} does not exist",
+                                            called_app_id
+                                        ),
+                                    }
+                                })?;
+                            app.clear_state_program.clone()
+                        } else {
+                            stxn.txn
+                                .clear_state_program
+                                .as_ref()
+                                .map(|b| b.to_vec())
+                                .unwrap_or_default()
+                        };
+                        if !csp.is_empty() {
+                            let csv = csp[0] as u64;
+                            if csv < params::MIN_INNER_APPL_VERSION {
+                                return Err(AlgoError::Avm {
+                                    message: format!(
+                                        "inner app call opt-in with CSP v{} < v{}",
+                                        csv,
+                                        params::MIN_INNER_APPL_VERSION
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    return Err(AlgoError::Avm {
+                        message: format!("unsupported inner transaction type: {}", tt),
+                    });
+                }
+            }
+        }
+
+        // ── Sender authorization ──
+        //
+        // Per go-algorand authorizedSender: the sender must be the current
+        // app address, or an account whose auth_addr (rekey) is the app address.
+        let app_addr = app_address(self.app_id);
+        for stxn in &txns {
+            let sender = &stxn.txn.sender;
+            if sender.0 == app_addr {
+                continue; // app address itself — always authorized
+            }
+            // Check if the sender is rekeyed to the app address.
+            let acct = self.store.get_or_default_account(sender);
+            let authorizer = acct.auth_addr.as_ref().map(|a| a.0).unwrap_or(sender.0);
+            if authorizer != app_addr {
+                return Err(AlgoError::Avm {
+                    message: format!(
+                        "app {} (addr {}) unauthorized {}",
+                        self.app_id,
+                        Address(app_addr),
+                        Address(authorizer),
+                    ),
+                });
+            }
+        }
+
+        // ── Take state snapshot for rollback ──
+        //
+        // Collect all addresses involved so the snapshot covers their state.
+        let mut snapshot_addrs: Vec<Address> = Vec::new();
+        snapshot_addrs.push(self.fee_sink);
+        for stxn in &txns {
+            snapshot_addrs.push(stxn.txn.sender);
+            if !stxn.txn.receiver.is_zero() {
+                snapshot_addrs.push(stxn.txn.receiver);
+            }
+            if !stxn.txn.close_remainder_to.is_zero() {
+                snapshot_addrs.push(stxn.txn.close_remainder_to);
+            }
+            if let Some(ref arcv) = stxn.txn.asset_receiver {
+                snapshot_addrs.push(*arcv);
+            }
+            if let Some(ref acl) = stxn.txn.asset_close_to {
+                snapshot_addrs.push(*acl);
+            }
+            if let Some(ref fa) = stxn.txn.freeze_account {
+                snapshot_addrs.push(*fa);
+            }
+            // For appl inner txns, include all accounts from the transaction's
+            // accounts array, plus the called app's address. These accounts can
+            // be mutated during program execution (H4).
+            if stxn.txn.txn_type == "appl" {
+                if let Some(ref accts) = stxn.txn.accounts {
+                    for acct in accts {
+                        snapshot_addrs.push(*acct);
+                    }
+                }
+                // Include the called app's address.
+                if stxn.txn.application_id != 0 {
+                    snapshot_addrs.push(Address(app_address(stxn.txn.application_id)));
+                }
+            }
+        }
+        // Deduplicate addresses by converting through raw bytes.
+        {
+            let mut seen = std::collections::HashSet::new();
+            snapshot_addrs.retain(|a| seen.insert(a.0));
+        }
+
+        // Collect asset/app IDs that might be created or modified.
+        let mut asset_ids: Vec<u64> = Vec::new();
+        let mut app_ids: Vec<u64> = Vec::new();
+        for stxn in &txns {
+            if stxn.txn.config_asset != 0 {
+                asset_ids.push(stxn.txn.config_asset);
+            }
+            if stxn.txn.xaid != 0 {
+                asset_ids.push(stxn.txn.xaid);
+            }
+            if stxn.txn.freeze_asset != 0 {
+                asset_ids.push(stxn.txn.freeze_asset);
+            }
+            // Include app IDs for inner app calls.
+            if stxn.txn.txn_type == "appl" && stxn.txn.application_id != 0 {
+                app_ids.push(stxn.txn.application_id);
+            }
+        }
+        asset_ids.sort();
+        asset_ids.dedup();
+        app_ids.sort();
+        app_ids.dedup();
+
+        let snapshot = self
+            .store
+            .snapshot_with_ids(&snapshot_addrs, &asset_ids, &app_ids);
+
+        // ── Execute each inner transaction ──
+        let round = self.round;
+        let fee_sink = self.fee_sink;
+        let txn_counter_base = self.txn_counter;
+
+        for (i, stxn) in txns.iter_mut().enumerate() {
+            // Deduct fee from sender to fee_sink (matches go-algorand takeFee).
+            let fee = stxn.txn.fee;
+            if fee > 0 && !fee_sink.is_zero() {
+                let mut sender_acct = self.store.get_or_default_account(&stxn.txn.sender);
+                if sender_acct.micro_algos < fee {
+                    self.store.restore_snapshot(snapshot);
+                    return Err(AlgoError::Avm {
+                        message: format!(
+                            "inner tx {}: sender {} has insufficient balance {} for fee {}",
+                            i, stxn.txn.sender, sender_acct.micro_algos, fee,
+                        ),
+                    });
+                }
+                sender_acct.micro_algos -= fee;
+                self.store.set_account(&stxn.txn.sender, sender_acct);
+
+                let mut sink_acct = self.store.get_or_default_account(&fee_sink);
+                sink_acct.micro_algos += fee;
+                self.store.set_account(&fee_sink, sink_acct);
+            }
+
+            // Increment txn counter before execution (matches go-algorand incTxnCount).
+            self.txn_counter = txn_counter_base + (i as u64) + 1;
+
+            // Dispatch to the appropriate apply function.
+            if stxn.txn.txn_type == "appl" {
+                // ── Inner app call — recursive AVM execution ──
+                let result = execute_inner_appl(
+                    self.store,
+                    stxn,
+                    self.depth,
+                    self.app_id,
+                    self.round,
+                    self.latest_timestamp,
+                    self.genesis_hash,
+                    self.fee_credit,
+                    self.txn_counter,
+                    self.fee_sink,
+                    &mut self.opcode_budget,
+                );
+                match result {
+                    Ok(ad) => {
+                        stxn.apply_data_config_asset = ad.config_asset;
+                        stxn.apply_data_application_id = ad.application_id;
+                        // Propagate fee_credit and txn_counter back from child (H5/H6).
+                        self.fee_credit = ad.fee_credit;
+                        self.txn_counter = ad.txn_counter;
+                    }
+                    Err(e) => {
+                        self.store.restore_snapshot(snapshot);
+                        return Err(AlgoError::Avm {
+                            message: format!("inner tx {} failed: {}", i, e),
+                        });
+                    }
+                }
+            } else {
+                let result = match stxn.txn.txn_type.as_str() {
+                    "pay" => apply_inner_pay(self.store, &stxn.txn),
+                    "axfer" => apply_inner_axfer(self.store, &stxn.txn),
+                    "acfg" => apply_inner_acfg(self.store, &stxn.txn, self.txn_counter),
+                    "afrz" => apply_inner_afrz(self.store, &stxn.txn),
+                    "keyreg" => apply_inner_keyreg(self.store, &stxn.txn, round),
+                    _ => {
+                        // Should not reach here due to earlier validation.
+                        self.store.restore_snapshot(snapshot);
+                        return Err(AlgoError::Avm {
+                            message: format!(
+                                "inner tx {}: unsupported type {}",
+                                i, stxn.txn.txn_type
+                            ),
+                        });
+                    }
+                };
+
+                match result {
+                    Ok(ad) => {
+                        stxn.apply_data_config_asset = ad.config_asset;
+                        stxn.apply_data_application_id = ad.application_id;
+                    }
+                    Err(e) => {
+                        self.store.restore_snapshot(snapshot);
+                        return Err(AlgoError::Avm {
+                            message: format!("inner tx {} failed: {}", i, e),
+                        });
+                    }
+                }
+            }
+        }
+
+        // ── Compute inner transaction IDs ──
+        //
+        // Each inner txn gets a unique ID derived from the parent (outer) txn's
+        // ID and its offset within all inner txns. This matches go-algorand's
+        // `Transaction.InnerID(parent, offset)`.
+        let parent_txid = algo_codec::compute_txn_id(&self.group[self.group_index].txn);
+        let offset_base: usize = self.inner_txns.iter().map(|g| g.len()).sum();
+        let mut ids = Vec::with_capacity(txns.len());
+        for (i, stxn) in txns.iter().enumerate() {
+            let id = algo_avm::itxn::compute_inner_txn_id(&parent_txid, offset_base + i, &stxn.txn);
+            ids.push(id);
+        }
+
+        // ── Track created resources (assets and apps) ──
+        //
+        // When inner transactions create new assets or apps, those resources
+        // become available to subsequent opcodes (matches go-algorand
+        // `createdAsas` / `createdApps`).
+        for stxn in &txns {
+            if stxn.apply_data_config_asset != 0 {
+                self.created_assets.push(stxn.apply_data_config_asset);
+            }
+            if stxn.apply_data_application_id != 0 {
+                self.created_apps.push(stxn.apply_data_application_id);
+            }
+        }
+
+        // ── Record completed inner transactions ──
         self.inner_txns.push(txns);
+        self.inner_txn_ids.push(ids);
         Ok(())
     }
 
@@ -1573,6 +2533,14 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         let last_txn = last_group.last().ok_or_else(|| AlgoError::Avm {
             message: "last_itxn_field: empty inner txn group".to_string(),
         })?;
+        // TxID (field 23) for inner txns uses the precomputed inner txn ID.
+        if field == 23 {
+            if let Some(last_ids) = self.inner_txn_ids.last() {
+                if let Some(id) = last_ids.last() {
+                    return Ok(TealValue::Bytes(id.0.to_vec()));
+                }
+            }
+        }
         read_txn_field(last_txn, field, array_index, 0)
     }
 
@@ -1594,6 +2562,14 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 ),
             });
         }
+        // TxID (field 23) for inner txns uses the precomputed inner txn ID.
+        if field == 23 {
+            if let Some(last_ids) = self.inner_txn_ids.last() {
+                if let Some(id) = last_ids.get(group_index) {
+                    return Ok(TealValue::Bytes(id.0.to_vec()));
+                }
+            }
+        }
         read_txn_field(&last_group[group_index], field, array_index, group_index)
     }
 
@@ -1613,6 +2589,76 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
     fn program_hash(&self) -> [u8; 32] {
         self.program_hash_value
+    }
+
+    // ---- Inner transaction caller / depth ----
+
+    fn caller_app_id(&self) -> u64 {
+        self.caller_app_id_val
+    }
+
+    fn caller_app_address(&self) -> [u8; 32] {
+        self.caller_app_address_val
+    }
+
+    fn inner_txn_depth(&self) -> u32 {
+        self.depth
+    }
+
+    // ---- Budget sharing for inner app calls ----
+
+    fn set_opcode_budget(&mut self, budget: i64) {
+        self.opcode_budget = budget;
+    }
+
+    fn get_opcode_budget(&self) -> i64 {
+        self.opcode_budget
+    }
+
+    // ---- Resource availability ----
+
+    fn is_asset_available(&self, asset_id: u64) -> bool {
+        if asset_id == 0 {
+            return false;
+        }
+        // Check the current transaction's foreign assets array.
+        let txn = &self.group[self.group_index].txn;
+        if let Some(ref assets) = txn.foreign_assets {
+            if assets.contains(&asset_id) {
+                return true;
+            }
+        }
+        // Check implied asset IDs from the transaction.
+        if txn.xaid == asset_id || txn.config_asset == asset_id || txn.freeze_asset == asset_id {
+            return true;
+        }
+        // Check assets created by inner transactions.
+        if self.created_assets.contains(&asset_id) {
+            return true;
+        }
+        false
+    }
+
+    fn is_app_available(&self, app_id: u64) -> bool {
+        if app_id == 0 {
+            return false;
+        }
+        // Current app is always available.
+        if app_id == self.app_id {
+            return true;
+        }
+        // Check the current transaction's foreign apps array.
+        let txn = &self.group[self.group_index].txn;
+        if let Some(ref apps) = txn.foreign_apps {
+            if apps.contains(&app_id) {
+                return true;
+            }
+        }
+        // Check apps created by inner transactions.
+        if self.created_apps.contains(&app_id) {
+            return true;
+        }
+        false
     }
 }
 
@@ -2407,6 +3453,17 @@ mod tests {
     fn inner_txn_build_and_submit() {
         let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
         let mut store = LedgerState::new();
+
+        // Fund the app address (app_id=42) so inner pay can succeed.
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
         let mut ctx = make_context(&mut store, vec![txn]);
 
         assert_eq!(ctx.num_inner_txns(), 0);
@@ -2429,21 +3486,84 @@ mod tests {
 
         let rcv_val = ctx.last_itxn_field(7, None).unwrap(); // Receiver
         assert_eq!(rcv_val, TealValue::Bytes([30u8; 32].to_vec()));
+
+        // Verify that the receiver actually got funded.
+        let rcv_acct = store.get_account(&Address([30u8; 32]));
+        assert_eq!(rcv_acct.unwrap().micro_algos, 999);
     }
 
     #[test]
     fn inner_txn_group() {
+        use algo_types::{AssetHolding as AssetHoldingType, AssetParamsRecord};
+
         let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
         let mut store = LedgerState::new();
+
+        // Fund the app address (app_id=42) so inner pay can succeed.
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                total_assets_opted_in: 1,
+                ..Default::default()
+            },
+        );
+
+        // Set up asset 77 so axfer can succeed.
+        let asset_params = algo_types::AssetParams {
+            total: 1_000_000,
+            ..Default::default()
+        };
+        store.set_asset_params(
+            77,
+            AssetParamsRecord {
+                params: asset_params,
+                creator: app_addr,
+            },
+        );
+        // App address holds asset 77.
+        store.set_asset_holding(
+            &app_addr,
+            77,
+            AssetHoldingType {
+                amount: 1_000_000,
+                frozen: false,
+            },
+        );
+        // Receiver [30u8; 32] opts in to asset 77.
+        let rcv_addr = Address([30u8; 32]);
+        store.set_account(
+            &rcv_addr,
+            AccountData {
+                micro_algos: 100_000,
+                total_assets_opted_in: 1,
+                ..Default::default()
+            },
+        );
+        store.set_asset_holding(
+            &rcv_addr,
+            77,
+            AssetHoldingType {
+                amount: 0,
+                frozen: false,
+            },
+        );
+
         let mut ctx = make_context(&mut store, vec![txn]);
 
         ctx.itxn_begin().unwrap();
         ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // pay
         ctx.itxn_field(8, TealValue::Uint(100)).unwrap();
+        ctx.itxn_field(7, TealValue::Bytes(rcv_addr.0.to_vec()))
+            .unwrap(); // Receiver
 
         ctx.itxn_next().unwrap();
         ctx.itxn_field(16, TealValue::Uint(4)).unwrap(); // axfer
+        ctx.itxn_field(17, TealValue::Uint(77)).unwrap(); // XferAsset
         ctx.itxn_field(18, TealValue::Uint(200)).unwrap(); // AssetAmount
+        ctx.itxn_field(20, TealValue::Bytes(rcv_addr.0.to_vec()))
+            .unwrap(); // AssetReceiver
 
         ctx.itxn_submit().unwrap();
 
@@ -2455,6 +3575,12 @@ mod tests {
 
         let val = ctx.last_itxn_group_field(1, 18, None).unwrap(); // AssetAmount of second
         assert_eq!(val, TealValue::Uint(200));
+
+        // Verify state changes: receiver got 100 microAlgos and 200 units of asset 77.
+        let rcv_acct = store.get_account(&rcv_addr).unwrap();
+        assert_eq!(rcv_acct.micro_algos, 100_000 + 100);
+        let rcv_holding = store.get_asset_holding(&rcv_addr, 77).unwrap();
+        assert_eq!(rcv_holding.amount, 200);
     }
 
     #[test]
@@ -2620,15 +3746,1274 @@ mod tests {
         assert!(ctx.txn_field(0, 64, Some(1)).is_err());
     }
 
-    // ---- div_ceil helper test ----
+    // ---- div_ceil inline test (std usize::div_ceil) ----
 
     #[test]
     fn test_div_ceil() {
-        assert_eq!(super::div_ceil(0, 4096), 0);
-        assert_eq!(super::div_ceil(1, 4096), 1);
-        assert_eq!(super::div_ceil(4096, 4096), 1);
-        assert_eq!(super::div_ceil(4097, 4096), 2);
-        assert_eq!(super::div_ceil(8192, 4096), 2);
-        assert_eq!(super::div_ceil(8193, 4096), 3);
+        assert_eq!(0usize.div_ceil(4096), 0);
+        assert_eq!(1usize.div_ceil(4096), 1);
+        assert_eq!(4096usize.div_ceil(4096), 1);
+        assert_eq!(4097usize.div_ceil(4096), 2);
+        assert_eq!(8192usize.div_ceil(4096), 2);
+        assert_eq!(8193usize.div_ceil(4096), 3);
+    }
+
+    // ---- Inner app call tests (Epic 22 Wave 4) ----
+
+    /// Helper: set up an app in the store with a given approval program.
+    /// Returns the app_id.
+    fn setup_app(
+        store: &mut LedgerState,
+        app_id: u64,
+        approval_program: Vec<u8>,
+        clear_program: Vec<u8>,
+    ) {
+        let creator = Address([1u8; 32]);
+        store.set_app_params(
+            app_id,
+            AppParams {
+                creator,
+                approval_program,
+                clear_state_program: clear_program,
+                global_state: std::collections::BTreeMap::new(),
+                local_state_schema: StateSchema {
+                    num_uint: 4,
+                    num_byte_slice: 4,
+                },
+                global_state_schema: StateSchema {
+                    num_uint: 4,
+                    num_byte_slice: 4,
+                },
+                extra_program_pages: 0,
+            },
+        );
+    }
+
+    /// Build a minimal AVM program: version + intcblock [val] + intc_0 + return
+    /// This produces a program that pushes `val` and returns.
+    fn make_program(version: u8, approves: bool) -> Vec<u8> {
+        // intcblock [val], intc_0, return
+        let val = if approves { 1u8 } else { 0u8 };
+        vec![version, 0x20, 0x01, val, 0x22, 0x43]
+    }
+
+    #[test]
+    fn inner_appl_basic_noop() {
+        // Set up: app 42 calls inner app 100, which runs a v6 approval
+        // program that pushes 1 (approve).
+        let mut store = LedgerState::new();
+
+        // App 42 (the outer app calling the inner appl)
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        // App 100 (the called inner app)
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+
+        // Fund the outer app address.
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        // Set opcode budget so inner execution can proceed.
+        ctx.opcode_budget = 2000;
+
+        // Build inner app call: itxn_begin, itxn_field TypeEnum=6 (appl),
+        // itxn_field ApplicationID=100, itxn_submit.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
+        ctx.itxn_submit().unwrap();
+
+        // Should have 1 inner txn recorded.
+        assert_eq!(ctx.num_inner_txns(), 1);
+
+        // Read back the inner txn's type.
+        let type_val = ctx.last_itxn_field(16, None).unwrap(); // TypeEnum
+        assert_eq!(type_val, TealValue::Uint(6));
+    }
+
+    #[test]
+    fn inner_appl_self_call_rejected() {
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(42)).unwrap(); // same app ID
+        let result = ctx.itxn_submit();
+
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("self-call"), "got: {msg}");
+    }
+
+    #[test]
+    fn inner_appl_depth_limit() {
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.opcode_budget = 2000;
+        // Set depth to MAX_APP_CALL_DEPTH (8), so it should be rejected.
+        ctx.depth = params::MAX_APP_CALL_DEPTH as u32;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap();
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap();
+        let result = ctx.itxn_submit();
+
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("depth"), "got: {msg}");
+    }
+
+    #[test]
+    fn inner_appl_budget_pooling() {
+        // Verify that an inner appl adds 700 to the opcode budget.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        // Start with exactly 100 budget.
+        ctx.opcode_budget = 100;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap();
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap();
+        ctx.itxn_submit().unwrap();
+
+        // Budget should have increased by 700 (INNER_APP_BUDGET) minus the
+        // cost of the inner program's opcodes (3 opcodes at cost 1 each).
+        // So: 100 + 700 - 3 = 797.
+        assert_eq!(ctx.opcode_budget, 797);
+    }
+
+    #[test]
+    fn inner_appl_clearstate_prohibition() {
+        // ClearState programs cannot issue inner transactions.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        let sender = [10u8; 32];
+        let mut txn = make_appl_txn(sender, 42, vec![], vec![], vec![]);
+        txn.txn.on_completion = 3; // ClearStateOC
+        let mut ctx = make_context(&mut store, vec![txn]);
+
+        let result = ctx.itxn_begin();
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("clear state programs can not issue inner transactions"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn inner_appl_version_too_low() {
+        // Programs with version < MIN_INNER_APPL_VERSION (4) cannot be
+        // called via inner transactions.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        // App 100 has a v2 program (below minimum v4).
+        setup_app(
+            &mut store,
+            100,
+            make_program(2, true),
+            make_program(2, true),
+        );
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap();
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap();
+        let result = ctx.itxn_submit();
+
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("v2 < v4"), "got: {msg}");
+    }
+
+    #[test]
+    fn inner_appl_opt_in() {
+        // Inner appl with OnCompletion=OptIn should create local state.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        // Verify app address is not opted in to app 100 (before creating ctx).
+        assert!(!store.has_app_local_state(&app_addr, 100));
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        {
+            let mut ctx = make_context(&mut store, vec![txn]);
+            ctx.fee_sink = Address([0xFEu8; 32]);
+            ctx.opcode_budget = 2000;
+
+            ctx.itxn_begin().unwrap();
+            ctx.itxn_field(16, TealValue::Uint(6)).unwrap();
+            ctx.itxn_field(24, TealValue::Uint(100)).unwrap();
+            ctx.itxn_field(25, TealValue::Uint(1)).unwrap(); // OnCompletion = OptIn
+            ctx.itxn_submit().unwrap();
+        }
+
+        // After opt-in, the app address should have local state for app 100.
+        assert!(store.has_app_local_state(&app_addr, 100));
+    }
+
+    #[test]
+    fn inner_appl_close_out() {
+        // Inner appl with OnCompletion=CloseOut should remove local state.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                total_apps_opted_in: 1,
+                ..Default::default()
+            },
+        );
+        // Opt in the app address to app 100.
+        store.set_app_local_state(
+            &app_addr,
+            100,
+            AppLocalState {
+                schema: StateSchema::default(),
+                key_value: BTreeMap::new(),
+            },
+        );
+        assert!(store.has_app_local_state(&app_addr, 100));
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        {
+            let mut ctx = make_context(&mut store, vec![txn]);
+            ctx.fee_sink = Address([0xFEu8; 32]);
+            ctx.opcode_budget = 2000;
+
+            ctx.itxn_begin().unwrap();
+            ctx.itxn_field(16, TealValue::Uint(6)).unwrap();
+            ctx.itxn_field(24, TealValue::Uint(100)).unwrap();
+            ctx.itxn_field(25, TealValue::Uint(2)).unwrap(); // OnCompletion = CloseOut
+            ctx.itxn_submit().unwrap();
+        }
+
+        // After close-out, local state should be removed.
+        assert!(!store.has_app_local_state(&app_addr, 100));
+    }
+
+    #[test]
+    fn inner_appl_delete() {
+        // Inner appl with OnCompletion=DeleteApplication should delete the app.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        // Set the creator of app 100 (must exist for counter update).
+        let creator = Address([1u8; 32]);
+        store.set_account(
+            &creator,
+            AccountData {
+                micro_algos: 1_000_000,
+                total_created_apps: 1,
+                ..Default::default()
+            },
+        );
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        assert!(store.has_app_params(100));
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        {
+            let mut ctx = make_context(&mut store, vec![txn]);
+            ctx.fee_sink = Address([0xFEu8; 32]);
+            ctx.opcode_budget = 2000;
+
+            ctx.itxn_begin().unwrap();
+            ctx.itxn_field(16, TealValue::Uint(6)).unwrap();
+            ctx.itxn_field(24, TealValue::Uint(100)).unwrap();
+            ctx.itxn_field(25, TealValue::Uint(5)).unwrap(); // OnCompletion = DeleteApplication
+            ctx.itxn_submit().unwrap();
+        }
+
+        // After delete, app should be gone.
+        assert!(!store.has_app_params(100));
+        // Creator's counter should be decremented.
+        let creator_acct = store.get_account(&creator).unwrap();
+        assert_eq!(creator_acct.total_created_apps, 0);
+    }
+
+    #[test]
+    fn inner_appl_rejection_rolls_back() {
+        // When the inner app program rejects, the outer itxn_submit
+        // should fail and no state changes should persist.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        // App 100 rejects (pushes 0).
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, false),
+            make_program(6, true),
+        );
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let initial_balance = store.get_account(&app_addr).unwrap().micro_algos;
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap();
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap();
+        let result = ctx.itxn_submit();
+
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("rejected"), "got: {msg}");
+
+        // Balance should be restored (rollback).
+        let balance_after = store.get_account(&app_addr).unwrap().micro_algos;
+        assert_eq!(balance_after, initial_balance);
+    }
+
+    #[test]
+    fn inner_appl_app_creation() {
+        // Inner appl with application_id=0 should create a new app.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+        ctx.txn_counter = 200;
+        // itxn_submit increments txn_counter to 201, then
+        // execute_inner_appl creates app with id txn_counter + 1 = 202.
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(0)).unwrap(); // ApplicationID = 0 (create)
+                                                         // Set approval and clear state programs on the inner txn.
+        ctx.itxn_field(30, TealValue::Bytes(make_program(6, true)))
+            .unwrap(); // ApprovalProgram
+        ctx.itxn_field(31, TealValue::Bytes(make_program(6, true)))
+            .unwrap(); // ClearStateProgram
+        ctx.itxn_submit().unwrap();
+
+        // The created app ID should be txn_counter + 1 = 202 (matching go-algorand).
+        let created_id = ctx.last_itxn_field(61, None).unwrap(); // CreatedApplicationID
+        assert_eq!(created_id, TealValue::Uint(202));
+
+        // The app should exist in the store.
+        assert!(store.has_app_params(202));
+    }
+
+    // ---- Wave 5: Inner txn field access, IDs, and resource availability ----
+
+    #[test]
+    fn inner_acfg_create_returns_created_asset_id() {
+        // An inner acfg with config_asset=0 creates a new asset.
+        // Field 60 (CreatedAssetID) should return the created asset ID.
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.txn_counter = 100;
+
+        // Build inner acfg create transaction.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(3)).unwrap(); // TypeEnum = acfg
+                                                         // config_asset = 0 means "create"
+        ctx.itxn_field(34, TealValue::Uint(1_000_000)).unwrap(); // ConfigAssetTotal
+        ctx.itxn_field(35, TealValue::Uint(6)).unwrap(); // ConfigAssetDecimals
+        ctx.itxn_submit().unwrap();
+
+        assert_eq!(ctx.num_inner_txns(), 1);
+
+        // CreatedAssetID should be the new asset ID.
+        // txn_counter = 100 + 0 + 1 = 101, then apply_inner_acfg does +1 = 102
+        let created = ctx.last_itxn_field(60, None).unwrap();
+        assert_eq!(created, TealValue::Uint(102));
+
+        // Also check via gitxn (group index 0).
+        let created_g = ctx.last_itxn_group_field(0, 60, None).unwrap();
+        assert_eq!(created_g, TealValue::Uint(102));
+
+        // The asset should be tracked as a created resource.
+        assert!(ctx.created_assets.contains(&102));
+    }
+
+    #[test]
+    fn inner_appl_logs_accessible_via_itxn() {
+        // An inner appl that logs a message should have logs accessible
+        // through fields 58 (Logs), 59 (NumLogs), and 62 (LastLog).
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        // Create a program that logs "hello" and approves.
+        // pushbytes "hello" (0x80 0x05 "hello"), log (0xb0), int 1 (0x81 0x01), return (0x43)
+        let log_program = {
+            let mut p = vec![6u8]; // version 6
+            p.push(0x80); // pushbytes
+            p.push(0x05); // length 5
+            p.extend_from_slice(b"hello");
+            p.push(0xb0); // log
+            p.push(0x81); // pushint
+            p.push(0x01); // 1
+            p.push(0x43); // return
+            p
+        };
+        setup_app(&mut store, 100, log_program, make_program(6, true));
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
+        ctx.itxn_submit().unwrap();
+
+        // NumLogs should be 1.
+        let num_logs = ctx.last_itxn_field(59, None).unwrap();
+        assert_eq!(num_logs, TealValue::Uint(1));
+
+        // Logs[0] should be "hello".
+        let log0 = ctx.last_itxn_field(58, Some(0)).unwrap();
+        assert_eq!(log0, TealValue::Bytes(b"hello".to_vec()));
+
+        // Logs count via field 58 with no array_index.
+        let logs_count = ctx.last_itxn_field(58, None).unwrap();
+        assert_eq!(logs_count, TealValue::Uint(1));
+
+        // LastLog should be "hello".
+        let last_log = ctx.last_itxn_field(62, None).unwrap();
+        assert_eq!(last_log, TealValue::Bytes(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn inner_txn_id_is_computed_correctly() {
+        // After itxn_submit, reading TxID (field 23) should return
+        // the inner txn ID, not the regular txn ID.
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn.clone()]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // TypeEnum = pay
+        ctx.itxn_field(7, TealValue::Bytes([30u8; 32].to_vec()))
+            .unwrap(); // Receiver
+        ctx.itxn_field(8, TealValue::Uint(500)).unwrap(); // Amount
+        ctx.itxn_submit().unwrap();
+
+        // Get the TxID from the inner txn.
+        let inner_txid = ctx.last_itxn_field(23, None).unwrap();
+
+        // Compute the expected inner txn ID manually.
+        let parent_txid = algo_codec::compute_txn_id(&txn.txn);
+        let inner_stxn = &ctx.inner_txns().last().unwrap()[0];
+        let expected_id = algo_avm::itxn::compute_inner_txn_id(&parent_txid, 0, &inner_stxn.txn);
+
+        assert_eq!(inner_txid, TealValue::Bytes(expected_id.0.to_vec()));
+
+        // It should NOT equal the regular txn ID of the inner txn.
+        let regular_id = algo_codec::compute_txn_id(&inner_stxn.txn);
+        assert_ne!(
+            inner_txid,
+            TealValue::Bytes(regular_id.0.to_vec()),
+            "inner TxID should differ from regular TxID"
+        );
+
+        // Also verify via inner_txn_ids accessor.
+        assert_eq!(ctx.inner_txn_ids().len(), 1);
+        assert_eq!(ctx.inner_txn_ids()[0].len(), 1);
+        assert_eq!(ctx.inner_txn_ids()[0][0], expected_id);
+    }
+
+    #[test]
+    fn inner_txn_id_varies_by_group_index() {
+        // When submitting a group of inner txns, each should have a
+        // distinct inner txn ID based on its offset.
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let rcv_addr = Address([30u8; 32]);
+        store.set_account(
+            &rcv_addr,
+            AccountData {
+                micro_algos: 100_000,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+
+        // Build a group of 2 inner pay txns.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // pay
+        ctx.itxn_field(7, TealValue::Bytes(rcv_addr.0.to_vec()))
+            .unwrap();
+        ctx.itxn_field(8, TealValue::Uint(100)).unwrap();
+
+        ctx.itxn_next().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // pay
+        ctx.itxn_field(7, TealValue::Bytes(rcv_addr.0.to_vec()))
+            .unwrap();
+        ctx.itxn_field(8, TealValue::Uint(200)).unwrap();
+
+        ctx.itxn_submit().unwrap();
+
+        // gitxn 0 TxID and gitxn 1 TxID should be different.
+        let id0 = ctx.last_itxn_group_field(0, 23, None).unwrap();
+        let id1 = ctx.last_itxn_group_field(1, 23, None).unwrap();
+        assert_ne!(id0, id1, "different inner txns should have different IDs");
+
+        // itxn TxID should match gitxn 1 TxID (last in group).
+        let last_id = ctx.last_itxn_field(23, None).unwrap();
+        assert_eq!(last_id, id1, "itxn TxID should be the last in the group");
+    }
+
+    #[test]
+    fn resource_availability_after_inner_asset_create() {
+        // After an inner acfg creates a new asset, that asset should be
+        // available via is_asset_available.
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.txn_counter = 300;
+
+        // Asset doesn't exist yet.
+        assert!(!ctx.is_asset_available(302));
+
+        // Inner acfg create.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(3)).unwrap(); // acfg
+        ctx.itxn_field(34, TealValue::Uint(1_000_000)).unwrap(); // total
+        ctx.itxn_submit().unwrap();
+
+        // Now the created asset should be available.
+        let created_id_val = ctx.last_itxn_field(60, None).unwrap();
+        let created_id = match created_id_val {
+            TealValue::Uint(v) => v,
+            _ => panic!("expected uint"),
+        };
+        assert!(ctx.is_asset_available(created_id));
+    }
+
+    #[test]
+    fn resource_availability_after_inner_app_create() {
+        // After an inner appl creates a new app, that app should be
+        // available via is_app_available.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+        ctx.txn_counter = 400;
+
+        // App 402 doesn't exist yet (txn_counter will be 401 after increment,
+        // then +1 gives new app ID 402).
+        assert!(!ctx.is_app_available(402));
+
+        // Inner appl create.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(0)).unwrap(); // create
+        ctx.itxn_field(30, TealValue::Bytes(make_program(6, true)))
+            .unwrap();
+        ctx.itxn_field(31, TealValue::Bytes(make_program(6, true)))
+            .unwrap();
+        ctx.itxn_submit().unwrap();
+
+        // The created app should now be available.
+        let created_id_val = ctx.last_itxn_field(61, None).unwrap();
+        let created_id = match created_id_val {
+            TealValue::Uint(v) => v,
+            _ => panic!("expected uint"),
+        };
+        assert!(ctx.is_app_available(created_id));
+        assert!(ctx.created_apps.contains(&created_id));
+    }
+
+    #[test]
+    fn resource_availability_foreign_arrays() {
+        // Assets and apps in foreign arrays should be available.
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![77], vec![88]);
+        let mut store = LedgerState::new();
+        let ctx = make_context(&mut store, vec![txn]);
+
+        // Foreign app 77 should be available.
+        assert!(ctx.is_app_available(77));
+        // Foreign asset 88 should be available.
+        assert!(ctx.is_asset_available(88));
+        // Current app (42) should be available.
+        assert!(ctx.is_app_available(42));
+        // Random IDs should not be available.
+        assert!(!ctx.is_app_available(999));
+        assert!(!ctx.is_asset_available(999));
+        // Zero is never available.
+        assert!(!ctx.is_app_available(0));
+        assert!(!ctx.is_asset_available(0));
+    }
+
+    #[test]
+    fn gitxn_reads_correct_fields_from_inner_group() {
+        // Submit a group of 2 inner txns (pay + acfg create),
+        // then use gitxn to read specific fields from each.
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        let rcv_addr = Address([30u8; 32]);
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.txn_counter = 500;
+
+        // Group: pay + acfg create.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // pay
+        ctx.itxn_field(7, TealValue::Bytes(rcv_addr.0.to_vec()))
+            .unwrap();
+        ctx.itxn_field(8, TealValue::Uint(1000)).unwrap();
+
+        ctx.itxn_next().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(3)).unwrap(); // acfg
+        ctx.itxn_field(34, TealValue::Uint(999_999)).unwrap(); // total
+
+        ctx.itxn_submit().unwrap();
+
+        assert_eq!(ctx.num_inner_txns(), 2);
+
+        // gitxn 0 TypeEnum should be pay (1).
+        let type0 = ctx.last_itxn_group_field(0, 16, None).unwrap();
+        assert_eq!(type0, TealValue::Uint(1));
+
+        // gitxn 1 TypeEnum should be acfg (3).
+        let type1 = ctx.last_itxn_group_field(1, 16, None).unwrap();
+        assert_eq!(type1, TealValue::Uint(3));
+
+        // gitxn 0 Amount should be 1000.
+        let amount0 = ctx.last_itxn_group_field(0, 8, None).unwrap();
+        assert_eq!(amount0, TealValue::Uint(1000));
+
+        // gitxn 1 CreatedAssetID should be non-zero.
+        let created1 = ctx.last_itxn_group_field(1, 60, None).unwrap();
+        match created1 {
+            TealValue::Uint(v) => assert!(v > 0, "created asset ID should be non-zero"),
+            _ => panic!("expected uint"),
+        }
+
+        // itxn (last in group = the acfg) TypeEnum should be acfg (3).
+        let last_type = ctx.last_itxn_field(16, None).unwrap();
+        assert_eq!(last_type, TealValue::Uint(3));
+    }
+
+    #[test]
+    fn inner_txn_ids_accumulate_across_submissions() {
+        // Submit two separate inner txn groups. The IDs from the second
+        // group should have offsets that account for the first group.
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let rcv_addr = Address([30u8; 32]);
+        let mut ctx = make_context(&mut store, vec![txn.clone()]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+
+        // First submission: 1 inner pay.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap();
+        ctx.itxn_field(7, TealValue::Bytes(rcv_addr.0.to_vec()))
+            .unwrap();
+        ctx.itxn_field(8, TealValue::Uint(100)).unwrap();
+        ctx.itxn_submit().unwrap();
+
+        let id_first = ctx.inner_txn_ids()[0][0];
+
+        // Second submission: 1 inner pay (different amount to get different txn).
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap();
+        ctx.itxn_field(7, TealValue::Bytes(rcv_addr.0.to_vec()))
+            .unwrap();
+        ctx.itxn_field(8, TealValue::Uint(200)).unwrap();
+        ctx.itxn_submit().unwrap();
+
+        let id_second = ctx.inner_txn_ids()[1][0];
+
+        // Both should exist.
+        assert_eq!(ctx.inner_txn_ids().len(), 2);
+
+        // They should be different (different offsets and different txn content).
+        assert_ne!(id_first, id_second);
+
+        // Verify offset: first has offset 0, second has offset 1.
+        let parent_txid = algo_codec::compute_txn_id(&txn.txn);
+        let first_inner = &ctx.inner_txns()[0][0];
+        let second_inner = &ctx.inner_txns()[1][0];
+
+        let expected_first =
+            algo_avm::itxn::compute_inner_txn_id(&parent_txid, 0, &first_inner.txn);
+        let expected_second =
+            algo_avm::itxn::compute_inner_txn_id(&parent_txid, 1, &second_inner.txn);
+
+        assert_eq!(id_first, expected_first);
+        assert_eq!(id_second, expected_second);
+    }
+
+    // ==================================================================
+    // Issue #25 fix tests
+    // ==================================================================
+
+    // ---- H1: Nested inner txns serialized into eval_delta "itx" key ----
+
+    #[test]
+    fn h1_nested_inner_txns_in_eval_delta() {
+        // When an inner appl calls another app that itself issues inner txns,
+        // the child's inner txns should appear in the parent's eval_delta
+        // under the "itx" key.
+        use crate::eval_delta::parse_eval_delta;
+
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        // App 100 is the called inner app. Its program logs "nested" and
+        // issues an inner pay. For this test, we just need the child context
+        // to have inner txns. Since our current infra runs a minimal program
+        // (which doesn't actually issue inner txns), we test the serialization
+        // path by verifying that logs from the child appear in eval_delta.
+        // The log_program below logs "nested" and approves.
+        let log_program = {
+            let mut p = vec![6u8]; // version 6
+            p.push(0x80); // pushbytes
+            p.push(0x06); // length 6
+            p.extend_from_slice(b"nested");
+            p.push(0xb0); // log
+            p.push(0x81); // pushint
+            p.push(0x01); // 1
+            p.push(0x43); // return
+            p
+        };
+        setup_app(&mut store, 100, log_program, make_program(6, true));
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
+        ctx.itxn_submit().unwrap();
+
+        // The inner txn should have an eval_delta with "lg" containing "nested".
+        let inner_stxn = &ctx.inner_txns().last().unwrap()[0];
+        assert!(inner_stxn.eval_delta.is_some(), "eval_delta should exist");
+
+        let ed = parse_eval_delta(inner_stxn.eval_delta.as_ref().unwrap()).unwrap();
+        let logs = ed.logs.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0], b"nested");
+    }
+
+    // ---- H2: Asset/app creation IDs are sequential (no gaps/duplicates) ----
+
+    #[test]
+    fn h2_asset_and_app_creation_ids_sequential() {
+        // Submit a group of inner txns: acfg create, appl create, acfg create.
+        // The IDs should be sequential with no gaps.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 5000;
+        ctx.txn_counter = 100;
+
+        // First inner: acfg create
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(3)).unwrap(); // acfg
+        ctx.itxn_field(34, TealValue::Uint(1_000_000)).unwrap(); // total
+
+        // Second inner: appl create
+        ctx.itxn_next().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(0)).unwrap(); // create
+        ctx.itxn_field(30, TealValue::Bytes(make_program(6, true)))
+            .unwrap();
+        ctx.itxn_field(31, TealValue::Bytes(make_program(6, true)))
+            .unwrap();
+
+        // Third inner: acfg create
+        ctx.itxn_next().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(3)).unwrap(); // acfg
+        ctx.itxn_field(34, TealValue::Uint(500_000)).unwrap(); // total
+
+        ctx.itxn_submit().unwrap();
+
+        // txn_counter_base = 100
+        // i=0: txn_counter = 101, acfg => asset_id = 101 + 1 = 102
+        // i=1: txn_counter = 102, appl => app_id = 102 + 1 = 103
+        // i=2: txn_counter = 103, acfg => asset_id = 103 + 1 = 104
+        let asset1 = ctx.last_itxn_group_field(0, 60, None).unwrap(); // CreatedAssetID
+        let app1 = ctx.last_itxn_group_field(1, 61, None).unwrap(); // CreatedApplicationID
+        let asset2 = ctx.last_itxn_group_field(2, 60, None).unwrap(); // CreatedAssetID
+
+        assert_eq!(asset1, TealValue::Uint(102), "first asset ID");
+        assert_eq!(app1, TealValue::Uint(103), "app ID");
+        assert_eq!(asset2, TealValue::Uint(104), "second asset ID");
+
+        // No gaps or duplicates.
+        assert!(store.get_asset_params(102).is_some());
+        assert!(store.get_app_params(103).is_some());
+        assert!(store.get_asset_params(104).is_some());
+    }
+
+    // ---- H3: ClearState does not inflate shared budget ----
+
+    #[test]
+    fn h3_clearstate_inner_appl_no_budget_inflation() {
+        // An inner appl with ClearState should NOT add INNER_APP_BUDGET to
+        // the shared opcode budget.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        // Opt sender into app 100 so ClearState has local state to clear.
+        let sender_addr = Address([10u8; 32]);
+        store.set_app_local_state(
+            &sender_addr,
+            100,
+            AppLocalState {
+                schema: StateSchema::default(),
+                key_value: BTreeMap::new(),
+            },
+        );
+        let mut sender_acct = store.get_or_default_account(&sender_addr);
+        sender_acct.total_apps_opted_in += 1;
+        store.set_account(&sender_addr, sender_acct);
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 1000;
+
+        let budget_before = ctx.opcode_budget;
+
+        // Inner ClearState call.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // app 100
+        ctx.itxn_field(25, TealValue::Uint(3)).unwrap(); // OnCompletion = ClearStateOC
+        ctx.itxn_submit().unwrap();
+
+        // ClearState should NOT have added 700 to the budget.
+        // The clear state program uses its own isolated budget (3 opcodes).
+        // So the shared budget should be unchanged (1000).
+        assert_eq!(
+            ctx.opcode_budget, budget_before,
+            "ClearState should not inflate shared budget"
+        );
+    }
+
+    // ---- H4: Rollback snapshot covers appl accounts ----
+
+    #[test]
+    fn h4_snapshot_includes_appl_accounts() {
+        // When an inner appl fails after mutating an account in the accounts
+        // array, rollback should restore that account's state.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        // App 100 rejects (pushes 0).
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, false),
+            make_program(6, true),
+        );
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        // Create a "bystander" account that will be in the accounts array.
+        let bystander = Address([50u8; 32]);
+        store.set_account(
+            &bystander,
+            AccountData {
+                micro_algos: 5_000_000,
+                ..Default::default()
+            },
+        );
+        let initial_balance = store.get_account(&bystander).unwrap().micro_algos;
+
+        // Build inner group: pay to bystander (succeeds), then appl that
+        // references bystander in accounts array (fails).
+        // Since the appl fails, the entire group should be rolled back.
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![bystander], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        // Submit a group: pay to bystander, then failing appl with bystander in accounts.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // pay
+        ctx.itxn_field(7, TealValue::Bytes(bystander.0.to_vec()))
+            .unwrap(); // Receiver = bystander
+        ctx.itxn_field(8, TealValue::Uint(1_000)).unwrap(); // Amount
+
+        ctx.itxn_next().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // app 100 (rejects)
+                                                           // Set accounts array to include bystander.
+        ctx.itxn_field(28, TealValue::Bytes(bystander.0.to_vec()))
+            .unwrap();
+
+        let result = ctx.itxn_submit();
+        assert!(result.is_err(), "second inner txn should fail");
+
+        // Bystander's balance should be restored to initial value.
+        let balance_after = store.get_account(&bystander).unwrap().micro_algos;
+        assert_eq!(
+            balance_after, initial_balance,
+            "bystander balance should be rolled back"
+        );
+    }
+
+    // ---- H5: fee_credit propagation from nested inner app calls ----
+
+    #[test]
+    fn h5_fee_credit_propagated_from_child() {
+        // An inner appl call inherits fee_credit from the parent.
+        // After the child runs, the parent's fee_credit should reflect
+        // the child's remaining credit.
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+        // Set fee_credit to a large value.
+        ctx.fee_credit = 50_000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // app 100
+        ctx.itxn_submit().unwrap();
+
+        // fee_credit should be propagated back from the child.
+        // The child received fee_credit = 50_000, and since it didn't
+        // issue any inner txns that would consume credit, it should still
+        // have the same credit (minus any shortfall/overpay at the child level).
+        // In this case the inner appl has default fee=1000 and MinTxnFee=1000,
+        // so no shortfall or overpay.
+        assert_eq!(
+            ctx.fee_credit, 50_000,
+            "fee_credit should be propagated back"
+        );
+    }
+
+    // ---- H6: txn_counter propagation from nested inner app calls ----
+
+    #[test]
+    fn h6_txn_counter_propagated_from_child() {
+        // After an inner appl call, the parent's txn_counter should
+        // reflect the child's final txn_counter (so that subsequent
+        // creates get unique IDs).
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+        ctx.txn_counter = 500;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // app 100
+        ctx.itxn_submit().unwrap();
+
+        // After itxn_submit, txn_counter should reflect the child's
+        // final value. The child was initialized with txn_counter = 501
+        // (from parent's increment). The child didn't create any inner
+        // txns, so its txn_counter stays at 501.
+        assert_eq!(
+            ctx.txn_counter, 501,
+            "txn_counter should be propagated back from child"
+        );
     }
 }

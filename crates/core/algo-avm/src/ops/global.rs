@@ -58,6 +58,17 @@ pub fn op_global(
         return machine.push(AvmValue::Uint64(remaining));
     }
 
+    // CallerApplicationID (field 13): delegate to context method so that
+    // inner transaction depth is correctly reflected.
+    if field_byte == 13 {
+        return machine.push(AvmValue::Uint64(ctx.caller_app_id()));
+    }
+
+    // CallerApplicationAddress (field 14): delegate to context method.
+    if field_byte == 14 {
+        return machine.push(AvmValue::Bytes(ctx.caller_app_address().to_vec()));
+    }
+
     // Delegate to the context for the actual value.
     let value = ctx.global_field(field_byte)?;
     machine.push(teal_to_avm(value))

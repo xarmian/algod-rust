@@ -17,6 +17,29 @@ pub const BOX_FLAT_MIN_BALANCE: u64 = 2_500;
 pub const BOX_BYTE_MIN_BALANCE: u64 = 400;
 pub const REWARDS_RATE_REFRESH_INTERVAL: u64 = 500_000;
 
+// Inner transaction consensus parameters (go-algorand v4.5.1).
+
+/// Maximum inner transactions per app call (before pooling, v30+).
+/// With `EnableInnerTransactionPooling` (v31+), this is pooled across the
+/// group: effective limit = `MAX_INNER_TRANSACTIONS * MAX_TX_GROUP_SIZE`.
+pub const MAX_INNER_TRANSACTIONS: usize = 16;
+
+/// Maximum atomic transaction group size.
+pub const MAX_TX_GROUP_SIZE: usize = 16;
+
+/// Maximum inner app-call depth (go-algorand `maxAppCallDepth = 8`).
+/// A value of 0 prevents inner app calls; 8 means top-level + 8 levels deep.
+pub const MAX_APP_CALL_DEPTH: usize = 8;
+
+/// Minimum AVM version for programs called via inner transactions (v34+).
+pub const MIN_INNER_APPL_VERSION: u64 = 4;
+
+/// Default per-app opcode budget (go-algorand `MaxAppProgramCost = 700`).
+pub const INNER_APP_BUDGET: i64 = 700;
+
+/// Minimum transaction fee in microAlgos.
+pub const MIN_TXN_FEE: u64 = 1000;
+
 /// Compute minimum balance for an account based on its opted-in assets,
 /// created assets, created apps, opted-in apps, extra app pages, boxes,
 /// and aggregate app schema.

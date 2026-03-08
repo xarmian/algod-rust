@@ -27,6 +27,7 @@ dependencies = [
 name = "algo-avm"
 version = "0.1.0"
 dependencies = [
+ "algo-codec",
  "algo-error",
  "algo-types",
  "base64",

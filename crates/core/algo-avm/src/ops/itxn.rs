@@ -38,12 +38,22 @@ pub fn op_itxn_field(
 
 /// `itxn_submit` (0xb3): execute the inner transaction(s) that were built.
 /// No stack args, no immediates.
+///
+/// Before submitting, syncs the machine's remaining opcode budget into the
+/// context so that inner app calls can share the pooled budget. After
+/// submission, reads the updated budget back from the context.
 pub fn op_itxn_submit(
-    _machine: &mut AvmMachine,
+    machine: &mut AvmMachine,
     _instruction: &Instruction,
     ctx: &mut dyn AvmContext,
 ) -> Result<(), AlgoError> {
-    ctx.itxn_submit()
+    // Tell the context the machine's current remaining budget.
+    ctx.set_opcode_budget(machine.budget);
+    // Execute inner transactions (may include recursive AVM for appl calls).
+    ctx.itxn_submit()?;
+    // Read back the budget — inner execution may have consumed some.
+    machine.budget = ctx.get_opcode_budget();
+    Ok(())
 }
 
 /// `itxn_next` (0xb6): chain another inner transaction in the current group.

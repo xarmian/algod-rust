@@ -886,6 +886,17 @@ fn itxn_with_multiple_fields() {
     let txn = make_appl_txn(sender, 42);
     let mut store = LedgerState::new();
     seed_app(&mut store);
+
+    // Fund the app address so inner pay can succeed.
+    let app_addr = Address(algo_ledger::avm_context::app_address(42));
+    store.accounts.insert(
+        app_addr,
+        AccountData {
+            micro_algos: 10_000_000,
+            ..Default::default()
+        },
+    );
+
     let mut ctx = make_context(&mut store, vec![txn]);
 
     // Build a pay inner txn with receiver and amount.
