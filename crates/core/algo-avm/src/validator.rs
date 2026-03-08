@@ -61,9 +61,12 @@ fn check_size(
     } else if mode == Mode::LogicSig {
         // LogicSig v4+ always uses the base limit, no extra pages.
         MAX_PROGRAM_SIZE_V4_PLUS
-    } else {
-        // Application programs: allow extra pages.
+    } else if program.version >= 4 && extra_pages > 0 {
+        // Application programs v4+: allow extra pages.
         MAX_PROGRAM_SIZE_V4_PLUS * (1 + extra_pages as usize)
+    } else {
+        // Application programs (v1-v3 or no extra pages): base limit.
+        MAX_PROGRAM_SIZE_V4_PLUS
     };
 
     if program_len > limit {
