@@ -74,6 +74,7 @@ pub fn dispatch(
         0xc1 => txn::op_gtxnas(machine, instruction, ctx),
         0xc2 => txn::op_gtxnsas(machine, instruction, ctx),
         0xc3 => txn::op_args(machine, instruction, ctx),
+        0xc4 => state::op_gloadss(machine, instruction, ctx),
 
         // ---- Logic / bitwise ----
         0x10 => logic::op_and(machine, instruction),
@@ -88,6 +89,8 @@ pub fn dispatch(
         0x35 => stack::op_store(machine, instruction),
         0x3a => state::op_gload(machine, instruction, ctx),
         0x3b => state::op_gloads(machine, instruction, ctx),
+        0x3c => state::op_gaid(machine, instruction, ctx),
+        0x3d => state::op_gaids(machine, instruction, ctx),
         0x3e => stack::op_loads(machine, instruction),
         0x3f => stack::op_stores(machine, instruction),
 
@@ -219,6 +222,9 @@ pub fn dispatch(
         // ---- Dynamic inner txn array access (v6+) ----
         0xc5 => itxn::op_itxnas(machine, instruction, ctx),
         0xc6 => itxn::op_gitxnas(machine, instruction, ctx),
+
+        // ---- Block field access (v7+) ----
+        0xd1 => state::op_block(machine, instruction, ctx),
 
         // ---- Everything else: not yet implemented ----
         _ => {

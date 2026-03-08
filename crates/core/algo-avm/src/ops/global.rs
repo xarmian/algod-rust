@@ -5,9 +5,26 @@ use algo_error::AlgoError;
 use crate::bytecode::Instruction;
 use crate::context::AvmContext;
 use crate::fields::GlobalField;
-use crate::machine::{AvmMachine, AvmValue};
+use crate::machine::{AvmMachine, AvmValue, ExecMode};
 
 use super::helpers::{get_uint8, teal_to_avm};
+
+/// Returns `true` if the given global field is restricted to Application mode only.
+///
+/// This matches go-algorand's `globalFieldSpecs` table where certain fields have
+/// `mode: ModeApp` instead of `modeAny`.
+fn is_app_mode_only(field: GlobalField) -> bool {
+    matches!(
+        field,
+        GlobalField::Round
+            | GlobalField::LatestTimestamp
+            | GlobalField::CurrentApplicationID
+            | GlobalField::CreatorAddress
+            | GlobalField::CurrentApplicationAddress
+            | GlobalField::CallerApplicationID
+            | GlobalField::CallerApplicationAddress
+    )
+}
 
 /// `global F` — push the value of global field `F` onto the stack.
 ///
@@ -20,7 +37,14 @@ pub fn op_global(
     let field_byte = get_uint8(instruction)?;
 
     // Validate the field index is known.
-    let _field = GlobalField::from_u8(field_byte)?;
+    let field = GlobalField::from_u8(field_byte)?;
+
+    // Enforce per-field mode restrictions (Go: `if (cx.runMode & fs.mode) == 0`).
+    if is_app_mode_only(field) && machine.mode == ExecMode::LogicSig {
+        return Err(AlgoError::Avm {
+            message: format!("global[{field_byte}] not allowed in LogicSig mode"),
+        });
+    }
 
     // OpcodeBudget (field 12): read directly from the machine's remaining
     // budget rather than routing through the context, which has no access
@@ -95,9 +119,10 @@ mod tests {
     #[test]
     fn global_round_value() {
         // Program: global Round (field 6), return
+        // Round is Application-mode-only, so use Application mode.
         let raw = prog(2, &[0x32, 0x06, 0x43]);
         let program = parse(&raw).unwrap();
-        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700);
         // Step through manually to inspect the stack.
         m.step(&mut TestGlobalContext).unwrap(); // global Round
         assert_eq!(m.stack.len(), 1);
@@ -157,6 +182,65 @@ mod tests {
             msg.contains("context unavailable"),
             "expected context unavailable error: {msg}"
         );
+    }
+
+    #[test]
+    fn global_round_rejected_in_logicsig() {
+        // Round (field 6) is Application-mode-only; should fail in LogicSig mode.
+        let raw = prog(2, &[0x32, 0x06]);
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
+        let result = m.step(&mut TestGlobalContext);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("not allowed in LogicSig"),
+            "expected mode restriction error: {msg}"
+        );
+    }
+
+    #[test]
+    fn global_current_app_id_rejected_in_logicsig() {
+        // CurrentApplicationID (field 8) is Application-mode-only.
+        let raw = prog(2, &[0x32, 0x08]);
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
+        let result = m.step(&mut TestGlobalContext);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("not allowed in LogicSig"),
+            "expected mode restriction error: {msg}"
+        );
+    }
+
+    #[test]
+    fn global_round_allowed_in_application() {
+        // Round (field 6) should work in Application mode.
+        let raw = prog(2, &[0x32, 0x06]);
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700);
+        let result = m.step(&mut TestGlobalContext);
+        assert!(result.is_ok(), "expected OK but got: {:?}", result.err());
+        assert_eq!(m.stack[0], AvmValue::Uint64(42));
+    }
+
+    #[test]
+    fn global_any_mode_fields_allowed_in_logicsig() {
+        // MinTxnFee (field 0), GroupSize (field 4), LogicSigVersion (field 5),
+        // GroupID (field 11), OpcodeBudget (field 12), GenesisHash (field 17)
+        // should all work in LogicSig mode.
+        for field_byte in [0x00, 0x04, 0x05] {
+            let raw = prog(2, &[0x32, field_byte]);
+            let program = parse(&raw).unwrap();
+            let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
+            let result = m.step(&mut TestGlobalContext);
+            assert!(
+                result.is_ok(),
+                "field {field_byte} should be allowed in LogicSig: {:?}",
+                result.err()
+            );
+        }
     }
 
     #[test]

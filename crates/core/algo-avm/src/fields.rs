@@ -87,70 +87,74 @@ field_enum! {
         Sender = 0,
         Fee = 1,
         FirstValid = 2,
-        LastValid = 3,
-        Note = 4,
-        Lease = 5,
-        Receiver = 6,
-        Amount = 7,
-        CloseRemainderTo = 8,
-        VotePK = 9,
-        SelectionPK = 10,
-        VoteFirst = 11,
-        VoteLast = 12,
-        VoteKeyDilution = 13,
-        Type = 14,
-        TypeEnum = 15,
-        XferAsset = 16,
-        AssetAmount = 17,
-        AssetSender = 18,
-        AssetReceiver = 19,
-        AssetCloseTo = 20,
-        GroupIndex = 21,
-        TxID = 22,
-        ApplicationID = 23,
-        OnCompletion = 24,
-        ApplicationArgs = 25,
-        NumAppArgs = 26,
-        Accounts = 27,
-        NumAccounts = 28,
-        ApprovalProgram = 29,
-        ClearStateProgram = 30,
-        RekeyTo = 31,
-        ConfigAsset = 32,
-        ConfigAssetTotal = 33,
-        ConfigAssetDecimals = 34,
-        ConfigAssetDefaultFrozen = 35,
-        ConfigAssetUnitName = 36,
-        ConfigAssetName = 37,
-        ConfigAssetURL = 38,
-        ConfigAssetMetadataHash = 39,
-        ConfigAssetManager = 40,
-        ConfigAssetReserve = 41,
-        ConfigAssetFreeze = 42,
-        ConfigAssetClawback = 43,
-        FreezeAsset = 44,
-        FreezeAssetAccount = 45,
-        FreezeAssetFrozen = 46,
-        Assets = 47,
-        NumAssets = 48,
-        Applications = 49,
-        NumApplications = 50,
-        GlobalNumUint = 51,
-        GlobalNumByteSlice = 52,
-        LocalNumUint = 53,
-        LocalNumByteSlice = 54,
-        ExtraProgramPages = 55,
-        Nonparticipation = 56,
-        Logs = 57,
-        NumLogs = 58,
-        CreatedAssetID = 59,
-        CreatedApplicationID = 60,
-        LastLog = 61,
-        StateProofPK = 62,
-        ApprovalProgramPages = 63,
-        NumApprovalProgramPages = 64,
-        ClearStateProgramPages = 65,
-        NumClearStateProgramPages = 66,
+        /// Timestamp of block(FirstValid-1). AVM v7+.
+        FirstValidTime = 3,
+        LastValid = 4,
+        Note = 5,
+        Lease = 6,
+        Receiver = 7,
+        Amount = 8,
+        CloseRemainderTo = 9,
+        VotePK = 10,
+        SelectionPK = 11,
+        VoteFirst = 12,
+        VoteLast = 13,
+        VoteKeyDilution = 14,
+        Type = 15,
+        TypeEnum = 16,
+        XferAsset = 17,
+        AssetAmount = 18,
+        AssetSender = 19,
+        AssetReceiver = 20,
+        AssetCloseTo = 21,
+        GroupIndex = 22,
+        TxID = 23,
+        ApplicationID = 24,
+        OnCompletion = 25,
+        ApplicationArgs = 26,
+        NumAppArgs = 27,
+        Accounts = 28,
+        NumAccounts = 29,
+        ApprovalProgram = 30,
+        ClearStateProgram = 31,
+        RekeyTo = 32,
+        ConfigAsset = 33,
+        ConfigAssetTotal = 34,
+        ConfigAssetDecimals = 35,
+        ConfigAssetDefaultFrozen = 36,
+        ConfigAssetUnitName = 37,
+        ConfigAssetName = 38,
+        ConfigAssetURL = 39,
+        ConfigAssetMetadataHash = 40,
+        ConfigAssetManager = 41,
+        ConfigAssetReserve = 42,
+        ConfigAssetFreeze = 43,
+        ConfigAssetClawback = 44,
+        FreezeAsset = 45,
+        FreezeAssetAccount = 46,
+        FreezeAssetFrozen = 47,
+        Assets = 48,
+        NumAssets = 49,
+        Applications = 50,
+        NumApplications = 51,
+        GlobalNumUint = 52,
+        GlobalNumByteSlice = 53,
+        LocalNumUint = 54,
+        LocalNumByteSlice = 55,
+        ExtraProgramPages = 56,
+        Nonparticipation = 57,
+        Logs = 58,
+        NumLogs = 59,
+        CreatedAssetID = 60,
+        CreatedApplicationID = 61,
+        LastLog = 62,
+        StateProofPK = 63,
+        ApprovalProgramPages = 64,
+        NumApprovalProgramPages = 65,
+        ClearStateProgramPages = 66,
+        NumClearStateProgramPages = 67,
+        /// Application version for which the txn must reject. AVM v12+.
+        RejectVersion = 68,
     }
 }
 
@@ -237,6 +241,138 @@ field_enum! {
 pub type ItxnField = TxnField;
 
 // ---------------------------------------------------------------------------
+// EcdsaCurve — `ecdsa_verify`, `ecdsa_pk_decompress`, `ecdsa_pk_recover`
+// ---------------------------------------------------------------------------
+
+field_enum! {
+    /// Curves available for the `ecdsa_*` opcodes.
+    pub enum EcdsaCurve {
+        /// secp256k1 curve, used in Bitcoin.
+        Secp256k1 = 0,
+        /// secp256r1 curve, NIST standard (FIDO).
+        Secp256r1 = 1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EcGroup — `ec_add`, `ec_scalar_mul`, `ec_pairing_check`, etc.
+// ---------------------------------------------------------------------------
+
+field_enum! {
+    /// Elliptic curve groups for the `ec_*` opcodes.
+    pub enum EcGroup {
+        /// G1 of the BN254 curve.
+        BN254g1 = 0,
+        /// G2 of the BN254 curve.
+        BN254g2 = 1,
+        /// G1 of the BLS 12-381 curve.
+        BLS12_381g1 = 2,
+        /// G2 of the BLS 12-381 curve.
+        BLS12_381g2 = 3,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MimcConfig — `mimc` opcode (0xe6)
+// ---------------------------------------------------------------------------
+
+field_enum! {
+    /// MiMC hash configuration for the `mimc` opcode.
+    pub enum MimcConfig {
+        /// MiMC configuration for BN254, Miyaguchi-Preneel mode, 110 rounds.
+        BN254Mp110 = 0,
+        /// MiMC configuration for BLS12-381, Miyaguchi-Preneel mode, 111 rounds.
+        BLS12_381Mp111 = 1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Base64Encoding — `base64_decode` opcode (0x5e)
+// ---------------------------------------------------------------------------
+
+field_enum! {
+    /// Encoding variants for the `base64_decode` opcode.
+    pub enum Base64Encoding {
+        /// base64url encoding (RFC 4648).
+        URLEncoding = 0,
+        /// Standard base64 encoding (RFC 4648).
+        StdEncoding = 1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSONRefType — `json_ref` opcode (0x5f)
+// ---------------------------------------------------------------------------
+
+field_enum! {
+    /// JSON reference types for the `json_ref` opcode.
+    pub enum JSONRefType {
+        /// JSON string value.
+        JSONString = 0,
+        /// JSON uint64 value.
+        JSONUint64 = 1,
+        /// JSON object value.
+        JSONObject = 2,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VrfStandard — `vrf_verify` opcode (0xd0)
+// ---------------------------------------------------------------------------
+
+field_enum! {
+    /// VRF standards for the `vrf_verify` opcode.
+    pub enum VrfStandard {
+        /// Algorand's built-in VRF standard.
+        VrfAlgorand = 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BlockField — `block` opcode (0xd1)
+// ---------------------------------------------------------------------------
+
+field_enum! {
+    /// Fields available via the `block` opcode.
+    pub enum BlockField {
+        /// The block's VRF seed.
+        BlkSeed = 0,
+        /// The block's timestamp (seconds from epoch).
+        BlkTimestamp = 1,
+        /// The block's proposer address (or ZeroAddress pre-Payouts).
+        BlkProposer = 2,
+        /// Sum of fees for the block (or 0 pre-Payouts).
+        BlkFeesCollected = 3,
+        /// Extra amount to be paid for the given block.
+        BlkBonus = 4,
+        /// Hash of the previous block.
+        BlkBranch = 5,
+        /// Fee sink address for the given round.
+        BlkFeeSink = 6,
+        /// ConsensusVersion of the block.
+        BlkProtocol = 7,
+        /// Number of the next transaction after the block.
+        BlkTxnCounter = 8,
+        /// Actual amount moved from fee sink to proposer.
+        BlkProposerPayout = 9,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VoterParamsField — `voter_params_get` opcode (0x74)
+// ---------------------------------------------------------------------------
+
+field_enum! {
+    /// Fields available via the `voter_params_get` opcode.
+    pub enum VoterParamsField {
+        /// Online stake in microalgos (from the balance round).
+        VoterBalance = 0,
+        /// Whether the account opted into block payouts via keyreg.
+        VoterIncentiveEligible = 1,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -262,14 +398,16 @@ mod tests {
     #[test]
     fn txn_field_round_trip() {
         assert_eq!(TxnField::from_u8(0).unwrap(), TxnField::Sender);
-        assert_eq!(TxnField::from_u8(15).unwrap(), TxnField::TypeEnum);
-        assert_eq!(TxnField::from_u8(22).unwrap(), TxnField::TxID);
-        assert_eq!(TxnField::from_u8(47).unwrap(), TxnField::Assets);
+        assert_eq!(TxnField::from_u8(3).unwrap(), TxnField::FirstValidTime);
+        assert_eq!(TxnField::from_u8(16).unwrap(), TxnField::TypeEnum);
+        assert_eq!(TxnField::from_u8(23).unwrap(), TxnField::TxID);
+        assert_eq!(TxnField::from_u8(48).unwrap(), TxnField::Assets);
         assert_eq!(
-            TxnField::from_u8(66).unwrap(),
+            TxnField::from_u8(67).unwrap(),
             TxnField::NumClearStateProgramPages,
         );
-        assert!(TxnField::from_u8(67).is_err());
+        assert_eq!(TxnField::from_u8(68).unwrap(), TxnField::RejectVersion);
+        assert!(TxnField::from_u8(69).is_err());
     }
 
     #[test]
@@ -343,5 +481,80 @@ mod tests {
             msg.contains("99"),
             "error should include the bad index: {msg}"
         );
+    }
+
+    #[test]
+    fn ecdsa_curve_round_trip() {
+        assert_eq!(EcdsaCurve::from_u8(0).unwrap(), EcdsaCurve::Secp256k1);
+        assert_eq!(EcdsaCurve::from_u8(1).unwrap(), EcdsaCurve::Secp256r1);
+        assert!(EcdsaCurve::from_u8(2).is_err());
+    }
+
+    #[test]
+    fn ec_group_round_trip() {
+        assert_eq!(EcGroup::from_u8(0).unwrap(), EcGroup::BN254g1);
+        assert_eq!(EcGroup::from_u8(1).unwrap(), EcGroup::BN254g2);
+        assert_eq!(EcGroup::from_u8(2).unwrap(), EcGroup::BLS12_381g1);
+        assert_eq!(EcGroup::from_u8(3).unwrap(), EcGroup::BLS12_381g2);
+        assert!(EcGroup::from_u8(4).is_err());
+    }
+
+    #[test]
+    fn mimc_config_round_trip() {
+        assert_eq!(MimcConfig::from_u8(0).unwrap(), MimcConfig::BN254Mp110);
+        assert_eq!(MimcConfig::from_u8(1).unwrap(), MimcConfig::BLS12_381Mp111,);
+        assert!(MimcConfig::from_u8(2).is_err());
+    }
+
+    #[test]
+    fn base64_encoding_round_trip() {
+        assert_eq!(
+            Base64Encoding::from_u8(0).unwrap(),
+            Base64Encoding::URLEncoding,
+        );
+        assert_eq!(
+            Base64Encoding::from_u8(1).unwrap(),
+            Base64Encoding::StdEncoding,
+        );
+        assert!(Base64Encoding::from_u8(2).is_err());
+    }
+
+    #[test]
+    fn json_ref_type_round_trip() {
+        assert_eq!(JSONRefType::from_u8(0).unwrap(), JSONRefType::JSONString,);
+        assert_eq!(JSONRefType::from_u8(1).unwrap(), JSONRefType::JSONUint64,);
+        assert_eq!(JSONRefType::from_u8(2).unwrap(), JSONRefType::JSONObject,);
+        assert!(JSONRefType::from_u8(3).is_err());
+    }
+
+    #[test]
+    fn vrf_standard_round_trip() {
+        assert_eq!(VrfStandard::from_u8(0).unwrap(), VrfStandard::VrfAlgorand,);
+        assert!(VrfStandard::from_u8(1).is_err());
+    }
+
+    #[test]
+    fn block_field_round_trip() {
+        assert_eq!(BlockField::from_u8(0).unwrap(), BlockField::BlkSeed);
+        assert_eq!(BlockField::from_u8(1).unwrap(), BlockField::BlkTimestamp);
+        assert_eq!(BlockField::from_u8(2).unwrap(), BlockField::BlkProposer);
+        assert_eq!(
+            BlockField::from_u8(9).unwrap(),
+            BlockField::BlkProposerPayout,
+        );
+        assert!(BlockField::from_u8(10).is_err());
+    }
+
+    #[test]
+    fn voter_params_field_round_trip() {
+        assert_eq!(
+            VoterParamsField::from_u8(0).unwrap(),
+            VoterParamsField::VoterBalance,
+        );
+        assert_eq!(
+            VoterParamsField::from_u8(1).unwrap(),
+            VoterParamsField::VoterIncentiveEligible,
+        );
+        assert!(VoterParamsField::from_u8(2).is_err());
     }
 }
