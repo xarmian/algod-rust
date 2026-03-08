@@ -2495,6 +2495,12 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // The offset base for inner ID computation: number of already-submitted inner txns.
         let id_offset_base: usize = self.inner_txns.iter().map(|g| g.len()).sum();
 
+        // Use a running counter that accumulates across sibling inner txns.
+        // This is critical when an earlier inner appl creates nested inner
+        // txns that consume counter slots — the next sibling must see the
+        // updated counter, not a stale value computed from txn_counter_base.
+        let mut current_counter = txn_counter_base;
+
         for (i, stxn) in txns.iter_mut().enumerate() {
             // Deduct fee from sender to fee_sink (matches go-algorand takeFee).
             let fee = stxn.txn.fee;
@@ -2524,7 +2530,8 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             }
 
             // Increment txn counter before execution (matches go-algorand incTxnCount).
-            self.txn_counter = txn_counter_base + (i as u64) + 1;
+            current_counter += 1;
+            self.txn_counter = current_counter;
 
             // Dispatch to the appropriate apply function.
             if stxn.txn.txn_type == "appl" {
@@ -2556,7 +2563,10 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         stxn.apply_data_application_id = ad.application_id;
                         // Propagate fee_credit and txn_counter back from child (H5/H6).
                         self.fee_credit = ad.fee_credit;
-                        self.txn_counter = ad.txn_counter;
+                        // Update running counter from child — the child's counter
+                        // accounts for any nested inner txns it created.
+                        current_counter = ad.txn_counter;
+                        self.txn_counter = current_counter;
                     }
                     Err(e) => {
                         self.store.restore_snapshot(snapshot);
@@ -6340,5 +6350,136 @@ mod tests {
         );
         // Local state should be removed.
         assert!(!store.has_app_local_state(&app42_addr, 100));
+    }
+
+    // ---- P1: Preserve txn_counter across sibling inner txns ----
+
+    #[test]
+    fn p1_sibling_inner_txns_get_distinct_creatable_ids() {
+        // Scenario: inner group with 2 txns:
+        //   [0] appl call to app 100, whose approval program creates an asset
+        //       via a nested inner acfg (consuming an extra txn_counter slot)
+        //   [1] acfg create (direct asset creation)
+        //
+        // Before the fix, txn_counter was reset from txn_counter_base + i for
+        // each sibling, so the nested asset creation in [0] was invisible to
+        // [1], causing duplicate IDs.
+        let mut store = LedgerState::new();
+
+        // App 42 (the outer app).
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        // App 100: its approval program does itxn_begin + acfg create + itxn_submit + approve.
+        // Bytecode: itxn_begin, pushint 3, itxn_field TypeEnum, pushint 1,
+        //           itxn_field ConfigAssetTotal, itxn_submit, pushint 1, return
+        let acfg_creating_program: Vec<u8> = vec![
+            0x06, // version 6
+            0xb1, // itxn_begin
+            0x81, 0x03, // pushint 3 (acfg)
+            0xb2, 0x10, // itxn_field TypeEnum (16)
+            0x81, 0x01, // pushint 1
+            0xb2, 0x22, // itxn_field ConfigAssetTotal (34)
+            0xb3, // itxn_submit
+            0x81, 0x01, // pushint 1
+            0x43, // return
+        ];
+        store.set_app_params(
+            100,
+            AppParams {
+                creator: Address([1u8; 32]),
+                approval_program: acfg_creating_program.clone(),
+                clear_state_program: make_program(6, true),
+                global_state: std::collections::BTreeMap::new(),
+                global_state_schema: StateSchema::default(),
+                local_state_schema: StateSchema::default(),
+                extra_program_pages: 0,
+            },
+        );
+
+        // Fund the outer app address (app 42) and the inner app address (app 100).
+        let app42_addr = Address(app_address(42));
+        store.set_account(
+            &app42_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        let app100_addr = Address(app_address(100));
+        store.set_account(
+            &app100_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        // Set up a fee sink.
+        let fee_sink = Address([0xFEu8; 32]);
+        store.set_account(
+            &fee_sink,
+            AccountData {
+                micro_algos: 0,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = fee_sink;
+        ctx.opcode_budget = 5000;
+        ctx.txn_counter = 100;
+
+        // Build inner group: [0] appl call to 100, [1] acfg create.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
+
+        ctx.itxn_next().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(3)).unwrap(); // TypeEnum = acfg
+        ctx.itxn_field(34, TealValue::Uint(500_000)).unwrap(); // ConfigAssetTotal
+
+        ctx.itxn_submit().unwrap();
+
+        // Expected counter progression:
+        //   txn_counter_base = 100
+        //   i=0 (appl): current_counter = 101, execute_inner_appl gets counter=101
+        //     Inside app 100: nested acfg uses counter 101+1=102, then child
+        //     counter becomes 102. Returned ad.txn_counter = 102.
+        //   current_counter = 102 (from ad.txn_counter)
+        //   i=1 (acfg): current_counter = 103, asset_id = 103 + 1 = 104
+        //
+        // The nested asset created by app 100 has ID 102+1 = 103 (inside the
+        // child context). The sibling acfg gets asset_id = current_counter + 1
+        // = 103 + 1 = 104.
+
+        // Read created asset ID from the second inner txn (index 1).
+        let sibling_asset = ctx.last_itxn_group_field(1, 60, None).unwrap(); // CreatedAssetID
+
+        // The sibling asset ID must not collide with the nested asset (103).
+        if let TealValue::Uint(sibling_id) = sibling_asset {
+            // The nested asset created inside app 100 should exist at ID 103.
+            assert!(
+                store.get_asset_params(103).is_some(),
+                "nested asset at ID 103 should exist"
+            );
+            // The sibling asset should be at a different (higher) ID.
+            assert_ne!(
+                sibling_id, 103,
+                "sibling acfg must not get the same ID as the nested asset"
+            );
+            assert!(
+                store.get_asset_params(sibling_id).is_some(),
+                "sibling asset should exist in store"
+            );
+            // They should be distinct.
+            assert_ne!(
+                sibling_id, 103,
+                "sibling and nested assets must have distinct IDs"
+            );
+        } else {
+            panic!("expected Uint for CreatedAssetID");
+        }
     }
 }

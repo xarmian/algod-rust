@@ -42,17 +42,31 @@ pub fn op_itxn_field(
 /// Before submitting, syncs the machine's remaining opcode budget into the
 /// context so that inner app calls can share the pooled budget. After
 /// submission, reads the updated budget back from the context.
+///
+/// If the context does not implement `set_opcode_budget`/`get_opcode_budget`
+/// (the trait defaults return 0), we preserve the machine's pre-submit budget
+/// to avoid accidentally zeroing it.
 pub fn op_itxn_submit(
     machine: &mut AvmMachine,
     _instruction: &Instruction,
     ctx: &mut dyn AvmContext,
 ) -> Result<(), AlgoError> {
+    let budget_before = machine.budget;
     // Tell the context the machine's current remaining budget.
     ctx.set_opcode_budget(machine.budget);
     // Execute inner transactions (may include recursive AVM for appl calls).
     ctx.itxn_submit()?;
     // Read back the budget — inner execution may have consumed some.
-    machine.budget = ctx.get_opcode_budget();
+    // Guard against contexts that don't implement the budget hooks: the
+    // default get_opcode_budget() returns 0, which would incorrectly zero
+    // the machine's budget. If the context returns 0 but we had a positive
+    // budget before, keep the original budget (the context didn't track it).
+    let ctx_budget = ctx.get_opcode_budget();
+    if ctx_budget == 0 && budget_before > 0 {
+        // Context likely uses the default no-op implementation; preserve budget.
+    } else {
+        machine.budget = ctx_budget;
+    }
     Ok(())
 }
 
@@ -288,6 +302,24 @@ mod tests {
         let mut ctx = TestItxnContext::new();
         let _m = step_with_ctx(5, &[0xb3], &mut ctx).unwrap();
         assert!(ctx.itxn_submit_called.get());
+    }
+
+    #[test]
+    fn test_itxn_submit_preserves_budget_for_default_context() {
+        // P2: When a context doesn't implement set_opcode_budget/get_opcode_budget
+        // (defaults return 0), itxn_submit should not zero the machine's budget.
+        let mut ctx = TestItxnContext::new();
+        let raw = prog(5, &[0xb3]); // itxn_submit
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        assert_eq!(m.budget, 20000);
+        m.step(&mut ctx).unwrap();
+        // Budget should be preserved minus the 1 opcode cost for itxn_submit
+        // itself, NOT zeroed to 0 by the default get_opcode_budget returning 0.
+        assert_eq!(
+            m.budget, 19999,
+            "budget should be preserved (minus opcode cost) when context uses default budget hooks"
+        );
     }
 
     // -- itxn_next tests --
