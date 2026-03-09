@@ -429,9 +429,17 @@ impl crate::store_trait::LedgerStore for LedgerState {
             .filter(|(_, aid)| *aid == asset_id)
             .copied()
             .collect();
+        // Collect affected addresses for counter updates.
+        let affected_addrs: Vec<Address> = keys_to_remove.iter().map(|(addr, _)| *addr).collect();
         for key in keys_to_remove {
             // Use the trait method so trie pre-mutations are recorded.
             self.remove_asset_holding(&key.0, key.1);
+        }
+        // Decrement total_assets_opted_in for each affected account.
+        for addr in affected_addrs {
+            let mut acct = self.accounts.get(&addr).cloned().unwrap_or_default();
+            acct.total_assets_opted_in = acct.total_assets_opted_in.saturating_sub(1);
+            self.set_account(&addr, acct);
         }
     }
 
@@ -616,9 +624,28 @@ impl crate::store_trait::LedgerStore for LedgerState {
             .filter(|(_, aid)| *aid == app_id)
             .copied()
             .collect();
+        // Collect affected addresses and their local schemas before removal.
+        let affected: Vec<(Address, StateSchema)> = keys_to_remove
+            .iter()
+            .map(|(addr, _)| {
+                let schema = self
+                    .app_local_states
+                    .get(&(*addr, app_id))
+                    .map(|ls| ls.schema.clone())
+                    .unwrap_or_default();
+                (*addr, schema)
+            })
+            .collect();
         for key in keys_to_remove {
             // Use the trait method so trie pre-mutations are recorded.
             self.remove_app_local_state(&key.0, key.1);
+        }
+        // Decrement total_apps_opted_in and subtract local schema for each affected account.
+        for (addr, local_schema) in affected {
+            let mut acct = self.accounts.get(&addr).cloned().unwrap_or_default();
+            acct.total_apps_opted_in = acct.total_apps_opted_in.saturating_sub(1);
+            acct.total_app_schema = acct.total_app_schema.sub_schema(&local_schema);
+            self.set_account(&addr, acct);
         }
     }
 
@@ -1576,6 +1603,35 @@ mod tests {
         let addr2 = Address([2u8; 32]);
         let addr3 = Address([3u8; 32]);
 
+        // Set up accounts with total_assets_opted_in counters.
+        // addr1 holds asset 42 and 99 => 2 opted in.
+        state.set_account(
+            &addr1,
+            AccountData {
+                micro_algos: 1_000_000,
+                total_assets_opted_in: 2,
+                ..Default::default()
+            },
+        );
+        // addr2 holds only asset 42 => 1 opted in.
+        state.set_account(
+            &addr2,
+            AccountData {
+                micro_algos: 1_000_000,
+                total_assets_opted_in: 1,
+                ..Default::default()
+            },
+        );
+        // addr3 holds only asset 42 => 1 opted in.
+        state.set_account(
+            &addr3,
+            AccountData {
+                micro_algos: 1_000_000,
+                total_assets_opted_in: 1,
+                ..Default::default()
+            },
+        );
+
         // Three addresses hold asset 42; addr1 also holds asset 99.
         state.set_asset_holding(
             &addr1,
@@ -1618,6 +1674,23 @@ mod tests {
         assert!(state.get_asset_holding(&addr3, 42).is_none());
         // Asset 99 holding should be untouched.
         assert_eq!(state.get_asset_holding(&addr1, 99).unwrap().amount, 50);
+
+        // Account counters should be decremented.
+        let acct1 = state.get_or_default_account(&addr1);
+        assert_eq!(
+            acct1.total_assets_opted_in, 1,
+            "addr1 had 2 assets, removed 1 => 1 remaining"
+        );
+        let acct2 = state.get_or_default_account(&addr2);
+        assert_eq!(
+            acct2.total_assets_opted_in, 0,
+            "addr2 had 1 asset, removed 1 => 0 remaining"
+        );
+        let acct3 = state.get_or_default_account(&addr3);
+        assert_eq!(
+            acct3.total_assets_opted_in, 0,
+            "addr3 had 1 asset, removed 1 => 0 remaining"
+        );
     }
 
     #[test]
@@ -1650,6 +1723,34 @@ mod tests {
             key_value: std::collections::BTreeMap::new(),
         };
 
+        // Set up accounts with counters reflecting their opt-ins.
+        // addr1: opted in to app 50 (schema: 1 uint) and app 99 (schema: 3 uint) => 2 opted in.
+        state.set_account(
+            &addr1,
+            AccountData {
+                micro_algos: 1_000_000,
+                total_apps_opted_in: 2,
+                total_app_schema: StateSchema {
+                    num_uint: 4, // 1 (app 50) + 3 (app 99)
+                    num_byte_slice: 0,
+                },
+                ..Default::default()
+            },
+        );
+        // addr2: opted in to app 50 only (schema: 2 uint) => 1 opted in.
+        state.set_account(
+            &addr2,
+            AccountData {
+                micro_algos: 1_000_000,
+                total_apps_opted_in: 1,
+                total_app_schema: StateSchema {
+                    num_uint: 2,
+                    num_byte_slice: 0,
+                },
+                ..Default::default()
+            },
+        );
+
         // Two addresses have local state for app 50; addr1 also has local state for app 99.
         state.set_app_local_state(&addr1, 50, local1);
         state.set_app_local_state(&addr2, 50, local2);
@@ -1662,6 +1763,29 @@ mod tests {
         assert!(state.get_app_local_state(&addr2, 50).is_none());
         // App 99 local state should be untouched.
         assert!(state.get_app_local_state(&addr1, 99).is_some());
+
+        // Account counters should be updated.
+        let acct1 = state.get_or_default_account(&addr1);
+        assert_eq!(
+            acct1.total_apps_opted_in, 1,
+            "addr1 had 2 apps opted in, removed 1 => 1 remaining"
+        );
+        assert_eq!(
+            acct1.total_app_schema.num_uint, 3,
+            "addr1 had 4 uint (1+3), subtracted 1 => 3 remaining"
+        );
+        assert_eq!(acct1.total_app_schema.num_byte_slice, 0);
+
+        let acct2 = state.get_or_default_account(&addr2);
+        assert_eq!(
+            acct2.total_apps_opted_in, 0,
+            "addr2 had 1 app opted in, removed 1 => 0 remaining"
+        );
+        assert_eq!(
+            acct2.total_app_schema.num_uint, 0,
+            "addr2 had 2 uint, subtracted 2 => 0 remaining"
+        );
+        assert_eq!(acct2.total_app_schema.num_byte_slice, 0);
     }
 
     #[test]

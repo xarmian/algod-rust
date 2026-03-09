@@ -2053,27 +2053,45 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_all_asset_holdings_for_asset(&mut self, asset_id: u64) {
-        // Find all (addrid, data) rows for this asset_id with a holding flag.
-        let mut stmt = self
-            .conn
-            .prepare("SELECT addrid, data FROM resources WHERE aidx = ?1 AND ctype = ?2")
-            .expect("prepare remove_all_asset_holdings_for_asset");
-        let rows: Vec<(i64, Vec<u8>)> = stmt
-            .query_map(params![asset_id as i64, CTYPE_ASSET], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        // Find all (addrid, data, address) rows for this asset_id with a holding flag.
+        let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT r.addrid, r.data, a.address FROM resources r \
+                     JOIN accountbase a ON a.rowid = r.addrid \
+                     WHERE r.aidx = ?1 AND r.ctype = ?2",
+                )
+                .expect("prepare remove_all_asset_holdings_for_asset");
+            stmt.query_map(params![asset_id as i64, CTYPE_ASSET], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
             })
             .expect("query remove_all_asset_holdings_for_asset")
             .filter_map(|r| r.ok())
-            .collect();
+            .collect()
+        };
 
-        for (rowid, data) in rows {
-            let flags = extract_resource_flags(&data);
+        // Track which addresses had holdings removed for counter updates.
+        let mut affected_addrs: Vec<Address> = Vec::new();
+
+        for (rowid, data, addr_bytes) in &rows {
+            let flags = extract_resource_flags(data);
             if flags & RESOURCE_FLAGS_HOLDING == 0 {
                 continue; // no holding in this blob
             }
+            // Record this address for counter update.
+            if addr_bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(addr_bytes);
+                affected_addrs.push(Address(arr));
+            }
             if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
                 // Both flags set — strip holding, keep asset params.
-                if let Some(stripped) = strip_asset_holding_from_blob(&data) {
+                if let Some(stripped) = strip_asset_holding_from_blob(data) {
                     let _ = self.conn.execute(
                         "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                         params![stripped, rowid, asset_id as i64, CTYPE_ASSET],
@@ -2086,6 +2104,13 @@ impl LedgerStore for SqliteLedger {
                     params![rowid, asset_id as i64, CTYPE_ASSET],
                 );
             }
+        }
+
+        // Decrement total_assets_opted_in for each affected account.
+        for addr in affected_addrs {
+            let mut acct = self.get_or_default_account(&addr);
+            acct.total_assets_opted_in = acct.total_assets_opted_in.saturating_sub(1);
+            self.set_account(&addr, acct);
         }
     }
 
@@ -2433,27 +2458,48 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_all_app_local_states_for_app(&mut self, app_id: u64) {
-        // Find all (addrid, data) rows for this app_id with a holding flag (local state).
-        let mut stmt = self
-            .conn
-            .prepare("SELECT addrid, data FROM resources WHERE aidx = ?1 AND ctype = ?2")
-            .expect("prepare remove_all_app_local_states_for_app");
-        let rows: Vec<(i64, Vec<u8>)> = stmt
-            .query_map(params![app_id as i64, CTYPE_APP], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        // Find all (addrid, data, address) rows for this app_id with a holding flag (local state).
+        let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT r.addrid, r.data, a.address FROM resources r \
+                     JOIN accountbase a ON a.rowid = r.addrid \
+                     WHERE r.aidx = ?1 AND r.ctype = ?2",
+                )
+                .expect("prepare remove_all_app_local_states_for_app");
+            stmt.query_map(params![app_id as i64, CTYPE_APP], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
             })
             .expect("query remove_all_app_local_states_for_app")
             .filter_map(|r| r.ok())
-            .collect();
+            .collect()
+        };
 
-        for (rowid, data) in rows {
-            let flags = extract_resource_flags(&data);
+        // Track affected addresses and their local schemas for counter updates.
+        let mut affected: Vec<(Address, StateSchema)> = Vec::new();
+
+        for (rowid, data, addr_bytes) in &rows {
+            let flags = extract_resource_flags(data);
             if flags & RESOURCE_FLAGS_HOLDING == 0 {
                 continue; // no local state in this blob
             }
+            // Decode the local state schema before removing.
+            if addr_bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(addr_bytes);
+                let local_schema = decode_app_local_state(data)
+                    .map(|ls| ls.schema)
+                    .unwrap_or_default();
+                affected.push((Address(arr), local_schema));
+            }
             if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
                 // Both flags set — strip local state, keep app params.
-                if let Some(stripped) = strip_holding_from_blob(&data) {
+                if let Some(stripped) = strip_holding_from_blob(data) {
                     let _ = self.conn.execute(
                         "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                         params![stripped, rowid, app_id as i64, CTYPE_APP],
@@ -2466,6 +2512,14 @@ impl LedgerStore for SqliteLedger {
                     params![rowid, app_id as i64, CTYPE_APP],
                 );
             }
+        }
+
+        // Decrement total_apps_opted_in and subtract local schema for each affected account.
+        for (addr, local_schema) in affected {
+            let mut acct = self.get_or_default_account(&addr);
+            acct.total_apps_opted_in = acct.total_apps_opted_in.saturating_sub(1);
+            acct.total_app_schema = acct.total_app_schema.sub_schema(&local_schema);
+            self.set_account(&addr, acct);
         }
     }
 
