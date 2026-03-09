@@ -375,7 +375,16 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
                     }
                 }
             }
-            if stx.apply_data_config_asset != 0 {
+            // For creates (config_asset == 0), snapshot the ID that apply_acfg
+            // will derive (txn_counter + 1) so rollback can clean it up on failure.
+            // Also snapshot apply_data_config_asset from block data if present.
+            let derived_id = ctx.txn_counter.get() + 1;
+            if txn.config_asset == 0 && derived_id != 0 {
+                asset_ids_to_snap.push(derived_id);
+            }
+            if stx.apply_data_config_asset != 0
+                && !asset_ids_to_snap.contains(&stx.apply_data_config_asset)
+            {
                 asset_ids_to_snap.push(stx.apply_data_config_asset);
             }
         }
