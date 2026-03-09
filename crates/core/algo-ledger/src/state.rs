@@ -90,6 +90,9 @@ pub struct LedgerState {
     pub genesis_hash: [u8; 32],
     pub protocol: String,
 
+    // Transaction counter (previous block's TxnCounter — base for ID generation)
+    pub txn_counter: u64,
+
     // Merkle trie tracking
     trie: Option<MerkleTrie>,
     pre_mutations: Vec<PreMutation>,
@@ -115,6 +118,7 @@ impl LedgerState {
             genesis_id: String::new(),
             genesis_hash: [0u8; 32],
             protocol: String::new(),
+            txn_counter: 0,
             trie: None,
             pre_mutations: Vec::new(),
         }
@@ -417,6 +421,28 @@ impl crate::store_trait::LedgerStore for LedgerState {
         self.asset_holdings.contains_key(&(*addr, asset_id))
     }
 
+    fn remove_all_asset_holdings_for_asset(&mut self, asset_id: u64) {
+        // Collect keys first to avoid borrowing issues.
+        let keys_to_remove: Vec<(Address, u64)> = self
+            .asset_holdings
+            .keys()
+            .filter(|(_, aid)| *aid == asset_id)
+            .copied()
+            .collect();
+        // Collect affected addresses for counter updates.
+        let affected_addrs: Vec<Address> = keys_to_remove.iter().map(|(addr, _)| *addr).collect();
+        for key in keys_to_remove {
+            // Use the trait method so trie pre-mutations are recorded.
+            self.remove_asset_holding(&key.0, key.1);
+        }
+        // Decrement total_assets_opted_in for each affected account.
+        for addr in affected_addrs {
+            let mut acct = self.accounts.get(&addr).cloned().unwrap_or_default();
+            acct.total_assets_opted_in = acct.total_assets_opted_in.saturating_sub(1);
+            self.set_account(&addr, acct);
+        }
+    }
+
     // ---- Asset Params ----
 
     fn get_asset_params(&self, asset_id: u64) -> Option<AssetParamsRecord> {
@@ -590,6 +616,39 @@ impl crate::store_trait::LedgerStore for LedgerState {
         self.app_local_states.contains_key(&(*addr, app_id))
     }
 
+    fn remove_all_app_local_states_for_app(&mut self, app_id: u64) {
+        // Collect keys first to avoid borrowing issues.
+        let keys_to_remove: Vec<(Address, u64)> = self
+            .app_local_states
+            .keys()
+            .filter(|(_, aid)| *aid == app_id)
+            .copied()
+            .collect();
+        // Collect affected addresses and their local schemas before removal.
+        let affected: Vec<(Address, StateSchema)> = keys_to_remove
+            .iter()
+            .map(|(addr, _)| {
+                let schema = self
+                    .app_local_states
+                    .get(&(*addr, app_id))
+                    .map(|ls| ls.schema.clone())
+                    .unwrap_or_default();
+                (*addr, schema)
+            })
+            .collect();
+        for key in keys_to_remove {
+            // Use the trait method so trie pre-mutations are recorded.
+            self.remove_app_local_state(&key.0, key.1);
+        }
+        // Decrement total_apps_opted_in and subtract local schema for each affected account.
+        for (addr, local_schema) in affected {
+            let mut acct = self.accounts.get(&addr).cloned().unwrap_or_default();
+            acct.total_apps_opted_in = acct.total_apps_opted_in.saturating_sub(1);
+            acct.total_app_schema = acct.total_app_schema.sub_schema(&local_schema);
+            self.set_account(&addr, acct);
+        }
+    }
+
     fn app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)> {
         self.app_local_states
             .iter()
@@ -659,6 +718,10 @@ impl crate::store_trait::LedgerStore for LedgerState {
         &self.protocol
     }
 
+    fn txn_counter(&self) -> u64 {
+        self.txn_counter
+    }
+
     // ---- Chain-level state (setters) ----
 
     fn set_current_round(&mut self, round: Round) {
@@ -699,6 +762,10 @@ impl crate::store_trait::LedgerStore for LedgerState {
 
     fn set_protocol(&mut self, protocol: String) {
         self.protocol = protocol;
+    }
+
+    fn set_txn_counter(&mut self, counter: u64) {
+        self.txn_counter = counter;
     }
 
     // ---- Snapshot / Restore ----
@@ -1525,5 +1592,273 @@ mod tests {
             num_byte_slice: 0,
         };
         assert_eq!(schema_min_balance(&schema), 0);
+    }
+
+    #[test]
+    fn test_remove_all_asset_holdings_for_asset() {
+        use crate::store_trait::LedgerStore;
+
+        let mut state = LedgerState::new();
+        let addr1 = Address([1u8; 32]);
+        let addr2 = Address([2u8; 32]);
+        let addr3 = Address([3u8; 32]);
+
+        // Set up accounts with total_assets_opted_in counters.
+        // addr1 holds asset 42 and 99 => 2 opted in.
+        state.set_account(
+            &addr1,
+            AccountData {
+                micro_algos: 1_000_000,
+                total_assets_opted_in: 2,
+                ..Default::default()
+            },
+        );
+        // addr2 holds only asset 42 => 1 opted in.
+        state.set_account(
+            &addr2,
+            AccountData {
+                micro_algos: 1_000_000,
+                total_assets_opted_in: 1,
+                ..Default::default()
+            },
+        );
+        // addr3 holds only asset 42 => 1 opted in.
+        state.set_account(
+            &addr3,
+            AccountData {
+                micro_algos: 1_000_000,
+                total_assets_opted_in: 1,
+                ..Default::default()
+            },
+        );
+
+        // Three addresses hold asset 42; addr1 also holds asset 99.
+        state.set_asset_holding(
+            &addr1,
+            42,
+            AssetHolding {
+                amount: 100,
+                frozen: false,
+            },
+        );
+        state.set_asset_holding(
+            &addr2,
+            42,
+            AssetHolding {
+                amount: 200,
+                frozen: false,
+            },
+        );
+        state.set_asset_holding(
+            &addr3,
+            42,
+            AssetHolding {
+                amount: 300,
+                frozen: true,
+            },
+        );
+        state.set_asset_holding(
+            &addr1,
+            99,
+            AssetHolding {
+                amount: 50,
+                frozen: false,
+            },
+        );
+
+        state.remove_all_asset_holdings_for_asset(42);
+
+        // All holdings for asset 42 should be gone.
+        assert!(state.get_asset_holding(&addr1, 42).is_none());
+        assert!(state.get_asset_holding(&addr2, 42).is_none());
+        assert!(state.get_asset_holding(&addr3, 42).is_none());
+        // Asset 99 holding should be untouched.
+        assert_eq!(state.get_asset_holding(&addr1, 99).unwrap().amount, 50);
+
+        // Account counters should be decremented.
+        let acct1 = state.get_or_default_account(&addr1);
+        assert_eq!(
+            acct1.total_assets_opted_in, 1,
+            "addr1 had 2 assets, removed 1 => 1 remaining"
+        );
+        let acct2 = state.get_or_default_account(&addr2);
+        assert_eq!(
+            acct2.total_assets_opted_in, 0,
+            "addr2 had 1 asset, removed 1 => 0 remaining"
+        );
+        let acct3 = state.get_or_default_account(&addr3);
+        assert_eq!(
+            acct3.total_assets_opted_in, 0,
+            "addr3 had 1 asset, removed 1 => 0 remaining"
+        );
+    }
+
+    #[test]
+    fn test_remove_all_app_local_states_for_app() {
+        use crate::store_trait::LedgerStore;
+
+        let mut state = LedgerState::new();
+        let addr1 = Address([1u8; 32]);
+        let addr2 = Address([2u8; 32]);
+
+        let local1 = AppLocalState {
+            schema: StateSchema {
+                num_uint: 1,
+                num_byte_slice: 0,
+            },
+            key_value: std::collections::BTreeMap::new(),
+        };
+        let local2 = AppLocalState {
+            schema: StateSchema {
+                num_uint: 2,
+                num_byte_slice: 0,
+            },
+            key_value: std::collections::BTreeMap::new(),
+        };
+        let local_other = AppLocalState {
+            schema: StateSchema {
+                num_uint: 3,
+                num_byte_slice: 0,
+            },
+            key_value: std::collections::BTreeMap::new(),
+        };
+
+        // Set up accounts with counters reflecting their opt-ins.
+        // addr1: opted in to app 50 (schema: 1 uint) and app 99 (schema: 3 uint) => 2 opted in.
+        state.set_account(
+            &addr1,
+            AccountData {
+                micro_algos: 1_000_000,
+                total_apps_opted_in: 2,
+                total_app_schema: StateSchema {
+                    num_uint: 4, // 1 (app 50) + 3 (app 99)
+                    num_byte_slice: 0,
+                },
+                ..Default::default()
+            },
+        );
+        // addr2: opted in to app 50 only (schema: 2 uint) => 1 opted in.
+        state.set_account(
+            &addr2,
+            AccountData {
+                micro_algos: 1_000_000,
+                total_apps_opted_in: 1,
+                total_app_schema: StateSchema {
+                    num_uint: 2,
+                    num_byte_slice: 0,
+                },
+                ..Default::default()
+            },
+        );
+
+        // Two addresses have local state for app 50; addr1 also has local state for app 99.
+        state.set_app_local_state(&addr1, 50, local1);
+        state.set_app_local_state(&addr2, 50, local2);
+        state.set_app_local_state(&addr1, 99, local_other);
+
+        state.remove_all_app_local_states_for_app(50);
+
+        // All local states for app 50 should be gone.
+        assert!(state.get_app_local_state(&addr1, 50).is_none());
+        assert!(state.get_app_local_state(&addr2, 50).is_none());
+        // App 99 local state should be untouched.
+        assert!(state.get_app_local_state(&addr1, 99).is_some());
+
+        // Account counters should be updated.
+        let acct1 = state.get_or_default_account(&addr1);
+        assert_eq!(
+            acct1.total_apps_opted_in, 1,
+            "addr1 had 2 apps opted in, removed 1 => 1 remaining"
+        );
+        assert_eq!(
+            acct1.total_app_schema.num_uint, 3,
+            "addr1 had 4 uint (1+3), subtracted 1 => 3 remaining"
+        );
+        assert_eq!(acct1.total_app_schema.num_byte_slice, 0);
+
+        let acct2 = state.get_or_default_account(&addr2);
+        assert_eq!(
+            acct2.total_apps_opted_in, 0,
+            "addr2 had 1 app opted in, removed 1 => 0 remaining"
+        );
+        assert_eq!(
+            acct2.total_app_schema.num_uint, 0,
+            "addr2 had 2 uint, subtracted 2 => 0 remaining"
+        );
+        assert_eq!(acct2.total_app_schema.num_byte_slice, 0);
+    }
+
+    #[test]
+    fn test_rollback_cleans_non_snapshotted_holdings() {
+        // Simulate the scenario: snapshot covers addr1, then a nested create
+        // adds an asset holding for addr2 (not snapshotted). On rollback +
+        // remove_all_asset_holdings_for_asset, addr2's holding should be removed.
+        use crate::store_trait::LedgerStore;
+
+        let mut state = LedgerState::new();
+        let addr1 = Address([1u8; 32]);
+        let addr2 = Address([2u8; 32]);
+
+        state.set_account(
+            &addr1,
+            AccountData {
+                micro_algos: 1_000_000,
+                ..Default::default()
+            },
+        );
+        state.set_account(
+            &addr2,
+            AccountData {
+                micro_algos: 500_000,
+                ..Default::default()
+            },
+        );
+
+        // Snapshot only covers addr1.
+        let snap = state.snapshot(&[addr1]);
+
+        // Simulate nested inner txn: create asset 42 and opt-in addr2.
+        state.set_asset_params(
+            42,
+            AssetParamsRecord {
+                params: algo_types::AssetParams {
+                    total: 1000,
+                    ..Default::default()
+                },
+                creator: addr1,
+            },
+        );
+        state.set_asset_holding(
+            &addr1,
+            42,
+            AssetHolding {
+                amount: 1000,
+                frozen: false,
+            },
+        );
+        state.set_asset_holding(
+            &addr2,
+            42,
+            AssetHolding {
+                amount: 0,
+                frozen: false,
+            },
+        );
+
+        // Rollback: restore snapshot then clean up created asset.
+        state.restore_snapshot(snap);
+        state.remove_asset_params(42);
+        state.remove_all_asset_holdings_for_asset(42);
+
+        // addr1's holding is cleaned by restore_snapshot (snapshotted addr).
+        assert!(state.get_asset_holding(&addr1, 42).is_none());
+        // addr2's holding was NOT snapshotted but should be cleaned by
+        // remove_all_asset_holdings_for_asset.
+        assert!(
+            state.get_asset_holding(&addr2, 42).is_none(),
+            "non-snapshotted account's holding should be cleaned on rollback"
+        );
+        // Asset params should be gone.
+        assert!(state.get_asset_params(42).is_none());
     }
 }

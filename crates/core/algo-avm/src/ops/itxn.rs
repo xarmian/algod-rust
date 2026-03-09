@@ -38,12 +38,34 @@ pub fn op_itxn_field(
 
 /// `itxn_submit` (0xb3): execute the inner transaction(s) that were built.
 /// No stack args, no immediates.
+///
+/// Before submitting, syncs the machine's remaining opcode budget into the
+/// context so that inner app calls can share the pooled budget. After
+/// submission, reads the updated budget back from the context.
+///
+/// If the context does not implement `set_opcode_budget`/`get_opcode_budget`
+/// (the trait defaults return 0), we preserve the machine's pre-submit budget
+/// to avoid accidentally zeroing it.
 pub fn op_itxn_submit(
-    _machine: &mut AvmMachine,
+    machine: &mut AvmMachine,
     _instruction: &Instruction,
     ctx: &mut dyn AvmContext,
 ) -> Result<(), AlgoError> {
-    ctx.itxn_submit()
+    // Tell the context the machine's current remaining budget.
+    ctx.set_opcode_budget(machine.budget);
+    // Execute inner transactions (may include recursive AVM for appl calls).
+    ctx.itxn_submit()?;
+    // Read back the budget — inner execution may have consumed some.
+    //
+    // Only update the machine's budget if the context actually implements
+    // budget pooling. Contexts that use the default no-op hooks return 0
+    // from `get_opcode_budget()`, which would incorrectly zero the budget.
+    // A real context that legitimately exhausts all budget to 0 will have
+    // `supports_budget_pooling() == true`, so we correctly accept the 0.
+    if ctx.supports_budget_pooling() {
+        machine.budget = ctx.get_opcode_budget();
+    }
+    Ok(())
 }
 
 /// `itxn_next` (0xb6): chain another inner transaction in the current group.
@@ -278,6 +300,102 @@ mod tests {
         let mut ctx = TestItxnContext::new();
         let _m = step_with_ctx(5, &[0xb3], &mut ctx).unwrap();
         assert!(ctx.itxn_submit_called.get());
+    }
+
+    #[test]
+    fn test_itxn_submit_preserves_budget_for_default_context() {
+        // P2: When a context doesn't implement set_opcode_budget/get_opcode_budget
+        // (defaults return 0), itxn_submit should not zero the machine's budget.
+        let mut ctx = TestItxnContext::new();
+        let raw = prog(5, &[0xb3]); // itxn_submit
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        assert_eq!(m.budget, 20000);
+        m.step(&mut ctx).unwrap();
+        // Budget should be preserved minus the 1 opcode cost for itxn_submit
+        // itself, NOT zeroed to 0 by the default get_opcode_budget returning 0.
+        assert_eq!(
+            m.budget, 19999,
+            "budget should be preserved (minus opcode cost) when context uses default budget hooks"
+        );
+    }
+
+    // -- Budget pooling context mock --
+
+    /// A test context that implements real budget pooling. When `itxn_submit`
+    /// is called, it stores the budget from `set_opcode_budget` and can
+    /// simulate consuming it (setting it to `post_submit_budget`).
+    struct BudgetPoolingContext {
+        budget: Cell<i64>,
+        post_submit_budget: i64,
+    }
+
+    impl BudgetPoolingContext {
+        fn new(post_submit_budget: i64) -> Self {
+            Self {
+                budget: Cell::new(0),
+                post_submit_budget,
+            }
+        }
+    }
+
+    impl AvmContext for BudgetPoolingContext {
+        fn itxn_submit(&mut self) -> Result<(), AlgoError> {
+            // Simulate inner execution consuming budget down to the configured value.
+            self.budget.set(self.post_submit_budget);
+            Ok(())
+        }
+        fn set_opcode_budget(&mut self, budget: i64) {
+            self.budget.set(budget);
+        }
+        fn get_opcode_budget(&self) -> i64 {
+            self.budget.get()
+        }
+        fn supports_budget_pooling(&self) -> bool {
+            true
+        }
+        fn is_app_mode(&self) -> bool {
+            true
+        }
+        fn current_app_id(&self) -> u64 {
+            42
+        }
+        fn num_inner_txns(&self) -> usize {
+            1
+        }
+    }
+
+    #[test]
+    fn test_itxn_submit_budget_exhausted_to_zero_with_pooling() {
+        // P1-1: When a context that supports budget pooling exhausts the budget
+        // to 0 during inner execution, the machine's budget must be set to 0
+        // (not preserved at the old value).
+        let mut ctx = BudgetPoolingContext::new(0); // inner execution uses all budget
+        let raw = prog(5, &[0xb3]); // itxn_submit
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        assert_eq!(m.budget, 20000);
+        m.step(&mut ctx).unwrap();
+        // Budget should be 0 — the context legitimately exhausted it.
+        // Before the P1-1 fix, this would incorrectly remain at 19999.
+        assert_eq!(
+            m.budget, 0,
+            "budget legitimately exhausted to 0 should stay at 0 with budget pooling"
+        );
+    }
+
+    #[test]
+    fn test_itxn_submit_budget_partially_consumed_with_pooling() {
+        // With budget pooling, a partial consumption should be reflected.
+        let mut ctx = BudgetPoolingContext::new(5000); // inner execution leaves 5000
+        let raw = prog(5, &[0xb3]); // itxn_submit
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        m.step(&mut ctx).unwrap();
+        assert_eq!(
+            m.budget, 5000,
+            "budget should reflect what the pooling context reports"
+        );
     }
 
     // -- itxn_next tests --

@@ -1436,6 +1436,8 @@ pub struct SqliteLedger {
     genesis_id: String,
     genesis_hash: [u8; 32],
     protocol: String,
+    /// Transaction counter from the latest committed block header.
+    txn_counter: u64,
     /// Savepoint counter for nested transactions.
     savepoint_counter: AtomicU64,
     /// Whether we are inside a begin_block/commit_block transaction.
@@ -1513,6 +1515,7 @@ impl SqliteLedger {
         };
 
         let protocol = get_meta_string(&conn, "protocol")?;
+        let txn_counter = get_meta_u64(&conn, "txn_counter")?;
 
         Ok(Self {
             conn,
@@ -1527,6 +1530,7 @@ impl SqliteLedger {
             genesis_id,
             genesis_hash,
             protocol,
+            txn_counter,
             savepoint_counter: AtomicU64::new(0),
             in_block: false,
             trie: None,
@@ -1791,6 +1795,7 @@ impl SqliteLedger {
         set_meta_string(&self.conn, "genesis_id", &self.genesis_id)?;
         set_meta_blob(&self.conn, "genesis_hash", &self.genesis_hash)?;
         set_meta_string(&self.conn, "protocol", &self.protocol)?;
+        set_meta_u64(&self.conn, "txn_counter", self.txn_counter)?;
         Ok(())
     }
 
@@ -2045,6 +2050,68 @@ impl LedgerStore for SqliteLedger {
 
     fn has_asset_holding(&self, addr: &Address, asset_id: u64) -> bool {
         self.get_asset_holding(addr, asset_id).is_some()
+    }
+
+    fn remove_all_asset_holdings_for_asset(&mut self, asset_id: u64) {
+        // Find all (addrid, data, address) rows for this asset_id with a holding flag.
+        let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT r.addrid, r.data, a.address FROM resources r \
+                     JOIN accountbase a ON a.rowid = r.addrid \
+                     WHERE r.aidx = ?1 AND r.ctype = ?2",
+                )
+                .expect("prepare remove_all_asset_holdings_for_asset");
+            stmt.query_map(params![asset_id as i64, CTYPE_ASSET], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .expect("query remove_all_asset_holdings_for_asset")
+            .filter_map(|r| r.ok())
+            .collect()
+        };
+
+        // Track which addresses had holdings removed for counter updates.
+        let mut affected_addrs: Vec<Address> = Vec::new();
+
+        for (rowid, data, addr_bytes) in &rows {
+            let flags = extract_resource_flags(data);
+            if flags & RESOURCE_FLAGS_HOLDING == 0 {
+                continue; // no holding in this blob
+            }
+            // Record this address for counter update.
+            if addr_bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(addr_bytes);
+                affected_addrs.push(Address(arr));
+            }
+            if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
+                // Both flags set — strip holding, keep asset params.
+                if let Some(stripped) = strip_asset_holding_from_blob(data) {
+                    let _ = self.conn.execute(
+                        "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
+                        params![stripped, rowid, asset_id as i64, CTYPE_ASSET],
+                    );
+                }
+            } else {
+                // Only holding — delete the whole row.
+                let _ = self.conn.execute(
+                    "DELETE FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
+                    params![rowid, asset_id as i64, CTYPE_ASSET],
+                );
+            }
+        }
+
+        // Decrement total_assets_opted_in for each affected account.
+        for addr in affected_addrs {
+            let mut acct = self.get_or_default_account(&addr);
+            acct.total_assets_opted_in = acct.total_assets_opted_in.saturating_sub(1);
+            self.set_account(&addr, acct);
+        }
     }
 
     // ---- Asset Params ----
@@ -2390,6 +2457,72 @@ impl LedgerStore for SqliteLedger {
         self.get_app_local_state(addr, app_id).is_some()
     }
 
+    fn remove_all_app_local_states_for_app(&mut self, app_id: u64) {
+        // Find all (addrid, data, address) rows for this app_id with a holding flag (local state).
+        let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT r.addrid, r.data, a.address FROM resources r \
+                     JOIN accountbase a ON a.rowid = r.addrid \
+                     WHERE r.aidx = ?1 AND r.ctype = ?2",
+                )
+                .expect("prepare remove_all_app_local_states_for_app");
+            stmt.query_map(params![app_id as i64, CTYPE_APP], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .expect("query remove_all_app_local_states_for_app")
+            .filter_map(|r| r.ok())
+            .collect()
+        };
+
+        // Track affected addresses and their local schemas for counter updates.
+        let mut affected: Vec<(Address, StateSchema)> = Vec::new();
+
+        for (rowid, data, addr_bytes) in &rows {
+            let flags = extract_resource_flags(data);
+            if flags & RESOURCE_FLAGS_HOLDING == 0 {
+                continue; // no local state in this blob
+            }
+            // Decode the local state schema before removing.
+            if addr_bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(addr_bytes);
+                let local_schema = decode_app_local_state(data)
+                    .map(|ls| ls.schema)
+                    .unwrap_or_default();
+                affected.push((Address(arr), local_schema));
+            }
+            if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
+                // Both flags set — strip local state, keep app params.
+                if let Some(stripped) = strip_holding_from_blob(data) {
+                    let _ = self.conn.execute(
+                        "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
+                        params![stripped, rowid, app_id as i64, CTYPE_APP],
+                    );
+                }
+            } else {
+                // Only local state — delete the whole row.
+                let _ = self.conn.execute(
+                    "DELETE FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
+                    params![rowid, app_id as i64, CTYPE_APP],
+                );
+            }
+        }
+
+        // Decrement total_apps_opted_in and subtract local schema for each affected account.
+        for (addr, local_schema) in affected {
+            let mut acct = self.get_or_default_account(&addr);
+            acct.total_apps_opted_in = acct.total_apps_opted_in.saturating_sub(1);
+            acct.total_app_schema = acct.total_app_schema.sub_schema(&local_schema);
+            self.set_account(&addr, acct);
+        }
+    }
+
     fn app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)> {
         let rowid = match self.get_rowid(addr) {
             Some(r) => r,
@@ -2484,6 +2617,10 @@ impl LedgerStore for SqliteLedger {
         &self.protocol
     }
 
+    fn txn_counter(&self) -> u64 {
+        self.txn_counter
+    }
+
     // ---- Chain-level state (setters) ----
 
     fn set_current_round(&mut self, round: Round) {
@@ -2524,6 +2661,10 @@ impl LedgerStore for SqliteLedger {
 
     fn set_protocol(&mut self, protocol: String) {
         self.protocol = protocol;
+    }
+
+    fn set_txn_counter(&mut self, counter: u64) {
+        self.txn_counter = counter;
     }
 
     // ---- Snapshot / Restore (SAVEPOINTs) ----

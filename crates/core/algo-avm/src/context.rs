@@ -293,6 +293,27 @@ pub trait AvmContext {
         })
     }
 
+    /// Set the context's tracked opcode budget (for budget sharing with
+    /// inner app calls). Called by `op_itxn_submit` before execution.
+    fn set_opcode_budget(&mut self, _budget: i64) {}
+
+    /// Get the context's tracked opcode budget. Called by `op_itxn_submit`
+    /// after inner execution to read back the (possibly reduced) budget.
+    fn get_opcode_budget(&self) -> i64 {
+        0
+    }
+
+    /// Whether this context implements real budget pooling.
+    ///
+    /// When `true`, `op_itxn_submit` always reads back the budget from
+    /// `get_opcode_budget()` after inner execution — even if the result is 0
+    /// (legitimate exhaustion). When `false` (the default), `op_itxn_submit`
+    /// preserves the machine's pre-submit budget so that stub contexts that
+    /// return 0 from `get_opcode_budget()` don't accidentally zero the budget.
+    fn supports_budget_pooling(&self) -> bool {
+        false
+    }
+
     /// Read a field from the last submitted inner transaction.
     fn last_itxn_field(
         &self,
@@ -337,6 +358,44 @@ pub trait AvmContext {
     fn program_hash(&self) -> [u8; 32] {
         [0u8; 32]
     }
+
+    // ---- Inner transaction caller / depth ----
+
+    /// The app ID of the application that invoked this one via inner txn.
+    /// Returns 0 if this is a top-level execution (no caller).
+    fn caller_app_id(&self) -> u64 {
+        0
+    }
+
+    /// The application address of the caller app.
+    /// Returns the zero address if this is a top-level execution.
+    fn caller_app_address(&self) -> [u8; 32] {
+        [0u8; 32]
+    }
+
+    /// Current inner transaction call depth.
+    /// 0 for top-level app calls, incremented for each level of inner app call.
+    fn inner_txn_depth(&self) -> u32 {
+        0
+    }
+
+    // ---- Resource availability ----
+
+    /// Check if an asset is available (in foreign arrays or created by a prior
+    /// inner transaction). Used for resource availability checking.
+    fn is_asset_available(&self, asset_id: u64) -> bool {
+        // Default: not available. Overridden by LedgerAvmContext.
+        let _ = asset_id;
+        false
+    }
+
+    /// Check if an app is available (in foreign arrays, is the current app,
+    /// or was created by a prior inner transaction).
+    fn is_app_available(&self, app_id: u64) -> bool {
+        // Default: not available. Overridden by LedgerAvmContext.
+        let _ = app_id;
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -373,5 +432,8 @@ mod tests {
         assert!(!ctx.is_app_mode());
         assert_eq!(ctx.current_app_id(), 0);
         assert_eq!(ctx.program_hash(), [0u8; 32]);
+        assert_eq!(ctx.caller_app_id(), 0);
+        assert_eq!(ctx.caller_app_address(), [0u8; 32]);
+        assert_eq!(ctx.inner_txn_depth(), 0);
     }
 }

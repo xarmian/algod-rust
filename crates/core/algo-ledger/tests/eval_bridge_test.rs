@@ -77,6 +77,8 @@ fn execute_ctx(fee_sink: Address, round: u64) -> ApplyContext {
         mode: ApplyMode::Execute,
         latest_timestamp: 0,
         genesis_hash: [0u8; 32],
+        txn_counter: std::cell::Cell::new(0),
+        fee_credit: std::cell::Cell::new(0),
     }
 }
 
@@ -850,5 +852,299 @@ fn clearstate_execute_empty_clear_program_still_clears() {
     assert!(
         state.get_app_local_state(&sender, app_id).is_none(),
         "local state should be cleared even with empty clear-state program"
+    );
+}
+
+// ===========================================================================
+// P1: Seed inner creatable counter from block txn_counter
+// ===========================================================================
+
+/// Two app calls in the same block both issue inner acfg creates.
+/// With the txn_counter properly seeded and incremented, the two inner
+/// creates should produce distinct asset IDs (not both ID 1).
+#[test]
+fn two_app_calls_produce_distinct_inner_asset_ids() {
+    use algo_ledger::avm_context::app_address;
+
+    let fee_sink = Address([0xFE; 32]);
+    let sender = Address([0x01; 32]);
+    let app_id = 100u64;
+
+    // AVM v6 program that creates an inner acfg asset:
+    //   itxn_begin
+    //   pushint 3          (TypeEnum = acfg)
+    //   itxn_field TypeEnum (field 16)
+    //   pushint 100        (ConfigAssetTotal)
+    //   itxn_field ConfigAssetTotal (field 34)
+    //   itxn_submit
+    //   pushint 1          (approve)
+    //   return
+    let inner_acfg_program: Vec<u8> = vec![
+        0x06, // version 6
+        0xb1, // itxn_begin
+        0x81, 0x03, // pushint 3 (acfg)
+        0xb2, 0x10, // itxn_field TypeEnum
+        0x81, 0x64, // pushint 100 (total)
+        0xb2, 0x22, // itxn_field ConfigAssetTotal
+        0xb3, // itxn_submit
+        0x81, 0x01, // pushint 1
+        0x43, // return
+    ];
+
+    let mut state = make_state(
+        &[
+            (sender, 10_000_000),
+            (fee_sink, 0),
+            // Fund the app address so it can hold created assets.
+            (Address(app_address(app_id)), 10_000_000),
+        ],
+        fee_sink,
+    );
+
+    create_app(
+        &mut state,
+        app_id,
+        sender,
+        inner_acfg_program.clone(),
+        prog(AVM_V6, &PUSHINT_1),
+    );
+
+    // Set up the context with a starting txn_counter of 200 (simulating
+    // a block where the previous block's counter was 200).
+    let ctx = ApplyContext {
+        rewards_level: 0,
+        fee_sink,
+        round: 1,
+        mode: ApplyMode::Execute,
+        latest_timestamp: 0,
+        genesis_hash: [0u8; 32],
+        txn_counter: std::cell::Cell::new(200),
+        fee_credit: std::cell::Cell::new(0),
+    };
+
+    // First app call: fee=1000 (no overpayment).
+    let stx1 = appl_noop_txn(sender, app_id, 1_000);
+    // Manually set fee_credit for this single-txn group (no overpayment).
+    ctx.fee_credit.set(0);
+    let result1 = apply_transaction(&mut state, &stx1, &ctx, 0);
+    assert!(
+        result1.is_ok(),
+        "first app call failed: {:?}",
+        result1.err()
+    );
+
+    // After first app call: txn_counter should have advanced.
+    // base=200, +1 for top-level txn, +1 for inner txn = 202.
+    let counter_after_first = ctx.txn_counter.get();
+    assert!(
+        counter_after_first > 200,
+        "txn_counter should have advanced from 200, got {}",
+        counter_after_first
+    );
+
+    // Second app call: same app, same program.
+    let stx2 = appl_noop_txn(sender, app_id, 1_000);
+    ctx.fee_credit.set(0);
+    let result2 = apply_transaction(&mut state, &stx2, &ctx, 0);
+    assert!(
+        result2.is_ok(),
+        "second app call failed: {:?}",
+        result2.err()
+    );
+
+    // After second app call: counter advanced further.
+    let counter_after_second = ctx.txn_counter.get();
+    assert!(
+        counter_after_second > counter_after_first,
+        "txn_counter should have advanced further, was {} now {}",
+        counter_after_first,
+        counter_after_second
+    );
+
+    // The first inner acfg should have created asset with ID = 201+1 = 202,
+    // and the second with a higher ID. They must be distinct.
+    // The inner create uses txn_counter+1 where txn_counter was the value
+    // at the time of incTxnCount inside itxn_submit.
+    // Verify that two different assets exist (not just one).
+    let mut created_asset_ids: Vec<u64> = state.asset_params.keys().copied().collect();
+    created_asset_ids.sort();
+    assert!(
+        created_asset_ids.len() >= 2,
+        "expected at least 2 created assets, got {:?}",
+        created_asset_ids
+    );
+    assert_ne!(
+        created_asset_ids[0], created_asset_ids[1],
+        "both inner creates produced the same asset ID: {}",
+        created_asset_ids[0]
+    );
+}
+
+// ===========================================================================
+// P2: Initialize AVM fee credit from outer group overpayment
+// ===========================================================================
+
+/// App call with fee=2000 issues an inner pay with fee=0.
+/// The overpayment (2000 - 1000 = 1000) should provide enough fee credit
+/// for the inner transaction (which needs MinTxnFee = 1000).
+#[test]
+fn fee_credit_from_outer_overpayment_enables_inner_zero_fee() {
+    use algo_ledger::avm_context::app_address;
+
+    let fee_sink = Address([0xFE; 32]);
+    let sender = Address([0x01; 32]);
+    let app_id = 200u64;
+
+    // AVM v6 program that creates an inner pay with explicit fee=0:
+    //   itxn_begin
+    //   pushint 1          (TypeEnum = pay)
+    //   itxn_field TypeEnum
+    //   txn Sender          (push outer sender address)
+    //   itxn_field Receiver  (field 7)
+    //   pushint 0           (Amount = 0)
+    //   itxn_field Amount    (field 8)
+    //   pushint 0           (Fee = 0)
+    //   itxn_field Fee       (field 1)
+    //   itxn_submit
+    //   pushint 1
+    //   return
+    let inner_pay_zero_fee: Vec<u8> = vec![
+        0x06, // version 6
+        0xb1, // itxn_begin
+        0x81, 0x01, // pushint 1 (pay)
+        0xb2, 0x10, // itxn_field TypeEnum
+        0x31, 0x00, // txn Sender
+        0xb2, 0x07, // itxn_field Receiver
+        0x81, 0x00, // pushint 0 (amount)
+        0xb2, 0x08, // itxn_field Amount
+        0x81, 0x00, // pushint 0 (fee)
+        0xb2, 0x01, // itxn_field Fee
+        0xb3, // itxn_submit
+        0x81, 0x01, // pushint 1
+        0x43, // return
+    ];
+
+    let mut state = make_state(
+        &[
+            (sender, 10_000_000),
+            (fee_sink, 0),
+            // Fund the app address so min balance checks pass.
+            (Address(app_address(app_id)), 10_000_000),
+        ],
+        fee_sink,
+    );
+
+    create_app(
+        &mut state,
+        app_id,
+        sender,
+        inner_pay_zero_fee.clone(),
+        prog(AVM_V6, &PUSHINT_1),
+    );
+
+    // fee=2000, so overpayment = 2000 - 1000 = 1000. This should cover the
+    // inner pay's MinTxnFee of 1000 when fee=0.
+    let stx = SignedTransaction {
+        txn: Transaction {
+            txn_type: "appl".to_string(),
+            sender,
+            fee: 2_000,
+            first_valid: 1.into(),
+            last_valid: 100.into(),
+            application_id: app_id,
+            on_completion: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // Set fee_credit to simulate group-level overpayment:
+    // single txn group, fee=2000, needs MinTxnFee=1000, credit = 1000.
+    let ctx = ApplyContext {
+        rewards_level: 0,
+        fee_sink,
+        round: 1,
+        mode: ApplyMode::Execute,
+        latest_timestamp: 0,
+        genesis_hash: [0u8; 32],
+        txn_counter: std::cell::Cell::new(0),
+        fee_credit: std::cell::Cell::new(2_000 - 1_000), // overpayment
+    };
+
+    let result = apply_transaction(&mut state, &stx, &ctx, 0);
+    assert!(
+        result.is_ok(),
+        "app call with inner fee=0 should succeed with fee credit: {:?}",
+        result.err()
+    );
+}
+
+/// Without fee credit, an inner pay with fee=0 should fail.
+#[test]
+fn inner_zero_fee_fails_without_fee_credit() {
+    use algo_ledger::avm_context::app_address;
+
+    let fee_sink = Address([0xFE; 32]);
+    let sender = Address([0x01; 32]);
+    let app_id = 300u64;
+
+    // Same inner-pay-with-fee=0 program.
+    let inner_pay_zero_fee: Vec<u8> = vec![
+        0x06, // version 6
+        0xb1, // itxn_begin
+        0x81, 0x01, // pushint 1 (pay)
+        0xb2, 0x10, // itxn_field TypeEnum
+        0x31, 0x00, // txn Sender
+        0xb2, 0x07, // itxn_field Receiver
+        0x81, 0x00, // pushint 0 (amount)
+        0xb2, 0x08, // itxn_field Amount
+        0x81, 0x00, // pushint 0 (fee)
+        0xb2, 0x01, // itxn_field Fee
+        0xb3, // itxn_submit
+        0x81, 0x01, // pushint 1
+        0x43, // return
+    ];
+
+    let mut state = make_state(
+        &[
+            (sender, 10_000_000),
+            (fee_sink, 0),
+            (Address(app_address(app_id)), 10_000_000),
+        ],
+        fee_sink,
+    );
+
+    create_app(
+        &mut state,
+        app_id,
+        sender,
+        inner_pay_zero_fee.clone(),
+        prog(AVM_V6, &PUSHINT_1),
+    );
+
+    // fee=1000, no overpayment -> fee_credit = 0.
+    let stx = appl_noop_txn(sender, app_id, 1_000);
+
+    let ctx = ApplyContext {
+        rewards_level: 0,
+        fee_sink,
+        round: 1,
+        mode: ApplyMode::Execute,
+        latest_timestamp: 0,
+        genesis_hash: [0u8; 32],
+        txn_counter: std::cell::Cell::new(0),
+        fee_credit: std::cell::Cell::new(0), // no fee credit
+    };
+
+    let result = apply_transaction(&mut state, &stx, &ctx, 0);
+    assert!(
+        result.is_err(),
+        "inner fee=0 without fee credit should fail"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("fee too small"),
+        "error should mention fee: {}",
+        err_msg
     );
 }

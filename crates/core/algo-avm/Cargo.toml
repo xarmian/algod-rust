@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+algo-codec.workspace = true
 algo-error.workspace = true
 algo-types.workspace = true
 num-bigint.workspace = true
