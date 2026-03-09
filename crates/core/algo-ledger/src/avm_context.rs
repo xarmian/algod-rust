@@ -696,10 +696,14 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// Remaining inner transaction budget.
     ///
     /// With `EnableInnerTransactionPooling` (v31+), the limit is
-    /// `MAX_INNER_TRANSACTIONS * MAX_TX_GROUP_SIZE` pooled across the whole
-    /// group, minus already-submitted inner txns.
+    /// `MAX_INNER_TRANSACTIONS * len(outer_group)` pooled across the whole
+    /// group, minus already-submitted inner txns.  go-algorand initialises
+    /// the shared counter to `MaxTxGroupSize * MaxInnerTransactions`, but
+    /// the budget is shared via a pointer across all EvalContexts in the
+    /// group.  Because our context is per-app-call we scope the budget to
+    /// the actual outer group size so a single-txn group gets 16, not 256.
     fn remaining_inners(&self) -> usize {
-        let total_budget = params::MAX_INNER_TRANSACTIONS * params::MAX_TX_GROUP_SIZE;
+        let total_budget = params::MAX_INNER_TRANSACTIONS * self.group.len();
         let used: usize = self.inner_txns.iter().map(|g| g.len()).sum();
         total_budget.saturating_sub(used)
     }
@@ -6934,5 +6938,103 @@ mod tests {
                 id
             );
         }
+    }
+
+    #[test]
+    fn p1_1_single_txn_group_inner_budget_is_16() {
+        // A single-transaction group should allow exactly 16 inner txns
+        // (MAX_INNER_TRANSACTIONS * 1), not 256.
+        let txn = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+
+        // Fund the app address generously so inner pays succeed.
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 100_000_000,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 100_000; // generous budget
+
+        // Submit 16 inner pay txns — should all succeed.
+        for i in 0..params::MAX_INNER_TRANSACTIONS {
+            ctx.itxn_begin().unwrap();
+            ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // TypeEnum = pay
+            let mut receiver = [0u8; 32];
+            receiver[0] = (i + 1) as u8;
+            ctx.itxn_field(7, TealValue::Bytes(receiver.to_vec()))
+                .unwrap(); // Receiver
+            ctx.itxn_field(8, TealValue::Uint(100)).unwrap(); // Amount
+            ctx.itxn_submit().unwrap();
+        }
+
+        assert_eq!(ctx.num_inner_txns(), 16);
+
+        // The 17th inner txn should fail — budget exhausted.
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap(); // TypeEnum = pay
+        ctx.itxn_field(7, TealValue::Bytes([0xFFu8; 32].to_vec()))
+            .unwrap();
+        ctx.itxn_field(8, TealValue::Uint(100)).unwrap();
+        let result = ctx.itxn_submit();
+        assert!(
+            result.is_err(),
+            "17th inner txn should fail in a single-txn group"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("too many inner transactions"),
+            "error should mention too many inner transactions, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn p1_1_two_txn_group_inner_budget_is_32() {
+        // A 2-transaction group should allow up to 32 inner txns
+        // (MAX_INNER_TRANSACTIONS * 2).
+        let txn1 = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let txn2 = make_pay_txn([10u8; 32], [20u8; 32], 5000);
+        let mut store = LedgerState::new();
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 100_000_000,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_context(&mut store, vec![txn1, txn2]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 100_000;
+
+        // Submit 16 inner txns — well within budget.
+        for i in 0..16 {
+            ctx.itxn_begin().unwrap();
+            ctx.itxn_field(16, TealValue::Uint(1)).unwrap();
+            let mut receiver = [0u8; 32];
+            receiver[0] = (i + 1) as u8;
+            ctx.itxn_field(7, TealValue::Bytes(receiver.to_vec()))
+                .unwrap();
+            ctx.itxn_field(8, TealValue::Uint(100)).unwrap();
+            ctx.itxn_submit().unwrap();
+        }
+
+        // 17th should also succeed (budget is 32 for a 2-txn group).
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(1)).unwrap();
+        ctx.itxn_field(7, TealValue::Bytes([0xAAu8; 32].to_vec()))
+            .unwrap();
+        ctx.itxn_field(8, TealValue::Uint(100)).unwrap();
+        ctx.itxn_submit().unwrap();
+
+        assert_eq!(ctx.num_inner_txns(), 17);
     }
 }

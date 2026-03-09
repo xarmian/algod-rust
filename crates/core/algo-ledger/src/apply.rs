@@ -1868,16 +1868,26 @@ pub fn apply_inner_acfg<L: crate::store_trait::LedgerStore>(
             // ── Reconfigure ──
             let mut updated_params = existing.params.clone();
 
-            if updated_params.manager.is_some_and(|a| !a.is_zero()) {
+            // Only update a role when the inner transaction explicitly set
+            // the field (i.e. `txn_params.{role}.is_some()`).  Fields not
+            // set via `itxn_field` are `None` in the builder and must NOT
+            // overwrite the existing on-chain value.  The outer-path can
+            // unconditionally assign because outer transactions always
+            // populate every field (zero-address means "clear").
+            if updated_params.manager.is_some_and(|a| !a.is_zero()) && txn_params.manager.is_some()
+            {
                 updated_params.manager = txn_params.manager;
             }
-            if updated_params.reserve.is_some_and(|a| !a.is_zero()) {
+            if updated_params.reserve.is_some_and(|a| !a.is_zero()) && txn_params.reserve.is_some()
+            {
                 updated_params.reserve = txn_params.reserve;
             }
-            if updated_params.freeze.is_some_and(|a| !a.is_zero()) {
+            if updated_params.freeze.is_some_and(|a| !a.is_zero()) && txn_params.freeze.is_some() {
                 updated_params.freeze = txn_params.freeze;
             }
-            if updated_params.clawback.is_some_and(|a| !a.is_zero()) {
+            if updated_params.clawback.is_some_and(|a| !a.is_zero())
+                && txn_params.clawback.is_some()
+            {
                 updated_params.clawback = txn_params.clawback;
             }
 
@@ -2961,6 +2971,127 @@ mod tests {
         let result = apply_transaction(&mut state, &stx2, &ctx, 0);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not the manager"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Inner acfg reconfig: P1-2 — unset fields must not clear existing roles
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn p1_2_inner_acfg_reconfig_preserves_unset_roles() {
+        // Create an asset with all four role addresses set.
+        // Then do an inner acfg reconfig that only sets the manager field.
+        // The reserve, freeze, and clawback should remain unchanged.
+        let creator = Address([1u8; 32]);
+        let new_manager = Address([5u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
+
+        let original_params = AssetParams {
+            total: 1_000,
+            manager: Some(creator),
+            reserve: Some(Address([10u8; 32])),
+            freeze: Some(Address([11u8; 32])),
+            clawback: Some(Address([12u8; 32])),
+            ..Default::default()
+        };
+        create_asset_in_state(&mut state, &ctx, creator, 42, original_params.clone());
+
+        // Build an inner acfg transaction that ONLY sets the manager field.
+        // Other role fields are None (not set via itxn_field).
+        let inner_txn = algo_types::Transaction {
+            txn_type: "acfg".to_string(),
+            sender: creator,
+            config_asset: 42,
+            asset_params: Some(AssetParams {
+                manager: Some(new_manager),
+                // reserve, freeze, clawback are None (not set by itxn_field)
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let _ad = apply_inner_acfg(&mut state, &inner_txn, 100).unwrap();
+
+        let record = state.get_asset_params(42).unwrap();
+        // Manager should be updated.
+        assert_eq!(record.params.manager, Some(new_manager));
+        // Reserve, freeze, clawback should be PRESERVED (not cleared to None).
+        assert_eq!(
+            record.params.reserve,
+            Some(Address([10u8; 32])),
+            "reserve should be preserved when not set in inner txn"
+        );
+        assert_eq!(
+            record.params.freeze,
+            Some(Address([11u8; 32])),
+            "freeze should be preserved when not set in inner txn"
+        );
+        assert_eq!(
+            record.params.clawback,
+            Some(Address([12u8; 32])),
+            "clawback should be preserved when not set in inner txn"
+        );
+    }
+
+    #[test]
+    fn p1_2_inner_acfg_reconfig_explicit_zero_clears_role() {
+        // When an inner acfg explicitly sets a role to the zero address
+        // (via itxn_field), it should clear that role.
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(creator, 10_000_000), (fee_sink, 0)], fee_sink);
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
+
+        let original_params = AssetParams {
+            total: 1_000,
+            manager: Some(creator),
+            reserve: Some(Address([10u8; 32])),
+            freeze: Some(Address([11u8; 32])),
+            clawback: Some(Address([12u8; 32])),
+            ..Default::default()
+        };
+        create_asset_in_state(&mut state, &ctx, creator, 42, original_params);
+
+        // Inner txn sets reserve to zero address (explicitly clearing it)
+        // and also sets manager to keep it valid.
+        let inner_txn = algo_types::Transaction {
+            txn_type: "acfg".to_string(),
+            sender: creator,
+            config_asset: 42,
+            asset_params: Some(AssetParams {
+                manager: Some(creator),
+                reserve: Some(Address::ZERO), // explicit clear
+                // freeze, clawback are None (not set)
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let _ad = apply_inner_acfg(&mut state, &inner_txn, 100).unwrap();
+
+        let record = state.get_asset_params(42).unwrap();
+        assert_eq!(record.params.manager, Some(creator));
+        // Reserve should be cleared to zero address.
+        assert_eq!(
+            record.params.reserve,
+            Some(Address::ZERO),
+            "reserve should be cleared when explicitly set to zero"
+        );
+        // Freeze and clawback should be preserved.
+        assert_eq!(
+            record.params.freeze,
+            Some(Address([11u8; 32])),
+            "freeze should be preserved when not set in inner txn"
+        );
+        assert_eq!(
+            record.params.clawback,
+            Some(Address([12u8; 32])),
+            "clawback should be preserved when not set in inner txn"
+        );
     }
 
     // -----------------------------------------------------------------------
