@@ -828,25 +828,32 @@ fn execute_inner_appl<L: LedgerStore>(
     // ── OptIn: create local state before running program ──
     if on_completion == 1 {
         // OptInOC = 1
-        if !store.has_app_local_state(&sender, effective_app_id) {
-            let app = store
-                .get_app_params(effective_app_id)
-                .ok_or_else(|| AlgoError::Avm {
-                    message: format!("inner appl opt-in: app {} not found", effective_app_id),
-                })?;
-            let local = algo_types::AppLocalState {
-                schema: app.local_state_schema.clone(),
-                key_value: std::collections::BTreeMap::new(),
-            };
-            store.set_app_local_state(&sender, effective_app_id, local);
-
-            // Update account counters.
-            let mut acct = store.get_or_default_account(&sender);
-            acct.total_apps_opted_in += 1;
-            // Update aggregate schema: sender stores local state.
-            acct.total_app_schema = acct.total_app_schema.add_schema(&app.local_state_schema);
-            store.set_account(&sender, acct);
+        // Reject duplicate opt-in (matches outer apply_appl path).
+        if store.has_app_local_state(&sender, effective_app_id) {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "inner appl opt-in: {} is already opted into app {}",
+                    sender, effective_app_id,
+                ),
+            });
         }
+        let app = store
+            .get_app_params(effective_app_id)
+            .ok_or_else(|| AlgoError::Avm {
+                message: format!("inner appl opt-in: app {} not found", effective_app_id),
+            })?;
+        let local = algo_types::AppLocalState {
+            schema: app.local_state_schema.clone(),
+            key_value: std::collections::BTreeMap::new(),
+        };
+        store.set_app_local_state(&sender, effective_app_id, local);
+
+        // Update account counters.
+        let mut acct = store.get_or_default_account(&sender);
+        acct.total_apps_opted_in += 1;
+        // Update aggregate schema: sender stores local state.
+        acct.total_app_schema = acct.total_app_schema.add_schema(&app.local_state_schema);
+        store.set_account(&sender, acct);
     }
 
     // ── Load the program ──
@@ -1004,11 +1011,16 @@ fn execute_inner_appl<L: LedgerStore>(
         0 => {} // NoOpOC — nothing to do
         1 => {} // OptInOC — local state was already created above
         2 => {
-            // CloseOutOC — remove local state
-            let local_schema = store
+            // CloseOutOC — remove local state (sender must be opted in).
+            let local_state = store
                 .get_app_local_state(&sender, effective_app_id)
-                .map(|ls| ls.schema.clone())
-                .unwrap_or_default();
+                .ok_or_else(|| AlgoError::Avm {
+                    message: format!(
+                        "inner appl close-out: {} is not opted into app {}",
+                        sender, effective_app_id,
+                    ),
+                })?;
+            let local_schema = local_state.schema.clone();
             store.remove_app_local_state(&sender, effective_app_id);
             let mut acct = store.get_or_default_account(&sender);
             acct.total_apps_opted_in = acct.total_apps_opted_in.saturating_sub(1);
@@ -4332,6 +4344,99 @@ mod tests {
 
         // After close-out, local state should be removed.
         assert!(!store.has_app_local_state(&app_addr, 100));
+    }
+
+    #[test]
+    fn inner_appl_duplicate_opt_in_fails() {
+        // Inner appl with OnCompletion=OptIn should fail when the sender is
+        // already opted into the app (matching outer apply_appl behaviour).
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                total_apps_opted_in: 1,
+                ..Default::default()
+            },
+        );
+        // Pre-opt-in: the app address already has local state for app 100.
+        store.set_app_local_state(
+            &app_addr,
+            100,
+            AppLocalState {
+                schema: StateSchema::default(),
+                key_value: BTreeMap::new(),
+            },
+        );
+        assert!(store.has_app_local_state(&app_addr, 100));
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
+        ctx.itxn_field(25, TealValue::Uint(1)).unwrap(); // OnCompletion = OptIn
+        let err = ctx.itxn_submit().unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("already opted into app"),
+            "expected 'already opted into app' error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn inner_appl_close_out_not_opted_in_fails() {
+        // Inner appl with OnCompletion=CloseOut should fail when the sender
+        // is NOT opted into the app (matching outer apply_appl behaviour).
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+        setup_app(
+            &mut store,
+            100,
+            make_program(6, true),
+            make_program(6, true),
+        );
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+        // Do NOT opt in the app address to app 100.
+        assert!(!store.has_app_local_state(&app_addr, 100));
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // TypeEnum = appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
+        ctx.itxn_field(25, TealValue::Uint(2)).unwrap(); // OnCompletion = CloseOut
+        let err = ctx.itxn_submit().unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("not opted into app"),
+            "expected 'not opted into app' error, got: {}",
+            msg
+        );
     }
 
     #[test]
