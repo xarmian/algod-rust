@@ -2620,6 +2620,8 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     Ok(ad) => {
                         stxn.apply_data_config_asset = ad.config_asset;
                         stxn.apply_data_application_id = ad.application_id;
+                        stxn.closing_amount = ad.closing_amount;
+                        stxn.asset_closing_amount = ad.asset_closing_amount;
                         // P1-3: Track any resources the child created that weren't
                         // in the original snapshot so rollback can clean them up.
                         if ad.config_asset != 0 && !snapshotted_asset_ids.contains(&ad.config_asset)
@@ -2697,6 +2699,8 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     Ok(ad) => {
                         stxn.apply_data_config_asset = ad.config_asset;
                         stxn.apply_data_application_id = ad.application_id;
+                        stxn.closing_amount = ad.closing_amount;
+                        stxn.asset_closing_amount = ad.asset_closing_amount;
                         // P1-3: Track non-app creates too (acfg assets).
                         if ad.config_asset != 0 && !snapshotted_asset_ids.contains(&ad.config_asset)
                         {
