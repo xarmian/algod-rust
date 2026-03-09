@@ -1253,8 +1253,9 @@ pub(crate) fn apply_appl_opt_in_pre_program<L: crate::store_trait::LedgerStore>(
 /// Handles NoOp, OptIn (post-program, outer path only — `had_local_state` + `is_create`
 /// semantics), CloseOut, ClearState, Delete, and Update.
 ///
-/// For ClearState, a missing local state is silently ignored (permissive
-/// `if let Some(...)` pattern), matching go-algorand's behavior.
+/// For ClearState, local state is required (the caller must have already
+/// verified the sender is opted in). This matches go-algorand's
+/// `closeOutApplication`, which errors if local state is absent.
 pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     txn: &algo_types::Transaction,
@@ -1291,17 +1292,28 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
             store.set_account(&txn.sender, sender_account);
         }
         ON_COMPLETION_CLEAR_STATE => {
-            // ClearState removes local state if present.
-            if let Some(local_state) = store.get_app_local_state(&txn.sender, app_id) {
-                let local_schema = local_state.schema.clone();
-                store.remove_app_local_state(&txn.sender, app_id);
-                let mut sender_account = store.get_or_default_account(&txn.sender);
-                sender_account.total_apps_opted_in =
-                    sender_account.total_apps_opted_in.saturating_sub(1);
-                sender_account.total_app_schema =
-                    sender_account.total_app_schema.sub_schema(&local_schema);
-                store.set_account(&txn.sender, sender_account);
-            }
+            // ClearState removes local state. The caller must have already
+            // verified that the sender is opted in (has local state) before
+            // reaching this point, matching go-algorand's closeOutApplication.
+            let local_state =
+                store
+                    .get_app_local_state(&txn.sender, app_id)
+                    .ok_or_else(|| {
+                        err_ctx.error(format!(
+                            "{} clear-state: {} is not opted into app {}",
+                            err_ctx.prefix(),
+                            txn.sender,
+                            app_id,
+                        ))
+                    })?;
+            let local_schema = local_state.schema.clone();
+            store.remove_app_local_state(&txn.sender, app_id);
+            let mut sender_account = store.get_or_default_account(&txn.sender);
+            sender_account.total_apps_opted_in =
+                sender_account.total_apps_opted_in.saturating_sub(1);
+            sender_account.total_app_schema =
+                sender_account.total_app_schema.sub_schema(&local_schema);
+            store.set_account(&txn.sender, sender_account);
         }
         ON_COMPLETION_DELETE => {
             if let Some(existing) = store.get_app_params(app_id) {
@@ -1399,6 +1411,19 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
 
     if is_create {
         create_application(store, txn, app_id, ApplErrorContext::Outer)?;
+    }
+
+    // ClearState requires the sender to be opted in (have local state).
+    // go-algorand checks this BEFORE running the clear-state program.
+    if txn.on_completion == ON_COMPLETION_CLEAR_STATE
+        && !store.has_app_local_state(&txn.sender, app_id)
+    {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "cannot clear state: {} is not currently opted in to app {}",
+                txn.sender, app_id,
+            ),
+        });
     }
 
     // Record whether local state exists BEFORE EvalDelta, so the OptIn branch

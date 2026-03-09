@@ -792,6 +792,19 @@ fn execute_inner_appl<L: LedgerStore>(
         apply_appl_opt_in_pre_program(store, &sender, effective_app_id, ApplErrorContext::Inner)?;
     }
 
+    // ── ClearState: verify sender is opted in before running program ──
+    // go-algorand checks HasAppLocalState BEFORE running the clear-state program.
+    if on_completion == ON_COMPLETION_CLEAR_STATE
+        && !store.has_app_local_state(&sender, effective_app_id)
+    {
+        return Err(AlgoError::Avm {
+            message: format!(
+                "cannot clear state: {} is not currently opted in to app {}",
+                sender, effective_app_id,
+            ),
+        });
+    }
+
     // ── Load the program ──
     let app = store
         .get_app_params(effective_app_id)
@@ -5003,27 +5016,24 @@ mod tests {
             make_program(6, true),
         );
         let app_addr = Address(app_address(42));
-        store.set_account(
-            &app_addr,
-            AccountData {
-                micro_algos: 10_000_000,
-                ..Default::default()
-            },
-        );
-
-        // Opt sender into app 100 so ClearState has local state to clear.
-        let sender_addr = Address([10u8; 32]);
+        // Opt the app address (inner txn sender) into app 100 so ClearState
+        // has local state to clear. Inner txns default sender to app_address(42).
         store.set_app_local_state(
-            &sender_addr,
+            &app_addr,
             100,
             AppLocalState {
                 schema: StateSchema::default(),
                 key_value: BTreeMap::new(),
             },
         );
-        let mut sender_acct = store.get_or_default_account(&sender_addr);
-        sender_acct.total_apps_opted_in += 1;
-        store.set_account(&sender_addr, sender_acct);
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                total_apps_opted_in: 1,
+                ..Default::default()
+            },
+        );
 
         let sender = [10u8; 32];
         let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
