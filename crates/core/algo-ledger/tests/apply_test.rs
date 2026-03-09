@@ -270,13 +270,14 @@ fn test_rekey_on_acfg_txn() {
     let mut state = make_state(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
     let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
-    // Use acfg create with proper apply_data_config_asset to test rekey on non-pay.
+    // Use acfg create to test rekey on non-pay.
+    // Set txn_counter so txn_counter + 1 == 42.
+    ctx.txn_counter.set(41);
     let mut stx = SignedTransaction::default();
     stx.txn.txn_type = "acfg".to_string();
     stx.txn.sender = sender;
     stx.txn.fee = 1_000;
     stx.txn.rekey_to = Some(auth);
-    stx.apply_data_config_asset = 42;
 
     apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
 
@@ -341,19 +342,13 @@ fn test_close_with_opted_in_apps_fails() {
 // Helpers for asset/app integration tests
 // ---------------------------------------------------------------------------
 
-fn acfg_create_txn(
-    sender: Address,
-    fee: u64,
-    asset_id: u64,
-    params: AssetParams,
-) -> SignedTransaction {
+fn acfg_create_txn(sender: Address, fee: u64, params: AssetParams) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
     stx.txn.txn_type = "acfg".to_string();
     stx.txn.sender = sender;
     stx.txn.fee = fee;
     stx.txn.config_asset = 0;
     stx.txn.asset_params = Some(params);
-    stx.apply_data_config_asset = asset_id;
     stx
 }
 
@@ -466,6 +461,9 @@ fn test_asset_full_lifecycle() {
 
     let asset_id = 100u64;
 
+    // Set txn_counter so apply_acfg computes txn_counter + 1 == asset_id.
+    state.txn_counter = asset_id - 1;
+
     // Block 1: Create asset.
     let create_params = AssetParams {
         total: 10_000,
@@ -474,11 +472,12 @@ fn test_asset_full_lifecycle() {
         clawback: Some(creator),
         ..Default::default()
     };
-    let block1 = minimal_block(
+    let mut block1 = minimal_block(
         fee_sink,
         1,
-        vec![acfg_create_txn(creator, 1_000, asset_id, create_params)],
+        vec![acfg_create_txn(creator, 1_000, create_params)],
     );
+    block1.txn_counter = asset_id; // persist counter after this block
     apply_block(&mut state, &block1).unwrap();
 
     assert!(state.get_asset_params(asset_id).is_some());
@@ -567,12 +566,14 @@ fn test_min_balance_tracks_assets() {
     assert_eq!(base_min, 100_000);
 
     // Create asset.
+    // Set txn_counter so txn_counter + 1 == 42.
+    ctx.txn_counter.set(41);
     let params = AssetParams {
         total: 1_000,
         manager: Some(creator),
         ..Default::default()
     };
-    let stx = acfg_create_txn(creator, 1_000, 42, params);
+    let stx = acfg_create_txn(creator, 1_000, params);
     apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
 
     // Creator: min_balance increases for opted-in holding (which includes creator holding).
@@ -1041,12 +1042,14 @@ fn test_min_balance_enforcement_with_assets() {
     let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
     // Create asset from creator.
+    // Set txn_counter so txn_counter + 1 == 42.
+    ctx.txn_counter.set(41);
     let params = AssetParams {
         total: 1_000,
         manager: Some(creator),
         ..Default::default()
     };
-    let create = acfg_create_txn(creator, 1_000, 42, params);
+    let create = acfg_create_txn(creator, 1_000, params);
     apply_transaction(&mut state, &create, &ctx, 0).unwrap();
 
     // Sender opts in to asset.
@@ -1221,12 +1224,14 @@ fn test_asset_close_out_with_rewards() {
     let ctx_no_rewards = ApplyContext::new_replay(0, fee_sink, 1);
 
     // Create asset from creator.
+    // Set txn_counter so txn_counter + 1 == 42.
+    ctx_no_rewards.txn_counter.set(41);
     let params = AssetParams {
         total: 1_000,
         manager: Some(creator),
         ..Default::default()
     };
-    let create = acfg_create_txn(creator, 1_000, 42, params);
+    let create = acfg_create_txn(creator, 1_000, params);
     apply_transaction(&mut state, &create, &ctx_no_rewards, 0).unwrap();
 
     // Holder opts in (no rewards context yet).

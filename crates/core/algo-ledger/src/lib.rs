@@ -12,8 +12,8 @@ pub mod store_trait;
 pub mod trie_hash;
 
 pub use apply::{
-    apply_block, apply_inner_acfg, apply_inner_afrz, apply_inner_axfer, apply_inner_keyreg,
-    apply_inner_pay, apply_transaction, ApplyContext, ApplyMode, InnerApplyData,
+    apply_acfg, apply_afrz, apply_axfer, apply_block, apply_keyreg, apply_pay, apply_transaction,
+    ApplyContext, ApplyMode, InnerApplyData,
 };
 pub use avm_context::{type_enum, LedgerAvmContext};
 pub use eval_delta::{parse_eval_delta, DeltaAction, EvalDelta, ValueDelta};
