@@ -2047,6 +2047,43 @@ impl LedgerStore for SqliteLedger {
         self.get_asset_holding(addr, asset_id).is_some()
     }
 
+    fn remove_all_asset_holdings_for_asset(&mut self, asset_id: u64) {
+        // Find all (addrid, data) rows for this asset_id with a holding flag.
+        let mut stmt = self
+            .conn
+            .prepare("SELECT addrid, data FROM resources WHERE aidx = ?1 AND ctype = ?2")
+            .expect("prepare remove_all_asset_holdings_for_asset");
+        let rows: Vec<(i64, Vec<u8>)> = stmt
+            .query_map(params![asset_id as i64, CTYPE_ASSET], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .expect("query remove_all_asset_holdings_for_asset")
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (rowid, data) in rows {
+            let flags = extract_resource_flags(&data);
+            if flags & RESOURCE_FLAGS_HOLDING == 0 {
+                continue; // no holding in this blob
+            }
+            if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
+                // Both flags set — strip holding, keep asset params.
+                if let Some(stripped) = strip_asset_holding_from_blob(&data) {
+                    let _ = self.conn.execute(
+                        "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
+                        params![stripped, rowid, asset_id as i64, CTYPE_ASSET],
+                    );
+                }
+            } else {
+                // Only holding — delete the whole row.
+                let _ = self.conn.execute(
+                    "DELETE FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
+                    params![rowid, asset_id as i64, CTYPE_ASSET],
+                );
+            }
+        }
+    }
+
     // ---- Asset Params ----
 
     fn get_asset_params(&self, asset_id: u64) -> Option<AssetParamsRecord> {
@@ -2388,6 +2425,43 @@ impl LedgerStore for SqliteLedger {
 
     fn has_app_local_state(&self, addr: &Address, app_id: u64) -> bool {
         self.get_app_local_state(addr, app_id).is_some()
+    }
+
+    fn remove_all_app_local_states_for_app(&mut self, app_id: u64) {
+        // Find all (addrid, data) rows for this app_id with a holding flag (local state).
+        let mut stmt = self
+            .conn
+            .prepare("SELECT addrid, data FROM resources WHERE aidx = ?1 AND ctype = ?2")
+            .expect("prepare remove_all_app_local_states_for_app");
+        let rows: Vec<(i64, Vec<u8>)> = stmt
+            .query_map(params![app_id as i64, CTYPE_APP], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .expect("query remove_all_app_local_states_for_app")
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (rowid, data) in rows {
+            let flags = extract_resource_flags(&data);
+            if flags & RESOURCE_FLAGS_HOLDING == 0 {
+                continue; // no local state in this blob
+            }
+            if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
+                // Both flags set — strip local state, keep app params.
+                if let Some(stripped) = strip_holding_from_blob(&data) {
+                    let _ = self.conn.execute(
+                        "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
+                        params![stripped, rowid, app_id as i64, CTYPE_APP],
+                    );
+                }
+            } else {
+                // Only local state — delete the whole row.
+                let _ = self.conn.execute(
+                    "DELETE FROM resources WHERE addrid = ?1 AND aidx = ?2 AND ctype = ?3",
+                    params![rowid, app_id as i64, CTYPE_APP],
+                );
+            }
+        }
     }
 
     fn app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)> {

@@ -45,6 +45,15 @@ pub trait LedgerStore {
         self.get_asset_holding(addr, asset_id).is_some()
     }
 
+    /// Remove ALL asset holdings for a given asset ID, across all addresses.
+    ///
+    /// Used during rollback cleanup: when a nested inner transaction created an
+    /// asset and various accounts opted in, rolling back the creator's params
+    /// alone is insufficient — all holdings referencing that asset must also be
+    /// removed. This handles non-snapshotted accounts that were touched by
+    /// nested inner transactions.
+    fn remove_all_asset_holdings_for_asset(&mut self, asset_id: u64);
+
     // ---- Asset Params ----
 
     fn get_asset_params(&self, asset_id: u64) -> Option<AssetParamsRecord>;
@@ -96,6 +105,15 @@ pub trait LedgerStore {
     fn has_app_local_state(&self, addr: &Address, app_id: u64) -> bool {
         self.get_app_local_state(addr, app_id).is_some()
     }
+
+    /// Remove ALL app local states for a given app ID, across all addresses.
+    ///
+    /// Used during rollback cleanup: when a nested inner transaction created an
+    /// app and various accounts opted in, rolling back the creator's params
+    /// alone is insufficient — all local states referencing that app must also
+    /// be removed. This handles non-snapshotted accounts that were touched by
+    /// nested inner transactions.
+    fn remove_all_app_local_states_for_app(&mut self, app_id: u64);
 
     /// Get app local state, inserting a default if absent, and return the value.
     ///

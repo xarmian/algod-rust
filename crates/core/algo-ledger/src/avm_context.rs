@@ -2538,9 +2538,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     self.store.restore_snapshot(snapshot);
                     for &id in &extra_created_asset_ids {
                         self.store.remove_asset_params(id);
+                        self.store.remove_all_asset_holdings_for_asset(id);
                     }
                     for &id in &extra_created_app_ids {
                         self.store.remove_app_params(id);
+                        self.store.remove_all_app_local_states_for_app(id);
                     }
                     return Err(AlgoError::Avm {
                         message: format!("inner tx {}: fee_sink not configured (zero address)", i,),
@@ -2551,9 +2553,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     self.store.restore_snapshot(snapshot);
                     for &id in &extra_created_asset_ids {
                         self.store.remove_asset_params(id);
+                        self.store.remove_all_asset_holdings_for_asset(id);
                     }
                     for &id in &extra_created_app_ids {
                         self.store.remove_app_params(id);
+                        self.store.remove_all_app_local_states_for_app(id);
                     }
                     return Err(AlgoError::Avm {
                         message: format!(
@@ -2637,9 +2641,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         self.store.restore_snapshot(snapshot);
                         for &id in &extra_created_asset_ids {
                             self.store.remove_asset_params(id);
+                            self.store.remove_all_asset_holdings_for_asset(id);
                         }
                         for &id in &extra_created_app_ids {
                             self.store.remove_app_params(id);
+                            self.store.remove_all_app_local_states_for_app(id);
                         }
                         return Err(AlgoError::Avm {
                             message: format!("inner tx {} failed: {}", i, e),
@@ -2658,9 +2664,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         self.store.restore_snapshot(snapshot);
                         for &id in &extra_created_asset_ids {
                             self.store.remove_asset_params(id);
+                            self.store.remove_all_asset_holdings_for_asset(id);
                         }
                         for &id in &extra_created_app_ids {
                             self.store.remove_app_params(id);
+                            self.store.remove_all_app_local_states_for_app(id);
                         }
                         return Err(AlgoError::Avm {
                             message: format!(
@@ -2690,9 +2698,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         self.store.restore_snapshot(snapshot);
                         for &id in &extra_created_asset_ids {
                             self.store.remove_asset_params(id);
+                            self.store.remove_all_asset_holdings_for_asset(id);
                         }
                         for &id in &extra_created_app_ids {
                             self.store.remove_app_params(id);
+                            self.store.remove_all_app_local_states_for_app(id);
                         }
                         return Err(AlgoError::Avm {
                             message: format!("inner tx {} failed: {}", i, e),
