@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use algo_avm::eval::{run_approval_program, run_clear_state_program};
 use algo_avm::group::GroupBudget;
 use algo_error::AlgoError;
@@ -38,6 +40,23 @@ pub struct ApplyContext {
     pub latest_timestamp: u64,
     /// Genesis hash (for AVM context).
     pub genesis_hash: [u8; 32],
+    /// Running transaction counter for creatable ID generation.
+    ///
+    /// Mirrors go-algorand's `roundCowState.Counter()`. Starts at the
+    /// previous block's `TxnCounter` and is incremented for each top-level
+    /// and inner transaction. Used to seed `LedgerAvmContext::txn_counter`
+    /// so that inner `acfg`/`appl` creates derive globally unique IDs.
+    ///
+    /// Uses `Cell` for interior mutability — the context is shared via `&`
+    /// across all transactions in a block.
+    pub txn_counter: Cell<u64>,
+    /// Fee credit available to inner transactions from outer group overpayment.
+    ///
+    /// Mirrors go-algorand's `EvalParams.FeeCredit`. Computed per group as
+    /// `total_fees_paid - (MinTxnFee * num_non_stpf_txns)`. Inner transactions
+    /// that set fee=0 draw from this credit; overpayment by inner txns adds
+    /// back to it. Shared across all app calls in a group.
+    pub fee_credit: Cell<u64>,
 }
 
 impl ApplyContext {
@@ -51,6 +70,8 @@ impl ApplyContext {
             mode: ApplyMode::Replay,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
+            txn_counter: Cell::new(0),
+            fee_credit: Cell::new(0),
         }
     }
 }
@@ -98,6 +119,10 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
         gh.copy_from_slice(&block.genesis_hash);
     }
 
+    // Initialize txn_counter from the store's current value (= previous block's
+    // TxnCounter). This is the base for creatable ID generation.
+    let base_txn_counter = store.txn_counter();
+
     let ctx = ApplyContext {
         rewards_level: block.rewards_level,
         fee_sink: block.fee_sink,
@@ -105,6 +130,8 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
         mode: ApplyMode::Replay,
         latest_timestamp: block.timestamp as u64,
         genesis_hash: gh,
+        txn_counter: Cell::new(base_txn_counter),
+        fee_credit: Cell::new(0),
     };
 
     let result = (|| {
@@ -125,6 +152,10 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
                         .filter(|stx| stx.txn.txn_type == "appl")
                         .count();
                     let mut group_budget = GroupBudget::new(num_app_calls);
+
+                    // Compute per-group fee credit (matches go-algorand feeCredit).
+                    let group_fee_credit = compute_group_fee_credit(group);
+                    ctx.fee_credit.set(group_fee_credit);
 
                     for stx in group {
                         if stx.txn.txn_type == "appl" {
@@ -159,7 +190,29 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
     store.set_current_round(block.round);
     store.purge_expired_leases(block.round.0);
 
+    // Persist the block's txn_counter so the next block's ID generation
+    // starts from the right base (matches go-algorand endOfBlock).
+    store.set_txn_counter(block.txn_counter);
+
     Ok(())
+}
+
+/// Compute the fee credit for a transaction group.
+///
+/// Mirrors go-algorand's `feeCredit()`: sum all fees paid in the group, subtract
+/// `MinTxnFee * num_non_stpf_txns`, return the difference (saturating at 0).
+/// State proof transactions are exempt from fees per go-algorand.
+fn compute_group_fee_credit(group: &[&SignedTransaction]) -> u64 {
+    let mut min_fee_count: u64 = 0;
+    let mut fees_paid: u64 = 0;
+    for stx in group {
+        if stx.txn.txn_type != "stpf" {
+            min_fee_count += 1;
+        }
+        fees_paid = fees_paid.saturating_add(stx.txn.fee);
+    }
+    let fee_needed = crate::params::MIN_TXN_FEE.saturating_mul(min_fee_count);
+    fees_paid.saturating_sub(fee_needed)
 }
 
 /// Detect transaction groups within a block's payset.
@@ -468,6 +521,11 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
 
         // Record lease on success (no-op for empty/zero leases).
         store.record_lease(&txn.sender, &lease_arr, txn.last_valid.0);
+
+        // Increment the running transaction counter for this top-level txn.
+        // Mirrors go-algorand's `addTx` -> `incTxnCount()`. This ensures
+        // creatable IDs from subsequent app calls use fresh counter values.
+        ctx.txn_counter.set(ctx.txn_counter.get() + 1);
 
         // Set update_round on all touched accounts (including fee_sink).
         // This tracks which round last modified each account, used by the
@@ -1199,7 +1257,12 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                         ctx.genesis_hash,
                     );
                     avm_ctx.fee_sink = ctx.fee_sink;
+                    avm_ctx.txn_counter = ctx.txn_counter.get();
+                    avm_ctx.fee_credit = ctx.fee_credit.get();
                     let result = run_clear_state_program(&clear_program, &mut avm_ctx);
+                    // Propagate updated counters back to context.
+                    ctx.txn_counter.set(avm_ctx.txn_counter);
+                    ctx.fee_credit.set(avm_ctx.fee_credit);
                     if !result.approved {
                         // ClearState rejection: roll back any state changes the
                         // program made during execution. The on-completion branch
@@ -1240,11 +1303,17 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     ctx.genesis_hash,
                 );
                 avm_ctx.fee_sink = ctx.fee_sink;
+                avm_ctx.txn_counter = ctx.txn_counter.get();
+                avm_ctx.fee_credit = ctx.fee_credit.get();
 
                 // Use the group budget if provided, otherwise create a single-call budget.
                 let mut fallback_budget = GroupBudget::new(1);
                 let budget = group_budget.unwrap_or(&mut fallback_budget);
                 let result = run_approval_program(&approval_program, &mut avm_ctx, budget)?;
+
+                // Propagate updated counters back to context.
+                ctx.txn_counter.set(avm_ctx.txn_counter);
+                ctx.fee_credit.set(avm_ctx.fee_credit);
 
                 if !result.approved {
                     return Err(AlgoError::Ledger {

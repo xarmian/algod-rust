@@ -90,6 +90,9 @@ pub struct LedgerState {
     pub genesis_hash: [u8; 32],
     pub protocol: String,
 
+    // Transaction counter (previous block's TxnCounter — base for ID generation)
+    pub txn_counter: u64,
+
     // Merkle trie tracking
     trie: Option<MerkleTrie>,
     pre_mutations: Vec<PreMutation>,
@@ -115,6 +118,7 @@ impl LedgerState {
             genesis_id: String::new(),
             genesis_hash: [0u8; 32],
             protocol: String::new(),
+            txn_counter: 0,
             trie: None,
             pre_mutations: Vec::new(),
         }
@@ -687,6 +691,10 @@ impl crate::store_trait::LedgerStore for LedgerState {
         &self.protocol
     }
 
+    fn txn_counter(&self) -> u64 {
+        self.txn_counter
+    }
+
     // ---- Chain-level state (setters) ----
 
     fn set_current_round(&mut self, round: Round) {
@@ -727,6 +735,10 @@ impl crate::store_trait::LedgerStore for LedgerState {
 
     fn set_protocol(&mut self, protocol: String) {
         self.protocol = protocol;
+    }
+
+    fn set_txn_counter(&mut self, counter: u64) {
+        self.txn_counter = counter;
     }
 
     // ---- Snapshot / Restore ----

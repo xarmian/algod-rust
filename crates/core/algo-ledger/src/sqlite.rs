@@ -1436,6 +1436,8 @@ pub struct SqliteLedger {
     genesis_id: String,
     genesis_hash: [u8; 32],
     protocol: String,
+    /// Transaction counter from the latest committed block header.
+    txn_counter: u64,
     /// Savepoint counter for nested transactions.
     savepoint_counter: AtomicU64,
     /// Whether we are inside a begin_block/commit_block transaction.
@@ -1513,6 +1515,7 @@ impl SqliteLedger {
         };
 
         let protocol = get_meta_string(&conn, "protocol")?;
+        let txn_counter = get_meta_u64(&conn, "txn_counter")?;
 
         Ok(Self {
             conn,
@@ -1527,6 +1530,7 @@ impl SqliteLedger {
             genesis_id,
             genesis_hash,
             protocol,
+            txn_counter,
             savepoint_counter: AtomicU64::new(0),
             in_block: false,
             trie: None,
@@ -1791,6 +1795,7 @@ impl SqliteLedger {
         set_meta_string(&self.conn, "genesis_id", &self.genesis_id)?;
         set_meta_blob(&self.conn, "genesis_hash", &self.genesis_hash)?;
         set_meta_string(&self.conn, "protocol", &self.protocol)?;
+        set_meta_u64(&self.conn, "txn_counter", self.txn_counter)?;
         Ok(())
     }
 
@@ -2558,6 +2563,10 @@ impl LedgerStore for SqliteLedger {
         &self.protocol
     }
 
+    fn txn_counter(&self) -> u64 {
+        self.txn_counter
+    }
+
     // ---- Chain-level state (setters) ----
 
     fn set_current_round(&mut self, round: Round) {
@@ -2598,6 +2607,10 @@ impl LedgerStore for SqliteLedger {
 
     fn set_protocol(&mut self, protocol: String) {
         self.protocol = protocol;
+    }
+
+    fn set_txn_counter(&mut self, counter: u64) {
+        self.txn_counter = counter;
     }
 
     // ---- Snapshot / Restore (SAVEPOINTs) ----

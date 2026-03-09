@@ -169,6 +169,12 @@ pub trait LedgerStore {
     fn genesis_hash(&self) -> &[u8; 32];
     fn protocol(&self) -> &str;
 
+    /// Transaction counter from the latest committed block header.
+    ///
+    /// Mirrors go-algorand's `prevHeader.TxnCounter` — used as the base
+    /// for creatable ID generation in the next block.
+    fn txn_counter(&self) -> u64;
+
     // ---- Chain-level state (setters) ----
 
     fn set_current_round(&mut self, round: Round);
@@ -181,6 +187,7 @@ pub trait LedgerStore {
     fn set_genesis_id(&mut self, id: String);
     fn set_genesis_hash(&mut self, hash: [u8; 32]);
     fn set_protocol(&mut self, protocol: String);
+    fn set_txn_counter(&mut self, counter: u64);
 
     // ---- Snapshot / Restore ----
 
