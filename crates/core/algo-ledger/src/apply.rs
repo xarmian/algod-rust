@@ -1106,18 +1106,268 @@ pub fn apply_afrz<L: crate::store_trait::LedgerStore>(
 }
 
 /// On-completion action constants for application calls.
-const ON_COMPLETION_OPT_IN: u64 = 1;
-const ON_COMPLETION_CLOSE_OUT: u64 = 2;
-const ON_COMPLETION_CLEAR_STATE: u64 = 3;
-const ON_COMPLETION_UPDATE: u64 = 4;
-const ON_COMPLETION_DELETE: u64 = 5;
+pub(crate) const ON_COMPLETION_NOOP: u64 = 0;
+pub(crate) const ON_COMPLETION_OPT_IN: u64 = 1;
+pub(crate) const ON_COMPLETION_CLOSE_OUT: u64 = 2;
+pub(crate) const ON_COMPLETION_CLEAR_STATE: u64 = 3;
+pub(crate) const ON_COMPLETION_UPDATE: u64 = 4;
+pub(crate) const ON_COMPLETION_DELETE: u64 = 5;
 
 /// Compute SHA-512/256 hash of program bytes for AVM context.
-fn program_hash(program: &[u8]) -> [u8; 32] {
+pub(crate) fn program_hash(program: &[u8]) -> [u8; 32] {
     let mut h = Sha512_256::new();
     h.update(b"Program");
     h.update(program);
     h.finalize().into()
+}
+
+/// Discriminates the error context for shared application call helpers.
+///
+/// Used by shared helpers to produce `AlgoError::Ledger` (outer transactions)
+/// or `AlgoError::Avm` (inner transactions) as appropriate.
+#[derive(Clone, Copy)]
+pub(crate) enum ApplErrorContext {
+    Outer,
+    Inner,
+}
+
+impl ApplErrorContext {
+    /// Create an `AlgoError` with the appropriate variant for this context.
+    #[inline]
+    fn error(&self, message: String) -> AlgoError {
+        match self {
+            ApplErrorContext::Outer => AlgoError::Ledger { message },
+            ApplErrorContext::Inner => AlgoError::Avm { message },
+        }
+    }
+
+    /// Prefix for error messages.
+    #[inline]
+    fn prefix(&self) -> &'static str {
+        match self {
+            ApplErrorContext::Outer => "appl",
+            ApplErrorContext::Inner => "inner appl",
+        }
+    }
+}
+
+/// Create a new application in the store.
+///
+/// Writes `AppParams`, increments the creator's counters, and returns the
+/// created `app_id`. The caller provides `app_id` directly — outer callers
+/// pass `stx.apply_data_application_id`, inner callers pass `txn_counter + 1`.
+pub(crate) fn create_application<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    txn: &algo_types::Transaction,
+    app_id: u64,
+    err_ctx: ApplErrorContext,
+) -> Result<(), AlgoError> {
+    if app_id == 0 {
+        return Err(err_ctx.error(format!(
+            "{} create: application id is zero",
+            err_ctx.prefix()
+        )));
+    }
+
+    let approval = txn
+        .approval_program
+        .as_ref()
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
+    let clear = txn
+        .clear_state_program
+        .as_ref()
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
+
+    let global_schema = txn.global_state_schema.clone().unwrap_or_default();
+    let local_schema = txn.local_state_schema.clone().unwrap_or_default();
+    let extra_pages = txn.extra_program_pages;
+
+    store.set_app_params(
+        app_id,
+        AppParams {
+            creator: txn.sender,
+            approval_program: approval,
+            clear_state_program: clear,
+            global_state: std::collections::BTreeMap::new(),
+            local_state_schema: local_schema,
+            global_state_schema: global_schema.clone(),
+            extra_program_pages: extra_pages,
+        },
+    );
+
+    let mut sender_account = store.get_or_default_account(&txn.sender);
+    sender_account.total_created_apps += 1;
+    sender_account.total_extra_app_pages += extra_pages;
+    // Update aggregate schema: creator stores global state.
+    sender_account.total_app_schema = sender_account.total_app_schema.add_schema(&global_schema);
+    store.set_account(&txn.sender, sender_account);
+
+    Ok(())
+}
+
+/// Pre-program opt-in: create local state before running the called app's program.
+///
+/// Used by the inner transaction path where opt-in happens before program execution
+/// (matching go-algorand's `optInApplication` called before `StatefulEval`).
+/// Rejects duplicate opt-in.
+pub(crate) fn apply_appl_opt_in_pre_program<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    sender: &Address,
+    app_id: u64,
+    err_ctx: ApplErrorContext,
+) -> Result<(), AlgoError> {
+    if store.has_app_local_state(sender, app_id) {
+        return Err(err_ctx.error(format!(
+            "{} opt-in: {} is already opted into app {}",
+            err_ctx.prefix(),
+            sender,
+            app_id,
+        )));
+    }
+    let app = store.get_app_params(app_id).ok_or_else(|| {
+        err_ctx.error(format!(
+            "{} opt-in: app {} not found",
+            err_ctx.prefix(),
+            app_id
+        ))
+    })?;
+    let local = AppLocalState {
+        schema: app.local_state_schema.clone(),
+        key_value: std::collections::BTreeMap::new(),
+    };
+    store.set_app_local_state(sender, app_id, local);
+
+    // Update account counters.
+    let mut acct = store.get_or_default_account(sender);
+    acct.total_apps_opted_in += 1;
+    acct.total_app_schema = acct.total_app_schema.add_schema(&app.local_state_schema);
+    store.set_account(sender, acct);
+
+    Ok(())
+}
+
+/// Apply on-completion side effects after program execution.
+///
+/// Handles NoOp, OptIn (post-program, outer path only — `had_local_state` + `is_create`
+/// semantics), CloseOut, ClearState, Delete, and Update.
+///
+/// For ClearState, local state is required (the caller must have already
+/// verified the sender is opted in). This matches go-algorand's
+/// `closeOutApplication`, which errors if local state is absent.
+pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    txn: &algo_types::Transaction,
+    app_id: u64,
+    err_ctx: ApplErrorContext,
+) -> Result<(), AlgoError> {
+    match txn.on_completion {
+        ON_COMPLETION_NOOP => {
+            // NoOp — no structural state changes.
+        }
+        ON_COMPLETION_OPT_IN => {
+            // OptIn — already handled before program execution (inner path)
+            // or handled separately by outer path's `had_local_state` logic.
+            // Nothing to do here.
+        }
+        ON_COMPLETION_CLOSE_OUT => {
+            let local_state = store
+                .get_app_local_state(&txn.sender, app_id)
+                .ok_or_else(|| {
+                    err_ctx.error(format!(
+                        "{} close-out: {} is not opted into app {}",
+                        err_ctx.prefix(),
+                        txn.sender,
+                        app_id,
+                    ))
+                })?;
+            let local_schema = local_state.schema.clone();
+            store.remove_app_local_state(&txn.sender, app_id);
+            let mut sender_account = store.get_or_default_account(&txn.sender);
+            sender_account.total_apps_opted_in =
+                sender_account.total_apps_opted_in.saturating_sub(1);
+            sender_account.total_app_schema =
+                sender_account.total_app_schema.sub_schema(&local_schema);
+            store.set_account(&txn.sender, sender_account);
+        }
+        ON_COMPLETION_CLEAR_STATE => {
+            // ClearState removes local state. The caller must have already
+            // verified that the sender is opted in (has local state) before
+            // reaching this point, matching go-algorand's closeOutApplication.
+            let local_state =
+                store
+                    .get_app_local_state(&txn.sender, app_id)
+                    .ok_or_else(|| {
+                        err_ctx.error(format!(
+                            "{} clear-state: {} is not opted into app {}",
+                            err_ctx.prefix(),
+                            txn.sender,
+                            app_id,
+                        ))
+                    })?;
+            let local_schema = local_state.schema.clone();
+            store.remove_app_local_state(&txn.sender, app_id);
+            let mut sender_account = store.get_or_default_account(&txn.sender);
+            sender_account.total_apps_opted_in =
+                sender_account.total_apps_opted_in.saturating_sub(1);
+            sender_account.total_app_schema =
+                sender_account.total_app_schema.sub_schema(&local_schema);
+            store.set_account(&txn.sender, sender_account);
+        }
+        ON_COMPLETION_DELETE => {
+            if let Some(existing) = store.get_app_params(app_id) {
+                if txn.sender != existing.creator {
+                    return Err(err_ctx.error(format!(
+                        "{} delete: sender {} is not the creator of app {}",
+                        err_ctx.prefix(),
+                        txn.sender,
+                        app_id,
+                    )));
+                }
+                let creator = existing.creator;
+                let global_schema = existing.global_state_schema.clone();
+                store.remove_app_params(app_id);
+                let mut creator_account = store.get_or_default_account(&creator);
+                creator_account.total_created_apps =
+                    creator_account.total_created_apps.saturating_sub(1);
+                creator_account.total_extra_app_pages = creator_account
+                    .total_extra_app_pages
+                    .saturating_sub(existing.extra_program_pages);
+                creator_account.total_app_schema =
+                    creator_account.total_app_schema.sub_schema(&global_schema);
+                store.set_account(&creator, creator_account);
+            }
+        }
+        ON_COMPLETION_UPDATE => {
+            if let Some(mut app) = store.get_app_params(app_id) {
+                if txn.sender != app.creator {
+                    return Err(err_ctx.error(format!(
+                        "{} update: sender {} is not the creator of app {}",
+                        err_ctx.prefix(),
+                        txn.sender,
+                        app_id,
+                    )));
+                }
+                if let Some(ref approval) = txn.approval_program {
+                    app.approval_program = approval.to_vec();
+                }
+                if let Some(ref clear) = txn.clear_state_program {
+                    app.clear_state_program = clear.to_vec();
+                }
+                store.set_app_params(app_id, app);
+            }
+        }
+        other => {
+            return Err(err_ctx.error(format!(
+                "{}: unknown on_completion value {}",
+                err_ctx.prefix(),
+                other,
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Apply an application call transaction.
@@ -1160,53 +1410,30 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
     }
 
     if is_create {
-        // App creation: create AppParams entry.
-        if app_id == 0 {
-            return Err(AlgoError::Ledger {
-                message: "appl create: apply_data_application_id (apid) is zero".to_string(),
-            });
-        }
+        create_application(store, txn, app_id, ApplErrorContext::Outer)?;
+    }
 
-        let approval = txn
-            .approval_program
-            .as_ref()
-            .map(|b| b.to_vec())
-            .unwrap_or_default();
-        let clear = txn
-            .clear_state_program
-            .as_ref()
-            .map(|b| b.to_vec())
-            .unwrap_or_default();
-
-        let global_schema = txn.global_state_schema.clone().unwrap_or_default();
-        let local_schema = txn.local_state_schema.clone().unwrap_or_default();
-        let extra_pages = txn.extra_program_pages;
-
-        store.set_app_params(
-            app_id,
-            AppParams {
-                creator: txn.sender,
-                approval_program: approval,
-                clear_state_program: clear,
-                global_state: std::collections::BTreeMap::new(),
-                local_state_schema: local_schema,
-                global_state_schema: global_schema.clone(),
-                extra_program_pages: extra_pages,
-            },
-        );
-
-        let mut sender_account = store.get_or_default_account(&txn.sender);
-        sender_account.total_created_apps += 1;
-        sender_account.total_extra_app_pages += extra_pages;
-        // Update aggregate schema: creator stores global state.
-        sender_account.total_app_schema =
-            sender_account.total_app_schema.add_schema(&global_schema);
-        store.set_account(&txn.sender, sender_account);
+    // ClearState requires the sender to be opted in (have local state).
+    // go-algorand checks this BEFORE running the clear-state program.
+    if txn.on_completion == ON_COMPLETION_CLEAR_STATE
+        && !store.has_app_local_state(&txn.sender, app_id)
+    {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "cannot clear state: {} is not currently opted in to app {}",
+                txn.sender, app_id,
+            ),
+        });
     }
 
     // Record whether local state exists BEFORE EvalDelta, so the OptIn branch
     // can correctly detect a new opt-in even if EvalDelta creates a placeholder entry.
-    let had_local_state = store.has_app_local_state(&txn.sender, app_id);
+    // Only needed in Replay mode; Execute mode handles opt-in pre-program.
+    let had_local_state = if ctx.mode == ApplyMode::Replay {
+        store.has_app_local_state(&txn.sender, app_id)
+    } else {
+        false
+    };
 
     // EvalDelta sourcing: Replay uses recorded block data, Execute runs AVM.
     match ctx.mode {
@@ -1289,6 +1516,20 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 // closure. That outer closure's error path restores the snapshot
                 // taken at the top of apply_transaction_inner, reverting all state
                 // changes (including any AVM writes) for the entire transaction.
+
+                // OptIn: create local state BEFORE program execution (matching
+                // go-algorand's `optInApplication()` before `StatefulEval()`).
+                // This lets the approval program read/write the sender's local
+                // state in the same transaction that opts them in.
+                if txn.on_completion == ON_COMPLETION_OPT_IN {
+                    apply_appl_opt_in_pre_program(
+                        store,
+                        &txn.sender,
+                        app_id,
+                        ApplErrorContext::Outer,
+                    )?;
+                }
+
                 let approval_program = app_params
                     .map(|p| p.approval_program.clone())
                     .unwrap_or_default();
@@ -1343,138 +1584,49 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
         }
     }
 
-    match txn.on_completion {
-        ON_COMPLETION_OPT_IN => {
-            // Reject duplicate opt-in.
-            if had_local_state {
-                return Err(AlgoError::Ledger {
-                    message: format!(
-                        "appl opt-in: {} is already opted into app {}",
-                        txn.sender, app_id,
-                    ),
-                });
-            }
-            {
-                let local_schema = if is_create {
-                    txn.local_state_schema.clone().unwrap_or_default()
-                } else {
-                    store
-                        .get_app_params(app_id)
-                        .map(|p| p.local_state_schema.clone())
-                        .unwrap_or_default()
-                };
-
-                // Insert or update with the correct schema (EvalDelta may have
-                // already created a placeholder with default schema).
-                let mut local = store
-                    .get_app_local_state(&txn.sender, app_id)
-                    .unwrap_or_else(|| AppLocalState {
-                        schema: local_schema.clone(),
-                        key_value: std::collections::BTreeMap::new(),
-                    });
-                local.schema = local_schema.clone();
-                store.set_app_local_state(&txn.sender, app_id, local);
-
-                let mut sender_account = store.get_or_default_account(&txn.sender);
-                sender_account.total_apps_opted_in += 1;
-                // Update aggregate schema: sender stores local state.
-                sender_account.total_app_schema =
-                    sender_account.total_app_schema.add_schema(&local_schema);
-                store.set_account(&txn.sender, sender_account);
-            }
-        }
-        ON_COMPLETION_CLOSE_OUT => {
-            // CloseOut requires the sender to be opted in.
-            let local_state = store
-                .get_app_local_state(&txn.sender, app_id)
-                .ok_or_else(|| AlgoError::Ledger {
-                    message: format!(
-                        "appl close-out: {} is not opted into app {}",
-                        txn.sender, app_id,
-                    ),
-                })?;
-            let local_schema = local_state.schema.clone();
-            store.remove_app_local_state(&txn.sender, app_id);
-            let mut sender_account = store.get_or_default_account(&txn.sender);
-            sender_account.total_apps_opted_in =
-                sender_account.total_apps_opted_in.saturating_sub(1);
-            // Subtract local schema from aggregate.
-            sender_account.total_app_schema =
-                sender_account.total_app_schema.sub_schema(&local_schema);
-            store.set_account(&txn.sender, sender_account);
-        }
-        ON_COMPLETION_CLEAR_STATE => {
-            // ClearState removes local state if present (does not fail if absent).
-            if let Some(local_state) = store.get_app_local_state(&txn.sender, app_id) {
-                let local_schema = local_state.schema.clone();
-                store.remove_app_local_state(&txn.sender, app_id);
-                let mut sender_account = store.get_or_default_account(&txn.sender);
-                sender_account.total_apps_opted_in =
-                    sender_account.total_apps_opted_in.saturating_sub(1);
-                // Subtract local schema from aggregate.
-                sender_account.total_app_schema =
-                    sender_account.total_app_schema.sub_schema(&local_schema);
-                store.set_account(&txn.sender, sender_account);
-            }
-        }
-        ON_COMPLETION_DELETE => {
-            // Only the creator can delete the app.
-            if let Some(existing) = store.get_app_params(app_id) {
-                if txn.sender != existing.creator {
-                    return Err(AlgoError::Ledger {
-                        message: format!(
-                            "appl delete: sender {} is not the creator of app {}",
-                            txn.sender, app_id,
-                        ),
-                    });
-                }
-                // Remove the app — decrement the CREATOR's counters, not sender's.
-                let creator = existing.creator;
-                let global_schema = existing.global_state_schema.clone();
-                store.remove_app_params(app_id);
-                let mut creator_account = store.get_or_default_account(&creator);
-                creator_account.total_created_apps =
-                    creator_account.total_created_apps.saturating_sub(1);
-                creator_account.total_extra_app_pages = creator_account
-                    .total_extra_app_pages
-                    .saturating_sub(existing.extra_program_pages);
-                // Subtract global schema from aggregate.
-                creator_account.total_app_schema =
-                    creator_account.total_app_schema.sub_schema(&global_schema);
-                store.set_account(&creator, creator_account);
-            }
-        }
-        ON_COMPLETION_UPDATE => {
-            // Only the creator can update the app programs.
-            if let Some(mut app) = store.get_app_params(app_id) {
-                if txn.sender != app.creator {
-                    return Err(AlgoError::Ledger {
-                        message: format!(
-                            "appl update: sender {} is not the creator of app {}",
-                            txn.sender, app_id,
-                        ),
-                    });
-                }
-                // Update the app programs only — extra_program_pages are immutable
-                // post-creation in go-algorand.
-                if let Some(ref approval) = txn.approval_program {
-                    app.approval_program = approval.to_vec();
-                }
-                if let Some(ref clear) = txn.clear_state_program {
-                    app.clear_state_program = clear.to_vec();
-                }
-                store.set_app_params(app_id, app);
-            }
-        }
-        0 => {
-            // NoOp — no structural state changes beyond EvalDelta.
-        }
-        other => {
+    // Handle OptIn for Replay mode — uses `had_local_state` and `is_create`
+    // to support EvalDelta placeholder merging. In Execute mode, opt-in is
+    // handled pre-program via `apply_appl_opt_in_pre_program` (matching
+    // go-algorand's `optInApplication()` before `StatefulEval()`).
+    if txn.on_completion == ON_COMPLETION_OPT_IN && ctx.mode == ApplyMode::Replay {
+        if had_local_state {
             return Err(AlgoError::Ledger {
-                message: format!("appl: unknown on_completion value {}", other),
+                message: format!(
+                    "appl opt-in: {} is already opted into app {}",
+                    txn.sender, app_id,
+                ),
             });
         }
+        let local_schema = if is_create {
+            txn.local_state_schema.clone().unwrap_or_default()
+        } else {
+            store
+                .get_app_params(app_id)
+                .map(|p| p.local_state_schema.clone())
+                .unwrap_or_default()
+        };
+
+        // Insert or update with the correct schema (EvalDelta may have
+        // already created a placeholder with default schema).
+        let mut local = store
+            .get_app_local_state(&txn.sender, app_id)
+            .unwrap_or_else(|| AppLocalState {
+                schema: local_schema.clone(),
+                key_value: std::collections::BTreeMap::new(),
+            });
+        local.schema = local_schema.clone();
+        store.set_app_local_state(&txn.sender, app_id, local);
+
+        let mut sender_account = store.get_or_default_account(&txn.sender);
+        sender_account.total_apps_opted_in += 1;
+        // Update aggregate schema: sender stores local state.
+        sender_account.total_app_schema = sender_account.total_app_schema.add_schema(&local_schema);
+        store.set_account(&txn.sender, sender_account);
     }
+
+    // Apply remaining on-completion side effects via the shared helper.
+    // ON_COMPLETION_OPT_IN is a no-op in the shared helper (handled above).
+    apply_appl_on_completion(store, txn, app_id, ApplErrorContext::Outer)?;
 
     Ok(())
 }
