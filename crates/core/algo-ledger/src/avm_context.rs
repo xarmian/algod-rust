@@ -14,7 +14,11 @@ use algo_error::AlgoError;
 use algo_types::{Address, SignedTransaction, TealValue, Transaction};
 use sha2::{Digest, Sha512_256};
 
-use crate::apply::{apply_acfg, apply_afrz, apply_axfer, apply_keyreg, apply_pay};
+use crate::apply::{
+    apply_acfg, apply_afrz, apply_appl_on_completion, apply_appl_opt_in_pre_program, apply_axfer,
+    apply_keyreg, apply_pay, create_application, program_hash, ApplErrorContext,
+    ON_COMPLETION_CLEAR_STATE, ON_COMPLETION_DELETE, ON_COMPLETION_OPT_IN,
+};
 use crate::params;
 use crate::store_trait::LedgerStore;
 
@@ -773,85 +777,19 @@ fn execute_inner_appl<L: LedgerStore>(
 
     // ── Handle app creation (application_id == 0) ──
     let effective_app_id = if called_app_id == 0 {
-        // Create a new application. Use txn_counter + 1 as the new app ID,
-        // matching go-algorand's createApplication(txnCounter + 1).
         let new_app_id = txn_counter + 1;
         ad.application_id = new_app_id;
-
-        let approval = stxn
-            .txn
-            .approval_program
-            .as_ref()
-            .map(|b| b.to_vec())
-            .unwrap_or_default();
-        let clear = stxn
-            .txn
-            .clear_state_program
-            .as_ref()
-            .map(|b| b.to_vec())
-            .unwrap_or_default();
-
-        let global_schema = stxn.txn.global_state_schema.clone().unwrap_or_default();
-        let local_schema = stxn.txn.local_state_schema.clone().unwrap_or_default();
-
-        let app_params = algo_types::AppParams {
-            creator: sender,
-            approval_program: approval,
-            clear_state_program: clear,
-            global_state: std::collections::BTreeMap::new(),
-            global_state_schema: global_schema,
-            local_state_schema: local_schema,
-            extra_program_pages: stxn.txn.extra_program_pages,
-        };
-        store.set_app_params(new_app_id, app_params);
-
-        // Update creator's account counters.
-        let mut creator_acct = store.get_or_default_account(&sender);
-        creator_acct.total_created_apps += 1;
-        creator_acct.total_extra_app_pages += stxn.txn.extra_program_pages;
-        // Update aggregate schema: creator stores global state.
-        creator_acct.total_app_schema = creator_acct
-            .total_app_schema
-            .add_schema(&stxn.txn.global_state_schema.clone().unwrap_or_default());
-        store.set_account(&sender, creator_acct);
-
+        create_application(store, &stxn.txn, new_app_id, ApplErrorContext::Inner)?;
         // Record the created app ID on the SignedTransaction.
         stxn.apply_data_application_id = new_app_id;
-
         new_app_id
     } else {
         called_app_id
     };
 
     // ── OptIn: create local state before running program ──
-    if on_completion == 1 {
-        // OptInOC = 1
-        // Reject duplicate opt-in (matches outer apply_appl path).
-        if store.has_app_local_state(&sender, effective_app_id) {
-            return Err(AlgoError::Avm {
-                message: format!(
-                    "inner appl opt-in: {} is already opted into app {}",
-                    sender, effective_app_id,
-                ),
-            });
-        }
-        let app = store
-            .get_app_params(effective_app_id)
-            .ok_or_else(|| AlgoError::Avm {
-                message: format!("inner appl opt-in: app {} not found", effective_app_id),
-            })?;
-        let local = algo_types::AppLocalState {
-            schema: app.local_state_schema.clone(),
-            key_value: std::collections::BTreeMap::new(),
-        };
-        store.set_app_local_state(&sender, effective_app_id, local);
-
-        // Update account counters.
-        let mut acct = store.get_or_default_account(&sender);
-        acct.total_apps_opted_in += 1;
-        // Update aggregate schema: sender stores local state.
-        acct.total_app_schema = acct.total_app_schema.add_schema(&app.local_state_schema);
-        store.set_account(&sender, acct);
+    if on_completion == ON_COMPLETION_OPT_IN {
+        apply_appl_opt_in_pre_program(store, &sender, effective_app_id, ApplErrorContext::Inner)?;
     }
 
     // ── Load the program ──
@@ -861,8 +799,7 @@ fn execute_inner_appl<L: LedgerStore>(
             message: format!("inner appl: app {} not found", effective_app_id),
         })?;
 
-    let program = if on_completion == 3 {
-        // ClearStateOC
+    let program = if on_completion == ON_COMPLETION_CLEAR_STATE {
         app.clear_state_program.clone()
     } else {
         app.approval_program.clone()
@@ -870,19 +807,13 @@ fn execute_inner_appl<L: LedgerStore>(
     let creator = app.creator.0;
 
     // Compute program hash for ed25519verify domain separation.
-    let program_hash = {
-        let mut h = Sha512_256::new();
-        h.update(b"Program");
-        h.update(&program);
-        let result: [u8; 32] = h.finalize().into();
-        result
-    };
+    let ph = program_hash(&program);
 
     // ── Budget pooling: add INNER_APP_BUDGET for this app call ──
     // Per go-algorand IsolateClearState: ClearState programs run with their
     // own isolated budget (MAX_APP_PROGRAM_COST = 700) and do NOT add to
     // the shared pool. Only non-ClearState app calls contribute budget.
-    if on_completion != 3 {
+    if on_completion != ON_COMPLETION_CLEAR_STATE {
         *opcode_budget += params::INNER_APP_BUDGET;
     }
 
@@ -904,7 +835,7 @@ fn execute_inner_appl<L: LedgerStore>(
         effective_app_id,
         creator,
         true, // app_mode
-        program_hash,
+        ph,
         genesis_hash,
     );
     inner_ctx.caller_app_id_val = caller_app_id;
@@ -919,7 +850,7 @@ fn execute_inner_appl<L: LedgerStore>(
     inner_ctx.parent_txn_id = inner_txn_id;
 
     // ── Execute the program ──
-    let avm_result = if on_completion == 3 {
+    let avm_result = if on_completion == ON_COMPLETION_CLEAR_STATE {
         // ClearStateOC: run clear state program. On failure, still clear state.
         run_clear_state_program(&program, &mut inner_ctx)
     } else {
@@ -937,7 +868,7 @@ fn execute_inner_appl<L: LedgerStore>(
     *opcode_budget = budget.remaining();
 
     // ── Check approval ──
-    if on_completion != 3 && !avm_result.approved {
+    if on_completion != ON_COMPLETION_CLEAR_STATE && !avm_result.approved {
         // Non-ClearState programs must approve.
         let err_msg = avm_result
             .error
@@ -1000,96 +931,12 @@ fn execute_inner_appl<L: LedgerStore>(
     }
 
     // ── Apply OnCompletion side effects (post-program) ──
-    // The store reference is now available again since inner_ctx is dropped
-    // at the end of this function. But inner_ctx still exists here...
-    // Actually inner_ctx borrows store, so we need to drop it first.
+    // Drop inner_ctx to release the borrow on store before applying on-completion effects.
     drop(inner_ctx);
 
-    match on_completion {
-        0 => {} // NoOpOC — nothing to do
-        1 => {} // OptInOC — local state was already created above
-        2 => {
-            // CloseOutOC — remove local state (sender must be opted in).
-            let local_state = store
-                .get_app_local_state(&sender, effective_app_id)
-                .ok_or_else(|| AlgoError::Avm {
-                    message: format!(
-                        "inner appl close-out: {} is not opted into app {}",
-                        sender, effective_app_id,
-                    ),
-                })?;
-            let local_schema = local_state.schema.clone();
-            store.remove_app_local_state(&sender, effective_app_id);
-            let mut acct = store.get_or_default_account(&sender);
-            acct.total_apps_opted_in = acct.total_apps_opted_in.saturating_sub(1);
-            // Subtract local schema from aggregate.
-            acct.total_app_schema = acct.total_app_schema.sub_schema(&local_schema);
-            store.set_account(&sender, acct);
-        }
-        3 => {
-            // ClearStateOC — always clear local state regardless of program result
-            if let Some(local_state) = store.get_app_local_state(&sender, effective_app_id) {
-                let local_schema = local_state.schema.clone();
-                store.remove_app_local_state(&sender, effective_app_id);
-                let mut acct = store.get_or_default_account(&sender);
-                acct.total_apps_opted_in = acct.total_apps_opted_in.saturating_sub(1);
-                // Subtract local schema from aggregate.
-                acct.total_app_schema = acct.total_app_schema.sub_schema(&local_schema);
-                store.set_account(&sender, acct);
-            }
-        }
-        4 => {
-            // UpdateApplicationOC — only the creator can update the app programs.
-            if let Some(mut app) = store.get_app_params(effective_app_id) {
-                if sender != app.creator {
-                    return Err(AlgoError::Avm {
-                        message: format!(
-                            "inner appl update: sender {} is not the creator of app {}",
-                            sender, effective_app_id,
-                        ),
-                    });
-                }
-                if let Some(ref approval) = stxn.txn.approval_program {
-                    app.approval_program = approval.to_vec();
-                }
-                if let Some(ref clear) = stxn.txn.clear_state_program {
-                    app.clear_state_program = clear.to_vec();
-                }
-                store.set_app_params(effective_app_id, app);
-            }
-        }
-        5 => {
-            // DeleteApplicationOC — only the creator can delete the app.
-            if let Some(existing) = store.get_app_params(effective_app_id) {
-                if sender != existing.creator {
-                    return Err(AlgoError::Avm {
-                        message: format!(
-                            "inner appl delete: sender {} is not the creator of app {}",
-                            sender, effective_app_id,
-                        ),
-                    });
-                }
-                let creator_addr = existing.creator;
-                let global_schema = existing.global_state_schema.clone();
-                store.remove_app_params(effective_app_id);
-                // Update creator's account counters.
-                let mut creator_acct = store.get_or_default_account(&creator_addr);
-                creator_acct.total_created_apps = creator_acct.total_created_apps.saturating_sub(1);
-                creator_acct.total_extra_app_pages = creator_acct
-                    .total_extra_app_pages
-                    .saturating_sub(existing.extra_program_pages);
-                // Subtract global schema from aggregate.
-                creator_acct.total_app_schema =
-                    creator_acct.total_app_schema.sub_schema(&global_schema);
-                store.set_account(&creator_addr, creator_acct);
-            }
-        }
-        _ => {
-            return Err(AlgoError::Avm {
-                message: format!("inner appl: unknown OnCompletion {}", on_completion),
-            });
-        }
-    }
+    // Apply on-completion side effects via the shared helper.
+    // ON_COMPLETION_OPT_IN is a no-op (handled by apply_appl_opt_in_pre_program above).
+    apply_appl_on_completion(store, &stxn.txn, effective_app_id, ApplErrorContext::Inner)?;
 
     // Propagate fee_credit and txn_counter back to the parent (H5/H6).
     ad.fee_credit = child_fee_credit;
@@ -2136,8 +1983,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // Per go-algorand IsolateClearState: clear state programs cannot
         // issue inner transactions.
         let on_completion = self.group[self.group_index].txn.on_completion;
-        if on_completion == 3 {
-            // ClearStateOC = 3
+        if on_completion == ON_COMPLETION_CLEAR_STATE {
             return Err(AlgoError::Avm {
                 message: "clear state programs can not issue inner transactions".to_string(),
             });
@@ -2294,8 +2140,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                                 ),
                             }
                         })?;
-                        if stxn.txn.on_completion == 3 {
-                            // ClearStateOC
+                        if stxn.txn.on_completion == ON_COMPLETION_CLEAR_STATE {
                             app.clear_state_program.clone()
                         } else {
                             app.approval_program.clone()
@@ -2328,8 +2173,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
                     // For OptIn, also check that the clear state program meets
                     // the minimum version requirement.
-                    if stxn.txn.on_completion == 1 {
-                        // OptInOC
+                    if stxn.txn.on_completion == ON_COMPLETION_OPT_IN {
                         let csp = if called_app_id != 0 {
                             let app =
                                 self.store.get_app_params(called_app_id).ok_or_else(|| {
@@ -2449,8 +2293,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     snapshot_addrs.push(Address(app_address(stxn.txn.application_id)));
                     // P1-2: Include the app creator for delete operations so
                     // their total_created_apps counter can be rolled back.
-                    if stxn.txn.on_completion == 5 {
-                        // DeleteApplicationOC
+                    if stxn.txn.on_completion == ON_COMPLETION_DELETE {
                         if let Some(app) = self.store.get_app_params(stxn.txn.application_id) {
                             snapshot_addrs.push(app.creator);
                         }
