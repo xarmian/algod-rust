@@ -1068,7 +1068,7 @@ fn created_asset_id_from_inner_acfg() {
     // Read CreatedAssetID (field 60)
     code.extend([0xb4, 60]); // itxn CreatedAssetID
                              // txn_counter starts at 500, incremented to 501 before execution,
-                             // then apply_inner_acfg uses txn_counter + 1 = 502
+                             // then apply_acfg uses txn_counter + 1 = 502
     code.extend(pushint(502));
     code.push(0x12); // ==
     code.push(0x43); // return

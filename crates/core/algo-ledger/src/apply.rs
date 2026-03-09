@@ -375,7 +375,16 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
                     }
                 }
             }
-            if stx.apply_data_config_asset != 0 {
+            // For creates (config_asset == 0), snapshot the ID that apply_acfg
+            // will derive (txn_counter + 1) so rollback can clean it up on failure.
+            // Also snapshot apply_data_config_asset from block data if present.
+            let derived_id = ctx.txn_counter.get() + 1;
+            if txn.config_asset == 0 && derived_id != 0 {
+                asset_ids_to_snap.push(derived_id);
+            }
+            if stx.apply_data_config_asset != 0
+                && !asset_ids_to_snap.contains(&stx.apply_data_config_asset)
+            {
                 asset_ids_to_snap.push(stx.apply_data_config_asset);
             }
         }
@@ -452,12 +461,27 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
 
         // Dispatch by transaction type.
         match txn.txn_type.as_str() {
-            "pay" => apply_pay(store, stx, ctx)?,
-            "acfg" => apply_acfg(store, stx, ctx)?,
-            "axfer" => apply_axfer(store, stx, ctx)?,
-            "afrz" => apply_afrz(store, stx, ctx)?,
+            "pay" => {
+                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
+                apply_pay(store, &stx.txn)?;
+            }
+            "acfg" => {
+                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
+                apply_acfg(store, &stx.txn, ctx.txn_counter.get())?;
+            }
+            "axfer" => {
+                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
+                apply_axfer(store, &stx.txn)?;
+            }
+            "afrz" => {
+                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
+                apply_afrz(store, &stx.txn)?;
+            }
             "appl" => apply_appl(store, stx, ctx, depth, group_budget)?,
-            "keyreg" => apply_keyreg(store, stx, ctx)?,
+            "keyreg" => {
+                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
+                apply_keyreg(store, &stx.txn, ctx.round)?;
+            }
             other => {
                 return Err(AlgoError::Ledger {
                     message: format!("unknown transaction type: {}", other),
@@ -574,56 +598,49 @@ fn apply_fee<L: crate::store_trait::LedgerStore>(
     Ok(())
 }
 
-/// Apply a payment transaction.
+/// Apply a payment transaction (core state mutation only).
 ///
-/// Debits `amount + fee` from sender, credits `amount` to receiver,
-/// credits `fee` to fee_sink. If `close_remainder_to` is set, moves
-/// the sender's remaining balance to that address.
-fn apply_pay<L: crate::store_trait::LedgerStore>(
+/// Debits `amount` from sender, credits `amount` to receiver.
+/// If `close_remainder_to` is set, moves the sender's remaining balance
+/// to that address and zeros the account.
+///
+/// Does NOT debit fees — the caller handles fee application separately.
+/// Returns `InnerApplyData` with `closing_amount` populated when applicable.
+///
+/// Used by both outer dispatch (after `apply_fee`) and inner transaction dispatch.
+pub fn apply_pay<L: crate::store_trait::LedgerStore>(
     store: &mut L,
-    stx: &SignedTransaction,
-    ctx: &ApplyContext,
-) -> Result<(), AlgoError> {
-    let txn = &stx.txn;
-    let total_debit = txn
-        .amount
-        .checked_add(txn.fee)
-        .ok_or_else(|| AlgoError::Ledger {
-            message: format!("amount {} + fee {} overflows u64", txn.amount, txn.fee,),
-        })?;
+    txn: &algo_types::Transaction,
+) -> Result<InnerApplyData, AlgoError> {
+    let mut ad = InnerApplyData::default();
 
-    // Check sender has enough for amount + fee.
-    {
+    // Transfer amount from sender to receiver.
+    if txn.amount > 0 || !txn.receiver.is_zero() {
         let mut sender = store.get_or_default_account(&txn.sender);
-        if sender.micro_algos < total_debit {
+        if sender.micro_algos < txn.amount {
             return Err(AlgoError::Ledger {
                 message: format!(
-                    "sender {} has insufficient balance {} for payment {} + fee {}",
-                    txn.sender, sender.micro_algos, txn.amount, txn.fee,
+                    "sender {} has insufficient balance {} for payment {}",
+                    txn.sender, sender.micro_algos, txn.amount,
                 ),
             });
         }
-        sender.micro_algos -= total_debit;
+        sender.micro_algos -= txn.amount;
         store.set_account(&txn.sender, sender);
-    }
 
-    // Credit receiver.
-    if txn.amount > 0 {
-        let mut receiver = store.get_or_default_account(&txn.receiver);
-        receiver.micro_algos += txn.amount;
-        store.set_account(&txn.receiver, receiver);
-    }
-
-    // Credit fee_sink.
-    {
-        let mut fee_sink = store.get_or_default_account(&ctx.fee_sink);
-        fee_sink.micro_algos += txn.fee;
-        store.set_account(&ctx.fee_sink, fee_sink);
+        if txn.amount > 0 {
+            let mut receiver = store.get_or_default_account(&txn.receiver);
+            receiver.micro_algos += txn.amount;
+            store.set_account(&txn.receiver, receiver);
+        }
     }
 
     // Handle close_remainder_to.
     if !txn.close_remainder_to.is_zero() {
         let sender = store.get_or_default_account(&txn.sender);
+
+        let close_amount = sender.micro_algos;
+        ad.closing_amount = close_amount;
 
         // Cannot close account with opted-in or created assets/apps.
         if sender.total_assets_opted_in > 0 {
@@ -675,38 +692,40 @@ fn apply_pay<L: crate::store_trait::LedgerStore>(
             });
         }
 
-        let close_amount = sender.micro_algos;
         // Go calls CloseAccount() which zeros the entire account record.
         // Reset to default to match that behavior.
         store.set_account(&txn.sender, algo_types::AccountData::default());
 
-        let mut close_to = store.get_or_default_account(&txn.close_remainder_to);
-        close_to.micro_algos += close_amount;
-        store.set_account(&txn.close_remainder_to, close_to);
+        // Credit close-to address.
+        if close_amount > 0 {
+            let mut close_to = store.get_or_default_account(&txn.close_remainder_to);
+            close_to.micro_algos += close_amount;
+            store.set_account(&txn.close_remainder_to, close_to);
+        }
     }
 
-    Ok(())
+    Ok(ad)
 }
 
-/// Apply an asset config transaction (create, reconfigure, or destroy).
-fn apply_acfg<L: crate::store_trait::LedgerStore>(
+/// Apply an asset config transaction (core state mutation only).
+///
+/// Handles asset creation (config_asset == 0), reconfiguration, and destruction.
+/// For creation, `txn_counter` is used to derive the new asset ID (txn_counter + 1),
+/// matching go-algorand's `AssetConfig` function.
+/// Does NOT debit fees — the outer dispatch handles fee application.
+/// Callable by both outer and inner transaction paths.
+///
+/// Returns `InnerApplyData` with `config_asset` populated on create.
+pub fn apply_acfg<L: crate::store_trait::LedgerStore>(
     store: &mut L,
-    stx: &SignedTransaction,
-    ctx: &ApplyContext,
-) -> Result<(), AlgoError> {
-    let txn = &stx.txn;
-
-    // Debit fee first.
-    apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
+    txn: &algo_types::Transaction,
+    txn_counter: u64,
+) -> Result<InnerApplyData, AlgoError> {
+    let mut ad = InnerApplyData::default();
 
     if txn.config_asset == 0 {
         // ── Create ──
-        let new_asset_id = stx.apply_data_config_asset;
-        if new_asset_id == 0 {
-            return Err(AlgoError::Ledger {
-                message: "acfg create: apply_data_config_asset (caid) is zero".to_string(),
-            });
-        }
+        let new_asset_id = txn_counter + 1;
 
         let txn_params = txn.asset_params.as_ref().cloned().unwrap_or_default();
         let total = txn_params.total;
@@ -731,6 +750,8 @@ fn apply_acfg<L: crate::store_trait::LedgerStore>(
         sender_account.total_created_assets += 1;
         sender_account.total_assets_opted_in += 1;
         store.set_account(&txn.sender, sender_account);
+
+        ad.config_asset = new_asset_id;
     } else {
         // ── Reconfigure or Destroy ──
         let asset_id = txn.config_asset;
@@ -795,17 +816,27 @@ fn apply_acfg<L: crate::store_trait::LedgerStore>(
             // ── Reconfigure ──
             let mut updated_params = existing.params.clone();
 
-            // Only update roles that are currently non-zero.
-            if updated_params.manager.is_some_and(|a| !a.is_zero()) {
+            // Only update a role when the existing on-chain role is non-zero
+            // AND the transaction explicitly set the field (is_some()).
+            // In go-algorand, unset inner txn fields are zero-valued Address{},
+            // but Rust uses Option<Address> where None = "not set via itxn_field".
+            // The is_some() guard prevents None from clearing existing roles.
+            // For outer transactions, all fields are always Some(...), so the
+            // guard is transparent.
+            if updated_params.manager.is_some_and(|a| !a.is_zero()) && txn_params.manager.is_some()
+            {
                 updated_params.manager = txn_params.manager;
             }
-            if updated_params.reserve.is_some_and(|a| !a.is_zero()) {
+            if updated_params.reserve.is_some_and(|a| !a.is_zero()) && txn_params.reserve.is_some()
+            {
                 updated_params.reserve = txn_params.reserve;
             }
-            if updated_params.freeze.is_some_and(|a| !a.is_zero()) {
+            if updated_params.freeze.is_some_and(|a| !a.is_zero()) && txn_params.freeze.is_some() {
                 updated_params.freeze = txn_params.freeze;
             }
-            if updated_params.clawback.is_some_and(|a| !a.is_zero()) {
+            if updated_params.clawback.is_some_and(|a| !a.is_zero())
+                && txn_params.clawback.is_some()
+            {
                 updated_params.clawback = txn_params.clawback;
             }
 
@@ -815,19 +846,22 @@ fn apply_acfg<L: crate::store_trait::LedgerStore>(
         }
     }
 
-    Ok(())
+    Ok(ad)
 }
 
-/// Apply an asset transfer transaction (opt-in, transfer, clawback, close-to).
-fn apply_axfer<L: crate::store_trait::LedgerStore>(
+/// Apply an asset transfer transaction (core state mutation only).
+///
+/// Handles opt-in, transfer (including clawback), and close-to paths.
+/// Does NOT debit fees — the outer dispatch handles fee application.
+/// Callable by both outer and inner transaction paths.
+///
+/// Returns `InnerApplyData` with `asset_closing_amount` populated when
+/// a close-to address is present.
+pub fn apply_axfer<L: crate::store_trait::LedgerStore>(
     store: &mut L,
-    stx: &SignedTransaction,
-    ctx: &ApplyContext,
-) -> Result<(), AlgoError> {
-    let txn = &stx.txn;
-
-    // Debit fee first.
-    apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
+    txn: &algo_types::Transaction,
+) -> Result<InnerApplyData, AlgoError> {
+    let mut ad = InnerApplyData::default();
 
     let asset_id = txn.xaid;
     if asset_id == 0 {
@@ -844,14 +878,8 @@ fn apply_axfer<L: crate::store_trait::LedgerStore>(
     let from_addr = clawback_source.unwrap_or(txn.sender);
     let is_clawback = clawback_source.is_some();
 
-    // ── Clawback cannot use close-to (go-algorand: "cannot close asset by clawback") ──
-    if is_clawback && txn.asset_close_to.is_some_and(|a| !a.is_zero()) {
-        return Err(AlgoError::Ledger {
-            message: format!("axfer: cannot close asset by clawback (asset {})", asset_id,),
-        });
-    }
-
     // ── Clawback authorization ──
+    // go-algorand checks clawback auth before anything else when AssetSender is set.
     if is_clawback {
         let params = store
             .get_asset_params(asset_id)
@@ -870,147 +898,134 @@ fn apply_axfer<L: crate::store_trait::LedgerStore>(
     }
 
     // ── Opt-in detection ──
-    let is_optin = asset_receiver == txn.sender
-        && txn.asset_amount == 0
-        && !is_clawback
-        && txn.asset_close_to.is_none();
+    // Matches go-algorand: `ct.AssetReceiver == source && ct.AssetAmount == 0 && !clawback`
+    // where `source` is `from_addr` (clawback_source or txn.sender). Since opt-in
+    // requires `!is_clawback`, `from_addr == txn.sender` in the opt-in path.
+    // go-algorand does NOT check AssetCloseTo here — close-to is handled independently.
+    let is_optin = asset_receiver == from_addr && txn.asset_amount == 0 && !is_clawback;
 
-    if is_optin {
-        if store.has_asset_holding(&txn.sender, asset_id) {
-            // Go does NOT error on duplicate opt-in — it falls through to the
-            // transfer path which is a 0-amount self-transfer no-op. Match that
-            // behavior by simply returning Ok.
-        } else {
-            let params = store
-                .get_asset_params(asset_id)
-                .ok_or_else(|| AlgoError::Ledger {
-                    message: format!("axfer opt-in: asset {} does not exist", asset_id),
-                })?;
-            let default_frozen = params.params.default_frozen;
-            store.set_asset_holding(
-                &txn.sender,
-                asset_id,
-                AssetHolding {
-                    amount: 0,
-                    frozen: default_frozen,
-                },
-            );
-            let mut sender_account = store.get_or_default_account(&txn.sender);
-            sender_account.total_assets_opted_in += 1;
-            store.set_account(&txn.sender, sender_account);
-        }
-    } else {
-        // ── Frozen check (only for non-clawback) ──
-        if !is_clawback {
-            let from_holding = store
-                .get_asset_holding(&from_addr, asset_id)
-                .ok_or_else(|| AlgoError::Ledger {
-                    message: format!("axfer: {} has no holding for asset {}", from_addr, asset_id,),
-                })?;
-            if from_holding.frozen {
-                return Err(AlgoError::Ledger {
-                    message: format!(
-                        "axfer: {} holding for asset {} is frozen",
-                        from_addr, asset_id,
-                    ),
-                });
-            }
-        }
+    // If already opted in, this is a no-op (matching go-algorand).
+    if is_optin && !store.has_asset_holding(&from_addr, asset_id) {
+        let params = store
+            .get_asset_params(asset_id)
+            .ok_or_else(|| AlgoError::Ledger {
+                message: format!("axfer opt-in: asset {} does not exist", asset_id),
+            })?;
+        let default_frozen = params.params.default_frozen;
+        store.set_asset_holding(
+            &from_addr,
+            asset_id,
+            AssetHolding {
+                amount: 0,
+                frozen: default_frozen,
+            },
+        );
+        let mut account = store.get_or_default_account(&from_addr);
+        account.total_assets_opted_in += 1;
+        store.set_account(&from_addr, account);
+    }
 
-        // ── Transfer ──
-        // Both sender and receiver must be opted in, even for zero-amount transfers.
-        if !store.has_asset_holding(&from_addr, asset_id) {
-            return Err(AlgoError::Ledger {
+    // ── Transfer ──
+    // go-algorand always runs takeOut/putIn after opt-in (they short-circuit on amount==0).
+    // Frozen checks and balance checks happen inside takeOut/putIn when amount > 0.
+    if txn.asset_amount > 0 {
+        // takeOut: debit from source
+        let mut from_holding = store
+            .get_asset_holding(&from_addr, asset_id)
+            .ok_or_else(|| AlgoError::Ledger {
                 message: format!("axfer: {} has no holding for asset {}", from_addr, asset_id),
+            })?;
+        if from_holding.frozen && !is_clawback {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "axfer: {} holding for asset {} is frozen",
+                    from_addr, asset_id,
+                ),
             });
         }
-        if !store.has_asset_holding(&asset_receiver, asset_id) {
+        if from_holding.amount < txn.asset_amount {
             return Err(AlgoError::Ledger {
+                message: format!(
+                    "axfer: {} holding {} insufficient for transfer {} of asset {}",
+                    from_addr, from_holding.amount, txn.asset_amount, asset_id,
+                ),
+            });
+        }
+        from_holding.amount -= txn.asset_amount;
+        store.set_asset_holding(&from_addr, asset_id, from_holding);
+
+        // putIn: credit receiver
+        let mut recv_holding = store
+            .get_asset_holding(&asset_receiver, asset_id)
+            .ok_or_else(|| AlgoError::Ledger {
                 message: format!(
                     "axfer: receiver {} has no holding for asset {} (not opted in)",
                     asset_receiver, asset_id,
                 ),
+            })?;
+        if recv_holding.frozen && !is_clawback {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "axfer: receiver {} holding for asset {} is frozen",
+                    asset_receiver, asset_id,
+                ),
             });
         }
-        // Check receiver frozen (non-clawback only, matching go-algorand).
-        if !is_clawback {
-            if let Some(recv_holding) = store.get_asset_holding(&asset_receiver, asset_id) {
-                if recv_holding.frozen {
+        recv_holding.amount += txn.asset_amount;
+        store.set_asset_holding(&asset_receiver, asset_id, recv_holding);
+    }
+
+    // ── Close-to ──
+    if let Some(close_to) = txn.asset_close_to {
+        if !close_to.is_zero() {
+            // Cannot close by clawback (go-algorand: "cannot close asset by clawback").
+            if is_clawback {
+                return Err(AlgoError::Ledger {
+                    message: format!("axfer: cannot close asset by clawback (asset {})", asset_id,),
+                });
+            }
+
+            let close_from = from_addr;
+
+            // The creator of the asset cannot close their holding.
+            // go-algorand: HasAssetParams(source, ct.XferAsset) -> "cannot close asset ID in allocating account"
+            // Also determine bypass_freeze: allowed when closing to the asset creator.
+            let bypass_freeze = if let Some(params_record) = store.get_asset_params(asset_id) {
+                if params_record.creator == close_from {
                     return Err(AlgoError::Ledger {
-                        message: format!(
-                            "axfer: receiver {} holding for asset {} is frozen",
-                            asset_receiver, asset_id,
-                        ),
+                        message: "cannot close asset ID in allocating account".to_string(),
                     });
                 }
-            }
-        }
-        if txn.asset_amount > 0 {
-            // Debit from.
-            let mut from_holding = store.get_asset_holding(&from_addr, asset_id).unwrap();
-            if from_holding.amount < txn.asset_amount {
+                params_record.creator == close_to
+            } else {
+                false
+            };
+
+            let from_holding = store
+                .get_asset_holding(&close_from, asset_id)
+                .ok_or_else(|| AlgoError::Ledger {
+                    message: format!(
+                        "axfer close: {} has no holding for asset {}",
+                        close_from, asset_id,
+                    ),
+                })?;
+            let remaining = from_holding.amount;
+            ad.asset_closing_amount = remaining;
+
+            // Check frozen on the sender's holding (unless bypassed).
+            if from_holding.frozen && !bypass_freeze {
                 return Err(AlgoError::Ledger {
                     message: format!(
-                        "axfer: {} holding {} insufficient for transfer {} of asset {}",
-                        from_addr, from_holding.amount, txn.asset_amount, asset_id,
+                        "axfer close: {} holding for asset {} is frozen",
+                        close_from, asset_id,
                     ),
                 });
             }
-            from_holding.amount -= txn.asset_amount;
-            store.set_asset_holding(&from_addr, asset_id, from_holding);
 
-            // Credit receiver.
-            let mut recv_holding = store.get_asset_holding(&asset_receiver, asset_id).unwrap();
-            recv_holding.amount += txn.asset_amount;
-            store.set_asset_holding(&asset_receiver, asset_id, recv_holding);
-        }
-
-        // ── Close-to ──
-        if let Some(close_to) = txn.asset_close_to {
-            if !close_to.is_zero() {
-                // Close the source account's holding. For non-clawback, from_addr == txn.sender.
-                // (Clawback + close-to is rejected above, so from_addr is always txn.sender here.)
-                let close_from = from_addr;
-
-                // The creator of the asset cannot close their holding.
-                // Go: HasAssetParams(source, ct.XferAsset) -> "cannot close asset ID in allocating account"
-                // Also determine if we bypass frozen checks: allowed when closing
-                // to the asset creator (go-algorand: bypassFreeze = HasAssetParams(closeTo)).
-                let bypass_freeze = if let Some(params_record) = store.get_asset_params(asset_id) {
-                    if params_record.creator == close_from {
-                        return Err(AlgoError::Ledger {
-                            message: "cannot close asset ID in allocating account".to_string(),
-                        });
-                    }
-                    params_record.creator == close_to
-                } else {
-                    false
-                };
-
-                let from_holding =
+            if remaining > 0 {
+                // Check frozen on close-to's holding (unless bypassed).
+                let mut close_holding =
                     store
-                        .get_asset_holding(&close_from, asset_id)
-                        .ok_or_else(|| AlgoError::Ledger {
-                            message: format!(
-                                "axfer close: {} has no holding for asset {}",
-                                close_from, asset_id,
-                            ),
-                        })?;
-                let remaining = from_holding.amount;
-
-                // Check frozen on the sender's holding (unless bypassed).
-                if from_holding.frozen && !bypass_freeze {
-                    return Err(AlgoError::Ledger {
-                        message: format!(
-                            "axfer close: {} holding for asset {} is frozen",
-                            close_from, asset_id,
-                        ),
-                    });
-                }
-
-                if remaining > 0 {
-                    // Check frozen on close-to's holding (unless bypassed).
-                    let mut close_holding = store
                         .get_asset_holding(&close_to, asset_id)
                         .ok_or_else(|| AlgoError::Ledger {
                             message: format!(
@@ -1018,43 +1033,39 @@ fn apply_axfer<L: crate::store_trait::LedgerStore>(
                                 close_to, asset_id,
                             ),
                         })?;
-                    if close_holding.frozen && !bypass_freeze {
-                        return Err(AlgoError::Ledger {
-                            message: format!(
-                                "axfer close: receiver {} holding for asset {} is frozen",
-                                close_to, asset_id,
-                            ),
-                        });
-                    }
-                    close_holding.amount += remaining;
-                    store.set_asset_holding(&close_to, asset_id, close_holding);
+                if close_holding.frozen && !bypass_freeze {
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "axfer close: receiver {} holding for asset {} is frozen",
+                            close_to, asset_id,
+                        ),
+                    });
                 }
-
-                // Remove sender holding.
-                store.remove_asset_holding(&close_from, asset_id);
-
-                let mut sender_account = store.get_or_default_account(&close_from);
-                sender_account.total_assets_opted_in =
-                    sender_account.total_assets_opted_in.saturating_sub(1);
-                store.set_account(&close_from, sender_account);
+                close_holding.amount += remaining;
+                store.set_asset_holding(&close_to, asset_id, close_holding);
             }
+
+            // Remove sender holding.
+            store.remove_asset_holding(&close_from, asset_id);
+
+            let mut account = store.get_or_default_account(&close_from);
+            account.total_assets_opted_in = account.total_assets_opted_in.saturating_sub(1);
+            store.set_account(&close_from, account);
         }
     }
 
-    Ok(())
+    Ok(ad)
 }
 
-/// Apply an asset freeze transaction.
-fn apply_afrz<L: crate::store_trait::LedgerStore>(
+/// Apply an asset freeze transaction (core state mutation only).
+///
+/// Freezes or unfreezes an asset holding for the target account.
+/// Does NOT debit fees — the outer dispatch handles fee application.
+/// Callable by both outer and inner transaction paths.
+pub fn apply_afrz<L: crate::store_trait::LedgerStore>(
     store: &mut L,
-    stx: &SignedTransaction,
-    ctx: &ApplyContext,
-) -> Result<(), AlgoError> {
-    let txn = &stx.txn;
-
-    // Debit fee first.
-    apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
-
+    txn: &algo_types::Transaction,
+) -> Result<InnerApplyData, AlgoError> {
     let asset_id = txn.freeze_asset;
     if asset_id == 0 {
         return Err(AlgoError::Ledger {
@@ -1091,7 +1102,7 @@ fn apply_afrz<L: crate::store_trait::LedgerStore>(
     holding.frozen = txn.asset_frozen;
     store.set_asset_holding(&target, asset_id, holding);
 
-    Ok(())
+    Ok(InnerApplyData::default())
 }
 
 /// On-completion action constants for application calls.
@@ -1468,24 +1479,22 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
     Ok(())
 }
 
-/// Apply a key registration transaction.
+/// Apply a key registration transaction (core state mutation only).
 ///
 /// Transitions account participation status:
 /// - `non_participation == true`: set NotParticipating (irreversible), clear all keys
 /// - `vote_pk` present with non-empty bytes: go Online, copy key material
 /// - Otherwise (offline keyreg): go Offline, clear all keys
 ///
-/// Fee is already handled by the caller (`apply_transaction` deducts fee before dispatch).
-fn apply_keyreg<L: crate::store_trait::LedgerStore>(
+/// Does NOT debit fees — the caller is responsible for calling `apply_fee()`
+/// before dispatching here. This allows the same function to be used for both
+/// outer transactions (where `apply_fee` is called in the dispatch layer) and
+/// inner transactions (where fee pooling is handled by `itxn_submit`).
+pub fn apply_keyreg<L: crate::store_trait::LedgerStore>(
     store: &mut L,
-    stx: &SignedTransaction,
-    ctx: &ApplyContext,
-) -> Result<(), AlgoError> {
-    let txn = &stx.txn;
-
-    // Debit fee first.
-    apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
-
+    txn: &algo_types::Transaction,
+    round: u64,
+) -> Result<InnerApplyData, AlgoError> {
     // Guard: NotParticipating is irreversible.
     {
         let account = store.get_or_default_account(&txn.sender);
@@ -1575,7 +1584,6 @@ fn apply_keyreg<L: crate::store_trait::LedgerStore>(
 
         // D14: Round-based keyreg coherency check (Go: EnableKeyregCoherencyCheck, enabled since v28).
         // VoteLast must be beyond the current round, and VoteFirst must start by next round.
-        let round = ctx.round;
         if txn.vote_last <= round {
             return Err(AlgoError::Ledger {
                 message: format!(
@@ -1623,7 +1631,7 @@ fn apply_keyreg<L: crate::store_trait::LedgerStore>(
         store.set_account(&txn.sender, account);
     }
 
-    Ok(())
+    Ok(InnerApplyData::default())
 }
 
 // ── Inner transaction apply functions ────────────────────────────────
@@ -1666,658 +1674,6 @@ pub struct InnerApplyData {
     /// All app IDs created by this inner app call and any nested inner txns.
     /// Used by the parent to track resources for snapshot rollback (P1-3).
     pub nested_created_apps: Vec<u64>,
-}
-
-/// Apply an inner payment transaction (core state mutation only).
-///
-/// Transfers `amount` from sender to receiver. If `close_remainder_to` is set,
-/// moves the sender's remaining balance to that address and zeros the account.
-/// Does NOT debit fees — the caller handles fee pooling.
-pub fn apply_inner_pay<L: crate::store_trait::LedgerStore>(
-    store: &mut L,
-    txn: &algo_types::Transaction,
-) -> Result<InnerApplyData, AlgoError> {
-    let mut ad = InnerApplyData::default();
-
-    // Transfer amount from sender to receiver.
-    if txn.amount > 0 || !txn.receiver.is_zero() {
-        let mut sender = store.get_or_default_account(&txn.sender);
-        if sender.micro_algos < txn.amount {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner pay: sender {} has insufficient balance {} for payment {}",
-                    txn.sender, sender.micro_algos, txn.amount,
-                ),
-            });
-        }
-        sender.micro_algos -= txn.amount;
-        store.set_account(&txn.sender, sender);
-
-        if txn.amount > 0 {
-            let mut receiver = store.get_or_default_account(&txn.receiver);
-            receiver.micro_algos += txn.amount;
-            store.set_account(&txn.receiver, receiver);
-        }
-    }
-
-    // Handle close_remainder_to.
-    if !txn.close_remainder_to.is_zero() {
-        let sender = store.get_or_default_account(&txn.sender);
-
-        let close_amount = sender.micro_algos;
-        ad.closing_amount = close_amount;
-
-        // Validate that account can be closed (no outstanding assets/apps/boxes).
-        if sender.total_assets_opted_in > 0 {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner pay close: cannot close: {} outstanding assets",
-                    sender.total_assets_opted_in,
-                ),
-            });
-        }
-        if sender.total_created_assets > 0 {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner pay close: cannot close: {} outstanding created assets",
-                    sender.total_created_assets,
-                ),
-            });
-        }
-        if sender.total_apps_opted_in > 0 {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner pay close: cannot close: {} outstanding applications opted in",
-                    sender.total_apps_opted_in,
-                ),
-            });
-        }
-        if sender.total_created_apps > 0 {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner pay close: cannot close: {} outstanding created applications",
-                    sender.total_created_apps,
-                ),
-            });
-        }
-        if sender.total_boxes > 0 {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner pay close: cannot close: {} outstanding boxes",
-                    sender.total_boxes,
-                ),
-            });
-        }
-        if sender.total_box_bytes > 0 {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner pay close: cannot close: {} outstanding box bytes",
-                    sender.total_box_bytes,
-                ),
-            });
-        }
-
-        // Zero the sender account (CloseAccount in go-algorand).
-        store.set_account(&txn.sender, algo_types::AccountData::default());
-
-        // Credit close-to address.
-        if close_amount > 0 {
-            let mut close_to = store.get_or_default_account(&txn.close_remainder_to);
-            close_to.micro_algos += close_amount;
-            store.set_account(&txn.close_remainder_to, close_to);
-        }
-    }
-
-    Ok(ad)
-}
-
-/// Apply an inner asset config transaction (core state mutation only).
-///
-/// Handles asset creation (config_asset == 0), reconfiguration, and destruction.
-/// For creation, `txn_counter` is used to derive the new asset ID (txn_counter + 1).
-/// Does NOT debit fees.
-pub fn apply_inner_acfg<L: crate::store_trait::LedgerStore>(
-    store: &mut L,
-    txn: &algo_types::Transaction,
-    txn_counter: u64,
-) -> Result<InnerApplyData, AlgoError> {
-    let mut ad = InnerApplyData::default();
-
-    if txn.config_asset == 0 {
-        // ── Create ──
-        let new_asset_id = txn_counter + 1;
-
-        let txn_params = txn.asset_params.as_ref().cloned().unwrap_or_default();
-        let total = txn_params.total;
-
-        let record = AssetParamsRecord {
-            params: txn_params,
-            creator: txn.sender,
-        };
-        store.set_asset_params(new_asset_id, record);
-
-        // Creator gets the full supply and an opt-in holding.
-        store.set_asset_holding(
-            &txn.sender,
-            new_asset_id,
-            AssetHolding {
-                amount: total,
-                frozen: false,
-            },
-        );
-
-        let mut sender_account = store.get_or_default_account(&txn.sender);
-        sender_account.total_created_assets += 1;
-        sender_account.total_assets_opted_in += 1;
-        store.set_account(&txn.sender, sender_account);
-
-        ad.config_asset = new_asset_id;
-    } else {
-        // ── Reconfigure or Destroy ──
-        let asset_id = txn.config_asset;
-        let existing = store
-            .get_asset_params(asset_id)
-            .ok_or_else(|| AlgoError::Ledger {
-                message: format!("inner acfg: asset {} does not exist", asset_id),
-            })?;
-
-        // Sender must be the manager.
-        let existing_manager = existing.params.manager.unwrap_or(Address::ZERO);
-        if existing_manager.is_zero() || txn.sender != existing_manager {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner acfg: sender {} is not the manager of asset {}",
-                    txn.sender, asset_id,
-                ),
-            });
-        }
-
-        let creator = existing.creator;
-        let txn_params = txn.asset_params.as_ref().cloned().unwrap_or_default();
-
-        if txn_params == AssetParams::default() {
-            // ── Destroy ──
-            let holding =
-                store
-                    .get_asset_holding(&creator, asset_id)
-                    .ok_or_else(|| AlgoError::Ledger {
-                        message: format!(
-                            "inner acfg destroy: creator {} has no holding for asset {}",
-                            creator, asset_id,
-                        ),
-                    })?;
-            if holding.amount != existing.params.total {
-                return Err(AlgoError::Ledger {
-                    message: format!(
-                        "inner acfg destroy: creator holds {} but total supply is {} for asset {}",
-                        holding.amount, existing.params.total, asset_id,
-                    ),
-                });
-            }
-
-            store.remove_asset_params(asset_id);
-            store.remove_asset_holding(&creator, asset_id);
-
-            let mut creator_account = store.get_or_default_account(&creator);
-            creator_account.total_created_assets =
-                creator_account.total_created_assets.saturating_sub(1);
-            creator_account.total_assets_opted_in =
-                creator_account.total_assets_opted_in.saturating_sub(1);
-            store.set_account(&creator, creator_account);
-        } else {
-            // ── Reconfigure ──
-            let mut updated_params = existing.params.clone();
-
-            // Only update a role when the inner transaction explicitly set
-            // the field (i.e. `txn_params.{role}.is_some()`).  Fields not
-            // set via `itxn_field` are `None` in the builder and must NOT
-            // overwrite the existing on-chain value.  The outer-path can
-            // unconditionally assign because outer transactions always
-            // populate every field (zero-address means "clear").
-            if updated_params.manager.is_some_and(|a| !a.is_zero()) && txn_params.manager.is_some()
-            {
-                updated_params.manager = txn_params.manager;
-            }
-            if updated_params.reserve.is_some_and(|a| !a.is_zero()) && txn_params.reserve.is_some()
-            {
-                updated_params.reserve = txn_params.reserve;
-            }
-            if updated_params.freeze.is_some_and(|a| !a.is_zero()) && txn_params.freeze.is_some() {
-                updated_params.freeze = txn_params.freeze;
-            }
-            if updated_params.clawback.is_some_and(|a| !a.is_zero())
-                && txn_params.clawback.is_some()
-            {
-                updated_params.clawback = txn_params.clawback;
-            }
-
-            let mut record = existing;
-            record.params = updated_params;
-            store.set_asset_params(asset_id, record);
-        }
-    }
-
-    Ok(ad)
-}
-
-/// Apply an inner asset transfer transaction (core state mutation only).
-///
-/// Handles opt-in, transfer, clawback, and close-to. Does NOT debit fees.
-pub fn apply_inner_axfer<L: crate::store_trait::LedgerStore>(
-    store: &mut L,
-    txn: &algo_types::Transaction,
-) -> Result<InnerApplyData, AlgoError> {
-    let mut ad = InnerApplyData::default();
-
-    let asset_id = txn.xaid;
-    if asset_id == 0 {
-        return Err(AlgoError::Ledger {
-            message: "inner axfer: asset ID (xaid) is zero".to_string(),
-        });
-    }
-
-    let asset_receiver = txn.asset_receiver.ok_or_else(|| AlgoError::Ledger {
-        message: "inner axfer: asset_receiver (arcv) is missing".to_string(),
-    })?;
-
-    let clawback_source = txn.asset_sender.filter(|a| !a.is_zero());
-    let from_addr = clawback_source.unwrap_or(txn.sender);
-    let is_clawback = clawback_source.is_some();
-
-    // Clawback cannot use close-to.
-    if is_clawback && txn.asset_close_to.is_some_and(|a| !a.is_zero()) {
-        return Err(AlgoError::Ledger {
-            message: format!(
-                "inner axfer: cannot close asset by clawback (asset {})",
-                asset_id,
-            ),
-        });
-    }
-
-    // Clawback authorization.
-    if is_clawback {
-        let params = store
-            .get_asset_params(asset_id)
-            .ok_or_else(|| AlgoError::Ledger {
-                message: format!("inner axfer: asset {} does not exist", asset_id),
-            })?;
-        let clawback = params.params.clawback.unwrap_or(Address::ZERO);
-        if txn.sender != clawback {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner axfer clawback: sender {} is not the clawback address for asset {}",
-                    txn.sender, asset_id,
-                ),
-            });
-        }
-    }
-
-    // Opt-in detection: self-transfer of zero amount, no clawback, no close-to.
-    let is_optin = asset_receiver == from_addr
-        && txn.asset_amount == 0
-        && !is_clawback
-        && txn.asset_close_to.is_none();
-
-    if is_optin {
-        if !store.has_asset_holding(&from_addr, asset_id) {
-            let params = store
-                .get_asset_params(asset_id)
-                .ok_or_else(|| AlgoError::Ledger {
-                    message: format!("inner axfer opt-in: asset {} does not exist", asset_id),
-                })?;
-            let default_frozen = params.params.default_frozen;
-            store.set_asset_holding(
-                &from_addr,
-                asset_id,
-                AssetHolding {
-                    amount: 0,
-                    frozen: default_frozen,
-                },
-            );
-            let mut account = store.get_or_default_account(&from_addr);
-            account.total_assets_opted_in += 1;
-            store.set_account(&from_addr, account);
-        }
-        // If already opted in, this is a no-op (matching go-algorand).
-    } else {
-        // Frozen check (non-clawback only).
-        if !is_clawback {
-            let from_holding = store
-                .get_asset_holding(&from_addr, asset_id)
-                .ok_or_else(|| AlgoError::Ledger {
-                    message: format!(
-                        "inner axfer: {} has no holding for asset {}",
-                        from_addr, asset_id,
-                    ),
-                })?;
-            if from_holding.frozen {
-                return Err(AlgoError::Ledger {
-                    message: format!(
-                        "inner axfer: {} holding for asset {} is frozen",
-                        from_addr, asset_id,
-                    ),
-                });
-            }
-        }
-
-        // Both source and receiver must be opted in.
-        if !store.has_asset_holding(&from_addr, asset_id) {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner axfer: {} has no holding for asset {}",
-                    from_addr, asset_id,
-                ),
-            });
-        }
-        if !store.has_asset_holding(&asset_receiver, asset_id) {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner axfer: receiver {} has no holding for asset {} (not opted in)",
-                    asset_receiver, asset_id,
-                ),
-            });
-        }
-
-        // Check receiver frozen (non-clawback only).
-        if !is_clawback {
-            if let Some(recv_holding) = store.get_asset_holding(&asset_receiver, asset_id) {
-                if recv_holding.frozen {
-                    return Err(AlgoError::Ledger {
-                        message: format!(
-                            "inner axfer: receiver {} holding for asset {} is frozen",
-                            asset_receiver, asset_id,
-                        ),
-                    });
-                }
-            }
-        }
-
-        // Transfer.
-        if txn.asset_amount > 0 {
-            let mut from_holding = store.get_asset_holding(&from_addr, asset_id).unwrap();
-            if from_holding.amount < txn.asset_amount {
-                return Err(AlgoError::Ledger {
-                    message: format!(
-                        "inner axfer: {} holding {} insufficient for transfer {} of asset {}",
-                        from_addr, from_holding.amount, txn.asset_amount, asset_id,
-                    ),
-                });
-            }
-            from_holding.amount -= txn.asset_amount;
-            store.set_asset_holding(&from_addr, asset_id, from_holding);
-
-            let mut recv_holding = store.get_asset_holding(&asset_receiver, asset_id).unwrap();
-            recv_holding.amount += txn.asset_amount;
-            store.set_asset_holding(&asset_receiver, asset_id, recv_holding);
-        }
-
-        // Close-to.
-        if let Some(close_to) = txn.asset_close_to {
-            if !close_to.is_zero() {
-                let close_from = from_addr;
-
-                // Creator cannot close their holding. Also determine bypass_freeze.
-                let bypass_freeze = if let Some(params_record) = store.get_asset_params(asset_id) {
-                    if params_record.creator == close_from {
-                        return Err(AlgoError::Ledger {
-                            message: "cannot close asset ID in allocating account".to_string(),
-                        });
-                    }
-                    params_record.creator == close_to
-                } else {
-                    false
-                };
-
-                let from_holding =
-                    store
-                        .get_asset_holding(&close_from, asset_id)
-                        .ok_or_else(|| AlgoError::Ledger {
-                            message: format!(
-                                "inner axfer close: {} has no holding for asset {}",
-                                close_from, asset_id,
-                            ),
-                        })?;
-                let remaining = from_holding.amount;
-                ad.asset_closing_amount = remaining;
-
-                // Check frozen on sender's holding (unless bypassed).
-                if from_holding.frozen && !bypass_freeze {
-                    return Err(AlgoError::Ledger {
-                        message: format!(
-                            "inner axfer close: {} holding for asset {} is frozen",
-                            close_from, asset_id,
-                        ),
-                    });
-                }
-
-                if remaining > 0 {
-                    let mut close_holding = store
-                        .get_asset_holding(&close_to, asset_id)
-                        .ok_or_else(|| AlgoError::Ledger {
-                            message: format!(
-                                "inner axfer close: {} has no holding for asset {} (not opted in)",
-                                close_to, asset_id,
-                            ),
-                        })?;
-                    if close_holding.frozen && !bypass_freeze {
-                        return Err(AlgoError::Ledger {
-                            message: format!(
-                                "inner axfer close: receiver {} holding for asset {} is frozen",
-                                close_to, asset_id,
-                            ),
-                        });
-                    }
-                    close_holding.amount += remaining;
-                    store.set_asset_holding(&close_to, asset_id, close_holding);
-                }
-
-                // Remove sender holding.
-                store.remove_asset_holding(&close_from, asset_id);
-
-                let mut account = store.get_or_default_account(&close_from);
-                account.total_assets_opted_in = account.total_assets_opted_in.saturating_sub(1);
-                store.set_account(&close_from, account);
-            }
-        }
-    }
-
-    Ok(ad)
-}
-
-/// Apply an inner asset freeze transaction (core state mutation only).
-///
-/// Sets or clears the frozen flag on the target account's asset holding.
-/// Does NOT debit fees.
-pub fn apply_inner_afrz<L: crate::store_trait::LedgerStore>(
-    store: &mut L,
-    txn: &algo_types::Transaction,
-) -> Result<InnerApplyData, AlgoError> {
-    let asset_id = txn.freeze_asset;
-    if asset_id == 0 {
-        return Err(AlgoError::Ledger {
-            message: "inner afrz: freeze asset ID (faid) is zero".to_string(),
-        });
-    }
-
-    // Verify sender is the freeze address.
-    let params = store
-        .get_asset_params(asset_id)
-        .ok_or_else(|| AlgoError::Ledger {
-            message: format!("inner afrz: asset {} does not exist", asset_id),
-        })?;
-    let freeze_addr = params.params.freeze.unwrap_or(Address::ZERO);
-    if freeze_addr.is_zero() || txn.sender != freeze_addr {
-        return Err(AlgoError::Ledger {
-            message: format!(
-                "inner afrz: sender {} is not the freeze address for asset {}",
-                txn.sender, asset_id,
-            ),
-        });
-    }
-
-    let target = txn.freeze_account.ok_or_else(|| AlgoError::Ledger {
-        message: "inner afrz: freeze_account (fadd) is missing".to_string(),
-    })?;
-
-    let mut holding =
-        store
-            .get_asset_holding(&target, asset_id)
-            .ok_or_else(|| AlgoError::Ledger {
-                message: format!(
-                    "inner afrz: {} has no holding for asset {}",
-                    target, asset_id,
-                ),
-            })?;
-    holding.frozen = txn.asset_frozen;
-    store.set_asset_holding(&target, asset_id, holding);
-
-    Ok(InnerApplyData::default())
-}
-
-/// Apply an inner key registration transaction (core state mutation only).
-///
-/// Updates the account's participation keys and online/offline status.
-/// Does NOT debit fees. Inner keyregs follow the same logic as outer keyregs
-/// but without fee-based incentive eligibility (inner txn fees are synthetic).
-pub fn apply_inner_keyreg<L: crate::store_trait::LedgerStore>(
-    store: &mut L,
-    txn: &algo_types::Transaction,
-    round: u64,
-) -> Result<InnerApplyData, AlgoError> {
-    // Guard: NotParticipating is irreversible.
-    {
-        let account = store.get_or_default_account(&txn.sender);
-        if account.status == AccountStatus::NotParticipating {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner keyreg: account {} has status NotParticipating (irreversible)",
-                    txn.sender,
-                ),
-            });
-        }
-    }
-
-    let vote_pk_empty = !txn.vote_pk.as_ref().is_some_and(|pk| !pk.is_empty());
-    let selection_pk_empty = !txn.selection_pk.as_ref().is_some_and(|pk| !pk.is_empty());
-
-    if vote_pk_empty || selection_pk_empty {
-        // Offline or non-participating.
-        let mut account = store.get_or_default_account(&txn.sender);
-        if txn.non_participation {
-            account.status = AccountStatus::NotParticipating;
-        } else {
-            account.status = AccountStatus::Offline;
-        }
-        account.vote_id = None;
-        account.selection_id = None;
-        account.state_proof_id = None;
-        account.vote_first_valid = 0;
-        account.vote_last_valid = 0;
-        account.vote_key_dilution = 0;
-        store.set_account(&txn.sender, account);
-    } else if txn.vote_pk.as_ref().is_some_and(|pk| !pk.is_empty()) {
-        // Online keyreg.
-        let vote_bytes = txn.vote_pk.as_ref().unwrap();
-        if vote_bytes.len() != 32 {
-            return Err(AlgoError::Ledger {
-                message: format!("inner keyreg: vote_pk length {} != 32", vote_bytes.len(),),
-            });
-        }
-        let mut vote_id = [0u8; 32];
-        vote_id.copy_from_slice(vote_bytes);
-
-        let sel_bytes = txn.selection_pk.as_ref().ok_or_else(|| AlgoError::Ledger {
-            message: "inner keyreg online: selection_pk is missing".to_string(),
-        })?;
-        if sel_bytes.len() != 32 {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner keyreg: selection_pk length {} != 32",
-                    sel_bytes.len(),
-                ),
-            });
-        }
-        let mut selection_id = [0u8; 32];
-        selection_id.copy_from_slice(sel_bytes);
-
-        let state_proof_id = if let Some(ref sp_bytes) = txn.state_proof_pk {
-            if !sp_bytes.is_empty() {
-                if sp_bytes.len() != 64 {
-                    return Err(AlgoError::Ledger {
-                        message: format!(
-                            "inner keyreg: state_proof_pk length {} != 64",
-                            sp_bytes.len(),
-                        ),
-                    });
-                }
-                let mut sp_id = [0u8; 64];
-                sp_id.copy_from_slice(sp_bytes);
-                Some(sp_id)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if txn.vote_key_dilution == 0 {
-            return Err(AlgoError::Ledger {
-                message: "inner keyreg online: vote_key_dilution must be > 0".to_string(),
-            });
-        }
-        if txn.vote_last < txn.vote_first {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner keyreg online: vote_last {} < vote_first {}",
-                    txn.vote_last, txn.vote_first,
-                ),
-            });
-        }
-
-        // Round-based keyreg coherency check.
-        if txn.vote_last <= round {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner keyreg online: vote_last {} <= current round {} (expired participation key)",
-                    txn.vote_last, round,
-                ),
-            });
-        }
-        if txn.vote_first > round + 1 {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "inner keyreg online: vote_first {} > round+1 {} (first voting round too far in future)",
-                    txn.vote_first, round + 1,
-                ),
-            });
-        }
-
-        let mut account = store.get_or_default_account(&txn.sender);
-        account.status = AccountStatus::Online;
-        account.vote_id = Some(vote_id);
-        account.selection_id = Some(selection_id);
-        account.state_proof_id = state_proof_id;
-        account.vote_first_valid = txn.vote_first;
-        account.vote_last_valid = txn.vote_last;
-        account.vote_key_dilution = txn.vote_key_dilution;
-
-        // Inner transactions do not set incentive eligibility or last heartbeat
-        // based on fee, because inner txn fees are synthetic (paid from the
-        // app's balance via fee pooling, not a real user payment).
-        // Go-algorand's Keyreg() does check `header.Fee.Raw >= params.Payouts.GoOnlineFee`
-        // but inner txn fees are typically MinTxnFee and wouldn't meet the threshold.
-        // We still set LastHeartbeat for consistency with the outer keyreg path.
-        const BALANCE_LOOKBACK: u64 = 320;
-        account.last_heartbeat = round + BALANCE_LOOKBACK;
-
-        if txn.fee >= 2_000_000 {
-            account.incentive_eligible = true;
-        }
-
-        store.set_account(&txn.sender, account);
-    }
-
-    Ok(InnerApplyData::default())
 }
 
 #[cfg(test)]
@@ -2632,8 +1988,8 @@ mod tests {
         let result = apply_transaction(&mut state, &stx, &ctx, 0);
         assert!(result.is_err());
 
-        // Fee sink should be rolled back — fee was credited inside apply_pay
-        // but the close check failed, so the whole transaction is reverted.
+        // Fee sink should be rolled back — fee was credited by apply_fee
+        // but the close check failed in apply_pay, so the whole transaction is reverted.
         assert_eq!(state.get_account(&fee_sink).unwrap().micro_algos, 100);
         assert_eq!(state.get_account(&sender).unwrap().micro_algos, 1_000_000);
     }
@@ -2643,23 +1999,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: build an acfg create transaction.
-    fn acfg_create_txn(
-        sender: Address,
-        fee: u64,
-        asset_id: u64,
-        params: AssetParams,
-    ) -> SignedTransaction {
+    fn acfg_create_txn(sender: Address, fee: u64, params: AssetParams) -> SignedTransaction {
         let mut stx = SignedTransaction::default();
         stx.txn.txn_type = "acfg".to_string();
         stx.txn.sender = sender;
         stx.txn.fee = fee;
         stx.txn.config_asset = 0; // 0 = create
         stx.txn.asset_params = Some(params);
-        stx.apply_data_config_asset = asset_id;
         stx
     }
 
     /// Helper: create an asset in state and return the asset_id.
+    ///
+    /// Sets `ctx.txn_counter` to `asset_id - 1` so that `apply_acfg` computes
+    /// `txn_counter + 1 == asset_id`. After `apply_transaction` the counter
+    /// will be incremented by the dispatch epilogue.
     fn create_asset_in_state(
         state: &mut LedgerState,
         ctx: &ApplyContext,
@@ -2667,7 +2021,9 @@ mod tests {
         asset_id: u64,
         params: AssetParams,
     ) {
-        let stx = acfg_create_txn(creator, 1_000, asset_id, params);
+        // Set counter so txn_counter + 1 == asset_id inside apply_acfg.
+        ctx.txn_counter.set(asset_id - 1);
+        let stx = acfg_create_txn(creator, 1_000, params);
         apply_transaction(state, &stx, ctx, 0).unwrap();
     }
 
@@ -2691,7 +2047,9 @@ mod tests {
             clawback: Some(sender),
             ..Default::default()
         };
-        let stx = acfg_create_txn(sender, 1_000, 42, params.clone());
+        // Set txn_counter so txn_counter + 1 == 42.
+        ctx.txn_counter.set(41);
+        let stx = acfg_create_txn(sender, 1_000, params.clone());
         apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
 
         // Verify asset params record.
@@ -2729,7 +2087,9 @@ mod tests {
             manager: Some(sender),
             ..Default::default()
         };
-        let stx = acfg_create_txn(sender, 1_000, 50, params);
+        // Set txn_counter so txn_counter + 1 == 50.
+        ctx.txn_counter.set(49);
+        let stx = acfg_create_txn(sender, 1_000, params);
         apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
 
         // Per Go semantics, creator holding is always unfrozen on create
@@ -2737,26 +2097,6 @@ mod tests {
         let holding = state.get_asset_holding(&sender, 50).unwrap();
         assert_eq!(holding.amount, 500);
         assert!(!holding.frozen);
-    }
-
-    #[test]
-    fn test_acfg_create_missing_caid_fails() {
-        let sender = Address([1u8; 32]);
-        let fee_sink = Address([3u8; 32]);
-
-        let mut state = make_state_with_accounts(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
-        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
-
-        let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "acfg".to_string();
-        stx.txn.sender = sender;
-        stx.txn.fee = 1_000;
-        stx.txn.config_asset = 0;
-        stx.apply_data_config_asset = 0; // missing!
-
-        let result = apply_transaction(&mut state, &stx, &ctx, 0);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("caid"));
     }
 
     #[test]
@@ -3013,7 +2353,7 @@ mod tests {
             ..Default::default()
         };
 
-        let _ad = apply_inner_acfg(&mut state, &inner_txn, 100).unwrap();
+        let _ad = apply_acfg(&mut state, &inner_txn, 100).unwrap();
 
         let record = state.get_asset_params(42).unwrap();
         // Manager should be updated.
@@ -3071,7 +2411,7 @@ mod tests {
             ..Default::default()
         };
 
-        let _ad = apply_inner_acfg(&mut state, &inner_txn, 100).unwrap();
+        let _ad = apply_acfg(&mut state, &inner_txn, 100).unwrap();
 
         let record = state.get_asset_params(42).unwrap();
         assert_eq!(record.params.manager, Some(creator));

@@ -14,9 +14,7 @@ use algo_error::AlgoError;
 use algo_types::{Address, SignedTransaction, TealValue, Transaction};
 use sha2::{Digest, Sha512_256};
 
-use crate::apply::{
-    apply_inner_acfg, apply_inner_afrz, apply_inner_axfer, apply_inner_keyreg, apply_inner_pay,
-};
+use crate::apply::{apply_acfg, apply_afrz, apply_axfer, apply_keyreg, apply_pay};
 use crate::params;
 use crate::store_trait::LedgerStore;
 
@@ -2622,6 +2620,8 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     Ok(ad) => {
                         stxn.apply_data_config_asset = ad.config_asset;
                         stxn.apply_data_application_id = ad.application_id;
+                        stxn.closing_amount = ad.closing_amount;
+                        stxn.asset_closing_amount = ad.asset_closing_amount;
                         // P1-3: Track any resources the child created that weren't
                         // in the original snapshot so rollback can clean them up.
                         if ad.config_asset != 0 && !snapshotted_asset_ids.contains(&ad.config_asset)
@@ -2670,11 +2670,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 }
             } else {
                 let result = match stxn.txn.txn_type.as_str() {
-                    "pay" => apply_inner_pay(self.store, &stxn.txn),
-                    "axfer" => apply_inner_axfer(self.store, &stxn.txn),
-                    "acfg" => apply_inner_acfg(self.store, &stxn.txn, self.txn_counter),
-                    "afrz" => apply_inner_afrz(self.store, &stxn.txn),
-                    "keyreg" => apply_inner_keyreg(self.store, &stxn.txn, round),
+                    "pay" => apply_pay(self.store, &stxn.txn),
+                    "axfer" => apply_axfer(self.store, &stxn.txn),
+                    "acfg" => apply_acfg(self.store, &stxn.txn, self.txn_counter),
+                    "afrz" => apply_afrz(self.store, &stxn.txn),
+                    "keyreg" => apply_keyreg(self.store, &stxn.txn, round),
                     _ => {
                         // Should not reach here due to earlier validation.
                         self.store.restore_snapshot(snapshot);
@@ -2699,6 +2699,8 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     Ok(ad) => {
                         stxn.apply_data_config_asset = ad.config_asset;
                         stxn.apply_data_application_id = ad.application_id;
+                        stxn.closing_amount = ad.closing_amount;
+                        stxn.asset_closing_amount = ad.asset_closing_amount;
                         // P1-3: Track non-app creates too (acfg assets).
                         if ad.config_asset != 0 && !snapshotted_asset_ids.contains(&ad.config_asset)
                         {
@@ -4615,7 +4617,7 @@ mod tests {
         assert_eq!(ctx.num_inner_txns(), 1);
 
         // CreatedAssetID should be the new asset ID.
-        // txn_counter = 100 + 0 + 1 = 101, then apply_inner_acfg does +1 = 102
+        // txn_counter = 100 + 0 + 1 = 101, then apply_acfg does +1 = 102
         let created = ctx.last_itxn_field(60, None).unwrap();
         assert_eq!(created, TealValue::Uint(102));
 
