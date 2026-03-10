@@ -36,9 +36,11 @@ pub const MAX_APP_PROGRAM_COST: i64 = 700;
 #[derive(Debug, Clone)]
 pub struct AvmResult {
     /// Changes to the application's global state.
-    pub global_delta: HashMap<Vec<u8>, TealValue>,
+    /// `Some(val)` = set, `None` = delete.
+    pub global_delta: HashMap<Vec<u8>, Option<TealValue>>,
     /// Changes to per-account local state, keyed by account address.
-    pub local_deltas: HashMap<Address, HashMap<Vec<u8>, TealValue>>,
+    /// Inner values: `Some(val)` = set, `None` = delete.
+    pub local_deltas: HashMap<Address, HashMap<Vec<u8>, Option<TealValue>>>,
     /// Inner transactions emitted by the program.
     pub inner_transactions: Vec<SignedTransaction>,
     /// Log messages emitted by the program.
@@ -239,11 +241,11 @@ mod tests {
     #[test]
     fn test_avm_result_construction() {
         let mut global_delta = HashMap::new();
-        global_delta.insert(b"key".to_vec(), TealValue::Uint(42));
+        global_delta.insert(b"key".to_vec(), Some(TealValue::Uint(42)));
 
         let mut local_deltas = HashMap::new();
         let mut account_delta = HashMap::new();
-        account_delta.insert(b"local_key".to_vec(), TealValue::Bytes(b"val".to_vec()));
+        account_delta.insert(b"local_key".to_vec(), Some(TealValue::Bytes(b"val".to_vec())));
         local_deltas.insert(Address::ZERO, account_delta);
 
         let result = AvmResult {
@@ -259,7 +261,7 @@ mod tests {
         assert_eq!(result.global_delta.len(), 1);
         assert_eq!(
             result.global_delta.get(b"key".as_slice()),
-            Some(&TealValue::Uint(42))
+            Some(&Some(TealValue::Uint(42)))
         );
         assert_eq!(result.local_deltas.len(), 1);
         assert_eq!(result.logs.len(), 1);

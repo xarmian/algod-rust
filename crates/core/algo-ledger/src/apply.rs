@@ -335,6 +335,12 @@ fn compute_group_fee_credit(group: &[&SignedTransaction]) -> u64 {
 /// Consecutive transactions sharing the same non-empty `group` hash form an
 /// atomic group. Transactions with an empty group hash are treated as their
 /// own single-transaction group.
+///
+/// Safety: two distinct atomic groups cannot share the same group hash in a
+/// valid block. The group ID is `SHA512/256("TG" || encode(TxGroup))` where
+/// `TxGroup` contains the individual transaction hashes (each unique), so a
+/// collision would require breaking SHA-512/256. Merging adjacent runs with
+/// the same hash is therefore correct.
 fn detect_transaction_groups(payset: &[SignedTransaction]) -> Vec<Vec<&SignedTransaction>> {
     let mut groups: Vec<Vec<&SignedTransaction>> = Vec::new();
     let mut i = 0;

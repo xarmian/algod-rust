@@ -143,7 +143,7 @@ fn compare_logs(
 // ---------------------------------------------------------------------------
 
 fn compare_global_delta(
-    avm_delta: &HashMap<Vec<u8>, TealValue>,
+    avm_delta: &HashMap<Vec<u8>, Option<TealValue>>,
     recorded_delta: &Option<HashMap<Vec<u8>, ValueDelta>>,
     mismatches: &mut Vec<FieldMismatch>,
 ) {
@@ -155,11 +155,11 @@ fn compare_global_delta(
         let key_str = format_key(key);
         match avm_delta.get(key) {
             Some(avm_val) => {
-                if !value_delta_matches_teal(vd, avm_val) {
+                if !value_delta_matches_option(vd, avm_val) {
                     mismatches.push(FieldMismatch {
                         field: format!("global_delta.{key_str}"),
                         expected: format_value_delta(vd),
-                        actual: format_teal_value(avm_val),
+                        actual: format_option_teal_value(avm_val),
                     });
                 }
             }
@@ -171,12 +171,9 @@ fn compare_global_delta(
                         actual: "<missing>".to_string(),
                     });
                 }
-                // Delete actions with no AVM counterpart: the AVM may not
-                // emit a delete if it never wrote the key. This is a
+                // Delete action with no AVM entry: the AVM never touched
+                // this key, so it did not emit a delete. This is still a
                 // semantic match — both result in the key not existing.
-                // However, the recorded delta explicitly says "delete",
-                // while the AVM just never set it. We flag this as a
-                // mismatch for strictness.
             }
         }
     }
@@ -188,7 +185,7 @@ fn compare_global_delta(
             mismatches.push(FieldMismatch {
                 field: format!("global_delta.{key_str}"),
                 expected: "<missing>".to_string(),
-                actual: format_teal_value(avm_val),
+                actual: format_option_teal_value(avm_val),
             });
         }
     }
@@ -199,7 +196,7 @@ fn compare_global_delta(
 // ---------------------------------------------------------------------------
 
 fn compare_local_deltas(
-    avm_deltas: &HashMap<Address, HashMap<Vec<u8>, TealValue>>,
+    avm_deltas: &HashMap<Address, HashMap<Vec<u8>, Option<TealValue>>>,
     recorded_deltas: &Option<HashMap<u64, HashMap<Vec<u8>, ValueDelta>>>,
     stx: &SignedTransaction,
     mismatches: &mut Vec<FieldMismatch>,
@@ -244,7 +241,7 @@ fn compare_local_deltas(
 
         let addr_str = addr.to_algorand_string();
         let avm_kv = avm_deltas.get(&addr);
-        let empty_avm: HashMap<Vec<u8>, TealValue> = HashMap::new();
+        let empty_avm: HashMap<Vec<u8>, Option<TealValue>> = HashMap::new();
         let avm_kv = avm_kv.unwrap_or(&empty_avm);
 
         // Check each recorded key.
@@ -252,11 +249,11 @@ fn compare_local_deltas(
             let key_str = format_key(key);
             match avm_kv.get(key) {
                 Some(avm_val) => {
-                    if !value_delta_matches_teal(vd, avm_val) {
+                    if !value_delta_matches_option(vd, avm_val) {
                         mismatches.push(FieldMismatch {
                             field: format!("local_deltas[{addr_str}].{key_str}"),
                             expected: format_value_delta(vd),
-                            actual: format_teal_value(avm_val),
+                            actual: format_option_teal_value(avm_val),
                         });
                     }
                 }
@@ -279,7 +276,7 @@ fn compare_local_deltas(
                 mismatches.push(FieldMismatch {
                     field: format!("local_deltas[{addr_str}].{key_str}"),
                     expected: "<missing>".to_string(),
-                    actual: format_teal_value(avm_val),
+                    actual: format_option_teal_value(avm_val),
                 });
             }
         }
@@ -297,7 +294,7 @@ fn compare_local_deltas(
                 mismatches.push(FieldMismatch {
                     field: format!("local_deltas[{addr_str}].{key_str}"),
                     expected: "<missing>".to_string(),
-                    actual: format_teal_value(avm_val),
+                    actual: format_option_teal_value(avm_val),
                 });
             }
         }
@@ -468,11 +465,15 @@ fn compare_inner_txns_at(
 ///
 /// Mapping: SetUint -> Uint, SetBytes -> Bytes, Delete has no TealValue
 /// counterpart (the key should be absent from the AVM delta).
-fn value_delta_matches_teal(vd: &ValueDelta, tv: &TealValue) -> bool {
-    match vd.action {
-        DeltaAction::SetUint => matches!(tv, TealValue::Uint(v) if *v == vd.uint),
-        DeltaAction::SetBytes => matches!(tv, TealValue::Bytes(b) if *b == vd.bytes),
-        DeltaAction::Delete => false, // Delete should not have a matching TealValue
+/// Match a recorded `ValueDelta` against an AVM `Option<TealValue>`.
+///
+/// `None` on the AVM side represents a delete operation.
+fn value_delta_matches_option(vd: &ValueDelta, avm_val: &Option<TealValue>) -> bool {
+    match (&vd.action, avm_val) {
+        (DeltaAction::Delete, None) => true,
+        (DeltaAction::SetUint, Some(TealValue::Uint(v))) => *v == vd.uint,
+        (DeltaAction::SetBytes, Some(TealValue::Bytes(b))) => *b == vd.bytes,
+        _ => false,
     }
 }
 
@@ -484,10 +485,11 @@ fn format_value_delta(vd: &ValueDelta) -> String {
     }
 }
 
-fn format_teal_value(tv: &TealValue) -> String {
+fn format_option_teal_value(tv: &Option<TealValue>) -> String {
     match tv {
-        TealValue::Uint(v) => format!("Uint({v})"),
-        TealValue::Bytes(b) => format!("Bytes({})", format_bytes(b)),
+        Some(TealValue::Uint(v)) => format!("Uint({v})"),
+        Some(TealValue::Bytes(b)) => format!("Bytes({})", format_bytes(b)),
+        None => "Delete".to_string(),
     }
 }
 
@@ -716,7 +718,7 @@ mod tests {
         let mut result = AvmResult::empty();
         result
             .global_delta
-            .insert(b"counter".to_vec(), TealValue::Uint(42));
+            .insert(b"counter".to_vec(), Some(TealValue::Uint(42)));
 
         let mut gd = HashMap::new();
         gd.insert(
@@ -743,7 +745,7 @@ mod tests {
         let mut result = AvmResult::empty();
         result
             .global_delta
-            .insert(b"counter".to_vec(), TealValue::Uint(99));
+            .insert(b"counter".to_vec(), Some(TealValue::Uint(99)));
 
         let mut gd = HashMap::new();
         gd.insert(
@@ -771,7 +773,7 @@ mod tests {
         let mut result = AvmResult::empty();
         result
             .global_delta
-            .insert(b"extra".to_vec(), TealValue::Uint(1));
+            .insert(b"extra".to_vec(), Some(TealValue::Uint(1)));
 
         let delta = EvalDelta {
             global_delta: None,
@@ -790,7 +792,7 @@ mod tests {
         let sender = Address([1u8; 32]);
         let mut result = AvmResult::empty();
         let mut kv = HashMap::new();
-        kv.insert(b"opted_in".to_vec(), TealValue::Uint(1));
+        kv.insert(b"opted_in".to_vec(), Some(TealValue::Uint(1)));
         result.local_deltas.insert(sender, kv);
 
         let mut rec_kv = HashMap::new();

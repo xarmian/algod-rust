@@ -496,12 +496,14 @@ pub trait AvmContext {
     }
 
     /// Take accumulated global state delta, leaving the context empty.
-    fn take_global_delta(&mut self) -> HashMap<Vec<u8>, TealValue> {
+    /// `Some(val)` = set, `None` = delete.
+    fn take_global_delta(&mut self) -> HashMap<Vec<u8>, Option<TealValue>> {
         HashMap::new()
     }
 
     /// Take accumulated local state deltas, leaving the context empty.
-    fn take_local_deltas(&mut self) -> HashMap<Address, HashMap<Vec<u8>, TealValue>> {
+    /// Inner values: `Some(val)` = set, `None` = delete.
+    fn take_local_deltas(&mut self) -> HashMap<Address, HashMap<Vec<u8>, Option<TealValue>>> {
         HashMap::new()
     }
 }

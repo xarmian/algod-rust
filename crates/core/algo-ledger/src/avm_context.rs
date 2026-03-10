@@ -3039,27 +3039,18 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         groups.into_iter().flat_map(|g| g.into_iter()).collect()
     }
 
-    fn take_global_delta(&mut self) -> HashMap<Vec<u8>, TealValue> {
+    fn take_global_delta(&mut self) -> HashMap<Vec<u8>, Option<TealValue>> {
         let tracker = std::mem::take(&mut self.global_delta_tracker);
-        let mut delta = HashMap::new();
-        for (key, maybe_val) in tracker {
-            if let Some(val) = maybe_val {
-                delta.insert(key, val);
-            }
-            // Deletes (None) are not represented in the HashMap<Vec<u8>, TealValue>
-            // output — the key is simply absent, which matches the comparison logic.
-        }
-        delta
+        // Preserve None entries — they represent key deletions (app_global_del).
+        tracker.into_iter().collect()
     }
 
-    fn take_local_deltas(&mut self) -> HashMap<Address, HashMap<Vec<u8>, TealValue>> {
+    fn take_local_deltas(&mut self) -> HashMap<Address, HashMap<Vec<u8>, Option<TealValue>>> {
         let tracker = std::mem::take(&mut self.local_delta_tracker);
-        let mut deltas: HashMap<Address, HashMap<Vec<u8>, TealValue>> = HashMap::new();
+        let mut deltas: HashMap<Address, HashMap<Vec<u8>, Option<TealValue>>> = HashMap::new();
         for ((addr, key), maybe_val) in tracker {
-            if let Some(val) = maybe_val {
-                deltas.entry(addr).or_default().insert(key, val);
-            }
-            // Deletes (None) are omitted — absent key = deleted.
+            // Preserve None entries — they represent key deletions (app_local_del).
+            deltas.entry(addr).or_default().insert(key, maybe_val);
         }
         deltas
     }

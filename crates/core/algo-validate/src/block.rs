@@ -533,6 +533,12 @@ pub fn validate_block(
 /// Returns groups of `(original_index, &SignedTransaction)` tuples. Consecutive
 /// transactions sharing the same non-empty `group` hash form an atomic group.
 /// Transactions with an empty group hash are standalone (single-txn group).
+///
+/// Safety: two distinct atomic groups cannot share the same group hash in a
+/// valid block. The group ID is `SHA512/256("TG" || encode(TxGroup))` where
+/// `TxGroup` contains the individual transaction hashes (each unique), so a
+/// collision would require breaking SHA-512/256. Merging adjacent runs with
+/// the same hash is therefore correct.
 fn detect_validation_groups(payset: &[SignedTransaction]) -> Vec<Vec<(usize, &SignedTransaction)>> {
     let mut groups: Vec<Vec<(usize, &SignedTransaction)>> = Vec::new();
     let mut i = 0;
