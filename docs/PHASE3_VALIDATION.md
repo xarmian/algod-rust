@@ -2,7 +2,7 @@
 
 _Completed: 2026-03-10_
 
-Phase 3 of algod-rust is **complete**. Eight epics (19--23) plus conformance reviews implement full AVM execution: bytecode parsing, stack machine, 182 of 185 opcodes dispatched, inner transaction execution, box storage, elliptic curve operations, and independent EvalDelta computation. The workspace contains 1,449 passing tests with zero failures. Mainnet replay validates 1,242 blocks (40,519 transactions) across two protocol versions (V40 and V41) at 100% pass rate.
+Phase 3 of algod-rust is **complete**. Eight epics (19--23) plus conformance reviews implement full AVM execution: bytecode parsing, stack machine, all 185 opcodes dispatched, inner transaction execution, box storage, elliptic curve operations, MiMC hashing, and independent EvalDelta computation. The workspace contains 1,466 passing tests with zero failures. Mainnet replay validates 1,242 blocks (40,519 transactions) across two protocol versions (V40 and V41) at 100% pass rate.
 
 ---
 
@@ -28,19 +28,15 @@ Phase 3 of algod-rust is **complete**. Eight epics (19--23) plus conformance rev
 | Metric | Value |
 |--------|-------|
 | Total opcodes defined in table | 185 |
-| Opcodes with dispatch handlers | 182 |
-| Opcodes not yet dispatched | 3 |
-| Implementation rate | 98.4% |
+| Opcodes with dispatch handlers | 185 |
+| Opcodes not yet dispatched | 0 |
+| Implementation rate | 100% |
 
-The 3 unimplemented opcodes are all v11 (AVM 11) specialized opcodes:
-
-| Opcode | Byte | Version | Notes |
-|--------|------|---------|-------|
-| `voter_params_get` | 0x74 | v11 | Requires consensus-level voter data; not exercised in standard TEAL programs |
-| `online_stake` | 0x75 | v11 | Requires consensus-level online stake tracking |
-| `mimc` | 0xe6 | v11 | MiMC hash function; requires dedicated circuit implementation |
-
-All opcodes from AVM v1 through v10 are fully implemented. For v11, only these 3 remain. For v12, `falcon_verify` (0x85) is implemented.
+All opcodes from AVM v1 through v12 are fully implemented, including:
+- `voter_params_get` (0x74, v11) — reads voter participation data from ledger context
+- `online_stake` (0x75, v11) — reads online stake from ledger context
+- `mimc` (0xe6, v11) — MiMC hash over BN254 (110 rounds) and BLS12-381 (111 rounds) scalar fields, with gnark-crypto-compatible round constant derivation
+- `falcon_verify` (0x85, v12) — Falcon-1024 post-quantum signature verification
 
 ### Opcode Categories Implemented
 
@@ -157,8 +153,8 @@ All 6 elliptic curve opcodes required a full arkworks integration for BN254 and 
 
 | Metric | Value |
 |--------|-------|
-| Total tests | 1,449 |
-| Tests passing | 1,449 |
+| Total tests | 1,466 |
+| Tests passing | 1,466 |
 | Tests failing | 0 |
 | Clippy warnings | 0 |
 | Workspace crates | 9 (algo-error, algo-types, algo-codec, algo-validate, algo-avm, algo-ledger, algo-rest-client, algo-fixtures, algo-conformance) + 1 binary |
@@ -168,13 +164,13 @@ Test breakdown by crate:
 
 | Crate | Unit | Integration | Total |
 |-------|------|-------------|-------|
-| algo-avm | 547 | 220 | 767 |
+| algo-avm | 564 | 220 | 784 |
 | algo-ledger | 276 | 143 | 419 |
 | algo-validate | 132 | 52 | 184 |
 | algo-codec | 10 | 50 | 60 |
 | algo-types | 14 | 0 | 14 |
 | algo-conformance | 0 | 5 | 5 |
-| **Total** | **979** | **470** | **1,449** |
+| **Total** | **996** | **470** | **1,466** |
 
 ### TEAL Test Vectors
 
@@ -219,11 +215,7 @@ The Phase 3 fuzz targets use structured generation (not raw byte fuzzing) to pro
 
 | Gap | Notes | Phase |
 |-----|-------|-------|
-| `voter_params_get` (0x74) | Requires consensus-level voter participation data not available in standard block replay | Phase 4 |
-| `online_stake` (0x75) | Requires consensus-level online stake tracking | Phase 4 |
-| `mimc` (0xe6) | MiMC hash function; requires dedicated circuit-style implementation | Phase 4 |
 | Stateful AVM replay on mainnet | Requires pre-built ledger state for high-round blocks; catchpoint sync needed | Phase 4 |
-| `ec_map_to` BN254 SvdW edge cases | arkworks SvdW implementation may differ from gnark-crypto for certain edge-case inputs | Known limitation |
 | `normalizedonlinebalance` | Placeholder uses micro_algos, not Go's sortition-weighted value | Phase 4 |
 | Heartbeat (`hb`) transaction execution | Structural validation passes; full heartbeat semantics not yet modeled | Phase 4 |
 
@@ -233,7 +225,7 @@ The Phase 3 fuzz targets use structured generation (not raw byte fuzzing) to pro
 
 Phase 3 delivers the complete AVM execution layer that Phase 4 (Catchup and Sync) builds upon:
 
-1. **AVM execution is production-ready**: 182/185 opcodes implemented with 100% mainnet replay pass rate across 1,242 blocks. The 3 missing opcodes (voter_params_get, online_stake, mimc) are v11 consensus-level opcodes that do not appear in standard TEAL programs.
+1. **AVM execution is production-ready**: All 185/185 opcodes implemented with 100% mainnet replay pass rate across 1,242 blocks.
 
 2. **Inner transaction execution works end-to-end**: Recursive execution with depth limiting, fee pooling, and EvalDelta propagation has been validated against mainnet blocks containing complex DeFi transactions.
 
@@ -244,7 +236,6 @@ Phase 3 delivers the complete AVM execution layer that Phase 4 (Catchup and Sync
 5. **Remaining work for Phase 4**:
    - Catchpoint sync to enable mid-chain state loading (eliminates need for genesis-to-current sequential replay)
    - Network protocol (gossip, block propagation, agreement)
-   - The 3 remaining v11 opcodes (low priority, consensus-level)
    - Heartbeat transaction full semantics
 
 ---
@@ -257,7 +248,7 @@ Phase 3 delivers the complete AVM execution layer that Phase 4 (Catchup and Sync
 # Build all crates
 cargo build --workspace
 
-# Run all 1,449 tests
+# Run all 1,466 tests
 cargo test --workspace
 
 # Lint (must pass with zero warnings)
@@ -302,7 +293,7 @@ cargo fuzz run fuzz_avm_context -- -max_total_time=3600
 
 ## Conclusion
 
-Phase 3 proves that Rust can execute AVM programs with full conformance to go-algorand. The `algo-avm` crate implements 182 of 185 opcodes (98.4%), covering all opcodes from AVM v1 through v10 and most of v11--v12. Independent EvalDelta computation replaces the Phase 2 approach of applying recorded block data, closing the last major gap in transaction validation.
+Phase 3 proves that Rust can execute AVM programs with full conformance to go-algorand. The `algo-avm` crate implements all 185 opcodes (100%), covering every opcode from AVM v1 through v12. Independent EvalDelta computation replaces the Phase 2 approach of applying recorded block data, closing the last major gap in transaction validation.
 
 Mainnet replay across 1,242 blocks and 40,519 transactions achieves a 100% pass rate, covering both V40 (MiMC-heavy, AVM 11) and V41 (falcon_verify, AVM 12) protocol versions. The implementation handles real-world DeFi programs with inner transactions, box storage, and elliptic curve operations.
 

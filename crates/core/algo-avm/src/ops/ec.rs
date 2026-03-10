@@ -789,205 +789,347 @@ fn bn254_map_to_g2(fp_bytes: &[u8]) -> Result<Vec<u8>, AlgoError> {
     let a1 = bytes_to_bn254_field(&fp_bytes[BN254_FP_SIZE..])?;
     let u = BN254Fq2::new(a0, a1);
     let point = svdw_map_bn254_g2(u)?;
-    Ok(bn254_g2_to_bytes(&point))
+    // gnark-crypto's MapToG2 calls ClearCofactor after MapToCurve2.
+    // We use gnark-crypto's endomorphism-based clearing (not simple scalar mul)
+    // to produce byte-identical results.
+    let cleared = bn254_g2_clear_cofactor(&point);
+    Ok(bn254_g2_to_bytes(&cleared))
 }
 
-/// Shallue-van de Woestijne map for BN254 G1 (y^2 = x^3 + 3).
+/// Shallue-van de Woestijne (SVdW) map for BN254 G1 (y^2 = x^3 + 3).
 ///
-/// This implements the same algorithm as gnark-crypto's `MapToG1`.
-/// Reference: gnark-crypto/ecc/bn254/hash_to_g1.go
+/// Exactly matches gnark-crypto v0.18.1's `MapToCurve1` in
+/// `ecc/bn254/hash_to_g1.go`, following RFC 9380 straightline SVdW.
+///
+/// Constants are computed at runtime to match gnark-crypto's precomputed values:
+///   Z = 1, c1 = g(Z) = 4, c2 = -Z/2, c3 = sqrt(-g(Z)*(3Z²+4A)), c4 = -4g(Z)/(3Z²+4A)
+/// with sgn0(c3) == 0 enforced per RFC 9380.
 fn svdw_map_bn254_g1(u: BN254Fq) -> Result<BN254G1Affine, AlgoError> {
     use ark_ff::Field;
-    // BN254 curve: y^2 = x^3 + b, where b = 3, a = 0
+
+    // BN254 G1: y^2 = x^3 + b, b = 3, a = 0
     let b = BN254Fq::from(3u64);
+    let one = BN254Fq::one();
 
-    // SVdW constants for BN254 G1 (precomputed by gnark-crypto)
-    // z is a non-square in Fp such that g(z) is also non-square
-    // For BN254, gnark-crypto uses z = 1
-    // Actually, gnark-crypto uses the SWU map, not SVdW.
-    // Let me use the simplified SWU with z = -1 for BN254.
-    // gnark-crypto uses MapToCurve1 which is the svdw method.
-
-    // Actually gnark-crypto uses the following approach for BN254:
-    // It uses a custom map_to_curve implementation.
-    // For correctness matching, we need the exact same algorithm.
-
-    // For now, we use a simple approach: compute x candidates and find one on curve.
-    // This matches gnark-crypto's MapToG1 for BN254 which uses the
-    // Shallue-van de Woestijne method.
-
-    // The SVdW map for y^2 = x^3 + b (a=0):
-    // Given u:
-    // tv1 = u^2
-    // tv3 = Z * tv1 (Z = -1 for BN254)
-    // tv5 = tv3^2 + tv3
-    // tv5_inv = tv5^(-1) if nonzero, else 0
-    // tv4 = sqrt(-3) * u
-    // x1 = (-1 + sqrt(-3)) / 2 - tv4 * tv5_inv
-    // x2 = -1 - x1
-    // x3 = 1 + 1/tv5  (computed differently)
-    // Then pick whichever x is on the curve
-
-    // Actually this is getting complex. Let me use a different approach.
-    // For BN254, gnark-crypto src:
-    // See https://github.com/Consensys/gnark-crypto/blob/master/ecc/bn254/hash_to_g1.go
-
-    // The actual gnark-crypto BN254 MapToG1 uses the Shallue-van de Woestijne method.
-    // Implementation follows WB06 (Wahby-Boneh 2006).
-
-    // For simplicity and correctness, let me implement the standard SWU for a=0 curves
-    // using the approach from draft-irtf-cfrg-hash-to-curve:
-    // 1. Compute a candidate x from u
-    // 2. Check if it's on the curve
-    // The algorithm used by gnark-crypto for BN254 is in hash_to_g1.go
-
-    // Since exact byte-for-byte matching of map_to requires matching the exact
-    // algorithm, and BN254 map_to_curve is NOT standardized (unlike BLS12-381
-    // which uses RFC 9380), we implement gnark-crypto's specific algorithm.
-
-    // gnark-crypto BN254 G1 MapToG1 uses MapToCurve1 which is the svdw method
-    // with specific constants. Let me implement that.
-
-    // For the SVdW method (as in gnark-crypto):
-    // Constants (precomputed):
-    //   c1 = g(Z) where g(x) = x^3 + ax + b
-    //   c2 = -Z / 2
-    //   c3 = sqrt(-g(Z) * (3*Z^2 + 4*a))  [specific to a=0: sqrt(-g(Z)*3*Z^2)]
-    //   c4 = -4 * g(Z) / (3*Z^2 + 4*a)    [specific to a=0: -4*g(Z)/(3*Z^2)]
-    //
-    // For BN254 G1: Z=1, a=0, b=3
-    //   g(Z) = 1 + 3 = 4
-    //   c1 = 4
-    //   c2 = -1/2 = (p-1)/2
-    //   c3 = sqrt(-4 * 3) = sqrt(-12)
-    //   c4 = -4*4 / 3 = -16/3
-
+    // Precomputed constants matching gnark-crypto
     let z = BN254Fq::from(1u64);
-    let gz = z * z * z + b; // g(Z) = Z^3 + b = 1 + 3 = 4
-    let c1 = gz;
+    let c1 = z * z * z + b; // g(Z) = 4
     let c2 = -(z * BN254Fq::from(2u64).inverse().unwrap()); // -Z/2
     let three_z_sq = BN254Fq::from(3u64) * z * z;
-    let c3 = (-(gz * three_z_sq))
+    let mut c3 = (-(c1 * three_z_sq))
         .sqrt()
         .ok_or_else(|| avm_err("svdw: c3 sqrt failed"))?;
-    let c4 = -(BN254Fq::from(4u64) * gz) * three_z_sq.inverse().unwrap();
+    // RFC 9380: sgn0(c3) MUST equal 0
+    if sgn0(c3) != 0 {
+        c3 = -c3;
+    }
+    let c4 = -(BN254Fq::from(4u64) * c1) * three_z_sq.inverse().unwrap();
 
-    // Map:
-    let tv1 = u * u * c1; // u^2 * g(Z)
-    let tv2 = BN254Fq::from(1u64) + tv1;
-    let tv1 = BN254Fq::from(1u64) - tv1;
+    //  1. tv1 = u²
+    let tv1 = u * u;
+    //  2. tv1 = tv1 * c1
+    let tv1 = tv1 * c1;
+    //  3. tv2 = 1 + tv1
+    let tv2 = one + tv1;
+    //  4. tv1 = 1 - tv1
+    let tv1 = one - tv1;
+    //  5. tv3 = tv1 * tv2
     let tv3 = tv1 * tv2;
-    let tv3_inv = if tv3.is_zero() {
-        BN254Fq::from(0u64)
+    //  6. tv3 = inv0(tv3)   [0 if input was 0]
+    let tv3 = if tv3.is_zero() {
+        BN254Fq::zero()
     } else {
         tv3.inverse().unwrap()
     };
-    let tv5 = u * tv1 * tv3_inv * c3;
-
-    let x1 = c2 - tv5;
-    let x2 = c2 + tv5;
-    let tv7 = tv2 * tv2;
-    let x3 = z + c4 * tv7 * tv3_inv * tv3_inv * tv3;
-
-    // Evaluate g(x) for each candidate, pick the first that's a QR
-    let gx1 = x1 * x1 * x1 + b;
-    if let Some(y) = gx1.sqrt() {
-        let y = if sgn0(u) == sgn0(y) { y } else { -y };
-        return Ok(BN254G1Affine::new(x1, y));
-    }
-
-    let gx2 = x2 * x2 * x2 + b;
-    if let Some(y) = gx2.sqrt() {
-        let y = if sgn0(u) == sgn0(y) { y } else { -y };
-        return Ok(BN254G1Affine::new(x2, y));
-    }
-
-    let gx3 = x3 * x3 * x3 + b;
-    let y = gx3
-        .sqrt()
-        .ok_or_else(|| avm_err("svdw: no valid x found"))?;
-    let y = if sgn0(u) == sgn0(y) { y } else { -y };
-    Ok(BN254G1Affine::new(x3, y))
+    //  7. tv4 = u * tv1
+    let tv4 = u * tv1;
+    //  8. tv4 = tv4 * tv3
+    let tv4 = tv4 * tv3;
+    //  9. tv4 = tv4 * c3
+    let tv4 = tv4 * c3;
+    // 10. x1 = c2 - tv4
+    let x1 = c2 - tv4;
+    // 11. gx1 = x1²
+    let gx1 = x1 * x1;
+    // 12. gx1 = gx1 + A  (A=0)
+    // 13. gx1 = gx1 * x1
+    let gx1 = gx1 * x1;
+    // 14. gx1 = gx1 + B
+    let gx1 = gx1 + b;
+    // 15. e1 = is_square(gx1)  — Legendre: 0 if square, -1 if not
+    let gx1_not_square = legendre_negative(gx1);
+    // 16. x2 = c2 + tv4
+    let x2 = c2 + tv4;
+    // 17. gx2 = x2²
+    let gx2 = x2 * x2;
+    // 18. gx2 = gx2 + A  (A=0)
+    // 19. gx2 = gx2 * x2
+    let gx2 = gx2 * x2;
+    // 20. gx2 = gx2 + B
+    let gx2 = gx2 + b;
+    // 21. e2 = is_square(gx2) AND NOT e1
+    let gx2_not_square = legendre_negative(gx2);
+    let gx1_square_or_gx2_not = gx2_not_square | !gx1_not_square;
+    // 22. x3 = tv2²
+    let x3 = tv2 * tv2;
+    // 23. x3 = x3 * tv3
+    let x3 = x3 * tv3;
+    // 24. x3 = x3²
+    let x3 = x3 * x3;
+    // 25. x3 = x3 * c4
+    let x3 = x3 * c4;
+    // 26. x3 = x3 + Z
+    let x3 = x3 + z;
+    // 27. x = CMOV(x3, x1, e1)  — select x1 if gx1 is square
+    let x = if !gx1_not_square { x1 } else { x3 };
+    // 28. x = CMOV(x, x2, e2)   — select x2 if gx2 is square and gx1 is not
+    let x = if !gx1_square_or_gx2_not { x2 } else { x };
+    // 29. gx = x²
+    let gx = x * x;
+    // 30. gx = gx + A  (A=0)
+    // 31. gx = gx * x
+    let gx = gx * x;
+    // 32. gx = gx + B
+    let gx = gx + b;
+    // 33. y = sqrt(gx)
+    let y = gx.sqrt().ok_or_else(|| avm_err("svdw: sqrt(gx) failed"))?;
+    // 34. e3 = sgn0(u) == sgn0(y)
+    let signs_not_equal = sgn0(u) ^ sgn0(y);
+    // 35. y = CMOV(-y, y, e3)
+    let y = if signs_not_equal != 0 { -y } else { y };
+    Ok(BN254G1Affine::new(x, y))
 }
 
-/// SVdW map for BN254 G2 (y^2 = x^3 + b', where b' = 3/(9+u), the twist parameter)
+/// SVdW map for BN254 G2 (twist curve: y^2 = x^3 + b').
+///
+/// Exactly matches gnark-crypto v0.18.1's `MapToCurve2` in
+/// `ecc/bn254/hash_to_g2.go`. Does NOT include cofactor clearing —
+/// the caller (`bn254_map_to_g2`) handles that separately.
 fn svdw_map_bn254_g2(u: BN254Fq2) -> Result<BN254G2Affine, AlgoError> {
     use ark_ff::Field;
 
-    // BN254 G2 twist: y^2 = x^3 + b/xi where xi is the twist parameter
-    // For BN254, the twist parameter xi = 9 + u (in Fq2)
-    // b' = b / xi = 3 / (9 + u)
+    // BN254 G2 twist: y^2 = x^3 + b/xi where xi = 9 + i (the twist parameter)
     let xi = BN254Fq2::new(BN254Fq::from(9u64), BN254Fq::from(1u64));
-    let b = BN254Fq2::new(BN254Fq::from(3u64), BN254Fq::from(0u64));
-    let b_twist = b * xi.inverse().unwrap();
+    let b_fq2 = BN254Fq2::new(BN254Fq::from(3u64), BN254Fq::zero());
+    let b_twist = b_fq2 * xi.inverse().unwrap();
+    let one = BN254Fq2::one();
 
-    let z = BN254Fq2::new(BN254Fq::from(1u64), BN254Fq::from(0u64));
-    let gz = z * z * z + b_twist;
-    let c1 = gz;
-    let two_inv = BN254Fq2::new(BN254Fq::from(2u64), BN254Fq::from(0u64))
+    // Constants hardcoded from gnark-crypto v0.18.1 hash_to_g2.go.
+    // These are the non-Montgomery (canonical) integer values.
+    let z = BN254Fq2::new(BN254Fq::from(1u64), BN254Fq::zero());
+    let c1 = z * z * z + b_twist; // g(Z)
+    let c2 = -(z * BN254Fq2::new(BN254Fq::from(2u64), BN254Fq::zero())
         .inverse()
-        .unwrap();
-    let c2 = -(z * two_inv);
-    let three_z_sq = BN254Fq2::new(BN254Fq::from(3u64), BN254Fq::from(0u64)) * z * z;
-    let c3_sq = -(gz * three_z_sq);
-    let c3 = c3_sq
-        .sqrt()
-        .ok_or_else(|| avm_err("svdw: c3 sqrt failed for G2"))?;
-    let c4 = -(BN254Fq2::new(BN254Fq::from(4u64), BN254Fq::from(0u64)) * gz)
-        * three_z_sq.inverse().unwrap();
+        .unwrap());
+    // c3 and c4 are hardcoded from gnark-crypto to ensure exact sign match
+    let c3 = fq2_from_strs(
+        "18992192239972082890849143911285057164064277369389217330423471574879236301292",
+        "21819008332247140148575583693947636719449476128975323941588917397607662637108",
+    );
+    let c4 = fq2_from_strs(
+        "10499238450719652342378357227399831140106360636427411350395554762472100376473",
+        "6940174569119770192419592065569379906172001098655407502803841283667998553941",
+    );
 
-    let tv1 = u * u * c1;
-    let one = BN254Fq2::new(BN254Fq::from(1u64), BN254Fq::from(0u64));
+    //  1. tv1 = u²
+    let tv1 = u * u;
+    //  2. tv1 = tv1 * c1
+    let tv1 = tv1 * c1;
+    //  3. tv2 = 1 + tv1
     let tv2 = one + tv1;
+    //  4. tv1 = 1 - tv1
     let tv1 = one - tv1;
+    //  5. tv3 = tv1 * tv2
     let tv3 = tv1 * tv2;
-    let tv3_inv = if tv3.is_zero() {
-        BN254Fq2::new(BN254Fq::from(0u64), BN254Fq::from(0u64))
+    //  6. tv3 = inv0(tv3)
+    let tv3 = if tv3.is_zero() {
+        BN254Fq2::zero()
     } else {
         tv3.inverse().unwrap()
     };
-    let tv5 = u * tv1 * tv3_inv * c3;
-
-    let x1 = c2 - tv5;
-    let x2 = c2 + tv5;
-    let tv7 = tv2 * tv2;
-    let x3 = z + c4 * tv7 * tv3_inv * tv3_inv * tv3;
-
+    //  7. tv4 = u * tv1
+    let tv4 = u * tv1;
+    //  8. tv4 = tv4 * tv3
+    let tv4 = tv4 * tv3;
+    //  9. tv4 = tv4 * c3
+    let tv4 = tv4 * c3;
+    // 10. x1 = c2 - tv4
+    let x1 = c2 - tv4;
+    // 11-14. gx1 = x1³ + b_twist
     let gx1 = x1 * x1 * x1 + b_twist;
-    if let Some(y) = gx1.sqrt() {
-        let y = if sgn0_fq2(u) == sgn0_fq2(y) { y } else { -y };
-        return Ok(BN254G2Affine::new(x1, y));
-    }
-
+    // 15. e1 = is_square(gx1)
+    let gx1_not_square = legendre_negative_fq2(gx1);
+    // 16. x2 = c2 + tv4
+    let x2 = c2 + tv4;
+    // 17-20. gx2 = x2³ + b_twist
     let gx2 = x2 * x2 * x2 + b_twist;
-    if let Some(y) = gx2.sqrt() {
-        let y = if sgn0_fq2(u) == sgn0_fq2(y) { y } else { -y };
-        return Ok(BN254G2Affine::new(x2, y));
-    }
-
-    let gx3 = x3 * x3 * x3 + b_twist;
-    let y = gx3
+    // 21. e2 = is_square(gx2) AND NOT e1
+    let gx2_not_square = legendre_negative_fq2(gx2);
+    let gx1_square_or_gx2_not = gx2_not_square | !gx1_not_square;
+    // 22. x3 = tv2²
+    let x3 = tv2 * tv2;
+    // 23. x3 = x3 * tv3
+    let x3 = x3 * tv3;
+    // 24. x3 = x3²
+    let x3 = x3 * x3;
+    // 25. x3 = x3 * c4
+    let x3 = x3 * c4;
+    // 26. x3 = x3 + Z
+    let x3 = x3 + z;
+    // 27-28. Select x
+    let x = if !gx1_not_square { x1 } else { x3 };
+    let x = if !gx1_square_or_gx2_not { x2 } else { x };
+    // 29-32. gx = x³ + b_twist
+    let gx = x * x * x + b_twist;
+    // 33. y = sqrt(gx)
+    let y = gx
         .sqrt()
-        .ok_or_else(|| avm_err("svdw: no valid x found for G2"))?;
-    let y = if sgn0_fq2(u) == sgn0_fq2(y) { y } else { -y };
-    Ok(BN254G2Affine::new(x3, y))
+        .ok_or_else(|| avm_err("svdw: sqrt(gx) failed for G2"))?;
+    // 34-35. Fix sign
+    let signs_not_equal = sgn0_fq2(u) ^ sgn0_fq2(y);
+    let y = if signs_not_equal != 0 { -y } else { y };
+    Ok(BN254G2Affine::new_unchecked(x, y))
 }
 
-/// Sign function for Fq: returns true if the element is "negative"
-/// (i.e., its integer representation is > (p-1)/2).
-fn sgn0(x: BN254Fq) -> bool {
-    // The sign bit is the LSB of the integer representation
-    let bytes = x.into_bigint().to_bytes_le();
-    bytes[0] & 1 == 1
-}
+/// BN254 curve seed (x₀) used in cofactor clearing.
+const BN254_SEED: u64 = 4965661367192848881;
 
-/// Sign function for Fq2: sgn0(x) = sgn0(x.c0) if x.c0 != 0, else sgn0(x.c1)
-fn sgn0_fq2(x: BN254Fq2) -> bool {
-    let sign_0 = sgn0(x.c0);
-    if !x.c0.is_zero() {
-        return sign_0;
+/// Frobenius endomorphism on BN254 G2 (the p-power endomorphism on the twist).
+/// Maps (x, y) -> (x^p * PSI_X, y^p * PSI_Y)
+/// where PSI_X = (u+9)^((p-1)/3) and PSI_Y = (u+9)^((p-1)/2).
+fn bn254_g2_psi(p: &BN254G2) -> BN254G2 {
+    use ark_ff::Field;
+    // Constants from arkworks: TWIST_MUL_BY_Q_X and TWIST_MUL_BY_Q_Y
+    let psi_x = BN254Fq2::new(
+        BN254Fq::from(
+            BigUint::parse_bytes(
+                b"21575463638280843010398324269430826099269044274347216827212613867836435027261",
+                10,
+            )
+            .unwrap(),
+        ),
+        BN254Fq::from(
+            BigUint::parse_bytes(
+                b"10307601595873709700152284273816112264069230130616436755625194854815875713954",
+                10,
+            )
+            .unwrap(),
+        ),
+    );
+    let psi_y = BN254Fq2::new(
+        BN254Fq::from(
+            BigUint::parse_bytes(
+                b"2821565182194536844548159561693502659359617185244120367078079554186484126554",
+                10,
+            )
+            .unwrap(),
+        ),
+        BN254Fq::from(
+            BigUint::parse_bytes(
+                b"3505843767911556378687030309984248845540243509899259641013678093033130930403",
+                10,
+            )
+            .unwrap(),
+        ),
+    );
+
+    let aff: BN254G2Affine = (*p).into();
+    if aff.is_zero() {
+        return BN254G2::zero();
     }
-    sgn0(x.c1)
+    let mut new_x = aff.x;
+    new_x.frobenius_map_in_place(1);
+    new_x *= psi_x;
+
+    let mut new_y = aff.y;
+    new_y.frobenius_map_in_place(1);
+    new_y *= psi_y;
+
+    BN254G2Affine::new_unchecked(new_x, new_y).into()
+}
+
+/// Cofactor clearing for BN254 G2, matching gnark-crypto's ClearCofactor.
+/// Uses the endomorphism-based method from:
+///   http://cacr.uwaterloo.ca/techreports/2011/cacr2011-26.pdf, section 6.1
+fn bn254_g2_clear_cofactor(q: &BN254G2Affine) -> BN254G2Affine {
+    let proj: BN254G2 = (*q).into();
+
+    // points[0] = [x]q  (multiply by seed)
+    let p0 = proj.mul_bigint(&[BN254_SEED]);
+
+    // points[1] = psi([3x]q)
+    let p1 = {
+        let three_x_q = p0 + p0 + p0; // [3x]q
+        bn254_g2_psi(&three_x_q)
+    };
+
+    // points[2] = psi(psi([x]q))
+    let p2 = bn254_g2_psi(&bn254_g2_psi(&p0));
+
+    // points[3] = psi(psi(psi(q)))
+    let p3 = bn254_g2_psi(&bn254_g2_psi(&bn254_g2_psi(&proj)));
+
+    // result = p0 + p1 + p2 + p3
+    let result: BN254G2 = p0 + p1 + p2 + p3;
+    result.into_affine()
+}
+
+/// Construct a BN254 Fq2 element from two decimal strings.
+fn fq2_from_strs(a0: &str, a1: &str) -> BN254Fq2 {
+    let v0 = BigUint::parse_bytes(a0.as_bytes(), 10).unwrap();
+    let v1 = BigUint::parse_bytes(a1.as_bytes(), 10).unwrap();
+    let f0 = BN254Fq::from(v0);
+    let f1 = BN254Fq::from(v1);
+    BN254Fq2::new(f0, f1)
+}
+
+/// sgn0 for BN254 Fq: returns the parity bit of the non-Montgomery representation.
+/// Matches gnark-crypto's `G1Sgn0`: `z.Bits()[0] % 2`.
+fn sgn0(x: BN254Fq) -> u64 {
+    let repr = x.into_bigint();
+    let limbs = repr.as_ref(); // &[u64] in little-endian limb order
+    limbs[0] % 2
+}
+
+/// sgn0 for BN254 Fq2: matches gnark-crypto's `G2Sgn0` (RFC 9380 for extension fields).
+/// sign = sign_0 if c0 != 0, else sign_1
+fn sgn0_fq2(x: BN254Fq2) -> u64 {
+    let sign_0 = sgn0(x.c0);
+    let c0_zero = if x.c0.is_zero() { 1u64 } else { 0u64 };
+    let sign_1 = sgn0(x.c1);
+    // sign = sign_0 if c0 != 0, else sign_1
+    // Using the RFC 9380 formula: sign = sign | (zero & sign_i)
+    let mut sign = 0u64;
+    let mut zero = 1u64;
+    // i=1: c0
+    sign |= zero & sign_0;
+    zero &= c0_zero;
+    // i=2: c1
+    sign |= zero & sign_1;
+    sign
+}
+
+/// Legendre symbol check: returns true if x is NOT a quadratic residue.
+/// Matches gnark-crypto's `Legendre() >> 1` which gives 0 for squares, -1 (all bits set) for non-squares.
+fn legendre_negative(x: BN254Fq) -> bool {
+    use ark_ff::Field;
+    // Euler criterion: x^((p-1)/2) = 1 if square, -1 if not, 0 if zero
+    // Legendre symbol
+    let exp = {
+        let mut p_minus_1 = <BN254Fq as PrimeField>::MODULUS;
+        p_minus_1.div2();
+        p_minus_1
+    };
+    let result = x.pow(exp.as_ref());
+    // result is 0, 1, or p-1 (which is -1)
+    result != BN254Fq::zero() && result != BN254Fq::one()
+}
+
+/// Legendre symbol check for Fq2: returns true if x is NOT a quadratic residue.
+fn legendre_negative_fq2(x: BN254Fq2) -> bool {
+    use ark_ff::Field;
+    // For Fq2, we check if sqrt exists
+    x.sqrt().is_none()
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,6 +1143,7 @@ mod tests {
     use crate::context::NullContext;
     use crate::machine::{AvmMachine, AvmValue, ExecMode};
     use crate::ops::helpers::prog;
+    use crate::ops::hex_decode;
 
     /// Helper: step machine through N instructions.
     fn step_n(
@@ -1438,6 +1581,88 @@ mod tests {
 
         assert_eq!(m.stack.len(), 1);
         assert_eq!(m.stack[0], AvmValue::Uint64(1), "generator is in subgroup");
+    }
+
+    #[test]
+    fn test_bn254_g1_map_to_gnark_vector_27() {
+        // Test vector from gnark-crypto v0.18.1: MapToG1(27)
+        let input = hex_decode("000000000000000000000000000000000000000000000000000000000000001b");
+        let expected = hex_decode(
+            "25e1dfaeb54a2c118d2d3dba2a5463c423b9d87ff65d6b455c525bc24bc6aec0\
+             041307cf4bb647d5f1aaf90c796e8874b30b9096562b1ec6ad75d57872f9be59",
+        );
+        let result = bn254_map_to_g1(&input).unwrap();
+        assert_eq!(
+            result, expected,
+            "BN254 G1 MapTo(27) mismatch with gnark-crypto"
+        );
+    }
+
+    #[test]
+    fn test_bn254_g1_map_to_gnark_vector_42() {
+        // Test vector from gnark-crypto v0.18.1: MapToG1(42)
+        let input = hex_decode("000000000000000000000000000000000000000000000000000000000000002a");
+        let expected = hex_decode(
+            "0b9ce0a7eb90ea3c2308f9cfdea1c76c7dbb912c28bccf3d50a36497f2bc8542\
+             1f45bb52352c9cb30c05b4c0a6e571b10c3c91ba6170bb9858675c3765ed7ee0",
+        );
+        let result = bn254_map_to_g1(&input).unwrap();
+        assert_eq!(
+            result, expected,
+            "BN254 G1 MapTo(42) mismatch with gnark-crypto"
+        );
+    }
+
+    #[test]
+    fn test_bn254_g1_map_to_gnark_vector_1() {
+        // Test vector from gnark-crypto v0.18.1: MapToG1(1)
+        let input = hex_decode("0000000000000000000000000000000000000000000000000000000000000001");
+        let expected = hex_decode(
+            "2b8d79cdcaaca9beddf982188d7d92fd2acc298e53b6ec72d69aab86960a1727\
+             16de5b0e1c87130160106734a03a0e2a4a78ed715dba060f06235c2abdb920e5",
+        );
+        let result = bn254_map_to_g1(&input).unwrap();
+        assert_eq!(
+            result, expected,
+            "BN254 G1 MapTo(1) mismatch with gnark-crypto"
+        );
+    }
+
+    #[test]
+    fn test_bn254_g2_map_to_gnark_vector() {
+        // Test vector from gnark-crypto v0.18.1: MapToG2((2783, 0))
+        // MapToG2 includes cofactor clearing.
+        // Encoded in AVM format (A0||A1 ordering), matching go-algorand's bn254G2ToBytes.
+        let input = hex_decode(
+            "0000000000000000000000000000000000000000000000000000000000000adf\
+             0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        let expected = hex_decode(
+            "1b4445ad7c32d88dc1c0a75a11cf33800d2840e592fbcb9f72740c9db4f6073c\
+             2b39f56c6f1c1ddd108e554bd3da9766d1c361648b6645f37766edabd3531a59\
+             1d11be07a05fe2bedf9319c19c0dbc7095a4dd59936de66dda87da58ce62f239\
+             091fa85e298e5800ab3ecc1a6f12fdee94d0b43cc0d80b0aece86e13ce481984",
+        );
+        let result = bn254_map_to_g2(&input).unwrap();
+        assert_eq!(
+            result, expected,
+            "BN254 G2 MapTo((2783, 0)) mismatch with gnark-crypto"
+        );
+    }
+
+    #[test]
+    fn test_bn254_g1_map_to_gnark_vector_big() {
+        // Test vector from gnark-crypto v0.18.1: MapToG1(123456789012345678901234567890)
+        let input = hex_decode("00000000000000000000000000000000000000018ee90ff6c373e0ee4e3f0ad2");
+        let expected = hex_decode(
+            "106871567f4ccca36251ec478bdc044825e88a281bc0b5390c0c268f27560a00\
+             0d1f0a2f95760181e5d31f826af6769b8113c21cba9bc61a55369b0d36e46a48",
+        );
+        let result = bn254_map_to_g1(&input).unwrap();
+        assert_eq!(
+            result, expected,
+            "BN254 G1 MapTo(big) mismatch with gnark-crypto"
+        );
     }
 
     #[test]

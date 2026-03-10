@@ -242,6 +242,10 @@ pub fn dispatch(
         0x72 => state::op_app_params_get(machine, instruction, ctx),
         0x73 => state::op_acct_params_get(machine, instruction, ctx),
 
+        // ---- Voter / stake (v11+) ----
+        0x74 => state::op_voter_params_get(machine, instruction, ctx),
+        0x75 => state::op_online_stake(machine, instruction, ctx),
+
         // ---- Min balance ----
         0x78 => state::op_min_balance(machine, instruction, ctx),
 
@@ -305,6 +309,9 @@ pub fn dispatch(
         0xe3 => ec::op_ec_multi_scalar_mul(machine, instruction),
         0xe4 => ec::op_ec_subgroup_check(machine, instruction),
         0xe5 => ec::op_ec_map_to(machine, instruction),
+
+        // ---- MiMC hash (v11+) ----
+        0xe6 => crypto::op_mimc(machine, instruction),
 
         // ---- Everything else: not yet implemented ----
         _ => {

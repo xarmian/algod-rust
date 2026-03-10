@@ -506,6 +506,41 @@ pub fn op_box_resize(
 }
 
 // ---------------------------------------------------------------------------
+// voter_params_get (0x74), online_stake (0x75) — v11+
+// ---------------------------------------------------------------------------
+
+/// `voter_params_get` (0x74, v11+): pop account, push value + did_exist.
+///
+/// Reads voter parameters from the balance round (320 rounds back).
+/// The immediate byte selects the field:
+///   0 = VoterBalance (online stake in microAlgos, uint64)
+///   1 = VoterIncentiveEligible (bool)
+/// Pushes `(value, did_exist)` where did_exist is 1 if the account was
+/// online at the balance round.
+pub fn op_voter_params_get(
+    machine: &mut AvmMachine,
+    instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let field = get_uint8(instruction)?;
+    let acct_val = machine.pop_uint()?;
+    let account = ctx.resolve_account(acct_val)?;
+    let (value, exists) = ctx.voter_params_get(&account, field)?;
+    machine.push(teal_to_avm(value))?;
+    machine.push(AvmValue::Uint64(u64::from(exists)))
+}
+
+/// `online_stake` (0x75, v11+): push total online stake in microAlgos.
+pub fn op_online_stake(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let amount = ctx.online_stake()?;
+    machine.push(AvmValue::Uint64(amount))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
