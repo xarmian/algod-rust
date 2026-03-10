@@ -7,7 +7,7 @@
 
 use algo_error::AlgoError;
 
-use crate::eval::APP_BUDGET_PER_CALL;
+use crate::eval::{APP_BUDGET_PER_CALL, LOGICSIG_BUDGET};
 
 /// Maximum number of transactions in an atomic group (per go-algorand).
 pub const MAX_GROUP_SIZE: usize = 16;
@@ -33,6 +33,17 @@ impl GroupBudget {
         let n = i64::try_from(num_app_calls).expect("group size too large for budget");
         GroupBudget {
             remaining: APP_BUDGET_PER_CALL.saturating_mul(n),
+        }
+    }
+
+    /// Create a new budget for LogicSig evaluation across an atomic group.
+    ///
+    /// Each transaction in the group contributes `LOGICSIG_BUDGET` (20,000)
+    /// opcodes to the shared pool, regardless of transaction type.
+    pub fn for_logicsig(group_size: usize) -> Self {
+        let n = i64::try_from(group_size).expect("group size too large for budget");
+        GroupBudget {
+            remaining: LOGICSIG_BUDGET.saturating_mul(n),
         }
     }
 

@@ -7,12 +7,16 @@
 //! - W4.4: LogicSig mode restrictions (verified via existing tests)
 //! - W4.5: Replay mode regression (existing patterns still work)
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
+use algo_avm::context::NullContext;
+use algo_avm::eval::{run_approval_program, AvmResult};
 use algo_avm::group::{GroupBudget, GroupContext};
-use algo_ledger::{apply_transaction, ApplyContext, ApplyMode, LedgerState};
+use algo_ledger::{apply_block_with_mode, apply_transaction, ApplyContext, ApplyMode, LedgerState};
 use algo_types::{
-    Address, AppLocalState, AppParams, SignedTransaction, StateSchema, TealValue, Transaction,
+    Address, AppLocalState, AppParams, Block, Round, SignedTransaction, StateSchema, TealValue,
+    Transaction,
 };
 
 // ===========================================================================
@@ -77,8 +81,10 @@ fn execute_ctx(fee_sink: Address, round: u64) -> ApplyContext {
         mode: ApplyMode::Execute,
         latest_timestamp: 0,
         genesis_hash: [0u8; 32],
-        txn_counter: std::cell::Cell::new(0),
-        fee_credit: std::cell::Cell::new(0),
+        txn_counter: Cell::new(0),
+        fee_credit: Cell::new(0),
+
+        txn_index: Cell::new(0),
     }
 }
 
@@ -918,8 +924,10 @@ fn two_app_calls_produce_distinct_inner_asset_ids() {
         mode: ApplyMode::Execute,
         latest_timestamp: 0,
         genesis_hash: [0u8; 32],
-        txn_counter: std::cell::Cell::new(200),
-        fee_credit: std::cell::Cell::new(0),
+        txn_counter: Cell::new(200),
+        fee_credit: Cell::new(0),
+
+        txn_index: Cell::new(0),
     };
 
     // First app call: fee=1000 (no overpayment).
@@ -1067,8 +1075,10 @@ fn fee_credit_from_outer_overpayment_enables_inner_zero_fee() {
         mode: ApplyMode::Execute,
         latest_timestamp: 0,
         genesis_hash: [0u8; 32],
-        txn_counter: std::cell::Cell::new(0),
-        fee_credit: std::cell::Cell::new(2_000 - 1_000), // overpayment
+        txn_counter: Cell::new(0),
+        fee_credit: Cell::new(2_000 - 1_000), // overpayment
+
+        txn_index: Cell::new(0),
     };
 
     let result = apply_transaction(&mut state, &stx, &ctx, 0);
@@ -1132,8 +1142,10 @@ fn inner_zero_fee_fails_without_fee_credit() {
         mode: ApplyMode::Execute,
         latest_timestamp: 0,
         genesis_hash: [0u8; 32],
-        txn_counter: std::cell::Cell::new(0),
-        fee_credit: std::cell::Cell::new(0), // no fee credit
+        txn_counter: Cell::new(0),
+        fee_credit: Cell::new(0), // no fee credit
+
+        txn_index: Cell::new(0),
     };
 
     let result = apply_transaction(&mut state, &stx, &ctx, 0);
@@ -1147,4 +1159,286 @@ fn inner_zero_fee_fails_without_fee_credit() {
         "error should mention fee: {}",
         err_msg
     );
+}
+
+// ===========================================================================
+// Block-level Execute mode tests (apply_block_with_mode)
+// ===========================================================================
+
+/// Helper: build a minimal Block with given transactions.
+fn make_block(
+    round: u64,
+    fee_sink: Address,
+    rewards_pool: Address,
+    payset: Vec<SignedTransaction>,
+) -> Block {
+    Block {
+        round: Round(round),
+        branch: serde_bytes::ByteBuf::new(),
+        seed: serde_bytes::ByteBuf::new(),
+        txn_commitment: serde_bytes::ByteBuf::new(),
+        timestamp: 1000,
+        genesis_id: String::new(),
+        genesis_hash: serde_bytes::ByteBuf::new(),
+        proposer: Address::ZERO,
+        fee_sink,
+        rewards_pool,
+        rewards_level: 0,
+        rewards_rate: 0,
+        rewards_residue: 0,
+        rewards_recalculation_round: Round(0),
+        current_protocol: String::new(),
+        next_protocol: String::new(),
+        next_protocol_approvals: 0,
+        next_protocol_switch_on: Round(0),
+        next_protocol_vote_before: Round(0),
+        txn_counter: 10,
+        fees_collected: 0,
+        bonus: 0,
+        proposer_payout: 0,
+        prev512: serde_bytes::ByteBuf::new(),
+        txn256: serde_bytes::ByteBuf::new(),
+        txn512: serde_bytes::ByteBuf::new(),
+        state_proof_tracking: None,
+        upgrade_propose: String::new(),
+        upgrade_delay: 0,
+        upgrade_approve: false,
+        expired_participation_accounts: None,
+        absent_participation_accounts: None,
+        payset,
+    }
+}
+
+/// apply_block_with_mode in Execute mode processes a block containing an
+/// app call transaction. The approval program runs and state is updated.
+#[test]
+fn apply_block_execute_mode_processes_appl_txn() {
+    let creator = Address([1u8; 32]);
+    let sender = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let rewards_pool = Address([4u8; 32]);
+
+    let mut state = LedgerState::new();
+    state.fee_sink = fee_sink;
+    state.rewards_pool = rewards_pool;
+    // Set current round to 0 so that block round=1 is expected.
+    state.current_round = Round(0);
+
+    // Fund accounts.
+    state.get_or_default_account(&creator).micro_algos = 50_000_000;
+    state.get_or_default_account(&sender).micro_algos = 50_000_000;
+    state.get_or_default_account(&fee_sink).micro_algos = 0;
+    state.get_or_default_account(&rewards_pool).micro_algos = 0;
+
+    // Create an app with an approval program that returns 1.
+    let app_id = 100u64;
+    create_app(
+        &mut state,
+        app_id,
+        creator,
+        approval_program(),
+        approval_program(),
+    );
+
+    // Build a block with one app call.
+    let stx = appl_noop_txn(sender, app_id, 1_000);
+    let block = make_block(1, fee_sink, rewards_pool, vec![stx]);
+
+    let result = apply_block_with_mode(&mut state, &block, ApplyMode::Execute);
+    assert!(
+        result.is_ok(),
+        "apply_block_with_mode Execute should succeed: {:?}",
+        result.err()
+    );
+
+    // Round should have advanced.
+    assert_eq!(state.current_round, Round(1));
+
+    // Fee should have been deducted from sender.
+    let sender_acct = state.get_account(&sender).unwrap();
+    assert_eq!(sender_acct.micro_algos, 50_000_000 - 1_000);
+}
+
+/// apply_block_with_mode in Execute mode rejects when approval program
+/// returns 0, causing the entire block application to fail.
+#[test]
+fn apply_block_execute_mode_rejects_failing_appl() {
+    let creator = Address([1u8; 32]);
+    let sender = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let rewards_pool = Address([4u8; 32]);
+
+    let mut state = LedgerState::new();
+    state.fee_sink = fee_sink;
+    state.rewards_pool = rewards_pool;
+    state.current_round = Round(0);
+
+    state.get_or_default_account(&creator).micro_algos = 50_000_000;
+    state.get_or_default_account(&sender).micro_algos = 50_000_000;
+    state.get_or_default_account(&fee_sink).micro_algos = 0;
+    state.get_or_default_account(&rewards_pool).micro_algos = 0;
+
+    // App with rejecting approval program.
+    let app_id = 101u64;
+    create_app(
+        &mut state,
+        app_id,
+        creator,
+        rejection_program(),
+        approval_program(),
+    );
+
+    let stx = appl_noop_txn(sender, app_id, 1_000);
+    let block = make_block(1, fee_sink, rewards_pool, vec![stx]);
+
+    let result = apply_block_with_mode(&mut state, &block, ApplyMode::Execute);
+    assert!(
+        result.is_err(),
+        "apply_block_with_mode should fail when approval program rejects"
+    );
+
+    // Round should NOT have advanced on error.
+    assert_eq!(state.current_round, Round(0));
+}
+
+/// apply_block_with_mode in Execute mode with a mixed block containing
+/// a pay + appl transaction correctly processes both.
+#[test]
+fn apply_block_execute_mode_mixed_pay_and_appl() {
+    let creator = Address([1u8; 32]);
+    let sender = Address([2u8; 32]);
+    let receiver = Address([5u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let rewards_pool = Address([4u8; 32]);
+
+    let mut state = LedgerState::new();
+    state.fee_sink = fee_sink;
+    state.rewards_pool = rewards_pool;
+    state.current_round = Round(0);
+
+    state.get_or_default_account(&creator).micro_algos = 50_000_000;
+    state.get_or_default_account(&sender).micro_algos = 50_000_000;
+    state.get_or_default_account(&receiver).micro_algos = 1_000_000;
+    state.get_or_default_account(&fee_sink).micro_algos = 0;
+    state.get_or_default_account(&rewards_pool).micro_algos = 0;
+
+    let app_id = 102u64;
+    create_app(
+        &mut state,
+        app_id,
+        creator,
+        approval_program(),
+        approval_program(),
+    );
+
+    // Pay transaction.
+    let pay_stx = SignedTransaction {
+        txn: Transaction {
+            txn_type: "pay".to_string(),
+            sender,
+            fee: 1_000,
+            first_valid: 1.into(),
+            last_valid: 100.into(),
+            receiver,
+            amount: 5_000,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // App call transaction.
+    let appl_stx = appl_noop_txn(sender, app_id, 1_000);
+
+    let block = make_block(1, fee_sink, rewards_pool, vec![pay_stx, appl_stx]);
+
+    let result = apply_block_with_mode(&mut state, &block, ApplyMode::Execute);
+    assert!(
+        result.is_ok(),
+        "block with pay+appl should succeed in Execute mode: {:?}",
+        result.err()
+    );
+
+    // Pay should have transferred funds.
+    let receiver_acct = state.get_account(&receiver).unwrap();
+    assert_eq!(receiver_acct.micro_algos, 1_000_000 + 5_000);
+
+    // Sender should have paid fees for both txns + the pay amount.
+    let sender_acct = state.get_account(&sender).unwrap();
+    assert_eq!(sender_acct.micro_algos, 50_000_000 - 1_000 - 1_000 - 5_000);
+}
+
+// ===========================================================================
+// AvmResult extraction tests
+// ===========================================================================
+
+/// After running an approval program that approves, AvmResult has approved=true.
+#[test]
+fn avm_result_approval_program_captures_approved() {
+    let raw = prog(AVM_V6, &PUSHINT_1); // pushint 1
+    let mut ctx = NullContext;
+    let mut budget = GroupBudget::new(1);
+
+    let result = run_approval_program(&raw, &mut ctx, &mut budget).unwrap();
+    assert!(result.approved);
+    assert!(result.error.is_none());
+    assert!(result.logs.is_empty()); // NullContext returns empty logs
+    assert!(result.inner_transactions.is_empty());
+    assert!(result.global_delta.is_empty());
+    assert!(result.local_deltas.is_empty());
+}
+
+/// After running an approval program that rejects, AvmResult has approved=false
+/// but no error (clean rejection).
+#[test]
+fn avm_result_rejection_is_clean() {
+    let raw = prog(AVM_V6, &PUSHINT_0); // pushint 0
+    let mut ctx = NullContext;
+    let mut budget = GroupBudget::new(1);
+
+    let result = run_approval_program(&raw, &mut ctx, &mut budget).unwrap();
+    assert!(!result.approved);
+    assert!(
+        result.error.is_none(),
+        "clean rejection should have no error"
+    );
+}
+
+/// After running an approval program that errors, AvmResult has approved=false
+/// and an error message.
+#[test]
+fn avm_result_runtime_error_captures_error_message() {
+    let raw = prog(AVM_V6, &[ERR_OPCODE]); // err
+    let mut ctx = NullContext;
+    let mut budget = GroupBudget::new(1);
+
+    let result = run_approval_program(&raw, &mut ctx, &mut budget).unwrap();
+    assert!(!result.approved);
+    assert!(
+        result.error.is_some(),
+        "runtime error should be captured in AvmResult"
+    );
+}
+
+/// AvmResult.empty() returns a well-formed default result.
+#[test]
+fn avm_result_empty_is_well_formed() {
+    let result = AvmResult::empty();
+    assert!(!result.approved);
+    assert!(result.error.is_none());
+    assert!(result.logs.is_empty());
+    assert!(result.inner_transactions.is_empty());
+    assert!(result.global_delta.is_empty());
+    assert!(result.local_deltas.is_empty());
+}
+
+/// NullContext's take_* methods return empty collections (verifying the
+/// trait default implementations that feed into AvmResult).
+#[test]
+fn null_context_take_methods_return_empty() {
+    use algo_avm::context::AvmContext;
+    let mut ctx = NullContext;
+    assert!(ctx.take_logs().is_empty());
+    assert!(ctx.take_inner_transactions().is_empty());
+    assert!(ctx.take_global_delta().is_empty());
+    assert!(ctx.take_local_deltas().is_empty());
 }

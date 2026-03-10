@@ -15,6 +15,7 @@
 
 use std::fmt;
 
+use algo_avm::group::GroupBudget;
 use algo_codec::canonical_encode_signed_txn_in_block;
 use algo_types::{Block, SignedTransaction};
 
@@ -265,56 +266,77 @@ pub fn validate_block(
 
     let mut total_txn_bytes: usize = 0;
 
-    for (idx, stx) in restored_payset.iter().enumerate() {
-        // State proof transactions (`stpf`) are special protocol-level
-        // transactions injected by consensus. They legitimately have fee=0
-        // and carry no standard ed25519/multisig/logicsig signature. Skip
-        // per-txn rules and signature verification for these; their validity
-        // is ensured by the state proof verification layer (out of scope for
-        // stateless validation).
-        if stx.txn.txn_type == "stpf" && stx.txn.state_proof.is_some() {
-            // Still accumulate encoded size for aggregate block size check.
+    // Detect transaction groups for per-group LogicSig budget pooling.
+    // go-algorand isolates LogicSig budget per transaction group — each group
+    // gets its own pool of `group_size * LOGICSIG_BUDGET` opcodes.
+    let groups = detect_validation_groups(&restored_payset);
+
+    for group in &groups {
+        let mut lsig_budget = GroupBudget::for_logicsig(group.len());
+
+        // Build the group slice of SignedTransactions for LogicSig context.
+        // LogicSig programs use `gtxn`, `global GroupSize`, and `txn GroupIndex`
+        // which must see only the atomic group, not the entire block payset.
+        let group_txns: Vec<SignedTransaction> =
+            group.iter().map(|&(_, stx)| stx.clone()).collect();
+
+        for (intra_group_idx, &(idx, stx)) in group.iter().enumerate() {
+            // State proof transactions (`stpf`) are special protocol-level
+            // transactions injected by consensus. They legitimately have fee=0
+            // and carry no standard ed25519/multisig/logicsig signature. Skip
+            // per-txn rules and signature verification for these; their validity
+            // is ensured by the state proof verification layer (out of scope for
+            // stateless validation).
+            if stx.txn.txn_type == "stpf" && stx.txn.state_proof.is_some() {
+                // Still accumulate encoded size for aggregate block size check.
+                let encoded = canonical_encode_signed_txn_in_block(&block.payset[idx]);
+                total_txn_bytes += encoded.len();
+                continue;
+            }
+
+            // Per-txn rules (fees, rounds, note size, etc.)
+            // If the transaction is part of a group, allow fee pooling so the
+            // per-txn minimum fee check is skipped. Group-level fee validation
+            // happens after the group ID check (step 4b).
+            // Free heartbeats (ungrouped, fee < min, v40+) are also fee-exempt.
+            let allow_fee_pooling = !stx.txn.group.is_empty();
+            if let Err(e) =
+                validate_transaction_wellformed(&stx.txn, allow_fee_pooling, &params, Some(&spec))
+            {
+                errors.push(BlockValidationError::TransactionValidationFailed {
+                    txn_index: idx,
+                    error: e.to_string(),
+                });
+            }
+
+            // Signature verification (includes LogicSig TEAL evaluation).
+            // Pass the atomic group slice and intra-group index so that
+            // LogicSig programs see correct `gtxn`, `global GroupSize`,
+            // and `txn GroupIndex` values.
+            if let Err(e) =
+                verify_transaction_signature(stx, &group_txns, intra_group_idx, &mut lsig_budget)
+            {
+                errors.push(BlockValidationError::SignatureVerificationFailed {
+                    txn_index: idx,
+                    error: e.to_string(),
+                });
+            }
+
+            // AuthAddr != Sender check (Go: EnforceAuthAddrSenderDiff, future only).
+            if let Err(e) = verify_auth_addr_sender_diff(stx, params.enforce_auth_addr_sender_diff)
+            {
+                errors.push(BlockValidationError::TransactionValidationFailed {
+                    txn_index: idx,
+                    error: e.to_string(),
+                });
+            }
+
+            // Accumulate encoded size for aggregate check.
+            // Use the original (stripped) encoding for size, matching go-algorand
+            // which counts the in-block encoded size.
             let encoded = canonical_encode_signed_txn_in_block(&block.payset[idx]);
             total_txn_bytes += encoded.len();
-            continue;
         }
-
-        // Per-txn rules (fees, rounds, note size, etc.)
-        // If the transaction is part of a group, allow fee pooling so the
-        // per-txn minimum fee check is skipped. Group-level fee validation
-        // happens after the group ID check (step 4b).
-        // Free heartbeats (ungrouped, fee < min, v40+) are also fee-exempt.
-        let allow_fee_pooling = !stx.txn.group.is_empty();
-        if let Err(e) =
-            validate_transaction_wellformed(&stx.txn, allow_fee_pooling, &params, Some(&spec))
-        {
-            errors.push(BlockValidationError::TransactionValidationFailed {
-                txn_index: idx,
-                error: e.to_string(),
-            });
-        }
-
-        // Signature verification.
-        if let Err(e) = verify_transaction_signature(stx) {
-            errors.push(BlockValidationError::SignatureVerificationFailed {
-                txn_index: idx,
-                error: e.to_string(),
-            });
-        }
-
-        // AuthAddr != Sender check (Go: EnforceAuthAddrSenderDiff, future only).
-        if let Err(e) = verify_auth_addr_sender_diff(stx, params.enforce_auth_addr_sender_diff) {
-            errors.push(BlockValidationError::TransactionValidationFailed {
-                txn_index: idx,
-                error: e.to_string(),
-            });
-        }
-
-        // Accumulate encoded size for aggregate check.
-        // Use the original (stripped) encoding for size, matching go-algorand
-        // which counts the in-block encoded size.
-        let encoded = canonical_encode_signed_txn_in_block(&block.payset[idx]);
-        total_txn_bytes += encoded.len();
     }
 
     // 4a. Transaction group validation (uses restored payset for group ID computation).
@@ -504,6 +526,39 @@ pub fn validate_block(
         txn_count,
         total_txn_bytes,
     }
+}
+
+/// Detect transaction groups within a payset for per-group LogicSig budget pooling.
+///
+/// Returns groups of `(original_index, &SignedTransaction)` tuples. Consecutive
+/// transactions sharing the same non-empty `group` hash form an atomic group.
+/// Transactions with an empty group hash are standalone (single-txn group).
+///
+/// Safety: two distinct atomic groups cannot share the same group hash in a
+/// valid block. The group ID is `SHA512/256("TG" || encode(TxGroup))` where
+/// `TxGroup` contains the individual transaction hashes (each unique), so a
+/// collision would require breaking SHA-512/256. Merging adjacent runs with
+/// the same hash is therefore correct.
+fn detect_validation_groups(payset: &[SignedTransaction]) -> Vec<Vec<(usize, &SignedTransaction)>> {
+    let mut groups: Vec<Vec<(usize, &SignedTransaction)>> = Vec::new();
+    let mut i = 0;
+    while i < payset.len() {
+        let stx = &payset[i];
+        if stx.txn.group.is_empty() {
+            groups.push(vec![(i, stx)]);
+            i += 1;
+        } else {
+            let group_hash = &stx.txn.group;
+            let mut group = vec![(i, stx)];
+            i += 1;
+            while i < payset.len() && payset[i].txn.group == *group_hash {
+                group.push((i, &payset[i]));
+                i += 1;
+            }
+            groups.push(group);
+        }
+    }
+    groups
 }
 
 #[cfg(test)]

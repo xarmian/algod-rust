@@ -8,8 +8,10 @@
 //! method, allowing pure stack/math/byte tests to run without wiring up
 //! real state.
 
+use std::collections::HashMap;
+
 use algo_error::AlgoError;
-use algo_types::TealValue;
+use algo_types::{Address, SignedTransaction, TealValue};
 
 use crate::machine::AvmValue;
 
@@ -471,6 +473,38 @@ pub trait AvmContext {
         // Default: not available. Overridden by LedgerAvmContext.
         let _ = app_id;
         false
+    }
+
+    // ---- Result extraction ----
+    //
+    // These methods allow `eval.rs` to extract accumulated execution results
+    // (logs, inner transactions, state deltas) from the context after program
+    // execution, without needing to know the concrete context type.
+    //
+    // Default implementations return empty collections, which is correct for
+    // `NullContext` and LogicSig mode. `LedgerAvmContext` overrides these to
+    // drain its accumulated state.
+
+    /// Take accumulated log entries, leaving the context's log list empty.
+    fn take_logs(&mut self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
+    /// Take accumulated inner transactions (flattened), leaving the context empty.
+    fn take_inner_transactions(&mut self) -> Vec<SignedTransaction> {
+        Vec::new()
+    }
+
+    /// Take accumulated global state delta, leaving the context empty.
+    /// `Some(val)` = set, `None` = delete.
+    fn take_global_delta(&mut self) -> HashMap<Vec<u8>, Option<TealValue>> {
+        HashMap::new()
+    }
+
+    /// Take accumulated local state deltas, leaving the context empty.
+    /// Inner values: `Some(val)` = set, `None` = delete.
+    fn take_local_deltas(&mut self) -> HashMap<Address, HashMap<Vec<u8>, Option<TealValue>>> {
+        HashMap::new()
     }
 }
 

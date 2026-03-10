@@ -1,3 +1,6 @@
+use algo_avm::group::GroupBudget;
+use algo_avm::logicsig_context::LogicSigAvmContext;
+use algo_avm::run_logicsig_program;
 use algo_codec::canonical_encode_transaction;
 use algo_error::AlgoError;
 use algo_types::{Address, LogicSig, MultisigSig, SignedTransaction};
@@ -235,13 +238,24 @@ fn verify_logicsig_multisig(
 /// 3. Delegated logic-multisig (lmsig present): verify multisig on "MsigProgram" || addr || logic
 /// 4. Contract account (no sig/msig/lmsig): sender = SHA512/256("Program" || logic)
 ///
-/// TEAL program evaluation is deferred to Phase 3.
+/// After signature verification, the TEAL program is executed via the AVM.
+/// The `group` slice is the full transaction group (used for `gtxn` access).
+/// `group_index` is the index of `stx` within that group.
+/// `budget` is the shared LogicSig budget pool for the group (each txn
+/// contributes `LOGICSIG_BUDGET` = 20,000 opcodes).
+///
 /// Default LogicSig maximum size (logic bytes + args bytes).
 /// Matches go-algorand `config/consensus.go` v18+ `LogicSigMaxSize = 1000`.
 /// This value has not changed across any consensus version.
 pub const LOGICSIG_MAX_SIZE: u64 = 1000;
 
-pub fn verify_logicsig(stx: &SignedTransaction, lsig: &LogicSig) -> Result<(), AlgoError> {
+pub fn verify_logicsig(
+    stx: &SignedTransaction,
+    lsig: &LogicSig,
+    group: &[SignedTransaction],
+    group_index: usize,
+    budget: &mut GroupBudget,
+) -> Result<(), AlgoError> {
     // ── Structural sanity checks (Go: logicSigSanityCheckBatchPrep) ──
     // Empty program is always invalid.
     if lsig.logic.is_empty() {
@@ -344,7 +358,27 @@ pub fn verify_logicsig(stx: &SignedTransaction, lsig: &LogicSig) -> Result<(), A
         verify_logicsig_multisig(stx, lmsig, &lmsig_msg)?;
     }
 
-    tracing::trace!("TEAL program evaluation skipped (deferred to Phase 3)");
+    // ── TEAL program execution ──
+    // Build LogicSig arguments from the lsig.args field.
+    let args: Vec<Vec<u8>> = lsig
+        .args
+        .as_ref()
+        .map(|a| a.iter().map(|b| b.to_vec()).collect())
+        .unwrap_or_default();
+
+    let mut ctx = LogicSigAvmContext::new(group, group_index, &lsig.logic, args);
+
+    let pass =
+        run_logicsig_program(&lsig.logic, &mut ctx, budget).map_err(|e| AlgoError::Validation {
+            message: format!("LogicSig program error: {e}"),
+        })?;
+
+    if !pass {
+        return Err(AlgoError::Validation {
+            message: "LogicSig program rejected the transaction".into(),
+        });
+    }
+
     Ok(())
 }
 
@@ -374,9 +408,19 @@ pub fn verify_auth_addr_sender_diff(
 ///
 /// - Single-sig (`sig` present): verifies ed25519 signature.
 /// - Multisig (`msig` present): verifies multisig threshold signature.
-/// - LogicSig (`lsig` present): verifies logic signature (delegated or contract account).
+/// - LogicSig (`lsig` present): verifies logic signature and executes TEAL program.
 /// - No signature present: returns an error.
-pub fn verify_transaction_signature(stx: &SignedTransaction) -> Result<(), AlgoError> {
+///
+/// For LogicSig transactions, `group` is the full transaction group (needed
+/// for `gtxn` opcode access), `group_index` is the index of `stx` within that
+/// group, and `lsig_budget` is the shared LogicSig opcode budget pool.
+/// For non-LogicSig transactions these parameters are ignored.
+pub fn verify_transaction_signature(
+    stx: &SignedTransaction,
+    group: &[SignedTransaction],
+    group_index: usize,
+    lsig_budget: &mut GroupBudget,
+) -> Result<(), AlgoError> {
     // Go-algorand requires exactly one of sig/msig/lsig.
     let has_sig = !stx.sig.is_empty();
     let has_msig = stx.msig.is_some();
@@ -402,7 +446,7 @@ pub fn verify_transaction_signature(stx: &SignedTransaction) -> Result<(), AlgoE
     }
 
     if let Some(lsig) = &stx.lsig {
-        return verify_logicsig(stx, lsig);
+        return verify_logicsig(stx, lsig, group, group_index, lsig_budget);
     }
 
     unreachable!()
@@ -411,9 +455,26 @@ pub fn verify_transaction_signature(stx: &SignedTransaction) -> Result<(), AlgoE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use algo_avm::group::GroupBudget;
     use algo_types::{Address, MultisigSubsig, Round, Transaction};
     use ed25519_dalek::SigningKey;
     use serde_bytes::ByteBuf;
+
+    /// Helper: verify a transaction signature with a single-element group and
+    /// a fresh LogicSig budget.  Used by tests that don't need group-level
+    /// budget pooling semantics.
+    fn verify_sig(stx: &SignedTransaction) -> Result<(), AlgoError> {
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        verify_transaction_signature(stx, &group, 0, &mut budget)
+    }
+
+    /// Helper: verify a logicsig with a single-element group and fresh budget.
+    fn verify_lsig(stx: &SignedTransaction, lsig: &LogicSig) -> Result<(), AlgoError> {
+        let group = [stx.clone()];
+        let mut budget = GroupBudget::for_logicsig(1);
+        verify_logicsig(stx, lsig, &group, 0, &mut budget)
+    }
 
     /// Create a signing key from a fixed seed for reproducibility.
     fn test_signing_key() -> SigningKey {
@@ -531,7 +592,7 @@ mod tests {
         };
 
         assert!(verify_single_sig(&stx).is_ok());
-        assert!(verify_transaction_signature(&stx).is_ok());
+        assert!(verify_sig(&stx).is_ok());
     }
 
     #[test]
@@ -599,7 +660,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = verify_transaction_signature(&stx).unwrap_err();
+        let err = verify_sig(&stx).unwrap_err();
         assert!(err.to_string().contains("no signature"));
     }
 
@@ -651,7 +712,7 @@ mod tests {
         };
 
         assert!(verify_multisig(&stx, stx.msig.as_ref().unwrap()).is_ok());
-        assert!(verify_transaction_signature(&stx).is_ok());
+        assert!(verify_sig(&stx).is_ok());
     }
 
     #[test]
@@ -738,8 +799,8 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).is_ok());
-        assert!(verify_transaction_signature(&stx).is_ok());
+        assert!(verify_lsig(&stx, stx.lsig.as_ref().unwrap()).is_ok());
+        assert!(verify_sig(&stx).is_ok());
     }
 
     #[test]
@@ -766,7 +827,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
+        let err = verify_lsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
         assert!(err.to_string().contains("does not match program hash"));
     }
 
@@ -799,8 +860,8 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).is_ok());
-        assert!(verify_transaction_signature(&stx).is_ok());
+        assert!(verify_lsig(&stx, stx.lsig.as_ref().unwrap()).is_ok());
+        assert!(verify_sig(&stx).is_ok());
     }
 
     #[test]
@@ -854,8 +915,8 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).is_ok());
-        assert!(verify_transaction_signature(&stx).is_ok());
+        assert!(verify_lsig(&stx, stx.lsig.as_ref().unwrap()).is_ok());
+        assert!(verify_sig(&stx).is_ok());
     }
 
     // ---- Security / edge-case tests ----
@@ -962,7 +1023,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = verify_transaction_signature(&stx).unwrap_err();
+        let err = verify_sig(&stx).unwrap_err();
         assert!(
             err.to_string().contains("exactly one signature type"),
             "expected mutual exclusivity error, got: {err}"
@@ -1013,7 +1074,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
+        let err = verify_lsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("only have one of Sig, Msig, or LMsig"),
@@ -1125,8 +1186,8 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).is_ok());
-        assert!(verify_transaction_signature(&stx).is_ok());
+        assert!(verify_lsig(&stx, stx.lsig.as_ref().unwrap()).is_ok());
+        assert!(verify_sig(&stx).is_ok());
     }
 
     #[test]
@@ -1183,7 +1244,7 @@ mod tests {
         };
 
         // Should fail because lmsig signatures were made with wrong_addr
-        let err = verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
+        let err = verify_lsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
         assert!(
             err.to_string().contains("verification failed"),
             "expected verification failure, got: {err}"
@@ -1233,7 +1294,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = verify_logicsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
+        let err = verify_lsig(&stx, stx.lsig.as_ref().unwrap()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("only have one of Sig, Msig, or LMsig"),

@@ -4,6 +4,7 @@ COMPOSE := docker compose -f docker/docker-compose.yml
 
 .PHONY: build test fmt fmt-check clippy lint deny ci clean
 .PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful replay-mainnet-1k
+.PHONY: avm-replay avm-replay-mainnet
 .PHONY: archival-up archival-down
 .PHONY: localnet-up localnet-down localnet-status localnet-logs
 .PHONY: capture validate validate-only generate-txns fixtures help
@@ -202,6 +203,30 @@ replay-mainnet-stateful: ## Run stateful replay against mainnet archival node
 		--compare-token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
 		--db ./ledger-mainnet.sqlite
 
+## ── AVM Replay ──────────────────────────────────────────────
+
+avm-replay: ## Run AVM execution replay against localnet
+	cargo run --bin algod-rust -- replay \
+		--stateful \
+		--avm-execute \
+		--genesis docker/genesis/genesis.json \
+		--network custom \
+		--algod-url http://localhost:4001 \
+		--algod-token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+		--start 1 \
+		--end 100 \
+		--db ./ledger-avm-localnet.sqlite
+
+avm-replay-mainnet: ## Run AVM execution replay against mainnet
+	cargo run --release --bin algod-rust -- replay \
+		--stateful \
+		--avm-execute \
+		--genesis crates/core/algo-ledger/tests/fixtures/mainnet-genesis.json \
+		--network mainnet \
+		--start $(START_ROUND) \
+		--end $$(( $(START_ROUND) + $(COUNT) - 1 )) \
+		--db ./ledger-avm-mainnet.sqlite
+
 ## ── Archival Node ───────────────────────────────────────────
 
 archival-up: ## Start archival Go node
@@ -248,6 +273,11 @@ help:
 	@echo "  make replay-stateful           Stateful replay against localnet (rounds 1-100)"
 	@echo "  make replay-mainnet-1k         1000-block stateful mainnet replay (no compare)"
 	@echo "  make replay-mainnet-stateful   Stateful replay against mainnet archival node"
+	@echo "                                 (START_ROUND=$(START_ROUND), COUNT=$(COUNT))"
+	@echo ""
+	@echo "AVM Replay:"
+	@echo "  make avm-replay                AVM execution replay against localnet (rounds 1-100)"
+	@echo "  make avm-replay-mainnet        AVM execution replay against mainnet"
 	@echo "                                 (START_ROUND=$(START_ROUND), COUNT=$(COUNT))"
 	@echo ""
 	@echo "Archival Node:"

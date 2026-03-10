@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use algo_avm::context::AvmContext;
 use algo_avm::eval::AvmResult;
+use algo_avm::txn_fields;
 use algo_avm::MAX_AVM_VERSION;
 use algo_error::AlgoError;
 use algo_types::{Address, SignedTransaction, TealValue, Transaction};
@@ -22,10 +23,6 @@ use crate::apply::{
 use crate::params;
 use crate::store_trait::LedgerStore;
 
-/// Maximum byte string length in the AVM (matches go-algorand `maxStringSize`).
-/// Used for program page chunking.
-const MAX_STRING_SIZE: usize = 4096;
-
 /// Box operation types for dirty-byte tracking in `available_box`.
 /// Matches go-algorand's `BoxOperation` enum in `box.go`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,24 +34,8 @@ enum BoxOperation {
     Resize,
 }
 
-// ---------------------------------------------------------------------------
-// Helper: transaction type string -> TypeEnum integer
-// ---------------------------------------------------------------------------
-
-/// Convert an Algorand transaction type string to its `TypeEnum` integer,
-/// matching go-algorand numbering.
-pub fn type_enum(txn_type: &str) -> u64 {
-    match txn_type {
-        "pay" => 1,
-        "keyreg" => 2,
-        "acfg" => 3,
-        "axfer" => 4,
-        "afrz" => 5,
-        "appl" => 6,
-        "stpf" => 7,
-        _ => 0,
-    }
-}
+// Re-export `type_enum` from the shared module for backward compatibility.
+pub use txn_fields::type_enum;
 
 // ---------------------------------------------------------------------------
 // Helper: compute application address = SHA512/256("appID" || app_id_be_bytes)
@@ -733,6 +714,14 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// newly created apps to access boxes not named in box refs.
     /// Matches go-algorand's `resources.unnamedAccess`.
     unnamed_access: i64,
+
+    // ---- Delta tracking for EvalDelta comparison ----
+    /// Tracks global state changes made during execution (dual-write with store).
+    /// Key: state key bytes, Value: the new TealValue (or absent for deletes).
+    global_delta_tracker: HashMap<Vec<u8>, Option<TealValue>>,
+    /// Tracks local state changes made during execution (dual-write with store).
+    /// Key: (account address, state key bytes), Value: the new TealValue (or absent for deletes).
+    local_delta_tracker: HashMap<(Address, Vec<u8>), Option<TealValue>>,
 }
 
 // Helper to create a default scratch row (256 zero-uint slots).
@@ -790,6 +779,8 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             io_budget: 0,
             read_budget_checked: false,
             unnamed_access: 0,
+            global_delta_tracker: HashMap::new(),
+            local_delta_tracker: HashMap::new(),
         }
     }
 
@@ -1281,12 +1272,10 @@ fn execute_inner_appl<L: LedgerStore>(
     }
 
     // ── Collect logs, inner txns, fee_credit, and txn_counter from child ──
-    let inner_logs = inner_ctx.logs.clone();
-    let inner_txns_from_child: Vec<SignedTransaction> = inner_ctx
-        .inner_txns
-        .iter()
-        .flat_map(|g| g.iter().cloned())
-        .collect();
+    // Logs and inner transactions are now captured in the AvmResult (extracted
+    // from the context by run_approval_program/run_clear_state_program).
+    let inner_logs = avm_result.logs.clone();
+    let inner_txns_from_child = avm_result.inner_transactions.clone();
     // Capture fee_credit and txn_counter for propagation back to parent (H5/H6).
     let child_fee_credit = inner_ctx.fee_credit;
     let child_txn_counter = inner_ctx.txn_counter;
@@ -1369,351 +1358,16 @@ fn execute_inner_appl<L: LedgerStore>(
 
 /// Read a transaction field from a `SignedTransaction`.
 ///
-/// This is a standalone function so it can be used for both outer txn field
-/// reads (`txn_field`) and inner txn field reads (`last_itxn_field`).
+/// Delegates to the shared `algo_avm::txn_fields::read_txn_field` for most
+/// fields, but overrides eval-delta fields (Logs, NumLogs, LastLog) with
+/// data from the `SignedTransaction`'s `eval_delta`.
 fn read_txn_field(
     stxn: &SignedTransaction,
     field: u8,
     array_index: Option<usize>,
     group_index_val: usize,
 ) -> Result<TealValue, AlgoError> {
-    let txn = &stxn.txn;
     match field {
-        // Sender
-        0 => Ok(TealValue::Bytes(txn.sender.0.to_vec())),
-        // Fee
-        1 => Ok(TealValue::Uint(txn.fee)),
-        // FirstValid
-        2 => Ok(TealValue::Uint(txn.first_valid.0)),
-        // FirstValidTime — timestamp of block(FirstValid-1). AVM v7+.
-        // Requires block history access which is not yet implemented.
-        3 => Err(AlgoError::Avm {
-            message: "FirstValidTime not yet supported (requires block history access)".to_string(),
-        }),
-        // LastValid
-        4 => Ok(TealValue::Uint(txn.last_valid.0)),
-        // Note
-        5 => Ok(TealValue::Bytes(txn.note.to_vec())),
-        // Lease
-        6 => Ok(TealValue::Bytes(txn.lease.to_vec())),
-        // Receiver
-        7 => Ok(TealValue::Bytes(txn.receiver.0.to_vec())),
-        // Amount
-        8 => Ok(TealValue::Uint(txn.amount)),
-        // CloseRemainderTo
-        9 => Ok(TealValue::Bytes(txn.close_remainder_to.0.to_vec())),
-        // VotePK
-        10 => Ok(TealValue::Bytes(
-            txn.vote_pk.as_ref().map(|b| b.to_vec()).unwrap_or_default(),
-        )),
-        // SelectionPK
-        11 => Ok(TealValue::Bytes(
-            txn.selection_pk
-                .as_ref()
-                .map(|b| b.to_vec())
-                .unwrap_or_default(),
-        )),
-        // VoteFirst
-        12 => Ok(TealValue::Uint(txn.vote_first)),
-        // VoteLast
-        13 => Ok(TealValue::Uint(txn.vote_last)),
-        // VoteKeyDilution
-        14 => Ok(TealValue::Uint(txn.vote_key_dilution)),
-        // Type
-        15 => Ok(TealValue::Bytes(txn.txn_type.as_bytes().to_vec())),
-        // TypeEnum
-        16 => Ok(TealValue::Uint(type_enum(&txn.txn_type))),
-        // XferAsset
-        17 => Ok(TealValue::Uint(txn.xaid)),
-        // AssetAmount
-        18 => Ok(TealValue::Uint(txn.asset_amount)),
-        // AssetSender
-        19 => Ok(TealValue::Bytes(
-            txn.asset_sender
-                .as_ref()
-                .map(|a| a.0.to_vec())
-                .unwrap_or_else(|| vec![0u8; 32]),
-        )),
-        // AssetReceiver
-        20 => Ok(TealValue::Bytes(
-            txn.asset_receiver
-                .as_ref()
-                .map(|a| a.0.to_vec())
-                .unwrap_or_else(|| vec![0u8; 32]),
-        )),
-        // AssetCloseTo
-        21 => Ok(TealValue::Bytes(
-            txn.asset_close_to
-                .as_ref()
-                .map(|a| a.0.to_vec())
-                .unwrap_or_else(|| vec![0u8; 32]),
-        )),
-        // GroupIndex
-        22 => Ok(TealValue::Uint(group_index_val as u64)),
-        // TxID
-        23 => {
-            // TxID = SHA512/256("TX" || canonical_encode(txn))
-            let digest = algo_codec::compute_txn_id(txn);
-            Ok(TealValue::Bytes(digest.0.to_vec()))
-        }
-        // ApplicationID
-        24 => Ok(TealValue::Uint(txn.application_id)),
-        // OnCompletion
-        25 => Ok(TealValue::Uint(txn.on_completion)),
-        // ApplicationArgs (array)
-        26 => {
-            let args = txn.app_arguments.as_deref().unwrap_or(&[]);
-            match array_index {
-                Some(i) => {
-                    if i >= args.len() {
-                        Err(AlgoError::Avm {
-                            message: format!(
-                                "ApplicationArgs index {} out of range (len={})",
-                                i,
-                                args.len()
-                            ),
-                        })
-                    } else {
-                        let val = args[i].as_ref().map(|b| b.to_vec()).unwrap_or_default();
-                        Ok(TealValue::Bytes(val))
-                    }
-                }
-                None => Ok(TealValue::Uint(args.len() as u64)),
-            }
-        }
-        // NumAppArgs
-        27 => {
-            let args = txn.app_arguments.as_deref().unwrap_or(&[]);
-            Ok(TealValue::Uint(args.len() as u64))
-        }
-        // Accounts (array) — index 0 = sender, 1+ = accounts[i-1]
-        // Per go-algorand: Accounts[0] is the sender, foreign accounts start at 1.
-        // NumAccounts (when array_index is None) = len(apat), not including sender.
-        28 => {
-            let accts = txn.accounts.as_deref().unwrap_or(&[]);
-            match array_index {
-                Some(0) => Ok(TealValue::Bytes(txn.sender.0.to_vec())),
-                Some(i) => {
-                    let idx = i - 1;
-                    if idx >= accts.len() {
-                        Err(AlgoError::Avm {
-                            message: format!(
-                                "Accounts index {} out of range (len={})",
-                                i,
-                                accts.len()
-                            ),
-                        })
-                    } else {
-                        Ok(TealValue::Bytes(accts[idx].0.to_vec()))
-                    }
-                }
-                None => Ok(TealValue::Uint(accts.len() as u64)),
-            }
-        }
-        // NumAccounts
-        29 => {
-            let accts = txn.accounts.as_deref().unwrap_or(&[]);
-            Ok(TealValue::Uint(accts.len() as u64))
-        }
-        // ApprovalProgram
-        30 => Ok(TealValue::Bytes(
-            txn.approval_program
-                .as_ref()
-                .map(|b| b.to_vec())
-                .unwrap_or_default(),
-        )),
-        // ClearStateProgram
-        31 => Ok(TealValue::Bytes(
-            txn.clear_state_program
-                .as_ref()
-                .map(|b| b.to_vec())
-                .unwrap_or_default(),
-        )),
-        // RekeyTo
-        32 => Ok(TealValue::Bytes(
-            txn.rekey_to
-                .as_ref()
-                .map(|a| a.0.to_vec())
-                .unwrap_or_else(|| vec![0u8; 32]),
-        )),
-        // ConfigAsset
-        33 => Ok(TealValue::Uint(txn.config_asset)),
-        // ConfigAssetTotal
-        34 => Ok(TealValue::Uint(
-            txn.asset_params.as_ref().map(|p| p.total).unwrap_or(0),
-        )),
-        // ConfigAssetDecimals
-        35 => Ok(TealValue::Uint(
-            txn.asset_params
-                .as_ref()
-                .map(|p| p.decimals as u64)
-                .unwrap_or(0),
-        )),
-        // ConfigAssetDefaultFrozen
-        36 => Ok(TealValue::Uint(
-            txn.asset_params
-                .as_ref()
-                .map(|p| p.default_frozen as u64)
-                .unwrap_or(0),
-        )),
-        // ConfigAssetUnitName
-        37 => Ok(TealValue::Bytes(
-            txn.asset_params
-                .as_ref()
-                .map(|p| p.unit_name.as_bytes().to_vec())
-                .unwrap_or_default(),
-        )),
-        // ConfigAssetName
-        38 => Ok(TealValue::Bytes(
-            txn.asset_params
-                .as_ref()
-                .map(|p| p.asset_name.as_bytes().to_vec())
-                .unwrap_or_default(),
-        )),
-        // ConfigAssetURL
-        39 => Ok(TealValue::Bytes(
-            txn.asset_params
-                .as_ref()
-                .map(|p| p.url.as_bytes().to_vec())
-                .unwrap_or_default(),
-        )),
-        // ConfigAssetMetadataHash
-        40 => Ok(TealValue::Bytes(
-            txn.asset_params
-                .as_ref()
-                .and_then(|p| p.metadata_hash.as_ref())
-                .map(|b| b.to_vec())
-                .unwrap_or_default(),
-        )),
-        // ConfigAssetManager
-        41 => Ok(TealValue::Bytes(
-            txn.asset_params
-                .as_ref()
-                .and_then(|p| p.manager.as_ref())
-                .map(|a| a.0.to_vec())
-                .unwrap_or_else(|| vec![0u8; 32]),
-        )),
-        // ConfigAssetReserve
-        42 => Ok(TealValue::Bytes(
-            txn.asset_params
-                .as_ref()
-                .and_then(|p| p.reserve.as_ref())
-                .map(|a| a.0.to_vec())
-                .unwrap_or_else(|| vec![0u8; 32]),
-        )),
-        // ConfigAssetFreeze
-        43 => Ok(TealValue::Bytes(
-            txn.asset_params
-                .as_ref()
-                .and_then(|p| p.freeze.as_ref())
-                .map(|a| a.0.to_vec())
-                .unwrap_or_else(|| vec![0u8; 32]),
-        )),
-        // ConfigAssetClawback
-        44 => Ok(TealValue::Bytes(
-            txn.asset_params
-                .as_ref()
-                .and_then(|p| p.clawback.as_ref())
-                .map(|a| a.0.to_vec())
-                .unwrap_or_else(|| vec![0u8; 32]),
-        )),
-        // FreezeAsset
-        45 => Ok(TealValue::Uint(txn.freeze_asset)),
-        // FreezeAssetAccount
-        46 => Ok(TealValue::Bytes(
-            txn.freeze_account
-                .as_ref()
-                .map(|a| a.0.to_vec())
-                .unwrap_or_else(|| vec![0u8; 32]),
-        )),
-        // FreezeAssetFrozen
-        47 => Ok(TealValue::Uint(txn.asset_frozen as u64)),
-        // Assets (foreign assets array)
-        48 => {
-            let assets = txn.foreign_assets.as_deref().unwrap_or(&[]);
-            match array_index {
-                Some(i) => {
-                    if i >= assets.len() {
-                        Err(AlgoError::Avm {
-                            message: format!(
-                                "Assets index {} out of range (len={})",
-                                i,
-                                assets.len()
-                            ),
-                        })
-                    } else {
-                        Ok(TealValue::Uint(assets[i]))
-                    }
-                }
-                None => Ok(TealValue::Uint(assets.len() as u64)),
-            }
-        }
-        // NumAssets
-        49 => {
-            let assets = txn.foreign_assets.as_deref().unwrap_or(&[]);
-            Ok(TealValue::Uint(assets.len() as u64))
-        }
-        // Applications (foreign apps array) — index 0 = current app ID, 1+ = foreign_apps[i-1]
-        // Per go-algorand: Applications[0] is the current ApplicationID.
-        // NumApplications (when array_index is None) = len(apfa), not including current app.
-        50 => {
-            let apps = txn.foreign_apps.as_deref().unwrap_or(&[]);
-            match array_index {
-                Some(0) => Ok(TealValue::Uint(txn.application_id)),
-                Some(i) => {
-                    let idx = i - 1;
-                    if idx >= apps.len() {
-                        Err(AlgoError::Avm {
-                            message: format!(
-                                "Applications index {} out of range (len={})",
-                                i,
-                                apps.len()
-                            ),
-                        })
-                    } else {
-                        Ok(TealValue::Uint(apps[idx]))
-                    }
-                }
-                None => Ok(TealValue::Uint(apps.len() as u64)),
-            }
-        }
-        // NumApplications
-        51 => {
-            let apps = txn.foreign_apps.as_deref().unwrap_or(&[]);
-            Ok(TealValue::Uint(apps.len() as u64))
-        }
-        // GlobalNumUint
-        52 => Ok(TealValue::Uint(
-            txn.global_state_schema
-                .as_ref()
-                .map(|s| s.num_uint)
-                .unwrap_or(0),
-        )),
-        // GlobalNumByteSlice
-        53 => Ok(TealValue::Uint(
-            txn.global_state_schema
-                .as_ref()
-                .map(|s| s.num_byte_slice)
-                .unwrap_or(0),
-        )),
-        // LocalNumUint
-        54 => Ok(TealValue::Uint(
-            txn.local_state_schema
-                .as_ref()
-                .map(|s| s.num_uint)
-                .unwrap_or(0),
-        )),
-        // LocalNumByteSlice
-        55 => Ok(TealValue::Uint(
-            txn.local_state_schema
-                .as_ref()
-                .map(|s| s.num_byte_slice)
-                .unwrap_or(0),
-        )),
-        // ExtraProgramPages
-        56 => Ok(TealValue::Uint(txn.extra_program_pages as u64)),
-        // Nonparticipation
-        57 => Ok(TealValue::Uint(txn.non_participation as u64)),
         // Logs (array) — extracted from ApplyData eval_delta ("dt.lg").
         58 => {
             let logs = extract_logs_from_eval_delta(stxn);
@@ -1735,89 +1389,14 @@ fn read_txn_field(
             let logs = extract_logs_from_eval_delta(stxn);
             Ok(TealValue::Uint(logs.len() as u64))
         }
-        // CreatedAssetID (from ApplyData)
-        60 => Ok(TealValue::Uint(stxn.apply_data_config_asset)),
-        // CreatedApplicationID (from ApplyData)
-        61 => Ok(TealValue::Uint(stxn.apply_data_application_id)),
         // LastLog — the last entry in the eval_delta logs, or empty bytes.
         62 => {
             let logs = extract_logs_from_eval_delta(stxn);
             let last = logs.last().cloned().unwrap_or_default();
             Ok(TealValue::Bytes(last))
         }
-        // StateProofPK
-        63 => Ok(TealValue::Bytes(
-            txn.state_proof_pk
-                .as_ref()
-                .map(|b| b.to_vec())
-                .unwrap_or_default(),
-        )),
-        // ApprovalProgramPages (array) — per go-algorand, pages are 4096-byte chunks.
-        // maxStringSize = 4096; page_count = DivCeil(len, 4096); OOB index is an error.
-        64 => {
-            let program = txn
-                .approval_program
-                .as_ref()
-                .map(|b| b.as_slice())
-                .unwrap_or(&[]);
-            let page_count = program.len().div_ceil(MAX_STRING_SIZE);
-            match array_index {
-                Some(i) => {
-                    if i >= page_count {
-                        Err(AlgoError::Avm {
-                            message: format!("invalid ApprovalProgramPages index {i}"),
-                        })
-                    } else {
-                        let first = i * MAX_STRING_SIZE;
-                        let last = (first + MAX_STRING_SIZE).min(program.len());
-                        Ok(TealValue::Bytes(program[first..last].to_vec()))
-                    }
-                }
-                None => Ok(TealValue::Uint(page_count as u64)),
-            }
-        }
-        // NumApprovalProgramPages
-        65 => {
-            let len = txn.approval_program.as_ref().map(|b| b.len()).unwrap_or(0);
-            Ok(TealValue::Uint(len.div_ceil(MAX_STRING_SIZE) as u64))
-        }
-        // ClearStateProgramPages (array) — same 4096-byte paging as approval.
-        66 => {
-            let program = txn
-                .clear_state_program
-                .as_ref()
-                .map(|b| b.as_slice())
-                .unwrap_or(&[]);
-            let page_count = program.len().div_ceil(MAX_STRING_SIZE);
-            match array_index {
-                Some(i) => {
-                    if i >= page_count {
-                        Err(AlgoError::Avm {
-                            message: format!("invalid ClearStateProgramPages index {i}"),
-                        })
-                    } else {
-                        let first = i * MAX_STRING_SIZE;
-                        let last = (first + MAX_STRING_SIZE).min(program.len());
-                        Ok(TealValue::Bytes(program[first..last].to_vec()))
-                    }
-                }
-                None => Ok(TealValue::Uint(page_count as u64)),
-            }
-        }
-        // NumClearStateProgramPages
-        67 => {
-            let len = txn
-                .clear_state_program
-                .as_ref()
-                .map(|b| b.len())
-                .unwrap_or(0);
-            Ok(TealValue::Uint(len.div_ceil(MAX_STRING_SIZE) as u64))
-        }
-        // RejectVersion — AVM v12+.
-        68 => Ok(TealValue::Uint(txn.reject_version)),
-        _ => Err(AlgoError::Avm {
-            message: format!("unknown TxnField index: {field}"),
-        }),
+        // All other fields: delegate to the shared implementation.
+        _ => txn_fields::read_txn_field(stxn, field, array_index, group_index_val),
     }
 }
 
@@ -2058,8 +1637,13 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     Address(*account)
                 ),
             })?;
-        local.key_value.insert(key.to_vec(), value);
+        local.key_value.insert(key.to_vec(), value.clone());
         self.store.set_app_local_state(&addr, app_id, local);
+        // Track delta for EvalDelta comparison.
+        if app_id == self.app_id {
+            self.local_delta_tracker
+                .insert((addr, key.to_vec()), Some(value));
+        }
         Ok(())
     }
 
@@ -2073,6 +1657,10 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         if let Some(mut local) = self.store.get_app_local_state(&addr, app_id) {
             local.key_value.remove(key);
             self.store.set_app_local_state(&addr, app_id, local);
+        }
+        // Track delta for EvalDelta comparison.
+        if app_id == self.app_id {
+            self.local_delta_tracker.insert((addr, key.to_vec()), None);
         }
         Ok(())
     }
@@ -2089,8 +1677,12 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             .ok_or_else(|| AlgoError::Avm {
                 message: format!("app_global_put: app {app_id} not found"),
             })?;
-        p.global_state.insert(key.to_vec(), value);
+        p.global_state.insert(key.to_vec(), value.clone());
         self.store.set_app_params(app_id, p);
+        // Track delta for EvalDelta comparison.
+        if app_id == self.app_id {
+            self.global_delta_tracker.insert(key.to_vec(), Some(value));
+        }
         Ok(())
     }
 
@@ -2098,6 +1690,10 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         if let Some(mut p) = self.store.get_app_params(app_id) {
             p.global_state.remove(key);
             self.store.set_app_params(app_id, p);
+        }
+        // Track delta for EvalDelta comparison.
+        if app_id == self.app_id {
+            self.global_delta_tracker.insert(key.to_vec(), None);
         }
         Ok(())
     }
@@ -3430,6 +3026,33 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
         self.store.set_box(self.app_id, name, result);
         Ok(())
+    }
+
+    // ---- Result extraction ----
+
+    fn take_logs(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.logs)
+    }
+
+    fn take_inner_transactions(&mut self) -> Vec<SignedTransaction> {
+        let groups = std::mem::take(&mut self.inner_txns);
+        groups.into_iter().flat_map(|g| g.into_iter()).collect()
+    }
+
+    fn take_global_delta(&mut self) -> HashMap<Vec<u8>, Option<TealValue>> {
+        let tracker = std::mem::take(&mut self.global_delta_tracker);
+        // Preserve None entries — they represent key deletions (app_global_del).
+        tracker.into_iter().collect()
+    }
+
+    fn take_local_deltas(&mut self) -> HashMap<Address, HashMap<Vec<u8>, Option<TealValue>>> {
+        let tracker = std::mem::take(&mut self.local_delta_tracker);
+        let mut deltas: HashMap<Address, HashMap<Vec<u8>, Option<TealValue>>> = HashMap::new();
+        for ((addr, key), maybe_val) in tracker {
+            // Preserve None entries — they represent key deletions (app_local_del).
+            deltas.entry(addr).or_default().insert(key, maybe_val);
+        }
+        deltas
     }
 }
 

@@ -36,9 +36,11 @@ pub const MAX_APP_PROGRAM_COST: i64 = 700;
 #[derive(Debug, Clone)]
 pub struct AvmResult {
     /// Changes to the application's global state.
-    pub global_delta: HashMap<Vec<u8>, TealValue>,
+    /// `Some(val)` = set, `None` = delete.
+    pub global_delta: HashMap<Vec<u8>, Option<TealValue>>,
     /// Changes to per-account local state, keyed by account address.
-    pub local_deltas: HashMap<Address, HashMap<Vec<u8>, TealValue>>,
+    /// Inner values: `Some(val)` = set, `None` = delete.
+    pub local_deltas: HashMap<Address, HashMap<Vec<u8>, Option<TealValue>>>,
     /// Inner transactions emitted by the program.
     pub inner_transactions: Vec<SignedTransaction>,
     /// Log messages emitted by the program.
@@ -92,13 +94,15 @@ pub fn run_approval_program(
             let cost_used = budget_before - machine.budget;
             budget.consume(cost_used)?;
 
-            // Build the result. Deltas, logs, and inner txns are accumulated
-            // inside the concrete AvmContext implementation; the caller who
-            // owns the context extracts them after this returns.
-            // TODO: once AvmContext exposes retrieval methods for deltas/logs/
-            // inner txns, populate these fields here.
-            let mut result = AvmResult::empty();
-            result.approved = pass;
+            // Extract accumulated state from the context into the result.
+            let result = AvmResult {
+                global_delta: ctx.take_global_delta(),
+                local_deltas: ctx.take_local_deltas(),
+                inner_transactions: ctx.take_inner_transactions(),
+                logs: ctx.take_logs(),
+                approved: pass,
+                error: None,
+            };
             Ok(result)
         }
         Err(e) => {
@@ -138,17 +142,71 @@ pub fn run_clear_state_program(program: &[u8], ctx: &mut dyn AvmContext) -> AvmR
 
     match machine.run(ctx) {
         Ok(true) => {
-            // Program approved. Build result.
-            // TODO: once AvmContext exposes retrieval methods for deltas/logs/
-            // inner txns, populate these fields here.
-            let mut result = AvmResult::empty();
-            result.approved = true;
-            result
+            // Program approved — extract accumulated state from the context.
+            AvmResult {
+                global_delta: ctx.take_global_delta(),
+                local_deltas: ctx.take_local_deltas(),
+                inner_transactions: ctx.take_inner_transactions(),
+                logs: ctx.take_logs(),
+                approved: true,
+                error: None,
+            }
         }
-        Ok(false) | Err(_) => {
-            // Program rejected or errored: return empty result with no
+        Ok(false) => {
+            // Program cleanly rejected: return empty result with no
             // deltas/logs/inner txns (caller handles local state clearing).
             AvmResult::empty()
+        }
+        Err(e) => {
+            // Program errored: return empty result but capture the error
+            // message for debugging/conformance reporting.
+            let mut result = AvmResult::empty();
+            result.error = Some(e.to_string());
+            result
+        }
+    }
+}
+
+/// Run a LogicSig program.
+///
+/// LogicSig programs execute in `ExecMode::LogicSig` mode, which disallows
+/// state writes and inner transactions. The program must leave a non-zero
+/// value on top of the stack to approve the transaction.
+///
+/// # Budget
+///
+/// The caller passes the remaining pooled budget for the transaction group.
+/// Each transaction in the group contributes `LOGICSIG_BUDGET` (20,000)
+/// opcodes. The actual cost consumed is deducted from `budget` so that the
+/// caller can track the shared pool across all LogicSig evaluations in the
+/// group.
+///
+/// # Return value
+///
+/// Returns `Ok(true)` if the program approved (stack top is non-zero),
+/// `Ok(false)` if it cleanly rejected (stack top is zero or stack empty),
+/// or `Err` on parse failure or runtime error.
+pub fn run_logicsig_program(
+    program: &[u8],
+    ctx: &mut dyn AvmContext,
+    budget: &mut GroupBudget,
+) -> Result<bool, AlgoError> {
+    let parsed = bytecode::parse(program)?;
+    let budget_before = budget.remaining();
+    let mut machine = AvmMachine::new(parsed, ExecMode::LogicSig, budget_before);
+
+    match machine.run(ctx) {
+        Ok(pass) => {
+            // Deduct actual cost consumed from the pooled budget.
+            let cost_used = budget_before - machine.budget;
+            budget.consume(cost_used)?;
+            Ok(pass)
+        }
+        Err(e) => {
+            // Deduct cost consumed up to the point of failure.
+            let cost_used = budget_before - machine.budget;
+            let _ = budget.consume(cost_used);
+            Err(e)
         }
     }
 }
@@ -183,11 +241,11 @@ mod tests {
     #[test]
     fn test_avm_result_construction() {
         let mut global_delta = HashMap::new();
-        global_delta.insert(b"key".to_vec(), TealValue::Uint(42));
+        global_delta.insert(b"key".to_vec(), Some(TealValue::Uint(42)));
 
         let mut local_deltas = HashMap::new();
         let mut account_delta = HashMap::new();
-        account_delta.insert(b"local_key".to_vec(), TealValue::Bytes(b"val".to_vec()));
+        account_delta.insert(b"local_key".to_vec(), Some(TealValue::Bytes(b"val".to_vec())));
         local_deltas.insert(Address::ZERO, account_delta);
 
         let result = AvmResult {
@@ -203,7 +261,7 @@ mod tests {
         assert_eq!(result.global_delta.len(), 1);
         assert_eq!(
             result.global_delta.get(b"key".as_slice()),
-            Some(&TealValue::Uint(42))
+            Some(&Some(TealValue::Uint(42)))
         );
         assert_eq!(result.local_deltas.len(), 1);
         assert_eq!(result.logs.len(), 1);
@@ -370,5 +428,94 @@ mod tests {
         let result = run_clear_state_program(&raw, &mut ctx);
         assert!(result.approved);
         assert_eq!(budget.remaining(), before);
+    }
+
+    // -----------------------------------------------------------------------
+    // run_logicsig_program tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_logicsig_program_approves() {
+        // intcblock [1], intc_0, return  =>  approves (top of stack is 1)
+        let raw = prog(2, &[0x20, 0x01, 0x01, 0x22, 0x43]);
+        let mut ctx = NullContext;
+        let mut budget = GroupBudget::for_logicsig(1);
+
+        let pass = run_logicsig_program(&raw, &mut ctx, &mut budget).unwrap();
+        assert!(pass);
+    }
+
+    #[test]
+    fn test_logicsig_program_rejects() {
+        // intcblock [0], intc_0, return  =>  rejects (top of stack is 0)
+        let raw = prog(2, &[0x20, 0x01, 0x00, 0x22, 0x43]);
+        let mut ctx = NullContext;
+        let mut budget = GroupBudget::for_logicsig(1);
+
+        let pass = run_logicsig_program(&raw, &mut ctx, &mut budget).unwrap();
+        assert!(!pass);
+    }
+
+    #[test]
+    fn test_logicsig_program_runtime_error() {
+        // err opcode (0x00) triggers a runtime error
+        let raw = prog(1, &[0x00]);
+        let mut ctx = NullContext;
+        let mut budget = GroupBudget::for_logicsig(1);
+
+        let result = run_logicsig_program(&raw, &mut ctx, &mut budget);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_logicsig_program_parse_error() {
+        // Empty program bytes should fail to parse
+        let result = run_logicsig_program(&[], &mut NullContext, &mut GroupBudget::for_logicsig(1));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_logicsig_program_consumes_budget() {
+        // intcblock [1], intc_0, return  -- 3 opcodes each costing 1
+        let raw = prog(2, &[0x20, 0x01, 0x01, 0x22, 0x43]);
+        let mut ctx = NullContext;
+        let mut budget = GroupBudget::for_logicsig(1);
+        let before = budget.remaining();
+
+        let pass = run_logicsig_program(&raw, &mut ctx, &mut budget).unwrap();
+        assert!(pass);
+
+        let after = budget.remaining();
+        assert!(
+            after < before,
+            "budget should decrease: before={before}, after={after}"
+        );
+        assert_eq!(before - after, 3);
+    }
+
+    #[test]
+    fn test_logicsig_program_empty_stack_rejects() {
+        // A program with version byte only (no instructions) -- empty stack
+        // should reject (pass = false).
+        let raw = prog(1, &[]);
+        let mut ctx = NullContext;
+        let mut budget = GroupBudget::for_logicsig(1);
+
+        let pass = run_logicsig_program(&raw, &mut ctx, &mut budget).unwrap();
+        assert!(!pass);
+    }
+
+    #[test]
+    fn test_logicsig_budget_pooled_across_group() {
+        // With group_size=2, the pooled budget should be 2 * LOGICSIG_BUDGET.
+        let mut budget = GroupBudget::for_logicsig(2);
+        assert_eq!(budget.remaining(), 2 * LOGICSIG_BUDGET);
+
+        // Run a small program and verify budget is deducted from the pool.
+        let raw = prog(2, &[0x20, 0x01, 0x01, 0x22, 0x43]);
+        let mut ctx = NullContext;
+        let pass = run_logicsig_program(&raw, &mut ctx, &mut budget).unwrap();
+        assert!(pass);
+        assert_eq!(budget.remaining(), 2 * LOGICSIG_BUDGET - 3);
     }
 }

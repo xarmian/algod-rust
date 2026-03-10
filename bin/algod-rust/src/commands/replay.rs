@@ -360,6 +360,7 @@ pub async fn run_stateful(
     db_path: &Path,
     trie: bool,
     compare_trie_db: Option<&Path>,
+    avm_execute: bool,
 ) -> anyhow::Result<()> {
     if start > end {
         anyhow::bail!("invalid range: start ({start}) must be <= end ({end})");
@@ -434,6 +435,7 @@ pub async fn run_stateful(
         compare,
         sample_rate,
         trie,
+        avm_execute,
         db = %db_path.display(),
         "starting stateful block replay"
     );
@@ -455,6 +457,7 @@ pub async fn run_stateful(
     let mut trie_mismatches: u64 = 0;
     let mut last_trie_root: Option<[u8; 32]> = None;
     let mut last_trie_round: u64 = 0;
+    let mut eval_delta_stats = algo_ledger::EvalDeltaStats::default();
 
     let mut round = effective_start;
     while round <= end {
@@ -510,7 +513,15 @@ pub async fn run_stateful(
 
         // Apply block to ledger state.
         store.begin_block()?;
-        match algo_ledger::apply_block(&mut store, block) {
+        let apply_result = if avm_execute {
+            let (result, block_stats) = algo_ledger::apply_block_with_comparison(&mut store, block);
+            // Merge per-block stats into running totals.
+            eval_delta_stats += block_stats;
+            result
+        } else {
+            algo_ledger::apply_block(&mut store, block)
+        };
+        match apply_result {
             Ok(()) => {
                 // Read trie root before commit (finalize_trie_updates is called
                 // inside apply_block; the root is logged at debug level there).
@@ -657,6 +668,10 @@ pub async fn run_stateful(
         }
     }
     println!("Elapsed:          {elapsed:.1}s ({blocks_per_sec:.1} blocks/sec)");
+
+    if avm_execute {
+        eval_delta_stats.print_summary();
+    }
 
     if !txn_type_counts.is_empty() {
         println!("\nTransaction type coverage:");

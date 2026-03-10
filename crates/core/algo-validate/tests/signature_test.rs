@@ -1,5 +1,9 @@
+use algo_avm::group::GroupBudget;
 use algo_codec::decode_block_response;
+use algo_types::{Address, LogicSig, Round, SignedTransaction, Transaction};
+use algo_validate::signature::verify_logicsig;
 use algo_validate::verify_transaction_signature;
+use sha2::{Digest, Sha512_256};
 use std::path::PathBuf;
 
 fn fixture_dir() -> PathBuf {
@@ -68,8 +72,9 @@ macro_rules! sig_verify_test {
             }
 
             let txns = restore_genesis_fields(&br);
+            let mut lsig_budget = GroupBudget::for_logicsig(txns.len());
             for (i, stx) in txns.iter().enumerate() {
-                verify_transaction_signature(stx).unwrap_or_else(|e| {
+                verify_transaction_signature(stx, &txns, i, &mut lsig_budget).unwrap_or_else(|e| {
                     panic!(
                         "signature verification failed for block {} txn {}: {e}",
                         $round, i
@@ -101,8 +106,9 @@ fn sig_verify_all_blocks() {
         };
 
         let txns = restore_genesis_fields(&br);
+        let mut lsig_budget = GroupBudget::for_logicsig(txns.len());
         for (i, stx) in txns.iter().enumerate() {
-            verify_transaction_signature(stx).unwrap_or_else(|e| {
+            verify_transaction_signature(stx, &txns, i, &mut lsig_budget).unwrap_or_else(|e| {
                 panic!("signature verification failed for block {round} txn {i}: {e}")
             });
             verified += 1;
@@ -114,4 +120,158 @@ fn sig_verify_all_blocks() {
     } else {
         eprintln!("verified {verified} transaction signatures across all block fixtures");
     }
+}
+
+// ===========================================================================
+// LogicSig integration tests
+// ===========================================================================
+
+/// Build a raw AVM program: version byte + code bytes.
+fn prog(version: u8, code: &[u8]) -> Vec<u8> {
+    let mut p = vec![version];
+    p.extend_from_slice(code);
+    p
+}
+
+/// Compute SHA512/256("Program" || program) and return as Address.
+fn program_address(program: &[u8]) -> Address {
+    let mut hasher = Sha512_256::new();
+    hasher.update(b"Program");
+    hasher.update(program);
+    let hash: [u8; 32] = hasher.finalize().into();
+    Address(hash)
+}
+
+/// Build a minimal pay transaction from a contract account (sender = program hash).
+fn make_contract_account_txn(program: &[u8]) -> SignedTransaction {
+    let sender = program_address(program);
+    SignedTransaction {
+        txn: Transaction {
+            txn_type: "pay".to_string(),
+            sender,
+            fee: 1_000,
+            first_valid: Round(1),
+            last_valid: Round(100),
+            receiver: Address([0x20; 32]),
+            amount: 0,
+            ..Default::default()
+        },
+        lsig: Some(LogicSig {
+            logic: serde_bytes::ByteBuf::from(program.to_vec()),
+            sig: Default::default(),
+            msig: None,
+            lmsig: None,
+            args: None,
+        }),
+        ..Default::default()
+    }
+}
+
+/// A LogicSig with `int 1` (pushint 1) should pass verification.
+#[test]
+fn logicsig_valid_program_approves() {
+    let program = prog(6, &[0x81, 0x01]); // pushint 1
+    let stx = make_contract_account_txn(&program);
+    let group = vec![stx.clone()];
+    let mut budget = GroupBudget::for_logicsig(1);
+
+    let lsig = stx.lsig.as_ref().unwrap();
+    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget);
+    assert!(
+        result.is_ok(),
+        "LogicSig with `pushint 1` should pass: {:?}",
+        result.err()
+    );
+}
+
+/// A LogicSig with `int 0` (pushint 0) should fail verification (program rejects).
+#[test]
+fn logicsig_rejecting_program_fails() {
+    let program = prog(6, &[0x81, 0x00]); // pushint 0
+    let stx = make_contract_account_txn(&program);
+    let group = vec![stx.clone()];
+    let mut budget = GroupBudget::for_logicsig(1);
+
+    let lsig = stx.lsig.as_ref().unwrap();
+    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget);
+    assert!(result.is_err(), "LogicSig with `pushint 0` should fail");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("rejected"),
+        "error should mention rejection: {}",
+        err_msg
+    );
+}
+
+/// LogicSig pooled budget: multiple transactions in a group share the budget.
+/// Running a LogicSig on one transaction should reduce the budget available
+/// to the next transaction in the group.
+#[test]
+fn logicsig_pooled_budget_shared_across_group() {
+    let program = prog(6, &[0x81, 0x01]); // pushint 1
+
+    let stx1 = make_contract_account_txn(&program);
+    let stx2 = make_contract_account_txn(&program);
+    let group = vec![stx1.clone(), stx2.clone()];
+
+    // Budget for a group of 2 is 2 * 20_000 = 40_000.
+    let mut budget = GroupBudget::for_logicsig(2);
+    assert_eq!(budget.remaining(), 40_000);
+
+    // Verify first transaction's LogicSig.
+    let lsig1 = stx1.lsig.as_ref().unwrap();
+    verify_logicsig(&stx1, lsig1, &group, 0, &mut budget).unwrap();
+
+    // Budget should have decreased (pushint 1 costs 1 opcode unit).
+    let after_first = budget.remaining();
+    assert!(
+        after_first < 40_000,
+        "budget should decrease after first LogicSig execution, got {}",
+        after_first
+    );
+
+    // Verify second transaction's LogicSig with the same pooled budget.
+    let lsig2 = stx2.lsig.as_ref().unwrap();
+    verify_logicsig(&stx2, lsig2, &group, 1, &mut budget).unwrap();
+
+    let after_second = budget.remaining();
+    assert!(
+        after_second < after_first,
+        "budget should decrease further after second LogicSig execution: \
+         after_first={}, after_second={}",
+        after_first,
+        after_second
+    );
+}
+
+/// A LogicSig program that uses `app_opted_in` (Application-mode only opcode)
+/// should fail because LogicSig programs cannot access state.
+#[test]
+fn logicsig_state_access_app_opted_in_fails() {
+    // Version 2, intcblock [0], intc_0, intc_0, app_opted_in, return
+    // This program tries to call app_opted_in(0, 0) which is Application-mode only.
+    let program = prog(2, &[0x20, 0x01, 0x00, 0x22, 0x22, 0x61, 0x43]);
+    let stx = make_contract_account_txn(&program);
+    let group = vec![stx.clone()];
+    let mut budget = GroupBudget::for_logicsig(1);
+
+    let lsig = stx.lsig.as_ref().unwrap();
+    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget);
+    assert!(result.is_err(), "LogicSig using app_opted_in should fail");
+}
+
+/// verify_transaction_signature dispatches to LogicSig path when lsig is set.
+#[test]
+fn verify_transaction_signature_dispatches_to_logicsig() {
+    let program = prog(6, &[0x81, 0x01]); // pushint 1
+    let stx = make_contract_account_txn(&program);
+    let group = vec![stx.clone()];
+    let mut budget = GroupBudget::for_logicsig(1);
+
+    let result = verify_transaction_signature(&stx, &group, 0, &mut budget);
+    assert!(
+        result.is_ok(),
+        "verify_transaction_signature should dispatch to LogicSig path: {:?}",
+        result.err()
+    );
 }
