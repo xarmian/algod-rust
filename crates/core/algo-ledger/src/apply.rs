@@ -1295,17 +1295,16 @@ pub(crate) fn apply_appl_on_completion<L: crate::store_trait::LedgerStore>(
             // ClearState removes local state. The caller must have already
             // verified that the sender is opted in (has local state) before
             // reaching this point, matching go-algorand's closeOutApplication.
-            let local_state =
-                store
-                    .get_app_local_state(&txn.sender, app_id)
-                    .ok_or_else(|| {
-                        err_ctx.error(format!(
-                            "{} clear-state: {} is not opted into app {}",
-                            err_ctx.prefix(),
-                            txn.sender,
-                            app_id,
-                        ))
-                    })?;
+            let local_state = store
+                .get_app_local_state(&txn.sender, app_id)
+                .ok_or_else(|| {
+                    err_ctx.error(format!(
+                        "{} clear-state: {} is not opted into app {}",
+                        err_ctx.prefix(),
+                        txn.sender,
+                        app_id,
+                    ))
+                })?;
             let local_schema = local_state.schema.clone();
             store.remove_app_local_state(&txn.sender, app_id);
             let mut sender_account = store.get_or_default_account(&txn.sender);
