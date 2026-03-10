@@ -274,7 +274,13 @@ pub fn validate_block(
     for group in &groups {
         let mut lsig_budget = GroupBudget::for_logicsig(group.len());
 
-        for &(idx, stx) in group {
+        // Build the group slice of SignedTransactions for LogicSig context.
+        // LogicSig programs use `gtxn`, `global GroupSize`, and `txn GroupIndex`
+        // which must see only the atomic group, not the entire block payset.
+        let group_txns: Vec<SignedTransaction> =
+            group.iter().map(|&(_, stx)| stx.clone()).collect();
+
+        for (intra_group_idx, &(idx, stx)) in group.iter().enumerate() {
             // State proof transactions (`stpf`) are special protocol-level
             // transactions injected by consensus. They legitimately have fee=0
             // and carry no standard ed25519/multisig/logicsig signature. Skip
@@ -304,8 +310,11 @@ pub fn validate_block(
             }
 
             // Signature verification (includes LogicSig TEAL evaluation).
+            // Pass the atomic group slice and intra-group index so that
+            // LogicSig programs see correct `gtxn`, `global GroupSize`,
+            // and `txn GroupIndex` values.
             if let Err(e) =
-                verify_transaction_signature(stx, &restored_payset, idx, &mut lsig_budget)
+                verify_transaction_signature(stx, &group_txns, intra_group_idx, &mut lsig_budget)
             {
                 errors.push(BlockValidationError::SignatureVerificationFailed {
                     txn_index: idx,

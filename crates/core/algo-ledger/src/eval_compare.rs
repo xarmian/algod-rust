@@ -313,11 +313,21 @@ fn compare_inner_txns(
     recorded_inner: &Option<Vec<SignedTransaction>>,
     mismatches: &mut Vec<FieldMismatch>,
 ) {
+    compare_inner_txns_at("inner_txns", avm_inner, recorded_inner, mismatches);
+}
+
+/// Recursive inner transaction comparison with a configurable field prefix.
+fn compare_inner_txns_at(
+    prefix: &str,
+    avm_inner: &[SignedTransaction],
+    recorded_inner: &Option<Vec<SignedTransaction>>,
+    mismatches: &mut Vec<FieldMismatch>,
+) {
     let recorded = recorded_inner.as_deref().unwrap_or(&[]);
 
     if avm_inner.len() != recorded.len() {
         mismatches.push(FieldMismatch {
-            field: "inner_txns.count".to_string(),
+            field: format!("{prefix}.count"),
             expected: recorded.len().to_string(),
             actual: avm_inner.len().to_string(),
         });
@@ -326,10 +336,12 @@ fn compare_inner_txns(
     }
 
     for (i, (avm_itx, rec_itx)) in avm_inner.iter().zip(recorded.iter()).enumerate() {
+        let p = format!("{prefix}[{i}]");
+
         // Compare transaction type.
         if avm_itx.txn.txn_type != rec_itx.txn.txn_type {
             mismatches.push(FieldMismatch {
-                field: format!("inner_txns[{i}].type"),
+                field: format!("{p}.type"),
                 expected: rec_itx.txn.txn_type.clone(),
                 actual: avm_itx.txn.txn_type.clone(),
             });
@@ -338,7 +350,7 @@ fn compare_inner_txns(
         // Compare sender.
         if avm_itx.txn.sender != rec_itx.txn.sender {
             mismatches.push(FieldMismatch {
-                field: format!("inner_txns[{i}].sender"),
+                field: format!("{p}.sender"),
                 expected: rec_itx.txn.sender.to_algorand_string(),
                 actual: avm_itx.txn.sender.to_algorand_string(),
             });
@@ -347,20 +359,104 @@ fn compare_inner_txns(
         // Compare receiver.
         if avm_itx.txn.receiver != rec_itx.txn.receiver {
             mismatches.push(FieldMismatch {
-                field: format!("inner_txns[{i}].receiver"),
+                field: format!("{p}.receiver"),
                 expected: rec_itx.txn.receiver.to_algorand_string(),
                 actual: avm_itx.txn.receiver.to_algorand_string(),
             });
         }
 
-        // Compare amount.
+        // Compare amount (Algo).
         if avm_itx.txn.amount != rec_itx.txn.amount {
             mismatches.push(FieldMismatch {
-                field: format!("inner_txns[{i}].amount"),
+                field: format!("{p}.amount"),
                 expected: rec_itx.txn.amount.to_string(),
                 actual: avm_itx.txn.amount.to_string(),
             });
         }
+
+        // Compare fee.
+        if avm_itx.txn.fee != rec_itx.txn.fee {
+            mismatches.push(FieldMismatch {
+                field: format!("{p}.fee"),
+                expected: rec_itx.txn.fee.to_string(),
+                actual: avm_itx.txn.fee.to_string(),
+            });
+        }
+
+        // Compare close_remainder_to.
+        if avm_itx.txn.close_remainder_to != rec_itx.txn.close_remainder_to {
+            mismatches.push(FieldMismatch {
+                field: format!("{p}.close_remainder_to"),
+                expected: rec_itx.txn.close_remainder_to.to_algorand_string(),
+                actual: avm_itx.txn.close_remainder_to.to_algorand_string(),
+            });
+        }
+
+        // Compare rekey_to.
+        if avm_itx.txn.rekey_to != rec_itx.txn.rekey_to {
+            let fmt_opt = |o: &Option<Address>| match o {
+                Some(a) => a.to_algorand_string(),
+                None => "<none>".to_string(),
+            };
+            mismatches.push(FieldMismatch {
+                field: format!("{p}.rekey_to"),
+                expected: fmt_opt(&rec_itx.txn.rekey_to),
+                actual: fmt_opt(&avm_itx.txn.rekey_to),
+            });
+        }
+
+        // Compare xaid (asset ID for asset transfers/config/freeze).
+        if avm_itx.txn.xaid != rec_itx.txn.xaid {
+            mismatches.push(FieldMismatch {
+                field: format!("{p}.xaid"),
+                expected: rec_itx.txn.xaid.to_string(),
+                actual: avm_itx.txn.xaid.to_string(),
+            });
+        }
+
+        // Compare application_id (for app calls).
+        if avm_itx.txn.application_id != rec_itx.txn.application_id {
+            mismatches.push(FieldMismatch {
+                field: format!("{p}.application_id"),
+                expected: rec_itx.txn.application_id.to_string(),
+                actual: avm_itx.txn.application_id.to_string(),
+            });
+        }
+
+        // Compare asset_amount (for asset transfers).
+        if avm_itx.txn.asset_amount != rec_itx.txn.asset_amount {
+            mismatches.push(FieldMismatch {
+                field: format!("{p}.asset_amount"),
+                expected: rec_itx.txn.asset_amount.to_string(),
+                actual: avm_itx.txn.asset_amount.to_string(),
+            });
+        }
+
+        // Compare on_completion (for app calls).
+        if avm_itx.txn.on_completion != rec_itx.txn.on_completion {
+            mismatches.push(FieldMismatch {
+                field: format!("{p}.on_completion"),
+                expected: rec_itx.txn.on_completion.to_string(),
+                actual: avm_itx.txn.on_completion.to_string(),
+            });
+        }
+
+        // Recursively compare nested inner transactions.
+        // Both sides store eval_delta as Option<rmpv::Value>; parse to extract
+        // nested inner txns for deeper comparison.
+        let avm_nested = avm_itx
+            .eval_delta
+            .as_ref()
+            .and_then(|raw| crate::eval_delta::parse_eval_delta(raw).ok())
+            .and_then(|ed| ed.inner_txns);
+        let rec_nested = rec_itx
+            .eval_delta
+            .as_ref()
+            .and_then(|raw| crate::eval_delta::parse_eval_delta(raw).ok())
+            .and_then(|ed| ed.inner_txns);
+        let avm_nested_slice = avm_nested.as_deref().unwrap_or(&[]);
+        let nested_prefix = format!("{p}.inner_txns");
+        compare_inner_txns_at(&nested_prefix, avm_nested_slice, &rec_nested, mismatches);
     }
 }
 
