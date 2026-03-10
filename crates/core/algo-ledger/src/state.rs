@@ -70,6 +70,7 @@ pub struct LedgerState {
     pub app_local_states: HashMap<(Address, u64), AppLocalState>,
     pub asset_params: HashMap<u64, AssetParamsRecord>,
     pub app_params: HashMap<u64, AppParams>,
+    pub boxes: HashMap<(u64, Vec<u8>), Vec<u8>>,
 
     // Lease tracking
     pub lease_table: LeaseTable,
@@ -107,6 +108,7 @@ impl LedgerState {
             app_local_states: HashMap::new(),
             asset_params: HashMap::new(),
             app_params: HashMap::new(),
+            boxes: HashMap::new(),
             lease_table: LeaseTable::new(),
             current_round: Round(0),
             rewards_level: 0,
@@ -216,11 +218,16 @@ impl LedgerState {
             asset_params: Vec::new(),
             app_params: Vec::new(),
             app_local_states,
+            boxes: Vec::new(),
+            snapshotted_box_app_ids: Vec::new(),
         }
     }
 
     /// Snapshot specific asset_params and app_params keys (by ID) in addition to
     /// address-based state. Use this when you know which asset/app IDs are affected.
+    ///
+    /// Also captures all box entries for the given `app_ids` so they can be
+    /// rolled back on `restore_snapshot`.
     pub fn snapshot_with_ids(
         &self,
         addrs: &[Address],
@@ -237,6 +244,16 @@ impl LedgerState {
             snap.app_params
                 .push((id, self.app_params.get(&id).cloned()));
         }
+
+        // Capture all box entries for the given app IDs.
+        for &app_id in app_ids {
+            for ((aid, key), value) in &self.boxes {
+                if *aid == app_id {
+                    snap.boxes.push(((*aid, key.clone()), Some(value.clone())));
+                }
+            }
+        }
+        snap.snapshotted_box_app_ids = app_ids.to_vec();
 
         snap
     }
@@ -317,6 +334,30 @@ impl LedgerState {
         // that weren't in the original snapshot.
         self.app_local_states
             .retain(|k, _| !snapped_addrs.contains(&k.0) || snapped_locals.contains(k));
+
+        // Restore snapshotted box entries.
+        let snapped_box_keys: std::collections::HashSet<(u64, Vec<u8>)> =
+            snap.boxes.iter().map(|(k, _)| k.clone()).collect();
+
+        for (key, data) in snap.boxes {
+            match data {
+                Some(value) => {
+                    self.boxes.insert(key, value);
+                }
+                None => {
+                    self.boxes.remove(&key);
+                }
+            }
+        }
+
+        // Remove any newly-created boxes for snapshotted app IDs that weren't
+        // in the original snapshot.
+        if !snap.snapshotted_box_app_ids.is_empty() {
+            let snapped_app_ids: std::collections::HashSet<u64> =
+                snap.snapshotted_box_app_ids.into_iter().collect();
+            self.boxes
+                .retain(|k, _| !snapped_app_ids.contains(&k.0) || snapped_box_keys.contains(k));
+        }
     }
 }
 
@@ -327,6 +368,12 @@ pub struct StateSnapshot {
     asset_params: Vec<(u64, Option<AssetParamsRecord>)>,
     app_params: Vec<(u64, Option<AppParams>)>,
     app_local_states: Vec<((Address, u64), Option<AppLocalState>)>,
+    /// Box entries snapshotted by app ID. Each entry is `((app_id, key), old_value)`.
+    /// `None` value means the box did not exist at snapshot time.
+    #[allow(clippy::type_complexity)]
+    boxes: Vec<((u64, Vec<u8>), Option<Vec<u8>>)>,
+    /// App IDs whose boxes were snapshotted (used to clean up newly-created boxes on restore).
+    snapshotted_box_app_ids: Vec<u64>,
 }
 
 impl Default for LedgerState {
@@ -655,6 +702,20 @@ impl crate::store_trait::LedgerStore for LedgerState {
             .filter(|((a, _), _)| a == addr)
             .map(|((_, app_id), state)| (*app_id, state.clone()))
             .collect()
+    }
+
+    // ---- Box Storage ----
+
+    fn get_box(&self, app_id: u64, key: &[u8]) -> Option<Vec<u8>> {
+        self.boxes.get(&(app_id, key.to_vec())).cloned()
+    }
+
+    fn set_box(&mut self, app_id: u64, key: &[u8], value: Vec<u8>) {
+        self.boxes.insert((app_id, key.to_vec()), value);
+    }
+
+    fn delete_box(&mut self, app_id: u64, key: &[u8]) -> bool {
+        self.boxes.remove(&(app_id, key.to_vec())).is_some()
     }
 
     // ---- Leases ----
@@ -1860,5 +1921,181 @@ mod tests {
         );
         // Asset params should be gone.
         assert!(state.get_asset_params(42).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Box storage tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_box_create_read_update_delete() {
+        use crate::store_trait::LedgerStore;
+
+        let mut state = LedgerState::new();
+
+        // Box does not exist yet.
+        assert!(state.get_box(100, b"mybox").is_none());
+        assert!(state.box_len(100, b"mybox").is_none());
+
+        // Create.
+        state.set_box(100, b"mybox", vec![0u8; 10]);
+        assert_eq!(state.get_box(100, b"mybox").unwrap().len(), 10);
+        assert_eq!(state.box_len(100, b"mybox").unwrap(), 10);
+
+        // Update.
+        state.set_box(100, b"mybox", b"hello world".to_vec());
+        assert_eq!(state.get_box(100, b"mybox").unwrap(), b"hello world");
+        assert_eq!(state.box_len(100, b"mybox").unwrap(), 11);
+
+        // Delete.
+        assert!(state.delete_box(100, b"mybox"));
+        assert!(state.get_box(100, b"mybox").is_none());
+
+        // Delete non-existing.
+        assert!(!state.delete_box(100, b"mybox"));
+    }
+
+    #[test]
+    fn test_box_isolation_between_apps() {
+        use crate::store_trait::LedgerStore;
+
+        let mut state = LedgerState::new();
+
+        // Two apps with same box name.
+        state.set_box(100, b"shared_name", b"app100_data".to_vec());
+        state.set_box(200, b"shared_name", b"app200_data".to_vec());
+
+        assert_eq!(state.get_box(100, b"shared_name").unwrap(), b"app100_data");
+        assert_eq!(state.get_box(200, b"shared_name").unwrap(), b"app200_data");
+
+        // Deleting one app's box does not affect the other.
+        state.delete_box(100, b"shared_name");
+        assert!(state.get_box(100, b"shared_name").is_none());
+        assert_eq!(state.get_box(200, b"shared_name").unwrap(), b"app200_data");
+    }
+
+    #[test]
+    fn test_box_snapshot_and_rollback_create() {
+        use crate::store_trait::LedgerStore;
+
+        let mut state = LedgerState::new();
+        let addr = Address([1u8; 32]);
+        state.get_or_default_account(&addr).micro_algos = 1_000_000;
+
+        // Snapshot with app_id 100 (no boxes yet).
+        let snap = state.snapshot_with_ids(&[addr], &[], &[100]);
+
+        // Create a box after snapshot.
+        state.set_box(100, b"newbox", b"data".to_vec());
+        assert!(state.get_box(100, b"newbox").is_some());
+
+        // Rollback should remove the newly-created box.
+        state.restore_snapshot(snap);
+        assert!(
+            state.get_box(100, b"newbox").is_none(),
+            "newly-created box should be removed on rollback"
+        );
+    }
+
+    #[test]
+    fn test_box_snapshot_and_rollback_modify() {
+        use crate::store_trait::LedgerStore;
+
+        let mut state = LedgerState::new();
+        let addr = Address([1u8; 32]);
+        state.get_or_default_account(&addr).micro_algos = 1_000_000;
+        state.set_box(100, b"mybox", b"original".to_vec());
+
+        // Snapshot with app_id 100.
+        let snap = state.snapshot_with_ids(&[addr], &[], &[100]);
+
+        // Modify box after snapshot.
+        state.set_box(100, b"mybox", b"modified".to_vec());
+        assert_eq!(state.get_box(100, b"mybox").unwrap(), b"modified");
+
+        // Rollback should restore original value.
+        state.restore_snapshot(snap);
+        assert_eq!(
+            state.get_box(100, b"mybox").unwrap(),
+            b"original",
+            "box should be restored to original value on rollback"
+        );
+    }
+
+    #[test]
+    fn test_box_snapshot_and_rollback_delete() {
+        use crate::store_trait::LedgerStore;
+
+        let mut state = LedgerState::new();
+        let addr = Address([1u8; 32]);
+        state.get_or_default_account(&addr).micro_algos = 1_000_000;
+        state.set_box(100, b"mybox", b"data".to_vec());
+
+        // Snapshot with app_id 100.
+        let snap = state.snapshot_with_ids(&[addr], &[], &[100]);
+
+        // Delete box after snapshot.
+        state.delete_box(100, b"mybox");
+        assert!(state.get_box(100, b"mybox").is_none());
+
+        // Rollback should restore the box.
+        state.restore_snapshot(snap);
+        assert_eq!(
+            state.get_box(100, b"mybox").unwrap(),
+            b"data",
+            "deleted box should be restored on rollback"
+        );
+    }
+
+    #[test]
+    fn test_box_snapshot_does_not_affect_other_apps() {
+        use crate::store_trait::LedgerStore;
+
+        let mut state = LedgerState::new();
+        let addr = Address([1u8; 32]);
+        state.get_or_default_account(&addr).micro_algos = 1_000_000;
+        state.set_box(100, b"box100", b"data100".to_vec());
+        state.set_box(200, b"box200", b"data200".to_vec());
+
+        // Snapshot only app 100.
+        let snap = state.snapshot_with_ids(&[addr], &[], &[100]);
+
+        // Modify both apps' boxes.
+        state.set_box(100, b"box100", b"modified100".to_vec());
+        state.set_box(200, b"box200", b"modified200".to_vec());
+
+        // Rollback only affects app 100.
+        state.restore_snapshot(snap);
+        assert_eq!(
+            state.get_box(100, b"box100").unwrap(),
+            b"data100",
+            "app 100's box should be restored"
+        );
+        assert_eq!(
+            state.get_box(200, b"box200").unwrap(),
+            b"modified200",
+            "app 200's box should NOT be affected by rollback"
+        );
+    }
+
+    #[test]
+    fn test_box_multiple_keys_same_app() {
+        use crate::store_trait::LedgerStore;
+
+        let mut state = LedgerState::new();
+
+        state.set_box(100, b"box_a", b"alpha".to_vec());
+        state.set_box(100, b"box_b", b"beta".to_vec());
+        state.set_box(100, b"box_c", b"gamma".to_vec());
+
+        assert_eq!(state.get_box(100, b"box_a").unwrap(), b"alpha");
+        assert_eq!(state.get_box(100, b"box_b").unwrap(), b"beta");
+        assert_eq!(state.get_box(100, b"box_c").unwrap(), b"gamma");
+
+        // Delete one, others unaffected.
+        state.delete_box(100, b"box_b");
+        assert!(state.get_box(100, b"box_b").is_none());
+        assert_eq!(state.get_box(100, b"box_a").unwrap(), b"alpha");
+        assert_eq!(state.get_box(100, b"box_c").unwrap(), b"gamma");
     }
 }

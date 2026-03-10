@@ -391,6 +391,121 @@ pub fn op_block(
 }
 
 // ---------------------------------------------------------------------------
+// Box storage opcodes (v8+)
+// ---------------------------------------------------------------------------
+
+/// `box_create` (0xb9, v8+): pop size (uint), pop name (bytes).
+/// Push 1 if newly created, 0 if already existed.
+pub fn op_box_create(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let size = machine.pop_uint()?;
+    let name = machine.pop_bytes()?;
+    let created = ctx.box_create(&name, size)?;
+    machine.push(AvmValue::Uint64(if created { 1 } else { 0 }))
+}
+
+/// `box_extract` (0xba, v8+): pop length (uint), pop offset (uint), pop name (bytes).
+/// Push extracted bytes.
+pub fn op_box_extract(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let length = machine.pop_uint()?;
+    let offset = machine.pop_uint()?;
+    let name = machine.pop_bytes()?;
+    let bytes = ctx.box_extract(&name, offset, length)?;
+    machine.push(AvmValue::Bytes(bytes))
+}
+
+/// `box_replace` (0xbb, v8+): pop value (bytes), pop offset (uint), pop name (bytes).
+pub fn op_box_replace(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let value = machine.pop_bytes()?;
+    let offset = machine.pop_uint()?;
+    let name = machine.pop_bytes()?;
+    ctx.box_replace(&name, offset, &value)
+}
+
+/// `box_del` (0xbc, v8+): pop name (bytes). Push 1 if existed, 0 otherwise.
+pub fn op_box_del(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let name = machine.pop_bytes()?;
+    let existed = ctx.box_del(&name)?;
+    machine.push(AvmValue::Uint64(if existed { 1 } else { 0 }))
+}
+
+/// `box_len` (0xbd, v8+): pop name (bytes). Push length (uint), push exists (bool).
+pub fn op_box_len(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let name = machine.pop_bytes()?;
+    let (len, exists) = ctx.box_len(&name)?;
+    machine.push(AvmValue::Uint64(len))?;
+    machine.push(AvmValue::Uint64(if exists { 1 } else { 0 }))
+}
+
+/// `box_get` (0xbe, v8+): pop name (bytes). Push value (bytes, empty if not exists),
+/// push exists (bool).
+pub fn op_box_get(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let name = machine.pop_bytes()?;
+    let (value, exists) = ctx.box_get(&name)?;
+    machine.push(AvmValue::Bytes(value))?;
+    machine.push(AvmValue::Uint64(if exists { 1 } else { 0 }))
+}
+
+/// `box_put` (0xbf, v8+): pop value (bytes), pop name (bytes).
+pub fn op_box_put(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let value = machine.pop_bytes()?;
+    let name = machine.pop_bytes()?;
+    ctx.box_put(&name, &value)
+}
+
+/// `box_splice` (0xd2, v10+): pop replace (bytes), pop length (uint),
+/// pop start (uint), pop name (bytes).
+pub fn op_box_splice(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let replacement = machine.pop_bytes()?;
+    let length = machine.pop_uint()?;
+    let start = machine.pop_uint()?;
+    let name = machine.pop_bytes()?;
+    ctx.box_splice(&name, start, length, &replacement)
+}
+
+/// `box_resize` (0xd3, v10+): pop size (uint), pop name (bytes).
+pub fn op_box_resize(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+    ctx: &mut dyn AvmContext,
+) -> Result<(), AlgoError> {
+    let size = machine.pop_uint()?;
+    let name = machine.pop_bytes()?;
+    ctx.box_resize(&name, size)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -443,6 +558,8 @@ mod tests {
         group_size_val: usize,
         /// Group index of the current transaction (for gaid tests).
         group_index_val: usize,
+        /// Box storage: (name) -> contents
+        boxes: HashMap<Vec<u8>, Vec<u8>>,
     }
 
     impl TestStateContext {
@@ -465,6 +582,7 @@ mod tests {
                 block_fields: HashMap::new(),
                 group_size_val: 1,
                 group_index_val: 0,
+                boxes: HashMap::new(),
             }
         }
     }
@@ -659,6 +777,138 @@ mod tests {
         }
         fn current_app_id(&self) -> u64 {
             self.app_id
+        }
+
+        fn box_get(&mut self, name: &[u8]) -> Result<(Vec<u8>, bool), AlgoError> {
+            match self.boxes.get(name) {
+                Some(v) => Ok((v.clone(), true)),
+                None => Ok((Vec::new(), false)),
+            }
+        }
+
+        fn box_put(&mut self, name: &[u8], value: &[u8]) -> Result<(), AlgoError> {
+            if name.is_empty() {
+                return Err(AlgoError::Avm {
+                    message: "box names may not be zero length".into(),
+                });
+            }
+            self.boxes.insert(name.to_vec(), value.to_vec());
+            Ok(())
+        }
+
+        fn box_del(&mut self, name: &[u8]) -> Result<bool, AlgoError> {
+            Ok(self.boxes.remove(name).is_some())
+        }
+
+        fn box_len(&mut self, name: &[u8]) -> Result<(u64, bool), AlgoError> {
+            match self.boxes.get(name) {
+                Some(v) => Ok((v.len() as u64, true)),
+                None => Ok((0, false)),
+            }
+        }
+
+        fn box_create(&mut self, name: &[u8], size: u64) -> Result<bool, AlgoError> {
+            if name.is_empty() {
+                return Err(AlgoError::Avm {
+                    message: "box names may not be zero length".into(),
+                });
+            }
+            use std::collections::hash_map::Entry;
+            match self.boxes.entry(name.to_vec()) {
+                Entry::Occupied(_) => Ok(false),
+                Entry::Vacant(e) => {
+                    e.insert(vec![0u8; size as usize]);
+                    Ok(true)
+                }
+            }
+        }
+
+        fn box_extract(
+            &mut self,
+            name: &[u8],
+            offset: u64,
+            length: u64,
+        ) -> Result<Vec<u8>, AlgoError> {
+            let contents = self.boxes.get(name).ok_or_else(|| AlgoError::Avm {
+                message: format!("no such box {:?}", name),
+            })?;
+            let start = offset as usize;
+            let end = start + length as usize;
+            if end > contents.len() {
+                return Err(AlgoError::Avm {
+                    message: format!("extraction end {} beyond length: {}", end, contents.len()),
+                });
+            }
+            Ok(contents[start..end].to_vec())
+        }
+
+        fn box_replace(&mut self, name: &[u8], offset: u64, value: &[u8]) -> Result<(), AlgoError> {
+            let contents = self.boxes.get_mut(name).ok_or_else(|| AlgoError::Avm {
+                message: format!("no such box {:?}", name),
+            })?;
+            let start = offset as usize;
+            let end = start + value.len();
+            if end > contents.len() {
+                return Err(AlgoError::Avm {
+                    message: format!("replacement end {} beyond length: {}", end, contents.len()),
+                });
+            }
+            contents[start..end].copy_from_slice(value);
+            Ok(())
+        }
+
+        fn box_resize(&mut self, name: &[u8], new_size: u64) -> Result<(), AlgoError> {
+            let contents = self.boxes.get(name).ok_or_else(|| AlgoError::Avm {
+                message: format!("no such box {:?}", name),
+            })?;
+            let mut resized = vec![0u8; new_size as usize];
+            let copy_len = contents.len().min(new_size as usize);
+            resized[..copy_len].copy_from_slice(&contents[..copy_len]);
+            self.boxes.insert(name.to_vec(), resized);
+            Ok(())
+        }
+
+        fn box_splice(
+            &mut self,
+            name: &[u8],
+            start: u64,
+            length: u64,
+            value: &[u8],
+        ) -> Result<(), AlgoError> {
+            let contents = self.boxes.get(name).ok_or_else(|| AlgoError::Avm {
+                message: format!("no such box {:?}", name),
+            })?;
+            let s = start as usize;
+            if s > contents.len() {
+                return Err(AlgoError::Avm {
+                    message: format!("replacement start {} beyond length: {}", s, contents.len()),
+                });
+            }
+            let oend = (start + length) as usize;
+            if oend > contents.len() {
+                return Err(AlgoError::Avm {
+                    message: format!(
+                        "splice end {} beyond original length: {}",
+                        oend,
+                        contents.len()
+                    ),
+                });
+            }
+            // Same-size splice per go-algorand behavior.
+            let mut result = vec![0u8; contents.len()];
+            result[..s].copy_from_slice(&contents[..s]);
+            let copied = value.len().min(contents.len() - s);
+            result[s..s + copied].copy_from_slice(&value[..copied]);
+            let tail_start = s + copied;
+            if tail_start < result.len() && oend < contents.len() {
+                let tail_len = result.len() - tail_start;
+                let avail = contents.len() - oend;
+                let copy_len = tail_len.min(avail);
+                result[tail_start..tail_start + copy_len]
+                    .copy_from_slice(&contents[oend..oend + copy_len]);
+            }
+            self.boxes.insert(name.to_vec(), result);
+            Ok(())
         }
     }
 
@@ -1418,5 +1668,420 @@ mod tests {
             msg.contains("block field access not available"),
             "got: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Box storage opcode tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build pushbytes instruction for a byte slice.
+    fn pushbytes_code(data: &[u8]) -> Vec<u8> {
+        let mut code = vec![0x80, data.len() as u8];
+        code.extend_from_slice(data);
+        code
+    }
+
+    /// Helper: build pushint instruction for a small uint (< 128).
+    fn pushint_code(val: u8) -> Vec<u8> {
+        vec![0x81, val]
+    }
+
+    // --- box_create ---
+
+    #[test]
+    fn test_box_create_new() {
+        let mut ctx = TestStateContext::new(100);
+        // pushbytes "mybox", pushint 10, box_create (0xb9)
+        let mut code = pushbytes_code(b"mybox");
+        code.extend_from_slice(&pushint_code(10));
+        code.push(0xb9);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Uint64(1)); // newly created
+        assert_eq!(ctx.boxes.get(b"mybox".as_slice()).unwrap().len(), 10);
+        assert!(ctx
+            .boxes
+            .get(b"mybox".as_slice())
+            .unwrap()
+            .iter()
+            .all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_box_create_existing() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.boxes.insert(b"mybox".to_vec(), vec![0u8; 10]);
+        // pushbytes "mybox", pushint 10, box_create
+        let mut code = pushbytes_code(b"mybox");
+        code.extend_from_slice(&pushint_code(10));
+        code.push(0xb9);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Uint64(0)); // already existed
+    }
+
+    #[test]
+    fn test_box_create_empty_name_rejected() {
+        let mut ctx = TestStateContext::new(100);
+        // pushbytes "" (length 0), pushint 10, box_create
+        let mut code = vec![0x80, 0x00]; // pushbytes, len=0
+        code.extend_from_slice(&pushint_code(10));
+        code.push(0xb9);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 2).unwrap(); // pushbytes + pushint succeed
+        let result = m.step(&mut ctx); // box_create fails
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("zero length"), "got: {msg}");
+    }
+
+    // --- box_del ---
+
+    #[test]
+    fn test_box_del_existing() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.boxes.insert(b"mybox".to_vec(), vec![1, 2, 3]);
+        // pushbytes "mybox", box_del (0xbc)
+        let mut code = pushbytes_code(b"mybox");
+        code.push(0xbc);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Uint64(1)); // existed
+        assert!(!ctx.boxes.contains_key(b"mybox".as_slice()));
+    }
+
+    #[test]
+    fn test_box_del_non_existing() {
+        let mut ctx = TestStateContext::new(100);
+        // pushbytes "nobox", box_del
+        let mut code = pushbytes_code(b"nobox");
+        code.push(0xbc);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Uint64(0)); // did not exist
+    }
+
+    // --- box_len ---
+
+    #[test]
+    fn test_box_len_existing() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.boxes.insert(b"mybox".to_vec(), vec![0u8; 42]);
+        // pushbytes "mybox", box_len (0xbd)
+        let mut code = pushbytes_code(b"mybox");
+        code.push(0xbd);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert_eq!(m.stack.len(), 2);
+        assert_eq!(m.stack[0], AvmValue::Uint64(42)); // length
+        assert_eq!(m.stack[1], AvmValue::Uint64(1)); // exists
+    }
+
+    #[test]
+    fn test_box_len_non_existing() {
+        let mut ctx = TestStateContext::new(100);
+        // pushbytes "nobox", box_len
+        let mut code = pushbytes_code(b"nobox");
+        code.push(0xbd);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert_eq!(m.stack.len(), 2);
+        assert_eq!(m.stack[0], AvmValue::Uint64(0)); // length = 0
+        assert_eq!(m.stack[1], AvmValue::Uint64(0)); // does not exist
+    }
+
+    // --- box_get ---
+
+    #[test]
+    fn test_box_get_existing() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.boxes.insert(b"mybox".to_vec(), vec![0xAA, 0xBB, 0xCC]);
+        // pushbytes "mybox", box_get (0xbe)
+        let mut code = pushbytes_code(b"mybox");
+        code.push(0xbe);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert_eq!(m.stack.len(), 2);
+        assert_eq!(m.stack[0], AvmValue::Bytes(vec![0xAA, 0xBB, 0xCC]));
+        assert_eq!(m.stack[1], AvmValue::Uint64(1)); // exists
+    }
+
+    #[test]
+    fn test_box_get_non_existing() {
+        let mut ctx = TestStateContext::new(100);
+        // pushbytes "nobox", box_get
+        let mut code = pushbytes_code(b"nobox");
+        code.push(0xbe);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert_eq!(m.stack.len(), 2);
+        assert_eq!(m.stack[0], AvmValue::Bytes(vec![])); // empty
+        assert_eq!(m.stack[1], AvmValue::Uint64(0)); // does not exist
+    }
+
+    // --- box_put ---
+
+    #[test]
+    fn test_box_put() {
+        let mut ctx = TestStateContext::new(100);
+        // pushbytes "mybox", pushbytes "hello", box_put (0xbf)
+        let mut code = pushbytes_code(b"mybox");
+        code.extend_from_slice(&pushbytes_code(b"hello"));
+        code.push(0xbf);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        assert_eq!(m.stack.len(), 0);
+        assert_eq!(ctx.boxes.get(b"mybox".as_slice()).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn test_box_put_overwrites_existing() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.boxes.insert(b"mybox".to_vec(), vec![0u8; 5]);
+        // pushbytes "mybox", pushbytes "world", box_put
+        let mut code = pushbytes_code(b"mybox");
+        code.extend_from_slice(&pushbytes_code(b"world"));
+        code.push(0xbf);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        assert_eq!(ctx.boxes.get(b"mybox".as_slice()).unwrap(), b"world");
+    }
+
+    // --- box_extract ---
+
+    #[test]
+    fn test_box_extract() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.boxes.insert(b"mybox".to_vec(), b"hello world".to_vec());
+        // pushbytes "mybox", pushint 6, pushint 5, box_extract (0xba)
+        let mut code = pushbytes_code(b"mybox");
+        code.extend_from_slice(&pushint_code(6)); // offset
+        code.extend_from_slice(&pushint_code(5)); // length
+        code.push(0xba);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 4).unwrap();
+        assert_eq!(m.stack.len(), 1);
+        assert_eq!(m.stack[0], AvmValue::Bytes(b"world".to_vec()));
+    }
+
+    #[test]
+    fn test_box_extract_out_of_bounds() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.boxes.insert(b"mybox".to_vec(), vec![0u8; 5]);
+        // pushbytes "mybox", pushint 3, pushint 5, box_extract -> out of bounds
+        let mut code = pushbytes_code(b"mybox");
+        code.extend_from_slice(&pushint_code(3));
+        code.extend_from_slice(&pushint_code(5));
+        code.push(0xba);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        let result = m.step(&mut ctx);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("beyond length"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_box_extract_non_existing() {
+        let mut ctx = TestStateContext::new(100);
+        // pushbytes "nobox", pushint 0, pushint 1, box_extract -> no such box
+        let mut code = pushbytes_code(b"nobox");
+        code.extend_from_slice(&pushint_code(0));
+        code.extend_from_slice(&pushint_code(1));
+        code.push(0xba);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        let result = m.step(&mut ctx);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("no such box"), "got: {msg}");
+    }
+
+    // --- box_replace ---
+
+    #[test]
+    fn test_box_replace() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.boxes.insert(b"mybox".to_vec(), b"hello world".to_vec());
+        // pushbytes "mybox", pushint 6, pushbytes "EARTH", box_replace (0xbb)
+        let mut code = pushbytes_code(b"mybox");
+        code.extend_from_slice(&pushint_code(6)); // offset
+        code.extend_from_slice(&pushbytes_code(b"EARTH"));
+        code.push(0xbb);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 4).unwrap();
+        assert_eq!(m.stack.len(), 0);
+        assert_eq!(ctx.boxes.get(b"mybox".as_slice()).unwrap(), b"hello EARTH");
+    }
+
+    #[test]
+    fn test_box_replace_out_of_bounds() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.boxes.insert(b"mybox".to_vec(), vec![0u8; 5]);
+        // pushbytes "mybox", pushint 3, pushbytes "ABC", box_replace
+        // offset 3 + len 3 = 6 > 5 -> error
+        let mut code = pushbytes_code(b"mybox");
+        code.extend_from_slice(&pushint_code(3));
+        code.extend_from_slice(&pushbytes_code(b"ABC"));
+        code.push(0xbb);
+        let raw = prog(8, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        let result = m.step(&mut ctx);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("beyond length"), "got: {msg}");
+    }
+
+    // --- box_resize ---
+
+    #[test]
+    fn test_box_resize_grow() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.boxes.insert(b"mybox".to_vec(), b"abc".to_vec());
+        // pushbytes "mybox", pushint 6, box_resize (0xd3)
+        let mut code = pushbytes_code(b"mybox");
+        code.extend_from_slice(&pushint_code(6));
+        code.push(0xd3);
+        let raw = prog(10, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        let box_val = ctx.boxes.get(b"mybox".as_slice()).unwrap();
+        assert_eq!(box_val.len(), 6);
+        assert_eq!(&box_val[..3], b"abc");
+        assert_eq!(&box_val[3..], &[0, 0, 0]); // zero-extended
+    }
+
+    #[test]
+    fn test_box_resize_shrink() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.boxes.insert(b"mybox".to_vec(), b"abcdef".to_vec());
+        // pushbytes "mybox", pushint 3, box_resize
+        let mut code = pushbytes_code(b"mybox");
+        code.extend_from_slice(&pushint_code(3));
+        code.push(0xd3);
+        let raw = prog(10, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 3).unwrap();
+        let box_val = ctx.boxes.get(b"mybox".as_slice()).unwrap();
+        assert_eq!(box_val, b"abc");
+    }
+
+    #[test]
+    fn test_box_resize_non_existing() {
+        let mut ctx = TestStateContext::new(100);
+        // pushbytes "nobox", pushint 5, box_resize -> error
+        let mut code = pushbytes_code(b"nobox");
+        code.extend_from_slice(&pushint_code(5));
+        code.push(0xd3);
+        let raw = prog(10, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        let result = m.step(&mut ctx);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("no such box"), "got: {msg}");
+    }
+
+    // --- box_splice ---
+
+    #[test]
+    fn test_box_splice_replace_middle() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.boxes.insert(b"mybox".to_vec(), b"abcdefgh".to_vec());
+        // pushbytes "mybox", pushint 2 (start), pushint 3 (length), pushbytes "XYZ", box_splice (0xd2)
+        let mut code = pushbytes_code(b"mybox");
+        code.extend_from_slice(&pushint_code(2)); // start
+        code.extend_from_slice(&pushint_code(3)); // length to remove
+        code.extend_from_slice(&pushbytes_code(b"XYZ")); // replacement
+        code.push(0xd2);
+        let raw = prog(10, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 5).unwrap();
+        let box_val = ctx.boxes.get(b"mybox".as_slice()).unwrap();
+        // Same size as original (8 bytes): "ab" + "XYZ" + "fgh"
+        assert_eq!(box_val.len(), 8);
+        assert_eq!(&box_val[..2], b"ab");
+        assert_eq!(&box_val[2..5], b"XYZ");
+        assert_eq!(&box_val[5..8], b"fgh");
+    }
+
+    #[test]
+    fn test_box_splice_non_existing() {
+        let mut ctx = TestStateContext::new(100);
+        // pushbytes "nobox", pushint 0, pushint 0, pushbytes "x", box_splice
+        let mut code = pushbytes_code(b"nobox");
+        code.extend_from_slice(&pushint_code(0));
+        code.extend_from_slice(&pushint_code(0));
+        code.extend_from_slice(&pushbytes_code(b"x"));
+        code.push(0xd2);
+        let raw = prog(10, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 4).unwrap();
+        let result = m.step(&mut ctx);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("no such box"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_box_splice_out_of_bounds() {
+        let mut ctx = TestStateContext::new(100);
+        ctx.boxes.insert(b"mybox".to_vec(), vec![0u8; 5]);
+        // pushbytes "mybox", pushint 3, pushint 5, pushbytes "xx", box_splice
+        // start=3 + length=5 = 8 > 5 -> error
+        let mut code = pushbytes_code(b"mybox");
+        code.extend_from_slice(&pushint_code(3));
+        code.extend_from_slice(&pushint_code(5));
+        code.extend_from_slice(&pushbytes_code(b"xx"));
+        code.push(0xd2);
+        let raw = prog(10, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        step_n(&mut m, &mut ctx, 4).unwrap();
+        let result = m.step(&mut ctx);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("beyond"), "got: {msg}");
     }
 }

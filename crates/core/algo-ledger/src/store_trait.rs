@@ -140,6 +140,23 @@ pub trait LedgerStore {
     /// Returns `Vec<(u64, AppLocalState)>` — the app ID and local state.
     fn app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)>;
 
+    // ---- Box Storage ----
+
+    /// Read a box value. Returns `None` if the box does not exist.
+    fn get_box(&self, app_id: u64, key: &[u8]) -> Option<Vec<u8>>;
+
+    /// Create or overwrite a box with the given value.
+    fn set_box(&mut self, app_id: u64, key: &[u8], value: Vec<u8>);
+
+    /// Delete a box. Returns `true` if the box existed and was removed.
+    fn delete_box(&mut self, app_id: u64, key: &[u8]) -> bool;
+
+    /// Check whether a box exists and return its length. Returns `None` if it
+    /// does not exist.
+    fn box_len(&self, app_id: u64, key: &[u8]) -> Option<usize> {
+        self.get_box(app_id, key).map(|v| v.len())
+    }
+
     // ---- Leases ----
 
     /// Check whether a lease is active for (sender, lease) at the given round.
