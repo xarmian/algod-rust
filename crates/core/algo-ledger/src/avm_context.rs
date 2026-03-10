@@ -86,6 +86,8 @@ const ARRAY_FIELD_INDICES: &[u8] = &[
     28, // Accounts
     48, // Assets (foreign assets)
     50, // Applications (foreign apps)
+    64, // ApprovalProgramPages
+    66, // ClearStateProgramPages
 ];
 
 /// Accumulates field values while an inner transaction is being constructed
@@ -448,9 +450,62 @@ impl InnerTxnBuilder {
                         txn.reject_version = *v;
                     }
                 }
-                _ => {
-                    // Silently ignore unknown fields for forward-compatibility
+                // Note
+                5 => {
+                    if let TealValue::Bytes(b) = value {
+                        txn.note = serde_bytes::ByteBuf::from(b.clone());
+                    }
                 }
+                // VotePK
+                10 => {
+                    if let TealValue::Bytes(b) = value {
+                        txn.vote_pk = Some(serde_bytes::ByteBuf::from(b.clone()));
+                    }
+                }
+                // SelectionPK
+                11 => {
+                    if let TealValue::Bytes(b) = value {
+                        txn.selection_pk = Some(serde_bytes::ByteBuf::from(b.clone()));
+                    }
+                }
+                // VoteFirst
+                12 => {
+                    if let TealValue::Uint(v) = value {
+                        txn.vote_first = *v;
+                    }
+                }
+                // VoteLast
+                13 => {
+                    if let TealValue::Uint(v) = value {
+                        txn.vote_last = *v;
+                    }
+                }
+                // VoteKeyDilution
+                14 => {
+                    if let TealValue::Uint(v) = value {
+                        txn.vote_key_dilution = *v;
+                    }
+                }
+                // RekeyTo
+                32 => {
+                    if let TealValue::Bytes(b) = value {
+                        if b.len() == 32 {
+                            let mut addr = [0u8; 32];
+                            addr.copy_from_slice(b);
+                            txn.rekey_to = Some(Address(addr));
+                        }
+                    }
+                }
+                // StateProofPK
+                63 => {
+                    if let TealValue::Bytes(b) = value {
+                        txn.state_proof_pk = Some(serde_bytes::ByteBuf::from(b.clone()));
+                    }
+                }
+                // Safety: op_itxn_field validates field indices before they reach
+                // build(), so all valid settable fields are handled above and
+                // this arm should never be reached.
+                _ => unreachable!("build(): unexpected field index {field}"),
             }
         }
 
@@ -523,7 +578,36 @@ impl InnerTxnBuilder {
                         txn.foreign_apps = Some(apps);
                     }
                 }
-                _ => {}
+                // ApprovalProgramPages
+                64 => {
+                    // Concatenate all pages into a single approval program.
+                    let mut program_bytes = Vec::new();
+                    for v in values {
+                        if let TealValue::Bytes(b) = v {
+                            program_bytes.extend_from_slice(b);
+                        }
+                    }
+                    if !program_bytes.is_empty() {
+                        txn.approval_program = Some(serde_bytes::ByteBuf::from(program_bytes));
+                    }
+                }
+                // ClearStateProgramPages
+                66 => {
+                    // Concatenate all pages into a single clear state program.
+                    let mut program_bytes = Vec::new();
+                    for v in values {
+                        if let TealValue::Bytes(b) = v {
+                            program_bytes.extend_from_slice(b);
+                        }
+                    }
+                    if !program_bytes.is_empty() {
+                        txn.clear_state_program = Some(serde_bytes::ByteBuf::from(program_bytes));
+                    }
+                }
+                // Safety: op_itxn_field validates field indices before they reach
+                // build(), so all valid array fields are handled above and
+                // this arm should never be reached.
+                _ => unreachable!("build(): unexpected array field index {field}"),
             }
         }
 

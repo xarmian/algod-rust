@@ -236,6 +236,178 @@ field_enum! {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TxnField — Display and itx_version helpers (matching go-algorand exactly)
+// ---------------------------------------------------------------------------
+
+impl std::fmt::Display for TxnField {
+    /// Returns the go-algorand field name string for known fields,
+    /// or `"TxnField(N)"` for unknown indices (matching Go's stringer output).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Sender => "Sender",
+            Self::Fee => "Fee",
+            Self::FirstValid => "FirstValid",
+            Self::FirstValidTime => "FirstValidTime",
+            Self::LastValid => "LastValid",
+            Self::Note => "Note",
+            Self::Lease => "Lease",
+            Self::Receiver => "Receiver",
+            Self::Amount => "Amount",
+            Self::CloseRemainderTo => "CloseRemainderTo",
+            Self::VotePK => "VotePK",
+            Self::SelectionPK => "SelectionPK",
+            Self::VoteFirst => "VoteFirst",
+            Self::VoteLast => "VoteLast",
+            Self::VoteKeyDilution => "VoteKeyDilution",
+            Self::Type => "Type",
+            Self::TypeEnum => "TypeEnum",
+            Self::XferAsset => "XferAsset",
+            Self::AssetAmount => "AssetAmount",
+            Self::AssetSender => "AssetSender",
+            Self::AssetReceiver => "AssetReceiver",
+            Self::AssetCloseTo => "AssetCloseTo",
+            Self::GroupIndex => "GroupIndex",
+            Self::TxID => "TxID",
+            Self::ApplicationID => "ApplicationID",
+            Self::OnCompletion => "OnCompletion",
+            Self::ApplicationArgs => "ApplicationArgs",
+            Self::NumAppArgs => "NumAppArgs",
+            Self::Accounts => "Accounts",
+            Self::NumAccounts => "NumAccounts",
+            Self::ApprovalProgram => "ApprovalProgram",
+            Self::ClearStateProgram => "ClearStateProgram",
+            Self::RekeyTo => "RekeyTo",
+            Self::ConfigAsset => "ConfigAsset",
+            Self::ConfigAssetTotal => "ConfigAssetTotal",
+            Self::ConfigAssetDecimals => "ConfigAssetDecimals",
+            Self::ConfigAssetDefaultFrozen => "ConfigAssetDefaultFrozen",
+            Self::ConfigAssetUnitName => "ConfigAssetUnitName",
+            Self::ConfigAssetName => "ConfigAssetName",
+            Self::ConfigAssetURL => "ConfigAssetURL",
+            Self::ConfigAssetMetadataHash => "ConfigAssetMetadataHash",
+            Self::ConfigAssetManager => "ConfigAssetManager",
+            Self::ConfigAssetReserve => "ConfigAssetReserve",
+            Self::ConfigAssetFreeze => "ConfigAssetFreeze",
+            Self::ConfigAssetClawback => "ConfigAssetClawback",
+            Self::FreezeAsset => "FreezeAsset",
+            Self::FreezeAssetAccount => "FreezeAssetAccount",
+            Self::FreezeAssetFrozen => "FreezeAssetFrozen",
+            Self::Assets => "Assets",
+            Self::NumAssets => "NumAssets",
+            Self::Applications => "Applications",
+            Self::NumApplications => "NumApplications",
+            Self::GlobalNumUint => "GlobalNumUint",
+            Self::GlobalNumByteSlice => "GlobalNumByteSlice",
+            Self::LocalNumUint => "LocalNumUint",
+            Self::LocalNumByteSlice => "LocalNumByteSlice",
+            Self::ExtraProgramPages => "ExtraProgramPages",
+            Self::Nonparticipation => "Nonparticipation",
+            Self::Logs => "Logs",
+            Self::NumLogs => "NumLogs",
+            Self::CreatedAssetID => "CreatedAssetID",
+            Self::CreatedApplicationID => "CreatedApplicationID",
+            Self::LastLog => "LastLog",
+            Self::StateProofPK => "StateProofPK",
+            Self::ApprovalProgramPages => "ApprovalProgramPages",
+            Self::NumApprovalProgramPages => "NumApprovalProgramPages",
+            Self::ClearStateProgramPages => "ClearStateProgramPages",
+            Self::NumClearStateProgramPages => "NumClearStateProgramPages",
+            Self::RejectVersion => "RejectVersion",
+        };
+        write!(f, "{}", name)
+    }
+}
+
+impl TxnField {
+    /// Returns the AVM version in which this field became settable via
+    /// `itxn_field`. Returns 0 if the field can never be set in an inner
+    /// transaction. Values match go-algorand's `txnFieldSpecs[].itxVersion`.
+    pub fn itx_version(&self) -> u8 {
+        match self {
+            // itxVersion from go-algorand txnFieldSpecs (fields.go)
+            Self::Sender => 5,
+            Self::Fee => 5,
+            Self::FirstValid => 0,     // not settable
+            Self::FirstValidTime => 0, // not settable
+            Self::LastValid => 0,      // not settable
+            Self::Note => 6,
+            Self::Lease => 0, // not settable
+            Self::Receiver => 5,
+            Self::Amount => 5,
+            Self::CloseRemainderTo => 5,
+            Self::VotePK => 6,
+            Self::SelectionPK => 6,
+            Self::VoteFirst => 6,
+            Self::VoteLast => 6,
+            Self::VoteKeyDilution => 6,
+            Self::Type => 5,
+            Self::TypeEnum => 5,
+            Self::XferAsset => 5,
+            Self::AssetAmount => 5,
+            Self::AssetSender => 5,
+            Self::AssetReceiver => 5,
+            Self::AssetCloseTo => 5,
+            Self::GroupIndex => 0, // not settable
+            Self::TxID => 0,       // not settable
+            Self::ApplicationID => 6,
+            Self::OnCompletion => 6,
+            Self::ApplicationArgs => 6,
+            Self::NumAppArgs => 0, // not settable (read-only)
+            Self::Accounts => 6,
+            Self::NumAccounts => 0, // not settable (read-only)
+            Self::ApprovalProgram => 6,
+            Self::ClearStateProgram => 6,
+            Self::RekeyTo => 6,
+            Self::ConfigAsset => 5,
+            Self::ConfigAssetTotal => 5,
+            Self::ConfigAssetDecimals => 5,
+            Self::ConfigAssetDefaultFrozen => 5,
+            Self::ConfigAssetUnitName => 5,
+            Self::ConfigAssetName => 5,
+            Self::ConfigAssetURL => 5,
+            Self::ConfigAssetMetadataHash => 5,
+            Self::ConfigAssetManager => 5,
+            Self::ConfigAssetReserve => 5,
+            Self::ConfigAssetFreeze => 5,
+            Self::ConfigAssetClawback => 5,
+            Self::FreezeAsset => 5,
+            Self::FreezeAssetAccount => 5,
+            Self::FreezeAssetFrozen => 5,
+            Self::Assets => 6,
+            Self::NumAssets => 0, // not settable (read-only)
+            Self::Applications => 6,
+            Self::NumApplications => 0, // not settable (read-only)
+            Self::GlobalNumUint => 6,
+            Self::GlobalNumByteSlice => 6,
+            Self::LocalNumUint => 6,
+            Self::LocalNumByteSlice => 6,
+            Self::ExtraProgramPages => 6,
+            Self::Nonparticipation => 6,
+            // Effects — not settable
+            Self::Logs => 0,
+            Self::NumLogs => 0,
+            Self::CreatedAssetID => 0,
+            Self::CreatedApplicationID => 0,
+            Self::LastLog => 0,
+            // Non-effect, but settable
+            Self::StateProofPK => 6,
+            // Pages — settable from v7
+            Self::ApprovalProgramPages => 7,
+            Self::NumApprovalProgramPages => 0, // read-only
+            Self::ClearStateProgramPages => 7,
+            Self::NumClearStateProgramPages => 0, // read-only
+            Self::RejectVersion => 12,
+        }
+    }
+
+    /// Format an unknown field index the same way Go's stringer does:
+    /// `"TxnField(N)"`.
+    pub fn unknown_display(index: u8) -> String {
+        format!("TxnField({})", index)
+    }
+}
+
 /// Inner transaction fields use the same field indices as regular transaction
 /// fields. Use [`TxnField`] for `itxn`, `itxn_field`, `gitxn`, etc.
 pub type ItxnField = TxnField;

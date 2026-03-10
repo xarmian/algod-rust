@@ -6,6 +6,7 @@ use algo_error::AlgoError;
 
 use crate::bytecode::Instruction;
 use crate::context::AvmContext;
+use crate::fields::TxnField;
 use crate::machine::AvmMachine;
 
 use super::helpers::{avm_to_teal, get_uint8, get_uint8_pair, get_uint8_triple, teal_to_avm};
@@ -26,12 +27,42 @@ pub fn op_itxn_begin(
 
 /// `itxn_field f` (0xb2): set a field on the inner transaction being built.
 /// 1 immediate: field byte. Pops one value from the stack.
+///
+/// Validates the field index before setting, matching go-algorand's
+/// `opItxnField` exactly:
+/// - Rejects unknown field indices
+/// - Rejects fields with `itxVersion == 0` (not settable in inner txns)
+/// - Rejects fields with `itxVersion > program_version` (version-gated)
 pub fn op_itxn_field(
     machine: &mut AvmMachine,
     instruction: &Instruction,
     ctx: &mut dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let field_byte = get_uint8(instruction)?;
+
+    // Validate field index, itxVersion != 0, itxVersion <= program version.
+    // Matches go-algorand opItxnField:
+    //   fs, ok := txnFieldSpecByField(field)
+    //   if !ok || fs.itxVersion == 0 || fs.itxVersion > cx.version { error }
+    match TxnField::from_u8(field_byte) {
+        Ok(field) => {
+            let itx_ver = field.itx_version();
+            if itx_ver == 0 || itx_ver > machine.version {
+                return Err(AlgoError::Avm {
+                    message: format!("invalid itxn_field {}", field),
+                });
+            }
+        }
+        Err(_) => {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "invalid itxn_field {}",
+                    TxnField::unknown_display(field_byte)
+                ),
+            });
+        }
+    }
+
     let value = machine.pop()?;
     ctx.itxn_field(field_byte, avm_to_teal(value))
 }
@@ -493,5 +524,119 @@ mod tests {
         m.step(&mut ctx).unwrap(); // gitxnas 1 25
         assert_eq!(m.stack.len(), 1);
         assert_eq!(m.stack[0], AvmValue::Uint64(65536 + 25 * 256 + 2));
+    }
+
+    // -- itxn_field validation tests --
+
+    /// Helper: build a program that does `pushint 0; itxn_field <field_byte>`
+    /// and run it at the given AVM version. Returns the error (if any).
+    fn try_itxn_field(version: u8, field_byte: u8) -> Result<(), AlgoError> {
+        let mut ctx = TestItxnContext::new();
+        // pushint 0 (0x81 0x00), itxn_field <field_byte> (0xb2 <field_byte>)
+        let raw = prog(version, &[0x81, 0x00, 0xb2, field_byte]);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        m.step(&mut ctx).unwrap(); // pushint 0
+        m.step(&mut ctx) // itxn_field
+    }
+
+    #[test]
+    fn test_itxn_field_rejects_unknown_field_index() {
+        // Field index 69 (invalidTxnField) and 200 are not valid TxnField values.
+        let err = try_itxn_field(10, 69).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid itxn_field TxnField(69)"),
+            "expected unknown field error, got: {}",
+            err
+        );
+
+        let err = try_itxn_field(10, 200).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid itxn_field TxnField(200)"),
+            "expected unknown field error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_itxn_field_rejects_unsettable_fields() {
+        // Fields with itxVersion == 0 cannot be set in inner txns.
+        // FirstValid (2) has itxVersion = 0
+        let err = try_itxn_field(10, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid itxn_field FirstValid"),
+            "expected unsettable field error, got: {}",
+            err
+        );
+
+        // GroupIndex (22) has itxVersion = 0
+        let err = try_itxn_field(10, 22).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid itxn_field GroupIndex"),
+            "expected unsettable field error, got: {}",
+            err
+        );
+
+        // NumAppArgs (27) has itxVersion = 0
+        let err = try_itxn_field(10, 27).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid itxn_field NumAppArgs"),
+            "expected unsettable field error, got: {}",
+            err
+        );
+
+        // Logs (58) has itxVersion = 0 (effects)
+        let err = try_itxn_field(10, 58).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid itxn_field Logs"),
+            "expected unsettable field error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_itxn_field_rejects_version_gated_fields() {
+        // Note has itxVersion = 6, so it should fail at version 5
+        let err = try_itxn_field(5, 5).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid itxn_field Note"),
+            "expected version-gated error, got: {}",
+            err
+        );
+
+        // ApprovalProgramPages has itxVersion = 7, should fail at version 6
+        let err = try_itxn_field(6, 64).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid itxn_field ApprovalProgramPages"),
+            "expected version-gated error, got: {}",
+            err
+        );
+
+        // RejectVersion has itxVersion = 12, should fail at version 11
+        let err = try_itxn_field(11, 68).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid itxn_field RejectVersion"),
+            "expected version-gated error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_itxn_field_accepts_valid_fields() {
+        // TypeEnum (16) has itxVersion = 5, should succeed at version 5
+        assert!(try_itxn_field(5, 16).is_ok());
+
+        // Sender (0) has itxVersion = 5, should succeed at version 5
+        assert!(try_itxn_field(5, 0).is_ok());
+
+        // Note (5) has itxVersion = 6, should succeed at version 6
+        assert!(try_itxn_field(6, 5).is_ok());
+
+        // ApprovalProgramPages (64) has itxVersion = 7, should succeed at version 7
+        assert!(try_itxn_field(7, 64).is_ok());
+
+        // RejectVersion (68) has itxVersion = 12, should succeed at version 12
+        assert!(try_itxn_field(12, 68).is_ok());
     }
 }
