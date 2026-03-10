@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -23,6 +23,33 @@ pub struct ReplayReport {
     pub failures: Vec<ReplayFailure>,
     pub elapsed_secs: f64,
     pub blocks_per_sec: f64,
+    /// AVM execution stats (present when --avm-execute is used).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avm_stats: Option<AvmReportStats>,
+}
+
+/// AVM execution statistics for the JSON report.
+#[derive(Debug, Serialize)]
+pub struct AvmReportStats {
+    pub app_calls_total: u64,
+    pub app_calls_matching: u64,
+    pub app_calls_mismatching: u64,
+    pub app_calls_errored: u64,
+    pub logicsig_total: u64,
+    pub logicsig_passed: u64,
+    pub logicsig_failed: u64,
+    pub opcode_coverage: OpcodeCoverageReport,
+    pub mismatch_categories: BTreeMap<String, u64>,
+}
+
+/// Opcode coverage statistics for the JSON report.
+#[derive(Debug, Serialize)]
+pub struct OpcodeCoverageReport {
+    pub hit_count: usize,
+    pub total_defined: usize,
+    pub coverage_pct: f64,
+    pub missed_opcodes: Vec<String>,
+    pub hit_opcodes: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,6 +260,7 @@ pub async fn run(
             failures,
             elapsed_secs: elapsed,
             blocks_per_sec,
+            avm_stats: None,
         };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -694,6 +722,11 @@ pub async fn run_stateful(
 
     // Write report if requested
     if let Some(path) = report_path {
+        let avm_stats = if avm_execute {
+            Some(build_avm_report_stats(&eval_delta_stats))
+        } else {
+            None
+        };
         let report = ReplayReport {
             network: network.to_string(),
             start_round: effective_start,
@@ -706,6 +739,7 @@ pub async fn run_stateful(
             failures,
             elapsed_secs: elapsed,
             blocks_per_sec,
+            avm_stats,
         };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -835,4 +869,42 @@ fn hex_decode(input: &[u8]) -> Result<Vec<u8>, ()> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
         .collect()
+}
+
+/// Convert EvalDeltaStats into a serializable AvmReportStats for JSON output.
+fn build_avm_report_stats(stats: &algo_ledger::EvalDeltaStats) -> AvmReportStats {
+    let cov = &stats.opcode_coverage;
+    let opcode_coverage = OpcodeCoverageReport {
+        hit_count: cov.hit_count(),
+        total_defined: cov.total_defined(),
+        coverage_pct: cov.coverage_pct(),
+        missed_opcodes: cov
+            .missed_opcodes()
+            .iter()
+            .map(|(byte, name)| format!("0x{byte:02x}:{name}"))
+            .collect(),
+        hit_opcodes: cov
+            .hit_opcodes()
+            .iter()
+            .map(|(byte, name)| format!("0x{byte:02x}:{name}"))
+            .collect(),
+    };
+
+    let mismatch_categories: BTreeMap<String, u64> = stats
+        .mismatch_categories
+        .iter()
+        .map(|(cat, count)| (cat.to_string(), *count))
+        .collect();
+
+    AvmReportStats {
+        app_calls_total: stats.app_calls_total,
+        app_calls_matching: stats.app_calls_matching,
+        app_calls_mismatching: stats.app_calls_mismatching,
+        app_calls_errored: stats.app_calls_errored,
+        logicsig_total: stats.logicsig_total,
+        logicsig_passed: stats.logicsig_passed,
+        logicsig_failed: stats.logicsig_failed,
+        opcode_coverage,
+        mismatch_categories,
+    }
 }

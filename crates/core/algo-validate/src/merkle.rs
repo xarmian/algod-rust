@@ -272,6 +272,20 @@ fn vc_hash(algo: HashAlgo, parts: &[&[u8]]) -> Vec<u8> {
     }
 }
 
+/// Hash helper that always uses SHA-256.
+///
+/// go-algorand's `txnMerkleElem.RawLeaf()` uses SHA-256 for leaf DATA
+/// (txid and stib_hash) when the tree hash type is either `Sha256` or
+/// `Sha512`. Only the `Sha512_256` tree type uses SHA-512/256 for leaf
+/// data. See `data/bookkeeping/txn_merkle.go` lines 101-107.
+fn vc_hash_sha256(parts: &[&[u8]]) -> Vec<u8> {
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p);
+    }
+    h.finalize().to_vec()
+}
+
 /// Return the zero hash for the given algorithm (all-zero bytes of the
 /// appropriate digest size).
 #[allow(dead_code)]
@@ -314,9 +328,15 @@ pub fn compute_vector_commitment(block: &Block, algo: HashAlgo) -> Vec<u8> {
     let n = block.payset.len();
 
     // Compute leaf hashes.
-    // go-algorand uses the SAME hash algorithm for txid, stib_hash, AND tree
-    // construction. For SHA512/256: txn.ID() + stib.Hash(). For SHA-256:
-    // txn.IDSha256() + stib.HashSHA256(). See data/bookkeeping/txn_merkle.go.
+    //
+    // go-algorand's `txnMerkleElem.RawLeaf()` (data/bookkeeping/txn_merkle.go)
+    // determines the hash algorithm for leaf DATA (txid and stib_hash):
+    //   - Sha512_256: uses txn.ID() (SHA-512/256) + stib.Hash() (SHA-512/256)
+    //   - Sha256 OR Sha512: uses txn.IDSha256() (SHA-256) + stib.HashSHA256() (SHA-256)
+    //
+    // The TREE construction (TL leaf wrapping, MA internal nodes) always uses
+    // the tree's own hash algorithm. So for Sha512 vector commitments, leaf
+    // data is SHA-256 but tree hashing is SHA-512.
     let leaf_hashes: Vec<Vec<u8>> = block
         .payset
         .iter()
@@ -331,10 +351,12 @@ pub fn compute_vector_commitment(block: &Block, algo: HashAlgo) -> Vec<u8> {
             }
 
             let txn_canonical = canonical_encode_transaction(&restored_txn);
-            let txid = vc_hash(algo, &[TX_PREFIX, &txn_canonical]);
+            // Leaf data (txid, stib_hash) always uses SHA-256 for both
+            // Sha256 and Sha512 vector commitments.
+            let txid = vc_hash_sha256(&[TX_PREFIX, &txn_canonical]);
 
             let stib_canonical = canonical_encode_signed_txn_in_block(stx);
-            let stib_hash = vc_hash(algo, &[STIB_PREFIX, &stib_canonical]);
+            let stib_hash = vc_hash_sha256(&[STIB_PREFIX, &stib_canonical]);
 
             vc_leaf_hash(algo, &txid, &stib_hash)
         })
@@ -478,8 +500,9 @@ pub fn compute_vector_commitment_raw(
 
     let n = block.payset.len();
 
-    // go-algorand uses the SAME hash algo for txid, stib_hash, AND tree
-    // construction. See data/bookkeeping/txn_merkle.go RawLeaf().
+    // go-algorand's RawLeaf() uses SHA-256 for leaf data (txid, stib_hash)
+    // when the tree hash type is Sha256 or Sha512. Only Sha512_256 uses
+    // SHA-512/256 for leaf data. See data/bookkeeping/txn_merkle.go.
     let leaf_hashes: Vec<Vec<u8>> = block
         .payset
         .iter()
@@ -495,10 +518,11 @@ pub fn compute_vector_commitment_raw(
             }
 
             let txn_canonical = canonical_encode_transaction(&restored_txn);
-            let txid = vc_hash(algo, &[TX_PREFIX, &txn_canonical]);
+            // Leaf data always uses SHA-256 for vector commitments.
+            let txid = vc_hash_sha256(&[TX_PREFIX, &txn_canonical]);
 
             // Use raw blob for stib_hash (preserves unknown fields).
-            let stib_hash = vc_hash(algo, &[STIB_PREFIX, raw_blob]);
+            let stib_hash = vc_hash_sha256(&[STIB_PREFIX, raw_blob]);
 
             vc_leaf_hash(algo, &txid, &stib_hash)
         })
@@ -877,5 +901,89 @@ mod tests {
         let root = compute_vector_commitment(&block, HashAlgo::Sha256);
         assert_eq!(root.len(), 32);
         assert_ne!(root, vec![0u8; 32]);
+    }
+
+    #[test]
+    fn vc_sha512_uses_sha256_for_leaf_data() {
+        // go-algorand's txnMerkleElem.RawLeaf() uses SHA-256 for leaf data
+        // (txid, stib_hash) when the tree hash type is Sha256 OR Sha512.
+        // Only the tree construction (TL wrapping, MA nodes) uses SHA-512.
+        //
+        // Verify this by manually computing:
+        //   txid = SHA256("TX" || canonical_txn)
+        //   stib_hash = SHA256("STIB" || canonical_stib)
+        //   leaf = SHA512("TL" || txid || stib_hash)
+        // and checking the single-txn root matches.
+        let stx = minimal_signed_txn(1000);
+        let block = minimal_block(vec![stx.clone()]);
+
+        // Restore genesis fields for txid.
+        let mut restored_txn = stx.txn.clone();
+        restored_txn.genesis_id = "test-v1".into();
+        restored_txn.genesis_hash = ByteBuf::from(vec![0xBB; 32]);
+
+        let txn_canonical = canonical_encode_transaction(&restored_txn);
+        // Leaf data uses SHA-256.
+        let txid = vc_hash_sha256(&[TX_PREFIX, &txn_canonical]);
+
+        let stib_canonical = canonical_encode_signed_txn_in_block(&stx);
+        let stib_hash = vc_hash_sha256(&[STIB_PREFIX, &stib_canonical]);
+
+        // Tree construction uses SHA-512.
+        let expected_leaf = vc_hash(HashAlgo::Sha512, &[TL_PREFIX, &txid, &stib_hash]);
+
+        let root = compute_vector_commitment(&block, HashAlgo::Sha512);
+        assert_eq!(root.len(), 64);
+        assert_eq!(
+            root, expected_leaf,
+            "SHA-512 VC single-txn root should use SHA-256 for leaf data and SHA-512 for tree"
+        );
+    }
+
+    #[test]
+    fn vc_sha256_leaf_data_matches_tree_algo() {
+        // For SHA-256 vector commitments, leaf data also uses SHA-256
+        // (same algorithm for both). Verify manually.
+        let stx = minimal_signed_txn(1000);
+        let block = minimal_block(vec![stx.clone()]);
+
+        let mut restored_txn = stx.txn.clone();
+        restored_txn.genesis_id = "test-v1".into();
+        restored_txn.genesis_hash = ByteBuf::from(vec![0xBB; 32]);
+
+        let txn_canonical = canonical_encode_transaction(&restored_txn);
+        let txid = vc_hash_sha256(&[TX_PREFIX, &txn_canonical]);
+
+        let stib_canonical = canonical_encode_signed_txn_in_block(&stx);
+        let stib_hash = vc_hash_sha256(&[STIB_PREFIX, &stib_canonical]);
+
+        let expected_leaf = vc_hash(HashAlgo::Sha256, &[TL_PREFIX, &txid, &stib_hash]);
+
+        let root = compute_vector_commitment(&block, HashAlgo::Sha256);
+        assert_eq!(root.len(), 32);
+        assert_eq!(
+            root, expected_leaf,
+            "SHA-256 VC single-txn root should use SHA-256 for everything"
+        );
+    }
+
+    #[test]
+    fn vc_raw_sha512_uses_sha256_for_leaf_data() {
+        // Same as vc_sha512_uses_sha256_for_leaf_data but for the raw-passthrough path.
+        let stx = minimal_signed_txn(1000);
+        let block = minimal_block(vec![stx.clone()]);
+        let raw_blob = canonical_encode_signed_txn_in_block(&stx);
+
+        let mut restored_txn = stx.txn.clone();
+        restored_txn.genesis_id = "test-v1".into();
+        restored_txn.genesis_hash = ByteBuf::from(vec![0xBB; 32]);
+
+        let txn_canonical = canonical_encode_transaction(&restored_txn);
+        let txid = vc_hash_sha256(&[TX_PREFIX, &txn_canonical]);
+        let stib_hash = vc_hash_sha256(&[STIB_PREFIX, &raw_blob]);
+        let expected_leaf = vc_hash(HashAlgo::Sha512, &[TL_PREFIX, &txid, &stib_hash]);
+
+        let root = compute_vector_commitment_raw(&block, HashAlgo::Sha512, &[raw_blob]);
+        assert_eq!(root, expected_leaf);
     }
 }

@@ -68,13 +68,73 @@ pub fn op_callsub(machine: &mut AvmMachine, instruction: &Instruction) -> Result
     machine.push_call_frame(CallFrame {
         return_pc,
         frame_pointer,
+        clear: false,
+        args: 0,
+        returns: 0,
     })?;
-    branch(machine, instruction)
+    branch(machine, instruction)?;
+
+    // Handshake with proto: set from_callsub if the branch target is a proto (0x8a).
+    // Go: cx.fromCallsub = true only when cx.program[cx.nextpc] == protoByte
+    const PROTO_BYTE: u8 = 0x8a;
+    if machine.pc < machine.program.instructions.len()
+        && machine.program.instructions[machine.pc].opcode == PROTO_BYTE
+    {
+        machine.from_callsub = true;
+    }
+
+    Ok(())
 }
 
 /// `retsub` (0x89): pop call frame and return to saved PC.
+///
+/// When `proto` was used (frame.clear == true), performs Go-style stack cleanup:
+/// copies the top `returns` values down over the arguments, then truncates the stack.
 pub fn op_retsub(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let frame = machine.pop_call_frame()?;
+
+    if frame.clear {
+        // Go: expect = frame.height + frame.returns
+        let expect = frame.frame_pointer + frame.returns;
+        if machine.stack.len() < expect {
+            if machine.stack.len() < frame.frame_pointer {
+                return Err(AlgoError::Avm {
+                    message: "retsub executed with stack below frame. Did you pop args?"
+                        .to_string(),
+                });
+            } else if machine.stack.len() == frame.frame_pointer {
+                return Err(AlgoError::Avm {
+                    message: format!(
+                        "retsub executed with no return values on stack. proto declared {}",
+                        frame.returns
+                    ),
+                });
+            } else {
+                return Err(AlgoError::Avm {
+                    message: format!(
+                        "retsub executed with {} return values on stack. proto declared {}",
+                        machine.stack.len() - frame.frame_pointer,
+                        frame.returns
+                    ),
+                });
+            }
+        }
+
+        // Go: argstart = frame.height - frame.args
+        let argstart = frame.frame_pointer - frame.args;
+
+        // Copy return values from [frame_pointer .. frame_pointer+returns)
+        // down to [argstart .. argstart+returns).
+        // We need to handle potential overlap, so collect first.
+        let return_values = machine.stack[frame.frame_pointer..expect].to_vec();
+        for (i, val) in return_values.into_iter().enumerate() {
+            machine.stack[argstart + i] = val;
+        }
+
+        // Truncate stack to argstart + returns.
+        machine.stack.truncate(argstart + frame.returns);
+    }
+
     machine.pc = frame.return_pc;
     Ok(())
 }
@@ -82,8 +142,17 @@ pub fn op_retsub(machine: &mut AvmMachine, _instruction: &Instruction) -> Result
 /// `proto a r` (0x8a): declare subroutine expects `a` args and returns `r` values.
 /// In go-algorand, callsub sets frame_pointer = stack.len() *before* entering the
 /// callee, so the callee's arguments live *below* frame_pointer.
+/// Proto marks the current call frame for stack cleanup on retsub.
 pub fn op_proto(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(), AlgoError> {
-    let (num_args, _num_returns) = if let Immediates::Uint8Pair(a, r) = instruction.immediates {
+    // Go: "proto was executed without a callsub"
+    if !machine.from_callsub {
+        return Err(AlgoError::Avm {
+            message: "proto was executed without a callsub".to_string(),
+        });
+    }
+    machine.from_callsub = false;
+
+    let (num_args, num_returns) = if let Immediates::Uint8Pair(a, r) = instruction.immediates {
         (a as usize, r as usize)
     } else {
         return Err(AlgoError::Avm {
@@ -92,21 +161,26 @@ pub fn op_proto(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(
     };
 
     // Arguments were pushed before callsub, so they live below the frame pointer.
-    let frame_pointer = if let Some(frame) = machine.call_stack.last() {
-        frame.frame_pointer
-    } else {
-        return Err(AlgoError::Avm {
+    let frame = machine
+        .call_stack
+        .last_mut()
+        .ok_or_else(|| AlgoError::Avm {
             message: "proto: no call frame (not inside a subroutine)".to_string(),
-        });
-    };
+        })?;
 
-    if frame_pointer < num_args {
+    if frame.frame_pointer < num_args {
         return Err(AlgoError::Avm {
             message: format!(
-                "proto: expected {num_args} args below frame pointer, but frame pointer is {frame_pointer}"
+                "proto: expected {num_args} args below frame pointer, but frame pointer is {}",
+                frame.frame_pointer
             ),
         });
     }
+
+    // Mark the frame for cleanup on retsub (Go: frame.clear = true).
+    frame.clear = true;
+    frame.args = num_args;
+    frame.returns = num_returns;
 
     Ok(())
 }

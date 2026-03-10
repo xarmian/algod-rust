@@ -456,6 +456,19 @@ pub fn lookup_by_name(name: &str) -> Option<&'static OpSpec> {
         .find(|s| s.name == name)
 }
 
+/// Return all defined opcodes as `(byte, name)` pairs, sorted by byte value.
+pub fn all_opcodes() -> Vec<(u8, &'static str)> {
+    OPCODE_TABLE
+        .iter()
+        .filter_map(|o| o.as_ref().map(|spec| (spec.opcode, spec.name)))
+        .collect()
+}
+
+/// Return the total number of defined opcodes (the coverage denominator).
+pub fn defined_opcode_count() -> usize {
+    OPCODE_TABLE.iter().filter(|o| o.is_some()).count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,5 +573,33 @@ mod tests {
             count >= 140,
             "only {count} opcodes defined, expected >= 140"
         );
+    }
+
+    #[test]
+    fn test_all_opcodes() {
+        let all = all_opcodes();
+        assert!(
+            all.len() >= 140,
+            "expected >= 140 opcodes, got {}",
+            all.len()
+        );
+        // Should be sorted by byte value (since we iterate 0..255).
+        for pair in all.windows(2) {
+            assert!(
+                pair[0].0 < pair[1].0,
+                "not sorted: {} >= {}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+        // First opcode should be err (0x00).
+        assert_eq!(all[0], (0x00, "err"));
+    }
+
+    #[test]
+    fn test_defined_opcode_count() {
+        let count = defined_opcode_count();
+        let all = all_opcodes();
+        assert_eq!(count, all.len());
     }
 }

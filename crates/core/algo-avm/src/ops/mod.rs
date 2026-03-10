@@ -7,6 +7,7 @@ pub mod arithmetic;
 pub mod bytes;
 pub mod constants;
 pub mod crypto;
+pub mod ec;
 pub mod falcon;
 pub mod flow;
 pub mod global;
@@ -296,6 +297,14 @@ pub fn dispatch(
         // ---- Box splice/resize (v10+) ----
         0xd2 => state::op_box_splice(machine, instruction, ctx),
         0xd3 => state::op_box_resize(machine, instruction, ctx),
+
+        // ---- Elliptic curve opcodes (v10+) ----
+        0xe0 => ec::op_ec_add(machine, instruction),
+        0xe1 => ec::op_ec_scalar_mul(machine, instruction),
+        0xe2 => ec::op_ec_pairing_check(machine, instruction),
+        0xe3 => ec::op_ec_multi_scalar_mul(machine, instruction),
+        0xe4 => ec::op_ec_subgroup_check(machine, instruction),
+        0xe5 => ec::op_ec_map_to(machine, instruction),
 
         // ---- Everything else: not yet implemented ----
         _ => {

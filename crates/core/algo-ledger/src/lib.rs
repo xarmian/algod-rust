@@ -20,6 +20,7 @@ pub use apply::{
 pub use avm_context::{type_enum, LedgerAvmContext};
 pub use eval_compare::{
     compare_eval_delta, CompareResult, EvalDeltaMismatchDetail, EvalDeltaStats, FieldMismatch,
+    MismatchCategory,
 };
 pub use eval_delta::{parse_eval_delta, DeltaAction, EvalDelta, ValueDelta};
 pub use genesis::{parse_genesis_json, populate_store, GenesisAllocation, GenesisJson};

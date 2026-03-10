@@ -10,6 +10,8 @@ use algo_types::{SignedTransaction, TealValue};
 use sha2::{Digest, Sha512_256};
 
 use crate::context::AvmContext;
+use crate::fields::GlobalField;
+use crate::opcode::MAX_AVM_VERSION;
 use crate::txn_fields::read_txn_field;
 
 /// Domain separation prefix for program hashing.
@@ -31,6 +33,8 @@ pub struct LogicSigAvmContext<'a> {
     args: Vec<Vec<u8>>,
     /// SHA-512/256 hash of `"Program" || program_bytes`.
     program_hash: [u8; 32],
+    /// Genesis hash from the transaction header (for `global GenesisHash`).
+    genesis_hash: [u8; 32],
 }
 
 impl<'a> LogicSigAvmContext<'a> {
@@ -50,16 +54,84 @@ impl<'a> LogicSigAvmContext<'a> {
         hasher.update(program);
         let hash: [u8; 32] = hasher.finalize().into();
 
+        // Extract genesis hash from the current transaction's header.
+        let genesis_hash = if group_index < group.len() {
+            let gh = &group[group_index].txn.genesis_hash;
+            if gh.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(gh);
+                arr
+            } else {
+                [0u8; 32]
+            }
+        } else {
+            [0u8; 32]
+        };
+
         LogicSigAvmContext {
             group,
             group_index,
             args,
             program_hash: hash,
+            genesis_hash,
         }
     }
 }
 
 impl<'a> AvmContext for LogicSigAvmContext<'a> {
+    // ---- Global fields ----
+
+    fn global_field(&self, field: u8) -> Result<TealValue, AlgoError> {
+        let gf = GlobalField::from_u8(field)?;
+        match gf {
+            // modeAny fields — available in both Sig and App mode.
+            GlobalField::MinTxnFee => Ok(TealValue::Uint(1000)),
+            GlobalField::MinBalance => Ok(TealValue::Uint(100_000)),
+            GlobalField::MaxTxnLife => Ok(TealValue::Uint(1000)),
+            GlobalField::ZeroAddress => Ok(TealValue::Bytes(vec![0u8; 32])),
+            GlobalField::GroupSize => Ok(TealValue::Uint(self.group.len() as u64)),
+            GlobalField::LogicSigVersion => Ok(TealValue::Uint(MAX_AVM_VERSION as u64)),
+            GlobalField::GroupID => {
+                let group_id = if self.group_index < self.group.len() {
+                    let g = &self.group[self.group_index].txn.group;
+                    if g.is_empty() {
+                        vec![0u8; 32]
+                    } else {
+                        g.to_vec()
+                    }
+                } else {
+                    vec![0u8; 32]
+                };
+                Ok(TealValue::Bytes(group_id))
+            }
+            // OpcodeBudget is handled directly by op_global (reads machine.budget);
+            // this fallback returns 0 but should not normally be reached.
+            GlobalField::OpcodeBudget => Ok(TealValue::Uint(0)),
+            GlobalField::AssetCreateMinBalance => Ok(TealValue::Uint(100_000)),
+            GlobalField::AssetOptInMinBalance => Ok(TealValue::Uint(100_000)),
+            GlobalField::GenesisHash => Ok(TealValue::Bytes(self.genesis_hash.to_vec())),
+            // Payouts fields — default to 0 (protocol-specific, not commonly
+            // available in LogicSig context but are modeAny in Go).
+            GlobalField::PayoutsEnabled
+            | GlobalField::PayoutsGoOnlineFee
+            | GlobalField::PayoutsPercent
+            | GlobalField::PayoutsMinBalance
+            | GlobalField::PayoutsMaxBalance => Ok(TealValue::Uint(0)),
+            // ModeApp-only fields — should never reach here because op_global
+            // rejects them in LogicSig mode before calling global_field(), but
+            // return an error for completeness.
+            GlobalField::Round
+            | GlobalField::LatestTimestamp
+            | GlobalField::CurrentApplicationID
+            | GlobalField::CreatorAddress
+            | GlobalField::CurrentApplicationAddress
+            | GlobalField::CallerApplicationID
+            | GlobalField::CallerApplicationAddress => Err(AlgoError::Avm {
+                message: format!("global[{field}] not available in LogicSig mode"),
+            }),
+        }
+    }
+
     // ---- Transaction access ----
 
     fn txn_field(
@@ -223,5 +295,154 @@ mod tests {
         let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
 
         assert!(ctx.txn_field(1, 0, None).is_err());
+    }
+
+    // ---- global_field tests ----
+
+    #[test]
+    fn global_field_min_txn_fee() {
+        let stxn = make_pay_stxn([0x10; 32]);
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+
+        assert_eq!(ctx.global_field(0).unwrap(), TealValue::Uint(1000));
+    }
+
+    #[test]
+    fn global_field_min_balance() {
+        let stxn = make_pay_stxn([0x10; 32]);
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+
+        assert_eq!(ctx.global_field(1).unwrap(), TealValue::Uint(100_000));
+    }
+
+    #[test]
+    fn global_field_max_txn_life() {
+        let stxn = make_pay_stxn([0x10; 32]);
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+
+        assert_eq!(ctx.global_field(2).unwrap(), TealValue::Uint(1000));
+    }
+
+    #[test]
+    fn global_field_zero_address() {
+        let stxn = make_pay_stxn([0x10; 32]);
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+
+        assert_eq!(
+            ctx.global_field(3).unwrap(),
+            TealValue::Bytes(vec![0u8; 32])
+        );
+    }
+
+    #[test]
+    fn global_field_group_size() {
+        let stxn1 = make_pay_stxn([0x10; 32]);
+        let stxn2 = make_pay_stxn([0x20; 32]);
+        let group = vec![stxn1, stxn2];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+
+        assert_eq!(ctx.global_field(4).unwrap(), TealValue::Uint(2));
+    }
+
+    #[test]
+    fn global_field_logicsig_version() {
+        let stxn = make_pay_stxn([0x10; 32]);
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+
+        assert_eq!(
+            ctx.global_field(5).unwrap(),
+            TealValue::Uint(MAX_AVM_VERSION as u64)
+        );
+    }
+
+    #[test]
+    fn global_field_group_id() {
+        let mut stxn = make_pay_stxn([0x10; 32]);
+        stxn.txn.group = vec![0xAA; 32].into();
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+
+        assert_eq!(
+            ctx.global_field(11).unwrap(),
+            TealValue::Bytes(vec![0xAA; 32])
+        );
+    }
+
+    #[test]
+    fn global_field_group_id_empty() {
+        let stxn = make_pay_stxn([0x10; 32]);
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+
+        // Empty group field should return 32 zero bytes.
+        assert_eq!(
+            ctx.global_field(11).unwrap(),
+            TealValue::Bytes(vec![0u8; 32])
+        );
+    }
+
+    #[test]
+    fn global_field_asset_min_balances() {
+        let stxn = make_pay_stxn([0x10; 32]);
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+
+        assert_eq!(ctx.global_field(15).unwrap(), TealValue::Uint(100_000)); // AssetCreateMinBalance
+        assert_eq!(ctx.global_field(16).unwrap(), TealValue::Uint(100_000)); // AssetOptInMinBalance
+    }
+
+    #[test]
+    fn global_field_genesis_hash() {
+        let mut stxn = make_pay_stxn([0x10; 32]);
+        stxn.txn.genesis_hash = vec![0xBB; 32].into();
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+
+        assert_eq!(
+            ctx.global_field(17).unwrap(),
+            TealValue::Bytes(vec![0xBB; 32])
+        );
+    }
+
+    #[test]
+    fn global_field_payouts_default_zero() {
+        let stxn = make_pay_stxn([0x10; 32]);
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+
+        for field_byte in 18..=22 {
+            assert_eq!(
+                ctx.global_field(field_byte).unwrap(),
+                TealValue::Uint(0),
+                "Payouts field {field_byte} should default to 0"
+            );
+        }
+    }
+
+    #[test]
+    fn global_field_app_mode_only_returns_error() {
+        let stxn = make_pay_stxn([0x10; 32]);
+        let group = vec![stxn];
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+
+        // Round (6), LatestTimestamp (7), CurrentApplicationID (8),
+        // CreatorAddress (9), CurrentApplicationAddress (10)
+        for field_byte in [6, 7, 8, 9, 10, 13, 14] {
+            let result = ctx.global_field(field_byte);
+            assert!(
+                result.is_err(),
+                "global[{field_byte}] should error in LogicSig mode"
+            );
+            let msg = format!("{}", result.unwrap_err());
+            assert!(
+                msg.contains("not available in LogicSig"),
+                "unexpected error for field {field_byte}: {msg}"
+            );
+        }
     }
 }

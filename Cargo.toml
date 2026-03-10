@@ -73,3 +73,10 @@ algo-validate = { path = "crates/core/algo-validate" }
 algo-ledger = { path = "crates/core/algo-ledger" }
 algo-avm = { path = "crates/core/algo-avm" }
 num-bigint = "0.4"
+
+# Elliptic curves (for AVM ec_* opcodes)
+ark-ff = "0.5"
+ark-ec = { version = "0.5", features = ["parallel"] }
+ark-bn254 = "0.5"
+ark-bls12-381 = "0.5"
+ark-serialize = "0.5"

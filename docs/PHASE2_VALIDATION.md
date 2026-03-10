@@ -123,16 +123,16 @@ Test breakdown by crate:
 
 ## Known Gaps
 
-| Gap | Notes | Phase |
-|-----|-------|-------|
-| TEAL program execution | EvalDelta applied from recorded block data. Independent TEAL execution deferred. | Phase 3 |
-| Independent EvalDelta computation | Inner transaction results taken from recorded ApplyData. | Phase 3 |
-| Full inner transaction re-execution | Applied from recorded data; not independently re-derived. | Phase 3 |
-| Box storage deep verification | Min-balance impact modeled; deep box state verification needs AVM. | Phase 3 |
-| `normalizedonlinebalance` | Placeholder (uses micro_algos, not Go's sortition-weighted value). | Phase 3+ |
+| Gap | Notes | Status |
+|-----|-------|--------|
+| ~~TEAL program execution~~ | ~~EvalDelta applied from recorded block data. Independent TEAL execution deferred.~~ | **Closed -- Phase 3** (Epic 23: `--avm-execute` flag, independent EvalDelta computation) |
+| ~~Independent EvalDelta computation~~ | ~~Inner transaction results taken from recorded ApplyData.~~ | **Closed -- Phase 3** (Epic 23: EvalDelta independently derived from TEAL execution) |
+| ~~Full inner transaction re-execution~~ | ~~Applied from recorded data; not independently re-derived.~~ | **Closed -- Phase 3** (Epic 21: recursive inner txn execution with depth limiting) |
+| ~~Box storage deep verification~~ | ~~Min-balance impact modeled; deep box state verification needs AVM.~~ | **Closed -- Phase 3** (Epic 22b: all 9 box opcodes implemented with min-balance tracking) |
+| ~~Fuzz target coverage~~ | ~~Fuzz targets use msgpack deserialization of random bytes; most inputs fail early.~~ | **Closed -- Phase 3** (2 new structured fuzz targets: fuzz_teal_program, fuzz_avm_context) |
+| `normalizedonlinebalance` | Placeholder (uses micro_algos, not Go's sortition-weighted value). | Phase 4 |
 | Stateful mainnet replay from genesis | Requires sequential replay from round 0 (44M+ blocks). Catchpoint sync would enable mid-chain start. | Phase 4 |
 | 4 commitment mismatches in stateless mode | Expected: stateless mode does not provide raw blobs for STIB encoding. Use `--stateful` mode for raw-blob commitment verification. | N/A (by design) |
-| Fuzz target coverage | Fuzz targets use msgpack deserialization of random bytes; most inputs fail early. Structured fuzzing (`Arbitrary` on full types) would improve coverage. | Future |
 
 ---
 
