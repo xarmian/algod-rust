@@ -5,7 +5,7 @@
 //! the AVM can read/write chain state through the `AvmContext` trait defined
 //! in `algo-avm`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use algo_avm::context::AvmContext;
 use algo_avm::eval::AvmResult;
@@ -25,6 +25,17 @@ use crate::store_trait::LedgerStore;
 /// Maximum byte string length in the AVM (matches go-algorand `maxStringSize`).
 /// Used for program page chunking.
 const MAX_STRING_SIZE: usize = 4096;
+
+/// Box operation types for dirty-byte tracking in `available_box`.
+/// Matches go-algorand's `BoxOperation` enum in `box.go`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoxOperation {
+    Create,
+    Read,
+    Write,
+    Delete,
+    Resize,
+}
 
 // ---------------------------------------------------------------------------
 // Helper: transaction type string -> TypeEnum integer
@@ -700,6 +711,28 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     ///
     /// Matches go-algorand's `cx.caller.txn.ID()` / `cx.caller.currentTxID()`.
     pub parent_txn_id: algo_types::Digest,
+
+    // ---- Box I/O budget tracking ----
+    /// Available box references: `(app_id, box_name) -> is_dirty`.
+    /// Populated from the transaction group's box references on first use.
+    available_boxes: HashMap<(u64, Vec<u8>), bool>,
+
+    /// Whether `available_boxes` has been populated yet.
+    boxes_initialized: bool,
+
+    /// Total dirty bytes written to boxes (must not exceed `io_budget`).
+    dirty_bytes: u64,
+
+    /// I/O budget: `num_box_refs * BYTES_PER_BOX_REFERENCE`.
+    io_budget: u64,
+
+    /// Whether the read budget check has already been performed.
+    read_budget_checked: bool,
+
+    /// Number of "unnamed" box refs (empty box refs) that can be used by
+    /// newly created apps to access boxes not named in box refs.
+    /// Matches go-algorand's `resources.unnamedAccess`.
+    unnamed_access: i64,
 }
 
 // Helper to create a default scratch row (256 zero-uint slots).
@@ -751,6 +784,12 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             created_assets: Vec::new(),
             created_apps: Vec::new(),
             parent_txn_id: algo_types::Digest([0u8; 32]),
+            available_boxes: HashMap::new(),
+            boxes_initialized: false,
+            dirty_bytes: 0,
+            io_budget: 0,
+            read_budget_checked: false,
+            unnamed_access: 0,
         }
     }
 
@@ -777,6 +816,258 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// Precomputed inner transaction IDs, mirroring `inner_txns` structure.
     pub fn inner_txn_ids(&self) -> &[Vec<algo_types::Digest>] {
         &self.inner_txn_ids
+    }
+
+    // ---- Box helpers ----
+
+    /// Lazily initialize the available-boxes map and I/O budget from the
+    /// transaction group's box references. Matches go-algorand's
+    /// `computeAvailability` + `fillApplicationCallForeign` for boxes.
+    fn ensure_boxes_initialized(&mut self) {
+        if self.boxes_initialized {
+            return;
+        }
+        self.boxes_initialized = true;
+
+        let mut num_box_refs: u64 = 0;
+
+        for stxn in &self.group {
+            let txn = &stxn.txn;
+            // Determine the app ID for this transaction (0 means "current app"
+            // which we resolve to the callee's app_id).
+            let txn_app_id = if txn.application_id == 0 {
+                // For app creation txns, the app_id is assigned at creation
+                // time. We use self.app_id which has already been set.
+                self.app_id
+            } else {
+                txn.application_id
+            };
+
+            if let Some(ref box_refs) = txn.boxes {
+                for br in box_refs {
+                    num_box_refs += 1;
+
+                    // Empty box ref (index=0, no name) bumps unnamed access
+                    // and I/O budget but doesn't add availability.
+                    let is_empty = br.index == 0 && br.name.as_ref().map_or(true, |n| n.is_empty());
+                    if is_empty {
+                        self.unnamed_access += 1;
+                        continue;
+                    }
+
+                    // Non-empty box ref: extract name for availability.
+                    let name = match &br.name {
+                        Some(n) if !n.is_empty() => n.to_vec(),
+                        _ => continue,
+                    };
+
+                    // Resolve the app index:
+                    // index 0 means "this app" (the app being called in this txn).
+                    // index > 0 is 1-based into foreign apps.
+                    let app_id = if br.index == 0 {
+                        txn_app_id
+                    } else {
+                        let fa = txn.foreign_apps.as_ref();
+                        let idx = (br.index - 1) as usize;
+                        match fa.and_then(|apps| apps.get(idx)) {
+                            Some(&id) => id,
+                            None => continue, // invalid ref, skip
+                        }
+                    };
+
+                    // Mark as available, not dirty.
+                    self.available_boxes.entry((app_id, name)).or_insert(false);
+                }
+            }
+        }
+
+        self.io_budget = num_box_refs.saturating_mul(params::BYTES_PER_BOX_REFERENCE);
+    }
+
+    /// Perform the one-time read budget check (on first box read for a
+    /// top-level call). Sums the sizes of all available boxes and verifies
+    /// against the I/O budget. Matches go-algorand's read budget check in
+    /// `EvalContract`.
+    fn check_read_budget(&mut self) -> Result<(), AlgoError> {
+        if self.read_budget_checked {
+            return Ok(());
+        }
+        // Inner transactions inherit the budget and skip the read check.
+        if self.caller_app_id_val != 0 {
+            self.read_budget_checked = true;
+            return Ok(());
+        }
+
+        self.read_budget_checked = true;
+        let mut used: u64 = 0;
+
+        // Iterate over a snapshot of box keys.
+        let keys: Vec<(u64, Vec<u8>)> = self.available_boxes.keys().cloned().collect();
+        for (app_id, name) in &keys {
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(content) = self.store.get_box(*app_id, name) {
+                let size = content.len() as u64;
+                used = used.saturating_add(size);
+                if used > self.io_budget {
+                    return Err(AlgoError::Avm {
+                        message: format!("box read budget ({}) exceeded", self.io_budget),
+                    });
+                }
+                // Mark as not-dirty (content is cached / known).
+                self.available_boxes.insert((*app_id, name.clone()), false);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Box availability check and dirty tracking, matching go-algorand's
+    /// `availableBox`. Returns `(contents, exists)`.
+    ///
+    /// `operation`: 0=create, 1=read, 2=write, 3=delete, 4=resize.
+    /// `create_size`: used for create/write/resize to track dirty bytes.
+    fn available_box(
+        &mut self,
+        name: &[u8],
+        operation: BoxOperation,
+        create_size: u64,
+    ) -> Result<(Vec<u8>, bool), AlgoError> {
+        // ClearState programs cannot access boxes.
+        let on_completion = self.group[self.group_index].txn.on_completion;
+        if on_completion == ON_COMPLETION_CLEAR_STATE {
+            return Err(AlgoError::Avm {
+                message: "boxes may not be accessed from ClearState program".into(),
+            });
+        }
+
+        self.ensure_boxes_initialized();
+        self.check_read_budget()?;
+
+        let key = (self.app_id, name.to_vec());
+        let mut ok = self.available_boxes.contains_key(&key);
+
+        // newAppAccess fallback: if the current app was newly created in this
+        // group, allow box access using an unnamed (empty) box ref slot.
+        // Matches go-algorand's `availableBox` newAppAccess logic.
+        let mut new_app_access = false;
+        if !ok && self.created_apps.contains(&self.app_id) && self.unnamed_access > 0 {
+            ok = true;
+            new_app_access = true;
+            self.unnamed_access -= 1;
+            // dirty will start as false; it will be marked dirty below
+            // for creates/writes and added to available_boxes
+        }
+
+        if !ok {
+            return Err(AlgoError::Avm {
+                message: format!("invalid Box reference {:?}", name),
+            });
+        }
+
+        let dirty = if new_app_access {
+            false
+        } else {
+            *self.available_boxes.get(&key).unwrap()
+        };
+
+        // Read the box content from the store.
+        // For newAppAccess, skip disk lookup -- we know the box doesn't exist yet.
+        let (content, exists) = if new_app_access {
+            (Vec::new(), false)
+        } else {
+            match self.store.get_box(self.app_id, name) {
+                Some(v) => (v, true),
+                None => (Vec::new(), false),
+            }
+        };
+
+        // Track dirtiness and enforce write budget.
+        let new_dirty = match operation {
+            BoxOperation::Create => {
+                if exists {
+                    if create_size != content.len() as u64 {
+                        return Err(AlgoError::Avm {
+                            message: format!("box size mismatch {} {}", content.len(), create_size),
+                        });
+                    }
+                    // Box already exists with correct size, no dirty work.
+                    return Ok((content, true));
+                }
+                // New box creation — treat as write.
+                if !dirty {
+                    self.dirty_bytes += create_size;
+                }
+                true
+            }
+            BoxOperation::Write => {
+                let write_size = if exists {
+                    content.len() as u64
+                } else {
+                    create_size
+                };
+                if !dirty {
+                    self.dirty_bytes += write_size;
+                }
+                true
+            }
+            BoxOperation::Resize => {
+                if dirty {
+                    self.dirty_bytes -= content.len() as u64;
+                }
+                self.dirty_bytes += create_size;
+                true
+            }
+            BoxOperation::Delete => {
+                if dirty {
+                    self.dirty_bytes -= content.len() as u64;
+                }
+                false
+            }
+            BoxOperation::Read => dirty,
+        };
+
+        self.available_boxes.insert(key, new_dirty);
+
+        if self.dirty_bytes > self.io_budget {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "write budget ({}) exceeded {}",
+                    self.io_budget, self.dirty_bytes
+                ),
+            });
+        }
+
+        Ok((content, exists))
+    }
+
+    /// Validate box name length and box size against protocol limits.
+    fn box_length_checks(name: &[u8], size: u64) -> Result<(), AlgoError> {
+        if name.is_empty() {
+            return Err(AlgoError::Avm {
+                message: "box names may not be zero length".into(),
+            });
+        }
+        if name.len() > params::MAX_APP_KEY_LEN {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "name too long: length was {}, maximum is {}",
+                    name.len(),
+                    params::MAX_APP_KEY_LEN
+                ),
+            });
+        }
+        if size > params::MAX_BOX_SIZE {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "box size too large: {}, maximum is {}",
+                    size,
+                    params::MAX_BOX_SIZE
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Remaining inner transaction budget.
@@ -850,6 +1141,8 @@ fn execute_inner_appl<L: LedgerStore>(
     fee_sink: Address,
     opcode_budget: &mut i64,
     inner_txn_id: algo_types::Digest,
+    box_state: crate::apply::BoxBudgetState,
+    created_apps_snapshot: Vec<u64>,
 ) -> Result<crate::apply::InnerApplyData, AlgoError> {
     use algo_avm::eval::{run_approval_program, run_clear_state_program};
     use algo_avm::group::GroupBudget;
@@ -946,6 +1239,18 @@ fn execute_inner_appl<L: LedgerStore>(
     // parent (the immediate parent inner txn, not the original outer txn).
     inner_ctx.parent_txn_id = inner_txn_id;
 
+    // H1: Inherit box budget state from parent. In go-algorand, `available`
+    // (containing boxes, dirtyBytes, unnamedAccess) and `ioBudget` are shared
+    // by pointer. We copy in and will copy back after execution.
+    inner_ctx.available_boxes = box_state.available_boxes;
+    inner_ctx.dirty_bytes = box_state.dirty_bytes;
+    inner_ctx.io_budget = box_state.io_budget;
+    inner_ctx.read_budget_checked = true; // inner calls skip the read check (go-algorand line 556)
+    inner_ctx.boxes_initialized = box_state.boxes_initialized;
+    inner_ctx.unnamed_access = box_state.unnamed_access;
+    // Inherit created_apps so newAppAccess fallback works for apps created earlier.
+    inner_ctx.created_apps = created_apps_snapshot;
+
     // ── Execute the program ──
     let avm_result = if on_completion == ON_COMPLETION_CLEAR_STATE {
         // ClearStateOC: run clear state program. On failure, still clear state.
@@ -989,6 +1294,16 @@ fn execute_inner_appl<L: LedgerStore>(
     // parent can track them for snapshot rollback.
     let child_created_assets = inner_ctx.created_assets.clone();
     let child_created_apps = inner_ctx.created_apps.clone();
+
+    // H1: Capture box budget state to propagate back to the parent.
+    let child_box_state = crate::apply::BoxBudgetState {
+        available_boxes: inner_ctx.available_boxes.clone(),
+        dirty_bytes: inner_ctx.dirty_bytes,
+        io_budget: inner_ctx.io_budget,
+        read_budget_checked: inner_ctx.read_budget_checked,
+        boxes_initialized: inner_ctx.boxes_initialized,
+        unnamed_access: inner_ctx.unnamed_access,
+    };
 
     // Store logs and nested inner txns as the eval_delta on the
     // inner SignedTransaction. We build a minimal eval_delta rmpv::Value map.
@@ -1042,6 +1357,8 @@ fn execute_inner_appl<L: LedgerStore>(
     // rollback can clean them up if a later sibling txn fails.
     ad.nested_created_assets = child_created_assets;
     ad.nested_created_apps = child_created_apps;
+    // H1: Propagate box budget state back to the parent.
+    ad.box_state = Some(child_box_state);
 
     Ok(ad)
 }
@@ -2542,6 +2859,17 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     id_offset_base + i,
                     &stxn.txn,
                 );
+                // H1: Snapshot box state to pass to inner context.
+                // Ensure boxes are initialized before extracting state.
+                self.ensure_boxes_initialized();
+                let caller_box_state = crate::apply::BoxBudgetState {
+                    available_boxes: self.available_boxes.clone(),
+                    dirty_bytes: self.dirty_bytes,
+                    io_budget: self.io_budget,
+                    read_budget_checked: self.read_budget_checked,
+                    boxes_initialized: self.boxes_initialized,
+                    unnamed_access: self.unnamed_access,
+                };
                 let result = execute_inner_appl(
                     self.store,
                     stxn,
@@ -2555,6 +2883,8 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     self.fee_sink,
                     &mut self.opcode_budget,
                     appl_inner_id,
+                    caller_box_state,
+                    self.created_apps.clone(),
                 );
                 match result {
                     Ok(ad) => {
@@ -2592,6 +2922,16 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         // accounts for any nested inner txns it created.
                         current_counter = ad.txn_counter;
                         self.txn_counter = current_counter;
+
+                        // H1: Restore box budget state from inner context.
+                        if let Some(bs) = ad.box_state {
+                            self.available_boxes = bs.available_boxes;
+                            self.dirty_bytes = bs.dirty_bytes;
+                            self.io_budget = bs.io_budget;
+                            self.read_budget_checked = bs.read_budget_checked;
+                            self.boxes_initialized = bs.boxes_initialized;
+                            self.unnamed_access = bs.unnamed_access;
+                        }
                     }
                     Err(e) => {
                         self.store.restore_snapshot(snapshot);
@@ -2850,6 +3190,238 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             return true;
         }
         false
+    }
+
+    // ---- Box storage ----
+
+    fn box_get(&mut self, name: &[u8]) -> Result<(Vec<u8>, bool), AlgoError> {
+        Self::box_length_checks(name, 0)?;
+        let (contents, exists) = self.available_box(name, BoxOperation::Read, 0)?;
+        if exists {
+            Ok((contents, true))
+        } else {
+            Ok((Vec::new(), false))
+        }
+    }
+
+    fn box_put(&mut self, name: &[u8], value: &[u8]) -> Result<(), AlgoError> {
+        Self::box_length_checks(name, value.len() as u64)?;
+
+        // BoxWriteOperation — pass value length as create_size because the
+        // box may not exist yet.
+        let (contents, exists) =
+            self.available_box(name, BoxOperation::Write, value.len() as u64)?;
+
+        if exists {
+            // Replacement must match existing size.
+            if contents.len() != value.len() {
+                return Err(AlgoError::Avm {
+                    message: format!(
+                        "attempt to box_put wrong size {} != {}",
+                        contents.len(),
+                        value.len()
+                    ),
+                });
+            }
+            self.store.set_box(self.app_id, name, value.to_vec());
+        } else {
+            // Create the box: update min-balance accounting.
+            let app_addr = Address(app_address(self.app_id));
+            let mut acct = self.store.get_account(&app_addr).unwrap_or_default();
+            acct.total_boxes = acct.total_boxes.saturating_add(1);
+            acct.total_box_bytes = acct
+                .total_box_bytes
+                .saturating_add(name.len() as u64 + value.len() as u64);
+            self.store.set_account(&app_addr, acct);
+            self.store.set_box(self.app_id, name, value.to_vec());
+        }
+        Ok(())
+    }
+
+    fn box_del(&mut self, name: &[u8]) -> Result<bool, AlgoError> {
+        Self::box_length_checks(name, 0)?;
+        let (_, exists) = self.available_box(name, BoxOperation::Delete, 0)?;
+        if exists {
+            // Update min-balance accounting before deleting.
+            let app_addr = Address(app_address(self.app_id));
+            // Get the content to know the size for accounting.
+            let content_len = self
+                .store
+                .get_box(self.app_id, name)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0);
+            let mut acct = self.store.get_account(&app_addr).unwrap_or_default();
+            acct.total_boxes = acct.total_boxes.saturating_sub(1);
+            acct.total_box_bytes = acct
+                .total_box_bytes
+                .saturating_sub(name.len() as u64 + content_len);
+            self.store.set_account(&app_addr, acct);
+            self.store.delete_box(self.app_id, name);
+        }
+        Ok(exists)
+    }
+
+    fn box_len(&mut self, name: &[u8]) -> Result<(u64, bool), AlgoError> {
+        Self::box_length_checks(name, 0)?;
+        let (contents, exists) = self.available_box(name, BoxOperation::Read, 0)?;
+        Ok((contents.len() as u64, exists))
+    }
+
+    fn box_create(&mut self, name: &[u8], size: u64) -> Result<bool, AlgoError> {
+        Self::box_length_checks(name, size)?;
+        let (_, exists) = self.available_box(name, BoxOperation::Create, size)?;
+        if !exists {
+            // Create the box (zero-filled) and update min-balance.
+            let app_addr = Address(app_address(self.app_id));
+            let mut acct = self.store.get_account(&app_addr).unwrap_or_default();
+            acct.total_boxes = acct.total_boxes.saturating_add(1);
+            acct.total_box_bytes = acct
+                .total_box_bytes
+                .saturating_add(name.len() as u64 + size);
+            self.store.set_account(&app_addr, acct);
+            self.store
+                .set_box(self.app_id, name, vec![0u8; size as usize]);
+        }
+        // Returns true if newly created.
+        Ok(!exists)
+    }
+
+    fn box_extract(&mut self, name: &[u8], offset: u64, length: u64) -> Result<Vec<u8>, AlgoError> {
+        Self::box_length_checks(name, offset.saturating_add(length))?;
+        let (contents, exists) = self.available_box(name, BoxOperation::Read, 0)?;
+        if !exists {
+            return Err(AlgoError::Avm {
+                message: format!("no such box {:?}", name),
+            });
+        }
+        let start = offset as usize;
+        let end = start + length as usize;
+        if end > contents.len() {
+            return Err(AlgoError::Avm {
+                message: format!("extraction end {} beyond length: {}", end, contents.len()),
+            });
+        }
+        Ok(contents[start..end].to_vec())
+    }
+
+    fn box_replace(&mut self, name: &[u8], offset: u64, value: &[u8]) -> Result<(), AlgoError> {
+        Self::box_length_checks(name, offset.saturating_add(value.len() as u64))?;
+        let (contents, exists) = self.available_box(name, BoxOperation::Write, 0)?;
+        if !exists {
+            return Err(AlgoError::Avm {
+                message: format!("no such box {:?}", name),
+            });
+        }
+        let start = offset as usize;
+        let end = start + value.len();
+        if end > contents.len() {
+            return Err(AlgoError::Avm {
+                message: format!("replacement end {} beyond length: {}", end, contents.len()),
+            });
+        }
+        let mut new_contents = contents;
+        new_contents[start..end].copy_from_slice(value);
+        self.store.set_box(self.app_id, name, new_contents);
+        Ok(())
+    }
+
+    fn box_resize(&mut self, name: &[u8], new_size: u64) -> Result<(), AlgoError> {
+        Self::box_length_checks(name, new_size)?;
+        let (contents, exists) = self.available_box(name, BoxOperation::Resize, new_size)?;
+        if !exists {
+            return Err(AlgoError::Avm {
+                message: format!("no such box {:?}", name),
+            });
+        }
+
+        // Delete and recreate with new size, preserving content.
+        let app_addr = Address(app_address(self.app_id));
+        let old_len = contents.len() as u64;
+
+        // Update min-balance: remove old, add new.
+        let mut acct = self.store.get_account(&app_addr).unwrap_or_default();
+        // Adjust total_box_bytes: remove old size, add new size.
+        acct.total_box_bytes = acct
+            .total_box_bytes
+            .saturating_sub(name.len() as u64 + old_len)
+            .saturating_add(name.len() as u64 + new_size);
+        self.store.set_account(&app_addr, acct);
+
+        // Build resized content.
+        let resized = if new_size > old_len {
+            let mut v = vec![0u8; new_size as usize];
+            v[..contents.len()].copy_from_slice(&contents);
+            v
+        } else {
+            contents[..new_size as usize].to_vec()
+        };
+
+        // Delete old and set new (go-algorand does DelBox + NewBox, but our
+        // store's set_box overwrites, which is equivalent since we already
+        // updated the account totals).
+        self.store.set_box(self.app_id, name, resized);
+        Ok(())
+    }
+
+    fn box_splice(
+        &mut self,
+        name: &[u8],
+        start: u64,
+        length: u64,
+        value: &[u8],
+    ) -> Result<(), AlgoError> {
+        Self::box_length_checks(name, 0)?;
+        let (contents, exists) = self.available_box(name, BoxOperation::Write, 0)?;
+        if !exists {
+            return Err(AlgoError::Avm {
+                message: format!("no such box {:?}", name),
+            });
+        }
+
+        let s = start as usize;
+        if s > contents.len() {
+            return Err(AlgoError::Avm {
+                message: format!("replacement start {} beyond length: {}", s, contents.len()),
+            });
+        }
+        let oend = start + length;
+        if oend < start {
+            return Err(AlgoError::Avm {
+                message: "splice end exceeds uint64".into(),
+            });
+        }
+        if oend as usize > contents.len() {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "splice end {} beyond original length: {}",
+                    oend,
+                    contents.len()
+                ),
+            });
+        }
+
+        // Splice: same-size result as original (go-algorand behavior).
+        let mut result = vec![0u8; contents.len()];
+        result[..s].copy_from_slice(&contents[..s]);
+        let copied = value.len().min(contents.len() - s);
+        result[s..s + copied].copy_from_slice(&value[..copied]);
+        if copied != value.len() {
+            return Err(AlgoError::Avm {
+                message: "splice inserted bytes too long".into(),
+            });
+        }
+        let tail_start = s + copied;
+        let tail_src = oend as usize;
+        if tail_start < result.len() && tail_src < contents.len() {
+            let tail_len = result.len() - tail_start;
+            let avail = contents.len() - tail_src;
+            let copy_len = tail_len.min(avail);
+            result[tail_start..tail_start + copy_len]
+                .copy_from_slice(&contents[tail_src..tail_src + copy_len]);
+        }
+
+        self.store.set_box(self.app_id, name, result);
+        Ok(())
     }
 }
 

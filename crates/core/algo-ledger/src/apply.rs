@@ -1825,6 +1825,28 @@ pub struct InnerApplyData {
     /// All app IDs created by this inner app call and any nested inner txns.
     /// Used by the parent to track resources for snapshot rollback (P1-3).
     pub nested_created_apps: Vec<u64>,
+    /// Box state propagated back from inner app call to parent.
+    /// In go-algorand, box state is shared by pointer; in Rust we pass it
+    /// through and propagate back.
+    pub box_state: Option<BoxBudgetState>,
+}
+
+/// Shared box budget state that is passed between parent and inner app calls.
+/// Mirrors go-algorand's shared `resources` + `EvalParams` box fields.
+#[derive(Debug, Clone, Default)]
+pub struct BoxBudgetState {
+    /// Available box references: `(app_id, box_name) -> is_dirty`.
+    pub available_boxes: std::collections::HashMap<(u64, Vec<u8>), bool>,
+    /// Total dirty bytes written to boxes.
+    pub dirty_bytes: u64,
+    /// I/O budget: `num_box_refs * BYTES_PER_BOX_REFERENCE`.
+    pub io_budget: u64,
+    /// Whether the read budget check has already been performed.
+    pub read_budget_checked: bool,
+    /// Whether boxes have been initialized.
+    pub boxes_initialized: bool,
+    /// Number of unnamed box ref slots available for newly created apps.
+    pub unnamed_access: i64,
 }
 
 #[cfg(test)]

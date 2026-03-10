@@ -379,6 +379,82 @@ pub trait AvmContext {
         0
     }
 
+    // ---- Box storage ----
+
+    /// Get a box's contents. Returns `(value, exists)`.
+    /// If the box does not exist, returns `(vec![], false)`.
+    fn box_get(&mut self, name: &[u8]) -> Result<(Vec<u8>, bool), AlgoError> {
+        Err(AlgoError::Avm {
+            message: "context unavailable: box_get".into(),
+        })
+    }
+
+    /// Write a value to an existing box (must already exist and size must match),
+    /// or create a new box if it does not exist.
+    fn box_put(&mut self, name: &[u8], value: &[u8]) -> Result<(), AlgoError> {
+        Err(AlgoError::Avm {
+            message: "context unavailable: box_put".into(),
+        })
+    }
+
+    /// Delete a box. Returns whether the box existed.
+    fn box_del(&mut self, name: &[u8]) -> Result<bool, AlgoError> {
+        Err(AlgoError::Avm {
+            message: "context unavailable: box_del".into(),
+        })
+    }
+
+    /// Get a box's length. Returns `(length, exists)`.
+    fn box_len(&mut self, name: &[u8]) -> Result<(u64, bool), AlgoError> {
+        Err(AlgoError::Avm {
+            message: "context unavailable: box_len".into(),
+        })
+    }
+
+    /// Create a box of the given size (zero-filled). Returns `true` if newly
+    /// created, `false` if the box already existed (with matching size).
+    fn box_create(&mut self, name: &[u8], size: u64) -> Result<bool, AlgoError> {
+        Err(AlgoError::Avm {
+            message: "context unavailable: box_create".into(),
+        })
+    }
+
+    /// Extract a slice from a box's contents.
+    fn box_extract(&mut self, name: &[u8], offset: u64, length: u64) -> Result<Vec<u8>, AlgoError> {
+        Err(AlgoError::Avm {
+            message: "context unavailable: box_extract".into(),
+        })
+    }
+
+    /// Replace bytes within a box starting at `offset`.
+    fn box_replace(&mut self, name: &[u8], offset: u64, value: &[u8]) -> Result<(), AlgoError> {
+        Err(AlgoError::Avm {
+            message: "context unavailable: box_replace".into(),
+        })
+    }
+
+    /// Resize a box, preserving existing content (truncating or zero-extending).
+    fn box_resize(&mut self, name: &[u8], new_size: u64) -> Result<(), AlgoError> {
+        Err(AlgoError::Avm {
+            message: "context unavailable: box_resize".into(),
+        })
+    }
+
+    /// Splice bytes within a box: remove `length` bytes at `start`, insert
+    /// `value` in their place. The box size changes by
+    /// `value.len() - length`.
+    fn box_splice(
+        &mut self,
+        name: &[u8],
+        start: u64,
+        length: u64,
+        value: &[u8],
+    ) -> Result<(), AlgoError> {
+        Err(AlgoError::Avm {
+            message: "context unavailable: box_splice".into(),
+        })
+    }
+
     // ---- Resource availability ----
 
     /// Check if an asset is available (in foreign arrays or created by a prior

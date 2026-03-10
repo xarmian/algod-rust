@@ -20,7 +20,7 @@ pub enum HashKind {
     Account = 0,
     Asset = 1,
     App = 2,
-    // Kv = 3,  // not needed for Phase 2
+    Kv = 3,
 }
 
 /// Compute the affinity value for an account.
@@ -78,6 +78,25 @@ pub fn resource_hash_v6_with_kind(
     let mut element = [0u8; ELEMENT_SIZE];
     element[0..4].copy_from_slice(&affinity.to_be_bytes());
     element[4] = kind as u8;
+    element[5..36].copy_from_slice(&hash[1..32]);
+    element
+}
+
+/// Compute the 36-byte trie element for a KV (box) entry.
+///
+/// Matches go-algorand's `KvHashBuilderV6`: affinity is always 0,
+/// HashKind is `Kv` (3), prehash is `key_bytes || value_bytes`.
+///
+/// The `key` is the full kvstore key (e.g. `"bx:" + big-endian app_id + box_name`).
+pub fn kv_hash_v6(key: &[u8], value: &[u8]) -> [u8; ELEMENT_SIZE] {
+    let mut hasher = Sha512_256::new();
+    hasher.update(key);
+    hasher.update(value);
+    let hash = hasher.finalize();
+
+    let mut element = [0u8; ELEMENT_SIZE];
+    // affinity = 0 (bytes 0..4 are already zero)
+    element[4] = HashKind::Kv as u8;
     element[5..36].copy_from_slice(&hash[1..32]);
     element
 }
@@ -337,6 +356,47 @@ mod tests {
         };
         let e1 = account_hash_v6(&addr, &a1);
         let e2 = account_hash_v6(&addr, &a2);
+        assert_ne!(e1[5..36], e2[5..36]);
+    }
+
+    #[test]
+    fn test_kv_hash_v6_format() {
+        let key = b"bx:\x00\x00\x00\x00\x00\x00\x00\x2amybox";
+        let value = b"hello world";
+
+        let element = kv_hash_v6(key, value);
+
+        // Verify total size
+        assert_eq!(element.len(), 36);
+
+        // Verify affinity is 0 (bytes 0..4)
+        assert_eq!(&element[0..4], &[0, 0, 0, 0]);
+
+        // Verify HashKind is Kv = 3 (byte 4)
+        assert_eq!(element[4], HashKind::Kv as u8);
+        assert_eq!(element[4], 3);
+
+        // Verify hash portion: reconstruct the prehash and check bytes [1..32]
+        let mut prehash = Vec::new();
+        prehash.extend_from_slice(key);
+        prehash.extend_from_slice(value);
+        let full_hash = sha512_256(&prehash);
+        assert_eq!(&element[5..36], &full_hash[1..32]);
+    }
+
+    #[test]
+    fn test_kv_hash_v6_different_keys_produce_different_hashes() {
+        let value = b"same_value";
+        let e1 = kv_hash_v6(b"bx:\x00\x00\x00\x00\x00\x00\x00\x01key1", value);
+        let e2 = kv_hash_v6(b"bx:\x00\x00\x00\x00\x00\x00\x00\x01key2", value);
+        assert_ne!(e1[5..36], e2[5..36]);
+    }
+
+    #[test]
+    fn test_kv_hash_v6_different_values_produce_different_hashes() {
+        let key = b"bx:\x00\x00\x00\x00\x00\x00\x00\x01mybox";
+        let e1 = kv_hash_v6(key, b"value_a");
+        let e2 = kv_hash_v6(key, b"value_b");
         assert_ne!(e1[5..36], e2[5..36]);
     }
 }

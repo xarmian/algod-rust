@@ -17,6 +17,18 @@ pub const BOX_FLAT_MIN_BALANCE: u64 = 2_500;
 pub const BOX_BYTE_MIN_BALANCE: u64 = 400;
 pub const REWARDS_RATE_REFRESH_INTERVAL: u64 = 500_000;
 
+// Box storage consensus parameters (go-algorand v4.5.1, consensus V41).
+
+/// Maximum length of a box name/key (consensus `MaxAppKeyLen`, set in V24).
+pub const MAX_APP_KEY_LEN: usize = 64;
+
+/// Maximum size of a box value in bytes (consensus `MaxBoxSize`, set in V36).
+pub const MAX_BOX_SIZE: u64 = 32_768;
+
+/// Number of bytes a single box reference covers in the I/O budget
+/// (consensus `BytesPerBoxReference`). Changed from 1024 (V36) to 2048 (V41).
+pub const BYTES_PER_BOX_REFERENCE: u64 = 2_048;
+
 // Inner transaction consensus parameters (go-algorand v4.5.1).
 
 /// Maximum inner transactions per app call (before pooling, v30+).

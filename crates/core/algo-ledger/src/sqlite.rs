@@ -68,6 +68,11 @@ CREATE TABLE IF NOT EXISTS merkle_trie (
     id   INTEGER PRIMARY KEY CHECK (id = 0),
     data BLOB NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS kvstore (
+    key   BLOB PRIMARY KEY,
+    value BLOB
+);
 ";
 
 // Resource ctype constants
@@ -77,6 +82,20 @@ const CTYPE_APP: i64 = 2;
 // Resource flags bitmask (stored in the "y" field of resource blobs)
 pub(crate) const RESOURCE_FLAGS_HOLDING: u64 = 0x01; // bit 0: has local state / holding data
 pub(crate) const RESOURCE_FLAGS_OWNERSHIP: u64 = 0x04; // bit 2: has creator/params data
+
+// Box key prefix and layout constants (matches go-algorand's avm-abi/apps.MakeBoxKey).
+const BOX_PREFIX: &[u8] = b"bx:";
+
+/// Build the full kvstore key for a box: `"bx:" + big-endian(app_id) + box_name`.
+///
+/// This matches go-algorand's `apps.MakeBoxKey(appIdx, name)`.
+fn make_box_key(app_id: u64, name: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(BOX_PREFIX.len() + 8 + name.len());
+    key.extend_from_slice(BOX_PREFIX);
+    key.extend_from_slice(&app_id.to_be_bytes());
+    key.extend_from_slice(name);
+    key
+}
 
 // ---------------------------------------------------------------------------
 // Msgpack encode/decode helpers for AccountData (Go-compatible codec keys)
@@ -1419,6 +1438,12 @@ enum SqlitePreMutation {
         ctype: i64,
         old_affinity: u32,
     },
+    Kv {
+        /// Full kvstore key (e.g. "bx:" + big-endian app_id + box_name).
+        full_key: Vec<u8>,
+        /// Old value before mutation (None if key didn't exist).
+        old_value: Option<Vec<u8>>,
+    },
 }
 
 pub struct SqliteLedger {
@@ -1568,7 +1593,8 @@ impl SqliteLedger {
     /// Rebuild the trie from all accounts and resources currently in the DB.
     fn rebuild_trie_from_db(&self) -> Result<crate::merkle_trie::MerkleTrie, AlgoError> {
         use crate::trie_hash::{
-            account_hash_v6, compute_affinity, resource_hash_v6_with_kind, HashKind, ELEMENT_SIZE,
+            account_hash_v6, compute_affinity, kv_hash_v6, resource_hash_v6_with_kind, HashKind,
+            ELEMENT_SIZE,
         };
 
         let mut trie = crate::merkle_trie::MerkleTrie::new(ELEMENT_SIZE);
@@ -1661,6 +1687,36 @@ impl SqliteLedger {
                 let elem = resource_hash_v6_with_kind(&addr, aidx as u64, &rdata, affinity, kind);
                 trie.add(&elem).map_err(|e| AlgoError::Ledger {
                     message: format!("trie add resource: {e}"),
+                })?;
+            }
+        }
+
+        // 3. Process all KV (box) entries from kvstore.
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT key, value FROM kvstore")
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("prepare kvstore for trie rebuild: {e}"),
+                })?;
+
+            let rows = stmt
+                .query_map([], |row| {
+                    let key: Vec<u8> = row.get(0)?;
+                    let value: Vec<u8> = row.get(1)?;
+                    Ok((key, value))
+                })
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("query kvstore for trie rebuild: {e}"),
+                })?;
+
+            for row in rows {
+                let (key, value) = row.map_err(|e| AlgoError::Ledger {
+                    message: format!("read kvstore row: {e}"),
+                })?;
+                let elem = kv_hash_v6(&key, &value);
+                trie.add(&elem).map_err(|e| AlgoError::Ledger {
+                    message: format!("trie add kv: {e}"),
                 })?;
             }
         }
@@ -2556,6 +2612,78 @@ impl LedgerStore for SqliteLedger {
         results
     }
 
+    // ---- Box Storage ----
+
+    fn get_box(&self, app_id: u64, key: &[u8]) -> Option<Vec<u8>> {
+        let full_key = make_box_key(app_id, key);
+        self.conn
+            .query_row(
+                "SELECT value FROM kvstore WHERE key = ?1",
+                params![full_key],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .unwrap_or(None)
+    }
+
+    fn set_box(&mut self, app_id: u64, key: &[u8], value: Vec<u8>) {
+        let full_key = make_box_key(app_id, key);
+
+        // Record pre-mutation for trie tracking.
+        if self.trie.is_some() {
+            let old_value = self
+                .conn
+                .query_row(
+                    "SELECT value FROM kvstore WHERE key = ?1",
+                    params![full_key],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .unwrap_or(None);
+            self.pre_mutations.push(SqlitePreMutation::Kv {
+                full_key: full_key.clone(),
+                old_value,
+            });
+        }
+
+        self.conn
+            .execute(
+                "INSERT INTO kvstore (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![full_key, value],
+            )
+            .expect("set_box upsert");
+    }
+
+    fn delete_box(&mut self, app_id: u64, key: &[u8]) -> bool {
+        let full_key = make_box_key(app_id, key);
+
+        // Record pre-mutation for trie tracking.
+        if self.trie.is_some() {
+            let old_value = self
+                .conn
+                .query_row(
+                    "SELECT value FROM kvstore WHERE key = ?1",
+                    params![full_key],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .unwrap_or(None);
+            if old_value.is_some() {
+                self.pre_mutations.push(SqlitePreMutation::Kv {
+                    full_key: full_key.clone(),
+                    old_value,
+                });
+            }
+        }
+
+        let rows = self
+            .conn
+            .execute("DELETE FROM kvstore WHERE key = ?1", params![full_key])
+            .expect("delete_box");
+        rows > 0
+    }
+
     // ---- Leases ----
 
     fn check_lease(
@@ -2740,7 +2868,7 @@ impl LedgerStore for SqliteLedger {
 
     fn finalize_trie_updates(&mut self) -> Option<[u8; 32]> {
         use crate::trie_hash::{
-            account_hash_v6, compute_affinity, resource_hash_v6_with_kind, HashKind,
+            account_hash_v6, compute_affinity, kv_hash_v6, resource_hash_v6_with_kind, HashKind,
         };
 
         // Take the trie out of self to avoid borrow conflicts.
@@ -2820,6 +2948,35 @@ impl LedgerStore for SqliteLedger {
                             resource_hash_v6_with_kind(&addr, index, new, new_affinity, kind);
                         if let Err(e) = trie.add(&new_elem) {
                             tracing::warn!("trie add resource failed: {}", e);
+                        }
+                    }
+                }
+                SqlitePreMutation::Kv {
+                    full_key,
+                    old_value,
+                } => {
+                    // Delete old trie element if the key previously existed.
+                    if let Some(ref old_val) = old_value {
+                        let old_elem = kv_hash_v6(&full_key, old_val);
+                        if let Err(e) = trie.delete(&old_elem) {
+                            tracing::warn!("trie delete kv failed: {}", e);
+                        }
+                    }
+
+                    // Add new trie element if the key still exists in the kvstore.
+                    let new_value: Option<Vec<u8>> = self
+                        .conn
+                        .query_row(
+                            "SELECT value FROM kvstore WHERE key = ?1",
+                            params![full_key],
+                            |row| row.get::<_, Vec<u8>>(0),
+                        )
+                        .optional()
+                        .unwrap_or(None);
+                    if let Some(ref new_val) = new_value {
+                        let new_elem = kv_hash_v6(&full_key, new_val);
+                        if let Err(e) = trie.add(&new_elem) {
+                            tracing::warn!("trie add kv failed: {}", e);
                         }
                     }
                 }

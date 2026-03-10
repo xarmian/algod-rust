@@ -276,6 +276,15 @@ pub fn dispatch(
         0xb7 => itxn::op_gitxn(machine, instruction, ctx),
         0xb8 => itxn::op_gitxna(machine, instruction, ctx),
 
+        // ---- Box storage (v8+) ----
+        0xb9 => state::op_box_create(machine, instruction, ctx),
+        0xba => state::op_box_extract(machine, instruction, ctx),
+        0xbb => state::op_box_replace(machine, instruction, ctx),
+        0xbc => state::op_box_del(machine, instruction, ctx),
+        0xbd => state::op_box_len(machine, instruction, ctx),
+        0xbe => state::op_box_get(machine, instruction, ctx),
+        0xbf => state::op_box_put(machine, instruction, ctx),
+
         // ---- Dynamic inner txn array access (v6+) ----
         0xc5 => itxn::op_itxnas(machine, instruction, ctx),
         0xc6 => itxn::op_gitxnas(machine, instruction, ctx),
@@ -283,6 +292,10 @@ pub fn dispatch(
         // ---- VRF / Block field access (v7+) ----
         0xd0 => crypto::op_vrf_verify(machine, instruction),
         0xd1 => state::op_block(machine, instruction, ctx),
+
+        // ---- Box splice/resize (v10+) ----
+        0xd2 => state::op_box_splice(machine, instruction, ctx),
+        0xd3 => state::op_box_resize(machine, instruction, ctx),
 
         // ---- Everything else: not yet implemented ----
         _ => {
