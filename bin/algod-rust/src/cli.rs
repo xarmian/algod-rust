@@ -132,6 +132,10 @@ pub enum Commands {
         /// Path to Go's tracker.db for trie root conformance comparison.
         #[arg(long)]
         compare_trie_db: Option<PathBuf>,
+
+        /// Enable AVM execution mode (run TEAL programs instead of replaying EvalDeltas).
+        #[arg(long)]
+        avm_execute: bool,
     },
 
     /// Follow mode: continuously validate new blocks as they arrive.

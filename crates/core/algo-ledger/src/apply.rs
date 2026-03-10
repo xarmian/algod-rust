@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use algo_avm::eval::{run_approval_program, run_clear_state_program};
 use algo_avm::group::GroupBudget;
@@ -10,6 +10,7 @@ use algo_types::{
 use sha2::{Digest, Sha512_256};
 
 use crate::avm_context::LedgerAvmContext;
+use crate::eval_compare::{compare_eval_delta, EvalDeltaMismatchDetail, EvalDeltaStats};
 use crate::eval_delta::{apply_eval_delta, parse_eval_delta};
 use crate::rewards::apply_rewards;
 
@@ -57,6 +58,8 @@ pub struct ApplyContext {
     /// that set fee=0 draw from this credit; overpayment by inner txns adds
     /// back to it. Shared across all app calls in a group.
     pub fee_credit: Cell<u64>,
+    /// Current transaction index within the block (for mismatch reporting).
+    pub txn_index: Cell<usize>,
 }
 
 impl ApplyContext {
@@ -72,23 +75,40 @@ impl ApplyContext {
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
             fee_credit: Cell::new(0),
+
+            txn_index: Cell::new(0),
         }
     }
 }
 
-/// Apply a full block to the ledger state.
+/// Apply a full block to the ledger state using the default Replay mode.
+///
+/// This is a convenience wrapper around [`apply_block_with_mode`] that uses
+/// `ApplyMode::Replay` for backward compatibility.
+pub fn apply_block<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+) -> Result<(), AlgoError> {
+    apply_block_with_mode(store, block, ApplyMode::Replay)
+}
+
+/// Apply a full block to the ledger state with the specified mode.
 ///
 /// Updates rewards parameters from the block header, then applies each
 /// transaction in payset order. Finally updates `current_round`.
+///
+/// In `Replay` mode, recorded EvalDeltas from block data are used directly.
+/// In `Execute` mode, AVM programs are run to produce results.
 ///
 /// On error, rewards state is restored to its pre-block values. Note that
 /// account mutations from earlier successful transactions in the payset are
 /// NOT rolled back — the caller should treat the state as corrupted on error.
 /// In practice, committed blocks are already validated and should never
 /// produce errors — the checks here are defensive safety nets.
-pub fn apply_block<L: crate::store_trait::LedgerStore>(
+pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
+    mode: ApplyMode,
 ) -> Result<(), AlgoError> {
     // Validate round monotonicity.
     let expected = Round(store.current_round().0 + 1);
@@ -127,11 +147,12 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
         rewards_level: block.rewards_level,
         fee_sink: block.fee_sink,
         round: block.round.0,
-        mode: ApplyMode::Replay,
+        mode,
         latest_timestamp: block.timestamp as u64,
         genesis_hash: gh,
         txn_counter: Cell::new(base_txn_counter),
         fee_credit: Cell::new(0),
+        txn_index: Cell::new(0),
     };
 
     let result = (|| {
@@ -146,6 +167,7 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
                 // Execute mode: detect transaction groups, create group budgets,
                 // and pass them through to apply_appl for AVM execution.
                 let groups = detect_transaction_groups(&block.payset);
+                let mut global_txn_idx: usize = 0;
                 for group in &groups {
                     let num_app_calls = group
                         .iter()
@@ -157,7 +179,12 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
                     let group_fee_credit = compute_group_fee_credit(group);
                     ctx.fee_credit.set(group_fee_credit);
 
-                    for stx in group {
+                    for (gi_idx, stx) in group.iter().enumerate() {
+                        ctx.txn_index.set(global_txn_idx);
+                        let gi = GroupInfo {
+                            txns: group,
+                            index: gi_idx,
+                        };
                         if stx.txn.txn_type == "appl" {
                             apply_transaction_with_budget(
                                 store,
@@ -165,10 +192,12 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
                                 &ctx,
                                 0,
                                 Some(&mut group_budget),
+                                Some(&gi),
                             )?;
                         } else {
                             apply_transaction(store, stx, &ctx, 0)?;
                         }
+                        global_txn_idx += 1;
                     }
                 }
             }
@@ -195,6 +224,92 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
     store.set_txn_counter(block.txn_counter);
 
     Ok(())
+}
+
+/// Apply a block in Execute mode with EvalDelta comparison enabled.
+///
+/// Returns the collected comparison statistics alongside the apply result.
+/// This is a convenience wrapper that enables stats collection, calls
+/// `apply_block_with_mode(Execute)`, and extracts the stats afterward.
+pub fn apply_block_with_comparison<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+) -> (Result<(), AlgoError>, EvalDeltaStats) {
+    // We need to set up stats before apply_block_with_mode runs, but that
+    // function creates its own ApplyContext internally. To avoid duplicating
+    // the entire function, we use a thread-local to pass stats through.
+    EVAL_DELTA_STATS_SLOT.with(|slot| {
+        *slot.borrow_mut() = Some(EvalDeltaStats::default());
+    });
+
+    let result = apply_block_with_mode(store, block, ApplyMode::Execute);
+
+    let stats = EVAL_DELTA_STATS_SLOT.with(|slot| slot.borrow_mut().take().unwrap_or_default());
+
+    (result, stats)
+}
+
+thread_local! {
+    /// Thread-local slot for passing EvalDelta stats into the apply path.
+    ///
+    /// When `Some`, the AVM Execute path records comparison results here.
+    /// Set by `apply_block_with_comparison`, consumed after apply completes.
+    static EVAL_DELTA_STATS_SLOT: RefCell<Option<EvalDeltaStats>> = const { RefCell::new(None) };
+}
+
+/// Record an EvalDelta comparison result into the thread-local stats slot.
+///
+/// Called from the AVM Execute path in `apply_appl`. No-op if stats
+/// collection is not active (i.e., called via `apply_block_with_mode`
+/// directly rather than `apply_block_with_comparison`).
+fn record_eval_delta_comparison(
+    stx: &SignedTransaction,
+    avm_result: &algo_avm::eval::AvmResult,
+    round: u64,
+    txn_index: usize,
+    app_id: u64,
+) {
+    EVAL_DELTA_STATS_SLOT.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        if let Some(ref mut stats) = *guard {
+            // Parse the recorded EvalDelta from block data.
+            let recorded = stx
+                .eval_delta
+                .as_ref()
+                .and_then(|dt| parse_eval_delta(dt).ok());
+
+            let cmp = compare_eval_delta(avm_result, recorded.as_ref(), stx);
+            if cmp.matches {
+                stats.record_match();
+            } else {
+                stats.record_mismatch(EvalDeltaMismatchDetail {
+                    round,
+                    txn_index,
+                    app_id,
+                    mismatches: cmp.mismatches,
+                });
+            }
+        }
+    });
+}
+
+/// Build the AVM group and group_index from optional `GroupInfo`.
+///
+/// When `group_info` is available (Execute mode with detected groups), the
+/// full atomic group is cloned so that `gtxn`/`global GroupSize` opcodes
+/// see the real group. When absent (Replay mode or standalone calls), falls
+/// back to a single-element group with index 0.
+fn build_avm_group(
+    stx: &SignedTransaction,
+    group_info: Option<&GroupInfo<'_>>,
+) -> (Vec<SignedTransaction>, usize) {
+    match group_info {
+        Some(gi) => {
+            let group: Vec<SignedTransaction> = gi.txns.iter().map(|s| (*s).clone()).collect();
+            (group, gi.index)
+        }
+        None => (vec![stx.clone()], 0),
+    }
 }
 
 /// Compute the fee credit for a transaction group.
@@ -244,18 +359,28 @@ fn detect_transaction_groups(payset: &[SignedTransaction]) -> Vec<Vec<&SignedTra
     groups
 }
 
+/// Information about the current transaction's group, used to provide correct
+/// group context to AVM execution (gtxn opcodes, global GroupSize, etc.).
+struct GroupInfo<'a> {
+    /// All transactions in the atomic group.
+    txns: &'a [&'a SignedTransaction],
+    /// Index of the current transaction within the group.
+    index: usize,
+}
+
 /// Apply a single signed transaction with a group budget for AVM execution.
 ///
-/// Same as `apply_transaction` but threads the group budget through to
-/// `apply_appl` for Execute-mode pooled budget accounting.
+/// Same as `apply_transaction` but threads the group budget and group info
+/// through to `apply_appl` for Execute-mode pooled budget accounting.
 fn apply_transaction_with_budget<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     stx: &SignedTransaction,
     ctx: &ApplyContext,
     depth: u32,
     group_budget: Option<&mut GroupBudget>,
+    group_info: Option<&GroupInfo<'_>>,
 ) -> Result<(), AlgoError> {
-    apply_transaction_inner(store, stx, ctx, depth, group_budget)
+    apply_transaction_inner(store, stx, ctx, depth, group_budget, group_info)
 }
 
 /// Apply a single signed transaction to the ledger state.
@@ -280,7 +405,7 @@ pub fn apply_transaction<L: crate::store_trait::LedgerStore>(
     ctx: &ApplyContext,
     depth: u32,
 ) -> Result<(), AlgoError> {
-    apply_transaction_inner(store, stx, ctx, depth, None)
+    apply_transaction_inner(store, stx, ctx, depth, None, None)
 }
 
 /// Core transaction application logic, shared by `apply_transaction` and
@@ -291,6 +416,7 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
     ctx: &ApplyContext,
     depth: u32,
     group_budget: Option<&mut GroupBudget>,
+    group_info: Option<&GroupInfo<'_>>,
 ) -> Result<(), AlgoError> {
     let txn = &stx.txn;
 
@@ -477,7 +603,7 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
                 apply_afrz(store, &stx.txn)?;
             }
-            "appl" => apply_appl(store, stx, ctx, depth, group_budget)?,
+            "appl" => apply_appl(store, stx, ctx, depth, group_budget, group_info)?,
             "keyreg" => {
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
                 apply_keyreg(store, &stx.txn, ctx.round)?;
@@ -1386,6 +1512,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
     ctx: &ApplyContext,
     depth: u32,
     group_budget: Option<&mut GroupBudget>,
+    group_info: Option<&GroupInfo<'_>>,
 ) -> Result<(), AlgoError> {
     let txn = &stx.txn;
 
@@ -1480,11 +1607,11 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     }
                     let cs_snapshot = store.snapshot_with_ids(&cs_addrs, &[], &[app_id]);
 
-                    let group = vec![stx.clone()];
+                    let (avm_group, avm_group_index) = build_avm_group(stx, group_info);
                     let mut avm_ctx = LedgerAvmContext::new(
                         store,
-                        group,
-                        0, // group_index (single-txn group for now)
+                        avm_group,
+                        avm_group_index,
                         ctx.round,
                         ctx.latest_timestamp,
                         app_id,
@@ -1500,6 +1627,14 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     // Propagate updated counters back to context.
                     ctx.txn_counter.set(avm_ctx.txn_counter);
                     ctx.fee_credit.set(avm_ctx.fee_credit);
+                    // Record EvalDelta comparison (clear-state).
+                    record_eval_delta_comparison(
+                        stx,
+                        &result,
+                        ctx.round,
+                        ctx.txn_index.get(),
+                        app_id,
+                    );
                     if !result.approved {
                         // ClearState rejection: roll back any state changes the
                         // program made during execution. The on-completion branch
@@ -1540,11 +1675,11 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 }
 
                 let ph = program_hash(&approval_program);
-                let group = vec![stx.clone()];
+                let (avm_group, avm_group_index) = build_avm_group(stx, group_info);
                 let mut avm_ctx = LedgerAvmContext::new(
                     store,
-                    group,
-                    0, // group_index
+                    avm_group,
+                    avm_group_index,
                     ctx.round,
                     ctx.latest_timestamp,
                     app_id,
@@ -1565,6 +1700,9 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 // Propagate updated counters back to context.
                 ctx.txn_counter.set(avm_ctx.txn_counter);
                 ctx.fee_credit.set(avm_ctx.fee_credit);
+
+                // Record EvalDelta comparison (approval program).
+                record_eval_delta_comparison(stx, &result, ctx.round, ctx.txn_index.get(), app_id);
 
                 if !result.approved {
                     return Err(AlgoError::Ledger {
