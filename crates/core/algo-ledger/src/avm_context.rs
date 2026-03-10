@@ -2862,6 +2862,14 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 // H1: Snapshot box state to pass to inner context.
                 // Ensure boxes are initialized before extracting state.
                 self.ensure_boxes_initialized();
+                // Run the read budget check before snapshotting, so
+                // the inner call (which inherits read_budget_checked=true)
+                // doesn't bypass the check if the parent hasn't run it yet.
+                // In go-algorand, EvalContract runs the read budget check
+                // eagerly before any opcodes execute (eval.go line 1145),
+                // so by the time an inner call is created the check has
+                // already passed.
+                self.check_read_budget()?;
                 let caller_box_state = crate::apply::BoxBudgetState {
                     available_boxes: self.available_boxes.clone(),
                     dirty_bytes: self.dirty_bytes,
