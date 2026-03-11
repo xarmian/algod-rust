@@ -14,7 +14,7 @@ use algo_types::{
     HeartbeatProof, HeartbeatTxnFields, HoldingRef, LocalsRef, LogicSig, MerkleProof,
     MerkleSignature, MerkleSignatureVerifier, MultisigSig, MultisigSubsig, Participant,
     ResourceRef, Reveal, SigSlotCommit, SignedTransaction, StateProofBody, StateProofMessage,
-    StateSchema, Transaction,
+    StateSchema, Transaction, TxTailRound, TxTailRoundLease,
 };
 use serde_bytes::ByteBuf;
 
@@ -860,6 +860,133 @@ pub fn canonical_encode_resource_ref(rr: &ResourceRef) -> Vec<u8> {
     m.encode()
 }
 
+/// Canonically encode a TxTailRoundLease.
+/// Fields: `"TxnIdx"` (u64), `"l"` (lease bytes), `"s"` (sender address).
+/// Sorted alphabetically: `T` < `l` < `s`. Non-default fields only (omitempty).
+pub fn canonical_encode_txtail_round_lease(lease: &TxTailRoundLease) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_u64("TxnIdx", lease.txn_idx);
+    m.add_bytes("l", &lease.lease);
+    m.add_address("s", &lease.sender);
+    m.encode()
+}
+
+/// Canonically encode a TxTailRound.
+/// Fields: `"h"` (BlockHeader), `"i"` (txn IDs), `"l"` (leases), `"v"` (last_valid rounds).
+/// Sorted: `h` < `i` < `l` < `v`. Non-empty fields only (omitempty).
+pub fn canonical_encode_txtail_round(tail: &TxTailRound) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    // "h" — block header (always present, but omit if empty map)
+    m.add_map("h", canonical_encode_block_header(&tail.hdr));
+
+    // "i" — txn IDs (array of binary digests)
+    if !tail.txn_ids.is_empty() {
+        let mut buf = Vec::new();
+        rmp::encode::write_array_len(&mut buf, tail.txn_ids.len() as u32).unwrap();
+        for id in &tail.txn_ids {
+            rmp::encode::write_bin(&mut buf, id).unwrap();
+        }
+        m.fields.push(("i", buf));
+    }
+
+    // "l" — leases (array of encoded TxTailRoundLease maps)
+    if !tail.leases.is_empty() {
+        let maps: Vec<Vec<u8>> = tail
+            .leases
+            .iter()
+            .map(canonical_encode_txtail_round_lease)
+            .collect();
+        let mut buf = Vec::new();
+        rmp::encode::write_array_len(&mut buf, maps.len() as u32).unwrap();
+        for map in &maps {
+            buf.extend_from_slice(map);
+        }
+        m.fields.push(("l", buf));
+    }
+
+    // "v" — last-valid rounds (array of u64)
+    if !tail.last_valid.is_empty() {
+        let mut buf = Vec::new();
+        rmp::encode::write_array_len(&mut buf, tail.last_valid.len() as u32).unwrap();
+        for &v in &tail.last_valid {
+            write_uint(&mut buf, v);
+        }
+        m.fields.push(("v", buf));
+    }
+
+    m.encode()
+}
+
+/// Build a `TxTailRound` from a `Block`, mirroring go-algorand's `TxTailRoundFromBlock`.
+///
+/// Iterates the block's payset to collect transaction IDs, last-valid rounds,
+/// and lease entries. The block header is copied into the result.
+pub fn build_txtail_from_block(block: &Block) -> TxTailRound {
+    use crate::compute_txn_id;
+
+    let hdr = BlockHeader {
+        round: block.round,
+        branch: block.branch.clone(),
+        seed: block.seed.clone(),
+        txn_commitment: block.txn_commitment.clone(),
+        timestamp: block.timestamp,
+        genesis_id: block.genesis_id.clone(),
+        genesis_hash: block.genesis_hash.clone(),
+        proposer: block.proposer,
+        fee_sink: block.fee_sink,
+        rewards_pool: block.rewards_pool,
+        rewards_level: block.rewards_level,
+        rewards_rate: block.rewards_rate,
+        rewards_residue: block.rewards_residue,
+        rewards_recalculation_round: block.rewards_recalculation_round,
+        current_protocol: block.current_protocol.clone(),
+        next_protocol: block.next_protocol.clone(),
+        next_protocol_approvals: block.next_protocol_approvals,
+        next_protocol_switch_on: block.next_protocol_switch_on,
+        next_protocol_vote_before: block.next_protocol_vote_before,
+        txn_counter: block.txn_counter,
+        fees_collected: block.fees_collected,
+        bonus: block.bonus,
+        proposer_payout: block.proposer_payout,
+        prev512: block.prev512.clone(),
+        txn256: block.txn256.clone(),
+        txn512: block.txn512.clone(),
+        state_proof_tracking: block.state_proof_tracking.clone(),
+        upgrade_propose: block.upgrade_propose.clone(),
+        upgrade_delay: block.upgrade_delay,
+        upgrade_approve: block.upgrade_approve,
+        expired_participation_accounts: block.expired_participation_accounts.clone(),
+        absent_participation_accounts: block.absent_participation_accounts.clone(),
+    };
+
+    let mut txn_ids = Vec::with_capacity(block.payset.len());
+    let mut last_valid = Vec::with_capacity(block.payset.len());
+    let mut leases = Vec::new();
+
+    for (idx, stx) in block.payset.iter().enumerate() {
+        let txid = compute_txn_id(&stx.txn);
+        txn_ids.push(ByteBuf::from(txid.0.to_vec()));
+        last_valid.push(stx.txn.last_valid.0);
+
+        // Check for non-zero lease (32-byte field)
+        if !stx.txn.lease.is_empty() && stx.txn.lease.iter().any(|&b| b != 0) {
+            leases.push(TxTailRoundLease {
+                sender: stx.txn.sender,
+                lease: stx.txn.lease.clone(),
+                txn_idx: idx as u64,
+            });
+        }
+    }
+
+    TxTailRound {
+        hdr,
+        txn_ids,
+        last_valid,
+        leases,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1132,5 +1259,87 @@ mod tests {
             // hgi=true included, hgh=false omitted
             assert_eq!(keys, vec!["hgi", "sig", "txn"]);
         }
+    }
+
+    /// Create a minimal Block for testing. Block doesn't derive Default, so
+    /// this helper fills every field with a zero/empty value.
+    fn minimal_block(round: Round, payset: Vec<SignedTransaction>) -> algo_types::Block {
+        algo_types::Block {
+            round,
+            branch: ByteBuf::new(),
+            seed: ByteBuf::new(),
+            txn_commitment: ByteBuf::new(),
+            timestamp: 0,
+            genesis_id: String::new(),
+            genesis_hash: ByteBuf::new(),
+            proposer: Address::ZERO,
+            fee_sink: Address::ZERO,
+            rewards_pool: Address::ZERO,
+            rewards_level: 0,
+            rewards_rate: 0,
+            rewards_residue: 0,
+            rewards_recalculation_round: Round(0),
+            current_protocol: String::new(),
+            next_protocol: String::new(),
+            next_protocol_approvals: 0,
+            next_protocol_switch_on: Round(0),
+            next_protocol_vote_before: Round(0),
+            txn_counter: 0,
+            fees_collected: 0,
+            bonus: 0,
+            proposer_payout: 0,
+            prev512: ByteBuf::new(),
+            txn256: ByteBuf::new(),
+            txn512: ByteBuf::new(),
+            state_proof_tracking: None,
+            upgrade_propose: String::new(),
+            upgrade_delay: 0,
+            upgrade_approve: false,
+            expired_participation_accounts: None,
+            absent_participation_accounts: None,
+            payset,
+        }
+    }
+
+    #[test]
+    fn test_build_txtail_from_block_empty_payset() {
+        let block = minimal_block(Round(42), vec![]);
+
+        let tail = build_txtail_from_block(&block);
+        assert!(tail.txn_ids.is_empty());
+        assert!(tail.last_valid.is_empty());
+        assert!(tail.leases.is_empty());
+        assert_eq!(tail.hdr.round, Round(42));
+    }
+
+    #[test]
+    fn test_build_txtail_from_block_with_lease() {
+        let lease_bytes = [0xABu8; 32];
+        let sender = Address([0x01u8; 32]);
+
+        let stx = SignedTransaction {
+            txn: Transaction {
+                txn_type: "pay".into(),
+                sender,
+                fee: 1000,
+                first_valid: Round(10),
+                last_valid: Round(20),
+                lease: ByteBuf::from(lease_bytes.to_vec()),
+                amount: 100,
+                receiver: Address([0x02u8; 32]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let block = minimal_block(Round(5), vec![stx]);
+
+        let tail = build_txtail_from_block(&block);
+        assert_eq!(tail.txn_ids.len(), 1);
+        assert_eq!(tail.last_valid, vec![20]);
+        assert_eq!(tail.leases.len(), 1);
+        assert_eq!(tail.leases[0].sender, sender);
+        assert_eq!(tail.leases[0].lease.as_ref(), &lease_bytes);
+        assert_eq!(tail.leases[0].txn_idx, 0);
     }
 }

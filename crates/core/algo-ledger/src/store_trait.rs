@@ -250,4 +250,70 @@ pub trait LedgerStore {
     fn finalize_trie_updates(&mut self) -> Option<[u8; 32]> {
         None
     }
+
+    // ---- Block / Certificate Storage ----
+
+    /// Store a block with header data, full block data, and protocol version.
+    fn put_block(
+        &mut self,
+        round: u64,
+        proto: &str,
+        hdrdata: &[u8],
+        blkdata: &[u8],
+    ) -> Result<(), AlgoError> {
+        let _ = (round, proto, hdrdata, blkdata);
+        Ok(())
+    }
+
+    /// Retrieve raw block data (full block) by round.
+    fn get_block_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        let _ = round;
+        Ok(None)
+    }
+
+    /// Retrieve raw block header data by round.
+    fn get_block_header_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        let _ = round;
+        Ok(None)
+    }
+
+    /// Retrieve certificate data for a block round.
+    fn get_block_cert(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        let _ = round;
+        Ok(None)
+    }
+
+    /// Retrieve the protocol version string for a block round.
+    fn get_block_proto(&self, round: u64) -> Result<Option<String>, AlgoError> {
+        let _ = round;
+        Ok(None)
+    }
+
+    /// Store a certificate for a block round.
+    fn put_block_cert(&mut self, round: u64, certdata: &[u8]) -> Result<(), AlgoError> {
+        let _ = (round, certdata);
+        Ok(())
+    }
+
+    // ---- TxTail Storage ----
+
+    /// Store a txtail entry (serialized `TxTailRound`) for a round.
+    fn put_txtail(&mut self, round: u64, data: &[u8]) -> Result<(), AlgoError> {
+        let _ = (round, data);
+        Ok(())
+    }
+
+    /// Retrieve a txtail entry by round.
+    fn get_txtail(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        let _ = round;
+        Ok(None)
+    }
+
+    // ---- Pruning ----
+
+    /// Delete blocks and txtail entries before the given round.
+    fn forget_before(&mut self, round: u64) -> Result<(), AlgoError> {
+        let _ = round;
+        Ok(())
+    }
 }

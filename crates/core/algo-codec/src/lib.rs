@@ -2,10 +2,11 @@ mod canonical;
 mod digest;
 
 pub use canonical::{
-    canonical_encode_block_header, canonical_encode_block_header_from_block,
-    canonical_encode_logicsig, canonical_encode_multisig, canonical_encode_multisig_subsig,
-    canonical_encode_signed_transaction, canonical_encode_signed_txn_in_block,
-    canonical_encode_transaction, canonical_encode_tx_group,
+    build_txtail_from_block, canonical_encode_block_header,
+    canonical_encode_block_header_from_block, canonical_encode_logicsig, canonical_encode_multisig,
+    canonical_encode_multisig_subsig, canonical_encode_signed_transaction,
+    canonical_encode_signed_txn_in_block, canonical_encode_transaction, canonical_encode_tx_group,
+    canonical_encode_txtail_round, canonical_encode_txtail_round_lease,
 };
 pub use digest::{compute_block_digest, compute_txn_id};
 
