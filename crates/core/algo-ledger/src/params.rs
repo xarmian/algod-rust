@@ -1,7 +1,19 @@
 use algo_types::AccountData;
 
-// Protocol parameters for minimum balance computation.
+// Protocol parameters for minimum balance computation and fixed limits.
+//
 // Values from go-algorand consensus parameters (v4.5.1).
+//
+// The majority of consensus parameters are now sourced from
+// `algo_types::ConsensusParams`, which is the single source of truth
+// and is threaded through AVM and ledger execution contexts.
+//
+// The constants below are kept for:
+//   - `min_balance()`: used by state.rs and sqlite.rs where ConsensusParams
+//     is not yet threaded (TODO: thread ConsensusParams through min_balance).
+//   - `MAX_APP_CALL_DEPTH`: a fixed protocol constant not in ConsensusParams
+//     (go-algorand `maxAppCallDepth = 8`).
+//   - Schema constants: used by state.rs for Merkle trie computation.
 
 pub const MIN_BALANCE: u64 = 100_000;
 pub const ASSET_OPT_IN_MIN_BALANCE: u64 = 100_000;
@@ -15,41 +27,22 @@ pub const SCHEMA_UINT_MIN_BALANCE: u64 = 3_500;
 pub const SCHEMA_BYTES_MIN_BALANCE: u64 = 25_000;
 pub const BOX_FLAT_MIN_BALANCE: u64 = 2_500;
 pub const BOX_BYTE_MIN_BALANCE: u64 = 400;
-pub const REWARDS_RATE_REFRESH_INTERVAL: u64 = 500_000;
-
-// Box storage consensus parameters (go-algorand v4.5.1, consensus V41).
-
-/// Maximum length of a box name/key (consensus `MaxAppKeyLen`, set in V24).
-pub const MAX_APP_KEY_LEN: usize = 64;
-
-/// Maximum size of a box value in bytes (consensus `MaxBoxSize`, set in V36).
-pub const MAX_BOX_SIZE: u64 = 32_768;
-
-/// Number of bytes a single box reference covers in the I/O budget
-/// (consensus `BytesPerBoxReference`). Changed from 1024 (V36) to 2048 (V41).
-pub const BYTES_PER_BOX_REFERENCE: u64 = 2_048;
-
-// Inner transaction consensus parameters (go-algorand v4.5.1).
-
-/// Maximum inner transactions per app call (before pooling, v30+).
-/// With `EnableInnerTransactionPooling` (v31+), this is pooled across the
-/// group: effective limit = `MAX_INNER_TRANSACTIONS * MAX_TX_GROUP_SIZE`.
-pub const MAX_INNER_TRANSACTIONS: usize = 16;
-
-/// Maximum atomic transaction group size.
-pub const MAX_TX_GROUP_SIZE: usize = 16;
 
 /// Maximum inner app-call depth (go-algorand `maxAppCallDepth = 8`).
 /// A value of 0 prevents inner app calls; 8 means top-level + 8 levels deep.
+/// This is a fixed protocol constant, not in ConsensusParams.
 pub const MAX_APP_CALL_DEPTH: usize = 8;
 
-/// Minimum AVM version for programs called via inner transactions (v34+).
-pub const MIN_INNER_APPL_VERSION: u64 = 4;
+// ── Test-only constants ────────────────────────────────────────────
+// The following are used only in test code. Production code reads these
+// values from `ConsensusParams`.
 
-/// Default per-app opcode budget (go-algorand `MaxAppProgramCost = 700`).
-pub const INNER_APP_BUDGET: i64 = 700;
+/// Maximum inner transactions per app call (test reference only).
+#[cfg(test)]
+pub const MAX_INNER_TRANSACTIONS: usize = 16;
 
-/// Minimum transaction fee in microAlgos.
+/// Minimum transaction fee in microAlgos (test reference only).
+#[cfg(test)]
 pub const MIN_TXN_FEE: u64 = 1000;
 
 /// Compute minimum balance for an account based on its opted-in assets,
@@ -60,6 +53,8 @@ pub const MIN_TXN_FEE: u64 = 1000;
 ///   SCHEMA_MIN_BALANCE_PER_ENTRY * (num_uint + num_byte_slice)
 ///   + SCHEMA_UINT_MIN_BALANCE * num_uint
 ///   + SCHEMA_BYTES_MIN_BALANCE * num_byte_slice
+///
+/// TODO: Accept `ConsensusParams` to make this version-aware.
 pub fn min_balance(account: &AccountData) -> u64 {
     // NOTE: total_assets_opted_in already includes creator holdings (incremented
     // on asset create), matching Go's single `TotalAssets` counter. Do NOT add

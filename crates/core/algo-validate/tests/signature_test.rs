@@ -1,5 +1,6 @@
 use algo_avm::group::GroupBudget;
 use algo_codec::decode_block_response;
+use algo_types::consensus::ConsensusParams;
 use algo_types::{Address, LogicSig, Round, SignedTransaction, Transaction};
 use algo_validate::signature::verify_logicsig;
 use algo_validate::verify_transaction_signature;
@@ -74,13 +75,19 @@ macro_rules! sig_verify_test {
             let txns = restore_genesis_fields(&br);
             let mut lsig_budget = GroupBudget::for_logicsig(txns.len());
             for (i, stx) in txns.iter().enumerate() {
-                verify_transaction_signature(stx, &txns, i, &mut lsig_budget, false)
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "signature verification failed for block {} txn {}: {e}",
-                            $round, i
-                        )
-                    });
+                verify_transaction_signature(
+                    stx,
+                    &txns,
+                    i,
+                    &mut lsig_budget,
+                    &ConsensusParams::default(),
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "signature verification failed for block {} txn {}: {e}",
+                        $round, i
+                    )
+                });
             }
         }
     };
@@ -109,9 +116,16 @@ fn sig_verify_all_blocks() {
         let txns = restore_genesis_fields(&br);
         let mut lsig_budget = GroupBudget::for_logicsig(txns.len());
         for (i, stx) in txns.iter().enumerate() {
-            verify_transaction_signature(stx, &txns, i, &mut lsig_budget, false).unwrap_or_else(
-                |e| panic!("signature verification failed for block {round} txn {i}: {e}"),
-            );
+            verify_transaction_signature(
+                stx,
+                &txns,
+                i,
+                &mut lsig_budget,
+                &ConsensusParams::default(),
+            )
+            .unwrap_or_else(|e| {
+                panic!("signature verification failed for block {round} txn {i}: {e}")
+            });
             verified += 1;
         }
     }
@@ -177,7 +191,14 @@ fn logicsig_valid_program_approves() {
     let mut budget = GroupBudget::for_logicsig(1);
 
     let lsig = stx.lsig.as_ref().unwrap();
-    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget, false);
+    let result = verify_logicsig(
+        &stx,
+        lsig,
+        &group,
+        0,
+        &mut budget,
+        &ConsensusParams::default(),
+    );
     assert!(
         result.is_ok(),
         "LogicSig with `pushint 1` should pass: {:?}",
@@ -194,7 +215,14 @@ fn logicsig_rejecting_program_fails() {
     let mut budget = GroupBudget::for_logicsig(1);
 
     let lsig = stx.lsig.as_ref().unwrap();
-    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget, false);
+    let result = verify_logicsig(
+        &stx,
+        lsig,
+        &group,
+        0,
+        &mut budget,
+        &ConsensusParams::default(),
+    );
     assert!(result.is_err(), "LogicSig with `pushint 0` should fail");
     let err_msg = result.unwrap_err().to_string();
     assert!(
@@ -221,7 +249,15 @@ fn logicsig_pooled_budget_shared_across_group() {
 
     // Verify first transaction's LogicSig.
     let lsig1 = stx1.lsig.as_ref().unwrap();
-    verify_logicsig(&stx1, lsig1, &group, 0, &mut budget, false).unwrap();
+    verify_logicsig(
+        &stx1,
+        lsig1,
+        &group,
+        0,
+        &mut budget,
+        &ConsensusParams::default(),
+    )
+    .unwrap();
 
     // Budget should have decreased (pushint 1 costs 1 opcode unit).
     let after_first = budget.remaining();
@@ -233,7 +269,15 @@ fn logicsig_pooled_budget_shared_across_group() {
 
     // Verify second transaction's LogicSig with the same pooled budget.
     let lsig2 = stx2.lsig.as_ref().unwrap();
-    verify_logicsig(&stx2, lsig2, &group, 1, &mut budget, false).unwrap();
+    verify_logicsig(
+        &stx2,
+        lsig2,
+        &group,
+        1,
+        &mut budget,
+        &ConsensusParams::default(),
+    )
+    .unwrap();
 
     let after_second = budget.remaining();
     assert!(
@@ -257,7 +301,14 @@ fn logicsig_state_access_app_opted_in_fails() {
     let mut budget = GroupBudget::for_logicsig(1);
 
     let lsig = stx.lsig.as_ref().unwrap();
-    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget, false);
+    let result = verify_logicsig(
+        &stx,
+        lsig,
+        &group,
+        0,
+        &mut budget,
+        &ConsensusParams::default(),
+    );
     assert!(result.is_err(), "LogicSig using app_opted_in should fail");
 }
 
@@ -269,7 +320,8 @@ fn verify_transaction_signature_dispatches_to_logicsig() {
     let group = vec![stx.clone()];
     let mut budget = GroupBudget::for_logicsig(1);
 
-    let result = verify_transaction_signature(&stx, &group, 0, &mut budget, false);
+    let result =
+        verify_transaction_signature(&stx, &group, 0, &mut budget, &ConsensusParams::default());
     assert!(
         result.is_ok(),
         "verify_transaction_signature should dispatch to LogicSig path: {:?}",
@@ -282,13 +334,14 @@ fn verify_transaction_signature_dispatches_to_logicsig() {
 #[test]
 fn logicsig_size_pooling_allows_large_lsig_in_group() {
     use algo_validate::signature::verify_group_logicsig_size;
-    use algo_validate::LOGICSIG_MAX_SIZE;
 
-    // Build a program that is larger than LOGICSIG_MAX_SIZE (1000 bytes).
+    let consensus = ConsensusParams::default();
+
+    // Build a program that is larger than LogicSigMaxSize (1000 bytes).
     // We'll use pushbytes with a large payload. The program needs to be valid
     // so we construct: version 6, pushbytes <large>, pop, pushint 1
     // pushbytes 0x80: opcode 0x80, then varuint length, then bytes
-    // Build a program > LOGICSIG_MAX_SIZE (1000 bytes) using pushbytes with
+    // Build a program > consensus.logic_sig_max_size (1000 bytes) using pushbytes with
     // a large blob. Layout: version(1) + pushbytes(1) + varuint(2) + 3380
     // + pop(1) + pushint 1(2) = 3387 bytes.
     let blob_len = 3380usize;
@@ -315,18 +368,22 @@ fn logicsig_size_pooling_allows_large_lsig_in_group() {
 
     let program_len = program.len() as u64;
     assert!(
-        program_len > LOGICSIG_MAX_SIZE,
-        "test program should exceed LOGICSIG_MAX_SIZE: {} > {}",
+        program_len > consensus.logic_sig_max_size,
+        "test program should exceed consensus.logic_sig_max_size: {} > {}",
         program_len,
-        LOGICSIG_MAX_SIZE
+        consensus.logic_sig_max_size
     );
 
     // Without pooling, the individual LogicSig should be rejected.
+    let no_pooling = ConsensusParams {
+        enable_logicsig_size_pooling: false,
+        ..ConsensusParams::default()
+    };
     let stx = make_contract_account_txn(&program);
     let group = vec![stx.clone()];
     let mut budget = GroupBudget::for_logicsig(1);
     let lsig = stx.lsig.as_ref().unwrap();
-    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget, false);
+    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget, &no_pooling);
     assert!(
         result.is_err(),
         "should reject large LogicSig without size pooling"
@@ -340,8 +397,12 @@ fn logicsig_size_pooling_allows_large_lsig_in_group() {
     );
 
     // With pooling enabled, the per-txn check is skipped.
+    let pooling_consensus = ConsensusParams {
+        enable_logicsig_size_pooling: true,
+        ..ConsensusParams::default()
+    };
     let mut budget2 = GroupBudget::for_logicsig(1);
-    let result2 = verify_logicsig(&stx, lsig, &group, 0, &mut budget2, true);
+    let result2 = verify_logicsig(&stx, lsig, &group, 0, &mut budget2, &pooling_consensus);
     assert!(
         result2.is_ok(),
         "should accept large LogicSig with size pooling (per-txn check skipped): {:?}",
@@ -370,7 +431,7 @@ fn logicsig_size_pooling_allows_large_lsig_in_group() {
         };
         group_of_8.push(plain);
     }
-    let pooled_result = verify_group_logicsig_size(&group_of_8);
+    let pooled_result = verify_group_logicsig_size(&group_of_8, &consensus);
     assert!(
         pooled_result.is_ok(),
         "group of 8 should have enough pool for one 3387-byte LogicSig: {:?}",
@@ -380,7 +441,7 @@ fn logicsig_size_pooling_allows_large_lsig_in_group() {
     // Group-level check with 1 member: pool = 1 * 1000 = 1000.
     // Our program is ~3387 bytes > 1000, so it should fail.
     let small_group = vec![stx.clone()];
-    let pooled_fail = verify_group_logicsig_size(&small_group);
+    let pooled_fail = verify_group_logicsig_size(&small_group, &consensus);
     assert!(
         pooled_fail.is_err(),
         "group of 1 should reject a 3387-byte LogicSig"

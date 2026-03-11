@@ -3,6 +3,7 @@ use algo_avm::logicsig_context::LogicSigAvmContext;
 use algo_avm::run_logicsig_program;
 use algo_codec::canonical_encode_transaction;
 use algo_error::AlgoError;
+use algo_types::consensus::ConsensusParams;
 use algo_types::{Address, LogicSig, MultisigSig, SignedTransaction};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha512_256};
@@ -244,18 +245,13 @@ fn verify_logicsig_multisig(
 /// `budget` is the shared LogicSig budget pool for the group (each txn
 /// contributes `LOGICSIG_BUDGET` = 20,000 opcodes).
 ///
-/// Default LogicSig maximum size (logic bytes + args bytes).
-/// Matches go-algorand `config/consensus.go` v18+ `LogicSigMaxSize = 1000`.
-/// This value has not changed across any consensus version.
-pub const LOGICSIG_MAX_SIZE: u64 = 1000;
-
 pub fn verify_logicsig(
     stx: &SignedTransaction,
     lsig: &LogicSig,
     group: &[SignedTransaction],
     group_index: usize,
     budget: &mut GroupBudget,
-    enable_logicsig_size_pooling: bool,
+    consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
     // ── Structural sanity checks (Go: logicSigSanityCheckBatchPrep) ──
     // Empty program is always invalid.
@@ -275,11 +271,11 @@ pub fn verify_logicsig(
             lsig_len += arg.len() as u64;
         }
     }
-    if !enable_logicsig_size_pooling && lsig_len > LOGICSIG_MAX_SIZE {
+    if !consensus.enable_logicsig_size_pooling && lsig_len > consensus.logic_sig_max_size {
         return Err(AlgoError::Validation {
             message: format!(
                 "LogicSig too long: {} bytes exceeds maximum {}",
-                lsig_len, LOGICSIG_MAX_SIZE
+                lsig_len, consensus.logic_sig_max_size
             ),
         });
     }
@@ -367,7 +363,7 @@ pub fn verify_logicsig(
         .map(|a| a.iter().map(|b| b.to_vec()).collect())
         .unwrap_or_default();
 
-    let mut ctx = LogicSigAvmContext::new(group, group_index, &lsig.logic, args);
+    let mut ctx = LogicSigAvmContext::new(group, group_index, &lsig.logic, args, consensus.clone());
 
     let pass =
         run_logicsig_program(&lsig.logic, &mut ctx, budget).map_err(|e| AlgoError::Validation {
@@ -421,7 +417,7 @@ pub fn verify_transaction_signature(
     group: &[SignedTransaction],
     group_index: usize,
     lsig_budget: &mut GroupBudget,
-    enable_logicsig_size_pooling: bool,
+    consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
     // Go-algorand requires exactly one of sig/msig/lsig.
     let has_sig = !stx.sig.is_empty();
@@ -448,14 +444,7 @@ pub fn verify_transaction_signature(
     }
 
     if let Some(lsig) = &stx.lsig {
-        return verify_logicsig(
-            stx,
-            lsig,
-            group,
-            group_index,
-            lsig_budget,
-            enable_logicsig_size_pooling,
-        );
+        return verify_logicsig(stx, lsig, group, group_index, lsig_budget, consensus);
     }
 
     unreachable!()
@@ -484,9 +473,12 @@ pub fn logicsig_group_size(group: &[SignedTransaction]) -> u64 {
 ///
 /// Called when `EnableLogicSigSizePooling` is true (v40+). The total available
 /// pool is `group_size * LogicSigMaxSize`.
-pub fn verify_group_logicsig_size(group: &[SignedTransaction]) -> Result<(), AlgoError> {
+pub fn verify_group_logicsig_size(
+    group: &[SignedTransaction],
+    consensus: &ConsensusParams,
+) -> Result<(), AlgoError> {
     let pooled_size = logicsig_group_size(group);
-    let max_pooled = group.len() as u64 * LOGICSIG_MAX_SIZE;
+    let max_pooled = group.len() as u64 * consensus.logic_sig_max_size;
     if pooled_size > max_pooled {
         return Err(AlgoError::Validation {
             message: format!(
@@ -511,14 +503,21 @@ mod tests {
     fn verify_sig(stx: &SignedTransaction) -> Result<(), AlgoError> {
         let group = [stx.clone()];
         let mut budget = GroupBudget::for_logicsig(1);
-        verify_transaction_signature(stx, &group, 0, &mut budget, false)
+        verify_transaction_signature(stx, &group, 0, &mut budget, &ConsensusParams::default())
     }
 
     /// Helper: verify a logicsig with a single-element group and fresh budget.
     fn verify_lsig(stx: &SignedTransaction, lsig: &LogicSig) -> Result<(), AlgoError> {
         let group = [stx.clone()];
         let mut budget = GroupBudget::for_logicsig(1);
-        verify_logicsig(stx, lsig, &group, 0, &mut budget, false)
+        verify_logicsig(
+            stx,
+            lsig,
+            &group,
+            0,
+            &mut budget,
+            &ConsensusParams::default(),
+        )
     }
 
     /// Create a signing key from a fixed seed for reproducibility.

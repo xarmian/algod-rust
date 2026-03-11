@@ -6,12 +6,12 @@
 //! `AvmContext` trait implementations.
 
 use algo_error::AlgoError;
+use algo_types::consensus::ConsensusParams;
 use algo_types::{SignedTransaction, TealValue};
 use sha2::{Digest, Sha512_256};
 
 use crate::context::AvmContext;
 use crate::fields::GlobalField;
-use crate::opcode::MAX_AVM_VERSION;
 use crate::txn_fields::read_txn_field;
 
 /// Domain separation prefix for program hashing.
@@ -35,6 +35,8 @@ pub struct LogicSigAvmContext<'a> {
     program_hash: [u8; 32],
     /// Genesis hash from the transaction header (for `global GenesisHash`).
     genesis_hash: [u8; 32],
+    /// Consensus parameters for the current protocol version.
+    consensus: ConsensusParams,
 }
 
 impl<'a> LogicSigAvmContext<'a> {
@@ -48,6 +50,7 @@ impl<'a> LogicSigAvmContext<'a> {
         group_index: usize,
         program: &[u8],
         args: Vec<Vec<u8>>,
+        consensus: ConsensusParams,
     ) -> Self {
         let mut hasher = Sha512_256::new();
         hasher.update(PROGRAM_PREFIX);
@@ -74,6 +77,7 @@ impl<'a> LogicSigAvmContext<'a> {
             args,
             program_hash: hash,
             genesis_hash,
+            consensus,
         }
     }
 }
@@ -85,12 +89,12 @@ impl<'a> AvmContext for LogicSigAvmContext<'a> {
         let gf = GlobalField::from_u8(field)?;
         match gf {
             // modeAny fields — available in both Sig and App mode.
-            GlobalField::MinTxnFee => Ok(TealValue::Uint(1000)),
-            GlobalField::MinBalance => Ok(TealValue::Uint(100_000)),
-            GlobalField::MaxTxnLife => Ok(TealValue::Uint(1000)),
+            GlobalField::MinTxnFee => Ok(TealValue::Uint(self.consensus.min_txn_fee)),
+            GlobalField::MinBalance => Ok(TealValue::Uint(self.consensus.min_balance)),
+            GlobalField::MaxTxnLife => Ok(TealValue::Uint(self.consensus.max_txn_life)),
             GlobalField::ZeroAddress => Ok(TealValue::Bytes(vec![0u8; 32])),
             GlobalField::GroupSize => Ok(TealValue::Uint(self.group.len() as u64)),
-            GlobalField::LogicSigVersion => Ok(TealValue::Uint(MAX_AVM_VERSION as u64)),
+            GlobalField::LogicSigVersion => Ok(TealValue::Uint(self.consensus.logic_sig_version)),
             GlobalField::GroupID => {
                 let group_id = if self.group_index < self.group.len() {
                     let g = &self.group[self.group_index].txn.group;
@@ -107,16 +111,25 @@ impl<'a> AvmContext for LogicSigAvmContext<'a> {
             // OpcodeBudget is handled directly by op_global (reads machine.budget);
             // this fallback returns 0 but should not normally be reached.
             GlobalField::OpcodeBudget => Ok(TealValue::Uint(0)),
-            GlobalField::AssetCreateMinBalance => Ok(TealValue::Uint(100_000)),
-            GlobalField::AssetOptInMinBalance => Ok(TealValue::Uint(100_000)),
+            GlobalField::AssetCreateMinBalance => Ok(TealValue::Uint(self.consensus.min_balance)),
+            GlobalField::AssetOptInMinBalance => Ok(TealValue::Uint(self.consensus.min_balance)),
             GlobalField::GenesisHash => Ok(TealValue::Bytes(self.genesis_hash.to_vec())),
-            // Payouts fields — default to 0 (protocol-specific, not commonly
-            // available in LogicSig context but are modeAny in Go).
-            GlobalField::PayoutsEnabled
-            | GlobalField::PayoutsGoOnlineFee
-            | GlobalField::PayoutsPercent
-            | GlobalField::PayoutsMinBalance
-            | GlobalField::PayoutsMaxBalance => Ok(TealValue::Uint(0)),
+            // Payouts fields — sourced from consensus params.
+            GlobalField::PayoutsEnabled => Ok(TealValue::Uint(if self.consensus.payouts_enabled {
+                1
+            } else {
+                0
+            })),
+            GlobalField::PayoutsGoOnlineFee => {
+                Ok(TealValue::Uint(self.consensus.payouts_go_online_fee))
+            }
+            GlobalField::PayoutsPercent => Ok(TealValue::Uint(self.consensus.payouts_percent)),
+            GlobalField::PayoutsMinBalance => {
+                Ok(TealValue::Uint(self.consensus.payouts_min_balance))
+            }
+            GlobalField::PayoutsMaxBalance => {
+                Ok(TealValue::Uint(self.consensus.payouts_max_balance))
+            }
             // ModeApp-only fields — should never reach here because op_global
             // rejects them in LogicSig mode before calling global_field(), but
             // return an error for completeness.
@@ -190,6 +203,7 @@ impl<'a> AvmContext for LogicSigAvmContext<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use algo_types::consensus::ConsensusParams;
     use algo_types::{Address, Round, Transaction};
 
     fn make_pay_stxn(sender: [u8; 32]) -> SignedTransaction {
@@ -212,7 +226,7 @@ mod tests {
     fn basic_txn_field_access() {
         let stxn = make_pay_stxn([0x10; 32]);
         let group = vec![stxn];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
         // Sender
         let sender = ctx.txn_field(0, 0, None).unwrap();
@@ -232,7 +246,7 @@ mod tests {
         let stxn1 = make_pay_stxn([0x10; 32]);
         let stxn2 = make_pay_stxn([0x20; 32]);
         let group = vec![stxn1, stxn2];
-        let ctx = LogicSigAvmContext::new(&group, 1, &[0x01], vec![]);
+        let ctx = LogicSigAvmContext::new(&group, 1, &[0x01], vec![], ConsensusParams::default());
 
         assert_eq!(ctx.group_size(), 2);
         assert_eq!(ctx.group_index(), 1);
@@ -243,7 +257,7 @@ mod tests {
         let stxn = make_pay_stxn([0x10; 32]);
         let group = vec![stxn];
         let args = vec![b"hello".to_vec(), b"world".to_vec()];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], args);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], args, ConsensusParams::default());
 
         assert_eq!(ctx.num_args(), 2);
         assert_eq!(ctx.arg(0).unwrap(), b"hello".to_vec());
@@ -256,7 +270,7 @@ mod tests {
         let stxn = make_pay_stxn([0x10; 32]);
         let group = vec![stxn];
         let program = vec![0x06, 0x81, 0x01];
-        let ctx = LogicSigAvmContext::new(&group, 0, &program, vec![]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &program, vec![], ConsensusParams::default());
 
         // Compute expected hash manually.
         let mut hasher = Sha512_256::new();
@@ -271,7 +285,8 @@ mod tests {
     fn state_operations_return_errors() {
         let stxn = make_pay_stxn([0x10; 32]);
         let group = vec![stxn];
-        let mut ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+        let mut ctx =
+            LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
         // State reads should error (default AvmContext implementations).
         assert!(ctx.app_global_get(1, b"key").is_err());
@@ -292,7 +307,7 @@ mod tests {
     fn out_of_range_group_index_errors() {
         let stxn = make_pay_stxn([0x10; 32]);
         let group = vec![stxn];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
         assert!(ctx.txn_field(1, 0, None).is_err());
     }
@@ -303,7 +318,7 @@ mod tests {
     fn global_field_min_txn_fee() {
         let stxn = make_pay_stxn([0x10; 32]);
         let group = vec![stxn];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
         assert_eq!(ctx.global_field(0).unwrap(), TealValue::Uint(1000));
     }
@@ -312,7 +327,7 @@ mod tests {
     fn global_field_min_balance() {
         let stxn = make_pay_stxn([0x10; 32]);
         let group = vec![stxn];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
         assert_eq!(ctx.global_field(1).unwrap(), TealValue::Uint(100_000));
     }
@@ -321,7 +336,7 @@ mod tests {
     fn global_field_max_txn_life() {
         let stxn = make_pay_stxn([0x10; 32]);
         let group = vec![stxn];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
         assert_eq!(ctx.global_field(2).unwrap(), TealValue::Uint(1000));
     }
@@ -330,7 +345,7 @@ mod tests {
     fn global_field_zero_address() {
         let stxn = make_pay_stxn([0x10; 32]);
         let group = vec![stxn];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
         assert_eq!(
             ctx.global_field(3).unwrap(),
@@ -343,7 +358,7 @@ mod tests {
         let stxn1 = make_pay_stxn([0x10; 32]);
         let stxn2 = make_pay_stxn([0x20; 32]);
         let group = vec![stxn1, stxn2];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
         assert_eq!(ctx.global_field(4).unwrap(), TealValue::Uint(2));
     }
@@ -352,11 +367,13 @@ mod tests {
     fn global_field_logicsig_version() {
         let stxn = make_pay_stxn([0x10; 32]);
         let group = vec![stxn];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+        let params = ConsensusParams::default();
+        let expected_version = params.logic_sig_version;
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], params);
 
         assert_eq!(
             ctx.global_field(5).unwrap(),
-            TealValue::Uint(MAX_AVM_VERSION as u64)
+            TealValue::Uint(expected_version)
         );
     }
 
@@ -365,7 +382,7 @@ mod tests {
         let mut stxn = make_pay_stxn([0x10; 32]);
         stxn.txn.group = vec![0xAA; 32].into();
         let group = vec![stxn];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
         assert_eq!(
             ctx.global_field(11).unwrap(),
@@ -377,7 +394,7 @@ mod tests {
     fn global_field_group_id_empty() {
         let stxn = make_pay_stxn([0x10; 32]);
         let group = vec![stxn];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
         // Empty group field should return 32 zero bytes.
         assert_eq!(
@@ -390,7 +407,7 @@ mod tests {
     fn global_field_asset_min_balances() {
         let stxn = make_pay_stxn([0x10; 32]);
         let group = vec![stxn];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
         assert_eq!(ctx.global_field(15).unwrap(), TealValue::Uint(100_000)); // AssetCreateMinBalance
         assert_eq!(ctx.global_field(16).unwrap(), TealValue::Uint(100_000)); // AssetOptInMinBalance
@@ -401,7 +418,7 @@ mod tests {
         let mut stxn = make_pay_stxn([0x10; 32]);
         stxn.txn.genesis_hash = vec![0xBB; 32].into();
         let group = vec![stxn];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
         assert_eq!(
             ctx.global_field(17).unwrap(),
@@ -410,25 +427,35 @@ mod tests {
     }
 
     #[test]
-    fn global_field_payouts_default_zero() {
+    fn global_field_payouts_from_consensus() {
         let stxn = make_pay_stxn([0x10; 32]);
         let group = vec![stxn];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+        // V41 has payouts enabled with specific values.
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
-        for field_byte in 18..=22 {
-            assert_eq!(
-                ctx.global_field(field_byte).unwrap(),
-                TealValue::Uint(0),
-                "Payouts field {field_byte} should default to 0"
-            );
-        }
+        // PayoutsEnabled (18): V41 has payouts_enabled=true => 1
+        assert_eq!(ctx.global_field(18).unwrap(), TealValue::Uint(1));
+        // PayoutsGoOnlineFee (19): V41 = 2_000_000
+        assert_eq!(ctx.global_field(19).unwrap(), TealValue::Uint(2_000_000));
+        // PayoutsPercent (20): V41 = 50
+        assert_eq!(ctx.global_field(20).unwrap(), TealValue::Uint(50));
+        // PayoutsMinBalance (21): V41 = 30_000_000_000
+        assert_eq!(
+            ctx.global_field(21).unwrap(),
+            TealValue::Uint(30_000_000_000)
+        );
+        // PayoutsMaxBalance (22): V41 = 70_000_000_000_000
+        assert_eq!(
+            ctx.global_field(22).unwrap(),
+            TealValue::Uint(70_000_000_000_000)
+        );
     }
 
     #[test]
     fn global_field_app_mode_only_returns_error() {
         let stxn = make_pay_stxn([0x10; 32]);
         let group = vec![stxn];
-        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![]);
+        let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
         // Round (6), LatestTimestamp (7), CurrentApplicationID (8),
         // CreatorAddress (9), CurrentApplicationAddress (10)

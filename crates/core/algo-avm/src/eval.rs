@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use algo_error::AlgoError;
+use algo_types::consensus::ConsensusParams;
 use algo_types::{Address, SignedTransaction, TealValue};
 
 use crate::bytecode;
@@ -15,17 +16,24 @@ use crate::group::GroupBudget;
 use crate::machine::{AvmMachine, ExecMode, OpcodeCoverage};
 
 // ---------------------------------------------------------------------------
-// Constants (from go-algorand config/consensus.go)
+// Budget constants — sourced from ConsensusParams (V41 defaults).
+//
+// These are re-exported for backward compatibility with callers that
+// reference the named constants.  The authoritative source is now
+// `ConsensusParams`; these are simply the V41 default values.
 // ---------------------------------------------------------------------------
 
 /// LogicSig budget per transaction (pooled across the group).
+/// Sourced from `ConsensusParams::logic_sig_max_cost` (V41 default).
 pub const LOGICSIG_BUDGET: i64 = 20_000;
 
 /// Application budget added per app call in the group.
+/// Sourced from `ConsensusParams::max_app_program_cost` (V41 default).
 pub const APP_BUDGET_PER_CALL: i64 = 700;
 
 /// Maximum cost a single ClearState program may consume.
 /// ClearState programs run with an isolated budget capped at this value.
+/// Sourced from `ConsensusParams::max_app_program_cost` (V41 default).
 pub const MAX_APP_PROGRAM_COST: i64 = 700;
 
 // ---------------------------------------------------------------------------
@@ -132,10 +140,16 @@ pub fn run_approval_program(
 /// On program failure: `approved = false`, no deltas/logs/inner txns are
 /// propagated, but local state is still cleared by the caller.
 ///
-/// ClearState budget is capped at `MAX_APP_PROGRAM_COST` (700), independent
-/// of the pooled budget. Per go-algorand `IsolateClearState`, this runs with
-/// its own isolated budget and does not draw from `GroupBudget`.
-pub fn run_clear_state_program(program: &[u8], ctx: &mut dyn AvmContext) -> AvmResult {
+/// ClearState budget is capped at `max_app_program_cost` from the consensus
+/// params (700 for V41), independent of the pooled budget. Per go-algorand
+/// `IsolateClearState`, this runs with its own isolated budget and does not
+/// draw from `GroupBudget`.
+///
+pub fn run_clear_state_program(
+    program: &[u8],
+    ctx: &mut dyn AvmContext,
+    consensus: &ConsensusParams,
+) -> AvmResult {
     let parsed = match bytecode::parse(program) {
         Ok(p) => p,
         Err(_) => {
@@ -144,7 +158,8 @@ pub fn run_clear_state_program(program: &[u8], ctx: &mut dyn AvmContext) -> AvmR
         }
     };
 
-    let mut machine = AvmMachine::new(parsed, ExecMode::Application, MAX_APP_PROGRAM_COST);
+    let clear_budget = consensus.max_app_program_cost as i64;
+    let mut machine = AvmMachine::new(parsed, ExecMode::Application, clear_budget);
 
     match machine.run(ctx) {
         Ok(true) => {
@@ -388,7 +403,7 @@ mod tests {
         let raw = prog(2, &[0x20, 0x01, 0x01, 0x22, 0x43]);
         let mut ctx = NullContext;
 
-        let result = run_clear_state_program(&raw, &mut ctx);
+        let result = run_clear_state_program(&raw, &mut ctx, &ConsensusParams::default());
         assert!(result.approved);
     }
 
@@ -398,7 +413,7 @@ mod tests {
         let raw = prog(2, &[0x20, 0x01, 0x00, 0x22, 0x43]);
         let mut ctx = NullContext;
 
-        let result = run_clear_state_program(&raw, &mut ctx);
+        let result = run_clear_state_program(&raw, &mut ctx, &ConsensusParams::default());
         assert!(!result.approved);
         // On rejection, no deltas/logs/inner txns should be propagated.
         assert!(result.global_delta.is_empty());
@@ -413,7 +428,7 @@ mod tests {
         let raw = prog(1, &[0x00]);
         let mut ctx = NullContext;
 
-        let result = run_clear_state_program(&raw, &mut ctx);
+        let result = run_clear_state_program(&raw, &mut ctx, &ConsensusParams::default());
         assert!(!result.approved);
         assert!(result.global_delta.is_empty());
         assert!(result.local_deltas.is_empty());
@@ -424,7 +439,7 @@ mod tests {
     #[test]
     fn test_clear_state_program_parse_error_returns_empty() {
         // Empty program bytes -- parse failure returns empty result
-        let result = run_clear_state_program(&[], &mut NullContext);
+        let result = run_clear_state_program(&[], &mut NullContext, &ConsensusParams::default());
         assert!(!result.approved);
     }
 
@@ -440,7 +455,7 @@ mod tests {
         // this is enforced by the function signature. Just verify the
         // budget we created is untouched.
         let mut ctx = NullContext;
-        let result = run_clear_state_program(&raw, &mut ctx);
+        let result = run_clear_state_program(&raw, &mut ctx, &ConsensusParams::default());
         assert!(result.approved);
         assert_eq!(budget.remaining(), before);
     }

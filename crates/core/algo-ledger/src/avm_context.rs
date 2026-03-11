@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, HashMap};
 use algo_avm::context::AvmContext;
 use algo_avm::eval::AvmResult;
 use algo_avm::txn_fields;
-use algo_avm::MAX_AVM_VERSION;
 use algo_error::AlgoError;
+use algo_types::consensus::ConsensusParams;
 use algo_types::{Address, SignedTransaction, TealValue, Transaction};
 use sha2::{Digest, Sha512_256};
 
@@ -698,6 +698,9 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// Populated from the transaction group's box references on first use.
     available_boxes: HashMap<(u64, Vec<u8>), bool>,
 
+    /// Consensus parameters for the current protocol version.
+    pub consensus: ConsensusParams,
+
     /// Whether `available_boxes` has been populated yet.
     boxes_initialized: bool,
 
@@ -744,6 +747,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         app_mode: bool,
         program_hash: [u8; 32],
         genesis_hash: [u8; 32],
+        consensus: ConsensusParams,
     ) -> Self {
         let group_len = group.len();
         Self {
@@ -773,6 +777,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             created_assets: Vec::new(),
             created_apps: Vec::new(),
             parent_txn_id: algo_types::Digest([0u8; 32]),
+            consensus,
             available_boxes: HashMap::new(),
             boxes_initialized: false,
             dirty_bytes: 0,
@@ -872,7 +877,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             }
         }
 
-        self.io_budget = num_box_refs.saturating_mul(params::BYTES_PER_BOX_REFERENCE);
+        self.io_budget = num_box_refs.saturating_mul(self.consensus.bytes_per_box_reference);
     }
 
     /// Perform the one-time read budget check (on first box read for a
@@ -1034,27 +1039,26 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     }
 
     /// Validate box name length and box size against protocol limits.
-    fn box_length_checks(name: &[u8], size: u64) -> Result<(), AlgoError> {
+    fn box_length_checks(&self, name: &[u8], size: u64) -> Result<(), AlgoError> {
         if name.is_empty() {
             return Err(AlgoError::Avm {
                 message: "box names may not be zero length".into(),
             });
         }
-        if name.len() > params::MAX_APP_KEY_LEN {
+        if name.len() > self.consensus.max_app_key_len {
             return Err(AlgoError::Avm {
                 message: format!(
                     "name too long: length was {}, maximum is {}",
                     name.len(),
-                    params::MAX_APP_KEY_LEN
+                    self.consensus.max_app_key_len
                 ),
             });
         }
-        if size > params::MAX_BOX_SIZE {
+        if size > self.consensus.max_box_size {
             return Err(AlgoError::Avm {
                 message: format!(
                     "box size too large: {}, maximum is {}",
-                    size,
-                    params::MAX_BOX_SIZE
+                    size, self.consensus.max_box_size
                 ),
             });
         }
@@ -1071,7 +1075,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     /// group.  Because our context is per-app-call we scope the budget to
     /// the actual outer group size so a single-txn group gets 16, not 256.
     fn remaining_inners(&self) -> usize {
-        let total_budget = params::MAX_INNER_TRANSACTIONS * self.group.len();
+        let total_budget = self.consensus.max_inner_transactions * self.group.len();
         let used: usize = self.inner_txns.iter().map(|g| g.len()).sum();
         total_budget.saturating_sub(used)
     }
@@ -1135,6 +1139,7 @@ fn execute_inner_appl<L: LedgerStore>(
     inner_txn_id: algo_types::Digest,
     box_state: crate::apply::BoxBudgetState,
     created_apps_snapshot: Vec<u64>,
+    consensus: ConsensusParams,
 ) -> Result<crate::apply::InnerApplyData, AlgoError> {
     use algo_avm::eval::{run_approval_program, run_clear_state_program};
     use algo_avm::group::GroupBudget;
@@ -1196,7 +1201,7 @@ fn execute_inner_appl<L: LedgerStore>(
     // own isolated budget (MAX_APP_PROGRAM_COST = 700) and do NOT add to
     // the shared pool. Only non-ClearState app calls contribute budget.
     if on_completion != ON_COMPLETION_CLEAR_STATE {
-        *opcode_budget += params::INNER_APP_BUDGET;
+        *opcode_budget += consensus.max_app_program_cost as i64;
     }
 
     // ── Create a GroupBudget from the shared opcode budget ──
@@ -1219,6 +1224,7 @@ fn execute_inner_appl<L: LedgerStore>(
         true, // app_mode
         ph,
         genesis_hash,
+        consensus.clone(),
     );
     inner_ctx.caller_app_id_val = caller_app_id;
     inner_ctx.caller_app_address_val = app_address(caller_app_id);
@@ -1246,7 +1252,7 @@ fn execute_inner_appl<L: LedgerStore>(
     // ── Execute the program ──
     let avm_result = if on_completion == ON_COMPLETION_CLEAR_STATE {
         // ClearStateOC: run clear state program. On failure, still clear state.
-        run_clear_state_program(&program, &mut inner_ctx)
+        run_clear_state_program(&program, &mut inner_ctx, &consensus)
     } else {
         match run_approval_program(&program, &mut inner_ctx, &mut budget) {
             Ok(result) => result,
@@ -1440,17 +1446,17 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     fn global_field(&self, field: u8) -> Result<TealValue, AlgoError> {
         match field {
             // MinTxnFee
-            0 => Ok(TealValue::Uint(1000)),
+            0 => Ok(TealValue::Uint(self.consensus.min_txn_fee)),
             // MinBalance
-            1 => Ok(TealValue::Uint(params::MIN_BALANCE)),
+            1 => Ok(TealValue::Uint(self.consensus.min_balance)),
             // MaxTxnLife
-            2 => Ok(TealValue::Uint(1000)),
+            2 => Ok(TealValue::Uint(self.consensus.max_txn_life)),
             // ZeroAddress
             3 => Ok(TealValue::Bytes(vec![0u8; 32])),
             // GroupSize
             4 => Ok(TealValue::Uint(self.group.len() as u64)),
             // LogicSigVersion
-            5 => Ok(TealValue::Uint(MAX_AVM_VERSION as u64)),
+            5 => Ok(TealValue::Uint(self.consensus.logic_sig_version)),
             // Round
             6 => Ok(TealValue::Uint(self.round)),
             // LatestTimestamp
@@ -1485,13 +1491,25 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             // CallerApplicationAddress — uses caller fields.
             14 => Ok(TealValue::Bytes(self.caller_app_address_val.to_vec())),
             // AssetCreateMinBalance
-            15 => Ok(TealValue::Uint(params::ASSET_OPT_IN_MIN_BALANCE)),
+            15 => Ok(TealValue::Uint(self.consensus.min_balance)),
             // AssetOptInMinBalance
-            16 => Ok(TealValue::Uint(params::ASSET_OPT_IN_MIN_BALANCE)),
+            16 => Ok(TealValue::Uint(self.consensus.min_balance)),
             // GenesisHash
             17 => Ok(TealValue::Bytes(self.genesis_hash.to_vec())),
-            // PayoutsEnabled .. PayoutsMaxBalance (18-22) — default to 0
-            18..=22 => Ok(TealValue::Uint(0)),
+            // PayoutsEnabled
+            18 => Ok(TealValue::Uint(if self.consensus.payouts_enabled {
+                1
+            } else {
+                0
+            })),
+            // PayoutsGoOnlineFee
+            19 => Ok(TealValue::Uint(self.consensus.payouts_go_online_fee)),
+            // PayoutsPercent
+            20 => Ok(TealValue::Uint(self.consensus.payouts_percent)),
+            // PayoutsMinBalance
+            21 => Ok(TealValue::Uint(self.consensus.payouts_min_balance)),
+            // PayoutsMaxBalance
+            22 => Ok(TealValue::Uint(self.consensus.payouts_max_balance)),
             _ => Err(AlgoError::Avm {
                 message: format!("unknown GlobalField index: {field}"),
             }),
@@ -2023,7 +2041,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // Per go-algorand addInnerTxn: check group size limit (precise) and
         // remaining inner txn budget (allows one extra for v5 compat, checked
         // precisely in itxn_submit).
-        if self.inner_building.len() >= params::MAX_TX_GROUP_SIZE {
+        if self.inner_building.len() >= self.consensus.max_tx_group_size {
             return Err(AlgoError::Avm {
                 message: format!(
                     "too many inner transactions {} with {} left",
@@ -2055,7 +2073,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         let num_subtxns = self.inner_building.len();
 
         // Check group size and remaining inner txn budget.
-        if num_subtxns > self.remaining_inners() || num_subtxns > params::MAX_TX_GROUP_SIZE {
+        if num_subtxns > self.remaining_inners() || num_subtxns > self.consensus.max_tx_group_size {
             return Err(AlgoError::Avm {
                 message: format!(
                     "too many inner transactions {} with {} left",
@@ -2080,7 +2098,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 // set via `itxn_field Fee`. When `fee_set` is true, the program
                 // intentionally chose the fee value (even 0 for fee pooling).
                 if !b.fee_set && stxn.txn.fee == 0 {
-                    stxn.txn.fee = params::MIN_TXN_FEE;
+                    stxn.txn.fee = self.consensus.min_txn_fee;
                 }
                 // Copy FirstValid/LastValid from the outer transaction.
                 let outer = &self.group[self.group_index].txn;
@@ -2096,7 +2114,10 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // Total paid = sum of individual fees.
         // Shortfall is covered by fee_credit (from outer group overpayment).
         // Overpayment is added back to fee_credit.
-        let group_fee = params::MIN_TXN_FEE.saturating_mul(num_subtxns as u64);
+        let group_fee = self
+            .consensus
+            .min_txn_fee
+            .saturating_mul(num_subtxns as u64);
         let group_paid: u64 = txns
             .iter()
             .map(|stxn| stxn.txn.fee)
@@ -2172,12 +2193,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         });
                     }
                     let called_version = program[0] as u64;
-                    if called_version < params::MIN_INNER_APPL_VERSION {
+                    if called_version < self.consensus.min_inner_appl_version {
                         return Err(AlgoError::Avm {
                             message: format!(
                                 "inner app call with version v{} < v{}",
-                                called_version,
-                                params::MIN_INNER_APPL_VERSION
+                                called_version, self.consensus.min_inner_appl_version
                             ),
                         });
                     }
@@ -2205,12 +2225,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         };
                         if !csp.is_empty() {
                             let csv = csp[0] as u64;
-                            if csv < params::MIN_INNER_APPL_VERSION {
+                            if csv < self.consensus.min_inner_appl_version {
                                 return Err(AlgoError::Avm {
                                     message: format!(
                                         "inner app call opt-in with CSP v{} < v{}",
-                                        csv,
-                                        params::MIN_INNER_APPL_VERSION
+                                        csv, self.consensus.min_inner_appl_version
                                     ),
                                 });
                             }
@@ -2490,6 +2509,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     appl_inner_id,
                     caller_box_state,
                     self.created_apps.clone(),
+                    self.consensus.clone(),
                 );
                 match result {
                     Ok(ad) => {
@@ -2800,7 +2820,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     // ---- Box storage ----
 
     fn box_get(&mut self, name: &[u8]) -> Result<(Vec<u8>, bool), AlgoError> {
-        Self::box_length_checks(name, 0)?;
+        self.box_length_checks(name, 0)?;
         let (contents, exists) = self.available_box(name, BoxOperation::Read, 0)?;
         if exists {
             Ok((contents, true))
@@ -2810,7 +2830,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     }
 
     fn box_put(&mut self, name: &[u8], value: &[u8]) -> Result<(), AlgoError> {
-        Self::box_length_checks(name, value.len() as u64)?;
+        self.box_length_checks(name, value.len() as u64)?;
 
         // BoxWriteOperation — pass value length as create_size because the
         // box may not exist yet.
@@ -2844,7 +2864,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     }
 
     fn box_del(&mut self, name: &[u8]) -> Result<bool, AlgoError> {
-        Self::box_length_checks(name, 0)?;
+        self.box_length_checks(name, 0)?;
         let (_, exists) = self.available_box(name, BoxOperation::Delete, 0)?;
         if exists {
             // Update min-balance accounting before deleting.
@@ -2867,13 +2887,13 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     }
 
     fn box_len(&mut self, name: &[u8]) -> Result<(u64, bool), AlgoError> {
-        Self::box_length_checks(name, 0)?;
+        self.box_length_checks(name, 0)?;
         let (contents, exists) = self.available_box(name, BoxOperation::Read, 0)?;
         Ok((contents.len() as u64, exists))
     }
 
     fn box_create(&mut self, name: &[u8], size: u64) -> Result<bool, AlgoError> {
-        Self::box_length_checks(name, size)?;
+        self.box_length_checks(name, size)?;
         let (_, exists) = self.available_box(name, BoxOperation::Create, size)?;
         if !exists {
             // Create the box (zero-filled) and update min-balance.
@@ -2892,7 +2912,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     }
 
     fn box_extract(&mut self, name: &[u8], offset: u64, length: u64) -> Result<Vec<u8>, AlgoError> {
-        Self::box_length_checks(name, offset.saturating_add(length))?;
+        self.box_length_checks(name, offset.saturating_add(length))?;
         let (contents, exists) = self.available_box(name, BoxOperation::Read, 0)?;
         if !exists {
             return Err(AlgoError::Avm {
@@ -2910,7 +2930,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     }
 
     fn box_replace(&mut self, name: &[u8], offset: u64, value: &[u8]) -> Result<(), AlgoError> {
-        Self::box_length_checks(name, offset.saturating_add(value.len() as u64))?;
+        self.box_length_checks(name, offset.saturating_add(value.len() as u64))?;
         let (contents, exists) = self.available_box(name, BoxOperation::Write, 0)?;
         if !exists {
             return Err(AlgoError::Avm {
@@ -2931,7 +2951,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     }
 
     fn box_resize(&mut self, name: &[u8], new_size: u64) -> Result<(), AlgoError> {
-        Self::box_length_checks(name, new_size)?;
+        self.box_length_checks(name, new_size)?;
         let (contents, exists) = self.available_box(name, BoxOperation::Resize, new_size)?;
         if !exists {
             return Err(AlgoError::Avm {
@@ -2975,7 +2995,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         length: u64,
         value: &[u8],
     ) -> Result<(), AlgoError> {
-        Self::box_length_checks(name, 0)?;
+        self.box_length_checks(name, 0)?;
         let (contents, exists) = self.available_box(name, BoxOperation::Write, 0)?;
         if !exists {
             return Err(AlgoError::Avm {
@@ -3138,12 +3158,17 @@ mod tests {
         group: Vec<SignedTransaction>,
     ) -> LedgerAvmContext<'_, LedgerState> {
         LedgerAvmContext::new(
-            store, group, 0,     // group_index
+            store,
+            group,
+            0,     // group_index
             1000,  // round
             12345, // latest_timestamp
             42,    // app_id
-            [1u8; 32], true, // app_mode
-            [2u8; 32], [3u8; 32],
+            [1u8; 32],
+            true, // app_mode
+            [2u8; 32],
+            [3u8; 32],
+            ConsensusParams::default(),
         )
     }
 
