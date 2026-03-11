@@ -255,6 +255,7 @@ pub fn verify_logicsig(
     group: &[SignedTransaction],
     group_index: usize,
     budget: &mut GroupBudget,
+    enable_logicsig_size_pooling: bool,
 ) -> Result<(), AlgoError> {
     // ── Structural sanity checks (Go: logicSigSanityCheckBatchPrep) ──
     // Empty program is always invalid.
@@ -265,16 +266,16 @@ pub fn verify_logicsig(
     }
 
     // Size check: len(logic) + sum(len(args[i])) must not exceed LogicSigMaxSize.
-    // Go checks this when EnableLogicSigSizePooling is false (which is the
-    // common case for individual txn validation). We use the constant 1000
-    // which has been stable since v18.
+    // When EnableLogicSigSizePooling is true (v40+), the per-txn check is
+    // skipped and the total is checked at group level instead (see
+    // `verify_group_logicsig_size`).
     let mut lsig_len: u64 = lsig.logic.len() as u64;
     if let Some(ref args) = lsig.args {
         for arg in args {
             lsig_len += arg.len() as u64;
         }
     }
-    if lsig_len > LOGICSIG_MAX_SIZE {
+    if !enable_logicsig_size_pooling && lsig_len > LOGICSIG_MAX_SIZE {
         return Err(AlgoError::Validation {
             message: format!(
                 "LogicSig too long: {} bytes exceeds maximum {}",
@@ -420,6 +421,7 @@ pub fn verify_transaction_signature(
     group: &[SignedTransaction],
     group_index: usize,
     lsig_budget: &mut GroupBudget,
+    enable_logicsig_size_pooling: bool,
 ) -> Result<(), AlgoError> {
     // Go-algorand requires exactly one of sig/msig/lsig.
     let has_sig = !stx.sig.is_empty();
@@ -446,10 +448,53 @@ pub fn verify_transaction_signature(
     }
 
     if let Some(lsig) = &stx.lsig {
-        return verify_logicsig(stx, lsig, group, group_index, lsig_budget);
+        return verify_logicsig(
+            stx,
+            lsig,
+            group,
+            group_index,
+            lsig_budget,
+            enable_logicsig_size_pooling,
+        );
     }
 
     unreachable!()
+}
+
+/// Compute the total LogicSig size for a group of transactions.
+///
+/// Returns the sum of `len(logic) + sum(len(arg))` across all LogicSigs in the group.
+/// Non-LogicSig transactions contribute 0.
+pub fn logicsig_group_size(group: &[SignedTransaction]) -> u64 {
+    let mut total: u64 = 0;
+    for stx in group {
+        if let Some(lsig) = &stx.lsig {
+            total += lsig.logic.len() as u64;
+            if let Some(ref args) = lsig.args {
+                for arg in args {
+                    total += arg.len() as u64;
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Verify that the pooled LogicSig size for a group does not exceed the limit.
+///
+/// Called when `EnableLogicSigSizePooling` is true (v40+). The total available
+/// pool is `group_size * LogicSigMaxSize`.
+pub fn verify_group_logicsig_size(group: &[SignedTransaction]) -> Result<(), AlgoError> {
+    let pooled_size = logicsig_group_size(group);
+    let max_pooled = group.len() as u64 * LOGICSIG_MAX_SIZE;
+    if pooled_size > max_pooled {
+        return Err(AlgoError::Validation {
+            message: format!(
+                "txgroup had {pooled_size} bytes of LogicSigs, more than the available pool of {max_pooled} bytes"
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -466,14 +511,14 @@ mod tests {
     fn verify_sig(stx: &SignedTransaction) -> Result<(), AlgoError> {
         let group = [stx.clone()];
         let mut budget = GroupBudget::for_logicsig(1);
-        verify_transaction_signature(stx, &group, 0, &mut budget)
+        verify_transaction_signature(stx, &group, 0, &mut budget, false)
     }
 
     /// Helper: verify a logicsig with a single-element group and fresh budget.
     fn verify_lsig(stx: &SignedTransaction, lsig: &LogicSig) -> Result<(), AlgoError> {
         let group = [stx.clone()];
         let mut budget = GroupBudget::for_logicsig(1);
-        verify_logicsig(stx, lsig, &group, 0, &mut budget)
+        verify_logicsig(stx, lsig, &group, 0, &mut budget, false)
     }
 
     /// Create a signing key from a fixed seed for reproducibility.

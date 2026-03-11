@@ -935,6 +935,131 @@ pub fn op_falcon_verify(
     machine.push(AvmValue::Uint64(verified))
 }
 
+// ---------------------------------------------------------------------------
+// MiMC hash (0xe6, v11+)
+// ---------------------------------------------------------------------------
+
+/// `mimc` (0xe6, v11+): pop bytes, push 32-byte MiMC hash.
+///
+/// Matches gnark-crypto's MiMC implementation:
+/// - BN254Mp110: 110 rounds, exponent 5, BN254 scalar field
+/// - BLS12_381Mp111: 111 rounds, exponent 5, BLS12-381 scalar field
+///
+/// The input must be non-empty and a multiple of 32 bytes.
+/// Each 32-byte chunk must be a valid field element (< modulus).
+/// Uses Miyaguchi-Preneel mode: h = encrypt(m, h) + h + m
+pub fn op_mimc(machine: &mut AvmMachine, instruction: &Instruction) -> Result<(), AlgoError> {
+    let config = get_uint8(instruction)?;
+
+    let data = machine.pop_bytes()?;
+    if data.is_empty() {
+        return Err(avm_err("the input data cannot be empty"));
+    }
+    if data.len() % 32 != 0 {
+        return Err(avm_err("the input data must be a multiple of 32 bytes"));
+    }
+
+    // Charge dynamic cost: baseCost + chunkCost * (len / chunkSize)
+    // Both configs: base=10, chunkCost=550, chunkSize=32
+    let num_chunks = data.len() / 32;
+    let cost = 10u64 + 550 * num_chunks as u64;
+    machine.charge_cost(cost)?;
+
+    let result = match config {
+        0 => mimc_bn254(&data)?,
+        1 => mimc_bls12_381(&data)?,
+        _ => return Err(avm_err(format!("invalid mimc config {config}"))),
+    };
+
+    machine.push(AvmValue::Bytes(result))
+}
+
+/// MiMC hash over BN254 scalar field (Fr), 110 rounds, exponent 5.
+fn mimc_bn254(data: &[u8]) -> Result<Vec<u8>, AlgoError> {
+    use ark_ff::{BigInteger, PrimeField};
+    type Fr = ark_bn254::Fr;
+
+    let constants = mimc_derive_constants::<Fr>(110);
+    let elements = parse_field_elements::<Fr>(data)?;
+    let h = mimc_miyaguchi_preneel::<Fr>(&elements, &constants);
+    let bytes = h.into_bigint().to_bytes_be();
+    // Pad/truncate to 32 bytes
+    let mut out = vec![0u8; 32];
+    let start = 32usize.saturating_sub(bytes.len());
+    out[start..].copy_from_slice(&bytes[..bytes.len().min(32)]);
+    Ok(out)
+}
+
+/// MiMC hash over BLS12-381 scalar field (Fr), 111 rounds, exponent 5.
+fn mimc_bls12_381(data: &[u8]) -> Result<Vec<u8>, AlgoError> {
+    use ark_ff::{BigInteger, PrimeField};
+    type Fr = ark_bls12_381::Fr;
+
+    let constants = mimc_derive_constants::<Fr>(111);
+    let elements = parse_field_elements::<Fr>(data)?;
+    let h = mimc_miyaguchi_preneel::<Fr>(&elements, &constants);
+    let bytes = h.into_bigint().to_bytes_be();
+    let mut out = vec![0u8; 32];
+    let start = 32usize.saturating_sub(bytes.len());
+    out[start..].copy_from_slice(&bytes[..bytes.len().min(32)]);
+    Ok(out)
+}
+
+/// Parse input bytes into field elements (big-endian, 32-byte chunks).
+fn parse_field_elements<F: ark_ff::PrimeField>(data: &[u8]) -> Result<Vec<F>, AlgoError> {
+    let mut elements = Vec::with_capacity(data.len() / 32);
+    for chunk in data.chunks_exact(32) {
+        let bi = F::BigInt::try_from(num_bigint::BigUint::from_bytes_be(chunk))
+            .map_err(|_| avm_err("field element exceeds modulus"))?;
+        let elem = F::from_bigint(bi)
+            .ok_or_else(|| avm_err("invalid mimc input: element exceeds modulus"))?;
+        elements.push(elem);
+    }
+    Ok(elements)
+}
+
+/// Derive MiMC round constants from seed "seed" using Keccak-256.
+/// Matches gnark-crypto's `initConstants`.
+fn mimc_derive_constants<F: ark_ff::PrimeField>(num_rounds: usize) -> Vec<F> {
+    use sha3::{Digest, Keccak256};
+    let mut hasher = Keccak256::new();
+    hasher.update(b"seed");
+    let mut rnd = hasher.finalize_reset().to_vec();
+    hasher.update(&rnd);
+
+    let mut constants = Vec::with_capacity(num_rounds);
+    for _ in 0..num_rounds {
+        rnd = hasher.finalize_reset().to_vec();
+        // gnark-crypto uses SetBytes which reduces mod p (big-endian)
+        let bi = num_bigint::BigUint::from_bytes_be(&rnd);
+        let fi = F::from(bi);
+        constants.push(fi);
+        hasher.update(&rnd);
+    }
+    constants
+}
+
+/// MiMC encryption: m = (m + k + c[i])^5 for each round, then m = m + k.
+fn mimc_encrypt<F: ark_ff::Field>(mut m: F, k: F, constants: &[F]) -> F {
+    for c in constants {
+        let tmp = m + k + c;
+        let tmp2 = tmp * tmp; // ^2
+        let tmp4 = tmp2 * tmp2; // ^4
+        m = tmp4 * tmp; // ^5
+    }
+    m + k
+}
+
+/// Miyaguchi-Preneel mode: h = encrypt(data[i], h) + h + data[i]
+fn mimc_miyaguchi_preneel<F: ark_ff::Field>(data: &[F], constants: &[F]) -> F {
+    let mut h = F::zero();
+    for d in data {
+        let r = mimc_encrypt(*d, h, constants);
+        h = r + h + *d;
+    }
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2758,5 +2883,107 @@ mod tests {
             result.is_err(),
             "json_ref should fail with insufficient budget"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // MiMC tests (using go-algorand test vectors)
+    // -----------------------------------------------------------------------
+
+    /// Helper: compute MiMC hash directly (for unit testing, not through the VM).
+    fn mimc_bn254_direct(input_hex: &str) -> Result<Vec<u8>, AlgoError> {
+        let data = super::super::hex_decode(input_hex);
+        super::mimc_bn254(&data)
+    }
+
+    fn mimc_bls12_direct(input_hex: &str) -> Result<Vec<u8>, AlgoError> {
+        let data = super::super::hex_decode(input_hex);
+        super::mimc_bls12_381(&data)
+    }
+
+    #[test]
+    fn test_mimc_bn254_single_chunk() {
+        // From go-algorand TestMimc: preimage[1] = 32-byte input (< modulus)
+        // circuitHashTestVectors["BN254Mp110"][1]
+        let result =
+            mimc_bn254_direct("23a950068dd3d1e21cee48e7919be7ae32cdef70311fc486336ea9d4b5042535")
+                .unwrap();
+        let result_int = num_bigint::BigUint::from_bytes_be(&result);
+        assert_eq!(
+            result_int.to_string(),
+            "12886436712380113721405259596386800092738845035233065858332878701083870690753",
+            "BN254 MiMC single-chunk hash mismatch"
+        );
+    }
+
+    #[test]
+    fn test_mimc_bn254_three_chunks() {
+        // From go-algorand TestMimc: preimage[4] = 96-byte input (3 chunks, all < modulus)
+        // circuitHashTestVectors["BN254Mp110"][4]
+        let result = mimc_bn254_direct(
+            "183de351a72141d79c51a27d10405549c98302cb2536c5968deeb3cba635121723a950068dd3d1e21cee48e7919be7ae32cdef70311fc486336ea9d4b504253530644e72e131a029b85045b68181585d2833e84879b9709143e1f593ef676981",
+        ).unwrap();
+        let result_int = num_bigint::BigUint::from_bytes_be(&result);
+        assert_eq!(
+            result_int.to_string(),
+            "6040222623731283351958201178122781676432899642144860863024149088913741383362",
+            "BN254 MiMC three-chunk hash mismatch"
+        );
+    }
+
+    #[test]
+    fn test_mimc_bn254_exceeds_modulus() {
+        // From go-algorand TestMimc: 32 bytes > BN254 Fr modulus should fail
+        let result =
+            mimc_bn254_direct("73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000002");
+        assert!(result.is_err(), "should reject element > modulus");
+    }
+
+    #[test]
+    fn test_mimc_bn254_empty_input() {
+        // The opcode handler checks for empty before calling mimc_bn254.
+        // mimc_bn254 itself returns h=0 for empty input (which is valid),
+        // but the opcode rejects it.
+        let _result = super::mimc_bn254(&[]);
+    }
+
+    #[test]
+    fn test_mimc_bls12_single_chunk() {
+        // From go-algorand TestMimc: BLS12_381Mp111 config, preimage[1]
+        // circuitHashTestVectors["BLS12_381Mp111"][1]
+        let result =
+            mimc_bls12_direct("23a950068dd3d1e21cee48e7919be7ae32cdef70311fc486336ea9d4b5042535")
+                .unwrap();
+        let result_int = num_bigint::BigUint::from_bytes_be(&result);
+        assert_eq!(
+            result_int.to_string(),
+            "8791766422525455185980675814845076441443662947059416063736889106252015893524",
+            "BLS12-381 MiMC single-chunk hash mismatch"
+        );
+    }
+
+    #[test]
+    fn test_mimc_bls12_three_chunks() {
+        // From go-algorand TestMimc: BLS12_381Mp111 config, preimage[4]
+        // circuitHashTestVectors["BLS12_381Mp111"][4]
+        let result = mimc_bls12_direct(
+            "183de351a72141d79c51a27d10405549c98302cb2536c5968deeb3cba635121723a950068dd3d1e21cee48e7919be7ae32cdef70311fc486336ea9d4b504253530644e72e131a029b85045b68181585d2833e84879b9709143e1f593ef676981",
+        ).unwrap();
+        let result_int = num_bigint::BigUint::from_bytes_be(&result);
+        assert_eq!(
+            result_int.to_string(),
+            "12964111614552580241101202600014316932811348627866250816177200046290462797607",
+            "BLS12-381 MiMC three-chunk hash mismatch"
+        );
+    }
+
+    #[test]
+    fn test_mimc_bn254_exceeds_modulus_value() {
+        // BN254 Fr modulus = 21888242871839275222246405745257275088548364400416034343698204186575808495617
+        // This value is > modulus:
+        // 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000002
+        // This is actually BLS12-381 Fr modulus which is > BN254 Fr modulus
+        let result =
+            mimc_bn254_direct("30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000002");
+        assert!(result.is_err(), "should reject element >= BN254 Fr modulus");
     }
 }

@@ -30,7 +30,9 @@ use crate::rules::{
     validate_lease_constraints, validate_transaction_group, validate_transaction_wellformed,
     SpecialAddresses, MAX_TIMESTAMP_INCREMENT,
 };
-use crate::signature::{verify_auth_addr_sender_diff, verify_transaction_signature};
+use crate::signature::{
+    verify_auth_addr_sender_diff, verify_group_logicsig_size, verify_transaction_signature,
+};
 
 /// Result of validating a complete block.
 #[derive(Debug, Clone)]
@@ -313,9 +315,13 @@ pub fn validate_block(
             // Pass the atomic group slice and intra-group index so that
             // LogicSig programs see correct `gtxn`, `global GroupSize`,
             // and `txn GroupIndex` values.
-            if let Err(e) =
-                verify_transaction_signature(stx, &group_txns, intra_group_idx, &mut lsig_budget)
-            {
+            if let Err(e) = verify_transaction_signature(
+                stx,
+                &group_txns,
+                intra_group_idx,
+                &mut lsig_budget,
+                params.enable_logicsig_size_pooling,
+            ) {
                 errors.push(BlockValidationError::SignatureVerificationFailed {
                     txn_index: idx,
                     error: e.to_string(),
@@ -336,6 +342,15 @@ pub fn validate_block(
             // which counts the in-block encoded size.
             let encoded = canonical_encode_signed_txn_in_block(&block.payset[idx]);
             total_txn_bytes += encoded.len();
+        }
+
+        // Group-level LogicSig size pooling check (Go: EnableLogicSigSizePooling, v40+).
+        if params.enable_logicsig_size_pooling {
+            if let Err(e) = verify_group_logicsig_size(&group_txns) {
+                errors.push(BlockValidationError::GroupValidationFailed {
+                    error: e.to_string(),
+                });
+            }
         }
     }
 

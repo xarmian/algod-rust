@@ -475,6 +475,28 @@ pub trait AvmContext {
         false
     }
 
+    // ---- Voter / stake queries ----
+
+    /// Get voter parameters for an account (from balance round, 320 rounds back).
+    /// Returns `(value, did_exist)` where `did_exist` is true if the account was
+    /// online at the balance round.
+    fn voter_params_get(
+        &self,
+        account: &[u8; 32],
+        field: u8,
+    ) -> Result<(TealValue, bool), AlgoError> {
+        Err(AlgoError::Avm {
+            message: "context unavailable: voter_params_get".into(),
+        })
+    }
+
+    /// Get the total online stake in microAlgos (from the balance round).
+    fn online_stake(&self) -> Result<u64, AlgoError> {
+        Err(AlgoError::Avm {
+            message: "context unavailable: online_stake".into(),
+        })
+    }
+
     // ---- Result extraction ----
     //
     // These methods allow `eval.rs` to extract accumulated execution results

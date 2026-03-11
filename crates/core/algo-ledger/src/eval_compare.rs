@@ -521,6 +521,30 @@ fn format_key(key: &[u8]) -> String {
     )
 }
 
+/// Classifies a mismatch into a high-level category for reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MismatchCategory {
+    /// AVM execution hit an unimplemented opcode or feature.
+    UnimplementedOpcode,
+    /// AVM produced a result that differs semantically from the recorded one.
+    SemanticMismatch,
+    /// Comparison logic defect (e.g. serialization/parsing difference).
+    ComparisonDefect,
+    /// Infrastructure error (fetch, decode, apply failure).
+    InfraError,
+}
+
+impl fmt::Display for MismatchCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MismatchCategory::UnimplementedOpcode => write!(f, "unimplemented_opcode"),
+            MismatchCategory::SemanticMismatch => write!(f, "semantic_mismatch"),
+            MismatchCategory::ComparisonDefect => write!(f, "comparison_defect"),
+            MismatchCategory::InfraError => write!(f, "infra_error"),
+        }
+    }
+}
+
 /// Aggregate statistics for EvalDelta comparison across a replay run.
 #[derive(Debug, Default)]
 pub struct EvalDeltaStats {
@@ -540,6 +564,10 @@ pub struct EvalDeltaStats {
     pub logicsig_passed: u64,
     /// LogicSig programs that failed.
     pub logicsig_failed: u64,
+    /// Aggregated opcode coverage across all AVM executions.
+    pub opcode_coverage: algo_avm::OpcodeCoverage,
+    /// Mismatch counts by category.
+    pub mismatch_categories: HashMap<MismatchCategory, u64>,
 }
 
 /// Detail about a single mismatching app call.
@@ -580,6 +608,10 @@ impl std::ops::AddAssign for EvalDeltaStats {
         self.logicsig_total += rhs.logicsig_total;
         self.logicsig_passed += rhs.logicsig_passed;
         self.logicsig_failed += rhs.logicsig_failed;
+        self.opcode_coverage.merge(&rhs.opcode_coverage);
+        for (cat, count) in &rhs.mismatch_categories {
+            *self.mismatch_categories.entry(*cat).or_insert(0) += count;
+        }
         for detail in rhs.mismatch_details {
             if self.mismatch_details.len() < MAX_MISMATCH_DETAILS {
                 self.mismatch_details.push(detail);
@@ -589,16 +621,43 @@ impl std::ops::AddAssign for EvalDeltaStats {
 }
 
 impl EvalDeltaStats {
-    /// Record a matching app call.
+    /// Record a matching app call, merging coverage from the execution.
     pub fn record_match(&mut self) {
         self.app_calls_total += 1;
         self.app_calls_matching += 1;
     }
 
-    /// Record a mismatching app call with detail.
+    /// Record a matching app call with opcode coverage data.
+    pub fn record_match_with_coverage(&mut self, coverage: &algo_avm::OpcodeCoverage) {
+        self.app_calls_total += 1;
+        self.app_calls_matching += 1;
+        self.opcode_coverage.merge(coverage);
+    }
+
+    /// Record a mismatching app call with detail and optional category.
     pub fn record_mismatch(&mut self, detail: EvalDeltaMismatchDetail) {
         self.app_calls_total += 1;
         self.app_calls_mismatching += 1;
+        *self
+            .mismatch_categories
+            .entry(MismatchCategory::SemanticMismatch)
+            .or_insert(0) += 1;
+        if self.mismatch_details.len() < MAX_MISMATCH_DETAILS {
+            self.mismatch_details.push(detail);
+        }
+    }
+
+    /// Record a mismatching app call with coverage and explicit category.
+    pub fn record_mismatch_with_coverage(
+        &mut self,
+        detail: EvalDeltaMismatchDetail,
+        coverage: &algo_avm::OpcodeCoverage,
+        category: MismatchCategory,
+    ) {
+        self.app_calls_total += 1;
+        self.app_calls_mismatching += 1;
+        self.opcode_coverage.merge(coverage);
+        *self.mismatch_categories.entry(category).or_insert(0) += 1;
         if self.mismatch_details.len() < MAX_MISMATCH_DETAILS {
             self.mismatch_details.push(detail);
         }
@@ -608,6 +667,27 @@ impl EvalDeltaStats {
     pub fn record_error(&mut self) {
         self.app_calls_total += 1;
         self.app_calls_errored += 1;
+        *self
+            .mismatch_categories
+            .entry(MismatchCategory::InfraError)
+            .or_insert(0) += 1;
+    }
+
+    /// Record an AVM execution error with coverage data.
+    pub fn record_error_with_coverage(
+        &mut self,
+        coverage: &algo_avm::OpcodeCoverage,
+        is_unimplemented: bool,
+    ) {
+        self.app_calls_total += 1;
+        self.app_calls_errored += 1;
+        self.opcode_coverage.merge(coverage);
+        let cat = if is_unimplemented {
+            MismatchCategory::UnimplementedOpcode
+        } else {
+            MismatchCategory::InfraError
+        };
+        *self.mismatch_categories.entry(cat).or_insert(0) += 1;
     }
 
     /// Record a LogicSig result.
@@ -631,6 +711,22 @@ impl EvalDeltaStats {
             println!("LogicSig total:       {}", self.logicsig_total);
             println!("  Passed:             {}", self.logicsig_passed);
             println!("  Failed:             {}", self.logicsig_failed);
+        }
+
+        // Opcode coverage summary.
+        let hit = self.opcode_coverage.hit_count();
+        let total = self.opcode_coverage.total_defined();
+        let pct = self.opcode_coverage.coverage_pct();
+        println!("\nOpcode coverage:      {hit}/{total} ({pct:.1}%)");
+
+        // Mismatch taxonomy.
+        if !self.mismatch_categories.is_empty() {
+            println!("\nMismatch categories:");
+            let mut cats: Vec<_> = self.mismatch_categories.iter().collect();
+            cats.sort_by_key(|(cat, _)| cat.to_string());
+            for (cat, count) in &cats {
+                println!("  {cat:<25} {count}");
+            }
         }
 
         if !self.mismatch_details.is_empty() {

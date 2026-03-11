@@ -57,6 +57,76 @@ pub struct CallFrame {
     pub return_pc: usize,
     /// Stack depth at the call point (for frame_dig/frame_bury).
     pub frame_pointer: usize,
+    /// Whether `proto` was used — triggers stack cleanup in `retsub`.
+    pub clear: bool,
+    /// Number of arguments declared by `proto`.
+    pub args: usize,
+    /// Number of return values declared by `proto`.
+    pub returns: usize,
+}
+
+/// Aggregated opcode coverage statistics.
+///
+/// Tracks which opcode bytes were executed across one or more program runs.
+/// Use [`AvmMachine::opcode_coverage`] to retrieve the current snapshot and
+/// [`OpcodeCoverage::merge`] to combine coverage across multiple runs.
+#[derive(Debug, Clone)]
+pub struct OpcodeCoverage {
+    /// One flag per opcode byte (0..255). `true` if that opcode was executed.
+    pub hit: [bool; 256],
+}
+
+impl Default for OpcodeCoverage {
+    fn default() -> Self {
+        Self { hit: [false; 256] }
+    }
+}
+
+impl OpcodeCoverage {
+    /// Merge another coverage snapshot into this one (union of hits).
+    pub fn merge(&mut self, other: &OpcodeCoverage) {
+        for i in 0..256 {
+            self.hit[i] |= other.hit[i];
+        }
+    }
+
+    /// Count of defined opcodes that were hit.
+    pub fn hit_count(&self) -> usize {
+        opcode::all_opcodes()
+            .iter()
+            .filter(|(byte, _)| self.hit[*byte as usize])
+            .count()
+    }
+
+    /// Total number of defined opcodes (denominator).
+    pub fn total_defined(&self) -> usize {
+        opcode::defined_opcode_count()
+    }
+
+    /// Return the list of defined opcodes that were NOT hit.
+    pub fn missed_opcodes(&self) -> Vec<(u8, &'static str)> {
+        opcode::all_opcodes()
+            .into_iter()
+            .filter(|(byte, _)| !self.hit[*byte as usize])
+            .collect()
+    }
+
+    /// Return the list of defined opcodes that were hit.
+    pub fn hit_opcodes(&self) -> Vec<(u8, &'static str)> {
+        opcode::all_opcodes()
+            .into_iter()
+            .filter(|(byte, _)| self.hit[*byte as usize])
+            .collect()
+    }
+
+    /// Coverage ratio as a percentage (0.0 - 100.0).
+    pub fn coverage_pct(&self) -> f64 {
+        let total = self.total_defined();
+        if total == 0 {
+            return 0.0;
+        }
+        (self.hit_count() as f64 / total as f64) * 100.0
+    }
 }
 
 /// The AVM stack machine.
@@ -89,6 +159,11 @@ pub struct AvmMachine {
     pub(crate) offset_to_index: HashMap<usize, usize>,
     /// Byte offset just past the last instruction (valid branch-to-end target).
     pub(crate) end_of_program_offset: usize,
+    /// Tracks which opcode bytes have been executed during this run.
+    pub opcode_hits: [bool; 256],
+    /// Set by `callsub` when the branch target is a `proto` instruction.
+    /// Cleared by `proto` after checking. Mirrors Go's `cx.fromCallsub`.
+    pub from_callsub: bool,
 }
 
 impl AvmMachine {
@@ -127,6 +202,8 @@ impl AvmMachine {
             pass: false,
             offset_to_index,
             end_of_program_offset,
+            opcode_hits: [false; 256],
+            from_callsub: false,
         }
     }
 
@@ -149,6 +226,9 @@ impl AvmMachine {
 
         let instr = self.program.instructions[self.pc].clone();
         let old_pc = self.pc;
+
+        // Record opcode hit for coverage tracking.
+        self.opcode_hits[instr.opcode as usize] = true;
 
         // Charge static cost.
         if let Some(spec) = opcode::lookup(instr.opcode) {
@@ -289,6 +369,13 @@ impl AvmMachine {
         self.call_stack.pop().ok_or_else(|| AlgoError::Avm {
             message: "call stack underflow (retsub without callsub)".to_string(),
         })
+    }
+
+    /// Return a coverage snapshot from this machine's execution.
+    pub fn opcode_coverage(&self) -> OpcodeCoverage {
+        OpcodeCoverage {
+            hit: self.opcode_hits,
+        }
     }
 
     /// Handle implicit program termination (PC past end of instructions).
@@ -485,5 +572,196 @@ mod tests {
         let program = parse(&raw).unwrap();
         let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
         assert!(m.run(&mut NullContext).is_err());
+    }
+
+    #[test]
+    fn test_opcode_coverage_tracking() {
+        // intcblock [1], intc_0, return -- opcodes 0x20, 0x22, 0x43
+        let raw = prog(2, &[0x20, 0x01, 0x01, 0x22, 0x43]);
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::LogicSig, 700);
+        m.run(&mut NullContext).unwrap();
+
+        let cov = m.opcode_coverage();
+        assert!(cov.hit[0x20]); // intcblock
+        assert!(cov.hit[0x22]); // intc_0
+        assert!(cov.hit[0x43]); // return
+        assert!(!cov.hit[0x00]); // err was not executed
+        assert!(!cov.hit[0x01]); // sha256 was not executed
+
+        assert!(cov.hit_count() >= 3);
+        assert!(cov.total_defined() >= 140);
+        assert!(cov.coverage_pct() > 0.0);
+    }
+
+    #[test]
+    fn test_opcode_coverage_merge() {
+        let mut cov1 = OpcodeCoverage::default();
+        cov1.hit[0x20] = true;
+        cov1.hit[0x22] = true;
+
+        let mut cov2 = OpcodeCoverage::default();
+        cov2.hit[0x43] = true;
+        cov2.hit[0x22] = true; // overlap
+
+        cov1.merge(&cov2);
+        assert!(cov1.hit[0x20]);
+        assert!(cov1.hit[0x22]);
+        assert!(cov1.hit[0x43]);
+        assert!(!cov1.hit[0x00]);
+    }
+
+    /// Test proto/retsub stack cleanup: a subroutine declared with `proto 2 1`
+    /// takes 2 args, returns 1. After retsub, the 2 args should be replaced by
+    /// the single return value, and any extra values pushed in the subroutine
+    /// should be cleaned up.
+    ///
+    /// Program layout (byte offsets include version byte at offset 0):
+    ///   0: version 8
+    ///   1-2: pushint 10
+    ///   3-4: pushint 20
+    ///   5-7: callsub offset=+1  (end of callsub is byte 8, target = byte 9)
+    ///   8: return
+    ///   9-11: proto 2 1
+    ///  12-13: frame_dig -2
+    ///  14-15: frame_dig -1
+    ///  16: +
+    ///  17: retsub
+    #[test]
+    fn test_retsub_proto_stack_cleanup() {
+        let raw = prog(
+            8,
+            &[
+                0x81, 0x0a, // pushint 10
+                0x81, 0x14, // pushint 20
+                0x88, 0x00, 0x01, // callsub offset=+1 (target byte 9)
+                0x43, // return
+                0x8a, 0x02, 0x01, // proto 2 1
+                0x8b, 0xfe, // frame_dig -2
+                0x8b, 0xff, // frame_dig -1
+                0x08, // +
+                0x89, // retsub
+            ],
+        );
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700);
+        let result = m.run(&mut NullContext).unwrap();
+        assert!(result, "program should pass (return 30)");
+    }
+
+    /// Test retsub without proto: should NOT do any stack cleanup (backwards compatible).
+    #[test]
+    fn test_retsub_without_proto_no_cleanup() {
+        // Layout:
+        //   0: version 8
+        //   1-2: pushint 42
+        //   3-5: callsub offset=+1 (end of callsub is byte 6, target = byte 7)
+        //   6: return
+        //   7-8: pushint 1
+        //   9: retsub
+        let raw = prog(
+            8,
+            &[
+                0x81, 0x2a, // pushint 42
+                0x88, 0x00, 0x01, // callsub offset=+1 (target byte 7)
+                0x43, // return
+                0x81, 0x01, // pushint 1
+                0x89, // retsub
+            ],
+        );
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700);
+        let result = m.run(&mut NullContext).unwrap();
+        assert!(result, "program should pass (return pops 1)");
+    }
+
+    /// Test retsub with proto: not enough return values should error.
+    #[test]
+    fn test_retsub_proto_insufficient_returns_errors() {
+        // Layout:
+        //   0: version 8
+        //   1-2: pushint 10
+        //   3-4: pushint 20
+        //   5-7: callsub offset=+1 (target byte 9)
+        //   8: return
+        //   9-11: proto 2 1
+        //  12: retsub
+        let raw = prog(
+            8,
+            &[
+                0x81, 0x0a, // pushint 10
+                0x81, 0x14, // pushint 20
+                0x88, 0x00, 0x01, // callsub offset=+1 (target byte 9)
+                0x43, // return
+                0x8a, 0x02, 0x01, // proto 2 1
+                0x89, // retsub
+            ],
+        );
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700);
+        let result = m.run(&mut NullContext);
+        assert!(
+            result.is_err(),
+            "retsub should error with no return values on stack"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no return values"),
+            "error should mention missing return values: {err}"
+        );
+    }
+
+    /// Test that `proto` without a preceding `callsub` errors.
+    /// Program: pushint 1, proto 0 0 — proto should fail because
+    /// there was no callsub to set the from_callsub flag.
+    #[test]
+    fn test_proto_without_callsub_errors() {
+        // Version 8+: proto 0 0, pushint 1
+        // But proto is inside a subroutine in normal usage. Let's directly
+        // jump into a proto without callsub — use `b` (unconditional branch)
+        // to skip to a proto instruction.
+        let raw = prog(
+            8,
+            &[
+                0x42, 0x00, 0x00, // b offset=+0 (target byte 3, i.e. next instr)
+                0x8a, 0x00, 0x00, // proto 0 0 — should error
+                0x81, 0x01, // pushint 1
+            ],
+        );
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700);
+        let result = m.run(&mut NullContext);
+        assert!(result.is_err(), "proto without callsub should error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("proto was executed without a callsub"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Test that callsub → proto handshake works correctly (no error).
+    #[test]
+    fn test_callsub_proto_handshake_ok() {
+        // pushint 1, callsub target, return
+        // target: proto 0 0, pushint 1, retsub
+        let raw = prog(
+            8,
+            &[
+                0x81, 0x01, // pushint 1 (for final return)
+                0x88, 0x00, 0x01, // callsub offset=+1 (target = byte 6)
+                0x43, // return (uses value left on stack)
+                0x8a, 0x00, 0x00, // proto 0 0
+                0x89, // retsub
+            ],
+        );
+        let program = parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 700);
+        let result = m.run(&mut NullContext);
+        assert!(
+            result.is_ok(),
+            "callsub->proto should succeed: {:?}",
+            result.err()
+        );
+        assert!(result.unwrap(), "program should approve");
     }
 }

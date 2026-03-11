@@ -26,7 +26,9 @@ pub use eval::{
 pub use group::{GroupBudget, GroupContext};
 pub use itxn::compute_inner_txn_id;
 pub use logicsig_context::LogicSigAvmContext;
-pub use machine::{AvmMachine, AvmValue, CallFrame, ExecMode};
-pub use opcode::{lookup, CostKind, ImmKind, Mode, OpSpec, MAX_AVM_VERSION};
+pub use machine::{AvmMachine, AvmValue, CallFrame, ExecMode, OpcodeCoverage};
+pub use opcode::{
+    all_opcodes, defined_opcode_count, lookup, CostKind, ImmKind, Mode, OpSpec, MAX_AVM_VERSION,
+};
 pub use txn_fields::{read_txn_field, type_enum};
 pub use validator::check_program;

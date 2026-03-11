@@ -61,6 +61,10 @@ pub struct ConsensusParams {
     pub enforce_auth_addr_sender_diff: bool,
     /// Maximum total transaction bytes per block.
     pub max_txn_bytes_per_block: usize,
+    /// Whether LogicSig sizes are pooled across a group (Go: `EnableLogicSigSizePooling`, v40+).
+    /// When true, the total LogicSig size across the group must not exceed
+    /// `group_size * LogicSigMaxSize` (checked at group level, not per-txn).
+    pub enable_logicsig_size_pooling: bool,
 }
 
 impl Default for ConsensusParams {
@@ -78,6 +82,7 @@ impl Default for ConsensusParams {
             enable_heartbeat: true,
             enforce_auth_addr_sender_diff: false,
             max_txn_bytes_per_block: MAX_TXN_BYTES_PER_BLOCK_V33,
+            enable_logicsig_size_pooling: true,
         }
     }
 }
@@ -129,6 +134,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         } else {
             MAX_TXN_BYTES_PER_BLOCK_V32
         },
+        enable_logicsig_size_pooling: idx >= V40_START_INDEX,
     })
 }
 

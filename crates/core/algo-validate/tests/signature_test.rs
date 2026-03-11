@@ -74,12 +74,13 @@ macro_rules! sig_verify_test {
             let txns = restore_genesis_fields(&br);
             let mut lsig_budget = GroupBudget::for_logicsig(txns.len());
             for (i, stx) in txns.iter().enumerate() {
-                verify_transaction_signature(stx, &txns, i, &mut lsig_budget).unwrap_or_else(|e| {
-                    panic!(
-                        "signature verification failed for block {} txn {}: {e}",
-                        $round, i
-                    )
-                });
+                verify_transaction_signature(stx, &txns, i, &mut lsig_budget, false)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "signature verification failed for block {} txn {}: {e}",
+                            $round, i
+                        )
+                    });
             }
         }
     };
@@ -108,9 +109,9 @@ fn sig_verify_all_blocks() {
         let txns = restore_genesis_fields(&br);
         let mut lsig_budget = GroupBudget::for_logicsig(txns.len());
         for (i, stx) in txns.iter().enumerate() {
-            verify_transaction_signature(stx, &txns, i, &mut lsig_budget).unwrap_or_else(|e| {
-                panic!("signature verification failed for block {round} txn {i}: {e}")
-            });
+            verify_transaction_signature(stx, &txns, i, &mut lsig_budget, false).unwrap_or_else(
+                |e| panic!("signature verification failed for block {round} txn {i}: {e}"),
+            );
             verified += 1;
         }
     }
@@ -176,7 +177,7 @@ fn logicsig_valid_program_approves() {
     let mut budget = GroupBudget::for_logicsig(1);
 
     let lsig = stx.lsig.as_ref().unwrap();
-    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget);
+    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget, false);
     assert!(
         result.is_ok(),
         "LogicSig with `pushint 1` should pass: {:?}",
@@ -193,7 +194,7 @@ fn logicsig_rejecting_program_fails() {
     let mut budget = GroupBudget::for_logicsig(1);
 
     let lsig = stx.lsig.as_ref().unwrap();
-    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget);
+    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget, false);
     assert!(result.is_err(), "LogicSig with `pushint 0` should fail");
     let err_msg = result.unwrap_err().to_string();
     assert!(
@@ -220,7 +221,7 @@ fn logicsig_pooled_budget_shared_across_group() {
 
     // Verify first transaction's LogicSig.
     let lsig1 = stx1.lsig.as_ref().unwrap();
-    verify_logicsig(&stx1, lsig1, &group, 0, &mut budget).unwrap();
+    verify_logicsig(&stx1, lsig1, &group, 0, &mut budget, false).unwrap();
 
     // Budget should have decreased (pushint 1 costs 1 opcode unit).
     let after_first = budget.remaining();
@@ -232,7 +233,7 @@ fn logicsig_pooled_budget_shared_across_group() {
 
     // Verify second transaction's LogicSig with the same pooled budget.
     let lsig2 = stx2.lsig.as_ref().unwrap();
-    verify_logicsig(&stx2, lsig2, &group, 1, &mut budget).unwrap();
+    verify_logicsig(&stx2, lsig2, &group, 1, &mut budget, false).unwrap();
 
     let after_second = budget.remaining();
     assert!(
@@ -256,7 +257,7 @@ fn logicsig_state_access_app_opted_in_fails() {
     let mut budget = GroupBudget::for_logicsig(1);
 
     let lsig = stx.lsig.as_ref().unwrap();
-    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget);
+    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget, false);
     assert!(result.is_err(), "LogicSig using app_opted_in should fail");
 }
 
@@ -268,10 +269,120 @@ fn verify_transaction_signature_dispatches_to_logicsig() {
     let group = vec![stx.clone()];
     let mut budget = GroupBudget::for_logicsig(1);
 
-    let result = verify_transaction_signature(&stx, &group, 0, &mut budget);
+    let result = verify_transaction_signature(&stx, &group, 0, &mut budget, false);
     assert!(
         result.is_ok(),
         "verify_transaction_signature should dispatch to LogicSig path: {:?}",
         result.err()
+    );
+}
+
+/// LogicSig size pooling: a LogicSig exceeding 1000 bytes should be rejected
+/// without pooling but accepted with pooling when the group pool is large enough.
+#[test]
+fn logicsig_size_pooling_allows_large_lsig_in_group() {
+    use algo_validate::signature::verify_group_logicsig_size;
+    use algo_validate::LOGICSIG_MAX_SIZE;
+
+    // Build a program that is larger than LOGICSIG_MAX_SIZE (1000 bytes).
+    // We'll use pushbytes with a large payload. The program needs to be valid
+    // so we construct: version 6, pushbytes <large>, pop, pushint 1
+    // pushbytes 0x80: opcode 0x80, then varuint length, then bytes
+    // Build a program > LOGICSIG_MAX_SIZE (1000 bytes) using pushbytes with
+    // a large blob. Layout: version(1) + pushbytes(1) + varuint(2) + 3380
+    // + pop(1) + pushint 1(2) = 3387 bytes.
+    let blob_len = 3380usize;
+    let mut program = Vec::with_capacity(3400);
+    program.push(0x06); // version 6
+    program.push(0x80); // pushbytes
+                        // varuint encode blob_len
+    let mut n = blob_len;
+    loop {
+        let mut byte = (n & 0x7f) as u8;
+        n >>= 7;
+        if n > 0 {
+            byte |= 0x80;
+        }
+        program.push(byte);
+        if n == 0 {
+            break;
+        }
+    }
+    program.extend(std::iter::repeat(0u8).take(blob_len));
+    program.push(0x48); // pop
+    program.push(0x81); // pushint
+    program.push(0x01); // 1
+
+    let program_len = program.len() as u64;
+    assert!(
+        program_len > LOGICSIG_MAX_SIZE,
+        "test program should exceed LOGICSIG_MAX_SIZE: {} > {}",
+        program_len,
+        LOGICSIG_MAX_SIZE
+    );
+
+    // Without pooling, the individual LogicSig should be rejected.
+    let stx = make_contract_account_txn(&program);
+    let group = vec![stx.clone()];
+    let mut budget = GroupBudget::for_logicsig(1);
+    let lsig = stx.lsig.as_ref().unwrap();
+    let result = verify_logicsig(&stx, lsig, &group, 0, &mut budget, false);
+    assert!(
+        result.is_err(),
+        "should reject large LogicSig without size pooling"
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("LogicSig too long"),
+        "error should mention size"
+    );
+
+    // With pooling enabled, the per-txn check is skipped.
+    let mut budget2 = GroupBudget::for_logicsig(1);
+    let result2 = verify_logicsig(&stx, lsig, &group, 0, &mut budget2, true);
+    assert!(
+        result2.is_ok(),
+        "should accept large LogicSig with size pooling (per-txn check skipped): {:?}",
+        result2.err()
+    );
+
+    // Group-level check with 8 members: pool = 8 * 1000 = 8000.
+    // Our program is ~3387 bytes < 8000, so it should pass.
+    let mut group_of_8: Vec<SignedTransaction> = Vec::new();
+    group_of_8.push(stx.clone());
+    for _ in 1..8 {
+        // Other 7 are plain pay txns (no LogicSig, contribute 0 to pool).
+        let plain = SignedTransaction {
+            txn: Transaction {
+                txn_type: "pay".to_string(),
+                sender: Address([0x10; 32]),
+                fee: 1_000,
+                first_valid: Round(1),
+                last_valid: Round(100),
+                receiver: Address([0x20; 32]),
+                amount: 0,
+                ..Default::default()
+            },
+            sig: serde_bytes::ByteBuf::from(vec![0u8; 64]),
+            ..Default::default()
+        };
+        group_of_8.push(plain);
+    }
+    let pooled_result = verify_group_logicsig_size(&group_of_8);
+    assert!(
+        pooled_result.is_ok(),
+        "group of 8 should have enough pool for one 3387-byte LogicSig: {:?}",
+        pooled_result.err()
+    );
+
+    // Group-level check with 1 member: pool = 1 * 1000 = 1000.
+    // Our program is ~3387 bytes > 1000, so it should fail.
+    let small_group = vec![stx.clone()];
+    let pooled_fail = verify_group_logicsig_size(&small_group);
+    assert!(
+        pooled_fail.is_err(),
+        "group of 1 should reject a 3387-byte LogicSig"
     );
 }

@@ -12,7 +12,7 @@ use algo_types::{Address, SignedTransaction, TealValue};
 use crate::bytecode;
 use crate::context::AvmContext;
 use crate::group::GroupBudget;
-use crate::machine::{AvmMachine, ExecMode};
+use crate::machine::{AvmMachine, ExecMode, OpcodeCoverage};
 
 // ---------------------------------------------------------------------------
 // Constants (from go-algorand config/consensus.go)
@@ -49,6 +49,8 @@ pub struct AvmResult {
     pub approved: bool,
     /// If set, indicates a runtime error (as opposed to a clean rejection).
     pub error: Option<String>,
+    /// Opcode coverage from this execution run.
+    pub coverage: OpcodeCoverage,
 }
 
 impl AvmResult {
@@ -61,6 +63,7 @@ impl AvmResult {
             logs: Vec::new(),
             approved: false,
             error: None,
+            coverage: OpcodeCoverage::default(),
         }
     }
 }
@@ -94,6 +97,7 @@ pub fn run_approval_program(
             let cost_used = budget_before - machine.budget;
             budget.consume(cost_used)?;
 
+            let coverage = machine.opcode_coverage();
             // Extract accumulated state from the context into the result.
             let result = AvmResult {
                 global_delta: ctx.take_global_delta(),
@@ -102,6 +106,7 @@ pub fn run_approval_program(
                 logs: ctx.take_logs(),
                 approved: pass,
                 error: None,
+                coverage,
             };
             Ok(result)
         }
@@ -113,6 +118,7 @@ pub fn run_approval_program(
             let _ = budget.consume(cost_used);
 
             let mut result = AvmResult::empty();
+            result.coverage = machine.opcode_coverage();
             result.approved = false;
             result.error = Some(e.to_string());
             Ok(result)
@@ -142,6 +148,7 @@ pub fn run_clear_state_program(program: &[u8], ctx: &mut dyn AvmContext) -> AvmR
 
     match machine.run(ctx) {
         Ok(true) => {
+            let coverage = machine.opcode_coverage();
             // Program approved — extract accumulated state from the context.
             AvmResult {
                 global_delta: ctx.take_global_delta(),
@@ -150,17 +157,21 @@ pub fn run_clear_state_program(program: &[u8], ctx: &mut dyn AvmContext) -> AvmR
                 logs: ctx.take_logs(),
                 approved: true,
                 error: None,
+                coverage,
             }
         }
         Ok(false) => {
             // Program cleanly rejected: return empty result with no
             // deltas/logs/inner txns (caller handles local state clearing).
-            AvmResult::empty()
+            let mut result = AvmResult::empty();
+            result.coverage = machine.opcode_coverage();
+            result
         }
         Err(e) => {
             // Program errored: return empty result but capture the error
             // message for debugging/conformance reporting.
             let mut result = AvmResult::empty();
+            result.coverage = machine.opcode_coverage();
             result.error = Some(e.to_string());
             result
         }
@@ -245,7 +256,10 @@ mod tests {
 
         let mut local_deltas = HashMap::new();
         let mut account_delta = HashMap::new();
-        account_delta.insert(b"local_key".to_vec(), Some(TealValue::Bytes(b"val".to_vec())));
+        account_delta.insert(
+            b"local_key".to_vec(),
+            Some(TealValue::Bytes(b"val".to_vec())),
+        );
         local_deltas.insert(Address::ZERO, account_delta);
 
         let result = AvmResult {
@@ -255,6 +269,7 @@ mod tests {
             logs: vec![b"hello".to_vec()],
             approved: true,
             error: None,
+            coverage: OpcodeCoverage::default(),
         };
 
         assert!(result.approved);

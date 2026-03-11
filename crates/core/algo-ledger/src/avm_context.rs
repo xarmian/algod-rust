@@ -1101,6 +1101,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             logs: self.logs.clone(),
             approved,
             error: None,
+            coverage: algo_avm::OpcodeCoverage::default(),
         }
     }
 }

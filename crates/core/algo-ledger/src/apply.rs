@@ -10,7 +10,9 @@ use algo_types::{
 use sha2::{Digest, Sha512_256};
 
 use crate::avm_context::LedgerAvmContext;
-use crate::eval_compare::{compare_eval_delta, EvalDeltaMismatchDetail, EvalDeltaStats};
+use crate::eval_compare::{
+    compare_eval_delta, EvalDeltaMismatchDetail, EvalDeltaStats, MismatchCategory,
+};
 use crate::eval_delta::{apply_eval_delta, parse_eval_delta};
 use crate::rewards::apply_rewards;
 
@@ -280,14 +282,18 @@ fn record_eval_delta_comparison(
 
             let cmp = compare_eval_delta(avm_result, recorded.as_ref(), stx);
             if cmp.matches {
-                stats.record_match();
+                stats.record_match_with_coverage(&avm_result.coverage);
             } else {
-                stats.record_mismatch(EvalDeltaMismatchDetail {
-                    round,
-                    txn_index,
-                    app_id,
-                    mismatches: cmp.mismatches,
-                });
+                stats.record_mismatch_with_coverage(
+                    EvalDeltaMismatchDetail {
+                        round,
+                        txn_index,
+                        app_id,
+                        mismatches: cmp.mismatches,
+                    },
+                    &avm_result.coverage,
+                    MismatchCategory::SemanticMismatch,
+                );
             }
         }
     });

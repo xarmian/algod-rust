@@ -9,11 +9,13 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
 algo-types = { path = "../crates/core/algo-types", features = ["fuzzing"] }
 algo-ledger = { path = "../crates/core/algo-ledger" }
 algo-codec = { path = "../crates/core/algo-codec" }
 algo-avm = { path = "../crates/core/algo-avm" }
 rmp-serde = "1"
+serde_bytes = "0.11"
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -32,4 +34,9 @@ doc = false
 [[bin]]
 name = "fuzz_teal_program"
 path = "fuzz_targets/fuzz_teal_program.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_avm_context"
+path = "fuzz_targets/fuzz_avm_context.rs"
 doc = false
