@@ -2021,9 +2021,13 @@ impl LedgerStore for SqliteLedger {
         // balance estimate at round 0). See NormalizedOnlineAccountBalance in
         // go-algorand data/basics/userBalance.go.
         let nob = account_nob_i64(&account);
+        // Use ON CONFLICT ... DO UPDATE instead of INSERT OR REPLACE to preserve
+        // the rowid. INSERT OR REPLACE deletes and re-inserts, which changes the
+        // rowid and orphans resources table entries that reference addrid.
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO accountbase (address, normalizedonlinebalance, data) VALUES (?1, ?2, ?3)",
+                "INSERT INTO accountbase (address, normalizedonlinebalance, data) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(address) DO UPDATE SET normalizedonlinebalance = excluded.normalizedonlinebalance, data = excluded.data",
                 params![addr.0.as_slice(), nob, data],
             )
             .expect("set_account");

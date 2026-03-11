@@ -46,6 +46,8 @@ pub async fn run(
             store = SqliteLedger::open(db_path)?;
             if start == 0 {
                 load_genesis_into_store(&mut store, genesis_path)?;
+                // Genesis populates round 0 state; start fetching from round 1.
+                1
             } else {
                 anyhow::bail!(
                     "cannot start sync at round {start} with a stale database; \
@@ -53,19 +55,17 @@ pub async fn run(
                      or provide an existing DB that already has state"
                 );
             }
-            start
         }
+    } else if start == 0 {
+        load_genesis_into_store(&mut store, genesis_path)?;
+        // Genesis populates round 0 state; start fetching from round 1.
+        1
     } else {
-        if start == 0 {
-            load_genesis_into_store(&mut store, genesis_path)?;
-        } else {
-            anyhow::bail!(
-                "cannot start sync at round {start} with a fresh database; \
-                 either use --start 0 with --genesis to initialize from genesis, \
-                 or provide an existing DB that already has state"
-            );
-        }
-        start
+        anyhow::bail!(
+            "cannot start sync at round {start} with a fresh database; \
+             either use --start 0 with --genesis to initialize from genesis, \
+             or provide an existing DB that already has state"
+        );
     };
 
     // Enable Merkle trie tracking if requested.
