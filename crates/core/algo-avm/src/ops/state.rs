@@ -523,8 +523,8 @@ pub fn op_voter_params_get(
     ctx: &mut dyn AvmContext,
 ) -> Result<(), AlgoError> {
     let field = get_uint8(instruction)?;
-    let acct_val = machine.pop_uint()?;
-    let account = ctx.resolve_account(acct_val)?;
+    let acct_val = machine.pop()?;
+    let account = resolve_account(acct_val, ctx)?;
     let (value, exists) = ctx.voter_params_get(&account, field)?;
     machine.push(teal_to_avm(value))?;
     machine.push(AvmValue::Uint64(u64::from(exists)))
@@ -581,6 +581,8 @@ mod tests {
         app_params: HashMap<(u64, u8), (TealValue, bool)>,
         /// Acct params: (account, field) -> (TealValue, bool)
         acct_params: HashMap<([u8; 32], u8), (TealValue, bool)>,
+        /// Voter params: (account, field) -> (TealValue, bool)
+        voter_params: HashMap<([u8; 32], u8), (TealValue, bool)>,
         /// Log messages collected.
         logs: Vec<Vec<u8>>,
         /// Group scratch: (group_index, slot) -> TealValue
@@ -611,6 +613,7 @@ mod tests {
                 asset_params: HashMap::new(),
                 app_params: HashMap::new(),
                 acct_params: HashMap::new(),
+                voter_params: HashMap::new(),
                 logs: Vec::new(),
                 group_scratch: HashMap::new(),
                 created_ids: HashMap::new(),
@@ -767,6 +770,18 @@ mod tests {
         ) -> Result<(TealValue, bool), AlgoError> {
             Ok(self
                 .acct_params
+                .get(&(*account, field))
+                .cloned()
+                .unwrap_or((TealValue::Uint(0), false)))
+        }
+
+        fn voter_params_get(
+            &self,
+            account: &[u8; 32],
+            field: u8,
+        ) -> Result<(TealValue, bool), AlgoError> {
+            Ok(self
+                .voter_params
                 .get(&(*account, field))
                 .cloned()
                 .unwrap_or((TealValue::Uint(0), false)))
@@ -2118,5 +2133,79 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("beyond"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // voter_params_get tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_voter_params_get_by_index() {
+        // pushint 0 (account index), voter_params_get field=0 (VoterBalance)
+        let addr = test_addr(0xAA);
+        let raw = prog(11, &[0x81, 0x00, 0x74, 0x00]); // pushint 0, voter_params_get 0
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        ctx.accounts.push(addr);
+        ctx.voter_params
+            .insert((addr, 0), (TealValue::Uint(999_000), true));
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert_eq!(m.stack.len(), 2);
+        assert_eq!(m.stack[0], AvmValue::Uint64(999_000));
+        assert_eq!(m.stack[1], AvmValue::Uint64(1)); // did_exist = true
+    }
+
+    #[test]
+    fn test_voter_params_get_by_address() {
+        // pushbytes <32-byte addr>, voter_params_get field=0 (VoterBalance)
+        let addr = test_addr(0xBB);
+        let mut code = vec![0x80, 0x20]; // pushbytes, length=32
+        code.extend_from_slice(&addr);
+        code.extend_from_slice(&[0x74, 0x00]); // voter_params_get field=0
+        let raw = prog(11, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        ctx.voter_params
+            .insert((addr, 0), (TealValue::Uint(500_000), true));
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert_eq!(m.stack.len(), 2);
+        assert_eq!(m.stack[0], AvmValue::Uint64(500_000));
+        assert_eq!(m.stack[1], AvmValue::Uint64(1)); // did_exist = true
+    }
+
+    #[test]
+    fn test_voter_params_get_not_found() {
+        // pushint 0 (account index), voter_params_get field=0 — account not in voter_params
+        let addr = test_addr(0xCC);
+        let raw = prog(11, &[0x81, 0x00, 0x74, 0x00]); // pushint 0, voter_params_get 0
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        ctx.accounts.push(addr);
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert_eq!(m.stack.len(), 2);
+        assert_eq!(m.stack[0], AvmValue::Uint64(0));
+        assert_eq!(m.stack[1], AvmValue::Uint64(0)); // did_exist = false
+    }
+
+    #[test]
+    fn test_voter_params_get_incentive_eligible_by_address() {
+        // pushbytes <32-byte addr>, voter_params_get field=1 (VoterIncentiveEligible)
+        let addr = test_addr(0xDD);
+        let mut code = vec![0x80, 0x20]; // pushbytes, length=32
+        code.extend_from_slice(&addr);
+        code.extend_from_slice(&[0x74, 0x01]); // voter_params_get field=1
+        let raw = prog(11, &code);
+        let program = bytecode::parse(&raw).unwrap();
+        let mut m = AvmMachine::new(program, ExecMode::Application, 20000);
+        let mut ctx = TestStateContext::new(100);
+        ctx.voter_params
+            .insert((addr, 1), (TealValue::Uint(1), true));
+        step_n(&mut m, &mut ctx, 2).unwrap();
+        assert_eq!(m.stack.len(), 2);
+        assert_eq!(m.stack[0], AvmValue::Uint64(1));
+        assert_eq!(m.stack[1], AvmValue::Uint64(1)); // did_exist = true
     }
 }

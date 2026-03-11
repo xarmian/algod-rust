@@ -492,7 +492,11 @@ pub fn op_ec_pairing_check(
     let group = get_ec_group(instruction)?;
 
     // Charge linear cost based on top-of-stack length before popping.
-    // Go: baseCost + chunkCost * DivCeil(len(top), chunkSize)
+    // Go uses linearCost.compute() with depth=0, i.e. len(stack[last].Bytes).
+    // The chunk sizes per group come from the Go opcode table directly.
+    // For g1 groups: TOS = "associated" G2 bytes, chunkSize = g1 point size.
+    // For g2 groups: TOS = "associated" G1 bytes, chunkSize = g2 point size.
+    // This matches go-algorand exactly (see opcodes.go costByFieldAndLength).
     let top_len = match machine.stack.last() {
         Some(AvmValue::Bytes(b)) => b.len(),
         _ => 0,
