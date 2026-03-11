@@ -31,7 +31,8 @@ use crate::rules::{
     SpecialAddresses, MAX_TIMESTAMP_INCREMENT,
 };
 use crate::signature::{
-    verify_auth_addr_sender_diff, verify_group_logicsig_size, verify_transaction_signature,
+    verify_auth_addr_sender_diff, verify_group_logicsig_size, verify_heartbeat_proof,
+    verify_transaction_signature,
 };
 
 /// Result of validating a complete block.
@@ -326,6 +327,33 @@ pub fn validate_block(
                     txn_index: idx,
                     error: e.to_string(),
                 });
+            }
+
+            // Heartbeat proof verification (Go: stxnCoreChecks, verify/txn.go).
+            // For heartbeat transactions, verify the one-time-sig proof that
+            // demonstrates possession of the account's participation keys.
+            if stx.txn.txn_type == "hb" {
+                if let Some(ref hb) = stx.txn.heartbeat {
+                    if let Some(ref proof) = hb.proof {
+                        if let Err(e) = verify_heartbeat_proof(
+                            proof,
+                            &hb.vote_id,
+                            stx.txn.last_valid.0,
+                            hb.key_dilution,
+                            &hb.seed,
+                        ) {
+                            errors.push(BlockValidationError::SignatureVerificationFailed {
+                                txn_index: idx,
+                                error: format!("heartbeat proof verification failed: {e}"),
+                            });
+                        }
+                    } else {
+                        errors.push(BlockValidationError::SignatureVerificationFailed {
+                            txn_index: idx,
+                            error: "heartbeat transaction missing proof".to_string(),
+                        });
+                    }
+                }
             }
 
             // AuthAddr != Sender check (Go: EnforceAuthAddrSenderDiff, future only).
@@ -871,6 +899,114 @@ mod tests {
         assert!(
             result.errors.len() >= 2,
             "expected multiple errors, got: {:?}",
+            result.errors
+        );
+    }
+
+    // ── Tests for issue #62 fix #1: heartbeat proof verification in block validation ──
+
+    #[test]
+    fn heartbeat_txn_missing_proof_reports_error() {
+        use algo_types::HeartbeatTxnFields;
+
+        let key = test_signing_key();
+        let pk = key.verifying_key();
+        let sender = Address(pk.to_bytes());
+
+        let mut block = empty_block();
+        block.current_protocol = algo_types::consensus::CONSENSUS_V41.to_string();
+
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "hb".to_string();
+        stx.txn.sender = sender;
+        stx.txn.first_valid = Round(1);
+        stx.txn.last_valid = Round(1001);
+        stx.txn.fee = 1000;
+        stx.txn.genesis_hash = ByteBuf::from(test_genesis_hash().to_vec());
+        stx.txn.heartbeat = Some(HeartbeatTxnFields {
+            address: Address([5u8; 32]),
+            proof: None, // Missing proof!
+            seed: ByteBuf::from(vec![0u8; 32]),
+            vote_id: ByteBuf::from(vec![0u8; 32]),
+            key_dilution: 100,
+        });
+
+        // Sign the transaction to pass signature checks.
+        let txn_bytes = algo_codec::canonical_encode_transaction(&stx.txn);
+        let msg = [b"TX".as_slice(), &txn_bytes].concat();
+        let sig = key.sign(&msg);
+        stx.sig = ByteBuf::from(sig.to_bytes().to_vec());
+
+        block.payset = vec![stx];
+
+        let result = validate_block(&block, Some(99), "test-v1", &test_genesis_hash(), None);
+        let hb_errors: Vec<_> = result
+            .errors
+            .iter()
+            .filter(|e| {
+                let s = e.to_string();
+                s.contains("heartbeat transaction missing proof")
+            })
+            .collect();
+        assert!(
+            !hb_errors.is_empty(),
+            "expected heartbeat missing proof error, got errors: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn heartbeat_txn_invalid_proof_reports_error() {
+        use algo_types::{HeartbeatProof, HeartbeatTxnFields};
+
+        let key = test_signing_key();
+        let pk = key.verifying_key();
+        let sender = Address(pk.to_bytes());
+
+        let mut block = empty_block();
+        block.current_protocol = algo_types::consensus::CONSENSUS_V41.to_string();
+
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "hb".to_string();
+        stx.txn.sender = sender;
+        stx.txn.first_valid = Round(1);
+        stx.txn.last_valid = Round(1001);
+        stx.txn.fee = 1000;
+        stx.txn.genesis_hash = ByteBuf::from(test_genesis_hash().to_vec());
+        stx.txn.heartbeat = Some(HeartbeatTxnFields {
+            address: Address([5u8; 32]),
+            proof: Some(HeartbeatProof {
+                sig: ByteBuf::from(vec![0u8; 64]),
+                pk: ByteBuf::from(vec![0u8; 32]),
+                pk2: ByteBuf::from(vec![0u8; 32]),
+                pk1_sig: ByteBuf::from(vec![0u8; 64]),
+                pk2_sig: ByteBuf::from(vec![0u8; 64]),
+            }),
+            seed: ByteBuf::from(vec![0u8; 32]),
+            vote_id: ByteBuf::from(vec![1u8; 32]), // Non-zero vote ID
+            key_dilution: 100,
+        });
+
+        // Sign the transaction.
+        let txn_bytes = algo_codec::canonical_encode_transaction(&stx.txn);
+        let msg = [b"TX".as_slice(), &txn_bytes].concat();
+        let sig = key.sign(&msg);
+        stx.sig = ByteBuf::from(sig.to_bytes().to_vec());
+
+        block.payset = vec![stx];
+
+        let result = validate_block(&block, Some(99), "test-v1", &test_genesis_hash(), None);
+        let hb_errors: Vec<_> = result
+            .errors
+            .iter()
+            .filter(|e| {
+                let s = e.to_string();
+                s.contains("heartbeat proof verification failed")
+            })
+            .collect();
+        assert!(
+            !hb_errors.is_empty(),
+            "expected heartbeat proof verification error, got errors: {:?}",
             result.errors
         );
     }

@@ -40,6 +40,13 @@ pub struct ApplyContext {
     pub round: u64,
     /// Controls whether EvalDeltas come from block data or AVM execution.
     pub mode: ApplyMode,
+    /// Whether to run end-of-block participation validation checks.
+    ///
+    /// Mirrors go-algorand's `eval.validate`. When true, validates that
+    /// expired/absent accounts in the block header are correct (duplicate
+    /// checks, vote key checks, etc.). When false (replay/catchup), only
+    /// the apply-side state transitions run.
+    pub validate: bool,
     /// Latest confirmed timestamp (for AVM context).
     pub latest_timestamp: u64,
     /// Genesis hash (for AVM context).
@@ -76,6 +83,7 @@ impl ApplyContext {
             fee_sink,
             round,
             mode: ApplyMode::Replay,
+            validate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
@@ -88,16 +96,39 @@ impl ApplyContext {
 
 /// Apply a full block to the ledger state using the default Replay mode.
 ///
-/// This is a convenience wrapper around [`apply_block_with_mode`] that uses
-/// `ApplyMode::Replay` for backward compatibility.
+/// This is a convenience wrapper around [`apply_block_impl`] that uses
+/// `ApplyMode::Replay` with `validate=false` for backward compatibility.
 pub fn apply_block<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<(), AlgoError> {
-    apply_block_with_mode(store, block, ApplyMode::Replay)
+    apply_block_impl(store, block, ApplyMode::Replay, false)
 }
 
 /// Apply a full block to the ledger state with the specified mode.
+///
+/// Convenience wrapper with `validate=false` (replay/catchup behavior).
+pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    mode: ApplyMode,
+) -> Result<(), AlgoError> {
+    apply_block_impl(store, block, mode, false)
+}
+
+/// Apply a full block to the ledger state with validation enabled.
+///
+/// Like [`apply_block`] but also runs end-of-block participation validation
+/// (duplicate checks, vote key checks, online status checks) matching
+/// Go's `eval.validate = true` code path.
+pub fn apply_block_validating<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+) -> Result<(), AlgoError> {
+    apply_block_impl(store, block, ApplyMode::Replay, true)
+}
+
+/// Apply a full block to the ledger state (internal implementation).
 ///
 /// Updates rewards parameters from the block header, then applies each
 /// transaction in payset order. Finally updates `current_round`.
@@ -105,15 +136,20 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
 /// In `Replay` mode, recorded EvalDeltas from block data are used directly.
 /// In `Execute` mode, AVM programs are run to produce results.
 ///
+/// When `validate` is true, end-of-block participation validation checks
+/// are run (matching Go's `eval.validate`). When false (replay/catchup),
+/// only the apply-side state transitions run.
+///
 /// On error, rewards state is restored to its pre-block values. Note that
 /// account mutations from earlier successful transactions in the payset are
 /// NOT rolled back — the caller should treat the state as corrupted on error.
 /// In practice, committed blocks are already validated and should never
 /// produce errors — the checks here are defensive safety nets.
-pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
+fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
     mode: ApplyMode,
+    validate: bool,
 ) -> Result<(), AlgoError> {
     // Validate round monotonicity.
     let expected = Round(store.current_round().0 + 1);
@@ -159,12 +195,13 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
         fee_sink: block.fee_sink,
         round: block.round.0,
         mode,
+        validate,
         latest_timestamp: block.timestamp as u64,
         genesis_hash: gh,
         txn_counter: Cell::new(base_txn_counter),
         fee_credit: Cell::new(0),
         txn_index: Cell::new(0),
-        consensus,
+        consensus: consensus.clone(),
     };
 
     let result = (|| {
@@ -229,6 +266,49 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
         return result;
     }
 
+    // ── End-of-block participation updates ──────────────────────────
+    // Mirrors go-algorand endOfBlock: for each category, first validate
+    // (gated on ctx.validate, matching Go's `eval.validate`), then apply.
+    //
+    // Go order:
+    //   1. validateExpiredOnlineAccounts()   — gated on eval.validate
+    //   2. resetExpiredOnlineAccountsParticipationKeys()  — always runs
+    //   3. validateAbsentOnlineAccounts()    — gated on eval.validate
+    //   4. suspendAbsentAccounts()           — always runs
+    //
+    // Wrap in a snapshot/rollback guard so that if any function fails,
+    // partial mutations from end-of-block processing are reverted.
+    {
+        // Collect all addresses that will be mutated by end-of-block processing
+        // so we can snapshot them for rollback.
+        let mut eob_addrs: Vec<Address> = Vec::new();
+        if let Some(ref expired) = block.expired_participation_accounts {
+            for addr in expired {
+                if !eob_addrs.contains(addr) {
+                    eob_addrs.push(*addr);
+                }
+            }
+        }
+        if let Some(ref absent) = block.absent_participation_accounts {
+            for addr in absent {
+                if !eob_addrs.contains(addr) {
+                    eob_addrs.push(*addr);
+                }
+            }
+        }
+        let eob_snapshot = store.snapshot(&eob_addrs);
+        let eob_result = (|| {
+            validate_expired_online_accounts(store, block, &consensus, ctx.validate)?;
+            reset_expired_online_accounts(store, block, &consensus)?;
+            validate_absent_online_accounts(store, block, &consensus, ctx.validate)?;
+            suspend_absent_accounts(store, block, &consensus)
+        })();
+        if eob_result.is_err() {
+            store.restore_snapshot(eob_snapshot);
+            return eob_result;
+        }
+    }
+
     store.set_current_round(block.round);
     store.purge_expired_leases(block.round.0);
 
@@ -257,6 +337,225 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
     let txtail_data = algo_codec::canonical_encode_txtail_round(&txtail);
     if let Err(e) = store.put_txtail(block.round.0, &txtail_data) {
         tracing::warn!("put_txtail failed for round {}: {e}", block.round.0);
+    }
+
+    Ok(())
+}
+
+/// Validate expired participation accounts at end of block.
+///
+/// Mirrors go-algorand's `validateExpiredOnlineAccounts`. Gated on the
+/// `validate` flag (matching Go's `if !eval.validate { return nil }`).
+///
+/// Checks: count <= max, no duplicate addresses, each account has a vote
+/// key and its vote_last_valid < current round.
+fn validate_expired_online_accounts<L: crate::store_trait::LedgerStore>(
+    store: &L,
+    block: &Block,
+    consensus: &ConsensusParams,
+    validate: bool,
+) -> Result<(), AlgoError> {
+    if !validate {
+        return Ok(());
+    }
+
+    let max_expired = consensus.max_proposed_expired_online_accounts;
+    let expired = block
+        .expired_participation_accounts
+        .as_deref()
+        .unwrap_or(&[]);
+
+    // If the length exceeds the max, it is an error (also handles max==0 disabling the feature).
+    if expired.len() > max_expired {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "length of expired accounts ({}) was greater than expected ({})",
+                expired.len(),
+                max_expired
+            ),
+        });
+    }
+
+    // Check for duplicates and that each account truly has expired keys.
+    let round = block.round.0;
+    let mut seen = std::collections::HashSet::with_capacity(expired.len());
+    for addr in expired {
+        if !seen.insert(*addr) {
+            return Err(AlgoError::Ledger {
+                message: format!("duplicate address found: {}", addr),
+            });
+        }
+
+        let acct = store.get_or_default_account(addr);
+
+        // Go: if acctData.VoteID.IsEmpty() -> error
+        if acct.vote_id.is_none() || acct.vote_id.as_ref().is_some_and(|v| v == &[0u8; 32]) {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "endOfBlock found expiration candidate {} had no vote key",
+                    addr
+                ),
+            });
+        }
+        // Go: if acctData.VoteLastValid >= currentRound -> error
+        if acct.vote_last_valid >= round {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "endOfBlock found {} round ({}) was not less than current round ({})",
+                    addr, acct.vote_last_valid, round
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply expired participation accounts at end of block.
+///
+/// Mirrors go-algorand's `resetExpiredOnlineAccountsParticipationKeys`.
+/// Always runs (not gated on validate). For each address in
+/// `block.expired_participation_accounts`, looks up the account (returning
+/// default for missing), calls ClearOnlineState, and persists.
+///
+/// Keeps the count check (Go has this in the apply function too).
+fn reset_expired_online_accounts<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    consensus: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    let max_expired = consensus.max_proposed_expired_online_accounts;
+    let expired = block
+        .expired_participation_accounts
+        .as_deref()
+        .unwrap_or(&[]);
+
+    // If the length exceeds the max, it is an error (also handles max==0 disabling the feature).
+    if expired.len() > max_expired {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "length of expired accounts ({}) was greater than expected ({})",
+                expired.len(),
+                max_expired
+            ),
+        });
+    }
+
+    // ClearOnlineState on each expired account.
+    for addr in expired {
+        let mut acct = store.get_or_default_account(addr);
+        // ClearOnlineState: set Offline and clear all voting keys.
+        acct.status = AccountStatus::Offline;
+        acct.vote_id = None;
+        acct.selection_id = None;
+        acct.state_proof_id = None;
+        acct.vote_first_valid = 0;
+        acct.vote_last_valid = 0;
+        acct.vote_key_dilution = 0;
+        store.set_account(addr, acct);
+    }
+
+    Ok(())
+}
+
+/// Validate absent participation accounts at end of block.
+///
+/// Mirrors go-algorand's `validateAbsentOnlineAccounts`. Gated on the
+/// `validate` flag (matching Go's `if !eval.validate { return nil }`).
+///
+/// Checks: count <= max, no duplicate addresses, each account is Online
+/// with non-zero balance and IncentiveEligible.
+///
+/// Note: Go also checks isAbsent (via online stake / voting stake) and
+/// challenge failure (via FindChallenge + ch.Failed). Those require
+/// agreement-level data not yet available here — deferred to Phase 6.
+fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore>(
+    store: &L,
+    block: &Block,
+    consensus: &ConsensusParams,
+    validate: bool,
+) -> Result<(), AlgoError> {
+    if !validate {
+        return Ok(());
+    }
+
+    let max_suspensions = consensus.payouts_max_mark_absent;
+    let absent = block
+        .absent_participation_accounts
+        .as_deref()
+        .unwrap_or(&[]);
+
+    // If the length exceeds the max, it is an error (also handles max==0 disabling the feature).
+    if absent.len() > max_suspensions {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "length of absent accounts ({}) was greater than expected ({})",
+                absent.len(),
+                max_suspensions
+            ),
+        });
+    }
+
+    // Check for duplicates and basic account eligibility for suspension.
+    let mut seen = std::collections::HashSet::with_capacity(absent.len());
+    for addr in absent {
+        if !seen.insert(*addr) {
+            return Err(AlgoError::Ledger {
+                message: format!("duplicate address found: {}", addr),
+            });
+        }
+
+        let acct = store.get_or_default_account(addr);
+
+        if acct.status != AccountStatus::Online {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "proposed absent account {} was {:?}, not Online",
+                    addr, acct.status
+                ),
+            });
+        }
+        if acct.micro_algos == 0 {
+            return Err(AlgoError::Ledger {
+                message: format!("proposed absent account {} with zero algos", addr),
+            });
+        }
+        if !acct.incentive_eligible {
+            return Err(AlgoError::Ledger {
+                message: format!("proposed absent account {} not IncentiveEligible", addr),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply absent participation accounts at end of block.
+///
+/// Mirrors go-algorand's `suspendAbsentAccounts`. Always runs (not gated
+/// on validate). For each address in `block.absent_participation_accounts`,
+/// looks up the account (returning default for missing), suspends it
+/// (Offline + clear IncentiveEligible), and persists.
+///
+/// Go's `suspendAbsentAccounts` has NO count check — the count check is
+/// only in `validateAbsentOnlineAccounts`.
+fn suspend_absent_accounts<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    _consensus: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    let absent = block
+        .absent_participation_accounts
+        .as_deref()
+        .unwrap_or(&[]);
+
+    // Suspend each absent account.
+    for addr in absent {
+        let mut acct = store.get_or_default_account(addr);
+        // Suspend: set Offline and clear incentive eligibility, but keep voting keys.
+        acct.status = AccountStatus::Offline;
+        acct.incentive_eligible = false;
+        store.set_account(addr, acct);
     }
 
     Ok(())
@@ -531,6 +830,12 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
             }
         }
     }
+    // Heartbeat target address: heartbeat mutates the target account.
+    if let Some(ref hb) = txn.heartbeat {
+        if !hb.address.is_zero() && !touched.contains(&hb.address) {
+            touched.push(hb.address);
+        }
+    }
 
     // Determine asset/app IDs to snapshot for rollback, and include
     // creator addresses that may differ from the transaction sender.
@@ -652,7 +957,16 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
             "appl" => apply_appl(store, stx, ctx, depth, group_budget, group_info)?,
             "keyreg" => {
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
-                apply_keyreg(store, &stx.txn, ctx.round)?;
+                apply_keyreg(store, &stx.txn, ctx.round, &ctx.consensus)?;
+            }
+            "hb" => {
+                if !ctx.consensus.enable_heartbeat {
+                    return Err(AlgoError::Ledger {
+                        message: "heartbeat transaction not supported".to_string(),
+                    });
+                }
+                apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
+                apply_heartbeat(store, &stx.txn, ctx.round, &ctx.consensus)?;
             }
             other => {
                 return Err(AlgoError::Ledger {
@@ -1832,6 +2146,7 @@ pub fn apply_keyreg<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     txn: &algo_types::Transaction,
     round: u64,
+    consensus: &ConsensusParams,
 ) -> Result<InnerApplyData, AlgoError> {
     // Guard: NotParticipating is irreversible.
     {
@@ -1949,25 +2264,206 @@ pub fn apply_keyreg<L: crate::store_trait::LedgerStore>(
         account.vote_key_dilution = txn.vote_key_dilution;
 
         // D15: Incentive eligibility and last heartbeat (Go: Payouts.Enabled, since v40).
-        // Go sets IncentiveEligible = true when fee >= Payouts.GoOnlineFee && Payouts.Enabled.
         // Go sets LastHeartbeat = round + lookback when Payouts.Enabled.
-        // Payouts.GoOnlineFee = 2_000_000 (2 Algos), Payouts.Enabled since v40.
+        // Go sets IncentiveEligible = true when fee >= Payouts.GoOnlineFee && Payouts.Enabled.
         // lookback = 2 * SeedRefreshInterval * SeedLookback = 2 * 80 * 2 = 320.
-        const PAYOUTS_GO_ONLINE_FEE: u64 = 2_000_000;
         const BALANCE_LOOKBACK: u64 = 320; // 2 * SeedRefreshInterval(80) * SeedLookback(2)
 
-        // TODO(conformance): Gate on Payouts.Enabled once consensus params are version-aware.
-        // Currently assumes v40+ where Payouts is enabled.
-        account.last_heartbeat = round + BALANCE_LOOKBACK;
+        if consensus.payouts_enabled {
+            account.last_heartbeat = round + BALANCE_LOOKBACK;
 
-        // TODO(conformance): Gate on Payouts.Enabled once consensus params are version-aware.
-        // Currently assumes v40+ where Payouts is enabled.
-        if txn.fee >= PAYOUTS_GO_ONLINE_FEE {
-            account.incentive_eligible = true;
+            if txn.fee >= consensus.payouts_go_online_fee {
+                account.incentive_eligible = true;
+            }
         }
 
         store.set_account(&txn.sender, account);
     }
+
+    Ok(InnerApplyData::default())
+}
+
+/// Apply a heartbeat transaction.
+///
+/// Matches go-algorand's `Heartbeat()` in `ledger/apply/heartbeat.go`.
+/// A heartbeat proves that the target account (hb_address) is online by
+/// demonstrating possession of the account's participation keys.
+///
+/// This implementation covers:
+/// - Challenge-based fee validation: if the fee is below MinTxnFee and the txn
+///   is a singleton (no group), the heartbeat is only allowed if the target
+///   account is online, incentive-eligible, and currently challenged.
+/// - Validates the target account exists and has matching voting keys
+/// - Sets `last_heartbeat = round` on the target account
+pub fn apply_heartbeat<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    txn: &algo_types::Transaction,
+    round: u64,
+    consensus: &ConsensusParams,
+) -> Result<InnerApplyData, AlgoError> {
+    let hb = txn.heartbeat.as_ref().ok_or_else(|| AlgoError::Ledger {
+        message: "heartbeat transaction missing heartbeat fields".to_string(),
+    })?;
+
+    let hb_address = &hb.address;
+
+    // Look up the target account.
+    let account = store.get_account(hb_address);
+    if account.is_none() {
+        return Err(AlgoError::Ledger {
+            message: format!("heartbeat: target account {} does not exist", hb_address),
+        });
+    }
+    let account = account.unwrap();
+
+    // Cheap/free heartbeat validation.
+    // Go: if header.Fee.Raw < proto.MinTxnFee && header.Group.IsZero()
+    // A heartbeat with fee below MinTxnFee in a singleton group is only
+    // allowed if the target account is online, incentive-eligible, and
+    // currently challenged (the "risky" challenge period).
+    let is_singleton = txn.group.is_empty() || txn.group.iter().all(|b| *b == 0);
+    if txn.fee < consensus.min_txn_fee && is_singleton {
+        let kind = if txn.fee > 0 { "cheap" } else { "free" };
+
+        if account.status != AccountStatus::Online {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "{} heartbeat is not allowed for {} {}",
+                    kind, account.status, hb_address
+                ),
+            });
+        }
+        if !account.incentive_eligible {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "{} heartbeat is not allowed when not IncentiveEligible {}",
+                    kind, hb_address
+                ),
+            });
+        }
+
+        let provider = crate::heartbeat::StoreHeaderProvider { store: &*store };
+        let ch = crate::heartbeat::find_challenge(
+            consensus,
+            round,
+            &provider,
+            crate::heartbeat::ChallengePeriod::Risky,
+        );
+        if ch.is_zero() {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "{} heartbeat for {} is not allowed with no challenge",
+                    kind, hb_address
+                ),
+            });
+        }
+        let acct_last_seen =
+            crate::heartbeat::last_seen(account.last_proposed, account.last_heartbeat);
+        if !ch.failed(&hb_address.0, acct_last_seen) {
+            return Err(AlgoError::Ledger {
+                message: format!("{} heartbeat for {} is not challenged", kind, hb_address),
+            });
+        }
+    }
+
+    // Validate HbSeed matches the block seed at FirstValid.
+    // Go (heartbeat.go:76-83): fetches the block header at header.FirstValid,
+    // checks hdr.Seed != hb.HbSeed. This discourages pre-signing heartbeats.
+    {
+        let first_valid = txn.first_valid.0;
+        let hdr_data = store
+            .get_block_header_data(first_valid)
+            .map_err(|e| AlgoError::Ledger {
+                message: format!(
+                    "heartbeat: failed to get block header at round {}: {}",
+                    first_valid, e
+                ),
+            })?;
+        let hdr_data = hdr_data.ok_or_else(|| AlgoError::Ledger {
+            message: format!("heartbeat: block header not found at round {}", first_valid),
+        })?;
+        // decode_block works on header-only data because Block is a flat struct;
+        // the payset fields simply default to empty.
+        let hdr_block = algo_codec::decode_block(&hdr_data).map_err(|e| AlgoError::Ledger {
+            message: format!(
+                "heartbeat: failed to decode block header at round {}: {}",
+                first_valid, e
+            ),
+        })?;
+        let hdr_seed: [u8; 32] = if hdr_block.seed.len() >= 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&hdr_block.seed[..32]);
+            arr
+        } else {
+            let mut arr = [0u8; 32];
+            if !hdr_block.seed.is_empty() {
+                arr[..hdr_block.seed.len()].copy_from_slice(&hdr_block.seed);
+            }
+            arr
+        };
+        let hb_seed: [u8; 32] = if hb.seed.len() >= 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&hb.seed[..32]);
+            arr
+        } else {
+            let mut arr = [0u8; 32];
+            if !hb.seed.is_empty() {
+                arr[..hb.seed.len()].copy_from_slice(&hb.seed);
+            }
+            arr
+        };
+        if hdr_seed != hb_seed {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "heartbeat: provided seed does not match round {}'s seed",
+                    first_valid
+                ),
+            });
+        }
+    }
+
+    // Validate vote_id matches.
+    // Go: account.VotingData.VoteID != hb.HbVoteID
+    let account_vote_id = account.vote_id.unwrap_or([0u8; 32]);
+    let hb_vote_id: [u8; 32] = if hb.vote_id.len() == 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&hb.vote_id);
+        arr
+    } else if hb.vote_id.is_empty() {
+        [0u8; 32]
+    } else {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "heartbeat: invalid vote_id length {}, expected 32",
+                hb.vote_id.len()
+            ),
+        });
+    };
+    if account_vote_id != hb_vote_id {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "heartbeat: provided vote ID does not match {}'s vote ID",
+                hb_address
+            ),
+        });
+    }
+
+    // Validate key_dilution matches.
+    // Go: account.VotingData.VoteKeyDilution != hb.HbKeyDilution
+    if account.vote_key_dilution != hb.key_dilution {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "heartbeat: provided key dilution {} does not match {}'s key dilution {}",
+                hb.key_dilution, hb_address, account.vote_key_dilution
+            ),
+        });
+    }
+
+    // Update last_heartbeat on the target account.
+    // Go: account.LastHeartbeat = round
+    let mut account = store.get_or_default_account(hb_address);
+    account.last_heartbeat = round;
+    store.set_account(hb_address, account);
 
     Ok(InnerApplyData::default())
 }
@@ -3888,5 +4384,1910 @@ mod tests {
             assert!(state.get_block_data(r).unwrap().is_some());
             assert!(state.get_txtail(r).unwrap().is_some());
         }
+    }
+
+    // ── Heartbeat tests ──────────────────────────────────────────────
+
+    /// Default seed used for heartbeat tests.
+    const HB_TEST_SEED: [u8; 32] = [0xABu8; 32];
+
+    fn heartbeat_txn(
+        sender: Address,
+        hb_address: Address,
+        vote_id: [u8; 32],
+        key_dilution: u64,
+        fee: u64,
+    ) -> SignedTransaction {
+        heartbeat_txn_with_seed(
+            sender,
+            hb_address,
+            vote_id,
+            key_dilution,
+            fee,
+            &HB_TEST_SEED,
+        )
+    }
+
+    fn heartbeat_txn_with_seed(
+        sender: Address,
+        hb_address: Address,
+        vote_id: [u8; 32],
+        key_dilution: u64,
+        fee: u64,
+        seed: &[u8; 32],
+    ) -> SignedTransaction {
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "hb".to_string();
+        stx.txn.sender = sender;
+        stx.txn.fee = fee;
+        // first_valid = 1 (matching the round of the stored block header).
+        stx.txn.first_valid = Round(1);
+        stx.txn.heartbeat = Some(algo_types::HeartbeatTxnFields {
+            address: hb_address,
+            proof: None,
+            seed: serde_bytes::ByteBuf::from(seed.to_vec()),
+            vote_id: serde_bytes::ByteBuf::from(vote_id.to_vec()),
+            key_dilution,
+        });
+        stx
+    }
+
+    /// Store a minimal block header at the given round with the given seed.
+    /// Used by heartbeat tests so that HbSeed validation can find the header.
+    fn store_block_header_with_seed(state: &mut LedgerState, round: u64, seed: &[u8; 32]) {
+        use crate::store_trait::LedgerStore;
+        use serde_bytes::ByteBuf;
+
+        // Build a minimal block with the seed for header encoding.
+        let block = Block {
+            round: Round(round),
+            branch: ByteBuf::new(),
+            seed: ByteBuf::from(seed.to_vec()),
+            txn_commitment: ByteBuf::new(),
+            timestamp: 0,
+            genesis_id: String::new(),
+            genesis_hash: ByteBuf::new(),
+            proposer: Address::ZERO,
+            fee_sink: Address::ZERO,
+            rewards_pool: Address::ZERO,
+            rewards_level: 0,
+            rewards_rate: 0,
+            rewards_residue: 0,
+            rewards_recalculation_round: Round(0),
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            next_protocol: String::new(),
+            next_protocol_approvals: 0,
+            next_protocol_switch_on: Round(0),
+            next_protocol_vote_before: Round(0),
+            txn_counter: 0,
+            fees_collected: 0,
+            bonus: 0,
+            proposer_payout: 0,
+            prev512: ByteBuf::new(),
+            txn256: ByteBuf::new(),
+            txn512: ByteBuf::new(),
+            state_proof_tracking: None,
+            upgrade_propose: String::new(),
+            upgrade_delay: 0,
+            upgrade_approve: false,
+            expired_participation_accounts: None,
+            absent_participation_accounts: None,
+            payset: vec![],
+        };
+        let hdrdata = algo_codec::canonical_encode_block_header_from_block(&block);
+        let blkdata = algo_codec::encode_block(&block).unwrap();
+        state
+            .put_block(
+                round,
+                algo_types::consensus::CONSENSUS_V41,
+                &hdrdata,
+                &blkdata,
+            )
+            .unwrap();
+    }
+
+    /// Create an ApplyContext with heartbeat-compatible consensus params (V41).
+    fn heartbeat_ctx(fee_sink: Address, round: u64) -> ApplyContext {
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap();
+        ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+            round,
+            mode: ApplyMode::Replay,
+            validate: false,
+            latest_timestamp: 0,
+            genesis_hash: [0u8; 32],
+            txn_counter: Cell::new(0),
+            fee_credit: Cell::new(0),
+            txn_index: Cell::new(0),
+            consensus,
+        }
+    }
+
+    #[test]
+    fn test_heartbeat_updates_last_heartbeat() {
+        let sender = Address([1u8; 32]);
+        let target = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let vote_id = [42u8; 32];
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (target, 500_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        // Store block header at round 1 (first_valid) with matching seed.
+        store_block_header_with_seed(&mut state, 1, &HB_TEST_SEED);
+
+        // Set target account to Online with matching voting keys.
+        {
+            let acct = state.get_or_default_account(&target);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some(vote_id);
+            acct.vote_key_dilution = 10;
+            acct.last_heartbeat = 0;
+        }
+
+        let ctx = heartbeat_ctx(fee_sink, 100);
+        let stx = heartbeat_txn(sender, target, vote_id, 10, 1_000);
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        // Verify last_heartbeat is updated to the current round.
+        let acct = state.get_account(&target).unwrap();
+        assert_eq!(acct.last_heartbeat, 100);
+
+        // Verify fee was deducted from sender.
+        let sender_acct = state.get_account(&sender).unwrap();
+        assert_eq!(sender_acct.micro_algos, 999_000);
+    }
+
+    #[test]
+    fn test_heartbeat_nonexistent_account_errors() {
+        let sender = Address([1u8; 32]);
+        let target = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let vote_id = [42u8; 32];
+
+        // Only create sender and fee_sink -- target does NOT exist.
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+        store_block_header_with_seed(&mut state, 1, &HB_TEST_SEED);
+
+        let ctx = heartbeat_ctx(fee_sink, 100);
+        let stx = heartbeat_txn(sender, target, vote_id, 10, 1_000);
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("does not exist"),
+            "expected 'does not exist' in error: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_vote_id_mismatch_errors() {
+        let sender = Address([1u8; 32]);
+        let target = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let account_vote_id = [42u8; 32];
+        let wrong_vote_id = [99u8; 32];
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (target, 500_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        store_block_header_with_seed(&mut state, 1, &HB_TEST_SEED);
+
+        // Set target account with one vote_id.
+        {
+            let acct = state.get_or_default_account(&target);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some(account_vote_id);
+            acct.vote_key_dilution = 10;
+        }
+
+        let ctx = heartbeat_ctx(fee_sink, 100);
+        // Heartbeat with a different vote_id.
+        let stx = heartbeat_txn(sender, target, wrong_vote_id, 10, 1_000);
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("vote ID"),
+            "expected 'vote ID' in error: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_key_dilution_mismatch_errors() {
+        let sender = Address([1u8; 32]);
+        let target = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let vote_id = [42u8; 32];
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (target, 500_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        store_block_header_with_seed(&mut state, 1, &HB_TEST_SEED);
+
+        // Set target account with key_dilution=10.
+        {
+            let acct = state.get_or_default_account(&target);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some(vote_id);
+            acct.vote_key_dilution = 10;
+        }
+
+        let ctx = heartbeat_ctx(fee_sink, 100);
+        // Heartbeat with wrong key_dilution=99.
+        let stx = heartbeat_txn(sender, target, vote_id, 99, 1_000);
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("key dilution"),
+            "expected 'key dilution' in error: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_missing_fields_errors() {
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
+
+        let ctx = heartbeat_ctx(fee_sink, 100);
+        // Heartbeat with no heartbeat fields (None).
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "hb".to_string();
+        stx.txn.sender = sender;
+        stx.txn.fee = 1_000;
+        // heartbeat field is None
+
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("missing heartbeat fields"),
+            "expected 'missing heartbeat fields' in error: {}",
+            err_msg
+        );
+    }
+
+    // ── Expired / absent participation account tests ──────────────────
+
+    /// Helper: create a minimal block for round 1 with the given protocol version,
+    /// no transactions, and optional expired/absent lists.
+    fn make_empty_block_with_protocol(
+        fee_sink: Address,
+        protocol: &str,
+        expired: Option<Vec<Address>>,
+        absent: Option<Vec<Address>>,
+    ) -> Block {
+        use serde_bytes::ByteBuf;
+
+        Block {
+            round: Round(1),
+            branch: ByteBuf::new(),
+            seed: ByteBuf::new(),
+            txn_commitment: ByteBuf::new(),
+            timestamp: 1000,
+            genesis_id: String::new(),
+            genesis_hash: ByteBuf::new(),
+            proposer: Address::ZERO,
+            fee_sink,
+            rewards_pool: Address::ZERO,
+            rewards_level: 0,
+            rewards_rate: 0,
+            rewards_residue: 0,
+            rewards_recalculation_round: Round(0),
+            current_protocol: protocol.to_string(),
+            next_protocol: String::new(),
+            next_protocol_approvals: 0,
+            next_protocol_switch_on: Round(0),
+            next_protocol_vote_before: Round(0),
+            txn_counter: 0,
+            fees_collected: 0,
+            bonus: 0,
+            proposer_payout: 0,
+            prev512: ByteBuf::new(),
+            txn256: ByteBuf::new(),
+            txn512: ByteBuf::new(),
+            state_proof_tracking: None,
+            upgrade_propose: String::new(),
+            upgrade_delay: 0,
+            upgrade_approve: false,
+            expired_participation_accounts: expired,
+            absent_participation_accounts: absent,
+            payset: vec![],
+        }
+    }
+
+    #[test]
+    fn test_expired_accounts_clear_online_state() {
+        let expired_addr = Address([10u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        // Set up the expired account as Online with voting keys.
+        // vote_last_valid = 0 so it is less than block round (1), i.e. truly expired.
+        {
+            let acct = state.get_or_default_account(&expired_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.selection_id = Some([2u8; 32]);
+            acct.state_proof_id = Some([3u8; 64]);
+            acct.vote_first_valid = 0;
+            acct.vote_last_valid = 0;
+            acct.vote_key_dilution = 50;
+            acct.incentive_eligible = true;
+        }
+
+        // V41 has max_proposed_expired_online_accounts = 32.
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(vec![expired_addr]),
+            None,
+        );
+
+        apply_block(&mut state, &block).unwrap();
+
+        // Verify the account is now Offline with all voting keys cleared.
+        let acct = state.get_account(&expired_addr).unwrap();
+        assert_eq!(acct.status, AccountStatus::Offline);
+        assert!(acct.vote_id.is_none());
+        assert!(acct.selection_id.is_none());
+        assert!(acct.state_proof_id.is_none());
+        assert_eq!(acct.vote_first_valid, 0);
+        assert_eq!(acct.vote_last_valid, 0);
+        assert_eq!(acct.vote_key_dilution, 0);
+        // Balance should be unchanged (no fee deducted for end-of-block processing).
+        assert_eq!(acct.micro_algos, 5_000_000);
+    }
+
+    #[test]
+    fn test_absent_accounts_suspend_preserves_keys() {
+        let absent_addr = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        // Set up the absent account as Online with voting keys and incentive eligible.
+        let vote_id = [42u8; 32];
+        let selection_id = [43u8; 32];
+        let state_proof_id = [44u8; 64];
+        {
+            let acct = state.get_or_default_account(&absent_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some(vote_id);
+            acct.selection_id = Some(selection_id);
+            acct.state_proof_id = Some(state_proof_id);
+            acct.vote_first_valid = 100;
+            acct.vote_last_valid = 999_999;
+            acct.vote_key_dilution = 50;
+            acct.incentive_eligible = true;
+        }
+
+        // V41 has payouts_enabled = true.
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![absent_addr]),
+        );
+
+        apply_block(&mut state, &block).unwrap();
+
+        // Verify the account is now Offline with incentive_eligible = false.
+        let acct = state.get_account(&absent_addr).unwrap();
+        assert_eq!(acct.status, AccountStatus::Offline);
+        assert!(!acct.incentive_eligible);
+
+        // Voting keys should be PRESERVED (unlike expired which clears them).
+        assert_eq!(acct.vote_id, Some(vote_id));
+        assert_eq!(acct.selection_id, Some(selection_id));
+        assert_eq!(acct.state_proof_id, Some(state_proof_id));
+        assert_eq!(acct.vote_first_valid, 100);
+        assert_eq!(acct.vote_last_valid, 999_999);
+        assert_eq!(acct.vote_key_dilution, 50);
+    }
+
+    #[test]
+    fn test_expired_gating_pre_v31_skips_processing() {
+        let expired_addr = Address([10u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&expired_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+        }
+
+        // V30 has max_proposed_expired_online_accounts = 0.
+        // Any non-empty list should be rejected.
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V30,
+            Some(vec![expired_addr]),
+            None,
+        );
+
+        let result = apply_block(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("greater than expected"),
+            "expected gating error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_expired_empty_list_pre_v31_succeeds() {
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        // V30 has max_proposed_expired_online_accounts = 0.
+        // An empty list (or None) should succeed.
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V30,
+            None,
+            None,
+        );
+
+        apply_block(&mut state, &block).unwrap();
+    }
+
+    #[test]
+    fn test_absent_gating_payouts_not_enabled_validate() {
+        // V39 does not have payouts_enabled (payouts_max_mark_absent = 0).
+        // In validate mode, a non-empty absent list should be rejected by
+        // the count check (absent.len() > 0 = max).
+        let absent_addr = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&absent_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.incentive_eligible = true;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V39,
+            None,
+            Some(vec![absent_addr]),
+        );
+
+        let result = apply_block_validating(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("greater than expected"),
+            "expected count overflow error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_absent_gating_payouts_not_enabled_replay_succeeds() {
+        // V39 does not have payouts_enabled. In replay mode, no validation
+        // runs, so the suspend just applies (matching Go's replay behavior).
+        let absent_addr = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&absent_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.incentive_eligible = true;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V39,
+            None,
+            Some(vec![absent_addr]),
+        );
+
+        // Replay mode: no validation, apply succeeds.
+        apply_block(&mut state, &block).unwrap();
+    }
+
+    #[test]
+    fn test_absent_empty_list_payouts_not_enabled_succeeds() {
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        // V39 does not have payouts_enabled.
+        // An empty list (or None) should succeed.
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V39,
+            None,
+            None,
+        );
+
+        apply_block(&mut state, &block).unwrap();
+    }
+
+    #[test]
+    fn test_empty_expired_and_absent_lists_noop() {
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        // V41 with empty lists — should be a no-op.
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(vec![]),
+            Some(vec![]),
+        );
+
+        apply_block(&mut state, &block).unwrap();
+    }
+
+    #[test]
+    fn test_integration_block_with_expired_and_absent() {
+        let expired_addr = Address([10u8; 32]);
+        let absent_addr = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[
+                (expired_addr, 5_000_000),
+                (absent_addr, 5_000_000),
+                (fee_sink, 0),
+            ],
+            fee_sink,
+        );
+
+        // Set up expired account as Online with voting keys.
+        // vote_last_valid = 0 so it is less than block round (1), i.e. truly expired.
+        {
+            let acct = state.get_or_default_account(&expired_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.selection_id = Some([2u8; 32]);
+            acct.state_proof_id = Some([3u8; 64]);
+            acct.vote_first_valid = 0;
+            acct.vote_last_valid = 0;
+            acct.vote_key_dilution = 50;
+            acct.incentive_eligible = true;
+        }
+
+        // Set up absent account as Online with voting keys.
+        let absent_vote_id = [42u8; 32];
+        {
+            let acct = state.get_or_default_account(&absent_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some(absent_vote_id);
+            acct.selection_id = Some([43u8; 32]);
+            acct.state_proof_id = Some([44u8; 64]);
+            acct.vote_first_valid = 100;
+            acct.vote_last_valid = 999_999;
+            acct.vote_key_dilution = 50;
+            acct.incentive_eligible = true;
+        }
+
+        // Build block with both expired and absent lists.
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(vec![expired_addr]),
+            Some(vec![absent_addr]),
+        );
+
+        apply_block(&mut state, &block).unwrap();
+
+        // Verify expired: Offline, keys cleared.
+        let expired_acct = state.get_account(&expired_addr).unwrap();
+        assert_eq!(expired_acct.status, AccountStatus::Offline);
+        assert!(expired_acct.vote_id.is_none());
+        assert!(expired_acct.selection_id.is_none());
+        assert!(expired_acct.state_proof_id.is_none());
+        assert_eq!(expired_acct.vote_first_valid, 0);
+        assert_eq!(expired_acct.vote_last_valid, 0);
+        assert_eq!(expired_acct.vote_key_dilution, 0);
+
+        // Verify absent: Offline, incentive_eligible = false, keys preserved.
+        let absent_acct = state.get_account(&absent_addr).unwrap();
+        assert_eq!(absent_acct.status, AccountStatus::Offline);
+        assert!(!absent_acct.incentive_eligible);
+        assert_eq!(absent_acct.vote_id, Some(absent_vote_id));
+        assert_eq!(absent_acct.selection_id, Some([43u8; 32]));
+        assert_eq!(absent_acct.state_proof_id, Some([44u8; 64]));
+        assert_eq!(absent_acct.vote_first_valid, 100);
+        assert_eq!(absent_acct.vote_last_valid, 999_999);
+        assert_eq!(absent_acct.vote_key_dilution, 50);
+    }
+
+    #[test]
+    fn test_expired_exceeds_max_errors() {
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        // Create 33 expired addresses (max is 32 for V41).
+        let expired: Vec<Address> = (0..33u8).map(|i| Address([100 + i; 32])).collect();
+        for addr in &expired {
+            let acct = state.get_or_default_account(addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(expired),
+            None,
+        );
+
+        let result = apply_block(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("greater than expected"),
+            "expected overflow error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_expired_at_max_succeeds() {
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        // Create exactly 32 expired addresses (max is 32 for V41).
+        let expired: Vec<Address> = (0..32u8).map(|i| Address([100 + i; 32])).collect();
+        for addr in &expired {
+            let acct = state.get_or_default_account(addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.micro_algos = 1_000_000;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(expired.clone()),
+            None,
+        );
+
+        apply_block(&mut state, &block).unwrap();
+
+        // All 32 accounts should be set Offline with cleared keys.
+        for addr in &expired {
+            let acct = state.get_account(addr).unwrap();
+            assert_eq!(acct.status, AccountStatus::Offline);
+            assert!(acct.vote_id.is_none());
+        }
+    }
+
+    // ── New tests for issue #62 fixes ──────────────────────────────────
+
+    #[test]
+    fn test_heartbeat_seed_mismatch_errors() {
+        let sender = Address([1u8; 32]);
+        let target = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let vote_id = [42u8; 32];
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (target, 500_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        // Store block header at round 1 with one seed.
+        let block_seed = [0xBBu8; 32];
+        store_block_header_with_seed(&mut state, 1, &block_seed);
+
+        // Set target account to Online with matching voting keys.
+        {
+            let acct = state.get_or_default_account(&target);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some(vote_id);
+            acct.vote_key_dilution = 10;
+        }
+
+        let ctx = heartbeat_ctx(fee_sink, 100);
+        // Heartbeat with a different seed than the block.
+        let wrong_seed = [0xCCu8; 32];
+        let stx = heartbeat_txn_with_seed(sender, target, vote_id, 10, 1_000, &wrong_seed);
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("provided seed does not match"),
+            "expected seed mismatch error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_seed_match_succeeds() {
+        let sender = Address([1u8; 32]);
+        let target = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let vote_id = [42u8; 32];
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (target, 500_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        // Store block header at round 1 with a specific seed.
+        let seed = [0xDDu8; 32];
+        store_block_header_with_seed(&mut state, 1, &seed);
+
+        // Set target account to Online with matching voting keys.
+        {
+            let acct = state.get_or_default_account(&target);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some(vote_id);
+            acct.vote_key_dilution = 10;
+        }
+
+        let ctx = heartbeat_ctx(fee_sink, 100);
+        // Heartbeat with the same seed as the block.
+        let stx = heartbeat_txn_with_seed(sender, target, vote_id, 10, 1_000, &seed);
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        // Verify heartbeat was applied.
+        let acct = state.get_account(&target).unwrap();
+        assert_eq!(acct.last_heartbeat, 100);
+    }
+
+    #[test]
+    fn test_heartbeat_rejected_pre_v40() {
+        let sender = Address([1u8; 32]);
+        let target = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let vote_id = [42u8; 32];
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (target, 500_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        // Set target account to Online.
+        {
+            let acct = state.get_or_default_account(&target);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some(vote_id);
+            acct.vote_key_dilution = 10;
+        }
+
+        // V39 does not support heartbeats (enable_heartbeat = false).
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V39,
+        )
+        .unwrap();
+        let ctx = ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+            round: 100,
+            mode: ApplyMode::Replay,
+            validate: false,
+            latest_timestamp: 0,
+            genesis_hash: [0u8; 32],
+            txn_counter: Cell::new(0),
+            fee_credit: Cell::new(0),
+            txn_index: Cell::new(0),
+            consensus,
+        };
+        let stx = heartbeat_txn(sender, target, vote_id, 10, 1_000);
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("heartbeat transaction not supported"),
+            "expected heartbeat not supported error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_absent_exceeds_max_errors() {
+        // The count check for absent accounts is in the validate path
+        // (matching Go's validateAbsentOnlineAccounts), not the apply path.
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        // Create 33 absent addresses (max is 32 for V41).
+        let absent: Vec<Address> = (0..33u8).map(|i| Address([100 + i; 32])).collect();
+        for addr in &absent {
+            let acct = state.get_or_default_account(addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.incentive_eligible = true;
+            acct.micro_algos = 1_000_000;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(absent),
+        );
+
+        let result = apply_block_validating(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("greater than expected"),
+            "expected absent overflow error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_absent_at_max_succeeds() {
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        // Create exactly 32 absent addresses (max is 32 for V41).
+        let absent: Vec<Address> = (0..32u8).map(|i| Address([100 + i; 32])).collect();
+        for addr in &absent {
+            let acct = state.get_or_default_account(addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.incentive_eligible = true;
+            acct.micro_algos = 1_000_000;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(absent.clone()),
+        );
+
+        apply_block(&mut state, &block).unwrap();
+
+        // All 32 accounts should be suspended (Offline, not incentive eligible).
+        for addr in &absent {
+            let acct = state.get_account(addr).unwrap();
+            assert_eq!(acct.status, AccountStatus::Offline);
+            assert!(!acct.incentive_eligible);
+        }
+    }
+
+    #[test]
+    fn test_eob_error_rolls_back_partial_mutations() {
+        // In validate mode: expired is valid (1 addr, max=32), but absent
+        // exceeds max (33 addresses). The expired validate+apply will succeed,
+        // then absent validate will fail. The rollback guard should revert
+        // all end-of-block mutations.
+        let expired_addr = Address([10u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        // Set up expired account as Online with expired keys.
+        {
+            let acct = state.get_or_default_account(&expired_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.selection_id = Some([2u8; 32]);
+            acct.vote_key_dilution = 50;
+            acct.incentive_eligible = true;
+            acct.vote_last_valid = 0; // Expired (< round 1)
+        }
+
+        let absent: Vec<Address> = (0..33u8).map(|i| Address([200 + i; 32])).collect();
+        for addr in &absent {
+            let acct = state.get_or_default_account(addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.incentive_eligible = true;
+            acct.micro_algos = 1_000_000;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(vec![expired_addr]),
+            Some(absent),
+        );
+
+        let result = apply_block_validating(&mut state, &block);
+        assert!(result.is_err());
+
+        // The expired account should be ROLLED BACK to Online with keys intact.
+        let acct = state.get_account(&expired_addr).unwrap();
+        assert_eq!(
+            acct.status,
+            AccountStatus::Online,
+            "expired account should be rolled back to Online"
+        );
+        assert!(
+            acct.vote_id.is_some(),
+            "expired account vote_id should be rolled back"
+        );
+    }
+
+    // ── Cheap/free heartbeat path tests ─────────────────────────────────
+
+    /// Helper: build a minimal msgpack-encoded block header for challenge lookup.
+    /// The header contains the seed and protocol version needed by `find_challenge`.
+    fn make_challenge_header_data(seed: &[u8; 32], proto: &str) -> Vec<u8> {
+        use serde::Serialize;
+        use serde_bytes::ByteBuf;
+
+        #[derive(Serialize)]
+        struct MinHeader {
+            #[serde(rename = "seed")]
+            seed: ByteBuf,
+            #[serde(rename = "proto")]
+            proto: String,
+            #[serde(rename = "rnd")]
+            rnd: u64,
+        }
+
+        let hdr = MinHeader {
+            seed: ByteBuf::from(seed.to_vec()),
+            proto: proto.to_string(),
+            rnd: 0,
+        };
+        rmp_serde::to_vec_named(&hdr).expect("encode block header")
+    }
+
+    /// Helper: create an ApplyContext with V41 consensus parameters.
+    fn make_v41_apply_context(fee_sink: Address, round: u64) -> ApplyContext {
+        use algo_types::consensus::consensus_params_for_version;
+        let consensus =
+            consensus_params_for_version(algo_types::consensus::CONSENSUS_V41).expect("V41 params");
+        ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+            round,
+            mode: ApplyMode::Replay,
+            validate: false,
+            latest_timestamp: 0,
+            genesis_hash: [0u8; 32],
+            txn_counter: Cell::new(0),
+            fee_credit: Cell::new(0),
+            txn_index: Cell::new(0),
+            consensus,
+        }
+    }
+
+    #[test]
+    fn test_cheap_heartbeat_challenged_account_succeeds() {
+        // Test gap #1: Cheap heartbeat for a challenged account should succeed.
+        // Challenge seed first 5 bits: 1111_1 (0xF8). Account address first 5 bits
+        // must match: 1111_1xxx (e.g., 0xFF).
+        let seed = [0xF8; 32];
+        let target = Address([0xFF; 32]); // First 5 bits match seed.
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let vote_id = [42u8; 32];
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (target, 5_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        // Set target account as Online, IncentiveEligible, with voting keys.
+        {
+            let acct = state.get_or_default_account(&target);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some(vote_id);
+            acct.vote_key_dilution = 10;
+            acct.incentive_eligible = true;
+            acct.last_heartbeat = 0; // Not heartbeated since before challenge.
+            acct.last_proposed = 0;
+        }
+
+        // V41 params: interval=1000, grace=200, bits=5.
+        // Challenge round = 2000 for rounds in [2000..3000).
+        // Risky window: (2000 + 100, 2000 + 200] = (2100, 2200].
+        // Use round 2150, which is in the risky window.
+        let round = 2150;
+
+        // Store block header data at challenge round 2000 with matching seed.
+        {
+            use crate::store_trait::LedgerStore;
+            let hdr = make_challenge_header_data(&seed, algo_types::consensus::CONSENSUS_V41);
+            state
+                .put_block(2000, algo_types::consensus::CONSENSUS_V41, &hdr, &[])
+                .unwrap();
+        }
+
+        // Store block header at first_valid round (1) with matching HbSeed.
+        store_block_header_with_seed(&mut state, 1, &HB_TEST_SEED);
+
+        let ctx = make_v41_apply_context(fee_sink, round);
+        // Fee = 0 (free heartbeat), singleton (no group).
+        let stx = heartbeat_txn(sender, target, vote_id, 10, 0);
+
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        // Verify last_heartbeat is updated.
+        let acct = state.get_account(&target).unwrap();
+        assert_eq!(acct.last_heartbeat, round);
+    }
+
+    #[test]
+    fn test_cheap_heartbeat_non_matching_address_rejected() {
+        // Test gap #2: Cheap heartbeat for account whose address does NOT match
+        // challenge bits should fail.
+        let seed = [0xF8; 32]; // First 5 bits: 1111_1
+        let target = Address([0x00; 32]); // First bit differs — no match.
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let vote_id = [42u8; 32];
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (target, 5_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        {
+            let acct = state.get_or_default_account(&target);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some(vote_id);
+            acct.vote_key_dilution = 10;
+            acct.incentive_eligible = true;
+            acct.last_heartbeat = 0;
+            acct.last_proposed = 0;
+        }
+
+        let round = 2150;
+        {
+            use crate::store_trait::LedgerStore;
+            let hdr = make_challenge_header_data(&seed, algo_types::consensus::CONSENSUS_V41);
+            state
+                .put_block(2000, algo_types::consensus::CONSENSUS_V41, &hdr, &[])
+                .unwrap();
+        }
+
+        let ctx = make_v41_apply_context(fee_sink, round);
+        let stx = heartbeat_txn(sender, target, vote_id, 10, 0);
+
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not challenged"),
+            "expected 'not challenged' in error: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_cheap_heartbeat_non_incentive_eligible_rejected() {
+        // Test gap #3: Cheap heartbeat for account that matches challenge but
+        // is not IncentiveEligible should fail.
+        let seed = [0xF8; 32];
+        let target = Address([0xFF; 32]); // Matches seed.
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let vote_id = [42u8; 32];
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (target, 5_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        {
+            let acct = state.get_or_default_account(&target);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some(vote_id);
+            acct.vote_key_dilution = 10;
+            acct.incentive_eligible = false; // NOT incentive eligible.
+            acct.last_heartbeat = 0;
+        }
+
+        let round = 2150;
+        {
+            use crate::store_trait::LedgerStore;
+            let hdr = make_challenge_header_data(&seed, algo_types::consensus::CONSENSUS_V41);
+            state
+                .put_block(2000, algo_types::consensus::CONSENSUS_V41, &hdr, &[])
+                .unwrap();
+        }
+
+        let ctx = make_v41_apply_context(fee_sink, round);
+        let stx = heartbeat_txn(sender, target, vote_id, 10, 0);
+
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not IncentiveEligible"),
+            "expected 'not IncentiveEligible' in error: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_cheap_heartbeat_offline_account_rejected() {
+        // Test gap #4: Cheap heartbeat for Offline account should fail,
+        // even if address matches challenge.
+        let seed = [0xF8; 32];
+        let target = Address([0xFF; 32]); // Matches seed bits.
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let vote_id = [42u8; 32];
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (target, 5_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        {
+            let acct = state.get_or_default_account(&target);
+            acct.status = AccountStatus::Offline; // Offline.
+            acct.vote_id = Some(vote_id);
+            acct.vote_key_dilution = 10;
+            acct.incentive_eligible = true;
+            acct.last_heartbeat = 0;
+        }
+
+        let round = 2150;
+        {
+            use crate::store_trait::LedgerStore;
+            let hdr = make_challenge_header_data(&seed, algo_types::consensus::CONSENSUS_V41);
+            state
+                .put_block(2000, algo_types::consensus::CONSENSUS_V41, &hdr, &[])
+                .unwrap();
+        }
+
+        let ctx = make_v41_apply_context(fee_sink, round);
+        let stx = heartbeat_txn(sender, target, vote_id, 10, 0);
+
+        let result = apply_transaction(&mut state, &stx, &ctx, 0);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not allowed for Offline"),
+            "expected 'not allowed for Offline' in error: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_store_header_provider_retrieves_correct_seed() {
+        // Test gap #5: StoreHeaderProvider integration -- store a block header,
+        // then look it up via StoreHeaderProvider and verify the seed.
+        use crate::heartbeat::{HeaderProvider, StoreHeaderProvider};
+        use crate::store_trait::LedgerStore;
+
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        let seed = [0xAB; 32];
+        let hdr = make_challenge_header_data(&seed, algo_types::consensus::CONSENSUS_V41);
+        state
+            .put_block(1000, algo_types::consensus::CONSENSUS_V41, &hdr, &[])
+            .unwrap();
+
+        let provider = StoreHeaderProvider { store: &state };
+        let data = provider.block_header_data(1000).unwrap();
+        assert!(data.is_some(), "block header should be retrievable");
+
+        // Decode and verify the seed.
+        let block = algo_codec::decode_block(&data.unwrap()).unwrap();
+        let mut got_seed = [0u8; 32];
+        got_seed.copy_from_slice(&block.seed[..32]);
+        assert_eq!(got_seed, seed);
+
+        // Non-existent round returns None.
+        let missing = provider.block_header_data(9999).unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_find_challenge_with_store_header_provider() {
+        // Test gap #6: find_challenge with a real StoreHeaderProvider.
+        use crate::heartbeat::{find_challenge, ChallengePeriod, StoreHeaderProvider};
+        use crate::store_trait::LedgerStore;
+        use algo_types::consensus::consensus_params_for_version;
+
+        let fee_sink = Address([3u8; 32]);
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        let seed = [0xCD; 32];
+        let hdr = make_challenge_header_data(&seed, algo_types::consensus::CONSENSUS_V41);
+        state
+            .put_block(2000, algo_types::consensus::CONSENSUS_V41, &hdr, &[])
+            .unwrap();
+
+        let params =
+            consensus_params_for_version(algo_types::consensus::CONSENSUS_V41).expect("V41 params");
+        let provider = StoreHeaderProvider { store: &state };
+
+        // Round 2150 is in the risky window (2100, 2200].
+        let ch = find_challenge(&params, 2150, &provider, ChallengePeriod::Risky);
+        assert!(!ch.is_zero());
+        assert_eq!(ch.round, 2000);
+        assert_eq!(ch.seed, seed);
+        assert_eq!(ch.bits, 5);
+
+        // Round outside risky window should return zero challenge.
+        let ch = find_challenge(&params, 2050, &provider, ChallengePeriod::Risky);
+        assert!(ch.is_zero());
+    }
+
+    #[test]
+    fn test_heartbeat_on_suspended_account_updates_last_heartbeat() {
+        // Test gap #7: A suspended account (Offline with voting keys) receives
+        // a normal-fee heartbeat. The heartbeat should succeed and update
+        // last_heartbeat. (A cheap heartbeat would be rejected because the
+        // cheap path requires status == Online.)
+        let sender = Address([1u8; 32]);
+        let target = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let vote_id = [42u8; 32];
+
+        let mut state = make_state_with_accounts(
+            &[(sender, 1_000_000), (target, 5_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+        store_block_header_with_seed(&mut state, 1, &HB_TEST_SEED);
+
+        // Set target as suspended: Offline but with voting keys intact.
+        {
+            let acct = state.get_or_default_account(&target);
+            acct.status = AccountStatus::Offline;
+            acct.vote_id = Some(vote_id);
+            acct.selection_id = Some([2u8; 32]);
+            acct.vote_key_dilution = 10;
+            acct.vote_first_valid = 100;
+            acct.vote_last_valid = 999_999;
+            acct.incentive_eligible = false; // Cleared by suspension.
+            acct.last_heartbeat = 0;
+        }
+
+        let ctx = heartbeat_ctx(fee_sink, 500);
+        // Normal fee (>= MinTxnFee of 1000), so it bypasses the cheap heartbeat check.
+        let stx = heartbeat_txn(sender, target, vote_id, 10, 1_000);
+
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        // Verify last_heartbeat is updated.
+        let acct = state.get_account(&target).unwrap();
+        assert_eq!(acct.last_heartbeat, 500);
+
+        // Account remains Offline -- heartbeat only updates last_heartbeat,
+        // it does NOT restore Online status (that requires a keyreg).
+        assert_eq!(acct.status, AccountStatus::Offline);
+
+        // Voting keys are preserved.
+        assert_eq!(acct.vote_id, Some(vote_id));
+    }
+
+    #[test]
+    fn test_multiple_heartbeats_in_same_block() {
+        // Test gap #8: Two heartbeat transactions for different accounts
+        // in the same block should both succeed.
+        let sender = Address([1u8; 32]);
+        let target1 = Address([10u8; 32]);
+        let target2 = Address([20u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let vote_id1 = [41u8; 32];
+        let vote_id2 = [42u8; 32];
+
+        let mut state = make_state_with_accounts(
+            &[
+                (sender, 10_000_000),
+                (target1, 5_000_000),
+                (target2, 5_000_000),
+                (fee_sink, 0),
+            ],
+            fee_sink,
+        );
+        store_block_header_with_seed(&mut state, 1, &HB_TEST_SEED);
+
+        // Set up both accounts as Online with voting keys.
+        {
+            let acct = state.get_or_default_account(&target1);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some(vote_id1);
+            acct.vote_key_dilution = 10;
+            acct.last_heartbeat = 0;
+        }
+        {
+            let acct = state.get_or_default_account(&target2);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some(vote_id2);
+            acct.vote_key_dilution = 20;
+            acct.last_heartbeat = 0;
+        }
+
+        let round = 500;
+        let ctx = heartbeat_ctx(fee_sink, round);
+
+        // Apply first heartbeat.
+        let stx1 = heartbeat_txn(sender, target1, vote_id1, 10, 1_000);
+        apply_transaction(&mut state, &stx1, &ctx, 0).unwrap();
+
+        // Apply second heartbeat.
+        let stx2 = heartbeat_txn(sender, target2, vote_id2, 20, 1_000);
+        apply_transaction(&mut state, &stx2, &ctx, 0).unwrap();
+
+        // Verify both accounts have updated last_heartbeat.
+        let acct1 = state.get_account(&target1).unwrap();
+        assert_eq!(acct1.last_heartbeat, round);
+
+        let acct2 = state.get_account(&target2).unwrap();
+        assert_eq!(acct2.last_heartbeat, round);
+
+        // Verify fee deducted from sender for both heartbeats.
+        let sender_acct = state.get_account(&sender).unwrap();
+        assert_eq!(sender_acct.micro_algos, 10_000_000 - 2_000);
+    }
+
+    // ── Tests for non-existent accounts in expired/absent lists (issue #62) ──
+    // In replay mode (validate=false), nonexistent accounts are treated as
+    // defaults (matching Go's lookup). In validate mode, they fail validation.
+
+    #[test]
+    fn test_expired_nonexistent_account_replay_applies_default() {
+        // In replay mode, a nonexistent expired account gets a default
+        // AccountData. ClearOnlineState is applied (a no-op on defaults).
+        // This matches Go where lookup returns default for missing accounts.
+        let fee_sink = Address([3u8; 32]);
+        let nonexistent = Address([99u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(vec![nonexistent]),
+            None,
+        );
+
+        // Replay mode: no validation, just apply. Should succeed.
+        apply_block(&mut state, &block).unwrap();
+    }
+
+    #[test]
+    fn test_expired_nonexistent_account_validate_errors() {
+        // In validate mode, a nonexistent expired account has no vote key,
+        // so it fails the "had no vote key" check.
+        let fee_sink = Address([3u8; 32]);
+        let nonexistent = Address([99u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(vec![nonexistent]),
+            None,
+        );
+
+        let result = apply_block_validating(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("had no vote key"),
+            "expected no-vote-key error for nonexistent expired, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_absent_nonexistent_account_replay_applies_default() {
+        // In replay mode, a nonexistent absent account gets a default
+        // AccountData. Suspend is applied (sets Offline + not eligible).
+        // This matches Go where lookup returns default for missing accounts.
+        let fee_sink = Address([3u8; 32]);
+        let nonexistent = Address([99u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![nonexistent]),
+        );
+
+        // Replay mode: no validation, just apply. Should succeed.
+        apply_block(&mut state, &block).unwrap();
+    }
+
+    #[test]
+    fn test_absent_nonexistent_account_validate_errors() {
+        // In validate mode, a nonexistent absent account has Offline status,
+        // so it fails the "not Online" check.
+        let fee_sink = Address([3u8; 32]);
+        let nonexistent = Address([99u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![nonexistent]),
+        );
+
+        let result = apply_block_validating(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not Online"),
+            "expected not-Online error for nonexistent absent, got: {}",
+            err_msg
+        );
+    }
+
+    // ── Validation-path tests (validate=true, matching Go's eval.validate) ──
+    // These tests exercise the validate functions that are gated behind
+    // ctx.validate=true (i.e., only during block validation, not replay).
+
+    // Fix #2: Validate expired accounts have expired keys
+    #[test]
+    fn test_expired_validation_rejects_non_expired_keys() {
+        // An account with vote_last_valid >= round should NOT be allowed in expired list.
+        let expired_addr = Address([10u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&expired_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.selection_id = Some([2u8; 32]);
+            acct.vote_last_valid = 999; // Not expired (>= round 1)
+            acct.vote_key_dilution = 50;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(vec![expired_addr]),
+            None,
+        );
+
+        let result = apply_block_validating(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("was not less than current round"),
+            "expected non-expired key error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_expired_non_expired_keys_replay_succeeds() {
+        // In replay mode, non-expired keys are NOT checked — apply just runs.
+        let expired_addr = Address([10u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&expired_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.selection_id = Some([2u8; 32]);
+            acct.vote_last_valid = 999; // Not actually expired
+            acct.vote_key_dilution = 50;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(vec![expired_addr]),
+            None,
+        );
+
+        // Replay mode: validation skipped, apply succeeds.
+        apply_block(&mut state, &block).unwrap();
+
+        // Account should still be cleared (ClearOnlineState applied).
+        let acct = state.get_account(&expired_addr).unwrap();
+        assert_eq!(acct.status, AccountStatus::Offline);
+        assert!(acct.vote_id.is_none());
+    }
+
+    #[test]
+    fn test_expired_validation_rejects_no_vote_key() {
+        // An account with no vote key should NOT be allowed in expired list.
+        let expired_addr = Address([10u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&expired_addr);
+            acct.status = AccountStatus::Online;
+            // No vote_id set (None) -> should be rejected
+            acct.vote_last_valid = 0;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(vec![expired_addr]),
+            None,
+        );
+
+        let result = apply_block_validating(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("had no vote key"),
+            "expected no-vote-key error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_expired_validation_rejects_duplicate_addresses() {
+        let expired_addr = Address([10u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&expired_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.vote_last_valid = 0;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(vec![expired_addr, expired_addr]), // duplicate!
+            None,
+        );
+
+        let result = apply_block_validating(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("duplicate address found"),
+            "expected duplicate error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_expired_duplicate_addresses_replay_succeeds() {
+        // In replay mode, duplicate check is skipped — apply just runs.
+        let expired_addr = Address([10u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&expired_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.vote_last_valid = 0;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(vec![expired_addr, expired_addr]), // duplicate
+            None,
+        );
+
+        // Replay mode: no validation, apply succeeds.
+        apply_block(&mut state, &block).unwrap();
+    }
+
+    // Fix #3: Validate absent accounts are Online, non-zero balance, IncentiveEligible
+    #[test]
+    fn test_absent_validation_rejects_offline_account() {
+        let absent_addr = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&absent_addr);
+            acct.status = AccountStatus::Offline; // Not Online!
+            acct.incentive_eligible = true;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![absent_addr]),
+        );
+
+        let result = apply_block_validating(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not Online"),
+            "expected not-Online error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_absent_offline_account_replay_succeeds() {
+        // In replay mode, Online check is skipped — Suspend just runs.
+        let absent_addr = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&absent_addr);
+            acct.status = AccountStatus::Offline;
+            acct.incentive_eligible = true;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![absent_addr]),
+        );
+
+        // Replay mode: no validation, apply succeeds.
+        apply_block(&mut state, &block).unwrap();
+    }
+
+    #[test]
+    fn test_absent_validation_rejects_zero_balance() {
+        let absent_addr = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&absent_addr);
+            acct.status = AccountStatus::Online;
+            acct.incentive_eligible = true;
+            acct.micro_algos = 0; // Zero balance!
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![absent_addr]),
+        );
+
+        let result = apply_block_validating(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("zero algos"),
+            "expected zero-algos error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_absent_validation_rejects_not_incentive_eligible() {
+        let absent_addr = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&absent_addr);
+            acct.status = AccountStatus::Online;
+            acct.incentive_eligible = false; // Not incentive eligible!
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![absent_addr]),
+        );
+
+        let result = apply_block_validating(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not IncentiveEligible"),
+            "expected not-IncentiveEligible error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_absent_validation_rejects_duplicate_addresses() {
+        let absent_addr = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&absent_addr);
+            acct.status = AccountStatus::Online;
+            acct.incentive_eligible = true;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![absent_addr, absent_addr]), // duplicate!
+        );
+
+        let result = apply_block_validating(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("duplicate address found"),
+            "expected duplicate error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_absent_duplicate_addresses_replay_succeeds() {
+        // In replay mode, duplicate check is skipped — Suspend just runs.
+        let absent_addr = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&absent_addr);
+            acct.status = AccountStatus::Online;
+            acct.incentive_eligible = true;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![absent_addr, absent_addr]), // duplicate
+        );
+
+        // Replay mode: no validation, apply succeeds.
+        apply_block(&mut state, &block).unwrap();
+    }
+
+    // Fix #4: Gate keyreg last_heartbeat/incentive_eligible on payouts_enabled
+    #[test]
+    fn test_keyreg_online_payouts_disabled_no_heartbeat_or_incentive() {
+        // When payouts_enabled = false (pre-v40), keyreg should NOT set
+        // last_heartbeat or incentive_eligible.
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
+
+        // Use a pre-V40 consensus where payouts_enabled = false.
+        let consensus = ConsensusParams {
+            payouts_enabled: false,
+            ..ConsensusParams::default()
+        };
+
+        let mut stx = keyreg_online_txn(sender, 3_000_000); // High fee
+        stx.txn.fee = 3_000_000;
+
+        let ctx = ApplyContext {
+            rewards_level: 0,
+            fee_sink,
+            round: 1,
+            mode: ApplyMode::Replay,
+            validate: false,
+            latest_timestamp: 0,
+            genesis_hash: [0u8; 32],
+            txn_counter: Cell::new(0),
+            fee_credit: Cell::new(0),
+            txn_index: Cell::new(0),
+            consensus,
+        };
+
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        let acct = state.get_account(&sender).unwrap();
+        assert_eq!(acct.status, AccountStatus::Online);
+        // With payouts disabled, last_heartbeat should remain 0.
+        assert_eq!(
+            acct.last_heartbeat, 0,
+            "last_heartbeat should not be set when payouts_enabled = false"
+        );
+        // With payouts disabled, incentive_eligible should remain false.
+        assert!(
+            !acct.incentive_eligible,
+            "incentive_eligible should not be set when payouts_enabled = false"
+        );
+    }
+
+    #[test]
+    fn test_keyreg_online_payouts_enabled_sets_heartbeat_and_incentive() {
+        // When payouts_enabled = true (v40+) and fee >= go_online_fee,
+        // keyreg should set last_heartbeat and incentive_eligible.
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
+
+        let mut stx = keyreg_online_txn(sender, 2_000_000); // fee >= payouts_go_online_fee
+        stx.txn.fee = 2_000_000;
+
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
+
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        let acct = state.get_account(&sender).unwrap();
+        assert_eq!(acct.status, AccountStatus::Online);
+        // With payouts enabled: last_heartbeat = round(1) + lookback(320) = 321.
+        assert_eq!(acct.last_heartbeat, 321);
+        // With payouts enabled and fee >= 2_000_000: incentive_eligible = true.
+        assert!(acct.incentive_eligible);
+    }
+
+    #[test]
+    fn test_keyreg_online_payouts_enabled_low_fee_no_incentive() {
+        // When payouts_enabled = true but fee < go_online_fee,
+        // last_heartbeat should be set but incentive_eligible should NOT.
+        let sender = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(sender, 10_000_000), (fee_sink, 0)], fee_sink);
+
+        let stx = keyreg_online_txn(sender, 1_000); // fee < payouts_go_online_fee
+
+        let ctx = ApplyContext::new_replay(0, fee_sink, 1);
+
+        apply_transaction(&mut state, &stx, &ctx, 0).unwrap();
+
+        let acct = state.get_account(&sender).unwrap();
+        assert_eq!(acct.status, AccountStatus::Online);
+        // last_heartbeat should still be set (independent of fee).
+        assert_eq!(acct.last_heartbeat, 321);
+        // But incentive_eligible should NOT be set (fee too low).
+        assert!(!acct.incentive_eligible);
     }
 }

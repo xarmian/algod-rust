@@ -2579,7 +2579,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     "axfer" => apply_axfer(self.store, &stxn.txn),
                     "acfg" => apply_acfg(self.store, &stxn.txn, self.txn_counter),
                     "afrz" => apply_afrz(self.store, &stxn.txn),
-                    "keyreg" => apply_keyreg(self.store, &stxn.txn, round),
+                    "keyreg" => apply_keyreg(self.store, &stxn.txn, round, &self.consensus),
                     _ => {
                         // Should not reach here due to earlier validation.
                         self.store.restore_snapshot(snapshot);
