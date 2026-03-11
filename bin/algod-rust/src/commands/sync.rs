@@ -44,7 +44,15 @@ pub async fn run(
             drop(store);
             std::fs::remove_file(db_path)?;
             store = SqliteLedger::open(db_path)?;
-            load_genesis_into_store(&mut store, genesis_path)?;
+            if start == 0 {
+                load_genesis_into_store(&mut store, genesis_path)?;
+            } else {
+                anyhow::bail!(
+                    "cannot start sync at round {start} with a stale database; \
+                     either use --start 0 with --genesis to initialize from genesis, \
+                     or provide an existing DB that already has state"
+                );
+            }
             start
         }
     } else {
