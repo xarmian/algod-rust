@@ -1,6 +1,7 @@
 mod account;
 mod address;
 mod block;
+pub mod consensus;
 mod digest;
 mod header;
 mod round;
@@ -13,6 +14,10 @@ pub use account::{
 };
 pub use address::Address;
 pub use block::{Block, BlockResponse};
+pub use consensus::{
+    consensus_params_for_version, ConsensusParams, CONSENSUS_CURRENT_VERSION, CONSENSUS_FUTURE,
+    CONSENSUS_V41, KNOWN_PROTOCOL_VERSIONS,
+};
 pub use digest::Digest;
 pub use header::BlockHeader;
 pub use round::Round;

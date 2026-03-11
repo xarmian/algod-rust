@@ -105,7 +105,9 @@ fn make_context<'a>(
     group: Vec<SignedTransaction>,
 ) -> LedgerAvmContext<'a, LedgerState> {
     LedgerAvmContext::new(
-        store, group, 0,         // group_index
+        store,
+        group,
+        0,         // group_index
         100,       // round
         50000,     // latest_timestamp
         42,        // app_id
@@ -113,6 +115,7 @@ fn make_context<'a>(
         true,      // app_mode
         [0u8; 32], // program_hash
         [0u8; 32], // genesis_hash
+        algo_types::ConsensusParams::default(),
     )
 }
 
@@ -122,7 +125,9 @@ fn make_lsig_context<'a>(
     group: Vec<SignedTransaction>,
 ) -> LedgerAvmContext<'a, LedgerState> {
     LedgerAvmContext::new(
-        store, group, 0,         // group_index
+        store,
+        group,
+        0,         // group_index
         100,       // round
         50000,     // latest_timestamp
         0,         // app_id (not used in lsig mode)
@@ -130,6 +135,7 @@ fn make_lsig_context<'a>(
         false,     // app_mode = false for LogicSig
         [0u8; 32], // program_hash
         [0u8; 32], // genesis_hash
+        algo_types::ConsensusParams::default(),
     )
 }
 

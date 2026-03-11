@@ -45,7 +45,7 @@ fn minimal_block(fee_sink: Address, round: u64, payset: Vec<SignedTransaction>) 
         rewards_rate: 0,
         rewards_residue: 0,
         rewards_recalculation_round: Round(0),
-        current_protocol: String::new(),
+        current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
         next_protocol: String::new(),
         next_protocol_approvals: 0,
         next_protocol_switch_on: Round(0),

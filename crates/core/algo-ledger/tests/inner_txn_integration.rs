@@ -63,7 +63,9 @@ fn make_context<'a>(
 ) -> LedgerAvmContext<'a, LedgerState> {
     let creator = [1u8; 32];
     LedgerAvmContext::new(
-        store, group, 0,         // group_index
+        store,
+        group,
+        0,         // group_index
         100,       // round
         50000,     // latest_timestamp
         app_id,    // app_id
@@ -71,6 +73,7 @@ fn make_context<'a>(
         true,      // app_mode
         [0u8; 32], // program_hash
         [0u8; 32], // genesis_hash
+        algo_types::ConsensusParams::default(),
     )
 }
 

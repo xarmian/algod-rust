@@ -531,6 +531,7 @@ fuzz_target!(|data: &[u8]| {
         input.app_mode,
         [0u8; 32],       // program_hash
         [0xAA; 32],      // genesis_hash
+        algo_types::ConsensusParams::default(),
     );
 
     // Run the program -- must not panic

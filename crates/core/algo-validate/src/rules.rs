@@ -8,9 +8,12 @@ use algo_types::{Address, Digest, SignedTransaction, Transaction};
 use serde_bytes::ByteBuf;
 use sha2::{Digest as _, Sha512_256};
 
+// Re-export the comprehensive ConsensusParams and lookup function from algo-types.
+pub use algo_types::consensus::ConsensusParams;
+pub use algo_types::consensus::KNOWN_PROTOCOL_VERSIONS;
+
 // Consensus defaults — stable across all protocol versions to date.
-// These constants are kept for backward compatibility and as the default
-// values used by `ConsensusParams::default()`.
+// These constants are kept for backward compatibility with existing callers.
 pub const MIN_TXN_FEE: u64 = 1000;
 pub const MAX_TXN_LIFE: u64 = 1000;
 pub const MAX_NOTE_SIZE: usize = 1024;
@@ -22,70 +25,11 @@ pub const MAX_LEASE_SIZE: usize = 32;
 /// Matches go-algorand `MaxTimestampIncrement` (set in v7, unchanged since).
 pub const MAX_TIMESTAMP_INCREMENT: i64 = 25;
 
-/// Maximum total transaction bytes per block (v7–v32).
+/// Maximum total transaction bytes per block (v7-v32).
 pub const MAX_TXN_BYTES_PER_BLOCK_V32: usize = 1_000_000;
 
 /// Maximum total transaction bytes per block (v33+).
 pub const MAX_TXN_BYTES_PER_BLOCK_V33: usize = 5 * 1024 * 1024;
-
-// ── ConsensusParams ────────────────────────────────────────────────
-// Version-aware consensus parameters, mirroring go-algorand's
-// `config.ConsensusParams` struct. Parameters are derived from the
-// protocol version string using `consensus_params_for_version()`.
-
-/// Version-aware consensus parameters for stateless validation.
-///
-/// Mirrors the subset of go-algorand `config.ConsensusParams` that is
-/// relevant to stateless transaction/block validation.
-#[derive(Debug, Clone)]
-pub struct ConsensusParams {
-    /// Minimum transaction fee in microAlgos (Go: `MinTxnFee`).
-    pub min_txn_fee: u64,
-    /// Maximum transaction lifetime in rounds (Go: `MaxTxnLife`).
-    pub max_txn_life: u64,
-    /// Maximum note field size in bytes (Go: `MaxTxnNoteBytes`).
-    pub max_txn_note_bytes: usize,
-    /// Maximum transactions per group (Go: `MaxTxGroupSize`).
-    pub max_tx_group_size: usize,
-    /// Whether fee pooling across groups is enabled (Go: `EnableFeePooling`, v28+).
-    pub enable_fee_pooling: bool,
-    /// Whether transaction groups are supported (Go: `SupportTxGroups`, v18+).
-    pub support_tx_groups: bool,
-    /// Whether transaction leases are supported (Go: `SupportTransactionLeases`, v18+).
-    pub support_transaction_leases: bool,
-    /// Whether account rekeying is supported (Go: `SupportRekeying`, v24+).
-    pub support_rekeying: bool,
-    /// Whether heartbeat transactions are enabled (Go: `Heartbeat`, v40+).
-    pub enable_heartbeat: bool,
-    /// Whether AuthAddr must differ from Sender (Go: `EnforceAuthAddrSenderDiff`, future only).
-    pub enforce_auth_addr_sender_diff: bool,
-    /// Maximum total transaction bytes per block.
-    pub max_txn_bytes_per_block: usize,
-    /// Whether LogicSig sizes are pooled across a group (Go: `EnableLogicSigSizePooling`, v40+).
-    /// When true, the total LogicSig size across the group must not exceed
-    /// `group_size * LogicSigMaxSize` (checked at group level, not per-txn).
-    pub enable_logicsig_size_pooling: bool,
-}
-
-impl Default for ConsensusParams {
-    /// Default params match the latest consensus (V41) values.
-    fn default() -> Self {
-        Self {
-            min_txn_fee: MIN_TXN_FEE,
-            max_txn_life: MAX_TXN_LIFE,
-            max_txn_note_bytes: MAX_NOTE_SIZE,
-            max_tx_group_size: MAX_GROUP_SIZE,
-            enable_fee_pooling: true,
-            support_tx_groups: true,
-            support_transaction_leases: true,
-            support_rekeying: true,
-            enable_heartbeat: true,
-            enforce_auth_addr_sender_diff: false,
-            max_txn_bytes_per_block: MAX_TXN_BYTES_PER_BLOCK_V33,
-            enable_logicsig_size_pooling: true,
-        }
-    }
-}
 
 /// Special addresses for validation (fee sink and rewards pool).
 ///
@@ -98,98 +42,13 @@ pub struct SpecialAddresses {
 
 /// Return consensus parameters for the given protocol version string.
 ///
-/// Derives parameters from the version index in `KNOWN_PROTOCOL_VERSIONS`.
+/// Delegates to `algo_types::consensus::consensus_params_for_version`.
 /// All values match go-algorand `config/consensus.go` at tag v4.5.1-stable.
 ///
 /// Returns `None` for unknown protocol versions.
 pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
-    let idx = protocol_version_index(version)?;
-
-    // Feature activation indices (from go-algorand config/consensus.go):
-    //   v7 (idx 0):  base version — groups=false, leases=false, rekeying=false
-    //   v18 (idx 11): SupportTxGroups=true, MaxTxGroupSize=16, SupportTransactionLeases=true
-    //   v24 (idx 17): SupportRekeying=true
-    //   v28 (idx 21): EnableFeePooling=true
-    //   v33 (idx 26): MaxTxnBytesPerBlock=5*1024*1024
-    //   v40 (idx 33): Heartbeat=true
-    const V18_INDEX: usize = 11; // v18
-    const V24_INDEX: usize = 17; // v24
-    const V28_INDEX: usize = 21; // v28
-
-    Some(ConsensusParams {
-        min_txn_fee: MIN_TXN_FEE,
-        max_txn_life: MAX_TXN_LIFE,
-        max_txn_note_bytes: MAX_NOTE_SIZE,
-        max_tx_group_size: if idx >= V18_INDEX { MAX_GROUP_SIZE } else { 1 },
-        enable_fee_pooling: idx >= V28_INDEX,
-        support_tx_groups: idx >= V18_INDEX,
-        support_transaction_leases: idx >= V18_INDEX,
-        support_rekeying: idx >= V24_INDEX,
-        enable_heartbeat: idx >= V40_START_INDEX,
-        // Go only enables this for `future` consensus (idx 35+, which covers
-        // future and alpha* versions).
-        enforce_auth_addr_sender_diff: version == "future" || version.starts_with("alpha"),
-        max_txn_bytes_per_block: if idx >= V33_START_INDEX {
-            MAX_TXN_BYTES_PER_BLOCK_V33
-        } else {
-            MAX_TXN_BYTES_PER_BLOCK_V32
-        },
-        enable_logicsig_size_pooling: idx >= V40_START_INDEX,
-    })
+    algo_types::consensus::consensus_params_for_version(version)
 }
-
-// ── Known protocol versions ─────────────────────────────────────────
-// Mirrors go-algorand `protocol/consensus.go` at tag v4.5.1-stable.
-// Only versions v7+ are relevant; v0–v6 are deprecated and never seen on
-// mainnet/testnet/devnet blocks.
-
-/// All protocol version strings recognised by go-algorand v4.5.1-stable.
-pub const KNOWN_PROTOCOL_VERSIONS: &[&str] = &[
-    // Short-form versions (v7–v12)
-    "v7",
-    "v8",
-    "v9",
-    "v10",
-    "v11",
-    "v12",
-    // Spec-URL versions (v13–v41)
-    "https://github.com/algorand/spec/tree/0c8a9dc44d7368cc266d5407b79fb3311f4fc795", // v13
-    "https://github.com/algorand/spec/tree/2526b6ae062b4fe5e163e06e41e1d9b9219135a9", // v14
-    "https://github.com/algorand/spec/tree/a26ed78ed8f834e2b9ccb6eb7d3ee9f629a6e622", // v15
-    "https://github.com/algorand/spec/tree/22726c9dcd12d9cddce4a8bd7e8ccaa707f74101", // v16
-    "https://github.com/algorandfoundation/specs/tree/5615adc36bad610c7f165fa2967f4ecfa75125f0", // v17
-    "https://github.com/algorandfoundation/specs/tree/6c6bd668be0ab14098e51b37e806c509f7b7e31f", // v18
-    "https://github.com/algorandfoundation/specs/tree/0e196e82bfd6e327994bec373c4cc81bc878ef5c", // v19
-    "https://github.com/algorandfoundation/specs/tree/4a9db6a25595c6fd097cf9cc137cc83027787eaa", // v20
-    "https://github.com/algorandfoundation/specs/tree/8096e2df2da75c3339986317f9abe69d4fa86b4b", // v21
-    "https://github.com/algorandfoundation/specs/tree/57016b942f6d97e6d4c0688b373bb0a2fc85a1a2", // v22
-    "https://github.com/algorandfoundation/specs/tree/e5f565421d720c6f75cdd186f7098495caf9101f", // v23
-    "https://github.com/algorandfoundation/specs/tree/3a83c4c743f8b17adfd73944b4319c25722a6782", // v24
-    "https://github.com/algorandfoundation/specs/tree/bea19289bf41217d2c0af30522fa222ef1366466", // v25
-    "https://github.com/algorandfoundation/specs/tree/ac2255d586c4474d4ebcf3809acccb59b7ef34ff", // v26
-    "https://github.com/algorandfoundation/specs/tree/d050b3cade6d5c664df8bd729bf219f179812595", // v27
-    "https://github.com/algorandfoundation/specs/tree/65b4ab3266c52c56a0fa7d591754887d68faad0a", // v28
-    "https://github.com/algorandfoundation/specs/tree/abc54f79f9ad679d2d22f0fb9909fb005c16f8a1", // v29
-    "https://github.com/algorandfoundation/specs/tree/bc36005dbd776e6d1eaf0c560619bb183215645c", // v30
-    "https://github.com/algorandfoundation/specs/tree/85e6db1fdbdef00aa232c75199e10dc5fe9498f6", // v31
-    "https://github.com/algorandfoundation/specs/tree/d5ac876d7ede07367dbaa26e149aa42589aac1f7", // v32
-    "https://github.com/algorandfoundation/specs/tree/830a4e673148498cc7230a0d1ba1ed0a5471acc6", // v33
-    "https://github.com/algorandfoundation/specs/tree/2dd5435993f6f6d65691140f592ebca5ef19ffbd", // v34
-    "https://github.com/algorandfoundation/specs/tree/433d8e9a7274b6fca703d91213e05c7e6a589e69", // v35
-    "https://github.com/algorandfoundation/specs/tree/44fa607d6051730f5264526bf3c108d51f0eadb6", // v36
-    "https://github.com/algorandfoundation/specs/tree/1ac4dd1f85470e1fb36c8a65520e1313d7dfed5e", // v37
-    "https://github.com/algorandfoundation/specs/tree/abd3d4823c6f77349fc04c3af7b1e99fe4df699f", // v38
-    "https://github.com/algorandfoundation/specs/tree/925a46433742afb0b51bb939354bd907fa88bf95", // v39
-    "https://github.com/algorandfoundation/specs/tree/236dcc18c9c507d794813ab768e467ea42d1b4d9", // v40
-    "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed", // v41
-    // Special versions
-    "future",
-    "alpha1",
-    "alpha2",
-    "alpha3",
-    "alpha4",
-    "alpha5",
-];
 
 /// Validate individual transaction rules (fee, round window, note size,
 /// lease size, group size). Does NOT validate group membership or signatures.
@@ -455,149 +314,45 @@ pub fn protocol_version_index(version: &str) -> Option<usize> {
     KNOWN_PROTOCOL_VERSIONS.iter().position(|&v| v == version)
 }
 
-// ── Feature version indices ────────────────────────────────────────
-// Each constant identifies the first index in KNOWN_PROTOCOL_VERSIONS
-// where a given consensus feature is active. Versions at that index
-// and beyond (including future/alpha) have the feature enabled.
-
-/// Index where v26 PaysetCommitMerkle begins (Merkle tree payset
-/// commitment instead of flat hash).
-const V26_START_INDEX: usize = 19;
-
-/// Expected prefix of the v26 protocol version URL at `V26_START_INDEX`.
-const V26_URL_PREFIX: &str = "https://github.com/algorandfoundation/specs/tree/ac2255d5";
-
-/// Index in `KNOWN_PROTOCOL_VERSIONS` where the v33 5-MiB block size limit
-/// begins. All versions at this index and beyond (including future/alpha)
-/// use the larger limit.
-const V33_START_INDEX: usize = 26;
-
-/// Expected prefix of the v33 protocol version URL at `V33_START_INDEX`.
-/// Used as a compile-time assertion to catch if the version list is reordered.
-const V33_URL_PREFIX: &str = "https://github.com/algorandfoundation/specs/tree/830a4e67";
-
-/// Index where v34 txn256 (SHA-256 vector commitment) begins.
-const V34_START_INDEX: usize = 27;
-
-/// Expected prefix of the v34 protocol version URL at `V34_START_INDEX`.
-const V34_URL_PREFIX: &str = "https://github.com/algorandfoundation/specs/tree/2dd54359";
-
-/// Index where v40 heartbeat transactions begin.
-const V40_START_INDEX: usize = 33;
-
-/// Expected prefix of the v40 protocol version URL at `V40_START_INDEX`.
-const V40_URL_PREFIX: &str = "https://github.com/algorandfoundation/specs/tree/236dcc18";
-
-/// Index where v41 txn512 (SHA-512 vector commitment) begins.
-const V41_START_INDEX: usize = 34;
-
-/// Expected prefix of the v41 protocol version URL at `V41_START_INDEX`.
-const V41_URL_PREFIX: &str = "https://github.com/algorandfoundation/specs/tree/953304de";
-
 /// Return the maximum transaction bytes per block for the given protocol
 /// version string. Versions v33+ use the larger 5 MiB limit; earlier
 /// versions use the 1 MiB limit. Returns an error for unknown versions.
 pub fn max_txn_bytes_per_block(version: &str) -> Result<usize, AlgoError> {
-    // Compile-time assertion: verify that V33_START_INDEX points to the
-    // expected v33 version string. This catches accidental reordering of
-    // the KNOWN_PROTOCOL_VERSIONS array.
-    const _: () = {
-        let v33 = KNOWN_PROTOCOL_VERSIONS[V33_START_INDEX].as_bytes();
-        let prefix = V33_URL_PREFIX.as_bytes();
-        let mut i = 0;
-        while i < prefix.len() {
-            assert!(
-                v33[i] == prefix[i],
-                // const assert messages must be string literals
-                // "KNOWN_PROTOCOL_VERSIONS[V33_START_INDEX] does not start with expected v33 URL"
-            );
-            i += 1;
-        }
-    };
-
-    let idx = protocol_version_index(version).ok_or_else(|| AlgoError::Validation {
+    let params = consensus_params_for_version(version).ok_or_else(|| AlgoError::Validation {
         message: format!("unknown protocol version: {version}"),
     })?;
-    if idx >= V33_START_INDEX {
-        // v33+ or special versions (future/alpha inherit latest params)
-        Ok(MAX_TXN_BYTES_PER_BLOCK_V33)
-    } else {
-        Ok(MAX_TXN_BYTES_PER_BLOCK_V32)
-    }
+    Ok(params.max_txn_bytes_per_block as usize)
 }
-
-// ── Compile-time assertions for feature version indices ────────────
-// Verify that each V*_START_INDEX points to the expected version string.
-
-const _: () = {
-    let v26 = KNOWN_PROTOCOL_VERSIONS[V26_START_INDEX].as_bytes();
-    let prefix = V26_URL_PREFIX.as_bytes();
-    let mut i = 0;
-    while i < prefix.len() {
-        assert!(v26[i] == prefix[i]);
-        i += 1;
-    }
-};
-
-const _: () = {
-    let v34 = KNOWN_PROTOCOL_VERSIONS[V34_START_INDEX].as_bytes();
-    let prefix = V34_URL_PREFIX.as_bytes();
-    let mut i = 0;
-    while i < prefix.len() {
-        assert!(v34[i] == prefix[i]);
-        i += 1;
-    }
-};
-
-const _: () = {
-    let v40 = KNOWN_PROTOCOL_VERSIONS[V40_START_INDEX].as_bytes();
-    let prefix = V40_URL_PREFIX.as_bytes();
-    let mut i = 0;
-    while i < prefix.len() {
-        assert!(v40[i] == prefix[i]);
-        i += 1;
-    }
-};
-
-const _: () = {
-    let v41 = KNOWN_PROTOCOL_VERSIONS[V41_START_INDEX].as_bytes();
-    let prefix = V41_URL_PREFIX.as_bytes();
-    let mut i = 0;
-    while i < prefix.len() {
-        assert!(v41[i] == prefix[i]);
-        i += 1;
-    }
-};
 
 /// Returns `true` if the given protocol version uses Merkle tree payset
 /// commitment (v26+). Returns `false` for unknown versions.
 pub fn has_payset_commit_merkle(version: &str) -> bool {
-    protocol_version_index(version)
-        .map(|idx| idx >= V26_START_INDEX)
+    consensus_params_for_version(version)
+        .map(|p| p.payset_commit == algo_types::consensus::PAYSET_COMMIT_MERKLE)
         .unwrap_or(false)
 }
 
 /// Returns `true` if the given protocol version supports SHA-256 vector
 /// commitments (`txn256` field, v34+). Returns `false` for unknown versions.
 pub fn has_txn256(version: &str) -> bool {
-    protocol_version_index(version)
-        .map(|idx| idx >= V34_START_INDEX)
+    consensus_params_for_version(version)
+        .map(|p| p.enable_sha256_txn_commitment_header)
         .unwrap_or(false)
 }
 
 /// Returns `true` if the given protocol version supports SHA-512 vector
 /// commitments (`txn512` field, v41+). Returns `false` for unknown versions.
 pub fn has_txn512(version: &str) -> bool {
-    protocol_version_index(version)
-        .map(|idx| idx >= V41_START_INDEX)
+    consensus_params_for_version(version)
+        .map(|p| p.enable_sha512_block_hash)
         .unwrap_or(false)
 }
 
 /// Returns `true` if the given protocol version supports heartbeat
 /// transactions (`hb` type, v40+). Returns `false` for unknown versions.
 pub fn has_heartbeat(version: &str) -> bool {
-    protocol_version_index(version)
-        .map(|idx| idx >= V40_START_INDEX)
+    consensus_params_for_version(version)
+        .map(|p| p.enable_heartbeat)
         .unwrap_or(false)
 }
 
@@ -1204,7 +959,10 @@ mod tests {
         assert!(params.enable_heartbeat);
         assert_eq!(params.max_tx_group_size, MAX_GROUP_SIZE);
         assert_eq!(params.min_txn_fee, MIN_TXN_FEE);
-        assert_eq!(params.max_txn_bytes_per_block, MAX_TXN_BYTES_PER_BLOCK_V33);
+        assert_eq!(
+            params.max_txn_bytes_per_block,
+            MAX_TXN_BYTES_PER_BLOCK_V33 as u64
+        );
     }
 
     #[test]

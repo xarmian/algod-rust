@@ -3,6 +3,7 @@ use std::cell::{Cell, RefCell};
 use algo_avm::eval::{run_approval_program, run_clear_state_program};
 use algo_avm::group::GroupBudget;
 use algo_error::AlgoError;
+use algo_types::consensus::{consensus_params_for_version, ConsensusParams};
 use algo_types::{
     AccountStatus, Address, AppLocalState, AppParams, AssetHolding, AssetParams, AssetParamsRecord,
     Block, Round, SignedTransaction,
@@ -62,6 +63,8 @@ pub struct ApplyContext {
     pub fee_credit: Cell<u64>,
     /// Current transaction index within the block (for mismatch reporting).
     pub txn_index: Cell<usize>,
+    /// Consensus parameters for the current protocol version.
+    pub consensus: ConsensusParams,
 }
 
 impl ApplyContext {
@@ -77,8 +80,8 @@ impl ApplyContext {
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
             fee_credit: Cell::new(0),
-
             txn_index: Cell::new(0),
+            consensus: ConsensusParams::default(),
         }
     }
 }
@@ -141,6 +144,12 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
         gh.copy_from_slice(&block.genesis_hash);
     }
 
+    // Look up consensus parameters from the block's protocol version.
+    let consensus =
+        consensus_params_for_version(&block.current_protocol).ok_or_else(|| AlgoError::Ledger {
+            message: format!("unknown protocol version: {}", block.current_protocol),
+        })?;
+
     // Initialize txn_counter from the store's current value (= previous block's
     // TxnCounter). This is the base for creatable ID generation.
     let base_txn_counter = store.txn_counter();
@@ -155,6 +164,7 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
         txn_counter: Cell::new(base_txn_counter),
         fee_credit: Cell::new(0),
         txn_index: Cell::new(0),
+        consensus,
     };
 
     let result = (|| {
@@ -178,7 +188,8 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
                     let mut group_budget = GroupBudget::new(num_app_calls);
 
                     // Compute per-group fee credit (matches go-algorand feeCredit).
-                    let group_fee_credit = compute_group_fee_credit(group);
+                    let group_fee_credit =
+                        compute_group_fee_credit(group, ctx.consensus.min_txn_fee);
                     ctx.fee_credit.set(group_fee_credit);
 
                     for (gi_idx, stx) in group.iter().enumerate() {
@@ -346,7 +357,7 @@ fn build_avm_group(
 /// Mirrors go-algorand's `feeCredit()`: sum all fees paid in the group, subtract
 /// `MinTxnFee * num_non_stpf_txns`, return the difference (saturating at 0).
 /// State proof transactions are exempt from fees per go-algorand.
-fn compute_group_fee_credit(group: &[&SignedTransaction]) -> u64 {
+fn compute_group_fee_credit(group: &[&SignedTransaction], min_txn_fee: u64) -> u64 {
     let mut min_fee_count: u64 = 0;
     let mut fees_paid: u64 = 0;
     for stx in group {
@@ -355,7 +366,7 @@ fn compute_group_fee_credit(group: &[&SignedTransaction]) -> u64 {
         }
         fees_paid = fees_paid.saturating_add(stx.txn.fee);
     }
-    let fee_needed = crate::params::MIN_TXN_FEE.saturating_mul(min_fee_count);
+    let fee_needed = min_txn_fee.saturating_mul(min_fee_count);
     fees_paid.saturating_sub(fee_needed)
 }
 
@@ -1654,11 +1665,13 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                         true, // app_mode
                         ph,
                         ctx.genesis_hash,
+                        ctx.consensus.clone(),
                     );
                     avm_ctx.fee_sink = ctx.fee_sink;
                     avm_ctx.txn_counter = ctx.txn_counter.get();
                     avm_ctx.fee_credit = ctx.fee_credit.get();
-                    let result = run_clear_state_program(&clear_program, &mut avm_ctx);
+                    let result =
+                        run_clear_state_program(&clear_program, &mut avm_ctx, &ctx.consensus);
                     // Propagate updated counters back to context.
                     ctx.txn_counter.set(avm_ctx.txn_counter);
                     ctx.fee_credit.set(avm_ctx.fee_credit);
@@ -1722,6 +1735,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     true, // app_mode
                     ph,
                     ctx.genesis_hash,
+                    ctx.consensus.clone(),
                 );
                 avm_ctx.fee_sink = ctx.fee_sink;
                 avm_ctx.txn_counter = ctx.txn_counter.get();
@@ -3771,7 +3785,7 @@ mod tests {
             rewards_rate: 0,
             rewards_residue: 0,
             rewards_recalculation_round: Round(0),
-            current_protocol: "test-v1".to_string(),
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
             next_protocol: String::new(),
             next_protocol_approvals: 0,
             next_protocol_switch_on: Round(0),

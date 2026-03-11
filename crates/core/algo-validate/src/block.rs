@@ -320,7 +320,7 @@ pub fn validate_block(
                 &group_txns,
                 intra_group_idx,
                 &mut lsig_budget,
-                params.enable_logicsig_size_pooling,
+                &params,
             ) {
                 errors.push(BlockValidationError::SignatureVerificationFailed {
                     txn_index: idx,
@@ -346,7 +346,7 @@ pub fn validate_block(
 
         // Group-level LogicSig size pooling check (Go: EnableLogicSigSizePooling, v40+).
         if params.enable_logicsig_size_pooling {
-            if let Err(e) = verify_group_logicsig_size(&group_txns) {
+            if let Err(e) = verify_group_logicsig_size(&group_txns, &params) {
                 errors.push(BlockValidationError::GroupValidationFailed {
                     error: e.to_string(),
                 });
