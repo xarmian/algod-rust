@@ -4,7 +4,7 @@ use algo_avm::run_logicsig_program;
 use algo_codec::canonical_encode_transaction;
 use algo_error::AlgoError;
 use algo_types::consensus::ConsensusParams;
-use algo_types::{Address, LogicSig, MultisigSig, SignedTransaction};
+use algo_types::{Address, HeartbeatProof, LogicSig, MultisigSig, SignedTransaction};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha512_256};
 
@@ -20,6 +20,18 @@ const PROGRAM_PREFIX: &[u8] = b"Program";
 /// Domain separation prefix for logic multisig program (lmsig) hashing.
 /// Used when verifying LMsig delegation: `"MsigProgram" || addr || program`.
 const MSIG_PROGRAM_PREFIX: &[u8] = b"MsigProgram";
+
+/// Domain separation prefix for one-time signature batch subkey (level 1).
+/// Used to sign `OneTimeSignatureSubkeyBatchID` under the master vote key.
+const OT1_PREFIX: &[u8] = b"OT1";
+
+/// Domain separation prefix for one-time signature offset subkey (level 2).
+/// Used to sign `OneTimeSignatureSubkeyOffsetID` under the batch subkey.
+const OT2_PREFIX: &[u8] = b"OT2";
+
+/// Domain separation prefix for seed signing.
+/// Used to sign the block seed under the ephemeral key.
+const SEED_PREFIX: &[u8] = b"SD";
 
 /// Verify a single ed25519 signature on a signed transaction.
 ///
@@ -375,6 +387,181 @@ pub fn verify_logicsig(
             message: "LogicSig program rejected the transaction".into(),
         });
     }
+
+    Ok(())
+}
+
+/// Encode a `OneTimeSignatureSubkeyBatchID` in canonical msgpack format.
+///
+/// Matches Go's `msgp_gen.go` `(*OneTimeSignatureSubkeyBatchID).MarshalMsg()`:
+/// ```text
+/// fixmap(2)
+///   fixstr("batch") → uint64(batch)
+///   fixstr("pk")    → bin(pk_bytes)
+/// ```
+///
+/// The struct uses `codec:""` (non-omitempty), so ALL fields are always
+/// encoded, even when zero.
+fn encode_batch_id(pk: &[u8; 32], batch: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(50);
+    // fixmap(2) + fixstr("batch")
+    buf.extend_from_slice(&[0x82, 0xa5, b'b', b'a', b't', b'c', b'h']);
+    // uint64 batch (use rmp for correct compact encoding)
+    rmp::encode::write_uint(&mut buf, batch).unwrap();
+    // fixstr("pk")
+    buf.extend_from_slice(&[0xa2, b'p', b'k']);
+    // bin(pk_bytes) — 32 bytes
+    rmp::encode::write_bin(&mut buf, pk).unwrap();
+    buf
+}
+
+/// Encode a `OneTimeSignatureSubkeyOffsetID` in canonical msgpack format.
+///
+/// Matches Go's `msgp_gen.go` `(*OneTimeSignatureSubkeyOffsetID).MarshalMsg()`:
+/// ```text
+/// fixmap(3)
+///   fixstr("batch")  → uint64(batch)
+///   fixstr("off")    → uint64(offset)
+///   fixstr("pk")     → bin(pk_bytes)
+/// ```
+///
+/// The struct uses `codec:""` (non-omitempty), so ALL fields are always
+/// encoded, even when zero.
+fn encode_offset_id(pk: &[u8; 32], batch: u64, offset: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(60);
+    // fixmap(3) + fixstr("batch")
+    buf.extend_from_slice(&[0x83, 0xa5, b'b', b'a', b't', b'c', b'h']);
+    // uint64 batch
+    rmp::encode::write_uint(&mut buf, batch).unwrap();
+    // fixstr("off")
+    buf.extend_from_slice(&[0xa3, b'o', b'f', b'f']);
+    // uint64 offset
+    rmp::encode::write_uint(&mut buf, offset).unwrap();
+    // fixstr("pk")
+    buf.extend_from_slice(&[0xa2, b'p', b'k']);
+    // bin(pk_bytes) — 32 bytes
+    rmp::encode::write_bin(&mut buf, pk).unwrap();
+    buf
+}
+
+/// Verify a heartbeat proof (three-level ed25519 ephemeral key tree).
+///
+/// This implements the same verification as Go's `HeartbeatProof.BatchPrep()`
+/// in `crypto/onetimesig.go`. The proof is a three-level ed25519 key tree:
+///
+/// 1. **PK2Sig**: `vote_id` signs `"OT1" || encode(BatchID{batch, pk2})`
+/// 2. **PK1Sig**: `pk2` signs `"OT2" || encode(OffsetID{pk, batch, offset})`
+/// 3. **Sig**: `pk` signs `"SD" || seed`
+///
+/// Where `batch = last_valid / key_dilution` and `offset = last_valid % key_dilution`.
+pub fn verify_heartbeat_proof(
+    proof: &HeartbeatProof,
+    vote_id: &[u8],
+    last_valid: u64,
+    key_dilution: u64,
+    seed: &[u8],
+) -> Result<(), AlgoError> {
+    // Guard against division by zero.
+    if key_dilution == 0 {
+        return Err(AlgoError::Validation {
+            message: "heartbeat proof: key_dilution is zero".into(),
+        });
+    }
+
+    // Extract fixed-size arrays from ByteBuf fields.
+    let pk: [u8; 32] = proof.pk[..].try_into().map_err(|_| AlgoError::Validation {
+        message: format!(
+            "heartbeat proof: invalid pk length: expected 32, got {}",
+            proof.pk.len()
+        ),
+    })?;
+    let pk2: [u8; 32] = proof.pk2[..]
+        .try_into()
+        .map_err(|_| AlgoError::Validation {
+            message: format!(
+                "heartbeat proof: invalid pk2 length: expected 32, got {}",
+                proof.pk2.len()
+            ),
+        })?;
+    let vote_id_bytes: [u8; 32] = vote_id.try_into().map_err(|_| AlgoError::Validation {
+        message: format!(
+            "heartbeat proof: invalid vote_id length: expected 32, got {}",
+            vote_id.len()
+        ),
+    })?;
+
+    let pk2_sig: [u8; 64] = proof.pk2_sig[..]
+        .try_into()
+        .map_err(|_| AlgoError::Validation {
+            message: format!(
+                "heartbeat proof: invalid pk2_sig length: expected 64, got {}",
+                proof.pk2_sig.len()
+            ),
+        })?;
+    let pk1_sig: [u8; 64] = proof.pk1_sig[..]
+        .try_into()
+        .map_err(|_| AlgoError::Validation {
+            message: format!(
+                "heartbeat proof: invalid pk1_sig length: expected 64, got {}",
+                proof.pk1_sig.len()
+            ),
+        })?;
+    let sig: [u8; 64] = proof.sig[..]
+        .try_into()
+        .map_err(|_| AlgoError::Validation {
+            message: format!(
+                "heartbeat proof: invalid sig length: expected 64, got {}",
+                proof.sig.len()
+            ),
+        })?;
+
+    let batch = last_valid / key_dilution;
+    let offset = last_valid % key_dilution;
+
+    // 1. Verify PK2Sig: vote_id signs BatchID(pk2, batch)
+    let batch_id_encoded = encode_batch_id(&pk2, batch);
+    let mut batch_msg = Vec::with_capacity(OT1_PREFIX.len() + batch_id_encoded.len());
+    batch_msg.extend_from_slice(OT1_PREFIX);
+    batch_msg.extend_from_slice(&batch_id_encoded);
+
+    let vk_master =
+        VerifyingKey::from_bytes(&vote_id_bytes).map_err(|e| AlgoError::Validation {
+            message: format!("heartbeat proof: invalid vote_id key: {e}"),
+        })?;
+    vk_master
+        .verify(&batch_msg, &Signature::from_bytes(&pk2_sig))
+        .map_err(|e| AlgoError::Validation {
+            message: format!("heartbeat proof: PK2Sig verification failed: {e}"),
+        })?;
+
+    // 2. Verify PK1Sig: pk2 signs OffsetID(pk, batch, offset)
+    let offset_id_encoded = encode_offset_id(&pk, batch, offset);
+    let mut offset_msg = Vec::with_capacity(OT2_PREFIX.len() + offset_id_encoded.len());
+    offset_msg.extend_from_slice(OT2_PREFIX);
+    offset_msg.extend_from_slice(&offset_id_encoded);
+
+    let vk_batch = VerifyingKey::from_bytes(&pk2).map_err(|e| AlgoError::Validation {
+        message: format!("heartbeat proof: invalid pk2 key: {e}"),
+    })?;
+    vk_batch
+        .verify(&offset_msg, &Signature::from_bytes(&pk1_sig))
+        .map_err(|e| AlgoError::Validation {
+            message: format!("heartbeat proof: PK1Sig verification failed: {e}"),
+        })?;
+
+    // 3. Verify Sig: pk signs "SD" || seed
+    let mut seed_msg = Vec::with_capacity(SEED_PREFIX.len() + seed.len());
+    seed_msg.extend_from_slice(SEED_PREFIX);
+    seed_msg.extend_from_slice(seed);
+
+    let vk_ephemeral = VerifyingKey::from_bytes(&pk).map_err(|e| AlgoError::Validation {
+        message: format!("heartbeat proof: invalid pk key: {e}"),
+    })?;
+    vk_ephemeral
+        .verify(&seed_msg, &Signature::from_bytes(&sig))
+        .map_err(|e| AlgoError::Validation {
+            message: format!("heartbeat proof: Sig verification failed: {e}"),
+        })?;
 
     Ok(())
 }
@@ -1421,5 +1608,390 @@ mod tests {
         };
 
         assert!(verify_auth_addr_sender_diff(&stx, true).is_ok());
+    }
+
+    // ---- Heartbeat proof tests ----
+
+    /// Build a valid three-level ed25519 heartbeat proof.
+    ///
+    /// Returns `(proof, master_pk, seed)` where the proof verifies
+    /// under the master public key for the given `last_valid` and `key_dilution`.
+    fn build_heartbeat_proof(
+        last_valid: u64,
+        key_dilution: u64,
+    ) -> (HeartbeatProof, [u8; 32], [u8; 32]) {
+        use ed25519_dalek::Signer;
+
+        let batch = last_valid / key_dilution;
+        let offset = last_valid % key_dilution;
+        let seed = [0x42u8; 32];
+
+        // Three levels of keys: master -> batch -> ephemeral
+        let master_key = SigningKey::from_bytes(&[0x01; 32]);
+        let batch_key = SigningKey::from_bytes(&[0x02; 32]);
+        let ephemeral_key = SigningKey::from_bytes(&[0x03; 32]);
+
+        let master_pk = master_key.verifying_key().to_bytes();
+        let batch_pk = batch_key.verifying_key().to_bytes();
+        let ephemeral_pk = ephemeral_key.verifying_key().to_bytes();
+
+        // 1. Master signs BatchID(batch_pk, batch)
+        let batch_id_encoded = encode_batch_id(&batch_pk, batch);
+        let mut batch_msg = Vec::new();
+        batch_msg.extend_from_slice(OT1_PREFIX);
+        batch_msg.extend_from_slice(&batch_id_encoded);
+        let pk2_sig = master_key.sign(&batch_msg);
+
+        // 2. Batch key signs OffsetID(ephemeral_pk, batch, offset)
+        let offset_id_encoded = encode_offset_id(&ephemeral_pk, batch, offset);
+        let mut offset_msg = Vec::new();
+        offset_msg.extend_from_slice(OT2_PREFIX);
+        offset_msg.extend_from_slice(&offset_id_encoded);
+        let pk1_sig = batch_key.sign(&offset_msg);
+
+        // 3. Ephemeral key signs "SD" || seed
+        let mut seed_msg = Vec::new();
+        seed_msg.extend_from_slice(SEED_PREFIX);
+        seed_msg.extend_from_slice(&seed);
+        let sig = ephemeral_key.sign(&seed_msg);
+
+        let proof = HeartbeatProof {
+            sig: ByteBuf::from(sig.to_bytes().to_vec()),
+            pk: ByteBuf::from(ephemeral_pk.to_vec()),
+            pk2: ByteBuf::from(batch_pk.to_vec()),
+            pk1_sig: ByteBuf::from(pk1_sig.to_bytes().to_vec()),
+            pk2_sig: ByteBuf::from(pk2_sig.to_bytes().to_vec()),
+        };
+
+        (proof, master_pk, seed)
+    }
+
+    #[test]
+    fn heartbeat_proof_valid() {
+        let last_valid = 1000u64;
+        let key_dilution = 100u64;
+        let (proof, master_pk, seed) = build_heartbeat_proof(last_valid, key_dilution);
+        assert!(
+            verify_heartbeat_proof(&proof, &master_pk, last_valid, key_dilution, &seed).is_ok()
+        );
+    }
+
+    #[test]
+    fn heartbeat_proof_valid_with_large_round() {
+        // Test with a large round number that exercises batch/offset calculation.
+        let last_valid = 999_999u64;
+        let key_dilution = 256u64;
+        let (proof, master_pk, seed) = build_heartbeat_proof(last_valid, key_dilution);
+        assert!(
+            verify_heartbeat_proof(&proof, &master_pk, last_valid, key_dilution, &seed).is_ok()
+        );
+    }
+
+    #[test]
+    fn heartbeat_proof_valid_offset_zero() {
+        // Test when offset is exactly 0 (last_valid is a multiple of key_dilution).
+        let key_dilution = 100u64;
+        let last_valid = 500u64; // 500 % 100 = 0
+        let (proof, master_pk, seed) = build_heartbeat_proof(last_valid, key_dilution);
+        assert!(
+            verify_heartbeat_proof(&proof, &master_pk, last_valid, key_dilution, &seed).is_ok()
+        );
+    }
+
+    #[test]
+    fn heartbeat_proof_invalid_pk2sig_wrong_master() {
+        let last_valid = 1000u64;
+        let key_dilution = 100u64;
+        let (proof, _master_pk, seed) = build_heartbeat_proof(last_valid, key_dilution);
+
+        // Use a different master key — PK2Sig should fail.
+        let wrong_master = SigningKey::from_bytes(&[0xFF; 32]);
+        let wrong_master_pk = wrong_master.verifying_key().to_bytes();
+
+        let err = verify_heartbeat_proof(&proof, &wrong_master_pk, last_valid, key_dilution, &seed)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("PK2Sig verification failed"),
+            "expected PK2Sig failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_proof_invalid_pk1sig_wrong_batch_key() {
+        use ed25519_dalek::Signer;
+
+        let last_valid = 1000u64;
+        let key_dilution = 100u64;
+        let batch = last_valid / key_dilution;
+        let offset = last_valid % key_dilution;
+        let seed = [0x42u8; 32];
+
+        let master_key = SigningKey::from_bytes(&[0x01; 32]);
+        let batch_key = SigningKey::from_bytes(&[0x02; 32]);
+        let wrong_batch_key = SigningKey::from_bytes(&[0xAA; 32]);
+        let ephemeral_key = SigningKey::from_bytes(&[0x03; 32]);
+
+        let master_pk = master_key.verifying_key().to_bytes();
+        let batch_pk = batch_key.verifying_key().to_bytes();
+        let ephemeral_pk = ephemeral_key.verifying_key().to_bytes();
+
+        // PK2Sig is valid (master signed batch_pk correctly)
+        let batch_id_encoded = encode_batch_id(&batch_pk, batch);
+        let mut batch_msg = Vec::new();
+        batch_msg.extend_from_slice(OT1_PREFIX);
+        batch_msg.extend_from_slice(&batch_id_encoded);
+        let pk2_sig = master_key.sign(&batch_msg);
+
+        // PK1Sig is INVALID — signed by wrong_batch_key instead of batch_key
+        let offset_id_encoded = encode_offset_id(&ephemeral_pk, batch, offset);
+        let mut offset_msg = Vec::new();
+        offset_msg.extend_from_slice(OT2_PREFIX);
+        offset_msg.extend_from_slice(&offset_id_encoded);
+        let pk1_sig = wrong_batch_key.sign(&offset_msg);
+
+        // Sig is valid
+        let mut seed_msg = Vec::new();
+        seed_msg.extend_from_slice(SEED_PREFIX);
+        seed_msg.extend_from_slice(&seed);
+        let sig = ephemeral_key.sign(&seed_msg);
+
+        let proof = HeartbeatProof {
+            sig: ByteBuf::from(sig.to_bytes().to_vec()),
+            pk: ByteBuf::from(ephemeral_pk.to_vec()),
+            pk2: ByteBuf::from(batch_pk.to_vec()),
+            pk1_sig: ByteBuf::from(pk1_sig.to_bytes().to_vec()),
+            pk2_sig: ByteBuf::from(pk2_sig.to_bytes().to_vec()),
+        };
+
+        let err = verify_heartbeat_proof(&proof, &master_pk, last_valid, key_dilution, &seed)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("PK1Sig verification failed"),
+            "expected PK1Sig failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_proof_invalid_sig_wrong_seed() {
+        let last_valid = 1000u64;
+        let key_dilution = 100u64;
+        let (proof, master_pk, _seed) = build_heartbeat_proof(last_valid, key_dilution);
+
+        // Use a different seed — ephemeral Sig should fail.
+        let wrong_seed = [0xFF; 32];
+        let err = verify_heartbeat_proof(&proof, &master_pk, last_valid, key_dilution, &wrong_seed)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Sig verification failed"),
+            "expected Sig failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_proof_invalid_sig_wrong_ephemeral_key() {
+        use ed25519_dalek::Signer;
+
+        let last_valid = 1000u64;
+        let key_dilution = 100u64;
+        let batch = last_valid / key_dilution;
+        let offset = last_valid % key_dilution;
+        let seed = [0x42u8; 32];
+
+        let master_key = SigningKey::from_bytes(&[0x01; 32]);
+        let batch_key = SigningKey::from_bytes(&[0x02; 32]);
+        let ephemeral_key = SigningKey::from_bytes(&[0x03; 32]);
+        let wrong_ephemeral_key = SigningKey::from_bytes(&[0xBB; 32]);
+
+        let master_pk = master_key.verifying_key().to_bytes();
+        let batch_pk = batch_key.verifying_key().to_bytes();
+        let ephemeral_pk = ephemeral_key.verifying_key().to_bytes();
+
+        // PK2Sig valid
+        let batch_id_encoded = encode_batch_id(&batch_pk, batch);
+        let mut batch_msg = Vec::new();
+        batch_msg.extend_from_slice(OT1_PREFIX);
+        batch_msg.extend_from_slice(&batch_id_encoded);
+        let pk2_sig = master_key.sign(&batch_msg);
+
+        // PK1Sig valid (signed by batch_key for ephemeral_pk)
+        let offset_id_encoded = encode_offset_id(&ephemeral_pk, batch, offset);
+        let mut offset_msg = Vec::new();
+        offset_msg.extend_from_slice(OT2_PREFIX);
+        offset_msg.extend_from_slice(&offset_id_encoded);
+        let pk1_sig = batch_key.sign(&offset_msg);
+
+        // Sig INVALID — signed by wrong ephemeral key
+        let mut seed_msg = Vec::new();
+        seed_msg.extend_from_slice(SEED_PREFIX);
+        seed_msg.extend_from_slice(&seed);
+        let sig = wrong_ephemeral_key.sign(&seed_msg);
+
+        let proof = HeartbeatProof {
+            sig: ByteBuf::from(sig.to_bytes().to_vec()),
+            pk: ByteBuf::from(ephemeral_pk.to_vec()),
+            pk2: ByteBuf::from(batch_pk.to_vec()),
+            pk1_sig: ByteBuf::from(pk1_sig.to_bytes().to_vec()),
+            pk2_sig: ByteBuf::from(pk2_sig.to_bytes().to_vec()),
+        };
+
+        let err = verify_heartbeat_proof(&proof, &master_pk, last_valid, key_dilution, &seed)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Sig verification failed"),
+            "expected Sig failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_proof_wrong_batch_from_last_valid() {
+        let last_valid = 1000u64;
+        let key_dilution = 100u64;
+        let (proof, master_pk, seed) = build_heartbeat_proof(last_valid, key_dilution);
+
+        // Use a different last_valid — batch/offset will be different, PK2Sig should fail.
+        let wrong_last_valid = 1050u64; // batch=10, offset=50 (different from 1000/100=10,0)
+        let err = verify_heartbeat_proof(&proof, &master_pk, wrong_last_valid, key_dilution, &seed)
+            .unwrap_err();
+        // The offset changed (0 -> 50), so PK1Sig will fail because the offset
+        // in the signed OffsetID doesn't match.
+        assert!(
+            err.to_string().contains("verification failed"),
+            "expected verification failure with wrong last_valid, got: {err}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_proof_wrong_key_dilution() {
+        let last_valid = 1000u64;
+        let key_dilution = 100u64;
+        let (proof, master_pk, seed) = build_heartbeat_proof(last_valid, key_dilution);
+
+        // Different key_dilution changes both batch and offset.
+        let wrong_kd = 200u64; // batch=5, offset=0 vs batch=10, offset=0
+        let err =
+            verify_heartbeat_proof(&proof, &master_pk, last_valid, wrong_kd, &seed).unwrap_err();
+        assert!(
+            err.to_string().contains("verification failed"),
+            "expected verification failure with wrong key_dilution, got: {err}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_proof_zero_key_dilution_errors() {
+        let (proof, master_pk, seed) = build_heartbeat_proof(1000, 100);
+        let err = verify_heartbeat_proof(&proof, &master_pk, 1000, 0, &seed).unwrap_err();
+        assert!(
+            err.to_string().contains("key_dilution is zero"),
+            "expected division-by-zero guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_proof_invalid_pk_length() {
+        let (mut proof, master_pk, seed) = build_heartbeat_proof(1000, 100);
+        proof.pk = ByteBuf::from(vec![0u8; 16]); // Wrong length
+        let err = verify_heartbeat_proof(&proof, &master_pk, 1000, 100, &seed).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid pk length"),
+            "expected pk length error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_proof_invalid_sig_length() {
+        let (mut proof, master_pk, seed) = build_heartbeat_proof(1000, 100);
+        proof.sig = ByteBuf::from(vec![0u8; 32]); // 32 instead of 64
+        let err = verify_heartbeat_proof(&proof, &master_pk, 1000, 100, &seed).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid sig length"),
+            "expected sig length error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_proof_invalid_vote_id_length() {
+        let (proof, _master_pk, seed) = build_heartbeat_proof(1000, 100);
+        let bad_vote_id = [0u8; 16]; // 16 instead of 32
+        let err = verify_heartbeat_proof(&proof, &bad_vote_id, 1000, 100, &seed).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid vote_id length"),
+            "expected vote_id length error, got: {err}"
+        );
+    }
+
+    // ---- BatchID / OffsetID encoding tests ----
+
+    #[test]
+    fn encode_batch_id_matches_go() {
+        // Verify that our encoding matches Go's msgp_gen.go MarshalMsg output.
+        // BatchID with batch=0 and pk=all zeros should produce:
+        //   0x82 (fixmap 2)
+        //   0xa5 "batch"  -> 0x00 (positive fixint 0)
+        //   0xa2 "pk"     -> 0xc4 0x20 [32 zero bytes]
+        let pk = [0u8; 32];
+        let encoded = encode_batch_id(&pk, 0);
+
+        // fixmap(2)
+        assert_eq!(encoded[0], 0x82);
+        // fixstr("batch") = a5 + "batch"
+        assert_eq!(&encoded[1..7], &[0xa5, b'b', b'a', b't', b'c', b'h']);
+        // uint 0 = 0x00
+        assert_eq!(encoded[7], 0x00);
+        // fixstr("pk") = a2 + "pk"
+        assert_eq!(&encoded[8..11], &[0xa2, b'p', b'k']);
+        // bin8 header for 32 bytes = c4 20
+        assert_eq!(encoded[11], 0xc4);
+        assert_eq!(encoded[12], 0x20);
+        // 32 zero bytes
+        assert_eq!(&encoded[13..45], &[0u8; 32]);
+        assert_eq!(encoded.len(), 45);
+    }
+
+    #[test]
+    fn encode_offset_id_matches_go() {
+        // OffsetID with batch=0, offset=0, pk=all zeros:
+        //   0x83 (fixmap 3)
+        //   0xa5 "batch"  -> 0x00
+        //   0xa3 "off"    -> 0x00
+        //   0xa2 "pk"     -> 0xc4 0x20 [32 zero bytes]
+        let pk = [0u8; 32];
+        let encoded = encode_offset_id(&pk, 0, 0);
+
+        assert_eq!(encoded[0], 0x83);
+        // "batch"
+        assert_eq!(&encoded[1..7], &[0xa5, b'b', b'a', b't', b'c', b'h']);
+        assert_eq!(encoded[7], 0x00); // batch = 0
+                                      // "off"
+        assert_eq!(&encoded[8..12], &[0xa3, b'o', b'f', b'f']);
+        assert_eq!(encoded[12], 0x00); // offset = 0
+                                       // "pk"
+        assert_eq!(&encoded[13..16], &[0xa2, b'p', b'k']);
+        assert_eq!(encoded[16], 0xc4);
+        assert_eq!(encoded[17], 0x20);
+        assert_eq!(&encoded[18..50], &[0u8; 32]);
+        assert_eq!(encoded.len(), 50);
+    }
+
+    #[test]
+    fn encode_batch_id_nonzero_batch() {
+        // Verify that a non-zero batch value is encoded correctly.
+        // batch=10 (0x0a) should encode as positive fixint 0x0a.
+        let pk = [0xAA; 32];
+        let encoded = encode_batch_id(&pk, 10);
+        // batch value at position 7
+        assert_eq!(encoded[7], 0x0a);
+    }
+
+    #[test]
+    fn encode_offset_id_nonzero_values() {
+        // batch=256, offset=42 — 256 requires uint16 encoding (0xcd 0x01 0x00).
+        let pk = [0xBB; 32];
+        let encoded = encode_offset_id(&pk, 256, 42);
+        // batch=256 is encoded as uint16: cd 01 00
+        assert_eq!(&encoded[7..10], &[0xcd, 0x01, 0x00]);
+        // "off" at offset 10..14
+        assert_eq!(&encoded[10..14], &[0xa3, b'o', b'f', b'f']);
+        // offset=42 is positive fixint: 0x2a
+        assert_eq!(encoded[14], 0x2a);
     }
 }

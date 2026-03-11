@@ -150,9 +150,9 @@ pub fn validate_transaction_wellformed(
     }
 
     // Heartbeat well-formedness: proof, seed, vote_id, key_dilution must be
-    // non-empty. Full HbProof cryptographic verification (falcon signature)
-    // is not yet implemented — it requires falcon key-tree infrastructure.
-    // TODO(#34): implement full HbProof verification when falcon crypto is added.
+    // non-empty. Cryptographic verification of the three-level ed25519
+    // ephemeral key tree is done separately via `verify_heartbeat_proof()`
+    // in signature.rs (called from `stxnCoreChecks` equivalent).
     if txn.txn_type == "hb" {
         if let Some(ref hb) = txn.heartbeat {
             if hb.proof.is_none()

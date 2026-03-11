@@ -329,7 +329,16 @@ fn reset_expired_online_accounts<L: crate::store_trait::LedgerStore>(
     }
 
     for addr in expired {
-        let mut acct = store.get_or_default_account(addr);
+        let account = store.get_account(addr);
+        if account.is_none() {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "account {} not found for expired participation processing",
+                    addr
+                ),
+            });
+        }
+        let mut acct = account.unwrap();
         // ClearOnlineState: set Offline and clear all voting keys.
         acct.status = AccountStatus::Offline;
         acct.vote_id = None;
@@ -395,7 +404,16 @@ fn suspend_absent_accounts<L: crate::store_trait::LedgerStore>(
     }
 
     for addr in absent {
-        let mut acct = store.get_or_default_account(addr);
+        let account = store.get_account(addr);
+        if account.is_none() {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "account {} not found for absent participation processing",
+                    addr
+                ),
+            });
+        }
+        let mut acct = account.unwrap();
         // Suspend: set Offline and clear incentive eligibility, but keep voting keys.
         acct.status = AccountStatus::Offline;
         acct.incentive_eligible = false;
@@ -5562,5 +5580,69 @@ mod tests {
         // Verify fee deducted from sender for both heartbeats.
         let sender_acct = state.get_account(&sender).unwrap();
         assert_eq!(sender_acct.micro_algos, 10_000_000 - 2_000);
+    }
+
+    // ── Tests for non-existent accounts in expired/absent lists (issue #62) ──
+
+    #[test]
+    fn test_expired_nonexistent_account_errors() {
+        let fee_sink = Address([3u8; 32]);
+        let nonexistent = Address([99u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        // nonexistent address is NOT in the ledger — should error.
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(vec![nonexistent]),
+            None,
+        );
+
+        let result = apply_block(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not found for expired participation processing"),
+            "expected not-found error for expired, got: {}",
+            err_msg
+        );
+
+        // Verify the nonexistent account was NOT created as a phantom.
+        assert!(
+            state.get_account(&nonexistent).is_none(),
+            "nonexistent account should not have been created"
+        );
+    }
+
+    #[test]
+    fn test_absent_nonexistent_account_errors() {
+        let fee_sink = Address([3u8; 32]);
+        let nonexistent = Address([99u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        // nonexistent address is NOT in the ledger — should error.
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![nonexistent]),
+        );
+
+        let result = apply_block(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not found for absent participation processing"),
+            "expected not-found error for absent, got: {}",
+            err_msg
+        );
+
+        // Verify the nonexistent account was NOT created as a phantom.
+        assert!(
+            state.get_account(&nonexistent).is_none(),
+            "nonexistent account should not have been created"
+        );
     }
 }
