@@ -279,8 +279,18 @@ where
     Ok(())
 }
 
-/// Maximum allowed size for a single tar entry (256 MB).
-const MAX_ENTRY_SIZE: usize = 256 * 1024 * 1024;
+/// Maximum allowed size for a single tar entry (2 GiB).
+///
+/// go-algorand's V8 writer allows `balances.N.msgpack` chunks to grow to
+/// roughly 2 GiB when a chunk contains many large app resources, so 256 MiB
+/// is too low. We match Go's practical upper bound here.
+const MAX_ENTRY_SIZE: usize = 2 * 1024 * 1024 * 1024;
+
+/// Maximum allowed size for decompressed Snappy output (2 GiB).
+///
+/// Without this bound, a crafted or corrupted Snappy stream could expand a
+/// small compressed payload into many gigabytes, exhausting memory.
+const MAX_DECOMPRESSED_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
 /// Read the full contents of a tar entry into a `Vec<u8>`.
 fn read_entry_bytes<R: Read>(entry: &mut tar::Entry<'_, R>) -> Result<Vec<u8>, CatchpointError> {
@@ -352,11 +362,20 @@ fn snappy_decompress_if_needed(data: Vec<u8>) -> Result<Vec<u8>, CatchpointError
     // Snappy framing format starts with stream identifier chunk:
     // byte 0xff + 3-byte LE length (0x06, 0x00, 0x00) + "sNaPpY"
     if data.len() >= 10 && data[0] == 0xff && &data[1..10] == b"\x06\x00\x00sNaPpY" {
-        let mut decoder = snap::read::FrameDecoder::new(data.as_slice());
+        let decoder = snap::read::FrameDecoder::new(data.as_slice());
+        // Bound the decompressed output to prevent memory exhaustion from
+        // crafted or corrupted Snappy streams.
+        let mut limited = decoder.take(MAX_DECOMPRESSED_SIZE as u64 + 1);
         let mut decompressed = Vec::new();
-        decoder
+        limited
             .read_to_end(&mut decompressed)
             .map_err(|e| CatchpointError::SnappyError(e.to_string()))?;
+        if decompressed.len() > MAX_DECOMPRESSED_SIZE {
+            return Err(CatchpointError::IntegrityError(format!(
+                "Snappy decompressed output too large: exceeded {} bytes",
+                MAX_DECOMPRESSED_SIZE
+            )));
+        }
         Ok(decompressed)
     } else {
         // Not Snappy-compressed; already plain msgpack. Return owned vec directly.
