@@ -328,6 +328,11 @@ pub struct ConsensusParams {
     /// Max asset unit name bytes (Go: `MaxAssetUnitNameBytes`).
     pub max_asset_unit_name_bytes: usize,
 
+    // ── Expired account removal (v31+) ───────────────────────────
+    /// Max online accounts a proposer can take offline for expired voting keys
+    /// (Go: `MaxProposedExpiredOnlineAccounts`, v31+).
+    pub max_proposed_expired_online_accounts: usize,
+
     // ── Proposer payouts (v40+) ─────────────────────────────────
     /// Proposer payouts enabled (Go: `Payouts.Enabled`).
     pub payouts_enabled: bool,
@@ -339,6 +344,17 @@ pub struct ConsensusParams {
     pub payouts_min_balance: u64,
     /// Maximum balance for proposer payouts (Go: `Payouts.MaxBalance`).
     pub payouts_max_balance: u64,
+    /// Max online accounts a proposer can suspend for not proposing lately
+    /// (Go: `Payouts.MaxMarkAbsent`, v40+).
+    pub payouts_max_mark_absent: usize,
+    /// Challenges occur once every this many rounds (Go: `Payouts.ChallengeInterval`, v40+).
+    pub payouts_challenge_interval: u64,
+    /// Grace period (in rounds) after a challenge before suspension
+    /// (Go: `Payouts.ChallengeGracePeriod`, v40+).
+    pub payouts_challenge_grace_period: u64,
+    /// Number of leading address bits that must match for a challenge
+    /// (Go: `Payouts.ChallengeBits`, v40+).
+    pub payouts_challenge_bits: u32,
 
     // ── Misc ────────────────────────────────────────────────────
     /// Support non-participating transactions (Go: `SupportBecomeNonParticipatingTransactions`, v18+).
@@ -443,11 +459,16 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         max_asset_url_bytes: 0,
         max_asset_name_bytes: 0,
         max_asset_unit_name_bytes: 0,
+        max_proposed_expired_online_accounts: 0,
         payouts_enabled: false,
         payouts_go_online_fee: 0,
         payouts_percent: 0,
         payouts_min_balance: 0,
         payouts_max_balance: 0,
+        payouts_max_mark_absent: 0,
+        payouts_challenge_interval: 0,
+        payouts_challenge_grace_period: 0,
+        payouts_challenge_bits: 0,
         support_become_non_participating_transactions: false,
         enable_app_versioning: false,
     };
@@ -666,6 +687,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v31.isolate_clear_state = true;
     v31.enable_state_proof_keyreg_check = true;
     v31.max_keyreg_valid_period = 256 * (1 << 16) - 1;
+    v31.max_proposed_expired_online_accounts = 32;
     if version == CONSENSUS_V31 {
         return Some(v31);
     }
@@ -746,6 +768,10 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v40.payouts_go_online_fee = 2_000_000;
     v40.payouts_min_balance = 30_000_000_000;
     v40.payouts_max_balance = 70_000_000_000_000;
+    v40.payouts_max_mark_absent = 32;
+    v40.payouts_challenge_interval = 1_000;
+    v40.payouts_challenge_grace_period = 200;
+    v40.payouts_challenge_bits = 5;
     if version == CONSENSUS_V40 {
         return Some(v40);
     }
@@ -888,6 +914,7 @@ mod tests {
         assert!(p.isolate_clear_state);
         assert_eq!(p.logic_sig_version, 6);
         assert_eq!(p.max_keyreg_valid_period, 256 * (1 << 16) - 1);
+        assert_eq!(p.max_proposed_expired_online_accounts, 32);
     }
 
     #[test]
@@ -937,6 +964,10 @@ mod tests {
         assert!(p.enable_logicsig_size_pooling);
         assert!(p.enable_heartbeat);
         assert!(p.payouts_enabled);
+        assert_eq!(p.payouts_max_mark_absent, 32);
+        assert_eq!(p.payouts_challenge_interval, 1_000);
+        assert_eq!(p.payouts_challenge_grace_period, 200);
+        assert_eq!(p.payouts_challenge_bits, 5);
     }
 
     #[test]
@@ -1005,6 +1036,37 @@ mod tests {
         let a5 = consensus_params_for_version(CONSENSUS_ALPHA5).unwrap();
         let v36 = consensus_params_for_version(CONSENSUS_V36).unwrap();
         assert_eq!(a5.logic_sig_version, v36.logic_sig_version);
+    }
+
+    #[test]
+    fn test_challenge_params_absent_before_v40() {
+        // Before v31, max_proposed_expired_online_accounts should be 0
+        let v30 = consensus_params_for_version(CONSENSUS_V30).unwrap();
+        assert_eq!(v30.max_proposed_expired_online_accounts, 0);
+
+        // Before v40, challenge params should be 0
+        let v39 = consensus_params_for_version(CONSENSUS_V39).unwrap();
+        assert_eq!(v39.payouts_max_mark_absent, 0);
+        assert_eq!(v39.payouts_challenge_interval, 0);
+        assert_eq!(v39.payouts_challenge_grace_period, 0);
+        assert_eq!(v39.payouts_challenge_bits, 0);
+        assert!(!v39.payouts_enabled);
+
+        // v31 introduces max_proposed_expired_online_accounts but not challenge params
+        let v31 = consensus_params_for_version(CONSENSUS_V31).unwrap();
+        assert_eq!(v31.max_proposed_expired_online_accounts, 32);
+        assert_eq!(v31.payouts_challenge_interval, 0);
+    }
+
+    #[test]
+    fn test_challenge_params_inherited_v41() {
+        // v41 inherits challenge params from v40
+        let v41 = consensus_params_for_version(CONSENSUS_V41).unwrap();
+        assert_eq!(v41.payouts_max_mark_absent, 32);
+        assert_eq!(v41.payouts_challenge_interval, 1_000);
+        assert_eq!(v41.payouts_challenge_grace_period, 200);
+        assert_eq!(v41.payouts_challenge_bits, 5);
+        assert_eq!(v41.max_proposed_expired_online_accounts, 32);
     }
 
     #[test]

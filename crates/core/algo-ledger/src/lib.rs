@@ -5,6 +5,7 @@ pub mod catchpoint;
 pub mod eval_compare;
 pub mod eval_delta;
 pub mod genesis;
+pub mod heartbeat;
 pub mod lease;
 pub mod merkle_trie;
 pub mod params;
@@ -26,6 +27,10 @@ pub use eval_compare::{
 };
 pub use eval_delta::{parse_eval_delta, DeltaAction, EvalDelta, ValueDelta};
 pub use genesis::{parse_genesis_json, populate_store, GenesisAllocation, GenesisJson};
+pub use heartbeat::{
+    bits_match, find_challenge, last_seen, Challenge, ChallengePeriod, HeaderProvider,
+    StoreHeaderProvider,
+};
 pub use lease::LeaseTable;
 pub use params::min_balance;
 pub use rewards::{
