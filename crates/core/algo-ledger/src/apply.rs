@@ -40,6 +40,13 @@ pub struct ApplyContext {
     pub round: u64,
     /// Controls whether EvalDeltas come from block data or AVM execution.
     pub mode: ApplyMode,
+    /// Whether to run end-of-block participation validation checks.
+    ///
+    /// Mirrors go-algorand's `eval.validate`. When true, validates that
+    /// expired/absent accounts in the block header are correct (duplicate
+    /// checks, vote key checks, etc.). When false (replay/catchup), only
+    /// the apply-side state transitions run.
+    pub validate: bool,
     /// Latest confirmed timestamp (for AVM context).
     pub latest_timestamp: u64,
     /// Genesis hash (for AVM context).
@@ -76,6 +83,7 @@ impl ApplyContext {
             fee_sink,
             round,
             mode: ApplyMode::Replay,
+            validate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
@@ -88,16 +96,39 @@ impl ApplyContext {
 
 /// Apply a full block to the ledger state using the default Replay mode.
 ///
-/// This is a convenience wrapper around [`apply_block_with_mode`] that uses
-/// `ApplyMode::Replay` for backward compatibility.
+/// This is a convenience wrapper around [`apply_block_impl`] that uses
+/// `ApplyMode::Replay` with `validate=false` for backward compatibility.
 pub fn apply_block<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<(), AlgoError> {
-    apply_block_with_mode(store, block, ApplyMode::Replay)
+    apply_block_impl(store, block, ApplyMode::Replay, false)
 }
 
 /// Apply a full block to the ledger state with the specified mode.
+///
+/// Convenience wrapper with `validate=false` (replay/catchup behavior).
+pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    mode: ApplyMode,
+) -> Result<(), AlgoError> {
+    apply_block_impl(store, block, mode, false)
+}
+
+/// Apply a full block to the ledger state with validation enabled.
+///
+/// Like [`apply_block`] but also runs end-of-block participation validation
+/// (duplicate checks, vote key checks, online status checks) matching
+/// Go's `eval.validate = true` code path.
+pub fn apply_block_validating<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+) -> Result<(), AlgoError> {
+    apply_block_impl(store, block, ApplyMode::Replay, true)
+}
+
+/// Apply a full block to the ledger state (internal implementation).
 ///
 /// Updates rewards parameters from the block header, then applies each
 /// transaction in payset order. Finally updates `current_round`.
@@ -105,15 +136,20 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
 /// In `Replay` mode, recorded EvalDeltas from block data are used directly.
 /// In `Execute` mode, AVM programs are run to produce results.
 ///
+/// When `validate` is true, end-of-block participation validation checks
+/// are run (matching Go's `eval.validate`). When false (replay/catchup),
+/// only the apply-side state transitions run.
+///
 /// On error, rewards state is restored to its pre-block values. Note that
 /// account mutations from earlier successful transactions in the payset are
 /// NOT rolled back — the caller should treat the state as corrupted on error.
 /// In practice, committed blocks are already validated and should never
 /// produce errors — the checks here are defensive safety nets.
-pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
+fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
     mode: ApplyMode,
+    validate: bool,
 ) -> Result<(), AlgoError> {
     // Validate round monotonicity.
     let expected = Round(store.current_round().0 + 1);
@@ -159,6 +195,7 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
         fee_sink: block.fee_sink,
         round: block.round.0,
         mode,
+        validate,
         latest_timestamp: block.timestamp as u64,
         genesis_hash: gh,
         txn_counter: Cell::new(base_txn_counter),
@@ -230,10 +267,16 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
     }
 
     // ── End-of-block participation updates ──────────────────────────
-    // Mirrors go-algorand endOfBlock: first reset expired accounts, then
-    // suspend absent accounts. These run after all transactions are applied.
+    // Mirrors go-algorand endOfBlock: for each category, first validate
+    // (gated on ctx.validate, matching Go's `eval.validate`), then apply.
     //
-    // Wrap in a snapshot/rollback guard so that if either function fails,
+    // Go order:
+    //   1. validateExpiredOnlineAccounts()   — gated on eval.validate
+    //   2. resetExpiredOnlineAccountsParticipationKeys()  — always runs
+    //   3. validateAbsentOnlineAccounts()    — gated on eval.validate
+    //   4. suspendAbsentAccounts()           — always runs
+    //
+    // Wrap in a snapshot/rollback guard so that if any function fails,
     // partial mutations from end-of-block processing are reverted.
     {
         // Collect all addresses that will be mutated by end-of-block processing
@@ -255,7 +298,9 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
         }
         let eob_snapshot = store.snapshot(&eob_addrs);
         let eob_result = (|| {
+            validate_expired_online_accounts(store, block, &consensus, ctx.validate)?;
             reset_expired_online_accounts(store, block, &consensus)?;
+            validate_absent_online_accounts(store, block, &consensus, ctx.validate)?;
             suspend_absent_accounts(store, block, &consensus)
         })();
         if eob_result.is_err() {
@@ -297,15 +342,83 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
     Ok(())
 }
 
-/// Process expired participation accounts at end of block.
+/// Validate expired participation accounts at end of block.
+///
+/// Mirrors go-algorand's `validateExpiredOnlineAccounts`. Gated on the
+/// `validate` flag (matching Go's `if !eval.validate { return nil }`).
+///
+/// Checks: count <= max, no duplicate addresses, each account has a vote
+/// key and its vote_last_valid < current round.
+fn validate_expired_online_accounts<L: crate::store_trait::LedgerStore>(
+    store: &L,
+    block: &Block,
+    consensus: &ConsensusParams,
+    validate: bool,
+) -> Result<(), AlgoError> {
+    if !validate {
+        return Ok(());
+    }
+
+    let max_expired = consensus.max_proposed_expired_online_accounts;
+    let expired = block
+        .expired_participation_accounts
+        .as_deref()
+        .unwrap_or(&[]);
+
+    // If the length exceeds the max, it is an error (also handles max==0 disabling the feature).
+    if expired.len() > max_expired {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "length of expired accounts ({}) was greater than expected ({})",
+                expired.len(),
+                max_expired
+            ),
+        });
+    }
+
+    // Check for duplicates and that each account truly has expired keys.
+    let round = block.round.0;
+    let mut seen = std::collections::HashSet::with_capacity(expired.len());
+    for addr in expired {
+        if !seen.insert(*addr) {
+            return Err(AlgoError::Ledger {
+                message: format!("duplicate address found: {}", addr),
+            });
+        }
+
+        let acct = store.get_or_default_account(addr);
+
+        // Go: if acctData.VoteID.IsEmpty() -> error
+        if acct.vote_id.is_none() || acct.vote_id.as_ref().is_some_and(|v| v == &[0u8; 32]) {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "endOfBlock found expiration candidate {} had no vote key",
+                    addr
+                ),
+            });
+        }
+        // Go: if acctData.VoteLastValid >= currentRound -> error
+        if acct.vote_last_valid >= round {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "endOfBlock found {} round ({}) was not less than current round ({})",
+                    addr, acct.vote_last_valid, round
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply expired participation accounts at end of block.
 ///
 /// Mirrors go-algorand's `resetExpiredOnlineAccountsParticipationKeys`.
-/// For each address in `block.expired_participation_accounts`, sets the
-/// account status to Offline and clears all voting keys (vote_id,
-/// selection_id, state_proof_id, vote_first_valid, vote_last_valid,
-/// vote_key_dilution).
+/// Always runs (not gated on validate). For each address in
+/// `block.expired_participation_accounts`, looks up the account (returning
+/// default for missing), calls ClearOnlineState, and persists.
 ///
-/// Gated behind `max_proposed_expired_online_accounts > 0` (introduced at v31).
+/// Keeps the count check (Go has this in the apply function too).
 fn reset_expired_online_accounts<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
@@ -328,51 +441,9 @@ fn reset_expired_online_accounts<L: crate::store_trait::LedgerStore>(
         });
     }
 
-    // Validate: check for duplicates and that each account truly has expired keys.
-    // Mirrors go-algorand's `validateExpiredOnlineAccounts`.
-    let round = block.round.0;
-    {
-        let mut seen = std::collections::HashSet::with_capacity(expired.len());
-        for addr in expired {
-            if !seen.insert(*addr) {
-                return Err(AlgoError::Ledger {
-                    message: format!("duplicate address found: {}", addr),
-                });
-            }
-            let acct = store.get_account(addr).ok_or_else(|| AlgoError::Ledger {
-                message: format!("endOfBlock was unable to retrieve account {}", addr),
-            })?;
-            // Go: if acctData.VoteID.IsEmpty() -> error
-            if acct.vote_id.is_none() || acct.vote_id.as_ref().is_some_and(|v| v == &[0u8; 32]) {
-                return Err(AlgoError::Ledger {
-                    message: format!(
-                        "endOfBlock found expiration candidate {} had no vote key",
-                        addr
-                    ),
-                });
-            }
-            // Go: if acctData.VoteLastValid >= currentRound -> error
-            if acct.vote_last_valid >= round {
-                return Err(AlgoError::Ledger {
-                    message: format!(
-                        "endOfBlock found {} round ({}) was not less than current round ({})",
-                        addr, acct.vote_last_valid, round
-                    ),
-                });
-            }
-        }
-    }
-
-    // Apply: ClearOnlineState on each expired account.
-    // Mirrors go-algorand's `resetExpiredOnlineAccountsParticipationKeys`.
+    // ClearOnlineState on each expired account.
     for addr in expired {
-        let acct = store.get_account(addr).ok_or_else(|| AlgoError::Ledger {
-            message: format!(
-                "resetExpiredOnlineAccountsParticipationKeys was unable to retrieve account {}",
-                addr
-            ),
-        })?;
-        let mut acct = acct;
+        let mut acct = store.get_or_default_account(addr);
         // ClearOnlineState: set Offline and clear all voting keys.
         acct.status = AccountStatus::Offline;
         acct.vote_id = None;
@@ -387,103 +458,100 @@ fn reset_expired_online_accounts<L: crate::store_trait::LedgerStore>(
     Ok(())
 }
 
-/// Process absent participation accounts at end of block.
+/// Validate absent participation accounts at end of block.
 ///
-/// Mirrors go-algorand's `suspendAbsentAccounts`. For each address in
-/// `block.absent_participation_accounts`, "suspends" the account by
-/// setting status to Offline and `incentive_eligible = false`, but
-/// keeps voting keys intact so a heartbeat can bring the account back.
+/// Mirrors go-algorand's `validateAbsentOnlineAccounts`. Gated on the
+/// `validate` flag (matching Go's `if !eval.validate { return nil }`).
 ///
-/// Gated behind `payouts_enabled` (consensus V40+).
-fn suspend_absent_accounts<L: crate::store_trait::LedgerStore>(
-    store: &mut L,
+/// Checks: count <= max, no duplicate addresses, each account is Online
+/// with non-zero balance and IncentiveEligible.
+///
+/// Note: Go also checks isAbsent (via online stake / voting stake) and
+/// challenge failure (via FindChallenge + ch.Failed). Those require
+/// agreement-level data not yet available here — deferred to Phase 6.
+fn validate_absent_online_accounts<L: crate::store_trait::LedgerStore>(
+    store: &L,
     block: &Block,
     consensus: &ConsensusParams,
+    validate: bool,
 ) -> Result<(), AlgoError> {
-    if !consensus.payouts_enabled {
-        // Absent account suspension is only active when payouts are enabled.
-        // If the block contains absent accounts but payouts are not enabled,
-        // that is an error.
-        let absent = block
-            .absent_participation_accounts
-            .as_deref()
-            .unwrap_or(&[]);
-        if !absent.is_empty() {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "block contains {} absent participation accounts but payouts are not enabled",
-                    absent.len()
-                ),
-            });
-        }
+    if !validate {
         return Ok(());
     }
 
+    let max_suspensions = consensus.payouts_max_mark_absent;
     let absent = block
         .absent_participation_accounts
         .as_deref()
         .unwrap_or(&[]);
 
-    // Validate count against MaxMarkAbsent.
-    // Go: validateAbsentOnlineAccounts checks `suspensionCount > maxSuspensions`.
-    // This also handles the maxSuspensions==0 case (feature disabled).
-    if absent.len() > consensus.payouts_max_mark_absent {
+    // If the length exceeds the max, it is an error (also handles max==0 disabling the feature).
+    if absent.len() > max_suspensions {
         return Err(AlgoError::Ledger {
             message: format!(
                 "length of absent accounts ({}) was greater than expected ({})",
                 absent.len(),
-                consensus.payouts_max_mark_absent
+                max_suspensions
             ),
         });
     }
 
-    // Validate: check duplicates and basic account eligibility for suspension.
-    // Mirrors go-algorand's `validateAbsentOnlineAccounts`.
-    // Note: Go also checks isAbsent (via online stake / voting stake) and
-    // challenge failure (via FindChallenge + ch.Failed). Those require
-    // agreement-level data not yet available here — deferred to a future epic.
-    {
-        let mut seen = std::collections::HashSet::with_capacity(absent.len());
-        for addr in absent {
-            if !seen.insert(*addr) {
-                return Err(AlgoError::Ledger {
-                    message: format!("duplicate address found: {}", addr),
-                });
-            }
-            let acct = store.get_account(addr).ok_or_else(|| AlgoError::Ledger {
-                message: format!("unable to retrieve proposed absent account {}", addr),
-            })?;
-            if acct.status != AccountStatus::Online {
-                return Err(AlgoError::Ledger {
-                    message: format!(
-                        "proposed absent account {} was {:?}, not Online",
-                        addr, acct.status
-                    ),
-                });
-            }
-            if acct.micro_algos == 0 {
-                return Err(AlgoError::Ledger {
-                    message: format!("proposed absent account {} with zero algos", addr),
-                });
-            }
-            if !acct.incentive_eligible {
-                return Err(AlgoError::Ledger {
-                    message: format!("proposed absent account {} not IncentiveEligible", addr),
-                });
-            }
+    // Check for duplicates and basic account eligibility for suspension.
+    let mut seen = std::collections::HashSet::with_capacity(absent.len());
+    for addr in absent {
+        if !seen.insert(*addr) {
+            return Err(AlgoError::Ledger {
+                message: format!("duplicate address found: {}", addr),
+            });
+        }
+
+        let acct = store.get_or_default_account(addr);
+
+        if acct.status != AccountStatus::Online {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "proposed absent account {} was {:?}, not Online",
+                    addr, acct.status
+                ),
+            });
+        }
+        if acct.micro_algos == 0 {
+            return Err(AlgoError::Ledger {
+                message: format!("proposed absent account {} with zero algos", addr),
+            });
+        }
+        if !acct.incentive_eligible {
+            return Err(AlgoError::Ledger {
+                message: format!("proposed absent account {} not IncentiveEligible", addr),
+            });
         }
     }
 
-    // Apply: Suspend each absent account.
-    // Mirrors go-algorand's `suspendAbsentAccounts`.
+    Ok(())
+}
+
+/// Apply absent participation accounts at end of block.
+///
+/// Mirrors go-algorand's `suspendAbsentAccounts`. Always runs (not gated
+/// on validate). For each address in `block.absent_participation_accounts`,
+/// looks up the account (returning default for missing), suspends it
+/// (Offline + clear IncentiveEligible), and persists.
+///
+/// Go's `suspendAbsentAccounts` has NO count check — the count check is
+/// only in `validateAbsentOnlineAccounts`.
+fn suspend_absent_accounts<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    _consensus: &ConsensusParams,
+) -> Result<(), AlgoError> {
+    let absent = block
+        .absent_participation_accounts
+        .as_deref()
+        .unwrap_or(&[]);
+
+    // Suspend each absent account.
     for addr in absent {
-        let acct = store.get_account(addr).ok_or_else(|| AlgoError::Ledger {
-            message: format!(
-                "account {} not found for absent participation processing",
-                addr
-            ),
-        })?;
-        let mut acct = acct;
+        let mut acct = store.get_or_default_account(addr);
         // Suspend: set Offline and clear incentive eligibility, but keep voting keys.
         acct.status = AccountStatus::Offline;
         acct.incentive_eligible = false;
@@ -4429,6 +4497,7 @@ mod tests {
             fee_sink,
             round,
             mode: ApplyMode::Replay,
+            validate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
@@ -4789,7 +4858,10 @@ mod tests {
     }
 
     #[test]
-    fn test_absent_gating_payouts_not_enabled() {
+    fn test_absent_gating_payouts_not_enabled_validate() {
+        // V39 does not have payouts_enabled (payouts_max_mark_absent = 0).
+        // In validate mode, a non-empty absent list should be rejected by
+        // the count check (absent.len() > 0 = max).
         let absent_addr = Address([11u8; 32]);
         let fee_sink = Address([3u8; 32]);
 
@@ -4803,8 +4875,6 @@ mod tests {
             acct.incentive_eligible = true;
         }
 
-        // V39 does not have payouts_enabled.
-        // A non-empty absent list should be rejected.
         let block = make_empty_block_with_protocol(
             fee_sink,
             algo_types::consensus::CONSENSUS_V39,
@@ -4812,14 +4882,42 @@ mod tests {
             Some(vec![absent_addr]),
         );
 
-        let result = apply_block(&mut state, &block);
+        let result = apply_block_validating(&mut state, &block);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("payouts are not enabled"),
-            "expected payouts gating error, got: {}",
+            err_msg.contains("greater than expected"),
+            "expected count overflow error, got: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_absent_gating_payouts_not_enabled_replay_succeeds() {
+        // V39 does not have payouts_enabled. In replay mode, no validation
+        // runs, so the suspend just applies (matching Go's replay behavior).
+        let absent_addr = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&absent_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.incentive_eligible = true;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V39,
+            None,
+            Some(vec![absent_addr]),
+        );
+
+        // Replay mode: no validation, apply succeeds.
+        apply_block(&mut state, &block).unwrap();
     }
 
     #[test]
@@ -5100,6 +5198,7 @@ mod tests {
             fee_sink,
             round: 100,
             mode: ApplyMode::Replay,
+            validate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
@@ -5121,6 +5220,8 @@ mod tests {
 
     #[test]
     fn test_absent_exceeds_max_errors() {
+        // The count check for absent accounts is in the validate path
+        // (matching Go's validateAbsentOnlineAccounts), not the apply path.
         let fee_sink = Address([3u8; 32]);
 
         let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
@@ -5142,7 +5243,7 @@ mod tests {
             Some(absent),
         );
 
-        let result = apply_block(&mut state, &block);
+        let result = apply_block_validating(&mut state, &block);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -5187,13 +5288,17 @@ mod tests {
 
     #[test]
     fn test_eob_error_rolls_back_partial_mutations() {
+        // In validate mode: expired is valid (1 addr, max=32), but absent
+        // exceeds max (33 addresses). The expired validate+apply will succeed,
+        // then absent validate will fail. The rollback guard should revert
+        // all end-of-block mutations.
         let expired_addr = Address([10u8; 32]);
         let fee_sink = Address([3u8; 32]);
 
         let mut state =
             make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
 
-        // Set up expired account as Online.
+        // Set up expired account as Online with expired keys.
         {
             let acct = state.get_or_default_account(&expired_addr);
             acct.status = AccountStatus::Online;
@@ -5201,12 +5306,9 @@ mod tests {
             acct.selection_id = Some([2u8; 32]);
             acct.vote_key_dilution = 50;
             acct.incentive_eligible = true;
+            acct.vote_last_valid = 0; // Expired (< round 1)
         }
 
-        // Build a block where expired is valid (1 addr, max=32) but absent
-        // exceeds max (33 addresses). The expired processing will succeed and
-        // mutate state, then absent will fail. The rollback guard should
-        // revert the expired mutations.
         let absent: Vec<Address> = (0..33u8).map(|i| Address([200 + i; 32])).collect();
         for addr in &absent {
             let acct = state.get_or_default_account(addr);
@@ -5223,7 +5325,7 @@ mod tests {
             Some(absent),
         );
 
-        let result = apply_block(&mut state, &block);
+        let result = apply_block_validating(&mut state, &block);
         assert!(result.is_err());
 
         // The expired account should be ROLLED BACK to Online with keys intact.
@@ -5275,6 +5377,7 @@ mod tests {
             fee_sink,
             round,
             mode: ApplyMode::Replay,
+            validate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
@@ -5652,15 +5755,19 @@ mod tests {
     }
 
     // ── Tests for non-existent accounts in expired/absent lists (issue #62) ──
+    // In replay mode (validate=false), nonexistent accounts are treated as
+    // defaults (matching Go's lookup). In validate mode, they fail validation.
 
     #[test]
-    fn test_expired_nonexistent_account_errors() {
+    fn test_expired_nonexistent_account_replay_applies_default() {
+        // In replay mode, a nonexistent expired account gets a default
+        // AccountData. ClearOnlineState is applied (a no-op on defaults).
+        // This matches Go where lookup returns default for missing accounts.
         let fee_sink = Address([3u8; 32]);
         let nonexistent = Address([99u8; 32]);
 
         let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
 
-        // nonexistent address is NOT in the ledger — should error during validation.
         let block = make_empty_block_with_protocol(
             fee_sink,
             algo_types::consensus::CONSENSUS_V41,
@@ -5668,30 +5775,46 @@ mod tests {
             None,
         );
 
-        let result = apply_block(&mut state, &block);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("endOfBlock was unable to retrieve account"),
-            "expected not-found error for expired, got: {}",
-            err_msg
-        );
-
-        // Verify the nonexistent account was NOT created as a phantom.
-        assert!(
-            state.get_account(&nonexistent).is_none(),
-            "nonexistent account should not have been created"
-        );
+        // Replay mode: no validation, just apply. Should succeed.
+        apply_block(&mut state, &block).unwrap();
     }
 
     #[test]
-    fn test_absent_nonexistent_account_errors() {
+    fn test_expired_nonexistent_account_validate_errors() {
+        // In validate mode, a nonexistent expired account has no vote key,
+        // so it fails the "had no vote key" check.
         let fee_sink = Address([3u8; 32]);
         let nonexistent = Address([99u8; 32]);
 
         let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
 
-        // nonexistent address is NOT in the ledger — should error during validation.
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(vec![nonexistent]),
+            None,
+        );
+
+        let result = apply_block_validating(&mut state, &block);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("had no vote key"),
+            "expected no-vote-key error for nonexistent expired, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_absent_nonexistent_account_replay_applies_default() {
+        // In replay mode, a nonexistent absent account gets a default
+        // AccountData. Suspend is applied (sets Offline + not eligible).
+        // This matches Go where lookup returns default for missing accounts.
+        let fee_sink = Address([3u8; 32]);
+        let nonexistent = Address([99u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
         let block = make_empty_block_with_protocol(
             fee_sink,
             algo_types::consensus::CONSENSUS_V41,
@@ -5699,23 +5822,39 @@ mod tests {
             Some(vec![nonexistent]),
         );
 
-        let result = apply_block(&mut state, &block);
+        // Replay mode: no validation, just apply. Should succeed.
+        apply_block(&mut state, &block).unwrap();
+    }
+
+    #[test]
+    fn test_absent_nonexistent_account_validate_errors() {
+        // In validate mode, a nonexistent absent account has Offline status,
+        // so it fails the "not Online" check.
+        let fee_sink = Address([3u8; 32]);
+        let nonexistent = Address([99u8; 32]);
+
+        let mut state = make_state_with_accounts(&[(fee_sink, 0)], fee_sink);
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![nonexistent]),
+        );
+
+        let result = apply_block_validating(&mut state, &block);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("unable to retrieve proposed absent account"),
-            "expected not-found error for absent, got: {}",
+            err_msg.contains("not Online"),
+            "expected not-Online error for nonexistent absent, got: {}",
             err_msg
-        );
-
-        // Verify the nonexistent account was NOT created as a phantom.
-        assert!(
-            state.get_account(&nonexistent).is_none(),
-            "nonexistent account should not have been created"
         );
     }
 
-    // ── Tests for issue #62 fixes ──────────────────────────────────
+    // ── Validation-path tests (validate=true, matching Go's eval.validate) ──
+    // These tests exercise the validate functions that are gated behind
+    // ctx.validate=true (i.e., only during block validation, not replay).
 
     // Fix #2: Validate expired accounts have expired keys
     #[test]
@@ -5743,7 +5882,7 @@ mod tests {
             None,
         );
 
-        let result = apply_block(&mut state, &block);
+        let result = apply_block_validating(&mut state, &block);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -5751,6 +5890,40 @@ mod tests {
             "expected non-expired key error, got: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_expired_non_expired_keys_replay_succeeds() {
+        // In replay mode, non-expired keys are NOT checked — apply just runs.
+        let expired_addr = Address([10u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&expired_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.selection_id = Some([2u8; 32]);
+            acct.vote_last_valid = 999; // Not actually expired
+            acct.vote_key_dilution = 50;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(vec![expired_addr]),
+            None,
+        );
+
+        // Replay mode: validation skipped, apply succeeds.
+        apply_block(&mut state, &block).unwrap();
+
+        // Account should still be cleared (ClearOnlineState applied).
+        let acct = state.get_account(&expired_addr).unwrap();
+        assert_eq!(acct.status, AccountStatus::Offline);
+        assert!(acct.vote_id.is_none());
     }
 
     #[test]
@@ -5776,7 +5949,7 @@ mod tests {
             None,
         );
 
-        let result = apply_block(&mut state, &block);
+        let result = apply_block_validating(&mut state, &block);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -5808,7 +5981,7 @@ mod tests {
             None,
         );
 
-        let result = apply_block(&mut state, &block);
+        let result = apply_block_validating(&mut state, &block);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -5816,6 +5989,33 @@ mod tests {
             "expected duplicate error, got: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_expired_duplicate_addresses_replay_succeeds() {
+        // In replay mode, duplicate check is skipped — apply just runs.
+        let expired_addr = Address([10u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(expired_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&expired_addr);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([1u8; 32]);
+            acct.vote_last_valid = 0;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            Some(vec![expired_addr, expired_addr]), // duplicate
+            None,
+        );
+
+        // Replay mode: no validation, apply succeeds.
+        apply_block(&mut state, &block).unwrap();
     }
 
     // Fix #3: Validate absent accounts are Online, non-zero balance, IncentiveEligible
@@ -5840,7 +6040,7 @@ mod tests {
             Some(vec![absent_addr]),
         );
 
-        let result = apply_block(&mut state, &block);
+        let result = apply_block_validating(&mut state, &block);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -5848,6 +6048,32 @@ mod tests {
             "expected not-Online error, got: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_absent_offline_account_replay_succeeds() {
+        // In replay mode, Online check is skipped — Suspend just runs.
+        let absent_addr = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&absent_addr);
+            acct.status = AccountStatus::Offline;
+            acct.incentive_eligible = true;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![absent_addr]),
+        );
+
+        // Replay mode: no validation, apply succeeds.
+        apply_block(&mut state, &block).unwrap();
     }
 
     #[test]
@@ -5871,7 +6097,7 @@ mod tests {
             Some(vec![absent_addr]),
         );
 
-        let result = apply_block(&mut state, &block);
+        let result = apply_block_validating(&mut state, &block);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -5902,7 +6128,7 @@ mod tests {
             Some(vec![absent_addr]),
         );
 
-        let result = apply_block(&mut state, &block);
+        let result = apply_block_validating(&mut state, &block);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -5933,7 +6159,7 @@ mod tests {
             Some(vec![absent_addr, absent_addr]), // duplicate!
         );
 
-        let result = apply_block(&mut state, &block);
+        let result = apply_block_validating(&mut state, &block);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -5941,6 +6167,32 @@ mod tests {
             "expected duplicate error, got: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_absent_duplicate_addresses_replay_succeeds() {
+        // In replay mode, duplicate check is skipped — Suspend just runs.
+        let absent_addr = Address([11u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let mut state =
+            make_state_with_accounts(&[(absent_addr, 5_000_000), (fee_sink, 0)], fee_sink);
+
+        {
+            let acct = state.get_or_default_account(&absent_addr);
+            acct.status = AccountStatus::Online;
+            acct.incentive_eligible = true;
+        }
+
+        let block = make_empty_block_with_protocol(
+            fee_sink,
+            algo_types::consensus::CONSENSUS_V41,
+            None,
+            Some(vec![absent_addr, absent_addr]), // duplicate
+        );
+
+        // Replay mode: no validation, apply succeeds.
+        apply_block(&mut state, &block).unwrap();
     }
 
     // Fix #4: Gate keyreg last_heartbeat/incentive_eligible on payouts_enabled
@@ -5967,6 +6219,7 @@ mod tests {
             fee_sink,
             round: 1,
             mode: ApplyMode::Replay,
+            validate: false,
             latest_timestamp: 0,
             genesis_hash: [0u8; 32],
             txn_counter: Cell::new(0),
