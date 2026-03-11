@@ -278,6 +278,9 @@ pub struct ConsensusParams {
     pub deeper_block_header_history: u64,
 
     // ── Rewards ─────────────────────────────────────────────────
+    /// Number of microAlgos per reward unit (Go: `RewardUnit`).
+    /// Rewards are received by whole reward units; fractions do not receive rewards.
+    pub reward_unit: u64,
     /// Rounds between reward rate recalculations (Go: `RewardsRateRefreshInterval`).
     pub rewards_rate_refresh_interval: u64,
 
@@ -423,6 +426,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         max_log_size: 1024,
         max_log_calls: 32,
         deeper_block_header_history: 0,
+        reward_unit: 1_000_000,
         rewards_rate_refresh_interval: 500_000,
         max_timestamp_increment: 25,
         payset_commit: PAYSET_COMMIT_UNSUPPORTED,

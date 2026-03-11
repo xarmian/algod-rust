@@ -28,7 +28,9 @@ pub use eval_delta::{parse_eval_delta, DeltaAction, EvalDelta, ValueDelta};
 pub use genesis::{parse_genesis_json, populate_store, GenesisAllocation, GenesisJson};
 pub use lease::LeaseTable;
 pub use params::min_balance;
-pub use rewards::{apply_rewards, compute_pending_rewards, REWARD_UNITS};
+pub use rewards::{
+    apply_rewards, compute_pending_rewards, normalized_online_balance, REWARD_UNITS,
+};
 pub use sqlite::SqliteLedger;
 pub use state::{schema_min_balance, LedgerState, StateSnapshot};
 pub use store_trait::LedgerStore;

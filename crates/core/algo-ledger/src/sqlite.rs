@@ -16,7 +16,20 @@ use algo_types::{
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::lease::LeaseTable;
+use crate::rewards::{normalized_online_balance, REWARD_UNITS};
 use crate::store_trait::LedgerStore;
+
+/// Compute the normalized online balance for an account and convert to i64
+/// for SQLite storage. Panics if the result does not fit in i64.
+fn account_nob_i64(account: &AccountData) -> i64 {
+    let nob = normalized_online_balance(
+        account.status,
+        account.micro_algos,
+        account.rewards_base,
+        REWARD_UNITS,
+    );
+    i64::try_from(nob).expect("normalized online balance should fit in i64")
+}
 
 // ---------------------------------------------------------------------------
 // Schema DDL
@@ -1890,12 +1903,14 @@ impl SqliteLedger {
         if let Some(rowid) = self.get_rowid(addr) {
             return Ok(rowid);
         }
-        // Insert a default account.
-        let default_data = encode_account_data(&AccountData::default());
+        // Insert a default account (Offline, zero balance → NOB is 0).
+        let default_account = AccountData::default();
+        let nob = account_nob_i64(&default_account);
+        let default_data = encode_account_data(&default_account);
         self.conn
             .execute(
-                "INSERT INTO accountbase (address, normalizedonlinebalance, data) VALUES (?1, 0, ?2)",
-                params![addr.0.as_slice(), default_data],
+                "INSERT INTO accountbase (address, normalizedonlinebalance, data) VALUES (?1, ?2, ?3)",
+                params![addr.0.as_slice(), nob, default_data],
             )
             .map_err(|e| AlgoError::Ledger {
                 message: format!("insert account error: {e}"),
@@ -2002,12 +2017,10 @@ impl LedgerStore for SqliteLedger {
             });
         }
         let data = encode_account_data(&account);
-        // normalizedonlinebalance: Go uses this for sortition; we compute a
-        // placeholder value (0 for offline/notpart, micro_algos for online).
-        let nob: i64 = match account.status {
-            AccountStatus::Online => account.micro_algos as i64,
-            _ => 0,
-        };
+        // Compute normalizedonlinebalance using Go's formula (rewards-adjusted
+        // balance estimate at round 0). See NormalizedOnlineAccountBalance in
+        // go-algorand data/basics/userBalance.go.
+        let nob = account_nob_i64(&account);
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO accountbase (address, normalizedonlinebalance, data) VALUES (?1, ?2, ?3)",
