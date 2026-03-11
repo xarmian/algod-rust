@@ -226,17 +226,27 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
     store.set_txn_counter(block.txn_counter);
 
     // Store block header data, full block data, and txtail for history.
+    // These are auxiliary tracker writes — failures are logged but do not
+    // fail block application (matches go-algorand's tracker persistence pattern).
     // TODO(Epic 25b): Wire up `forget_before` to prune old blocks/txtail entries.
     let hdrdata = algo_codec::canonical_encode_block_header_from_block(block);
-    let blkdata = algo_codec::encode_block(block).map_err(|e| AlgoError::Ledger {
-        message: format!("encode_block error: {e}"),
-    })?;
-    let proto = &block.current_protocol;
-    store.put_block(block.round.0, proto, &hdrdata, &blkdata)?;
+    match algo_codec::encode_block(block) {
+        Ok(blkdata) => {
+            let proto = &block.current_protocol;
+            if let Err(e) = store.put_block(block.round.0, proto, &hdrdata, &blkdata) {
+                tracing::warn!("put_block failed for round {}: {e}", block.round.0);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("encode_block failed for round {}: {e}", block.round.0);
+        }
+    }
 
     let txtail = algo_codec::build_txtail_from_block(block);
     let txtail_data = algo_codec::canonical_encode_txtail_round(&txtail);
-    store.put_txtail(block.round.0, &txtail_data)?;
+    if let Err(e) = store.put_txtail(block.round.0, &txtail_data) {
+        tracing::warn!("put_txtail failed for round {}: {e}", block.round.0);
+    }
 
     Ok(())
 }
