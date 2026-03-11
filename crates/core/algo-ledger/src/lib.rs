@@ -1,5 +1,6 @@
 pub mod apply;
 pub mod avm_context;
+pub mod block_entry;
 pub mod eval_compare;
 pub mod eval_delta;
 pub mod genesis;

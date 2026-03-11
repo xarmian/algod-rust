@@ -225,6 +225,29 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
     // starts from the right base (matches go-algorand endOfBlock).
     store.set_txn_counter(block.txn_counter);
 
+    // Store block header data, full block data, and txtail for history.
+    // These are auxiliary tracker writes — failures are logged but do not
+    // fail block application (matches go-algorand's tracker persistence pattern).
+    // TODO(Epic 25b): Wire up `forget_before` to prune old blocks/txtail entries.
+    let hdrdata = algo_codec::canonical_encode_block_header_from_block(block);
+    match algo_codec::encode_block(block) {
+        Ok(blkdata) => {
+            let proto = &block.current_protocol;
+            if let Err(e) = store.put_block(block.round.0, proto, &hdrdata, &blkdata) {
+                tracing::warn!("put_block failed for round {}: {e}", block.round.0);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("encode_block failed for round {}: {e}", block.round.0);
+        }
+    }
+
+    let txtail = algo_codec::build_txtail_from_block(block);
+    let txtail_data = algo_codec::canonical_encode_txtail_round(&txtail);
+    if let Err(e) = store.put_txtail(block.round.0, &txtail_data) {
+        tracing::warn!("put_txtail failed for round {}: {e}", block.round.0);
+    }
+
     Ok(())
 }
 
@@ -3723,5 +3746,133 @@ mod tests {
         assert_eq!(groups[1].len(), 2);
         assert_eq!(groups[1][0].txn.sender, Address([3u8; 32]));
         assert_eq!(groups[1][1].txn.sender, Address([4u8; 32]));
+    }
+
+    /// Create a minimal Block for round 1 with a single payment transaction.
+    fn make_test_block(fee_sink: Address) -> Block {
+        use serde_bytes::ByteBuf;
+
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let stx = pay_txn(sender, receiver, 100, 1_000);
+
+        Block {
+            round: Round(1),
+            branch: ByteBuf::new(),
+            seed: ByteBuf::new(),
+            txn_commitment: ByteBuf::new(),
+            timestamp: 1000,
+            genesis_id: String::new(),
+            genesis_hash: ByteBuf::new(),
+            proposer: Address::ZERO,
+            fee_sink,
+            rewards_pool: Address::ZERO,
+            rewards_level: 0,
+            rewards_rate: 0,
+            rewards_residue: 0,
+            rewards_recalculation_round: Round(0),
+            current_protocol: "test-v1".to_string(),
+            next_protocol: String::new(),
+            next_protocol_approvals: 0,
+            next_protocol_switch_on: Round(0),
+            next_protocol_vote_before: Round(0),
+            txn_counter: 1,
+            fees_collected: 0,
+            bonus: 0,
+            proposer_payout: 0,
+            prev512: ByteBuf::new(),
+            txn256: ByteBuf::new(),
+            txn512: ByteBuf::new(),
+            state_proof_tracking: None,
+            upgrade_propose: String::new(),
+            upgrade_delay: 0,
+            upgrade_approve: false,
+            expired_participation_accounts: None,
+            absent_participation_accounts: None,
+            payset: vec![stx],
+        }
+    }
+
+    #[test]
+    fn test_apply_stores_block() {
+        use crate::store_trait::LedgerStore;
+
+        let fee_sink = Address([3u8; 32]);
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(sender, 10_000_000), (receiver, 1_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        let block = make_test_block(fee_sink);
+        apply_block(&mut state, &block).unwrap();
+
+        let blkdata = state.get_block_data(1).unwrap();
+        assert!(blkdata.is_some(), "block data should be stored after apply");
+        assert!(!blkdata.unwrap().is_empty());
+
+        let hdrdata = state.get_block_header_data(1).unwrap();
+        assert!(
+            hdrdata.is_some(),
+            "header data should be stored after apply"
+        );
+        assert!(!hdrdata.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_apply_stores_txtail() {
+        use crate::store_trait::LedgerStore;
+
+        let fee_sink = Address([3u8; 32]);
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(sender, 10_000_000), (receiver, 1_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        let block = make_test_block(fee_sink);
+        apply_block(&mut state, &block).unwrap();
+
+        let txtail = state.get_txtail(1).unwrap();
+        assert!(txtail.is_some(), "txtail should be stored after apply");
+        assert!(!txtail.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_forget_before_in_memory() {
+        use crate::store_trait::LedgerStore;
+
+        let mut state = LedgerState::new();
+
+        // Insert block and txtail entries for rounds 1-5.
+        for r in 1..=5u64 {
+            state
+                .put_block(r, "test-v1", &[r as u8], &[r as u8, 0])
+                .unwrap();
+            state.put_txtail(r, &[r as u8, 1]).unwrap();
+        }
+
+        // Verify all 5 rounds are present.
+        for r in 1..=5u64 {
+            assert!(state.get_block_data(r).unwrap().is_some());
+            assert!(state.get_txtail(r).unwrap().is_some());
+        }
+
+        // Forget rounds before 3.
+        state.forget_before(3).unwrap();
+
+        // Rounds 1, 2 should be gone.
+        assert!(state.get_block_data(1).unwrap().is_none());
+        assert!(state.get_block_data(2).unwrap().is_none());
+        assert!(state.get_txtail(1).unwrap().is_none());
+        assert!(state.get_txtail(2).unwrap().is_none());
+
+        // Rounds 3, 4, 5 should still be present.
+        for r in 3..=5u64 {
+            assert!(state.get_block_data(r).unwrap().is_some());
+            assert!(state.get_txtail(r).unwrap().is_some());
+        }
     }
 }

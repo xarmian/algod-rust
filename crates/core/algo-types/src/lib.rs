@@ -5,6 +5,7 @@ mod digest;
 mod header;
 mod round;
 mod transaction;
+pub mod txtail;
 
 pub use account::{
     AccountData, AccountStatus, AppLocalState, AppParams, AssetHolding, AssetParamsRecord,
@@ -21,3 +22,4 @@ pub use transaction::{
     MultisigSig, MultisigSubsig, Participant, ResourceRef, Reveal, SigSlotCommit,
     SignedTransaction, StateProofBody, StateProofMessage, StateSchema, Transaction,
 };
+pub use txtail::{TxTailRound, TxTailRoundLease};

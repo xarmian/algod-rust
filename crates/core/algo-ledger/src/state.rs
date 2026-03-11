@@ -5,6 +5,7 @@ use algo_types::{
     StateSchema,
 };
 
+use crate::block_entry::BlockEntry;
 use crate::lease::LeaseTable;
 use crate::merkle_trie::MerkleTrie;
 use crate::params::{
@@ -97,6 +98,10 @@ pub struct LedgerState {
     // Merkle trie tracking
     trie: Option<MerkleTrie>,
     pre_mutations: Vec<PreMutation>,
+
+    // Block and txtail storage (in-memory backend for LedgerStore trait)
+    block_store: HashMap<u64, BlockEntry>,
+    txtail_store: HashMap<u64, Vec<u8>>,
 }
 
 impl LedgerState {
@@ -123,6 +128,8 @@ impl LedgerState {
             txn_counter: 0,
             trie: None,
             pre_mutations: Vec::new(),
+            block_store: HashMap::new(),
+            txtail_store: HashMap::new(),
         }
     }
 
@@ -1318,6 +1325,77 @@ impl crate::store_trait::LedgerStore for LedgerState {
         }
 
         Some(trie.root_hash())
+    }
+
+    // ---- Block / Certificate Storage ----
+
+    fn put_block(
+        &mut self,
+        round: u64,
+        proto: &str,
+        hdrdata: &[u8],
+        blkdata: &[u8],
+    ) -> Result<(), algo_error::AlgoError> {
+        // Preserve existing certdata on re-insert (matches ON CONFLICT behavior).
+        let existing_cert = self
+            .block_store
+            .get(&round)
+            .and_then(|e| e.certdata.clone());
+        self.block_store.insert(
+            round,
+            BlockEntry {
+                proto: proto.to_string(),
+                hdrdata: hdrdata.to_vec(),
+                blkdata: blkdata.to_vec(),
+                certdata: existing_cert,
+            },
+        );
+        Ok(())
+    }
+
+    fn get_block_data(&self, round: u64) -> Result<Option<Vec<u8>>, algo_error::AlgoError> {
+        Ok(self.block_store.get(&round).map(|e| e.blkdata.clone()))
+    }
+
+    fn get_block_header_data(&self, round: u64) -> Result<Option<Vec<u8>>, algo_error::AlgoError> {
+        Ok(self.block_store.get(&round).map(|e| e.hdrdata.clone()))
+    }
+
+    fn put_block_cert(&mut self, round: u64, certdata: &[u8]) -> Result<(), algo_error::AlgoError> {
+        if let Some(entry) = self.block_store.get_mut(&round) {
+            entry.certdata = Some(certdata.to_vec());
+        }
+        Ok(())
+    }
+
+    fn get_block_cert(&self, round: u64) -> Result<Option<Vec<u8>>, algo_error::AlgoError> {
+        Ok(self
+            .block_store
+            .get(&round)
+            .and_then(|e| e.certdata.clone()))
+    }
+
+    fn get_block_proto(&self, round: u64) -> Result<Option<String>, algo_error::AlgoError> {
+        Ok(self.block_store.get(&round).map(|e| e.proto.clone()))
+    }
+
+    // ---- TxTail Storage ----
+
+    fn put_txtail(&mut self, round: u64, data: &[u8]) -> Result<(), algo_error::AlgoError> {
+        self.txtail_store.insert(round, data.to_vec());
+        Ok(())
+    }
+
+    fn get_txtail(&self, round: u64) -> Result<Option<Vec<u8>>, algo_error::AlgoError> {
+        Ok(self.txtail_store.get(&round).cloned())
+    }
+
+    // ---- Pruning ----
+
+    fn forget_before(&mut self, round: u64) -> Result<(), algo_error::AlgoError> {
+        self.block_store.retain(|&r, _| r >= round);
+        self.txtail_store.retain(|&r, _| r >= round);
+        Ok(())
     }
 }
 

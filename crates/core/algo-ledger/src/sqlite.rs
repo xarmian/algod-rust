@@ -73,6 +73,19 @@ CREATE TABLE IF NOT EXISTS kvstore (
     key   BLOB PRIMARY KEY,
     value BLOB
 );
+
+CREATE TABLE IF NOT EXISTS blocks (
+    rnd INTEGER PRIMARY KEY,
+    proto TEXT,
+    hdrdata BLOB,
+    blkdata BLOB,
+    certdata BLOB
+);
+
+CREATE TABLE IF NOT EXISTS txtail (
+    rnd INTEGER PRIMARY KEY NOT NULL,
+    data BLOB NOT NULL
+);
 ";
 
 // Resource ctype constants
@@ -3022,6 +3035,134 @@ impl LedgerStore for SqliteLedger {
         self.trie = Some(trie);
         Some(root)
     }
+
+    // ---- Block / Certificate Storage ----
+
+    fn put_block(
+        &mut self,
+        round: u64,
+        proto: &str,
+        hdrdata: &[u8],
+        blkdata: &[u8],
+    ) -> Result<(), AlgoError> {
+        self.conn
+            .execute(
+                "INSERT INTO blocks (rnd, proto, hdrdata, blkdata) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(rnd) DO UPDATE SET proto=excluded.proto, hdrdata=excluded.hdrdata, blkdata=excluded.blkdata",
+                params![round as i64, proto, hdrdata, blkdata],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("put_block error: {e}"),
+            })?;
+        Ok(())
+    }
+
+    fn get_block_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        self.conn
+            .query_row(
+                "SELECT blkdata FROM blocks WHERE rnd = ?1",
+                params![round as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("get_block_data error: {e}"),
+            })
+    }
+
+    fn get_block_header_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        self.conn
+            .query_row(
+                "SELECT hdrdata FROM blocks WHERE rnd = ?1",
+                params![round as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("get_block_header_data error: {e}"),
+            })
+    }
+
+    fn get_block_cert(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        self.conn
+            .query_row(
+                "SELECT certdata FROM blocks WHERE rnd = ?1",
+                params![round as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("get_block_cert error: {e}"),
+            })
+    }
+
+    fn get_block_proto(&self, round: u64) -> Result<Option<String>, AlgoError> {
+        self.conn
+            .query_row(
+                "SELECT proto FROM blocks WHERE rnd = ?1",
+                params![round as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("get_block_proto error: {e}"),
+            })
+    }
+
+    fn put_block_cert(&mut self, round: u64, certdata: &[u8]) -> Result<(), AlgoError> {
+        self.conn
+            .execute(
+                "UPDATE blocks SET certdata = ?2 WHERE rnd = ?1",
+                params![round as i64, certdata],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("put_block_cert error: {e}"),
+            })?;
+        Ok(())
+    }
+
+    // ---- TxTail Storage ----
+
+    fn put_txtail(&mut self, round: u64, data: &[u8]) -> Result<(), AlgoError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO txtail (rnd, data) VALUES (?1, ?2)",
+                params![round as i64, data],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("put_txtail error: {e}"),
+            })?;
+        Ok(())
+    }
+
+    fn get_txtail(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        self.conn
+            .query_row(
+                "SELECT data FROM txtail WHERE rnd = ?1",
+                params![round as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("get_txtail error: {e}"),
+            })
+    }
+
+    // ---- Pruning ----
+
+    fn forget_before(&mut self, round: u64) -> Result<(), AlgoError> {
+        self.conn
+            .execute("DELETE FROM blocks WHERE rnd < ?1", params![round as i64])
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("forget_before blocks error: {e}"),
+            })?;
+        self.conn
+            .execute("DELETE FROM txtail WHERE rnd < ?1", params![round as i64])
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("forget_before txtail error: {e}"),
+            })?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -3745,5 +3886,100 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_put_get_block() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let hdrdata = b"header-bytes";
+        let blkdata = b"block-bytes";
+        ledger.put_block(10, "v41", hdrdata, blkdata).unwrap();
+
+        let got_blk = ledger.get_block_data(10).unwrap().unwrap();
+        assert_eq!(got_blk, blkdata);
+
+        let got_hdr = ledger.get_block_header_data(10).unwrap().unwrap();
+        assert_eq!(got_hdr, hdrdata);
+    }
+
+    #[test]
+    fn test_put_get_txtail() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let data = b"txtail-payload";
+        ledger.put_txtail(5, data).unwrap();
+
+        let got = ledger.get_txtail(5).unwrap().unwrap();
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn test_forget_before() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        for rnd in 1..=10u64 {
+            ledger
+                .put_block(rnd, "v41", &[rnd as u8], &[rnd as u8])
+                .unwrap();
+            ledger.put_txtail(rnd, &[rnd as u8]).unwrap();
+        }
+
+        ledger.forget_before(6).unwrap();
+
+        // Rounds 1-5 should be gone.
+        for rnd in 1..=5u64 {
+            assert!(ledger.get_block_data(rnd).unwrap().is_none());
+            assert!(ledger.get_txtail(rnd).unwrap().is_none());
+        }
+        // Rounds 6-10 should remain.
+        for rnd in 6..=10u64 {
+            assert!(ledger.get_block_data(rnd).unwrap().is_some());
+            assert!(ledger.get_txtail(rnd).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn test_block_not_found() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        assert!(ledger.get_block_data(999).unwrap().is_none());
+        assert!(ledger.get_block_header_data(999).unwrap().is_none());
+        assert!(ledger.get_txtail(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_put_block_cert() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.put_block(7, "v41", b"hdr", b"blk").unwrap();
+        ledger.put_block_cert(7, b"cert-data").unwrap();
+
+        // Verify cert via raw SQL since there's no get_block_cert method.
+        let certdata: Option<Vec<u8>> = ledger
+            .conn
+            .query_row(
+                "SELECT certdata FROM blocks WHERE rnd = ?1",
+                params![7i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(certdata.unwrap(), b"cert-data");
+    }
+
+    #[test]
+    fn test_put_block_overwrites_preserves_cert() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.put_block(3, "v40", b"hdr1", b"blk1").unwrap();
+        ledger.put_block_cert(3, b"cert-data").unwrap();
+
+        // Re-insert block data — certificate should be preserved.
+        ledger.put_block(3, "v41", b"hdr2", b"blk2").unwrap();
+
+        let got_blk = ledger.get_block_data(3).unwrap().unwrap();
+        assert_eq!(got_blk, b"blk2");
+
+        let got_hdr = ledger.get_block_header_data(3).unwrap().unwrap();
+        assert_eq!(got_hdr, b"hdr2");
+
+        // Verify cert was NOT erased by the re-insert.
+        let got_cert = ledger.get_block_cert(3).unwrap();
+        assert_eq!(got_cert, Some(b"cert-data".to_vec()));
     }
 }
