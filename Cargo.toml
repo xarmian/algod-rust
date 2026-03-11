@@ -80,3 +80,8 @@ ark-ec = { version = "0.5", features = ["parallel"] }
 ark-bn254 = "0.5"
 ark-bls12-381 = "0.5"
 ark-serialize = "0.5"
+
+# Compression / archive
+snap = "1"
+tar = "0.4"
+flate2 = "1"
