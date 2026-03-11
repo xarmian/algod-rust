@@ -138,6 +138,53 @@ pub enum Commands {
         avm_execute: bool,
     },
 
+    /// Sync blocks from a remote algod endpoint using parallel fetching.
+    Sync {
+        /// Network preset (mainnet, testnet, or custom).
+        #[arg(long, default_value = "custom")]
+        network: String,
+
+        /// Base URL of the algod REST API (required for custom network).
+        #[arg(long)]
+        algod_url: Option<String>,
+
+        /// API token for the algod node.
+        #[arg(long, default_value = "")]
+        algod_token: String,
+
+        /// Path to genesis.json file (required when starting from round 0 without existing DB).
+        #[arg(long)]
+        genesis: Option<PathBuf>,
+
+        /// SQLite database path for ledger state.
+        #[arg(long, default_value = "./ledger.sqlite")]
+        db: PathBuf,
+
+        /// First round to sync (default: 0, or resume from DB).
+        #[arg(long, default_value = "0")]
+        start: u64,
+
+        /// Last round to sync (default: fetch to chain tip).
+        #[arg(long)]
+        end: Option<u64>,
+
+        /// Number of concurrent block fetches.
+        #[arg(long, default_value = "16")]
+        concurrency: usize,
+
+        /// Enable AVM execution mode.
+        #[arg(long)]
+        avm_execute: bool,
+
+        /// Stop on the first failure.
+        #[arg(long)]
+        fail_fast: bool,
+
+        /// Enable Merkle trie state root computation.
+        #[arg(long)]
+        trie: bool,
+    },
+
     /// Follow mode: continuously validate new blocks as they arrive.
     Follow {
         /// Base URL of the algod REST API.

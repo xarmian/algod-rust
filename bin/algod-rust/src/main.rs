@@ -61,30 +61,8 @@ async fn main() -> anyhow::Result<()> {
             compare_trie_db,
             avm_execute,
         } => {
-            let (resolved_url, resolved_token, net_name) = match network.as_str() {
-                "mainnet" => (
-                    "https://mainnet-api.4160.nodely.dev".to_string(),
-                    String::new(),
-                    "mainnet",
-                ),
-                "testnet" => (
-                    "https://testnet-api.4160.nodely.dev".to_string(),
-                    String::new(),
-                    "testnet",
-                ),
-                "custom" => {
-                    let url = algod_url.ok_or_else(|| {
-                        anyhow::anyhow!("--algod-url is required when --network=custom")
-                    })?;
-                    (url, algod_token, "custom")
-                }
-                other => {
-                    anyhow::bail!(
-                        "unknown network '{}': use mainnet, testnet, or custom",
-                        other
-                    );
-                }
-            };
+            let (resolved_url, resolved_token, net_name) =
+                commands::resolve_network(&network, algod_url.as_deref(), &algod_token)?;
 
             if stateful {
                 commands::replay::run_stateful(
@@ -118,6 +96,37 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
             }
+        }
+        Commands::Sync {
+            network,
+            algod_url,
+            algod_token,
+            genesis,
+            db,
+            start,
+            end,
+            concurrency,
+            avm_execute,
+            fail_fast,
+            trie,
+        } => {
+            let (resolved_url, resolved_token, net_name) =
+                commands::resolve_network(&network, algod_url.as_deref(), &algod_token)?;
+
+            commands::sync::run(
+                net_name,
+                &resolved_url,
+                &resolved_token,
+                genesis.as_deref(),
+                &db,
+                start,
+                end,
+                concurrency,
+                avm_execute,
+                fail_fast,
+                trie,
+            )
+            .await?;
         }
         Commands::Follow {
             algod_url,
