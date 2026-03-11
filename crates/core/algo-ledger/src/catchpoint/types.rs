@@ -48,6 +48,18 @@ pub enum CatchpointError {
 
     #[error("catchpoint integrity error: {0}")]
     IntegrityError(String),
+
+    #[error("catchpoint import error: {0}")]
+    ImportError(String),
+
+    #[error("catchpoint cutover error: {0}")]
+    CutoverError(String),
+
+    #[error("catchpoint checkpoint error: {0}")]
+    CheckpointError(String),
+
+    #[error("catchpoint sqlite error")]
+    SqliteError(#[from] rusqlite::Error),
 }
 
 // ---------------------------------------------------------------------------
