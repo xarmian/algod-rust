@@ -2080,12 +2080,20 @@ impl SqliteLedger {
 /// * `genesis_id` — the genesis ID for the network (e.g. "mainnet-v1.0")
 /// * `genesis_hash` — the 32-byte genesis hash
 /// * `protocol` — the consensus protocol version string
+/// * `txn_counter` — transaction counter from the catchpoint round; used to
+///   seed asset/app ID generation in the first post-import block. Typically
+///   derived from `MAX(asset) FROM assetcreators` when the catchpoint file
+///   header does not carry this field directly.
+/// * `rewards_level` — cumulative rewards level from the catchpoint header's
+///   `AccountTotals.rewards_level`
 pub fn initialize_meta_from_catchpoint(
     conn: &Connection,
     round: u64,
     genesis_id: &str,
     genesis_hash: &[u8; 32],
     protocol: &str,
+    txn_counter: u64,
+    rewards_level: u64,
 ) -> Result<(), AlgoError> {
     // Ensure the meta table exists.
     conn.execute_batch(
@@ -2102,12 +2110,23 @@ pub fn initialize_meta_from_catchpoint(
     set_meta_string(conn, "genesis_id", genesis_id)?;
     set_meta_blob(conn, "genesis_hash", genesis_hash)?;
     set_meta_string(conn, "protocol", protocol)?;
+    set_meta_u64(conn, "txn_counter", txn_counter)?;
+    set_meta_u64(conn, "rewards_level", rewards_level)?;
+
+    // TODO: rewards_rate, rewards_residue, rewards_recalculation_round,
+    // fee_sink, and rewards_pool are also read by SqliteLedger::init but
+    // are not available from the catchpoint file header. They will need to
+    // be populated from the lookback block headers or from genesis state
+    // once the node downloads lookback blocks.
 
     tracing::info!(
-        "initialized chain meta from catchpoint: round={}, genesis_id={}, protocol={}",
+        "initialized chain meta from catchpoint: round={}, genesis_id={}, protocol={}, \
+         txn_counter={}, rewards_level={}",
         round,
         genesis_id,
         protocol,
+        txn_counter,
+        rewards_level,
     );
 
     Ok(())

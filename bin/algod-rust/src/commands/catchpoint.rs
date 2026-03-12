@@ -180,6 +180,37 @@ pub async fn run_import(
                 None
             });
 
+        // Derive txn_counter from the maximum creatable ID in the imported
+        // assetcreators table. Asset/app IDs are derived as txn_counter + 1,
+        // so the max creatable ID equals the txn_counter at the time of its
+        // creation. This is a safe lower bound that prevents ID collisions
+        // in the first post-import block.
+        //
+        // The catchpoint file header (Go's CatchpointFileHeader) does not
+        // carry TxnCounter — Go-algorand restores it from lookback block
+        // headers. Until lookback download is implemented, this derivation
+        // is the best available approximation.
+        let txn_counter: u64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(asset), 0) FROM assetcreators",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if txn_counter > 0 {
+            info!(txn_counter, "derived txn_counter from max creatable ID");
+            println!(
+                "  txn_counter: {} (derived from max creatable ID)",
+                txn_counter
+            );
+        } else {
+            warn!("txn_counter is 0 — no creatables found in assetcreators table");
+            println!("  txn_counter: 0 (no creatables found; first block with asset/app creation may fail)");
+        }
+
+        let rewards_level = header.totals.rewards_level;
+
         let proto_str = protocol.as_deref().unwrap_or("");
         // Use a zeroed genesis hash as placeholder — the caller should
         // provide the real genesis info via a separate init step if needed.
@@ -190,6 +221,8 @@ pub async fn run_import(
             "", // genesis_id not available from catchpoint file
             &empty_genesis_hash,
             proto_str,
+            txn_counter,
+            rewards_level,
         ) {
             warn!("failed to initialize chain meta: {e}");
             println!("Warning: chain meta initialization failed: {e}");
@@ -198,13 +231,40 @@ pub async fn run_import(
             info!(
                 round = import_result.round,
                 protocol = proto_str,
+                txn_counter,
+                rewards_level,
                 "chain meta initialized from catchpoint"
             );
         }
     }
 
+    // Step 8: Warn about lease table reconstruction.
+    //
+    // The import pipeline does not download lookback blocks or reconstruct
+    // the lease table. Without these steps, the node cannot safely validate
+    // lease constraints for new blocks that reference leases created in
+    // the lookback window (up to MaxTxnLife rounds before the catchpoint).
+    //
+    // In go-algorand, the catchpoint restore process downloads lookback
+    // blocks and replays them to rebuild the lease table and the txtail.
+    // Our import path does not yet do this automatically because it
+    // requires network access (a block source / algod URL).
+    println!();
+    println!("WARNING: Lease table not reconstructed after catchpoint import.");
+    println!("  The node cannot safely process new blocks until lookback blocks");
+    println!("  are downloaded and leases are rebuilt. To complete the import:");
+    println!();
+    println!("  1. Run `algod-rust sync` from the catchpoint round to download");
+    println!("     lookback blocks and reconstruct the lease table, OR");
+    println!("  2. If resuming from a trusted state, ensure no active leases");
+    println!("     exist in the lookback window (MaxTxnLife = 1000 rounds).");
+    println!();
+    println!("  Without this step, blocks containing lease-constrained transactions");
+    println!("  may be incorrectly accepted or rejected.");
+    warn!("lease table not reconstructed — lookback block download required before processing new blocks");
+
     let total_elapsed = timer.elapsed();
-    println!("\n=== Done ({:.1}s total) ===", total_elapsed.as_secs_f64());
+    println!("=== Done ({:.1}s total) ===", total_elapsed.as_secs_f64());
 
     Ok(())
 }
