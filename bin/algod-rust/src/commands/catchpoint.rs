@@ -213,56 +213,17 @@ pub async fn run_import(
 
         let proto_str = protocol.as_deref().unwrap_or("");
 
-        // P1-1 fix: Preserve existing genesis_id and genesis_hash if they
-        // are already valid in the DB. The catchpoint file does not carry
-        // genesis info, so we only write placeholders into a fresh DB.
-        let existing_genesis_id: String = conn
-            .query_row(
-                "SELECT value FROM algod_rust_meta WHERE key = 'genesis_id'",
-                [],
-                |row| {
-                    let bytes: Vec<u8> = row.get(0)?;
-                    Ok(String::from_utf8(bytes).unwrap_or_default())
-                },
-            )
-            .unwrap_or_default();
-
-        let existing_genesis_hash: [u8; 32] = conn
-            .query_row(
-                "SELECT value FROM algod_rust_meta WHERE key = 'genesis_hash'",
-                [],
-                |row| {
-                    let bytes: Vec<u8> = row.get(0)?;
-                    if bytes.len() == 32 {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&bytes);
-                        Ok(arr)
-                    } else {
-                        Ok([0u8; 32])
-                    }
-                },
-            )
-            .unwrap_or([0u8; 32]);
-
-        let genesis_id = if existing_genesis_id.is_empty() {
-            if proto_str.is_empty() {
-                warn!("genesis_id not available from catchpoint file or DB");
-            } else {
-                warn!("genesis_id not available; writing empty placeholder");
-            }
-            ""
-        } else {
-            info!(genesis_id = %existing_genesis_id, "preserving existing genesis_id");
-            &existing_genesis_id
-        };
-
-        let genesis_hash = if existing_genesis_hash == [0u8; 32] {
-            warn!("genesis_hash not available; writing zero placeholder");
-            [0u8; 32]
-        } else {
-            info!("preserving existing genesis_hash");
-            existing_genesis_hash
-        };
+        // Always clear genesis metadata during catchpoint import.
+        // The catchpoint file does not carry genesis info, and reusing
+        // existing values from the DB is unsafe — the DB may have been
+        // used with a different network (e.g., importing a mainnet
+        // catchpoint into a DB that previously held testnet data).
+        let genesis_id = "";
+        let genesis_hash = [0u8; 32];
+        warn!("genesis metadata not set. Use --genesis-id and --genesis-hash flags or configure via genesis file before processing blocks");
+        println!("  WARNING: genesis_id and genesis_hash are not set.");
+        println!("           Use --genesis-id and --genesis-hash flags or configure via");
+        println!("           genesis file before processing blocks.");
 
         if let Err(e) = algo_ledger::sqlite::initialize_meta_from_catchpoint(
             &conn,

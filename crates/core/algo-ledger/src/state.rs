@@ -39,18 +39,21 @@ enum PreMutation {
         old_holding: Option<AssetHolding>,
         old_params: Option<AssetParamsRecord>,
         old_affinity: u32,
+        old_update_round: u64,
     },
     AssetParams {
         asset_id: u64,
         old_record: Option<AssetParamsRecord>,
         old_holding: Option<(Address, AssetHolding)>,
         old_affinity: u32,
+        old_update_round: u64,
     },
     AppParams {
         app_id: u64,
         old_params: Option<AppParams>,
         old_local: Option<(Address, AppLocalState)>,
         old_affinity: u32,
+        old_update_round: u64,
     },
     AppLocalState {
         addr: Address,
@@ -58,6 +61,7 @@ enum PreMutation {
         old_local: Option<AppLocalState>,
         old_params: Option<AppParams>,
         old_affinity: u32,
+        old_update_round: u64,
     },
 }
 
@@ -71,6 +75,10 @@ pub struct LedgerState {
     pub asset_params: HashMap<u64, AssetParamsRecord>,
     pub app_params: HashMap<u64, AppParams>,
     pub boxes: HashMap<(u64, Vec<u8>), Vec<u8>>,
+
+    /// Tracks the UpdateRound for each resource, for trie affinity computation.
+    /// Key: (address, creatable_id), Value: round when last modified.
+    pub resource_update_rounds: HashMap<(Address, u64), u64>,
 
     // Lease tracking
     pub lease_table: LeaseTable,
@@ -113,6 +121,7 @@ impl LedgerState {
             asset_params: HashMap::new(),
             app_params: HashMap::new(),
             boxes: HashMap::new(),
+            resource_update_rounds: HashMap::new(),
             lease_table: LeaseTable::new(),
             current_round: Round(0),
             rewards_level: 0,
@@ -218,6 +227,14 @@ impl LedgerState {
             .map(|(k, v)| (*k, Some(v.clone())))
             .collect();
 
+        // Capture resource_update_rounds for keys involving snapshotted addresses.
+        let resource_update_rounds: Vec<((Address, u64), Option<u64>)> = self
+            .resource_update_rounds
+            .iter()
+            .filter(|((addr, _), _)| addrs.contains(addr))
+            .map(|(k, v)| (*k, Some(*v)))
+            .collect();
+
         StateSnapshot {
             accounts,
             asset_holdings,
@@ -226,6 +243,7 @@ impl LedgerState {
             app_local_states,
             boxes: Vec::new(),
             snapshotted_box_app_ids: Vec::new(),
+            resource_update_rounds,
         }
     }
 
@@ -245,10 +263,22 @@ impl LedgerState {
         for &id in asset_ids {
             snap.asset_params
                 .push((id, self.asset_params.get(&id).cloned()));
+            // Also capture resource_update_rounds for the asset creator.
+            if let Some(record) = self.asset_params.get(&id) {
+                let key = (record.creator, id);
+                snap.resource_update_rounds
+                    .push((key, self.resource_update_rounds.get(&key).copied()));
+            }
         }
         for &id in app_ids {
             snap.app_params
                 .push((id, self.app_params.get(&id).cloned()));
+            // Also capture resource_update_rounds for the app creator.
+            if let Some(params) = self.app_params.get(&id) {
+                let key = (params.creator, id);
+                snap.resource_update_rounds
+                    .push((key, self.resource_update_rounds.get(&key).copied()));
+            }
         }
 
         // Capture all box entries for the given app IDs.
@@ -364,6 +394,27 @@ impl LedgerState {
             self.boxes
                 .retain(|k, _| !snapped_app_ids.contains(&k.0) || snapped_box_keys.contains(k));
         }
+
+        // Restore resource_update_rounds.
+        let snapped_ur_keys: std::collections::HashSet<(Address, u64)> = snap
+            .resource_update_rounds
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        for (key, data) in snap.resource_update_rounds {
+            match data {
+                Some(round) => {
+                    self.resource_update_rounds.insert(key, round);
+                }
+                None => {
+                    self.resource_update_rounds.remove(&key);
+                }
+            }
+        }
+        // Remove any newly-created resource_update_rounds for snapshotted addresses
+        // that weren't in the original snapshot.
+        self.resource_update_rounds
+            .retain(|k, _| !snapped_addrs.contains(&k.0) || snapped_ur_keys.contains(k));
     }
 }
 
@@ -380,6 +431,8 @@ pub struct StateSnapshot {
     boxes: Vec<((u64, Vec<u8>), Option<Vec<u8>>)>,
     /// App IDs whose boxes were snapshotted (used to clean up newly-created boxes on restore).
     snapshotted_box_app_ids: Vec<u64>,
+    /// Snapshotted resource update_rounds for trie affinity tracking.
+    resource_update_rounds: Vec<((Address, u64), Option<u64>)>,
 }
 
 impl Default for LedgerState {
@@ -434,11 +487,17 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 .get(&asset_id)
                 .filter(|r| r.creator == *addr)
                 .cloned();
-            // Derive affinity from the resource blob, not the account,
-            // matching Go's ResourcesHashBuilderV6 which uses resData.UpdateRound.
-            let old_blob = encode_merged_asset_resource(
+            // Use the stored update_round for the old blob so the affinity
+            // matches the trie element that was inserted at creation/update time.
+            let old_update_round = self
+                .resource_update_rounds
+                .get(&(*addr, asset_id))
+                .copied()
+                .unwrap_or(0);
+            let old_blob = encode_merged_asset_resource_with_round(
                 old_holding.as_ref(),
                 old_params.as_ref().map(|r| (&r.params, &r.creator)),
+                old_update_round,
             );
             let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AssetHolding {
@@ -447,9 +506,13 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 old_holding,
                 old_params,
                 old_affinity,
+                old_update_round,
             });
         }
         self.asset_holdings.insert((*addr, asset_id), holding);
+        // Track the update_round for this resource.
+        self.resource_update_rounds
+            .insert((*addr, asset_id), self.current_round.0);
     }
 
     fn remove_asset_holding(&mut self, addr: &Address, asset_id: u64) {
@@ -460,10 +523,17 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 .get(&asset_id)
                 .filter(|r| r.creator == *addr)
                 .cloned();
-            // Derive affinity from the resource blob, not the account.
-            let old_blob = encode_merged_asset_resource(
+            // Use the stored update_round for the old blob so the affinity
+            // matches the trie element that was inserted at creation/update time.
+            let old_update_round = self
+                .resource_update_rounds
+                .get(&(*addr, asset_id))
+                .copied()
+                .unwrap_or(0);
+            let old_blob = encode_merged_asset_resource_with_round(
                 old_holding.as_ref(),
                 old_params.as_ref().map(|r| (&r.params, &r.creator)),
+                old_update_round,
             );
             let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AssetHolding {
@@ -472,9 +542,11 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 old_holding,
                 old_params,
                 old_affinity,
+                old_update_round,
             });
         }
         self.asset_holdings.remove(&(*addr, asset_id));
+        self.resource_update_rounds.remove(&(*addr, asset_id));
     }
 
     fn has_asset_holding(&self, addr: &Address, asset_id: u64) -> bool {
@@ -518,10 +590,20 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     .get(&(r.creator, asset_id))
                     .map(|h| (r.creator, h.clone()))
             });
-            // Derive affinity from the resource blob, not the account.
-            let old_blob = encode_merged_asset_resource(
+            // Use the stored update_round for the old blob so the affinity
+            // matches the trie element that was inserted at creation/update time.
+            let old_update_round = old_record
+                .as_ref()
+                .and_then(|r| {
+                    self.resource_update_rounds
+                        .get(&(r.creator, asset_id))
+                        .copied()
+                })
+                .unwrap_or(0);
+            let old_blob = encode_merged_asset_resource_with_round(
                 old_holding.as_ref().map(|(_, h)| h),
                 old_record.as_ref().map(|r| (&r.params, &r.creator)),
+                old_update_round,
             );
             let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AssetParams {
@@ -529,9 +611,14 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 old_record,
                 old_holding,
                 old_affinity,
+                old_update_round,
             });
         }
+        // Track the update_round for this resource (keyed by creator address).
+        let creator = record.creator;
         self.asset_params.insert(asset_id, record);
+        self.resource_update_rounds
+            .insert((creator, asset_id), self.current_round.0);
     }
 
     fn remove_asset_params(&mut self, asset_id: u64) {
@@ -542,10 +629,20 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     .get(&(r.creator, asset_id))
                     .map(|h| (r.creator, h.clone()))
             });
-            // Derive affinity from the resource blob, not the account.
-            let old_blob = encode_merged_asset_resource(
+            // Use the stored update_round for the old blob so the affinity
+            // matches the trie element that was inserted at creation/update time.
+            let old_update_round = old_record
+                .as_ref()
+                .and_then(|r| {
+                    self.resource_update_rounds
+                        .get(&(r.creator, asset_id))
+                        .copied()
+                })
+                .unwrap_or(0);
+            let old_blob = encode_merged_asset_resource_with_round(
                 old_holding.as_ref().map(|(_, h)| h),
                 old_record.as_ref().map(|r| (&r.params, &r.creator)),
+                old_update_round,
             );
             let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AssetParams {
@@ -553,7 +650,13 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 old_record,
                 old_holding,
                 old_affinity,
+                old_update_round,
             });
+        }
+        // Remove the update_round tracking for the creator.
+        if let Some(record) = self.asset_params.get(&asset_id) {
+            let creator = record.creator;
+            self.resource_update_rounds.remove(&(creator, asset_id));
         }
         self.asset_params.remove(&asset_id);
     }
@@ -577,18 +680,35 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     .get(&(p.creator, app_id))
                     .map(|s| (p.creator, s.clone()))
             });
-            // Derive affinity from the resource blob, not the account.
-            let old_blob =
-                encode_merged_app_resource(old_local.as_ref().map(|(_, s)| s), old_params.as_ref());
+            // Use the stored update_round for the old blob so the affinity
+            // matches the trie element that was inserted at creation/update time.
+            let old_update_round = old_params
+                .as_ref()
+                .and_then(|p| {
+                    self.resource_update_rounds
+                        .get(&(p.creator, app_id))
+                        .copied()
+                })
+                .unwrap_or(0);
+            let old_blob = encode_merged_app_resource_with_round(
+                old_local.as_ref().map(|(_, s)| s),
+                old_params.as_ref(),
+                old_update_round,
+            );
             let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AppParams {
                 app_id,
                 old_params,
                 old_local,
                 old_affinity,
+                old_update_round,
             });
         }
+        // Track the update_round for this resource (keyed by creator address).
+        let creator = params.creator;
         self.app_params.insert(app_id, params);
+        self.resource_update_rounds
+            .insert((creator, app_id), self.current_round.0);
     }
 
     fn remove_app_params(&mut self, app_id: u64) {
@@ -599,16 +719,34 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     .get(&(p.creator, app_id))
                     .map(|s| (p.creator, s.clone()))
             });
-            // Derive affinity from the resource blob, not the account.
-            let old_blob =
-                encode_merged_app_resource(old_local.as_ref().map(|(_, s)| s), old_params.as_ref());
+            // Use the stored update_round for the old blob so the affinity
+            // matches the trie element that was inserted at creation/update time.
+            let old_update_round = old_params
+                .as_ref()
+                .and_then(|p| {
+                    self.resource_update_rounds
+                        .get(&(p.creator, app_id))
+                        .copied()
+                })
+                .unwrap_or(0);
+            let old_blob = encode_merged_app_resource_with_round(
+                old_local.as_ref().map(|(_, s)| s),
+                old_params.as_ref(),
+                old_update_round,
+            );
             let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AppParams {
                 app_id,
                 old_params,
                 old_local,
                 old_affinity,
+                old_update_round,
             });
+        }
+        // Remove the update_round tracking for the creator.
+        if let Some(params) = self.app_params.get(&app_id) {
+            let creator = params.creator;
+            self.resource_update_rounds.remove(&(creator, app_id));
         }
         self.app_params.remove(&app_id);
     }
@@ -640,8 +778,18 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 .get(&app_id)
                 .filter(|p| p.creator == *addr)
                 .cloned();
-            // Derive affinity from the resource blob, not the account.
-            let old_blob = encode_merged_app_resource(old_local.as_ref(), old_params.as_ref());
+            // Use the stored update_round for the old blob so the affinity
+            // matches the trie element that was inserted at creation/update time.
+            let old_update_round = self
+                .resource_update_rounds
+                .get(&(*addr, app_id))
+                .copied()
+                .unwrap_or(0);
+            let old_blob = encode_merged_app_resource_with_round(
+                old_local.as_ref(),
+                old_params.as_ref(),
+                old_update_round,
+            );
             let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AppLocalState {
                 addr: *addr,
@@ -649,9 +797,13 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 old_local,
                 old_params,
                 old_affinity,
+                old_update_round,
             });
         }
         self.app_local_states.insert((*addr, app_id), local_state);
+        // Track the update_round for this resource.
+        self.resource_update_rounds
+            .insert((*addr, app_id), self.current_round.0);
     }
 
     fn remove_app_local_state(&mut self, addr: &Address, app_id: u64) {
@@ -662,8 +814,18 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 .get(&app_id)
                 .filter(|p| p.creator == *addr)
                 .cloned();
-            // Derive affinity from the resource blob, not the account.
-            let old_blob = encode_merged_app_resource(old_local.as_ref(), old_params.as_ref());
+            // Use the stored update_round for the old blob so the affinity
+            // matches the trie element that was inserted at creation/update time.
+            let old_update_round = self
+                .resource_update_rounds
+                .get(&(*addr, app_id))
+                .copied()
+                .unwrap_or(0);
+            let old_blob = encode_merged_app_resource_with_round(
+                old_local.as_ref(),
+                old_params.as_ref(),
+                old_update_round,
+            );
             let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AppLocalState {
                 addr: *addr,
@@ -671,9 +833,11 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 old_local,
                 old_params,
                 old_affinity,
+                old_update_round,
             });
         }
         self.app_local_states.remove(&(*addr, app_id));
+        self.resource_update_rounds.remove(&(*addr, app_id));
     }
 
     fn has_app_local_state(&self, addr: &Address, app_id: u64) -> bool {
@@ -896,9 +1060,16 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 .asset_params
                 .get(&asset_id)
                 .filter(|r| r.creator == addr);
-            let blob = encode_merged_asset_resource(
+            // Use the stored update_round if available, otherwise 0.
+            let ur = self
+                .resource_update_rounds
+                .get(&(addr, asset_id))
+                .copied()
+                .unwrap_or(0);
+            let blob = encode_merged_asset_resource_with_round(
                 Some(holding),
                 params.map(|r| (&r.params, &r.creator)),
+                ur,
             );
             // Derive affinity from the resource blob, matching Go's
             // ResourcesHashBuilderV6 which uses resData.UpdateRound.
@@ -917,7 +1088,16 @@ impl crate::store_trait::LedgerStore for LedgerState {
             if added_asset_resources.contains(&(creator, asset_id)) {
                 continue;
             }
-            let blob = encode_merged_asset_resource(None, Some((&record.params, &record.creator)));
+            let ur = self
+                .resource_update_rounds
+                .get(&(creator, asset_id))
+                .copied()
+                .unwrap_or(0);
+            let blob = encode_merged_asset_resource_with_round(
+                None,
+                Some((&record.params, &record.creator)),
+                ur,
+            );
             let affinity = extract_raw_affinity(&blob);
             let elem =
                 resource_hash_v6_with_kind(&creator, asset_id, &blob, affinity, HashKind::Asset);
@@ -932,7 +1112,12 @@ impl crate::store_trait::LedgerStore for LedgerState {
         // Iterate app local states; merge with co-located params if creator == addr.
         for (&(addr, app_id), local) in &self.app_local_states {
             let params = self.app_params.get(&app_id).filter(|p| p.creator == addr);
-            let blob = encode_merged_app_resource(Some(local), params);
+            let ur = self
+                .resource_update_rounds
+                .get(&(addr, app_id))
+                .copied()
+                .unwrap_or(0);
+            let blob = encode_merged_app_resource_with_round(Some(local), params, ur);
             let affinity = extract_raw_affinity(&blob);
             let elem = resource_hash_v6_with_kind(&addr, app_id, &blob, affinity, HashKind::App);
             if let Err(e) = trie.add(&elem) {
@@ -947,7 +1132,12 @@ impl crate::store_trait::LedgerStore for LedgerState {
             if added_app_resources.contains(&(creator, app_id)) {
                 continue;
             }
-            let blob = encode_merged_app_resource(None, Some(params));
+            let ur = self
+                .resource_update_rounds
+                .get(&(creator, app_id))
+                .copied()
+                .unwrap_or(0);
+            let blob = encode_merged_app_resource_with_round(None, Some(params), ur);
             let affinity = extract_raw_affinity(&blob);
             let elem = resource_hash_v6_with_kind(&creator, app_id, &blob, affinity, HashKind::App);
             if let Err(e) = trie.add(&elem) {
@@ -994,12 +1184,14 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     old_holding,
                     old_params,
                     old_affinity,
+                    old_update_round,
                 } => {
                     // Delete old resource element.
                     if old_holding.is_some() || old_params.is_some() {
-                        let old_blob = encode_merged_asset_resource(
+                        let old_blob = encode_merged_asset_resource_with_round(
                             old_holding.as_ref(),
                             old_params.as_ref().map(|r| (&r.params, &r.creator)),
+                            old_update_round,
                         );
                         let old_elem = resource_hash_v6_with_kind(
                             &addr,
@@ -1043,12 +1235,14 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     old_record,
                     old_holding,
                     old_affinity,
+                    old_update_round,
                 } => {
                     if let Some(ref old_rec) = old_record {
                         let creator = old_rec.creator;
-                        let old_blob = encode_merged_asset_resource(
+                        let old_blob = encode_merged_asset_resource_with_round(
                             old_holding.as_ref().map(|(_, h)| h),
                             Some((&old_rec.params, &old_rec.creator)),
+                            old_update_round,
                         );
                         let old_elem = resource_hash_v6_with_kind(
                             &creator,
@@ -1113,12 +1307,14 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     old_params,
                     old_local,
                     old_affinity,
+                    old_update_round,
                 } => {
                     if let Some(ref old_p) = old_params {
                         let creator = old_p.creator;
-                        let old_blob = encode_merged_app_resource(
+                        let old_blob = encode_merged_app_resource_with_round(
                             old_local.as_ref().map(|(_, s)| s),
                             Some(old_p),
+                            old_update_round,
                         );
                         let old_elem = resource_hash_v6_with_kind(
                             &creator,
@@ -1180,10 +1376,14 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     old_local,
                     old_params,
                     old_affinity,
+                    old_update_round,
                 } => {
                     if old_local.is_some() || old_params.is_some() {
-                        let old_blob =
-                            encode_merged_app_resource(old_local.as_ref(), old_params.as_ref());
+                        let old_blob = encode_merged_app_resource_with_round(
+                            old_local.as_ref(),
+                            old_params.as_ref(),
+                            old_update_round,
+                        );
                         let old_elem = resource_hash_v6_with_kind(
                             &addr,
                             app_id,
@@ -1307,13 +1507,6 @@ impl crate::store_trait::LedgerStore for LedgerState {
 ///
 /// `update_round` is written as the `"z"` field in the blob when non-zero,
 /// matching Go's `ResourcesData.UpdateRound`.
-fn encode_merged_asset_resource(
-    holding: Option<&AssetHolding>,
-    params: Option<(&algo_types::AssetParams, &Address)>,
-) -> Vec<u8> {
-    encode_merged_asset_resource_with_round(holding, params, 0)
-}
-
 fn encode_merged_asset_resource_with_round(
     holding: Option<&AssetHolding>,
     params: Option<(&algo_types::AssetParams, &Address)>,
@@ -1380,13 +1573,6 @@ fn encode_merged_asset_resource_with_round(
 }
 
 /// Encode a merged app resource blob (local state + params) matching Go's format.
-fn encode_merged_app_resource(
-    local_state: Option<&AppLocalState>,
-    params: Option<&AppParams>,
-) -> Vec<u8> {
-    encode_merged_app_resource_with_round(local_state, params, 0)
-}
-
 fn encode_merged_app_resource_with_round(
     local_state: Option<&AppLocalState>,
     params: Option<&AppParams>,
