@@ -26,9 +26,10 @@ use super::checkpoint::{
 use super::msgp_compat::{decode_base_account_data, decode_resources_data};
 use super::parser::{self, CatchpointEntry};
 use super::types::{
-    BalanceRecordV6, CatchpointError, CatchpointFileHeader, CatchpointSnapshotChunkV6, KVRecordV6,
-    OnlineAccountRecordV6, OnlineRoundParamsRecordV6, RESOURCE_FLAGS_EMPTY_APP,
-    RESOURCE_FLAGS_EMPTY_ASSET, RESOURCE_FLAGS_OWNERSHIP,
+    BalanceRecordV6, CatchpointError, CatchpointFileHeader, CatchpointSnapshotChunkV6,
+    CatchpointStateProofVerificationWrapper, KVRecordV6, OnlineAccountRecordV6,
+    OnlineRoundParamsRecordV6, RESOURCE_FLAGS_EMPTY_APP, RESOURCE_FLAGS_EMPTY_ASSET,
+    RESOURCE_FLAGS_OWNERSHIP,
 };
 use crate::rewards::normalized_online_balance;
 
@@ -188,9 +189,8 @@ impl<'a> CatchpointImporter<'a> {
         chunks: impl Iterator<Item = Result<(u64, CatchpointSnapshotChunkV6), CatchpointError>>,
         total_chunks: u64,
     ) -> Result<ImportStats, CatchpointError> {
-        let resume_ordinal = read_checkpoint(self.conn)?
-            .map(|cp| cp.last_chunk_ordinal)
-            .unwrap_or(0);
+        let resume_ordinal: Option<u64> =
+            read_checkpoint(self.conn)?.map(|cp| cp.last_chunk_ordinal);
 
         let mut stats = ImportStats::default();
         let mut batch_count: usize = 0;
@@ -200,8 +200,13 @@ impl<'a> CatchpointImporter<'a> {
             let (ordinal, chunk) = chunk_result?;
 
             // Resume support: skip already-committed chunks.
-            if ordinal <= resume_ordinal && resume_ordinal > 0 {
-                continue;
+            // Using Option<u64> avoids ambiguity when ordinal 0 was the last
+            // committed chunk (previously, resume_ordinal == 0 was
+            // indistinguishable from "no checkpoint exists").
+            if let Some(last) = resume_ordinal {
+                if ordinal <= last {
+                    continue;
+                }
             }
 
             if !in_txn {
@@ -515,6 +520,46 @@ impl<'a> CatchpointImporter<'a> {
         )?;
         Ok(())
     }
+
+    /// Import state proof verification context data into
+    /// `catchpointstateproofverification`.
+    ///
+    /// The raw bytes are the msgpack-encoded wrapper
+    /// (`CatchpointStateProofVerificationWrapper`) containing an array of
+    /// individual verification contexts. Each context is re-encoded and stored
+    /// with its `lastattestedround` as the primary key.
+    fn import_state_proof_verification(&self, raw_data: &[u8]) -> Result<(), CatchpointError> {
+        let wrapper: CatchpointStateProofVerificationWrapper = rmp_serde::from_slice(raw_data)
+            .map_err(|e| {
+                CatchpointError::DecodeError(format!(
+                    "state proof verification context msgpack: {e}"
+                ))
+            })?;
+
+        if wrapper.data.is_empty() {
+            return Ok(());
+        }
+
+        for ctx in &wrapper.data {
+            let encoded = rmp_serde::to_vec_named(ctx).map_err(|e| {
+                CatchpointError::ImportError(format!(
+                    "re-encode state proof verification context: {e}"
+                ))
+            })?;
+
+            self.conn.execute(
+                "INSERT INTO catchpointstateproofverification(lastattestedround, verificationContext) VALUES(?1, ?2)",
+                rusqlite::params![ctx.last_attested_round as i64, encoded],
+            )?;
+        }
+
+        tracing::debug!(
+            "imported {} state proof verification contexts",
+            wrapper.data.len()
+        );
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -576,9 +621,7 @@ pub fn import_catchpoint_file(
         let mut chunk_ordinal: u64 = 0;
         let mut stats = ImportStats::default();
 
-        let resume_ordinal = read_checkpoint(conn)?
-            .map(|cp| cp.last_chunk_ordinal)
-            .unwrap_or(0);
+        let resume_ordinal: Option<u64> = read_checkpoint(conn)?.map(|cp| cp.last_chunk_ordinal);
         let batch_size = importer.batch_size;
         let mut batch_count: usize = 0;
         let mut in_txn = false;
@@ -591,8 +634,10 @@ pub fn import_catchpoint_file(
                     chunk_ordinal += 1;
 
                     // Resume support: skip already-committed chunks.
-                    if chunk_ordinal <= resume_ordinal && resume_ordinal > 0 {
-                        return Ok(());
+                    if let Some(last) = resume_ordinal {
+                        if chunk_ordinal <= last {
+                            return Ok(());
+                        }
                     }
 
                     if !in_txn {
@@ -615,9 +660,14 @@ pub fn import_catchpoint_file(
                         batch_count = 0;
                     }
                 }
-                CatchpointEntry::StateProofVerification(_) => {
-                    // State proof verification context is not imported into
-                    // staging tables; skip.
+                CatchpointEntry::StateProofVerification(ref sp_data) => {
+                    // Import state proof verification contexts into the
+                    // staging table so they survive the atomic cutover.
+                    if !in_txn {
+                        conn.execute_batch("BEGIN IMMEDIATE")?;
+                        in_txn = true;
+                    }
+                    importer.import_state_proof_verification(sp_data)?;
                 }
             }
             Ok(())
@@ -631,6 +681,14 @@ pub fn import_catchpoint_file(
 
         stats
     };
+
+    // Reject truncated catchpoint files: verify all chunks were processed.
+    if stats.chunks_processed != total_chunks {
+        return Err(CatchpointError::IntegrityError(format!(
+            "truncated catchpoint file: expected {} chunks, got {}",
+            total_chunks, stats.chunks_processed
+        )));
+    }
 
     // Atomic cutover: replace live tables with staging tables.
     importer.atomic_cutover(&header)?;

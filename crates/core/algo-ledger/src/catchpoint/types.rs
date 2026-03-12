@@ -529,6 +529,39 @@ impl Default for CatchpointBaseOnlineAccountData {
     }
 }
 
+// ---------------------------------------------------------------------------
+// State proof verification context types (from ledgercore/stateproofverification.go)
+// ---------------------------------------------------------------------------
+
+/// Wrapper for the state proof verification context data in catchpoint files.
+/// Corresponds to Go's `catchpointStateProofVerificationContext`.
+///
+/// The `stateProofVerificationContext.msgpack` tar entry contains this wrapper,
+/// which holds an array of individual verification contexts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatchpointStateProofVerificationWrapper {
+    /// Array of state proof verification contexts.
+    #[serde(rename = "spd", default)]
+    pub data: Vec<StateProofVerificationContext>,
+}
+
+/// A single state proof verification context.
+/// Corresponds to Go's `ledgercore.StateProofVerificationContext`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateProofVerificationContext {
+    /// Last attested round for this state proof verification context.
+    #[serde(rename = "spround", default)]
+    pub last_attested_round: u64,
+
+    /// Voters commitment (vector commitment root).
+    #[serde(rename = "vc", default)]
+    pub voters_commitment: ByteBuf,
+
+    /// Online total weight (total stake attesting).
+    #[serde(rename = "pw", default)]
+    pub online_total_weight: u64,
+}
+
 /// Decoded form of Go's `OnlineRoundParamsData` from `ledgercore/totals.go`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CatchpointOnlineRoundParamsData {
