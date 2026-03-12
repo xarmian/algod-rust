@@ -25,5 +25,6 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+rmpv.workspace = true
 rusqlite.workspace = true
 tokio-util.workspace = true

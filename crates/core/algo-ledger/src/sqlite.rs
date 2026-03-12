@@ -391,6 +391,10 @@ fn decode_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn encode_asset_holding(h: &AssetHolding) -> Vec<u8> {
+    encode_asset_holding_with_round(h, 0)
+}
+
+pub(crate) fn encode_asset_holding_with_round(h: &AssetHolding, update_round: u64) -> Vec<u8> {
     let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
     if h.amount != 0 {
         pairs.push((rmpv::Value::String("l".into()), rmpv::Value::from(h.amount)));
@@ -400,6 +404,13 @@ pub(crate) fn encode_asset_holding(h: &AssetHolding) -> Vec<u8> {
     }
     // Resource flags bitmask: bit 0 = holding present
     pairs.push((rmpv::Value::String("y".into()), rmpv::Value::from(1u64)));
+    // UpdateRound — matches Go's ResourcesData.UpdateRound (codec "z").
+    if update_round != 0 {
+        pairs.push((
+            rmpv::Value::String("z".into()),
+            rmpv::Value::from(update_round),
+        ));
+    }
 
     let val = rmpv::Value::Map(pairs);
     let mut buf = Vec::new();
@@ -433,6 +444,14 @@ fn decode_asset_holding(data: &[u8]) -> Result<AssetHolding, AlgoError> {
 }
 
 pub(crate) fn encode_asset_params(p: &AssetParams, creator: &Address) -> Vec<u8> {
+    encode_asset_params_with_round(p, creator, 0)
+}
+
+pub(crate) fn encode_asset_params_with_round(
+    p: &AssetParams,
+    creator: &Address,
+    update_round: u64,
+) -> Vec<u8> {
     let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
 
     if p.total != 0 {
@@ -503,6 +522,13 @@ pub(crate) fn encode_asset_params(p: &AssetParams, creator: &Address) -> Vec<u8>
 
     // Resource flags: bit 2 = ownership (asset params present)
     pairs.push((rmpv::Value::String("y".into()), rmpv::Value::from(4u64)));
+    // UpdateRound — matches Go's ResourcesData.UpdateRound (codec "z").
+    if update_round != 0 {
+        pairs.push((
+            rmpv::Value::String("z".into()),
+            rmpv::Value::from(update_round),
+        ));
+    }
 
     let val = rmpv::Value::Map(pairs);
     let mut buf = Vec::new();
@@ -671,6 +697,10 @@ fn decode_teal_key_value(val: &rmpv::Value) -> BTreeMap<Vec<u8>, TealValue> {
 }
 
 pub(crate) fn encode_app_params(p: &AppParams) -> Vec<u8> {
+    encode_app_params_with_round(p, 0)
+}
+
+pub(crate) fn encode_app_params_with_round(p: &AppParams, update_round: u64) -> Vec<u8> {
     let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
 
     if !p.approval_program.is_empty() {
@@ -730,6 +760,13 @@ pub(crate) fn encode_app_params(p: &AppParams) -> Vec<u8> {
 
     // Resource flags: bit 2 = ownership (app params present)
     pairs.push((rmpv::Value::String("y".into()), rmpv::Value::from(4u64)));
+    // UpdateRound — matches Go's ResourcesData.UpdateRound (codec "z").
+    if update_round != 0 {
+        pairs.push((
+            rmpv::Value::String("z".into()),
+            rmpv::Value::from(update_round),
+        ));
+    }
 
     let val = rmpv::Value::Map(pairs);
     let mut buf = Vec::new();
@@ -814,6 +851,10 @@ fn decode_app_params(data: &[u8], creator: Address) -> Result<AppParams, AlgoErr
 }
 
 pub(crate) fn encode_app_local_state(s: &AppLocalState) -> Vec<u8> {
+    encode_app_local_state_with_round(s, 0)
+}
+
+pub(crate) fn encode_app_local_state_with_round(s: &AppLocalState, update_round: u64) -> Vec<u8> {
     let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
 
     // Schema
@@ -843,6 +884,13 @@ pub(crate) fn encode_app_local_state(s: &AppLocalState) -> Vec<u8> {
 
     // Resource flags: bit 0 = holding present (local state)
     pairs.push((rmpv::Value::String("y".into()), rmpv::Value::from(1u64)));
+    // UpdateRound — matches Go's ResourcesData.UpdateRound (codec "z").
+    if update_round != 0 {
+        pairs.push((
+            rmpv::Value::String("z".into()),
+            rmpv::Value::from(update_round),
+        ));
+    }
 
     let val = rmpv::Value::Map(pairs);
     let mut buf = Vec::new();
@@ -1405,6 +1453,37 @@ fn strip_asset_params_from_blob(data: &[u8]) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// Set or overwrite the `"z"` (UpdateRound) field in a resource msgpack blob.
+///
+/// If `update_round` is 0, the blob is returned unmodified.
+/// Otherwise, the `"z"` key is added or replaced in the top-level msgpack map.
+pub(crate) fn set_blob_update_round(blob: &[u8], update_round: u64) -> Vec<u8> {
+    if update_round == 0 {
+        return blob.to_vec();
+    }
+    let val = match rmpv::decode::read_value(&mut &blob[..]) {
+        Ok(v) => v,
+        Err(_) => return blob.to_vec(),
+    };
+    let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
+    if let rmpv::Value::Map(m) = val {
+        for (k, v) in m {
+            if k.as_str() == Some("z") {
+                continue; // will be rewritten below
+            }
+            pairs.push((k, v));
+        }
+    }
+    pairs.push((
+        rmpv::Value::String("z".into()),
+        rmpv::Value::from(update_round),
+    ));
+    let out = rmpv::Value::Map(pairs);
+    let mut buf = Vec::new();
+    rmpv::encode::write_value(&mut buf, &out).expect("msgpack encode");
+    buf
+}
+
 // ---------------------------------------------------------------------------
 // Chain-level meta helpers
 // ---------------------------------------------------------------------------
@@ -1492,7 +1571,6 @@ enum SqlitePreMutation {
     Account {
         addr: Address,
         old_data: Option<Box<AccountData>>,
-        old_affinity: u32,
     },
     Resource {
         addr: Address,
@@ -1656,8 +1734,8 @@ impl SqliteLedger {
     /// Rebuild the trie from all accounts and resources currently in the DB.
     fn rebuild_trie_from_db(&self) -> Result<crate::merkle_trie::MerkleTrie, AlgoError> {
         use crate::trie_hash::{
-            account_hash_v6, compute_affinity, kv_hash_v6, resource_hash_v6_with_kind, HashKind,
-            ELEMENT_SIZE,
+            account_hash_v6, extract_raw_affinity, kv_hash_v6, resource_hash_v6_with_kind,
+            HashKind, ELEMENT_SIZE,
         };
 
         let mut trie = crate::merkle_trie::MerkleTrie::new(ELEMENT_SIZE);
@@ -1686,7 +1764,12 @@ impl SqliteLedger {
                     message: format!("read account row: {e}"),
                 })?;
                 if addr_bytes.len() != 32 {
-                    continue;
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "bad address length {} (expected 32) in accountbase",
+                            addr_bytes.len()
+                        ),
+                    });
                 }
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&addr_bytes);
@@ -1727,19 +1810,25 @@ impl SqliteLedger {
                 })?;
 
             for row in rows {
-                let (aidx, ctype, rdata, addr_bytes, acct_data) =
+                let (aidx, ctype, rdata, addr_bytes, _acct_data) =
                     row.map_err(|e| AlgoError::Ledger {
                         message: format!("read resource row: {e}"),
                     })?;
                 if addr_bytes.len() != 32 {
-                    continue;
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "bad address length {} (expected 32) for resource aidx={aidx}",
+                            addr_bytes.len()
+                        ),
+                    });
                 }
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&addr_bytes);
                 let addr = Address(arr);
 
-                let acct = decode_account_data(&acct_data).unwrap_or_default();
-                let affinity = compute_affinity(&acct);
+                // Use the resource's own UpdateRound for affinity, matching Go's
+                // ResourcesHashBuilderV6 which passes resData.UpdateRound.
+                let affinity = extract_raw_affinity(&rdata);
 
                 let kind = if ctype == CTYPE_APP {
                     HashKind::App
@@ -1800,9 +1889,11 @@ impl SqliteLedger {
                     .optional()
                     .unwrap_or(None)
             });
-            let old_affinity = self
-                .get_account(addr)
-                .map(|a| crate::trie_hash::compute_affinity(&a))
+            // Derive affinity from the resource blob, not the account,
+            // matching Go's ResourcesHashBuilderV6 which uses resData.UpdateRound.
+            let old_affinity = old_blob
+                .as_ref()
+                .map(|b| crate::trie_hash::extract_raw_affinity(b))
                 .unwrap_or(0);
             self.pre_mutations.push(SqlitePreMutation::Resource {
                 addr: *addr,
@@ -2055,6 +2146,75 @@ impl SqliteLedger {
     }
 }
 
+/// Initialize the `algod_rust_meta` table after a catchpoint import.
+///
+/// This populates the chain-level metadata that `SqliteLedger::init` reads
+/// on startup. Should be called after `atomic_cutover` completes, within the
+/// same database connection.
+///
+/// # Arguments
+///
+/// * `conn` — open SQLite connection (same one used for catchpoint import)
+/// * `round` — the balances round from the catchpoint header
+/// * `genesis_id` — the genesis ID for the network (e.g. "mainnet-v1.0")
+/// * `genesis_hash` — the 32-byte genesis hash
+/// * `protocol` — the consensus protocol version string
+/// * `txn_counter` — transaction counter from the catchpoint round; used to
+///   seed asset/app ID generation in the first post-import block. Typically
+///   derived from `MAX(asset) FROM assetcreators` when the catchpoint file
+///   header does not carry this field directly.
+/// * `rewards_level` — cumulative rewards level from the catchpoint header's
+///   `AccountTotals.rewards_level`
+pub fn initialize_meta_from_catchpoint(
+    conn: &Connection,
+    round: u64,
+    genesis_id: &str,
+    genesis_hash: &[u8; 32],
+    protocol: &str,
+    txn_counter: u64,
+    rewards_level: u64,
+) -> Result<(), AlgoError> {
+    // Ensure the meta table exists.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS algod_rust_meta (
+            key   TEXT PRIMARY KEY,
+            value BLOB
+        );",
+    )
+    .map_err(|e| AlgoError::Ledger {
+        message: format!("create meta table error: {e}"),
+    })?;
+
+    set_meta_u64(conn, "current_round", round)?;
+    set_meta_string(conn, "genesis_id", genesis_id)?;
+    set_meta_blob(conn, "genesis_hash", genesis_hash)?;
+    set_meta_string(conn, "protocol", protocol)?;
+    set_meta_u64(conn, "txn_counter", txn_counter)?;
+    set_meta_u64(conn, "rewards_level", rewards_level)?;
+
+    // P1-2 fix: Reset ALL meta keys that SqliteLedger::init reads.
+    // Without these, stale values from a previously-used DB survive cutover.
+    // These will be corrected by the first block application or by
+    // downloading lookback blocks.
+    set_meta_u64(conn, "rewards_rate", 0)?;
+    set_meta_u64(conn, "rewards_residue", 0)?;
+    set_meta_u64(conn, "rewards_recalculation_round", 0)?;
+    set_meta_blob(conn, "fee_sink", &[0u8; 32])?;
+    set_meta_blob(conn, "rewards_pool", &[0u8; 32])?;
+
+    tracing::info!(
+        "initialized chain meta from catchpoint: round={}, genesis_id={}, protocol={}, \
+         txn_counter={}, rewards_level={}",
+        round,
+        genesis_id,
+        protocol,
+        txn_counter,
+        rewards_level,
+    );
+
+    Ok(())
+}
+
 /// DDL for catchpoint staging tables (matches go-algorand exactly).
 ///
 /// This is the single source of truth for staging table schemas. The
@@ -2157,14 +2317,9 @@ impl LedgerStore for SqliteLedger {
     fn set_account(&mut self, addr: &Address, account: AccountData) {
         if self.trie.is_some() {
             let old = self.get_account(addr);
-            let old_affinity = old
-                .as_ref()
-                .map(crate::trie_hash::compute_affinity)
-                .unwrap_or(0);
             self.pre_mutations.push(SqlitePreMutation::Account {
                 addr: *addr,
                 old_data: old.map(Box::new),
-                old_affinity,
             });
         }
         let data = encode_account_data(&account);
@@ -2187,14 +2342,9 @@ impl LedgerStore for SqliteLedger {
     fn remove_account(&mut self, addr: &Address) {
         if self.trie.is_some() {
             let old = self.get_account(addr);
-            let old_affinity = old
-                .as_ref()
-                .map(crate::trie_hash::compute_affinity)
-                .unwrap_or(0);
             self.pre_mutations.push(SqlitePreMutation::Account {
                 addr: *addr,
                 old_data: old.map(Box::new),
-                old_affinity,
             });
         }
         // Also remove all resources for this account.
@@ -2238,6 +2388,7 @@ impl LedgerStore for SqliteLedger {
     fn set_asset_holding(&mut self, addr: &Address, asset_id: u64, holding: AssetHolding) {
         self.record_resource_pre_mutation(addr, asset_id, CTYPE_ASSET);
         let rowid = self.get_or_insert_rowid(addr).expect("get_or_insert_rowid");
+        let update_round = self.current_round.0;
 
         // Check if an existing blob has ownership (params) flag set; if so, merge.
         let data = if let Some(existing) = self.get_asset_resource_blob(rowid, asset_id) {
@@ -2251,6 +2402,8 @@ impl LedgerStore for SqliteLedger {
         } else {
             encode_asset_holding(&holding)
         };
+        // Stamp the resource blob with the current round's UpdateRound.
+        let data = set_blob_update_round(&data, update_round);
 
         self.conn
             .execute(
@@ -2262,6 +2415,7 @@ impl LedgerStore for SqliteLedger {
 
     fn remove_asset_holding(&mut self, addr: &Address, asset_id: u64) {
         self.record_resource_pre_mutation(addr, asset_id, CTYPE_ASSET);
+        let update_round = self.current_round.0;
         if let Some(rowid) = self.get_rowid(addr) {
             // Check if the blob also has ownership (asset params) data.
             if let Some(existing) = self.get_asset_resource_blob(rowid, asset_id) {
@@ -2269,6 +2423,7 @@ impl LedgerStore for SqliteLedger {
                 if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
                     // Both flags set — strip holding, keep asset params.
                     if let Some(stripped) = strip_asset_holding_from_blob(&existing) {
+                        let stripped = set_blob_update_round(&stripped, update_round);
                         let _ = self.conn.execute(
                             "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                             params![stripped, rowid, asset_id as i64, CTYPE_ASSET],
@@ -2315,6 +2470,7 @@ impl LedgerStore for SqliteLedger {
         // Track which addresses had holdings removed for counter updates.
         let mut affected_addrs: Vec<Address> = Vec::new();
 
+        let update_round = self.current_round.0;
         for (rowid, data, addr_bytes) in &rows {
             let flags = extract_resource_flags(data);
             if flags & RESOURCE_FLAGS_HOLDING == 0 {
@@ -2329,6 +2485,7 @@ impl LedgerStore for SqliteLedger {
             if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
                 // Both flags set — strip holding, keep asset params.
                 if let Some(stripped) = strip_asset_holding_from_blob(data) {
+                    let stripped = set_blob_update_round(&stripped, update_round);
                     let _ = self.conn.execute(
                         "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                         params![stripped, rowid, asset_id as i64, CTYPE_ASSET],
@@ -2387,6 +2544,7 @@ impl LedgerStore for SqliteLedger {
         let rowid = self
             .get_or_insert_rowid(&record.creator)
             .expect("get_or_insert_rowid");
+        let update_round = self.current_round.0;
 
         // Check if an existing blob has holding flag set; if so, merge.
         let data = if let Some(existing) = self.get_asset_resource_blob(rowid, asset_id) {
@@ -2400,6 +2558,8 @@ impl LedgerStore for SqliteLedger {
         } else {
             encode_asset_params(&record.params, &record.creator)
         };
+        // Stamp the resource blob with the current round's UpdateRound.
+        let data = set_blob_update_round(&data, update_round);
 
         // Upsert into resources.
         self.conn
@@ -2425,6 +2585,7 @@ impl LedgerStore for SqliteLedger {
                 self.record_resource_pre_mutation(&creator, asset_id, CTYPE_ASSET);
             }
         }
+        let update_round = self.current_round.0;
         // Get creator to find the rowid.
         if let Some(creator) = self.get_creator_from_assetcreators(asset_id) {
             if let Some(rowid) = self.get_rowid(&creator) {
@@ -2434,6 +2595,7 @@ impl LedgerStore for SqliteLedger {
                     if flags & RESOURCE_FLAGS_HOLDING != 0 {
                         // Both flags set — strip params, keep holding.
                         if let Some(stripped) = strip_asset_params_from_blob(&existing) {
+                            let stripped = set_blob_update_round(&stripped, update_round);
                             let _ = self.conn.execute(
                                 "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                                 params![stripped, rowid, asset_id as i64, CTYPE_ASSET],
@@ -2501,6 +2663,7 @@ impl LedgerStore for SqliteLedger {
         let rowid = self
             .get_or_insert_rowid(&creator)
             .expect("get_or_insert_rowid");
+        let update_round = self.current_round.0;
 
         // Check if a local-state blob already exists at this key; if so, merge.
         let data = if let Some(existing) = self.get_app_resource_blob(rowid, app_id) {
@@ -2514,6 +2677,8 @@ impl LedgerStore for SqliteLedger {
         } else {
             encode_app_params(&params)
         };
+        // Stamp the resource blob with the current round's UpdateRound.
+        let data = set_blob_update_round(&data, update_round);
 
         self.conn
             .execute(
@@ -2537,6 +2702,7 @@ impl LedgerStore for SqliteLedger {
                 self.record_resource_pre_mutation(&creator, app_id, CTYPE_APP);
             }
         }
+        let update_round = self.current_round.0;
         if let Some(creator) = self.get_creator_from_assetcreators(app_id) {
             if let Some(rowid) = self.get_rowid(&creator) {
                 // Check if the blob also has holding (local state) data.
@@ -2545,6 +2711,7 @@ impl LedgerStore for SqliteLedger {
                     if flags & RESOURCE_FLAGS_HOLDING != 0 {
                         // Both flags set — strip ownership, keep local state.
                         if let Some(stripped) = strip_ownership_from_blob(&existing) {
+                            let stripped = set_blob_update_round(&stripped, update_round);
                             let _ = self.conn.execute(
                                 "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                                 params![stripped, rowid, app_id as i64, CTYPE_APP],
@@ -2643,6 +2810,7 @@ impl LedgerStore for SqliteLedger {
     fn set_app_local_state(&mut self, addr: &Address, app_id: u64, local_state: AppLocalState) {
         self.record_resource_pre_mutation(addr, app_id, CTYPE_APP);
         let rowid = self.get_or_insert_rowid(addr).expect("get_or_insert_rowid");
+        let update_round = self.current_round.0;
 
         // Check if an app-params blob already exists at this key; if so, merge.
         let data = if let Some(existing) = self.get_app_resource_blob(rowid, app_id) {
@@ -2656,6 +2824,8 @@ impl LedgerStore for SqliteLedger {
         } else {
             encode_app_local_state(&local_state)
         };
+        // Stamp the resource blob with the current round's UpdateRound.
+        let data = set_blob_update_round(&data, update_round);
 
         self.conn
             .execute(
@@ -2667,6 +2837,7 @@ impl LedgerStore for SqliteLedger {
 
     fn remove_app_local_state(&mut self, addr: &Address, app_id: u64) {
         self.record_resource_pre_mutation(addr, app_id, CTYPE_APP);
+        let update_round = self.current_round.0;
         if let Some(rowid) = self.get_rowid(addr) {
             // Check if the blob also has ownership (app params) data.
             if let Some(existing) = self.get_app_resource_blob(rowid, app_id) {
@@ -2674,6 +2845,7 @@ impl LedgerStore for SqliteLedger {
                 if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
                     // Both flags set — strip holding, keep app params.
                     if let Some(stripped) = strip_holding_from_blob(&existing) {
+                        let stripped = set_blob_update_round(&stripped, update_round);
                         let _ = self.conn.execute(
                             "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                             params![stripped, rowid, app_id as i64, CTYPE_APP],
@@ -2720,6 +2892,7 @@ impl LedgerStore for SqliteLedger {
         // Track affected addresses and their local schemas for counter updates.
         let mut affected: Vec<(Address, StateSchema)> = Vec::new();
 
+        let update_round = self.current_round.0;
         for (rowid, data, addr_bytes) in &rows {
             let flags = extract_resource_flags(data);
             if flags & RESOURCE_FLAGS_HOLDING == 0 {
@@ -2737,6 +2910,7 @@ impl LedgerStore for SqliteLedger {
             if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
                 // Both flags set — strip local state, keep app params.
                 if let Some(stripped) = strip_holding_from_blob(data) {
+                    let stripped = set_blob_update_round(&stripped, update_round);
                     let _ = self.conn.execute(
                         "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                         params![stripped, rowid, app_id as i64, CTYPE_APP],
@@ -3049,23 +3223,16 @@ impl LedgerStore for SqliteLedger {
 
     fn finalize_trie_updates(&mut self) -> Option<[u8; 32]> {
         use crate::trie_hash::{
-            account_hash_v6, compute_affinity, kv_hash_v6, resource_hash_v6_with_kind, HashKind,
+            account_hash_v6, extract_raw_affinity, kv_hash_v6, resource_hash_v6_with_kind, HashKind,
         };
 
         // Take the trie out of self to avoid borrow conflicts.
         let mut trie = self.trie.take()?;
         let mutations = std::mem::take(&mut self.pre_mutations);
 
-        // Track addresses whose affinity changed for resource cascade (H2).
-        let mut affinity_changed: Vec<(Address, u32, u32)> = Vec::new();
-
         for mutation in mutations {
             match mutation {
-                SqlitePreMutation::Account {
-                    addr,
-                    old_data,
-                    old_affinity,
-                } => {
+                SqlitePreMutation::Account { addr, old_data } => {
                     // Delete old element.
                     if let Some(ref old) = old_data {
                         let old_elem = account_hash_v6(&addr, old);
@@ -3075,13 +3242,9 @@ impl LedgerStore for SqliteLedger {
                     }
                     // Add new element if account still exists.
                     if let Some(new_data) = self.get_account(&addr) {
-                        let new_affinity = compute_affinity(&new_data);
                         let new_elem = account_hash_v6(&addr, &new_data);
                         if let Err(e) = trie.add(&new_elem) {
                             tracing::warn!("trie add account failed: {}", e);
-                        }
-                        if old_affinity != new_affinity {
-                            affinity_changed.push((addr, old_affinity, new_affinity));
                         }
                     }
                 }
@@ -3098,7 +3261,7 @@ impl LedgerStore for SqliteLedger {
                         HashKind::Asset
                     };
 
-                    // Delete old element using captured old_affinity.
+                    // Delete old element using captured old_affinity (from old blob).
                     if let Some(ref old) = old_blob {
                         let old_elem =
                             resource_hash_v6_with_kind(&addr, index, old, old_affinity, kind);
@@ -3107,13 +3270,8 @@ impl LedgerStore for SqliteLedger {
                         }
                     }
 
-                    // Get current affinity for new element.
-                    let new_affinity = self
-                        .get_account(&addr)
-                        .map(|a| compute_affinity(&a))
-                        .unwrap_or(0);
-
-                    // Read current blob from DB and add new element.
+                    // Read current blob from DB and derive affinity from it,
+                    // matching Go's ResourcesHashBuilderV6 which uses resData.UpdateRound.
                     let new_blob = self.get_rowid(&addr).and_then(|rowid| {
                         self.conn
                             .query_row(
@@ -3125,6 +3283,7 @@ impl LedgerStore for SqliteLedger {
                             .unwrap_or(None)
                     });
                     if let Some(ref new) = new_blob {
+                        let new_affinity = extract_raw_affinity(new);
                         let new_elem =
                             resource_hash_v6_with_kind(&addr, index, new, new_affinity, kind);
                         if let Err(e) = trie.add(&new_elem) {
@@ -3164,40 +3323,10 @@ impl LedgerStore for SqliteLedger {
             }
         }
 
-        // H2: Cascade affinity changes to resources not already mutated.
-        for (addr, old_aff, new_aff) in &affinity_changed {
-            if let Some(rowid) = self.get_rowid(addr) {
-                let mut stmt = self
-                    .conn
-                    .prepare("SELECT aidx, data, ctype FROM resources WHERE addrid = ?1")
-                    .expect("prepare resource query");
-                let rows: Vec<(i64, Vec<u8>, i64)> = stmt
-                    .query_map(params![rowid], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                    })
-                    .expect("query resources")
-                    .filter_map(|r| r.ok())
-                    .collect();
-
-                for (aidx, blob, ctype) in rows {
-                    let kind = if ctype == CTYPE_APP {
-                        HashKind::App
-                    } else {
-                        HashKind::Asset
-                    };
-                    let old_elem =
-                        resource_hash_v6_with_kind(addr, aidx as u64, &blob, *old_aff, kind);
-                    if let Err(e) = trie.delete(&old_elem) {
-                        tracing::warn!("trie delete (affinity cascade) failed: {}", e);
-                    }
-                    let new_elem =
-                        resource_hash_v6_with_kind(addr, aidx as u64, &blob, *new_aff, kind);
-                    if let Err(e) = trie.add(&new_elem) {
-                        tracing::warn!("trie add (affinity cascade) failed: {}", e);
-                    }
-                }
-            }
-        }
+        // Note: No H2 cascade needed. Resource trie elements use the resource's
+        // own UpdateRound for affinity (extracted from the blob via extract_raw_affinity),
+        // not the account's. This matches Go's ResourcesHashBuilderV6 which passes
+        // resData.UpdateRound. Account affinity changes do not affect resource elements.
 
         let root = trie.root_hash();
         self.trie = Some(trie);

@@ -56,12 +56,57 @@ pub fn account_hash_v6(address: &Address, account_data: &AccountData) -> [u8; EL
     element
 }
 
+/// Extract the affinity value from a raw msgpack-encoded data blob.
+///
+/// Scans the msgpack map for keys `"z"` (update_round) and `"c"` (rewards_base).
+/// Returns `update_round` if non-zero, otherwise `rewards_base`, truncated to u32.
+/// This works for both account data (which has both `"z"` and `"c"`) and resource
+/// data (which has `"z"` but not `"c"`).
+///
+/// Matches Go's `AccountHashBuilderV6` (for accounts) and
+/// `ResourcesHashBuilderV6` (for resources, which passes `resData.UpdateRound`).
+pub fn extract_raw_affinity(data: &[u8]) -> u32 {
+    let val = match rmpv::decode::read_value(&mut &data[..]) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let map = match &val {
+        rmpv::Value::Map(m) => m,
+        _ => return 0,
+    };
+
+    let mut update_round: u64 = 0;
+    let mut rewards_base: u64 = 0;
+
+    for (k, v) in map {
+        let key_str = match k {
+            rmpv::Value::String(s) => match s.as_str() {
+                Some(s) => s,
+                None => continue,
+            },
+            _ => continue,
+        };
+        match key_str {
+            "z" => update_round = v.as_u64().unwrap_or(0),
+            "c" => rewards_base = v.as_u64().unwrap_or(0),
+            _ => {}
+        }
+    }
+
+    let val = if update_round != 0 {
+        update_round
+    } else {
+        rewards_base
+    };
+    val as u32
+}
+
 /// Compute the 36-byte trie element for a resource with an explicit HashKind.
 ///
-/// Prehash layout: `address_bytes(32) || creatable_index(8 bytes BE) || resource_blob`
+/// Prehash layout: `address_bytes(32) || creatable_index(8 bytes LE) || resource_blob`
 ///
 /// The `resource_data` is the already-encoded msgpack blob (possibly merged holding + params).
-/// The `affinity` should come from the owning account's `compute_affinity()`.
+/// The `affinity` should come from the resource's own `UpdateRound` (codec key `"z"`).
 pub fn resource_hash_v6_with_kind(
     address: &Address,
     creatable_index: u64,
@@ -71,7 +116,7 @@ pub fn resource_hash_v6_with_kind(
 ) -> [u8; ELEMENT_SIZE] {
     let mut hasher = Sha512_256::new();
     hasher.update(address.0);
-    hasher.update(creatable_index.to_be_bytes());
+    hasher.update(creatable_index.to_le_bytes());
     hasher.update(resource_data);
     let hash = hasher.finalize();
 
@@ -235,7 +280,7 @@ mod tests {
         // Verify hash portion: reconstruct the prehash and check bytes [1..32]
         let mut prehash = Vec::new();
         prehash.extend_from_slice(&addr.0);
-        prehash.extend_from_slice(&creatable_index.to_be_bytes());
+        prehash.extend_from_slice(&creatable_index.to_le_bytes());
         prehash.extend_from_slice(resource_data);
         let full_hash = sha512_256(&prehash);
         assert_eq!(&element[5..36], &full_hash[1..32]);
@@ -261,7 +306,7 @@ mod tests {
         // Hash portion should match
         let mut prehash = Vec::new();
         prehash.extend_from_slice(&addr.0);
-        prehash.extend_from_slice(&creatable_index.to_be_bytes());
+        prehash.extend_from_slice(&creatable_index.to_le_bytes());
         prehash.extend_from_slice(resource_data);
         let full_hash = sha512_256(&prehash);
         assert_eq!(&element[5..36], &full_hash[1..32]);
@@ -289,14 +334,14 @@ mod tests {
 
     #[test]
     fn test_prehash_layout_resource() {
-        // Verify that resource prehash is exactly address || index(8 BE) || data
+        // Verify that resource prehash is exactly address || index(8 LE) || data
         let addr = Address([0xCD; 32]);
         let index: u64 = 0x0000_0000_0000_002A; // 42
         let data = vec![0x80]; // empty msgpack map
 
         let mut expected_prehash = Vec::new();
         expected_prehash.extend_from_slice(&[0xCD; 32]);
-        expected_prehash.extend_from_slice(&index.to_be_bytes());
+        expected_prehash.extend_from_slice(&index.to_le_bytes());
         expected_prehash.extend_from_slice(&data);
 
         let full_hash = sha512_256(&expected_prehash);

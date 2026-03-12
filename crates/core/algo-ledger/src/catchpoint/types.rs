@@ -60,6 +60,29 @@ pub enum CatchpointError {
 
     #[error("catchpoint sqlite error")]
     SqliteError(#[from] rusqlite::Error),
+
+    #[error("catchpoint label parsing failed: {0}")]
+    LabelParsingFailed(String),
+
+    #[error("catchpoint verification error: {0}")]
+    VerificationError(String),
+}
+
+// ---------------------------------------------------------------------------
+// CatchpointLabel — parsed representation of "{round}#{base32_hash}"
+// ---------------------------------------------------------------------------
+
+/// A parsed catchpoint label.
+///
+/// Corresponds to the result of Go's `ledgercore.ParseCatchpointLabel`.
+/// Format: `{round}#{base32_hash}` where hash is base32 standard encoding
+/// (no padding) of a 32-byte SHA-512/256 digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatchpointLabel {
+    /// The round number from the label.
+    pub round: u64,
+    /// The 32-byte hash digest from the label.
+    pub hash: [u8; 32],
 }
 
 // ---------------------------------------------------------------------------
@@ -560,6 +583,12 @@ pub struct StateProofVerificationContext {
     /// Online total weight (total stake attesting).
     #[serde(rename = "pw", default)]
     pub online_total_weight: u64,
+
+    /// Version field for the verification context.
+    /// Go codec tag: `"v"`. Must be preserved during decode/re-encode to
+    /// avoid corrupting the state proof verification hash.
+    #[serde(rename = "v", default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
 }
 
 /// Decoded form of Go's `OnlineRoundParamsData` from `ledgercore/totals.go`.
