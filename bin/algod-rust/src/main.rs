@@ -109,24 +109,50 @@ async fn main() -> anyhow::Result<()> {
             avm_execute,
             fail_fast,
             trie,
+            catchpoint,
+            catchpoint_auto,
+            follow,
+            compare,
+            trie_path,
         } => {
             let (resolved_url, resolved_token, net_name) =
                 commands::resolve_network(&network, algod_url.as_deref(), &algod_token)?;
 
-            commands::sync::run(
-                net_name,
-                &resolved_url,
-                &resolved_token,
-                genesis.as_deref(),
-                &db,
-                start,
-                end,
-                concurrency,
-                avm_execute,
-                fail_fast,
-                trie,
-            )
-            .await?;
+            if catchpoint.is_some() || catchpoint_auto {
+                // Catchpoint sync path.
+                commands::catchpoint_sync::run(
+                    net_name,
+                    &resolved_url,
+                    &resolved_token,
+                    &db,
+                    catchpoint.as_deref(),
+                    catchpoint_auto,
+                    concurrency,
+                    follow,
+                    compare,
+                    trie_path.as_deref(),
+                    avm_execute,
+                    fail_fast,
+                    end,
+                )
+                .await?;
+            } else {
+                // Genesis-based sync path.
+                commands::sync::run(
+                    net_name,
+                    &resolved_url,
+                    &resolved_token,
+                    genesis.as_deref(),
+                    &db,
+                    start,
+                    end,
+                    concurrency,
+                    avm_execute,
+                    fail_fast,
+                    trie,
+                )
+                .await?;
+            }
         }
         Commands::Catchpoint { action } => match action {
             CatchpointAction::Import {

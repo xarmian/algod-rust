@@ -131,6 +131,8 @@ dependencies = [
  "snap",
  "tar",
  "thiserror",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 

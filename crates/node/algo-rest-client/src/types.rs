@@ -34,6 +34,10 @@ pub struct NodeStatus {
     /// Whether the node has stopped at the upgrade round.
     #[serde(rename = "stopped-at-unsupported-round", default)]
     pub stopped_at_unsupported_round: bool,
+
+    /// The last catchpoint seen by the node.
+    #[serde(rename = "last-catchpoint", default)]
+    pub last_catchpoint: Option<String>,
 }
 
 /// Account information as returned by `GET /v2/accounts/{addr}`.
