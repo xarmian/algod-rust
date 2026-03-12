@@ -48,45 +48,55 @@ impl SyncBackend for AlgodSyncBackend {
         round: u64,
         dest_path: &std::path::Path,
     ) -> Result<(), AlgoError> {
-        self.rt.block_on(async {
-            self.downloader
-                .download::<fn(algo_rest_client::DownloadProgress)>(
-                    genesis_id, round, dest_path, None,
-                )
-                .await
+        tokio::task::block_in_place(|| {
+            self.rt.block_on(async {
+                self.downloader
+                    .download::<fn(algo_rest_client::DownloadProgress)>(
+                        genesis_id, round, dest_path, None,
+                    )
+                    .await
+            })
         })
     }
 
     fn fetch_block_raw(&self, round: u64) -> Result<(String, Vec<u8>, Vec<u8>), AlgoError> {
-        self.rt.block_on(async {
-            let raw = self.client.get_block_raw(Round(round)).await?;
-            let br = decode_block_response(&raw)?;
-            let proto = br.block.current_protocol.clone();
-            // Return the full raw bytes as both header and block data.
-            // The caller uses these for storage in the blocks table.
-            Ok((proto, raw.clone(), raw))
+        tokio::task::block_in_place(|| {
+            self.rt.block_on(async {
+                let raw = self.client.get_block_raw(Round(round)).await?;
+                let br = decode_block_response(&raw)?;
+                let proto = br.block.current_protocol.clone();
+                // Return the full raw bytes as both header and block data.
+                // The caller uses these for storage in the blocks table.
+                Ok((proto, raw.clone(), raw))
+            })
         })
     }
 
     fn fetch_block(&self, round: u64) -> Result<Block, AlgoError> {
-        self.rt.block_on(async {
-            let raw = self.client.get_block_raw(Round(round)).await?;
-            let br = decode_block_response(&raw)?;
-            Ok(br.block)
+        tokio::task::block_in_place(|| {
+            self.rt.block_on(async {
+                let raw = self.client.get_block_raw(Round(round)).await?;
+                let br = decode_block_response(&raw)?;
+                Ok(br.block)
+            })
         })
     }
 
     fn get_current_round(&self) -> Result<u64, AlgoError> {
-        self.rt.block_on(async {
-            let status = self.client.get_status().await?;
-            Ok(status.last_round)
+        tokio::task::block_in_place(|| {
+            self.rt.block_on(async {
+                let status = self.client.get_status().await?;
+                Ok(status.last_round)
+            })
         })
     }
 
     fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError> {
-        self.rt.block_on(async {
-            let status = self.client.get_status().await?;
-            Ok(status.last_catchpoint)
+        tokio::task::block_in_place(|| {
+            self.rt.block_on(async {
+                let status = self.client.get_status().await?;
+                Ok(status.last_catchpoint)
+            })
         })
     }
 }

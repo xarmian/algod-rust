@@ -563,18 +563,12 @@ impl SyncOrchestrator {
         self.progress.phase_detail = format!("downloading catchpoint round {round}");
         self.notify_progress();
 
-        // Determine the download destination.
+        // Determine the download destination — always next to the ledger database.
         let file_path = self
             .config
-            .trie_path
-            .clone()
-            .unwrap_or_else(|| {
-                self.config
-                    .db_path
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new("."))
-                    .to_path_buf()
-            })
+            .db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
             .join(format!("catchpoint-{round}.tar.gz"));
 
         // Resolve genesis_id: must be set by the caller (CLI layer resolves
@@ -923,7 +917,6 @@ impl SyncOrchestrator {
 
         let timer = Instant::now();
         let mut blocks_applied: u64 = 0;
-        let mut blocks_failed: u64 = 0;
         let progress_interval: u64 = 1000;
 
         for round in start_round..=target_round {
@@ -957,13 +950,14 @@ impl SyncOrchestrator {
                 Err(e) => {
                     tracing::warn!(round, error = %e, "apply_block failed during replay");
                     let _ = store.rollback_block();
-                    blocks_failed += 1;
 
-                    if self.config.fail_fast {
-                        return Err(AlgoError::Ledger {
-                            message: format!("block replay failed at round {round}: {e}"),
-                        });
-                    }
+                    // Block apply failures are always fatal to the replay.
+                    // After a failed apply the ledger state is at round N-1,
+                    // so round N+1 would also fail with a round mismatch.
+                    // Break out and report the error regardless of fail_fast.
+                    return Err(AlgoError::Ledger {
+                        message: format!("block replay failed at round {round}: {e}"),
+                    });
                 }
             }
 
@@ -971,11 +965,10 @@ impl SyncOrchestrator {
             self.final_round = round;
 
             // Progress logging.
-            let total_done = blocks_applied + blocks_failed;
-            if total_done % progress_interval == 0 || round == target_round {
+            if blocks_applied % progress_interval == 0 || round == target_round {
                 let elapsed = timer.elapsed().as_secs_f64();
                 let rate = if elapsed > 0.0 {
-                    total_done as f64 / elapsed
+                    blocks_applied as f64 / elapsed
                 } else {
                     0.0
                 };
@@ -988,9 +981,9 @@ impl SyncOrchestrator {
                 );
 
                 let total_range = (target_round - start_round + 1) as f64;
-                self.progress.phase_progress = total_done as f64 / total_range;
+                self.progress.phase_progress = blocks_applied as f64 / total_range;
                 self.progress.phase_detail = format!(
-                    "replayed {total_done}/{} blocks ({rate:.1} blocks/sec)",
+                    "replayed {blocks_applied}/{} blocks ({rate:.1} blocks/sec)",
                     target_round - start_round + 1
                 );
                 self.notify_progress();
@@ -1001,15 +994,10 @@ impl SyncOrchestrator {
 
         tracing::info!(
             blocks_applied,
-            blocks_failed,
             final_round = self.final_round,
             elapsed = ?timer.elapsed(),
             "block replay complete"
         );
-
-        if blocks_failed > 0 && !self.config.fail_fast {
-            tracing::warn!(blocks_failed, "some blocks failed during replay");
-        }
 
         self.progress.phase_progress = 1.0;
         self.notify_progress();
@@ -1070,7 +1058,9 @@ impl SyncOrchestrator {
                         if self.cancel.is_cancelled() {
                             tracing::info!("follow mode stopped: sync cancelled");
                         } else {
-                            tracing::warn!(error = %e, "follow mode exited with error");
+                            // Non-cancellation error in follow mode is a real failure —
+                            // propagate it so the CLI exits with a non-zero status.
+                            return Err(e);
                         }
                     }
                 }
