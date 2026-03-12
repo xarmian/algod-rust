@@ -196,47 +196,58 @@ impl<'a> CatchpointImporter<'a> {
         let mut batch_count: usize = 0;
         let mut in_txn = false;
 
-        for chunk_result in chunks {
-            let (ordinal, chunk) = chunk_result?;
+        let result: Result<ImportStats, CatchpointError> = (|| {
+            for chunk_result in chunks {
+                let (ordinal, chunk) = chunk_result?;
 
-            // Resume support: skip already-committed chunks.
-            // Using Option<u64> avoids ambiguity when ordinal 0 was the last
-            // committed chunk (previously, resume_ordinal == 0 was
-            // indistinguishable from "no checkpoint exists").
-            if let Some(last) = resume_ordinal {
-                if ordinal <= last {
-                    continue;
+                // Resume support: skip already-committed chunks.
+                // Using Option<u64> avoids ambiguity when ordinal 0 was the last
+                // committed chunk (previously, resume_ordinal == 0 was
+                // indistinguishable from "no checkpoint exists").
+                if let Some(last) = resume_ordinal {
+                    if ordinal <= last {
+                        continue;
+                    }
+                }
+
+                if !in_txn {
+                    self.conn.execute_batch("BEGIN IMMEDIATE")?;
+                    in_txn = true;
+                }
+
+                self.import_chunk(ordinal, &chunk, &mut stats)?;
+                batch_count += 1;
+
+                if batch_count >= self.batch_size {
+                    update_checkpoint(self.conn, ordinal, total_chunks, &self.catchpoint_label)?;
+                    self.conn.execute_batch("COMMIT")?;
+                    in_txn = false;
+                    batch_count = 0;
                 }
             }
 
-            if !in_txn {
-                self.conn.execute_batch("BEGIN IMMEDIATE")?;
-                in_txn = true;
-            }
-
-            self.import_chunk(ordinal, &chunk, &mut stats)?;
-            batch_count += 1;
-
-            if batch_count >= self.batch_size {
-                update_checkpoint(self.conn, ordinal, total_chunks, &self.catchpoint_label)?;
+            // Commit any remaining partial batch.
+            if in_txn {
+                update_checkpoint(
+                    self.conn,
+                    self.chunk_ordinal,
+                    total_chunks,
+                    &self.catchpoint_label,
+                )?;
                 self.conn.execute_batch("COMMIT")?;
                 in_txn = false;
-                batch_count = 0;
             }
-        }
 
-        // Commit any remaining partial batch.
+            Ok(stats)
+        })();
+
+        // Roll back any open transaction on error so the connection is left
+        // in a clean state for retry/resume.
         if in_txn {
-            update_checkpoint(
-                self.conn,
-                self.chunk_ordinal,
-                total_chunks,
-                &self.catchpoint_label,
-            )?;
-            self.conn.execute_batch("COMMIT")?;
+            let _ = self.conn.execute_batch("ROLLBACK");
         }
 
-        Ok(stats)
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -627,7 +638,7 @@ pub fn import_catchpoint_file(
         let mut in_txn = false;
         let catchpoint_label_ref = importer.catchpoint_label.clone();
 
-        reader.for_each(|entry| {
+        let stream_result: Result<(), CatchpointError> = reader.for_each(|entry| {
             match entry {
                 CatchpointEntry::Header(_) => { /* already extracted */ }
                 CatchpointEntry::Chunk(chunk) => {
@@ -672,7 +683,16 @@ pub fn import_catchpoint_file(
                 }
             }
             Ok(())
-        })?;
+        });
+
+        // Roll back any open transaction on error so the connection is left
+        // in a clean state for retry/resume.
+        if let Err(e) = stream_result {
+            if in_txn {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
+            return Err(e);
+        }
 
         // Commit any remaining partial batch.
         if in_txn {
