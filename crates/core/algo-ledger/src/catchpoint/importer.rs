@@ -548,7 +548,7 @@ impl<'a> CatchpointImporter<'a> {
             })?;
 
             self.conn.execute(
-                "INSERT INTO catchpointstateproofverification(lastattestedround, verificationContext) VALUES(?1, ?2)",
+                "INSERT OR REPLACE INTO catchpointstateproofverification(lastattestedround, verificationContext) VALUES(?1, ?2)",
                 rusqlite::params![ctx.last_attested_round as i64, encoded],
             )?;
         }
@@ -636,6 +636,7 @@ pub fn import_catchpoint_file(
                     // Resume support: skip already-committed chunks.
                     if let Some(last) = resume_ordinal {
                         if chunk_ordinal <= last {
+                            stats.chunks_processed += 1;
                             return Ok(());
                         }
                     }
