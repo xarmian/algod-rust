@@ -28,6 +28,7 @@ use crate::catchpoint::{
     CatchpointError, CatchpointFileHeader,
 };
 use crate::EvalDeltaStats;
+use crate::LedgerStore;
 
 /// Callback type for progress reporting.
 ///
@@ -78,6 +79,26 @@ pub trait SyncBackend: Send + Sync {
     /// Discover the latest catchpoint label from the node.
     /// Returns `None` if the node does not advertise a catchpoint.
     fn discover_catchpoint(&self) -> Result<Option<String>, AlgoError>;
+
+    /// Fetch a batch of blocks in the range `[start, end]` (inclusive).
+    ///
+    /// The `concurrency` parameter hints at how many blocks to fetch in
+    /// parallel.  The default implementation fetches blocks sequentially;
+    /// backends backed by an async runtime can override this to use
+    /// [`ParallelBlockFetcher`] for higher throughput.
+    fn fetch_blocks_batch(
+        &self,
+        start: u64,
+        end: u64,
+        _concurrency: usize,
+    ) -> Result<Vec<(u64, Block)>, AlgoError> {
+        let mut blocks = Vec::new();
+        for round in start..=end {
+            let block = self.fetch_block(round)?;
+            blocks.push((round, block));
+        }
+        Ok(blocks)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -967,15 +988,28 @@ impl SyncOrchestrator {
                 message: format!("open ledger for replay: {e}"),
             })?;
 
+        // Enable Merkle trie tracking if a trie path is configured.
+        if self.config.trie_path.is_some() {
+            store.enable_trie();
+            tracing::info!("Merkle trie tracking enabled for replay");
+        }
+
         let timer = Instant::now();
         let mut blocks_applied: u64 = 0;
         let progress_interval: u64 = 1000;
 
-        for round in start_round..=target_round {
-            // Check cancellation between blocks.
+        // Fetch blocks in batches to overlap network I/O with block application.
+        // The batch size is derived from the concurrency setting (default: 1 means
+        // sequential). Blocks within each batch are fetched in parallel by the
+        // backend, then applied sequentially to maintain round monotonicity.
+        let batch_size = (self.config.concurrency * 2).max(1) as u64;
+        let mut batch_start = start_round;
+
+        while batch_start <= target_round {
+            // Check cancellation between batches.
             if self.cancel.is_cancelled() {
                 tracing::info!(
-                    round,
+                    round = batch_start,
                     blocks_applied,
                     "cancellation requested during block replay"
                 );
@@ -983,64 +1017,93 @@ impl SyncOrchestrator {
                 return Err(self.handle_cancellation());
             }
 
-            let block = self.backend.fetch_block(round)?;
+            let batch_end = std::cmp::min(batch_start + batch_size - 1, target_round);
 
-            store.begin_block()?;
+            // Fetch the batch (parallel if the backend supports it).
+            let batch = self.backend.fetch_blocks_batch(
+                batch_start,
+                batch_end,
+                self.config.concurrency,
+            )?;
 
-            let apply_result = if self.config.avm_execute || self.config.compare_mode {
-                let (result, block_stats) = crate::apply_block_with_comparison(&mut store, &block);
-                self.eval_delta_stats += block_stats;
-                result
-            } else {
-                crate::apply_block(&mut store, &block)
-            };
+            // Apply each block in the batch sequentially.
+            for (round, block) in &batch {
+                let round = *round;
 
-            match apply_result {
-                Ok(()) => {
-                    store.commit_block()?;
-                    blocks_applied += 1;
+                // Check cancellation between blocks within a batch.
+                if self.cancel.is_cancelled() {
+                    tracing::info!(
+                        round,
+                        blocks_applied,
+                        "cancellation requested during block replay"
+                    );
+                    self.blocks_replayed = blocks_applied;
+                    return Err(self.handle_cancellation());
                 }
-                Err(e) => {
-                    tracing::warn!(round, error = %e, "apply_block failed during replay");
-                    let _ = store.rollback_block();
 
-                    // Block apply failures are always fatal to the replay.
-                    // After a failed apply the ledger state is at round N-1,
-                    // so round N+1 would also fail with a round mismatch.
-                    // Break out and report the error regardless of fail_fast.
-                    return Err(AlgoError::Ledger {
-                        message: format!("block replay failed at round {round}: {e}"),
-                    });
-                }
-            }
+                store.begin_block()?;
 
-            // Track the actual last round processed.
-            self.final_round = round;
-
-            // Progress logging.
-            if blocks_applied % progress_interval == 0 || round == target_round {
-                let elapsed = timer.elapsed().as_secs_f64();
-                let rate = if elapsed > 0.0 {
-                    blocks_applied as f64 / elapsed
+                let apply_result = if self.config.avm_execute || self.config.compare_mode {
+                    let (result, block_stats) =
+                        crate::apply_block_with_comparison(&mut store, block);
+                    self.eval_delta_stats += block_stats;
+                    result
                 } else {
-                    0.0
+                    crate::apply_block(&mut store, block)
                 };
-                tracing::info!(
-                    round,
-                    target = target_round,
-                    elapsed_secs = format!("{elapsed:.1}"),
-                    rate = format!("{rate:.1}"),
-                    "replay progress"
-                );
 
-                let total_range = (target_round - start_round + 1) as f64;
-                self.progress.phase_progress = blocks_applied as f64 / total_range;
-                self.progress.phase_detail = format!(
-                    "replayed {blocks_applied}/{} blocks ({rate:.1} blocks/sec)",
-                    target_round - start_round + 1
-                );
-                self.notify_progress();
+                match apply_result {
+                    Ok(()) => {
+                        if self.config.trie_path.is_some() {
+                            store.finalize_trie_updates();
+                        }
+                        store.commit_block()?;
+                        blocks_applied += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(round, error = %e, "apply_block failed during replay");
+                        let _ = store.rollback_block();
+
+                        // Block apply failures are always fatal to the replay.
+                        // After a failed apply the ledger state is at round N-1,
+                        // so round N+1 would also fail with a round mismatch.
+                        // Break out and report the error regardless of fail_fast.
+                        return Err(AlgoError::Ledger {
+                            message: format!("block replay failed at round {round}: {e}"),
+                        });
+                    }
+                }
+
+                // Track the actual last round processed.
+                self.final_round = round;
+
+                // Progress logging.
+                if blocks_applied % progress_interval == 0 || round == target_round {
+                    let elapsed = timer.elapsed().as_secs_f64();
+                    let rate = if elapsed > 0.0 {
+                        blocks_applied as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    tracing::info!(
+                        round,
+                        target = target_round,
+                        elapsed_secs = format!("{elapsed:.1}"),
+                        rate = format!("{rate:.1}"),
+                        "replay progress"
+                    );
+
+                    let total_range = (target_round - start_round + 1) as f64;
+                    self.progress.phase_progress = blocks_applied as f64 / total_range;
+                    self.progress.phase_detail = format!(
+                        "replayed {blocks_applied}/{} blocks ({rate:.1} blocks/sec)",
+                        target_round - start_round + 1
+                    );
+                    self.notify_progress();
+                }
             }
+
+            batch_start = batch_end + 1;
         }
 
         self.blocks_replayed = blocks_applied;
@@ -1105,7 +1168,7 @@ impl SyncOrchestrator {
             }
         }
 
-        let result = self.run_phases(resume_state);
+        let mut result = self.run_phases(resume_state);
 
         match &result {
             Ok(_) => {
@@ -1120,6 +1183,15 @@ impl SyncOrchestrator {
                             // propagate it so the CLI exits with a non-zero status.
                             return Err(e);
                         }
+                    }
+
+                    // Update the SyncResult with values accumulated during follow mode.
+                    // Follow mode updates self.final_round and self.blocks_replayed
+                    // as it applies blocks, so reflect those in the returned result.
+                    if let Ok(ref mut r) = result {
+                        r.final_round = self.final_round;
+                        r.blocks_replayed = self.blocks_replayed;
+                        r.duration = start.elapsed();
                     }
                 }
 
@@ -1190,6 +1262,12 @@ impl SyncOrchestrator {
             crate::SqliteLedger::open(&self.config.db_path).map_err(|e| AlgoError::Ledger {
                 message: format!("open ledger for follow mode: {e}"),
             })?;
+
+        // Enable Merkle trie tracking if a trie path is configured.
+        if self.config.trie_path.is_some() {
+            store.enable_trie();
+            tracing::info!("Merkle trie tracking enabled for follow mode");
+        }
 
         // Determine starting round from the last committed round in the ledger.
         let mut current_round = store
@@ -1282,10 +1360,14 @@ impl SyncOrchestrator {
 
                 match apply_result {
                     Ok(()) => {
+                        if self.config.trie_path.is_some() {
+                            store.finalize_trie_updates();
+                        }
                         store.commit_block()?;
                         blocks_followed += 1;
                         current_round = next_round;
                         self.final_round = current_round;
+                        self.blocks_replayed += 1;
 
                         tracing::info!(
                             round = current_round,

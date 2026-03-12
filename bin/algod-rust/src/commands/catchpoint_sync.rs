@@ -1,9 +1,10 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use algo_codec::{canonical_encode_block_header_from_block, decode_block_response, encode_block};
 use algo_error::AlgoError;
 use algo_ledger::sync::{SyncBackend, SyncConfig, SyncOrchestrator};
-use algo_rest_client::{AlgodClient, BlockSource, CatchpointDownloader};
+use algo_rest_client::{AlgodClient, BlockSource, CatchpointDownloader, ParallelBlockFetcher};
 use algo_types::{Block, Round};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -22,6 +23,10 @@ struct AlgodSyncBackend {
     downloader: CatchpointDownloader,
     /// Tokio runtime handle for running async operations from sync context.
     rt: tokio::runtime::Handle,
+    /// Stored URL for constructing parallel fetchers.
+    algod_url: String,
+    /// Stored token for constructing parallel fetchers.
+    algod_token: String,
 }
 
 impl AlgodSyncBackend {
@@ -33,6 +38,8 @@ impl AlgodSyncBackend {
             client,
             downloader,
             rt,
+            algod_url: algod_url.to_string(),
+            algod_token: algod_token.to_string(),
         }
     }
 }
@@ -100,6 +107,47 @@ impl SyncBackend for AlgodSyncBackend {
             self.rt.block_on(async {
                 let status = self.client.get_status().await?;
                 Ok(status.last_catchpoint)
+            })
+        })
+    }
+
+    fn fetch_blocks_batch(
+        &self,
+        start: u64,
+        end: u64,
+        concurrency: usize,
+    ) -> Result<Vec<(u64, Block)>, AlgoError> {
+        if start > end {
+            return Ok(Vec::new());
+        }
+
+        tokio::task::block_in_place(|| {
+            self.rt.block_on(async {
+                let source: Arc<dyn BlockSource> = Arc::new(AlgodClient::new(
+                    &self.algod_url,
+                    &self.algod_token,
+                ));
+                let fetcher = ParallelBlockFetcher::new(source, concurrency);
+                let cancel = CancellationToken::new();
+                // fetch_range uses half-open [start, end), so add 1 to include `end`.
+                let mut rx = fetcher.fetch_range(Round(start), Round(end + 1), cancel);
+
+                let mut blocks = Vec::with_capacity((end - start + 1) as usize);
+                while let Some((round, block_resp)) = rx.recv().await {
+                    blocks.push((round.0, block_resp.block));
+                }
+
+                if blocks.len() != (end - start + 1) as usize {
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "parallel fetch incomplete: expected {} blocks, got {}",
+                            end - start + 1,
+                            blocks.len()
+                        ),
+                    });
+                }
+
+                Ok(blocks)
             })
         })
     }
