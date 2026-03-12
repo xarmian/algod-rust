@@ -965,6 +965,7 @@ impl crate::store_trait::LedgerStore for LedgerState {
 
     fn finalize_trie_updates(&mut self) -> Option<[u8; 32]> {
         let trie = self.trie.as_mut()?;
+        let update_round = self.current_round.0;
 
         // Process all recorded pre-mutations.
         let mutations = std::mem::take(&mut self.pre_mutations);
@@ -1019,9 +1020,10 @@ impl crate::store_trait::LedgerStore for LedgerState {
                         .get(&asset_id)
                         .filter(|r| r.creator == addr);
                     if new_holding.is_some() || new_params.is_some() {
-                        let new_blob = encode_merged_asset_resource(
+                        let new_blob = encode_merged_asset_resource_with_round(
                             new_holding,
                             new_params.map(|r| (&r.params, &r.creator)),
+                            update_round,
                         );
                         let new_affinity = extract_raw_affinity(&new_blob);
                         let new_elem = resource_hash_v6_with_kind(
@@ -1065,9 +1067,10 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     if let Some(new_rec) = new_record {
                         let creator = new_rec.creator;
                         let new_holding = self.asset_holdings.get(&(creator, asset_id));
-                        let new_blob = encode_merged_asset_resource(
+                        let new_blob = encode_merged_asset_resource_with_round(
                             new_holding,
                             Some((&new_rec.params, &new_rec.creator)),
+                            update_round,
                         );
                         let new_affinity = extract_raw_affinity(&new_blob);
                         let new_elem = resource_hash_v6_with_kind(
@@ -1083,7 +1086,11 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     } else if let Some((creator, _)) = old_holding {
                         let new_h = self.asset_holdings.get(&(creator, asset_id));
                         if let Some(h) = new_h {
-                            let new_blob = encode_merged_asset_resource(Some(h), None);
+                            let new_blob = encode_merged_asset_resource_with_round(
+                                Some(h),
+                                None,
+                                update_round,
+                            );
                             let new_affinity = extract_raw_affinity(&new_blob);
                             let new_elem = resource_hash_v6_with_kind(
                                 &creator,
@@ -1129,7 +1136,11 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     if let Some(new_p) = new_params {
                         let creator = new_p.creator;
                         let new_local = self.app_local_states.get(&(creator, app_id));
-                        let new_blob = encode_merged_app_resource(new_local, Some(new_p));
+                        let new_blob = encode_merged_app_resource_with_round(
+                            new_local,
+                            Some(new_p),
+                            update_round,
+                        );
                         let new_affinity = extract_raw_affinity(&new_blob);
                         let new_elem = resource_hash_v6_with_kind(
                             &creator,
@@ -1144,7 +1155,8 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     } else if let Some((creator, _)) = old_local {
                         let new_l = self.app_local_states.get(&(creator, app_id));
                         if let Some(l) = new_l {
-                            let new_blob = encode_merged_app_resource(Some(l), None);
+                            let new_blob =
+                                encode_merged_app_resource_with_round(Some(l), None, update_round);
                             let new_affinity = extract_raw_affinity(&new_blob);
                             let new_elem = resource_hash_v6_with_kind(
                                 &creator,
@@ -1187,7 +1199,11 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     let new_local = self.app_local_states.get(&(addr, app_id));
                     let new_params = self.app_params.get(&app_id).filter(|p| p.creator == addr);
                     if new_local.is_some() || new_params.is_some() {
-                        let new_blob = encode_merged_app_resource(new_local, new_params);
+                        let new_blob = encode_merged_app_resource_with_round(
+                            new_local,
+                            new_params,
+                            update_round,
+                        );
                         let new_affinity = extract_raw_affinity(&new_blob);
                         let new_elem = resource_hash_v6_with_kind(
                             &addr,
@@ -1288,18 +1304,29 @@ impl crate::store_trait::LedgerStore for LedgerState {
 ///
 /// Combines holding fields (l, m) with params fields (a..k) and the resource
 /// flags field (y) into a single msgpack map blob.
+///
+/// `update_round` is written as the `"z"` field in the blob when non-zero,
+/// matching Go's `ResourcesData.UpdateRound`.
 fn encode_merged_asset_resource(
     holding: Option<&AssetHolding>,
     params: Option<(&algo_types::AssetParams, &Address)>,
 ) -> Vec<u8> {
-    use crate::sqlite::{encode_asset_holding, encode_asset_params};
+    encode_merged_asset_resource_with_round(holding, params, 0)
+}
+
+fn encode_merged_asset_resource_with_round(
+    holding: Option<&AssetHolding>,
+    params: Option<(&algo_types::AssetParams, &Address)>,
+    update_round: u64,
+) -> Vec<u8> {
+    use crate::sqlite::{encode_asset_holding_with_round, encode_asset_params_with_round};
 
     match (holding, params) {
         (Some(h), Some((p, creator))) => {
             // Merge both into one blob — combine fields from both encodings.
             // The simplest correct approach: decode both, merge maps, re-encode.
-            let h_bytes = encode_asset_holding(h);
-            let p_bytes = encode_asset_params(p, creator);
+            let h_bytes = encode_asset_holding_with_round(h, update_round);
+            let p_bytes = encode_asset_params_with_round(p, creator, update_round);
 
             let h_val: rmpv::Value =
                 rmpv::decode::read_value(&mut &h_bytes[..]).unwrap_or(rmpv::Value::Map(vec![]));
@@ -1346,8 +1373,8 @@ fn encode_merged_asset_resource(
             rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
             buf
         }
-        (Some(h), None) => encode_asset_holding(h),
-        (None, Some((p, creator))) => encode_asset_params(p, creator),
+        (Some(h), None) => encode_asset_holding_with_round(h, update_round),
+        (None, Some((p, creator))) => encode_asset_params_with_round(p, creator, update_round),
         (None, None) => Vec::new(),
     }
 }
@@ -1357,12 +1384,20 @@ fn encode_merged_app_resource(
     local_state: Option<&AppLocalState>,
     params: Option<&AppParams>,
 ) -> Vec<u8> {
-    use crate::sqlite::{encode_app_local_state, encode_app_params};
+    encode_merged_app_resource_with_round(local_state, params, 0)
+}
+
+fn encode_merged_app_resource_with_round(
+    local_state: Option<&AppLocalState>,
+    params: Option<&AppParams>,
+    update_round: u64,
+) -> Vec<u8> {
+    use crate::sqlite::{encode_app_local_state_with_round, encode_app_params_with_round};
 
     match (local_state, params) {
         (Some(s), Some(p)) => {
-            let s_bytes = encode_app_local_state(s);
-            let p_bytes = encode_app_params(p);
+            let s_bytes = encode_app_local_state_with_round(s, update_round);
+            let p_bytes = encode_app_params_with_round(p, update_round);
 
             let s_val: rmpv::Value =
                 rmpv::decode::read_value(&mut &s_bytes[..]).unwrap_or(rmpv::Value::Map(vec![]));
@@ -1408,8 +1443,8 @@ fn encode_merged_app_resource(
             rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
             buf
         }
-        (Some(s), None) => encode_app_local_state(s),
-        (None, Some(p)) => encode_app_params(p),
+        (Some(s), None) => encode_app_local_state_with_round(s, update_round),
+        (None, Some(p)) => encode_app_params_with_round(p, update_round),
         (None, None) => Vec::new(),
     }
 }

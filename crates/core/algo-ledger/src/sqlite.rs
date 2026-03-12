@@ -391,6 +391,10 @@ fn decode_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn encode_asset_holding(h: &AssetHolding) -> Vec<u8> {
+    encode_asset_holding_with_round(h, 0)
+}
+
+pub(crate) fn encode_asset_holding_with_round(h: &AssetHolding, update_round: u64) -> Vec<u8> {
     let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
     if h.amount != 0 {
         pairs.push((rmpv::Value::String("l".into()), rmpv::Value::from(h.amount)));
@@ -400,6 +404,13 @@ pub(crate) fn encode_asset_holding(h: &AssetHolding) -> Vec<u8> {
     }
     // Resource flags bitmask: bit 0 = holding present
     pairs.push((rmpv::Value::String("y".into()), rmpv::Value::from(1u64)));
+    // UpdateRound — matches Go's ResourcesData.UpdateRound (codec "z").
+    if update_round != 0 {
+        pairs.push((
+            rmpv::Value::String("z".into()),
+            rmpv::Value::from(update_round),
+        ));
+    }
 
     let val = rmpv::Value::Map(pairs);
     let mut buf = Vec::new();
@@ -433,6 +444,14 @@ fn decode_asset_holding(data: &[u8]) -> Result<AssetHolding, AlgoError> {
 }
 
 pub(crate) fn encode_asset_params(p: &AssetParams, creator: &Address) -> Vec<u8> {
+    encode_asset_params_with_round(p, creator, 0)
+}
+
+pub(crate) fn encode_asset_params_with_round(
+    p: &AssetParams,
+    creator: &Address,
+    update_round: u64,
+) -> Vec<u8> {
     let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
 
     if p.total != 0 {
@@ -503,6 +522,13 @@ pub(crate) fn encode_asset_params(p: &AssetParams, creator: &Address) -> Vec<u8>
 
     // Resource flags: bit 2 = ownership (asset params present)
     pairs.push((rmpv::Value::String("y".into()), rmpv::Value::from(4u64)));
+    // UpdateRound — matches Go's ResourcesData.UpdateRound (codec "z").
+    if update_round != 0 {
+        pairs.push((
+            rmpv::Value::String("z".into()),
+            rmpv::Value::from(update_round),
+        ));
+    }
 
     let val = rmpv::Value::Map(pairs);
     let mut buf = Vec::new();
@@ -671,6 +697,10 @@ fn decode_teal_key_value(val: &rmpv::Value) -> BTreeMap<Vec<u8>, TealValue> {
 }
 
 pub(crate) fn encode_app_params(p: &AppParams) -> Vec<u8> {
+    encode_app_params_with_round(p, 0)
+}
+
+pub(crate) fn encode_app_params_with_round(p: &AppParams, update_round: u64) -> Vec<u8> {
     let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
 
     if !p.approval_program.is_empty() {
@@ -730,6 +760,13 @@ pub(crate) fn encode_app_params(p: &AppParams) -> Vec<u8> {
 
     // Resource flags: bit 2 = ownership (app params present)
     pairs.push((rmpv::Value::String("y".into()), rmpv::Value::from(4u64)));
+    // UpdateRound — matches Go's ResourcesData.UpdateRound (codec "z").
+    if update_round != 0 {
+        pairs.push((
+            rmpv::Value::String("z".into()),
+            rmpv::Value::from(update_round),
+        ));
+    }
 
     let val = rmpv::Value::Map(pairs);
     let mut buf = Vec::new();
@@ -814,6 +851,10 @@ fn decode_app_params(data: &[u8], creator: Address) -> Result<AppParams, AlgoErr
 }
 
 pub(crate) fn encode_app_local_state(s: &AppLocalState) -> Vec<u8> {
+    encode_app_local_state_with_round(s, 0)
+}
+
+pub(crate) fn encode_app_local_state_with_round(s: &AppLocalState, update_round: u64) -> Vec<u8> {
     let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
 
     // Schema
@@ -843,6 +884,13 @@ pub(crate) fn encode_app_local_state(s: &AppLocalState) -> Vec<u8> {
 
     // Resource flags: bit 0 = holding present (local state)
     pairs.push((rmpv::Value::String("y".into()), rmpv::Value::from(1u64)));
+    // UpdateRound — matches Go's ResourcesData.UpdateRound (codec "z").
+    if update_round != 0 {
+        pairs.push((
+            rmpv::Value::String("z".into()),
+            rmpv::Value::from(update_round),
+        ));
+    }
 
     let val = rmpv::Value::Map(pairs);
     let mut buf = Vec::new();
@@ -1403,6 +1451,37 @@ fn strip_asset_params_from_blob(data: &[u8]) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
     Some(buf)
+}
+
+/// Set or overwrite the `"z"` (UpdateRound) field in a resource msgpack blob.
+///
+/// If `update_round` is 0, the blob is returned unmodified.
+/// Otherwise, the `"z"` key is added or replaced in the top-level msgpack map.
+pub(crate) fn set_blob_update_round(blob: &[u8], update_round: u64) -> Vec<u8> {
+    if update_round == 0 {
+        return blob.to_vec();
+    }
+    let val = match rmpv::decode::read_value(&mut &blob[..]) {
+        Ok(v) => v,
+        Err(_) => return blob.to_vec(),
+    };
+    let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
+    if let rmpv::Value::Map(m) = val {
+        for (k, v) in m {
+            if k.as_str() == Some("z") {
+                continue; // will be rewritten below
+            }
+            pairs.push((k, v));
+        }
+    }
+    pairs.push((
+        rmpv::Value::String("z".into()),
+        rmpv::Value::from(update_round),
+    ));
+    let out = rmpv::Value::Map(pairs);
+    let mut buf = Vec::new();
+    rmpv::encode::write_value(&mut buf, &out).expect("msgpack encode");
+    buf
 }
 
 // ---------------------------------------------------------------------------
@@ -2113,11 +2192,15 @@ pub fn initialize_meta_from_catchpoint(
     set_meta_u64(conn, "txn_counter", txn_counter)?;
     set_meta_u64(conn, "rewards_level", rewards_level)?;
 
-    // TODO: rewards_rate, rewards_residue, rewards_recalculation_round,
-    // fee_sink, and rewards_pool are also read by SqliteLedger::init but
-    // are not available from the catchpoint file header. They will need to
-    // be populated from the lookback block headers or from genesis state
-    // once the node downloads lookback blocks.
+    // P1-2 fix: Reset ALL meta keys that SqliteLedger::init reads.
+    // Without these, stale values from a previously-used DB survive cutover.
+    // These will be corrected by the first block application or by
+    // downloading lookback blocks.
+    set_meta_u64(conn, "rewards_rate", 0)?;
+    set_meta_u64(conn, "rewards_residue", 0)?;
+    set_meta_u64(conn, "rewards_recalculation_round", 0)?;
+    set_meta_blob(conn, "fee_sink", &[0u8; 32])?;
+    set_meta_blob(conn, "rewards_pool", &[0u8; 32])?;
 
     tracing::info!(
         "initialized chain meta from catchpoint: round={}, genesis_id={}, protocol={}, \
@@ -2305,6 +2388,7 @@ impl LedgerStore for SqliteLedger {
     fn set_asset_holding(&mut self, addr: &Address, asset_id: u64, holding: AssetHolding) {
         self.record_resource_pre_mutation(addr, asset_id, CTYPE_ASSET);
         let rowid = self.get_or_insert_rowid(addr).expect("get_or_insert_rowid");
+        let update_round = self.current_round.0;
 
         // Check if an existing blob has ownership (params) flag set; if so, merge.
         let data = if let Some(existing) = self.get_asset_resource_blob(rowid, asset_id) {
@@ -2318,6 +2402,8 @@ impl LedgerStore for SqliteLedger {
         } else {
             encode_asset_holding(&holding)
         };
+        // Stamp the resource blob with the current round's UpdateRound.
+        let data = set_blob_update_round(&data, update_round);
 
         self.conn
             .execute(
@@ -2329,6 +2415,7 @@ impl LedgerStore for SqliteLedger {
 
     fn remove_asset_holding(&mut self, addr: &Address, asset_id: u64) {
         self.record_resource_pre_mutation(addr, asset_id, CTYPE_ASSET);
+        let update_round = self.current_round.0;
         if let Some(rowid) = self.get_rowid(addr) {
             // Check if the blob also has ownership (asset params) data.
             if let Some(existing) = self.get_asset_resource_blob(rowid, asset_id) {
@@ -2336,6 +2423,7 @@ impl LedgerStore for SqliteLedger {
                 if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
                     // Both flags set — strip holding, keep asset params.
                     if let Some(stripped) = strip_asset_holding_from_blob(&existing) {
+                        let stripped = set_blob_update_round(&stripped, update_round);
                         let _ = self.conn.execute(
                             "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                             params![stripped, rowid, asset_id as i64, CTYPE_ASSET],
@@ -2382,6 +2470,7 @@ impl LedgerStore for SqliteLedger {
         // Track which addresses had holdings removed for counter updates.
         let mut affected_addrs: Vec<Address> = Vec::new();
 
+        let update_round = self.current_round.0;
         for (rowid, data, addr_bytes) in &rows {
             let flags = extract_resource_flags(data);
             if flags & RESOURCE_FLAGS_HOLDING == 0 {
@@ -2396,6 +2485,7 @@ impl LedgerStore for SqliteLedger {
             if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
                 // Both flags set — strip holding, keep asset params.
                 if let Some(stripped) = strip_asset_holding_from_blob(data) {
+                    let stripped = set_blob_update_round(&stripped, update_round);
                     let _ = self.conn.execute(
                         "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                         params![stripped, rowid, asset_id as i64, CTYPE_ASSET],
@@ -2454,6 +2544,7 @@ impl LedgerStore for SqliteLedger {
         let rowid = self
             .get_or_insert_rowid(&record.creator)
             .expect("get_or_insert_rowid");
+        let update_round = self.current_round.0;
 
         // Check if an existing blob has holding flag set; if so, merge.
         let data = if let Some(existing) = self.get_asset_resource_blob(rowid, asset_id) {
@@ -2467,6 +2558,8 @@ impl LedgerStore for SqliteLedger {
         } else {
             encode_asset_params(&record.params, &record.creator)
         };
+        // Stamp the resource blob with the current round's UpdateRound.
+        let data = set_blob_update_round(&data, update_round);
 
         // Upsert into resources.
         self.conn
@@ -2492,6 +2585,7 @@ impl LedgerStore for SqliteLedger {
                 self.record_resource_pre_mutation(&creator, asset_id, CTYPE_ASSET);
             }
         }
+        let update_round = self.current_round.0;
         // Get creator to find the rowid.
         if let Some(creator) = self.get_creator_from_assetcreators(asset_id) {
             if let Some(rowid) = self.get_rowid(&creator) {
@@ -2501,6 +2595,7 @@ impl LedgerStore for SqliteLedger {
                     if flags & RESOURCE_FLAGS_HOLDING != 0 {
                         // Both flags set — strip params, keep holding.
                         if let Some(stripped) = strip_asset_params_from_blob(&existing) {
+                            let stripped = set_blob_update_round(&stripped, update_round);
                             let _ = self.conn.execute(
                                 "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                                 params![stripped, rowid, asset_id as i64, CTYPE_ASSET],
@@ -2568,6 +2663,7 @@ impl LedgerStore for SqliteLedger {
         let rowid = self
             .get_or_insert_rowid(&creator)
             .expect("get_or_insert_rowid");
+        let update_round = self.current_round.0;
 
         // Check if a local-state blob already exists at this key; if so, merge.
         let data = if let Some(existing) = self.get_app_resource_blob(rowid, app_id) {
@@ -2581,6 +2677,8 @@ impl LedgerStore for SqliteLedger {
         } else {
             encode_app_params(&params)
         };
+        // Stamp the resource blob with the current round's UpdateRound.
+        let data = set_blob_update_round(&data, update_round);
 
         self.conn
             .execute(
@@ -2604,6 +2702,7 @@ impl LedgerStore for SqliteLedger {
                 self.record_resource_pre_mutation(&creator, app_id, CTYPE_APP);
             }
         }
+        let update_round = self.current_round.0;
         if let Some(creator) = self.get_creator_from_assetcreators(app_id) {
             if let Some(rowid) = self.get_rowid(&creator) {
                 // Check if the blob also has holding (local state) data.
@@ -2612,6 +2711,7 @@ impl LedgerStore for SqliteLedger {
                     if flags & RESOURCE_FLAGS_HOLDING != 0 {
                         // Both flags set — strip ownership, keep local state.
                         if let Some(stripped) = strip_ownership_from_blob(&existing) {
+                            let stripped = set_blob_update_round(&stripped, update_round);
                             let _ = self.conn.execute(
                                 "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                                 params![stripped, rowid, app_id as i64, CTYPE_APP],
@@ -2710,6 +2810,7 @@ impl LedgerStore for SqliteLedger {
     fn set_app_local_state(&mut self, addr: &Address, app_id: u64, local_state: AppLocalState) {
         self.record_resource_pre_mutation(addr, app_id, CTYPE_APP);
         let rowid = self.get_or_insert_rowid(addr).expect("get_or_insert_rowid");
+        let update_round = self.current_round.0;
 
         // Check if an app-params blob already exists at this key; if so, merge.
         let data = if let Some(existing) = self.get_app_resource_blob(rowid, app_id) {
@@ -2723,6 +2824,8 @@ impl LedgerStore for SqliteLedger {
         } else {
             encode_app_local_state(&local_state)
         };
+        // Stamp the resource blob with the current round's UpdateRound.
+        let data = set_blob_update_round(&data, update_round);
 
         self.conn
             .execute(
@@ -2734,6 +2837,7 @@ impl LedgerStore for SqliteLedger {
 
     fn remove_app_local_state(&mut self, addr: &Address, app_id: u64) {
         self.record_resource_pre_mutation(addr, app_id, CTYPE_APP);
+        let update_round = self.current_round.0;
         if let Some(rowid) = self.get_rowid(addr) {
             // Check if the blob also has ownership (app params) data.
             if let Some(existing) = self.get_app_resource_blob(rowid, app_id) {
@@ -2741,6 +2845,7 @@ impl LedgerStore for SqliteLedger {
                 if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
                     // Both flags set — strip holding, keep app params.
                     if let Some(stripped) = strip_holding_from_blob(&existing) {
+                        let stripped = set_blob_update_round(&stripped, update_round);
                         let _ = self.conn.execute(
                             "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                             params![stripped, rowid, app_id as i64, CTYPE_APP],
@@ -2787,6 +2892,7 @@ impl LedgerStore for SqliteLedger {
         // Track affected addresses and their local schemas for counter updates.
         let mut affected: Vec<(Address, StateSchema)> = Vec::new();
 
+        let update_round = self.current_round.0;
         for (rowid, data, addr_bytes) in &rows {
             let flags = extract_resource_flags(data);
             if flags & RESOURCE_FLAGS_HOLDING == 0 {
@@ -2804,6 +2910,7 @@ impl LedgerStore for SqliteLedger {
             if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
                 // Both flags set — strip local state, keep app params.
                 if let Some(stripped) = strip_holding_from_blob(data) {
+                    let stripped = set_blob_update_round(&stripped, update_round);
                     let _ = self.conn.execute(
                         "UPDATE resources SET data = ?1 WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
                         params![stripped, rowid, app_id as i64, CTYPE_APP],
