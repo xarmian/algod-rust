@@ -1,7 +1,10 @@
+pub mod checkpoint;
+pub mod importer;
 pub mod msgp_compat;
 pub mod parser;
 pub mod types;
 
+pub use importer::{import_catchpoint_file, ImportResult, ImportStats};
 pub use parser::{CatchpointEntry, CatchpointReader, CatchpointReaderFile};
 pub use types::{
     AccountTotals, AlgoCount, BalanceRecordV6, CatchpointBaseAccountData,

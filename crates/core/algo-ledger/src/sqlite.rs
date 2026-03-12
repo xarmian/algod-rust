@@ -53,10 +53,16 @@ CREATE TABLE IF NOT EXISTS accounttotals (
 );
 
 CREATE TABLE IF NOT EXISTS accountbase (
-    address                 BLOB PRIMARY KEY,
-    normalizedonlinebalance INTEGER,
-    data                    BLOB
+    addrid                  INTEGER PRIMARY KEY NOT NULL,
+    address                 BLOB NOT NULL,
+    data                    BLOB,
+    normalizedonlinebalance INTEGER
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS accountbase_address_idx ON accountbase (address);
+
+CREATE INDEX IF NOT EXISTS onlineaccountbals
+    ON accountbase ( normalizedonlinebalance, address, data ) WHERE normalizedonlinebalance>0;
 
 CREATE TABLE IF NOT EXISTS resources (
     addrid  INTEGER NOT NULL,
@@ -99,11 +105,42 @@ CREATE TABLE IF NOT EXISTS txtail (
     rnd INTEGER PRIMARY KEY NOT NULL,
     data BLOB NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS onlineaccounts (
+    address BLOB NOT NULL,
+    updround INTEGER NOT NULL,
+    normalizedonlinebalance INTEGER NOT NULL,
+    votelastvalid INTEGER NOT NULL,
+    data BLOB NOT NULL,
+    PRIMARY KEY (address, updround)
+);
+
+CREATE INDEX IF NOT EXISTS onlineaccountnorm
+    ON onlineaccounts (normalizedonlinebalance, address);
+
+CREATE INDEX IF NOT EXISTS onlineaccounts_votelastvalid_idx
+    ON onlineaccounts (votelastvalid);
+
+CREATE TABLE IF NOT EXISTS onlineroundparamstail (
+    rnd INTEGER NOT NULL PRIMARY KEY,
+    data BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS catchpointstate (
+    id TEXT PRIMARY KEY,
+    intval INTEGER,
+    strval TEXT
+);
+
+CREATE TABLE IF NOT EXISTS stateproofverification (
+    lastattestedround INTEGER PRIMARY KEY NOT NULL,
+    verificationcontext BLOB NOT NULL
+);
 ";
 
-// Resource ctype constants
-const CTYPE_ASSET: i64 = 1;
-const CTYPE_APP: i64 = 2;
+// Resource ctype constants (matches Go's `basics.AssetCreatable = 0`, `basics.AppCreatable = 1`)
+const CTYPE_ASSET: i64 = 0;
+const CTYPE_APP: i64 = 1;
 
 // Resource flags bitmask (stored in the "y" field of resource blobs)
 pub(crate) const RESOURCE_FLAGS_HOLDING: u64 = 0x01; // bit 0: has local state / holding data
@@ -1975,7 +2012,121 @@ impl SqliteLedger {
             }
         })
     }
+
+    // ---- Catchpoint staging table helpers ----
+
+    /// Accessor for the underlying SQLite connection.
+    #[allow(dead_code)] // Used by catchpoint importer (Wave 2+).
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Create all catchpoint staging tables in a single transaction.
+    ///
+    /// These tables mirror the Go `catchpoint*` staging tables used during
+    /// catchpoint import. Data is staged here before the cutover to live tables.
+    pub fn create_catchpoint_staging_tables(&self) -> Result<(), AlgoError> {
+        self.conn
+            .execute_batch(CATCHPOINT_STAGING_TABLES_SQL)
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("create catchpoint staging tables error: {e}"),
+            })
+    }
+
+    /// Drop all catchpoint staging tables.
+    pub fn drop_catchpoint_staging_tables(&self) -> Result<(), AlgoError> {
+        self.conn
+            .execute_batch(
+                "
+                DROP TABLE IF EXISTS catchpointassetcreators;
+                DROP TABLE IF EXISTS catchpointbalances;
+                DROP TABLE IF EXISTS catchpointpendinghashes;
+                DROP TABLE IF EXISTS catchpointaccounthashes;
+                DROP TABLE IF EXISTS catchpointresources;
+                DROP TABLE IF EXISTS catchpointkvstore;
+                DROP TABLE IF EXISTS catchpointonlineaccounts;
+                DROP TABLE IF EXISTS catchpointonlineroundparamstail;
+                DROP TABLE IF EXISTS catchpointstateproofverification;
+                ",
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("drop catchpoint staging tables error: {e}"),
+            })
+    }
 }
+
+/// DDL for catchpoint staging tables (matches go-algorand exactly).
+///
+/// This is the single source of truth for staging table schemas. The
+/// catchpoint importer references this constant via
+/// `crate::sqlite::catchpoint_staging_ddl()`.
+pub(crate) const CATCHPOINT_STAGING_TABLES_SQL: &str = "
+CREATE TABLE IF NOT EXISTS catchpointassetcreators (
+    asset INTEGER PRIMARY KEY,
+    creator BLOB,
+    ctype INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS catchpointbalances (
+    addrid INTEGER PRIMARY KEY NOT NULL,
+    address BLOB NOT NULL,
+    data BLOB,
+    normalizedonlinebalance INTEGER
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS catchpointbalances_address_idx
+    ON catchpointbalances (address);
+
+CREATE INDEX IF NOT EXISTS catchpointbalances_nob_idx
+    ON catchpointbalances ( normalizedonlinebalance, address, data ) WHERE normalizedonlinebalance>0;
+
+CREATE TABLE IF NOT EXISTS catchpointpendinghashes (
+    data BLOB
+);
+
+CREATE TABLE IF NOT EXISTS catchpointaccounthashes (
+    id INTEGER PRIMARY KEY,
+    data BLOB
+);
+
+CREATE TABLE IF NOT EXISTS catchpointresources (
+    addrid INTEGER NOT NULL,
+    aidx INTEGER NOT NULL,
+    data BLOB NOT NULL,
+    ctype INTEGER,
+    PRIMARY KEY (addrid, aidx)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS catchpointkvstore (
+    key BLOB PRIMARY KEY,
+    value BLOB
+);
+
+CREATE TABLE IF NOT EXISTS catchpointonlineaccounts (
+    address BLOB NOT NULL,
+    updround INTEGER NOT NULL,
+    normalizedonlinebalance INTEGER NOT NULL,
+    votelastvalid INTEGER NOT NULL,
+    data BLOB NOT NULL,
+    PRIMARY KEY (address, updround)
+);
+
+CREATE INDEX IF NOT EXISTS catchpointonlineaccounts_norm_idx
+    ON catchpointonlineaccounts ( normalizedonlinebalance, address );
+
+CREATE INDEX IF NOT EXISTS catchpointonlineaccounts_vlv_idx
+    ON catchpointonlineaccounts ( votelastvalid );
+
+CREATE TABLE IF NOT EXISTS catchpointonlineroundparamstail (
+    rnd INTEGER NOT NULL PRIMARY KEY,
+    data BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS catchpointstateproofverification (
+    lastattestedround INTEGER PRIMARY KEY NOT NULL,
+    verificationContext BLOB NOT NULL
+);
+";
 
 // ---------------------------------------------------------------------------
 // LedgerStore implementation
