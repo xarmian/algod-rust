@@ -1,5 +1,11 @@
 # Developer Workflow Guide
 
+> **Phase 4 is complete.** See [PHASE4_VALIDATION.md](PHASE4_VALIDATION.md) for the validation report.
+>
+> **Phase 3 is complete.** See [PHASE3_VALIDATION.md](PHASE3_VALIDATION.md) for the validation report.
+>
+> **Phase 2 is complete.** See [PHASE2_VALIDATION.md](PHASE2_VALIDATION.md) for the validation report.
+>
 > **Phase 1 is complete.** See [PHASE1_VALIDATION.md](PHASE1_VALIDATION.md) for the validation report.
 >
 > **Phase 0 is complete.** See [PHASE0_VALIDATION.md](PHASE0_VALIDATION.md) for the validation report
