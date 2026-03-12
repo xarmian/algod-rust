@@ -13,6 +13,7 @@ pub mod rewards;
 pub mod sqlite;
 pub mod state;
 pub mod store_trait;
+pub mod sync;
 pub mod trie_hash;
 
 pub use apply::{

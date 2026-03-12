@@ -139,6 +139,9 @@ pub enum Commands {
     },
 
     /// Sync blocks from a remote algod endpoint using parallel fetching.
+    ///
+    /// By default, syncs from genesis. Use --catchpoint or --catchpoint-auto
+    /// to bootstrap from a catchpoint snapshot instead.
     Sync {
         /// Network preset (mainnet, testnet, or custom).
         #[arg(long, default_value = "custom")]
@@ -183,6 +186,29 @@ pub enum Commands {
         /// Enable Merkle trie state root computation.
         #[arg(long)]
         trie: bool,
+
+        // --- Catchpoint sync options ---
+        /// Catchpoint label to sync from (e.g. "47000000#HASH").
+        /// Triggers catchpoint sync mode instead of genesis sync.
+        #[arg(long)]
+        catchpoint: Option<String>,
+
+        /// Auto-discover the latest catchpoint from the network.
+        /// Triggers catchpoint sync mode instead of genesis sync.
+        #[arg(long)]
+        catchpoint_auto: bool,
+
+        /// Continue following new blocks after sync completes (catchpoint mode).
+        #[arg(long)]
+        follow: bool,
+
+        /// Enable conformance comparison during block replay (catchpoint mode).
+        #[arg(long)]
+        compare: bool,
+
+        /// Path for Merkle trie storage (catchpoint mode).
+        #[arg(long)]
+        trie_path: Option<PathBuf>,
     },
 
     /// Catchpoint operations: import, verify, and download catchpoint files.

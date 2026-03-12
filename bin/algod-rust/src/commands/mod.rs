@@ -1,5 +1,6 @@
 pub mod capture;
 pub mod catchpoint;
+pub mod catchpoint_sync;
 pub mod follow;
 pub mod replay;
 pub mod sync;
