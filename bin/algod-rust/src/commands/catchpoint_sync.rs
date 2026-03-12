@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use algo_codec::decode_block_response;
+use algo_codec::{
+    canonical_encode_block_header_from_block, decode_block_response, encode_block,
+};
 use algo_error::AlgoError;
 use algo_ledger::sync::{SyncBackend, SyncConfig, SyncOrchestrator};
 use algo_rest_client::{AlgodClient, BlockSource, CatchpointDownloader};
@@ -65,9 +67,13 @@ impl SyncBackend for AlgodSyncBackend {
                 let raw = self.client.get_block_raw(Round(round)).await?;
                 let br = decode_block_response(&raw)?;
                 let proto = br.block.current_protocol.clone();
-                // Return the full raw bytes as both header and block data.
-                // The caller uses these for storage in the blocks table.
-                Ok((proto, raw.clone(), raw))
+                // Encode in the same format that apply_block uses:
+                // hdrdata = canonical block header encoding (for heartbeat
+                //           validation and block digest computation)
+                // blkdata = full block msgpack encoding (for block replay)
+                let hdrdata = canonical_encode_block_header_from_block(&br.block);
+                let blkdata = encode_block(&br.block)?;
+                Ok((proto, hdrdata, blkdata))
             })
         })
     }

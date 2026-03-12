@@ -803,6 +803,27 @@ impl SyncOrchestrator {
 
         let conn = self.open_db()?;
 
+        // Ensure the blocks and txtail tables exist. On a fresh database created
+        // by the catchpoint importer, only the catchpoint staging/account tables
+        // exist — the normal SCHEMA_SQL (run by SqliteLedger::open()) has not
+        // been executed yet. Using IF NOT EXISTS makes this idempotent.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS blocks (
+                rnd INTEGER PRIMARY KEY,
+                proto TEXT,
+                hdrdata BLOB,
+                blkdata BLOB,
+                certdata BLOB
+            );
+            CREATE TABLE IF NOT EXISTS txtail (
+                rnd INTEGER PRIMARY KEY NOT NULL,
+                data BLOB NOT NULL
+            );",
+        )
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("create blocks/txtail tables for lookback: {e}"),
+        })?;
+
         // Use download_lookback_blocks with callbacks that bridge to the backend.
         let blocks_downloaded = crate::catchpoint::download_lookback_blocks(
             round,
@@ -826,9 +847,9 @@ impl SyncOrchestrator {
                 })?;
 
                 // Decode the block to extract txtail data for lease reconstruction.
-                // The block header's txtail data is stored separately.
-                if let Ok(block_resp) = algo_codec::decode_block_response(blkdata) {
-                    let block = &block_resp.block;
+                // blkdata is canonical block encoding (not a response wrapper).
+                if let Ok(block) = algo_codec::decode_block(blkdata) {
+                    let block = &block;
                     // Build and store txtail entry.
                     if let Ok(txtail_data) = build_txtail_entry(block) {
                         conn.execute(
@@ -885,7 +906,28 @@ impl SyncOrchestrator {
 
         // Determine target: current network round.
         let target_round = self.backend.get_current_round()?;
-        let start_round = catchpoint_round + 1;
+
+        // When resuming after an interruption, some blocks may already have
+        // been committed. Query the database for the last committed round and
+        // skip ahead to avoid re-applying blocks (which would fail with a
+        // round mismatch in apply_block's strict monotonicity check).
+        let start_round = {
+            let resume_store =
+                crate::SqliteLedger::open(&self.config.db_path).map_err(|e| AlgoError::Ledger {
+                    message: format!("open ledger for resume check: {e}"),
+                })?;
+            match resume_store.last_committed_round() {
+                Ok(Some(last)) if last > catchpoint_round => {
+                    tracing::info!(
+                        last_committed = last,
+                        catchpoint_round,
+                        "resuming replay from last committed round"
+                    );
+                    last + 1
+                }
+                _ => catchpoint_round + 1,
+            }
+        };
 
         if start_round > target_round {
             tracing::info!(
