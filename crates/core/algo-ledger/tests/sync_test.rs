@@ -28,6 +28,7 @@ fn test_config() -> SyncConfig {
         trie_path: None,
         avm_execute: false,
         fail_fast: true,
+        end_round: None,
     }
 }
 
@@ -573,6 +574,7 @@ fn test_sync_config_various_constructions() {
         trie_path: Some(PathBuf::from("/var/data/trie")),
         avm_execute: true,
         fail_fast: false,
+        end_round: None,
     };
 
     assert!(config.catchpoint_label.is_none());

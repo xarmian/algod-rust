@@ -1,8 +1,6 @@
 use std::path::PathBuf;
 
-use algo_codec::{
-    canonical_encode_block_header_from_block, decode_block_response, encode_block,
-};
+use algo_codec::{canonical_encode_block_header_from_block, decode_block_response, encode_block};
 use algo_error::AlgoError;
 use algo_ledger::sync::{SyncBackend, SyncConfig, SyncOrchestrator};
 use algo_rest_client::{AlgodClient, BlockSource, CatchpointDownloader};
@@ -198,6 +196,7 @@ pub async fn run(
     trie_path: Option<&std::path::Path>,
     avm_execute: bool,
     fail_fast: bool,
+    end: Option<u64>,
 ) -> anyhow::Result<()> {
     // Determine the catchpoint label to use.
     let label = match (catchpoint_label, catchpoint_auto) {
@@ -234,6 +233,7 @@ pub async fn run(
         trie_path: trie_path.map(PathBuf::from),
         avm_execute,
         fail_fast,
+        end_round: end,
     };
 
     info!(

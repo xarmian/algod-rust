@@ -27,6 +27,7 @@ use crate::catchpoint::{
     import_catchpoint_file, parse_catchpoint_label, validate_post_import, verify_catchpoint,
     CatchpointError, CatchpointFileHeader,
 };
+use crate::EvalDeltaStats;
 
 /// Callback type for progress reporting.
 ///
@@ -110,6 +111,8 @@ pub struct SyncConfig {
     pub avm_execute: bool,
     /// Whether to stop on first error during block replay.
     pub fail_fast: bool,
+    /// Optional end round — stop replay at this round instead of the network tip.
+    pub end_round: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +341,8 @@ pub struct SyncOrchestrator {
     cancel: CancellationToken,
     /// Optional progress callback — invoked on state transitions and periodic updates.
     on_progress: Option<ProgressCallback>,
+    /// Accumulated EvalDelta comparison stats (when compare_mode or avm_execute is enabled).
+    eval_delta_stats: EvalDeltaStats,
 }
 
 impl SyncOrchestrator {
@@ -366,6 +371,7 @@ impl SyncOrchestrator {
             final_round: 0,
             cancel: CancellationToken::new(),
             on_progress: None,
+            eval_delta_stats: EvalDeltaStats::default(),
         }
     }
 
@@ -904,8 +910,12 @@ impl SyncOrchestrator {
             message: "catchpoint round not known — earlier phases did not complete".to_string(),
         })?;
 
-        // Determine target: current network round.
-        let target_round = self.backend.get_current_round()?;
+        // Determine target: current network round, capped by end_round if set.
+        let network_round = self.backend.get_current_round()?;
+        let target_round = match self.config.end_round {
+            Some(end) => std::cmp::min(network_round, end),
+            None => network_round,
+        };
 
         // When resuming after an interruption, some blocks may already have
         // been committed. Query the database for the last committed round and
@@ -978,7 +988,8 @@ impl SyncOrchestrator {
             store.begin_block()?;
 
             let apply_result = if self.config.avm_execute || self.config.compare_mode {
-                let (result, _stats) = crate::apply_block_with_comparison(&mut store, &block);
+                let (result, block_stats) = crate::apply_block_with_comparison(&mut store, &block);
+                self.eval_delta_stats += block_stats;
                 result
             } else {
                 crate::apply_block(&mut store, &block)
@@ -1040,6 +1051,11 @@ impl SyncOrchestrator {
             elapsed = ?timer.elapsed(),
             "block replay complete"
         );
+
+        // Print AVM/EvalDelta stats if compare or AVM execution was enabled.
+        if self.config.avm_execute || self.config.compare_mode {
+            self.eval_delta_stats.print_summary();
+        }
 
         self.progress.phase_progress = 1.0;
         self.notify_progress();
@@ -1198,6 +1214,9 @@ impl SyncOrchestrator {
                     last_round = current_round,
                     "follow mode: cancellation requested"
                 );
+                if self.config.avm_execute || self.config.compare_mode {
+                    self.eval_delta_stats.print_summary();
+                }
                 return Ok(());
             }
 
@@ -1226,6 +1245,9 @@ impl SyncOrchestrator {
                         last_round = current_round,
                         "follow mode: cancellation requested"
                     );
+                    if self.config.avm_execute || self.config.compare_mode {
+                        self.eval_delta_stats.print_summary();
+                    }
                     return Ok(());
                 }
 
@@ -1250,7 +1272,9 @@ impl SyncOrchestrator {
                 store.begin_block()?;
 
                 let apply_result = if self.config.avm_execute || self.config.compare_mode {
-                    let (result, _stats) = crate::apply_block_with_comparison(&mut store, &block);
+                    let (result, block_stats) =
+                        crate::apply_block_with_comparison(&mut store, &block);
+                    self.eval_delta_stats += block_stats;
                     result
                 } else {
                     crate::apply_block(&mut store, &block)
@@ -1278,16 +1302,20 @@ impl SyncOrchestrator {
                         );
                         let _ = store.rollback_block();
 
-                        if self.config.fail_fast {
-                            return Err(AlgoError::Ledger {
-                                message: format!(
-                                    "follow mode: block apply failed at round {next_round}: {e}"
-                                ),
-                            });
+                        // Block apply failures are always fatal in follow mode.
+                        // After a failed apply the ledger state is at round N-1,
+                        // so advancing current_round would permanently desynchronize
+                        // the follower (every subsequent block would fail with a
+                        // round mismatch).
+                        // Print accumulated stats before returning the error.
+                        if self.config.avm_execute || self.config.compare_mode {
+                            self.eval_delta_stats.print_summary();
                         }
-
-                        // Skip this round and continue.
-                        current_round = next_round;
+                        return Err(AlgoError::Ledger {
+                            message: format!(
+                                "follow mode: block apply failed at round {next_round}: {e}"
+                            ),
+                        });
                     }
                 }
             }

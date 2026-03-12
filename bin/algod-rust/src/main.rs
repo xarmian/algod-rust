@@ -133,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
                     trie_path.as_deref(),
                     avm_execute,
                     fail_fast,
+                    end,
                 )
                 .await?;
             } else {
