@@ -1492,7 +1492,6 @@ enum SqlitePreMutation {
     Account {
         addr: Address,
         old_data: Option<Box<AccountData>>,
-        old_affinity: u32,
     },
     Resource {
         addr: Address,
@@ -1656,8 +1655,8 @@ impl SqliteLedger {
     /// Rebuild the trie from all accounts and resources currently in the DB.
     fn rebuild_trie_from_db(&self) -> Result<crate::merkle_trie::MerkleTrie, AlgoError> {
         use crate::trie_hash::{
-            account_hash_v6, compute_affinity, kv_hash_v6, resource_hash_v6_with_kind, HashKind,
-            ELEMENT_SIZE,
+            account_hash_v6, extract_raw_affinity, kv_hash_v6, resource_hash_v6_with_kind,
+            HashKind, ELEMENT_SIZE,
         };
 
         let mut trie = crate::merkle_trie::MerkleTrie::new(ELEMENT_SIZE);
@@ -1686,7 +1685,12 @@ impl SqliteLedger {
                     message: format!("read account row: {e}"),
                 })?;
                 if addr_bytes.len() != 32 {
-                    continue;
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "bad address length {} (expected 32) in accountbase",
+                            addr_bytes.len()
+                        ),
+                    });
                 }
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&addr_bytes);
@@ -1727,19 +1731,25 @@ impl SqliteLedger {
                 })?;
 
             for row in rows {
-                let (aidx, ctype, rdata, addr_bytes, acct_data) =
+                let (aidx, ctype, rdata, addr_bytes, _acct_data) =
                     row.map_err(|e| AlgoError::Ledger {
                         message: format!("read resource row: {e}"),
                     })?;
                 if addr_bytes.len() != 32 {
-                    continue;
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "bad address length {} (expected 32) for resource aidx={aidx}",
+                            addr_bytes.len()
+                        ),
+                    });
                 }
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&addr_bytes);
                 let addr = Address(arr);
 
-                let acct = decode_account_data(&acct_data).unwrap_or_default();
-                let affinity = compute_affinity(&acct);
+                // Use the resource's own UpdateRound for affinity, matching Go's
+                // ResourcesHashBuilderV6 which passes resData.UpdateRound.
+                let affinity = extract_raw_affinity(&rdata);
 
                 let kind = if ctype == CTYPE_APP {
                     HashKind::App
@@ -1800,9 +1810,11 @@ impl SqliteLedger {
                     .optional()
                     .unwrap_or(None)
             });
-            let old_affinity = self
-                .get_account(addr)
-                .map(|a| crate::trie_hash::compute_affinity(&a))
+            // Derive affinity from the resource blob, not the account,
+            // matching Go's ResourcesHashBuilderV6 which uses resData.UpdateRound.
+            let old_affinity = old_blob
+                .as_ref()
+                .map(|b| crate::trie_hash::extract_raw_affinity(b))
                 .unwrap_or(0);
             self.pre_mutations.push(SqlitePreMutation::Resource {
                 addr: *addr,
@@ -2055,6 +2067,52 @@ impl SqliteLedger {
     }
 }
 
+/// Initialize the `algod_rust_meta` table after a catchpoint import.
+///
+/// This populates the chain-level metadata that `SqliteLedger::init` reads
+/// on startup. Should be called after `atomic_cutover` completes, within the
+/// same database connection.
+///
+/// # Arguments
+///
+/// * `conn` — open SQLite connection (same one used for catchpoint import)
+/// * `round` — the balances round from the catchpoint header
+/// * `genesis_id` — the genesis ID for the network (e.g. "mainnet-v1.0")
+/// * `genesis_hash` — the 32-byte genesis hash
+/// * `protocol` — the consensus protocol version string
+pub fn initialize_meta_from_catchpoint(
+    conn: &Connection,
+    round: u64,
+    genesis_id: &str,
+    genesis_hash: &[u8; 32],
+    protocol: &str,
+) -> Result<(), AlgoError> {
+    // Ensure the meta table exists.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS algod_rust_meta (
+            key   TEXT PRIMARY KEY,
+            value BLOB
+        );",
+    )
+    .map_err(|e| AlgoError::Ledger {
+        message: format!("create meta table error: {e}"),
+    })?;
+
+    set_meta_u64(conn, "current_round", round)?;
+    set_meta_string(conn, "genesis_id", genesis_id)?;
+    set_meta_blob(conn, "genesis_hash", genesis_hash)?;
+    set_meta_string(conn, "protocol", protocol)?;
+
+    tracing::info!(
+        "initialized chain meta from catchpoint: round={}, genesis_id={}, protocol={}",
+        round,
+        genesis_id,
+        protocol,
+    );
+
+    Ok(())
+}
+
 /// DDL for catchpoint staging tables (matches go-algorand exactly).
 ///
 /// This is the single source of truth for staging table schemas. The
@@ -2157,14 +2215,9 @@ impl LedgerStore for SqliteLedger {
     fn set_account(&mut self, addr: &Address, account: AccountData) {
         if self.trie.is_some() {
             let old = self.get_account(addr);
-            let old_affinity = old
-                .as_ref()
-                .map(crate::trie_hash::compute_affinity)
-                .unwrap_or(0);
             self.pre_mutations.push(SqlitePreMutation::Account {
                 addr: *addr,
                 old_data: old.map(Box::new),
-                old_affinity,
             });
         }
         let data = encode_account_data(&account);
@@ -2187,14 +2240,9 @@ impl LedgerStore for SqliteLedger {
     fn remove_account(&mut self, addr: &Address) {
         if self.trie.is_some() {
             let old = self.get_account(addr);
-            let old_affinity = old
-                .as_ref()
-                .map(crate::trie_hash::compute_affinity)
-                .unwrap_or(0);
             self.pre_mutations.push(SqlitePreMutation::Account {
                 addr: *addr,
                 old_data: old.map(Box::new),
-                old_affinity,
             });
         }
         // Also remove all resources for this account.
@@ -3049,23 +3097,16 @@ impl LedgerStore for SqliteLedger {
 
     fn finalize_trie_updates(&mut self) -> Option<[u8; 32]> {
         use crate::trie_hash::{
-            account_hash_v6, compute_affinity, kv_hash_v6, resource_hash_v6_with_kind, HashKind,
+            account_hash_v6, extract_raw_affinity, kv_hash_v6, resource_hash_v6_with_kind, HashKind,
         };
 
         // Take the trie out of self to avoid borrow conflicts.
         let mut trie = self.trie.take()?;
         let mutations = std::mem::take(&mut self.pre_mutations);
 
-        // Track addresses whose affinity changed for resource cascade (H2).
-        let mut affinity_changed: Vec<(Address, u32, u32)> = Vec::new();
-
         for mutation in mutations {
             match mutation {
-                SqlitePreMutation::Account {
-                    addr,
-                    old_data,
-                    old_affinity,
-                } => {
+                SqlitePreMutation::Account { addr, old_data } => {
                     // Delete old element.
                     if let Some(ref old) = old_data {
                         let old_elem = account_hash_v6(&addr, old);
@@ -3075,13 +3116,9 @@ impl LedgerStore for SqliteLedger {
                     }
                     // Add new element if account still exists.
                     if let Some(new_data) = self.get_account(&addr) {
-                        let new_affinity = compute_affinity(&new_data);
                         let new_elem = account_hash_v6(&addr, &new_data);
                         if let Err(e) = trie.add(&new_elem) {
                             tracing::warn!("trie add account failed: {}", e);
-                        }
-                        if old_affinity != new_affinity {
-                            affinity_changed.push((addr, old_affinity, new_affinity));
                         }
                     }
                 }
@@ -3098,7 +3135,7 @@ impl LedgerStore for SqliteLedger {
                         HashKind::Asset
                     };
 
-                    // Delete old element using captured old_affinity.
+                    // Delete old element using captured old_affinity (from old blob).
                     if let Some(ref old) = old_blob {
                         let old_elem =
                             resource_hash_v6_with_kind(&addr, index, old, old_affinity, kind);
@@ -3107,13 +3144,8 @@ impl LedgerStore for SqliteLedger {
                         }
                     }
 
-                    // Get current affinity for new element.
-                    let new_affinity = self
-                        .get_account(&addr)
-                        .map(|a| compute_affinity(&a))
-                        .unwrap_or(0);
-
-                    // Read current blob from DB and add new element.
+                    // Read current blob from DB and derive affinity from it,
+                    // matching Go's ResourcesHashBuilderV6 which uses resData.UpdateRound.
                     let new_blob = self.get_rowid(&addr).and_then(|rowid| {
                         self.conn
                             .query_row(
@@ -3125,6 +3157,7 @@ impl LedgerStore for SqliteLedger {
                             .unwrap_or(None)
                     });
                     if let Some(ref new) = new_blob {
+                        let new_affinity = extract_raw_affinity(new);
                         let new_elem =
                             resource_hash_v6_with_kind(&addr, index, new, new_affinity, kind);
                         if let Err(e) = trie.add(&new_elem) {
@@ -3164,40 +3197,10 @@ impl LedgerStore for SqliteLedger {
             }
         }
 
-        // H2: Cascade affinity changes to resources not already mutated.
-        for (addr, old_aff, new_aff) in &affinity_changed {
-            if let Some(rowid) = self.get_rowid(addr) {
-                let mut stmt = self
-                    .conn
-                    .prepare("SELECT aidx, data, ctype FROM resources WHERE addrid = ?1")
-                    .expect("prepare resource query");
-                let rows: Vec<(i64, Vec<u8>, i64)> = stmt
-                    .query_map(params![rowid], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                    })
-                    .expect("query resources")
-                    .filter_map(|r| r.ok())
-                    .collect();
-
-                for (aidx, blob, ctype) in rows {
-                    let kind = if ctype == CTYPE_APP {
-                        HashKind::App
-                    } else {
-                        HashKind::Asset
-                    };
-                    let old_elem =
-                        resource_hash_v6_with_kind(addr, aidx as u64, &blob, *old_aff, kind);
-                    if let Err(e) = trie.delete(&old_elem) {
-                        tracing::warn!("trie delete (affinity cascade) failed: {}", e);
-                    }
-                    let new_elem =
-                        resource_hash_v6_with_kind(addr, aidx as u64, &blob, *new_aff, kind);
-                    if let Err(e) = trie.add(&new_elem) {
-                        tracing::warn!("trie add (affinity cascade) failed: {}", e);
-                    }
-                }
-            }
-        }
+        // Note: No H2 cascade needed. Resource trie elements use the resource's
+        // own UpdateRound for affinity (extracted from the blob via extract_raw_affinity),
+        // not the account's. This matches Go's ResourcesHashBuilderV6 which passes
+        // resData.UpdateRound. Account affinity changes do not affect resource elements.
 
         let root = trie.root_hash();
         self.trie = Some(trie);

@@ -12,7 +12,7 @@ use crate::params::{
     SCHEMA_BYTES_MIN_BALANCE, SCHEMA_MIN_BALANCE_PER_ENTRY, SCHEMA_UINT_MIN_BALANCE,
 };
 use crate::trie_hash::{
-    account_hash_v6, compute_affinity, resource_hash_v6_with_kind, HashKind, ELEMENT_SIZE,
+    account_hash_v6, extract_raw_affinity, resource_hash_v6_with_kind, HashKind, ELEMENT_SIZE,
 };
 
 /// Compute the min-balance cost for a single state schema.
@@ -32,7 +32,6 @@ enum PreMutation {
     Account {
         addr: Address,
         old_data: Option<AccountData>,
-        old_affinity: u32,
     },
     AssetHolding {
         addr: Address,
@@ -401,11 +400,9 @@ impl crate::store_trait::LedgerStore for LedgerState {
     fn set_account(&mut self, addr: &Address, account: AccountData) {
         if self.trie.is_some() {
             let old = self.accounts.get(addr).cloned();
-            let old_affinity = old.as_ref().map(compute_affinity).unwrap_or(0);
             self.pre_mutations.push(PreMutation::Account {
                 addr: *addr,
                 old_data: old,
-                old_affinity,
             });
         }
         self.accounts.insert(*addr, account);
@@ -414,11 +411,9 @@ impl crate::store_trait::LedgerStore for LedgerState {
     fn remove_account(&mut self, addr: &Address) {
         if self.trie.is_some() {
             let old = self.accounts.get(addr).cloned();
-            let old_affinity = old.as_ref().map(compute_affinity).unwrap_or(0);
             self.pre_mutations.push(PreMutation::Account {
                 addr: *addr,
                 old_data: old,
-                old_affinity,
             });
         }
         self.accounts.remove(addr);
@@ -439,7 +434,13 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 .get(&asset_id)
                 .filter(|r| r.creator == *addr)
                 .cloned();
-            let old_affinity = self.accounts.get(addr).map(compute_affinity).unwrap_or(0);
+            // Derive affinity from the resource blob, not the account,
+            // matching Go's ResourcesHashBuilderV6 which uses resData.UpdateRound.
+            let old_blob = encode_merged_asset_resource(
+                old_holding.as_ref(),
+                old_params.as_ref().map(|r| (&r.params, &r.creator)),
+            );
+            let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AssetHolding {
                 addr: *addr,
                 asset_id,
@@ -459,7 +460,12 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 .get(&asset_id)
                 .filter(|r| r.creator == *addr)
                 .cloned();
-            let old_affinity = self.accounts.get(addr).map(compute_affinity).unwrap_or(0);
+            // Derive affinity from the resource blob, not the account.
+            let old_blob = encode_merged_asset_resource(
+                old_holding.as_ref(),
+                old_params.as_ref().map(|r| (&r.params, &r.creator)),
+            );
+            let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AssetHolding {
                 addr: *addr,
                 asset_id,
@@ -512,11 +518,12 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     .get(&(r.creator, asset_id))
                     .map(|h| (r.creator, h.clone()))
             });
-            let old_affinity = old_record
-                .as_ref()
-                .and_then(|r| self.accounts.get(&r.creator))
-                .map(compute_affinity)
-                .unwrap_or(0);
+            // Derive affinity from the resource blob, not the account.
+            let old_blob = encode_merged_asset_resource(
+                old_holding.as_ref().map(|(_, h)| h),
+                old_record.as_ref().map(|r| (&r.params, &r.creator)),
+            );
+            let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AssetParams {
                 asset_id,
                 old_record,
@@ -535,11 +542,12 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     .get(&(r.creator, asset_id))
                     .map(|h| (r.creator, h.clone()))
             });
-            let old_affinity = old_record
-                .as_ref()
-                .and_then(|r| self.accounts.get(&r.creator))
-                .map(compute_affinity)
-                .unwrap_or(0);
+            // Derive affinity from the resource blob, not the account.
+            let old_blob = encode_merged_asset_resource(
+                old_holding.as_ref().map(|(_, h)| h),
+                old_record.as_ref().map(|r| (&r.params, &r.creator)),
+            );
+            let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AssetParams {
                 asset_id,
                 old_record,
@@ -569,11 +577,10 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     .get(&(p.creator, app_id))
                     .map(|s| (p.creator, s.clone()))
             });
-            let old_affinity = old_params
-                .as_ref()
-                .and_then(|p| self.accounts.get(&p.creator))
-                .map(compute_affinity)
-                .unwrap_or(0);
+            // Derive affinity from the resource blob, not the account.
+            let old_blob =
+                encode_merged_app_resource(old_local.as_ref().map(|(_, s)| s), old_params.as_ref());
+            let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AppParams {
                 app_id,
                 old_params,
@@ -592,11 +599,10 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     .get(&(p.creator, app_id))
                     .map(|s| (p.creator, s.clone()))
             });
-            let old_affinity = old_params
-                .as_ref()
-                .and_then(|p| self.accounts.get(&p.creator))
-                .map(compute_affinity)
-                .unwrap_or(0);
+            // Derive affinity from the resource blob, not the account.
+            let old_blob =
+                encode_merged_app_resource(old_local.as_ref().map(|(_, s)| s), old_params.as_ref());
+            let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AppParams {
                 app_id,
                 old_params,
@@ -634,7 +640,9 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 .get(&app_id)
                 .filter(|p| p.creator == *addr)
                 .cloned();
-            let old_affinity = self.accounts.get(addr).map(compute_affinity).unwrap_or(0);
+            // Derive affinity from the resource blob, not the account.
+            let old_blob = encode_merged_app_resource(old_local.as_ref(), old_params.as_ref());
+            let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AppLocalState {
                 addr: *addr,
                 app_id,
@@ -654,7 +662,9 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 .get(&app_id)
                 .filter(|p| p.creator == *addr)
                 .cloned();
-            let old_affinity = self.accounts.get(addr).map(compute_affinity).unwrap_or(0);
+            // Derive affinity from the resource blob, not the account.
+            let old_blob = encode_merged_app_resource(old_local.as_ref(), old_params.as_ref());
+            let old_affinity = extract_raw_affinity(&old_blob);
             self.pre_mutations.push(PreMutation::AppLocalState {
                 addr: *addr,
                 app_id,
@@ -890,7 +900,9 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 Some(holding),
                 params.map(|r| (&r.params, &r.creator)),
             );
-            let affinity = self.accounts.get(&addr).map(compute_affinity).unwrap_or(0);
+            // Derive affinity from the resource blob, matching Go's
+            // ResourcesHashBuilderV6 which uses resData.UpdateRound.
+            let affinity = extract_raw_affinity(&blob);
             let elem =
                 resource_hash_v6_with_kind(&addr, asset_id, &blob, affinity, HashKind::Asset);
             if let Err(e) = trie.add(&elem) {
@@ -906,11 +918,7 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 continue;
             }
             let blob = encode_merged_asset_resource(None, Some((&record.params, &record.creator)));
-            let affinity = self
-                .accounts
-                .get(&creator)
-                .map(compute_affinity)
-                .unwrap_or(0);
+            let affinity = extract_raw_affinity(&blob);
             let elem =
                 resource_hash_v6_with_kind(&creator, asset_id, &blob, affinity, HashKind::Asset);
             if let Err(e) = trie.add(&elem) {
@@ -925,7 +933,7 @@ impl crate::store_trait::LedgerStore for LedgerState {
         for (&(addr, app_id), local) in &self.app_local_states {
             let params = self.app_params.get(&app_id).filter(|p| p.creator == addr);
             let blob = encode_merged_app_resource(Some(local), params);
-            let affinity = self.accounts.get(&addr).map(compute_affinity).unwrap_or(0);
+            let affinity = extract_raw_affinity(&blob);
             let elem = resource_hash_v6_with_kind(&addr, app_id, &blob, affinity, HashKind::App);
             if let Err(e) = trie.add(&elem) {
                 tracing::warn!("enable_trie: add app local state failed: {}", e);
@@ -940,11 +948,7 @@ impl crate::store_trait::LedgerStore for LedgerState {
                 continue;
             }
             let blob = encode_merged_app_resource(None, Some(params));
-            let affinity = self
-                .accounts
-                .get(&creator)
-                .map(compute_affinity)
-                .unwrap_or(0);
+            let affinity = extract_raw_affinity(&blob);
             let elem = resource_hash_v6_with_kind(&creator, app_id, &blob, affinity, HashKind::App);
             if let Err(e) = trie.add(&elem) {
                 tracing::warn!("enable_trie: add app params failed: {}", e);
@@ -965,16 +969,9 @@ impl crate::store_trait::LedgerStore for LedgerState {
         // Process all recorded pre-mutations.
         let mutations = std::mem::take(&mut self.pre_mutations);
 
-        // Track addresses whose affinity changed, so we can cascade to resources (H2).
-        let mut affinity_changed: HashMap<Address, (u32, u32)> = HashMap::new();
-
         for mutation in mutations {
             match mutation {
-                PreMutation::Account {
-                    addr,
-                    old_data,
-                    old_affinity,
-                } => {
+                PreMutation::Account { addr, old_data } => {
                     // Delete old element if it existed.
                     if let Some(ref old) = old_data {
                         let old_elem = account_hash_v6(&addr, old);
@@ -984,14 +981,9 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     }
                     // Add new element if account still exists.
                     if let Some(new_data) = self.accounts.get(&addr) {
-                        let new_affinity = compute_affinity(new_data);
                         let new_elem = account_hash_v6(&addr, new_data);
                         if let Err(e) = trie.add(&new_elem) {
                             tracing::warn!("trie add account failed: {}", e);
-                        }
-                        // Track affinity change for resource cascade (H2).
-                        if old_affinity != new_affinity {
-                            affinity_changed.insert(addr, (old_affinity, new_affinity));
                         }
                     }
                 }
@@ -1027,12 +1019,11 @@ impl crate::store_trait::LedgerStore for LedgerState {
                         .get(&asset_id)
                         .filter(|r| r.creator == addr);
                     if new_holding.is_some() || new_params.is_some() {
-                        let new_affinity =
-                            self.accounts.get(&addr).map(compute_affinity).unwrap_or(0);
                         let new_blob = encode_merged_asset_resource(
                             new_holding,
                             new_params.map(|r| (&r.params, &r.creator)),
                         );
+                        let new_affinity = extract_raw_affinity(&new_blob);
                         let new_elem = resource_hash_v6_with_kind(
                             &addr,
                             asset_id,
@@ -1074,15 +1065,11 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     if let Some(new_rec) = new_record {
                         let creator = new_rec.creator;
                         let new_holding = self.asset_holdings.get(&(creator, asset_id));
-                        let new_affinity = self
-                            .accounts
-                            .get(&creator)
-                            .map(compute_affinity)
-                            .unwrap_or(0);
                         let new_blob = encode_merged_asset_resource(
                             new_holding,
                             Some((&new_rec.params, &new_rec.creator)),
                         );
+                        let new_affinity = extract_raw_affinity(&new_blob);
                         let new_elem = resource_hash_v6_with_kind(
                             &creator,
                             asset_id,
@@ -1096,12 +1083,8 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     } else if let Some((creator, _)) = old_holding {
                         let new_h = self.asset_holdings.get(&(creator, asset_id));
                         if let Some(h) = new_h {
-                            let new_affinity = self
-                                .accounts
-                                .get(&creator)
-                                .map(compute_affinity)
-                                .unwrap_or(0);
                             let new_blob = encode_merged_asset_resource(Some(h), None);
+                            let new_affinity = extract_raw_affinity(&new_blob);
                             let new_elem = resource_hash_v6_with_kind(
                                 &creator,
                                 asset_id,
@@ -1146,12 +1129,8 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     if let Some(new_p) = new_params {
                         let creator = new_p.creator;
                         let new_local = self.app_local_states.get(&(creator, app_id));
-                        let new_affinity = self
-                            .accounts
-                            .get(&creator)
-                            .map(compute_affinity)
-                            .unwrap_or(0);
                         let new_blob = encode_merged_app_resource(new_local, Some(new_p));
+                        let new_affinity = extract_raw_affinity(&new_blob);
                         let new_elem = resource_hash_v6_with_kind(
                             &creator,
                             app_id,
@@ -1165,12 +1144,8 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     } else if let Some((creator, _)) = old_local {
                         let new_l = self.app_local_states.get(&(creator, app_id));
                         if let Some(l) = new_l {
-                            let new_affinity = self
-                                .accounts
-                                .get(&creator)
-                                .map(compute_affinity)
-                                .unwrap_or(0);
                             let new_blob = encode_merged_app_resource(Some(l), None);
+                            let new_affinity = extract_raw_affinity(&new_blob);
                             let new_elem = resource_hash_v6_with_kind(
                                 &creator,
                                 app_id,
@@ -1212,9 +1187,8 @@ impl crate::store_trait::LedgerStore for LedgerState {
                     let new_local = self.app_local_states.get(&(addr, app_id));
                     let new_params = self.app_params.get(&app_id).filter(|p| p.creator == addr);
                     if new_local.is_some() || new_params.is_some() {
-                        let new_affinity =
-                            self.accounts.get(&addr).map(compute_affinity).unwrap_or(0);
                         let new_blob = encode_merged_app_resource(new_local, new_params);
+                        let new_affinity = extract_raw_affinity(&new_blob);
                         let new_elem = resource_hash_v6_with_kind(
                             &addr,
                             app_id,
@@ -1230,99 +1204,10 @@ impl crate::store_trait::LedgerStore for LedgerState {
             }
         }
 
-        // H2: Cascade affinity changes to resources not already mutated.
-        // When an account's affinity changed (e.g. update_round bumped by a payment),
-        // all resource trie elements for that address use the account's affinity in
-        // bytes 0..4. If the resources themselves weren't mutated, they are stale.
-        for (addr, (old_aff, new_aff)) in &affinity_changed {
-            // Re-hash asset holdings for this address.
-            for (&(ref a, asset_id), holding) in &self.asset_holdings {
-                if a != addr {
-                    continue;
-                }
-                let params = self
-                    .asset_params
-                    .get(&asset_id)
-                    .filter(|r| r.creator == *addr);
-                let blob = encode_merged_asset_resource(
-                    Some(holding),
-                    params.map(|r| (&r.params, &r.creator)),
-                );
-                // Delete old element with old affinity.
-                let old_elem =
-                    resource_hash_v6_with_kind(addr, asset_id, &blob, *old_aff, HashKind::Asset);
-                if let Err(e) = trie.delete(&old_elem) {
-                    tracing::warn!("trie delete (affinity cascade asset) failed: {}", e);
-                }
-                // Add new element with new affinity.
-                let new_elem =
-                    resource_hash_v6_with_kind(addr, asset_id, &blob, *new_aff, HashKind::Asset);
-                if let Err(e) = trie.add(&new_elem) {
-                    tracing::warn!("trie add (affinity cascade asset) failed: {}", e);
-                }
-            }
-            // Re-hash asset params where this address is creator.
-            for (&asset_id, record) in &self.asset_params {
-                if record.creator != *addr {
-                    continue;
-                }
-                // Skip if already covered by asset_holdings iteration above.
-                if self.asset_holdings.contains_key(&(*addr, asset_id)) {
-                    continue;
-                }
-                let blob =
-                    encode_merged_asset_resource(None, Some((&record.params, &record.creator)));
-                let old_elem =
-                    resource_hash_v6_with_kind(addr, asset_id, &blob, *old_aff, HashKind::Asset);
-                if let Err(e) = trie.delete(&old_elem) {
-                    tracing::warn!("trie delete (affinity cascade asset params) failed: {}", e);
-                }
-                let new_elem =
-                    resource_hash_v6_with_kind(addr, asset_id, &blob, *new_aff, HashKind::Asset);
-                if let Err(e) = trie.add(&new_elem) {
-                    tracing::warn!("trie add (affinity cascade asset params) failed: {}", e);
-                }
-            }
-            // Re-hash app local states for this address.
-            for (&(ref a, app_id), local) in &self.app_local_states {
-                if a != addr {
-                    continue;
-                }
-                let params = self.app_params.get(&app_id).filter(|p| p.creator == *addr);
-                let blob = encode_merged_app_resource(Some(local), params);
-                let old_elem =
-                    resource_hash_v6_with_kind(addr, app_id, &blob, *old_aff, HashKind::App);
-                if let Err(e) = trie.delete(&old_elem) {
-                    tracing::warn!("trie delete (affinity cascade app local) failed: {}", e);
-                }
-                let new_elem =
-                    resource_hash_v6_with_kind(addr, app_id, &blob, *new_aff, HashKind::App);
-                if let Err(e) = trie.add(&new_elem) {
-                    tracing::warn!("trie add (affinity cascade app local) failed: {}", e);
-                }
-            }
-            // Re-hash app params where this address is creator.
-            for (&app_id, params) in &self.app_params {
-                if params.creator != *addr {
-                    continue;
-                }
-                // Skip if already covered by app_local_states iteration above.
-                if self.app_local_states.contains_key(&(*addr, app_id)) {
-                    continue;
-                }
-                let blob = encode_merged_app_resource(None, Some(params));
-                let old_elem =
-                    resource_hash_v6_with_kind(addr, app_id, &blob, *old_aff, HashKind::App);
-                if let Err(e) = trie.delete(&old_elem) {
-                    tracing::warn!("trie delete (affinity cascade app params) failed: {}", e);
-                }
-                let new_elem =
-                    resource_hash_v6_with_kind(addr, app_id, &blob, *new_aff, HashKind::App);
-                if let Err(e) = trie.add(&new_elem) {
-                    tracing::warn!("trie add (affinity cascade app params) failed: {}", e);
-                }
-            }
-        }
+        // Note: No H2 cascade needed. Resource trie elements use the resource's
+        // own UpdateRound for affinity (extracted from the blob via extract_raw_affinity),
+        // not the account's. This matches Go's ResourcesHashBuilderV6 which passes
+        // resData.UpdateRound. Account affinity changes do not affect resource elements.
 
         Some(trie.root_hash())
     }

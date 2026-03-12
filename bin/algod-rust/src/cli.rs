@@ -185,6 +185,12 @@ pub enum Commands {
         trie: bool,
     },
 
+    /// Catchpoint operations: import, verify, and download catchpoint files.
+    Catchpoint {
+        #[command(subcommand)]
+        action: CatchpointAction,
+    },
+
     /// Follow mode: continuously validate new blocks as they arrive.
     Follow {
         /// Base URL of the algod REST API.
@@ -198,5 +204,65 @@ pub enum Commands {
         /// Directory to write periodic conformance reports.
         #[arg(long)]
         report_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CatchpointAction {
+    /// Import a catchpoint file into the database.
+    Import {
+        /// Path to the catchpoint file (tar or tar.gz).
+        #[arg(long)]
+        file: PathBuf,
+
+        /// SQLite database path.
+        #[arg(long, default_value = "./ledger.sqlite")]
+        db: PathBuf,
+
+        /// Expected catchpoint label (optional, verified against file header).
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Reward unit for normalized online balance computation.
+        #[arg(long, default_value = "1000000")]
+        reward_unit: u64,
+
+        /// Skip verification after import.
+        #[arg(long)]
+        no_verify: bool,
+    },
+
+    /// Verify an already-imported catchpoint database.
+    Verify {
+        /// SQLite database path to verify.
+        #[arg(long, default_value = "./ledger.sqlite")]
+        db: PathBuf,
+
+        /// Path to the catchpoint file (required for block header digest).
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+
+    /// Download a catchpoint file from an algod node.
+    Download {
+        /// Base URL of the algod REST API.
+        #[arg(long)]
+        url: String,
+
+        /// API token for the algod node.
+        #[arg(long, default_value = "")]
+        token: String,
+
+        /// Genesis ID (e.g. "mainnet-v1.0").
+        #[arg(long)]
+        genesis_id: String,
+
+        /// Catchpoint round to download.
+        #[arg(long)]
+        round: u64,
+
+        /// Output file path.
+        #[arg(long)]
+        output: PathBuf,
     },
 }

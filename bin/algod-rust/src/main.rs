@@ -4,7 +4,7 @@ mod commands;
 use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use cli::{Cli, Commands};
+use cli::{CatchpointAction, Cli, Commands};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -128,6 +128,37 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
+        Commands::Catchpoint { action } => match action {
+            CatchpointAction::Import {
+                file,
+                db,
+                label,
+                reward_unit,
+                no_verify,
+            } => {
+                commands::catchpoint::run_import(
+                    &file,
+                    &db,
+                    label.as_deref(),
+                    reward_unit,
+                    !no_verify,
+                )
+                .await?;
+            }
+            CatchpointAction::Verify { db, file } => {
+                commands::catchpoint::run_verify(&db, file.as_deref()).await?;
+            }
+            CatchpointAction::Download {
+                url,
+                token,
+                genesis_id,
+                round,
+                output,
+            } => {
+                commands::catchpoint::run_download(&url, &token, &genesis_id, round, &output)
+                    .await?;
+            }
+        },
         Commands::Follow {
             algod_url,
             algod_token,

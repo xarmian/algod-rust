@@ -349,7 +349,47 @@ impl<'a> CatchpointImporter<'a> {
             ],
         )?;
 
-        // Step 5: Clean up remaining staging tables and checkpoint.
+        // Step 5: Write catchpointstate entries (matches Go's processStagingContent).
+        // Ensure the catchpointstate table exists.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS catchpointstate (
+                id TEXT PRIMARY KEY,
+                intval INTEGER,
+                strval TEXT
+            );",
+        )?;
+
+        // catchpointCatchupLabel — the label string
+        tx.execute(
+            "INSERT OR REPLACE INTO catchpointstate(id, strval) VALUES('catchpointCatchupLabel', ?1)",
+            rusqlite::params![&self.catchpoint_label],
+        )?;
+
+        // catchpointCatchupVersion — file version from the header
+        tx.execute(
+            "INSERT OR REPLACE INTO catchpointstate(id, intval) VALUES('catchpointCatchupVersion', ?1)",
+            rusqlite::params![header.version as i64],
+        )?;
+
+        // catchpointCatchupBlockRound — block round from the header
+        tx.execute(
+            "INSERT OR REPLACE INTO catchpointstate(id, intval) VALUES('catchpointCatchupBlockRound', ?1)",
+            rusqlite::params![header.blocks_round as i64],
+        )?;
+
+        // catchpointCatchupBalancesRound — balances round from the header
+        tx.execute(
+            "INSERT OR REPLACE INTO catchpointstate(id, intval) VALUES('catchpointCatchupBalancesRound', ?1)",
+            rusqlite::params![header.balances_round as i64],
+        )?;
+
+        // catchpointCatchupHashRound — same as block round for V6+ (matches Go)
+        tx.execute(
+            "INSERT OR REPLACE INTO catchpointstate(id, intval) VALUES('catchpointCatchupHashRound', ?1)",
+            rusqlite::params![header.blocks_round as i64],
+        )?;
+
+        // Step 6: Clean up remaining staging tables and checkpoint.
         tx.execute_batch(
             "DROP TABLE IF EXISTS catchpointpendinghashes;
             DROP TABLE IF EXISTS catchpoint_import_state;",
