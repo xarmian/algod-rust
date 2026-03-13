@@ -241,12 +241,18 @@ pub async fn try_connect(addr: &str, config: &ConnectConfig) -> Result<PeerHandl
         .get(HeaderName::from_static("x-algorand-peer-features"))
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let peer_features = decode_peer_features(&server_info.protocol_version, peer_features_header);
+    let remote_features = decode_peer_features(&server_info.protocol_version, peer_features_header);
+    // The effective feature set is the intersection of the server's advertised
+    // capabilities and our local configuration.  Without this, the write_loop
+    // would zstd-compress outbound PP payloads even when the caller has
+    // deliberately disabled COMPRESSED_PROPOSAL in `ConnectConfig::our_features`.
+    let peer_features = remote_features.intersection(config.our_features);
     tracing::debug!(
         addr = %addr,
         features_raw = %peer_features_header,
-        features_decoded = ?peer_features,
-        "decoded peer features"
+        features_remote = ?remote_features,
+        features_negotiated = ?peer_features,
+        "negotiated peer features"
     );
 
     // Step 9: Check for priority challenge header (NP)
@@ -318,19 +324,10 @@ pub async fn try_connect(addr: &str, config: &ConnectConfig) -> Result<PeerHandl
     );
     let handle = peer.start();
 
-    // Step 12: Send MsgOfInterest
-    let mi_tags = Tag::active_tags();
-    let mi_payload = marshal_msg_of_interest(&mi_tags);
-    let mi_msg = OutgoingMessage::new(Tag::MsgOfInterest, mi_payload);
-    if let Err(e) = handle.send_priority(mi_msg) {
-        tracing::warn!(
-            addr = %addr,
-            error = %e,
-            "could not send MsgOfInterest"
-        );
-    }
-
-    // Step 13: Send identity verification (if exchange succeeded)
+    // Step 12: Send identity verification (if exchange succeeded)
+    // The identity protocol requires the NI verification message (Message 3)
+    // to be sent before any gossip traffic. Go relays that enforce identity
+    // flow ordering will drop the connection otherwise.
     if let Some(verification_bytes) = id_verification_bytes {
         let ni_msg = OutgoingMessage {
             tag: Tag::NetIDVerification,
@@ -343,6 +340,18 @@ pub async fn try_connect(addr: &str, config: &ConnectConfig) -> Result<PeerHandl
                 "could not send identity verification"
             );
         }
+    }
+
+    // Step 13: Send MsgOfInterest
+    let mi_tags = Tag::active_tags();
+    let mi_payload = marshal_msg_of_interest(&mi_tags);
+    let mi_msg = OutgoingMessage::new(Tag::MsgOfInterest, mi_payload);
+    if let Err(e) = handle.send_priority(mi_msg) {
+        tracing::warn!(
+            addr = %addr,
+            error = %e,
+            "could not send MsgOfInterest"
+        );
     }
 
     tracing::info!(
