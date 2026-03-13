@@ -123,10 +123,8 @@ impl SyncBackend for AlgodSyncBackend {
 
         tokio::task::block_in_place(|| {
             self.rt.block_on(async {
-                let source: Arc<dyn BlockSource> = Arc::new(AlgodClient::new(
-                    &self.algod_url,
-                    &self.algod_token,
-                ));
+                let source: Arc<dyn BlockSource> =
+                    Arc::new(AlgodClient::new(&self.algod_url, &self.algod_token));
                 let fetcher = ParallelBlockFetcher::new(source, concurrency);
                 let cancel = CancellationToken::new();
                 // fetch_range uses half-open [start, end), so add 1 to include `end`.
