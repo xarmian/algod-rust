@@ -262,7 +262,6 @@ impl WsPeer {
             send_high_prio_rx,
             send_bulk_rx,
             send_message_tags.clone(),
-            last_packet_time.clone(),
             closing.clone(),
             remote_addr.clone(),
             features,
@@ -511,13 +510,12 @@ async fn read_loop<St>(
                     payload.to_vec()
                 };
 
-                // VP (VotePacked) messages are re-tagged to AV (AgreementVote)
-                // after decompression, matching Go's wsPeer.readLoop behavior.
-                let tag = if tag == Tag::VotePacked {
-                    Tag::AgreementVote
-                } else {
-                    tag
-                };
+                // VP (VotePacked) messages are dispatched with their original
+                // tag.  When the avvpack codec is implemented in a future epic,
+                // VP payloads will be decoded and re-tagged to AV here.
+                // Re-tagging without first unpacking the vpack payload would
+                // cause higher layers to receive vpack-encoded bytes labelled
+                // as normal AV, making them undecodable.
 
                 // Handle MI (MsgOfInterest) messages: update the send filter.
                 if tag == Tag::MsgOfInterest {
@@ -631,7 +629,6 @@ async fn write_loop<Sk>(
     mut send_high_prio_rx: mpsc::Receiver<WriteCommand>,
     mut send_bulk_rx: mpsc::Receiver<WriteCommand>,
     send_message_tags: Arc<RwLock<HashSet<Tag>>>,
-    last_packet_time: Arc<RwLock<Instant>>,
     closing: CancellationToken,
     remote_addr: String,
     features: PeerFeatureFlags,
@@ -647,7 +644,6 @@ async fn write_loop<Sk>(
                     cmd,
                     &mut sink,
                     &send_message_tags,
-                    &last_packet_time,
                     &remote_addr,
                     features,
                 )
@@ -705,15 +701,8 @@ async fn write_loop<Sk>(
             }
         };
 
-        if let Err(reason) = process_write_command(
-            cmd,
-            &mut sink,
-            &send_message_tags,
-            &last_packet_time,
-            &remote_addr,
-            features,
-        )
-        .await
+        if let Err(reason) =
+            process_write_command(cmd, &mut sink, &send_message_tags, &remote_addr, features).await
         {
             tracing::warn!(
                 peer = %remote_addr,
@@ -729,11 +718,15 @@ async fn write_loop<Sk>(
 /// Process a single write command: either a data message or a filter update.
 ///
 /// Returns `Ok(())` on success, `Err(reason)` if the connection should close.
+///
+/// Note: this function intentionally does NOT update `last_packet_time`.
+/// Only inbound traffic (received frames, pongs) should refresh the idle
+/// timer.  Updating on outbound writes would mask dead peers whose TCP
+/// stack still accepts writes.
 async fn process_write_command<Sk>(
     cmd: WriteCommand,
     sink: &mut SplitSink<Sk, WsMessage>,
     send_message_tags: &Arc<RwLock<HashSet<Tag>>>,
-    last_packet_time: &Arc<RwLock<Instant>>,
     remote_addr: &str,
     features: PeerFeatureFlags,
 ) -> Result<(), String>
@@ -752,11 +745,10 @@ where
             if let Err(e) = sink.send(WsMessage::Ping(payload)).await {
                 return Err(format!("ping write error: {e}"));
             }
-            // Update last packet time on successful write.
-            {
-                let mut lpt = last_packet_time.write().await;
-                *lpt = Instant::now();
-            }
+            // Do NOT update last_packet_time here — only inbound traffic
+            // (received frames, pongs) should refresh the idle timer.
+            // Updating on outbound pings would mask dead peers whose TCP
+            // stack still accepts writes.
             Ok(())
         }
         WriteCommand::Data(send_msg) => {
@@ -817,11 +809,9 @@ where
                 return Err(format!("write error: {e}"));
             }
 
-            // Update last packet time on successful write.
-            {
-                let mut lpt = last_packet_time.write().await;
-                *lpt = Instant::now();
-            }
+            // Do NOT update last_packet_time here — only inbound traffic
+            // (received frames, pongs) should refresh the idle timer.
+            // Updating on outbound writes would mask dead peers.
 
             Ok(())
         }
@@ -1045,7 +1035,6 @@ mod tests {
         let (client_ws, _server_ws) = ws_raw_pair().await;
         let (mut sink, _stream) = client_ws.split();
         let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
-        let last_packet_time = Arc::new(RwLock::new(Instant::now()));
 
         // Verify TX is initially allowed.
         {
@@ -1062,7 +1051,6 @@ mod tests {
             cmd,
             &mut sink,
             &send_message_tags,
-            &last_packet_time,
             "test",
             PeerFeatureFlags::empty(),
         )
@@ -1082,7 +1070,6 @@ mod tests {
         let (_server_sink, mut server_stream) = server_ws.split();
 
         let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
-        let last_packet_time = Arc::new(RwLock::new(Instant::now()));
 
         let msg = OutgoingMessage::new(Tag::Transaction, b"hello".to_vec());
         let cmd = WriteCommand::Data(SendMessage {
@@ -1094,7 +1081,6 @@ mod tests {
             cmd,
             &mut sink,
             &send_message_tags,
-            &last_packet_time,
             "test",
             PeerFeatureFlags::empty(),
         )
@@ -1122,7 +1108,6 @@ mod tests {
         let mut tags = HashSet::new();
         tags.insert(Tag::AgreementVote);
         let send_message_tags = Arc::new(RwLock::new(tags));
-        let last_packet_time = Arc::new(RwLock::new(Instant::now()));
 
         // Try to send TX — should be silently dropped.
         let msg = OutgoingMessage::new(Tag::Transaction, b"filtered".to_vec());
@@ -1135,7 +1120,6 @@ mod tests {
             cmd,
             &mut sink,
             &send_message_tags,
-            &last_packet_time,
             "test",
             PeerFeatureFlags::empty(),
         )
@@ -1151,7 +1135,6 @@ mod tests {
         let (mut sink, _client_stream) = client_ws.split();
 
         let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
-        let last_packet_time = Arc::new(RwLock::new(Instant::now()));
 
         // Create a message that is older than MAX_MESSAGE_QUEUE_DURATION.
         let msg = OutgoingMessage::new(Tag::Transaction, b"old".to_vec());
@@ -1164,7 +1147,6 @@ mod tests {
             cmd,
             &mut sink,
             &send_message_tags,
-            &last_packet_time,
             "test",
             PeerFeatureFlags::empty(),
         )
@@ -1185,7 +1167,6 @@ mod tests {
         let (_server_sink, mut server_stream) = server_ws.split();
 
         let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
-        let last_packet_time = Arc::new(RwLock::new(Instant::now()));
         let closing = CancellationToken::new();
 
         let (high_prio_tx, high_prio_rx) = mpsc::channel::<WriteCommand>(10);
@@ -1217,7 +1198,6 @@ mod tests {
             high_prio_rx,
             bulk_rx,
             send_message_tags,
-            last_packet_time,
             closing_clone,
             "test".to_string(),
             PeerFeatureFlags::empty(),
@@ -1400,7 +1380,6 @@ mod tests {
             high_prio_rx,
             bulk_rx,
             send_message_tags.clone(),
-            last_packet_time.clone(),
             closing_clone,
             "test".to_string(),
             PeerFeatureFlags::empty(),

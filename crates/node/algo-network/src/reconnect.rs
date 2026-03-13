@@ -364,15 +364,18 @@ impl ReconnectSupervisor {
     /// Run the reconnection loop.
     ///
     /// `connect_fn` is an async function that attempts to connect and run the
-    /// peer session.  It should return `Ok(())` only when the session ends
-    /// cleanly (i.e. the caller no longer wants to reconnect).  Returning an
-    /// `Err(SupervisorError)` will trigger classification and possible retry.
+    /// peer session.  When it returns `Ok(())`, the supervisor resets the
+    /// backoff and attempt counter, then loops to reconnect.  When it returns
+    /// `Err(SupervisorError)`, the error is classified and may trigger a
+    /// retry (transient) or immediate exit (terminal).
     ///
     /// The function returns when:
-    /// - `connect_fn` returns `Ok(())` (clean exit)
     /// - A terminal failure is encountered
     /// - `max_attempts` is exhausted
     /// - The cancellation token is cancelled
+    ///
+    /// To stop the supervisor after a single successful session, cancel the
+    /// token from within `connect_fn` before returning `Ok(())`.
     pub async fn run<F, Fut>(&mut self, connect_fn: F) -> Result<(), SupervisorError>
     where
         F: Fn() -> Fut,
@@ -417,9 +420,17 @@ impl ReconnectSupervisor {
 
             match result {
                 Ok(()) => {
-                    // Clean exit — the session ended normally.
-                    tracing::info!(addr = %self.addr, "peer session ended cleanly");
-                    return Ok(());
+                    // Session ended normally.  Reset backoff and attempt
+                    // counter so that if the next connection attempt fails
+                    // transiently we start with a fresh (short) delay instead
+                    // of an accumulated long one.
+                    tracing::info!(addr = %self.addr, "peer session ended cleanly, resetting backoff");
+                    self.policy.backoff.reset();
+                    attempt = 0;
+                    // Continue the loop to reconnect.  If the caller wants the
+                    // supervisor to stop after one successful session, they can
+                    // cancel the token.
+                    continue;
                 }
                 Err(err) => {
                     let classification = err.classify();
@@ -759,11 +770,13 @@ mod tests {
         };
 
         let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
         let mut sup = ReconnectSupervisor::new("127.0.0.1:4160", policy, cancel);
 
         let result = sup
             .run(|| {
                 let ac = Arc::clone(&attempt_clone);
+                let cancel_inner = cancel_clone.clone();
                 async move {
                     let n = ac.fetch_add(1, Ordering::SeqCst) + 1;
                     if n < 3 {
@@ -771,13 +784,19 @@ mod tests {
                             "refused".into(),
                         )))
                     } else {
+                        // Succeed, then cancel so the supervisor stops.
+                        cancel_inner.cancel();
                         Ok(())
                     }
                 }
             })
             .await;
 
-        assert!(result.is_ok(), "should succeed after retries");
+        // The supervisor loops after success; it exits via cancellation.
+        match result.unwrap_err() {
+            SupervisorError::Shutdown => {}
+            other => panic!("expected Shutdown, got: {other}"),
+        }
         assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
     }
 
@@ -980,11 +999,13 @@ mod tests {
     #[tokio::test]
     async fn supervisor_resets_backoff_on_success_concept() {
         // This test verifies that the backoff is reset between connection
-        // cycles by checking that after a successful connection that later
-        // fails, the supervisor restarts with a short delay (not a
-        // previously-accumulated long one).
+        // cycles.  After a successful connection the supervisor resets the
+        // backoff and attempt counter, so a subsequent transient failure
+        // starts with a fresh (short) delay instead of an accumulated one.
         //
-        // We simulate: fail, fail, succeed (then return Ok to exit).
+        // Sequence: fail, fail, succeed, fail, succeed, cancel.
+        // After the first success the attempt counter resets to 0, so the
+        // second failure uses the initial (1 ms) backoff, not a longer one.
         let attempt_count = Arc::new(AtomicUsize::new(0));
         let attempt_clone = Arc::clone(&attempt_count);
 
@@ -1000,26 +1021,43 @@ mod tests {
         };
 
         let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
         let mut sup = ReconnectSupervisor::new("127.0.0.1:4160", policy, cancel);
 
         let result = sup
             .run(|| {
                 let ac = Arc::clone(&attempt_clone);
+                let cancel_inner = cancel_clone.clone();
                 async move {
                     let n = ac.fetch_add(1, Ordering::SeqCst) + 1;
-                    if n <= 2 {
-                        Err(SupervisorError::Connect(WsConnectError::TcpFailure(
+                    match n {
+                        // First two calls fail (transient).
+                        1 | 2 => Err(SupervisorError::Connect(WsConnectError::TcpFailure(
                             "refused".into(),
-                        )))
-                    } else {
-                        Ok(())
+                        ))),
+                        // Third call succeeds — backoff and attempt counter
+                        // are reset by the supervisor.
+                        3 => Ok(()),
+                        // Fourth call fails again — should use fresh backoff.
+                        4 => Err(SupervisorError::Connect(WsConnectError::TcpFailure(
+                            "refused again".into(),
+                        ))),
+                        // Fifth call succeeds — then cancel to stop the loop.
+                        _ => {
+                            cancel_inner.cancel();
+                            Ok(())
+                        }
                     }
                 }
             })
             .await;
 
-        assert!(result.is_ok());
-        assert_eq!(attempt_count.load(Ordering::SeqCst), 3);
+        // Supervisor exits via cancellation after the second success.
+        match result.unwrap_err() {
+            SupervisorError::Shutdown => {}
+            other => panic!("expected Shutdown, got: {other}"),
+        }
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 5);
     }
 
     #[test]
@@ -1104,12 +1142,14 @@ mod tests {
         };
 
         let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
         let mut sup = ReconnectSupervisor::new("127.0.0.1:4160", policy, cancel);
 
         let result = sup
             .run(|| {
                 let ac = Arc::clone(&attempt_clone);
                 let ts = Arc::clone(&ts_clone);
+                let cancel_inner = cancel_clone.clone();
                 async move {
                     let n = ac.fetch_add(1, Ordering::SeqCst) + 1;
                     ts.lock().unwrap().push(std::time::Instant::now());
@@ -1120,13 +1160,17 @@ mod tests {
                             retry_after_secs: Some(1),
                         }))
                     } else {
+                        cancel_inner.cancel();
                         Ok(())
                     }
                 }
             })
             .await;
 
-        assert!(result.is_ok());
+        match result.unwrap_err() {
+            SupervisorError::Shutdown => {}
+            other => panic!("expected Shutdown, got: {other}"),
+        }
         assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
 
         // The gap between attempts should be >= 1 second (the Retry-After),
@@ -1159,11 +1203,13 @@ mod tests {
         };
 
         let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
         let mut sup = ReconnectSupervisor::new("127.0.0.1:4160", policy, cancel);
 
         let result = sup
             .run(|| {
                 let ac = Arc::clone(&attempt_clone);
+                let cancel_inner = cancel_clone.clone();
                 async move {
                     let n = ac.fetch_add(1, Ordering::SeqCst) + 1;
                     if n < 2 {
@@ -1172,13 +1218,17 @@ mod tests {
                             retry_after_secs: Some(0),
                         }))
                     } else {
+                        cancel_inner.cancel();
                         Ok(())
                     }
                 }
             })
             .await;
 
-        assert!(result.is_ok());
+        match result.unwrap_err() {
+            SupervisorError::Shutdown => {}
+            other => panic!("expected Shutdown, got: {other}"),
+        }
         assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
     }
 
@@ -1200,11 +1250,13 @@ mod tests {
         };
 
         let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
         let mut sup = ReconnectSupervisor::new("127.0.0.1:4160", policy, cancel);
 
         let result = sup
             .run(|| {
                 let ac = Arc::clone(&attempt_clone);
+                let cancel_inner = cancel_clone.clone();
                 async move {
                     let n = ac.fetch_add(1, Ordering::SeqCst) + 1;
                     if n < 2 {
@@ -1212,13 +1264,17 @@ mod tests {
                             retry_after_secs: None,
                         }))
                     } else {
+                        cancel_inner.cancel();
                         Ok(())
                     }
                 }
             })
             .await;
 
-        assert!(result.is_ok());
+        match result.unwrap_err() {
+            SupervisorError::Shutdown => {}
+            other => panic!("expected Shutdown, got: {other}"),
+        }
         assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
     }
 
