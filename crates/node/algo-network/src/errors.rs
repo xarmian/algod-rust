@@ -116,6 +116,13 @@ pub enum IdentityError {
     #[error("invalid identity signature")]
     BadSignature,
 
+    /// The identity challenge response header was missing or empty.
+    ///
+    /// This is non-fatal: the server simply did not participate in identity
+    /// exchange (e.g. older relay software).
+    #[error("identity challenge header missing")]
+    HeaderMissing,
+
     /// The challenge bytes in the response did not match what we sent.
     #[error("identity challenge mismatch")]
     ChallengeMismatch,

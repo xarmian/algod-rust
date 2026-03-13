@@ -557,13 +557,29 @@ async fn read_loop<St>(
                 let incoming_msg = IncomingMessage::new(tag, payload, remote_addr.clone(), now_ns);
 
                 // Dispatch to the incoming channel.
-                if incoming_tx.send(incoming_msg).await.is_err() {
-                    tracing::debug!(
-                        peer = %remote_addr,
-                        "read_loop: incoming channel closed"
-                    );
-                    closing.cancel();
-                    return;
+                //
+                // Use try_send instead of send().await to avoid blocking the
+                // read loop when the incoming buffer is full.  Blocking here
+                // would prevent us from processing WebSocket pings/pongs and
+                // updating last_packet_time, causing keepalive_loop to
+                // declare the peer idle and disconnect it.
+                match incoming_tx.try_send(incoming_msg) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            peer = %remote_addr,
+                            tag = %tag,
+                            "read_loop: incoming channel full, dropping message (backpressure)"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::debug!(
+                            peer = %remote_addr,
+                            "read_loop: incoming channel closed"
+                        );
+                        closing.cancel();
+                        return;
+                    }
                 }
             }
             WsMessage::Pong(_) => {
@@ -1510,6 +1526,69 @@ mod tests {
         // Verify the cancel logic works.
         closing.cancel();
         assert!(closing.is_cancelled());
+    }
+
+    // -----------------------------------------------------------------------
+    // Read loop: full incoming channel drops messages without blocking
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn read_loop_full_incoming_channel_drops_without_blocking() {
+        // Create a WebSocket pair.
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (mut client_sink, _client_stream) = client_ws.split();
+        let (_server_sink, server_stream) = server_ws.split();
+
+        // Create an incoming channel with capacity 1 so it fills immediately.
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(1);
+        let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+        let closing = CancellationToken::new();
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let last_packet_time = Arc::new(RwLock::new(Instant::now()));
+
+        let closing_clone = closing.clone();
+        let _read_task = tokio::spawn(read_loop(
+            server_stream,
+            incoming_tx,
+            high_prio_tx,
+            send_message_tags,
+            last_packet_time.clone(),
+            closing_clone,
+            "test-peer".to_string(),
+            PeerFeatureFlags::empty(),
+        ));
+
+        // Send several messages to fill the incoming channel and overflow it.
+        for i in 0..5u8 {
+            let frame = encode_frame(&Tag::Transaction, &[i]).unwrap();
+            client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+        }
+
+        // Give the read loop time to process all the frames.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The read loop should NOT be blocked — verify it is still running
+        // by checking that last_packet_time was updated recently.
+        let idle = {
+            let lpt = last_packet_time.read().await;
+            lpt.elapsed()
+        };
+        assert!(
+            idle < Duration::from_secs(2),
+            "read_loop appears to be blocked (last_packet_time is stale: {idle:?})"
+        );
+
+        // We should be able to receive at least the first message.
+        let msg = tokio::time::timeout(Duration::from_millis(500), incoming_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(msg.tag, Tag::Transaction);
+
+        // The connection should still be alive (not cancelled by blocked read).
+        assert!(!closing.is_cancelled(), "connection should still be open");
+
+        closing.cancel();
     }
 
     // -----------------------------------------------------------------------

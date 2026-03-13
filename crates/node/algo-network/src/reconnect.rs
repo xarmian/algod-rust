@@ -461,7 +461,26 @@ impl ReconnectSupervisor {
                                 }
                             }
 
-                            let delay = self.policy.backoff.next_delay();
+                            let mut delay = self.policy.backoff.next_delay();
+
+                            // Respect the server's Retry-After header for 429
+                            // responses.  Use whichever is longer: our backoff
+                            // or the server's requested cooling-off period.
+                            if let SupervisorError::Connect(WsConnectError::TooManyRequests {
+                                retry_after_secs: Some(secs),
+                            }) = &err
+                            {
+                                let server_delay = Duration::from_secs(*secs);
+                                if server_delay > delay {
+                                    tracing::info!(
+                                        addr = %self.addr,
+                                        retry_after_secs = secs,
+                                        backoff_ms = delay.as_millis() as u64,
+                                        "using server Retry-After (longer than backoff)"
+                                    );
+                                    delay = server_delay;
+                                }
+                            }
 
                             tracing::info!(
                                 addr = %self.addr,
@@ -1058,5 +1077,160 @@ mod tests {
         assert!(p.backoff.jitter);
         assert!(p.max_attempts.is_none());
         assert_eq!(p.on_terminal_failure, TerminalAction::NotifyAndStop);
+    }
+
+    // -- Retry-After (429) tests -------------------------------------------
+
+    #[tokio::test]
+    async fn supervisor_respects_retry_after_when_larger_than_backoff() {
+        // The server says "retry after 10s" but our backoff is only 1ms.
+        // The supervisor should wait at least 10s.  We verify this by
+        // checking that the second attempt happens after the Retry-After
+        // period, not after the tiny backoff.
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let attempt_clone = Arc::clone(&attempt_count);
+        let timestamps = Arc::new(std::sync::Mutex::new(Vec::<std::time::Instant>::new()));
+        let ts_clone = Arc::clone(&timestamps);
+
+        let policy = ReconnectPolicy {
+            backoff: ExponentialBackoff::new(
+                Duration::from_millis(1),
+                Duration::from_millis(100),
+                2.0,
+                false,
+            ),
+            max_attempts: Some(2),
+            on_terminal_failure: TerminalAction::Stop,
+        };
+
+        let cancel = CancellationToken::new();
+        let mut sup = ReconnectSupervisor::new("127.0.0.1:4160", policy, cancel);
+
+        let result = sup
+            .run(|| {
+                let ac = Arc::clone(&attempt_clone);
+                let ts = Arc::clone(&ts_clone);
+                async move {
+                    let n = ac.fetch_add(1, Ordering::SeqCst) + 1;
+                    ts.lock().unwrap().push(std::time::Instant::now());
+                    if n < 2 {
+                        // First attempt: return 429 with retry_after = 1 second
+                        // (we use 1s instead of 10s to keep the test fast).
+                        Err(SupervisorError::Connect(WsConnectError::TooManyRequests {
+                            retry_after_secs: Some(1),
+                        }))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+
+        // The gap between attempts should be >= 1 second (the Retry-After),
+        // not the tiny 1ms backoff.
+        let ts = timestamps.lock().unwrap();
+        assert_eq!(ts.len(), 2);
+        let gap = ts[1].duration_since(ts[0]);
+        assert!(
+            gap >= Duration::from_millis(900),
+            "expected gap >= ~1s (Retry-After), got {gap:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_uses_backoff_when_larger_than_retry_after() {
+        // The server says "retry after 0s" but our backoff is 1s.
+        // The supervisor should use the backoff (which is larger).
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let attempt_clone = Arc::clone(&attempt_count);
+
+        let policy = ReconnectPolicy {
+            backoff: ExponentialBackoff::new(
+                Duration::from_millis(1),
+                Duration::from_millis(100),
+                2.0,
+                false,
+            ),
+            max_attempts: Some(2),
+            on_terminal_failure: TerminalAction::Stop,
+        };
+
+        let cancel = CancellationToken::new();
+        let mut sup = ReconnectSupervisor::new("127.0.0.1:4160", policy, cancel);
+
+        let result = sup
+            .run(|| {
+                let ac = Arc::clone(&attempt_clone);
+                async move {
+                    let n = ac.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n < 2 {
+                        // Server says retry after 0s — backoff should win.
+                        Err(SupervisorError::Connect(WsConnectError::TooManyRequests {
+                            retry_after_secs: Some(0),
+                        }))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn supervisor_handles_429_without_retry_after() {
+        // 429 with no Retry-After header — should just use backoff.
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let attempt_clone = Arc::clone(&attempt_count);
+
+        let policy = ReconnectPolicy {
+            backoff: ExponentialBackoff::new(
+                Duration::from_millis(1),
+                Duration::from_millis(100),
+                2.0,
+                false,
+            ),
+            max_attempts: Some(2),
+            on_terminal_failure: TerminalAction::Stop,
+        };
+
+        let cancel = CancellationToken::new();
+        let mut sup = ReconnectSupervisor::new("127.0.0.1:4160", policy, cancel);
+
+        let result = sup
+            .run(|| {
+                let ac = Arc::clone(&attempt_clone);
+                async move {
+                    let n = ac.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n < 2 {
+                        Err(SupervisorError::Connect(WsConnectError::TooManyRequests {
+                            retry_after_secs: None,
+                        }))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn too_many_requests_is_transient() {
+        let err = WsConnectError::TooManyRequests {
+            retry_after_secs: Some(60),
+        };
+        assert_eq!(
+            classify_connect_error(&err),
+            ConnectionFailure::Transient,
+            "TooManyRequests should be transient"
+        );
     }
 }

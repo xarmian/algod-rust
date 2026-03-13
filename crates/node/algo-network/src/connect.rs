@@ -372,10 +372,10 @@ fn extract_and_verify_identity(
     let header_value = response_headers
         .get(HeaderName::from_static("x-algorand-identitychallenge"))
         .and_then(|v| v.to_str().ok())
-        .ok_or(crate::errors::IdentityError::ChallengeMismatch)?;
+        .ok_or(crate::errors::IdentityError::HeaderMissing)?;
 
     if header_value.is_empty() {
-        return Err(crate::errors::IdentityError::ChallengeMismatch);
+        return Err(crate::errors::IdentityError::HeaderMissing);
     }
 
     let (peer_identity, verification_signed) =
@@ -392,12 +392,13 @@ fn extract_and_verify_identity(
 
 /// Returns `true` if the identity error indicates that the server simply
 /// did not participate in the identity exchange (not a fatal error).
+///
+/// Only a genuinely missing or empty header is non-fatal.  Any other
+/// identity error (bad signature, challenge mismatch, invalid key,
+/// address not matched) means the server *attempted* the exchange but
+/// the result is malformed — that must abort the connection.
 fn is_identity_exchange_skipped(err: &crate::errors::IdentityError) -> bool {
-    matches!(
-        err,
-        crate::errors::IdentityError::ChallengeMismatch
-            | crate::errors::IdentityError::AddressNotMatched
-    )
+    matches!(err, crate::errors::IdentityError::HeaderMissing)
 }
 
 /// Map a tungstenite error to our `WsConnectError`, handling HTTP status
@@ -641,15 +642,26 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn identity_exchange_skipped_on_challenge_mismatch() {
+    fn identity_exchange_skipped_on_header_missing() {
         assert!(is_identity_exchange_skipped(
+            &crate::errors::IdentityError::HeaderMissing
+        ));
+    }
+
+    #[test]
+    fn identity_exchange_not_skipped_on_challenge_mismatch() {
+        // ChallengeMismatch means the server sent a response but the echoed
+        // challenge did not match — this is a malformed response, not a skip.
+        assert!(!is_identity_exchange_skipped(
             &crate::errors::IdentityError::ChallengeMismatch
         ));
     }
 
     #[test]
-    fn identity_exchange_skipped_on_address_not_matched() {
-        assert!(is_identity_exchange_skipped(
+    fn identity_exchange_not_skipped_on_address_not_matched() {
+        // AddressNotMatched means the server responded but addresses don't
+        // line up — this should abort the connection.
+        assert!(!is_identity_exchange_skipped(
             &crate::errors::IdentityError::AddressNotMatched
         ));
     }
@@ -658,6 +670,13 @@ mod tests {
     fn identity_exchange_not_skipped_on_bad_signature() {
         assert!(!is_identity_exchange_skipped(
             &crate::errors::IdentityError::BadSignature
+        ));
+    }
+
+    #[test]
+    fn identity_exchange_not_skipped_on_invalid_public_key() {
+        assert!(!is_identity_exchange_skipped(
+            &crate::errors::IdentityError::InvalidPublicKey("bad key".into())
         ));
     }
 }
