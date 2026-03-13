@@ -1,0 +1,54 @@
+# Docker Compose overlay that adds a relay node for WebSocket integration tests.
+#
+# The relay is the same `algorand/algod` Docker image configured with
+# `GOSSIP_PORT=4161`, which causes the entrypoint script to set
+# `NetAddress = 0.0.0.0:4161` via `algocfg`.  This makes the node accept
+# incoming WebSocket gossip connections on that port.
+#
+# The relay runs its own independent devnet (genesis ID "v1").  It does NOT
+# need to share data with `algod-go`; the Rust integration tests only need a
+# real Algorand relay to perform the gossip handshake, exchange messages, and
+# validate protocol behaviour.
+#
+# Usage (standalone):
+#   docker compose -f docker/docker-compose.test-relay.yml up -d
+#   cargo test -p algo-network --test ws_integration
+#   docker compose -f docker/docker-compose.test-relay.yml down -v
+#
+# Usage (with existing localnet):
+#   docker compose -f docker/docker-compose.yml \
+#                  -f docker/docker-compose.test-relay.yml up -d algod-go algod-relay
+
+services:
+  algod-relay:
+    image: algorand/algod:4.5.1-stable
+    container_name: algod-relay
+    environment:
+      - DEV_MODE=1
+      - GOSSIP_PORT=4161
+      - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    ports:
+      # Gossip WebSocket port (the port under test)
+      - "4161:4161"
+      # REST API port (for health checks and genesis ID discovery)
+      - "4003:8080"
+    volumes:
+      - algod-relay-data:/algod/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "-H",
+          "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "http://localhost:8080/v2/status",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  algod-relay-data:

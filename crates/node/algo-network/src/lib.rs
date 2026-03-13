@@ -1,27 +1,86 @@
 pub mod block_cert;
 pub mod compression;
+pub mod connect;
+pub mod errors;
 pub mod framing;
+pub mod handshake;
+pub mod identity;
 pub mod message;
 pub mod msg_of_interest;
+pub mod peer_features;
+pub mod reconnect;
 pub mod tag;
 pub mod topics;
+pub mod ws_peer;
 
-// Re-exports: primary types and functions at crate root.
+// ---------------------------------------------------------------------------
+// Re-exports: gossip wire format (Epic 30)
+// ---------------------------------------------------------------------------
+
+// Block certificates
 pub use block_cert::{
     Certificate, EncodedBlockCert, EquivocationVoteAuthenticator, OneTimeSignature, ProposalValue,
     UnauthenticatedCredential, VoteAuthenticator,
 };
+
+// Compression
 pub use compression::{
     is_zstd_compressed, zstd_compress, zstd_decompress, CompressionError,
     MAX_DECOMPRESSED_MESSAGE_SIZE, ZSTD_MAGIC,
 };
+
+// Framing
 pub use framing::{decode_frame, encode_frame, NetworkError};
+
+// Messages
 pub use message::{IncomingMessage, OutgoingMessage};
+
+// Message-of-interest filtering
 pub use msg_of_interest::{marshal_msg_of_interest, unmarshal_msg_of_interest, MsgOfInterestError};
+
+// Tags
 pub use tag::{Tag, MAX_MESSAGE_LENGTH, TAG_LENGTH};
+
+// Topics (request/response key-value pairs)
 pub use topics::{
     Topic, Topics, TopicsError, BLOCK_AND_CERT_VALUE, BLOCK_DATA_KEY, CERT_DATA_KEY, ERROR_KEY,
     LATEST_ROUND_KEY, REQUEST_DATA_TYPE_KEY, REQUEST_HASH_KEY, ROUND_KEY,
+};
+
+// ---------------------------------------------------------------------------
+// Re-exports: WebSocket peer connectivity (Epic 31)
+// ---------------------------------------------------------------------------
+
+// Error taxonomy
+pub use errors::{HandshakeError, IdentityError, PeerError, WsConnectError};
+
+// Handshake: header building, protocol version negotiation, server response
+// validation, gossip path construction
+pub use handshake::{
+    check_protocol_version_match, check_server_response_variables, gossip_path, set_headers,
+    OutgoingHeaderParams, ServerResponseInfo, VersionMatch, GOSSIP_NETWORK_PATH, PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
+};
+
+// Identity: challenge-response protocol types and flow functions
+pub use identity::{
+    attach_challenge_header, attach_response_header, build_identity_verification,
+    generate_challenge, verify_challenge_and_respond, verify_challenge_response,
+    verify_identity_verification, IdentityChallengeResponseSigned, IdentityChallengeSigned,
+    IdentityVerificationMessageSigned, PeerIdentity,
+};
+
+// Peer feature negotiation
+pub use peer_features::{decode_peer_features, encode_peer_features, PeerFeatureFlags};
+
+// WebSocket peer abstraction
+pub use ws_peer::{PeerHandle, WsPeer};
+
+// Reconnection supervisor with exponential backoff
+pub use reconnect::{
+    classify_connect_error, classify_handshake_error, classify_peer_error, ConnectionFailure,
+    ExponentialBackoff, ReconnectEvent, ReconnectPolicy, ReconnectSupervisor, SupervisorError,
+    TerminalAction,
 };
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 ALGOD_TOKEN := aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ALGOD_URL := http://localhost:4001
 COMPOSE := docker compose -f docker/docker-compose.yml
+COMPOSE_RELAY := docker compose -f docker/docker-compose.test-relay.yml
 
 .PHONY: build test fmt fmt-check clippy lint deny ci clean
 .PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful replay-mainnet-1k
@@ -9,6 +10,7 @@ COMPOSE := docker compose -f docker/docker-compose.yml
 .PHONY: localnet-up localnet-down localnet-status localnet-logs
 .PHONY: capture validate validate-only generate-txns fixtures help
 .PHONY: generate-diverse-txns fixtures-diverse
+.PHONY: relay-up relay-down relay-test
 
 ## ── Build & Test ──────────────────────────────────────────────
 
@@ -227,6 +229,24 @@ avm-replay-mainnet: ## Run AVM execution replay against mainnet
 		--end $$(( $(START_ROUND) + $(COUNT) - 1 )) \
 		--db ./ledger-avm-mainnet.sqlite
 
+## ── Test Relay (WebSocket Integration) ──────────────────────
+
+relay-up: ## Start test relay for WebSocket integration tests
+	$(COMPOSE_RELAY) up -d
+	@echo "Waiting for algod-relay to be healthy..."
+	@until docker inspect --format='{{.State.Health.Status}}' algod-relay 2>/dev/null | grep -q healthy; do \
+		sleep 1; \
+	done
+	@echo "algod-relay is healthy — gossip on :4161, REST on :4003"
+
+relay-down: ## Stop test relay and remove volumes
+	$(COMPOSE_RELAY) down -v
+
+relay-test: relay-up ## Run WebSocket integration tests against relay
+	ALGO_RELAY_ADDR=localhost:4161 ALGO_RELAY_REST=http://localhost:4003 \
+		cargo test -p algo-network --test ws_integration -- --nocapture
+	$(MAKE) relay-down
+
 ## ── Archival Node ───────────────────────────────────────────
 
 archival-up: ## Start archival Go node
@@ -279,6 +299,11 @@ help:
 	@echo "  make avm-replay                AVM execution replay against localnet (rounds 1-100)"
 	@echo "  make avm-replay-mainnet        AVM execution replay against mainnet"
 	@echo "                                 (START_ROUND=$(START_ROUND), COUNT=$(COUNT))"
+	@echo ""
+	@echo "Test Relay (WebSocket):"
+	@echo "  make relay-up         Start test relay (gossip on :4161)"
+	@echo "  make relay-down       Stop test relay"
+	@echo "  make relay-test       Start relay + run integration tests + stop relay"
 	@echo ""
 	@echo "Archival Node:"
 	@echo "  make archival-up      Start archival Go node (docker)"
