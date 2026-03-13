@@ -151,7 +151,9 @@ pub async fn try_connect(addr: &str, config: &ConnectConfig) -> Result<PeerHandl
     tracing::debug!(url = %gossip_url, "connecting to peer");
 
     // Step 2: Generate identity challenge (only if we have a signing key)
-    let their_addr = addr.to_lowercase();
+    // Strip the URL scheme from the address before using it for the identity
+    // challenge — the peer advertises itself as "host:port" without a scheme.
+    let their_addr = strip_scheme(addr).to_lowercase();
     let identity_data = config.our_identity_key.as_ref().map(|key| {
         let (challenge_signed, challenge_value) = generate_challenge(key, &their_addr);
         let challenge_header = attach_challenge_header(&challenge_signed);
@@ -438,6 +440,21 @@ fn map_tungstenite_error(err: tokio_tungstenite::tungstenite::Error) -> WsConnec
     }
 }
 
+/// Strip a URL scheme prefix (`ws://`, `wss://`, `http://`, `https://`)
+/// from an address string, returning just the `host:port` portion.
+///
+/// If no recognised scheme is present the input is returned unchanged.
+/// This is used to normalise addresses before identity challenge signing,
+/// because the peer advertises itself as `host:port` without a scheme.
+fn strip_scheme(addr: &str) -> &str {
+    for prefix in &["wss://", "ws://", "https://", "http://"] {
+        if let Some(rest) = addr.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    addr
+}
+
 /// Filter a string to contain only printable ASCII characters, truncating
 /// to `max_len`. Mirrors Go's `filterASCII` in `wsNetwork.go`.
 fn filter_ascii(s: &str, max_len: usize) -> String {
@@ -624,6 +641,50 @@ mod tests {
     #[test]
     fn filter_ascii_empty() {
         assert_eq!(filter_ascii("", 128), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_scheme tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strip_scheme_ws() {
+        assert_eq!(
+            strip_scheme("ws://relay.example.com:4161"),
+            "relay.example.com:4161"
+        );
+    }
+
+    #[test]
+    fn strip_scheme_wss() {
+        assert_eq!(
+            strip_scheme("wss://relay.example.com:4161"),
+            "relay.example.com:4161"
+        );
+    }
+
+    #[test]
+    fn strip_scheme_no_scheme() {
+        assert_eq!(
+            strip_scheme("relay.example.com:4161"),
+            "relay.example.com:4161"
+        );
+    }
+
+    #[test]
+    fn strip_scheme_http() {
+        assert_eq!(
+            strip_scheme("http://relay.example.com"),
+            "relay.example.com"
+        );
+    }
+
+    #[test]
+    fn strip_scheme_https() {
+        assert_eq!(
+            strip_scheme("https://relay.example.com"),
+            "relay.example.com"
+        );
     }
 
     // -----------------------------------------------------------------------

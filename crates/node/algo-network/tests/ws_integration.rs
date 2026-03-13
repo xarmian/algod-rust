@@ -488,6 +488,7 @@ async fn test_reconnect_supervisor_connects() {
         .run(|| {
             let addr = addr.clone();
             let genesis_id = genesis_id.clone();
+            let cancel = cancel.clone();
             async move {
                 let signing_key = random_signing_key();
                 let config = ConnectConfig {
@@ -510,17 +511,24 @@ async fn test_reconnect_supervisor_connects() {
                 assert!(!handle.is_closed());
                 assert_eq!(handle.version(), PROTOCOL_VERSION);
 
-                // Close cleanly and return Ok to end the supervisor loop.
+                // Close cleanly.
                 handle.close();
+
+                // Cancel the token so the supervisor exits after this
+                // successful session instead of looping to reconnect.
+                cancel.cancel();
                 Ok(())
             }
         })
         .await;
 
-    assert!(
-        result.is_ok(),
-        "supervisor should succeed on first attempt: {result:?}"
-    );
+    // The supervisor returns Err(Shutdown) when the token is cancelled
+    // after a successful session.
+    match &result {
+        Ok(()) => { /* also acceptable if cancellation races */ }
+        Err(SupervisorError::Shutdown) => { /* expected path */ }
+        other => panic!("unexpected supervisor result: {other:?}"),
+    }
 }
 
 /// Verify that the supervisor handles transient failures and retries.
@@ -557,6 +565,7 @@ async fn test_reconnect_after_failure() {
             let real_addr = real_addr.clone();
             let genesis_id = genesis_id.clone();
             let ac = attempt_clone.clone();
+            let cancel = cancel.clone();
             async move {
                 let attempt = ac.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
 
@@ -586,15 +595,22 @@ async fn test_reconnect_after_failure() {
                     .map_err(SupervisorError::Connect)?;
 
                 handle.close();
+
+                // Cancel the token so the supervisor exits after this
+                // successful session instead of looping to reconnect.
+                cancel.cancel();
                 Ok(())
             }
         })
         .await;
 
-    assert!(
-        result.is_ok(),
-        "supervisor should succeed after retry: {result:?}"
-    );
+    // The supervisor returns Err(Shutdown) when the token is cancelled
+    // after a successful session.
+    match &result {
+        Ok(()) => { /* also acceptable if cancellation races */ }
+        Err(SupervisorError::Shutdown) => { /* expected path */ }
+        other => panic!("unexpected supervisor result: {other:?}"),
+    }
 
     let attempts = attempt_count.load(std::sync::atomic::Ordering::SeqCst);
     assert!(
