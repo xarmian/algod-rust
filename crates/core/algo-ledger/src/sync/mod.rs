@@ -1020,11 +1020,9 @@ impl SyncOrchestrator {
             let batch_end = std::cmp::min(batch_start + batch_size - 1, target_round);
 
             // Fetch the batch (parallel if the backend supports it).
-            let batch = self.backend.fetch_blocks_batch(
-                batch_start,
-                batch_end,
-                self.config.concurrency,
-            )?;
+            let batch =
+                self.backend
+                    .fetch_blocks_batch(batch_start, batch_end, self.config.concurrency)?;
 
             // Apply each block in the batch sequentially.
             for (round, block) in &batch {

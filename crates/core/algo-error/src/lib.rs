@@ -36,6 +36,9 @@ pub enum AlgoError {
 
     #[error("AVM: {message}")]
     Avm { message: String },
+
+    #[error("network error: {message}")]
+    Network { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, AlgoError>;
