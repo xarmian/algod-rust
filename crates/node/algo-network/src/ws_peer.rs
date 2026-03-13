@@ -734,8 +734,15 @@ where
     Sk: futures_util::Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     match cmd {
-        WriteCommand::UpdateFilter(new_tags) => {
-            // Update the send message tag filter.
+        WriteCommand::UpdateFilter(mut new_tags) => {
+            // Always preserve control tags that are needed for protocol
+            // operation, regardless of what the peer requests via
+            // MsgOfInterest.  Go's wsPeer.writeLoopSendMsg replaces
+            // sendMessageTag verbatim, but we add defense-in-depth:
+            // without MI the peer cannot update its interest set, and
+            // without NI identity exchange breaks.
+            new_tags.insert(Tag::MsgOfInterest);
+            new_tags.insert(Tag::NetIDVerification);
             let mut tags = send_message_tags.write().await;
             *tags = new_tags;
             Ok(())
@@ -1061,6 +1068,43 @@ mod tests {
         let tags = send_message_tags.read().await;
         assert!(!tags.contains(&Tag::Transaction));
         assert!(tags.contains(&Tag::AgreementVote));
+    }
+
+    #[tokio::test]
+    async fn update_filter_preserves_control_tags() {
+        let (client_ws, _server_ws) = ws_raw_pair().await;
+        let (mut sink, _stream) = client_ws.split();
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+
+        // Send an UpdateFilter that does NOT include MI or NI.
+        let mut new_tags = HashSet::new();
+        new_tags.insert(Tag::Transaction);
+        let cmd = WriteCommand::UpdateFilter(new_tags);
+
+        let result = process_write_command(
+            cmd,
+            &mut sink,
+            &send_message_tags,
+            "test",
+            PeerFeatureFlags::empty(),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // MI and NI must still be present (defense-in-depth).
+        let tags = send_message_tags.read().await;
+        assert!(
+            tags.contains(&Tag::MsgOfInterest),
+            "MI must be preserved in send filter"
+        );
+        assert!(
+            tags.contains(&Tag::NetIDVerification),
+            "NI must be preserved in send filter"
+        );
+        // The requested tag should also be present.
+        assert!(tags.contains(&Tag::Transaction));
+        // Total should be TX + MI + NI = 3.
+        assert_eq!(tags.len(), 3);
     }
 
     #[tokio::test]

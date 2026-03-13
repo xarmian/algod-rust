@@ -121,6 +121,9 @@ pub fn classify_connect_error(err: &WsConnectError) -> ConnectionFailure {
         // Permanent: wrong network or self-connection — retrying won't help.
         WsConnectError::GenesisMismatch => ConnectionFailure::Terminal,
         WsConnectError::SelfLoop => ConnectionFailure::Terminal,
+        // Identity verification failures are permanent — the peer's identity
+        // configuration (keys, signatures) won't change on retry.
+        WsConnectError::Identity(_) => ConnectionFailure::Terminal,
         // Delegate handshake errors to the handshake classifier.
         WsConnectError::Handshake(h) => classify_handshake_error(h),
         // Everything else (DNS, TCP, TLS, upgrade, I/O, tungstenite, etc.) is transient.
@@ -682,6 +685,23 @@ mod tests {
                 classify_connect_error(err),
                 ConnectionFailure::Terminal,
                 "WsConnectError::{err} should be terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_error_is_terminal() {
+        use crate::errors::IdentityError;
+        let cases = vec![
+            WsConnectError::Identity(IdentityError::BadSignature),
+            WsConnectError::Identity(IdentityError::ChallengeMismatch),
+            WsConnectError::Identity(IdentityError::InvalidPublicKey("bad key".into())),
+        ];
+        for err in &cases {
+            assert_eq!(
+                classify_connect_error(err),
+                ConnectionFailure::Terminal,
+                "WsConnectError::Identity({err}) should be terminal"
             );
         }
     }
