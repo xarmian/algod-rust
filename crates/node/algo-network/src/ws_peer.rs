@@ -525,11 +525,16 @@ async fn read_loop<St>(
                             // high-prio channel (matches Go's approach of routing
                             // through the send channel to avoid locking).
                             let cmd = WriteCommand::UpdateFilter(new_tags);
-                            // Try non-blocking first (matches Go's first select).
-                            if send_high_prio_tx.try_send(cmd).is_err() {
+                            // MI filter updates are critical control messages that
+                            // must not be silently dropped.  Use blocking send
+                            // instead of try_send — MI messages are infrequent so
+                            // briefly yielding the read loop is acceptable.
+                            if let Err(e) = send_high_prio_tx.send(cmd).await {
                                 tracing::warn!(
                                     peer = %remote_addr,
-                                    "read_loop: failed to enqueue MI filter update"
+                                    error = %e,
+                                    "read_loop: failed to enqueue MI filter update, \
+                                     write loop may have closed"
                                 );
                             }
                         }
@@ -786,6 +791,11 @@ where
             let payload = &send_msg.msg.payload;
 
             // Optionally compress PP tag payloads with zstd.
+            //
+            // encode_frame failures (e.g. payload exceeds MAX_MESSAGE_LENGTH)
+            // are non-fatal: log a warning and drop the single oversized
+            // message rather than tearing down the entire peer connection.
+            // Only actual WebSocket I/O errors below should cause disconnection.
             let data = if tag == Tag::ProposalPayload
                 && features.contains(PeerFeatureFlags::COMPRESSED_PROPOSAL)
                 && !payload.is_empty()
@@ -804,11 +814,33 @@ where
                             error = %e,
                             "write_loop: PP compression failed, sending uncompressed"
                         );
-                        encode_frame(&tag, payload).map_err(|e| format!("encode error: {e}"))?
+                        match encode_frame(&tag, payload) {
+                            Ok(frame) => frame,
+                            Err(e) => {
+                                tracing::warn!(
+                                    peer = %remote_addr,
+                                    tag = %tag,
+                                    error = %e,
+                                    "write_loop: dropping oversized outbound message"
+                                );
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             } else {
-                encode_frame(&tag, payload).map_err(|e| format!("encode error: {e}"))?
+                match encode_frame(&tag, payload) {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        tracing::warn!(
+                            peer = %remote_addr,
+                            tag = %tag,
+                            error = %e,
+                            "write_loop: dropping oversized outbound message"
+                        );
+                        return Ok(());
+                    }
+                }
             };
 
             // Write to the WebSocket.
