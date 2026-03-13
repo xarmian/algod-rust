@@ -21,8 +21,8 @@ fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
-fn is_empty_bytebuf(v: &ByteBuf) -> bool {
-    v.is_empty()
+fn is_zero_or_empty_bytebuf(v: &ByteBuf) -> bool {
+    v.is_empty() || v.iter().all(|&b| b == 0)
 }
 
 fn is_default_round(v: &Round) -> bool {
@@ -46,11 +46,16 @@ fn is_empty_eqvote_vec(v: &[EquivocationVoteAuthenticator]) -> bool {
 }
 
 fn is_default_one_time_signature(v: &OneTimeSignature) -> bool {
-    *v == OneTimeSignature::default()
+    is_zero_or_empty_bytebuf(&v.sig)
+        && is_zero_or_empty_bytebuf(&v.pk)
+        && is_zero_or_empty_bytebuf(&v.pk_sig_old)
+        && is_zero_or_empty_bytebuf(&v.pk2)
+        && is_zero_or_empty_bytebuf(&v.pk1_sig)
+        && is_zero_or_empty_bytebuf(&v.pk2_sig)
 }
 
 fn is_default_one_time_signature_pair(v: &[OneTimeSignature; 2]) -> bool {
-    v[0] == OneTimeSignature::default() && v[1] == OneTimeSignature::default()
+    is_default_one_time_signature(&v[0]) && is_default_one_time_signature(&v[1])
 }
 
 // ---------------------------------------------------------------------------
@@ -138,12 +143,20 @@ pub struct ProposalValue {
 
     /// Block digest (Go: `crypto.Digest`, 32 bytes).
     // TODO: Consider using algo_types::Digest for type-safe 32-byte enforcement
-    #[serde(rename = "dig", default, skip_serializing_if = "is_empty_bytebuf")]
+    #[serde(
+        rename = "dig",
+        default,
+        skip_serializing_if = "is_zero_or_empty_bytebuf"
+    )]
     pub block_digest: ByteBuf,
 
     /// Encoding digest (Go: `crypto.Digest`, 32 bytes).
     // TODO: Consider using algo_types::Digest for type-safe 32-byte enforcement
-    #[serde(rename = "encdig", default, skip_serializing_if = "is_empty_bytebuf")]
+    #[serde(
+        rename = "encdig",
+        default,
+        skip_serializing_if = "is_zero_or_empty_bytebuf"
+    )]
     pub encoding_digest: ByteBuf,
 }
 
@@ -273,12 +286,12 @@ pub struct OneTimeSignature {
 impl Default for OneTimeSignature {
     fn default() -> Self {
         Self {
-            sig: ByteBuf::new(),
-            pk: ByteBuf::new(),
-            pk_sig_old: ByteBuf::new(),
-            pk2: ByteBuf::new(),
-            pk1_sig: ByteBuf::new(),
-            pk2_sig: ByteBuf::new(),
+            sig: ByteBuf::from(vec![0u8; 64]),
+            pk: ByteBuf::from(vec![0u8; 32]),
+            pk_sig_old: ByteBuf::from(vec![0u8; 64]),
+            pk2: ByteBuf::from(vec![0u8; 32]),
+            pk1_sig: ByteBuf::from(vec![0u8; 64]),
+            pk2_sig: ByteBuf::from(vec![0u8; 64]),
         }
     }
 }
@@ -298,7 +311,11 @@ impl Default for OneTimeSignature {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnauthenticatedCredential {
     /// The VRF proof (80 bytes). `codec:"pf"`
-    #[serde(rename = "pf", default, skip_serializing_if = "is_empty_bytebuf")]
+    #[serde(
+        rename = "pf",
+        default,
+        skip_serializing_if = "is_zero_or_empty_bytebuf"
+    )]
     pub proof: ByteBuf,
 }
 
@@ -343,12 +360,31 @@ mod tests {
     #[test]
     fn default_one_time_signature() {
         let ots = OneTimeSignature::default();
-        assert!(ots.sig.is_empty());
-        assert!(ots.pk.is_empty());
-        assert!(ots.pk_sig_old.is_empty());
-        assert!(ots.pk2.is_empty());
-        assert!(ots.pk1_sig.is_empty());
-        assert!(ots.pk2_sig.is_empty());
+        assert_eq!(ots.sig.len(), 64, "sig should be 64 zero bytes");
+        assert_eq!(ots.pk.len(), 32, "pk should be 32 zero bytes");
+        assert_eq!(
+            ots.pk_sig_old.len(),
+            64,
+            "pk_sig_old should be 64 zero bytes"
+        );
+        assert_eq!(ots.pk2.len(), 32, "pk2 should be 32 zero bytes");
+        assert_eq!(ots.pk1_sig.len(), 64, "pk1_sig should be 64 zero bytes");
+        assert_eq!(ots.pk2_sig.len(), 64, "pk2_sig should be 64 zero bytes");
+        assert!(ots.sig.iter().all(|&b| b == 0), "sig should be all zeros");
+        assert!(ots.pk.iter().all(|&b| b == 0), "pk should be all zeros");
+        assert!(
+            ots.pk_sig_old.iter().all(|&b| b == 0),
+            "pk_sig_old should be all zeros"
+        );
+        assert!(ots.pk2.iter().all(|&b| b == 0), "pk2 should be all zeros");
+        assert!(
+            ots.pk1_sig.iter().all(|&b| b == 0),
+            "pk1_sig should be all zeros"
+        );
+        assert!(
+            ots.pk2_sig.iter().all(|&b| b == 0),
+            "pk2_sig should be all zeros"
+        );
     }
 
     #[test]
@@ -743,10 +779,13 @@ mod tests {
     #[test]
     fn deserialize_one_time_signature_from_partial_json() {
         // OneTimeSignature fields have defaults, so partial JSON should work.
+        // Missing fields get serde `default` (empty ByteBuf from Deserialize),
+        // not our Default impl.
         let json = r#"{"s": [1,2,3], "p": [4,5,6]}"#;
         let ots: OneTimeSignature = serde_json::from_str(json).unwrap();
         assert_eq!(ots.sig.as_ref(), &[1, 2, 3]);
         assert_eq!(ots.pk.as_ref(), &[4, 5, 6]);
+        // serde `default` for ByteBuf produces empty, not our Default impl
         assert!(ots.pk_sig_old.is_empty());
         assert!(ots.pk2.is_empty());
         assert!(ots.pk1_sig.is_empty());
