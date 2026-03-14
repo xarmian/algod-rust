@@ -114,6 +114,9 @@ async fn main() -> anyhow::Result<()> {
             follow,
             compare,
             trie_path,
+            gossip,
+            genesis_id,
+            relay_addr,
         } => {
             let (resolved_url, resolved_token, net_name) =
                 commands::resolve_network(&network, algod_url.as_deref(), &algod_token)?;
@@ -150,6 +153,9 @@ async fn main() -> anyhow::Result<()> {
                     avm_execute,
                     fail_fast,
                     trie,
+                    gossip,
+                    genesis_id.as_deref(),
+                    &relay_addr,
                 )
                 .await?;
             }
@@ -185,6 +191,20 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
             }
         },
+        Commands::Observe {
+            network,
+            relay_addr,
+            genesis_id,
+            dns_bootstrap,
+        } => {
+            commands::observe::run(
+                &network,
+                &relay_addr,
+                genesis_id.as_deref(),
+                dns_bootstrap.as_deref(),
+            )
+            .await?;
+        }
         Commands::Follow {
             algod_url,
             algod_token,

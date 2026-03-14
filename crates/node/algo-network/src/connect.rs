@@ -31,8 +31,8 @@ use crate::identity::{
 use crate::message::OutgoingMessage;
 use crate::msg_of_interest::marshal_msg_of_interest;
 use crate::peer_features::{decode_peer_features, encode_peer_features, PeerFeatureFlags};
-use crate::tag::Tag;
 use crate::request_response::RequestTracker;
+use crate::tag::Tag;
 use crate::ws_peer::{PeerHandle, WsPeer, WsPeerConfig};
 
 // ---------------------------------------------------------------------------
@@ -84,6 +84,10 @@ pub struct ConnectConfig {
     /// Maximum time allowed for the full connect + handshake sequence.
     /// Defaults to 45 seconds if not specified (matching Go).
     pub handshake_timeout: Duration,
+
+    /// Optional per-peer configuration (filters, request timeout, etc.).
+    /// When `None`, uses `WsPeerConfig::default()`.
+    pub peer_config: Option<WsPeerConfig>,
 }
 
 impl Default for ConnectConfig {
@@ -98,6 +102,7 @@ impl Default for ConnectConfig {
             telemetry_id: String::new(),
             our_features: PeerFeatureFlags::COMPRESSED_PROPOSAL,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            peer_config: None,
         }
     }
 }
@@ -315,10 +320,10 @@ pub async fn try_connect(addr: &str, config: &ConnectConfig) -> Result<PeerHandl
 
     // Step 11: Create and start WsPeer
     let closing = CancellationToken::new();
-    let config = WsPeerConfig {
-        request_tracker: Some(Arc::new(RequestTracker::new())),
-        ..WsPeerConfig::default()
-    };
+    let mut peer_cfg = config.peer_config.clone().unwrap_or_default();
+    if peer_cfg.request_tracker.is_none() {
+        peer_cfg.request_tracker = Some(Arc::new(RequestTracker::new()));
+    }
     let peer = WsPeer::with_config(
         ws_stream,
         addr.to_string(),
@@ -327,7 +332,7 @@ pub async fn try_connect(addr: &str, config: &ConnectConfig) -> Result<PeerHandl
         identity_key,
         identity_verified,
         closing,
-        config,
+        peer_cfg,
     );
     let handle = peer.start();
 

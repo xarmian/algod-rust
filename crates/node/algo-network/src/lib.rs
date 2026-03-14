@@ -19,11 +19,13 @@ pub mod ws_peer;
 pub mod discovery;
 pub mod dns_bootstrap;
 pub mod gossip_node;
+pub mod mesh;
 pub mod message_filter;
 pub mod peer_role;
 pub mod phonebook;
 pub mod request_response;
 pub mod srv_resolver;
+pub mod ws_network;
 
 // ---------------------------------------------------------------------------
 // Re-exports: gossip wire format (Epic 30)
@@ -95,7 +97,7 @@ pub use identity::{
 pub use peer_features::{decode_peer_features, encode_peer_features, PeerFeatureFlags};
 
 // WebSocket peer abstraction
-pub use ws_peer::{PeerHandle, PeerSender, WsPeer, WsPeerConfig};
+pub use ws_peer::{PeerHandle, PeerSender, UnicastPeerRef, WsPeer, WsPeerConfig};
 
 // Reconnection supervisor with exponential backoff
 pub use reconnect::{
@@ -159,6 +161,18 @@ pub use gossip_node::{substitute_genesis_id, GossipNode, Peer, PeerOption, Unica
 pub use request_response::{
     hash_topics, RequestResponseError, RequestTracker, DEFAULT_REQUEST_TIMEOUT,
     REQUEST_NONCE_FIELD, RESPONSE_HASH_FIELD,
+};
+
+// ---------------------------------------------------------------------------
+// Re-exports: WebsocketNetwork coordinator (Epic 33b)
+// ---------------------------------------------------------------------------
+
+// WebSocket network coordinator implementing GossipNode
+pub use ws_network::{PeerDirection, WebsocketNetwork, WebsocketNetworkConfig};
+
+// Mesh connectivity thread — maintains target outgoing connection count
+pub use mesh::{
+    ConnectFn, MeshRequest, MeshThread, PeerCounter, DEFAULT_GOSSIP_FANOUT, DEFAULT_MESH_INTERVAL,
 };
 
 // ---------------------------------------------------------------------------

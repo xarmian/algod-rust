@@ -209,12 +209,54 @@ pub enum Commands {
         /// Path for Merkle trie storage (catchpoint mode).
         #[arg(long)]
         trie_path: Option<PathBuf>,
+
+        /// Use gossip (WebSocket) peers for block fetching instead of REST.
+        ///
+        /// When enabled, connects to relay peers via WebSocket and fetches
+        /// blocks using the WS unicast catchup protocol. Falls back to REST
+        /// on per-round gossip failures.
+        #[arg(long)]
+        gossip: bool,
+
+        /// Override the genesis ID for gossip mode (e.g. "mainnet-v1.0").
+        ///
+        /// When using --gossip with --network custom, this specifies the
+        /// genesis ID for the WebSocket handshake. If not set, the genesis
+        /// ID is looked up by network name or fetched from the algod REST
+        /// endpoint.
+        #[arg(long)]
+        genesis_id: Option<String>,
+
+        /// Direct relay address(es) for gossip mode (can be repeated).
+        /// When provided, DNS discovery and algod URL auto-seeding are skipped.
+        #[arg(long)]
+        relay_addr: Vec<String>,
     },
 
     /// Catchpoint operations: import, verify, and download catchpoint files.
     Catchpoint {
         #[command(subcommand)]
         action: CatchpointAction,
+    },
+
+    /// Observe gossip traffic: connect to relay peers and log all messages as JSON lines.
+    Observe {
+        /// Network preset (mainnet, testnet, devnet, betanet).
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+
+        /// Direct relay address(es) to connect to (can be repeated).
+        /// When provided, DNS discovery is skipped.
+        #[arg(long)]
+        relay_addr: Vec<String>,
+
+        /// Override the genesis ID (e.g. "mainnet-v1.0").
+        #[arg(long)]
+        genesis_id: Option<String>,
+
+        /// Override the DNS bootstrap template for peer discovery.
+        #[arg(long)]
+        dns_bootstrap: Option<String>,
     },
 
     /// Follow mode: continuously validate new blocks as they arrive.
