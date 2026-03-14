@@ -1,4 +1,5 @@
 pub mod block_cert;
+pub mod block_fetcher;
 pub mod compression;
 pub mod connect;
 pub mod errors;
@@ -32,6 +33,12 @@ pub mod srv_resolver;
 pub use block_cert::{
     Certificate, EncodedBlockCert, EquivocationVoteAuthenticator, OneTimeSignature, ProposalValue,
     UnauthenticatedCredential, VoteAuthenticator,
+};
+
+// Block fetch primitives (WS unicast catchup protocol)
+pub use block_fetcher::{
+    decode_round_from_uvarint, format_round_base36, make_block_request_topics,
+    parse_block_response, BlockFetchError, BlockResponseData,
 };
 
 // Compression
@@ -141,8 +148,8 @@ pub use message_filter::{
 // Re-exports: GossipNode trait and Peer abstraction (Epic 33a)
 // ---------------------------------------------------------------------------
 
-// GossipNode network abstraction
-pub use gossip_node::{substitute_genesis_id, GossipNode, Peer, PeerOption};
+// GossipNode network abstraction and unicast peer interface
+pub use gossip_node::{substitute_genesis_id, GossipNode, Peer, PeerOption, UnicastPeer};
 
 // ---------------------------------------------------------------------------
 // Re-exports: Request/Response correlation (Epic 33a)
