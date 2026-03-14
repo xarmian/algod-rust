@@ -579,6 +579,21 @@ impl PeerHandle {
     pub async fn recv(&mut self) -> Option<IncomingMessage> {
         self.incoming.recv().await
     }
+
+    /// Take the incoming message receiver out of this handle.
+    ///
+    /// This allows the caller (e.g. [`WebsocketNetwork::add_peer`]) to spawn
+    /// a dedicated receive/dispatch loop without holding the entire
+    /// `PeerHandle`.  After calling this, [`recv()`](Self::recv) will always
+    /// return `None`.
+    ///
+    /// Returns `None` if the receiver has already been taken.
+    pub fn take_incoming(&mut self) -> Option<mpsc::Receiver<IncomingMessage>> {
+        // Replace with a dummy closed channel.
+        let (_, empty_rx) = mpsc::channel(1);
+        let old = std::mem::replace(&mut self.incoming, empty_rx);
+        Some(old)
+    }
 }
 
 impl Drop for PeerHandle {

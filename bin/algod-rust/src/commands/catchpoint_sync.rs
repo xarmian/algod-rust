@@ -200,10 +200,7 @@ impl BlockSource for HttpBlockFetcherSource {
             })
     }
 
-    async fn get_block(
-        &self,
-        round: Round,
-    ) -> algo_error::Result<algo_types::BlockResponse> {
+    async fn get_block(&self, round: Round) -> algo_error::Result<algo_types::BlockResponse> {
         let raw = self.get_block_raw(round).await?;
         let br = decode_block_response(&raw)?;
         Ok(br)

@@ -31,8 +31,8 @@ use crate::identity::{
 use crate::message::OutgoingMessage;
 use crate::msg_of_interest::marshal_msg_of_interest;
 use crate::peer_features::{decode_peer_features, encode_peer_features, PeerFeatureFlags};
-use crate::tag::Tag;
 use crate::request_response::RequestTracker;
+use crate::tag::Tag;
 use crate::ws_peer::{PeerHandle, WsPeer, WsPeerConfig};
 
 // ---------------------------------------------------------------------------

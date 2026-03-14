@@ -2,6 +2,8 @@ pub mod capture;
 pub mod catchpoint;
 pub mod catchpoint_sync;
 pub mod follow;
+pub mod network_common;
+pub mod observe;
 pub mod replay;
 pub mod sync;
 pub mod validate;
