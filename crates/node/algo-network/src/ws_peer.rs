@@ -54,8 +54,9 @@ use crate::message_filter::{
 };
 use crate::msg_of_interest::unmarshal_msg_of_interest;
 use crate::peer_features::PeerFeatureFlags;
-use crate::request_response::RequestTracker;
+use crate::request_response::{encode_uvarint, hash_topics, RequestTracker, RESPONSE_HASH_FIELD};
 use crate::tag::Tag;
+use crate::topics::{Topic, Topics};
 
 // ---------------------------------------------------------------------------
 // Constants (matching go-algorand)
@@ -718,7 +719,7 @@ async fn read_loop<St>(
                 // For dedup-safe tags (AV, TX), check the incoming filter.
                 if dedup_safe_tag(&tag) && !payload.is_empty() {
                     if let Some(ref inf) = incoming_filter {
-                        if inf.check_incoming_message(&tag, &payload, true, false) {
+                        if inf.check_incoming_message(&tag, &payload, true, true) {
                             tracing::trace!(
                                 peer = %remote_addr,
                                 tag = %tag,
@@ -797,20 +798,83 @@ async fn read_loop<St>(
                             return;
                         }
                         ForwardingPolicy::Broadcast => {
-                            // Actual broadcast requires the network layer which
-                            // isn't wired yet. Log for now.
-                            tracing::debug!(
-                                peer = %remote_addr,
-                                tag = %tag,
-                                "read_loop: handler requested broadcast \
-                                 (not yet wired to network layer)"
+                            // Forward the message to the incoming channel so
+                            // the network layer can broadcast it to other
+                            // peers.  This matches Go's messageHandlerThread
+                            // which calls net.Broadcast() when the handler
+                            // returns Broadcast.
+                            //
+                            // Additionally, if the outgoing filter is present
+                            // and the message is large enough, add its digest
+                            // so we don't re-send it to this peer.
+                            if dedup_safe_tag(&tag)
+                                && payload.len() >= MESSAGE_FILTER_SIZE
+                            {
+                                let digest =
+                                    generate_message_digest(&tag, &payload);
+                                if let Some(ref of) = outgoing_filter {
+                                    of.check_digest(&digest, true, false);
+                                }
+                            }
+
+                            let broadcast_msg = IncomingMessage::with_peer(
+                                tag,
+                                payload.clone(),
+                                remote_addr.clone(),
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_nanos() as i64,
+                                peer_sender.clone(),
                             );
+                            match incoming_tx.try_send(broadcast_msg) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    tracing::warn!(
+                                        peer = %remote_addr,
+                                        tag = %tag,
+                                        "read_loop: incoming channel full, \
+                                         dropping broadcast message"
+                                    );
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    tracing::debug!(
+                                        peer = %remote_addr,
+                                        "read_loop: incoming channel closed"
+                                    );
+                                    closing.cancel();
+                                    return;
+                                }
+                            }
                         }
                         ForwardingPolicy::Respond => {
-                            // Send the full OutgoingMessage (including topics)
-                            // back to this peer via the high-prio channel.
+                            // Build a proper TopicMsgResp matching Go's
+                            // wsPeer.Respond():
+                            // 1. Hash the original incoming data
+                            // 2. Append RequestHash topic to handler's
+                            //    response topics
+                            // 3. Serialize and send as TopicMsgResp
+                            let request_hash = hash_topics(&payload);
+                            let request_hash_data = encode_uvarint(request_hash);
+
+                            let mut response_topics = out
+                                .topics
+                                .unwrap_or_else(Topics::new);
+                            response_topics.0.push(Topic::new(
+                                RESPONSE_HASH_FIELD,
+                                request_hash_data,
+                            ));
+
+                            let serialized = response_topics.marshal();
+                            let resp_msg = OutgoingMessage {
+                                action: ForwardingPolicy::Respond,
+                                tag: Tag::TopicMsgResp,
+                                payload: serialized,
+                                topics: None,
+                            };
+
                             let cmd = WriteCommand::Data(SendMessage {
-                                msg: out,
+                                msg: resp_msg,
                                 enqueued: Instant::now(),
                             });
                             if let Err(e) = send_high_prio_tx.try_send(cmd) {
@@ -1071,7 +1135,7 @@ where
             // peer already has this message (via a prior MsgDigestSkip
             // notification). Reference: Go's writeNonBlock() in wsPeer.go.
             if let Some(ref of) = outgoing_filter {
-                if dedup_safe_tag(&tag) && !send_msg.msg.payload.is_empty() {
+                if dedup_safe_tag(&tag) && send_msg.msg.payload.len() >= MESSAGE_FILTER_SIZE {
                     let digest = generate_message_digest(&tag, &send_msg.msg.payload);
                     if of.check_digest(&digest, false, false) {
                         // Peer already has this message; skip sending.
@@ -2313,12 +2377,16 @@ mod tests {
             // Give it time to process.
             tokio::time::sleep(Duration::from_millis(100)).await;
 
-            // Multiplexer handled it, so nothing on incoming channel.
-            let result = tokio::time::timeout(Duration::from_millis(100), incoming_rx.recv()).await;
+            // Broadcast policy forwards the message to the incoming channel
+            // so the network layer can broadcast it to other peers.
+            let result = tokio::time::timeout(Duration::from_millis(500), incoming_rx.recv()).await;
             assert!(
-                result.is_err(),
-                "multiplexer should consume the message, not pass to incoming channel"
+                result.is_ok(),
+                "Broadcast policy should forward the message to the incoming channel"
             );
+            let forwarded = result.unwrap().expect("channel should not be closed");
+            assert_eq!(forwarded.tag, Tag::Transaction);
+            assert_eq!(forwarded.data, b"tx-data");
 
             // Connection should still be open.
             assert!(
@@ -2434,8 +2502,22 @@ mod tests {
 
         match cmd {
             WriteCommand::Data(send_msg) => {
-                assert_eq!(send_msg.msg.tag, Tag::UniEnsBlockReq);
-                assert_eq!(send_msg.msg.payload, b"request-data");
+                // The Respond path now builds a proper TopicMsgResp with the
+                // request hash appended as a topic.
+                assert_eq!(send_msg.msg.tag, Tag::TopicMsgResp);
+
+                // The payload should be serialized Topics containing the
+                // RequestHash topic.
+                use crate::topics::Topics;
+                let topics = Topics::unmarshal(&send_msg.msg.payload)
+                    .expect("payload should be valid Topics");
+                let hash_val = topics.get_value(
+                    crate::request_response::RESPONSE_HASH_FIELD,
+                );
+                assert!(
+                    hash_val.is_some(),
+                    "response must include RequestHash topic"
+                );
             }
             other => panic!("expected Data, got: {other:?}"),
         }
@@ -2446,7 +2528,9 @@ mod tests {
     #[tokio::test]
     async fn outgoing_filter_prevents_sending_already_seen() {
         // If the outgoing filter has a digest for a message, the write loop
-        // should skip sending that message.
+        // should skip sending that message. Only messages >= MESSAGE_FILTER_SIZE
+        // (5000 bytes) are checked against the outgoing filter (matching Go's
+        // writeNonBlock behavior).
         let (client_ws, server_ws) = ws_raw_pair().await;
         let (mut sink, _client_stream) = client_ws.split();
         let (_server_sink, mut server_stream) = server_ws.split();
@@ -2455,13 +2539,14 @@ mod tests {
 
         let outgoing_filter = Arc::new(MessageFilter::new(1024));
 
-        // Pre-populate the outgoing filter with the digest of a TX message.
-        let tx_payload = b"already-seen-tx";
-        let digest = generate_message_digest(&Tag::Transaction, tx_payload);
+        // Pre-populate the outgoing filter with the digest of a large TX
+        // message (>= MESSAGE_FILTER_SIZE so the outgoing filter is consulted).
+        let tx_payload = vec![0xAB; MESSAGE_FILTER_SIZE];
+        let digest = generate_message_digest(&Tag::Transaction, &tx_payload);
         outgoing_filter.check_digest(&digest, true, false);
 
         // Try to send the same TX message — should be filtered out.
-        let msg = OutgoingMessage::new(Tag::Transaction, tx_payload.to_vec());
+        let msg = OutgoingMessage::new(Tag::Transaction, tx_payload.clone());
         let cmd = WriteCommand::Data(SendMessage {
             msg,
             enqueued: Instant::now(),
@@ -2478,8 +2563,9 @@ mod tests {
         .await;
         assert!(result.is_ok(), "should succeed (silently dropped)");
 
-        // Send a different TX message — should go through.
-        let msg2 = OutgoingMessage::new(Tag::Transaction, b"new-tx".to_vec());
+        // Send a different large TX message — should go through.
+        let new_payload = vec![0xCD; MESSAGE_FILTER_SIZE];
+        let msg2 = OutgoingMessage::new(Tag::Transaction, new_payload.clone());
         let cmd2 = WriteCommand::Data(SendMessage {
             msg: msg2,
             enqueued: Instant::now(),
@@ -2507,7 +2593,7 @@ mod tests {
             WsMessage::Binary(data) => {
                 let (tag, payload) = decode_frame(&data).unwrap();
                 assert_eq!(tag, Tag::Transaction);
-                assert_eq!(payload, b"new-tx");
+                assert_eq!(payload, new_payload.as_slice());
             }
             other => panic!("expected binary message, got: {other:?}"),
         }

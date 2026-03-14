@@ -30,7 +30,7 @@ use crate::topics::{Topic, Topics, TopicsError};
 // ---------------------------------------------------------------------------
 
 /// Encode a `u64` as an unsigned variable-length integer (LEB128).
-fn encode_uvarint(mut value: u64) -> Vec<u8> {
+pub(crate) fn encode_uvarint(mut value: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(10);
     loop {
         let mut byte = (value & 0x7F) as u8;
