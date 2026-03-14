@@ -174,7 +174,7 @@ type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 ///
 /// All fields are `Option` so existing code that doesn't need these features
 /// can pass `WsPeerConfig::default()` (all `None`).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct WsPeerConfig {
     /// Message multiplexer for handler dispatch.
     pub multiplexer: Option<Arc<Multiplexer>>,

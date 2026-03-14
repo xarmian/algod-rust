@@ -8,7 +8,7 @@ use algo_network::{
     gossip_node::UnicastPeer,
     ws_network::PeerDirection,
     Discovery, GossipNode, HickorySrvResolver, Phonebook, WebsocketNetwork, WebsocketNetworkConfig,
-    RELAY_ROLE,
+    WsPeerConfig, RELAY_ROLE,
 };
 use algo_rest_client::{AlgodClient, BlockSource, GossipBlockSource, ParallelBlockFetcher};
 use algo_types::Round;
@@ -90,6 +90,7 @@ async fn setup_gossip_network(
     algod_url: &str,
     algod_token: &str,
     genesis_id_override: Option<&str>,
+    relay_addrs_cli: &[String],
 ) -> anyhow::Result<(Arc<GossipBlockSource>, Arc<WebsocketNetwork>)> {
     // Resolve genesis ID for WS handshake:
     // 1. Explicit --genesis-id override
@@ -115,12 +116,15 @@ async fn setup_gossip_network(
         genesis_id, "setting up gossip network for block sync"
     );
 
-    // Build phonebook and populate via DNS discovery.
+    // Build phonebook and populate via DNS discovery or explicit CLI relay addrs.
     let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
 
-    // Try extracting a relay address from the algod_url as a seed peer.
-    // For known networks, we also do DNS discovery.
-    if matches!(network, "mainnet" | "testnet" | "devnet" | "betanet") {
+    if !relay_addrs_cli.is_empty() {
+        // Explicit --relay-addr flags take priority; skip DNS discovery.
+        phonebook.replace_peer_list(relay_addrs_cli, "cli", RELAY_ROLE);
+        info!(count = relay_addrs_cli.len(), "added CLI relay addresses");
+    } else if matches!(network, "mainnet" | "testnet" | "devnet" | "betanet") {
+        // Known networks: discover relay peers via DNS SRV.
         let resolver = Box::new(HickorySrvResolver::new(None));
         let discovery = Discovery::new(
             phonebook.clone(),
@@ -131,13 +135,11 @@ async fn setup_gossip_network(
         )?;
         discovery.refresh_phonebook_addresses().await;
         info!("DNS discovery complete");
-    }
-
-    // Also add the algod_url host as a relay peer if it looks like a direct address.
-    // Parse "http://host:port" or "https://host:port" to extract "host:port".
-    if let Some(host_port) = extract_host_port(algod_url) {
-        phonebook.replace_peer_list(std::slice::from_ref(&host_port), "cli", RELAY_ROLE);
-        info!(addr = %host_port, "added algod host as relay peer");
+    } else {
+        warn!(
+            "gossip mode on custom network with no --relay-addr; \
+             use --relay-addr to specify relay peers for gossip"
+        );
     }
 
     // Get relay addresses from phonebook.
@@ -145,7 +147,7 @@ async fn setup_gossip_network(
     if relay_addrs.is_empty() {
         anyhow::bail!(
             "no relay peers found for gossip sync; \
-             check network name or provide a valid --algod-url"
+             use --relay-addr to specify relay peers, or use a known network name"
         );
     }
     info!(count = relay_addrs.len(), "discovered relay peers");
@@ -165,8 +167,14 @@ async fn setup_gossip_network(
         .map_err(|e| anyhow::anyhow!("failed to start WebsocketNetwork: {e}"))?;
 
     // Connect to relay peers and collect PeerHandles (which implement UnicastPeer).
+    // Use a short request timeout (5s) so that a dead relay fails over to REST
+    // quickly via FallbackBlockSource, rather than stalling for the default 60s.
     let connect_config = ConnectConfig {
         genesis_id,
+        peer_config: Some(WsPeerConfig {
+            request_timeout: Some(Duration::from_secs(5)),
+            ..WsPeerConfig::default()
+        }),
         ..ConnectConfig::default()
     };
 
@@ -235,6 +243,7 @@ pub async fn run(
     trie: bool,
     gossip: bool,
     genesis_id_override: Option<&str>,
+    relay_addrs: &[String],
 ) -> anyhow::Result<()> {
     let client = Arc::new(AlgodClient::new(algod_url, algod_token));
 
@@ -311,8 +320,14 @@ pub async fn run(
     // Set up block source: gossip-first with REST fallback, or REST-only.
     let (block_source, ws_network): (Arc<dyn BlockSource>, Option<Arc<WebsocketNetwork>>) =
         if gossip {
-            let (gossip_source, ws_net) =
-                setup_gossip_network(network, algod_url, algod_token, genesis_id_override).await?;
+            let (gossip_source, ws_net) = setup_gossip_network(
+                network,
+                algod_url,
+                algod_token,
+                genesis_id_override,
+                relay_addrs,
+            )
+            .await?;
             let fallback: Arc<dyn BlockSource> = Arc::new(FallbackBlockSource {
                 gossip: gossip_source,
                 rest: Arc::clone(&client),
@@ -466,6 +481,7 @@ pub async fn run(
 ///
 /// Falls back to port 4160 if no port is present. Returns `None` if the URL
 /// cannot be parsed.
+#[cfg(test)]
 fn extract_host_port(url: &str) -> Option<String> {
     // Strip scheme.
     let after_scheme = url
@@ -498,9 +514,10 @@ async fn fetch_genesis_id(algod_url: &str, algod_token: &str) -> anyhow::Result<
     if !algod_token.is_empty() {
         request = request.header("X-Algo-API-Token", algod_token);
     }
-    let resp = request.send().await.map_err(|e| {
-        anyhow::anyhow!("failed to fetch /genesis from {algod_url}: {e}")
-    })?;
+    let resp = request
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fetch /genesis from {algod_url}: {e}"))?;
     if !resp.status().is_success() {
         anyhow::bail!(
             "GET /genesis returned {}: {}",
@@ -508,9 +525,10 @@ async fn fetch_genesis_id(algod_url: &str, algod_token: &str) -> anyhow::Result<
             resp.text().await.unwrap_or_default()
         );
     }
-    let body: serde_json::Value = resp.json().await.map_err(|e| {
-        anyhow::anyhow!("failed to parse /genesis JSON from {algod_url}: {e}")
-    })?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to parse /genesis JSON from {algod_url}: {e}"))?;
     let id = body["id"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("genesis JSON from {algod_url} has no 'id' field"))?;

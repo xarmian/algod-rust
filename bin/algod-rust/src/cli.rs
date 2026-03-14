@@ -226,6 +226,11 @@ pub enum Commands {
         /// endpoint.
         #[arg(long)]
         genesis_id: Option<String>,
+
+        /// Direct relay address(es) for gossip mode (can be repeated).
+        /// When provided, DNS discovery and algod URL auto-seeding are skipped.
+        #[arg(long)]
+        relay_addr: Vec<String>,
     },
 
     /// Catchpoint operations: import, verify, and download catchpoint files.

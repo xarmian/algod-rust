@@ -116,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
             trie_path,
             gossip,
             genesis_id,
+            relay_addr,
         } => {
             let (resolved_url, resolved_token, net_name) =
                 commands::resolve_network(&network, algod_url.as_deref(), &algod_token)?;
@@ -154,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
                     trie,
                     gossip,
                     genesis_id.as_deref(),
+                    &relay_addr,
                 )
                 .await?;
             }

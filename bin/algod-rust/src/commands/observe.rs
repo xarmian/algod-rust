@@ -5,6 +5,7 @@ use std::time::Duration;
 use algo_network::{
     Discovery, GossipNode, HickorySrvResolver, IncomingMessage, MessageHandler, OutgoingMessage,
     Phonebook, Tag, TaggedMessageHandler, WebsocketNetwork, WebsocketNetworkConfig,
+    DEFAULT_GOSSIP_FANOUT,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -103,9 +104,18 @@ pub async fn run(
     }
 
     // Build network config.
+    // When explicit relay addresses are provided, ensure gossip_fanout is at
+    // least as large as the number of addresses so that start_arc() dials all
+    // of them instead of silently ignoring extras beyond the default fanout.
+    let fanout = if relay_addrs.is_empty() {
+        DEFAULT_GOSSIP_FANOUT
+    } else {
+        relay_addrs.len().max(DEFAULT_GOSSIP_FANOUT)
+    };
     let config = WebsocketNetworkConfig {
         genesis_id: genesis_id.to_string(),
         network_id: network.to_string(),
+        gossip_fanout: fanout,
         ..Default::default()
     };
 
