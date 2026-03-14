@@ -29,23 +29,34 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::extract::ws::WebSocket;
+use axum::extract::{ConnectInfo, Path, State, WebSocketUpgrade};
+use axum::response::IntoResponse;
+use axum::Router;
+use http::{HeaderMap, HeaderName, StatusCode};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::broadcast::{BroadcastHandle, BroadcastPeer, BroadcastThread};
 use crate::connect::{try_connect, ConnectConfig};
+use crate::forwarding_policy::ForwardingPolicy;
 use crate::gossip_node::{GossipNode, Peer, PeerOption};
 use crate::handler::{Multiplexer, TaggedMessageHandler, TaggedMessageValidatorHandler};
+use crate::handshake::{check_protocol_version_match, VersionMatch, SUPPORTED_PROTOCOL_VERSIONS};
+use crate::health_service::health_router;
 use crate::mesh::{ConnectFn, MeshRequest, MeshThread, PeerCounter};
 use crate::message::OutgoingMessage;
 use crate::message_filter::MessageFilter;
 use crate::peer_role::{ARCHIVAL_ROLE, RELAY_ROLE};
 use crate::phonebook::Phonebook;
+use crate::request_tracker::ConnectionTracker;
 use crate::tag::Tag;
 use crate::ws_peer::PeerHandle;
 
@@ -100,7 +111,61 @@ pub struct WebsocketNetworkConfig {
 
     /// Network identifier for phonebook/discovery (e.g. "mainnet").
     pub network_id: String,
+
+    // -------------------------------------------------------------------
+    // Relay / listener configuration (Epic 34)
+    // -------------------------------------------------------------------
+    /// Bind address for relay mode (e.g. `:4160`).  `None` means the node
+    /// does not listen for inbound connections.
+    ///
+    /// Matches Go's `NetAddress` (default `""`).
+    pub net_address: Option<String>,
+
+    /// Maximum number of simultaneous inbound connections (default: 2400).
+    ///
+    /// Matches Go's `IncomingConnectionsLimit`.
+    pub incoming_connections_limit: u32,
+
+    /// Whether this node should forward (relay) messages to other peers
+    /// (default: `false`).
+    ///
+    /// Matches Go's `ForceRelayMessages`.
+    pub relay_messages: bool,
+
+    /// Maximum connections allowed from a single IP address (default: 8).
+    ///
+    /// Matches Go's `MaxConnectionsPerIP`.
+    pub max_connections_per_ip: u32,
+
+    /// Connection-rate limit: maximum new connections per window (default: 60).
+    ///
+    /// Matches Go's `ConnectionsRateLimitingCount`.
+    pub connections_rate_limiting_count: u32,
+
+    /// Number of outgoing connections used for broadcast (default: 35).
+    ///
+    /// Matches the target broadcast fanout.
+    pub broadcast_connections_limit: u32,
+
+    /// Path to TLS certificate file.  `None` means plain HTTP/WS.
+    ///
+    /// Matches Go's `TLSCertFile`.
+    pub tls_cert_file: Option<String>,
+
+    /// Path to TLS private-key file.  `None` means plain HTTP/WS.
+    ///
+    /// Matches Go's `TLSKeyFile`.
+    pub tls_key_file: Option<String>,
+
+    /// Memory cap for the block service cache in bytes (default: 500 MiB).
+    ///
+    /// Matches Go's `BlockServiceMemCap` (500_000_000 in Go, we use
+    /// 500 * 1024 * 1024 = 524_288_000 for a clean binary multiple).
+    pub block_service_mem_cap: u64,
 }
+
+/// Default block-service memory cap: 500 MiB.
+const DEFAULT_BLOCK_SERVICE_MEM_CAP: u64 = 500 * 1024 * 1024;
 
 impl Default for WebsocketNetworkConfig {
     fn default() -> Self {
@@ -111,6 +176,15 @@ impl Default for WebsocketNetworkConfig {
             slow_write_threshold: DEFAULT_SLOW_WRITE_THRESHOLD,
             genesis_id: String::new(),
             network_id: String::new(),
+            net_address: None,
+            incoming_connections_limit: 2400,
+            relay_messages: false,
+            max_connections_per_ip: 8,
+            connections_rate_limiting_count: 60,
+            broadcast_connections_limit: 35,
+            tls_cert_file: None,
+            tls_key_file: None,
+            block_service_mem_cap: DEFAULT_BLOCK_SERVICE_MEM_CAP,
         }
     }
 }
@@ -177,12 +251,44 @@ pub struct WebsocketNetwork {
 
     /// Background task handles, stored so they are not dropped prematurely.
     tasks: Mutex<Vec<JoinHandle<()>>>,
+
+    // -------------------------------------------------------------------
+    // Relay / inbound server state (Epic 34)
+    // -------------------------------------------------------------------
+    /// Per-node random identifier used for self-loop detection.
+    ///
+    /// Generated once at construction time.  Sent as
+    /// `X-Algorand-NodeRandom` on outgoing connections and checked
+    /// against the same header on incoming ones.
+    node_random: String,
+
+    /// Per-IP connection tracker for inbound connections.
+    connection_tracker: Arc<ConnectionTracker>,
+
+    /// The local listening address of the relay server once started.
+    /// `None` when not in relay mode or before `start` completes.
+    listen_addr: std::sync::Mutex<Option<SocketAddr>>,
+
+    /// HTTP handlers registered via [`GossipNode::register_http_handler`]
+    /// before the server starts.  Collected here and merged into the axum
+    /// `Router` at start time.
+    registered_handlers: std::sync::Mutex<Vec<(String, Router)>>,
+
+    // -------------------------------------------------------------------
+    // Broadcast thread (priority queues, stale dropping)
+    // -------------------------------------------------------------------
+    /// Background broadcast thread for relay message forwarding.
+    ///
+    /// Initialized when the network starts in relay mode (`start_arc`).
+    /// `None` when relay mode is disabled or the network hasn't started yet.
+    broadcast_thread: std::sync::Mutex<Option<BroadcastThread>>,
 }
 
 impl WebsocketNetwork {
     /// Create a new `WebsocketNetwork` with the given configuration and
     /// shared phonebook.
     pub fn new(config: WebsocketNetworkConfig, phonebook: Arc<Phonebook>) -> Self {
+        let node_random: u64 = rand::random();
         Self {
             config,
             peers: Arc::new(RwLock::new(HashMap::new())),
@@ -196,6 +302,11 @@ impl WebsocketNetwork {
             mesh_update_tx: Mutex::new(None),
             pending_disconnects: Arc::new(std::sync::Mutex::new(Vec::new())),
             tasks: Mutex::new(Vec::new()),
+            node_random: node_random.to_string(),
+            connection_tracker: Arc::new(ConnectionTracker::new(Duration::from_secs(1))),
+            listen_addr: std::sync::Mutex::new(None),
+            registered_handlers: std::sync::Mutex::new(Vec::new()),
+            broadcast_thread: std::sync::Mutex::new(None),
         }
     }
 
@@ -223,6 +334,22 @@ impl WebsocketNetwork {
     /// Returns a reference to the message filter.
     pub fn message_filter(&self) -> &Arc<MessageFilter> {
         &self.message_filter
+    }
+
+    /// Returns a reference to the connection tracker.
+    pub fn connection_tracker(&self) -> &Arc<ConnectionTracker> {
+        &self.connection_tracker
+    }
+
+    /// Returns the node's random identifier (for self-loop detection).
+    pub fn node_random(&self) -> &str {
+        &self.node_random
+    }
+
+    /// Returns `true` if this network is configured as a relay (has a
+    /// listen address and relay_messages is enabled).
+    pub fn is_relay(&self) -> bool {
+        self.config.net_address.is_some() && self.config.relay_messages
     }
 
     /// Returns the number of currently connected peers.
@@ -273,6 +400,13 @@ impl WebsocketNetwork {
             let cancel = self.cancel.clone();
             let peers = Arc::clone(&self.peers);
             let peer_addr = addr;
+            let broadcast_handle: Option<BroadcastHandle> = {
+                let guard = self
+                    .broadcast_thread
+                    .lock()
+                    .expect("broadcast_thread lock poisoned");
+                guard.as_ref().map(|bt| bt.handle())
+            };
 
             let recv_task = tokio::spawn(async move {
                 loop {
@@ -284,9 +418,41 @@ impl WebsocketNetwork {
                         msg = rx.recv() => {
                             match msg {
                                 Some(incoming) => {
+                                    let tag = incoming.tag;
+                                    // Only clone data and sender when relay mode is
+                                    // active (broadcast_handle is Some), avoiding the
+                                    // allocation on non-relay nodes.
+                                    let relay_data = if broadcast_handle.is_some() {
+                                        Some((incoming.data.clone(), incoming.sender.clone()))
+                                    } else {
+                                        None
+                                    };
                                     // Dispatch to the multiplexer.
-                                    let _out = multiplexer.handle(incoming).await;
-                                    // TODO: act on forwarding policy (broadcast/relay/disconnect)
+                                    let out = multiplexer.handle(incoming).await;
+                                    // Act on forwarding policy.
+                                    match out.action {
+                                        ForwardingPolicy::Broadcast => {
+                                            if let (Some(ref bh), Some((data, sender))) =
+                                                (&broadcast_handle, relay_data)
+                                            {
+                                                if let Err(e) = bh.enqueue(tag, data, Some(sender)) {
+                                                    tracing::debug!(
+                                                        error = %e,
+                                                        "failed to enqueue relay message"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        ForwardingPolicy::Disconnect => {
+                                            tracing::info!(addr = %peer_addr, "handler requested disconnect");
+                                            let mut guard = peers.write().await;
+                                            if let Some(entry) = guard.remove(&peer_addr) {
+                                                entry.handle.close();
+                                            }
+                                            break;
+                                        }
+                                        _ => { /* Ignore, Respond, Accept — no relay action */ }
+                                    }
                                 }
                                 None => {
                                     // Channel closed — peer disconnected.
@@ -427,6 +593,134 @@ impl WebsocketNetwork {
         }
     }
 
+    /// Build the axum router for relay mode.
+    ///
+    /// Includes the gossip WebSocket upgrade endpoint, the health service,
+    /// and any routes registered via [`GossipNode::register_http_handler`].
+    fn build_relay_router(self: &Arc<Self>) -> Router {
+        let gossip_path = "/v1/:genesis_id/gossip";
+
+        let mut app = Router::new()
+            .route(gossip_path, axum::routing::get(gossip_upgrade_handler))
+            .with_state(Arc::clone(self));
+
+        // Merge health service.
+        app = app.merge(health_router());
+
+        // Merge any externally registered handlers.
+        let handlers = {
+            let mut guard = self
+                .registered_handlers
+                .lock()
+                .expect("registered_handlers lock poisoned");
+            std::mem::take(&mut *guard)
+        };
+        for (path, handler) in handlers {
+            app = app.nest(&path, handler);
+        }
+
+        app
+    }
+
+    /// Start the relay HTTP server (listener + axum).
+    ///
+    /// Binds a TCP listener to `config.net_address`, wraps it with
+    /// [`RejectingLimitListener`] to enforce the connection limit, and
+    /// spawns a manual accept loop that serves each connection via hyper.
+    /// The task is cancelled when `self.cancel` fires.
+    async fn start_relay_server(
+        self: &Arc<Self>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::listener::RejectingLimitListener;
+        use tower_service::Service;
+
+        let bind_addr = match &self.config.net_address {
+            Some(addr) => addr.clone(),
+            None => return Ok(()),
+        };
+
+        if !self.config.relay_messages {
+            return Ok(());
+        }
+
+        let tcp_listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+        let local_addr = tcp_listener.local_addr()?;
+
+        tracing::info!(
+            addr = %local_addr,
+            limit = self.config.incoming_connections_limit,
+            "relay server listening (with connection limit)"
+        );
+
+        // Store the bound address so `address()` returns it.
+        {
+            let mut guard = self.listen_addr.lock().expect("listen_addr lock poisoned");
+            *guard = Some(local_addr);
+        }
+
+        // Wrap the TCP listener with a connection limiter.
+        let limit_listener =
+            RejectingLimitListener::new(tcp_listener, self.config.incoming_connections_limit);
+
+        let app = self.build_relay_router();
+        let mut make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+        let cancel = self.cancel.clone();
+
+        let server_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        tracing::debug!("relay server shutting down");
+                        break;
+                    }
+                    result = limit_listener.accept() => {
+                        match result {
+                            Ok((stream, remote_addr, conn_guard)) => {
+                                // Create a per-connection service from the MakeService.
+                                // Connected<SocketAddr> is implemented for SocketAddr.
+                                let svc = match make_service.call(remote_addr).await {
+                                    Ok(svc) => svc,
+                                    Err(e) => match e {},
+                                };
+
+                                // Wrap the tower service so hyper 1.x can use it.
+                                let hyper_svc =
+                                    hyper_util::service::TowerToHyperService::new(svc);
+
+                                // Spawn a task to serve this connection.
+                                // The conn_guard is moved into the task so the
+                                // connection slot is held for its lifetime.
+                                tokio::spawn(async move {
+                                    let io = hyper_util::rt::TokioIo::new(stream);
+                                    let conn = hyper::server::conn::http1::Builder::new()
+                                        .serve_connection(io, hyper_svc)
+                                        .with_upgrades();
+                                    if let Err(e) = conn.await {
+                                        tracing::debug!(
+                                            addr = %remote_addr,
+                                            error = %e,
+                                            "connection error"
+                                        );
+                                    }
+                                    drop(conn_guard);
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "accept error");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut tasks = self.tasks.lock().await;
+        tasks.push(server_task);
+
+        Ok(())
+    }
+
     /// Spawn the peer monitoring background task.
     ///
     /// Periodically checks all peers for closed connections and removes them.
@@ -482,9 +776,11 @@ impl WebsocketNetwork {
 #[async_trait]
 impl GossipNode for WebsocketNetwork {
     fn address(&self) -> (String, bool) {
-        // WebsocketNetwork does not currently listen for inbound connections.
-        // This will be implemented when the server-side listener is added.
-        (String::new(), false)
+        let guard = self.listen_addr.lock().expect("listen_addr lock poisoned");
+        match *guard {
+            Some(addr) => (addr.to_string(), true),
+            None => (String::new(), false),
+        }
     }
 
     async fn broadcast(
@@ -504,11 +800,39 @@ impl GossipNode for WebsocketNetwork {
         &self,
         tag: Tag,
         data: Vec<u8>,
-        wait: bool,
+        _wait: bool,
         except: Option<Arc<dyn Peer>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Relay is semantically identical to broadcast with an exclusion.
-        self.broadcast(tag, data, wait, except).await
+        if !self.config.relay_messages {
+            return Ok(());
+        }
+
+        // Try to enqueue via the broadcast thread (lock is held briefly,
+        // never across an await point).
+        let enqueue_result = {
+            let guard = self
+                .broadcast_thread
+                .lock()
+                .expect("broadcast_thread lock poisoned");
+            if let Some(ref bt) = *guard {
+                let exclude = except.as_ref().map(|p| p.get_address().to_string());
+                Some(bt.enqueue(tag, data.clone(), exclude))
+            } else {
+                None
+            }
+        };
+
+        match enqueue_result {
+            Some(result) => {
+                result.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }
+            None => {
+                // Fallback: direct broadcast (no priority queues).
+                let except_addr = except.as_ref().map(|p| p.get_address().to_string());
+                self.broadcast_inner(tag, data, except_addr.as_deref())
+                    .await
+            }
+        }
     }
 
     fn disconnect(&self, peer: Arc<dyn Peer>) {
@@ -627,6 +951,20 @@ impl GossipNode for WebsocketNetwork {
         // Cancel all background tasks.
         self.cancel.cancel();
 
+        // Stop the broadcast thread if running.
+        {
+            let mut guard = self
+                .broadcast_thread
+                .lock()
+                .expect("broadcast_thread lock poisoned");
+            if let Some(ref mut _bt) = *guard {
+                // Cancel is already signalled above; dropping the
+                // BroadcastThread closes its channels so the background
+                // task will exit on the next iteration.
+            }
+            *guard = None;
+        }
+
         // Wait for tasks to finish.
         let mut tasks = self.tasks.lock().await;
         for task in tasks.drain(..) {
@@ -673,6 +1011,14 @@ impl GossipNode for WebsocketNetwork {
 
     fn get_genesis_id(&self) -> &str {
         &self.config.genesis_id
+    }
+
+    fn register_http_handler(&self, path: &str, handler: Router) {
+        let mut guard = self
+            .registered_handlers
+            .lock()
+            .expect("registered_handlers lock poisoned");
+        guard.push((path.to_string(), handler));
     }
 }
 
@@ -861,6 +1207,47 @@ impl WebsocketNetwork {
             tasks.push(monitor_task);
         }
 
+        // Start the broadcast thread if relay mode is active.
+        if self.config.relay_messages {
+            let peers_ref = Arc::clone(&self.peers);
+            let peers_fn = move || {
+                // Use try_read to avoid blocking the broadcast thread.
+                match peers_ref.try_read() {
+                    Ok(peers) => peers
+                        .iter()
+                        .filter(|(_, entry)| !entry.handle.is_closed())
+                        .map(|(addr, entry)| BroadcastPeer {
+                            addr: addr.clone(),
+                            handle: Arc::new(entry.handle.sender()),
+                        })
+                        .collect(),
+                    Err(_) => Vec::new(),
+                }
+            };
+
+            let bt = BroadcastThread::start(
+                peers_fn,
+                self.config.broadcast_connections_limit,
+                self.cancel.clone(),
+            );
+
+            {
+                let mut guard = self
+                    .broadcast_thread
+                    .lock()
+                    .expect("broadcast_thread lock poisoned");
+                *guard = Some(bt);
+            }
+
+            tracing::info!(
+                limit = self.config.broadcast_connections_limit,
+                "broadcast thread started (relay mode)"
+            );
+        }
+
+        // Start the relay server if configured.
+        self.start_relay_server().await?;
+
         // Perform initial mesh connect (immediate, before the first MeshThread
         // timer fires).
         self.mesh_connect().await;
@@ -896,6 +1283,266 @@ impl Peer for PeerRef {
 }
 
 // ---------------------------------------------------------------------------
+// Shared state for the axum gossip handler
+// ---------------------------------------------------------------------------
+
+/// Axum handler state, aliased for readability.
+type NetworkState = Arc<WebsocketNetwork>;
+
+// ---------------------------------------------------------------------------
+// Incoming connection validation
+// ---------------------------------------------------------------------------
+
+/// Validation result for an incoming gossip connection.
+enum ValidationResult {
+    /// Validation passed, with the negotiated protocol version.
+    Ok { matched_version: String },
+    /// Validation failed — return this response to the client.
+    Rejected(axum::response::Response),
+}
+
+/// Validate an incoming gossip WebSocket connection.
+///
+/// Checks (matching Go's `ServeHTTP` flow):
+/// 1. Genesis ID in the URL path matches ours
+/// 2. Protocol version is compatible
+/// 3. Per-IP connection limit
+/// 4. Per-IP rate limit
+/// 5. Self-loop detection (NodeRandom header)
+fn validate_incoming_connection(
+    network: &WebsocketNetwork,
+    genesis_id_from_path: &str,
+    headers: &HeaderMap,
+    remote_ip: std::net::IpAddr,
+) -> ValidationResult {
+    // 1. Genesis ID check
+    if genesis_id_from_path != network.config.genesis_id {
+        tracing::warn!(
+            expected = %network.config.genesis_id,
+            got = %genesis_id_from_path,
+            "incoming connection: genesis ID mismatch"
+        );
+        return ValidationResult::Rejected(
+            (StatusCode::PRECONDITION_FAILED, "mismatching genesis ID").into_response(),
+        );
+    }
+
+    // 2. Protocol version check
+    let matched_version = match check_protocol_version_match(headers, SUPPORTED_PROTOCOL_VERSIONS) {
+        VersionMatch::Matched(v) => v,
+        VersionMatch::NoMatch { other_version } => {
+            tracing::warn!(
+                remote_version = %other_version,
+                "incoming connection: protocol version mismatch"
+            );
+            return ValidationResult::Rejected(
+                (StatusCode::PRECONDITION_FAILED, "protocol version mismatch").into_response(),
+            );
+        }
+    };
+
+    // 3. Per-IP connection limit
+    if !network
+        .connection_tracker
+        .check_connection_limit(remote_ip, network.config.max_connections_per_ip)
+    {
+        tracing::warn!(
+            ip = %remote_ip,
+            limit = network.config.max_connections_per_ip,
+            "incoming connection: per-IP connection limit exceeded"
+        );
+        return ValidationResult::Rejected(
+            (StatusCode::FORBIDDEN, "per-IP connection limit exceeded").into_response(),
+        );
+    }
+
+    // 4. Rate limit
+    if !network
+        .connection_tracker
+        .check_rate_limit(remote_ip, network.config.connections_rate_limiting_count)
+    {
+        tracing::warn!(
+            ip = %remote_ip,
+            "incoming connection: rate limit exceeded"
+        );
+        return ValidationResult::Rejected(
+            (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response(),
+        );
+    }
+
+    // 5. Self-loop detection
+    let other_random = headers
+        .get(HeaderName::from_static("x-algorand-noderandom"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if other_random.is_empty() {
+        tracing::warn!("incoming connection: missing NodeRandom header");
+        return ValidationResult::Rejected(
+            (StatusCode::PRECONDITION_FAILED, "missing NodeRandom header").into_response(),
+        );
+    }
+
+    if other_random == network.node_random {
+        tracing::debug!("incoming connection: self-loop detected");
+        // HTTP 508 Loop Detected (matching Go)
+        return ValidationResult::Rejected(
+            (
+                StatusCode::from_u16(508).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                "self-connection detected",
+            )
+                .into_response(),
+        );
+    }
+
+    ValidationResult::Ok { matched_version }
+}
+
+// ---------------------------------------------------------------------------
+// Gossip WebSocket upgrade handler (axum)
+// ---------------------------------------------------------------------------
+
+/// Axum handler for `GET /v1/:genesis_id/gossip`.
+///
+/// Validates the incoming connection, then upgrades to WebSocket.  On
+/// successful upgrade, creates an inbound `WsPeer` and registers it in
+/// the peer registry.
+///
+/// Mirrors Go's `WebsocketNetwork.ServeHTTP`.
+async fn gossip_upgrade_handler(
+    State(network): State<NetworkState>,
+    Path(genesis_id): Path<String>,
+    ws: WebSocketUpgrade,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let remote_ip = remote_addr.ip();
+
+    // Validate the incoming connection.
+    let matched_version =
+        match validate_incoming_connection(&network, &genesis_id, &headers, remote_ip) {
+            ValidationResult::Ok { matched_version } => matched_version,
+            ValidationResult::Rejected(response) => return response,
+        };
+
+    // Build response headers (matching Go's setHeaders for server responses).
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        HeaderName::from_static("x-algorand-version"),
+        matched_version.parse().expect("valid header value"),
+    );
+    for v in SUPPORTED_PROTOCOL_VERSIONS {
+        response_headers.append(
+            HeaderName::from_static("x-algorand-accept-version"),
+            v.parse().expect("valid header value"),
+        );
+    }
+    response_headers.insert(
+        HeaderName::from_static("x-algorand-genesis"),
+        network
+            .config
+            .genesis_id
+            .parse()
+            .expect("valid header value"),
+    );
+    response_headers.insert(
+        HeaderName::from_static("x-algorand-noderandom"),
+        network.node_random.parse().expect("valid header value"),
+    );
+
+    // Perform the WebSocket upgrade and attach the response headers
+    // to the 101 Switching Protocols response.
+    let network_clone = Arc::clone(&network);
+    let version_clone = matched_version;
+    let addr_str = remote_addr.to_string();
+
+    let mut response = ws
+        .on_upgrade(move |socket| {
+            handle_gossip_websocket(network_clone, socket, addr_str, version_clone, remote_ip)
+        })
+        .into_response();
+
+    // Inject the Algorand handshake headers into the 101 response.
+    let headers_mut = response.headers_mut();
+    for (key, value) in response_headers.iter() {
+        headers_mut.insert(key, value.clone());
+    }
+
+    response
+}
+
+/// Post-upgrade WebSocket handler.
+///
+/// Creates an inbound [`PeerHandle`] via [`PeerHandle::new_inbound`],
+/// registers it in the network peer map (so broadcasts/relays reach
+/// inbound peers), and tracks the connection in [`ConnectionTracker`].
+///
+/// On disconnect, the peer is removed from the peer map and the
+/// connection tracking slot is released.
+async fn handle_gossip_websocket(
+    network: Arc<WebsocketNetwork>,
+    socket: WebSocket,
+    remote_addr: String,
+    version: String,
+    remote_ip: std::net::IpAddr,
+) {
+    // Track the connection.
+    network.connection_tracker.track_connection(remote_ip);
+
+    tracing::info!(
+        addr = %remote_addr,
+        version = %version,
+        "inbound WebSocket connection accepted"
+    );
+
+    // Create a proper inbound PeerHandle that wraps the axum WebSocket
+    // with read/write loops, so this peer is visible to broadcasts.
+    let handle = PeerHandle::new_inbound(
+        socket,
+        remote_addr.clone(),
+        version,
+        network.cancel.child_token(),
+    );
+
+    // Register the inbound peer in the peer map via add_peer, which
+    // also spawns the receive/dispatch loop for multiplexer integration.
+    network.add_peer(handle, PeerDirection::Inbound).await;
+
+    // Wait for the peer to disconnect (watch for removal from the peer map
+    // or cancellation).  When it disconnects, release the connection tracker.
+    let cancel = network.cancel.clone();
+    let cleanup_network = Arc::clone(&network);
+    let cleanup_addr = remote_addr;
+    tokio::spawn(async move {
+        // Poll until the peer is removed or the network shuts down.
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    let peers = cleanup_network.peers.read().await;
+                    if !peers.contains_key(&cleanup_addr) {
+                        break;
+                    }
+                    // Check if the peer's handle has been closed.
+                    if let Some(entry) = peers.get(&cleanup_addr) {
+                        if entry.handle.is_closed() {
+                            drop(peers);
+                            cleanup_network.remove_peer(&cleanup_addr).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Release connection tracking on disconnect.
+        cleanup_network
+            .connection_tracker
+            .release_connection(remote_ip);
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -927,6 +1574,7 @@ mod tests {
             slow_write_threshold: Duration::from_secs(10),
             genesis_id: "testnet-v1.0".to_string(),
             network_id: "testnet".to_string(),
+            ..Default::default()
         };
         assert_eq!(config.gossip_fanout, 8);
         assert_eq!(config.genesis_id, "testnet-v1.0");
@@ -1127,5 +1775,384 @@ mod tests {
             .lock()
             .expect("pending_disconnects lock poisoned");
         assert!(guard.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Relay mode tests (Epic 34 — Wave 2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_relay_false_by_default() {
+        let net = WebsocketNetwork::with_defaults("test", "test");
+        assert!(!net.is_relay());
+    }
+
+    #[test]
+    fn is_relay_requires_both_net_address_and_relay_messages() {
+        // net_address only — not a relay
+        let config = WebsocketNetworkConfig {
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: false,
+            genesis_id: "test".to_string(),
+            ..Default::default()
+        };
+        let net = WebsocketNetwork::new(
+            config,
+            Arc::new(Phonebook::new(10, Duration::from_secs(60))),
+        );
+        assert!(!net.is_relay());
+
+        // relay_messages only — not a relay
+        let config2 = WebsocketNetworkConfig {
+            net_address: None,
+            relay_messages: true,
+            genesis_id: "test".to_string(),
+            ..Default::default()
+        };
+        let net2 = WebsocketNetwork::new(
+            config2,
+            Arc::new(Phonebook::new(10, Duration::from_secs(60))),
+        );
+        assert!(!net2.is_relay());
+
+        // Both — is a relay
+        let config3 = WebsocketNetworkConfig {
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            genesis_id: "test".to_string(),
+            ..Default::default()
+        };
+        let net3 = WebsocketNetwork::new(
+            config3,
+            Arc::new(Phonebook::new(10, Duration::from_secs(60))),
+        );
+        assert!(net3.is_relay());
+    }
+
+    #[test]
+    fn node_random_is_nonempty() {
+        let net = WebsocketNetwork::with_defaults("test", "test");
+        assert!(!net.node_random().is_empty());
+    }
+
+    #[test]
+    fn node_random_differs_between_instances() {
+        let net1 = WebsocketNetwork::with_defaults("test", "test");
+        let net2 = WebsocketNetwork::with_defaults("test", "test");
+        // Very unlikely (1 in 2^64) to collide
+        assert_ne!(net1.node_random(), net2.node_random());
+    }
+
+    #[test]
+    fn register_http_handler_stores_handlers() {
+        let net = WebsocketNetwork::with_defaults("test", "test");
+        let router = axum::Router::new();
+        net.register_http_handler("/blocks", router);
+
+        let guard = net.registered_handlers.lock().unwrap();
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0].0, "/blocks");
+    }
+
+    #[test]
+    fn address_returns_empty_when_not_relay() {
+        let net = WebsocketNetwork::with_defaults("test", "test");
+        let (addr, listening) = net.address();
+        assert!(addr.is_empty());
+        assert!(!listening);
+    }
+
+    // -----------------------------------------------------------------------
+    // Connection validation tests
+    // -----------------------------------------------------------------------
+
+    fn make_relay_network(genesis_id: &str) -> WebsocketNetwork {
+        let config = WebsocketNetworkConfig {
+            genesis_id: genesis_id.to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            max_connections_per_ip: 3,
+            connections_rate_limiting_count: 10,
+            ..Default::default()
+        };
+        WebsocketNetwork::new(
+            config,
+            Arc::new(Phonebook::new(10, Duration::from_secs(60))),
+        )
+    }
+
+    fn valid_incoming_headers(node_random: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            HeaderName::from_static("x-algorand-version"),
+            "2.2".parse().unwrap(),
+        );
+        h.append(
+            HeaderName::from_static("x-algorand-accept-version"),
+            "2.2".parse().unwrap(),
+        );
+        h.insert(
+            HeaderName::from_static("x-algorand-noderandom"),
+            node_random.parse().unwrap(),
+        );
+        h.insert(
+            HeaderName::from_static("x-algorand-genesis"),
+            "testnet-v1.0".parse().unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn validate_incoming_genesis_mismatch() {
+        let net = make_relay_network("testnet-v1.0");
+        let headers = valid_incoming_headers("some-random");
+        let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Correct genesis
+        let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, ip);
+        assert!(matches!(result, ValidationResult::Ok { .. }));
+
+        // Wrong genesis
+        let result = validate_incoming_connection(&net, "mainnet-v1.0", &headers, ip);
+        assert!(matches!(result, ValidationResult::Rejected(_)));
+    }
+
+    #[test]
+    fn validate_incoming_protocol_version_mismatch() {
+        let net = make_relay_network("testnet-v1.0");
+        let ip: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-algorand-version"),
+            "1.0".parse().unwrap(),
+        );
+        headers.insert(
+            HeaderName::from_static("x-algorand-noderandom"),
+            "peer-random".parse().unwrap(),
+        );
+
+        let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, ip);
+        assert!(matches!(result, ValidationResult::Rejected(_)));
+    }
+
+    #[test]
+    fn validate_incoming_self_loop_rejected() {
+        let net = make_relay_network("testnet-v1.0");
+        let ip: std::net::IpAddr = "10.0.0.3".parse().unwrap();
+
+        // Use the network's own node_random
+        let headers = valid_incoming_headers(net.node_random());
+
+        let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, ip);
+        assert!(matches!(result, ValidationResult::Rejected(_)));
+    }
+
+    #[test]
+    fn validate_incoming_missing_node_random_rejected() {
+        let net = make_relay_network("testnet-v1.0");
+        let ip: std::net::IpAddr = "10.0.0.4".parse().unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-algorand-version"),
+            "2.2".parse().unwrap(),
+        );
+        // No x-algorand-noderandom header
+
+        let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, ip);
+        assert!(matches!(result, ValidationResult::Rejected(_)));
+    }
+
+    #[test]
+    fn validate_incoming_per_ip_connection_limit() {
+        let net = make_relay_network("testnet-v1.0");
+        let ip: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+        let headers = valid_incoming_headers("peer-random-42");
+
+        // Track 3 connections from this IP (max is 3)
+        net.connection_tracker.track_connection(ip);
+        net.connection_tracker.track_connection(ip);
+        net.connection_tracker.track_connection(ip);
+
+        let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, ip);
+        assert!(matches!(result, ValidationResult::Rejected(_)));
+
+        // Release one connection — should be allowed again
+        net.connection_tracker.release_connection(ip);
+        let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, ip);
+        assert!(matches!(result, ValidationResult::Ok { .. }));
+    }
+
+    #[test]
+    fn validate_incoming_rate_limit() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            max_connections_per_ip: 100, // High limit so we only test rate
+            connections_rate_limiting_count: 3,
+            ..Default::default()
+        };
+        let net = WebsocketNetwork::new(
+            config,
+            Arc::new(Phonebook::new(10, Duration::from_secs(60))),
+        );
+        let ip: std::net::IpAddr = "10.0.0.6".parse().unwrap();
+        let headers = valid_incoming_headers("peer-random-43");
+
+        // Track 3 connections (rate limit threshold is 3)
+        net.connection_tracker.track_connection(ip);
+        net.connection_tracker.track_connection(ip);
+        net.connection_tracker.track_connection(ip);
+
+        let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, ip);
+        assert!(matches!(result, ValidationResult::Rejected(_)));
+    }
+
+    #[test]
+    fn validate_incoming_valid_connection_passes() {
+        let net = make_relay_network("testnet-v1.0");
+        let ip: std::net::IpAddr = "10.0.0.7".parse().unwrap();
+        let headers = valid_incoming_headers("different-random");
+
+        let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, ip);
+        match result {
+            ValidationResult::Ok { matched_version } => {
+                assert_eq!(matched_version, "2.2");
+            }
+            ValidationResult::Rejected(_) => {
+                panic!("expected Ok, got Rejected");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP server routing tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn relay_server_starts_and_address_updates() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            network_id: "testnet".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let net = Arc::new(WebsocketNetwork::new(config, phonebook));
+
+        // Before starting, address should be empty.
+        let (addr, listening) = net.address();
+        assert!(addr.is_empty());
+        assert!(!listening);
+
+        // Start the relay server.
+        net.start_relay_server().await.unwrap();
+
+        // After starting, address should be populated.
+        let (addr, listening) = net.address();
+        assert!(listening);
+        assert!(addr.contains("127.0.0.1:"));
+        // The port should not be 0 (OS-assigned a real port).
+        let port: u16 = addr.split(':').next_back().unwrap().parse().unwrap();
+        assert_ne!(port, 0);
+
+        // Cleanup.
+        net.stop().await;
+    }
+
+    #[tokio::test]
+    async fn relay_server_health_endpoint_responds() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            network_id: "testnet".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let net = Arc::new(WebsocketNetwork::new(config, phonebook));
+        net.start_relay_server().await.unwrap();
+
+        let (addr, _) = net.address();
+
+        // Hit the /status endpoint.
+        let url = format!("http://{}/status", addr);
+        let resp = reqwest::get(&url).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "ok");
+
+        net.stop().await;
+    }
+
+    #[tokio::test]
+    async fn relay_server_unknown_path_returns_404() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            network_id: "testnet".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let net = Arc::new(WebsocketNetwork::new(config, phonebook));
+        net.start_relay_server().await.unwrap();
+
+        let (addr, _) = net.address();
+
+        // Hit an unknown path.
+        let url = format!("http://{}/nonexistent", addr);
+        let resp = reqwest::get(&url).await.unwrap();
+        assert_eq!(resp.status(), 404);
+
+        net.stop().await;
+    }
+
+    #[tokio::test]
+    async fn relay_server_gossip_path_without_upgrade_rejected() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            network_id: "testnet".to_string(),
+            net_address: Some("127.0.0.1:0".to_string()),
+            relay_messages: true,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let net = Arc::new(WebsocketNetwork::new(config, phonebook));
+        net.start_relay_server().await.unwrap();
+
+        let (addr, _) = net.address();
+
+        // Hit the gossip path without WebSocket upgrade headers.
+        // Axum's WebSocket extractor will reject with a 400-level error.
+        let url = format!("http://{}/v1/testnet-v1.0/gossip", addr);
+        let resp = reqwest::get(&url).await.unwrap();
+        // Without proper upgrade headers, axum will return an error.
+        assert_ne!(resp.status(), 200);
+
+        net.stop().await;
+    }
+
+    #[tokio::test]
+    async fn non_relay_start_does_not_listen() {
+        let config = WebsocketNetworkConfig {
+            genesis_id: "testnet-v1.0".to_string(),
+            network_id: "testnet".to_string(),
+            net_address: None,
+            relay_messages: false,
+            ..Default::default()
+        };
+        let phonebook = Arc::new(Phonebook::new(10, Duration::from_secs(60)));
+        let net = Arc::new(WebsocketNetwork::new(config, phonebook));
+        net.start_relay_server().await.unwrap();
+
+        let (addr, listening) = net.address();
+        assert!(addr.is_empty());
+        assert!(!listening);
+
+        net.stop().await;
     }
 }

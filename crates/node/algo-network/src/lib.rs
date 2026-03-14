@@ -1,5 +1,7 @@
 pub mod block_cert;
 pub mod block_fetcher;
+pub mod block_service;
+pub mod broadcast;
 pub mod compression;
 pub mod connect;
 pub mod errors;
@@ -7,7 +9,9 @@ pub mod forwarding_policy;
 pub mod framing;
 pub mod handler;
 pub mod handshake;
+pub mod health_service;
 pub mod identity;
+pub mod listener;
 pub mod message;
 pub mod msg_of_interest;
 pub mod peer_features;
@@ -24,6 +28,7 @@ pub mod message_filter;
 pub mod peer_role;
 pub mod phonebook;
 pub mod request_response;
+pub mod request_tracker;
 pub mod srv_resolver;
 pub mod ws_network;
 
@@ -41,6 +46,12 @@ pub use block_cert::{
 pub use block_fetcher::{
     decode_round_from_uvarint, format_round_base36, make_block_request_topics,
     parse_block_response, BlockFetchError, BlockResponseData,
+};
+
+// Block service (HTTP and WebSocket block serving)
+pub use block_service::{
+    BlockService, BlockServiceError, LedgerForBlockService, MemoryGuard,
+    BLOCK_RESPONSE_CONTENT_TYPE, DEFAULT_BLOCK_SERVICE_MEM_CAP,
 };
 
 // Compression
@@ -151,7 +162,7 @@ pub use message_filter::{
 // ---------------------------------------------------------------------------
 
 // GossipNode network abstraction and unicast peer interface
-pub use gossip_node::{substitute_genesis_id, GossipNode, Peer, PeerOption, UnicastPeer};
+pub use gossip_node::{substitute_genesis_id, GossipNode, Peer, PeerOption, Router, UnicastPeer};
 
 // ---------------------------------------------------------------------------
 // Re-exports: Request/Response correlation (Epic 33a)
@@ -164,6 +175,26 @@ pub use request_response::{
 };
 
 // ---------------------------------------------------------------------------
+// Re-exports: Per-IP connection tracking and rate limiting
+// ---------------------------------------------------------------------------
+
+// Connection-level tracking (per-IP connection counts + sliding-window rate limit)
+pub use request_tracker::ConnectionTracker;
+
+// ---------------------------------------------------------------------------
+// Re-exports: Health service (HTTP /status endpoint)
+// ---------------------------------------------------------------------------
+
+pub use health_service::{health_check, health_router, HealthResponse, HEALTH_SERVICE_STATUS_PATH};
+
+// ---------------------------------------------------------------------------
+// Re-exports: Rejecting limit listener (Epic 34)
+// ---------------------------------------------------------------------------
+
+// Semaphore-based TCP connection limiter
+pub use listener::{ConnectionGuard, RejectingLimitListener, RESERVED_HEALTH_SERVICE_CONNECTIONS};
+
+// ---------------------------------------------------------------------------
 // Re-exports: WebsocketNetwork coordinator (Epic 33b)
 // ---------------------------------------------------------------------------
 
@@ -173,6 +204,16 @@ pub use ws_network::{PeerDirection, WebsocketNetwork, WebsocketNetworkConfig};
 // Mesh connectivity thread — maintains target outgoing connection count
 pub use mesh::{
     ConnectFn, MeshRequest, MeshThread, PeerCounter, DEFAULT_GOSSIP_FANOUT, DEFAULT_MESH_INTERVAL,
+};
+
+// ---------------------------------------------------------------------------
+// Re-exports: Broadcast thread (priority queues, stale dropping)
+// ---------------------------------------------------------------------------
+
+// Background broadcast with priority queues and connection limit
+pub use broadcast::{
+    is_high_priority_tag, BroadcastError, BroadcastHandle, BroadcastPeer, BroadcastThread,
+    PeerSendRef, MAX_MESSAGE_QUEUE_DURATION,
 };
 
 // ---------------------------------------------------------------------------
