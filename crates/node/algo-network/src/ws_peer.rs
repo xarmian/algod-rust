@@ -710,6 +710,126 @@ impl UnicastPeer for PeerHandle {
 }
 
 // ---------------------------------------------------------------------------
+// UnicastPeerRef — lightweight clone of PeerHandle for block fetching
+// ---------------------------------------------------------------------------
+
+/// A lightweight, cloneable reference to a [`PeerHandle`] that implements
+/// [`UnicastPeer`] for block request/response flows.
+///
+/// Unlike `PeerHandle` (which owns task handles and the incoming receiver),
+/// `UnicastPeerRef` holds only the send channel, request tracker, and
+/// cancellation token — all of which are cheaply cloneable.  This allows
+/// callers (e.g. `GossipBlockSource`) to obtain unicast-capable peer
+/// references from the [`WebsocketNetwork`] peer registry without taking
+/// ownership of the underlying connection.
+pub struct UnicastPeerRef {
+    send_bulk: mpsc::Sender<WriteCommand>,
+    closing: CancellationToken,
+    remote_addr: String,
+    request_tracker: Option<Arc<RequestTracker>>,
+    request_timeout: Duration,
+}
+
+impl Peer for UnicastPeerRef {
+    fn get_address(&self) -> &str {
+        &self.remote_addr
+    }
+
+    fn get_connection_latency(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    fn routing_addr(&self) -> &[u8] {
+        &[]
+    }
+}
+
+#[async_trait]
+impl UnicastPeer for UnicastPeerRef {
+    async fn request(&self, tag: Tag, topics: Topics) -> Result<Topics, PeerError> {
+        let tracker = self
+            .request_tracker
+            .as_ref()
+            .ok_or(PeerError::NoRequestTracker)?;
+
+        let (serialized, hash, rx) = tracker.prepare_request(topics).await;
+
+        let msg = OutgoingMessage::new(tag, serialized);
+        let cmd = WriteCommand::Data(SendMessage {
+            msg,
+            enqueued: Instant::now(),
+        });
+        if self.send_bulk.try_send(cmd).is_err() {
+            tracker.cancel_request(hash).await;
+            return Err(PeerError::SendBufferFull);
+        }
+
+        let result = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                tracker.cancel_request(hash).await;
+                return Err(PeerError::ConnectionClosed);
+            }
+            resp = tokio::time::timeout(self.request_timeout, rx) => {
+                resp
+            }
+        };
+
+        match result {
+            Ok(Ok(response_topics)) => Ok(response_topics),
+            Ok(Err(_recv_error)) => Err(PeerError::ResponseChannelClosed),
+            Err(_timeout) => {
+                tracker.cancel_request(hash).await;
+                Err(PeerError::RequestTimeout)
+            }
+        }
+    }
+
+    async fn respond(&self, request_hash: u64, topics: Topics) -> Result<(), PeerError> {
+        let request_hash_data = encode_uvarint(request_hash);
+        let mut response_topics = topics;
+        response_topics
+            .0
+            .push(Topic::new(RESPONSE_HASH_FIELD, request_hash_data));
+
+        let serialized = response_topics.marshal();
+        let msg = OutgoingMessage {
+            action: ForwardingPolicy::Respond,
+            tag: Tag::TopicMsgResp,
+            payload: serialized,
+            topics: None,
+        };
+
+        let cmd = WriteCommand::Data(SendMessage {
+            msg,
+            enqueued: Instant::now(),
+        });
+
+        self.send_bulk
+            .try_send(cmd)
+            .map_err(|_| PeerError::SendBufferFull)
+    }
+}
+
+impl PeerHandle {
+    /// Create a lightweight [`UnicastPeerRef`] that shares this handle's
+    /// send channel and request tracker.
+    ///
+    /// The returned reference can be used for unicast request/response
+    /// (e.g. block fetching) without owning the connection's task handles
+    /// or incoming message receiver.
+    pub fn unicast_ref(&self) -> UnicastPeerRef {
+        UnicastPeerRef {
+            send_bulk: self.send_bulk.clone(),
+            closing: self.closing.clone(),
+            remote_addr: self.remote_addr.clone(),
+            request_tracker: self.request_tracker.clone(),
+            request_timeout: self.request_timeout,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // read_loop
 // ---------------------------------------------------------------------------
 

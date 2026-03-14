@@ -97,7 +97,7 @@ pub use identity::{
 pub use peer_features::{decode_peer_features, encode_peer_features, PeerFeatureFlags};
 
 // WebSocket peer abstraction
-pub use ws_peer::{PeerHandle, PeerSender, WsPeer, WsPeerConfig};
+pub use ws_peer::{PeerHandle, PeerSender, UnicastPeerRef, WsPeer, WsPeerConfig};
 
 // Reconnection supervisor with exponential backoff
 pub use reconnect::{

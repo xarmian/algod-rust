@@ -231,6 +231,22 @@ impl WebsocketNetwork {
         peers.len()
     }
 
+    /// Returns lightweight [`UnicastPeer`] references for all connected
+    /// outbound peers.
+    ///
+    /// These references share the underlying send channels and request
+    /// trackers with the real peer handles, so unicast request/response
+    /// (e.g. block fetching) works without creating additional TCP
+    /// connections.
+    pub async fn get_unicast_peers(&self) -> Vec<Arc<dyn crate::gossip_node::UnicastPeer>> {
+        let peers = self.peers.read().await;
+        peers
+            .values()
+            .filter(|e| e.direction == PeerDirection::Outbound && !e.handle.is_closed())
+            .map(|e| Arc::new(e.handle.unicast_ref()) as Arc<dyn crate::gossip_node::UnicastPeer>)
+            .collect()
+    }
+
     /// Add a peer to the registry.
     ///
     /// Takes the incoming message receiver from the peer handle and spawns

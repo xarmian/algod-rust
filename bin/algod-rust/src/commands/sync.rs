@@ -4,11 +4,8 @@ use std::time::{Duration, Instant};
 
 use algo_ledger::{LedgerStore, SqliteLedger};
 use algo_network::{
-    connect::{try_connect, ConnectConfig},
-    gossip_node::UnicastPeer,
-    ws_network::PeerDirection,
     Discovery, GossipNode, HickorySrvResolver, Phonebook, WebsocketNetwork, WebsocketNetworkConfig,
-    WsPeerConfig, RELAY_ROLE,
+    RELAY_ROLE,
 };
 use algo_rest_client::{AlgodClient, BlockSource, GossipBlockSource, ParallelBlockFetcher};
 use algo_types::Round;
@@ -24,40 +21,55 @@ use crate::commands::network_common::{genesis_id_for, DNS_BOOTSTRAP_TEMPLATE};
 
 /// A [`BlockSource`] wrapper that tries gossip first, then falls back to REST.
 ///
+/// On each block request, the gossip peers are obtained dynamically from the
+/// [`WebsocketNetwork`] via [`get_unicast_peers()`], so the set of peers
+/// automatically reflects any connections established (or dropped) by the
+/// background [`MeshThread`].  This avoids creating a static peer list at
+/// construction time and eliminates the double-dial race where manually
+/// connected handles conflict with mesh-managed connections.
+///
 /// This enables `ParallelBlockFetcher` to transparently retry failed gossip
 /// fetches via the REST API, so that a single-round gossip failure does not
 /// cancel the entire batch pipeline.
 struct FallbackBlockSource {
-    gossip: Arc<GossipBlockSource>,
+    ws_network: Arc<WebsocketNetwork>,
     rest: Arc<AlgodClient>,
 }
 
 #[async_trait]
 impl BlockSource for FallbackBlockSource {
     async fn get_block_raw(&self, round: Round) -> algo_error::Result<Vec<u8>> {
-        match self.gossip.get_block_raw(round).await {
-            Ok(raw) => Ok(raw),
-            Err(_gossip_err) => {
-                debug!(
-                    round = round.0,
-                    "gossip get_block_raw failed, falling back to REST"
-                );
-                self.rest.get_block_raw(round).await
+        let peers = self.ws_network.get_unicast_peers().await;
+        if !peers.is_empty() {
+            let gossip = GossipBlockSource::new(peers);
+            match gossip.get_block_raw(round).await {
+                Ok(raw) => return Ok(raw),
+                Err(_gossip_err) => {
+                    debug!(
+                        round = round.0,
+                        "gossip get_block_raw failed, falling back to REST"
+                    );
+                }
             }
         }
+        self.rest.get_block_raw(round).await
     }
 
     async fn get_block(&self, round: Round) -> algo_error::Result<algo_types::BlockResponse> {
-        match self.gossip.get_block(round).await {
-            Ok(block) => Ok(block),
-            Err(_gossip_err) => {
-                debug!(
-                    round = round.0,
-                    "gossip get_block failed, falling back to REST"
-                );
-                self.rest.get_block(round).await
+        let peers = self.ws_network.get_unicast_peers().await;
+        if !peers.is_empty() {
+            let gossip = GossipBlockSource::new(peers);
+            match gossip.get_block(round).await {
+                Ok(block) => return Ok(block),
+                Err(_gossip_err) => {
+                    debug!(
+                        round = round.0,
+                        "gossip get_block failed, falling back to REST"
+                    );
+                }
             }
         }
+        self.rest.get_block(round).await
     }
 
     async fn get_status(&self) -> algo_error::Result<algo_rest_client::NodeStatus> {
@@ -77,21 +89,24 @@ impl BlockSource for FallbackBlockSource {
 // Gossip network setup
 // ---------------------------------------------------------------------------
 
-/// Set up gossip networking: discover relay peers, connect via WebSocket,
-/// and return a `GossipBlockSource` plus the `WebsocketNetwork` for lifecycle
-/// management.
+/// Set up gossip networking: discover relay peers, start the
+/// [`WebsocketNetwork`] (which spawns a [`MeshThread`] to dial peers), and
+/// return the network handle.
 ///
-/// Returns `(gossip_source, network)` where:
-/// - `gossip_source` has connected peers for block fetching via WS unicast
-/// - `network` should be used for `on_network_advance()` signaling and
-///   must be stopped on shutdown
+/// The returned [`WebsocketNetwork`] provides dynamic access to connected
+/// peers via [`get_unicast_peers()`]; the [`FallbackBlockSource`] uses this
+/// on every block request so the peer set automatically reflects mesh changes.
+///
+/// Connection establishment is entirely delegated to the `MeshThread` — no
+/// manual `try_connect` / `add_peer` calls are made here, avoiding the
+/// double-dial race where manually-added peers conflict with mesh-managed ones.
 async fn setup_gossip_network(
     network: &str,
     algod_url: &str,
     algod_token: &str,
     genesis_id_override: Option<&str>,
     relay_addrs_cli: &[String],
-) -> anyhow::Result<(Arc<GossipBlockSource>, Arc<WebsocketNetwork>)> {
+) -> anyhow::Result<Arc<WebsocketNetwork>> {
     // Resolve genesis ID for WS handshake:
     // 1. Explicit --genesis-id override
     // 2. Well-known network name lookup
@@ -136,10 +151,21 @@ async fn setup_gossip_network(
         discovery.refresh_phonebook_addresses().await;
         info!("DNS discovery complete");
     } else {
-        warn!(
-            "gossip mode on custom network with no --relay-addr; \
-             use --relay-addr to specify relay peers for gossip"
-        );
+        // Custom network with no explicit relay addresses — try to derive a
+        // peer address from the algod REST URL so we have *something* to dial.
+        if let Some(host_port) = extract_host_port(algod_url) {
+            warn!(
+                addr = %host_port,
+                "no --relay-addr provided for custom network; \
+                 using algod URL as gossip peer (port may differ from actual gossip port)"
+            );
+            phonebook.replace_peer_list(&[host_port], "algod-url", RELAY_ROLE);
+        } else {
+            warn!(
+                "gossip mode on custom network with no --relay-addr; \
+                 use --relay-addr to specify relay peers for gossip"
+            );
+        }
     }
 
     // Get relay addresses from phonebook.
@@ -160,71 +186,28 @@ async fn setup_gossip_network(
     };
     let ws_network = Arc::new(WebsocketNetwork::new(ws_config, phonebook));
 
-    // Start the network so mesh/monitor background tasks are spawned.
+    // Start the network — this spawns the MeshThread which dials peers from
+    // the phonebook, plus a peer monitor task.  All connection establishment
+    // is handled by MeshThread; no manual try_connect calls are needed.
     ws_network
         .start_arc()
         .await
         .map_err(|e| anyhow::anyhow!("failed to start WebsocketNetwork: {e}"))?;
 
-    // Connect to relay peers and collect PeerHandles (which implement UnicastPeer).
-    // Use a short request timeout (5s) so that a dead relay fails over to REST
-    // quickly via FallbackBlockSource, rather than stalling for the default 60s.
-    let connect_config = ConnectConfig {
-        genesis_id,
-        peer_config: Some(WsPeerConfig {
-            request_timeout: Some(Duration::from_secs(5)),
-            ..WsPeerConfig::default()
-        }),
-        ..ConnectConfig::default()
-    };
+    // Give the MeshThread a moment to establish initial connections before
+    // block fetching begins.  The FallbackBlockSource will transparently
+    // fall back to REST if gossip peers are not yet ready, so this is just
+    // an optimistic warm-up.
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let mut unicast_peers: Vec<Arc<dyn UnicastPeer>> = Vec::new();
-    for addr in &relay_addrs {
-        match try_connect(addr, &connect_config).await {
-            Ok(handle) => {
-                info!(addr = %addr, "connected to relay peer via WebSocket");
-                // Use the PeerHandle as a UnicastPeer for block fetching.
-                unicast_peers.push(Arc::new(handle));
-            }
-            Err(e) => {
-                warn!(addr = %addr, error = %e, "failed to connect to relay peer");
-            }
-        }
-    }
-
-    if unicast_peers.is_empty() {
-        anyhow::bail!(
-            "could not connect to any relay peers for gossip sync; \
-             tried {} addresses",
-            relay_addrs.len()
-        );
-    }
-
-    // Also connect separate handles and register them with the WebsocketNetwork
-    // so that mesh management and on_network_advance work correctly.
-    for addr in &relay_addrs {
-        match try_connect(addr, &connect_config).await {
-            Ok(handle) => {
-                ws_network.add_peer(handle, PeerDirection::Outbound).await;
-            }
-            Err(e) => {
-                debug!(
-                    addr = %addr,
-                    error = %e,
-                    "failed to connect mesh peer (gossip source handles are primary)"
-                );
-            }
-        }
-    }
-
+    let peer_count = ws_network.peer_count().await;
     info!(
-        connected = unicast_peers.len(),
+        connected = peer_count,
         total = relay_addrs.len(),
-        "gossip peers connected"
+        "gossip network started, MeshThread managing connections"
     );
 
-    let gossip_source = Arc::new(GossipBlockSource::new(unicast_peers));
-    Ok((gossip_source, ws_network))
+    Ok(ws_network)
 }
 
 /// Run the sync command: fetch blocks in parallel and apply them to the ledger.
@@ -320,7 +303,7 @@ pub async fn run(
     // Set up block source: gossip-first with REST fallback, or REST-only.
     let (block_source, ws_network): (Arc<dyn BlockSource>, Option<Arc<WebsocketNetwork>>) =
         if gossip {
-            let (gossip_source, ws_net) = setup_gossip_network(
+            let ws_net = setup_gossip_network(
                 network,
                 algod_url,
                 algod_token,
@@ -329,7 +312,7 @@ pub async fn run(
             )
             .await?;
             let fallback: Arc<dyn BlockSource> = Arc::new(FallbackBlockSource {
-                gossip: gossip_source,
+                ws_network: Arc::clone(&ws_net),
                 rest: Arc::clone(&client),
             });
             (fallback, Some(ws_net))
@@ -481,7 +464,6 @@ pub async fn run(
 ///
 /// Falls back to port 4160 if no port is present. Returns `None` if the URL
 /// cannot be parsed.
-#[cfg(test)]
 fn extract_host_port(url: &str) -> Option<String> {
     // Strip scheme.
     let after_scheme = url
