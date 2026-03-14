@@ -1,6 +1,8 @@
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use algo_ledger::{SqliteLedger, LedgerStore};
 use algo_network::{
     BlockService, BlockServiceError, GossipNode, LedgerForBlockService, Phonebook,
     WebsocketNetwork, WebsocketNetworkConfig, RELAY_ROLE,
@@ -10,25 +12,50 @@ use tracing::info;
 use crate::commands::network_common::genesis_id_for;
 
 // ---------------------------------------------------------------------------
-// Stub ledger — returns "not available" for every round
+// SqliteLedger-backed block service
 // ---------------------------------------------------------------------------
 
-/// A no-op ledger that always reports round 0 and has no blocks.
-///
-/// Used to wire up the `BlockService` HTTP handler before a real ledger
-/// integration is available.
-struct StubLedger;
+/// Wraps a `SqliteLedger` behind a `Mutex` so it can satisfy the
+/// `Send + Sync + 'static` bounds required by `LedgerForBlockService`.
+struct LedgerBlockService {
+    ledger: Mutex<SqliteLedger>,
+}
 
-impl LedgerForBlockService for StubLedger {
+impl LedgerForBlockService for LedgerBlockService {
     fn encoded_block_cert(&self, round: u64) -> Result<(Vec<u8>, Vec<u8>), BlockServiceError> {
-        Err(BlockServiceError::BlockNotAvailable {
+        let ledger = self.ledger.lock().map_err(|_| BlockServiceError::BlockNotAvailable {
             round,
-            latest_round: Some(0),
-        })
+            latest_round: None,
+        })?;
+        let latest = ledger.current_round().0;
+
+        let block_data = ledger
+            .get_block_data(round)
+            .map_err(|_| BlockServiceError::BlockNotAvailable {
+                round,
+                latest_round: Some(latest),
+            })?
+            .ok_or(BlockServiceError::BlockNotAvailable {
+                round,
+                latest_round: Some(latest),
+            })?;
+
+        let cert_data = ledger
+            .get_block_cert(round)
+            .map_err(|_| BlockServiceError::BlockNotAvailable {
+                round,
+                latest_round: Some(latest),
+            })?
+            .unwrap_or_default();
+
+        Ok((block_data, cert_data))
     }
 
     fn latest_round(&self) -> u64 {
-        0
+        self.ledger
+            .lock()
+            .map(|l| l.current_round().0)
+            .unwrap_or(0)
     }
 }
 
@@ -51,6 +78,7 @@ pub async fn run(
     tls_cert: Option<&str>,
     tls_key: Option<&str>,
     mem_cap_mb: u64,
+    ledger_path: &Path,
 ) -> anyhow::Result<()> {
     // Resolve genesis ID: use the provided value, or look it up by network name.
     let resolved_genesis_id = if genesis_id.is_empty() {
@@ -112,8 +140,16 @@ pub async fn run(
 
     let net = Arc::new(WebsocketNetwork::new(config, phonebook));
 
-    // Register the block service HTTP handler (stub ledger for now).
-    let ledger: Arc<dyn LedgerForBlockService> = Arc::new(StubLedger);
+    // Open the SQLite ledger and register the block service HTTP handler.
+    let sqlite_ledger = SqliteLedger::open(ledger_path)
+        .map_err(|e| anyhow::anyhow!("failed to open ledger at {}: {}", ledger_path.display(), e))?;
+
+    let latest = sqlite_ledger.current_round().0;
+    info!(path = %ledger_path.display(), latest_round = latest, "opened ledger database");
+
+    let ledger: Arc<dyn LedgerForBlockService> = Arc::new(LedgerBlockService {
+        ledger: Mutex::new(sqlite_ledger),
+    });
     let block_service = BlockService::new(ledger, resolved_genesis_id.clone(), mem_cap);
     net.register_http_handler("/", block_service.http_router());
 

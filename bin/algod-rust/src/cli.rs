@@ -245,6 +245,10 @@ pub enum Commands {
         #[arg(long, short = 'b')]
         bind_address: String,
 
+        /// Path to the SQLite ledger database.
+        #[arg(long, short = 'l')]
+        ledger_path: PathBuf,
+
         /// Genesis ID string (e.g. "mainnet-v1.0").
         /// If not provided, derived from --network.
         #[arg(long, short = 'g')]

@@ -193,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Relay {
             bind_address,
+            ledger_path,
             genesis_id,
             network,
             peers,
@@ -216,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
                 tls_cert.as_deref(),
                 tls_key.as_deref(),
                 mem_cap_mb,
+                &ledger_path,
             )
             .await?;
         }
