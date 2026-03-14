@@ -329,10 +329,7 @@ pub async fn try_connect(addr: &str, config: &ConnectConfig) -> Result<PeerHandl
     // to be sent before any gossip traffic. Go relays that enforce identity
     // flow ordering will drop the connection otherwise.
     if let Some(verification_bytes) = id_verification_bytes {
-        let ni_msg = OutgoingMessage {
-            tag: Tag::NetIDVerification,
-            payload: verification_bytes,
-        };
+        let ni_msg = OutgoingMessage::new(Tag::NetIDVerification, verification_bytes);
         if let Err(e) = handle.send_priority(ni_msg) {
             tracing::warn!(
                 addr = %addr,

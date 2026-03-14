@@ -2,7 +2,9 @@ pub mod block_cert;
 pub mod compression;
 pub mod connect;
 pub mod errors;
+pub mod forwarding_policy;
 pub mod framing;
+pub mod handler;
 pub mod handshake;
 pub mod identity;
 pub mod message;
@@ -15,8 +17,11 @@ pub mod ws_peer;
 
 pub mod discovery;
 pub mod dns_bootstrap;
+pub mod gossip_node;
+pub mod message_filter;
 pub mod peer_role;
 pub mod phonebook;
+pub mod request_response;
 pub mod srv_resolver;
 
 // ---------------------------------------------------------------------------
@@ -37,6 +42,9 @@ pub use compression::{
 
 // Framing
 pub use framing::{decode_frame, encode_frame, NetworkError};
+
+// Forwarding policy
+pub use forwarding_policy::ForwardingPolicy;
 
 // Messages
 pub use message::{IncomingMessage, OutgoingMessage};
@@ -80,7 +88,7 @@ pub use identity::{
 pub use peer_features::{decode_peer_features, encode_peer_features, PeerFeatureFlags};
 
 // WebSocket peer abstraction
-pub use ws_peer::{PeerHandle, WsPeer};
+pub use ws_peer::{PeerHandle, PeerSender, WsPeer, WsPeerConfig};
 
 // Reconnection supervisor with exponential backoff
 pub use reconnect::{
@@ -109,6 +117,42 @@ pub use phonebook::Phonebook;
 
 // Discovery
 pub use discovery::Discovery;
+
+// ---------------------------------------------------------------------------
+// Re-exports: Message Handler Framework (Epic 33a)
+// ---------------------------------------------------------------------------
+
+// Handler traits and dispatch
+pub use handler::{
+    MessageHandler, MessageValidatorHandler, Multiplexer, TaggedMessageHandler,
+    TaggedMessageValidatorHandler, ValidatedMessage,
+};
+
+// ---------------------------------------------------------------------------
+// Re-exports: Message deduplication filter (Epic 33a)
+// ---------------------------------------------------------------------------
+
+// Digest-based seen-message cache
+pub use message_filter::{
+    dedup_safe_tag, generate_message_digest, MessageFilter, MESSAGE_FILTER_SIZE,
+};
+
+// ---------------------------------------------------------------------------
+// Re-exports: GossipNode trait and Peer abstraction (Epic 33a)
+// ---------------------------------------------------------------------------
+
+// GossipNode network abstraction
+pub use gossip_node::{substitute_genesis_id, GossipNode, Peer, PeerOption};
+
+// ---------------------------------------------------------------------------
+// Re-exports: Request/Response correlation (Epic 33a)
+// ---------------------------------------------------------------------------
+
+// Request/response tracker and constants
+pub use request_response::{
+    hash_topics, RequestResponseError, RequestTracker, DEFAULT_REQUEST_TIMEOUT,
+    REQUEST_NONCE_FIELD, RESPONSE_HASH_FIELD,
+};
 
 // ---------------------------------------------------------------------------
 // Message filtering helpers
