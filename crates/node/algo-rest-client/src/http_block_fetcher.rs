@@ -181,7 +181,7 @@ impl HttpBlockFetcher {
         let url = self.block_url(round);
         debug!(round, url = %url, "fetching block via HTTP");
 
-        let response = self
+        let mut response = self
             .client
             .get(&url)
             .header(ACCEPT, BLOCK_RESPONSE_CONTENT_TYPE)
@@ -227,7 +227,7 @@ impl HttpBlockFetcher {
         // Validate Content-Type
         validate_content_type(&response)?;
 
-        // Read body with size guard (compare as u64 to avoid truncation on 32-bit)
+        // Early rejection when Content-Length is present and exceeds the limit.
         let content_length = response.content_length();
         if let Some(len) = content_length {
             if len > MAX_BLOCK_BYTES as u64 {
@@ -235,12 +235,26 @@ impl HttpBlockFetcher {
             }
         }
 
-        let bytes = response.bytes().await?;
-        if bytes.len() > MAX_BLOCK_BYTES {
-            return Err(HttpBlockFetchError::ResponseTooLarge);
+        // Stream the body in chunks, enforcing the size limit incrementally.
+        // This prevents unbounded memory allocation from chunked
+        // transfer-encoding responses that lack a Content-Length header.
+        let mut body = Vec::with_capacity(
+            content_length
+                .map(|l| l as usize)
+                .unwrap_or(0)
+                .min(MAX_BLOCK_BYTES),
+        );
+        let mut total = 0usize;
+
+        while let Some(chunk) = response.chunk().await? {
+            total = total.saturating_add(chunk.len());
+            if total > MAX_BLOCK_BYTES {
+                return Err(HttpBlockFetchError::ResponseTooLarge);
+            }
+            body.extend_from_slice(&chunk);
         }
 
-        Ok(bytes.to_vec())
+        Ok(body)
     }
 }
 
