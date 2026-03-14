@@ -183,3 +183,24 @@ pub enum PeerError {
     #[error("WebSocket error: {0}")]
     Tungstenite(#[from] tokio_tungstenite::tungstenite::Error),
 }
+
+// ---------------------------------------------------------------------------
+// Phonebook errors
+// ---------------------------------------------------------------------------
+
+/// Errors related to the peer phonebook.
+#[derive(Debug, Error)]
+pub enum PhonebookError {
+    /// A DNS SRV lookup failed.
+    #[error("SRV lookup failed for {service}.{protocol}.{name}: {reason}")]
+    SrvLookupFailed {
+        service: String,
+        protocol: String,
+        name: String,
+        reason: String,
+    },
+
+    /// DNS bootstrap configuration is invalid.
+    #[error("DNS bootstrap error: {0}")]
+    DnsBootstrap(#[from] crate::dns_bootstrap::DnsBootstrapError),
+}
