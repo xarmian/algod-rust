@@ -179,6 +179,18 @@ pub enum PeerError {
     #[error("connection closed by remote")]
     ConnectionClosed,
 
+    /// A unicast request timed out waiting for a response.
+    #[error("request timed out")]
+    RequestTimeout,
+
+    /// The response channel was dropped (peer closed during request).
+    #[error("response channel closed")]
+    ResponseChannelClosed,
+
+    /// No request tracker is configured on this peer.
+    #[error("no request tracker configured")]
+    NoRequestTracker,
+
     /// Tungstenite-level error on an active connection.
     #[error("WebSocket error: {0}")]
     Tungstenite(#[from] tokio_tungstenite::tungstenite::Error),

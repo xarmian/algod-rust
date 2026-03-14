@@ -17,6 +17,7 @@ algo-validate.workspace = true
 algo-conformance.workspace = true
 algo-ledger.workspace = true
 algo-fixtures.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -11,6 +11,7 @@
 //! - `network/netidentity.go` — identity challenge exchange
 //! - `network/wsPeer.go` — peer initialization after handshake
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -31,7 +32,8 @@ use crate::message::OutgoingMessage;
 use crate::msg_of_interest::marshal_msg_of_interest;
 use crate::peer_features::{decode_peer_features, encode_peer_features, PeerFeatureFlags};
 use crate::tag::Tag;
-use crate::ws_peer::{PeerHandle, WsPeer};
+use crate::request_response::RequestTracker;
+use crate::ws_peer::{PeerHandle, WsPeer, WsPeerConfig};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -313,7 +315,11 @@ pub async fn try_connect(addr: &str, config: &ConnectConfig) -> Result<PeerHandl
 
     // Step 11: Create and start WsPeer
     let closing = CancellationToken::new();
-    let peer = WsPeer::new(
+    let config = WsPeerConfig {
+        request_tracker: Some(Arc::new(RequestTracker::new())),
+        ..WsPeerConfig::default()
+    };
+    let peer = WsPeer::with_config(
         ws_stream,
         addr.to_string(),
         server_info.protocol_version,
@@ -321,6 +327,7 @@ pub async fn try_connect(addr: &str, config: &ConnectConfig) -> Result<PeerHandl
         identity_key,
         identity_verified,
         closing,
+        config,
     );
     let handle = peer.start();
 

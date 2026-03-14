@@ -5,8 +5,9 @@
 //! `network.GossipNode` interface from `go-algorand/network/gossipNode.go`.
 //!
 //! Also defines the [`Peer`] trait (combining Go's `Peer`,
-//! `DisconnectablePeer`, and `IPAddressable` interfaces) and the
-//! [`PeerOption`] enum for filtering peer queries.
+//! `DisconnectablePeer`, and `IPAddressable` interfaces), the
+//! [`UnicastPeer`] trait (extending `Peer` with request/response methods),
+//! and the [`PeerOption`] enum for filtering peer queries.
 
 use std::fmt;
 use std::sync::Arc;
@@ -14,8 +15,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::errors::PeerError;
 use crate::handler::{TaggedMessageHandler, TaggedMessageValidatorHandler};
 use crate::tag::Tag;
+use crate::topics::Topics;
 
 // ---------------------------------------------------------------------------
 // Peer trait
@@ -44,6 +47,48 @@ pub trait Peer: Send + Sync {
     /// Mirrors Go's `IPAddressable.RoutingAddr()`.  Returns an empty slice
     /// if the routing address is not known.
     fn routing_addr(&self) -> &[u8];
+}
+
+// ---------------------------------------------------------------------------
+// UnicastPeer trait
+// ---------------------------------------------------------------------------
+
+/// A peer that supports request/response (unicast) communication.
+///
+/// Extends [`Peer`] with the ability to send a topic-based request and
+/// await a correlated response, or to send a response to an incoming
+/// request.
+///
+/// Mirrors Go's `UnicastPeer` interface from
+/// `go-algorand/network/wsPeer.go`:
+///
+/// ```go
+/// type UnicastPeer interface {
+///     GetAddress() string
+///     Request(ctx context.Context, tag Tag, topics Topics) (resp *Response, e error)
+///     Respond(ctx context.Context, reqMsg IncomingMessage, outMsg OutgoingMessage) (e error)
+/// }
+/// ```
+#[async_trait]
+pub trait UnicastPeer: Peer {
+    /// Send a topic-based request and await the correlated response.
+    ///
+    /// The implementation appends a unique nonce, serializes the topics,
+    /// sends the message with the given tag, and waits for the matching
+    /// `TopicMsgResp` response (correlated by SHA-512/256 hash of the
+    /// serialized request).
+    ///
+    /// Returns the response [`Topics`] or a [`PeerError`] on failure
+    /// (timeout, send buffer full, peer closed, etc.).
+    async fn request(&self, tag: Tag, topics: Topics) -> Result<Topics, PeerError>;
+
+    /// Send a response to a previously received request.
+    ///
+    /// `request_hash` is the SHA-512/256-truncated-to-u64 hash of the
+    /// original request's serialized topics.  The response topics are
+    /// augmented with a `RequestHash` field containing this value and
+    /// sent as a `TopicMsgResp` message.
+    async fn respond(&self, request_hash: u64, topics: Topics) -> Result<(), PeerError>;
 }
 
 // ---------------------------------------------------------------------------

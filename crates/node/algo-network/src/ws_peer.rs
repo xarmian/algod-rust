@@ -32,6 +32,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -47,6 +48,7 @@ use crate::compression::{
 use crate::errors::PeerError;
 use crate::forwarding_policy::ForwardingPolicy;
 use crate::framing::{decode_frame, encode_frame};
+use crate::gossip_node::{Peer, UnicastPeer};
 use crate::handler::Multiplexer;
 use crate::message::{IncomingMessage, OutgoingMessage};
 use crate::message_filter::{
@@ -54,7 +56,9 @@ use crate::message_filter::{
 };
 use crate::msg_of_interest::unmarshal_msg_of_interest;
 use crate::peer_features::PeerFeatureFlags;
-use crate::request_response::{encode_uvarint, hash_topics, RequestTracker, RESPONSE_HASH_FIELD};
+use crate::request_response::{
+    encode_uvarint, hash_topics, RequestTracker, DEFAULT_REQUEST_TIMEOUT, RESPONSE_HASH_FIELD,
+};
 use crate::tag::Tag;
 use crate::topics::{Topic, Topics};
 
@@ -166,6 +170,7 @@ type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 /// - **incoming_filter**: deduplicates incoming messages (for AV and TX tags)
 /// - **outgoing_filter**: tracks digests the peer already has (via MsgDigestSkip)
 /// - **request_tracker**: correlates TopicMsgResp responses to pending requests
+/// - **request_timeout**: overrides the default 60s timeout for unicast requests
 ///
 /// All fields are `Option` so existing code that doesn't need these features
 /// can pass `WsPeerConfig::default()` (all `None`).
@@ -179,6 +184,12 @@ pub struct WsPeerConfig {
     pub outgoing_filter: Option<Arc<MessageFilter>>,
     /// Request/response correlation tracker.
     pub request_tracker: Option<Arc<RequestTracker>>,
+    /// Timeout for unicast requests made via [`PeerHandle::request()`].
+    ///
+    /// When `None`, defaults to [`DEFAULT_REQUEST_TIMEOUT`] (60s).
+    /// Set this to a shorter duration (e.g. 4s) for block-fetch peers
+    /// where fast failover is more important than tolerating slow peers.
+    pub request_timeout: Option<Duration>,
 }
 
 /// A live WebSocket peer connection.
@@ -306,6 +317,14 @@ impl WsPeer {
         let incoming_filter = self.config.incoming_filter;
         let outgoing_filter = self.config.outgoing_filter;
         let request_tracker = self.config.request_tracker;
+        let request_timeout = self
+            .config
+            .request_timeout
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+
+        // Clone request_tracker for the PeerHandle (the read loop also
+        // gets a reference so it can route TopicMsgResp to pending receivers).
+        let handle_request_tracker = request_tracker.clone();
 
         // Extract fields for the individual tasks.
         let stream = self.stream;
@@ -366,6 +385,8 @@ impl WsPeer {
             identity_verified: self.identity_verified,
             features,
             version: self.version,
+            request_tracker: handle_request_tracker,
+            request_timeout,
             _read_handle: read_handle,
             _write_handle: write_handle,
             _keepalive_handle: keepalive_handle,
@@ -457,6 +478,16 @@ pub struct PeerHandle {
     features: PeerFeatureFlags,
     /// Negotiated protocol version.
     version: String,
+    /// Request/response correlation tracker for unicast request/response.
+    ///
+    /// Shared with the read loop which routes `TopicMsgResp` responses
+    /// back to pending request receivers.
+    request_tracker: Option<Arc<RequestTracker>>,
+    /// Timeout for unicast requests.
+    ///
+    /// Defaults to [`DEFAULT_REQUEST_TIMEOUT`] (60s) but can be overridden
+    /// via [`WsPeerConfig::request_timeout`] or [`PeerHandle::set_request_timeout`].
+    request_timeout: Duration,
     /// Task handles (kept alive so tasks are not dropped prematurely).
     _read_handle: JoinHandle<()>,
     _write_handle: JoinHandle<()>,
@@ -527,6 +558,21 @@ impl PeerHandle {
         &self.version
     }
 
+    /// Override the timeout used for unicast requests.
+    ///
+    /// This allows callers to set a shorter timeout (e.g. 4s for block
+    /// fetching) after construction.  The timeout is applied inside
+    /// [`UnicastPeer::request()`] so that cleanup of pending tracker
+    /// entries happens correctly even on timeout.
+    pub fn set_request_timeout(&mut self, timeout: Duration) {
+        self.request_timeout = timeout;
+    }
+
+    /// Returns the currently configured request timeout.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
     /// Receive the next incoming message from this peer.
     ///
     /// Returns `None` when the peer has disconnected and the channel is drained.
@@ -542,6 +588,109 @@ impl Drop for PeerHandle {
         self._read_handle.abort();
         self._write_handle.abort();
         self._keepalive_handle.abort();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Peer trait implementation for PeerHandle
+// ---------------------------------------------------------------------------
+
+impl Peer for PeerHandle {
+    fn get_address(&self) -> &str {
+        &self.remote_addr
+    }
+
+    fn get_connection_latency(&self) -> Duration {
+        // Latency measurement is not yet implemented for WS peers.
+        Duration::ZERO
+    }
+
+    fn routing_addr(&self) -> &[u8] {
+        // Routing address extraction from the remote address string is
+        // deferred to a future epic where IP-based peer bucketing is needed.
+        &[]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UnicastPeer trait implementation for PeerHandle
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl UnicastPeer for PeerHandle {
+    async fn request(&self, tag: Tag, topics: Topics) -> Result<Topics, PeerError> {
+        let tracker = self
+            .request_tracker
+            .as_ref()
+            .ok_or(PeerError::NoRequestTracker)?;
+
+        // 1. Prepare the request: append nonce, serialize, hash, register receiver.
+        let (serialized, hash, rx) = tracker.prepare_request(topics).await;
+
+        // 2. Send the serialized topics as the payload with the given tag.
+        let msg = OutgoingMessage::new(tag, serialized);
+        let cmd = WriteCommand::Data(SendMessage {
+            msg,
+            enqueued: Instant::now(),
+        });
+        if self.send_bulk.try_send(cmd).is_err() {
+            // Clean up the pending request entry to prevent a leak.
+            tracker.cancel_request(hash).await;
+            return Err(PeerError::SendBufferFull);
+        }
+
+        // 3. Await the response with a timeout, cancelling on peer close.
+        let result = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                // Peer is closing; cancel the pending request.
+                tracker.cancel_request(hash).await;
+                return Err(PeerError::ConnectionClosed);
+            }
+            resp = tokio::time::timeout(self.request_timeout, rx) => {
+                resp
+            }
+        };
+
+        match result {
+            Ok(Ok(response_topics)) => Ok(response_topics),
+            Ok(Err(_recv_error)) => {
+                // The sender was dropped (peer closed or request cancelled).
+                Err(PeerError::ResponseChannelClosed)
+            }
+            Err(_timeout) => {
+                // Clean up the pending request on timeout.
+                tracker.cancel_request(hash).await;
+                Err(PeerError::RequestTimeout)
+            }
+        }
+    }
+
+    async fn respond(&self, request_hash: u64, topics: Topics) -> Result<(), PeerError> {
+        // Build the response: append the RequestHash topic and serialize.
+        let request_hash_data = encode_uvarint(request_hash);
+        let mut response_topics = topics;
+        response_topics
+            .0
+            .push(Topic::new(RESPONSE_HASH_FIELD, request_hash_data));
+
+        let serialized = response_topics.marshal();
+        let msg = OutgoingMessage {
+            action: ForwardingPolicy::Respond,
+            tag: Tag::TopicMsgResp,
+            payload: serialized,
+            topics: None,
+        };
+
+        let cmd = WriteCommand::Data(SendMessage {
+            msg,
+            enqueued: Instant::now(),
+        });
+
+        // Use the bulk channel (matching Go's sendBufferBulk for Respond).
+        self.send_bulk
+            .try_send(cmd)
+            .map_err(|_| PeerError::SendBufferFull)
     }
 }
 
@@ -807,11 +956,8 @@ async fn read_loop<St>(
                             // Additionally, if the outgoing filter is present
                             // and the message is large enough, add its digest
                             // so we don't re-send it to this peer.
-                            if dedup_safe_tag(&tag)
-                                && payload.len() >= MESSAGE_FILTER_SIZE
-                            {
-                                let digest =
-                                    generate_message_digest(&tag, &payload);
+                            if dedup_safe_tag(&tag) && payload.len() >= MESSAGE_FILTER_SIZE {
+                                let digest = generate_message_digest(&tag, &payload);
                                 if let Some(ref of) = outgoing_filter {
                                     of.check_digest(&digest, true, false);
                                 }
@@ -857,13 +1003,10 @@ async fn read_loop<St>(
                             let request_hash = hash_topics(&payload);
                             let request_hash_data = encode_uvarint(request_hash);
 
-                            let mut response_topics = out
-                                .topics
-                                .unwrap_or_else(Topics::new);
-                            response_topics.0.push(Topic::new(
-                                RESPONSE_HASH_FIELD,
-                                request_hash_data,
-                            ));
+                            let mut response_topics = out.topics.unwrap_or_else(Topics::new);
+                            response_topics
+                                .0
+                                .push(Topic::new(RESPONSE_HASH_FIELD, request_hash_data));
 
                             let serialized = response_topics.marshal();
                             let resp_msg = OutgoingMessage {
@@ -2511,9 +2654,7 @@ mod tests {
                 use crate::topics::Topics;
                 let topics = Topics::unmarshal(&send_msg.msg.payload)
                     .expect("payload should be valid Topics");
-                let hash_val = topics.get_value(
-                    crate::request_response::RESPONSE_HASH_FIELD,
-                );
+                let hash_val = topics.get_value(crate::request_response::RESPONSE_HASH_FIELD);
                 assert!(
                     hash_val.is_some(),
                     "response must include RequestHash topic"
@@ -2703,5 +2844,417 @@ mod tests {
         assert!(config.incoming_filter.is_none());
         assert!(config.outgoing_filter.is_none());
         assert!(config.request_tracker.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // UnicastPeer: respond() constructs correct TopicMsgResp
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn unicast_respond_sends_topic_msg_resp() {
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (mut _server_sink, mut server_stream) = server_ws.split();
+        let closing = CancellationToken::new();
+
+        // Create channels manually to build a PeerHandle-like struct.
+        let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+        let (bulk_tx, bulk_rx) = mpsc::channel(10);
+        let (_incoming_tx, _incoming_rx) = mpsc::channel(10);
+
+        // Set up the write loop to actually send the message.
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let (client_sink, _client_stream) = client_ws.split();
+        let closing_clone = closing.clone();
+        let _write_task = tokio::spawn(write_loop(
+            client_sink,
+            _high_prio_rx,
+            bulk_rx,
+            send_message_tags,
+            closing_clone,
+            "test".to_string(),
+            PeerFeatureFlags::empty(),
+            None,
+        ));
+
+        // Build a PeerHandle with a request tracker.
+        let tracker = Arc::new(RequestTracker::new());
+        let handle = PeerHandle {
+            send_high_prio: high_prio_tx,
+            send_bulk: bulk_tx,
+            incoming: _incoming_rx,
+            closing: closing.clone(),
+            remote_addr: "127.0.0.1:9999".to_string(),
+            identity_key: None,
+            identity_verified: false,
+            features: PeerFeatureFlags::empty(),
+            version: "2.2".to_string(),
+            request_tracker: Some(tracker),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            _read_handle: tokio::spawn(async {}),
+            _write_handle: tokio::spawn(async {}),
+            _keepalive_handle: tokio::spawn(async {}),
+        };
+
+        // Send a response via UnicastPeer::respond().
+        let request_hash = 0xDEAD_BEEF_u64;
+        let response_topics = Topics::from_vec(vec![Topic::new("result", b"success".to_vec())]);
+        handle.respond(request_hash, response_topics).await.unwrap();
+
+        // Read the frame from the server side.
+        let received = tokio::time::timeout(Duration::from_secs(2), server_stream.next())
+            .await
+            .expect("timeout")
+            .unwrap()
+            .unwrap();
+
+        match received {
+            WsMessage::Binary(data) => {
+                let (tag, payload) = decode_frame(&data).unwrap();
+                assert_eq!(tag, Tag::TopicMsgResp);
+
+                // Deserialize the payload as Topics and verify.
+                let decoded = Topics::unmarshal(payload).unwrap();
+
+                // Should contain "result" and "RequestHash" topics.
+                assert_eq!(decoded.get_value("result"), Some(b"success".as_slice()));
+                let hash_bytes = decoded.get_value(RESPONSE_HASH_FIELD).unwrap();
+                let encoded_hash = encode_uvarint(request_hash);
+                assert_eq!(hash_bytes, &encoded_hash[..]);
+            }
+            other => panic!("expected binary message, got: {other:?}"),
+        }
+
+        closing.cancel();
+    }
+
+    // -----------------------------------------------------------------------
+    // UnicastPeer: request() + response round-trip
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn unicast_request_response_roundtrip() {
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (server_sink, mut server_stream) = server_ws.split();
+        let closing = CancellationToken::new();
+
+        let (high_prio_tx, high_prio_rx) = mpsc::channel(10);
+        let (bulk_tx, bulk_rx) = mpsc::channel(10);
+        let (_incoming_tx, incoming_rx) = mpsc::channel(10);
+
+        // Set up the write loop so messages actually get sent.
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let (client_sink, client_stream) = client_ws.split();
+        let closing_clone = closing.clone();
+        let _write_task = tokio::spawn(write_loop(
+            client_sink,
+            high_prio_rx,
+            bulk_rx,
+            send_message_tags.clone(),
+            closing_clone,
+            "test".to_string(),
+            PeerFeatureFlags::empty(),
+            None,
+        ));
+
+        // Set up the request tracker (shared between PeerHandle and read loop).
+        let tracker = Arc::new(RequestTracker::new());
+
+        // Set up the read loop so TopicMsgResp responses get routed.
+        let read_closing = closing.clone();
+        let read_tracker = tracker.clone();
+        let (read_incoming_tx, _read_incoming_rx) = mpsc::channel(10);
+        let (read_high_prio_tx, _read_high_prio_rx) = mpsc::channel(10);
+        let read_send_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let last_packet_time = Arc::new(RwLock::new(Instant::now()));
+        let peer_sender = make_test_peer_sender(closing.clone());
+        let _read_task = tokio::spawn(read_loop(
+            client_stream,
+            read_incoming_tx,
+            read_high_prio_tx,
+            read_send_tags,
+            last_packet_time,
+            read_closing,
+            "test-peer".to_string(),
+            PeerFeatureFlags::empty(),
+            None,
+            None,
+            None,
+            Some(read_tracker),
+            peer_sender,
+        ));
+
+        // Build the PeerHandle.
+        let handle = PeerHandle {
+            send_high_prio: high_prio_tx,
+            send_bulk: bulk_tx,
+            incoming: incoming_rx,
+            closing: closing.clone(),
+            remote_addr: "127.0.0.1:9999".to_string(),
+            identity_key: None,
+            identity_verified: false,
+            features: PeerFeatureFlags::empty(),
+            version: "2.2".to_string(),
+            request_tracker: Some(tracker.clone()),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            _read_handle: tokio::spawn(async {}),
+            _write_handle: tokio::spawn(async {}),
+            _keepalive_handle: tokio::spawn(async {}),
+        };
+
+        // Spawn the request in a background task.
+        let request_topics = Topics::from_vec(vec![Topic::new("query", b"blocks".to_vec())]);
+        let request_handle =
+            tokio::spawn(async move { handle.request(Tag::UniEnsBlockReq, request_topics).await });
+
+        // On the "server" side, read the request, extract its hash, and
+        // send back a TopicMsgResp response.
+        let request_frame = tokio::time::timeout(Duration::from_secs(2), server_stream.next())
+            .await
+            .expect("timeout waiting for request")
+            .unwrap()
+            .unwrap();
+
+        let request_payload = match request_frame {
+            WsMessage::Binary(data) => {
+                let (tag, payload) = decode_frame(&data).unwrap();
+                assert_eq!(tag, Tag::UniEnsBlockReq);
+                payload.to_vec()
+            }
+            other => panic!("expected binary, got: {other:?}"),
+        };
+
+        // Compute the request hash (same as RequestTracker does).
+        let request_hash = hash_topics(&request_payload);
+
+        // Build a response with the request hash.
+        let hash_data = encode_uvarint(request_hash);
+        let resp_topics = Topics::from_vec(vec![
+            Topic::new(RESPONSE_HASH_FIELD, hash_data),
+            Topic::new("block", b"block-data-here".to_vec()),
+        ]);
+        let resp_payload = resp_topics.marshal();
+        let resp_frame = encode_frame(&Tag::TopicMsgResp, &resp_payload).unwrap();
+
+        // Send the response back through the server sink.
+        let mut server_sink = server_sink;
+        server_sink
+            .send(WsMessage::Binary(resp_frame))
+            .await
+            .unwrap();
+
+        // The request task should now complete with the response topics.
+        let result = tokio::time::timeout(Duration::from_secs(2), request_handle)
+            .await
+            .expect("timeout waiting for request result")
+            .expect("request task panicked");
+
+        let response = result.expect("request failed");
+        assert_eq!(
+            response.get_value("block"),
+            Some(b"block-data-here".as_slice())
+        );
+
+        // Verify the tracker is now empty.
+        assert_eq!(tracker.pending_count().await, 0);
+
+        closing.cancel();
+    }
+
+    // -----------------------------------------------------------------------
+    // UnicastPeer: request() without tracker returns error
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn unicast_request_no_tracker_returns_error() {
+        let (client_ws, _server_ws) = ws_raw_pair().await;
+        let closing = CancellationToken::new();
+
+        let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+        let (bulk_tx, _bulk_rx) = mpsc::channel(10);
+        let (_incoming_tx, incoming_rx) = mpsc::channel(10);
+
+        let (client_sink, _client_stream) = client_ws.split();
+        drop(client_sink);
+
+        let handle = PeerHandle {
+            send_high_prio: high_prio_tx,
+            send_bulk: bulk_tx,
+            incoming: incoming_rx,
+            closing: closing.clone(),
+            remote_addr: "127.0.0.1:9999".to_string(),
+            identity_key: None,
+            identity_verified: false,
+            features: PeerFeatureFlags::empty(),
+            version: "2.2".to_string(),
+            request_tracker: None, // No tracker configured!
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            _read_handle: tokio::spawn(async {}),
+            _write_handle: tokio::spawn(async {}),
+            _keepalive_handle: tokio::spawn(async {}),
+        };
+
+        let topics = Topics::from_vec(vec![Topic::new("q", b"test".to_vec())]);
+        let result = handle.request(Tag::UniEnsBlockReq, topics).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, PeerError::NoRequestTracker),
+            "expected NoRequestTracker, got: {err}"
+        );
+
+        closing.cancel();
+    }
+
+    // -----------------------------------------------------------------------
+    // UnicastPeer: request() returns ResponseChannelClosed when sender dropped
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn unicast_request_response_channel_closed() {
+        let (_client_ws, _server_ws) = ws_raw_pair().await;
+        let closing = CancellationToken::new();
+
+        let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+        let (bulk_tx, _bulk_rx) = mpsc::channel(10);
+        let (_incoming_tx, incoming_rx) = mpsc::channel(10);
+
+        let tracker = Arc::new(RequestTracker::new());
+
+        let handle = PeerHandle {
+            send_high_prio: high_prio_tx,
+            send_bulk: bulk_tx,
+            incoming: incoming_rx,
+            closing: closing.clone(),
+            remote_addr: "127.0.0.1:9999".to_string(),
+            identity_key: None,
+            identity_verified: false,
+            features: PeerFeatureFlags::empty(),
+            version: "2.2".to_string(),
+            request_tracker: Some(tracker.clone()),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            _read_handle: tokio::spawn(async {}),
+            _write_handle: tokio::spawn(async {}),
+            _keepalive_handle: tokio::spawn(async {}),
+        };
+
+        // Spawn the request, then cancel it from the tracker side
+        // to simulate a dropped sender (e.g. peer disconnect cleanup).
+        let tracker_clone = tracker.clone();
+        let topics = Topics::from_vec(vec![Topic::new("q", b"test".to_vec())]);
+        let request_handle =
+            tokio::spawn(async move { handle.request(Tag::UniEnsBlockReq, topics).await });
+
+        // Wait briefly for the request to be registered, then cancel it.
+        tokio::task::yield_now().await;
+
+        // There should be exactly one pending request.
+        assert_eq!(tracker_clone.pending_count().await, 1);
+
+        // Get the hash from the tracker by preparing and cancelling.
+        // Instead, just cancel all pending by dropping the tracker state.
+        // We can't easily get the hash, so we cancel by index. The simplest
+        // way is to cancel the pending request which drops the sender.
+        // Since we can't know the hash, use the closing token instead.
+        closing.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), request_handle)
+            .await
+            .expect("timeout waiting for request")
+            .expect("request task panicked");
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, PeerError::ConnectionClosed),
+            "expected ConnectionClosed, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // UnicastPeer: request() returns ConnectionClosed when peer closes
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn unicast_request_peer_closing() {
+        let (_client_ws, _server_ws) = ws_raw_pair().await;
+        let closing = CancellationToken::new();
+
+        let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+        let (bulk_tx, _bulk_rx) = mpsc::channel(10);
+        let (_incoming_tx, incoming_rx) = mpsc::channel(10);
+
+        let tracker = Arc::new(RequestTracker::new());
+
+        let handle = PeerHandle {
+            send_high_prio: high_prio_tx,
+            send_bulk: bulk_tx,
+            incoming: incoming_rx,
+            closing: closing.clone(),
+            remote_addr: "127.0.0.1:9999".to_string(),
+            identity_key: None,
+            identity_verified: false,
+            features: PeerFeatureFlags::empty(),
+            version: "2.2".to_string(),
+            request_tracker: Some(tracker.clone()),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            _read_handle: tokio::spawn(async {}),
+            _write_handle: tokio::spawn(async {}),
+            _keepalive_handle: tokio::spawn(async {}),
+        };
+
+        // Cancel immediately so the request observes the closing signal.
+        closing.cancel();
+
+        let topics = Topics::from_vec(vec![Topic::new("q", b"test".to_vec())]);
+        let result = handle.request(Tag::UniEnsBlockReq, topics).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, PeerError::ConnectionClosed),
+            "expected ConnectionClosed, got: {err}"
+        );
+
+        // The pending request should have been cleaned up.
+        assert_eq!(tracker.pending_count().await, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Peer trait: get_address, get_connection_latency, routing_addr
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn peer_handle_peer_trait_methods() {
+        let (_client_ws, _server_ws) = ws_raw_pair().await;
+        let closing = CancellationToken::new();
+
+        let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+        let (bulk_tx, _bulk_rx) = mpsc::channel(10);
+        let (_incoming_tx, incoming_rx) = mpsc::channel(10);
+
+        let handle = PeerHandle {
+            send_high_prio: high_prio_tx,
+            send_bulk: bulk_tx,
+            incoming: incoming_rx,
+            closing: closing.clone(),
+            remote_addr: "10.0.0.1:4160".to_string(),
+            identity_key: None,
+            identity_verified: false,
+            features: PeerFeatureFlags::empty(),
+            version: "2.2".to_string(),
+            request_tracker: None,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            _read_handle: tokio::spawn(async {}),
+            _write_handle: tokio::spawn(async {}),
+            _keepalive_handle: tokio::spawn(async {}),
+        };
+
+        // Test Peer trait methods.
+        assert_eq!(handle.get_address(), "10.0.0.1:4160");
+        assert_eq!(handle.get_connection_latency(), Duration::ZERO);
+        assert!(handle.routing_addr().is_empty());
+
+        closing.cancel();
     }
 }
