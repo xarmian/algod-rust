@@ -25,6 +25,8 @@ sha2.workspace = true
 rmp.workspace = true
 rmp-serde.workspace = true
 tracing.workspace = true
+hickory-resolver.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

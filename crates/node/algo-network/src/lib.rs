@@ -13,6 +13,12 @@ pub mod tag;
 pub mod topics;
 pub mod ws_peer;
 
+pub mod discovery;
+pub mod dns_bootstrap;
+pub mod peer_role;
+pub mod phonebook;
+pub mod srv_resolver;
+
 // ---------------------------------------------------------------------------
 // Re-exports: gossip wire format (Epic 30)
 // ---------------------------------------------------------------------------
@@ -52,7 +58,7 @@ pub use topics::{
 // ---------------------------------------------------------------------------
 
 // Error taxonomy
-pub use errors::{HandshakeError, IdentityError, PeerError, WsConnectError};
+pub use errors::{HandshakeError, IdentityError, PeerError, PhonebookError, WsConnectError};
 
 // Handshake: header building, protocol version negotiation, server response
 // validation, gossip path construction
@@ -82,6 +88,27 @@ pub use reconnect::{
     ExponentialBackoff, ReconnectEvent, ReconnectPolicy, ReconnectSupervisor, SupervisorError,
     TerminalAction,
 };
+
+// ---------------------------------------------------------------------------
+// Re-exports: Peer Discovery and Phonebook (Epic 32)
+// ---------------------------------------------------------------------------
+
+// Peer roles
+pub use peer_role::{Role, RoleSet, ARCHIVAL_ROLE, RELAY_ROLE};
+
+// DNS bootstrap
+pub use dns_bootstrap::{DnsBootstrap, DnsBootstrapError};
+
+// SRV resolver
+pub use srv_resolver::{
+    resolve_addresses, HickorySrvResolver, SrvRecord, SrvResolveError, SrvResolver,
+};
+
+// Phonebook
+pub use phonebook::Phonebook;
+
+// Discovery
+pub use discovery::Discovery;
 
 // ---------------------------------------------------------------------------
 // Message filtering helpers

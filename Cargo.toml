@@ -96,3 +96,5 @@ futures-util = "0.3"
 rand = "0.8"
 http = "1"
 url = "2"
+hickory-resolver = { version = "0.25", features = ["dnssec-ring", "tokio"] }
+regex = "1"
