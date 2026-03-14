@@ -48,7 +48,7 @@ impl TrackingConnect {
 }
 
 impl ConnectFn for TrackingConnect {
-    fn try_dial(&self, addr: String) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+    fn try_dial(&self, addr: String) -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> {
         let dialed = Arc::clone(&self.dialed);
         let succeed = self.succeed;
         Box::pin(async move {
@@ -144,6 +144,9 @@ async fn mesh_thread_dials_to_fanout_target() {
         .await
         .expect("mesh cycle should complete")
         .expect("done channel should not be dropped");
+
+    // Yield to let spawned dial tasks complete.
+    tokio::task::yield_now().await;
 
     let dialed = connect.dialed();
     assert_eq!(
@@ -294,6 +297,9 @@ async fn mesh_thread_multiple_on_demand_requests() {
     .await
     .unwrap();
     done1_rx.await.unwrap();
+
+    // Yield to let spawned dial tasks complete.
+    tokio::task::yield_now().await;
 
     let first_dialed = connect.dialed().len();
     assert_eq!(first_dialed, 2, "first cycle should dial 2 peers");

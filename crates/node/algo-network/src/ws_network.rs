@@ -691,10 +691,22 @@ struct NetworkConnectFn {
 }
 
 impl ConnectFn for NetworkConnectFn {
-    fn try_dial(&self, addr: String) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+    fn try_dial(&self, addr: String) -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> {
+        let peers = Arc::clone(&self.peers);
+        let multiplexer = Arc::clone(&self.multiplexer);
+        let cancel = self.cancel.clone();
+        let tasks = Arc::clone(&self.tasks);
+        let genesis_id = self.genesis_id.clone();
+
         Box::pin(async move {
+            use crate::ws_peer::WsPeerConfig;
+
             let connect_config = ConnectConfig {
-                genesis_id: self.genesis_id.clone(),
+                genesis_id,
+                peer_config: Some(WsPeerConfig {
+                    request_timeout: Some(Duration::from_secs(5)),
+                    ..WsPeerConfig::default()
+                }),
                 ..ConnectConfig::default()
             };
 
@@ -705,8 +717,8 @@ impl ConnectFn for NetworkConnectFn {
 
                     // Store the peer entry.
                     {
-                        let mut peers = self.peers.write().await;
-                        peers.insert(
+                        let mut guard = peers.write().await;
+                        guard.insert(
                             peer_addr.clone(),
                             PeerEntry {
                                 handle,
@@ -719,26 +731,26 @@ impl ConnectFn for NetworkConnectFn {
 
                     // Spawn receive/dispatch loop.
                     if let Some(mut rx) = incoming_rx {
-                        let multiplexer = Arc::clone(&self.multiplexer);
-                        let cancel = self.cancel.clone();
-                        let peers = Arc::clone(&self.peers);
+                        let recv_multiplexer = Arc::clone(&multiplexer);
+                        let recv_cancel = cancel.clone();
+                        let recv_peers = Arc::clone(&peers);
                         let recv_addr = peer_addr;
 
                         let recv_task = tokio::spawn(async move {
                             loop {
                                 tokio::select! {
-                                    _ = cancel.cancelled() => {
+                                    _ = recv_cancel.cancelled() => {
                                         tracing::debug!(addr = %recv_addr, "receive loop cancelled");
                                         break;
                                     }
                                     msg = rx.recv() => {
                                         match msg {
                                             Some(incoming) => {
-                                                let _out = multiplexer.handle(incoming).await;
+                                                let _out = recv_multiplexer.handle(incoming).await;
                                             }
                                             None => {
                                                 tracing::info!(addr = %recv_addr, "peer incoming channel closed, removing");
-                                                let mut guard = peers.write().await;
+                                                let mut guard = recv_peers.write().await;
                                                 if let Some(entry) = guard.remove(&recv_addr) {
                                                     entry.handle.close();
                                                 }
@@ -750,8 +762,8 @@ impl ConnectFn for NetworkConnectFn {
                             }
                         });
 
-                        let mut tasks = self.tasks.lock().await;
-                        tasks.push(recv_task);
+                        let mut task_guard = tasks.lock().await;
+                        task_guard.push(recv_task);
                     }
 
                     true

@@ -85,7 +85,7 @@ pub struct MeshRequest {
 pub trait ConnectFn: Send + Sync + 'static {
     /// Attempt to connect to `addr`. Returns `true` if the attempt was
     /// initiated (not necessarily completed).
-    fn try_dial(&self, addr: String) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+    fn try_dial(&self, addr: String) -> Pin<Box<dyn Future<Output = bool> + Send + 'static>>;
 }
 
 /// Blanket implementation for closures / function pointers that return a
@@ -95,7 +95,7 @@ where
     F: Fn(String) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = bool> + Send + 'static,
 {
-    fn try_dial(&self, addr: String) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+    fn try_dial(&self, addr: String) -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> {
         Box::pin((self)(addr))
     }
 }
@@ -140,7 +140,8 @@ pub struct MeshThread<C: ConnectFn, P: PeerCounter> {
     role: Role,
 
     /// Dial function — called to initiate a connection to an address.
-    connect_fn: C,
+    /// Wrapped in `Arc` so it can be shared with spawned dial tasks.
+    connect_fn: Arc<C>,
 
     /// Provides current outgoing peer count and connected addresses.
     peer_counter: P,
@@ -185,7 +186,7 @@ impl<C: ConnectFn, P: PeerCounter> MeshThread<C, P> {
             mesh_update_rx,
             phonebook,
             role: RELAY_ROLE,
-            connect_fn,
+            connect_fn: Arc::new(connect_fn),
             peer_counter,
             in_progress: Arc::new(Mutex::new(HashSet::new())),
             backoff: ExponentialBackoff::new(
@@ -324,24 +325,29 @@ impl<C: ConnectFn, P: PeerCounter> MeshThread<C, P> {
                 continue;
             }
 
-            // Spawn the connection attempt. On completion (success or
-            // failure), remove from in_progress.
+            // Spawn the connection attempt concurrently. On completion
+            // (success or failure), remove from in_progress. This avoids
+            // one slow/unreachable address blocking the entire cycle.
             let in_progress = Arc::clone(&self.in_progress);
+            let connect_fn = Arc::clone(&self.connect_fn);
             let addr_clone = addr.clone();
-            let success = self.connect_fn.try_dial(addr.clone()).await;
+            tokio::spawn(async move {
+                let success = connect_fn.try_dial(addr_clone.clone()).await;
 
-            // Remove from in_progress set regardless of outcome.
-            {
-                let mut guard = in_progress.lock().unwrap();
-                guard.remove(&addr_clone);
-            }
+                // Remove from in_progress set regardless of outcome.
+                {
+                    let mut guard = in_progress.lock().unwrap();
+                    guard.remove(&addr_clone);
+                }
 
-            if success {
-                initiated += 1;
-                tracing::debug!(addr = %addr_clone, "mesh: connection initiated");
-            } else {
-                tracing::debug!(addr = %addr_clone, "mesh: connection attempt failed");
-            }
+                if success {
+                    tracing::debug!(addr = %addr_clone, "mesh: connection initiated");
+                } else {
+                    tracing::debug!(addr = %addr_clone, "mesh: connection attempt failed");
+                }
+            });
+
+            initiated += 1;
         }
 
         if initiated > 0 {
@@ -350,7 +356,7 @@ impl<C: ConnectFn, P: PeerCounter> MeshThread<C, P> {
                 need,
                 outgoing = num_outgoing,
                 target = self.target_conn_count,
-                "mesh: initiated new connections"
+                "mesh: initiated new dial attempts"
             );
         }
 
@@ -440,7 +446,7 @@ mod tests {
     }
 
     impl ConnectFn for MockConnect {
-        fn try_dial(&self, addr: String) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        fn try_dial(&self, addr: String) -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> {
             let dialed = Arc::clone(&self.dialed);
             let succeed = self.should_succeed.load(Ordering::SeqCst) != 0;
             Box::pin(async move {
@@ -452,7 +458,7 @@ mod tests {
 
     // Also implement for Arc<MockConnect> for shared usage.
     impl ConnectFn for Arc<MockConnect> {
-        fn try_dial(&self, addr: String) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        fn try_dial(&self, addr: String) -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> {
             (**self).try_dial(addr)
         }
     }
@@ -529,6 +535,8 @@ mod tests {
 
         let initiated = mesh.mesh_cycle().await;
         assert_eq!(initiated, 4);
+        // Yield to let spawned dial tasks complete.
+        tokio::task::yield_now().await;
         assert_eq!(connect.dialed_addrs().len(), 4);
     }
 
@@ -553,6 +561,8 @@ mod tests {
         let initiated = mesh.mesh_cycle().await;
         // Need 2 more (target=4, outgoing=2), only "c" is available
         assert_eq!(initiated, 1);
+        // Yield to let spawned dial tasks complete.
+        tokio::task::yield_now().await;
         let dialed = connect.dialed_addrs();
         assert_eq!(dialed, vec!["c"]);
     }
@@ -579,6 +589,8 @@ mod tests {
         let initiated = mesh.mesh_cycle().await;
         // Should have dialed "other" but skipped "self-addr"
         assert_eq!(initiated, 1);
+        // Yield to let spawned dial tasks complete.
+        tokio::task::yield_now().await;
         let dialed = connect.dialed_addrs();
         assert_eq!(dialed, vec!["other"]);
     }
@@ -690,7 +702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mesh_cycle_failed_connect_not_counted() {
+    async fn mesh_cycle_counts_all_spawned_dials() {
         let cancel = CancellationToken::new();
         let (_tx, rx) = mpsc::channel(1);
         let pb = make_phonebook(&["a", "b"]);
@@ -708,8 +720,11 @@ mod tests {
         );
 
         let initiated = mesh.mesh_cycle().await;
-        // Both addresses were attempted but failed.
-        assert_eq!(initiated, 0);
+        // Both addresses had dial attempts spawned (success/failure is
+        // determined asynchronously, so initiated counts spawned attempts).
+        assert_eq!(initiated, 2);
+        // Yield to let spawned dial tasks complete.
+        tokio::task::yield_now().await;
         assert_eq!(connect.dialed_addrs().len(), 2);
     }
 
@@ -810,6 +825,9 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(2), done_rx).await;
         assert!(result.is_ok(), "on-demand request should complete");
 
+        // Yield to let spawned dial tasks complete.
+        tokio::task::yield_now().await;
+
         // Should have dialed 2 addresses (target=2, outgoing=0).
         let dialed = connect.dialed_addrs();
         assert_eq!(dialed.len(), 2);
@@ -831,7 +849,10 @@ mod tests {
 
         let _ = mesh.mesh_cycle().await;
 
-        // After mesh_cycle completes, in_progress should be empty
+        // Yield to let spawned dial tasks complete and clean up in_progress.
+        tokio::task::yield_now().await;
+
+        // After spawned tasks complete, in_progress should be empty
         // (addresses are removed after dial completes).
         let guard = in_progress.lock().unwrap();
         assert!(guard.is_empty(), "in_progress should be empty after cycle");
