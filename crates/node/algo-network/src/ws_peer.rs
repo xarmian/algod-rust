@@ -170,6 +170,7 @@ type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 /// - **incoming_filter**: deduplicates incoming messages (for AV and TX tags)
 /// - **outgoing_filter**: tracks digests the peer already has (via MsgDigestSkip)
 /// - **request_tracker**: correlates TopicMsgResp responses to pending requests
+/// - **request_timeout**: overrides the default 60s timeout for unicast requests
 ///
 /// All fields are `Option` so existing code that doesn't need these features
 /// can pass `WsPeerConfig::default()` (all `None`).
@@ -183,6 +184,12 @@ pub struct WsPeerConfig {
     pub outgoing_filter: Option<Arc<MessageFilter>>,
     /// Request/response correlation tracker.
     pub request_tracker: Option<Arc<RequestTracker>>,
+    /// Timeout for unicast requests made via [`PeerHandle::request()`].
+    ///
+    /// When `None`, defaults to [`DEFAULT_REQUEST_TIMEOUT`] (60s).
+    /// Set this to a shorter duration (e.g. 4s) for block-fetch peers
+    /// where fast failover is more important than tolerating slow peers.
+    pub request_timeout: Option<Duration>,
 }
 
 /// A live WebSocket peer connection.
@@ -310,6 +317,10 @@ impl WsPeer {
         let incoming_filter = self.config.incoming_filter;
         let outgoing_filter = self.config.outgoing_filter;
         let request_tracker = self.config.request_tracker;
+        let request_timeout = self
+            .config
+            .request_timeout
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
 
         // Clone request_tracker for the PeerHandle (the read loop also
         // gets a reference so it can route TopicMsgResp to pending receivers).
@@ -375,6 +386,7 @@ impl WsPeer {
             features,
             version: self.version,
             request_tracker: handle_request_tracker,
+            request_timeout,
             _read_handle: read_handle,
             _write_handle: write_handle,
             _keepalive_handle: keepalive_handle,
@@ -471,6 +483,11 @@ pub struct PeerHandle {
     /// Shared with the read loop which routes `TopicMsgResp` responses
     /// back to pending request receivers.
     request_tracker: Option<Arc<RequestTracker>>,
+    /// Timeout for unicast requests.
+    ///
+    /// Defaults to [`DEFAULT_REQUEST_TIMEOUT`] (60s) but can be overridden
+    /// via [`WsPeerConfig::request_timeout`] or [`PeerHandle::set_request_timeout`].
+    request_timeout: Duration,
     /// Task handles (kept alive so tasks are not dropped prematurely).
     _read_handle: JoinHandle<()>,
     _write_handle: JoinHandle<()>,
@@ -539,6 +556,21 @@ impl PeerHandle {
     /// The negotiated network protocol version (e.g. "2.2").
     pub fn version(&self) -> &str {
         &self.version
+    }
+
+    /// Override the timeout used for unicast requests.
+    ///
+    /// This allows callers to set a shorter timeout (e.g. 4s for block
+    /// fetching) after construction.  The timeout is applied inside
+    /// [`UnicastPeer::request()`] so that cleanup of pending tracker
+    /// entries happens correctly even on timeout.
+    pub fn set_request_timeout(&mut self, timeout: Duration) {
+        self.request_timeout = timeout;
+    }
+
+    /// Returns the currently configured request timeout.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
     }
 
     /// Receive the next incoming message from this peer.
@@ -615,7 +647,7 @@ impl UnicastPeer for PeerHandle {
                 tracker.cancel_request(hash).await;
                 return Err(PeerError::ConnectionClosed);
             }
-            resp = tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT, rx) => {
+            resp = tokio::time::timeout(self.request_timeout, rx) => {
                 resp
             }
         };
@@ -2857,6 +2889,7 @@ mod tests {
             features: PeerFeatureFlags::empty(),
             version: "2.2".to_string(),
             request_tracker: Some(tracker),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             _read_handle: tokio::spawn(async {}),
             _write_handle: tokio::spawn(async {}),
             _keepalive_handle: tokio::spawn(async {}),
@@ -2962,6 +2995,7 @@ mod tests {
             features: PeerFeatureFlags::empty(),
             version: "2.2".to_string(),
             request_tracker: Some(tracker.clone()),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             _read_handle: tokio::spawn(async {}),
             _write_handle: tokio::spawn(async {}),
             _keepalive_handle: tokio::spawn(async {}),
@@ -3053,6 +3087,7 @@ mod tests {
             features: PeerFeatureFlags::empty(),
             version: "2.2".to_string(),
             request_tracker: None, // No tracker configured!
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             _read_handle: tokio::spawn(async {}),
             _write_handle: tokio::spawn(async {}),
             _keepalive_handle: tokio::spawn(async {}),
@@ -3097,6 +3132,7 @@ mod tests {
             features: PeerFeatureFlags::empty(),
             version: "2.2".to_string(),
             request_tracker: Some(tracker.clone()),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             _read_handle: tokio::spawn(async {}),
             _write_handle: tokio::spawn(async {}),
             _keepalive_handle: tokio::spawn(async {}),
@@ -3161,6 +3197,7 @@ mod tests {
             features: PeerFeatureFlags::empty(),
             version: "2.2".to_string(),
             request_tracker: Some(tracker.clone()),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             _read_handle: tokio::spawn(async {}),
             _write_handle: tokio::spawn(async {}),
             _keepalive_handle: tokio::spawn(async {}),
@@ -3207,6 +3244,7 @@ mod tests {
             features: PeerFeatureFlags::empty(),
             version: "2.2".to_string(),
             request_tracker: None,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             _read_handle: tokio::spawn(async {}),
             _write_handle: tokio::spawn(async {}),
             _keepalive_handle: tokio::spawn(async {}),

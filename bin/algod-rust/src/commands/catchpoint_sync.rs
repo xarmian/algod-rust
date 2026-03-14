@@ -461,12 +461,21 @@ impl SyncBackend for GossipSyncBackend {
     }
 
     fn get_current_round(&self) -> Result<u64, AlgoError> {
-        // Use gossip status if available (returns last fetched round),
-        // but fall back to REST for authoritative round info.
         tokio::task::block_in_place(|| {
             self.rt.block_on(async {
-                let status = self.rest_client.get_status().await?;
-                Ok(status.last_round)
+                match self.policy {
+                    BlockSourcePolicy::GossipOnly => {
+                        // In GossipOnly mode, use the gossip source's synthetic
+                        // status (based on last fetched round) instead of REST.
+                        let status = self.gossip.get_status().await?;
+                        Ok(status.last_round)
+                    }
+                    BlockSourcePolicy::GossipFirst | BlockSourcePolicy::HttpOnly => {
+                        // Use REST for authoritative round info.
+                        let status = self.rest_client.get_status().await?;
+                        Ok(status.last_round)
+                    }
+                }
             })
         })
     }
@@ -637,6 +646,7 @@ pub async fn handoff_to_gossip_sync(
 
     let start = Instant::now();
     let mut blocks_synced: u64 = 0;
+    let mut eval_delta_stats = algo_ledger::EvalDeltaStats::default();
 
     loop {
         // Check for cancellation.
@@ -717,7 +727,16 @@ pub async fn handoff_to_gossip_sync(
                 message: format!("begin_block at round {next_round}: {e}"),
             })?;
 
-            match algo_ledger::apply_block(&mut store, &block) {
+            let apply_result = if config.compare_mode || config.avm_execute {
+                let (result, block_stats) =
+                    algo_ledger::apply_block_with_comparison(&mut store, &block);
+                eval_delta_stats += block_stats;
+                result
+            } else {
+                algo_ledger::apply_block(&mut store, &block)
+            };
+
+            match apply_result {
                 Ok(()) => {
                     // Finalize trie updates before commit, matching the
                     // SyncOrchestrator replay/follow paths.
@@ -745,12 +764,20 @@ pub async fn handoff_to_gossip_sync(
                         "gossip handoff: apply_block failed"
                     );
                     let _ = store.rollback_block();
+                    if config.compare_mode || config.avm_execute {
+                        eval_delta_stats.print_summary();
+                    }
                     return Err(anyhow::anyhow!(
                         "gossip handoff: block apply failed at round {next_round}: {e}"
                     ));
                 }
             }
         }
+    }
+
+    // Print AVM/EvalDelta stats if compare or AVM execution was enabled.
+    if config.compare_mode || config.avm_execute {
+        eval_delta_stats.print_summary();
     }
 
     Ok(algo_ledger::sync::SyncResult {

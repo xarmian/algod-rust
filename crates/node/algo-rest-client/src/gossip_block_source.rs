@@ -40,10 +40,11 @@ use crate::{BlockSource, NodeStatus};
 pub struct GossipBlockSourceConfig {
     /// Timeout for a single WS block request (default: 4s).
     ///
-    /// **Note:** This field is retained for configuration compatibility but
-    /// is no longer applied as an outer `tokio::time::timeout`. Instead,
-    /// timeout handling is delegated to the peer's own `request()` method
-    /// (which defaults to 60s and properly cleans up `RequestTracker` state).
+    /// This value should be passed to [`WsPeerConfig::request_timeout`] when
+    /// constructing peers that will be used with this source.  The peer's own
+    /// `request()` method applies the timeout internally and properly cleans
+    /// up `RequestTracker` state on expiry — avoiding the tracker leak that
+    /// occurs when an outer `tokio::time::timeout` drops the request future.
     pub request_timeout: Duration,
 
     /// Maximum number of peers to try per round before giving up (default: 5).
@@ -132,16 +133,19 @@ impl GossipBlockSource {
     ///
     /// Mirrors Go's `wsFetcherClient.requestBlock()`.
     ///
-    /// Timeout handling is delegated to the peer's own `request()` method
-    /// (which uses `DEFAULT_REQUEST_TIMEOUT` = 60s and properly cleans up
-    /// its `RequestTracker` entry on timeout). Wrapping with an additional
-    /// outer `tokio::time::timeout` would leak tracker entries when the outer
-    /// timeout fires before the peer's internal timeout can clean up.
+    /// Timeout handling is delegated to the peer's own `request()` method,
+    /// which uses the peer's configured `request_timeout` (set via
+    /// [`WsPeerConfig::request_timeout`]) and properly cleans up its
+    /// `RequestTracker` entry on expiry.  Callers should configure peers
+    /// with the desired timeout (e.g. [`GossipBlockSourceConfig::request_timeout`])
+    /// rather than wrapping with an outer `tokio::time::timeout`, which
+    /// would leak tracker entries.
     async fn fetch_from_peer(&self, peer: &dyn UnicastPeer, round: Round) -> Result<BlockResponse> {
         let topics = make_block_request_topics(round.0);
 
         // Send the request and await the response. The peer's own timeout
-        // (60s default) handles cleanup of pending tracker state.
+        // (configurable via WsPeerConfig::request_timeout) handles cleanup
+        // of pending tracker state.
         let response_topics = peer
             .request(Tag::UniEnsBlockReq, topics)
             .await
