@@ -143,6 +143,7 @@ dependencies = [
  "algo-codec",
  "algo-error",
  "algo-types",
+ "async-trait",
  "base64",
  "ed25519-dalek",
  "futures-util",

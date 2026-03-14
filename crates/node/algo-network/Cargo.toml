@@ -8,6 +8,7 @@ rust-version.workspace = true
 algo-types.workspace = true
 algo-codec.workspace = true
 algo-error.workspace = true
+async-trait.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
 thiserror.workspace = true

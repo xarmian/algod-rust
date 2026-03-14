@@ -45,11 +45,18 @@ use crate::compression::{
     is_zstd_compressed, zstd_compress, zstd_decompress, MAX_DECOMPRESSED_MESSAGE_SIZE,
 };
 use crate::errors::PeerError;
+use crate::forwarding_policy::ForwardingPolicy;
 use crate::framing::{decode_frame, encode_frame};
+use crate::handler::Multiplexer;
 use crate::message::{IncomingMessage, OutgoingMessage};
+use crate::message_filter::{
+    dedup_safe_tag, generate_message_digest, MessageFilter, MESSAGE_FILTER_SIZE,
+};
 use crate::msg_of_interest::unmarshal_msg_of_interest;
 use crate::peer_features::PeerFeatureFlags;
+use crate::request_response::{encode_uvarint, hash_topics, RequestTracker, RESPONSE_HASH_FIELD};
 use crate::tag::Tag;
+use crate::topics::{Topic, Topics};
 
 // ---------------------------------------------------------------------------
 // Constants (matching go-algorand)
@@ -150,6 +157,30 @@ type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 // WsPeer
 // ---------------------------------------------------------------------------
 
+/// Optional components for message handling integration.
+///
+/// When provided to [`WsPeer::with_config`], these components enable
+/// advanced message processing in the read and write loops:
+///
+/// - **multiplexer**: dispatches incoming messages to registered handlers
+/// - **incoming_filter**: deduplicates incoming messages (for AV and TX tags)
+/// - **outgoing_filter**: tracks digests the peer already has (via MsgDigestSkip)
+/// - **request_tracker**: correlates TopicMsgResp responses to pending requests
+///
+/// All fields are `Option` so existing code that doesn't need these features
+/// can pass `WsPeerConfig::default()` (all `None`).
+#[derive(Default)]
+pub struct WsPeerConfig {
+    /// Message multiplexer for handler dispatch.
+    pub multiplexer: Option<Arc<Multiplexer>>,
+    /// Incoming message dedup filter.
+    pub incoming_filter: Option<Arc<MessageFilter>>,
+    /// Outgoing message filter (digests the peer already has).
+    pub outgoing_filter: Option<Arc<MessageFilter>>,
+    /// Request/response correlation tracker.
+    pub request_tracker: Option<Arc<RequestTracker>>,
+}
+
 /// A live WebSocket peer connection.
 ///
 /// This struct owns the WebSocket connection halves and the spawned async
@@ -182,6 +213,8 @@ pub struct WsPeer {
     remote_addr: String,
     /// Timestamp of the last successful communication with this peer.
     last_packet_time: Arc<RwLock<Instant>>,
+    /// Optional message handling components.
+    config: WsPeerConfig,
 }
 
 impl WsPeer {
@@ -201,6 +234,33 @@ impl WsPeer {
         identity_key: Option<ed25519_dalek::VerifyingKey>,
         identity_verified: bool,
         closing: CancellationToken,
+    ) -> Self {
+        Self::with_config(
+            ws_stream,
+            remote_addr,
+            version,
+            features,
+            identity_key,
+            identity_verified,
+            closing,
+            WsPeerConfig::default(),
+        )
+    }
+
+    /// Create a new `WsPeer` with optional message-handling components.
+    ///
+    /// Like [`new`](Self::new) but accepts a [`WsPeerConfig`] that can wire
+    /// up a multiplexer, message filters, and a request tracker.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_config(
+        ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        remote_addr: String,
+        version: String,
+        features: PeerFeatureFlags,
+        identity_key: Option<ed25519_dalek::VerifyingKey>,
+        identity_verified: bool,
+        closing: CancellationToken,
+        config: WsPeerConfig,
     ) -> Self {
         let (sink, stream) = ws_stream.split();
 
@@ -224,6 +284,7 @@ impl WsPeer {
             version,
             remote_addr,
             last_packet_time,
+            config,
         }
     }
 
@@ -240,11 +301,26 @@ impl WsPeer {
         let features = self.features;
         let identity_key = self.identity_key;
 
+        // Extract optional config components.
+        let multiplexer = self.config.multiplexer;
+        let incoming_filter = self.config.incoming_filter;
+        let outgoing_filter = self.config.outgoing_filter;
+        let request_tracker = self.config.request_tracker;
+
         // Extract fields for the individual tasks.
         let stream = self.stream;
         let sink = self.sink;
         let send_high_prio_rx = self.send_high_prio_rx;
         let send_bulk_rx = self.send_bulk_rx;
+
+        // Create a shareable PeerSender that the read loop can attach to
+        // IncomingMessages so that handlers can respond to the peer.
+        let peer_sender = Arc::new(PeerSender {
+            send_high_prio: self.send_high_prio_tx.clone(),
+            send_bulk: self.send_bulk_tx.clone(),
+            closing: closing.clone(),
+            remote_addr: remote_addr.clone(),
+        });
 
         let read_handle = tokio::spawn(read_loop(
             stream,
@@ -255,6 +331,11 @@ impl WsPeer {
             closing.clone(),
             remote_addr.clone(),
             features,
+            multiplexer,
+            incoming_filter,
+            outgoing_filter.clone(),
+            request_tracker,
+            peer_sender,
         ));
 
         let write_handle = tokio::spawn(write_loop(
@@ -265,6 +346,7 @@ impl WsPeer {
             closing.clone(),
             remote_addr.clone(),
             features,
+            outgoing_filter,
         ));
 
         let keepalive_handle = tokio::spawn(keepalive_loop(
@@ -288,6 +370,63 @@ impl WsPeer {
             _write_handle: write_handle,
             _keepalive_handle: keepalive_handle,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PeerSender — sharable peer reference for message handlers
+// ---------------------------------------------------------------------------
+
+/// A lightweight, shareable reference to a peer's send channels and identity.
+///
+/// This is the peer reference carried by [`IncomingMessage`] so that message
+/// handlers can respond to or disconnect the sending peer.  Unlike
+/// [`PeerHandle`], this type does not own the incoming message receiver or
+/// task handles, so it can be wrapped in `Arc` and shared freely.
+pub struct PeerSender {
+    /// Sender for high-priority messages.
+    send_high_prio: mpsc::Sender<WriteCommand>,
+    /// Sender for bulk/normal data messages.
+    send_bulk: mpsc::Sender<WriteCommand>,
+    /// Cancellation token for shutdown.
+    closing: CancellationToken,
+    /// Remote address of the peer (e.g. "1.2.3.4:4160").
+    remote_addr: String,
+}
+
+impl PeerSender {
+    /// Send a message on the bulk (normal priority) channel.
+    #[allow(clippy::result_large_err)]
+    pub fn send(&self, msg: OutgoingMessage) -> Result<(), PeerError> {
+        let cmd = WriteCommand::Data(SendMessage {
+            msg,
+            enqueued: Instant::now(),
+        });
+        self.send_bulk
+            .try_send(cmd)
+            .map_err(|_| PeerError::SendBufferFull)
+    }
+
+    /// Send a message on the high-priority channel.
+    #[allow(clippy::result_large_err)]
+    pub fn send_priority(&self, msg: OutgoingMessage) -> Result<(), PeerError> {
+        let cmd = WriteCommand::Data(SendMessage {
+            msg,
+            enqueued: Instant::now(),
+        });
+        self.send_high_prio
+            .try_send(cmd)
+            .map_err(|_| PeerError::SendBufferFull)
+    }
+
+    /// Trigger graceful shutdown.
+    pub fn close(&self) {
+        self.closing.cancel();
+    }
+
+    /// The remote address of this peer.
+    pub fn remote_addr(&self) -> &str {
+        &self.remote_addr
     }
 }
 
@@ -427,6 +566,11 @@ async fn read_loop<St>(
     closing: CancellationToken,
     remote_addr: String,
     features: PeerFeatureFlags,
+    multiplexer: Option<Arc<Multiplexer>>,
+    incoming_filter: Option<Arc<MessageFilter>>,
+    outgoing_filter: Option<Arc<MessageFilter>>,
+    request_tracker: Option<Arc<RequestTracker>>,
+    peer_sender: Arc<PeerSender>,
 ) where
     St: futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
         + Unpin,
@@ -551,6 +695,206 @@ async fn read_loop<St>(
                     continue;
                 }
 
+                // --- (a) MsgDigestSkip handling ---
+                // A peer is telling us not to send messages with this digest.
+                // Reference: Go's handleFilterMessage() in wsPeer.go.
+                if tag == Tag::MsgDigestSkip {
+                    if let Some(ref of) = outgoing_filter {
+                        if payload.len() == 32 {
+                            let mut digest = [0u8; 32];
+                            digest.copy_from_slice(&payload);
+                            of.check_digest(&digest, true, true);
+                        } else {
+                            tracing::warn!(
+                                peer = %remote_addr,
+                                size = payload.len(),
+                                "read_loop: bad MsgDigestSkip size"
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                // --- (b) Incoming dedup ---
+                // For dedup-safe tags (AV, TX), check the incoming filter.
+                if dedup_safe_tag(&tag) && !payload.is_empty() {
+                    if let Some(ref inf) = incoming_filter {
+                        if inf.check_incoming_message(&tag, &payload, true, true) {
+                            tracing::trace!(
+                                peer = %remote_addr,
+                                tag = %tag,
+                                "read_loop: dropping incoming duplicate"
+                            );
+                            continue;
+                        }
+                    }
+                }
+
+                // --- (c) Request/response correlation ---
+                // TopicMsgResp messages are routed to the RequestTracker.
+                if tag == Tag::TopicMsgResp {
+                    if let Some(ref rt) = request_tracker {
+                        if let Err(e) = rt.handle_response(&payload).await {
+                            tracing::warn!(
+                                peer = %remote_addr,
+                                error = %e,
+                                "read_loop: failed to handle TopicMsgResp"
+                            );
+                        }
+                        continue;
+                    }
+                    // If no request_tracker, fall through to normal dispatch.
+                }
+
+                // --- (d) Multiplexer dispatch ---
+                if let Some(ref mux) = multiplexer {
+                    let now_ns = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as i64;
+
+                    let incoming_msg = IncomingMessage::with_peer(
+                        tag,
+                        payload.clone(),
+                        remote_addr.clone(),
+                        now_ns,
+                        peer_sender.clone(),
+                    );
+
+                    // --- (e) Filter notification ---
+                    // For dedup-safe tags with large payloads, compute the
+                    // digest and add it to our outgoing filter. In a full
+                    // network implementation this would also broadcast a
+                    // MsgDigestSkip to other peers.
+                    if dedup_safe_tag(&tag) && payload.len() >= MESSAGE_FILTER_SIZE {
+                        let digest = generate_message_digest(&tag, &payload);
+                        if let Some(ref of) = outgoing_filter {
+                            of.check_digest(&digest, true, false);
+                        }
+                        tracing::trace!(
+                            peer = %remote_addr,
+                            tag = %tag,
+                            "read_loop: large message processed, filter notification \
+                             would be broadcast (not yet wired to network layer)"
+                        );
+                    }
+
+                    // Use validate_handle for unified dispatch: tries
+                    // validator handlers first, then falls through to
+                    // regular handlers.
+                    let out = mux.validate_handle(incoming_msg).await;
+
+                    match out.action {
+                        ForwardingPolicy::Ignore => {
+                            // Do nothing.
+                        }
+                        ForwardingPolicy::Disconnect => {
+                            tracing::info!(
+                                peer = %remote_addr,
+                                tag = %tag,
+                                "read_loop: handler requested disconnect"
+                            );
+                            closing.cancel();
+                            return;
+                        }
+                        ForwardingPolicy::Broadcast => {
+                            // Forward the message to the incoming channel so
+                            // the network layer can broadcast it to other
+                            // peers.  This matches Go's messageHandlerThread
+                            // which calls net.Broadcast() when the handler
+                            // returns Broadcast.
+                            //
+                            // Additionally, if the outgoing filter is present
+                            // and the message is large enough, add its digest
+                            // so we don't re-send it to this peer.
+                            if dedup_safe_tag(&tag)
+                                && payload.len() >= MESSAGE_FILTER_SIZE
+                            {
+                                let digest =
+                                    generate_message_digest(&tag, &payload);
+                                if let Some(ref of) = outgoing_filter {
+                                    of.check_digest(&digest, true, false);
+                                }
+                            }
+
+                            let broadcast_msg = IncomingMessage::with_peer(
+                                tag,
+                                payload.clone(),
+                                remote_addr.clone(),
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_nanos() as i64,
+                                peer_sender.clone(),
+                            );
+                            match incoming_tx.try_send(broadcast_msg) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    tracing::warn!(
+                                        peer = %remote_addr,
+                                        tag = %tag,
+                                        "read_loop: incoming channel full, \
+                                         dropping broadcast message"
+                                    );
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    tracing::debug!(
+                                        peer = %remote_addr,
+                                        "read_loop: incoming channel closed"
+                                    );
+                                    closing.cancel();
+                                    return;
+                                }
+                            }
+                        }
+                        ForwardingPolicy::Respond => {
+                            // Build a proper TopicMsgResp matching Go's
+                            // wsPeer.Respond():
+                            // 1. Hash the original incoming data
+                            // 2. Append RequestHash topic to handler's
+                            //    response topics
+                            // 3. Serialize and send as TopicMsgResp
+                            let request_hash = hash_topics(&payload);
+                            let request_hash_data = encode_uvarint(request_hash);
+
+                            let mut response_topics = out
+                                .topics
+                                .unwrap_or_else(Topics::new);
+                            response_topics.0.push(Topic::new(
+                                RESPONSE_HASH_FIELD,
+                                request_hash_data,
+                            ));
+
+                            let serialized = response_topics.marshal();
+                            let resp_msg = OutgoingMessage {
+                                action: ForwardingPolicy::Respond,
+                                tag: Tag::TopicMsgResp,
+                                payload: serialized,
+                                topics: None,
+                            };
+
+                            let cmd = WriteCommand::Data(SendMessage {
+                                msg: resp_msg,
+                                enqueued: Instant::now(),
+                            });
+                            if let Err(e) = send_high_prio_tx.try_send(cmd) {
+                                tracing::warn!(
+                                    peer = %remote_addr,
+                                    error = %e,
+                                    "read_loop: failed to enqueue response"
+                                );
+                            }
+                        }
+                        ForwardingPolicy::Accept => {
+                            // Message was accepted/processed; nothing more to do.
+                        }
+                    }
+
+                    continue;
+                }
+
+                // --- Fallback: no multiplexer, send to incoming channel ---
+
                 // Build the incoming message.
                 let now_ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -637,6 +981,7 @@ async fn write_loop<Sk>(
     closing: CancellationToken,
     remote_addr: String,
     features: PeerFeatureFlags,
+    outgoing_filter: Option<Arc<MessageFilter>>,
 ) where
     Sk: futures_util::Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
@@ -651,6 +996,7 @@ async fn write_loop<Sk>(
                     &send_message_tags,
                     &remote_addr,
                     features,
+                    &outgoing_filter,
                 )
                 .await
                 {
@@ -706,8 +1052,15 @@ async fn write_loop<Sk>(
             }
         };
 
-        if let Err(reason) =
-            process_write_command(cmd, &mut sink, &send_message_tags, &remote_addr, features).await
+        if let Err(reason) = process_write_command(
+            cmd,
+            &mut sink,
+            &send_message_tags,
+            &remote_addr,
+            features,
+            &outgoing_filter,
+        )
+        .await
         {
             tracing::warn!(
                 peer = %remote_addr,
@@ -734,6 +1087,7 @@ async fn process_write_command<Sk>(
     send_message_tags: &Arc<RwLock<HashSet<Tag>>>,
     remote_addr: &str,
     features: PeerFeatureFlags,
+    outgoing_filter: &Option<Arc<MessageFilter>>,
 ) -> Result<(), String>
 where
     Sk: futures_util::Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
@@ -775,6 +1129,26 @@ where
                 }
             }
 
+            // Check outgoing dedup filter.
+            //
+            // For dedup-safe tags, compute the digest and check whether the
+            // peer already has this message (via a prior MsgDigestSkip
+            // notification). Reference: Go's writeNonBlock() in wsPeer.go.
+            if let Some(ref of) = outgoing_filter {
+                if dedup_safe_tag(&tag) && send_msg.msg.payload.len() >= MESSAGE_FILTER_SIZE {
+                    let digest = generate_message_digest(&tag, &send_msg.msg.payload);
+                    if of.check_digest(&digest, false, false) {
+                        // Peer already has this message; skip sending.
+                        tracing::trace!(
+                            peer = %remote_addr,
+                            tag = %tag,
+                            "write_loop: outgoing filter suppressed duplicate"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+
             // Check staleness.
             let age = send_msg.enqueued.elapsed();
             if age > MAX_MESSAGE_QUEUE_DURATION {
@@ -787,8 +1161,16 @@ where
                 return Err("stale message".to_string());
             }
 
-            // Encode the frame: 2-byte tag + payload.
-            let payload = &send_msg.msg.payload;
+            // Determine the payload to send: if the message carries
+            // Topics, serialize them as the wire payload (matching Go's
+            // Respond path which serializes topics into the data field).
+            let topics_serialized;
+            let payload: &[u8] = if let Some(ref topics) = send_msg.msg.topics {
+                topics_serialized = topics.marshal();
+                &topics_serialized
+            } else {
+                &send_msg.msg.payload
+            };
 
             // Optionally compress PP tag payloads with zstd.
             //
@@ -939,6 +1321,18 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use std::time::Duration;
     use tokio::net::{TcpListener, TcpStream};
+
+    /// Helper: create a dummy PeerSender for testing read_loop calls.
+    fn make_test_peer_sender(closing: CancellationToken) -> Arc<PeerSender> {
+        let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+        let (bulk_tx, _bulk_rx) = mpsc::channel(10);
+        Arc::new(PeerSender {
+            send_high_prio: high_prio_tx,
+            send_bulk: bulk_tx,
+            closing,
+            remote_addr: "test-peer".to_string(),
+        })
+    }
 
     // Helper: create a raw TCP-based WebSocket pair for testing components.
     async fn ws_raw_pair() -> (WebSocketStream<TcpStream>, WebSocketStream<TcpStream>) {
@@ -1092,6 +1486,7 @@ mod tests {
             &send_message_tags,
             "test",
             PeerFeatureFlags::empty(),
+            &None,
         )
         .await;
         assert!(result.is_ok());
@@ -1119,6 +1514,7 @@ mod tests {
             &send_message_tags,
             "test",
             PeerFeatureFlags::empty(),
+            &None,
         )
         .await;
         assert!(result.is_ok());
@@ -1159,6 +1555,7 @@ mod tests {
             &send_message_tags,
             "test",
             PeerFeatureFlags::empty(),
+            &None,
         )
         .await;
         assert!(result.is_ok());
@@ -1198,6 +1595,7 @@ mod tests {
             &send_message_tags,
             "test",
             PeerFeatureFlags::empty(),
+            &None,
         )
         .await;
 
@@ -1225,6 +1623,7 @@ mod tests {
             &send_message_tags,
             "test",
             PeerFeatureFlags::empty(),
+            &None,
         )
         .await;
 
@@ -1277,6 +1676,7 @@ mod tests {
             closing_clone,
             "test".to_string(),
             PeerFeatureFlags::empty(),
+            None,
         ));
 
         // Read the first two messages from the server.
@@ -1342,6 +1742,11 @@ mod tests {
             closing_clone,
             "test-peer".to_string(),
             PeerFeatureFlags::empty(),
+            None,
+            None,
+            None,
+            None,
+            make_test_peer_sender(closing.clone()),
         ));
 
         // Send a TX message from the client.
@@ -1387,6 +1792,11 @@ mod tests {
             closing_clone,
             "test-peer".to_string(),
             PeerFeatureFlags::empty(),
+            None,
+            None,
+            None,
+            None,
+            make_test_peer_sender(closing.clone()),
         ));
 
         // Build and send an MI message saying we only want AV and TX.
@@ -1448,6 +1858,11 @@ mod tests {
             closing_clone,
             "test".to_string(),
             PeerFeatureFlags::empty(),
+            None,
+            None,
+            None,
+            None,
+            make_test_peer_sender(closing.clone()),
         ));
 
         let closing_clone = closing.clone();
@@ -1459,6 +1874,7 @@ mod tests {
             closing_clone,
             "test".to_string(),
             PeerFeatureFlags::empty(),
+            None,
         ));
 
         let (keepalive_prio_tx, _keepalive_prio_rx) = mpsc::channel::<WriteCommand>(10);
@@ -1512,6 +1928,11 @@ mod tests {
             closing_clone,
             "test".to_string(),
             PeerFeatureFlags::empty(),
+            None,
+            None,
+            None,
+            None,
+            make_test_peer_sender(closing.clone()),
         ));
 
         // Send a close frame from the client.
@@ -1611,6 +2032,11 @@ mod tests {
             closing_clone,
             "test-peer".to_string(),
             PeerFeatureFlags::empty(),
+            None,
+            None,
+            None,
+            None,
+            make_test_peer_sender(closing.clone()),
         ));
 
         // Send several messages to fill the incoming channel and overflow it.
@@ -1658,5 +2084,624 @@ mod tests {
         // This test is intentionally minimal.
         fn _assert_send_sync<T: Send>() {}
         _assert_send_sync::<mpsc::Sender<WriteCommand>>();
+    }
+
+    // -----------------------------------------------------------------------
+    // Message handler framework integration tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn msg_digest_skip_adds_to_outgoing_filter() {
+        // When we receive a MsgDigestSkip message, the 32-byte digest should
+        // be added to the outgoing filter.
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (mut client_sink, _client_stream) = client_ws.split();
+        let (_server_sink, server_stream) = server_ws.split();
+
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(10);
+        let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+        let closing = CancellationToken::new();
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let last_packet_time = Arc::new(RwLock::new(Instant::now()));
+
+        let outgoing_filter = Arc::new(MessageFilter::new(1024));
+
+        let closing_clone = closing.clone();
+        let _read_task = tokio::spawn(read_loop(
+            server_stream,
+            incoming_tx,
+            high_prio_tx,
+            send_message_tags,
+            last_packet_time,
+            closing_clone,
+            "test-peer".to_string(),
+            PeerFeatureFlags::empty(),
+            None,
+            None,
+            Some(outgoing_filter.clone()),
+            None,
+            make_test_peer_sender(closing.clone()),
+        ));
+
+        // Send a MsgDigestSkip with a 32-byte digest.
+        let digest = [0xABu8; 32];
+        let frame = encode_frame(&Tag::MsgDigestSkip, &digest).unwrap();
+        client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+
+        // Give the read loop time to process.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The digest should now be in the outgoing filter.
+        assert!(
+            outgoing_filter.check_digest(&digest, false, false),
+            "MsgDigestSkip digest should be added to outgoing filter"
+        );
+
+        // MsgDigestSkip should NOT appear on the incoming channel.
+        let result = tokio::time::timeout(Duration::from_millis(100), incoming_rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "MsgDigestSkip should not appear on incoming channel"
+        );
+
+        closing.cancel();
+    }
+
+    #[tokio::test]
+    async fn incoming_dedup_skips_duplicates() {
+        // When an incoming filter is present, duplicate TX/AV messages
+        // should be dropped.
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (mut client_sink, _client_stream) = client_ws.split();
+        let (_server_sink, server_stream) = server_ws.split();
+
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(10);
+        let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+        let closing = CancellationToken::new();
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let last_packet_time = Arc::new(RwLock::new(Instant::now()));
+
+        let incoming_filter = Arc::new(MessageFilter::new(1024));
+
+        let closing_clone = closing.clone();
+        let _read_task = tokio::spawn(read_loop(
+            server_stream,
+            incoming_tx,
+            high_prio_tx,
+            send_message_tags,
+            last_packet_time,
+            closing_clone,
+            "test-peer".to_string(),
+            PeerFeatureFlags::empty(),
+            None,
+            Some(incoming_filter.clone()),
+            None,
+            None,
+            make_test_peer_sender(closing.clone()),
+        ));
+
+        // Send the same TX message twice.
+        let payload = b"duplicate transaction data";
+        let frame = encode_frame(&Tag::Transaction, payload).unwrap();
+        client_sink
+            .send(WsMessage::Binary(frame.clone()))
+            .await
+            .unwrap();
+        client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+
+        // Give the read loop time to process both.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Only the first message should appear on the incoming channel.
+        let msg = tokio::time::timeout(Duration::from_millis(200), incoming_rx.recv())
+            .await
+            .expect("timeout waiting for first message")
+            .expect("channel closed");
+        assert_eq!(msg.tag, Tag::Transaction);
+        assert_eq!(msg.data, payload);
+
+        // The duplicate should have been dropped.
+        let result = tokio::time::timeout(Duration::from_millis(200), incoming_rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "duplicate message should not appear on incoming channel"
+        );
+
+        closing.cancel();
+    }
+
+    #[tokio::test]
+    async fn topic_msg_resp_routes_to_request_tracker() {
+        // TopicMsgResp messages should be routed to the RequestTracker
+        // and NOT appear on the incoming channel.
+        use crate::topics::{Topic, Topics};
+
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (mut client_sink, _client_stream) = client_ws.split();
+        let (_server_sink, server_stream) = server_ws.split();
+
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(10);
+        let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+        let closing = CancellationToken::new();
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let last_packet_time = Arc::new(RwLock::new(Instant::now()));
+
+        let request_tracker = Arc::new(RequestTracker::new());
+
+        // Prepare a request so we have a pending entry.
+        let request_topics = Topics::from_vec(vec![Topic::new("q", b"data".to_vec())]);
+        let (_serialized, hash, rx) = request_tracker.prepare_request(request_topics).await;
+        assert_eq!(request_tracker.pending_count().await, 1);
+
+        let closing_clone = closing.clone();
+        let _read_task = tokio::spawn(read_loop(
+            server_stream,
+            incoming_tx,
+            high_prio_tx,
+            send_message_tags,
+            last_packet_time,
+            closing_clone,
+            "test-peer".to_string(),
+            PeerFeatureFlags::empty(),
+            None,
+            None,
+            None,
+            Some(request_tracker.clone()),
+            make_test_peer_sender(closing.clone()),
+        ));
+
+        // Build a TopicMsgResp response containing the request hash
+        // as a uvarint-encoded value under the "RequestHash" key.
+        use crate::request_response::RESPONSE_HASH_FIELD;
+        let hash_uvarint = {
+            let mut buf = Vec::new();
+            let mut val = hash;
+            loop {
+                let mut byte = (val & 0x7F) as u8;
+                val >>= 7;
+                if val != 0 {
+                    byte |= 0x80;
+                }
+                buf.push(byte);
+                if val == 0 {
+                    break;
+                }
+            }
+            buf
+        };
+        let response_topics = Topics::from_vec(vec![
+            Topic::new(RESPONSE_HASH_FIELD, hash_uvarint),
+            Topic::new("result", b"ok".to_vec()),
+        ]);
+        let response_data = response_topics.marshal();
+        let frame = encode_frame(&Tag::TopicMsgResp, &response_data).unwrap();
+        client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+
+        // The receiver should get the response.
+        let response = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("timeout waiting for response")
+            .expect("sender dropped");
+        assert_eq!(response.get_value("result"), Some(b"ok".as_slice()));
+
+        // TopicMsgResp should NOT appear on the incoming channel.
+        let result = tokio::time::timeout(Duration::from_millis(200), incoming_rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "TopicMsgResp should not appear on incoming channel"
+        );
+
+        // Pending count should be 0 now.
+        assert_eq!(request_tracker.pending_count().await, 0);
+
+        closing.cancel();
+    }
+
+    #[tokio::test]
+    async fn multiplexer_dispatch_routes_by_tag_and_acts_on_policy() {
+        use crate::handler::{MessageHandler, TaggedMessageHandler};
+        use async_trait::async_trait;
+
+        // Handler that returns Broadcast for TX messages.
+        struct BroadcastHandler;
+        #[async_trait]
+        impl MessageHandler for BroadcastHandler {
+            async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+                OutgoingMessage {
+                    action: ForwardingPolicy::Broadcast,
+                    tag: msg.tag,
+                    payload: msg.data.clone(),
+                    topics: None,
+                }
+            }
+        }
+
+        // Handler that returns Disconnect for AV messages.
+        struct DisconnectHandler;
+        #[async_trait]
+        impl MessageHandler for DisconnectHandler {
+            async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+                OutgoingMessage {
+                    action: ForwardingPolicy::Disconnect,
+                    tag: msg.tag,
+                    payload: Vec::new(),
+                    topics: None,
+                }
+            }
+        }
+
+        let mux = Arc::new(Multiplexer::new());
+        mux.register_handlers(vec![
+            TaggedMessageHandler {
+                tag: Tag::Transaction,
+                handler: Arc::new(BroadcastHandler),
+            },
+            TaggedMessageHandler {
+                tag: Tag::AgreementVote,
+                handler: Arc::new(DisconnectHandler),
+            },
+        ]);
+
+        // Test 1: TX message with Broadcast policy (should not disconnect).
+        {
+            let (client_ws, server_ws) = ws_raw_pair().await;
+            let (mut client_sink, _client_stream) = client_ws.split();
+            let (_server_sink, server_stream) = server_ws.split();
+
+            let (incoming_tx, mut incoming_rx) = mpsc::channel(10);
+            let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+            let closing = CancellationToken::new();
+            let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+            let last_packet_time = Arc::new(RwLock::new(Instant::now()));
+
+            let closing_clone = closing.clone();
+            let _read_task = tokio::spawn(read_loop(
+                server_stream,
+                incoming_tx,
+                high_prio_tx,
+                send_message_tags,
+                last_packet_time,
+                closing_clone,
+                "test-peer".to_string(),
+                PeerFeatureFlags::empty(),
+                Some(mux.clone()),
+                None,
+                None,
+                None,
+                make_test_peer_sender(closing.clone()),
+            ));
+
+            let frame = encode_frame(&Tag::Transaction, b"tx-data").unwrap();
+            client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+
+            // Give it time to process.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Broadcast policy forwards the message to the incoming channel
+            // so the network layer can broadcast it to other peers.
+            let result = tokio::time::timeout(Duration::from_millis(500), incoming_rx.recv()).await;
+            assert!(
+                result.is_ok(),
+                "Broadcast policy should forward the message to the incoming channel"
+            );
+            let forwarded = result.unwrap().expect("channel should not be closed");
+            assert_eq!(forwarded.tag, Tag::Transaction);
+            assert_eq!(forwarded.data, b"tx-data");
+
+            // Connection should still be open.
+            assert!(
+                !closing.is_cancelled(),
+                "Broadcast policy should not close connection"
+            );
+
+            closing.cancel();
+        }
+
+        // Test 2: AV message with Disconnect policy (should close).
+        {
+            let (client_ws, server_ws) = ws_raw_pair().await;
+            let (mut client_sink, _client_stream) = client_ws.split();
+            let (_server_sink, server_stream) = server_ws.split();
+
+            let (incoming_tx, _incoming_rx) = mpsc::channel(10);
+            let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+            let closing = CancellationToken::new();
+            let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+            let last_packet_time = Arc::new(RwLock::new(Instant::now()));
+
+            let closing_clone = closing.clone();
+            let _read_task = tokio::spawn(read_loop(
+                server_stream,
+                incoming_tx,
+                high_prio_tx,
+                send_message_tags,
+                last_packet_time,
+                closing_clone,
+                "test-peer".to_string(),
+                PeerFeatureFlags::empty(),
+                Some(mux.clone()),
+                None,
+                None,
+                None,
+                make_test_peer_sender(closing.clone()),
+            ));
+
+            let frame = encode_frame(&Tag::AgreementVote, b"bad-vote").unwrap();
+            client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+
+            // Give it time to process.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            assert!(
+                closing.is_cancelled(),
+                "Disconnect policy should close the connection"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multiplexer_respond_sends_reply() {
+        use crate::handler::{MessageHandler, TaggedMessageHandler};
+        use async_trait::async_trait;
+
+        // Handler that returns Respond with echoed data.
+        struct RespondHandler;
+        #[async_trait]
+        impl MessageHandler for RespondHandler {
+            async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+                OutgoingMessage {
+                    action: ForwardingPolicy::Respond,
+                    tag: Tag::UniEnsBlockReq,
+                    payload: msg.data.clone(),
+                    topics: None,
+                }
+            }
+        }
+
+        let mux = Arc::new(Multiplexer::new());
+        mux.register_handlers(vec![TaggedMessageHandler {
+            tag: Tag::UniEnsBlockReq,
+            handler: Arc::new(RespondHandler),
+        }]);
+
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (mut client_sink, _client_stream) = client_ws.split();
+        let (_server_sink, server_stream) = server_ws.split();
+
+        let (incoming_tx, _incoming_rx) = mpsc::channel(10);
+        let (high_prio_tx, mut high_prio_rx) = mpsc::channel::<WriteCommand>(10);
+        let closing = CancellationToken::new();
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let last_packet_time = Arc::new(RwLock::new(Instant::now()));
+
+        let closing_clone = closing.clone();
+        let _read_task = tokio::spawn(read_loop(
+            server_stream,
+            incoming_tx,
+            high_prio_tx,
+            send_message_tags,
+            last_packet_time,
+            closing_clone,
+            "test-peer".to_string(),
+            PeerFeatureFlags::empty(),
+            Some(mux),
+            None,
+            None,
+            None,
+            make_test_peer_sender(closing.clone()),
+        ));
+
+        let frame = encode_frame(&Tag::UniEnsBlockReq, b"request-data").unwrap();
+        client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+
+        // The Respond action should enqueue a reply on the high-prio channel.
+        let cmd = tokio::time::timeout(Duration::from_secs(2), high_prio_rx.recv())
+            .await
+            .expect("timeout waiting for response command")
+            .expect("channel closed");
+
+        match cmd {
+            WriteCommand::Data(send_msg) => {
+                // The Respond path now builds a proper TopicMsgResp with the
+                // request hash appended as a topic.
+                assert_eq!(send_msg.msg.tag, Tag::TopicMsgResp);
+
+                // The payload should be serialized Topics containing the
+                // RequestHash topic.
+                use crate::topics::Topics;
+                let topics = Topics::unmarshal(&send_msg.msg.payload)
+                    .expect("payload should be valid Topics");
+                let hash_val = topics.get_value(
+                    crate::request_response::RESPONSE_HASH_FIELD,
+                );
+                assert!(
+                    hash_val.is_some(),
+                    "response must include RequestHash topic"
+                );
+            }
+            other => panic!("expected Data, got: {other:?}"),
+        }
+
+        closing.cancel();
+    }
+
+    #[tokio::test]
+    async fn outgoing_filter_prevents_sending_already_seen() {
+        // If the outgoing filter has a digest for a message, the write loop
+        // should skip sending that message. Only messages >= MESSAGE_FILTER_SIZE
+        // (5000 bytes) are checked against the outgoing filter (matching Go's
+        // writeNonBlock behavior).
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (mut sink, _client_stream) = client_ws.split();
+        let (_server_sink, mut server_stream) = server_ws.split();
+
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+
+        let outgoing_filter = Arc::new(MessageFilter::new(1024));
+
+        // Pre-populate the outgoing filter with the digest of a large TX
+        // message (>= MESSAGE_FILTER_SIZE so the outgoing filter is consulted).
+        let tx_payload = vec![0xAB; MESSAGE_FILTER_SIZE];
+        let digest = generate_message_digest(&Tag::Transaction, &tx_payload);
+        outgoing_filter.check_digest(&digest, true, false);
+
+        // Try to send the same TX message — should be filtered out.
+        let msg = OutgoingMessage::new(Tag::Transaction, tx_payload.clone());
+        let cmd = WriteCommand::Data(SendMessage {
+            msg,
+            enqueued: Instant::now(),
+        });
+
+        let result = process_write_command(
+            cmd,
+            &mut sink,
+            &send_message_tags,
+            "test",
+            PeerFeatureFlags::empty(),
+            &Some(outgoing_filter.clone()),
+        )
+        .await;
+        assert!(result.is_ok(), "should succeed (silently dropped)");
+
+        // Send a different large TX message — should go through.
+        let new_payload = vec![0xCD; MESSAGE_FILTER_SIZE];
+        let msg2 = OutgoingMessage::new(Tag::Transaction, new_payload.clone());
+        let cmd2 = WriteCommand::Data(SendMessage {
+            msg: msg2,
+            enqueued: Instant::now(),
+        });
+
+        let result2 = process_write_command(
+            cmd2,
+            &mut sink,
+            &send_message_tags,
+            "test",
+            PeerFeatureFlags::empty(),
+            &Some(outgoing_filter),
+        )
+        .await;
+        assert!(result2.is_ok());
+
+        // Read the frame from the server side — should only be the new TX.
+        let received = tokio::time::timeout(Duration::from_secs(2), server_stream.next())
+            .await
+            .expect("timeout")
+            .unwrap()
+            .unwrap();
+
+        match received {
+            WsMessage::Binary(data) => {
+                let (tag, payload) = decode_frame(&data).unwrap();
+                assert_eq!(tag, Tag::Transaction);
+                assert_eq!(payload, new_payload.as_slice());
+            }
+            other => panic!("expected binary message, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn outgoing_filter_does_not_affect_non_dedup_tags() {
+        // Non dedup-safe tags (e.g., PP) should NOT be filtered by the
+        // outgoing filter, even if their digest is present.
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (mut sink, _client_stream) = client_ws.split();
+        let (_server_sink, mut server_stream) = server_ws.split();
+
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+
+        let outgoing_filter = Arc::new(MessageFilter::new(1024));
+
+        // Add the digest for a PP message.
+        let pp_payload = b"proposal-payload";
+        let digest = generate_message_digest(&Tag::ProposalPayload, pp_payload);
+        outgoing_filter.check_digest(&digest, true, false);
+
+        // Sending the PP message should still go through (PP is not dedup-safe).
+        let msg = OutgoingMessage::new(Tag::ProposalPayload, pp_payload.to_vec());
+        let cmd = WriteCommand::Data(SendMessage {
+            msg,
+            enqueued: Instant::now(),
+        });
+
+        let result = process_write_command(
+            cmd,
+            &mut sink,
+            &send_message_tags,
+            "test",
+            PeerFeatureFlags::empty(),
+            &Some(outgoing_filter),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // Read the frame from the server side — PP should have gone through.
+        let received = tokio::time::timeout(Duration::from_secs(2), server_stream.next())
+            .await
+            .expect("timeout")
+            .unwrap()
+            .unwrap();
+
+        match received {
+            WsMessage::Binary(data) => {
+                let (tag, _payload) = decode_frame(&data).unwrap();
+                assert_eq!(tag, Tag::ProposalPayload);
+            }
+            other => panic!("expected binary message, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn backward_compat_no_optional_components() {
+        // When no optional components are provided, behavior is identical
+        // to the original WsPeer (messages flow through the incoming channel).
+        let (client_ws, server_ws) = ws_raw_pair().await;
+        let (mut client_sink, _client_stream) = client_ws.split();
+        let (_server_sink, server_stream) = server_ws.split();
+
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(10);
+        let (high_prio_tx, _high_prio_rx) = mpsc::channel(10);
+        let closing = CancellationToken::new();
+        let send_message_tags = Arc::new(RwLock::new(default_send_message_tags()));
+        let last_packet_time = Arc::new(RwLock::new(Instant::now()));
+
+        let closing_clone = closing.clone();
+        let _read_task = tokio::spawn(read_loop(
+            server_stream,
+            incoming_tx,
+            high_prio_tx,
+            send_message_tags,
+            last_packet_time,
+            closing_clone,
+            "test-peer".to_string(),
+            PeerFeatureFlags::empty(),
+            None, // no multiplexer
+            None, // no incoming filter
+            None, // no outgoing filter
+            None, // no request tracker
+            make_test_peer_sender(closing.clone()),
+        ));
+
+        // Send a TX message.
+        let frame = encode_frame(&Tag::Transaction, b"compat-test").unwrap();
+        client_sink.send(WsMessage::Binary(frame)).await.unwrap();
+
+        // Should arrive on the incoming channel as before.
+        let msg = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(msg.tag, Tag::Transaction);
+        assert_eq!(msg.data, b"compat-test");
+
+        closing.cancel();
+    }
+
+    #[test]
+    fn ws_peer_config_default_all_none() {
+        let config = WsPeerConfig::default();
+        assert!(config.multiplexer.is_none());
+        assert!(config.incoming_filter.is_none());
+        assert!(config.outgoing_filter.is_none());
+        assert!(config.request_tracker.is_none());
     }
 }
