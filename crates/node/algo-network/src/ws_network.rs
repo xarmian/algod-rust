@@ -281,7 +281,11 @@ pub struct WebsocketNetwork {
     ///
     /// Initialized when the network starts in relay mode (`start_arc`).
     /// `None` when relay mode is disabled or the network hasn't started yet.
-    broadcast_thread: std::sync::Mutex<Option<BroadcastThread>>,
+    /// Background broadcast thread for relay message forwarding.
+    ///
+    /// Wrapped in `Arc` so it can be shared with the mesh connect adapter
+    /// (which needs to relay messages from outbound peers to inbound peers).
+    broadcast_thread: Arc<std::sync::Mutex<Option<BroadcastThread>>>,
 }
 
 impl WebsocketNetwork {
@@ -306,7 +310,7 @@ impl WebsocketNetwork {
             connection_tracker: Arc::new(ConnectionTracker::new(Duration::from_secs(1))),
             listen_addr: std::sync::Mutex::new(None),
             registered_handlers: std::sync::Mutex::new(Vec::new()),
-            broadcast_thread: std::sync::Mutex::new(None),
+            broadcast_thread: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -1103,6 +1107,7 @@ struct NetworkConnectFn {
     cancel: CancellationToken,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     genesis_id: String,
+    broadcast_thread: Arc<std::sync::Mutex<Option<BroadcastThread>>>,
 }
 
 impl ConnectFn for NetworkConnectFn {
@@ -1112,6 +1117,7 @@ impl ConnectFn for NetworkConnectFn {
         let cancel = self.cancel.clone();
         let tasks = Arc::clone(&self.tasks);
         let genesis_id = self.genesis_id.clone();
+        let broadcast_thread = Arc::clone(&self.broadcast_thread);
 
         Box::pin(async move {
             use crate::ws_peer::WsPeerConfig;
@@ -1144,12 +1150,21 @@ impl ConnectFn for NetworkConnectFn {
 
                     tracing::info!(addr = %peer_addr, "outbound connection established (mesh)");
 
-                    // Spawn receive/dispatch loop.
+                    // Spawn receive/dispatch loop — must relay Broadcast
+                    // messages through the BroadcastThread so gossip from
+                    // outbound peers reaches inbound peers (e.g. go-relay →
+                    // rust-relay → go-nonrelay).
                     if let Some(mut rx) = incoming_rx {
                         let recv_multiplexer = Arc::clone(&multiplexer);
                         let recv_cancel = cancel.clone();
                         let recv_peers = Arc::clone(&peers);
                         let recv_addr = peer_addr;
+                        let broadcast_handle: Option<BroadcastHandle> = {
+                            let guard = broadcast_thread
+                                .lock()
+                                .expect("broadcast_thread lock poisoned");
+                            guard.as_ref().map(|bt| bt.handle())
+                        };
 
                         let recv_task = tokio::spawn(async move {
                             loop {
@@ -1161,7 +1176,36 @@ impl ConnectFn for NetworkConnectFn {
                                     msg = rx.recv() => {
                                         match msg {
                                             Some(incoming) => {
-                                                let _out = recv_multiplexer.handle(incoming).await;
+                                                let tag = incoming.tag;
+                                                let relay_data = if broadcast_handle.is_some() {
+                                                    Some((incoming.data.clone(), incoming.sender.clone()))
+                                                } else {
+                                                    None
+                                                };
+                                                let out = recv_multiplexer.handle(incoming).await;
+                                                match out.action {
+                                                    ForwardingPolicy::Broadcast => {
+                                                        if let (Some(ref bh), Some((data, sender))) =
+                                                            (&broadcast_handle, relay_data)
+                                                        {
+                                                            if let Err(e) = bh.enqueue(tag, data, Some(sender)) {
+                                                                tracing::debug!(
+                                                                    error = %e,
+                                                                    "failed to enqueue relay message (mesh)"
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                    ForwardingPolicy::Disconnect => {
+                                                        tracing::info!(addr = %recv_addr, "handler requested disconnect (mesh)");
+                                                        let mut guard = recv_peers.write().await;
+                                                        if let Some(entry) = guard.remove(&recv_addr) {
+                                                            entry.handle.close();
+                                                        }
+                                                        break;
+                                                    }
+                                                    _ => {}
+                                                }
                                             }
                                             None => {
                                                 tracing::info!(addr = %recv_addr, "peer incoming channel closed, removing");
@@ -1249,6 +1293,7 @@ impl WebsocketNetwork {
             cancel: self.cancel.clone(),
             tasks: Arc::new(Mutex::new(Vec::new())),
             genesis_id: self.config.genesis_id.clone(),
+            broadcast_thread: Arc::clone(&self.broadcast_thread),
         };
 
         let peer_counter = NetworkPeerCounter {
