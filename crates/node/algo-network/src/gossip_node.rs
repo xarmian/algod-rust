@@ -20,6 +20,10 @@ use crate::handler::{TaggedMessageHandler, TaggedMessageValidatorHandler};
 use crate::tag::Tag;
 use crate::topics::Topics;
 
+// Re-export axum::Router so trait implementors don't need to import axum
+// directly (downstream crates see `algo_network::gossip_node::Router`).
+pub use axum::Router;
+
 // ---------------------------------------------------------------------------
 // Peer trait
 // ---------------------------------------------------------------------------
@@ -240,6 +244,17 @@ pub trait GossipNode: Send + Sync {
     ///
     /// Mirrors Go's `GetGenesisID() string`.
     fn get_genesis_id(&self) -> &str;
+
+    /// Register an HTTP handler at the given path.
+    ///
+    /// External services (e.g. BlockService) call this before [`start`] so that
+    /// their routes are merged into the relay's HTTP server.  The `handler` is
+    /// an [`axum::Router`] that will be nested at `path`.
+    ///
+    /// Mirrors Go's `RegisterHTTPHandler(path string, handler http.Handler)`.
+    ///
+    /// [`start`]: GossipNode::start
+    fn register_http_handler(&self, path: &str, handler: Router);
 }
 
 /// Substitute `{genesisID}` placeholders in a URL with the node's actual
@@ -439,6 +454,8 @@ mod tests {
         fn get_genesis_id(&self) -> &str {
             &self.genesis_id
         }
+
+        fn register_http_handler(&self, _path: &str, _handler: Router) {}
     }
 
     #[test]

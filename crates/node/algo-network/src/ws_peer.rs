@@ -451,6 +451,12 @@ impl PeerSender {
     }
 }
 
+impl crate::broadcast::PeerSendRef for PeerSender {
+    fn send(&self, msg: OutgoingMessage) -> Result<(), crate::errors::PeerError> {
+        self.send(msg)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PeerHandle — the external interface
 // ---------------------------------------------------------------------------
@@ -573,6 +579,19 @@ impl PeerHandle {
         self.request_timeout
     }
 
+    /// Create a shareable [`PeerSender`] from this handle's channels.
+    ///
+    /// The returned `PeerSender` can be wrapped in `Arc` and shared freely
+    /// (e.g. for the broadcast thread's peer snapshot).
+    pub fn sender(&self) -> PeerSender {
+        PeerSender {
+            send_high_prio: self.send_high_prio.clone(),
+            send_bulk: self.send_bulk.clone(),
+            closing: self.closing.clone(),
+            remote_addr: self.remote_addr.clone(),
+        }
+    }
+
     /// Receive the next incoming message from this peer.
     ///
     /// Returns `None` when the peer has disconnected and the channel is drained.
@@ -593,6 +612,158 @@ impl PeerHandle {
         let (_, empty_rx) = mpsc::channel(1);
         let old = std::mem::replace(&mut self.incoming, empty_rx);
         Some(old)
+    }
+
+    /// Create a `PeerHandle` for an inbound peer connected via axum WebSocket.
+    ///
+    /// This is the counterpart of [`WsPeer::start`] for connections accepted
+    /// by the relay server.  Since axum's [`axum::extract::ws::WebSocket`]
+    /// uses a different stream type than `tokio-tungstenite`, this constructor
+    /// spawns its own read/write loops that work with axum's API.
+    ///
+    /// The returned handle is compatible with the peer registry and supports
+    /// broadcast, send, and close operations.
+    pub fn new_inbound(
+        socket: axum::extract::ws::WebSocket,
+        remote_addr: String,
+        version: String,
+        closing: CancellationToken,
+    ) -> Self {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (mut ws_writer, mut ws_reader) = socket.split();
+
+        let (send_high_prio_tx, mut send_high_prio_rx) =
+            mpsc::channel::<WriteCommand>(SEND_BUFFER_LENGTH);
+        let (send_bulk_tx, mut send_bulk_rx) = mpsc::channel::<WriteCommand>(SEND_BUFFER_LENGTH);
+        let (incoming_tx, incoming_rx) = mpsc::channel(MSGS_IN_READ_BUFFER_PER_PEER);
+
+        let read_closing = closing.clone();
+        let read_addr = remote_addr.clone();
+
+        // Read loop: reads from axum WebSocket and dispatches to incoming channel.
+        let read_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = read_closing.cancelled() => {
+                        tracing::debug!(addr = %read_addr, "inbound read loop cancelled");
+                        break;
+                    }
+                    msg = ws_reader.next() => {
+                        match msg {
+                            Some(Ok(axum::extract::ws::Message::Binary(data))) => {
+                                if let Ok((tag, payload)) = crate::framing::decode_frame(&data) {
+                                    let now_ns = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_nanos() as i64;
+                                    let incoming = IncomingMessage {
+                                        tag,
+                                        data: payload.to_vec(),
+                                        sender: read_addr.clone(),
+                                        received_at: now_ns,
+                                        peer: None,
+                                    };
+                                    if incoming_tx.send(incoming).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Some(Ok(axum::extract::ws::Message::Close(_))) | None => {
+                                tracing::info!(addr = %read_addr, "inbound peer disconnected");
+                                break;
+                            }
+                            Some(Ok(_)) => { /* Ping/Pong/Text — ignore */ }
+                            Some(Err(e)) => {
+                                tracing::warn!(addr = %read_addr, error = %e, "inbound read error");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let write_closing = closing.clone();
+        let write_addr = remote_addr.clone();
+
+        // Write loop: drains high-prio and bulk channels, writes to axum WebSocket.
+        let write_handle = tokio::spawn(async move {
+            loop {
+                // Prefer high-priority messages.
+                tokio::select! {
+                    biased;
+                    _ = write_closing.cancelled() => {
+                        tracing::debug!(addr = %write_addr, "inbound write loop cancelled");
+                        break;
+                    }
+                    cmd = send_high_prio_rx.recv() => {
+                        match cmd {
+                            Some(WriteCommand::Data(sm)) => {
+                                let frame = match encode_frame(&sm.msg.tag, &sm.msg.payload) {
+                                    Ok(f) => f,
+                                    Err(_) => continue,
+                                };
+                                if ws_writer.send(axum::extract::ws::Message::Binary(frame)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(WriteCommand::Ping(data)) => {
+                                if ws_writer.send(axum::extract::ws::Message::Ping(data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(WriteCommand::UpdateFilter(_)) => { /* no-op for inbound */ }
+                            None => break,
+                        }
+                    }
+                    cmd = send_bulk_rx.recv() => {
+                        match cmd {
+                            Some(WriteCommand::Data(sm)) => {
+                                let frame = match encode_frame(&sm.msg.tag, &sm.msg.payload) {
+                                    Ok(f) => f,
+                                    Err(_) => continue,
+                                };
+                                if ws_writer.send(axum::extract::ws::Message::Binary(frame)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(WriteCommand::Ping(data)) => {
+                                if ws_writer.send(axum::extract::ws::Message::Ping(data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(WriteCommand::UpdateFilter(_)) => {}
+                            None => break,
+                        }
+                    }
+                }
+            }
+        });
+
+        // No separate keepalive loop for inbound peers — the write loop
+        // handles shutdown via the cancellation token.
+        let keepalive_closing = closing.clone();
+        let keepalive_handle = tokio::spawn(async move {
+            keepalive_closing.cancelled().await;
+        });
+
+        PeerHandle {
+            send_high_prio: send_high_prio_tx,
+            send_bulk: send_bulk_tx,
+            incoming: incoming_rx,
+            closing,
+            remote_addr,
+            identity_key: None,
+            identity_verified: false,
+            features: PeerFeatureFlags::empty(),
+            version,
+            request_tracker: None,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            _read_handle: read_handle,
+            _write_handle: write_handle,
+            _keepalive_handle: keepalive_handle,
+        }
     }
 }
 

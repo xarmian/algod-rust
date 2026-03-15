@@ -191,6 +191,36 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
             }
         },
+        Commands::Relay {
+            bind_address,
+            ledger_path,
+            genesis_id,
+            network,
+            peers,
+            incoming_limit,
+            max_per_ip,
+            rate_limit,
+            broadcast_limit,
+            tls_cert,
+            tls_key,
+            mem_cap_mb,
+        } => {
+            commands::relay::run(
+                &bind_address,
+                genesis_id.as_deref().unwrap_or(""),
+                &network,
+                &peers,
+                incoming_limit,
+                max_per_ip,
+                rate_limit,
+                broadcast_limit,
+                tls_cert.as_deref(),
+                tls_key.as_deref(),
+                mem_cap_mb,
+                &ledger_path,
+            )
+            .await?;
+        }
         Commands::Observe {
             network,
             relay_addr,

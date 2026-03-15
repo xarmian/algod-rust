@@ -239,6 +239,58 @@ pub enum Commands {
         action: CatchpointAction,
     },
 
+    /// Run a relay node: accept inbound connections and forward gossip messages.
+    Relay {
+        /// Address to bind for incoming connections (e.g. "0.0.0.0:4160").
+        #[arg(long, short = 'b')]
+        bind_address: String,
+
+        /// Path to the SQLite ledger database.
+        #[arg(long, short = 'l')]
+        ledger_path: PathBuf,
+
+        /// Genesis ID string (e.g. "mainnet-v1.0").
+        /// If not provided, derived from --network.
+        #[arg(long, short = 'g')]
+        genesis_id: Option<String>,
+
+        /// Network name (mainnet, testnet, betanet).
+        #[arg(long, short = 'n', default_value = "mainnet")]
+        network: String,
+
+        /// Comma-separated initial peer addresses to connect to.
+        #[arg(long, value_delimiter = ',')]
+        peers: Vec<String>,
+
+        /// Maximum incoming connections.
+        #[arg(long, default_value = "2400")]
+        incoming_limit: u32,
+
+        /// Maximum connections per IP address.
+        #[arg(long, default_value = "8")]
+        max_per_ip: u32,
+
+        /// Connection rate limit (connections per second per IP).
+        #[arg(long, default_value = "60")]
+        rate_limit: u32,
+
+        /// Maximum peers per broadcast.
+        #[arg(long, default_value = "35")]
+        broadcast_limit: u32,
+
+        /// Path to TLS certificate file (optional).
+        #[arg(long)]
+        tls_cert: Option<String>,
+
+        /// Path to TLS private key file (optional).
+        #[arg(long)]
+        tls_key: Option<String>,
+
+        /// Block service memory cap in MB.
+        #[arg(long, default_value = "500")]
+        mem_cap_mb: u64,
+    },
+
     /// Observe gossip traffic: connect to relay peers and log all messages as JSON lines.
     Observe {
         /// Network preset (mainnet, testnet, devnet, betanet).

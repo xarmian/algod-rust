@@ -32,7 +32,9 @@ rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
 
 # HTTP
+axum = { version = "0.7", features = ["ws"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tower = "0.5"
 
 # Async
 tokio = { version = "1", features = ["full"] }
@@ -98,3 +100,7 @@ http = "1"
 url = "2"
 hickory-resolver = { version = "0.25", features = ["dnssec-ring", "tokio"] }
 regex = "1"
+
+# TLS
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
