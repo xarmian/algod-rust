@@ -261,6 +261,23 @@ mixed-cluster-up: ## Start mixed cluster (Go relay + Rust observer/relay + Go no
 	@echo "go-relay is healthy. Starting remaining services..."
 	$(COMPOSE_MIXED) up -d
 	@echo "Mixed cluster is up."
+	@echo "Starting background transaction generator..."
+	@$(MAKE) mixed-cluster-txns &
+
+mixed-cluster-txns: ## Send periodic transactions to go-relay (runs in foreground)
+	@echo "Discovering accounts..."
+	@ACCOUNTS=$$(docker exec mc-go-relay goal account list -d /algod/data 2>/dev/null | awk '{print $$2}'); \
+	FROM=$$(echo "$$ACCOUNTS" | head -1); \
+	TO=$$(echo "$$ACCOUNTS" | tail -1); \
+	if [ -z "$$FROM" ] || [ -z "$$TO" ]; then echo "ERROR: no accounts found"; exit 1; fi; \
+	echo "Sending txns: $$FROM -> $$TO"; \
+	SEQ=0; \
+	while docker inspect --format='{{.State.Status}}' mc-go-relay 2>/dev/null | grep -q running; do \
+		SEQ=$$((SEQ + 1)); \
+		docker exec mc-go-relay goal clerk send -a 1000 -f "$$FROM" -t "$$TO" -d /algod/data -n "mc-txn-$$SEQ" >/dev/null 2>&1 || true; \
+		sleep 5; \
+	done; \
+	echo "Transaction generator stopped (go-relay not running)."
 
 mixed-cluster-down: ## Stop mixed cluster and remove volumes
 	$(COMPOSE_MIXED) down -v

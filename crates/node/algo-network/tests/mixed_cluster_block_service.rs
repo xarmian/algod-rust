@@ -68,13 +68,14 @@ async fn test_go_fetches_block_from_rust_relay() {
 
     // Now poll the Go non-relay node until it syncs past round 5.
     // This proves blocks are flowing: go-relay -> rust-relay -> go-nonrelay.
+    // With real consensus (~3.3s/block), 5 rounds needs ~17s plus sync delay.
     let target_round = 5u64;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
 
     loop {
         if tokio::time::Instant::now() > deadline {
             panic!(
-                "go-nonrelay did not reach round {target_round} within 60s — \
+                "go-nonrelay did not reach round {target_round} within 180s — \
                  block serving via rust-relay may be broken"
             );
         }
@@ -137,10 +138,19 @@ async fn test_rust_relay_forwards_messages() {
             let text = resp.text().await.unwrap_or_default();
             serde_json::from_str::<Value>(&text)
                 .ok()
-                .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(String::from))
-                .unwrap_or_else(|| "v1".to_string())
+                .and_then(|v| {
+                    // Genesis ID = "<network>-<id>" (e.g. "dockernet-v1")
+                    let network = v.get("network").and_then(|n| n.as_str());
+                    let id = v.get("id").and_then(|i| i.as_str());
+                    match (network, id) {
+                        (Some(net), Some(schema_id)) => Some(format!("{net}-{schema_id}")),
+                        (None, Some(schema_id)) => Some(schema_id.to_string()),
+                        _ => None,
+                    }
+                })
+                .unwrap_or_else(|| "dockernet-v1".to_string())
         }
-        Err(_) => "v1".to_string(),
+        Err(_) => "dockernet-v1".to_string(),
     };
     eprintln!("using genesis_id: {genesis_id}");
 
@@ -179,10 +189,10 @@ async fn test_rust_relay_forwards_messages() {
         .send_priority(mi_msg)
         .expect("should send MsgOfInterest");
 
-    // Wait for gossip messages from the Rust relay. In a dev-mode network
-    // with transactions being generated, we should see proposals or votes.
+    // Wait for gossip messages from the Rust relay. With real consensus
+    // (~3.3s/block), we need to wait for at least a couple of rounds.
     let mut received_count = 0u32;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -244,12 +254,13 @@ async fn test_block_content_consistency() {
 
     // Wait until go-nonrelay has synced to at least round 3 so we have
     // a block that both nodes should have.
+    // With real consensus (~3.3s/block), 3 rounds needs ~10s plus sync delay.
     let target_round = 3u64;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
 
     let nonrelay_round = loop {
         if tokio::time::Instant::now() > deadline {
-            panic!("go-nonrelay did not reach round {target_round} within 60s");
+            panic!("go-nonrelay did not reach round {target_round} within 180s");
         }
 
         match test_helpers::get_status(&client, &go_nonrelay_rest).await {

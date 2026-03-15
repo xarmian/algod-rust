@@ -4,10 +4,14 @@ use std::time::Duration;
 
 use algo_ledger::{LedgerStore, SqliteLedger};
 use algo_network::{
-    BlockService, BlockServiceError, GossipNode, LedgerForBlockService, Phonebook,
+    BlockService, BlockServiceError, ForwardingPolicy, GossipNode, IncomingMessage,
+    LedgerForBlockService, MessageHandler, OutgoingMessage, Phonebook, Tag, TaggedMessageHandler,
     WebsocketNetwork, WebsocketNetworkConfig, RELAY_ROLE,
 };
-use tracing::info;
+use algo_types::Round;
+use async_trait::async_trait;
+use tokio::sync::Notify;
+use tracing::{debug, info, warn};
 
 use crate::commands::network_common::genesis_id_for;
 
@@ -17,8 +21,40 @@ use crate::commands::network_common::genesis_id_for;
 
 /// Wraps a `SqliteLedger` behind a `Mutex` so it can satisfy the
 /// `Send + Sync + 'static` bounds required by `LedgerForBlockService`.
+///
+/// Also provides write methods for block ingestion from peer gossip.
 struct LedgerBlockService {
     ledger: Mutex<SqliteLedger>,
+}
+
+impl LedgerBlockService {
+    /// Store a raw block and certificate fetched from a peer.
+    ///
+    /// This uses the SQLite ledger's block storage: `put_block` inserts the
+    /// raw block data, `put_block_cert` stores the certificate, and
+    /// `set_current_round` + `commit_block` advance the ledger tip.
+    fn store_block_and_cert(
+        &self,
+        round: u64,
+        block_data: &[u8],
+        cert_data: &[u8],
+    ) -> Result<(), String> {
+        let mut ledger = self.ledger.lock().map_err(|e| format!("lock: {e}"))?;
+        ledger.begin_block().map_err(|e| format!("begin: {e}"))?;
+        ledger
+            .put_block(round, "", &[], block_data)
+            .map_err(|e| format!("put_block: {e}"))?;
+        ledger
+            .put_block_cert(round, cert_data)
+            .map_err(|e| format!("put_block_cert: {e}"))?;
+        ledger.set_current_round(Round(round));
+        ledger.commit_block().map_err(|e| format!("commit: {e}"))?;
+        Ok(())
+    }
+
+    fn latest_round_inner(&self) -> u64 {
+        self.ledger.lock().map(|l| l.current_round().0).unwrap_or(0)
+    }
 }
 
 impl LedgerForBlockService for LedgerBlockService {
@@ -55,7 +91,234 @@ impl LedgerForBlockService for LedgerBlockService {
     }
 
     fn latest_round(&self) -> u64 {
-        self.ledger.lock().map(|l| l.current_round().0).unwrap_or(0)
+        self.latest_round_inner()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gossip handler: notifies the catchup loop when new blocks may be available
+// ---------------------------------------------------------------------------
+
+/// A gossip handler that signals the block catchup loop whenever
+/// agreement-related messages arrive (ProposalPayload, AgreementVote).
+///
+/// This handler does not process the message content itself; it simply
+/// triggers a wakeup so the catchup loop can fetch the new block via HTTP.
+struct BlockNotifyHandler {
+    notify: Arc<Notify>,
+}
+
+#[async_trait]
+impl MessageHandler for BlockNotifyHandler {
+    async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+        // Signal the catchup loop that new consensus activity was seen.
+        self.notify.notify_one();
+        OutgoingMessage {
+            action: ForwardingPolicy::Broadcast,
+            tag: msg.tag,
+            payload: msg.data,
+            topics: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Block catchup: fetch blocks from peers via HTTP
+// ---------------------------------------------------------------------------
+
+/// Parse a `PreEncodedBlockCert` msgpack response body into raw block bytes
+/// and raw cert bytes.
+///
+/// The response is a msgpack map: `{"block": <raw>, "cert": <raw>}`.
+/// We decode just enough to extract the two raw byte sequences.
+fn parse_block_cert_response(body: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let value: rmpv::Value =
+        rmpv::decode::read_value(&mut &body[..]).map_err(|e| format!("msgpack decode: {e}"))?;
+
+    let map = value.as_map().ok_or("response is not a msgpack map")?;
+
+    let mut block_data: Option<Vec<u8>> = None;
+    let mut cert_data: Option<Vec<u8>> = None;
+
+    for (key, val) in map {
+        let key_str = key.as_str().unwrap_or("");
+        match key_str {
+            "block" => {
+                // Go's PreEncodedBlockCert stores block as raw msgpack bytes
+                // (protocol.EncodedBytes = []byte).  In the msgpack response
+                // these appear as Binary values — extract the raw bytes directly
+                // rather than re-encoding (which would double-wrap them).
+                if let Some(bytes) = val.as_slice() {
+                    block_data = Some(bytes.to_vec());
+                } else {
+                    // Fallback: re-encode non-binary values.
+                    let mut buf = Vec::new();
+                    rmpv::encode::write_value(&mut buf, val)
+                        .map_err(|e| format!("re-encode block: {e}"))?;
+                    block_data = Some(buf);
+                }
+            }
+            "cert" => {
+                if let Some(bytes) = val.as_slice() {
+                    cert_data = Some(bytes.to_vec());
+                } else {
+                    let mut buf = Vec::new();
+                    rmpv::encode::write_value(&mut buf, val)
+                        .map_err(|e| format!("re-encode cert: {e}"))?;
+                    cert_data = Some(buf);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let block = block_data.ok_or("response missing 'block' key")?;
+    let cert = cert_data.ok_or("response missing 'cert' key")?;
+    Ok((block, cert))
+}
+
+/// Convert a gossip peer address to an HTTP base URL.
+///
+/// Peer addresses from the CLI are typically `host:port` (e.g. `go-relay:4161`).
+/// Go algod serves both WebSocket gossip and HTTP block service on the same port.
+fn peer_to_http_base(addr: &str) -> String {
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{}", addr)
+    }
+}
+
+/// Background task that fetches new blocks from peer relays via HTTP and
+/// stores them in the local SQLite ledger.
+///
+/// The loop is woken by the `Notify` signal (from gossip handlers) or by a
+/// periodic 2-second poll as a fallback.
+async fn block_catchup_loop(
+    ledger: Arc<LedgerBlockService>,
+    peers: Vec<String>,
+    genesis_id: String,
+    notify: Arc<Notify>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("failed to build HTTP client");
+
+    info!(peers = peers.len(), "block catchup loop started");
+
+    loop {
+        // Wait for a gossip signal or a timeout (poll fallback).
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!("block catchup loop cancelled");
+                return;
+            }
+            _ = notify.notified() => {
+                // Woken by gossip activity — try to fetch immediately.
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                // Periodic poll fallback.
+            }
+        }
+
+        // Determine what round to fetch next.
+        // If current is 0 and we haven't stored the genesis block yet,
+        // fetch round 0 first (needed by Go nodes to bootstrap).
+        let current = ledger.latest_round_inner();
+        let has_genesis = current > 0
+            || ledger
+                .ledger
+                .lock()
+                .ok()
+                .and_then(|l| l.get_block_data(0).ok().flatten())
+                .is_some();
+        let next_round = if has_genesis { current + 1 } else { 0 };
+
+        // Try each peer until one succeeds.
+        let mut fetched = false;
+        for peer_addr in &peers {
+            let base = peer_to_http_base(peer_addr);
+            let url = format!(
+                "{}/v1/{}/block/{}",
+                base,
+                genesis_id,
+                algo_network::format_round_base36(next_round)
+            );
+
+            match client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                    Ok(body) => match parse_block_cert_response(&body) {
+                        Ok((block_data, cert_data)) => {
+                            match ledger.store_block_and_cert(next_round, &block_data, &cert_data) {
+                                Ok(()) => {
+                                    info!(
+                                        round = next_round,
+                                        peer = peer_addr.as_str(),
+                                        block_bytes = block_data.len(),
+                                        cert_bytes = cert_data.len(),
+                                        "stored block from peer"
+                                    );
+                                    fetched = true;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        round = next_round,
+                                        error = %e,
+                                        "failed to store block"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                round = next_round,
+                                peer = peer_addr.as_str(),
+                                error = %e,
+                                "failed to parse block response"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        debug!(
+                            round = next_round,
+                            peer = peer_addr.as_str(),
+                            error = %e,
+                            "failed to read block response body"
+                        );
+                    }
+                },
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    debug!(
+                        round = next_round,
+                        peer = peer_addr.as_str(),
+                        status = status,
+                        "block not available from peer"
+                    );
+                }
+                Err(e) => {
+                    debug!(
+                        round = next_round,
+                        peer = peer_addr.as_str(),
+                        error = %e,
+                        "failed to connect to peer for block fetch"
+                    );
+                }
+            }
+
+            if fetched {
+                break;
+            }
+        }
+
+        // If we fetched a block successfully, immediately try the next one
+        // (don't wait for notify/timeout). This handles catch-up of multiple
+        // rounds efficiently.
+        if fetched {
+            notify.notify_one();
+        }
     }
 }
 
@@ -148,11 +411,52 @@ pub async fn run(
     let latest = sqlite_ledger.current_round().0;
     info!(path = %ledger_path.display(), latest_round = latest, "opened ledger database");
 
-    let ledger: Arc<dyn LedgerForBlockService> = Arc::new(LedgerBlockService {
+    let ledger = Arc::new(LedgerBlockService {
         ledger: Mutex::new(sqlite_ledger),
     });
-    let block_service = BlockService::new(ledger, resolved_genesis_id.clone(), mem_cap);
+    let block_service = BlockService::new(
+        Arc::clone(&ledger) as Arc<dyn LedgerForBlockService>,
+        resolved_genesis_id.clone(),
+        mem_cap,
+    );
     net.register_http_handler("/", block_service.http_router());
+
+    // Register gossip handlers for all relay-forwarded message types.
+    // The handler returns ForwardingPolicy::Broadcast so the network layer
+    // enqueues each message to the broadcast thread for delivery to all
+    // connected peers (excluding the originator).  Agreement-related tags
+    // (PP, AV, VB, VP) also notify the catchup loop so it can fetch the
+    // committed block via HTTP from the upstream peer.
+    let catchup_notify = Arc::new(Notify::new());
+    let notify_handler: Arc<dyn MessageHandler> = Arc::new(BlockNotifyHandler {
+        notify: Arc::clone(&catchup_notify),
+    });
+    net.register_handlers(vec![
+        TaggedMessageHandler {
+            tag: Tag::ProposalPayload,
+            handler: Arc::clone(&notify_handler),
+        },
+        TaggedMessageHandler {
+            tag: Tag::AgreementVote,
+            handler: Arc::clone(&notify_handler),
+        },
+        TaggedMessageHandler {
+            tag: Tag::VoteBundle,
+            handler: Arc::clone(&notify_handler),
+        },
+        TaggedMessageHandler {
+            tag: Tag::VotePacked,
+            handler: Arc::clone(&notify_handler),
+        },
+        TaggedMessageHandler {
+            tag: Tag::Transaction,
+            handler: Arc::clone(&notify_handler),
+        },
+        TaggedMessageHandler {
+            tag: Tag::StateProofSig,
+            handler: Arc::clone(&notify_handler),
+        },
+    ]);
 
     // Start the network (listener + mesh + monitor tasks).
     net.start_arc()
@@ -166,6 +470,23 @@ pub async fn run(
         info!("relay node started (no listener)");
     }
 
+    // Spawn the background block catchup task that fetches committed blocks
+    // from peer relays via HTTP and stores them in the local SQLite ledger.
+    let catchup_cancel = tokio_util::sync::CancellationToken::new();
+    let catchup_task = if !peers.is_empty() {
+        let cancel = catchup_cancel.clone();
+        let ledger_for_catchup = Arc::clone(&ledger);
+        let genesis = resolved_genesis_id.clone();
+        let peer_list: Vec<String> = peers.to_vec();
+        let notify = Arc::clone(&catchup_notify);
+        Some(tokio::spawn(async move {
+            block_catchup_loop(ledger_for_catchup, peer_list, genesis, notify, cancel).await;
+        }))
+    } else {
+        warn!("no peers configured; block catchup is disabled");
+        None
+    };
+
     info!(
         genesis_id = %resolved_genesis_id,
         "relay node active — press Ctrl+C to stop"
@@ -175,6 +496,10 @@ pub async fn run(
     tokio::signal::ctrl_c().await?;
 
     info!("shutting down relay node...");
+    catchup_cancel.cancel();
+    if let Some(task) = catchup_task {
+        let _ = task.await;
+    }
     net.stop().await;
     info!("relay node stopped");
 

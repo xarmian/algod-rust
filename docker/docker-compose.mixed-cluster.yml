@@ -1,16 +1,22 @@
-# Mixed-Cluster Conformance Testing
+# Mixed-Cluster Conformance Testing — Real Consensus
 #
 # Topology:
-#   go-relay  (Go algod relay)  -->  block producer, gossip source
+#   go-relay  (Go algod relay)  -->  block producer (real agreement), gossip source
 #   rust-observer               -->  connects to go-relay via gossip, receives blocks
-#   rust-relay                  -->  connects to go-relay, accepts incoming connections, serves blocks
+#   rust-relay                  -->  connects to go-relay, accepts incoming, serves blocks
 #   go-nonrelay                 -->  bootstraps against rust-relay to test block serving
-#   txn-generator               -->  sidecar generating transactions on go-relay
 #
-# All nodes share the same genesis via the go-relay data volume.
+# Uses a REAL private network (not DEV_MODE) so that:
+#   - Agreement protocol runs, producing valid certificates
+#   - Blocks are produced every ~3.3 seconds
+#   - go-nonrelay can sync via catchup with certificate validation
+#
+# Transaction generation is handled via `docker exec` (see Makefile
+# `mixed-cluster-txns` target) because `goal clerk send` requires KMD.
 #
 # Usage:
 #   docker compose -f docker/docker-compose.mixed-cluster.yml up -d
+#   make mixed-cluster-txns &   # optional: background txn generator
 #   docker compose -f docker/docker-compose.mixed-cluster.yml down -v
 
 services:
@@ -18,15 +24,17 @@ services:
     image: algorand/algod:4.5.1-stable
     container_name: mc-go-relay
     environment:
-      - DEV_MODE=1
       - GOSSIP_PORT=4161
       - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - START_KMD=1
+      - NUM_ROUNDS=30000
     ports:
       - "4001:8080"
       - "4161:4161"
     volumes:
       - go-relay-data:/algod/data
+      - ./config/relay-template.json:/etc/algorand/template.json:ro
     healthcheck:
       test:
         [
@@ -39,25 +47,8 @@ services:
         ]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 15
     restart: unless-stopped
-    networks:
-      - mixed-cluster
-
-  txn-generator:
-    image: algorand/algod:4.5.1-stable
-    container_name: mc-txn-generator
-    depends_on:
-      go-relay:
-        condition: service_healthy
-    entrypoint: ["/bin/bash", "/scripts/generate-txns.sh"]
-    volumes:
-      - ./scripts/generate-txns.sh:/scripts/generate-txns.sh:ro
-      - go-relay-data:/algod/data
-    environment:
-      - ALGOD_DATA=/algod/data
-      - TXN_INTERVAL=5
-      - TXN_BATCH_SIZE=1
     networks:
       - mixed-cluster
 
@@ -72,9 +63,9 @@ services:
     entrypoint:
       - algod-rust
       - observe
-      - --network=devnet
+      - --network=dockernet
       - --relay-addr=go-relay:4161
-      - --genesis-id=v1
+      - --genesis-id=dockernet-v1
     networks:
       - mixed-cluster
 
@@ -90,8 +81,8 @@ services:
       - algod-rust
       - relay
       - --bind-address=0.0.0.0:4160
-      - --network=devnet
-      - --genesis-id=v1
+      - --network=dockernet
+      - --genesis-id=dockernet-v1
       - --ledger-path=/app/ledger.sqlite
       - --peers=go-relay:4161
     ports:
@@ -138,7 +129,7 @@ services:
         ]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 15
     restart: unless-stopped
     networks:
       - mixed-cluster
