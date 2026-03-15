@@ -30,7 +30,7 @@ fn prog(version: u8, code: &[u8]) -> Vec<u8> {
 fn make_appl_txn(sender: [u8; 32], app_id: u64) -> SignedTransaction {
     SignedTransaction {
         txn: Transaction {
-            txn_type: "appl".to_string(),
+            txn_type: "appl".into(),
             sender: Address(sender),
             fee: 1000,
             first_valid: 100.into(),
@@ -49,7 +49,7 @@ fn make_appl_txn_with_args(sender: [u8; 32], app_id: u64, args: Vec<Vec<u8>>) ->
         args.into_iter().map(|a| Some(ByteBuf::from(a))).collect();
     SignedTransaction {
         txn: Transaction {
-            txn_type: "appl".to_string(),
+            txn_type: "appl".into(),
             sender: Address(sender),
             fee: 1000,
             first_valid: 100.into(),
@@ -76,7 +76,7 @@ fn make_appl_txn_with_refs(
 ) -> SignedTransaction {
     SignedTransaction {
         txn: Transaction {
-            txn_type: "appl".to_string(),
+            txn_type: "appl".into(),
             sender: Address(sender),
             fee: 1000,
             first_valid: 100.into(),

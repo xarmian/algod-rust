@@ -13,7 +13,6 @@ use algo_codec::canonical_encode_transaction;
 use algo_types::{Address, Block, Round, SignedTransaction, Transaction};
 use algo_validate::merkle::{compute_payset_merkle_root, compute_vector_commitment, HashAlgo};
 use ed25519_dalek::{Signer, SigningKey};
-use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha512_256};
 
 // ---------------------------------------------------------------------------
@@ -32,12 +31,12 @@ fn test_signing_key() -> SigningKey {
 fn make_block(payset: Vec<SignedTransaction>) -> Block {
     Block {
         round: Round(1),
-        branch: ByteBuf::from(vec![0u8; 32]),
-        seed: ByteBuf::from(vec![0u8; 32]),
-        txn_commitment: ByteBuf::new(),
+        branch: [0u8; 32],
+        seed: [0u8; 32],
+        txn_commitment: [0u8; 32],
         timestamp: 100,
         genesis_id: "bench-v1".into(),
-        genesis_hash: ByteBuf::from(test_genesis_hash().to_vec()),
+        genesis_hash: test_genesis_hash(),
         proposer: Address::default(),
         fee_sink: Address::default(),
         rewards_pool: Address::default(),
@@ -54,9 +53,9 @@ fn make_block(payset: Vec<SignedTransaction>) -> Block {
         fees_collected: 0,
         bonus: 0,
         proposer_payout: 0,
-        prev512: ByteBuf::new(),
-        txn256: ByteBuf::new(),
-        txn512: ByteBuf::new(),
+        prev512: [0u8; 64],
+        txn256: [0u8; 32],
+        txn512: [0u8; 64],
         state_proof_tracking: None,
         upgrade_propose: String::new(),
         upgrade_delay: 0,
@@ -83,7 +82,7 @@ fn make_signed_txn(key: &SigningKey, amount: u64) -> SignedTransaction {
         amount,
         receiver: Address([2u8; 32]),
         genesis_id: "bench-v1".into(),
-        genesis_hash: ByteBuf::from(test_genesis_hash().to_vec()),
+        genesis_hash: test_genesis_hash(),
         ..Default::default()
     };
 
@@ -97,11 +96,11 @@ fn make_signed_txn(key: &SigningKey, amount: u64) -> SignedTransaction {
     // Strip genesis fields (as stored in-block).
     let mut stripped_txn = txn;
     stripped_txn.genesis_id = String::new();
-    stripped_txn.genesis_hash = ByteBuf::new();
+    stripped_txn.genesis_hash = [0u8; 32];
 
     SignedTransaction {
         txn: stripped_txn,
-        sig: ByteBuf::from(sig.to_bytes().to_vec()),
+        sig: sig.to_bytes(),
         msig: None,
         lsig: None,
         auth_addr: None,
@@ -167,7 +166,7 @@ fn bench_ed25519_verify(c: &mut Criterion) {
     // Restore genesis fields so verify_single_sig can compute the correct message.
     let mut stx_restored = stx.clone();
     stx_restored.txn.genesis_id = "bench-v1".into();
-    stx_restored.txn.genesis_hash = ByteBuf::from(test_genesis_hash().to_vec());
+    stx_restored.txn.genesis_hash = test_genesis_hash();
 
     c.bench_function("ed25519_verify_single_sig", |b| {
         b.iter(|| {
@@ -230,7 +229,7 @@ fn bench_validate_block(c: &mut Criterion) {
     let mut block4 = make_block(payset);
     // Compute the correct Merkle commitment so the block validates cleanly.
     let root = compute_payset_merkle_root(&block4);
-    block4.txn_commitment = ByteBuf::from(root.to_vec());
+    block4.txn_commitment = root;
 
     group.bench_function("4_txn_block", |b| {
         b.iter(|| {

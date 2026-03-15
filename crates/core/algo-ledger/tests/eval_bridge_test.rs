@@ -146,7 +146,7 @@ fn opt_in_account(state: &mut LedgerState, addr: &Address, app_id: u64) {
 fn appl_noop_txn(sender: Address, app_id: u64, fee: u64) -> SignedTransaction {
     SignedTransaction {
         txn: Transaction {
-            txn_type: "appl".to_string(),
+            txn_type: "appl".into(),
             sender,
             fee,
             first_valid: 1.into(),
@@ -163,7 +163,7 @@ fn appl_noop_txn(sender: Address, app_id: u64, fee: u64) -> SignedTransaction {
 fn appl_clearstate_txn(sender: Address, app_id: u64, fee: u64) -> SignedTransaction {
     SignedTransaction {
         txn: Transaction {
-            txn_type: "appl".to_string(),
+            txn_type: "appl".into(),
             sender,
             fee,
             first_valid: 1.into(),
@@ -645,7 +645,7 @@ fn replay_mode_appl_create_still_works() {
 
     let app_id = 500u64;
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "appl".to_string();
+    stx.txn.txn_type = "appl".into();
     stx.txn.sender = creator;
     stx.txn.fee = 1_000;
     stx.txn.application_id = 0; // creation
@@ -693,7 +693,7 @@ fn replay_mode_clearstate_clears_local_state() {
 
     // Create app in Replay mode.
     let mut create_stx = SignedTransaction::default();
-    create_stx.txn.txn_type = "appl".to_string();
+    create_stx.txn.txn_type = "appl".into();
     create_stx.txn.sender = creator;
     create_stx.txn.fee = 1_000;
     create_stx.txn.application_id = 0;
@@ -713,7 +713,7 @@ fn replay_mode_clearstate_clears_local_state() {
 
     // Opt in sender.
     let mut optin_stx = SignedTransaction::default();
-    optin_stx.txn.txn_type = "appl".to_string();
+    optin_stx.txn.txn_type = "appl".into();
     optin_stx.txn.sender = sender;
     optin_stx.txn.fee = 1_000;
     optin_stx.txn.application_id = app_id;
@@ -791,7 +791,7 @@ fn execute_mode_app_creation_runs_approval_program() {
 
     let app_id = 600u64;
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "appl".to_string();
+    stx.txn.txn_type = "appl".into();
     stx.txn.sender = creator;
     stx.txn.fee = 1_000;
     stx.txn.application_id = 0; // creation
@@ -1056,7 +1056,7 @@ fn fee_credit_from_outer_overpayment_enables_inner_zero_fee() {
     // inner pay's MinTxnFee of 1000 when fee=0.
     let stx = SignedTransaction {
         txn: Transaction {
-            txn_type: "appl".to_string(),
+            txn_type: "appl".into(),
             sender,
             fee: 2_000,
             first_valid: 1.into(),
@@ -1178,12 +1178,12 @@ fn make_block(
 ) -> Block {
     Block {
         round: Round(round),
-        branch: serde_bytes::ByteBuf::new(),
-        seed: serde_bytes::ByteBuf::new(),
-        txn_commitment: serde_bytes::ByteBuf::new(),
+        branch: [0u8; 32],
+        seed: [0u8; 32],
+        txn_commitment: [0u8; 32],
         timestamp: 1000,
         genesis_id: String::new(),
-        genesis_hash: serde_bytes::ByteBuf::new(),
+        genesis_hash: [0u8; 32],
         proposer: Address::ZERO,
         fee_sink,
         rewards_pool,
@@ -1200,9 +1200,9 @@ fn make_block(
         fees_collected: 0,
         bonus: 0,
         proposer_payout: 0,
-        prev512: serde_bytes::ByteBuf::new(),
-        txn256: serde_bytes::ByteBuf::new(),
-        txn512: serde_bytes::ByteBuf::new(),
+        prev512: [0u8; 64],
+        txn256: [0u8; 32],
+        txn512: [0u8; 64],
         state_proof_tracking: None,
         upgrade_propose: String::new(),
         upgrade_delay: 0,
@@ -1338,7 +1338,7 @@ fn apply_block_execute_mode_mixed_pay_and_appl() {
     // Pay transaction.
     let pay_stx = SignedTransaction {
         txn: Transaction {
-            txn_type: "pay".to_string(),
+            txn_type: "pay".into(),
             sender,
             fee: 1_000,
             first_valid: 1.into(),

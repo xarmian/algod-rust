@@ -45,7 +45,7 @@ macro_rules! merkle_commitment_test {
             );
             let block = &br.block;
 
-            if block.payset.is_empty() && block.txn_commitment.is_empty() {
+            if block.payset.is_empty() && block.txn_commitment == [0u8; 32] {
                 // Empty block with no commitment — nothing to verify.
                 return;
             }

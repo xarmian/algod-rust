@@ -160,7 +160,7 @@ pub async fn run(
             let ttype = if stxn.txn.txn_type.is_empty() {
                 "unknown".to_string()
             } else {
-                stxn.txn.txn_type.clone()
+                stxn.txn.txn_type.to_string()
             };
             *txn_type_counts.entry(ttype).or_insert(0) += 1;
             total_txns += 1;
@@ -533,7 +533,7 @@ pub async fn run_stateful(
             let ttype = if stxn.txn.txn_type.is_empty() {
                 "unknown".to_string()
             } else {
-                stxn.txn.txn_type.clone()
+                stxn.txn.txn_type.to_string()
             };
             *txn_type_counts.entry(ttype).or_insert(0) += 1;
             total_txns += 1;

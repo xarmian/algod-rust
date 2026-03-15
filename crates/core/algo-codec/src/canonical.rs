@@ -64,10 +64,9 @@ impl CanonicalMap {
     }
 
     fn add_bytes(&mut self, key: &'static str, val: &[u8]) {
-        // Go's omitempty for []byte: omit when len == 0 (nil or empty).
-        // Note: [32]byte digests (gh, seed, prev) use Address type or come
-        // through as empty ByteBuf when absent — never as 32 zero bytes.
-        if !val.is_empty() {
+        // Go's omitempty for []byte: omit when len == 0 (nil or empty) OR
+        // when all bytes are zero (for fixed-size [N]byte fields like digests).
+        if !val.is_empty() && val.iter().any(|&b| b != 0) {
             let mut buf = Vec::new();
             rmp::encode::write_bin(&mut buf, val).unwrap();
             self.fields.push((key, buf));
@@ -134,6 +133,18 @@ impl CanonicalMap {
     fn add_option_bytes(&mut self, key: &'static str, val: &Option<ByteBuf>) {
         if let Some(b) = val {
             self.add_bytes(key, b);
+        }
+    }
+
+    fn add_option_fixed_bytes<const N: usize>(
+        &mut self,
+        key: &'static str,
+        val: &Option<[u8; N]>,
+    ) {
+        if let Some(b) = val {
+            if b.iter().any(|&x| x != 0) {
+                self.add_bytes(key, b);
+            }
         }
     }
 
@@ -369,7 +380,7 @@ pub fn canonical_encode_transaction(tx: &Transaction) -> Vec<u8> {
     m.add_option_address("rekey", &tx.rekey_to);
 
     // Key registration (keyreg)
-    m.add_option_bytes("selkey", &tx.selection_pk);
+    m.add_option_fixed_bytes("selkey", &tx.selection_pk);
 
     m.add_address("snd", &tx.sender);
 
@@ -381,13 +392,13 @@ pub fn canonical_encode_transaction(tx: &Transaction) -> Vec<u8> {
         m.add_map("spmsg", canonical_encode_state_proof_message(msg));
     }
     m.add_u64("sptype", tx.state_proof_type);
-    m.add_option_bytes("sprfkey", &tx.state_proof_pk);
+    m.add_option_fixed_bytes("sprfkey", &tx.state_proof_pk);
 
-    m.add_string("type", &tx.txn_type);
+    m.add_string("type", tx.txn_type.as_str());
 
     // Key registration (keyreg)
     m.add_u64("votefst", tx.vote_first);
-    m.add_option_bytes("votekey", &tx.vote_pk);
+    m.add_option_fixed_bytes("votekey", &tx.vote_pk);
     m.add_u64("votekd", tx.vote_key_dilution);
     m.add_u64("votelst", tx.vote_last);
 
@@ -538,7 +549,7 @@ pub fn canonical_encode_block_header(header: &BlockHeader) -> Vec<u8> {
 pub fn canonical_encode_asset_params(apar: &AssetParams) -> Vec<u8> {
     let mut m = CanonicalMap::new();
 
-    m.add_option_bytes("am", &apar.metadata_hash);
+    m.add_option_fixed_bytes("am", &apar.metadata_hash);
     m.add_string("an", &apar.asset_name);
     m.add_string("au", &apar.url);
     m.add_option_address("c", &apar.clawback);
@@ -927,12 +938,12 @@ pub fn build_txtail_from_block(block: &Block) -> TxTailRound {
 
     let hdr = BlockHeader {
         round: block.round,
-        branch: block.branch.clone(),
-        seed: block.seed.clone(),
-        txn_commitment: block.txn_commitment.clone(),
+        branch: block.branch,
+        seed: block.seed,
+        txn_commitment: block.txn_commitment,
         timestamp: block.timestamp,
         genesis_id: block.genesis_id.clone(),
-        genesis_hash: block.genesis_hash.clone(),
+        genesis_hash: block.genesis_hash,
         proposer: block.proposer,
         fee_sink: block.fee_sink,
         rewards_pool: block.rewards_pool,
@@ -949,9 +960,9 @@ pub fn build_txtail_from_block(block: &Block) -> TxTailRound {
         fees_collected: block.fees_collected,
         bonus: block.bonus,
         proposer_payout: block.proposer_payout,
-        prev512: block.prev512.clone(),
-        txn256: block.txn256.clone(),
-        txn512: block.txn512.clone(),
+        prev512: block.prev512,
+        txn256: block.txn256,
+        txn512: block.txn512,
         state_proof_tracking: block.state_proof_tracking.clone(),
         upgrade_propose: block.upgrade_propose.clone(),
         upgrade_delay: block.upgrade_delay,
@@ -970,10 +981,10 @@ pub fn build_txtail_from_block(block: &Block) -> TxTailRound {
         last_valid.push(stx.txn.last_valid.0);
 
         // Check for non-zero lease (32-byte field)
-        if !stx.txn.lease.is_empty() && stx.txn.lease.iter().any(|&b| b != 0) {
+        if stx.txn.lease.iter().any(|&b| b != 0) {
             leases.push(TxTailRoundLease {
                 sender: stx.txn.sender,
-                lease: stx.txn.lease.clone(),
+                lease: ByteBuf::from(stx.txn.lease.to_vec()),
                 txn_idx: idx as u64,
             });
         }
@@ -991,7 +1002,6 @@ pub fn build_txtail_from_block(block: &Block) -> TxTailRound {
 mod tests {
     use super::*;
     use algo_types::Round;
-    use serde_bytes::ByteBuf;
 
     #[test]
     fn test_empty_transaction_produces_minimal_map() {
@@ -1150,7 +1160,7 @@ mod tests {
                 receiver: Address([2u8; 32]),
                 ..Default::default()
             },
-            sig: ByteBuf::from(vec![0xDE; 64]),
+            sig: [0xDE; 64],
             msig: None,
             lsig: None,
             auth_addr: None,
@@ -1240,7 +1250,7 @@ mod tests {
                 receiver: Address([2u8; 32]),
                 ..Default::default()
             },
-            sig: ByteBuf::from(vec![0xDE; 64]),
+            sig: [0xDE; 64],
             msig: None,
             lsig: None,
             auth_addr: None,
@@ -1266,12 +1276,12 @@ mod tests {
     fn minimal_block(round: Round, payset: Vec<SignedTransaction>) -> algo_types::Block {
         algo_types::Block {
             round,
-            branch: ByteBuf::new(),
-            seed: ByteBuf::new(),
-            txn_commitment: ByteBuf::new(),
+            branch: [0u8; 32],
+            seed: [0u8; 32],
+            txn_commitment: [0u8; 32],
             timestamp: 0,
             genesis_id: String::new(),
-            genesis_hash: ByteBuf::new(),
+            genesis_hash: [0u8; 32],
             proposer: Address::ZERO,
             fee_sink: Address::ZERO,
             rewards_pool: Address::ZERO,
@@ -1288,9 +1298,9 @@ mod tests {
             fees_collected: 0,
             bonus: 0,
             proposer_payout: 0,
-            prev512: ByteBuf::new(),
-            txn256: ByteBuf::new(),
-            txn512: ByteBuf::new(),
+            prev512: [0u8; 64],
+            txn256: [0u8; 32],
+            txn512: [0u8; 64],
             state_proof_tracking: None,
             upgrade_propose: String::new(),
             upgrade_delay: 0,
@@ -1324,7 +1334,7 @@ mod tests {
                 fee: 1000,
                 first_valid: Round(10),
                 last_valid: Round(20),
-                lease: ByteBuf::from(lease_bytes.to_vec()),
+                lease: lease_bytes,
                 amount: 100,
                 receiver: Address([0x02u8; 32]),
                 ..Default::default()

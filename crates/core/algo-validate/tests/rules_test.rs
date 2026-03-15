@@ -47,8 +47,8 @@ fn restore_genesis_fields(br: &algo_types::BlockResponse) -> Vec<algo_types::Sig
                 full.txn.genesis_id.clone_from(&br.block.genesis_id);
             }
             // Genesis hash is always stripped from block-stored transactions
-            if full.txn.genesis_hash.is_empty() {
-                full.txn.genesis_hash = br.block.genesis_hash.clone();
+            if full.txn.genesis_hash == [0u8; 32] {
+                full.txn.genesis_hash = br.block.genesis_hash;
             }
             full
         })

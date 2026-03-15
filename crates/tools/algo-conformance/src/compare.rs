@@ -134,8 +134,8 @@ pub fn compare_block(
                 compare_field(
                     &mut mismatches,
                     "round-trip header.genesis_hash",
-                    &hex::encode(&block.genesis_hash),
-                    &hex::encode(&re_decoded.genesis_hash),
+                    &hex::encode(block.genesis_hash),
+                    &hex::encode(re_decoded.genesis_hash),
                 );
                 compare_field(
                     &mut mismatches,
@@ -164,20 +164,20 @@ pub fn compare_block(
                 compare_field(
                     &mut mismatches,
                     "round-trip header.branch",
-                    &hex::encode(&block.branch),
-                    &hex::encode(&re_decoded.branch),
+                    &hex::encode(block.branch),
+                    &hex::encode(re_decoded.branch),
                 );
                 compare_field(
                     &mut mismatches,
                     "round-trip header.seed",
-                    &hex::encode(&block.seed),
-                    &hex::encode(&re_decoded.seed),
+                    &hex::encode(block.seed),
+                    &hex::encode(re_decoded.seed),
                 );
                 compare_field(
                     &mut mismatches,
                     "round-trip header.txn_commitment",
-                    &hex::encode(&block.txn_commitment),
-                    &hex::encode(&re_decoded.txn_commitment),
+                    &hex::encode(block.txn_commitment),
+                    &hex::encode(re_decoded.txn_commitment),
                 );
                 compare_field(
                     &mut mismatches,
@@ -255,8 +255,8 @@ pub fn compare_block(
                     compare_field(
                         &mut mismatches,
                         &format!("round-trip txns[{i}].sig"),
-                        &hex::encode(&orig.sig),
-                        &hex::encode(&rt.sig),
+                        &hex::encode(orig.sig),
+                        &hex::encode(rt.sig),
                     );
                     compare_field(
                         &mut mismatches,
@@ -383,7 +383,7 @@ impl TxnTypeCoverage {
             let ttype = if stxn.txn.txn_type.is_empty() {
                 "unknown".to_string()
             } else {
-                stxn.txn.txn_type.clone()
+                stxn.txn.txn_type.to_string()
             };
             *counts.entry(ttype).or_insert(0) += 1;
         }
@@ -445,6 +445,23 @@ fn compare_opt_bytes_hex(
 ) {
     let e_hex = expected.as_ref().map(|b| hex::encode(b.as_slice()));
     let a_hex = actual.as_ref().map(|b| hex::encode(b.as_slice()));
+    if e_hex != a_hex {
+        mismatches.push(Mismatch::FieldMismatch {
+            path: path.into(),
+            expected: e_hex.unwrap_or_else(|| "None".into()),
+            actual: a_hex.unwrap_or_else(|| "None".into()),
+        });
+    }
+}
+
+fn compare_opt_fixed_bytes_hex<const N: usize>(
+    mismatches: &mut Vec<Mismatch>,
+    path: &str,
+    expected: &Option<[u8; N]>,
+    actual: &Option<[u8; N]>,
+) {
+    let e_hex = expected.as_ref().map(hex::encode);
+    let a_hex = actual.as_ref().map(hex::encode);
     if e_hex != a_hex {
         mismatches.push(Mismatch::FieldMismatch {
             path: path.into(),
@@ -583,7 +600,7 @@ fn compare_txn_type_fields(
                         &ap.asset_name,
                     );
                     compare_field(mismatches, &format!("{prefix}.apar.url"), &ep.url, &ap.url);
-                    compare_opt_bytes_hex(
+                    compare_opt_fixed_bytes_hex(
                         mismatches,
                         &format!("{prefix}.apar.metadata_hash"),
                         &ep.metadata_hash,
@@ -801,19 +818,19 @@ fn compare_txn_type_fields(
                 &orig.non_participation,
                 &rt.non_participation,
             );
-            compare_opt_bytes_hex(
+            compare_opt_fixed_bytes_hex(
                 mismatches,
                 &format!("{prefix}.vote_pk"),
                 &orig.vote_pk,
                 &rt.vote_pk,
             );
-            compare_opt_bytes_hex(
+            compare_opt_fixed_bytes_hex(
                 mismatches,
                 &format!("{prefix}.selection_pk"),
                 &orig.selection_pk,
                 &rt.selection_pk,
             );
-            compare_opt_bytes_hex(
+            compare_opt_fixed_bytes_hex(
                 mismatches,
                 &format!("{prefix}.state_proof_pk"),
                 &orig.state_proof_pk,

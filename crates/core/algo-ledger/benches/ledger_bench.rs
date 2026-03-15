@@ -29,7 +29,7 @@ fn make_account(balance: u64) -> AccountData {
 
 fn pay_txn(sender: Address, receiver: Address, amount: u64) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "pay".to_string();
+    stx.txn.txn_type = "pay".into();
     stx.txn.sender = sender;
     stx.txn.receiver = receiver;
     stx.txn.amount = amount;

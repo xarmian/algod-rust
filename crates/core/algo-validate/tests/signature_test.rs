@@ -49,8 +49,8 @@ fn restore_genesis_fields(br: &algo_types::BlockResponse) -> Vec<algo_types::Sig
                 full.txn.genesis_id.clone_from(&br.block.genesis_id);
             }
             // Genesis hash is always stripped from block-stored transactions
-            if full.txn.genesis_hash.is_empty() {
-                full.txn.genesis_hash = br.block.genesis_hash.clone();
+            if full.txn.genesis_hash == [0u8; 32] {
+                full.txn.genesis_hash = br.block.genesis_hash;
             }
             full
         })
@@ -162,7 +162,7 @@ fn make_contract_account_txn(program: &[u8]) -> SignedTransaction {
     let sender = program_address(program);
     SignedTransaction {
         txn: Transaction {
-            txn_type: "pay".to_string(),
+            txn_type: "pay".into(),
             sender,
             fee: 1_000,
             first_valid: Round(1),
@@ -173,7 +173,7 @@ fn make_contract_account_txn(program: &[u8]) -> SignedTransaction {
         },
         lsig: Some(LogicSig {
             logic: serde_bytes::ByteBuf::from(program.to_vec()),
-            sig: Default::default(),
+            sig: [0u8; 64],
             msig: None,
             lmsig: None,
             args: None,
@@ -417,7 +417,7 @@ fn logicsig_size_pooling_allows_large_lsig_in_group() {
         // Other 7 are plain pay txns (no LogicSig, contribute 0 to pool).
         let plain = SignedTransaction {
             txn: Transaction {
-                txn_type: "pay".to_string(),
+                txn_type: "pay".into(),
                 sender: Address([0x10; 32]),
                 fee: 1_000,
                 first_valid: Round(1),
@@ -426,7 +426,7 @@ fn logicsig_size_pooling_allows_large_lsig_in_group() {
                 amount: 0,
                 ..Default::default()
             },
-            sig: serde_bytes::ByteBuf::from(vec![0u8; 64]),
+            sig: [0u8; 64],
             ..Default::default()
         };
         group_of_8.push(plain);
