@@ -311,6 +311,29 @@ pub enum Commands {
         dns_bootstrap: Option<String>,
     },
 
+    /// Capture raw wire-protocol messages from a Go relay for offline regression tests.
+    CaptureWire {
+        /// WebSocket address of the relay to connect to (e.g. "r-mn.algorand.network:4160").
+        #[arg(long)]
+        relay_addr: String,
+
+        /// Output directory for captured wire fixtures.
+        #[arg(long, default_value = "wire_fixtures")]
+        output_dir: PathBuf,
+
+        /// Maximum number of messages to capture.
+        #[arg(long, default_value = "100")]
+        count: u64,
+
+        /// Maximum seconds to capture before stopping.
+        #[arg(long, default_value = "60")]
+        duration: u64,
+
+        /// Genesis ID for the WebSocket handshake (e.g. "mainnet-v1.0").
+        #[arg(long)]
+        genesis_id: Option<String>,
+    },
+
     /// Follow mode: continuously validate new blocks as they arrive.
     Follow {
         /// Base URL of the algod REST API.

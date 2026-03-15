@@ -981,9 +981,7 @@ mod tests {
 
         // WS path
         let service = BlockService::new(ledger.clone(), "test".to_string(), 0);
-        service
-            .ws_mem_used
-            .store(u64::MAX / 2, Ordering::Relaxed);
+        service.ws_mem_used.store(u64::MAX / 2, Ordering::Relaxed);
 
         let topics = make_block_request_topics(1);
         let request_data = topics.marshal();
@@ -1005,9 +1003,7 @@ mod tests {
         // Build service with mem_cap=0 (unlimited)
         let service = BlockService::new(ledger, "testnet-v1.0".to_string(), 0);
         // Pre-load a large memory value to confirm it is not checked
-        service
-            .http_mem_used
-            .store(u64::MAX / 2, Ordering::Relaxed);
+        service.http_mem_used.store(u64::MAX / 2, Ordering::Relaxed);
         let app = service.http_router();
 
         let uri = format!("/v1/testnet-v1.0/block/{}", format_round_base36(1));

@@ -1,0 +1,144 @@
+# Mixed-Cluster Conformance Testing — Real Consensus
+#
+# Topology:
+#   go-relay  (Go algod relay)  -->  block producer (real agreement), gossip source
+#   rust-observer               -->  connects to go-relay via gossip, receives blocks
+#   rust-relay                  -->  connects to go-relay, accepts incoming, serves blocks
+#   go-nonrelay                 -->  bootstraps against rust-relay to test block serving
+#
+# Uses a REAL private network (not DEV_MODE) so that:
+#   - Agreement protocol runs, producing valid certificates
+#   - Blocks are produced every ~3.3 seconds
+#   - go-nonrelay can sync via catchup with certificate validation
+#
+# Transaction generation is handled via `docker exec` (see Makefile
+# `mixed-cluster-txns` target) because `goal clerk send` requires KMD.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.mixed-cluster.yml up -d
+#   make mixed-cluster-txns &   # optional: background txn generator
+#   docker compose -f docker/docker-compose.mixed-cluster.yml down -v
+
+services:
+  go-relay:
+    image: algorand/algod:4.5.1-stable
+    container_name: mc-go-relay
+    environment:
+      - GOSSIP_PORT=4161
+      - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - START_KMD=1
+      - NUM_ROUNDS=30000
+    ports:
+      - "4001:8080"
+      - "4161:4161"
+    volumes:
+      - go-relay-data:/algod/data
+      - ./config/relay-template.json:/etc/algorand/template.json:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "-H",
+          "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "http://localhost:8080/v2/status",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+    networks:
+      - mixed-cluster
+
+  rust-observer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: mc-rust-observer
+    depends_on:
+      go-relay:
+        condition: service_healthy
+    entrypoint:
+      - algod-rust
+      - observe
+      - --network=dockernet
+      - --relay-addr=go-relay:4161
+      - --genesis-id=dockernet-v1
+    networks:
+      - mixed-cluster
+
+  rust-relay:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: mc-rust-relay
+    depends_on:
+      go-relay:
+        condition: service_healthy
+    entrypoint:
+      - algod-rust
+      - relay
+      - --bind-address=0.0.0.0:4160
+      - --network=dockernet
+      - --genesis-id=dockernet-v1
+      - --ledger-path=/app/ledger.sqlite
+      - --peers=go-relay:4161
+    ports:
+      - "4160:4160"
+    volumes:
+      - rust-relay-data:/app
+    networks:
+      - mixed-cluster
+
+  go-nonrelay:
+    image: algorand/algod:4.5.1-stable
+    container_name: mc-go-nonrelay
+    depends_on:
+      go-relay:
+        condition: service_healthy
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        # Copy genesis from the go-relay data volume so algod recognises the
+        # network and enters `start_public_network` mode (which honours
+        # PEER_ADDRESS).
+        cp /relay-data/genesis.json /algod/data/genesis.json 2>/dev/null || true
+        exec /node/run/run.sh
+    environment:
+      - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - PEER_ADDRESS=rust-relay:4160
+    ports:
+      - "4002:8080"
+    volumes:
+      - go-nonrelay-data:/algod/data
+      - go-relay-data:/relay-data:ro
+      - ./config/nonrelay-config.json:/etc/algorand/config.json:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "-H",
+          "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "http://localhost:8080/v2/status",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+    networks:
+      - mixed-cluster
+
+volumes:
+  go-relay-data:
+  rust-relay-data:
+  go-nonrelay-data:
+
+networks:
+  mixed-cluster:
+    driver: bridge

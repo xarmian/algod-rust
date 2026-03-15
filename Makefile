@@ -2,6 +2,7 @@ ALGOD_TOKEN := aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ALGOD_URL := http://localhost:4001
 COMPOSE := docker compose -f docker/docker-compose.yml
 COMPOSE_RELAY := docker compose -f docker/docker-compose.test-relay.yml
+COMPOSE_MIXED := docker compose -f docker/docker-compose.mixed-cluster.yml
 
 .PHONY: build test fmt fmt-check clippy lint deny ci clean
 .PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful replay-mainnet-1k
@@ -11,6 +12,7 @@ COMPOSE_RELAY := docker compose -f docker/docker-compose.test-relay.yml
 .PHONY: capture validate validate-only generate-txns fixtures help
 .PHONY: generate-diverse-txns fixtures-diverse
 .PHONY: relay-up relay-down relay-test
+.PHONY: mixed-cluster-up mixed-cluster-down mixed-cluster-smoke mixed-cluster-test mixed-cluster-conformance
 
 ## ── Build & Test ──────────────────────────────────────────────
 
@@ -247,6 +249,89 @@ relay-test: relay-up ## Run WebSocket integration tests against relay
 		cargo test -p algo-network --test ws_integration -- --nocapture
 	$(MAKE) relay-down
 
+## ── Mixed Cluster (Conformance Testing) ─────────────────────
+
+mixed-cluster-up: ## Start mixed cluster (Go relay + Rust observer/relay + Go non-relay)
+	$(COMPOSE_MIXED) build
+	$(COMPOSE_MIXED) up -d go-relay
+	@echo "Waiting for go-relay to be healthy..."
+	@until docker inspect --format='{{.State.Health.Status}}' mc-go-relay 2>/dev/null | grep -q healthy; do \
+		sleep 1; \
+	done
+	@echo "go-relay is healthy. Starting remaining services..."
+	$(COMPOSE_MIXED) up -d
+	@echo "Mixed cluster is up."
+	@echo "Starting background transaction generator..."
+	@$(MAKE) mixed-cluster-txns &
+
+mixed-cluster-txns: ## Send periodic transactions to go-relay (runs in foreground)
+	@echo "Discovering accounts..."
+	@ACCOUNTS=$$(docker exec mc-go-relay goal account list -d /algod/data 2>/dev/null | awk '{print $$2}'); \
+	FROM=$$(echo "$$ACCOUNTS" | head -1); \
+	TO=$$(echo "$$ACCOUNTS" | tail -1); \
+	if [ -z "$$FROM" ] || [ -z "$$TO" ]; then echo "ERROR: no accounts found"; exit 1; fi; \
+	echo "Sending txns: $$FROM -> $$TO"; \
+	SEQ=0; \
+	while docker inspect --format='{{.State.Status}}' mc-go-relay 2>/dev/null | grep -q running; do \
+		SEQ=$$((SEQ + 1)); \
+		docker exec mc-go-relay goal clerk send -a 1000 -f "$$FROM" -t "$$TO" -d /algod/data -n "mc-txn-$$SEQ" >/dev/null 2>&1 || true; \
+		sleep 5; \
+	done; \
+	echo "Transaction generator stopped (go-relay not running)."
+
+mixed-cluster-down: ## Stop mixed cluster and remove volumes
+	$(COMPOSE_MIXED) down -v
+
+mixed-cluster-smoke: ## Quick connectivity check on the mixed cluster
+	@echo "==> Checking go-relay REST..."
+	@curl -sf -H "X-Algo-API-Token: $(ALGOD_TOKEN)" http://localhost:4001/v2/status | python3 -c "import sys,json; s=json.load(sys.stdin); print('  go-relay: round', s.get('last-round', '?'))"
+	@echo "==> Checking rust-observer container is running..."
+	@docker inspect --format='{{.State.Status}}' mc-rust-observer 2>/dev/null || echo "  rust-observer: NOT RUNNING"
+	@echo "==> Checking rust-relay container is running..."
+	@docker inspect --format='{{.State.Status}}' mc-rust-relay 2>/dev/null || echo "  rust-relay: NOT RUNNING"
+	@echo "==> Checking go-nonrelay REST..."
+	@curl -sf -H "X-Algo-API-Token: $(ALGOD_TOKEN)" http://localhost:4002/v2/status | python3 -c "import sys,json; s=json.load(sys.stdin); print('  go-nonrelay: round', s.get('last-round', '?'))" || echo "  go-nonrelay: NOT RESPONDING"
+	@echo "==> Smoke check complete."
+
+mixed-cluster-test: mixed-cluster-up ## Run full mixed-cluster conformance test
+	@echo "==> Waiting for cluster to produce blocks..."
+	@sleep 15
+	@echo "==> Running smoke check..."
+	$(MAKE) mixed-cluster-smoke
+	@echo "==> Running cargo integration tests..."
+	MIXED_CLUSTER=1 cargo test -p algo-network \
+		--test mixed_cluster_connectivity \
+		--test mixed_cluster_block_service \
+		-- --ignored --nocapture
+	@echo "==> Checking container logs for errors..."
+	@echo "--- rust-observer (last 20 lines) ---"
+	@docker logs mc-rust-observer --tail 20 2>&1 || true
+	@echo "--- rust-relay (last 20 lines) ---"
+	@docker logs mc-rust-relay --tail 20 2>&1 || true
+	@echo "--- go-nonrelay (last 20 lines) ---"
+	@docker logs mc-go-nonrelay --tail 20 2>&1 || true
+	@echo "==> Mixed cluster test complete."
+	$(MAKE) mixed-cluster-down
+
+mixed-cluster-conformance: mixed-cluster-up ## Run long-running conformance tests (1000+ rounds, ~10 min)
+	@echo "==> Waiting for cluster to produce blocks..."
+	@sleep 15
+	@echo "==> Running smoke check..."
+	$(MAKE) mixed-cluster-smoke
+	@echo "==> Running long-running conformance tests (this may take 10+ minutes)..."
+	MIXED_CLUSTER=1 cargo test -p algo-network \
+		--test mixed_cluster_conformance \
+		-- --ignored --nocapture
+	@echo "==> Checking container logs for errors..."
+	@echo "--- rust-observer (last 20 lines) ---"
+	@docker logs mc-rust-observer --tail 20 2>&1 || true
+	@echo "--- rust-relay (last 20 lines) ---"
+	@docker logs mc-rust-relay --tail 20 2>&1 || true
+	@echo "--- go-nonrelay (last 20 lines) ---"
+	@docker logs mc-go-nonrelay --tail 20 2>&1 || true
+	@echo "==> Mixed cluster conformance test complete."
+	$(MAKE) mixed-cluster-down
+
 ## ── Archival Node ───────────────────────────────────────────
 
 archival-up: ## Start archival Go node
@@ -304,6 +389,12 @@ help:
 	@echo "  make relay-up         Start test relay (gossip on :4161)"
 	@echo "  make relay-down       Stop test relay"
 	@echo "  make relay-test       Start relay + run integration tests + stop relay"
+	@echo ""
+	@echo "Mixed Cluster (Conformance):"
+	@echo "  make mixed-cluster-up     Start mixed cluster (Go relay + Rust + Go non-relay)"
+	@echo "  make mixed-cluster-down   Stop mixed cluster and remove volumes"
+	@echo "  make mixed-cluster-smoke  Quick connectivity check"
+	@echo "  make mixed-cluster-test   Full conformance test (up + smoke + logs + down)"
 	@echo ""
 	@echo "Archival Node:"
 	@echo "  make archival-up      Start archival Go node (docker)"
