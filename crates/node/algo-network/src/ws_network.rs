@@ -53,13 +53,13 @@ use crate::handshake::{check_protocol_version_match, VersionMatch, SUPPORTED_PRO
 use crate::health_service::health_router;
 use crate::mesh::{ConnectFn, MeshRequest, MeshThread, PeerCounter};
 use crate::message::OutgoingMessage;
-use crate::request_response::{encode_uvarint, hash_topics, RESPONSE_HASH_FIELD};
-use crate::topics::{Topic, Topics};
 use crate::message_filter::MessageFilter;
 use crate::peer_role::{ARCHIVAL_ROLE, RELAY_ROLE};
 use crate::phonebook::Phonebook;
+use crate::request_response::{encode_uvarint, hash_topics, RESPONSE_HASH_FIELD};
 use crate::request_tracker::ConnectionTracker;
 use crate::tag::Tag;
+use crate::topics::{Topic, Topics};
 use crate::ws_peer::PeerHandle;
 
 // ---------------------------------------------------------------------------
