@@ -5,6 +5,16 @@
 // Each version inherits from its predecessor and overrides specific fields,
 // exactly matching the Go initialisation chain.
 
+use std::time::Duration;
+
+// ── Global protocol parameters (not per-version) ──────────────────
+/// Min time to wait for leader's credential (time to propagate one credential).
+/// Matches go-algorand `Protocol.SmallLambda` = 2000ms.
+pub const SMALL_LAMBDA: Duration = Duration::from_millis(2000);
+/// Max time to wait for leader's proposal (time to propagate one block).
+/// Matches go-algorand `Protocol.BigLambda` = 15000ms.
+pub const BIG_LAMBDA: Duration = Duration::from_millis(15000);
+
 // ── Protocol version constants ──────────────────────────────────────
 // Mirrors go-algorand `protocol/consensus.go` at tag v4.5.1-stable.
 // Only versions v7+ are listed; v0–v6 are deprecated.
@@ -361,6 +371,65 @@ pub struct ConsensusParams {
     pub support_become_non_participating_transactions: bool,
     /// App versioning enabled (Go: `EnableAppVersioning`, v41+).
     pub enable_app_versioning: bool,
+
+    // ── Agreement / committee ──────────────────────────────────
+    /// Number of block proposers (Go: `NumProposers`).
+    pub num_proposers: u64,
+    /// Soft vote committee size (Go: `SoftCommitteeSize`).
+    pub soft_committee_size: u64,
+    /// Soft vote committee threshold (Go: `SoftCommitteeThreshold`).
+    pub soft_committee_threshold: u64,
+    /// Cert vote committee size (Go: `CertCommitteeSize`).
+    pub cert_committee_size: u64,
+    /// Cert vote committee threshold (Go: `CertCommitteeThreshold`).
+    pub cert_committee_threshold: u64,
+    /// Next step committee size (Go: `NextCommitteeSize`).
+    pub next_committee_size: u64,
+    /// Next step committee threshold (Go: `NextCommitteeThreshold`).
+    pub next_committee_threshold: u64,
+    /// Late step committee size (Go: `LateCommitteeSize`).
+    pub late_committee_size: u64,
+    /// Late step committee threshold (Go: `LateCommitteeThreshold`).
+    pub late_committee_threshold: u64,
+    /// Redo step committee size (Go: `RedoCommitteeSize`).
+    pub redo_committee_size: u64,
+    /// Redo step committee threshold (Go: `RedoCommitteeThreshold`).
+    pub redo_committee_threshold: u64,
+    /// Down step committee size (Go: `DownCommitteeSize`).
+    pub down_committee_size: u64,
+    /// Down step committee threshold (Go: `DownCommitteeThreshold`).
+    pub down_committee_threshold: u64,
+
+    // ── Agreement timeouts ─────────────────────────────────────
+    /// Filter timeout for period > 0 (Go: `AgreementFilterTimeout`).
+    /// Value should be 2 * SmallLambda.
+    pub agreement_filter_timeout: Duration,
+    /// Filter timeout for period 0 (Go: `AgreementFilterTimeoutPeriod0`).
+    pub agreement_filter_timeout_period0: Duration,
+    /// Deadline timeout for period 0 (Go: `AgreementDeadlineTimeoutPeriod0`).
+    /// Defaults to BigLambda + SmallLambda.
+    pub agreement_deadline_timeout_period0: Duration,
+    /// Time between fast recovery attempts (Go: `FastRecoveryLambda`).
+    pub fast_recovery_lambda: Duration,
+
+    // ── Seed / sortition ───────────────────────────────────────
+    /// How many blocks back we use seeds from in sortition, delta_s in the spec (Go: `SeedLookback`).
+    pub seed_lookback: u64,
+    /// How often an old block hash is mixed into the seed, delta_r in the spec (Go: `SeedRefreshInterval`).
+    pub seed_refresh_interval: u64,
+    /// Max balance lookback for sortition (Go: `MaxBalLookback`).
+    pub max_bal_lookback: u64,
+
+    // ── Key management ─────────────────────────────────────────
+    /// Granularity of top-level ephemeral keys (Go: `DefaultKeyDilution`).
+    pub default_key_dilution: u64,
+    /// Domain-separated credentials (Go: `CredentialDomainSeparationEnabled`, v16+).
+    pub credential_domain_separation_enabled: bool,
+
+    // ── Dynamic filter ─────────────────────────────────────────
+    /// Whether filter timeout is set dynamically based on credential arrival times
+    /// (Go: `DynamicFilterTimeout`, v39+).
+    pub dynamic_filter_timeout: bool,
 }
 
 /// Payset commit types matching go-algorand.
@@ -471,14 +540,57 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         payouts_challenge_bits: 0,
         support_become_non_participating_transactions: false,
         enable_app_versioning: false,
+        // Agreement / committee
+        num_proposers: 30,
+        soft_committee_size: 2500,
+        soft_committee_threshold: 1870,
+        cert_committee_size: 1000,
+        cert_committee_threshold: 720,
+        next_committee_size: 10000,
+        next_committee_threshold: 7750,
+        late_committee_size: 10000,
+        late_committee_threshold: 7750,
+        redo_committee_size: 10000,
+        redo_committee_threshold: 7750,
+        down_committee_size: 10000,
+        down_committee_threshold: 7750,
+        // Agreement timeouts
+        agreement_filter_timeout: Duration::from_secs(4),
+        agreement_filter_timeout_period0: Duration::from_secs(4),
+        // BigLambda (15s) + SmallLambda (2s) = 17s
+        agreement_deadline_timeout_period0: Duration::from_millis(17000),
+        fast_recovery_lambda: Duration::from_secs(300), // 5 minutes
+        // Seed / sortition
+        seed_lookback: 2,
+        seed_refresh_interval: 100,
+        max_bal_lookback: 320,
+        // Key management
+        default_key_dilution: 10000,
+        credential_domain_separation_enabled: false,
+        // Dynamic filter
+        dynamic_filter_timeout: false,
     };
     if version == CONSENSUS_V7 {
         return Some(v7);
     }
 
     // ── v8 ──────────────────────────────────────────────────────
-    let v8 = v7.clone();
-    // v8 only changes agreement/committee parameters which we don't model
+    let mut v8 = v7.clone();
+    // v8 uses parameters and a seed derivation policy from Georgios' new analysis
+    v8.seed_refresh_interval = 80;
+    v8.num_proposers = 9;
+    v8.soft_committee_size = 2990;
+    v8.soft_committee_threshold = 2267;
+    v8.cert_committee_size = 1500;
+    v8.cert_committee_threshold = 1112;
+    v8.next_committee_size = 5000;
+    v8.next_committee_threshold = 3838;
+    v8.late_committee_size = 5000;
+    v8.late_committee_threshold = 3838;
+    v8.redo_committee_size = 5000;
+    v8.redo_committee_threshold = 3838;
+    v8.down_committee_size = 5000;
+    v8.down_committee_threshold = 3838;
     if version == CONSENSUS_V8 {
         return Some(v8);
     }
@@ -491,8 +603,15 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     }
 
     // ── v10 ─────────────────────────────────────────────────────
-    let v10 = v9.clone();
-    // v10 only changes committee sizes (fast partition recovery)
+    let mut v10 = v9.clone();
+    // v10 introduces fast partition recovery (and also raises NumProposers)
+    v10.num_proposers = 20;
+    v10.late_committee_size = 500;
+    v10.late_committee_threshold = 320;
+    v10.redo_committee_size = 2400;
+    v10.redo_committee_threshold = 1768;
+    v10.down_committee_size = 6000;
+    v10.down_committee_threshold = 4560;
     if version == CONSENSUS_V10 {
         return Some(v10);
     }
@@ -533,6 +652,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
 
     // ── v16 ─────────────────────────────────────────────────────
     let mut v16 = v15.clone();
+    v16.credential_domain_separation_enabled = true;
     v16.require_genesis_hash = true;
     if version == CONSENSUS_V16 {
         return Some(v16);
@@ -714,6 +834,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v34.logic_sig_version = 7;
     v34.min_inner_appl_version = 4;
     v34.enable_sha256_txn_commitment_header = true;
+    v34.agreement_filter_timeout_period0 = Duration::from_millis(3400);
     if version == CONSENSUS_V34 {
         return Some(v34);
     }
@@ -746,6 +867,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     // ── v38 ─────────────────────────────────────────────────────
     let mut v38 = v37.clone();
     v38.logic_sig_version = 9;
+    v38.agreement_filter_timeout_period0 = Duration::from_millis(3000);
     if version == CONSENSUS_V38 {
         return Some(v38);
     }
@@ -754,6 +876,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     let mut v39 = v38.clone();
     v39.logic_sig_version = 10;
     v39.enable_logicsig_cost_pooling = true;
+    v39.agreement_deadline_timeout_period0 = Duration::from_secs(4);
+    v39.dynamic_filter_timeout = true;
     if version == CONSENSUS_V39 {
         return Some(v39);
     }
@@ -802,6 +926,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     if version == CONSENSUS_ALPHA1 {
         let mut alpha =
             consensus_params_for_version(CONSENSUS_V32).expect("V32 must be constructible");
+        alpha.agreement_filter_timeout_period0 = Duration::from_secs(2);
         alpha.max_txn_bytes_per_block = 5_000_000;
         return Some(alpha);
     }
@@ -810,6 +935,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     if version == CONSENSUS_ALPHA2 {
         let mut alpha =
             consensus_params_for_version(CONSENSUS_ALPHA1).expect("alpha1 must be constructible");
+        alpha.agreement_filter_timeout_period0 = Duration::from_millis(3500);
         alpha.max_txn_bytes_per_block = 5 * 1024 * 1024;
         return Some(alpha);
     }
@@ -1084,5 +1210,372 @@ mod tests {
         assert!(v28.fix_transaction_leases); // inherited
         assert!(v28.support_rekeying); // inherited
         assert!(v28.enable_fee_pooling); // new in v28
+    }
+
+    // ── Agreement / committee parameter regression tests ────────────
+    // Verify that agreement-related fields match go-algorand config/consensus.go
+    // at tag v4.5.1-stable for every version where they change.
+
+    #[test]
+    fn test_agreement_params_v7() {
+        let p = consensus_params_for_version(CONSENSUS_V7).unwrap();
+        // Committee sizes & thresholds
+        assert_eq!(p.num_proposers, 30);
+        assert_eq!(p.soft_committee_size, 2500);
+        assert_eq!(p.soft_committee_threshold, 1870);
+        assert_eq!(p.cert_committee_size, 1000);
+        assert_eq!(p.cert_committee_threshold, 720);
+        assert_eq!(p.next_committee_size, 10000);
+        assert_eq!(p.next_committee_threshold, 7750);
+        assert_eq!(p.late_committee_size, 10000);
+        assert_eq!(p.late_committee_threshold, 7750);
+        assert_eq!(p.redo_committee_size, 10000);
+        assert_eq!(p.redo_committee_threshold, 7750);
+        assert_eq!(p.down_committee_size, 10000);
+        assert_eq!(p.down_committee_threshold, 7750);
+        // Timeouts
+        assert_eq!(p.agreement_filter_timeout, Duration::from_secs(4));
+        assert_eq!(p.agreement_filter_timeout_period0, Duration::from_secs(4));
+        // BigLambda (15s) + SmallLambda (2s) = 17s
+        assert_eq!(
+            p.agreement_deadline_timeout_period0,
+            Duration::from_millis(17000)
+        );
+        assert_eq!(p.fast_recovery_lambda, Duration::from_secs(300));
+        // Seed / sortition
+        assert_eq!(p.seed_lookback, 2);
+        assert_eq!(p.seed_refresh_interval, 100);
+        assert_eq!(p.max_bal_lookback, 320);
+        // Key management
+        assert_eq!(p.default_key_dilution, 10000);
+        assert!(!p.credential_domain_separation_enabled);
+        // Dynamic filter
+        assert!(!p.dynamic_filter_timeout);
+    }
+
+    #[test]
+    fn test_agreement_params_v8() {
+        let p = consensus_params_for_version(CONSENSUS_V8).unwrap();
+        // v8: new analysis parameters from Georgios
+        assert_eq!(p.seed_refresh_interval, 80);
+        assert_eq!(p.num_proposers, 9);
+        assert_eq!(p.soft_committee_size, 2990);
+        assert_eq!(p.soft_committee_threshold, 2267);
+        assert_eq!(p.cert_committee_size, 1500);
+        assert_eq!(p.cert_committee_threshold, 1112);
+        assert_eq!(p.next_committee_size, 5000);
+        assert_eq!(p.next_committee_threshold, 3838);
+        assert_eq!(p.late_committee_size, 5000);
+        assert_eq!(p.late_committee_threshold, 3838);
+        assert_eq!(p.redo_committee_size, 5000);
+        assert_eq!(p.redo_committee_threshold, 3838);
+        assert_eq!(p.down_committee_size, 5000);
+        assert_eq!(p.down_committee_threshold, 3838);
+        // Unchanged from v7
+        assert_eq!(p.agreement_filter_timeout, Duration::from_secs(4));
+        assert_eq!(p.agreement_filter_timeout_period0, Duration::from_secs(4));
+        assert_eq!(
+            p.agreement_deadline_timeout_period0,
+            Duration::from_millis(17000)
+        );
+        assert_eq!(p.fast_recovery_lambda, Duration::from_secs(300));
+        assert_eq!(p.seed_lookback, 2);
+        assert_eq!(p.max_bal_lookback, 320);
+        assert_eq!(p.default_key_dilution, 10000);
+        assert!(!p.credential_domain_separation_enabled);
+        assert!(!p.dynamic_filter_timeout);
+    }
+
+    #[test]
+    fn test_agreement_params_v10() {
+        let p = consensus_params_for_version(CONSENSUS_V10).unwrap();
+        // v10: fast partition recovery + raised NumProposers
+        assert_eq!(p.num_proposers, 20);
+        assert_eq!(p.late_committee_size, 500);
+        assert_eq!(p.late_committee_threshold, 320);
+        assert_eq!(p.redo_committee_size, 2400);
+        assert_eq!(p.redo_committee_threshold, 1768);
+        assert_eq!(p.down_committee_size, 6000);
+        assert_eq!(p.down_committee_threshold, 4560);
+        // Inherited from v8 (unchanged)
+        assert_eq!(p.soft_committee_size, 2990);
+        assert_eq!(p.soft_committee_threshold, 2267);
+        assert_eq!(p.cert_committee_size, 1500);
+        assert_eq!(p.cert_committee_threshold, 1112);
+        assert_eq!(p.next_committee_size, 5000);
+        assert_eq!(p.next_committee_threshold, 3838);
+        assert_eq!(p.seed_refresh_interval, 80);
+    }
+
+    #[test]
+    fn test_agreement_params_v16() {
+        let p = consensus_params_for_version(CONSENSUS_V16).unwrap();
+        // v16: credential domain separation enabled
+        assert!(p.credential_domain_separation_enabled);
+        // Committee params inherited from v10 (through v11-v15)
+        assert_eq!(p.num_proposers, 20);
+        assert_eq!(p.soft_committee_size, 2990);
+        assert_eq!(p.cert_committee_size, 1500);
+        assert_eq!(p.late_committee_size, 500);
+        assert_eq!(p.redo_committee_size, 2400);
+        assert_eq!(p.down_committee_size, 6000);
+    }
+
+    #[test]
+    fn test_agreement_params_v34() {
+        let p = consensus_params_for_version(CONSENSUS_V34).unwrap();
+        // v34: filter timeout period0 changed to 3400ms
+        assert_eq!(
+            p.agreement_filter_timeout_period0,
+            Duration::from_millis(3400)
+        );
+        // Other timeouts unchanged
+        assert_eq!(p.agreement_filter_timeout, Duration::from_secs(4));
+        assert_eq!(
+            p.agreement_deadline_timeout_period0,
+            Duration::from_millis(17000)
+        );
+        assert_eq!(p.fast_recovery_lambda, Duration::from_secs(300));
+        assert!(!p.dynamic_filter_timeout);
+    }
+
+    #[test]
+    fn test_agreement_params_v38() {
+        let p = consensus_params_for_version(CONSENSUS_V38).unwrap();
+        // v38: filter timeout period0 changed to 3000ms
+        assert_eq!(
+            p.agreement_filter_timeout_period0,
+            Duration::from_millis(3000)
+        );
+        // Other timeouts still unchanged
+        assert_eq!(p.agreement_filter_timeout, Duration::from_secs(4));
+        assert_eq!(
+            p.agreement_deadline_timeout_period0,
+            Duration::from_millis(17000)
+        );
+        assert!(!p.dynamic_filter_timeout);
+    }
+
+    #[test]
+    fn test_agreement_params_v39() {
+        let p = consensus_params_for_version(CONSENSUS_V39).unwrap();
+        // v39: deadline timeout changed, dynamic filter enabled
+        assert_eq!(p.agreement_deadline_timeout_period0, Duration::from_secs(4));
+        assert!(p.dynamic_filter_timeout);
+        // Filter timeout period0 inherited from v38
+        assert_eq!(
+            p.agreement_filter_timeout_period0,
+            Duration::from_millis(3000)
+        );
+        assert_eq!(p.agreement_filter_timeout, Duration::from_secs(4));
+        assert_eq!(p.fast_recovery_lambda, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_agreement_params_v41_inherited() {
+        // v41 inherits all agreement params from v39 (through v40)
+        let p = consensus_params_for_version(CONSENSUS_V41).unwrap();
+        assert_eq!(p.num_proposers, 20);
+        assert_eq!(p.soft_committee_size, 2990);
+        assert_eq!(p.soft_committee_threshold, 2267);
+        assert_eq!(p.cert_committee_size, 1500);
+        assert_eq!(p.cert_committee_threshold, 1112);
+        assert_eq!(p.next_committee_size, 5000);
+        assert_eq!(p.next_committee_threshold, 3838);
+        assert_eq!(p.late_committee_size, 500);
+        assert_eq!(p.late_committee_threshold, 320);
+        assert_eq!(p.redo_committee_size, 2400);
+        assert_eq!(p.redo_committee_threshold, 1768);
+        assert_eq!(p.down_committee_size, 6000);
+        assert_eq!(p.down_committee_threshold, 4560);
+        assert_eq!(p.agreement_filter_timeout, Duration::from_secs(4));
+        assert_eq!(
+            p.agreement_filter_timeout_period0,
+            Duration::from_millis(3000)
+        );
+        assert_eq!(p.agreement_deadline_timeout_period0, Duration::from_secs(4));
+        assert_eq!(p.fast_recovery_lambda, Duration::from_secs(300));
+        assert_eq!(p.seed_lookback, 2);
+        assert_eq!(p.seed_refresh_interval, 80);
+        assert_eq!(p.max_bal_lookback, 320);
+        assert_eq!(p.default_key_dilution, 10000);
+        assert!(p.credential_domain_separation_enabled);
+        assert!(p.dynamic_filter_timeout);
+    }
+
+    #[test]
+    fn test_agreement_params_future_inherited() {
+        // future inherits all agreement params from v41
+        let p = consensus_params_for_version(CONSENSUS_FUTURE).unwrap();
+        let v41 = consensus_params_for_version(CONSENSUS_V41).unwrap();
+        assert_eq!(p.num_proposers, v41.num_proposers);
+        assert_eq!(p.soft_committee_size, v41.soft_committee_size);
+        assert_eq!(p.soft_committee_threshold, v41.soft_committee_threshold);
+        assert_eq!(p.cert_committee_size, v41.cert_committee_size);
+        assert_eq!(p.cert_committee_threshold, v41.cert_committee_threshold);
+        assert_eq!(p.next_committee_size, v41.next_committee_size);
+        assert_eq!(p.next_committee_threshold, v41.next_committee_threshold);
+        assert_eq!(p.late_committee_size, v41.late_committee_size);
+        assert_eq!(p.late_committee_threshold, v41.late_committee_threshold);
+        assert_eq!(p.redo_committee_size, v41.redo_committee_size);
+        assert_eq!(p.redo_committee_threshold, v41.redo_committee_threshold);
+        assert_eq!(p.down_committee_size, v41.down_committee_size);
+        assert_eq!(p.down_committee_threshold, v41.down_committee_threshold);
+        assert_eq!(p.agreement_filter_timeout, v41.agreement_filter_timeout);
+        assert_eq!(
+            p.agreement_filter_timeout_period0,
+            v41.agreement_filter_timeout_period0
+        );
+        assert_eq!(
+            p.agreement_deadline_timeout_period0,
+            v41.agreement_deadline_timeout_period0
+        );
+        assert_eq!(p.fast_recovery_lambda, v41.fast_recovery_lambda);
+        assert_eq!(p.seed_lookback, v41.seed_lookback);
+        assert_eq!(p.seed_refresh_interval, v41.seed_refresh_interval);
+        assert_eq!(p.max_bal_lookback, v41.max_bal_lookback);
+        assert_eq!(p.default_key_dilution, v41.default_key_dilution);
+        assert_eq!(
+            p.credential_domain_separation_enabled,
+            v41.credential_domain_separation_enabled
+        );
+        assert_eq!(p.dynamic_filter_timeout, v41.dynamic_filter_timeout);
+    }
+
+    #[test]
+    fn test_agreement_params_alpha1() {
+        let p = consensus_params_for_version(CONSENSUS_ALPHA1).unwrap();
+        // alpha1 inherits from v32, which inherits committee params from v10
+        assert_eq!(p.num_proposers, 20);
+        assert_eq!(p.soft_committee_size, 2990);
+        assert_eq!(p.cert_committee_size, 1500);
+        // alpha1 overrides AgreementFilterTimeoutPeriod0 to 2s
+        assert_eq!(p.agreement_filter_timeout_period0, Duration::from_secs(2));
+        // Other timeouts inherited from v32 (= v7 base values)
+        assert_eq!(p.agreement_filter_timeout, Duration::from_secs(4));
+        assert_eq!(
+            p.agreement_deadline_timeout_period0,
+            Duration::from_millis(17000)
+        );
+        assert!(!p.dynamic_filter_timeout);
+    }
+
+    #[test]
+    fn test_agreement_params_alpha2() {
+        let p = consensus_params_for_version(CONSENSUS_ALPHA2).unwrap();
+        // alpha2 inherits from alpha1 but overrides filter timeout period0
+        assert_eq!(
+            p.agreement_filter_timeout_period0,
+            Duration::from_millis(3500)
+        );
+        assert_eq!(p.agreement_filter_timeout, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn test_agreement_params_no_change_v9_through_v15() {
+        // v9 through v15: committee params should be same as v8/v10
+        // (v9 inherits v8 committee, v10 overrides some, v11-v15 inherit v10)
+        let v9 = consensus_params_for_version(CONSENSUS_V9).unwrap();
+        let v8 = consensus_params_for_version(CONSENSUS_V8).unwrap();
+        assert_eq!(v9.num_proposers, v8.num_proposers);
+        assert_eq!(v9.soft_committee_size, v8.soft_committee_size);
+        assert_eq!(v9.cert_committee_size, v8.cert_committee_size);
+        assert_eq!(v9.late_committee_size, v8.late_committee_size);
+
+        // v11-v15 inherit from v10
+        for &ver in &[
+            CONSENSUS_V11,
+            CONSENSUS_V12,
+            CONSENSUS_V13,
+            CONSENSUS_V14,
+            CONSENSUS_V15,
+        ] {
+            let p = consensus_params_for_version(ver).unwrap();
+            assert_eq!(p.num_proposers, 20, "v{ver} num_proposers");
+            assert_eq!(p.late_committee_size, 500, "v{ver} late_committee_size");
+            assert_eq!(p.redo_committee_size, 2400, "v{ver} redo_committee_size");
+            assert_eq!(p.down_committee_size, 6000, "v{ver} down_committee_size");
+            assert!(!p.credential_domain_separation_enabled);
+        }
+    }
+
+    #[test]
+    fn test_agreement_timeouts_stable_v16_to_v33() {
+        // From v16 to v33, agreement timeouts should remain unchanged from v7 base
+        for &ver in &[
+            CONSENSUS_V16,
+            CONSENSUS_V17,
+            CONSENSUS_V18,
+            CONSENSUS_V24,
+            CONSENSUS_V28,
+            CONSENSUS_V30,
+            CONSENSUS_V31,
+            CONSENSUS_V32,
+            CONSENSUS_V33,
+        ] {
+            let p = consensus_params_for_version(ver).unwrap();
+            assert_eq!(
+                p.agreement_filter_timeout,
+                Duration::from_secs(4),
+                "{ver} filter_timeout"
+            );
+            assert_eq!(
+                p.agreement_filter_timeout_period0,
+                Duration::from_secs(4),
+                "{ver} filter_timeout_period0"
+            );
+            assert_eq!(
+                p.agreement_deadline_timeout_period0,
+                Duration::from_millis(17000),
+                "{ver} deadline_timeout_period0"
+            );
+            assert_eq!(
+                p.fast_recovery_lambda,
+                Duration::from_secs(300),
+                "{ver} fast_recovery_lambda"
+            );
+            assert!(!p.dynamic_filter_timeout, "{ver} dynamic_filter_timeout");
+        }
+    }
+
+    #[test]
+    fn test_credential_domain_separation_versions() {
+        // Not enabled before v16
+        for &ver in &[
+            CONSENSUS_V7,
+            CONSENSUS_V8,
+            CONSENSUS_V9,
+            CONSENSUS_V10,
+            CONSENSUS_V11,
+            CONSENSUS_V12,
+            CONSENSUS_V13,
+            CONSENSUS_V14,
+            CONSENSUS_V15,
+        ] {
+            let p = consensus_params_for_version(ver).unwrap();
+            assert!(
+                !p.credential_domain_separation_enabled,
+                "{ver} should not have credential domain separation"
+            );
+        }
+        // Enabled from v16 onward
+        for &ver in &[
+            CONSENSUS_V16,
+            CONSENSUS_V17,
+            CONSENSUS_V18,
+            CONSENSUS_V24,
+            CONSENSUS_V28,
+            CONSENSUS_V34,
+            CONSENSUS_V38,
+            CONSENSUS_V39,
+            CONSENSUS_V40,
+            CONSENSUS_V41,
+        ] {
+            let p = consensus_params_for_version(ver).unwrap();
+            assert!(
+                p.credential_domain_separation_enabled,
+                "{ver} should have credential domain separation"
+            );
+        }
     }
 }
