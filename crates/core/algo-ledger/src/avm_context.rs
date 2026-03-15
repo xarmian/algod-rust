@@ -175,7 +175,8 @@ impl InnerTxnBuilder {
                 // Type (string)
                 15 => {
                     if let TealValue::Bytes(b) = value {
-                        txn.txn_type = algo_types::TxnType::from(String::from_utf8_lossy(b).into_owned());
+                        txn.txn_type =
+                            algo_types::TxnType::from(String::from_utf8_lossy(b).into_owned());
                     }
                 }
                 // TypeEnum

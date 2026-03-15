@@ -10,6 +10,7 @@ fuzzing = ["arbitrary"]
 [dependencies]
 algo-error.workspace = true
 serde.workspace = true
+rmp.workspace = true
 rmpv.workspace = true
 hex.workspace = true
 serde_bytes.workspace = true

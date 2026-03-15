@@ -29,6 +29,22 @@ pub fn decode_block(bytes: &[u8]) -> Result<Block> {
     })
 }
 
+/// Decode a Block using the fast rmp-direct path (no serde overhead).
+///
+/// This calls `Block::decode_from_bytes` which uses raw `rmp` decoding
+/// instead of going through serde, avoiding the serde derive machinery.
+pub fn decode_block_fast(bytes: &[u8]) -> Result<Block> {
+    Block::decode_from_bytes(bytes)
+}
+
+/// Decode a BlockResponse using the fast rmp-direct path (no serde overhead).
+///
+/// This calls `BlockResponse::decode_from_bytes` which uses raw `rmp` decoding
+/// instead of going through serde, avoiding the serde derive machinery.
+pub fn decode_block_response_fast(bytes: &[u8]) -> Result<BlockResponse> {
+    BlockResponse::decode_from_bytes(bytes)
+}
+
 /// Encode a block to msgpack bytes.
 ///
 /// Note: Phase 0 uses `rmp-serde` named encoding. This does NOT produce
