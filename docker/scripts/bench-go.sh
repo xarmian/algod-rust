@@ -133,7 +133,7 @@ TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 # ── Write JSON output ────────────────────────────────────────────────
 jq -n \
-    --arg scenario "block-replay" \
+    --arg scenario "replay" \
     --arg implementation "Go" \
     --argjson wall_clock "${ELAPSED}" \
     --argjson peak_rss "${PEAK_RSS}" \

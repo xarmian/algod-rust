@@ -210,6 +210,24 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
             }
+            BenchAction::Decode {
+                algod_url,
+                token,
+                start_round,
+                count,
+                output,
+                quick,
+            } => {
+                let effective_count = if quick { 100 } else { count };
+                commands::bench::run_decode(
+                    &algod_url,
+                    &token,
+                    start_round,
+                    effective_count,
+                    &output,
+                )
+                .await?;
+            }
             BenchAction::Compare {
                 rust_json,
                 go_json,

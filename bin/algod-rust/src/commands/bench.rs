@@ -59,6 +59,8 @@ pub async fn run_replay(
 
     let mut blocks_processed: u64 = 0;
     let mut total_txns: u64 = 0;
+    let mut validation_pass: u64 = 0;
+    let mut validation_fail: u64 = 0;
 
     for round in start_round..=end_round {
         // Fetch block.
@@ -83,7 +85,10 @@ pub async fn run_replay(
             &genesis_hash,
             raw_blobs_ref,
         );
-        if !result.is_valid {
+        if result.is_valid {
+            validation_pass += 1;
+        } else {
+            validation_fail += 1;
             warn!(
                 round,
                 errors = ?result.errors,
@@ -118,7 +123,7 @@ pub async fn run_replay(
     metrics.txns_per_sec = Some(txns_per_sec);
 
     let run = BenchRun {
-        scenario: "block-replay".to_string(),
+        scenario: "replay".to_string(),
         implementation: Implementation::Rust,
         metrics,
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -143,6 +148,111 @@ pub async fn run_replay(
 
     // Print terminal summary.
     println!("=== Bench Replay Summary ===");
+    println!("Scenario:     {}", run.scenario);
+    println!("Blocks:       {blocks_processed}");
+    println!("Transactions: {total_txns}");
+    println!("Validated:    {validation_pass} pass, {validation_fail} fail");
+    println!("Elapsed:      {:.1}s", run.metrics.wall_clock_secs);
+    println!("Blocks/sec:   {blocks_per_sec:.1}");
+    println!("Txns/sec:     {txns_per_sec:.1}");
+    println!(
+        "Peak RSS:     {}",
+        algo_bench::format_bytes(run.metrics.peak_rss_bytes)
+    );
+    println!("Avg CPU:      {:.1}%", run.metrics.avg_cpu_pct);
+    println!("Output:       {}", output.display());
+
+    Ok(())
+}
+
+/// Run a benchmark of pure msgpack decode throughput (no validation).
+pub async fn run_decode(
+    algod_url: &str,
+    algod_token: &str,
+    start_round: u64,
+    count: u64,
+    output: &Path,
+) -> anyhow::Result<()> {
+    if count == 0 {
+        anyhow::bail!("--count must be > 0");
+    }
+
+    let end_round = start_round + count - 1;
+
+    info!(
+        algod_url,
+        start_round, end_round, count, "starting bench decode"
+    );
+
+    let client = AlgodClient::new(algod_url, algod_token);
+
+    // Start metrics collection.
+    let collector = MetricsCollector::new();
+
+    let mut blocks_processed: u64 = 0;
+    let mut total_txns: u64 = 0;
+
+    for round in start_round..=end_round {
+        // Fetch block as raw msgpack bytes.
+        let raw = client.get_block_raw(Round(round)).await?;
+
+        // Decode block from msgpack — no validation.
+        let block_resp = algo_codec::decode_block_response(&raw)?;
+        let block = &block_resp.block;
+
+        // Count transactions.
+        total_txns += block.payset.len() as u64;
+
+        blocks_processed += 1;
+
+        // Progress logging every 10 blocks.
+        if blocks_processed % 10 == 0 || round == end_round {
+            info!("Block {round}/{end_round} ({blocks_processed}/{count} done)");
+        }
+    }
+
+    // Finish metrics collection.
+    let mut metrics = collector.finish();
+
+    let blocks_per_sec = if metrics.wall_clock_secs > 0.0 {
+        blocks_processed as f64 / metrics.wall_clock_secs
+    } else {
+        0.0
+    };
+    let txns_per_sec = if metrics.wall_clock_secs > 0.0 {
+        total_txns as f64 / metrics.wall_clock_secs
+    } else {
+        0.0
+    };
+    metrics.blocks_per_sec = Some(blocks_per_sec);
+    metrics.txns_per_sec = Some(txns_per_sec);
+
+    let run = BenchRun {
+        scenario: "decode".to_string(),
+        implementation: Implementation::Rust,
+        metrics,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        git_sha: algo_bench::metrics::git_sha(),
+        config: BenchConfig {
+            block_range: Some(format!("{}-{}", start_round, end_round)),
+            block_count: Some(count),
+            duration_secs: None,
+            custom: HashMap::new(),
+        },
+    };
+
+    // Save JSON output.
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    algo_bench::output::save_run(&run, output)
+        .map_err(|e| anyhow::anyhow!("failed to save bench run: {e}"))?;
+    info!(path = %output.display(), "benchmark results saved");
+
+    // Print terminal summary.
+    println!("=== Bench Decode Summary ===");
     println!("Scenario:     {}", run.scenario);
     println!("Blocks:       {blocks_processed}");
     println!("Transactions: {total_txns}");

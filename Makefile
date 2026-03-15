@@ -7,7 +7,7 @@ COMPOSE_MIXED := docker compose -f docker/docker-compose.mixed-cluster.yml
 .PHONY: build test fmt fmt-check clippy lint deny ci clean
 .PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful replay-mainnet-1k
 .PHONY: avm-replay avm-replay-mainnet
-.PHONY: bench-rust bench-go bench-micro bench-compare benchmark
+.PHONY: bench-rust bench-decode bench-go bench-micro bench-compare benchmark
 .PHONY: archival-up archival-down
 .PHONY: localnet-up localnet-down localnet-status localnet-logs
 .PHONY: capture validate validate-only generate-txns fixtures help
@@ -338,11 +338,17 @@ BENCH_START  ?= 40000000
 BENCH_COUNT  ?= 100
 BENCH_OUTPUT ?= bench-results
 
-bench-rust: ## Run Rust block replay benchmark
+bench-rust: ## Run Rust validated replay benchmark
 	@mkdir -p $(BENCH_OUTPUT)
 	cargo run --release --bin algod-rust -- bench replay \
 		--start-round $(BENCH_START) --count $(BENCH_COUNT) \
 		--output $(BENCH_OUTPUT)/bench-replay-rust.json
+
+bench-decode: ## Run Rust decode-only benchmark
+	@mkdir -p $(BENCH_OUTPUT)
+	cargo run --release --bin algod-rust -- bench decode \
+		--start-round $(BENCH_START) --count $(BENCH_COUNT) \
+		--output $(BENCH_OUTPUT)/bench-decode-rust.json
 
 bench-go: ## Run Go block replay benchmark
 	@mkdir -p $(BENCH_OUTPUT)
@@ -426,7 +432,8 @@ help:
 	@echo "  make mixed-cluster-test   Full conformance test (up + smoke + logs + down)"
 	@echo ""
 	@echo "Benchmarks:"
-	@echo "  make bench-rust       Run Rust block replay benchmark"
+	@echo "  make bench-rust       Run Rust validated replay benchmark"
+	@echo "  make bench-decode     Run Rust decode-only benchmark (no validation)"
 	@echo "  make bench-go         Run Go block replay benchmark"
 	@echo "  make bench-compare    Run both and compare side by side"
 	@echo "  make bench-micro      Run criterion microbenchmarks"

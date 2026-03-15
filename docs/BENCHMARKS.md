@@ -4,14 +4,18 @@ Performance comparison of algod-rust against go-algorand (v4.5.1-stable).
 
 ## Overview
 
-This benchmark suite measures two things:
+This benchmark suite measures three things:
 
-1. **Block replay throughput** -- how fast each implementation can fetch, decode, and validate mainnet blocks over REST. This is the primary Rust-vs-Go comparison.
-2. **Microbenchmarks** -- Criterion-based benchmarks for hot-path operations (codec, validation, AVM execution, ledger I/O). These track regressions within the Rust codebase.
+1. **Block decode throughput** (`bench decode`) -- how fast the Rust implementation can fetch and decode (msgpack to struct) mainnet blocks over REST, with no validation. Always runnable, useful for measuring pure serialization performance.
+2. **Block replay throughput** (`bench replay`) -- how fast each implementation can fetch, decode, and validate mainnet blocks over REST. This is the primary Rust-vs-Go comparison. Validation is properly chained: each block validates against its predecessor's timestamp, and genesis fields are extracted from the blocks themselves.
+3. **Microbenchmarks** -- Criterion-based benchmarks for hot-path operations (codec, validation, AVM execution, ledger I/O). These track regressions within the Rust codebase.
 
 ## Quick Start
 
 ```bash
+# Run decode-only benchmark (no validation, always works)
+make bench-decode
+
 # Run the full Rust-vs-Go comparison (fetches 100 mainnet blocks by default)
 make bench-compare
 
@@ -24,11 +28,20 @@ make benchmark
 
 ## Benchmark Scenarios
 
+### Decode Only (`make bench-decode`)
+
+Measures pure msgpack decode throughput. Fetches N blocks from a REST endpoint and decodes each from msgpack to the Rust `Block` struct. No validation is performed. This is useful for isolating serialization performance from validation overhead.
+
+```bash
+# Decode 100 blocks starting at round 40000000
+make bench-decode BENCH_START=40000000 BENCH_COUNT=100
+```
+
 ### Block Replay (`make bench-compare`)
 
 Replays a range of mainnet blocks through the full decode-and-validate pipeline. Both implementations fetch blocks from the same REST endpoint (default: Nodely public API) and process them sequentially.
 
-**Rust side** (`make bench-rust`): Runs `algod-rust bench replay`, which fetches each block via REST, decodes msgpack, extracts raw payset blobs, runs stateless validation (`algo_validate::validate_block`), and collects resource metrics via a background sampling thread (100ms interval using `sysinfo`).
+**Rust side** (`make bench-rust`): Runs `algod-rust bench replay`, which first fetches the block at `start_round - 1` to obtain the previous timestamp and genesis context. Then for each block in the range, it decodes msgpack, extracts raw payset blobs, runs stateless validation (`algo_validate::validate_block`) with proper chained context, and collects resource metrics via a background sampling thread (100ms interval using `sysinfo`). Validation pass/fail counts are reported in the summary.
 
 **Go side** (`make bench-go`): Runs `docker/scripts/bench-go.sh`, which fetches blocks via `curl` and measures wall-clock time and bytes downloaded. RSS and CPU are reported as 0 since they reflect `curl` overhead, not the Go node itself.
 

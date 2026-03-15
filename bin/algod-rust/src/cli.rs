@@ -445,6 +445,33 @@ pub enum BenchAction {
         quick: bool,
     },
 
+    /// Benchmark pure msgpack decode throughput (no validation).
+    Decode {
+        /// Base URL of the algod REST API.
+        #[arg(long, default_value = "http://mainnet-api.4160.nodely.dev")]
+        algod_url: String,
+
+        /// API token for the algod node.
+        #[arg(long, default_value = "")]
+        token: String,
+
+        /// First round to decode (required).
+        #[arg(long)]
+        start_round: u64,
+
+        /// Number of blocks to decode.
+        #[arg(long, default_value = "1000")]
+        count: u64,
+
+        /// JSON output file path.
+        #[arg(long, default_value = "bench-decode-rust.json")]
+        output: PathBuf,
+
+        /// Shorthand for --count 100.
+        #[arg(long)]
+        quick: bool,
+    },
+
     /// Compare Rust and Go benchmark results side by side.
     Compare {
         /// Path to the Rust benchmark JSON file.
