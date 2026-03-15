@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use algo_ledger::{SqliteLedger, LedgerStore};
+use algo_ledger::{LedgerStore, SqliteLedger};
 use algo_network::{
     BlockService, BlockServiceError, GossipNode, LedgerForBlockService, Phonebook,
     WebsocketNetwork, WebsocketNetworkConfig, RELAY_ROLE,
@@ -23,10 +23,13 @@ struct LedgerBlockService {
 
 impl LedgerForBlockService for LedgerBlockService {
     fn encoded_block_cert(&self, round: u64) -> Result<(Vec<u8>, Vec<u8>), BlockServiceError> {
-        let ledger = self.ledger.lock().map_err(|_| BlockServiceError::BlockNotAvailable {
-            round,
-            latest_round: None,
-        })?;
+        let ledger = self
+            .ledger
+            .lock()
+            .map_err(|_| BlockServiceError::BlockNotAvailable {
+                round,
+                latest_round: None,
+            })?;
         let latest = ledger.current_round().0;
 
         let block_data = ledger
@@ -52,10 +55,7 @@ impl LedgerForBlockService for LedgerBlockService {
     }
 
     fn latest_round(&self) -> u64 {
-        self.ledger
-            .lock()
-            .map(|l| l.current_round().0)
-            .unwrap_or(0)
+        self.ledger.lock().map(|l| l.current_round().0).unwrap_or(0)
     }
 }
 
@@ -141,8 +141,9 @@ pub async fn run(
     let net = Arc::new(WebsocketNetwork::new(config, phonebook));
 
     // Open the SQLite ledger and register the block service HTTP handler.
-    let sqlite_ledger = SqliteLedger::open(ledger_path)
-        .map_err(|e| anyhow::anyhow!("failed to open ledger at {}: {}", ledger_path.display(), e))?;
+    let sqlite_ledger = SqliteLedger::open(ledger_path).map_err(|e| {
+        anyhow::anyhow!("failed to open ledger at {}: {}", ledger_path.display(), e)
+    })?;
 
     let latest = sqlite_ledger.current_round().0;
     info!(path = %ledger_path.display(), latest_round = latest, "opened ledger database");

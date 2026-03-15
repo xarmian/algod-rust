@@ -7,3 +7,4 @@ docker/data/
 *.swo
 .DS_Store
 .env
+wire_fixtures/

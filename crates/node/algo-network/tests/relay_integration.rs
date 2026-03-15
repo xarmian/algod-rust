@@ -456,7 +456,7 @@ async fn block_service_http_endpoint() {
 /// forwarding handler is registered for AgreementVote. It will become
 /// meaningful once handler integration is wired up.
 #[tokio::test]
-#[ignore = "requires handler integration to be meaningful — currently accepts any outcome"]
+#[ignore = "requires mixed cluster for full relay forwarding verification"]
 async fn relay_forwards_messages() {
     init_tracing();
 

@@ -235,6 +235,22 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
+        Commands::CaptureWire {
+            relay_addr,
+            output_dir,
+            count,
+            duration,
+            genesis_id,
+        } => {
+            commands::capture_wire::run(
+                &relay_addr,
+                &output_dir,
+                count,
+                duration,
+                genesis_id.as_deref(),
+            )
+            .await?;
+        }
         Commands::Follow {
             algod_url,
             algod_token,

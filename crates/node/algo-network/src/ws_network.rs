@@ -638,8 +638,8 @@ impl WebsocketNetwork {
         let key_file = &mut std::io::BufReader::new(std::fs::File::open(&key_path)?);
 
         let certs: Vec<_> = rustls_pemfile::certs(cert_file).collect::<Result<_, _>>()?;
-        let key = rustls_pemfile::private_key(key_file)?
-            .ok_or("no private key found in TLS key file")?;
+        let key =
+            rustls_pemfile::private_key(key_file)?.ok_or("no private key found in TLS key file")?;
 
         let server_config = tokio_rustls::rustls::ServerConfig::builder()
             .with_no_client_auth()

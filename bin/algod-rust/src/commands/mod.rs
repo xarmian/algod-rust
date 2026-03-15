@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod capture_wire;
 pub mod catchpoint;
 pub mod catchpoint_sync;
 pub mod follow;
