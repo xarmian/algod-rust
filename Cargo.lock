@@ -144,6 +144,7 @@ version = "0.1.0"
 dependencies = [
  "algo-avm",
  "algo-codec",
+ "algo-consensus-crypto",
  "algo-error",
  "algo-types",
  "criterion",
