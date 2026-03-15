@@ -156,14 +156,12 @@ async fn test_high_message_volume() {
 
     let host_port = relay_host_port(&net);
 
-    // Tags to cycle through for message variety.  Use tags that have
-    // sufficiently large max_message_size for our payloads.
+    // Tags to cycle through for message variety.  Only use tags with
+    // max_message_size >= 10KB to accommodate our payload range (1-10KB).
     let tags = [
-        Tag::Transaction,
-        Tag::AgreementVote,
-        Tag::ProposalPayload,
-        Tag::VoteBundle,
-        Tag::StateProofSig,
+        Tag::Transaction,     // 5MB max
+        Tag::ProposalPayload, // ~5MB max
+        Tag::VoteBundle,      // 6MB max
     ];
 
     let total_messages_sent = Arc::new(AtomicU64::new(0));
@@ -323,12 +321,13 @@ async fn test_sustained_throughput() {
             let client_start = Instant::now();
 
             while client_start.elapsed() < sustained_duration {
-                // Use a moderate payload size (2KB-5KB) for sustained throughput.
-                let payload_size = 2048 + (msg_idx % 4) * 1024;
+                // Use a moderate payload size (1KB-4KB) for sustained throughput.
+                // Only use tags with large max_message_size to avoid encode errors.
+                let payload_size = 1024 + (msg_idx % 4) * 1024;
                 let tag = if msg_idx % 3 == 0 {
-                    Tag::AgreementVote
+                    Tag::ProposalPayload // ~5MB max
                 } else {
-                    Tag::Transaction
+                    Tag::Transaction // 5MB max
                 };
 
                 let payload = make_payload(payload_size, (client_id * 13 + msg_idx) as u8);
