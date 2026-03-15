@@ -136,11 +136,7 @@ impl CanonicalMap {
         }
     }
 
-    fn add_option_fixed_bytes<const N: usize>(
-        &mut self,
-        key: &'static str,
-        val: &Option<[u8; N]>,
-    ) {
+    fn add_option_fixed_bytes<const N: usize>(&mut self, key: &'static str, val: &Option<[u8; N]>) {
         if let Some(b) = val {
             if b.iter().any(|&x| x != 0) {
                 self.add_bytes(key, b);

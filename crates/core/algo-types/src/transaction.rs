@@ -1001,3 +1001,777 @@ pub struct ResourceRef {
     #[serde(rename = "b", default, skip_serializing_if = "Option::is_none")]
     pub box_ref: Option<BoxRef>,
 }
+
+// ════════════════════════════════════════════════════════════════
+// Standalone msgpack decoders (rmp-based, no serde overhead)
+// ════════════════════════════════════════════════════════════════
+
+use crate::rmp_decode;
+
+/// Type alias for decoder methods to avoid shadowing serde's Result usage.
+type DecodeResult<T> = algo_error::Result<T>;
+
+impl StateSchema {
+    /// Decode from a msgpack map using raw rmp.
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"nui" => s.num_uint = rmp_decode::read_u64(rd)?,
+                b"nbs" => s.num_byte_slice = rmp_decode::read_u64(rd)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    /// Decode from msgpack bytes.
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl BoxRef {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"i" => s.index = rmp_decode::read_u64(rd)?,
+                b"n" => s.name = rmp_decode::read_optional(rd, rmp_decode::read_bytes_as_bytebuf)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl AssetParams {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"t" => s.total = rmp_decode::read_u64(rd)?,
+                b"dc" => s.decimals = rmp_decode::read_u32(rd)?,
+                b"df" => s.default_frozen = rmp_decode::read_bool(rd)?,
+                b"un" => s.unit_name = rmp_decode::read_string(rd)?,
+                b"an" => s.asset_name = rmp_decode::read_string(rd)?,
+                b"au" => s.url = rmp_decode::read_string(rd)?,
+                b"am" => {
+                    s.metadata_hash =
+                        rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes::<32>)?
+                }
+                b"m" => s.manager = rmp_decode::read_optional(rd, rmp_decode::read_address)?,
+                b"r" => s.reserve = rmp_decode::read_optional(rd, rmp_decode::read_address)?,
+                b"f" => s.freeze = rmp_decode::read_optional(rd, rmp_decode::read_address)?,
+                b"c" => s.clawback = rmp_decode::read_optional(rd, rmp_decode::read_address)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl MultisigSubsig {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"pk" => s.public_key = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                b"s" => s.signature = rmp_decode::read_fixed_bytes::<64>(rd)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl MultisigSig {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        let mut has_version = false;
+        let mut has_threshold = false;
+        let mut has_subsig = false;
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"v" => {
+                    s.version = rmp_decode::read_u8_val(rd)?;
+                    has_version = true;
+                }
+                b"thr" => {
+                    s.threshold = rmp_decode::read_u8_val(rd)?;
+                    has_threshold = true;
+                }
+                b"subsig" => {
+                    s.subsigs = rmp_decode::read_vec(rd, MultisigSubsig::decode_from_reader)?;
+                    has_subsig = true;
+                }
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        if !has_version {
+            return Err(algo_error::AlgoError::Codec {
+                source: "missing required field 'v'".into(),
+                context: "rmp_decode".into(),
+            });
+        }
+        if !has_threshold {
+            return Err(algo_error::AlgoError::Codec {
+                source: "missing required field 'thr'".into(),
+                context: "rmp_decode".into(),
+            });
+        }
+        if !has_subsig {
+            return Err(algo_error::AlgoError::Codec {
+                source: "missing required field 'subsig'".into(),
+                context: "rmp_decode".into(),
+            });
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl LogicSig {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        let mut has_logic = false;
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"l" => {
+                    s.logic = rmp_decode::read_bytes_as_bytebuf(rd)?;
+                    has_logic = true;
+                }
+                b"sig" => s.sig = rmp_decode::read_fixed_bytes::<64>(rd)?,
+                b"msig" => s.msig = rmp_decode::read_optional(rd, MultisigSig::decode_from_reader)?,
+                b"arg" => {
+                    s.args = rmp_decode::read_optional_vec(rd, rmp_decode::read_bytes_as_bytebuf)?
+                }
+                b"lmsig" => {
+                    s.lmsig = rmp_decode::read_optional(rd, MultisigSig::decode_from_reader)?
+                }
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        if !has_logic {
+            return Err(algo_error::AlgoError::Codec {
+                source: "missing required field 'l'".into(),
+                context: "rmp_decode".into(),
+            });
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl HeartbeatProof {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"s" => s.sig = rmp_decode::read_fixed_bytes::<64>(rd)?,
+                b"p" => s.pk = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                b"p2" => s.pk2 = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                b"p1s" => s.pk1_sig = rmp_decode::read_fixed_bytes::<64>(rd)?,
+                b"p2s" => s.pk2_sig = rmp_decode::read_fixed_bytes::<64>(rd)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl HeartbeatTxnFields {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"a" => s.address = rmp_decode::read_address(rd)?,
+                b"prf" => {
+                    s.proof = rmp_decode::read_optional(rd, HeartbeatProof::decode_from_reader)?
+                }
+                b"sd" => s.seed = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                b"vid" => s.vote_id = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                b"kd" => s.key_dilution = rmp_decode::read_u64(rd)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl HashFactory {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"t" => s.hash_type = rmp_decode::read_u16(rd)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+/// Helper to read an optional ByteBuf that may be nil.
+fn read_optional_bytebuf(rd: &mut &[u8]) -> DecodeResult<Option<ByteBuf>> {
+    rmp_decode::read_optional(rd, rmp_decode::read_bytes_as_bytebuf)
+}
+
+impl MerkleProof {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"pth" => s.path = rmp_decode::read_optional_vec(rd, read_optional_bytebuf)?,
+                b"hsh" => {
+                    s.hash_factory = rmp_decode::read_optional(rd, HashFactory::decode_from_reader)?
+                }
+                b"td" => s.tree_depth = rmp_decode::read_u8_val(rd)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl FalconVerifier {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"k" => s.public_key = rmp_decode::read_bytes_as_bytebuf(rd)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl MerkleSignature {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"sig" => s.signature = rmp_decode::read_bytes_as_bytebuf(rd)?,
+                b"idx" => s.vector_commitment_index = rmp_decode::read_u64(rd)?,
+                b"prf" => s.proof = rmp_decode::read_optional(rd, MerkleProof::decode_from_reader)?,
+                b"vkey" => {
+                    s.verifying_key =
+                        rmp_decode::read_optional(rd, FalconVerifier::decode_from_reader)?
+                }
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl SigSlotCommit {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"s" => s.sig = rmp_decode::read_optional(rd, MerkleSignature::decode_from_reader)?,
+                b"l" => s.l = rmp_decode::read_u64(rd)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl MerkleSignatureVerifier {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"cmt" => s.commitment = rmp_decode::read_fixed_bytes::<64>(rd)?,
+                b"lf" => s.key_lifetime = rmp_decode::read_u64(rd)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl Participant {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"p" => {
+                    s.pk =
+                        rmp_decode::read_optional(rd, MerkleSignatureVerifier::decode_from_reader)?
+                }
+                b"w" => s.weight = rmp_decode::read_u64(rd)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl Reveal {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"s" => {
+                    s.sig_slot = rmp_decode::read_optional(rd, SigSlotCommit::decode_from_reader)?
+                }
+                b"p" => s.part = rmp_decode::read_optional(rd, Participant::decode_from_reader)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl StateProofBody {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"c" => s.sig_commit = rmp_decode::read_bytes_as_bytebuf(rd)?,
+                b"w" => s.signed_weight = rmp_decode::read_u64(rd)?,
+                b"S" => {
+                    s.sig_proofs = rmp_decode::read_optional(rd, MerkleProof::decode_from_reader)?
+                }
+                b"P" => {
+                    s.part_proofs = rmp_decode::read_optional(rd, MerkleProof::decode_from_reader)?
+                }
+                b"v" => s.merkle_signature_salt_version = rmp_decode::read_u8_val(rd)?,
+                b"r" => {
+                    if rmp_decode::try_read_nil(rd) {
+                        s.reveals = None;
+                    } else {
+                        s.reveals = Some(rmp_decode::read_u64_map(rd, Reveal::decode_from_reader)?);
+                    }
+                }
+                b"pr" => {
+                    s.positions_to_reveal = rmp_decode::read_optional_vec(rd, rmp_decode::read_u64)?
+                }
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl StateProofMessage {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"b" => s.block_headers_commitment = rmp_decode::read_bytes_as_bytebuf(rd)?,
+                b"v" => s.voters_commitment = rmp_decode::read_bytes_as_bytebuf(rd)?,
+                b"P" => s.ln_proven_weight = rmp_decode::read_u64(rd)?,
+                b"f" => s.first_attested_round = rmp_decode::read_u64(rd)?,
+                b"l" => s.last_attested_round = rmp_decode::read_u64(rd)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl HoldingRef {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"d" => s.address = rmp_decode::read_u64(rd)?,
+                b"s" => s.asset = rmp_decode::read_u64(rd)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl LocalsRef {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"d" => s.address = rmp_decode::read_u64(rd)?,
+                b"p" => s.app = rmp_decode::read_u64(rd)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl ResourceRef {
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        for _ in 0..len {
+            match rmp_decode::read_key_bytes(rd)? {
+                b"d" => s.address = rmp_decode::read_address(rd)?,
+                b"s" => s.asset = rmp_decode::read_u64(rd)?,
+                b"p" => s.app = rmp_decode::read_u64(rd)?,
+                b"h" => s.holding = rmp_decode::read_optional(rd, HoldingRef::decode_from_reader)?,
+                b"l" => s.locals = rmp_decode::read_optional(rd, LocalsRef::decode_from_reader)?,
+                b"b" => s.box_ref = rmp_decode::read_optional(rd, BoxRef::decode_from_reader)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(s)
+    }
+
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+// ── Transaction decoder ────────────────────────────────────────
+
+impl Transaction {
+    /// Decode a Transaction from a msgpack map using raw rmp.
+    ///
+    /// Uses two-level key dispatch: (key_len, first_byte) for O(1) routing
+    /// instead of linear byte-slice comparison across all 49 fields.
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut t = Self::default();
+        let mut has_type = false;
+        let mut has_snd = false;
+        for _ in 0..len {
+            let key = rmp_decode::read_key_bytes(rd)?;
+            match (key.len(), key.first().copied().unwrap_or(0)) {
+                // ── 2-byte keys ──────────────────────────────────
+                (2, b'a') if key == b"al" => {
+                    t.access = rmp_decode::read_optional_vec(rd, ResourceRef::decode_from_reader)?
+                }
+                (2, b'f') if key == b"fv" => t.first_valid = Round(rmp_decode::read_u64(rd)?),
+                (2, b'g') if key == b"gh" => {
+                    t.genesis_hash = rmp_decode::read_fixed_bytes::<32>(rd)?
+                }
+                (2, b'h') if key == b"hb" => {
+                    t.heartbeat =
+                        rmp_decode::read_optional(rd, HeartbeatTxnFields::decode_from_reader)?
+                }
+                (2, b'l') if key == b"lv" => t.last_valid = Round(rmp_decode::read_u64(rd)?),
+                (2, b'l') if key == b"lx" => t.lease = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                (2, b's') if key == b"sp" => {
+                    t.state_proof =
+                        rmp_decode::read_optional(rd, StateProofBody::decode_from_reader)?
+                }
+                // ── 3-byte keys ──────────────────────────────────
+                (3, b'a') if key == b"amt" => t.amount = rmp_decode::read_u64(rd)?,
+                (3, b'f') if key == b"fee" => t.fee = rmp_decode::read_u64(rd)?,
+                (3, b'g') if key == b"gen" => t.genesis_id = rmp_decode::read_string(rd)?,
+                (3, b'g') if key == b"grp" => t.group = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                (3, b'r') if key == b"rcv" => t.receiver = rmp_decode::read_address(rd)?,
+                (3, b's') if key == b"snd" => {
+                    t.sender = rmp_decode::read_address(rd)?;
+                    has_snd = true;
+                }
+                // ── 4-byte keys ──────────────────────────────────
+                (4, b'a') => match key {
+                    b"aamt" => t.asset_amount = rmp_decode::read_u64(rd)?,
+                    b"afrz" => t.asset_frozen = rmp_decode::read_bool(rd)?,
+                    b"apaa" => {
+                        t.app_arguments = rmp_decode::read_optional_vec(rd, read_optional_bytebuf)?
+                    }
+                    b"apan" => t.on_completion = rmp_decode::read_u64(rd)?,
+                    b"apap" => {
+                        t.approval_program =
+                            rmp_decode::read_optional(rd, rmp_decode::read_bytes_as_bytebuf)?
+                    }
+                    b"apar" => {
+                        t.asset_params =
+                            rmp_decode::read_optional(rd, AssetParams::decode_from_reader)?
+                    }
+                    b"apas" => {
+                        t.foreign_assets = rmp_decode::read_optional_vec(rd, rmp_decode::read_u64)?
+                    }
+                    b"apat" => {
+                        t.accounts = rmp_decode::read_optional_vec(rd, rmp_decode::read_address)?
+                    }
+                    b"apbx" => {
+                        t.boxes = rmp_decode::read_optional_vec(rd, BoxRef::decode_from_reader)?
+                    }
+                    b"apep" => t.extra_program_pages = rmp_decode::read_u32(rd)?,
+                    b"apfa" => {
+                        t.foreign_apps = rmp_decode::read_optional_vec(rd, rmp_decode::read_u64)?
+                    }
+                    b"apgs" => {
+                        t.global_state_schema =
+                            rmp_decode::read_optional(rd, StateSchema::decode_from_reader)?
+                    }
+                    b"apid" => t.application_id = rmp_decode::read_u64(rd)?,
+                    b"apls" => {
+                        t.local_state_schema =
+                            rmp_decode::read_optional(rd, StateSchema::decode_from_reader)?
+                    }
+                    b"aprv" => t.reject_version = rmp_decode::read_u64(rd)?,
+                    b"apsu" => {
+                        t.clear_state_program =
+                            rmp_decode::read_optional(rd, rmp_decode::read_bytes_as_bytebuf)?
+                    }
+                    b"arcv" => {
+                        t.asset_receiver = rmp_decode::read_optional(rd, rmp_decode::read_address)?
+                    }
+                    b"asnd" => {
+                        t.asset_sender = rmp_decode::read_optional(rd, rmp_decode::read_address)?
+                    }
+                    _ => rmp_decode::skip_value(rd)?,
+                },
+                (4, b'c') if key == b"caid" => t.config_asset = rmp_decode::read_u64(rd)?,
+                (4, b'f') if key == b"fadd" => {
+                    t.freeze_account = rmp_decode::read_optional(rd, rmp_decode::read_address)?
+                }
+                (4, b'f') if key == b"faid" => t.freeze_asset = rmp_decode::read_u64(rd)?,
+                (4, b'n') if key == b"note" => t.note = rmp_decode::read_bytes_as_bytebuf(rd)?,
+                (4, b't') if key == b"type" => {
+                    t.txn_type = TxnType::from(rmp_decode::read_string(rd)?);
+                    has_type = true;
+                }
+                (4, b'x') if key == b"xaid" => t.xaid = rmp_decode::read_u64(rd)?,
+                // ── 5-byte keys ──────────────────────────────────
+                (5, b'c') if key == b"close" => {
+                    t.close_remainder_to = rmp_decode::read_address(rd)?
+                }
+                (5, b'r') if key == b"rekey" => {
+                    t.rekey_to = rmp_decode::read_optional(rd, rmp_decode::read_address)?
+                }
+                (5, b's') if key == b"spmsg" => {
+                    t.state_proof_message =
+                        rmp_decode::read_optional(rd, StateProofMessage::decode_from_reader)?
+                }
+                // ── 6-byte keys ──────────────────────────────────
+                (6, b'a') if key == b"aclose" => {
+                    t.asset_close_to = rmp_decode::read_optional(rd, rmp_decode::read_address)?
+                }
+                (6, b's') if key == b"selkey" => {
+                    t.selection_pk =
+                        rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes::<32>)?
+                }
+                (6, b's') if key == b"sptype" => t.state_proof_type = rmp_decode::read_u64(rd)?,
+                (6, b'v') if key == b"votekd" => t.vote_key_dilution = rmp_decode::read_u64(rd)?,
+                // ── 7-byte keys ──────────────────────────────────
+                (7, b'n') if key == b"nonpart" => t.non_participation = rmp_decode::read_bool(rd)?,
+                (7, b's') if key == b"sprfkey" => {
+                    t.state_proof_pk =
+                        rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes::<64>)?
+                }
+                (7, b'v') => match key {
+                    b"votefst" => t.vote_first = rmp_decode::read_u64(rd)?,
+                    b"votekey" => {
+                        t.vote_pk =
+                            rmp_decode::read_optional(rd, rmp_decode::read_fixed_bytes::<32>)?
+                    }
+                    b"votelst" => t.vote_last = rmp_decode::read_u64(rd)?,
+                    _ => rmp_decode::skip_value(rd)?,
+                },
+                // Unknown fields are skipped
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        // The serde path requires `type` and `snd` (no #[serde(default)]), so validate here.
+        if !has_type {
+            return Err(algo_error::AlgoError::Codec {
+                source: "missing required field 'type'".into(),
+                context: "rmp_decode".into(),
+            });
+        }
+        if !has_snd {
+            return Err(algo_error::AlgoError::Codec {
+                source: "missing required field 'snd'".into(),
+                context: "rmp_decode".into(),
+            });
+        }
+        Ok(t)
+    }
+
+    /// Decode a Transaction from msgpack bytes.
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+// ── SignedTransaction decoder ──────────────────────────────────
+
+impl SignedTransaction {
+    /// Decode a SignedTransaction (SignedTxnInBlock) from a msgpack map using raw rmp.
+    ///
+    /// Uses two-level key dispatch: (key_len, first_byte) for fast routing.
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut s = Self::default();
+        let mut has_txn = false;
+        for _ in 0..len {
+            let key = rmp_decode::read_key_bytes(rd)?;
+            match (key.len(), key.first().copied().unwrap_or(0)) {
+                (2, b'c') if key == b"ca" => s.closing_amount = rmp_decode::read_u64(rd)?,
+                (2, b'd') if key == b"dt" => s.eval_delta = rmp_decode::read_optional_rmpv(rd)?,
+                (2, b'r') => match key {
+                    b"rs" => s.sender_rewards = rmp_decode::read_u64(rd)?,
+                    b"rr" => s.receiver_rewards = rmp_decode::read_u64(rd)?,
+                    b"rc" => s.close_rewards = rmp_decode::read_u64(rd)?,
+                    _ => rmp_decode::skip_value(rd)?,
+                },
+                (3, b'a') if key == b"aca" => s.asset_closing_amount = rmp_decode::read_u64(rd)?,
+                (3, b'h') => match key {
+                    b"hgi" => s.has_genesis_id = rmp_decode::read_bool(rd)?,
+                    b"hgh" => s.has_genesis_hash = rmp_decode::read_bool(rd)?,
+                    _ => rmp_decode::skip_value(rd)?,
+                },
+                (3, b's') if key == b"sig" => s.sig = rmp_decode::read_fixed_bytes::<64>(rd)?,
+                (3, b't') if key == b"txn" => {
+                    s.txn = Transaction::decode_from_reader(rd)?;
+                    has_txn = true;
+                }
+                (4, b'a') if key == b"apid" => {
+                    s.apply_data_application_id = rmp_decode::read_u64(rd)?
+                }
+                (4, b'c') if key == b"caid" => {
+                    s.apply_data_config_asset = rmp_decode::read_u64(rd)?
+                }
+                (4, b'l') if key == b"lsig" => {
+                    s.lsig = rmp_decode::read_optional(rd, LogicSig::decode_from_reader)?
+                }
+                (4, b'm') if key == b"msig" => {
+                    s.msig = rmp_decode::read_optional(rd, MultisigSig::decode_from_reader)?
+                }
+                (4, b's') if key == b"sgnr" => {
+                    s.auth_addr = rmp_decode::read_optional(rd, rmp_decode::read_address)?
+                }
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        // The serde path requires `txn` (no #[serde(default)]), so validate here.
+        if !has_txn {
+            return Err(algo_error::AlgoError::Codec {
+                source: "SignedTransaction: missing required 'txn' field".into(),
+                context: "rmp_decode".into(),
+            });
+        }
+        Ok(s)
+    }
+
+    /// Decode a SignedTransaction from msgpack bytes.
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}

@@ -1,7 +1,8 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use algo_codec::{
-    compute_block_digest, compute_txn_id, decode_block, decode_block_response, encode_block,
+    compute_block_digest, compute_txn_id, decode_block, decode_block_fast, decode_block_response,
+    decode_block_response_fast, encode_block,
 };
 
 /// Load a block-response fixture (msgpack bytes captured from go-algorand).
@@ -14,44 +15,68 @@ fn fixture_bytes(name: &str) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark: decode a BlockResponse from raw msgpack
+// A/B Comparison: decode BlockResponse (serde vs fast path)
 // ---------------------------------------------------------------------------
-fn bench_decode_block_response(c: &mut Criterion) {
-    let bytes = fixture_bytes("block_1.msgpack");
+fn bench_decode_block_response_ab(c: &mut Criterion) {
+    let fixtures: &[(&str, &str)] = &[
+        ("block_1.msgpack", "block 1 (pay)"),
+        ("block_6.msgpack", "block 6 (appl)"),
+        ("block_8.msgpack", "block 8 (keyreg)"),
+    ];
 
-    c.bench_function("decode_block_response (block 1, pay)", |b| {
-        b.iter(|| {
-            let _ = decode_block_response(black_box(&bytes)).unwrap();
-        });
-    });
+    let mut group = c.benchmark_group("decode_block_response");
+    for &(file, label) in fixtures {
+        let bytes = fixture_bytes(file);
 
-    // Also bench a more complex fixture (appl-create) if available
-    let bytes_appl = fixture_bytes("block_6.msgpack");
-    c.bench_function("decode_block_response (block 6, appl)", |b| {
-        b.iter(|| {
-            let _ = decode_block_response(black_box(&bytes_appl)).unwrap();
+        group.bench_with_input(BenchmarkId::new("serde", label), &bytes, |b, data| {
+            b.iter(|| {
+                let _ = decode_block_response(black_box(data)).unwrap();
+            });
         });
-    });
+
+        group.bench_with_input(BenchmarkId::new("fast", label), &bytes, |b, data| {
+            b.iter(|| {
+                let _ = decode_block_response_fast(black_box(data)).unwrap();
+            });
+        });
+    }
+    group.finish();
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark: decode a Block (without the BlockResponse wrapper)
+// A/B Comparison: decode Block (serde vs fast path)
 // ---------------------------------------------------------------------------
-fn bench_decode_block(c: &mut Criterion) {
-    // First decode the response to get the block, re-encode it as a standalone block
-    let response_bytes = fixture_bytes("block_1.msgpack");
-    let br = decode_block_response(&response_bytes).unwrap();
-    let block_bytes = encode_block(&br.block).unwrap();
+fn bench_decode_block_ab(c: &mut Criterion) {
+    let fixtures: &[(&str, &str)] = &[
+        ("block_1.msgpack", "block 1 (pay)"),
+        ("block_6.msgpack", "block 6 (appl)"),
+        ("block_8.msgpack", "block 8 (keyreg)"),
+    ];
 
-    c.bench_function("decode_block (block 1, pay)", |b| {
-        b.iter(|| {
-            let _ = decode_block(black_box(&block_bytes)).unwrap();
+    let mut group = c.benchmark_group("decode_block");
+    for &(file, label) in fixtures {
+        // Decode the response with serde to get a standalone block, then re-encode it
+        let response_bytes = fixture_bytes(file);
+        let br = decode_block_response(&response_bytes).unwrap();
+        let block_bytes = encode_block(&br.block).unwrap();
+
+        group.bench_with_input(BenchmarkId::new("serde", label), &block_bytes, |b, data| {
+            b.iter(|| {
+                let _ = decode_block(black_box(data)).unwrap();
+            });
         });
-    });
+
+        group.bench_with_input(BenchmarkId::new("fast", label), &block_bytes, |b, data| {
+            b.iter(|| {
+                let _ = decode_block_fast(black_box(data)).unwrap();
+            });
+        });
+    }
+    group.finish();
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark: encode a Block to msgpack
+// Benchmark: encode a Block to msgpack (unchanged — no fast path yet)
 // ---------------------------------------------------------------------------
 fn bench_encode_block(c: &mut Criterion) {
     let response_bytes = fixture_bytes("block_1.msgpack");
@@ -154,14 +179,58 @@ fn bench_extract_raw_payset(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// A/B Comparison: full pipeline decode all fixtures (serde vs fast)
+// ---------------------------------------------------------------------------
+fn bench_decode_all_fixtures(c: &mut Criterion) {
+    let fixtures: &[(&str, &str)] = &[
+        ("block_1.msgpack", "pay"),
+        ("block_2.msgpack", "acfg"),
+        ("block_3.msgpack", "axfer"),
+        ("block_4.msgpack", "axfer-clawback"),
+        ("block_5.msgpack", "afrz"),
+        ("block_6.msgpack", "appl-create"),
+        ("block_7.msgpack", "appl-call"),
+        ("block_8.msgpack", "keyreg"),
+        ("block_9.msgpack", "pay-2"),
+    ];
+
+    // Pre-load all fixture bytes
+    let all_bytes: Vec<(&str, Vec<u8>)> = fixtures
+        .iter()
+        .map(|&(file, label)| (label, fixture_bytes(file)))
+        .collect();
+
+    let mut group = c.benchmark_group("decode_all_responses");
+
+    group.bench_function("serde", |b| {
+        b.iter(|| {
+            for (_, data) in &all_bytes {
+                let _ = decode_block_response(black_box(data)).unwrap();
+            }
+        });
+    });
+
+    group.bench_function("fast", |b| {
+        b.iter(|| {
+            for (_, data) in &all_bytes {
+                let _ = decode_block_response_fast(black_box(data)).unwrap();
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
-    bench_decode_block_response,
-    bench_decode_block,
+    bench_decode_block_response_ab,
+    bench_decode_block_ab,
     bench_encode_block,
     bench_round_trip,
     bench_block_digest,
     bench_txn_id,
     bench_extract_raw_payset,
+    bench_decode_all_fixtures,
 );
 criterion_main!(benches);

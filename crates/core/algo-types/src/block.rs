@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::serde_bytes_array::{is_zero_32, is_zero_64, serde_bytes_32, serde_bytes_64, zeros_64};
-use crate::{Address, Round, SignedTransaction};
+use crate::{rmp_decode, Address, Round, SignedTransaction};
 
 /// An Algorand block as returned by the REST API.
 ///
@@ -219,4 +219,208 @@ fn is_zero_u64(v: &u64) -> bool {
 
 fn is_false(v: &bool) -> bool {
     !v
+}
+
+impl Default for Block {
+    fn default() -> Self {
+        Self {
+            round: Round::default(),
+            branch: [0u8; 32],
+            seed: [0u8; 32],
+            txn_commitment: [0u8; 32],
+            timestamp: 0,
+            genesis_id: String::new(),
+            genesis_hash: [0u8; 32],
+            proposer: Address::default(),
+            fee_sink: Address::default(),
+            rewards_pool: Address::default(),
+            rewards_level: 0,
+            rewards_rate: 0,
+            rewards_residue: 0,
+            rewards_recalculation_round: Round::default(),
+            current_protocol: String::new(),
+            next_protocol: String::new(),
+            next_protocol_approvals: 0,
+            next_protocol_switch_on: Round::default(),
+            next_protocol_vote_before: Round::default(),
+            txn_counter: 0,
+            fees_collected: 0,
+            bonus: 0,
+            proposer_payout: 0,
+            prev512: [0u8; 64],
+            txn256: [0u8; 32],
+            txn512: [0u8; 64],
+            state_proof_tracking: None,
+            upgrade_propose: String::new(),
+            upgrade_delay: 0,
+            upgrade_approve: false,
+            expired_participation_accounts: None,
+            absent_participation_accounts: None,
+            payset: Vec::new(),
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// Standalone msgpack decoders (rmp-based, no serde overhead)
+// ════════════════════════════════════════════════════════════════
+
+/// Type alias for decoder methods to avoid shadowing serde's Result usage.
+type DecodeResult<T> = algo_error::Result<T>;
+
+impl Block {
+    /// Decode a Block from a msgpack map using raw rmp.
+    ///
+    /// Block is a flat struct containing all BlockHeader fields plus a `txns` payset.
+    /// Uses two-level key dispatch: (key_len, first_byte) for fast routing.
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut b = Self::default();
+        let mut has_rnd = false;
+        for _ in 0..len {
+            let key = rmp_decode::read_key_bytes(rd)?;
+            match (key.len(), key.first().copied().unwrap_or(0)) {
+                // ── 2-byte keys ──────────────────────────────────
+                (2, b'b') if key == b"bi" => b.bonus = rmp_decode::read_u64(rd)?,
+                (2, b'f') if key == b"fc" => b.fees_collected = rmp_decode::read_u64(rd)?,
+                (2, b'g') if key == b"gh" => {
+                    b.genesis_hash = rmp_decode::read_fixed_bytes::<32>(rd)?
+                }
+                (2, b'p') if key == b"pp" => b.proposer_payout = rmp_decode::read_u64(rd)?,
+                (2, b't') => match key {
+                    b"tc" => b.txn_counter = rmp_decode::read_u64(rd)?,
+                    b"ts" => b.timestamp = rmp_decode::read_i64(rd)?,
+                    _ => rmp_decode::skip_value(rd)?,
+                },
+                // ── 3-byte keys ──────────────────────────────────
+                (3, b'g') if key == b"gen" => b.genesis_id = rmp_decode::read_string(rd)?,
+                (3, b'p') if key == b"prp" => b.proposer = rmp_decode::read_address(rd)?,
+                (3, b'r') => match key {
+                    b"rnd" => {
+                        b.round = Round(rmp_decode::read_u64(rd)?);
+                        has_rnd = true;
+                    }
+                    b"rwd" => b.rewards_pool = rmp_decode::read_address(rd)?,
+                    _ => rmp_decode::skip_value(rd)?,
+                },
+                (3, b's') if key == b"spt" => {
+                    b.state_proof_tracking = rmp_decode::read_optional_rmpv(rd)?
+                }
+                (3, b't') if key == b"txn" => {
+                    b.txn_commitment = rmp_decode::read_fixed_bytes::<32>(rd)?
+                }
+                // ── 4-byte keys ──────────────────────────────────
+                (4, b'e') if key == b"earn" => b.rewards_level = rmp_decode::read_u64(rd)?,
+                (4, b'f') => match key {
+                    b"fees" => b.fee_sink = rmp_decode::read_address(rd)?,
+                    b"frac" => b.rewards_residue = rmp_decode::read_u64(rd)?,
+                    _ => rmp_decode::skip_value(rd)?,
+                },
+                (4, b'p') if key == b"prev" => b.branch = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                (4, b'r') if key == b"rate" => b.rewards_rate = rmp_decode::read_u64(rd)?,
+                (4, b's') if key == b"seed" => b.seed = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                (4, b't') if key == b"txns" => {
+                    b.payset = rmp_decode::read_vec(rd, SignedTransaction::decode_from_reader)?
+                }
+                // ── 5-byte keys ──────────────────────────────────
+                (5, b'p') if key == b"proto" => b.current_protocol = rmp_decode::read_string(rd)?,
+                // ── 6-byte keys ──────────────────────────────────
+                (6, b'r') if key == b"rwcalr" => {
+                    b.rewards_recalculation_round = Round(rmp_decode::read_u64(rd)?)
+                }
+                (6, b't') => match key {
+                    b"txn256" => b.txn256 = rmp_decode::read_fixed_bytes::<32>(rd)?,
+                    b"txn512" => b.txn512 = rmp_decode::read_fixed_bytes::<64>(rd)?,
+                    _ => rmp_decode::skip_value(rd)?,
+                },
+                // ── 7-byte keys ──────────────────────────────────
+                (7, b'n') => match key {
+                    b"nextyes" => b.next_protocol_approvals = rmp_decode::read_u64(rd)?,
+                    _ => rmp_decode::skip_value(rd)?,
+                },
+                (7, b'p') if key == b"prev512" => {
+                    b.prev512 = rmp_decode::read_fixed_bytes::<64>(rd)?
+                }
+                // ── 9-byte keys ──────────────────────────────────
+                (9, b'n') => match key {
+                    b"nextproto" => b.next_protocol = rmp_decode::read_string(rd)?,
+                    _ => rmp_decode::skip_value(rd)?,
+                },
+                // ── 10-byte keys ─────────────────────────────────
+                (10, b'n') => match key {
+                    b"nextswitch" => b.next_protocol_switch_on = Round(rmp_decode::read_u64(rd)?),
+                    b"nextbefore" => b.next_protocol_vote_before = Round(rmp_decode::read_u64(rd)?),
+                    _ => rmp_decode::skip_value(rd)?,
+                },
+                (10, b'p') => match key {
+                    b"partupdrmv" => {
+                        b.expired_participation_accounts =
+                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address)?
+                    }
+                    b"partupdabs" => {
+                        b.absent_participation_accounts =
+                            rmp_decode::read_optional_vec(rd, rmp_decode::read_address)?
+                    }
+                    _ => rmp_decode::skip_value(rd)?,
+                },
+                // ── upgrade* keys (10-12 bytes) ──────────────────
+                (_, b'u') => match key {
+                    b"upgradeprop" => b.upgrade_propose = rmp_decode::read_string(rd)?,
+                    b"upgradedelay" => b.upgrade_delay = rmp_decode::read_u64(rd)?,
+                    b"upgradeyes" => b.upgrade_approve = rmp_decode::read_bool(rd)?,
+                    _ => rmp_decode::skip_value(rd)?,
+                },
+                // Unknown fields are skipped
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        // The serde path requires `rnd` (no #[serde(default)]), so validate here.
+        if !has_rnd {
+            return Err(algo_error::AlgoError::Codec {
+                source: "Block: missing required 'rnd' field".into(),
+                context: "rmp_decode".into(),
+            });
+        }
+        Ok(b)
+    }
+
+    /// Decode a Block from msgpack bytes.
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
+}
+
+impl BlockResponse {
+    /// Decode a BlockResponse from a msgpack map using raw rmp.
+    ///
+    /// The REST API wraps the block in a `{"block": ..., "cert": ...}` envelope.
+    /// The `cert` field is skipped (not parsed into rmpv::Value) since we don't
+    /// use certificate data in the fast decode path.
+    pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
+        let len = rmp_decode::read_map_len(rd)?;
+        let mut block = None;
+        let mut cert = None;
+        for _ in 0..len {
+            let key = rmp_decode::read_key_bytes(rd)?;
+            match (key.len(), key.first().copied().unwrap_or(0)) {
+                (5, b'b') if key == b"block" => block = Some(Block::decode_from_reader(rd)?),
+                (4, b'c') if key == b"cert" => cert = rmp_decode::read_optional_rmpv(rd)?,
+                _ => rmp_decode::skip_value(rd)?,
+            }
+        }
+        Ok(BlockResponse {
+            block: block.ok_or_else(|| algo_error::AlgoError::Codec {
+                source: "BlockResponse: missing 'block' field".into(),
+                context: "rmp_decode".into(),
+            })?,
+            cert,
+        })
+    }
+
+    /// Decode a BlockResponse from msgpack bytes.
+    pub fn decode_from_bytes(data: &[u8]) -> DecodeResult<Self> {
+        let mut rd = data;
+        Self::decode_from_reader(&mut rd)
+    }
 }

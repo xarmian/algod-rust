@@ -599,7 +599,8 @@ pub fn validate_genesis_consistency(
                 ),
             });
         }
-        if stx.txn.genesis_hash != [0u8; 32] && stx.txn.genesis_hash.as_ref() != block_genesis_hash {
+        if stx.txn.genesis_hash != [0u8; 32] && stx.txn.genesis_hash.as_ref() != block_genesis_hash
+        {
             return Err(AlgoError::Validation {
                 message: format!(
                     "txn {} genesis hash mismatch: txn has {}, block has {}",

@@ -4,6 +4,7 @@ mod block;
 pub mod consensus;
 mod digest;
 mod header;
+pub(crate) mod rmp_decode;
 mod round;
 pub mod serde_bytes_array;
 mod transaction;

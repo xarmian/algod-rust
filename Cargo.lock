@@ -220,6 +220,7 @@ dependencies = [
  "arbitrary",
  "data-encoding",
  "hex",
+ "rmp",
  "rmpv",
  "serde",
  "serde_bytes",
