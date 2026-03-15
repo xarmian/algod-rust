@@ -53,6 +53,8 @@ use crate::handshake::{check_protocol_version_match, VersionMatch, SUPPORTED_PRO
 use crate::health_service::health_router;
 use crate::mesh::{ConnectFn, MeshRequest, MeshThread, PeerCounter};
 use crate::message::OutgoingMessage;
+use crate::request_response::{encode_uvarint, hash_topics, RESPONSE_HASH_FIELD};
+use crate::topics::{Topic, Topics};
 use crate::message_filter::MessageFilter;
 use crate::peer_role::{ARCHIVAL_ROLE, RELAY_ROLE};
 use crate::phonebook::Phonebook;
@@ -390,6 +392,10 @@ impl WebsocketNetwork {
         // Take the incoming receiver before storing the handle.
         let incoming_rx = handle.take_incoming();
 
+        // Clone the peer sender before moving the handle — needed for
+        // sending Respond messages back (e.g. UniEnsBlockReq responses).
+        let peer_sender = handle.sender();
+
         // Store the peer entry.
         {
             let mut peers = self.peers.write().await;
@@ -423,11 +429,14 @@ impl WebsocketNetwork {
                             match msg {
                                 Some(incoming) => {
                                     let tag = incoming.tag;
+                                    // Save request data for Respond (hash_topics
+                                    // needs the original payload).
+                                    let request_data = incoming.data.clone();
                                     // Only clone data and sender when relay mode is
                                     // active (broadcast_handle is Some), avoiding the
                                     // allocation on non-relay nodes.
                                     let relay_data = if broadcast_handle.is_some() {
-                                        Some((incoming.data.clone(), incoming.sender.clone()))
+                                        Some((request_data.clone(), incoming.sender.clone()))
                                     } else {
                                         None
                                     };
@@ -447,6 +456,34 @@ impl WebsocketNetwork {
                                                 }
                                             }
                                         }
+                                        ForwardingPolicy::Respond => {
+                                            // Build TopicMsgResp matching Go's
+                                            // wsPeer.Respond(): hash the original
+                                            // request, append RequestHash topic,
+                                            // serialize, and send back to the peer.
+                                            let request_hash = hash_topics(&request_data);
+                                            let request_hash_data = encode_uvarint(request_hash);
+                                            let mut response_topics =
+                                                out.topics.unwrap_or_else(Topics::new);
+                                            response_topics.0.push(Topic::new(
+                                                RESPONSE_HASH_FIELD,
+                                                request_hash_data,
+                                            ));
+                                            let serialized = response_topics.marshal();
+                                            let resp_msg = OutgoingMessage {
+                                                action: ForwardingPolicy::Respond,
+                                                tag: Tag::TopicMsgResp,
+                                                payload: serialized,
+                                                topics: None,
+                                            };
+                                            if let Err(e) = peer_sender.send_priority(resp_msg) {
+                                                tracing::debug!(
+                                                    addr = %peer_addr,
+                                                    error = %e,
+                                                    "failed to send Respond message"
+                                                );
+                                            }
+                                        }
                                         ForwardingPolicy::Disconnect => {
                                             tracing::info!(addr = %peer_addr, "handler requested disconnect");
                                             let mut guard = peers.write().await;
@@ -455,7 +492,7 @@ impl WebsocketNetwork {
                                             }
                                             break;
                                         }
-                                        _ => { /* Ignore, Respond, Accept — no relay action */ }
+                                        _ => { /* Ignore, Accept — no relay action */ }
                                     }
                                 }
                                 None => {
