@@ -376,7 +376,8 @@ impl ParticipationStore {
     ) -> Result<Vec<ParticipationRecord>, rusqlite::Error> {
         let sql = format!(
             "{SELECT_RECORDS} WHERE k.firstValidRound <= ?1 AND k.lastValidRound >= ?1
-             AND (r.effectiveFirstRound IS NULL OR r.effectiveFirstRound = 0 OR r.effectiveFirstRound <= ?2)"
+             AND (r.effectiveFirstRound IS NULL OR r.effectiveFirstRound = 0 OR r.effectiveFirstRound <= ?2)
+             AND (r.effectiveLastRound IS NULL OR r.effectiveLastRound = 0 OR r.effectiveLastRound >= ?1)"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(
@@ -796,6 +797,39 @@ mod tests {
         // voting_round=180, key_round=140 — p1 does NOT qualify (effective_first=150 > 140).
         let keys = store.get_for_voting_round(Round(180), Round(140)).unwrap();
         assert_eq!(keys.len(), 0);
+    }
+
+    #[test]
+    fn get_for_voting_round_excludes_deactivated_keys() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        // Two keys for the same account (same address).
+        let p1 = make_test_participation(1, 100, 300, 10);
+        let p2 = Participation {
+            parent: Address([1u8; 32]),
+            vrf: VrfKeypair::from_seed([2u8; 32]),
+            voting: algo_consensus_crypto::OneTimeSignatureSecrets::generate(0, 10),
+            first_valid: Round(200),
+            last_valid: Round(400),
+            key_dilution: 10,
+            state_proof_secrets: None,
+        };
+        let id1 = store.insert(&p1).unwrap();
+        let id2 = store.insert(&p2).unwrap();
+
+        // Register key A at round 150.
+        store.register(&id1, Round(150)).unwrap();
+        // Register key B at round 200 — deactivates key A (effectiveLast = 199).
+        store.register(&id2, Round(200)).unwrap();
+
+        // Round 250: key A is deactivated (effectiveLast=199), only key B should appear.
+        let keys = store.get_for_voting_round(Round(250), Round(250)).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].participation_id, id2);
+
+        // Round 180: key A is still active (effectiveLast=199), key B not yet effective.
+        let keys = store.get_for_voting_round(Round(180), Round(180)).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].participation_id, id1);
     }
 
     #[test]
