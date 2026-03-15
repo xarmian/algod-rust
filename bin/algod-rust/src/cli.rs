@@ -334,6 +334,12 @@ pub enum Commands {
         genesis_id: Option<String>,
     },
 
+    /// Benchmark tools for measuring decode + validate throughput.
+    Bench {
+        #[command(subcommand)]
+        action: BenchAction,
+    },
+
     /// Follow mode: continuously validate new blocks as they arrive.
     Follow {
         /// Base URL of the algod REST API.
@@ -407,5 +413,50 @@ pub enum CatchpointAction {
         /// Output file path.
         #[arg(long)]
         output: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BenchAction {
+    /// Benchmark mainnet block replay (decode + validate throughput).
+    Replay {
+        /// Base URL of the algod REST API.
+        #[arg(long, default_value = "http://mainnet-api.4160.nodely.dev")]
+        algod_url: String,
+
+        /// API token for the algod node.
+        #[arg(long, default_value = "")]
+        token: String,
+
+        /// First round to replay (required).
+        #[arg(long)]
+        start_round: u64,
+
+        /// Number of blocks to replay.
+        #[arg(long, default_value = "1000")]
+        count: u64,
+
+        /// JSON output file path.
+        #[arg(long, default_value = "bench-replay-rust.json")]
+        output: PathBuf,
+
+        /// Shorthand for --count 100.
+        #[arg(long)]
+        quick: bool,
+    },
+
+    /// Compare Rust and Go benchmark results side by side.
+    Compare {
+        /// Path to the Rust benchmark JSON file.
+        #[arg(long)]
+        rust_json: PathBuf,
+
+        /// Path to the Go benchmark JSON file.
+        #[arg(long)]
+        go_json: PathBuf,
+
+        /// Output as markdown instead of terminal table.
+        #[arg(long)]
+        markdown: bool,
     },
 }

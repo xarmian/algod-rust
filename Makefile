@@ -7,6 +7,7 @@ COMPOSE_MIXED := docker compose -f docker/docker-compose.mixed-cluster.yml
 .PHONY: build test fmt fmt-check clippy lint deny ci clean
 .PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful replay-mainnet-1k
 .PHONY: avm-replay avm-replay-mainnet
+.PHONY: bench-rust bench-go bench-micro bench-compare benchmark
 .PHONY: archival-up archival-down
 .PHONY: localnet-up localnet-down localnet-status localnet-logs
 .PHONY: capture validate validate-only generate-txns fixtures help
@@ -332,6 +333,34 @@ mixed-cluster-conformance: mixed-cluster-up ## Run long-running conformance test
 	@echo "==> Mixed cluster conformance test complete."
 	$(MAKE) mixed-cluster-down
 
+## ── Benchmarks ─────────────────────────────────────────────
+BENCH_START  ?= 40000000
+BENCH_COUNT  ?= 100
+BENCH_OUTPUT ?= bench-results
+
+bench-rust: ## Run Rust block replay benchmark
+	@mkdir -p $(BENCH_OUTPUT)
+	cargo run --release --bin algod-rust -- bench replay \
+		--start-round $(BENCH_START) --count $(BENCH_COUNT) \
+		--output $(BENCH_OUTPUT)/bench-replay-rust.json
+
+bench-go: ## Run Go block replay benchmark
+	@mkdir -p $(BENCH_OUTPUT)
+	bash docker/scripts/bench-go.sh \
+		--start-round $(BENCH_START) --count $(BENCH_COUNT) \
+		--output $(BENCH_OUTPUT)/bench-replay-go.json
+
+bench-micro: ## Run criterion microbenchmarks
+	cargo bench --workspace
+
+bench-compare: bench-rust bench-go ## Run both and compare
+	cargo run --release --bin algod-rust -- bench compare \
+		--rust-json $(BENCH_OUTPUT)/bench-replay-rust.json \
+		--go-json $(BENCH_OUTPUT)/bench-replay-go.json
+
+benchmark: bench-compare bench-micro ## Full benchmark suite
+	@echo "Benchmark complete. Results in $(BENCH_OUTPUT)/"
+
 ## ── Archival Node ───────────────────────────────────────────
 
 archival-up: ## Start archival Go node
@@ -395,6 +424,14 @@ help:
 	@echo "  make mixed-cluster-down   Stop mixed cluster and remove volumes"
 	@echo "  make mixed-cluster-smoke  Quick connectivity check"
 	@echo "  make mixed-cluster-test   Full conformance test (up + smoke + logs + down)"
+	@echo ""
+	@echo "Benchmarks:"
+	@echo "  make bench-rust       Run Rust block replay benchmark"
+	@echo "  make bench-go         Run Go block replay benchmark"
+	@echo "  make bench-compare    Run both and compare side by side"
+	@echo "  make bench-micro      Run criterion microbenchmarks"
+	@echo "  make benchmark        Full benchmark suite (compare + micro)"
+	@echo "                        (BENCH_START=$(BENCH_START), BENCH_COUNT=$(BENCH_COUNT))"
 	@echo ""
 	@echo "Archival Node:"
 	@echo "  make archival-up      Start archival Go node (docker)"

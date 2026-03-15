@@ -4,7 +4,7 @@ mod commands;
 use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use cli::{CatchpointAction, Cli, Commands};
+use cli::{BenchAction, CatchpointAction, Cli, Commands};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -189,6 +189,33 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 commands::catchpoint::run_download(&url, &token, &genesis_id, round, &output)
                     .await?;
+            }
+        },
+        Commands::Bench { action } => match action {
+            BenchAction::Replay {
+                algod_url,
+                token,
+                start_round,
+                count,
+                output,
+                quick,
+            } => {
+                let effective_count = if quick { 100 } else { count };
+                commands::bench::run_replay(
+                    &algod_url,
+                    &token,
+                    start_round,
+                    effective_count,
+                    &output,
+                )
+                .await?;
+            }
+            BenchAction::Compare {
+                rust_json,
+                go_json,
+                markdown,
+            } => {
+                commands::bench::run_compare(&rust_json, &go_json, markdown)?;
             }
         },
         Commands::Relay {

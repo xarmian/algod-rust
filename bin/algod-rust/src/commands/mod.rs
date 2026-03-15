@@ -1,3 +1,4 @@
+pub mod bench;
 pub mod capture;
 pub mod capture_wire;
 pub mod catchpoint;
