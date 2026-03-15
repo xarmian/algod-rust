@@ -1,7 +1,5 @@
 //! Integration tests for apply.rs — covers edge cases NOT in the inline unit tests.
 
-use serde_bytes::ByteBuf;
-
 use algo_ledger::{apply_block, apply_transaction, ApplyContext, LedgerState};
 use algo_types::{AccountStatus, Address, AssetParams, Block, Round, SignedTransaction, TealValue};
 
@@ -21,7 +19,7 @@ fn make_state(balances: &[(Address, u64)], fee_sink: Address) -> LedgerState {
 
 fn pay_txn(sender: Address, receiver: Address, amount: u64, fee: u64) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "pay".to_string();
+    stx.txn.txn_type = "pay".into();
     stx.txn.sender = sender;
     stx.txn.receiver = receiver;
     stx.txn.amount = amount;
@@ -32,12 +30,12 @@ fn pay_txn(sender: Address, receiver: Address, amount: u64, fee: u64) -> SignedT
 fn minimal_block(fee_sink: Address, round: u64, payset: Vec<SignedTransaction>) -> Block {
     Block {
         round: Round(round),
-        branch: ByteBuf::from(vec![]),
-        seed: ByteBuf::from(vec![]),
-        txn_commitment: ByteBuf::from(vec![]),
+        branch: [0u8; 32],
+        seed: [0u8; 32],
+        txn_commitment: [0u8; 32],
         timestamp: 0,
         genesis_id: String::new(),
-        genesis_hash: ByteBuf::from(vec![]),
+        genesis_hash: [0u8; 32],
         proposer: Address::ZERO,
         fee_sink,
         rewards_pool: Address::ZERO,
@@ -54,9 +52,9 @@ fn minimal_block(fee_sink: Address, round: u64, payset: Vec<SignedTransaction>) 
         fees_collected: 0,
         bonus: 0,
         proposer_payout: 0,
-        prev512: ByteBuf::from(vec![]),
-        txn256: ByteBuf::from(vec![]),
-        txn512: ByteBuf::from(vec![]),
+        prev512: [0u8; 64],
+        txn256: [0u8; 32],
+        txn512: [0u8; 64],
         state_proof_tracking: None,
         upgrade_propose: String::new(),
         upgrade_delay: 0,
@@ -226,7 +224,7 @@ fn test_stpf_zero_fee_no_error() {
     let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "stpf".to_string();
+    stx.txn.txn_type = "stpf".into();
     stx.txn.sender = sender;
     stx.txn.fee = 0;
 
@@ -246,7 +244,7 @@ fn test_stpf_nonzero_fee_still_noop() {
     let ctx = ApplyContext::new_replay(0, fee_sink, 1);
 
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "stpf".to_string();
+    stx.txn.txn_type = "stpf".into();
     stx.txn.sender = sender;
     stx.txn.fee = 5_000;
 
@@ -274,7 +272,7 @@ fn test_rekey_on_acfg_txn() {
     // Set txn_counter so txn_counter + 1 == 42.
     ctx.txn_counter.set(41);
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "acfg".to_string();
+    stx.txn.txn_type = "acfg".into();
     stx.txn.sender = sender;
     stx.txn.fee = 1_000;
     stx.txn.rekey_to = Some(auth);
@@ -300,7 +298,7 @@ fn test_rekey_clear_on_non_pay() {
 
     // Rekey back to self on a keyreg txn.
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "keyreg".to_string();
+    stx.txn.txn_type = "keyreg".into();
     stx.txn.sender = sender;
     stx.txn.fee = 1_000;
     stx.txn.rekey_to = Some(sender);
@@ -344,7 +342,7 @@ fn test_close_with_opted_in_apps_fails() {
 
 fn acfg_create_txn(sender: Address, fee: u64, params: AssetParams) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "acfg".to_string();
+    stx.txn.txn_type = "acfg".into();
     stx.txn.sender = sender;
     stx.txn.fee = fee;
     stx.txn.config_asset = 0;
@@ -354,7 +352,7 @@ fn acfg_create_txn(sender: Address, fee: u64, params: AssetParams) -> SignedTran
 
 fn axfer_optin_txn(sender: Address, fee: u64, asset_id: u64) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "axfer".to_string();
+    stx.txn.txn_type = "axfer".into();
     stx.txn.sender = sender;
     stx.txn.fee = fee;
     stx.txn.xaid = asset_id;
@@ -371,7 +369,7 @@ fn axfer_transfer_txn(
     asset_id: u64,
 ) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "axfer".to_string();
+    stx.txn.txn_type = "axfer".into();
     stx.txn.sender = sender;
     stx.txn.fee = fee;
     stx.txn.xaid = asset_id;
@@ -388,7 +386,7 @@ fn afrz_txn(
     fee: u64,
 ) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "afrz".to_string();
+    stx.txn.txn_type = "afrz".into();
     stx.txn.sender = sender;
     stx.txn.fee = fee;
     stx.txn.freeze_asset = asset_id;
@@ -406,7 +404,7 @@ fn axfer_close_txn(
     asset_id: u64,
 ) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "axfer".to_string();
+    stx.txn.txn_type = "axfer".into();
     stx.txn.sender = sender;
     stx.txn.fee = fee;
     stx.txn.xaid = asset_id;
@@ -423,7 +421,7 @@ fn appl_create_txn(
     on_completion: u64,
 ) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "appl".to_string();
+    stx.txn.txn_type = "appl".into();
     stx.txn.sender = sender;
     stx.txn.fee = fee;
     stx.txn.application_id = 0;
@@ -436,7 +434,7 @@ fn appl_create_txn(
 
 fn appl_optin_txn(sender: Address, fee: u64, app_id: u64) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "appl".to_string();
+    stx.txn.txn_type = "appl".into();
     stx.txn.sender = sender;
     stx.txn.fee = fee;
     stx.txn.application_id = app_id;
@@ -533,7 +531,7 @@ fn test_asset_full_lifecycle() {
 
     // Block 6: Destroy asset.
     let mut destroy_stx = SignedTransaction::default();
-    destroy_stx.txn.txn_type = "acfg".to_string();
+    destroy_stx.txn.txn_type = "acfg".into();
     destroy_stx.txn.sender = creator;
     destroy_stx.txn.fee = 1_000;
     destroy_stx.txn.config_asset = asset_id;
@@ -599,7 +597,7 @@ fn test_min_balance_tracks_assets() {
 
     // Destroy asset.
     let mut destroy = SignedTransaction::default();
-    destroy.txn.txn_type = "acfg".to_string();
+    destroy.txn.txn_type = "acfg".into();
     destroy.txn.sender = creator;
     destroy.txn.fee = 1_000;
     destroy.txn.config_asset = 42;
@@ -677,7 +675,7 @@ fn test_eval_delta_global_state() {
 
     // App call (NoOp) with global delta setting a uint key.
     let mut call = SignedTransaction::default();
-    call.txn.txn_type = "appl".to_string();
+    call.txn.txn_type = "appl".into();
     call.txn.sender = creator;
     call.txn.fee = 1_000;
     call.txn.application_id = app_id;
@@ -733,7 +731,7 @@ fn test_eval_delta_inner_txns() {
 
     // Build an inner payment txn as rmpv::Value (msgpack-encoded SignedTransaction).
     let mut inner_pay = SignedTransaction::default();
-    inner_pay.txn.txn_type = "pay".to_string();
+    inner_pay.txn.txn_type = "pay".into();
     inner_pay.txn.sender = creator;
     inner_pay.txn.receiver = receiver;
     inner_pay.txn.amount = 100_000;
@@ -744,7 +742,7 @@ fn test_eval_delta_inner_txns() {
 
     // App call with inner txn in eval_delta.
     let mut call = SignedTransaction::default();
-    call.txn.txn_type = "appl".to_string();
+    call.txn.txn_type = "appl".into();
     call.txn.sender = creator;
     call.txn.fee = 1_000;
     call.txn.application_id = app_id;
@@ -771,12 +769,12 @@ fn test_eval_delta_inner_txns() {
 
 fn keyreg_online_txn(sender: Address, fee: u64) -> SignedTransaction {
     let mut stx = SignedTransaction::default();
-    stx.txn.txn_type = "keyreg".to_string();
+    stx.txn.txn_type = "keyreg".into();
     stx.txn.sender = sender;
     stx.txn.fee = fee;
-    stx.txn.vote_pk = Some(ByteBuf::from(vec![0xAA; 32]));
-    stx.txn.selection_pk = Some(ByteBuf::from(vec![0xBB; 32]));
-    stx.txn.state_proof_pk = Some(ByteBuf::from(vec![0xCC; 64]));
+    stx.txn.vote_pk = Some([0xAA; 32]);
+    stx.txn.selection_pk = Some([0xBB; 32]);
+    stx.txn.state_proof_pk = Some([0xCC; 64]);
     // vote_first <= round+1 and vote_last > round to pass keyreg coherency checks.
     stx.txn.vote_first = 1;
     stx.txn.vote_last = 300;
@@ -822,18 +820,18 @@ fn test_lease_across_blocks() {
         fee_sink,
     );
 
-    let lease_val = ByteBuf::from(vec![0xDD; 32]);
+    let lease_val: [u8; 32] = [0xDD; 32];
 
     // Block 1 at round 1: txn with lease, last_valid = round + 5 = 6.
     let mut stx1 = pay_txn(sender, receiver, 1_000, 1_000);
-    stx1.txn.lease = lease_val.clone();
+    stx1.txn.lease = lease_val;
     stx1.txn.last_valid = Round(6);
     let block1 = minimal_block(fee_sink, 1, vec![stx1]);
     apply_block(&mut state, &block1).unwrap();
 
     // Block 2 at round 2: same sender, same lease — should be rejected.
     let mut stx2 = pay_txn(sender, receiver, 1_000, 1_000);
-    stx2.txn.lease = lease_val.clone();
+    stx2.txn.lease = lease_val;
     stx2.txn.last_valid = Round(7);
     let block2 = minimal_block(fee_sink, 2, vec![stx2]);
     let result = apply_block(&mut state, &block2);
@@ -861,11 +859,11 @@ fn test_lease_expired_across_blocks() {
         fee_sink,
     );
 
-    let lease_val = ByteBuf::from(vec![0xEE; 32]);
+    let lease_val: [u8; 32] = [0xEE; 32];
 
     // Block 1 at round 1: txn with lease, last_valid = 1 (expires at round 1).
     let mut stx1 = pay_txn(sender, receiver, 1_000, 1_000);
-    stx1.txn.lease = lease_val.clone();
+    stx1.txn.lease = lease_val;
     stx1.txn.last_valid = Round(1);
     let block1 = minimal_block(fee_sink, 1, vec![stx1]);
     apply_block(&mut state, &block1).unwrap();
@@ -880,7 +878,7 @@ fn test_lease_expired_across_blocks() {
 
     // Block 5 at round 5: same sender, same lease — should succeed (lease expired).
     let mut stx2 = pay_txn(sender, receiver, 1_000, 1_000);
-    stx2.txn.lease = lease_val.clone();
+    stx2.txn.lease = lease_val;
     stx2.txn.last_valid = Round(10);
     let block5 = minimal_block(fee_sink, 5, vec![stx2]);
     apply_block(&mut state, &block5).unwrap();
@@ -917,18 +915,18 @@ fn test_lease_different_senders_ok() {
         fee_sink,
     );
 
-    let lease_val = ByteBuf::from(vec![0xFF; 32]);
+    let lease_val: [u8; 32] = [0xFF; 32];
 
     // Block 1: sender_a uses the lease.
     let mut stx1 = pay_txn(sender_a, receiver, 1_000, 1_000);
-    stx1.txn.lease = lease_val.clone();
+    stx1.txn.lease = lease_val;
     stx1.txn.last_valid = Round(10);
     let block1 = minimal_block(fee_sink, 1, vec![stx1]);
     apply_block(&mut state, &block1).unwrap();
 
     // Block 2: sender_b uses the same lease value — should succeed (different sender).
     let mut stx2 = pay_txn(sender_b, receiver, 2_000, 1_000);
-    stx2.txn.lease = lease_val.clone();
+    stx2.txn.lease = lease_val;
     stx2.txn.last_valid = Round(10);
     let block2 = minimal_block(fee_sink, 2, vec![stx2]);
     apply_block(&mut state, &block2).unwrap();
@@ -1135,11 +1133,11 @@ fn test_fee_pooling_stateful_apply_block() {
     // Txn from A: fee=0, amount=100_000
     let mut txn_a = pay_txn(a, receiver, 100_000, 0);
     // Give them the same group ID to represent an atomic group.
-    txn_a.txn.group = ByteBuf::from(vec![0xAA; 32]);
+    txn_a.txn.group = [0xAA; 32];
 
     // Txn from B: fee=2000, amount=50_000
     let mut txn_b = pay_txn(b, receiver, 50_000, 2_000);
-    txn_b.txn.group = ByteBuf::from(vec![0xAA; 32]);
+    txn_b.txn.group = [0xAA; 32];
 
     let block = minimal_block(fee_sink, 1, vec![txn_a, txn_b]);
     apply_block(&mut state, &block).unwrap();

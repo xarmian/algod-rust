@@ -212,7 +212,8 @@ mod tests {
 }
 
 mod serde_bytes {
-    use serde::{self, Deserialize, Deserializer, Serializer};
+    use serde::{self, Deserializer, Serializer};
+    use std::fmt;
 
     pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -225,9 +226,40 @@ mod serde_bytes {
     where
         D: Deserializer<'de>,
     {
-        let v: Vec<u8> = Deserialize::deserialize(deserializer)?;
-        v.try_into().map_err(|v: Vec<u8>| {
-            serde::de::Error::custom(format!("expected 32 bytes, got {}", v.len()))
-        })
+        struct ByteArray32Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for ByteArray32Visitor {
+            type Value = [u8; 32];
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("32 bytes")
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<[u8; 32], E> {
+                v.try_into()
+                    .map_err(|_| E::custom(format!("expected 32 bytes, got {}", v.len())))
+            }
+
+            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<[u8; 32], E> {
+                v.as_slice()
+                    .try_into()
+                    .map_err(|_| E::custom(format!("expected 32 bytes, got {}", v.len())))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<[u8; 32], A::Error> {
+                let mut arr = [0u8; 32];
+                for (i, byte) in arr.iter_mut().enumerate() {
+                    *byte = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                }
+                Ok(arr)
+            }
+        }
+
+        deserializer.deserialize_bytes(ByteArray32Visitor)
     }
 }

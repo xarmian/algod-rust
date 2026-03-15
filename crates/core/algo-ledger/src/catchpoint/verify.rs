@@ -2261,15 +2261,14 @@ mod tests {
 
     /// Build a minimal BlockHeader for testing purposes.
     fn minimal_block_header() -> algo_types::BlockHeader {
-        use serde_bytes::ByteBuf;
         algo_types::BlockHeader {
             round: algo_types::Round(0),
-            branch: ByteBuf::new(),
-            seed: ByteBuf::new(),
-            txn_commitment: ByteBuf::new(),
+            branch: [0u8; 32],
+            seed: [0u8; 32],
+            txn_commitment: [0u8; 32],
             timestamp: 0,
             genesis_id: String::new(),
-            genesis_hash: ByteBuf::new(),
+            genesis_hash: [0u8; 32],
             proposer: algo_types::Address([0u8; 32]),
             fee_sink: algo_types::Address([0u8; 32]),
             rewards_pool: algo_types::Address([0u8; 32]),
@@ -2286,9 +2285,9 @@ mod tests {
             fees_collected: 0,
             bonus: 0,
             proposer_payout: 0,
-            prev512: ByteBuf::new(),
-            txn256: ByteBuf::new(),
-            txn512: ByteBuf::new(),
+            prev512: [0u8; 64],
+            txn256: [0u8; 32],
+            txn512: [0u8; 64],
             state_proof_tracking: None,
             upgrade_propose: String::new(),
             upgrade_delay: 0,

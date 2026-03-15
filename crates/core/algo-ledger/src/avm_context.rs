@@ -175,23 +175,22 @@ impl InnerTxnBuilder {
                 // Type (string)
                 15 => {
                     if let TealValue::Bytes(b) = value {
-                        txn.txn_type = String::from_utf8_lossy(b).to_string();
+                        txn.txn_type = algo_types::TxnType::from(String::from_utf8_lossy(b).into_owned());
                     }
                 }
                 // TypeEnum
                 16 => {
                     if let TealValue::Uint(v) = value {
                         txn.txn_type = match v {
-                            1 => "pay",
-                            2 => "keyreg",
-                            3 => "acfg",
-                            4 => "axfer",
-                            5 => "afrz",
-                            6 => "appl",
-                            7 => "stpf",
-                            _ => "",
-                        }
-                        .to_string();
+                            1 => algo_types::TxnType::Pay,
+                            2 => algo_types::TxnType::Keyreg,
+                            3 => algo_types::TxnType::Acfg,
+                            4 => algo_types::TxnType::Axfer,
+                            5 => algo_types::TxnType::Afrz,
+                            6 => algo_types::TxnType::Appl,
+                            7 => algo_types::TxnType::Stpf,
+                            _ => algo_types::TxnType::default(),
+                        };
                     }
                 }
                 // XferAsset
@@ -317,9 +316,12 @@ impl InnerTxnBuilder {
                 // ConfigAssetMetadataHash
                 40 => {
                     if let TealValue::Bytes(b) = value {
+                        let mut arr = [0u8; 32];
+                        let len = b.len().min(32);
+                        arr[..len].copy_from_slice(&b[..len]);
                         txn.asset_params
                             .get_or_insert_with(algo_types::AssetParams::default)
-                            .metadata_hash = Some(serde_bytes::ByteBuf::from(b.clone()));
+                            .metadata_hash = Some(arr);
                     }
                 }
                 // ConfigAssetManager
@@ -451,13 +453,19 @@ impl InnerTxnBuilder {
                 // VotePK
                 10 => {
                     if let TealValue::Bytes(b) = value {
-                        txn.vote_pk = Some(serde_bytes::ByteBuf::from(b.clone()));
+                        let mut arr = [0u8; 32];
+                        let len = b.len().min(32);
+                        arr[..len].copy_from_slice(&b[..len]);
+                        txn.vote_pk = Some(arr);
                     }
                 }
                 // SelectionPK
                 11 => {
                     if let TealValue::Bytes(b) = value {
-                        txn.selection_pk = Some(serde_bytes::ByteBuf::from(b.clone()));
+                        let mut arr = [0u8; 32];
+                        let len = b.len().min(32);
+                        arr[..len].copy_from_slice(&b[..len]);
+                        txn.selection_pk = Some(arr);
                     }
                 }
                 // VoteFirst
@@ -491,7 +499,10 @@ impl InnerTxnBuilder {
                 // StateProofPK
                 63 => {
                     if let TealValue::Bytes(b) = value {
-                        txn.state_proof_pk = Some(serde_bytes::ByteBuf::from(b.clone()));
+                        let mut arr = [0u8; 64];
+                        let len = b.len().min(64);
+                        arr[..len].copy_from_slice(&b[..len]);
+                        txn.state_proof_pk = Some(arr);
                     }
                 }
                 // Safety: op_itxn_field validates field indices before they reach
@@ -1471,7 +1482,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             11 => {
                 let group_id = if !self.group.is_empty() {
                     let g = &self.group[0].txn.group;
-                    if g.is_empty() {
+                    if *g == [0u8; 32] {
                         vec![0u8; 32]
                     } else {
                         g.to_vec()
@@ -1964,12 +1975,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             });
         }
         let stxn = &self.group[group_index];
-        let txn_type = stxn.txn.txn_type.as_str();
-        if txn_type != "appl" && txn_type != "acfg" {
+        if stxn.txn.txn_type != "appl" && stxn.txn.txn_type != "acfg" {
             return Err(AlgoError::Avm {
                 message: format!(
                     "gaid: txn at index {} is not an app call or asset config (type='{}')",
-                    group_index, txn_type
+                    group_index, stxn.txn.txn_type
                 ),
             });
         }
@@ -3096,7 +3106,7 @@ mod tests {
         use serde_bytes::ByteBuf;
         SignedTransaction {
             txn: Transaction {
-                txn_type: "pay".to_string(),
+                txn_type: "pay".into(),
                 sender: Address(sender),
                 fee: 1000,
                 first_valid: 100.into(),
@@ -3121,7 +3131,7 @@ mod tests {
         use serde_bytes::ByteBuf;
         SignedTransaction {
             txn: Transaction {
-                txn_type: "appl".to_string(),
+                txn_type: "appl".into(),
                 sender: Address(sender),
                 fee: 1000,
                 first_valid: 100.into(),
@@ -4081,7 +4091,7 @@ mod tests {
         let sender = [10u8; 32];
         let program = vec![0x06, 0x81, 0x01]; // short program (3 bytes < 4096)
         let mut txn = make_pay_txn(sender, [20u8; 32], 5000);
-        txn.txn.txn_type = "appl".to_string();
+        txn.txn.txn_type = "appl".into();
         txn.txn.approval_program = Some(serde_bytes::ByteBuf::from(program.clone()));
         let mut store = LedgerState::new();
         let ctx = make_context(&mut store, vec![txn]);
@@ -4105,7 +4115,7 @@ mod tests {
         // Create a program that spans 2 pages (4097 bytes)
         let program: Vec<u8> = (0..4097u16).map(|i| (i % 256) as u8).collect();
         let mut txn = make_pay_txn(sender, [20u8; 32], 5000);
-        txn.txn.txn_type = "appl".to_string();
+        txn.txn.txn_type = "appl".into();
         txn.txn.approval_program = Some(serde_bytes::ByteBuf::from(program.clone()));
         let mut store = LedgerState::new();
         let ctx = make_context(&mut store, vec![txn]);
@@ -4133,7 +4143,7 @@ mod tests {
     fn program_pages_empty_program() {
         let sender = [10u8; 32];
         let mut txn = make_pay_txn(sender, [20u8; 32], 5000);
-        txn.txn.txn_type = "appl".to_string();
+        txn.txn.txn_type = "appl".into();
         txn.txn.approval_program = None;
         txn.txn.clear_state_program = None;
         let mut store = LedgerState::new();
@@ -4155,7 +4165,7 @@ mod tests {
         // Exactly 4096 bytes = 1 page, not 2
         let program = vec![0xAA; 4096];
         let mut txn = make_pay_txn(sender, [20u8; 32], 5000);
-        txn.txn.txn_type = "appl".to_string();
+        txn.txn.txn_type = "appl".into();
         txn.txn.approval_program = Some(serde_bytes::ByteBuf::from(program.clone()));
         let mut store = LedgerState::new();
         let ctx = make_context(&mut store, vec![txn]);
@@ -5925,7 +5935,7 @@ mod tests {
         // We need to manually simulate what itxn_submit does to verify
         // the parent_txn_id is correctly set.
         let inner_appl_txn = Transaction {
-            txn_type: "appl".to_string(),
+            txn_type: "appl".into(),
             sender: app_addr_42,
             fee: 1000,
             application_id: 100,
@@ -5939,7 +5949,7 @@ mod tests {
         // Now if app 100 creates a nested inner pay txn, it should use
         // inner_appl_id as parent, NOT outer_txn_id.
         let nested_pay_txn = Transaction {
-            txn_type: "pay".to_string(),
+            txn_type: "pay".into(),
             sender: app_addr_100,
             fee: 1000,
             receiver: Address([20u8; 32]),

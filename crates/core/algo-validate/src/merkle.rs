@@ -144,8 +144,8 @@ pub fn compute_payset_merkle_root(block: &Block) -> Hash {
             if stx.has_genesis_id && restored_txn.genesis_id.is_empty() {
                 restored_txn.genesis_id.clone_from(&block.genesis_id);
             }
-            if restored_txn.genesis_hash.is_empty() {
-                restored_txn.genesis_hash = block.genesis_hash.clone();
+            if restored_txn.genesis_hash == [0u8; 32] {
+                restored_txn.genesis_hash = block.genesis_hash;
             }
 
             let txid = compute_txid(&restored_txn);
@@ -346,8 +346,8 @@ pub fn compute_vector_commitment(block: &Block, algo: HashAlgo) -> Vec<u8> {
             if stx.has_genesis_id && restored_txn.genesis_id.is_empty() {
                 restored_txn.genesis_id.clone_from(&block.genesis_id);
             }
-            if restored_txn.genesis_hash.is_empty() {
-                restored_txn.genesis_hash = block.genesis_hash.clone();
+            if restored_txn.genesis_hash == [0u8; 32] {
+                restored_txn.genesis_hash = block.genesis_hash;
             }
 
             let txn_canonical = canonical_encode_transaction(&restored_txn);
@@ -433,8 +433,8 @@ pub fn compute_payset_merkle_root_raw(block: &Block, raw_blobs: &[Vec<u8>]) -> H
             if stx.has_genesis_id && restored_txn.genesis_id.is_empty() {
                 restored_txn.genesis_id.clone_from(&block.genesis_id);
             }
-            if restored_txn.genesis_hash.is_empty() {
-                restored_txn.genesis_hash = block.genesis_hash.clone();
+            if restored_txn.genesis_hash == [0u8; 32] {
+                restored_txn.genesis_hash = block.genesis_hash;
             }
 
             let txid = compute_txid(&restored_txn);
@@ -513,8 +513,8 @@ pub fn compute_vector_commitment_raw(
             if stx.has_genesis_id && restored_txn.genesis_id.is_empty() {
                 restored_txn.genesis_id.clone_from(&block.genesis_id);
             }
-            if restored_txn.genesis_hash.is_empty() {
-                restored_txn.genesis_hash = block.genesis_hash.clone();
+            if restored_txn.genesis_hash == [0u8; 32] {
+                restored_txn.genesis_hash = block.genesis_hash;
             }
 
             let txn_canonical = canonical_encode_transaction(&restored_txn);
@@ -560,7 +560,6 @@ pub fn compute_vector_commitment_raw(
 mod tests {
     use super::*;
     use algo_types::{Address, Round, Transaction};
-    use serde_bytes::ByteBuf;
 
     fn minimal_signed_txn(amount: u64) -> SignedTransaction {
         SignedTransaction {
@@ -574,7 +573,7 @@ mod tests {
                 receiver: Address([2u8; 32]),
                 ..Default::default()
             },
-            sig: ByteBuf::from(vec![0xAA; 64]),
+            sig: [0xAA; 64],
             msig: None,
             lsig: None,
             auth_addr: None,
@@ -594,12 +593,12 @@ mod tests {
     fn minimal_block(payset: Vec<SignedTransaction>) -> Block {
         Block {
             round: Round(1),
-            branch: ByteBuf::new(),
-            seed: ByteBuf::new(),
-            txn_commitment: ByteBuf::new(),
+            branch: [0u8; 32],
+            seed: [0u8; 32],
+            txn_commitment: [0u8; 32],
             timestamp: 100,
             genesis_id: "test-v1".into(),
-            genesis_hash: ByteBuf::from(vec![0xBB; 32]),
+            genesis_hash: [0xBB; 32],
             proposer: Address::default(),
             fee_sink: Address::default(),
             rewards_pool: Address::default(),
@@ -616,9 +615,9 @@ mod tests {
             fees_collected: 0,
             bonus: 0,
             proposer_payout: 0,
-            prev512: ByteBuf::new(),
-            txn256: ByteBuf::new(),
-            txn512: ByteBuf::new(),
+            prev512: [0u8; 64],
+            txn256: [0u8; 32],
+            txn512: [0u8; 64],
             state_proof_tracking: None,
             upgrade_propose: String::new(),
             upgrade_delay: 0,
@@ -654,7 +653,7 @@ mod tests {
         // Compute expected leaf hash with genesis fields restored
         let mut restored_txn = stx.txn.clone();
         restored_txn.genesis_id = "test-v1".into();
-        restored_txn.genesis_hash = ByteBuf::from(vec![0xBB; 32]);
+        restored_txn.genesis_hash = [0xBB; 32];
         let txid = compute_txid(&restored_txn);
         let stib_hash = compute_stib_hash(&stx);
         let expected_root = compute_leaf_hash(&txid, &stib_hash);
@@ -672,7 +671,7 @@ mod tests {
         let make_leaf = |stx: &SignedTransaction| {
             let mut restored_txn = stx.txn.clone();
             restored_txn.genesis_id = "test-v1".into();
-            restored_txn.genesis_hash = ByteBuf::from(vec![0xBB; 32]);
+            restored_txn.genesis_hash = [0xBB; 32];
             let txid = compute_txid(&restored_txn);
             let stib_hash = compute_stib_hash(stx);
             compute_leaf_hash(&txid, &stib_hash)
@@ -696,7 +695,7 @@ mod tests {
         let make_leaf = |stx: &SignedTransaction| {
             let mut restored_txn = stx.txn.clone();
             restored_txn.genesis_id = "test-v1".into();
-            restored_txn.genesis_hash = ByteBuf::from(vec![0xBB; 32]);
+            restored_txn.genesis_hash = [0xBB; 32];
             let txid = compute_txid(&restored_txn);
             let stib_hash = compute_stib_hash(stx);
             compute_leaf_hash(&txid, &stib_hash)
@@ -920,7 +919,7 @@ mod tests {
         // Restore genesis fields for txid.
         let mut restored_txn = stx.txn.clone();
         restored_txn.genesis_id = "test-v1".into();
-        restored_txn.genesis_hash = ByteBuf::from(vec![0xBB; 32]);
+        restored_txn.genesis_hash = [0xBB; 32];
 
         let txn_canonical = canonical_encode_transaction(&restored_txn);
         // Leaf data uses SHA-256.
@@ -949,7 +948,7 @@ mod tests {
 
         let mut restored_txn = stx.txn.clone();
         restored_txn.genesis_id = "test-v1".into();
-        restored_txn.genesis_hash = ByteBuf::from(vec![0xBB; 32]);
+        restored_txn.genesis_hash = [0xBB; 32];
 
         let txn_canonical = canonical_encode_transaction(&restored_txn);
         let txid = vc_hash_sha256(&[TX_PREFIX, &txn_canonical]);
@@ -976,7 +975,7 @@ mod tests {
 
         let mut restored_txn = stx.txn.clone();
         restored_txn.genesis_id = "test-v1".into();
-        restored_txn.genesis_hash = ByteBuf::from(vec![0xBB; 32]);
+        restored_txn.genesis_hash = [0xBB; 32];
 
         let txn_canonical = canonical_encode_transaction(&restored_txn);
         let txid = vc_hash_sha256(&[TX_PREFIX, &txn_canonical]);

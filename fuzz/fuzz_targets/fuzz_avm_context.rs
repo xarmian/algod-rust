@@ -493,9 +493,9 @@ fuzz_target!(|data: &[u8]| {
     let mut txn = Transaction::default();
     txn.sender = sender;
     txn.txn_type = if input.app_mode {
-        "appl".to_string()
+        "appl".into()
     } else {
-        "pay".to_string()
+        "pay".into()
     };
     txn.application_id = if input.app_mode { input.app_id } else { 0 };
     txn.first_valid = Round(input.round.saturating_sub(10));

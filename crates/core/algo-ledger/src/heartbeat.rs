@@ -160,13 +160,8 @@ pub fn find_challenge(
         return Challenge::default();
     }
 
-    // Extract the seed from the block header.
-    let mut seed = [0u8; 32];
-    if block.seed.len() >= 32 {
-        seed.copy_from_slice(&block.seed[..32]);
-    } else if !block.seed.is_empty() {
-        seed[..block.seed.len()].copy_from_slice(&block.seed);
-    }
+    // Extract the seed from the block header (now always [u8; 32]).
+    let seed = block.seed;
 
     Challenge {
         round: last_challenge,

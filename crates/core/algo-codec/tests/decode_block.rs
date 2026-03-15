@@ -35,7 +35,7 @@ macro_rules! fixture_decode_test {
             // Header fields are populated
             assert!(!br.block.genesis_id.is_empty(), "genesis_id should be set");
             assert!(
-                !br.block.genesis_hash.is_empty(),
+                br.block.genesis_hash != [0u8; 32],
                 "genesis_hash should be set"
             );
             assert!(

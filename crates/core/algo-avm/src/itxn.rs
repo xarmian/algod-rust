@@ -40,7 +40,7 @@ mod tests {
     fn inner_txn_id_deterministic() {
         let parent = Digest([0xAB; 32]);
         let txn = Transaction {
-            txn_type: "pay".to_string(),
+            txn_type: algo_types::TxnType::Pay,
             sender: Address([1u8; 32]),
             fee: 1000,
             ..Default::default()
@@ -55,7 +55,7 @@ mod tests {
     fn inner_txn_id_varies_with_offset() {
         let parent = Digest([0xAB; 32]);
         let txn = Transaction {
-            txn_type: "pay".to_string(),
+            txn_type: algo_types::TxnType::Pay,
             sender: Address([1u8; 32]),
             fee: 1000,
             ..Default::default()
@@ -74,7 +74,7 @@ mod tests {
         let parent_a = Digest([0xAA; 32]);
         let parent_b = Digest([0xBB; 32]);
         let txn = Transaction {
-            txn_type: "pay".to_string(),
+            txn_type: algo_types::TxnType::Pay,
             sender: Address([1u8; 32]),
             fee: 1000,
             ..Default::default()

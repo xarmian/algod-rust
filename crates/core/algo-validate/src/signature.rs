@@ -38,19 +38,13 @@ const SEED_PREFIX: &[u8] = b"SD";
 /// The signed message is `b"TX" || canonical_encode(txn)`.
 /// The public key is derived from the sender address (or `auth_addr` if rekeyed).
 pub fn verify_single_sig(stx: &SignedTransaction) -> Result<(), AlgoError> {
-    if stx.sig.is_empty() {
+    if stx.sig == [0u8; 64] {
         return Err(AlgoError::Validation {
             message: "single-sig verification called but sig field is empty".into(),
         });
     }
 
-    let sig_bytes: [u8; 64] = stx.sig[..].try_into().map_err(|_| AlgoError::Validation {
-        message: format!(
-            "invalid signature length: expected 64 bytes, got {}",
-            stx.sig.len()
-        ),
-    })?;
-    let signature = Signature::from_bytes(&sig_bytes);
+    let signature = Signature::from_bytes(&stx.sig);
 
     // Use auth_addr (rekeyed) if present, otherwise sender IS the public key.
     let pk_bytes = match &stx.auth_addr {
@@ -131,42 +125,16 @@ fn verify_multisig_subsigs(msig: &MultisigSig, msg: &[u8], context: &str) -> Res
 
     let mut valid_count: u16 = 0;
     for subsig in &msig.subsigs {
-        // Validate public key length for all subsigs, even unsigned ones.
-        if subsig.public_key.len() != 32 {
-            return Err(AlgoError::Validation {
-                message: format!(
-                    "invalid {context} subsig public key length: expected 32 bytes, got {}",
-                    subsig.public_key.len()
-                ),
-            });
-        }
+        // Public key length is now enforced by the type system ([u8; 32]).
 
-        if subsig.signature.is_empty() {
+        if subsig.signature == [0u8; 64] {
             continue;
         }
 
-        let sig_bytes: [u8; 64] =
-            subsig.signature[..]
-                .try_into()
-                .map_err(|_| AlgoError::Validation {
-                    message: format!(
-                        "invalid {context} subsig length: expected 64 bytes, got {}",
-                        subsig.signature.len()
-                    ),
-                })?;
-        let signature = Signature::from_bytes(&sig_bytes);
+        let signature = Signature::from_bytes(&subsig.signature);
 
-        let pk_bytes: [u8; 32] =
-            subsig.public_key[..]
-                .try_into()
-                .map_err(|_| AlgoError::Validation {
-                    message: format!(
-                        "invalid {context} public key length: expected 32 bytes, got {}",
-                        subsig.public_key.len()
-                    ),
-                })?;
         let verifying_key =
-            VerifyingKey::from_bytes(&pk_bytes).map_err(|e| AlgoError::Validation {
+            VerifyingKey::from_bytes(&subsig.public_key).map_err(|e| AlgoError::Validation {
                 message: format!("invalid {context} public key: {e}"),
             })?;
 
@@ -293,7 +261,7 @@ pub fn verify_logicsig(
     }
 
     // Count how many of sig/msig/lmsig are set — must be 0 or 1 (matches Go).
-    let has_sig = !lsig.sig.is_empty();
+    let has_sig = lsig.sig != [0u8; 64];
     let has_msig = lsig.msig.is_some();
     let has_lmsig = lsig.lmsig.is_some();
     let num_sigs = has_sig as u8 + has_msig as u8 + has_lmsig as u8;
@@ -468,52 +436,18 @@ pub fn verify_heartbeat_proof(
         });
     }
 
-    // Extract fixed-size arrays from ByteBuf fields.
-    let pk: [u8; 32] = proof.pk[..].try_into().map_err(|_| AlgoError::Validation {
-        message: format!(
-            "heartbeat proof: invalid pk length: expected 32, got {}",
-            proof.pk.len()
-        ),
-    })?;
-    let pk2: [u8; 32] = proof.pk2[..]
-        .try_into()
-        .map_err(|_| AlgoError::Validation {
-            message: format!(
-                "heartbeat proof: invalid pk2 length: expected 32, got {}",
-                proof.pk2.len()
-            ),
-        })?;
+    // Fixed-size arrays are now enforced by the type system.
+    let pk = proof.pk;
+    let pk2 = proof.pk2;
     let vote_id_bytes: [u8; 32] = vote_id.try_into().map_err(|_| AlgoError::Validation {
         message: format!(
             "heartbeat proof: invalid vote_id length: expected 32, got {}",
             vote_id.len()
         ),
     })?;
-
-    let pk2_sig: [u8; 64] = proof.pk2_sig[..]
-        .try_into()
-        .map_err(|_| AlgoError::Validation {
-            message: format!(
-                "heartbeat proof: invalid pk2_sig length: expected 64, got {}",
-                proof.pk2_sig.len()
-            ),
-        })?;
-    let pk1_sig: [u8; 64] = proof.pk1_sig[..]
-        .try_into()
-        .map_err(|_| AlgoError::Validation {
-            message: format!(
-                "heartbeat proof: invalid pk1_sig length: expected 64, got {}",
-                proof.pk1_sig.len()
-            ),
-        })?;
-    let sig: [u8; 64] = proof.sig[..]
-        .try_into()
-        .map_err(|_| AlgoError::Validation {
-            message: format!(
-                "heartbeat proof: invalid sig length: expected 64, got {}",
-                proof.sig.len()
-            ),
-        })?;
+    let pk2_sig = proof.pk2_sig;
+    let pk1_sig = proof.pk1_sig;
+    let sig = proof.sig;
 
     let batch = last_valid / key_dilution;
     let offset = last_valid % key_dilution;
@@ -607,7 +541,7 @@ pub fn verify_transaction_signature(
     consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
     // Go-algorand requires exactly one of sig/msig/lsig.
-    let has_sig = !stx.sig.is_empty();
+    let has_sig = stx.sig != [0u8; 64];
     let has_msig = stx.msig.is_some();
     let has_lsig = stx.lsig.is_some();
     let count = has_sig as u8 + has_msig as u8 + has_lsig as u8;
@@ -736,24 +670,24 @@ mod tests {
     }
 
     /// Sign a transaction with the given key, returning the 64-byte signature.
-    fn sign_txn(key: &SigningKey, txn: &Transaction) -> Vec<u8> {
+    fn sign_txn(key: &SigningKey, txn: &Transaction) -> [u8; 64] {
         use ed25519_dalek::Signer;
         let canonical = canonical_encode_transaction(txn);
         let mut msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
         msg.extend_from_slice(TX_PREFIX);
         msg.extend_from_slice(&canonical);
         let sig = key.sign(&msg);
-        sig.to_bytes().to_vec()
+        sig.to_bytes()
     }
 
     /// Sign a program message ("Program" || logic) with the given key.
-    fn sign_program(key: &SigningKey, logic: &[u8]) -> Vec<u8> {
+    fn sign_program(key: &SigningKey, logic: &[u8]) -> [u8; 64] {
         use ed25519_dalek::Signer;
         let mut msg = Vec::with_capacity(PROGRAM_PREFIX.len() + logic.len());
         msg.extend_from_slice(PROGRAM_PREFIX);
         msg.extend_from_slice(logic);
         let sig = key.sign(&msg);
-        sig.to_bytes().to_vec()
+        sig.to_bytes()
     }
 
     /// Build a MultisigSig with N keys, signing with the specified key indices.
@@ -769,12 +703,12 @@ mod tests {
             .map(|(i, key)| {
                 let pk = key.verifying_key();
                 let signature = if sign_indices.contains(&i) {
-                    ByteBuf::from(sign_txn(key, txn))
+                    sign_txn(key, txn)
                 } else {
-                    ByteBuf::new()
+                    [0u8; 64]
                 };
                 MultisigSubsig {
-                    public_key: ByteBuf::from(pk.to_bytes().to_vec()),
+                    public_key: pk.to_bytes(),
                     signature,
                 }
             })
@@ -795,8 +729,8 @@ mod tests {
             subsigs: keys
                 .iter()
                 .map(|k| MultisigSubsig {
-                    public_key: ByteBuf::from(k.verifying_key().to_bytes().to_vec()),
-                    signature: ByteBuf::new(),
+                    public_key: k.verifying_key().to_bytes(),
+                    signature: [0u8; 64],
                 })
                 .collect(),
         };
@@ -813,7 +747,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::from(sig),
+            sig,
             msig: None,
             lsig: None,
             auth_addr: None,
@@ -839,7 +773,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::from(sig),
+            sig,
             msig: None,
             lsig: None,
             auth_addr: None,
@@ -860,7 +794,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::from(sig),
+            sig,
             msig: None,
             lsig: None,
             auth_addr: None,
@@ -882,7 +816,7 @@ mod tests {
         let txn = minimal_pay_txn(Address([0x01; 32]));
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::from(vec![]),
+            sig: [0u8; 64],
             msig: None,
             lsig: None,
             auth_addr: None,
@@ -908,7 +842,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::from(sig),
+            sig,
             msig: None,
             lsig: None,
             auth_addr: Some(auth),
@@ -933,7 +867,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: Some(msig),
             lsig: None,
             auth_addr: None,
@@ -957,7 +891,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: Some(msig),
             lsig: None,
             auth_addr: None,
@@ -981,7 +915,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: Some(msig),
             lsig: None,
             auth_addr: None,
@@ -1013,7 +947,7 @@ mod tests {
         let txn = minimal_pay_txn(contract_addr);
         let lsig = LogicSig {
             logic: ByteBuf::from(logic),
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: None,
             args: None,
             lmsig: None,
@@ -1021,7 +955,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: None,
             lsig: Some(lsig),
             auth_addr: None,
@@ -1041,7 +975,7 @@ mod tests {
         let txn = minimal_pay_txn(wrong_sender);
         let lsig = LogicSig {
             logic: ByteBuf::from(logic),
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: None,
             args: None,
             lmsig: None,
@@ -1049,7 +983,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: None,
             lsig: Some(lsig),
             auth_addr: None,
@@ -1074,7 +1008,7 @@ mod tests {
         let txn = minimal_pay_txn(sender);
         let lsig = LogicSig {
             logic: ByteBuf::from(logic),
-            sig: ByteBuf::from(sig),
+            sig,
             msig: None,
             args: None,
             lmsig: None,
@@ -1082,7 +1016,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: None,
             lsig: Some(lsig),
             auth_addr: None,
@@ -1109,12 +1043,12 @@ mod tests {
             .map(|(i, key)| {
                 let pk = key.verifying_key();
                 let signature = if i < 2 {
-                    ByteBuf::from(sign_program(key, &logic))
+                    sign_program(key, &logic)
                 } else {
-                    ByteBuf::new()
+                    [0u8; 64]
                 };
                 MultisigSubsig {
-                    public_key: ByteBuf::from(pk.to_bytes().to_vec()),
+                    public_key: pk.to_bytes(),
                     signature,
                 }
             })
@@ -1129,7 +1063,7 @@ mod tests {
         let txn = minimal_pay_txn(msig_addr);
         let lsig = LogicSig {
             logic: ByteBuf::from(logic),
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: Some(msig),
             args: None,
             lmsig: None,
@@ -1137,7 +1071,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: None,
             lsig: Some(lsig),
             auth_addr: None,
@@ -1162,7 +1096,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: Some(msig),
             lsig: None,
             auth_addr: None,
@@ -1190,7 +1124,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: Some(msig),
             lsig: None,
             auth_addr: None,
@@ -1215,7 +1149,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: Some(msig),
             lsig: None,
             auth_addr: None,
@@ -1245,7 +1179,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::from(sig),
+            sig,
             msig: Some(msig),
             lsig: None,
             auth_addr: None,
@@ -1275,8 +1209,8 @@ mod tests {
         let subsigs: Vec<MultisigSubsig> = keys
             .iter()
             .map(|k| MultisigSubsig {
-                public_key: ByteBuf::from(k.verifying_key().to_bytes().to_vec()),
-                signature: ByteBuf::new(),
+                public_key: k.verifying_key().to_bytes(),
+                signature: [0u8; 64],
             })
             .collect();
         let msig = MultisigSig {
@@ -1288,7 +1222,7 @@ mod tests {
         let txn = minimal_pay_txn(sender);
         let lsig = LogicSig {
             logic: ByteBuf::from(logic),
-            sig: ByteBuf::from(sig),
+            sig,
             msig: Some(msig),
             args: None,
             lmsig: None,
@@ -1296,7 +1230,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: None,
             lsig: Some(lsig),
             auth_addr: None,
@@ -1314,24 +1248,26 @@ mod tests {
     }
 
     #[test]
-    fn verify_multisig_invalid_pk_length_fails() {
+    fn verify_multisig_invalid_pk_fails() {
+        // With [u8; 32] public_key, wrong-length keys are impossible at the type level.
+        // Instead test that a corrupted (but valid-length) key causes a verification failure.
         let keys: Vec<SigningKey> = (10u8..13).map(signing_key_from_seed).collect();
         let txn = minimal_pay_txn(Address([0; 32])); // placeholder sender
 
-        let mut msig = build_multisig(&keys, &[0, 1], 2, &txn);
-        // Corrupt the third subsig's public key to be wrong length (unsigned subsig).
-        msig.subsigs[2].public_key = ByteBuf::from(vec![0u8; 16]); // 16 bytes instead of 32
+        let mut msig = build_multisig(&keys, &[0, 1, 2], 2, &txn);
+        // Corrupt the third subsig's public key (valid length but wrong key).
+        msig.subsigs[2].public_key = [0xFFu8; 32];
 
         // Compute the address from the corrupted msig so the address check passes.
         let msig_addr = compute_multisig_address(&msig);
         let txn = minimal_pay_txn(msig_addr);
         // Rebuild signatures for keys 0 and 1 with the correct txn.
-        msig.subsigs[0].signature = ByteBuf::from(sign_txn(&keys[0], &txn));
-        msig.subsigs[1].signature = ByteBuf::from(sign_txn(&keys[1], &txn));
+        msig.subsigs[0].signature = sign_txn(&keys[0], &txn);
+        msig.subsigs[1].signature = sign_txn(&keys[1], &txn);
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: Some(msig),
             lsig: None,
             auth_addr: None,
@@ -1340,10 +1276,13 @@ mod tests {
             ..Default::default()
         };
 
+        // Key 2 has a corrupted public key but its signature was built with the real key,
+        // so verification should fail.
         let err = verify_multisig(&stx, stx.msig.as_ref().unwrap()).unwrap_err();
         assert!(
-            err.to_string().contains("public key length"),
-            "expected public key length error, got: {err}"
+            err.to_string().contains("public key")
+                || err.to_string().contains("verification failed"),
+            "expected public key error, got: {err}"
         );
     }
 
@@ -1359,11 +1298,11 @@ mod tests {
     }
 
     /// Sign an lmsig message with a key.
-    fn sign_lmsig_msg(key: &SigningKey, addr: &Address, logic: &[u8]) -> Vec<u8> {
+    fn sign_lmsig_msg(key: &SigningKey, addr: &Address, logic: &[u8]) -> [u8; 64] {
         use ed25519_dalek::Signer;
         let msg = build_lmsig_msg(addr, logic);
         let sig = key.sign(&msg);
-        sig.to_bytes().to_vec()
+        sig.to_bytes()
     }
 
     #[test]
@@ -1380,12 +1319,12 @@ mod tests {
             .map(|(i, key)| {
                 let pk = key.verifying_key();
                 let signature = if i < 2 {
-                    ByteBuf::from(sign_lmsig_msg(key, &msig_addr, &logic))
+                    sign_lmsig_msg(key, &msig_addr, &logic)
                 } else {
-                    ByteBuf::new()
+                    [0u8; 64]
                 };
                 MultisigSubsig {
-                    public_key: ByteBuf::from(pk.to_bytes().to_vec()),
+                    public_key: pk.to_bytes(),
                     signature,
                 }
             })
@@ -1400,7 +1339,7 @@ mod tests {
         let txn = minimal_pay_txn(msig_addr);
         let lsig = LogicSig {
             logic: ByteBuf::from(logic),
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: None,
             args: None,
             lmsig: Some(lmsig),
@@ -1408,7 +1347,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: None,
             lsig: Some(lsig),
             auth_addr: None,
@@ -1437,12 +1376,12 @@ mod tests {
                 let pk = key.verifying_key();
                 let signature = if i < 2 {
                     // Signed with wrong_addr, but the txn sender is msig_addr
-                    ByteBuf::from(sign_lmsig_msg(key, &wrong_addr, &logic))
+                    sign_lmsig_msg(key, &wrong_addr, &logic)
                 } else {
-                    ByteBuf::new()
+                    [0u8; 64]
                 };
                 MultisigSubsig {
-                    public_key: ByteBuf::from(pk.to_bytes().to_vec()),
+                    public_key: pk.to_bytes(),
                     signature,
                 }
             })
@@ -1457,7 +1396,7 @@ mod tests {
         let txn = minimal_pay_txn(msig_addr);
         let lsig = LogicSig {
             logic: ByteBuf::from(logic),
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: None,
             args: None,
             lmsig: Some(lmsig),
@@ -1465,7 +1404,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: None,
             lsig: Some(lsig),
             auth_addr: None,
@@ -1495,8 +1434,8 @@ mod tests {
         let subsigs: Vec<MultisigSubsig> = keys
             .iter()
             .map(|k| MultisigSubsig {
-                public_key: ByteBuf::from(k.verifying_key().to_bytes().to_vec()),
-                signature: ByteBuf::new(),
+                public_key: k.verifying_key().to_bytes(),
+                signature: [0u8; 64],
             })
             .collect();
         let lmsig = MultisigSig {
@@ -1508,7 +1447,7 @@ mod tests {
         let txn = minimal_pay_txn(sender);
         let lsig = LogicSig {
             logic: ByteBuf::from(logic),
-            sig: ByteBuf::from(sig),
+            sig,
             msig: None,
             args: None,
             lmsig: Some(lmsig),
@@ -1516,7 +1455,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::new(),
+            sig: [0u8; 64],
             msig: None,
             lsig: Some(lsig),
             auth_addr: None,
@@ -1545,7 +1484,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::from(sig),
+            sig,
             msig: None,
             lsig: None,
             auth_addr: Some(sender), // Same as sender
@@ -1576,7 +1515,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::from(sig),
+            sig,
             msig: None,
             lsig: None,
             auth_addr: Some(Address([0xFF; 32])), // Different from sender
@@ -1598,7 +1537,7 @@ mod tests {
 
         let stx = SignedTransaction {
             txn,
-            sig: ByteBuf::from(sig),
+            sig,
             msig: None,
             lsig: None,
             auth_addr: None,
@@ -1656,11 +1595,11 @@ mod tests {
         let sig = ephemeral_key.sign(&seed_msg);
 
         let proof = HeartbeatProof {
-            sig: ByteBuf::from(sig.to_bytes().to_vec()),
-            pk: ByteBuf::from(ephemeral_pk.to_vec()),
-            pk2: ByteBuf::from(batch_pk.to_vec()),
-            pk1_sig: ByteBuf::from(pk1_sig.to_bytes().to_vec()),
-            pk2_sig: ByteBuf::from(pk2_sig.to_bytes().to_vec()),
+            sig: sig.to_bytes(),
+            pk: ephemeral_pk,
+            pk2: batch_pk,
+            pk1_sig: pk1_sig.to_bytes(),
+            pk2_sig: pk2_sig.to_bytes(),
         };
 
         (proof, master_pk, seed)
@@ -1756,11 +1695,11 @@ mod tests {
         let sig = ephemeral_key.sign(&seed_msg);
 
         let proof = HeartbeatProof {
-            sig: ByteBuf::from(sig.to_bytes().to_vec()),
-            pk: ByteBuf::from(ephemeral_pk.to_vec()),
-            pk2: ByteBuf::from(batch_pk.to_vec()),
-            pk1_sig: ByteBuf::from(pk1_sig.to_bytes().to_vec()),
-            pk2_sig: ByteBuf::from(pk2_sig.to_bytes().to_vec()),
+            sig: sig.to_bytes(),
+            pk: ephemeral_pk,
+            pk2: batch_pk,
+            pk1_sig: pk1_sig.to_bytes(),
+            pk2_sig: pk2_sig.to_bytes(),
         };
 
         let err = verify_heartbeat_proof(&proof, &master_pk, last_valid, key_dilution, &seed)
@@ -1827,11 +1766,11 @@ mod tests {
         let sig = wrong_ephemeral_key.sign(&seed_msg);
 
         let proof = HeartbeatProof {
-            sig: ByteBuf::from(sig.to_bytes().to_vec()),
-            pk: ByteBuf::from(ephemeral_pk.to_vec()),
-            pk2: ByteBuf::from(batch_pk.to_vec()),
-            pk1_sig: ByteBuf::from(pk1_sig.to_bytes().to_vec()),
-            pk2_sig: ByteBuf::from(pk2_sig.to_bytes().to_vec()),
+            sig: sig.to_bytes(),
+            pk: ephemeral_pk,
+            pk2: batch_pk,
+            pk1_sig: pk1_sig.to_bytes(),
+            pk2_sig: pk2_sig.to_bytes(),
         };
 
         let err = verify_heartbeat_proof(&proof, &master_pk, last_valid, key_dilution, &seed)
@@ -1887,24 +1826,29 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_proof_invalid_pk_length() {
+    fn heartbeat_proof_corrupted_pk() {
+        // With [u8; 32] pk, wrong-length is impossible at the type level.
+        // Instead test that a zeroed pk (wrong key) causes verification to fail.
         let (mut proof, master_pk, seed) = build_heartbeat_proof(1000, 100);
-        proof.pk = ByteBuf::from(vec![0u8; 16]); // Wrong length
+        proof.pk = [0u8; 32]; // Corrupted key
         let err = verify_heartbeat_proof(&proof, &master_pk, 1000, 100, &seed).unwrap_err();
         assert!(
-            err.to_string().contains("invalid pk length"),
-            "expected pk length error, got: {err}"
+            err.to_string().contains("public key")
+                || err.to_string().contains("verification failed"),
+            "expected verification error, got: {err}"
         );
     }
 
     #[test]
-    fn heartbeat_proof_invalid_sig_length() {
+    fn heartbeat_proof_corrupted_sig() {
+        // With [u8; 64] sig, wrong-length is impossible at the type level.
+        // Instead test that a zeroed sig causes verification to fail.
         let (mut proof, master_pk, seed) = build_heartbeat_proof(1000, 100);
-        proof.sig = ByteBuf::from(vec![0u8; 32]); // 32 instead of 64
+        proof.sig = [0u8; 64]; // Corrupted signature
         let err = verify_heartbeat_proof(&proof, &master_pk, 1000, 100, &seed).unwrap_err();
         assert!(
-            err.to_string().contains("invalid sig length"),
-            "expected sig length error, got: {err}"
+            err.to_string().contains("verification failed"),
+            "expected verification error, got: {err}"
         );
     }
 

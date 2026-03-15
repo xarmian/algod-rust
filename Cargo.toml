@@ -11,6 +11,7 @@ members = [
     "crates/core/algo-ledger",
     "crates/core/algo-avm",
     "crates/node/algo-network",
+    "crates/tools/algo-bench",
     "bin/algod-rust",
 ]
 exclude = ["fuzz"]
@@ -77,6 +78,7 @@ algo-validate = { path = "crates/core/algo-validate" }
 algo-ledger = { path = "crates/core/algo-ledger" }
 algo-avm = { path = "crates/core/algo-avm" }
 algo-network = { path = "crates/node/algo-network" }
+algo-bench = { path = "crates/tools/algo-bench" }
 num-bigint = "0.4"
 
 # Elliptic curves (for AVM ec_* opcodes)
@@ -85,6 +87,9 @@ ark-ec = { version = "0.5", features = ["parallel"] }
 ark-bn254 = "0.5"
 ark-bls12-381 = "0.5"
 ark-serialize = "0.5"
+
+# System info
+sysinfo = "0.33"
 
 # Compression / archive
 snap = "1"

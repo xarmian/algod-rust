@@ -5,7 +5,6 @@
 use algo_codec::{canonical_encode_transaction, canonical_encode_tx_group};
 use algo_error::AlgoError;
 use algo_types::{Address, Digest, SignedTransaction, Transaction};
-use serde_bytes::ByteBuf;
 use sha2::{Digest as _, Sha512_256};
 
 // Re-export the comprehensive ConsensusParams and lookup function from algo-types.
@@ -124,7 +123,7 @@ pub fn validate_transaction_wellformed(
     // heartbeats. Go exempts them from the fee check entirely but
     // requires they have no note, no lease, and no rekey-to.
     let is_free_heartbeat = txn.txn_type == "hb"
-        && txn.group.is_empty()
+        && txn.group == [0u8; 32]
         && txn.fee < params.min_txn_fee
         && params.enable_heartbeat;
 
@@ -135,7 +134,7 @@ pub fn validate_transaction_wellformed(
                 message: format!("tx.Note is set in {kind} heartbeat"),
             });
         }
-        if !txn.lease.is_empty() {
+        if txn.lease != [0u8; 32] {
             let kind = if txn.fee > 0 { "cheap" } else { "free" };
             return Err(AlgoError::Validation {
                 message: format!("tx.Lease is set in {kind} heartbeat"),
@@ -159,18 +158,18 @@ pub fn validate_transaction_wellformed(
                 || hb
                     .proof
                     .as_ref()
-                    .is_some_and(|p| p.sig.is_empty() && p.pk.is_empty())
+                    .is_some_and(|p| p.sig == [0u8; 64] && p.pk == [0u8; 32])
             {
                 return Err(AlgoError::Validation {
                     message: "tx.HbProof is empty".to_string(),
                 });
             }
-            if hb.seed.is_empty() {
+            if hb.seed == [0u8; 32] {
                 return Err(AlgoError::Validation {
                     message: "tx.HbSeed is empty".to_string(),
                 });
             }
-            if hb.vote_id.is_empty() {
+            if hb.vote_id == [0u8; 32] {
                 return Err(AlgoError::Validation {
                     message: "tx.HbVoteID is empty".to_string(),
                 });
@@ -245,7 +244,7 @@ pub fn validate_transaction_wellformed(
 
     // Lease must be empty or exactly 32 bytes.
     // If leases are not supported, any non-empty lease is rejected.
-    if !txn.lease.is_empty() {
+    if txn.lease != [0u8; 32] {
         if !params.support_transaction_leases {
             return Err(AlgoError::Validation {
                 message: "transaction tried to acquire lease but protocol does not support transaction leases".to_string(),
@@ -264,7 +263,7 @@ pub fn validate_transaction_wellformed(
 
     // Group must be empty or exactly 32 bytes.
     // If groups are not supported, any non-empty group is rejected.
-    if !txn.group.is_empty() {
+    if txn.group != [0u8; 32] {
         if !params.support_tx_groups {
             return Err(AlgoError::Validation {
                 message: "transaction has group but groups not yet enabled".to_string(),
@@ -360,7 +359,7 @@ pub fn has_heartbeat(version: &str) -> bool {
 /// is exempt from fee checks (ungrouped `hb` with fee < min, v40+).
 pub fn is_free_heartbeat(txn: &Transaction, params: &ConsensusParams) -> bool {
     txn.txn_type == "hb"
-        && txn.group.is_empty()
+        && txn.group == [0u8; 32]
         && txn.fee < params.min_txn_fee
         && params.enable_heartbeat
 }
@@ -381,7 +380,7 @@ pub fn compute_group_id(txns: &[Transaction]) -> Digest {
         .iter()
         .map(|txn| {
             let mut zeroed = txn.clone();
-            zeroed.group = ByteBuf::new();
+            zeroed.group = [0u8; 32];
             let canonical = canonical_encode_transaction(&zeroed);
             let mut msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
             msg.extend_from_slice(TX_PREFIX);
@@ -419,10 +418,10 @@ where
     let mut order: Vec<&[u8]> = Vec::new();
 
     for stx in txns {
-        let grp = stx.txn.group.as_ref();
-        if grp.is_empty() {
+        if stx.txn.group == [0u8; 32] {
             continue;
         }
+        let grp: &[u8] = stx.txn.group.as_ref();
         let entry = groups.entry(grp).or_insert_with(|| {
             order.push(grp);
             Vec::new()
@@ -492,7 +491,7 @@ pub fn validate_lease_constraints(txns: &[SignedTransaction]) -> Result<(), Algo
         // Collect (sender, lease) pairs for txns with non-empty leases.
         let mut seen = std::collections::HashSet::new();
         for stx in group_members {
-            if stx.txn.lease.is_empty() {
+            if stx.txn.lease == [0u8; 32] {
                 continue;
             }
             let key = (stx.txn.sender, stx.txn.lease.to_vec());
@@ -501,7 +500,7 @@ pub fn validate_lease_constraints(txns: &[SignedTransaction]) -> Result<(), Algo
                     message: format!(
                         "duplicate lease within group: sender {} lease {}",
                         stx.txn.sender,
-                        hex::encode(&stx.txn.lease)
+                        hex::encode(stx.txn.lease)
                     ),
                 });
             }
@@ -545,10 +544,10 @@ pub fn validate_group_fees_with_params(
     let mut order: Vec<&[u8]> = Vec::new();
 
     for stx in txns {
-        let grp = stx.txn.group.as_ref();
-        if grp.is_empty() {
+        if stx.txn.group == [0u8; 32] {
             continue;
         }
+        let grp: &[u8] = stx.txn.group.as_ref();
         let entry = groups.entry(grp).or_insert_with(|| {
             order.push(grp);
             (0u64, 0u64)
@@ -600,12 +599,12 @@ pub fn validate_genesis_consistency(
                 ),
             });
         }
-        if !stx.txn.genesis_hash.is_empty() && stx.txn.genesis_hash.as_ref() != block_genesis_hash {
+        if stx.txn.genesis_hash != [0u8; 32] && stx.txn.genesis_hash.as_ref() != block_genesis_hash {
             return Err(AlgoError::Validation {
                 message: format!(
                     "txn {} genesis hash mismatch: txn has {}, block has {}",
                     idx,
-                    hex::encode(&stx.txn.genesis_hash),
+                    hex::encode(stx.txn.genesis_hash),
                     hex::encode(block_genesis_hash)
                 ),
             });
@@ -626,16 +625,11 @@ mod tests {
     /// Build a minimal valid transaction for testing.
     fn make_valid_txn() -> Transaction {
         Transaction {
-            txn_type: "pay".to_string(),
+            txn_type: "pay".into(),
             sender: TEST_SENDER,
             fee: MIN_TXN_FEE,
             first_valid: Round(1000),
             last_valid: Round(1100),
-            note: ByteBuf::new(),
-            genesis_id: String::new(),
-            genesis_hash: ByteBuf::new(),
-            group: ByteBuf::new(),
-            lease: ByteBuf::new(),
             ..Default::default()
         }
     }
@@ -722,26 +716,26 @@ mod tests {
     #[test]
     fn test_lease_wrong_size_fails() {
         let mut txn = make_valid_txn();
-        txn.lease = ByteBuf::from(vec![0u8; 16]); // not 32
-        let err = validate_transaction_rules(&txn, false).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("lease"), "unexpected error: {msg}");
+        // With [u8; 32] lease type, wrong-size leases are impossible at the type level.
+        // Instead test that a non-zero lease passes when leases are supported.
+        txn.lease = [0x42; 32];
+        assert!(validate_transaction_rules(&txn, false).is_ok());
     }
 
     #[test]
     fn test_lease_exactly_32_passes() {
         let mut txn = make_valid_txn();
-        txn.lease = ByteBuf::from(vec![0u8; 32]);
+        txn.lease = [0u8; 32];
         assert!(validate_transaction_rules(&txn, false).is_ok());
     }
 
     #[test]
     fn test_group_field_wrong_size_fails() {
         let mut txn = make_valid_txn();
-        txn.group = ByteBuf::from(vec![0u8; 10]); // not 32
-        let err = validate_transaction_rules(&txn, false).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("group field"), "unexpected error: {msg}");
+        // With [u8; 32] group type, wrong-size groups are impossible at the type level.
+        // Instead test that a non-zero group passes basic rules check.
+        txn.group = [0xAA; 32];
+        assert!(validate_transaction_rules(&txn, false).is_ok());
     }
 
     // ── Zero sender / rewards pool sender tests ──────────────────
@@ -799,7 +793,7 @@ mod tests {
     /// Build a minimal valid heartbeat transaction.
     fn make_heartbeat_txn(fee: u64) -> Transaction {
         Transaction {
-            txn_type: "hb".to_string(),
+            txn_type: "hb".into(),
             sender: TEST_SENDER,
             fee,
             first_valid: Round(1000),
@@ -807,14 +801,14 @@ mod tests {
             heartbeat: Some(HeartbeatTxnFields {
                 address: Address([2u8; 32]),
                 proof: Some(HeartbeatProof {
-                    sig: ByteBuf::from(vec![0xAA; 64]),
-                    pk: ByteBuf::from(vec![0xBB; 32]),
-                    pk2: ByteBuf::from(vec![0xCC; 32]),
-                    pk1_sig: ByteBuf::from(vec![0xDD; 64]),
-                    pk2_sig: ByteBuf::from(vec![0xEE; 64]),
+                    sig: [0xAA; 64],
+                    pk: [0xBB; 32],
+                    pk2: [0xCC; 32],
+                    pk1_sig: [0xDD; 64],
+                    pk2_sig: [0xEE; 64],
                 }),
-                seed: ByteBuf::from(vec![0x11; 32]),
-                vote_id: ByteBuf::from(vec![0x22; 32]),
+                seed: [0x11; 32],
+                vote_id: [0x22; 32],
                 key_dilution: 10000,
             }),
             ..Default::default()
@@ -853,7 +847,7 @@ mod tests {
     #[test]
     fn test_cheap_heartbeat_with_lease_rejected() {
         let mut txn = make_heartbeat_txn(500);
-        txn.lease = ByteBuf::from(vec![0x42; 32]);
+        txn.lease = [0x42; 32];
         let params = ConsensusParams::default();
         let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
         let msg = err.to_string();
@@ -897,7 +891,7 @@ mod tests {
     #[test]
     fn test_heartbeat_empty_seed_rejected() {
         let mut txn = make_heartbeat_txn(MIN_TXN_FEE);
-        txn.heartbeat.as_mut().unwrap().seed = ByteBuf::new();
+        txn.heartbeat.as_mut().unwrap().seed = [0u8; 32];
         let params = ConsensusParams::default();
         let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
         assert!(err.to_string().contains("HbSeed is empty"));
@@ -922,7 +916,7 @@ mod tests {
         assert!(!is_free_heartbeat(&txn_with_fee, &params));
 
         let mut grouped_hb = make_heartbeat_txn(0);
-        grouped_hb.group = ByteBuf::from(vec![0xFF; 32]);
+        grouped_hb.group = [0xFF; 32];
         assert!(!is_free_heartbeat(&grouped_hb, &params));
 
         let mut params_no_hb = params.clone();
@@ -981,7 +975,7 @@ mod tests {
     fn test_lease_rejected_pre_v18() {
         let params = consensus_params_for_version("v7").unwrap(); // no leases
         let mut txn = make_valid_txn();
-        txn.lease = ByteBuf::from(vec![0x42; 32]);
+        txn.lease = [0x42; 32];
         let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
         assert!(err
             .to_string()
@@ -992,7 +986,7 @@ mod tests {
     fn test_group_rejected_pre_v18() {
         let params = consensus_params_for_version("v7").unwrap(); // no groups
         let mut txn = make_valid_txn();
-        txn.group = ByteBuf::from(vec![0xFF; 32]);
+        txn.group = [0xFF; 32];
         let err = validate_transaction_wellformed(&txn, false, &params, None).unwrap_err();
         assert!(err.to_string().contains("groups not yet enabled"));
     }
@@ -1038,7 +1032,7 @@ mod tests {
     fn wrap_signed(txn: Transaction) -> SignedTransaction {
         SignedTransaction {
             txn,
-            sig: ByteBuf::from(vec![0u8; 64]),
+            sig: [0u8; 64],
             msig: None,
             lsig: None,
             auth_addr: None,
@@ -1075,7 +1069,7 @@ mod tests {
         let signed: Vec<SignedTransaction> = txns
             .into_iter()
             .map(|mut t| {
-                t.group = ByteBuf::from(gid.as_bytes().to_vec());
+                t.group = *gid.as_bytes();
                 wrap_signed(t)
             })
             .collect();
@@ -1094,7 +1088,7 @@ mod tests {
         // Set a non-empty group ID on a single txn.
         // Single-member groups are skipped (not validated) because on mainnet
         // blocks may contain partial group views.
-        txn.group = ByteBuf::from(vec![0xAA; 32]);
+        txn.group = [0xAA; 32];
         let signed = vec![wrap_signed(txn)];
 
         assert!(validate_transaction_group(&signed).is_ok());
@@ -1107,9 +1101,9 @@ mod tests {
         txn2.amount = 999;
 
         // Use a wrong group ID.
-        let wrong_gid = ByteBuf::from(vec![0xFF; 32]);
+        let wrong_gid = [0xFF; 32];
         let mut s1 = txn1;
-        s1.group = wrong_gid.clone();
+        s1.group = wrong_gid;
         let mut s2 = txn2;
         s2.group = wrong_gid;
 
@@ -1138,9 +1132,9 @@ mod tests {
         let gid = compute_group_id(&[txn1.clone(), txn2.clone()]);
 
         let mut s1 = txn1;
-        s1.group = ByteBuf::from(gid.as_bytes().to_vec());
+        s1.group = *gid.as_bytes();
         let mut s2 = txn2;
-        s2.group = ByteBuf::from(gid.as_bytes().to_vec());
+        s2.group = *gid.as_bytes();
 
         let signed = vec![wrap_signed(s1), wrap_signed(s2)];
         assert!(validate_transaction_group(&signed).is_ok());
@@ -1151,14 +1145,14 @@ mod tests {
     #[test]
     fn test_lease_duplicate_in_group_fails() {
         let mut txn1 = make_valid_txn();
-        txn1.lease = ByteBuf::from(vec![0x42; 32]);
+        txn1.lease = [0x42; 32];
         let mut txn2 = make_valid_txn();
-        txn2.lease = ByteBuf::from(vec![0x42; 32]); // same sender, same lease
+        txn2.lease = [0x42; 32]; // same sender, same lease
         txn2.amount = 999;
 
         let gid = compute_group_id(&[txn1.clone(), txn2.clone()]);
-        txn1.group = ByteBuf::from(gid.as_bytes().to_vec());
-        txn2.group = ByteBuf::from(gid.as_bytes().to_vec());
+        txn1.group = *gid.as_bytes();
+        txn2.group = *gid.as_bytes();
 
         let signed = vec![wrap_signed(txn1), wrap_signed(txn2)];
         let err = validate_lease_constraints(&signed).unwrap_err();
@@ -1172,14 +1166,14 @@ mod tests {
     #[test]
     fn test_lease_unique_in_group_passes() {
         let mut txn1 = make_valid_txn();
-        txn1.lease = ByteBuf::from(vec![0x42; 32]);
+        txn1.lease = [0x42; 32];
         let mut txn2 = make_valid_txn();
-        txn2.lease = ByteBuf::from(vec![0x43; 32]); // different lease
+        txn2.lease = [0x43; 32]; // different lease
         txn2.amount = 999;
 
         let gid = compute_group_id(&[txn1.clone(), txn2.clone()]);
-        txn1.group = ByteBuf::from(gid.as_bytes().to_vec());
-        txn2.group = ByteBuf::from(gid.as_bytes().to_vec());
+        txn1.group = *gid.as_bytes();
+        txn2.group = *gid.as_bytes();
 
         let signed = vec![wrap_signed(txn1), wrap_signed(txn2)];
         assert!(validate_lease_constraints(&signed).is_ok());
@@ -1204,7 +1198,7 @@ mod tests {
     #[test]
     fn test_genesis_hash_mismatch_fails() {
         let mut txn = make_valid_txn();
-        txn.genesis_hash = ByteBuf::from(vec![0xAA; 32]);
+        txn.genesis_hash = [0xAA; 32];
         let signed = vec![wrap_signed(txn)];
 
         let err = validate_genesis_consistency(&signed, "", &[0xBB; 32]).unwrap_err();
@@ -1219,7 +1213,7 @@ mod tests {
     fn test_genesis_fields_match_passes() {
         let mut txn = make_valid_txn();
         txn.genesis_id = "testnet-v1.0".to_string();
-        txn.genesis_hash = ByteBuf::from(vec![0xAA; 32]);
+        txn.genesis_hash = [0xAA; 32];
         let signed = vec![wrap_signed(txn)];
 
         assert!(validate_genesis_consistency(&signed, "testnet-v1.0", &[0xAA; 32]).is_ok());

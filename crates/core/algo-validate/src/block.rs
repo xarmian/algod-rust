@@ -262,7 +262,7 @@ pub fn validate_block(
         if stx.has_genesis_id && stx.txn.genesis_id.is_empty() {
             stx.txn.genesis_id.clone_from(&block.genesis_id);
         }
-        if stx.txn.genesis_hash.is_empty() {
+        if stx.txn.genesis_hash == [0u8; 32] {
             stx.txn.genesis_hash.clone_from(&block.genesis_hash);
         }
     }
@@ -302,7 +302,7 @@ pub fn validate_block(
             // per-txn minimum fee check is skipped. Group-level fee validation
             // happens after the group ID check (step 4b).
             // Free heartbeats (ungrouped, fee < min, v40+) are also fee-exempt.
-            let allow_fee_pooling = !stx.txn.group.is_empty();
+            let allow_fee_pooling = stx.txn.group != [0u8; 32];
             if let Err(e) =
                 validate_transaction_wellformed(&stx.txn, allow_fee_pooling, &params, Some(&spec))
             {
@@ -409,11 +409,11 @@ pub fn validate_block(
             ),
         });
     }
-    if !block.genesis_hash.is_empty() && block.genesis_hash.as_ref() != genesis_hash {
+    if block.genesis_hash != [0u8; 32] && block.genesis_hash.as_ref() != genesis_hash {
         errors.push(BlockValidationError::GenesisConsistencyFailed {
             error: format!(
                 "block header genesis hash {} does not match expected {}",
-                hex::encode(&block.genesis_hash),
+                hex::encode(block.genesis_hash),
                 hex::encode(genesis_hash)
             ),
         });
@@ -449,7 +449,7 @@ pub fn validate_block(
     // to warn-only typed path to avoid panics on malformed input.
     let raw_payset_blobs = raw_payset_blobs.filter(|blobs| blobs.len() == block.payset.len());
     let has_raw = raw_payset_blobs.is_some();
-    if !block.txn_commitment.is_empty() || !block.payset.is_empty() {
+    if block.txn_commitment != [0u8; 32] || !block.payset.is_empty() {
         if has_payset_commit_merkle(version) {
             // Merkle tree commitment (v26+).
             let computed_root = if let Some(raw_blobs) = raw_payset_blobs {
@@ -500,7 +500,7 @@ pub fn validate_block(
     }
 
     // 7b. Vector commitment: txn256 (SHA-256, v34+).
-    if has_txn256(version) && !block.txn256.is_empty() {
+    if has_txn256(version) && block.txn256 != [0u8; 32] {
         let computed = if let Some(raw_blobs) = raw_payset_blobs {
             compute_vector_commitment_raw(block, HashAlgo::Sha256, raw_blobs)
         } else {
@@ -510,14 +510,14 @@ pub fn validate_block(
             if has_raw {
                 errors.push(BlockValidationError::VectorCommitmentMismatch {
                     field: "txn256".into(),
-                    expected: hex::encode(&block.txn256),
+                    expected: hex::encode(block.txn256),
                     computed: hex::encode(&computed),
                 });
             } else {
                 eprintln!(
                     "WARNING: round {}: txn256 vector commitment mismatch: header={}, computed={}",
                     round,
-                    hex::encode(&block.txn256),
+                    hex::encode(block.txn256),
                     hex::encode(&computed),
                 );
             }
@@ -525,7 +525,7 @@ pub fn validate_block(
     }
 
     // 7c. Vector commitment: txn512 (SHA-512, v41+).
-    if has_txn512(version) && !block.txn512.is_empty() {
+    if has_txn512(version) && block.txn512 != [0u8; 64] {
         let computed = if let Some(raw_blobs) = raw_payset_blobs {
             compute_vector_commitment_raw(block, HashAlgo::Sha512, raw_blobs)
         } else {
@@ -535,14 +535,14 @@ pub fn validate_block(
             if has_raw {
                 errors.push(BlockValidationError::VectorCommitmentMismatch {
                     field: "txn512".into(),
-                    expected: hex::encode(&block.txn512),
+                    expected: hex::encode(block.txn512),
                     computed: hex::encode(&computed),
                 });
             } else {
                 eprintln!(
                     "WARNING: round {}: txn512 vector commitment mismatch: header={}, computed={}",
                     round,
-                    hex::encode(&block.txn512),
+                    hex::encode(block.txn512),
                     hex::encode(&computed),
                 );
             }
@@ -587,7 +587,7 @@ fn detect_validation_groups(payset: &[SignedTransaction]) -> Vec<Vec<(usize, &Si
     let mut i = 0;
     while i < payset.len() {
         let stx = &payset[i];
-        if stx.txn.group.is_empty() {
+        if stx.txn.group == [0u8; 32] {
             groups.push(vec![(i, stx)]);
             i += 1;
         } else {
@@ -609,7 +609,6 @@ mod tests {
     use super::*;
     use algo_types::{Address, Round, SignedTransaction, Transaction};
     use ed25519_dalek::{Signer, SigningKey};
-    use serde_bytes::ByteBuf;
 
     fn test_genesis_hash() -> [u8; 32] {
         [0xAA; 32]
@@ -623,12 +622,12 @@ mod tests {
     fn empty_block() -> Block {
         Block {
             round: Round(1),
-            branch: ByteBuf::from(vec![0u8; 32]),
-            seed: ByteBuf::from(vec![0u8; 32]),
-            txn_commitment: ByteBuf::new(),
+            branch: [0u8; 32],
+            seed: [0u8; 32],
+            txn_commitment: [0u8; 32],
             timestamp: 100,
             genesis_id: "test-v1".into(),
-            genesis_hash: ByteBuf::from(test_genesis_hash().to_vec()),
+            genesis_hash: test_genesis_hash(),
             proposer: Address::default(),
             fee_sink: Address::default(),
             rewards_pool: Address::default(),
@@ -645,9 +644,9 @@ mod tests {
             fees_collected: 0,
             bonus: 0,
             proposer_payout: 0,
-            prev512: ByteBuf::new(),
-            txn256: ByteBuf::new(),
-            txn512: ByteBuf::new(),
+            prev512: [0u8; 64],
+            txn256: [0u8; 32],
+            txn512: [0u8; 64],
             state_proof_tracking: None,
             upgrade_propose: String::new(),
             upgrade_delay: 0,
@@ -671,7 +670,7 @@ mod tests {
             amount,
             receiver: Address([2u8; 32]),
             genesis_id: "test-v1".into(),
-            genesis_hash: ByteBuf::from(test_genesis_hash().to_vec()),
+            genesis_hash: test_genesis_hash(),
             ..Default::default()
         };
 
@@ -686,11 +685,11 @@ mod tests {
         // has_genesis_hash flags indicate they were present.
         let mut stripped_txn = txn;
         stripped_txn.genesis_id = String::new();
-        stripped_txn.genesis_hash = ByteBuf::new();
+        stripped_txn.genesis_hash = [0u8; 32];
 
         SignedTransaction {
             txn: stripped_txn,
-            sig: ByteBuf::from(sig.to_bytes().to_vec()),
+            sig: sig.to_bytes(),
             msig: None,
             lsig: None,
             auth_addr: None,
@@ -852,7 +851,7 @@ mod tests {
         block.payset = vec![stx];
         // Compute the correct commitment (needs full block for genesis restoration).
         let root = compute_payset_merkle_root(&block);
-        block.txn_commitment = ByteBuf::from(root.to_vec());
+        block.txn_commitment = root;
 
         let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
         assert!(
@@ -874,7 +873,7 @@ mod tests {
         // Wrong commitment — should warn (eprintln) but not produce a validation error.
         // Commitment verification is warn-only until Epic 12a implements raw-passthrough
         // encoding for STIB hashing.
-        block.txn_commitment = ByteBuf::from(vec![0xFF; 32]);
+        block.txn_commitment = [0xFF; 32];
 
         let result = validate_block(&block, Some(90), "test-v1", &test_genesis_hash(), None);
         assert!(
@@ -917,17 +916,17 @@ mod tests {
         block.current_protocol = algo_types::consensus::CONSENSUS_V41.to_string();
 
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "hb".to_string();
+        stx.txn.txn_type = "hb".into();
         stx.txn.sender = sender;
         stx.txn.first_valid = Round(1);
         stx.txn.last_valid = Round(1001);
         stx.txn.fee = 1000;
-        stx.txn.genesis_hash = ByteBuf::from(test_genesis_hash().to_vec());
+        stx.txn.genesis_hash = test_genesis_hash();
         stx.txn.heartbeat = Some(HeartbeatTxnFields {
             address: Address([5u8; 32]),
             proof: None, // Missing proof!
-            seed: ByteBuf::from(vec![0u8; 32]),
-            vote_id: ByteBuf::from(vec![0u8; 32]),
+            seed: [0u8; 32],
+            vote_id: [0u8; 32],
             key_dilution: 100,
         });
 
@@ -935,7 +934,7 @@ mod tests {
         let txn_bytes = algo_codec::canonical_encode_transaction(&stx.txn);
         let msg = [b"TX".as_slice(), &txn_bytes].concat();
         let sig = key.sign(&msg);
-        stx.sig = ByteBuf::from(sig.to_bytes().to_vec());
+        stx.sig = sig.to_bytes();
 
         block.payset = vec![stx];
 
@@ -967,23 +966,23 @@ mod tests {
         block.current_protocol = algo_types::consensus::CONSENSUS_V41.to_string();
 
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "hb".to_string();
+        stx.txn.txn_type = "hb".into();
         stx.txn.sender = sender;
         stx.txn.first_valid = Round(1);
         stx.txn.last_valid = Round(1001);
         stx.txn.fee = 1000;
-        stx.txn.genesis_hash = ByteBuf::from(test_genesis_hash().to_vec());
+        stx.txn.genesis_hash = test_genesis_hash();
         stx.txn.heartbeat = Some(HeartbeatTxnFields {
             address: Address([5u8; 32]),
             proof: Some(HeartbeatProof {
-                sig: ByteBuf::from(vec![0u8; 64]),
-                pk: ByteBuf::from(vec![0u8; 32]),
-                pk2: ByteBuf::from(vec![0u8; 32]),
-                pk1_sig: ByteBuf::from(vec![0u8; 64]),
-                pk2_sig: ByteBuf::from(vec![0u8; 64]),
+                sig: [0u8; 64],
+                pk: [0u8; 32],
+                pk2: [0u8; 32],
+                pk1_sig: [0u8; 64],
+                pk2_sig: [0u8; 64],
             }),
-            seed: ByteBuf::from(vec![0u8; 32]),
-            vote_id: ByteBuf::from(vec![1u8; 32]), // Non-zero vote ID
+            seed: [0u8; 32],
+            vote_id: [1u8; 32], // Non-zero vote ID
             key_dilution: 100,
         });
 
@@ -991,7 +990,7 @@ mod tests {
         let txn_bytes = algo_codec::canonical_encode_transaction(&stx.txn);
         let msg = [b"TX".as_slice(), &txn_bytes].concat();
         let sig = key.sign(&msg);
-        stx.sig = ByteBuf::from(sig.to_bytes().to_vec());
+        stx.sig = sig.to_bytes();
 
         block.payset = vec![stx];
 

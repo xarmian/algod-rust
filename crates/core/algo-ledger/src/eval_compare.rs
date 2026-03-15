@@ -339,8 +339,8 @@ fn compare_inner_txns_at(
         if avm_itx.txn.txn_type != rec_itx.txn.txn_type {
             mismatches.push(FieldMismatch {
                 field: format!("{p}.type"),
-                expected: rec_itx.txn.txn_type.clone(),
-                actual: avm_itx.txn.txn_type.clone(),
+                expected: rec_itx.txn.txn_type.to_string(),
+                actual: avm_itx.txn.txn_type.to_string(),
             });
         }
 

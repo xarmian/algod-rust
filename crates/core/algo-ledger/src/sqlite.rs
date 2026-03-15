@@ -580,7 +580,10 @@ fn decode_asset_params(data: &[u8]) -> Result<AssetParams, AlgoError> {
             }
             "g" => {
                 if let Some(bytes) = v.as_slice() {
-                    p.metadata_hash = Some(serde_bytes::ByteBuf::from(bytes.to_vec()));
+                    let mut arr = [0u8; 32];
+                    let len = bytes.len().min(32);
+                    arr[..len].copy_from_slice(&bytes[..len]);
+                    p.metadata_hash = Some(arr);
                 }
             }
             "h" => {

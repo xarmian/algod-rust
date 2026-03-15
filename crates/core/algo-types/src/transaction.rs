@@ -1,18 +1,139 @@
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
+use std::fmt;
 
+use crate::serde_bytes_array::{
+    is_none_or_zero_32, is_none_or_zero_64, is_zero_32, is_zero_64, serde_bytes_32,
+    serde_bytes_32_opt, serde_bytes_64, serde_bytes_64_opt, zeros_64,
+};
 use crate::{Address, Round};
 
+/// Algorand transaction type as a zero-allocation enum.
+///
+/// Maps 1-to-1 with the short protocol strings ("pay", "axfer", etc.).
+/// The `Unknown(String)` variant preserves forward compatibility for new
+/// transaction types that this codebase does not yet recognise.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TxnType {
+    Pay,
+    Axfer,
+    Acfg,
+    Afrz,
+    Appl,
+    Keyreg,
+    Stpf,
+    Hb,
+    Unknown(String),
+}
+
+impl TxnType {
+    /// Return the canonical protocol-level short string.
+    pub fn as_str(&self) -> &str {
+        match self {
+            TxnType::Pay => "pay",
+            TxnType::Axfer => "axfer",
+            TxnType::Acfg => "acfg",
+            TxnType::Afrz => "afrz",
+            TxnType::Appl => "appl",
+            TxnType::Keyreg => "keyreg",
+            TxnType::Stpf => "stpf",
+            TxnType::Hb => "hb",
+            TxnType::Unknown(s) => s.as_str(),
+        }
+    }
+
+    /// Return `true` if this is the empty/default type.
+    pub fn is_empty(&self) -> bool {
+        matches!(self, TxnType::Unknown(s) if s.is_empty())
+    }
+}
+
+impl Default for TxnType {
+    fn default() -> Self {
+        TxnType::Unknown(String::new())
+    }
+}
+
+impl fmt::Display for TxnType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&str> for TxnType {
+    fn from(s: &str) -> Self {
+        match s {
+            "pay" => TxnType::Pay,
+            "axfer" => TxnType::Axfer,
+            "acfg" => TxnType::Acfg,
+            "afrz" => TxnType::Afrz,
+            "appl" => TxnType::Appl,
+            "keyreg" => TxnType::Keyreg,
+            "stpf" => TxnType::Stpf,
+            "hb" => TxnType::Hb,
+            other => TxnType::Unknown(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for TxnType {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "pay" => TxnType::Pay,
+            "axfer" => TxnType::Axfer,
+            "acfg" => TxnType::Acfg,
+            "afrz" => TxnType::Afrz,
+            "appl" => TxnType::Appl,
+            "keyreg" => TxnType::Keyreg,
+            "stpf" => TxnType::Stpf,
+            "hb" => TxnType::Hb,
+            _ => TxnType::Unknown(s),
+        }
+    }
+}
+
+/// Allow `TxnType == "pay"` comparisons for ergonomics.
+impl PartialEq<&str> for TxnType {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+/// Allow `"pay" == TxnType` comparisons.
+impl PartialEq<TxnType> for &str {
+    fn eq(&self, other: &TxnType) -> bool {
+        *self == other.as_str()
+    }
+}
+
+impl Serialize for TxnType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TxnType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(TxnType::from(s))
+    }
+}
+
 /// A signed transaction as it appears in a block's payset.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SignedTransaction {
     /// The transaction body.
     #[serde(rename = "txn")]
     pub txn: Transaction,
 
-    /// Ed25519 signature.
-    #[serde(rename = "sig", default, skip_serializing_if = "is_empty_bytes")]
-    pub sig: ByteBuf,
+    /// Ed25519 signature (ed25519Signature = [64]byte in Go).
+    #[serde(
+        rename = "sig",
+        default = "zeros_64",
+        skip_serializing_if = "is_zero_64",
+        with = "serde_bytes_64"
+    )]
+    pub sig: [u8; 64],
 
     /// Multisig signature.
     #[serde(rename = "msig", default, skip_serializing_if = "Option::is_none")]
@@ -58,7 +179,7 @@ pub struct SignedTransaction {
     #[serde(rename = "rc", default, skip_serializing_if = "is_zero_u64")]
     pub close_rewards: u64,
 
-    /// Eval delta — application state changes (ApplyData.dt).
+    /// Eval delta -- application state changes (ApplyData.dt).
     /// Opaque passthrough; uses rmpv::Value since EvalDelta contains
     /// recursive inner transactions and complex state deltas.
     #[serde(rename = "dt", default, skip_serializing_if = "Option::is_none")]
@@ -66,7 +187,7 @@ pub struct SignedTransaction {
 
     /// Created/configured asset ID from ApplyData (ApplyData.caid).
     /// Set when an acfg create transaction is executed.
-    /// Note: this is DISTINCT from Transaction.config_asset (txn.caid) —
+    /// Note: this is DISTINCT from Transaction.config_asset (txn.caid) --
     /// this field is at the SignedTxnInBlock level, not inside the "txn" map.
     #[serde(rename = "caid", default, skip_serializing_if = "is_zero_u64")]
     pub apply_data_config_asset: u64,
@@ -76,6 +197,28 @@ pub struct SignedTransaction {
     /// Note: this is DISTINCT from Transaction.application_id (txn.apid).
     #[serde(rename = "apid", default, skip_serializing_if = "is_zero_u64")]
     pub apply_data_application_id: u64,
+}
+
+impl Default for SignedTransaction {
+    fn default() -> Self {
+        Self {
+            txn: Transaction::default(),
+            sig: [0u8; 64],
+            msig: None,
+            lsig: None,
+            auth_addr: None,
+            has_genesis_id: false,
+            has_genesis_hash: false,
+            closing_amount: 0,
+            asset_closing_amount: 0,
+            sender_rewards: 0,
+            receiver_rewards: 0,
+            close_rewards: 0,
+            eval_delta: None,
+            apply_data_config_asset: 0,
+            apply_data_application_id: 0,
+        }
+    }
 }
 
 /// Core transaction fields.
@@ -97,9 +240,9 @@ pub struct SignedTransaction {
 /// from the zero address.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Transaction {
-    /// Transaction type string ("pay", "axfer", "acfg", "afrz", "appl", "keyreg", "stpf").
+    /// Transaction type ("pay", "axfer", "acfg", "afrz", "appl", "keyreg", "stpf", "hb").
     #[serde(rename = "type")]
-    pub txn_type: String,
+    pub txn_type: TxnType,
 
     /// Sender address.
     #[serde(rename = "snd")]
@@ -117,7 +260,7 @@ pub struct Transaction {
     #[serde(rename = "lv", default)]
     pub last_valid: Round,
 
-    /// Note field.
+    /// Note field (variable length).
     #[serde(rename = "note", default, skip_serializing_if = "is_empty_bytes")]
     pub note: ByteBuf,
 
@@ -125,17 +268,32 @@ pub struct Transaction {
     #[serde(rename = "gen", default, skip_serializing_if = "String::is_empty")]
     pub genesis_id: String,
 
-    /// Genesis hash.
-    #[serde(rename = "gh", default, skip_serializing_if = "is_empty_bytes")]
-    pub genesis_hash: ByteBuf,
+    /// Genesis hash (crypto.Digest = [32]byte in Go).
+    #[serde(
+        rename = "gh",
+        default,
+        skip_serializing_if = "is_zero_32",
+        with = "serde_bytes_32"
+    )]
+    pub genesis_hash: [u8; 32],
 
-    /// Group ID.
-    #[serde(rename = "grp", default, skip_serializing_if = "is_empty_bytes")]
-    pub group: ByteBuf,
+    /// Group ID (crypto.Digest = [32]byte in Go).
+    #[serde(
+        rename = "grp",
+        default,
+        skip_serializing_if = "is_zero_32",
+        with = "serde_bytes_32"
+    )]
+    pub group: [u8; 32],
 
-    /// Lease.
-    #[serde(rename = "lx", default, skip_serializing_if = "is_empty_bytes")]
-    pub lease: ByteBuf,
+    /// Lease ([32]byte in Go).
+    #[serde(
+        rename = "lx",
+        default,
+        skip_serializing_if = "is_zero_32",
+        with = "serde_bytes_32"
+    )]
+    pub lease: [u8; 32],
 
     /// Rekey-to address.
     #[serde(rename = "rekey", default, skip_serializing_if = "Option::is_none")]
@@ -206,15 +364,15 @@ pub struct Transaction {
     #[serde(rename = "apan", default, skip_serializing_if = "is_zero_u64")]
     pub on_completion: u64,
 
-    /// Approval program.
+    /// Approval program (variable length).
     #[serde(rename = "apap", default, skip_serializing_if = "Option::is_none")]
     pub approval_program: Option<ByteBuf>,
 
-    /// Clear state program.
+    /// Clear state program (variable length).
     #[serde(rename = "apsu", default, skip_serializing_if = "Option::is_none")]
     pub clear_state_program: Option<ByteBuf>,
 
-    /// Application arguments.
+    /// Application arguments (variable length).
     #[serde(rename = "apaa", default, skip_serializing_if = "Option::is_none")]
     pub app_arguments: Option<Vec<Option<ByteBuf>>>,
 
@@ -247,17 +405,32 @@ pub struct Transaction {
     pub extra_program_pages: u32,
 
     // ── Key Registration (keyreg) fields ──────────────────────
-    /// Vote public key.
-    #[serde(rename = "votekey", default, skip_serializing_if = "Option::is_none")]
-    pub vote_pk: Option<ByteBuf>,
+    /// Vote public key (OneTimeSignatureVerifier = [32]byte in Go).
+    #[serde(
+        rename = "votekey",
+        default,
+        skip_serializing_if = "is_none_or_zero_32",
+        with = "serde_bytes_32_opt"
+    )]
+    pub vote_pk: Option<[u8; 32]>,
 
-    /// Selection public key.
-    #[serde(rename = "selkey", default, skip_serializing_if = "Option::is_none")]
-    pub selection_pk: Option<ByteBuf>,
+    /// Selection public key (VRFVerifier = [32]byte in Go).
+    #[serde(
+        rename = "selkey",
+        default,
+        skip_serializing_if = "is_none_or_zero_32",
+        with = "serde_bytes_32_opt"
+    )]
+    pub selection_pk: Option<[u8; 32]>,
 
-    /// State proof key.
-    #[serde(rename = "sprfkey", default, skip_serializing_if = "Option::is_none")]
-    pub state_proof_pk: Option<ByteBuf>,
+    /// State proof key (merklesignature.Commitment = [64]byte in Go).
+    #[serde(
+        rename = "sprfkey",
+        default,
+        skip_serializing_if = "is_none_or_zero_64",
+        with = "serde_bytes_64_opt"
+    )]
+    pub state_proof_pk: Option<[u8; 64]>,
 
     /// Vote first valid round.
     #[serde(rename = "votefst", default, skip_serializing_if = "is_zero_u64")]
@@ -328,15 +501,29 @@ fn is_false(v: &bool) -> bool {
 }
 
 /// Multisig subsignature.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MultisigSubsig {
-    /// Public key.
-    #[serde(rename = "pk")]
-    pub public_key: ByteBuf,
+    /// Public key (ed25519PublicKey = [32]byte in Go).
+    #[serde(rename = "pk", with = "serde_bytes_32")]
+    pub public_key: [u8; 32],
 
-    /// Signature (empty if this subsigner hasn't signed).
-    #[serde(rename = "s", default, skip_serializing_if = "is_empty_bytes")]
-    pub signature: ByteBuf,
+    /// Signature (ed25519Signature = [64]byte in Go; empty if this subsigner hasn't signed).
+    #[serde(
+        rename = "s",
+        default = "zeros_64",
+        skip_serializing_if = "is_zero_64",
+        with = "serde_bytes_64"
+    )]
+    pub signature: [u8; 64],
+}
+
+impl Default for MultisigSubsig {
+    fn default() -> Self {
+        Self {
+            public_key: [0u8; 32],
+            signature: [0u8; 64],
+        }
+    }
 }
 
 /// Multisig signature.
@@ -356,27 +543,44 @@ pub struct MultisigSig {
 }
 
 /// Logic signature.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogicSig {
-    /// TEAL program bytes.
+    /// TEAL program bytes (variable length).
     #[serde(rename = "l")]
     pub logic: ByteBuf,
 
-    /// Delegated signature (optional).
-    #[serde(rename = "sig", default, skip_serializing_if = "is_empty_bytes")]
-    pub sig: ByteBuf,
+    /// Delegated signature (ed25519Signature = [64]byte in Go).
+    #[serde(
+        rename = "sig",
+        default = "zeros_64",
+        skip_serializing_if = "is_zero_64",
+        with = "serde_bytes_64"
+    )]
+    pub sig: [u8; 64],
 
     /// Delegated multisig (optional).
     #[serde(rename = "msig", default, skip_serializing_if = "Option::is_none")]
     pub msig: Option<MultisigSig>,
 
-    /// Arguments (optional).
+    /// Arguments (optional, variable length).
     #[serde(rename = "arg", default, skip_serializing_if = "Option::is_none")]
     pub args: Option<Vec<ByteBuf>>,
 
     /// Delegated logic multisig (optional).
     #[serde(rename = "lmsig", default, skip_serializing_if = "Option::is_none")]
     pub lmsig: Option<MultisigSig>,
+}
+
+impl Default for LogicSig {
+    fn default() -> Self {
+        Self {
+            logic: ByteBuf::new(),
+            sig: [0u8; 64],
+            msig: None,
+            args: None,
+            lmsig: None,
+        }
+    }
 }
 
 /// Asset parameters for asset config transactions.
@@ -406,9 +610,14 @@ pub struct AssetParams {
     #[serde(rename = "au", default, skip_serializing_if = "String::is_empty")]
     pub url: String,
 
-    /// Metadata hash.
-    #[serde(rename = "am", default, skip_serializing_if = "Option::is_none")]
-    pub metadata_hash: Option<ByteBuf>,
+    /// Metadata hash ([32]byte in Go).
+    #[serde(
+        rename = "am",
+        default,
+        skip_serializing_if = "is_none_or_zero_32",
+        with = "serde_bytes_32_opt"
+    )]
+    pub metadata_hash: Option<[u8; 32]>,
 
     /// Manager address.
     #[serde(rename = "m", default, skip_serializing_if = "Option::is_none")]
@@ -465,7 +674,7 @@ pub struct BoxRef {
     #[serde(rename = "i", default, skip_serializing_if = "is_zero_u64")]
     pub index: u64,
 
-    /// Box name.
+    /// Box name (variable length).
     #[serde(rename = "n", default, skip_serializing_if = "Option::is_none")]
     pub name: Option<ByteBuf>,
 }
@@ -473,27 +682,64 @@ pub struct BoxRef {
 // ── Heartbeat types ────────────────────────────────────────────
 
 /// Heartbeat proof (crypto.HeartbeatProof in Go).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HeartbeatProof {
     /// Ed25519 signature ([64]byte).
-    #[serde(rename = "s", default, skip_serializing_if = "is_empty_bytes")]
-    pub sig: ByteBuf,
+    #[serde(
+        rename = "s",
+        default = "zeros_64",
+        skip_serializing_if = "is_zero_64",
+        with = "serde_bytes_64"
+    )]
+    pub sig: [u8; 64],
 
     /// Ephemeral public key ([32]byte).
-    #[serde(rename = "p", default, skip_serializing_if = "is_empty_bytes")]
-    pub pk: ByteBuf,
+    #[serde(
+        rename = "p",
+        default,
+        skip_serializing_if = "is_zero_32",
+        with = "serde_bytes_32"
+    )]
+    pub pk: [u8; 32],
 
     /// Second ephemeral public key ([32]byte).
-    #[serde(rename = "p2", default, skip_serializing_if = "is_empty_bytes")]
-    pub pk2: ByteBuf,
+    #[serde(
+        rename = "p2",
+        default,
+        skip_serializing_if = "is_zero_32",
+        with = "serde_bytes_32"
+    )]
+    pub pk2: [u8; 32],
 
     /// PK1 signature ([64]byte).
-    #[serde(rename = "p1s", default, skip_serializing_if = "is_empty_bytes")]
-    pub pk1_sig: ByteBuf,
+    #[serde(
+        rename = "p1s",
+        default = "zeros_64",
+        skip_serializing_if = "is_zero_64",
+        with = "serde_bytes_64"
+    )]
+    pub pk1_sig: [u8; 64],
 
     /// PK2 signature ([64]byte).
-    #[serde(rename = "p2s", default, skip_serializing_if = "is_empty_bytes")]
-    pub pk2_sig: ByteBuf,
+    #[serde(
+        rename = "p2s",
+        default = "zeros_64",
+        skip_serializing_if = "is_zero_64",
+        with = "serde_bytes_64"
+    )]
+    pub pk2_sig: [u8; 64],
+}
+
+impl Default for HeartbeatProof {
+    fn default() -> Self {
+        Self {
+            sig: [0u8; 64],
+            pk: [0u8; 32],
+            pk2: [0u8; 32],
+            pk1_sig: [0u8; 64],
+            pk2_sig: [0u8; 64],
+        }
+    }
 }
 
 /// Heartbeat transaction fields.
@@ -508,12 +754,22 @@ pub struct HeartbeatTxnFields {
     pub proof: Option<HeartbeatProof>,
 
     /// Seed ([32]byte).
-    #[serde(rename = "sd", default, skip_serializing_if = "is_empty_bytes")]
-    pub seed: ByteBuf,
+    #[serde(
+        rename = "sd",
+        default,
+        skip_serializing_if = "is_zero_32",
+        with = "serde_bytes_32"
+    )]
+    pub seed: [u8; 32],
 
     /// Vote ID ([32]byte).
-    #[serde(rename = "vid", default, skip_serializing_if = "is_empty_bytes")]
-    pub vote_id: ByteBuf,
+    #[serde(
+        rename = "vid",
+        default,
+        skip_serializing_if = "is_zero_32",
+        with = "serde_bytes_32"
+    )]
+    pub vote_id: [u8; 32],
 
     /// Key dilution.
     #[serde(rename = "kd", default, skip_serializing_if = "is_zero_u64")]
@@ -533,7 +789,7 @@ pub struct HashFactory {
 /// Merkle array proof (merklearray.Proof in Go).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MerkleProof {
-    /// Proof path — array of generic digests ([]byte each).
+    /// Proof path -- array of generic digests ([]byte each, variable length).
     #[serde(rename = "pth", default, skip_serializing_if = "Option::is_none")]
     pub path: Option<Vec<Option<ByteBuf>>>,
 
@@ -549,7 +805,7 @@ pub struct MerkleProof {
 /// Falcon verifier (crypto.FalconVerifier in Go).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FalconVerifier {
-    /// Falcon public key ([1793]byte in Go, variable-length bytes here).
+    /// Falcon public key ([1793]byte in Go, kept as variable-length bytes).
     #[serde(rename = "k", default, skip_serializing_if = "is_empty_bytes")]
     pub public_key: ByteBuf,
 }
@@ -587,15 +843,29 @@ pub struct SigSlotCommit {
 }
 
 /// Merkle signature verifier (merklesignature.Verifier in Go).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MerkleSignatureVerifier {
-    /// Commitment ([64]byte).
-    #[serde(rename = "cmt", default, skip_serializing_if = "is_empty_bytes")]
-    pub commitment: ByteBuf,
+    /// Commitment (merklesignature.Commitment = [64]byte in Go).
+    #[serde(
+        rename = "cmt",
+        default = "zeros_64",
+        skip_serializing_if = "is_zero_64",
+        with = "serde_bytes_64"
+    )]
+    pub commitment: [u8; 64],
 
     /// Key lifetime.
     #[serde(rename = "lf", default, skip_serializing_if = "is_zero_u64")]
     pub key_lifetime: u64,
+}
+
+impl Default for MerkleSignatureVerifier {
+    fn default() -> Self {
+        Self {
+            commitment: [0u8; 64],
+            key_lifetime: 0,
+        }
+    }
 }
 
 /// State proof participant (basics.Participant in Go).
@@ -625,7 +895,7 @@ pub struct Reveal {
 /// State proof body (stateproof.StateProof in Go).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StateProofBody {
-    /// Signature commitment (GenericDigest = []byte).
+    /// Signature commitment (GenericDigest = []byte, variable length).
     #[serde(rename = "c", default, skip_serializing_if = "is_empty_bytes")]
     pub sig_commit: ByteBuf,
 
@@ -657,11 +927,11 @@ pub struct StateProofBody {
 /// State proof message (stateproofmsg.Message in Go).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StateProofMessage {
-    /// Block headers commitment ([]byte, max 32).
+    /// Block headers commitment (GenericDigest = []byte, variable length).
     #[serde(rename = "b", default, skip_serializing_if = "is_empty_bytes")]
     pub block_headers_commitment: ByteBuf,
 
-    /// Voters commitment ([]byte, max 64).
+    /// Voters commitment (GenericDigest = []byte, variable length).
     #[serde(rename = "v", default, skip_serializing_if = "is_empty_bytes")]
     pub voters_commitment: ByteBuf,
 

@@ -42,7 +42,7 @@ fn app_address(app_id: u64) -> [u8; 32] {
 fn make_appl_txn(sender: [u8; 32], app_id: u64) -> SignedTransaction {
     SignedTransaction {
         txn: Transaction {
-            txn_type: "appl".to_string(),
+            txn_type: "appl".into(),
             sender: Address(sender),
             fee: 1000,
             first_valid: 100.into(),
@@ -1714,7 +1714,7 @@ fn clear_state_cannot_issue_inner_txns() {
     // Create a ClearState on_completion txn
     let txn = SignedTransaction {
         txn: Transaction {
-            txn_type: "appl".to_string(),
+            txn_type: "appl".into(),
             sender: Address(sender),
             fee: 1000,
             first_valid: 100.into(),

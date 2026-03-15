@@ -5,6 +5,7 @@ pub mod consensus;
 mod digest;
 mod header;
 mod round;
+pub mod serde_bytes_array;
 mod transaction;
 pub mod txtail;
 
@@ -25,6 +26,6 @@ pub use transaction::{
     AssetParams, BoxRef, FalconVerifier, HashFactory, HeartbeatProof, HeartbeatTxnFields,
     HoldingRef, LocalsRef, LogicSig, MerkleProof, MerkleSignature, MerkleSignatureVerifier,
     MultisigSig, MultisigSubsig, Participant, ResourceRef, Reveal, SigSlotCommit,
-    SignedTransaction, StateProofBody, StateProofMessage, StateSchema, Transaction,
+    SignedTransaction, StateProofBody, StateProofMessage, StateSchema, Transaction, TxnType,
 };
 pub use txtail::{TxTailRound, TxTailRoundLease};

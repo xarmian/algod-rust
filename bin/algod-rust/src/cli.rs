@@ -334,6 +334,12 @@ pub enum Commands {
         genesis_id: Option<String>,
     },
 
+    /// Benchmark tools for measuring decode + validate throughput.
+    Bench {
+        #[command(subcommand)]
+        action: BenchAction,
+    },
+
     /// Follow mode: continuously validate new blocks as they arrive.
     Follow {
         /// Base URL of the algod REST API.
@@ -407,5 +413,89 @@ pub enum CatchpointAction {
         /// Output file path.
         #[arg(long)]
         output: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BenchAction {
+    /// Benchmark Rust block replay: end-to-end throughput including HTTP fetch.
+    ///
+    /// NOTE: This measures end-to-end throughput (network fetch + decode +
+    /// validate). Network latency dominates (~99% of wall time). This is
+    /// useful for profiling the Rust implementation in isolation but NOT for
+    /// Go-vs-Rust comparison. For fair comparison, use `make bench-micro-go`
+    /// (same fixture files) or `make bench-cluster` (side-by-side nodes).
+    Replay {
+        /// Base URL of the algod REST API.
+        #[arg(long, default_value = "http://mainnet-api.4160.nodely.dev")]
+        algod_url: String,
+
+        /// API token for the algod node.
+        #[arg(long, default_value = "")]
+        token: String,
+
+        /// First round to replay (required).
+        #[arg(long)]
+        start_round: u64,
+
+        /// Number of blocks to replay.
+        #[arg(long, default_value = "1000")]
+        count: u64,
+
+        /// JSON output file path.
+        #[arg(long, default_value = "bench-replay-rust.json")]
+        output: PathBuf,
+
+        /// Shorthand for --count 100.
+        #[arg(long)]
+        quick: bool,
+    },
+
+    /// Benchmark Rust msgpack decode throughput: end-to-end including HTTP fetch.
+    ///
+    /// NOTE: This measures end-to-end throughput (network fetch + decode, no
+    /// validation). Network latency dominates. This is useful for profiling
+    /// the Rust decoder in isolation but NOT for Go-vs-Rust comparison. For
+    /// fair comparison, use `make bench-micro-go` (same fixture files) or
+    /// `make bench-cluster` (side-by-side nodes).
+    Decode {
+        /// Base URL of the algod REST API.
+        #[arg(long, default_value = "http://mainnet-api.4160.nodely.dev")]
+        algod_url: String,
+
+        /// API token for the algod node.
+        #[arg(long, default_value = "")]
+        token: String,
+
+        /// First round to decode (required).
+        #[arg(long)]
+        start_round: u64,
+
+        /// Number of blocks to decode.
+        #[arg(long, default_value = "1000")]
+        count: u64,
+
+        /// JSON output file path.
+        #[arg(long, default_value = "bench-decode-rust.json")]
+        output: PathBuf,
+
+        /// Shorthand for --count 100.
+        #[arg(long)]
+        quick: bool,
+    },
+
+    /// Compare Rust and Go benchmark results side by side.
+    Compare {
+        /// Path to the Rust benchmark JSON file.
+        #[arg(long)]
+        rust_json: PathBuf,
+
+        /// Path to the Go benchmark JSON file.
+        #[arg(long)]
+        go_json: PathBuf,
+
+        /// Output as markdown instead of terminal table.
+        #[arg(long)]
+        markdown: bool,
     },
 }

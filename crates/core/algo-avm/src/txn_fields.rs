@@ -82,9 +82,9 @@ pub fn read_txn_field(
         // VoteKeyDilution
         14 => Ok(TealValue::Uint(txn.vote_key_dilution)),
         // Type
-        15 => Ok(TealValue::Bytes(txn.txn_type.as_bytes().to_vec())),
+        15 => Ok(TealValue::Bytes(txn.txn_type.as_str().as_bytes().to_vec())),
         // TypeEnum
-        16 => Ok(TealValue::Uint(type_enum(&txn.txn_type))),
+        16 => Ok(TealValue::Uint(type_enum(txn.txn_type.as_str()))),
         // XferAsset
         17 => Ok(TealValue::Uint(txn.xaid)),
         // AssetAmount

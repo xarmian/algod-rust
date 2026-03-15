@@ -7,6 +7,7 @@ COMPOSE_MIXED := docker compose -f docker/docker-compose.mixed-cluster.yml
 .PHONY: build test fmt fmt-check clippy lint deny ci clean
 .PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful replay-mainnet-1k
 .PHONY: avm-replay avm-replay-mainnet
+.PHONY: bench-rust bench-decode bench-go bench-micro bench-micro-go bench-cluster benchmark
 .PHONY: archival-up archival-down
 .PHONY: localnet-up localnet-down localnet-status localnet-logs
 .PHONY: capture validate validate-only generate-txns fixtures help
@@ -332,6 +333,41 @@ mixed-cluster-conformance: mixed-cluster-up ## Run long-running conformance test
 	@echo "==> Mixed cluster conformance test complete."
 	$(MAKE) mixed-cluster-down
 
+## ── Benchmarks ─────────────────────────────────────────────
+BENCH_START  ?= 40000000
+BENCH_COUNT  ?= 100
+BENCH_OUTPUT ?= bench-results
+
+bench-rust: ## Run Rust validated replay benchmark (end-to-end, includes network fetch)
+	@mkdir -p $(BENCH_OUTPUT)
+	cargo run --release --bin algod-rust -- bench replay \
+		--start-round $(BENCH_START) --count $(BENCH_COUNT) \
+		--output $(BENCH_OUTPUT)/bench-replay-rust.json
+
+bench-decode: ## Run Rust decode-only benchmark (end-to-end, includes network fetch)
+	@mkdir -p $(BENCH_OUTPUT)
+	cargo run --release --bin algod-rust -- bench decode \
+		--start-round $(BENCH_START) --count $(BENCH_COUNT) \
+		--output $(BENCH_OUTPUT)/bench-decode-rust.json
+
+bench-go: ## Run Go REST fetch benchmark (HTTP only, not for Go-vs-Rust comparison)
+	@mkdir -p $(BENCH_OUTPUT)
+	bash docker/scripts/bench-go.sh \
+		--start-round $(BENCH_START) --count $(BENCH_COUNT) \
+		--output $(BENCH_OUTPUT)/bench-replay-go.json
+
+bench-micro: ## Run Rust criterion microbenchmarks
+	cargo bench --workspace
+
+bench-micro-go: ## Run Go decode microbenchmarks (same fixture files as Rust criterion)
+	cd benchmarks/go-decode && go test -bench=. -benchmem -count=5
+
+bench-cluster: ## Run mixed-cluster Go vs Rust comparison (requires Docker)
+	bash docker/scripts/bench-cluster.sh
+
+benchmark: bench-micro bench-micro-go ## Run all microbenchmarks (Rust + Go)
+	@echo "Benchmark complete. For cluster comparison: make bench-cluster"
+
 ## ── Archival Node ───────────────────────────────────────────
 
 archival-up: ## Start archival Go node
@@ -395,6 +431,18 @@ help:
 	@echo "  make mixed-cluster-down   Stop mixed cluster and remove volumes"
 	@echo "  make mixed-cluster-smoke  Quick connectivity check"
 	@echo "  make mixed-cluster-test   Full conformance test (up + smoke + logs + down)"
+	@echo ""
+	@echo "Benchmarks (fair comparison):"
+	@echo "  make bench-micro      Run Rust criterion microbenchmarks (fixture-based)"
+	@echo "  make bench-micro-go   Run Go decode microbenchmarks (same fixture files)"
+	@echo "  make bench-cluster    Run mixed-cluster Go vs Rust comparison (Docker)"
+	@echo "  make benchmark        Run all microbenchmarks (Rust + Go)"
+	@echo ""
+	@echo "Benchmarks (single-implementation profiling):"
+	@echo "  make bench-rust       Rust validated replay (includes HTTP fetch)"
+	@echo "  make bench-decode     Rust decode-only (includes HTTP fetch)"
+	@echo "  make bench-go         Go REST fetch (HTTP only, curl-based)"
+	@echo "                        (BENCH_START=$(BENCH_START), BENCH_COUNT=$(BENCH_COUNT))"
 	@echo ""
 	@echo "Archival Node:"
 	@echo "  make archival-up      Start archival Go node (docker)"

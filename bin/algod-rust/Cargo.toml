@@ -15,6 +15,7 @@ algo-error.workspace = true
 algo-network.workspace = true
 algo-rest-client.workspace = true
 algo-validate.workspace = true
+algo-bench.workspace = true
 algo-conformance.workspace = true
 algo-ledger.workspace = true
 algo-fixtures.workspace = true

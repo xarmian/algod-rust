@@ -6,7 +6,6 @@ use algo_types::{Address, Round, SignedTransaction, Transaction};
 use algo_validate::{
     compute_group_id, validate_group_fees, validate_transaction_rules, MIN_TXN_FEE,
 };
-use serde_bytes::ByteBuf;
 
 /// A non-zero sender address for tests.
 const TEST_SENDER: Address = Address([1u8; 32]);
@@ -14,18 +13,13 @@ const TEST_SENDER: Address = Address([1u8; 32]);
 /// Build a minimal valid transaction for testing.
 fn make_txn(fee: u64, amount: u64) -> Transaction {
     Transaction {
-        txn_type: "pay".to_string(),
+        txn_type: "pay".into(),
         sender: TEST_SENDER,
         fee,
         first_valid: Round(1000),
         last_valid: Round(1100),
         amount,
         receiver: Address([2u8; 32]),
-        note: ByteBuf::new(),
-        genesis_id: String::new(),
-        genesis_hash: ByteBuf::new(),
-        group: ByteBuf::new(),
-        lease: ByteBuf::new(),
         ..Default::default()
     }
 }
@@ -34,12 +28,7 @@ fn make_txn(fee: u64, amount: u64) -> Transaction {
 fn wrap_signed(txn: Transaction) -> SignedTransaction {
     SignedTransaction {
         txn,
-        sig: ByteBuf::from(vec![0u8; 64]),
-        msig: None,
-        lsig: None,
-        auth_addr: None,
-        has_genesis_id: false,
-        has_genesis_hash: false,
+        sig: [0u8; 64],
         ..Default::default()
     }
 }
@@ -49,7 +38,7 @@ fn wrap_signed(txn: Transaction) -> SignedTransaction {
 fn assign_group(txns: &mut [Transaction]) {
     let gid = compute_group_id(txns);
     for txn in txns.iter_mut() {
-        txn.group = ByteBuf::from(gid.as_bytes().to_vec());
+        txn.group = gid.0;
     }
 }
 
@@ -64,8 +53,8 @@ fn fee_pooling_valid_group_passes() {
 
     // Re-read the group field after assignment (assign_group computed on unmodified txns).
     let gid = compute_group_id(&[make_txn(0, 100), make_txn(2000, 200)]);
-    txn1.group = ByteBuf::from(gid.as_bytes().to_vec());
-    txn2.group = ByteBuf::from(gid.as_bytes().to_vec());
+    txn1.group = gid.0;
+    txn2.group = gid.0;
 
     let stx1 = wrap_signed(txn1);
     let stx2 = wrap_signed(txn2);
@@ -90,8 +79,8 @@ fn fee_pooling_insufficient_group_fees_fails() {
     let mut txn2 = make_txn(400, 200);
 
     let gid = compute_group_id(&[txn1.clone(), txn2.clone()]);
-    txn1.group = ByteBuf::from(gid.as_bytes().to_vec());
-    txn2.group = ByteBuf::from(gid.as_bytes().to_vec());
+    txn1.group = gid.0;
+    txn2.group = gid.0;
 
     let stx1 = wrap_signed(txn1);
     let stx2 = wrap_signed(txn2);
@@ -141,8 +130,8 @@ fn mixed_block_grouped_and_ungrouped_passes() {
     let mut gtxn2 = make_txn(2000, 200);
 
     let gid = compute_group_id(&[gtxn1.clone(), gtxn2.clone()]);
-    gtxn1.group = ByteBuf::from(gid.as_bytes().to_vec());
-    gtxn2.group = ByteBuf::from(gid.as_bytes().to_vec());
+    gtxn1.group = gid.0;
+    gtxn2.group = gid.0;
 
     // Ungrouped txn with standard fee.
     let utxn = make_txn(MIN_TXN_FEE, 500);
@@ -176,8 +165,8 @@ fn fee_pooling_exact_minimum_passes() {
     let mut txn2 = make_txn(1500, 200);
 
     let gid = compute_group_id(&[txn1.clone(), txn2.clone()]);
-    txn1.group = ByteBuf::from(gid.as_bytes().to_vec());
-    txn2.group = ByteBuf::from(gid.as_bytes().to_vec());
+    txn1.group = gid.0;
+    txn2.group = gid.0;
 
     let stx1 = wrap_signed(txn1);
     let stx2 = wrap_signed(txn2);
@@ -195,8 +184,8 @@ fn fee_pooling_one_below_minimum_fails() {
     let mut txn2 = make_txn(1000, 200);
 
     let gid = compute_group_id(&[txn1.clone(), txn2.clone()]);
-    txn1.group = ByteBuf::from(gid.as_bytes().to_vec());
-    txn2.group = ByteBuf::from(gid.as_bytes().to_vec());
+    txn1.group = gid.0;
+    txn2.group = gid.0;
 
     let stx1 = wrap_signed(txn1);
     let stx2 = wrap_signed(txn2);

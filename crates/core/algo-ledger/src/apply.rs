@@ -685,7 +685,7 @@ fn detect_transaction_groups(payset: &[SignedTransaction]) -> Vec<Vec<&SignedTra
     let mut i = 0;
     while i < payset.len() {
         let stx = &payset[i];
-        if stx.txn.group.is_empty() {
+        if stx.txn.group == [0u8; 32] {
             // Standalone transaction.
             groups.push(vec![stx]);
             i += 1;
@@ -772,7 +772,7 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
     }
 
     // Convert lease bytes to [u8; 32] for lease table operations.
-    let lease_arr: [u8; 32] = if txn.lease.is_empty() {
+    let lease_arr: [u8; 32] = if txn.lease == [0u8; 32] {
         [0u8; 32]
     } else {
         <[u8; 32]>::try_from(txn.lease.as_ref()).map_err(|_| AlgoError::Ledger {
@@ -2321,7 +2321,7 @@ pub fn apply_heartbeat<L: crate::store_trait::LedgerStore>(
     // A heartbeat with fee below MinTxnFee in a singleton group is only
     // allowed if the target account is online, incentive-eligible, and
     // currently challenged (the "risky" challenge period).
-    let is_singleton = txn.group.is_empty() || txn.group.iter().all(|b| *b == 0);
+    let is_singleton = txn.group == [0u8; 32];
     if txn.fee < consensus.min_txn_fee && is_singleton {
         let kind = if txn.fee > 0 { "cheap" } else { "free" };
 
@@ -2390,28 +2390,8 @@ pub fn apply_heartbeat<L: crate::store_trait::LedgerStore>(
                 first_valid, e
             ),
         })?;
-        let hdr_seed: [u8; 32] = if hdr_block.seed.len() >= 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&hdr_block.seed[..32]);
-            arr
-        } else {
-            let mut arr = [0u8; 32];
-            if !hdr_block.seed.is_empty() {
-                arr[..hdr_block.seed.len()].copy_from_slice(&hdr_block.seed);
-            }
-            arr
-        };
-        let hb_seed: [u8; 32] = if hb.seed.len() >= 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&hb.seed[..32]);
-            arr
-        } else {
-            let mut arr = [0u8; 32];
-            if !hb.seed.is_empty() {
-                arr[..hb.seed.len()].copy_from_slice(&hb.seed);
-            }
-            arr
-        };
+        let hdr_seed: [u8; 32] = hdr_block.seed;
+        let hb_seed: [u8; 32] = hb.seed;
         if hdr_seed != hb_seed {
             return Err(AlgoError::Ledger {
                 message: format!(
@@ -2425,20 +2405,7 @@ pub fn apply_heartbeat<L: crate::store_trait::LedgerStore>(
     // Validate vote_id matches.
     // Go: account.VotingData.VoteID != hb.HbVoteID
     let account_vote_id = account.vote_id.unwrap_or([0u8; 32]);
-    let hb_vote_id: [u8; 32] = if hb.vote_id.len() == 32 {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&hb.vote_id);
-        arr
-    } else if hb.vote_id.is_empty() {
-        [0u8; 32]
-    } else {
-        return Err(AlgoError::Ledger {
-            message: format!(
-                "heartbeat: invalid vote_id length {}, expected 32",
-                hb.vote_id.len()
-            ),
-        });
-    };
+    let hb_vote_id: [u8; 32] = hb.vote_id;
     if account_vote_id != hb_vote_id {
         return Err(AlgoError::Ledger {
             message: format!(
@@ -2549,7 +2516,7 @@ mod tests {
 
     fn pay_txn(sender: Address, receiver: Address, amount: u64, fee: u64) -> SignedTransaction {
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "pay".to_string();
+        stx.txn.txn_type = "pay".into();
         stx.txn.sender = sender;
         stx.txn.receiver = receiver;
         stx.txn.amount = amount;
@@ -2689,7 +2656,7 @@ mod tests {
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
         let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "stpf".to_string();
+        stx.txn.txn_type = "stpf".into();
         stx.txn.sender = sender;
         stx.txn.fee = 0;
 
@@ -2706,7 +2673,7 @@ mod tests {
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
         let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "bogus".to_string();
+        stx.txn.txn_type = "bogus".into();
         stx.txn.sender = sender;
         stx.txn.fee = 2_000;
 
@@ -2724,7 +2691,7 @@ mod tests {
         let mut state = make_state_with_accounts(&[(sender, 1_000_000), (fee_sink, 0)], fee_sink);
         let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "keyreg".to_string();
+        stx.txn.txn_type = "keyreg".into();
         stx.txn.sender = sender;
         stx.txn.fee = 2_000;
 
@@ -2746,7 +2713,7 @@ mod tests {
         let mut state = make_state_with_accounts(&[(sender, 100_000), (fee_sink, 0)], fee_sink);
         let ctx = ApplyContext::new_replay(0, fee_sink, 1);
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "keyreg".to_string();
+        stx.txn.txn_type = "keyreg".into();
         stx.txn.sender = sender;
         stx.txn.fee = 1_000;
 
@@ -2857,7 +2824,7 @@ mod tests {
     /// Helper: build an acfg create transaction.
     fn acfg_create_txn(sender: Address, fee: u64, params: AssetParams) -> SignedTransaction {
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "acfg".to_string();
+        stx.txn.txn_type = "acfg".into();
         stx.txn.sender = sender;
         stx.txn.fee = fee;
         stx.txn.config_asset = 0; // 0 = create
@@ -2973,7 +2940,7 @@ mod tests {
 
         // Destroy: config_asset = existing ID, asset_params = default (empty).
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "acfg".to_string();
+        stx.txn.txn_type = "acfg".into();
         stx.txn.sender = sender;
         stx.txn.fee = 1_000;
         stx.txn.config_asset = 42;
@@ -3027,7 +2994,7 @@ mod tests {
 
         // Attempt destroy — should fail because creator doesn't hold full supply.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "acfg".to_string();
+        stx.txn.txn_type = "acfg".into();
         stx.txn.sender = sender;
         stx.txn.fee = 1_000;
         stx.txn.config_asset = 42;
@@ -3061,7 +3028,7 @@ mod tests {
 
         // Reconfigure: change all role addresses.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "acfg".to_string();
+        stx.txn.txn_type = "acfg".into();
         stx.txn.sender = sender;
         stx.txn.fee = 1_000;
         stx.txn.config_asset = 42;
@@ -3105,7 +3072,7 @@ mod tests {
 
         // Attacker tries to reconfigure.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "acfg".to_string();
+        stx.txn.txn_type = "acfg".into();
         stx.txn.sender = attacker;
         stx.txn.fee = 1_000;
         stx.txn.config_asset = 42;
@@ -3139,7 +3106,7 @@ mod tests {
 
         // Clear the manager (set to zero address).
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "acfg".to_string();
+        stx.txn.txn_type = "acfg".into();
         stx.txn.sender = sender;
         stx.txn.fee = 1_000;
         stx.txn.config_asset = 42;
@@ -3155,7 +3122,7 @@ mod tests {
 
         // Now manager is zero — any further reconfig should fail.
         let mut stx2 = SignedTransaction::default();
-        stx2.txn.txn_type = "acfg".to_string();
+        stx2.txn.txn_type = "acfg".into();
         stx2.txn.sender = sender;
         stx2.txn.fee = 1_000;
         stx2.txn.config_asset = 42;
@@ -3198,7 +3165,7 @@ mod tests {
         // Build an inner acfg transaction that ONLY sets the manager field.
         // Other role fields are None (not set via itxn_field).
         let inner_txn = algo_types::Transaction {
-            txn_type: "acfg".to_string(),
+            txn_type: "acfg".into(),
             sender: creator,
             config_asset: 42,
             asset_params: Some(AssetParams {
@@ -3255,7 +3222,7 @@ mod tests {
         // Inner txn sets reserve to zero address (explicitly clearing it)
         // and also sets manager to keep it valid.
         let inner_txn = algo_types::Transaction {
-            txn_type: "acfg".to_string(),
+            txn_type: "acfg".into(),
             sender: creator,
             config_asset: 42,
             asset_params: Some(AssetParams {
@@ -3317,7 +3284,7 @@ mod tests {
 
         // Opt-in: axfer to self, amount 0.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "axfer".to_string();
+        stx.txn.txn_type = "axfer".into();
         stx.txn.sender = user;
         stx.txn.fee = 1_000;
         stx.txn.xaid = 42;
@@ -3356,7 +3323,7 @@ mod tests {
 
         // First opt-in succeeds.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "axfer".to_string();
+        stx.txn.txn_type = "axfer".into();
         stx.txn.sender = user;
         stx.txn.fee = 1_000;
         stx.txn.xaid = 42;
@@ -3403,7 +3370,7 @@ mod tests {
 
         // Transfer 300 from creator to user.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "axfer".to_string();
+        stx.txn.txn_type = "axfer".into();
         stx.txn.sender = creator;
         stx.txn.fee = 1_000;
         stx.txn.xaid = 42;
@@ -3447,7 +3414,7 @@ mod tests {
 
         // Try to transfer more than creator holds.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "axfer".to_string();
+        stx.txn.txn_type = "axfer".into();
         stx.txn.sender = creator;
         stx.txn.fee = 1_000;
         stx.txn.xaid = 42;
@@ -3480,7 +3447,7 @@ mod tests {
 
         // Transfer to user who hasn't opted in.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "axfer".to_string();
+        stx.txn.txn_type = "axfer".into();
         stx.txn.sender = creator;
         stx.txn.fee = 1_000;
         stx.txn.xaid = 42;
@@ -3532,7 +3499,7 @@ mod tests {
 
         // Clawback: sender=clawback_addr, asset_sender=user (source), receiver=creator.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "axfer".to_string();
+        stx.txn.txn_type = "axfer".into();
         stx.txn.sender = clawback_addr;
         stx.txn.fee = 1_000;
         stx.txn.xaid = 42;
@@ -3584,7 +3551,7 @@ mod tests {
 
         // Attacker tries clawback.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "axfer".to_string();
+        stx.txn.txn_type = "axfer".into();
         stx.txn.sender = attacker;
         stx.txn.fee = 1_000;
         stx.txn.xaid = 42;
@@ -3646,7 +3613,7 @@ mod tests {
 
         // Close asset holding: transfer 100 to creator, close remainder to close_target.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "axfer".to_string();
+        stx.txn.txn_type = "axfer".into();
         stx.txn.sender = user;
         stx.txn.fee = 1_000;
         stx.txn.xaid = 42;
@@ -3701,7 +3668,7 @@ mod tests {
 
         // User tries to transfer from frozen holding.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "axfer".to_string();
+        stx.txn.txn_type = "axfer".into();
         stx.txn.sender = user;
         stx.txn.fee = 1_000;
         stx.txn.xaid = 42;
@@ -3749,7 +3716,7 @@ mod tests {
 
         // Freeze user's holding.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "afrz".to_string();
+        stx.txn.txn_type = "afrz".into();
         stx.txn.sender = creator;
         stx.txn.fee = 1_000;
         stx.txn.freeze_asset = 42;
@@ -3793,7 +3760,7 @@ mod tests {
 
         // Unfreeze.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "afrz".to_string();
+        stx.txn.txn_type = "afrz".into();
         stx.txn.sender = creator;
         stx.txn.fee = 1_000;
         stx.txn.freeze_asset = 42;
@@ -3843,7 +3810,7 @@ mod tests {
 
         // Attacker tries to freeze.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "afrz".to_string();
+        stx.txn.txn_type = "afrz".into();
         stx.txn.sender = attacker;
         stx.txn.fee = 1_000;
         stx.txn.freeze_asset = 42;
@@ -3880,7 +3847,7 @@ mod tests {
 
         // User has NOT opted in — no holding.
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "afrz".to_string();
+        stx.txn.txn_type = "afrz".into();
         stx.txn.sender = creator;
         stx.txn.fee = 1_000;
         stx.txn.freeze_asset = 42;
@@ -3898,12 +3865,12 @@ mod tests {
 
     fn keyreg_online_txn(sender: Address, fee: u64) -> SignedTransaction {
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "keyreg".to_string();
+        stx.txn.txn_type = "keyreg".into();
         stx.txn.sender = sender;
         stx.txn.fee = fee;
-        stx.txn.vote_pk = Some(serde_bytes::ByteBuf::from(vec![1u8; 32]));
-        stx.txn.selection_pk = Some(serde_bytes::ByteBuf::from(vec![2u8; 32]));
-        stx.txn.state_proof_pk = Some(serde_bytes::ByteBuf::from(vec![3u8; 64]));
+        stx.txn.vote_pk = Some([1u8; 32]);
+        stx.txn.selection_pk = Some([2u8; 32]);
+        stx.txn.state_proof_pk = Some([3u8; 64]);
         // vote_first <= round+1 and vote_last > round to pass coherency checks.
         // Tests use round=1, so vote_first=1, vote_last=200.
         stx.txn.vote_first = 1;
@@ -3914,7 +3881,7 @@ mod tests {
 
     fn keyreg_offline_txn(sender: Address, fee: u64) -> SignedTransaction {
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "keyreg".to_string();
+        stx.txn.txn_type = "keyreg".into();
         stx.txn.sender = sender;
         stx.txn.fee = fee;
         // No keys, non_participation=false => offline
@@ -3923,7 +3890,7 @@ mod tests {
 
     fn keyreg_nonpart_txn(sender: Address, fee: u64) -> SignedTransaction {
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "keyreg".to_string();
+        stx.txn.txn_type = "keyreg".into();
         stx.txn.sender = sender;
         stx.txn.fee = fee;
         stx.txn.non_participation = true;
@@ -4158,29 +4125,29 @@ mod tests {
         // [standalone_A, group_B1, group_B2, group_B3, standalone_C]
 
         let mut standalone_a = SignedTransaction::default();
-        standalone_a.txn.txn_type = "pay".to_string();
+        standalone_a.txn.txn_type = "pay".into();
         standalone_a.txn.sender = Address([1u8; 32]);
         // Empty group hash => standalone.
 
-        let group_hash = serde_bytes::ByteBuf::from(vec![42u8; 32]);
+        let group_hash = [42u8; 32];
 
         let mut group_b1 = SignedTransaction::default();
-        group_b1.txn.txn_type = "appl".to_string();
+        group_b1.txn.txn_type = "appl".into();
         group_b1.txn.sender = Address([2u8; 32]);
-        group_b1.txn.group = group_hash.clone();
+        group_b1.txn.group = group_hash;
 
         let mut group_b2 = SignedTransaction::default();
-        group_b2.txn.txn_type = "pay".to_string();
+        group_b2.txn.txn_type = "pay".into();
         group_b2.txn.sender = Address([3u8; 32]);
-        group_b2.txn.group = group_hash.clone();
+        group_b2.txn.group = group_hash;
 
         let mut group_b3 = SignedTransaction::default();
-        group_b3.txn.txn_type = "axfer".to_string();
+        group_b3.txn.txn_type = "axfer".into();
         group_b3.txn.sender = Address([4u8; 32]);
-        group_b3.txn.group = group_hash.clone();
+        group_b3.txn.group = group_hash;
 
         let mut standalone_c = SignedTransaction::default();
-        standalone_c.txn.txn_type = "pay".to_string();
+        standalone_c.txn.txn_type = "pay".into();
         standalone_c.txn.sender = Address([5u8; 32]);
 
         let payset = vec![standalone_a, group_b1, group_b2, group_b3, standalone_c];
@@ -4227,24 +4194,24 @@ mod tests {
 
     #[test]
     fn test_detect_transaction_groups_two_different_groups() {
-        let group_a = serde_bytes::ByteBuf::from(vec![10u8; 32]);
-        let group_b = serde_bytes::ByteBuf::from(vec![20u8; 32]);
+        let group_a = [10u8; 32];
+        let group_b = [20u8; 32];
 
         let mut a1 = SignedTransaction::default();
         a1.txn.sender = Address([1u8; 32]);
-        a1.txn.group = group_a.clone();
+        a1.txn.group = group_a;
 
         let mut a2 = SignedTransaction::default();
         a2.txn.sender = Address([2u8; 32]);
-        a2.txn.group = group_a.clone();
+        a2.txn.group = group_a;
 
         let mut b1 = SignedTransaction::default();
         b1.txn.sender = Address([3u8; 32]);
-        b1.txn.group = group_b.clone();
+        b1.txn.group = group_b;
 
         let mut b2 = SignedTransaction::default();
         b2.txn.sender = Address([4u8; 32]);
-        b2.txn.group = group_b.clone();
+        b2.txn.group = group_b;
 
         let payset = vec![a1, a2, b1, b2];
         let groups = detect_transaction_groups(&payset);
@@ -4260,20 +4227,18 @@ mod tests {
 
     /// Create a minimal Block for round 1 with a single payment transaction.
     fn make_test_block(fee_sink: Address) -> Block {
-        use serde_bytes::ByteBuf;
-
         let sender = Address([1u8; 32]);
         let receiver = Address([2u8; 32]);
         let stx = pay_txn(sender, receiver, 100, 1_000);
 
         Block {
             round: Round(1),
-            branch: ByteBuf::new(),
-            seed: ByteBuf::new(),
-            txn_commitment: ByteBuf::new(),
+            branch: [0u8; 32],
+            seed: [0u8; 32],
+            txn_commitment: [0u8; 32],
             timestamp: 1000,
             genesis_id: String::new(),
-            genesis_hash: ByteBuf::new(),
+            genesis_hash: [0u8; 32],
             proposer: Address::ZERO,
             fee_sink,
             rewards_pool: Address::ZERO,
@@ -4290,9 +4255,9 @@ mod tests {
             fees_collected: 0,
             bonus: 0,
             proposer_payout: 0,
-            prev512: ByteBuf::new(),
-            txn256: ByteBuf::new(),
-            txn512: ByteBuf::new(),
+            prev512: [0u8; 64],
+            txn256: [0u8; 32],
+            txn512: [0u8; 64],
             state_proof_tracking: None,
             upgrade_propose: String::new(),
             upgrade_delay: 0,
@@ -4417,7 +4382,7 @@ mod tests {
         seed: &[u8; 32],
     ) -> SignedTransaction {
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "hb".to_string();
+        stx.txn.txn_type = "hb".into();
         stx.txn.sender = sender;
         stx.txn.fee = fee;
         // first_valid = 1 (matching the round of the stored block header).
@@ -4425,8 +4390,8 @@ mod tests {
         stx.txn.heartbeat = Some(algo_types::HeartbeatTxnFields {
             address: hb_address,
             proof: None,
-            seed: serde_bytes::ByteBuf::from(seed.to_vec()),
-            vote_id: serde_bytes::ByteBuf::from(vote_id.to_vec()),
+            seed: *seed,
+            vote_id,
             key_dilution,
         });
         stx
@@ -4436,17 +4401,16 @@ mod tests {
     /// Used by heartbeat tests so that HbSeed validation can find the header.
     fn store_block_header_with_seed(state: &mut LedgerState, round: u64, seed: &[u8; 32]) {
         use crate::store_trait::LedgerStore;
-        use serde_bytes::ByteBuf;
 
         // Build a minimal block with the seed for header encoding.
         let block = Block {
             round: Round(round),
-            branch: ByteBuf::new(),
-            seed: ByteBuf::from(seed.to_vec()),
-            txn_commitment: ByteBuf::new(),
+            branch: [0u8; 32],
+            seed: *seed,
+            txn_commitment: [0u8; 32],
             timestamp: 0,
             genesis_id: String::new(),
-            genesis_hash: ByteBuf::new(),
+            genesis_hash: [0u8; 32],
             proposer: Address::ZERO,
             fee_sink: Address::ZERO,
             rewards_pool: Address::ZERO,
@@ -4463,9 +4427,9 @@ mod tests {
             fees_collected: 0,
             bonus: 0,
             proposer_payout: 0,
-            prev512: ByteBuf::new(),
-            txn256: ByteBuf::new(),
-            txn512: ByteBuf::new(),
+            prev512: [0u8; 64],
+            txn256: [0u8; 32],
+            txn512: [0u8; 64],
             state_proof_tracking: None,
             upgrade_propose: String::new(),
             upgrade_delay: 0,
@@ -4649,7 +4613,7 @@ mod tests {
         let ctx = heartbeat_ctx(fee_sink, 100);
         // Heartbeat with no heartbeat fields (None).
         let mut stx = SignedTransaction::default();
-        stx.txn.txn_type = "hb".to_string();
+        stx.txn.txn_type = "hb".into();
         stx.txn.sender = sender;
         stx.txn.fee = 1_000;
         // heartbeat field is None
@@ -4674,16 +4638,14 @@ mod tests {
         expired: Option<Vec<Address>>,
         absent: Option<Vec<Address>>,
     ) -> Block {
-        use serde_bytes::ByteBuf;
-
         Block {
             round: Round(1),
-            branch: ByteBuf::new(),
-            seed: ByteBuf::new(),
-            txn_commitment: ByteBuf::new(),
+            branch: [0u8; 32],
+            seed: [0u8; 32],
+            txn_commitment: [0u8; 32],
             timestamp: 1000,
             genesis_id: String::new(),
-            genesis_hash: ByteBuf::new(),
+            genesis_hash: [0u8; 32],
             proposer: Address::ZERO,
             fee_sink,
             rewards_pool: Address::ZERO,
@@ -4700,9 +4662,9 @@ mod tests {
             fees_collected: 0,
             bonus: 0,
             proposer_payout: 0,
-            prev512: ByteBuf::new(),
-            txn256: ByteBuf::new(),
-            txn512: ByteBuf::new(),
+            prev512: [0u8; 64],
+            txn256: [0u8; 32],
+            txn512: [0u8; 64],
             state_proof_tracking: None,
             upgrade_propose: String::new(),
             upgrade_delay: 0,

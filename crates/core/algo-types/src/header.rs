@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use serde_bytes::ByteBuf;
 
+use crate::serde_bytes_array::{is_zero_32, is_zero_64, serde_bytes_32, serde_bytes_64, zeros_64};
 use crate::{Address, Round};
 
 /// Algorand block header.
@@ -16,17 +16,32 @@ pub struct BlockHeader {
     #[serde(rename = "rnd")]
     pub round: Round,
 
-    /// Previous block hash.
-    #[serde(rename = "prev", default, skip_serializing_if = "is_empty_bytes")]
-    pub branch: ByteBuf,
+    /// Previous block hash (crypto.Digest = [32]byte in Go).
+    #[serde(
+        rename = "prev",
+        default,
+        skip_serializing_if = "is_zero_32",
+        with = "serde_bytes_32"
+    )]
+    pub branch: [u8; 32],
 
-    /// Sortition seed.
-    #[serde(rename = "seed", default, skip_serializing_if = "is_empty_bytes")]
-    pub seed: ByteBuf,
+    /// Sortition seed (committee.Seed = [32]byte in Go).
+    #[serde(
+        rename = "seed",
+        default,
+        skip_serializing_if = "is_zero_32",
+        with = "serde_bytes_32"
+    )]
+    pub seed: [u8; 32],
 
-    /// Transaction commitment (root of payset merkle tree).
-    #[serde(rename = "txn", default, skip_serializing_if = "is_empty_bytes")]
-    pub txn_commitment: ByteBuf,
+    /// Transaction commitment (crypto.Digest = [32]byte in Go).
+    #[serde(
+        rename = "txn",
+        default,
+        skip_serializing_if = "is_zero_32",
+        with = "serde_bytes_32"
+    )]
+    pub txn_commitment: [u8; 32],
 
     /// Block timestamp (seconds since epoch).
     #[serde(rename = "ts", default)]
@@ -36,9 +51,14 @@ pub struct BlockHeader {
     #[serde(rename = "gen", default, skip_serializing_if = "String::is_empty")]
     pub genesis_id: String,
 
-    /// Genesis hash.
-    #[serde(rename = "gh", default, skip_serializing_if = "is_empty_bytes")]
-    pub genesis_hash: ByteBuf,
+    /// Genesis hash (crypto.Digest = [32]byte in Go).
+    #[serde(
+        rename = "gh",
+        default,
+        skip_serializing_if = "is_zero_32",
+        with = "serde_bytes_32"
+    )]
+    pub genesis_hash: [u8; 32],
 
     /// Block proposer address.
     #[serde(rename = "prp", default, skip_serializing_if = "Address::is_zero")]
@@ -109,19 +129,34 @@ pub struct BlockHeader {
     #[serde(rename = "pp", default, skip_serializing_if = "is_zero_u64")]
     pub proposer_payout: u64,
 
-    /// SHA512/256 digest of the previous block header.
-    #[serde(rename = "prev512", default, skip_serializing_if = "is_empty_bytes")]
-    pub prev512: ByteBuf,
+    /// SHA512/256 digest of the previous block header (crypto.Sha512Digest = [64]byte in Go).
+    #[serde(
+        rename = "prev512",
+        default = "zeros_64",
+        skip_serializing_if = "is_zero_64",
+        with = "serde_bytes_64"
+    )]
+    pub prev512: [u8; 64],
 
-    /// SHA256 merkle root of the payset.
-    #[serde(rename = "txn256", default, skip_serializing_if = "is_empty_bytes")]
-    pub txn256: ByteBuf,
+    /// SHA256 merkle root of the payset (crypto.Digest = [32]byte in Go).
+    #[serde(
+        rename = "txn256",
+        default,
+        skip_serializing_if = "is_zero_32",
+        with = "serde_bytes_32"
+    )]
+    pub txn256: [u8; 32],
 
-    /// SHA512/256 merkle root variant of the payset.
-    #[serde(rename = "txn512", default, skip_serializing_if = "is_empty_bytes")]
-    pub txn512: ByteBuf,
+    /// SHA512/256 merkle root variant of the payset (crypto.Sha512Digest = [64]byte in Go).
+    #[serde(
+        rename = "txn512",
+        default = "zeros_64",
+        skip_serializing_if = "is_zero_64",
+        with = "serde_bytes_64"
+    )]
+    pub txn512: [u8; 64],
 
-    /// State proof tracking (opaque — uses integer map keys).
+    /// State proof tracking (opaque -- uses integer map keys).
     #[serde(rename = "spt", default, skip_serializing_if = "Option::is_none")]
     pub state_proof_tracking: Option<rmpv::Value>,
 
@@ -162,10 +197,6 @@ pub struct BlockHeader {
 
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
-}
-
-fn is_empty_bytes(v: &ByteBuf) -> bool {
-    v.is_empty()
 }
 
 fn is_false(v: &bool) -> bool {

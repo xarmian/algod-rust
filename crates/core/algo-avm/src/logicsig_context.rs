@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn global_field_group_id() {
         let mut stxn = make_pay_stxn([0x10; 32]);
-        stxn.txn.group = vec![0xAA; 32].into();
+        stxn.txn.group = [0xAA; 32];
         let group = vec![stxn];
         let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
@@ -416,7 +416,7 @@ mod tests {
     #[test]
     fn global_field_genesis_hash() {
         let mut stxn = make_pay_stxn([0x10; 32]);
-        stxn.txn.genesis_hash = vec![0xBB; 32].into();
+        stxn.txn.genesis_hash = [0xBB; 32];
         let group = vec![stxn];
         let ctx = LogicSigAvmContext::new(&group, 0, &[0x01], vec![], ConsensusParams::default());
 
