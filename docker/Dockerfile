@@ -8,7 +8,7 @@ RUN cargo build --release --bin algod-rust
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/algod-rust /usr/local/bin/algod-rust
 WORKDIR /app

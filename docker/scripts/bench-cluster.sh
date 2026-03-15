@@ -157,6 +157,8 @@ while true; do
     # Get rounds
     GO_RELAY_ROUND=$(get_round "http://localhost:4001")
     GO_NONRELAY_ROUND=$(get_round "http://localhost:4002")
+    # Query rust-relay's ledger round directly via sqlite
+    RUST_RELAY_ROUND=$(docker exec mc-rust-relay sqlite3 /app/ledger.sqlite "SELECT value FROM algod_rust_meta WHERE key='current_round'" 2>/dev/null || echo "?")
 
     # Sample container stats
     RUST_STATS=$(sample_stats "mc-rust-relay" 2>/dev/null || echo "")
@@ -196,7 +198,7 @@ while true; do
     fi
 
     # Progress
-    echo "  [t=${ELAPSED_INT}s] go-relay=${GO_RELAY_ROUND} go-nonrelay(via rust)=${GO_NONRELAY_ROUND}"
+    echo "  [t=${ELAPSED_INT}s] go-relay=${GO_RELAY_ROUND} rust-relay=${RUST_RELAY_ROUND} go-nonrelay(via rust)=${GO_NONRELAY_ROUND}"
 
     # Both reached target?
     if [ -n "$RUST_REACHED" ] && [ -n "$GO_REACHED" ]; then
@@ -292,6 +294,12 @@ echo "Avg CPU:             ${GO_AVG_CPU}%            ${RUST_AVG_CPU}%"
 echo "Blocks/sec:          ${GO_BPS}             ${RUST_BPS}"
 echo ""
 echo "Output: ${OUTPUT}"
+
+# ── Save logs before tear down ────────────────────────────────────────
+echo ""
+echo "==> Saving container logs..."
+docker logs mc-rust-relay > bench-results/rust-relay.log 2>&1 || true
+docker logs mc-go-nonrelay > bench-results/go-nonrelay.log 2>&1 || true
 
 # ── Tear down ─────────────────────────────────────────────────────────
 echo ""

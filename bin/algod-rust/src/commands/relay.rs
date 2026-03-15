@@ -123,6 +123,39 @@ impl MessageHandler for BlockNotifyHandler {
 }
 
 // ---------------------------------------------------------------------------
+// WebSocket block request handler: serves blocks to peers via UniEnsBlockReq
+// ---------------------------------------------------------------------------
+
+/// Handles incoming `UniEnsBlockReq` WebSocket messages by delegating to the
+/// [`BlockService`]'s existing `handle_ws_block_request` method.
+///
+/// When a Go non-relay peer asks for a block, it sends a `UniEnsBlockReq`
+/// message over WebSocket.  This handler looks up the block in the local
+/// ledger and returns it as a `TopicMsgResp` with block+cert Topics.
+///
+/// Without this handler, Go peers fall back to periodic HTTP catchup (~17s
+/// intervals), causing bursty sync behaviour.
+struct BlockRequestHandler {
+    block_service: Arc<BlockService>,
+}
+
+#[async_trait]
+impl MessageHandler for BlockRequestHandler {
+    async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+        let (response_topics, _guard) = self.block_service.handle_ws_block_request(&msg.data);
+        // The read_loop's Respond path will append the RequestHash topic,
+        // marshal the Topics, and send as TopicMsgResp.  We just pass the
+        // topics through — the payload field is unused for Respond.
+        OutgoingMessage {
+            action: ForwardingPolicy::Respond,
+            tag: Tag::TopicMsgResp,
+            payload: Vec::new(),
+            topics: Some(response_topics),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Block catchup: fetch blocks from peers via HTTP
 // ---------------------------------------------------------------------------
 
@@ -414,11 +447,11 @@ pub async fn run(
     let ledger = Arc::new(LedgerBlockService {
         ledger: Mutex::new(sqlite_ledger),
     });
-    let block_service = BlockService::new(
+    let block_service = Arc::new(BlockService::new(
         Arc::clone(&ledger) as Arc<dyn LedgerForBlockService>,
         resolved_genesis_id.clone(),
         mem_cap,
-    );
+    ));
     net.register_http_handler("/", block_service.http_router());
 
     // Register gossip handlers for all relay-forwarded message types.
@@ -431,6 +464,13 @@ pub async fn run(
     let notify_handler: Arc<dyn MessageHandler> = Arc::new(BlockNotifyHandler {
         notify: Arc::clone(&catchup_notify),
     });
+    // Register the block request handler for UniEnsBlockReq — this allows
+    // Go peers to fetch blocks directly over WebSocket instead of falling
+    // back to periodic HTTP catchup (~17s intervals).
+    let block_request_handler: Arc<dyn MessageHandler> = Arc::new(BlockRequestHandler {
+        block_service: Arc::clone(&block_service),
+    });
+
     net.register_handlers(vec![
         TaggedMessageHandler {
             tag: Tag::ProposalPayload,
@@ -455,6 +495,10 @@ pub async fn run(
         TaggedMessageHandler {
             tag: Tag::StateProofSig,
             handler: Arc::clone(&notify_handler),
+        },
+        TaggedMessageHandler {
+            tag: Tag::UniEnsBlockReq,
+            handler: block_request_handler,
         },
     ]);
 

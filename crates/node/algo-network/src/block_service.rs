@@ -57,6 +57,10 @@ const BLOCK_RESPONSE_MISSING_BLOCK_CACHE_CONTROL: &str = "public, max-age=1, mus
 /// Retry-After header value in seconds.
 const BLOCK_RESPONSE_RETRY_AFTER: &str = "1";
 
+/// Header returned when the requested block is not yet available.
+/// Matches Go's `BlockResponseLatestRoundHeader`.
+const BLOCK_RESPONSE_LATEST_ROUND_HEADER: &str = "X-Latest-Round";
+
 /// Default block service memory cap: 500 MiB.
 pub const DEFAULT_BLOCK_SERVICE_MEM_CAP: u64 = 500 * 1024 * 1024;
 
@@ -451,12 +455,15 @@ async fn serve_block(
             .into_response();
     }
 
-    // Check if round is ahead of latest
+    // Check if round is ahead of latest — return 404 (not 503) to match
+    // Go's block service behaviour.  Go's catchup treats 404 as "try another
+    // peer immediately" whereas 503 triggers aggressive backoff.
     let latest = state.ledger.latest_round();
     if round > latest {
         return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header("Retry-After", BLOCK_RESPONSE_RETRY_AFTER)
+            .status(StatusCode::NOT_FOUND)
+            .header("Cache-Control", BLOCK_RESPONSE_MISSING_BLOCK_CACHE_CONTROL)
+            .header(BLOCK_RESPONSE_LATEST_ROUND_HEADER, latest.to_string())
             .body(Body::empty())
             .unwrap()
             .into_response();
@@ -711,7 +718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_returns_503_when_round_ahead_of_latest() {
+    async fn http_returns_404_when_round_ahead_of_latest() {
         let ledger = Arc::new(MockLedger::new());
         ledger.add_block(5, b"\x80".to_vec(), b"\x80".to_vec());
         let app = make_test_service(ledger);
@@ -721,10 +728,17 @@ mod tests {
         let req = Request::builder().uri(&uri).body(Body::empty()).unwrap();
         let resp = app.oneshot(req).await.unwrap();
 
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Must return 404 (not 503) to match Go's behaviour.
+        // Go's catchup treats 404 as "try another peer immediately"
+        // but treats 503 as "server overloaded, back off aggressively."
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(
-            resp.headers().get("retry-after").unwrap().to_str().unwrap(),
-            BLOCK_RESPONSE_RETRY_AFTER,
+            resp.headers()
+                .get(BLOCK_RESPONSE_LATEST_ROUND_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "5",
         );
     }
 

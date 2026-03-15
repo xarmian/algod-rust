@@ -77,6 +77,8 @@ services:
     depends_on:
       go-relay:
         condition: service_healthy
+    environment:
+      - RUST_LOG=info,algod_rust=debug,algo_network=debug
     entrypoint:
       - algod-rust
       - relay
