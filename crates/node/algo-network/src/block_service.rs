@@ -192,9 +192,9 @@ impl BlockService {
     /// Subject to the same memory cap as the HTTP path (tracked separately
     /// on `ws_mem_used`).
     pub fn handle_ws_block_request(&self, request_data: &[u8]) -> (Topics, Option<MemoryGuard>) {
-        // Check memory cap before processing
+        // Check memory cap before processing (mem_cap == 0 means unlimited)
         let mem_used = self.ws_mem_used.load(Ordering::Relaxed);
-        if mem_used >= self.mem_cap {
+        if self.mem_cap > 0 && mem_used >= self.mem_cap {
             return (
                 Topics::from_vec(vec![Topic::new(
                     ERROR_KEY,
@@ -439,9 +439,10 @@ async fn serve_block(
         None => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    // Check memory cap before processing (>= matches Go's behaviour)
+    // Check memory cap before processing (>= matches Go's behaviour).
+    // mem_cap == 0 means unlimited — skip the check entirely.
     let mem_used = state.mem_used.load(Ordering::Relaxed);
-    if mem_used >= state.mem_cap {
+    if state.mem_cap > 0 && mem_used >= state.mem_cap {
         return Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .header("Retry-After", BLOCK_RESPONSE_RETRY_AFTER)
@@ -969,6 +970,55 @@ mod tests {
         assert!(guard.is_none(), "no guard for error responses");
         let error = resp.get_value(ERROR_KEY).unwrap();
         assert_eq!(error, MEMORY_AT_CAPACITY_ERR_MSG.as_bytes());
+    }
+
+    #[test]
+    fn mem_cap_zero_allows_unlimited_requests() {
+        // mem_cap == 0 is documented as "unlimited" — verify it does not
+        // reject requests even when mem_used is already large.
+        let ledger = Arc::new(MockLedger::new());
+        ledger.add_block(1, b"\x80".to_vec(), b"\x80".to_vec());
+
+        // WS path
+        let service = BlockService::new(ledger.clone(), "test".to_string(), 0);
+        service
+            .ws_mem_used
+            .store(u64::MAX / 2, Ordering::Relaxed);
+
+        let topics = make_block_request_topics(1);
+        let request_data = topics.marshal();
+        let (resp, guard) = service.handle_ws_block_request(&request_data);
+
+        assert!(
+            guard.is_some(),
+            "mem_cap=0 should allow the request (guard should be Some)"
+        );
+        assert!(resp.get_value(BLOCK_DATA_KEY).is_some());
+        assert!(resp.get_value(ERROR_KEY).is_none());
+    }
+
+    #[tokio::test]
+    async fn http_mem_cap_zero_allows_unlimited_requests() {
+        let ledger = Arc::new(MockLedger::new());
+        ledger.add_block(1, b"\x80".to_vec(), b"\x80".to_vec());
+
+        // Build service with mem_cap=0 (unlimited)
+        let service = BlockService::new(ledger, "testnet-v1.0".to_string(), 0);
+        // Pre-load a large memory value to confirm it is not checked
+        service
+            .http_mem_used
+            .store(u64::MAX / 2, Ordering::Relaxed);
+        let app = service.http_router();
+
+        let uri = format!("/v1/testnet-v1.0/block/{}", format_round_base36(1));
+        let req = Request::builder().uri(&uri).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "mem_cap=0 should allow the request"
+        );
     }
 
     #[test]

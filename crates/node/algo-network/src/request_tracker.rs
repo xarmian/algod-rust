@@ -111,22 +111,31 @@ impl ConnectionTracker {
     }
 
     /// Returns `true` if the number of active connections from `ip` is
-    /// strictly below `max_per_ip`.
+    /// at or below `max_per_ip`.
     ///
-    /// A return value of `false` means the IP has reached (or exceeded)
-    /// the connection limit and should be rejected.
+    /// The check uses `<=` because [`validate_incoming_connection`] calls
+    /// [`track_connection`] **before** this check, so the current request
+    /// is already included in the count. A count equal to `max_per_ip`
+    /// means the current request is allowed but no more after it.
+    ///
+    /// A return value of `false` means the IP has exceeded the connection
+    /// limit and should be rejected.
     pub fn check_connection_limit(&self, ip: IpAddr, max_per_ip: u32) -> bool {
         let inner = self.inner.lock().unwrap();
         let count = inner.active_connections.get(&ip).copied().unwrap_or(0);
-        count < max_per_ip
+        count <= max_per_ip
     }
 
     /// Returns `true` if the connection-attempt rate from `ip` is within
     /// the allowed `max_per_window` threshold.
     ///
     /// The check counts how many connection attempts from `ip` occurred
-    /// within the sliding window configured at construction time. If the
-    /// count is strictly below `max_per_window`, the IP is allowed.
+    /// within the sliding window configured at construction time. The
+    /// check uses `<=` because [`validate_incoming_connection`] calls
+    /// [`track_connection`] **before** this check, so the current
+    /// request is already included in the count. A count equal to
+    /// `max_per_window` means the current request is allowed but no
+    /// more after it within this window.
     ///
     /// Stale entries (older than the window) are pruned on each call to
     /// keep memory bounded, matching Go's `pruneRequests` behaviour.
@@ -152,7 +161,7 @@ impl ConnectionTracker {
             return true;
         }
 
-        (attempts.len() as u32) < max_per_window
+        (attempts.len() as u32) <= max_per_window
     }
 
     /// Returns the number of currently active connections from `ip`.
@@ -257,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_limit_reached() {
+    fn connection_limit_at_max_allowed() {
         let tracker = ConnectionTracker::new(Duration::from_secs(1));
         let ip = ipv4(10, 0, 0, 5);
 
@@ -265,8 +274,9 @@ mod tests {
         tracker.track_connection(ip);
         tracker.track_connection(ip);
 
-        // At limit (3 connections, max 3) => should be rejected.
-        assert!(!tracker.check_connection_limit(ip, 3));
+        // At limit (3 connections, max 3) => allowed because the current
+        // request (already tracked) makes count == max.
+        assert!(tracker.check_connection_limit(ip, 3));
     }
 
     #[test]
@@ -275,6 +285,19 @@ mod tests {
         let ip = ipv4(10, 0, 0, 6);
 
         for _ in 0..5 {
+            tracker.track_connection(ip);
+        }
+        // 5 > 3, so rejected.
+        assert!(!tracker.check_connection_limit(ip, 3));
+    }
+
+    #[test]
+    fn connection_limit_one_past_max_rejected() {
+        let tracker = ConnectionTracker::new(Duration::from_secs(1));
+        let ip = ipv4(10, 0, 0, 55);
+
+        // Track max_per_ip + 1 connections — should be rejected.
+        for _ in 0..4 {
             tracker.track_connection(ip);
         }
         assert!(!tracker.check_connection_limit(ip, 3));
@@ -288,9 +311,12 @@ mod tests {
         tracker.track_connection(ip);
         tracker.track_connection(ip);
         tracker.track_connection(ip);
+        tracker.track_connection(ip);
+        // 4 > 3, so rejected.
         assert!(!tracker.check_connection_limit(ip, 3));
 
         tracker.release_connection(ip);
+        // 3 <= 3, so allowed.
         assert!(tracker.check_connection_limit(ip, 3));
     }
 
@@ -309,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_reached() {
+    fn rate_limit_at_max_allowed() {
         let tracker = ConnectionTracker::new(Duration::from_secs(10));
         let ip = ipv4(10, 0, 0, 11);
 
@@ -317,8 +343,8 @@ mod tests {
             tracker.track_connection(ip);
         }
 
-        // 5 attempts, limit 5 => rejected (not strictly below).
-        assert!(!tracker.check_rate_limit(ip, 5));
+        // 5 attempts, limit 5 => allowed (current request already tracked).
+        assert!(tracker.check_rate_limit(ip, 5));
     }
 
     #[test]
@@ -330,6 +356,20 @@ mod tests {
             tracker.track_connection(ip);
         }
 
+        // 10 > 5, so rejected.
+        assert!(!tracker.check_rate_limit(ip, 5));
+    }
+
+    #[test]
+    fn rate_limit_one_past_max_rejected() {
+        let tracker = ConnectionTracker::new(Duration::from_secs(10));
+        let ip = ipv4(10, 0, 0, 120);
+
+        for _ in 0..6 {
+            tracker.track_connection(ip);
+        }
+
+        // 6 > 5, so rejected.
         assert!(!tracker.check_rate_limit(ip, 5));
     }
 
@@ -385,9 +425,10 @@ mod tests {
 
         tracker.track_connection(ip_a);
         tracker.track_connection(ip_a);
+        tracker.track_connection(ip_a); // 3 connections, max 2 => rejected
         tracker.track_connection(ip_b);
 
-        assert_eq!(tracker.active_count(ip_a), 2);
+        assert_eq!(tracker.active_count(ip_a), 3);
         assert_eq!(tracker.active_count(ip_b), 1);
 
         assert!(!tracker.check_connection_limit(ip_a, 2));
@@ -400,12 +441,12 @@ mod tests {
         let ip_a = ipv4(10, 1, 0, 1);
         let ip_b = ipv4(10, 1, 0, 2);
 
-        for _ in 0..5 {
+        for _ in 0..6 {
             tracker.track_connection(ip_a);
         }
         tracker.track_connection(ip_b);
 
-        // ip_a exceeded, ip_b fine.
+        // ip_a exceeded (6 > 5), ip_b fine (1 <= 5).
         assert!(!tracker.check_rate_limit(ip_a, 5));
         assert!(tracker.check_rate_limit(ip_b, 5));
     }

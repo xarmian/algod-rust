@@ -100,3 +100,7 @@ http = "1"
 url = "2"
 hickory-resolver = { version = "0.25", features = ["dnssec-ring", "tokio"] }
 regex = "1"
+
+# TLS
+tokio-rustls = "0.26"
+rustls-pemfile = "2"

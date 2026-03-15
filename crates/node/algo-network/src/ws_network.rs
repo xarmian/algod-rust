@@ -622,11 +622,41 @@ impl WebsocketNetwork {
         app
     }
 
+    /// Build a [`tokio_rustls::TlsAcceptor`] from the configured cert and
+    /// key files, if both are present.
+    ///
+    /// Returns `None` when TLS is not configured.
+    fn build_tls_acceptor(
+        &self,
+    ) -> Result<Option<tokio_rustls::TlsAcceptor>, Box<dyn std::error::Error + Send + Sync>> {
+        let (cert_path, key_path) = match (&self.config.tls_cert_file, &self.config.tls_key_file) {
+            (Some(c), Some(k)) => (c.clone(), k.clone()),
+            _ => return Ok(None),
+        };
+
+        let cert_file = &mut std::io::BufReader::new(std::fs::File::open(&cert_path)?);
+        let key_file = &mut std::io::BufReader::new(std::fs::File::open(&key_path)?);
+
+        let certs: Vec<_> = rustls_pemfile::certs(cert_file).collect::<Result<_, _>>()?;
+        let key = rustls_pemfile::private_key(key_file)?
+            .ok_or("no private key found in TLS key file")?;
+
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?;
+
+        Ok(Some(tokio_rustls::TlsAcceptor::from(Arc::new(
+            server_config,
+        ))))
+    }
+
     /// Start the relay HTTP server (listener + axum).
     ///
     /// Binds a TCP listener to `config.net_address`, wraps it with
     /// [`RejectingLimitListener`] to enforce the connection limit, and
     /// spawns a manual accept loop that serves each connection via hyper.
+    /// When `tls_cert_file` and `tls_key_file` are both set, each accepted
+    /// connection is wrapped with TLS before being handed to the HTTP layer.
     /// The task is cancelled when `self.cancel` fires.
     async fn start_relay_server(
         self: &Arc<Self>,
@@ -643,14 +673,25 @@ impl WebsocketNetwork {
             return Ok(());
         }
 
+        // Build optional TLS acceptor from config.
+        let tls_acceptor = self.build_tls_acceptor()?;
+
         let tcp_listener = tokio::net::TcpListener::bind(&bind_addr).await?;
         let local_addr = tcp_listener.local_addr()?;
 
-        tracing::info!(
-            addr = %local_addr,
-            limit = self.config.incoming_connections_limit,
-            "relay server listening (with connection limit)"
-        );
+        if tls_acceptor.is_some() {
+            tracing::info!(
+                addr = %local_addr,
+                limit = self.config.incoming_connections_limit,
+                "relay server listening with TLS (with connection limit)"
+            );
+        } else {
+            tracing::info!(
+                addr = %local_addr,
+                limit = self.config.incoming_connections_limit,
+                "relay server listening (with connection limit)"
+            );
+        }
 
         // Store the bound address so `address()` returns it.
         {
@@ -690,17 +731,45 @@ impl WebsocketNetwork {
                                 // Spawn a task to serve this connection.
                                 // The conn_guard is moved into the task so the
                                 // connection slot is held for its lifetime.
+                                let tls = tls_acceptor.clone();
                                 tokio::spawn(async move {
-                                    let io = hyper_util::rt::TokioIo::new(stream);
-                                    let conn = hyper::server::conn::http1::Builder::new()
-                                        .serve_connection(io, hyper_svc)
-                                        .with_upgrades();
-                                    if let Err(e) = conn.await {
-                                        tracing::debug!(
-                                            addr = %remote_addr,
-                                            error = %e,
-                                            "connection error"
-                                        );
+                                    if let Some(acceptor) = tls {
+                                        // TLS-wrapped connection.
+                                        match acceptor.accept(stream).await {
+                                            Ok(tls_stream) => {
+                                                let io = hyper_util::rt::TokioIo::new(tls_stream);
+                                                let conn = hyper::server::conn::http1::Builder::new()
+                                                    .serve_connection(io, hyper_svc)
+                                                    .with_upgrades();
+                                                if let Err(e) = conn.await {
+                                                    tracing::debug!(
+                                                        addr = %remote_addr,
+                                                        error = %e,
+                                                        "TLS connection error"
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    addr = %remote_addr,
+                                                    error = %e,
+                                                    "TLS handshake failed"
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        // Plain TCP connection.
+                                        let io = hyper_util::rt::TokioIo::new(stream);
+                                        let conn = hyper::server::conn::http1::Builder::new()
+                                            .serve_connection(io, hyper_svc)
+                                            .with_upgrades();
+                                        if let Err(e) = conn.await {
+                                            tracing::debug!(
+                                                addr = %remote_addr,
+                                                error = %e,
+                                                "connection error"
+                                            );
+                                        }
                                     }
                                     drop(conn_guard);
                                 });
@@ -1306,9 +1375,15 @@ enum ValidationResult {
 /// Checks (matching Go's `ServeHTTP` flow):
 /// 1. Genesis ID in the URL path matches ours
 /// 2. Protocol version is compatible
-/// 3. Per-IP connection limit
-/// 4. Per-IP rate limit
-/// 5. Self-loop detection (NodeRandom header)
+/// 3. Track the connection (atomically, before limit checks)
+/// 4. Per-IP connection limit
+/// 5. Per-IP rate limit
+/// 6. Self-loop detection (NodeRandom header)
+///
+/// The connection is tracked at the start of validation so that concurrent
+/// handshakes from the same IP cannot all pass stale counters. If validation
+/// fails after tracking, [`ConnectionTracker::release_connection`] is called
+/// to undo the tracking.
 fn validate_incoming_connection(
     network: &WebsocketNetwork,
     genesis_id_from_path: &str,
@@ -1341,11 +1416,17 @@ fn validate_incoming_connection(
         }
     };
 
-    // 3. Per-IP connection limit
+    // 3. Track the connection BEFORE checking limits so that concurrent
+    //    handshakes from the same IP see each other's counts.
+    network.connection_tracker.track_connection(remote_ip);
+
+    // 4. Per-IP connection limit
     if !network
         .connection_tracker
         .check_connection_limit(remote_ip, network.config.max_connections_per_ip)
     {
+        // Undo tracking — this request will not proceed.
+        network.connection_tracker.release_connection(remote_ip);
         tracing::warn!(
             ip = %remote_ip,
             limit = network.config.max_connections_per_ip,
@@ -1356,11 +1437,13 @@ fn validate_incoming_connection(
         );
     }
 
-    // 4. Rate limit
+    // 5. Rate limit
     if !network
         .connection_tracker
         .check_rate_limit(remote_ip, network.config.connections_rate_limiting_count)
     {
+        // Undo tracking — this request will not proceed.
+        network.connection_tracker.release_connection(remote_ip);
         tracing::warn!(
             ip = %remote_ip,
             "incoming connection: rate limit exceeded"
@@ -1370,13 +1453,15 @@ fn validate_incoming_connection(
         );
     }
 
-    // 5. Self-loop detection
+    // 6. Self-loop detection
     let other_random = headers
         .get(HeaderName::from_static("x-algorand-noderandom"))
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
     if other_random.is_empty() {
+        // Undo tracking — this request will not proceed.
+        network.connection_tracker.release_connection(remote_ip);
         tracing::warn!("incoming connection: missing NodeRandom header");
         return ValidationResult::Rejected(
             (StatusCode::PRECONDITION_FAILED, "missing NodeRandom header").into_response(),
@@ -1384,6 +1469,8 @@ fn validate_incoming_connection(
     }
 
     if other_random == network.node_random {
+        // Undo tracking — this request will not proceed.
+        network.connection_tracker.release_connection(remote_ip);
         tracing::debug!("incoming connection: self-loop detected");
         // HTTP 508 Loop Detected (matching Go)
         return ValidationResult::Rejected(
@@ -1486,8 +1573,7 @@ async fn handle_gossip_websocket(
     version: String,
     remote_ip: std::net::IpAddr,
 ) {
-    // Track the connection.
-    network.connection_tracker.track_connection(remote_ip);
+    // Connection is already tracked by validate_incoming_connection().
 
     tracing::info!(
         addr = %remote_addr,
@@ -1970,18 +2056,27 @@ mod tests {
         let ip: std::net::IpAddr = "10.0.0.5".parse().unwrap();
         let headers = valid_incoming_headers("peer-random-42");
 
-        // Track 3 connections from this IP (max is 3)
+        // Pre-track 3 connections from this IP (max_connections_per_ip is 3).
+        // validate_incoming_connection tracks internally, so the count becomes
+        // 4 during validation, which exceeds the limit (4 < 3 = false).
+        // On rejection the tracker is released back to 3.
         net.connection_tracker.track_connection(ip);
         net.connection_tracker.track_connection(ip);
         net.connection_tracker.track_connection(ip);
 
         let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, ip);
         assert!(matches!(result, ValidationResult::Rejected(_)));
+        // Rejected path releases, so count is back to 3.
+        assert_eq!(net.connection_tracker.active_count(ip), 3);
 
-        // Release one connection — should be allowed again
+        // Release two connections (count → 1) — validation will track to 2,
+        // which is below the limit of 3, so it should be allowed.
+        net.connection_tracker.release_connection(ip);
         net.connection_tracker.release_connection(ip);
         let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, ip);
         assert!(matches!(result, ValidationResult::Ok { .. }));
+        // Successful validation keeps the tracked connection, so count is 2.
+        assert_eq!(net.connection_tracker.active_count(ip), 2);
     }
 
     #[test]
@@ -2001,13 +2096,18 @@ mod tests {
         let ip: std::net::IpAddr = "10.0.0.6".parse().unwrap();
         let headers = valid_incoming_headers("peer-random-43");
 
-        // Track 3 connections (rate limit threshold is 3)
+        // Pre-track 3 connections. validate_incoming_connection will track a
+        // 4th internally, making the rate count 4 which exceeds the threshold
+        // of 3 (4 <= 3 is false), so it will be rejected.
         net.connection_tracker.track_connection(ip);
         net.connection_tracker.track_connection(ip);
         net.connection_tracker.track_connection(ip);
 
         let result = validate_incoming_connection(&net, "testnet-v1.0", &headers, ip);
         assert!(matches!(result, ValidationResult::Rejected(_)));
+        // Rejected path releases the active count, but the rate-limit
+        // timestamps are not removed, ensuring the rate window is enforced.
+        assert_eq!(net.connection_tracker.active_count(ip), 3);
     }
 
     #[test]

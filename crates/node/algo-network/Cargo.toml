@@ -35,6 +35,8 @@ rmp-serde.workspace = true
 tracing.workspace = true
 hickory-resolver.workspace = true
 regex.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
