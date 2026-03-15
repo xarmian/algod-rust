@@ -8,3 +8,4 @@ docker/data/
 .DS_Store
 .env
 wire_fixtures/
+benchmarks/go-decode/go.sum

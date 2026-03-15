@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# Benchmark Go algod's block replay performance via REST API.
+# Benchmark Go algod's block fetch performance via REST API (HTTP fetch only).
 #
-# Fetches a range of blocks from an Algorand node's REST API and measures
-# wall-clock time, throughput (blocks/sec), and total bytes downloaded.
-# Outputs results in the same JSON schema as algo-bench's BenchRun.
+# WARNING: This script measures HTTP fetch throughput via curl, NOT in-process
+# Go decode+validate performance. Network latency dominates the results (~99%
+# of wall time), making this unsuitable for Go-vs-Rust comparison.
+#
+# For fair comparison, use:
+#   - `make bench-micro-go`  — Go testing.B benchmarks on same fixture files
+#   - `make bench-cluster`   — side-by-side mixed-cluster node comparison
+#
+# This script is retained for single-implementation profiling (e.g., measuring
+# REST endpoint throughput from a particular node).
 #
 # Usage:
 #   ./bench-go.sh --start-round 40000000 --count 100
