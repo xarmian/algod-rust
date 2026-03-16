@@ -8,7 +8,6 @@ rust-version.workspace = true
 algo-codec.workspace = true
 algo-consensus-crypto.workspace = true
 algo-types.workspace = true
-ed25519-dalek.workspace = true
 num-bigint.workspace = true
 rmp.workspace = true
 sha2.workspace = true

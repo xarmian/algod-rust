@@ -36,7 +36,6 @@ dependencies = [
  "algo-codec",
  "algo-consensus-crypto",
  "algo-types",
- "ed25519-dalek",
  "num-bigint",
  "rmp",
  "sha2",

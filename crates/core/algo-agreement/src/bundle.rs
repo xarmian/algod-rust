@@ -99,6 +99,8 @@ pub enum BundleError {
     },
     /// A vote sender appears more than once in the bundle.
     DuplicateVoter(Address),
+    /// An equivocation vote pair has identical proposals (not real equivocation).
+    IdenticalEquivocationProposals,
     /// A vote in the bundle failed verification.
     VoteVerificationFailed { index: usize, detail: String },
     /// Quorum was not reached.
@@ -123,6 +125,9 @@ impl std::fmt::Display for BundleError {
             ),
             Self::DuplicateVoter(addr) => {
                 write!(f, "duplicate voter in bundle: {addr:?}")
+            }
+            Self::IdenticalEquivocationProposals => {
+                write!(f, "equivocation vote pair has identical proposals")
             }
             Self::VoteVerificationFailed { index, detail } => {
                 write!(f, "vote at index {index} failed verification: {detail}")
@@ -289,6 +294,12 @@ impl UnauthenticatedBundle {
         auth: &EquivocationVoteAuthenticator,
         index: usize,
     ) -> Result<Vote, BundleError> {
+        // Reject if both proposals are identical — that's not real equivocation.
+        // Mirrors Go's unauthenticatedEquivocationVote.verify() check.
+        if auth.proposals[0] == auth.proposals[1] {
+            return Err(BundleError::IdenticalEquivocationProposals);
+        }
+
         // Verify the first proposal's vote (this checks credential + first OTS)
         let uv1 = UnauthenticatedVote {
             raw_vote: RawVote {
@@ -627,6 +638,38 @@ mod tests {
         assert!(ledger.circulation(Round(0), Round(100)).is_ok());
         assert!(ledger.lookup_digest(Round(0)).is_ok());
         assert!(ledger.consensus_params(Round(0)).is_ok());
+    }
+
+    #[test]
+    fn bundle_verify_rejects_identical_equivocation_proposals() {
+        let ledger = MockLedgerReader::new(v41_params());
+        let proposal = ProposalValue {
+            original_period: Period(0),
+            original_proposer: Address([0x01; 32]),
+            block_digest: Digest([0xaa; 32]),
+            encoding_digest: Digest([0xbb; 32]),
+        };
+
+        let bundle = UnauthenticatedBundle {
+            round: Round(100),
+            period: Period(0),
+            step: CERT,
+            proposal,
+            votes: vec![],
+            equivocation_votes: vec![EquivocationVoteAuthenticator {
+                sender: Address([0x01; 32]),
+                cred: UnauthenticatedCredential::new([0u8; 80]),
+                sigs: [make_zero_sig(), make_zero_sig()],
+                // Both proposals are identical — not real equivocation
+                proposals: [proposal, proposal],
+            }],
+        };
+
+        let result = bundle.verify(&ledger);
+        assert!(
+            matches!(result, Err(BundleError::IdenticalEquivocationProposals)),
+            "expected IdenticalEquivocationProposals, got {result:?}"
+        );
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────
