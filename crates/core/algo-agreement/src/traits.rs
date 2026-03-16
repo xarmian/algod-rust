@@ -209,7 +209,7 @@ pub struct Message {
 ///
 /// Mirrors Go's `protocol.Tag` (a string alias).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Tag(pub String);
+pub struct Tag(pub &'static str);
 
 /// The tag for agreement vote messages (`"AV"`).
 pub const AGREEMENT_VOTE_TAG: &str = "AV";
