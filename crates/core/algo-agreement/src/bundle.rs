@@ -430,6 +430,18 @@ mod tests {
         fn consensus_params(&self, _round: Round) -> Result<ConsensusParams, LedgerError> {
             Ok(self.params.clone())
         }
+
+        fn next_round(&self) -> Round {
+            Round(1)
+        }
+
+        fn consensus_version(&self, _round: Round) -> Result<String, LedgerError> {
+            Ok(algo_types::CONSENSUS_V41.to_string())
+        }
+
+        fn wait_for_round(&self, _round: Round) -> Result<(), LedgerError> {
+            Ok(())
+        }
     }
 
     fn v41_params() -> ConsensusParams {
