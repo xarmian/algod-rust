@@ -230,6 +230,11 @@ pub const VOTE_BUNDLE_TAG: &str = "VB";
 pub trait AgreementNetwork {
     /// Returns a receiver for messages with the given protocol tag.
     ///
+    /// This is a single-call-per-tag API: calling it again for the same tag
+    /// creates a new channel, and any messages buffered in the previous
+    /// receiver are lost. This is an intentional constraint matching Go's
+    /// channel semantics where `Messages()` returns a moved `<-chan`.
+    ///
     /// Mirrors Go's `Messages(protocol.Tag) <-chan Message`.
     fn messages(&self, tag: &Tag) -> std::sync::mpsc::Receiver<Message>;
 
@@ -318,6 +323,8 @@ pub enum ParticipationAction {
     Proposed,
     /// The account voted in agreement.
     Voted,
+    /// The account participated in a state proof.
+    StateProof,
 }
 
 // ---------------------------------------------------------------------------

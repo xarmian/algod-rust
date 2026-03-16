@@ -77,7 +77,10 @@ pub enum LedgerError {
     /// The requested round has not yet been confirmed.
     RoundNotAvailable(Round),
     /// The requested round was dropped from the ledger.
-    DroppedRound(Round),
+    DroppedRound {
+        round: Round,
+        source: Option<String>,
+    },
     /// Generic error with message.
     Other(String),
 }
@@ -86,7 +89,13 @@ impl std::fmt::Display for LedgerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RoundNotAvailable(r) => write!(f, "round {r} not available"),
-            Self::DroppedRound(r) => write!(f, "round {r} dropped from ledger"),
+            Self::DroppedRound { round, source } => {
+                write!(f, "round {round} dropped from ledger")?;
+                if let Some(src) = source {
+                    write!(f, ": {src}")?;
+                }
+                Ok(())
+            }
             Self::Other(msg) => write!(f, "{msg}"),
         }
     }
@@ -214,8 +223,17 @@ mod tests {
         let err = LedgerError::RoundNotAvailable(Round(42));
         assert_eq!(format!("{err}"), "round 42 not available");
 
-        let err = LedgerError::DroppedRound(Round(10));
+        let err = LedgerError::DroppedRound {
+            round: Round(10),
+            source: None,
+        };
         assert_eq!(format!("{err}"), "round 10 dropped from ledger");
+
+        let err = LedgerError::DroppedRound {
+            round: Round(10),
+            source: Some("catchup lag".to_string()),
+        };
+        assert_eq!(format!("{err}"), "round 10 dropped from ledger: catchup lag");
 
         let err = LedgerError::Other("test error".to_string());
         assert_eq!(format!("{err}"), "test error");

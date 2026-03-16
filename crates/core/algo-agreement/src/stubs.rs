@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use std::sync::mpsc;
 
@@ -213,9 +214,9 @@ pub struct StubLedger {
     /// Protocol version string.
     pub consensus_ver: String,
     /// Blocks written via `ensure_block` / `ensure_validated_block`.
-    pub written_blocks: RefCell<Vec<WrittenBlock>>,
+    pub written_blocks: Mutex<Vec<WrittenBlock>>,
     /// Certificates passed to `ensure_digest`.
-    pub ensured_digests: RefCell<Vec<Certificate>>,
+    pub ensured_digests: Mutex<Vec<Certificate>>,
 }
 
 impl StubLedger {
@@ -231,8 +232,8 @@ impl StubLedger {
             params,
             params_by_round: HashMap::new(),
             consensus_ver: algo_types::CONSENSUS_V41.to_string(),
-            written_blocks: RefCell::new(Vec::new()),
-            ensured_digests: RefCell::new(Vec::new()),
+            written_blocks: Mutex::new(Vec::new()),
+            ensured_digests: Mutex::new(Vec::new()),
         }
     }
 
@@ -263,12 +264,12 @@ impl StubLedger {
 
     /// Returns the blocks that have been written via `ensure_block`.
     pub fn get_written_blocks(&self) -> Vec<WrittenBlock> {
-        self.written_blocks.borrow().clone()
+        self.written_blocks.lock().unwrap().clone()
     }
 
     /// Returns the certificates that were passed to `ensure_digest`.
     pub fn get_ensured_digests(&self) -> Vec<Certificate> {
-        self.ensured_digests.borrow().clone()
+        self.ensured_digests.lock().unwrap().clone()
     }
 }
 
@@ -334,7 +335,7 @@ impl LedgerReader for StubLedger {
 
 impl LedgerWriter for StubLedger {
     fn ensure_block(&self, block: &Block, cert: &Certificate) {
-        self.written_blocks.borrow_mut().push(WrittenBlock {
+        self.written_blocks.lock().unwrap().push(WrittenBlock {
             block: block.clone(),
             cert: cert.clone(),
         });
@@ -345,7 +346,7 @@ impl LedgerWriter for StubLedger {
     }
 
     fn ensure_digest(&self, cert: &Certificate) {
-        self.ensured_digests.borrow_mut().push(cert.clone());
+        self.ensured_digests.lock().unwrap().push(cert.clone());
     }
 }
 
