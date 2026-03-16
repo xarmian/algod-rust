@@ -316,17 +316,27 @@ mod tests {
     // ── Mock LedgerReader ─────────────────────────────────────────
 
     struct MockLedgerReader {
+        /// Default consensus params (used when no per-round override exists).
         params: ConsensusParams,
+        /// Per-round consensus params overrides.
+        params_by_round: HashMap<Round, ConsensusParams>,
         seed: Seed,
         accounts: HashMap<Address, OnlineAccountData>,
+        /// Per-round digest overrides.
+        digests_by_round: HashMap<Round, Digest>,
+        /// Track which rounds were queried for consensus_params.
+        queried_params_rounds: std::cell::RefCell<Vec<Round>>,
     }
 
     impl MockLedgerReader {
         fn new(params: ConsensusParams) -> Self {
             Self {
                 params,
+                params_by_round: HashMap::new(),
                 seed: Seed([0xab; 32]),
                 accounts: HashMap::new(),
+                digests_by_round: HashMap::new(),
+                queried_params_rounds: std::cell::RefCell::new(Vec::new()),
             }
         }
 
@@ -337,6 +347,18 @@ mod tests {
 
         fn add_account(&mut self, addr: Address, data: OnlineAccountData) {
             self.accounts.insert(addr, data);
+        }
+
+        fn set_params_for_round(&mut self, round: Round, params: ConsensusParams) {
+            self.params_by_round.insert(round, params);
+        }
+
+        fn set_digest_for_round(&mut self, round: Round, digest: Digest) {
+            self.digests_by_round.insert(round, digest);
+        }
+
+        fn queried_params_rounds(&self) -> Vec<Round> {
+            self.queried_params_rounds.borrow().clone()
         }
     }
 
@@ -360,15 +382,24 @@ mod tests {
             Ok(10_000_000)
         }
 
-        fn lookup_digest(&self, _round: Round) -> Result<Digest, LedgerError> {
-            Ok(Digest([0u8; 32]))
+        fn lookup_digest(&self, round: Round) -> Result<Digest, LedgerError> {
+            Ok(self
+                .digests_by_round
+                .get(&round)
+                .cloned()
+                .unwrap_or(Digest([0u8; 32])))
         }
 
         fn consensus_params(
             &self,
-            _round: Round,
+            round: Round,
         ) -> Result<ConsensusParams, LedgerError> {
-            Ok(self.params.clone())
+            self.queried_params_rounds.borrow_mut().push(round);
+            if let Some(p) = self.params_by_round.get(&round) {
+                Ok(p.clone())
+            } else {
+                Ok(self.params.clone())
+            }
         }
     }
 
@@ -383,6 +414,7 @@ mod tests {
             incentive_eligible: false,
             last_proposed: Round(0),
             last_heartbeat: Round(0),
+            state_proof_id: [0u8; 64],
         }
     }
 
@@ -1084,5 +1116,161 @@ mod tests {
         assert!(msg.contains("proposer payout"));
         assert!(msg.contains("500"));
         assert!(msg.contains("ineligible"));
+    }
+
+    // ── Mock round-differentiation tests ─────────────────────────
+
+    #[test]
+    fn consensus_params_queries_correct_rounds() {
+        // verify_proposer calls consensus_params with params_round (rnd - 2)
+        // and payout_eligible calls it with balance_round. We verify those
+        // rounds are actually passed to the mock.
+        let prev_seed = Seed([0xab; 32]);
+        let expected_seed = crate::seed::derive_seed_period_nonzero(&prev_seed, None);
+
+        let mut block = make_test_block(); // round 100
+        block.seed = expected_seed.0;
+        block.proposer = Address([0; 32]);
+        block.proposer_payout = 0;
+
+        let prop = UnauthenticatedProposal {
+            block,
+            seed_proof: [0; VRF_PROOF_SIZE],
+            original_period: Period(1),
+            original_proposer: Address([0x11; 32]),
+        };
+
+        let (ledger, _) = make_ledger_with_proposer([0; 32], prev_seed, false, 50_000_000_000);
+        let result = verify_proposer(&prop, &ledger);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+
+        let queried = ledger.queried_params_rounds();
+        // verify_proposer queries params_round(100) = 98
+        assert!(
+            queried.contains(&Round(98)),
+            "expected params_round(100) = Round(98) to be queried, got {:?}",
+            queried
+        );
+        // payout_eligible queries balance_round, which is Round(0) since 100 < 320
+        assert!(
+            queried.contains(&Round(0)),
+            "expected balance_round to be queried (Round(0)), got {:?}",
+            queried
+        );
+    }
+
+    #[test]
+    fn consensus_params_per_round_override() {
+        // Verify the mock can return different params per round
+        let params = v41_params();
+        let mut ledger = MockLedgerReader::new(params.clone());
+
+        // Set a different payouts_min_balance for round 0
+        let mut alt_params = params.clone();
+        alt_params.payouts_min_balance = 999_999;
+        ledger.set_params_for_round(Round(0), alt_params.clone());
+
+        // Query round 0 should return the override
+        let p0 = ledger.consensus_params(Round(0)).unwrap();
+        assert_eq!(p0.payouts_min_balance, 999_999);
+
+        // Query round 1 should return the default
+        let p1 = ledger.consensus_params(Round(1)).unwrap();
+        assert_eq!(p1.payouts_min_balance, params.payouts_min_balance);
+    }
+
+    // ── Seed history rerandomization test ─────────────────────────
+
+    #[test]
+    fn verify_proposer_with_seed_rerandomization_period_nonzero() {
+        // Round 320: rerand = 320 % (2 * 80) = 320 % 160 = 0, which is < 2
+        // so history mixing applies.
+        // digrnd = 320 - 160 = 160
+        let params = v41_params();
+        let prev_seed = Seed([0xab; 32]);
+
+        // The history digest for round 160
+        let history_digest = Digest([0xcc; 32]);
+
+        // Compute expected seed WITH history mixing
+        let expected_seed =
+            crate::seed::derive_seed_period_nonzero(&prev_seed, Some(history_digest));
+
+        let mut block = Block {
+            round: Round(320),
+            seed: expected_seed.0,
+            current_protocol: "future".to_string(),
+            ..Default::default()
+        };
+        block.proposer = Address([0; 32]);
+
+        let prop = UnauthenticatedProposal {
+            block,
+            seed_proof: [0; VRF_PROOF_SIZE],
+            original_period: Period(1),
+            original_proposer: Address([0x11; 32]),
+        };
+
+        let mut ledger = MockLedgerReader::new(params).with_seed(prev_seed);
+        // Set the digest for round 160 (the history round)
+        ledger.set_digest_for_round(Round(160), history_digest);
+        let mut account = default_online_account([0; 32]);
+        account.micro_algos = 50_000_000_000;
+        ledger.add_account(Address([0x11; 32]), account);
+
+        let result = verify_proposer(&prop, &ledger);
+        assert!(
+            result.is_ok(),
+            "expected Ok for rerandomization path, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn verify_proposer_with_seed_rerandomization_period_zero() {
+        // Round 320 with period 0: uses VRF proof + history mixing
+        let params = v41_params();
+        let prev_seed = Seed([0xab; 32]);
+        let kp = VrfKeypair::from_seed([42u8; 32]);
+
+        let vrf_message = hash_rep(&prev_seed);
+        let (proof, _) = kp.sk.prove(&vrf_message);
+        let vrf_out = kp.pk.verify(&proof, &vrf_message).unwrap();
+        let vrf_output: VrfOutput = vrf_out.0;
+
+        let proposer = Address([0x11; 32]);
+        let history_digest = Digest([0xdd; 32]);
+
+        // Compute expected seed WITH history for period 0
+        let expected_seed =
+            crate::seed::derive_seed_period_zero(&proposer, &vrf_output, Some(history_digest));
+
+        let mut block = Block {
+            round: Round(320),
+            seed: expected_seed.0,
+            current_protocol: "future".to_string(),
+            ..Default::default()
+        };
+        block.proposer = Address([0; 32]);
+
+        let prop = UnauthenticatedProposal {
+            block,
+            seed_proof: *proof.as_bytes(),
+            original_period: Period(0),
+            original_proposer: proposer,
+        };
+
+        let mut ledger = MockLedgerReader::new(params).with_seed(prev_seed);
+        ledger.set_digest_for_round(Round(160), history_digest);
+        let mut account = default_online_account(*kp.pk.as_bytes());
+        account.micro_algos = 50_000_000_000;
+        ledger.add_account(proposer, account);
+
+        let result = verify_proposer(&prop, &ledger);
+        assert!(
+            result.is_ok(),
+            "expected Ok for period-0 rerandomization path, got {:?}",
+            result
+        );
     }
 }

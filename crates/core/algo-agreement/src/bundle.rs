@@ -633,6 +633,7 @@ mod tests {
                 incentive_eligible: false,
                 last_proposed: Round(0),
                 last_heartbeat: Round(0),
+                state_proof_id: [0u8; 64],
             },
         );
 

@@ -42,6 +42,9 @@ pub struct OnlineAccountData {
     /// Last round the account sent a heartbeat.
     /// Go: `LastHeartbeat`.
     pub last_heartbeat: Round,
+    /// The state proof ID (Merkle signature commitment, 64 bytes).
+    /// Go: `StateProofID` (`merklesignature.Commitment`, 64 bytes).
+    pub state_proof_id: [u8; 64],
 }
 
 /// A balance record pairing an address with its online account data.
@@ -179,6 +182,7 @@ mod tests {
                 incentive_eligible: false,
                 last_proposed: Round(0),
                 last_heartbeat: Round(0),
+                state_proof_id: [0u8; 64],
             },
             addr: Address([0x42; 32]),
         };
@@ -209,6 +213,7 @@ mod tests {
             incentive_eligible: true,
             last_proposed: Round(50),
             last_heartbeat: Round(60),
+            state_proof_id: [0u8; 64],
         };
         assert_eq!(oad.micro_algos, 1_000_000);
         assert_eq!(oad.vote_id, [1u8; 32]);
