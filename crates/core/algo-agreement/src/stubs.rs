@@ -15,8 +15,8 @@ use crate::certificate::Certificate;
 use crate::ledger_reader::{LedgerError, LedgerReader, OnlineAccountData};
 use crate::seed::Seed;
 use crate::traits::{
-    AgreementError, AgreementNetwork, BlockFactory, BlockValidator, LedgerWriter, Message,
-    MessageHandle, RandomSource, Tag, UnfinishedBlock, ValidatedBlock,
+    AgreementError, AgreementNetwork, BlockFactory, BlockValidator, EventsProcessingMonitor,
+    LedgerWriter, Message, MessageHandle, RandomSource, Tag, UnfinishedBlock, ValidatedBlock,
 };
 
 // ---------------------------------------------------------------------------
@@ -503,6 +503,54 @@ impl AgreementNetwork for StubNetwork {
 }
 
 // ---------------------------------------------------------------------------
+// StubEventsProcessingMonitor
+// ---------------------------------------------------------------------------
+
+/// A record of a single `update_events_queue` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventsQueueUpdate {
+    /// The name of the queue that was updated.
+    pub queue_name: String,
+    /// The reported queue length.
+    pub queue_length: usize,
+}
+
+/// A stub `EventsProcessingMonitor` that records all calls for test assertions.
+pub struct StubEventsProcessingMonitor {
+    /// All recorded queue updates.
+    pub updates: RefCell<Vec<EventsQueueUpdate>>,
+}
+
+impl StubEventsProcessingMonitor {
+    /// Creates a new monitor with no recorded updates.
+    pub fn new() -> Self {
+        Self {
+            updates: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Returns a snapshot of all recorded updates.
+    pub fn get_updates(&self) -> Vec<EventsQueueUpdate> {
+        self.updates.borrow().clone()
+    }
+}
+
+impl Default for StubEventsProcessingMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventsProcessingMonitor for StubEventsProcessingMonitor {
+    fn update_events_queue(&self, queue_name: &str, queue_length: usize) {
+        self.updates.borrow_mut().push(EventsQueueUpdate {
+            queue_name: queue_name.to_string(),
+            queue_length,
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -783,5 +831,39 @@ mod tests {
     #[should_panic(expected = "at least one value")]
     fn stub_random_source_empty_panics() {
         let _ = StubRandomSource::new(vec![]);
+    }
+
+    // -- StubEventsProcessingMonitor --
+
+    #[test]
+    fn stub_events_monitor_records_updates() {
+        let monitor = StubEventsProcessingMonitor::new();
+        assert!(monitor.get_updates().is_empty());
+
+        monitor.update_events_queue("cryptoVerifier", 5);
+        monitor.update_events_queue("demux", 12);
+
+        let updates = monitor.get_updates();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(
+            updates[0],
+            EventsQueueUpdate {
+                queue_name: "cryptoVerifier".to_string(),
+                queue_length: 5,
+            }
+        );
+        assert_eq!(
+            updates[1],
+            EventsQueueUpdate {
+                queue_name: "demux".to_string(),
+                queue_length: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn stub_events_monitor_default() {
+        let monitor = StubEventsProcessingMonitor::default();
+        assert!(monitor.get_updates().is_empty());
     }
 }

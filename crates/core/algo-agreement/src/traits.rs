@@ -328,6 +328,23 @@ pub enum ParticipationAction {
 }
 
 // ---------------------------------------------------------------------------
+// EventsProcessingMonitor
+// ---------------------------------------------------------------------------
+
+/// An abstraction over the inner queues of the agreement service.
+///
+/// Allows an external client to monitor the activity of the various event
+/// queues.
+///
+/// Mirrors Go's `agreement.EventsProcessingMonitor` interface.
+pub trait EventsProcessingMonitor {
+    /// Called when the length of a named event queue changes.
+    ///
+    /// Mirrors Go's `UpdateEventsQueue(queueName string, queueLength int)`.
+    fn update_events_queue(&self, queue_name: &str, queue_length: usize);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
