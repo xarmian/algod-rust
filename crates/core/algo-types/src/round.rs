@@ -16,6 +16,12 @@ impl Round {
     pub fn prev(self) -> Self {
         Round(self.0.saturating_sub(1))
     }
+
+    /// Subtract `amount` rounds with saturation arithmetic — returns `Round(0)`
+    /// on underflow instead of wrapping.  Matches Go's `Round.SubSaturate`.
+    pub fn sub_saturate(self, amount: u64) -> Self {
+        Round(self.0.saturating_sub(amount))
+    }
 }
 
 impl fmt::Display for Round {

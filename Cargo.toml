@@ -12,6 +12,7 @@ members = [
     "crates/core/algo-avm",
     "crates/core/algo-falcon",
     "crates/core/algo-consensus-crypto",
+    "crates/core/algo-agreement",
     "crates/node/algo-network",
     "crates/tools/algo-bench",
     "bin/algod-rust",
@@ -80,6 +81,7 @@ algo-validate = { path = "crates/core/algo-validate" }
 algo-ledger = { path = "crates/core/algo-ledger" }
 algo-avm = { path = "crates/core/algo-avm" }
 algo-consensus-crypto = { path = "crates/core/algo-consensus-crypto" }
+algo-agreement = { path = "crates/core/algo-agreement" }
 algo-falcon = { path = "crates/core/algo-falcon" }
 algo-network = { path = "crates/node/algo-network" }
 algo-bench = { path = "crates/tools/algo-bench" }
