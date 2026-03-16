@@ -16,6 +16,7 @@ pub mod store;
 pub use equivocation::AntiEquivocationTracker;
 pub use store::ParticipationStore;
 
+use algo_consensus_crypto::merklesig;
 use algo_consensus_crypto::{OneTimeSignatureSecrets, VrfKeypair, VrfPubkey};
 use algo_types::{AccountData, AccountStatus};
 use algo_types::{Address, Digest, Round};
@@ -216,9 +217,13 @@ pub struct Participation {
     pub last_valid: Round,
     /// Key dilution parameter.
     pub key_dilution: u64,
-    /// State proof secrets (raw bytes for now; full merkle signature secrets
-    /// will be implemented in a separate epic).
-    pub state_proof_secrets: Option<Vec<u8>>,
+    /// State proof secrets (merkle signature scheme keys for state proof signing).
+    ///
+    /// Contains the `SignerContext` (tree, first_valid, key_lifetime) and
+    /// ephemeral Falcon signing keys. When persisted, the `SignerContext` is
+    /// stored in the Keysets table and keys are stored individually in the
+    /// `StateProofKeys` table.
+    pub state_proof_secrets: Option<merklesig::Secrets>,
 }
 
 impl Participation {
@@ -291,8 +296,10 @@ pub struct ParticipationRecord {
     pub effective_last: Round,
     /// VRF public key (if available).
     pub vrf_public_key: Option<VrfPubkey>,
-    /// State proof verifier commitment (raw bytes for now).
-    pub state_proof_verifier: Option<Vec<u8>>,
+    /// State proof verifier (commitment + key lifetime).
+    ///
+    /// Decoded from the `SignerContext` stored in the Keysets table.
+    pub state_proof_verifier: Option<merklesig::Verifier>,
 }
 
 impl ParticipationRecord {

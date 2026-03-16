@@ -10,6 +10,7 @@ members = [
     "crates/core/algo-validate",
     "crates/core/algo-ledger",
     "crates/core/algo-avm",
+    "crates/core/algo-falcon",
     "crates/core/algo-consensus-crypto",
     "crates/node/algo-network",
     "crates/tools/algo-bench",
@@ -79,6 +80,7 @@ algo-validate = { path = "crates/core/algo-validate" }
 algo-ledger = { path = "crates/core/algo-ledger" }
 algo-avm = { path = "crates/core/algo-avm" }
 algo-consensus-crypto = { path = "crates/core/algo-consensus-crypto" }
+algo-falcon = { path = "crates/core/algo-falcon" }
 algo-network = { path = "crates/node/algo-network" }
 algo-bench = { path = "crates/tools/algo-bench" }
 num-bigint = "0.4"

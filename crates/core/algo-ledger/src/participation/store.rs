@@ -21,6 +21,7 @@
 
 use std::path::Path;
 
+use algo_consensus_crypto::merklesig::{self, index_to_round, FalconSigner};
 use algo_consensus_crypto::{OneTimeSignatureSecrets, VrfKeypair};
 use algo_types::{Address, Round};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -54,6 +55,14 @@ CREATE TABLE IF NOT EXISTS Rolling (
     voting                    BLOB
 )";
 
+const CREATE_STATE_PROOF_KEYS: &str = "
+CREATE TABLE IF NOT EXISTS StateProofKeys (
+    pk    INTEGER NOT NULL,
+    round INTEGER NOT NULL,
+    key   BLOB    NOT NULL,
+    PRIMARY KEY (pk, round)
+)";
+
 // ---------------------------------------------------------------------------
 // SQL statements
 // ---------------------------------------------------------------------------
@@ -77,6 +86,14 @@ const SELECT_PK: &str = "SELECT pk FROM Keysets WHERE participationID = ?1 LIMIT
 
 const DELETE_KEYSET: &str = "DELETE FROM Keysets WHERE pk = ?1";
 const DELETE_ROLLING: &str = "DELETE FROM Rolling WHERE pk = ?1";
+const DELETE_STATE_PROOF_KEYS: &str = "DELETE FROM StateProofKeys WHERE pk = ?1";
+
+const INSERT_STATE_PROOF_KEY: &str =
+    "INSERT INTO StateProofKeys (pk, round, key) VALUES (?1, ?2, ?3)";
+const SELECT_STATE_PROOF_KEYS: &str =
+    "SELECT round, key FROM StateProofKeys WHERE pk = ?1 ORDER BY round ASC";
+const DELETE_STATE_PROOF_KEYS_BEFORE: &str =
+    "DELETE FROM StateProofKeys WHERE pk = ?1 AND round < ?2";
 
 // ---------------------------------------------------------------------------
 // ParticipationStore
@@ -97,6 +114,7 @@ impl ParticipationStore {
     pub fn new(conn: Connection) -> Result<Self, rusqlite::Error> {
         conn.execute_batch(CREATE_KEYSETS)?;
         conn.execute_batch(CREATE_ROLLING)?;
+        conn.execute_batch(CREATE_STATE_PROOF_KEYS)?;
         Ok(Self { conn })
     }
 
@@ -135,8 +153,12 @@ impl ParticipationStore {
         // Voting: serialize via canonical msgpack encoding.
         let voting_blob: Vec<u8> = participation.voting.to_msgpack();
 
-        // State proof: store raw bytes if present.
-        let state_proof_blob: Option<Vec<u8>> = participation.state_proof_secrets.clone();
+        // State proof: serialize the SignerContext (without ephemeral keys)
+        // to store in the Keysets table.
+        let state_proof_blob: Option<Vec<u8>> = participation
+            .state_proof_secrets
+            .as_ref()
+            .map(|s| s.to_msgpack());
 
         let tx = self.conn.unchecked_transaction()?;
 
@@ -156,6 +178,11 @@ impl ParticipationStore {
         let pk = tx.last_insert_rowid();
 
         tx.execute(INSERT_ROLLING, params![pk, voting_blob])?;
+
+        // Persist individual state proof keys to the StateProofKeys table.
+        if let Some(ref secrets) = participation.state_proof_secrets {
+            Self::persist_state_proof_keys_in_tx(&tx, pk, secrets)?;
+        }
 
         tx.commit()?;
 
@@ -304,6 +331,39 @@ impl ParticipationStore {
         let mut parent = Address([0u8; 32]);
         parent.0.copy_from_slice(&raw_account);
 
+        // Reconstruct state proof secrets from the SignerContext + StateProofKeys.
+        let state_proof_secrets = if let Some(ref sp_blob) = raw_state_proof {
+            if !sp_blob.is_empty() {
+                match merklesig::Secrets::from_msgpack(sp_blob) {
+                    Ok((mut secrets, _)) => {
+                        // Look up the pk for this participation ID to load
+                        // the ephemeral keys from StateProofKeys table.
+                        let part_id_blob = id.0.as_slice();
+                        let pk_opt: Option<i64> = self
+                            .conn
+                            .query_row(SELECT_PK, params![part_id_blob], |row| row.get(0))
+                            .optional()?;
+                        if let Some(pk) = pk_opt {
+                            let (offset, keys) = Self::restore_state_proof_keys(
+                                &self.conn,
+                                pk,
+                                secrets.signer_context.first_valid,
+                                secrets.signer_context.key_lifetime,
+                            )?;
+                            secrets.ephemeral_keys = keys;
+                            secrets.first_key_offset = offset;
+                        }
+                        Some(secrets)
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Some(Participation {
             parent,
             vrf,
@@ -311,7 +371,7 @@ impl ParticipationStore {
             first_valid: Round(first_valid as u64),
             last_valid: Round(last_valid as u64),
             key_dilution: key_dilution as u64,
-            state_proof_secrets: raw_state_proof,
+            state_proof_secrets,
         }))
     }
 
@@ -359,6 +419,7 @@ impl ParticipationStore {
             None => Ok(false),
             Some(pk) => {
                 let tx = self.conn.unchecked_transaction()?;
+                tx.execute(DELETE_STATE_PROOF_KEYS, params![pk])?;
                 tx.execute(DELETE_ROLLING, params![pk])?;
                 let deleted = tx.execute(DELETE_KEYSET, params![pk])?;
                 tx.commit()?;
@@ -385,6 +446,7 @@ impl ParticipationStore {
         if count > 0 {
             let tx = self.conn.unchecked_transaction()?;
             for pk in pks {
+                tx.execute(DELETE_STATE_PROOF_KEYS, params![pk])?;
                 tx.execute(DELETE_ROLLING, params![pk])?;
                 tx.execute(DELETE_KEYSET, params![pk])?;
             }
@@ -588,6 +650,116 @@ impl ParticipationStore {
         Ok(())
     }
 
+    // -- State proof key persistence ----------------------------------------
+
+    /// Persist individual Falcon keys from a `Secrets` to the `StateProofKeys`
+    /// table, one row per key-round.
+    ///
+    /// Each key is stored as its msgpack-encoded `FalconSigner` blob.
+    /// Matches Go's `Secrets.Persist()` in `persistentMerkleSignatureScheme.go`.
+    fn persist_state_proof_keys_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        pk: i64,
+        secrets: &merklesig::Secrets,
+    ) -> Result<(), rusqlite::Error> {
+        if secrets.signer_context.key_lifetime == 0 {
+            return Ok(());
+        }
+
+        let mut round = index_to_round(
+            secrets.signer_context.first_valid,
+            secrets.signer_context.key_lifetime,
+            0,
+        );
+
+        for key in &secrets.ephemeral_keys {
+            let key_blob = key.to_msgpack();
+            tx.execute(INSERT_STATE_PROOF_KEY, params![pk, round as i64, key_blob])?;
+            round += secrets.signer_context.key_lifetime;
+        }
+
+        Ok(())
+    }
+
+    /// Restore all Falcon keys from the `StateProofKeys` table for the given
+    /// internal primary key.
+    ///
+    /// Returns `(first_key_offset, keys)` where `first_key_offset` is the
+    /// index of the first returned key relative to the original dense array
+    /// (the array that starts at `round_to_index(first_valid, …, 0)`).
+    /// Keys are ordered by round (ascending), matching Go's
+    /// `Secrets.RestoreAllSecrets()`.
+    ///
+    /// After pruning via `delete_state_proof_keys_before`, the earliest
+    /// remaining key may correspond to a later index than 0.  The offset
+    /// is stored on `Secrets.first_key_offset` so that `get_key()` can
+    /// translate a round-based index to the correct position in the
+    /// (now shorter) vector without padding with dummy entries.
+    fn restore_state_proof_keys(
+        conn: &Connection,
+        pk: i64,
+        first_valid: u64,
+        key_lifetime: u64,
+    ) -> Result<(u64, Vec<FalconSigner>), rusqlite::Error> {
+        let mut stmt = conn.prepare(SELECT_STATE_PROOF_KEYS)?;
+        let rows = stmt.query_map(params![pk], |row| {
+            let round: i64 = row.get(0)?;
+            let key_blob: Vec<u8> = row.get(1)?;
+            Ok((round as u64, key_blob))
+        })?;
+
+        let mut round_keys: Vec<(u64, FalconSigner)> = Vec::new();
+        for row in rows {
+            let (round, key_blob) = row?;
+            let (signer, _) = FalconSigner::from_msgpack(&key_blob).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                )
+            })?;
+            round_keys.push((round, signer));
+        }
+
+        if round_keys.is_empty() || key_lifetime == 0 {
+            let keys = round_keys.into_iter().map(|(_, k)| k).collect();
+            return Ok((0, keys));
+        }
+
+        // Compute how many index positions precede the first remaining key.
+        let first_remaining_round = round_keys[0].0;
+        let first_key_offset =
+            merklesig::round_to_index(first_valid, first_remaining_round, key_lifetime);
+
+        let keys = round_keys.into_iter().map(|(_, k)| k).collect();
+        Ok((first_key_offset, keys))
+    }
+
+    /// Delete state proof keys for rounds before the given round.
+    ///
+    /// This is used for forward-secure deletion of state proof keys.
+    /// Matches Go's `DeleteStateProofKeys(id, round)`.
+    pub fn delete_state_proof_keys_before(
+        &self,
+        id: &ParticipationID,
+        round: Round,
+    ) -> Result<usize, rusqlite::Error> {
+        let pk: Option<i64> = self
+            .conn
+            .query_row(SELECT_PK, params![id.0.as_slice()], |row| row.get(0))
+            .optional()?;
+
+        match pk {
+            None => Ok(0),
+            Some(pk) => {
+                let deleted = self
+                    .conn
+                    .execute(DELETE_STATE_PROOF_KEYS_BEFORE, params![pk, round.0 as i64])?;
+                Ok(deleted)
+            }
+        }
+    }
+
     // -- Internal helpers ---------------------------------------------------
 
     /// Scan a single row from the joined `Keysets`/`Rolling` query into a
@@ -635,6 +807,17 @@ impl ParticipationStore {
             }
         });
 
+        // Decode state proof verifier from the SignerContext msgpack blob.
+        let state_proof_verifier = raw_state_proof.and_then(|blob| {
+            if blob.is_empty() {
+                return None;
+            }
+            match merklesig::SignerContext::from_msgpack(&blob) {
+                Ok((ctx, _)) => Some(ctx.get_verifier()),
+                Err(_) => None,
+            }
+        });
+
         Ok(ParticipationRecord {
             participation_id: ParticipationID(participation_id),
             account,
@@ -647,7 +830,7 @@ impl ParticipationStore {
             effective_first: Round(effective_first.unwrap_or(0) as u64),
             effective_last: Round(effective_last.unwrap_or(0) as u64),
             vrf_public_key,
-            state_proof_verifier: raw_state_proof,
+            state_proof_verifier,
         })
     }
 }
@@ -1111,5 +1294,257 @@ mod tests {
         let store = ParticipationStore::open_in_memory().unwrap();
         let id = ParticipationID([99u8; 32]);
         assert!(store.get_for_round(&id, Round(100)).unwrap().is_none());
+    }
+
+    // -- State proof key persistence tests ----------------------------------
+
+    /// Helper to create a `Participation` with state proof secrets.
+    fn make_test_participation_with_state_proof(
+        seed_byte: u8,
+        first: u64,
+        last: u64,
+        dilution: u64,
+    ) -> Participation {
+        let vrf = VrfKeypair::from_seed([seed_byte; 32]);
+        let voting = OneTimeSignatureSecrets::generate(0, 10);
+
+        // Generate state proof secrets for the round range.
+        let state_proof =
+            merklesig::Secrets::new(first, last, merklesig::KEY_LIFETIME_DEFAULT).unwrap();
+
+        Participation {
+            parent: Address([seed_byte; 32]),
+            vrf,
+            voting,
+            first_valid: Round(first),
+            last_valid: Round(last),
+            key_dilution: dilution,
+            state_proof_secrets: Some(state_proof),
+        }
+    }
+
+    #[test]
+    fn state_proof_keys_roundtrip() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation_with_state_proof(1, 0, 1024, 32);
+
+        let original_num_keys = part
+            .state_proof_secrets
+            .as_ref()
+            .unwrap()
+            .ephemeral_keys
+            .len();
+        assert!(original_num_keys > 0, "should have generated some keys");
+
+        let original_verifier = part.state_proof_secrets.as_ref().unwrap().get_verifier();
+
+        let id = store.insert(&part).unwrap();
+
+        // Retrieve and verify secrets are fully restored.
+        let restored = store
+            .get_for_round(&id, Round(500))
+            .unwrap()
+            .expect("should find key");
+
+        let restored_secrets = restored
+            .state_proof_secrets
+            .as_ref()
+            .expect("state proof secrets should be present");
+
+        // Number of keys should match.
+        assert_eq!(
+            restored_secrets.ephemeral_keys.len(),
+            original_num_keys,
+            "number of restored keys should match original"
+        );
+
+        // Verifier should match.
+        assert_eq!(
+            restored_secrets.get_verifier(),
+            original_verifier,
+            "verifier commitment should match after restore"
+        );
+
+        // First key should have matching public key.
+        assert_eq!(
+            restored_secrets.ephemeral_keys[0].pk,
+            part.state_proof_secrets.as_ref().unwrap().ephemeral_keys[0].pk,
+            "first falcon public key should match"
+        );
+    }
+
+    #[test]
+    fn state_proof_verifier_in_record() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation_with_state_proof(2, 0, 512, 16);
+
+        let original_verifier = part.state_proof_secrets.as_ref().unwrap().get_verifier();
+
+        let id = store.insert(&part).unwrap();
+
+        // The ParticipationRecord should have the verifier decoded.
+        let record = store.get(&id).unwrap().expect("should find record");
+        let verifier = record
+            .state_proof_verifier
+            .expect("verifier should be present");
+
+        assert_eq!(
+            verifier.key_lifetime,
+            merklesig::KEY_LIFETIME_DEFAULT,
+            "key lifetime should match"
+        );
+        assert_eq!(
+            verifier.commitment, original_verifier.commitment,
+            "commitment should match"
+        );
+    }
+
+    #[test]
+    fn state_proof_keys_delete_before_round() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation_with_state_proof(3, 0, 2048, 32);
+
+        let original_num_keys = part
+            .state_proof_secrets
+            .as_ref()
+            .unwrap()
+            .ephemeral_keys
+            .len();
+        let id = store.insert(&part).unwrap();
+
+        // Delete keys before round 512.
+        let deleted = store
+            .delete_state_proof_keys_before(&id, Round(512))
+            .unwrap();
+        assert!(deleted > 0, "should have deleted some keys");
+
+        // Retrieve — vector should have fewer keys, with first_key_offset
+        // tracking the number of pruned entries.
+        let restored = store
+            .get_for_round(&id, Round(1000))
+            .unwrap()
+            .expect("should find key");
+
+        let restored_secrets = restored
+            .state_proof_secrets
+            .as_ref()
+            .expect("state proof secrets should be present");
+
+        assert!(
+            restored_secrets.ephemeral_keys.len() < original_num_keys,
+            "should have fewer keys after deletion (had {}, now {})",
+            original_num_keys,
+            restored_secrets.ephemeral_keys.len()
+        );
+        assert!(
+            restored_secrets.first_key_offset > 0,
+            "first_key_offset should be non-zero after pruning"
+        );
+    }
+
+    #[test]
+    fn state_proof_keys_get_key_correct_after_pruning() {
+        // Regression test for issue #110: after deleting early-round keys
+        // and restoring, `get_key()` must still return the correct key for
+        // remaining rounds.
+        let store = ParticipationStore::open_in_memory().unwrap();
+
+        // first_valid=0, last_valid=2048, key_lifetime=256 → 9 keys
+        // (rounds 0, 256, 512, 768, 1024, 1280, 1536, 1792, 2048)
+        let part = make_test_participation_with_state_proof(5, 0, 2048, 32);
+
+        let original_secrets = part.state_proof_secrets.as_ref().unwrap();
+        let key_lifetime = original_secrets.signer_context.key_lifetime;
+        assert_eq!(key_lifetime, merklesig::KEY_LIFETIME_DEFAULT);
+
+        // Capture the public keys for later comparison.
+        let original_keys: Vec<_> = original_secrets
+            .ephemeral_keys
+            .iter()
+            .map(|k| k.pk)
+            .collect();
+
+        let id = store.insert(&part).unwrap();
+
+        // Delete keys for rounds < 512 (removes rounds 0 and 256).
+        let deleted = store
+            .delete_state_proof_keys_before(&id, Round(512))
+            .unwrap();
+        assert_eq!(deleted, 2, "should have deleted 2 keys (rounds 0, 256)");
+
+        // Restore and verify get_key returns correct keys for remaining rounds.
+        let restored = store
+            .get_for_round(&id, Round(1000))
+            .unwrap()
+            .expect("should find key");
+
+        let restored_secrets = restored
+            .state_proof_secrets
+            .as_ref()
+            .expect("state proof secrets should be present");
+
+        // Pruned rounds should return None from get_key.
+        assert!(
+            restored_secrets.get_key(0).is_none(),
+            "pruned round 0 should return None"
+        );
+        assert!(
+            restored_secrets.get_key(256).is_none(),
+            "pruned round 256 should return None"
+        );
+
+        // Remaining rounds should return the correct key (matching the original).
+        for (idx, original_pk) in original_keys.iter().enumerate().skip(2) {
+            let round = merklesig::index_to_round(0, key_lifetime, idx as u64);
+            let key = restored_secrets
+                .get_key(round)
+                .unwrap_or_else(|| panic!("get_key({}) should succeed", round));
+            assert_eq!(
+                key.pk, *original_pk,
+                "key at round {} should match original",
+                round
+            );
+        }
+    }
+
+    #[test]
+    fn state_proof_keys_deleted_with_participation() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation_with_state_proof(4, 0, 512, 32);
+        let id = store.insert(&part).unwrap();
+
+        // Verify keys are in the DB.
+        assert!(store.get(&id).unwrap().is_some());
+
+        // Delete the participation key entirely.
+        let deleted = store.delete(&id).unwrap();
+        assert!(deleted);
+
+        // The participation key and its state proof keys should be gone.
+        assert!(store.get(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn state_proof_none_still_works() {
+        // Ensure that participation keys without state proof secrets
+        // still work correctly after the type change.
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation(1, 100, 200, 10);
+        let id = store.insert(&part).unwrap();
+
+        let record = store.get(&id).unwrap().expect("should find record");
+        assert!(
+            record.state_proof_verifier.is_none(),
+            "verifier should be None for keys without state proof"
+        );
+
+        let full = store
+            .get_for_round(&id, Round(150))
+            .unwrap()
+            .expect("should find key");
+        assert!(
+            full.state_proof_secrets.is_none(),
+            "secrets should be None for keys without state proof"
+        );
     }
 }

@@ -8,6 +8,7 @@ rust-version.workspace = true
 algo-codec.workspace = true
 algo-consensus-crypto.workspace = true
 algo-error.workspace = true
+algo-falcon.workspace = true
 algo-types.workspace = true
 num-bigint.workspace = true
 sha2.workspace = true
@@ -28,8 +29,6 @@ ark-serialize.workspace = true
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
-[build-dependencies]
-cc = "1"
 
 [[bench]]
 name = "avm_bench"

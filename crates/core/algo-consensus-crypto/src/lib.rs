@@ -8,8 +8,11 @@
 //!   with forward-secure deletion, matching go-algorand's `crypto/onetimesig.go`.
 //! - **Sortition** — VRF-based committee selection.
 
+pub mod merklearray;
+pub mod merklesig;
 pub mod onetimesig;
 pub mod sortition;
+pub mod sumhash;
 pub mod vrf;
 
 pub use onetimesig::{
