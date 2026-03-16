@@ -556,6 +556,32 @@ impl OneTimeSignatureSecrets {
     }
 }
 
+/// Identifies a specific position in the two-level ephemeral key tree.
+///
+/// Matches Go's `crypto.OneTimeSignatureIdentifier`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OneTimeSignatureIdentifier {
+    /// The batch (most-significant) part.
+    pub batch: u64,
+    /// The offset (least-significant) part within the batch.
+    pub offset: u64,
+}
+
+/// Compute the `OneTimeSignatureIdentifier` for a given round and key dilution.
+///
+/// Matches Go's `basics.OneTimeIDForRound`.
+///
+/// # Panics
+///
+/// Panics if `key_dilution` is zero.
+pub fn one_time_id_for_round(round: u64, key_dilution: u64) -> OneTimeSignatureIdentifier {
+    assert!(key_dilution > 0, "key_dilution must be > 0");
+    OneTimeSignatureIdentifier {
+        batch: round / key_dilution,
+        offset: round % key_dilution,
+    }
+}
+
 /// Verify a `OneTimeSignature` against a master public key (verifier).
 ///
 /// This performs the same three-level verification as

@@ -16,7 +16,8 @@ pub mod sumhash;
 pub mod vrf;
 
 pub use onetimesig::{
-    OneTimeSignature, OneTimeSignatureSecrets, OneTimeSignatureSubkeyBatchID,
+    one_time_id_for_round, verify_one_time_signature, OneTimeSignature,
+    OneTimeSignatureIdentifier, OneTimeSignatureSecrets, OneTimeSignatureSubkeyBatchID,
     OneTimeSignatureSubkeyOffsetID,
 };
 pub use vrf::{VrfKeypair, VrfOutput, VrfPrivkey, VrfProof, VrfPubkey};

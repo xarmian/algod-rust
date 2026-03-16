@@ -30,6 +30,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "algo-agreement"
+version = "0.1.0"
+dependencies = [
+ "algo-codec",
+ "algo-consensus-crypto",
+ "algo-types",
+ "ed25519-dalek",
+ "num-bigint",
+ "rmp",
+ "sha2",
+]
+
+[[package]]
 name = "algo-avm"
 version = "0.1.0"
 dependencies = [

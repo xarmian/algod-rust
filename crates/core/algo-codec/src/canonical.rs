@@ -501,6 +501,89 @@ pub fn canonical_encode_block_header_from_block(block: &Block) -> Vec<u8> {
     m.encode()
 }
 
+/// Canonically encode an unauthenticated proposal.
+///
+/// In Go, `unauthenticatedProposal` embeds `bookkeeping.Block` (which embeds
+/// `BlockHeader` and has a `Payset` field) plus `SeedProof`, `OriginalPeriod`,
+/// and `OriginalProposer`. All fields are flattened into a single msgpack map
+/// with keys sorted alphabetically (Go's canonical encoding).
+///
+/// This matches `protocol.Encode(&unauthenticatedProposal{...})` in Go.
+///
+/// The `seed_proof` is an 80-byte VRF proof (codec tag `"sdpf"`).
+/// The `original_period` is a u64 (codec tag `"oper"`).
+/// The `original_proposer` is a 32-byte address (codec tag `"oprop"`).
+/// Block header fields and payset (`"txns"`) are also included.
+pub fn canonical_encode_unauthenticated_proposal(
+    block: &Block,
+    seed_proof: &[u8; 80],
+    original_period: u64,
+    original_proposer: &Address,
+) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    // Block header fields (same as canonical_encode_block_header_from_block)
+    m.add_u64("bi", block.bonus);
+    m.add_u64("earn", block.rewards_level);
+    m.add_u64("fc", block.fees_collected);
+    m.add_address("fees", &block.fee_sink);
+    m.add_u64("frac", block.rewards_residue);
+    m.add_string("gen", &block.genesis_id);
+    m.add_bytes("gh", &block.genesis_hash);
+    m.add_u64("nextbefore", block.next_protocol_vote_before.0);
+    m.add_string("nextproto", &block.next_protocol);
+    m.add_u64("nextswitch", block.next_protocol_switch_on.0);
+    m.add_u64("nextyes", block.next_protocol_approvals);
+
+    // Proposal-specific fields (interleaved alphabetically)
+    m.add_u64("oper", original_period);
+    m.add_address("oprop", original_proposer);
+
+    m.add_option_vec_address("partupdabs", &block.absent_participation_accounts);
+    m.add_option_vec_address("partupdrmv", &block.expired_participation_accounts);
+    m.add_u64("pp", block.proposer_payout);
+    m.add_bytes("prev", &block.branch);
+    m.add_bytes("prev512", &block.prev512);
+    m.add_string("proto", &block.current_protocol);
+    m.add_address("prp", &block.proposer);
+    m.add_u64("rate", block.rewards_rate);
+    m.add_u64("rnd", block.round.0);
+    m.add_address("rwd", &block.rewards_pool);
+    m.add_u64("rwcalr", block.rewards_recalculation_round.0);
+
+    // SeedProof (VRF proof, 80 bytes, codec tag "sdpf")
+    m.add_bytes("sdpf", seed_proof);
+
+    m.add_bytes("seed", &block.seed);
+    m.add_option_rmpv("spt", &block.state_proof_tracking);
+    m.add_u64("tc", block.txn_counter);
+    m.add_i64("ts", block.timestamp);
+    m.add_bytes("txn", &block.txn_commitment);
+    m.add_bytes("txn256", &block.txn256);
+    m.add_bytes("txn512", &block.txn512);
+
+    // Payset (codec tag "txns")
+    if !block.payset.is_empty() {
+        let maps: Vec<Vec<u8>> = block
+            .payset
+            .iter()
+            .map(canonical_encode_signed_txn_in_block)
+            .collect();
+        let mut buf = Vec::new();
+        rmp::encode::write_array_len(&mut buf, maps.len() as u32).unwrap();
+        for map in &maps {
+            buf.extend_from_slice(map);
+        }
+        m.fields.push(("txns", buf));
+    }
+
+    m.add_u64("upgradedelay", block.upgrade_delay);
+    m.add_string("upgradeprop", &block.upgrade_propose);
+    m.add_bool("upgradeyes", block.upgrade_approve);
+
+    m.encode()
+}
+
 /// Canonically encode a BlockHeader struct.
 pub fn canonical_encode_block_header(header: &BlockHeader) -> Vec<u8> {
     let mut m = CanonicalMap::new();
