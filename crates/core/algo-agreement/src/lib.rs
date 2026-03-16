@@ -32,7 +32,7 @@ pub use ledger_reader::{
     membership_from_ledger, BalanceRecord, LedgerError, LedgerReader, OnlineAccountData,
 };
 pub use lookback::{balance_lookback, balance_round, effective_key_dilution, params_round, seed_round};
-pub use proposal::{verify_proposer, ProposalError, UnauthenticatedProposal};
+pub use proposal::{payout_eligible, verify_proposer, ProposalError, UnauthenticatedProposal};
 pub use seed::{
     derive_seed_period_nonzero, derive_seed_period_zero, history_mix_round, ProposerSeed, Seed,
     SeedInput, VrfOutput,

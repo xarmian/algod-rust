@@ -33,6 +33,15 @@ pub struct OnlineAccountData {
     /// Key dilution parameter (0 = use consensus default).
     /// Go: `VoteKeyDilution`.
     pub vote_key_dilution: u64,
+    /// Whether the account is eligible for block incentive payouts.
+    /// Go: `IncentiveEligible`.
+    pub incentive_eligible: bool,
+    /// Last round the account proposed a block.
+    /// Go: `LastProposed`.
+    pub last_proposed: Round,
+    /// Last round the account sent a heartbeat.
+    /// Go: `LastHeartbeat`.
+    pub last_heartbeat: Round,
 }
 
 /// A balance record pairing an address with its online account data.
@@ -167,6 +176,9 @@ mod tests {
                 vote_first_valid: Round(0),
                 vote_last_valid: Round(0),
                 vote_key_dilution: 0,
+                incentive_eligible: false,
+                last_proposed: Round(0),
+                last_heartbeat: Round(0),
             },
             addr: Address([0x42; 32]),
         };
@@ -194,6 +206,9 @@ mod tests {
             vote_first_valid: Round(100),
             vote_last_valid: Round(200),
             vote_key_dilution: 1000,
+            incentive_eligible: true,
+            last_proposed: Round(50),
+            last_heartbeat: Round(60),
         };
         assert_eq!(oad.micro_algos, 1_000_000);
         assert_eq!(oad.vote_id, [1u8; 32]);
@@ -201,5 +216,8 @@ mod tests {
         assert_eq!(oad.vote_first_valid, Round(100));
         assert_eq!(oad.vote_last_valid, Round(200));
         assert_eq!(oad.vote_key_dilution, 1000);
+        assert!(oad.incentive_eligible);
+        assert_eq!(oad.last_proposed, Round(50));
+        assert_eq!(oad.last_heartbeat, Round(60));
     }
 }
