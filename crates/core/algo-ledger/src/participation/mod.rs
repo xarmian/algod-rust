@@ -384,7 +384,7 @@ impl KeyManager for ParticipationStore {
     }
 
     fn delete_old_keys(&self, current_round: Round) -> Result<(), rusqlite::Error> {
-        self.delete_expired(current_round)?;
+        delete_old_key_material(self, current_round)?;
         Ok(())
     }
 
@@ -463,23 +463,65 @@ pub fn discover_participating_accounts(
 /// irrecoverably deleted so that an attacker who later compromises the
 /// node cannot forge historical votes.
 ///
-/// Currently removes fully expired participation records (where
-/// `last_valid < current_round`) using `store.delete_expired()`.
+/// Performs two levels of deletion:
+/// 1. **Fully expired**: removes records where `last_valid < current_round`
+/// 2. **Forward-secure trimming**: for each remaining record, loads the
+///    voting secrets, calls `delete_before(current_round, key_dilution)` to
+///    erase ephemeral keys for past rounds, and persists the trimmed secrets
+///    back to SQLite via `update_voting_secrets()`.
 ///
-/// Returns the number of records deleted.
+/// Returns the total count: fully expired records removed + records that
+/// had key material trimmed.
 ///
-/// # Limitations
+/// # Crash-safety note
 ///
-/// TODO: True forward-secure deletion within OTS batches requires mutating
-/// `OneTimeSignatureSecrets` to delete individual ephemeral keys for past
-/// rounds while keeping keys for future rounds. This is blocked on OTS
-/// serialization support (the secrets must be persisted back to SQLite
-/// after mutation). For now, only fully expired keys are deleted.
+/// The in-memory `delete_before` and the subsequent `update_voting_secrets`
+/// persist are NOT atomic: if the process crashes between the two steps,
+/// the old key material may still be present on disk. This matches the
+/// same limitation in go-algorand's `participationDB`.
 pub fn delete_old_key_material(
     store: &ParticipationStore,
     current_round: Round,
 ) -> Result<usize, rusqlite::Error> {
-    store.delete_expired(current_round)
+    // Step 1: Remove fully expired records.
+    let fully_expired = store.delete_expired(current_round)?;
+
+    // Step 2: For each remaining record, trim forward-secure key material.
+    let records = store.get_all()?;
+    let mut trimmed = 0usize;
+
+    for record in &records {
+        // Only trim records where current_round falls within their validity window.
+        if current_round.0 < record.first_valid.0 || current_round.0 > record.last_valid.0 {
+            continue;
+        }
+
+        // Load the full Participation (with voting secrets).
+        let mut participation =
+            match store.get_for_round(&record.participation_id, current_round)? {
+                Some(p) => p,
+                None => continue,
+            };
+
+        // Snapshot state before trimming.
+        let old_first_batch = participation.voting.first_batch();
+        let old_first_offset = participation.voting.first_offset();
+
+        // Trim old key material from the voting secrets.
+        participation
+            .voting
+            .delete_before(current_round.0, record.key_dilution);
+
+        // Only persist if something actually changed.
+        if participation.voting.first_batch() != old_first_batch
+            || participation.voting.first_offset() != old_first_offset
+        {
+            store.update_voting_secrets(&record.participation_id, &participation.voting)?;
+            trimmed += 1;
+        }
+    }
+
+    Ok(fully_expired + trimmed)
 }
 
 // ── Helper functions ───────────────────────────────────────────────────────
@@ -971,7 +1013,12 @@ mod tests {
         insert_test_key(&store, 2, 100, 200);
 
         let deleted = delete_old_key_material(&store, Round(100)).unwrap();
-        assert_eq!(deleted, 1);
+        // 1 fully expired (key 1, last_valid=50 < 100) + 1 trimmed (key 2,
+        // forward-secure deletion within its validity window).
+        assert!(
+            deleted >= 2,
+            "expected at least 2 (1 expired + 1 trimmed), got {deleted}"
+        );
 
         let all = store.get_all().unwrap();
         assert_eq!(all.len(), 1);
@@ -992,5 +1039,145 @@ mod tests {
     fn default_key_dilution_underflow_guard() {
         // last < first should return 1 instead of panicking.
         assert_eq!(default_key_dilution(Round(200), Round(100)), 1);
+    }
+
+    // ── Forward-secure deletion persistence tests ────────────────────────
+
+    /// Helper: insert a participation key with explicit key_dilution.
+    fn insert_test_key_with_dilution(
+        store: &ParticipationStore,
+        addr_byte: u8,
+        first: u64,
+        last: u64,
+        key_dilution: u64,
+    ) -> ParticipationID {
+        let vrf = VrfKeypair::from_seed([addr_byte; 32]);
+        // Generate enough batches to cover the round range.
+        let num_batches = (last / key_dilution) + 2;
+        let voting = OneTimeSignatureSecrets::generate(0, num_batches);
+        let part = Participation {
+            parent: Address([addr_byte; 32]),
+            vrf,
+            voting,
+            first_valid: Round(first),
+            last_valid: Round(last),
+            key_dilution,
+            state_proof_secrets: None,
+        };
+        store.insert(&part).unwrap()
+    }
+
+    #[test]
+    fn forward_secure_deletion_full_lifecycle() {
+        use algo_consensus_crypto::onetimesig::verify_one_time_signature;
+
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let key_dilution = 10u64;
+        let id = insert_test_key_with_dilution(&store, 1, 0, 100, key_dilution);
+
+        // Retrieve and sign round 5 before deletion.
+        let part = store.get_for_round(&id, Round(5)).unwrap().unwrap();
+        let verifier = part.voting.verifier();
+        let sig5 = part.voting.sign(b"round5", 5, key_dilution);
+        assert!(verify_one_time_signature(&sig5, &verifier, 0, 5, b"round5"));
+
+        // Delete key material before round 20.
+        let count = delete_old_key_material(&store, Round(20)).unwrap();
+        assert!(count > 0, "should have trimmed at least one key");
+
+        // Retrieve again — signing round 25 should work.
+        let part2 = store.get_for_round(&id, Round(25)).unwrap().unwrap();
+        let sig25 = part2.voting.sign(b"round25", 25, key_dilution);
+        assert!(verify_one_time_signature(
+            &sig25, &verifier, 2, 5, b"round25"
+        ));
+
+        // Verify old key material is gone: first_batch should have advanced.
+        assert!(
+            part2.voting.first_batch() > 0,
+            "first_batch should have advanced past 0 after deleting before round 20"
+        );
+    }
+
+    #[test]
+    fn forward_secure_deletion_persists_across_get() {
+        // Insert, trim via delete_old_key_material, then retrieve and verify
+        // the trimmed state was persisted.
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let key_dilution = 10u64;
+        let id = insert_test_key_with_dilution(&store, 2, 0, 100, key_dilution);
+
+        // Get initial first_batch.
+        let part_before = store.get_for_round(&id, Round(0)).unwrap().unwrap();
+        let initial_first_batch = part_before.voting.first_batch();
+
+        // Trim at round 30 (should advance past batch 2).
+        delete_old_key_material(&store, Round(30)).unwrap();
+
+        // Retrieve again — the persisted state should reflect the trim.
+        let part_after = store.get_for_round(&id, Round(50)).unwrap().unwrap();
+        assert!(
+            part_after.voting.first_batch() > initial_first_batch,
+            "first_batch should have advanced after deletion persistence"
+        );
+    }
+
+    #[test]
+    fn forward_secure_deletion_mixed_expired_and_trimmed() {
+        // Three keys:
+        //   key A: rounds 0-50 (fully expired at round 60)
+        //   key B: rounds 0-100 (partially trimmed at round 60)
+        //   key C: rounds 80-200 (partially trimmed at round 60 — within window)
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let key_dilution = 10u64;
+
+        let _id_a = insert_test_key_with_dilution(&store, 1, 0, 50, key_dilution);
+        let id_b = insert_test_key_with_dilution(&store, 2, 0, 100, key_dilution);
+        let _id_c = insert_test_key_with_dilution(&store, 3, 80, 200, key_dilution);
+
+        assert_eq!(store.get_all().unwrap().len(), 3);
+
+        // Delete at round 60: key A fully expired, key B trimmed, key C not yet in range
+        let count = delete_old_key_material(&store, Round(60)).unwrap();
+        // 1 fully expired (A) + 1 trimmed (B) = 2; C has first_valid=80 > 60 so not trimmed
+        assert_eq!(
+            count, 2,
+            "expected exactly 2 (1 expired + 1 trimmed), got {count}"
+        );
+
+        // Key A should be gone.
+        let all = store.get_all().unwrap();
+        assert_eq!(all.len(), 2, "key A should be fully deleted");
+
+        // Key B should still be retrievable and have trimmed state.
+        let part_b = store.get_for_round(&id_b, Round(70)).unwrap().unwrap();
+        assert!(
+            part_b.voting.first_batch() > 0,
+            "key B should have trimmed batches"
+        );
+    }
+
+    #[test]
+    fn forward_secure_deletion_idempotent() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let key_dilution = 10u64;
+        let id = insert_test_key_with_dilution(&store, 1, 0, 100, key_dilution);
+
+        // First deletion at round 30.
+        let count1 = delete_old_key_material(&store, Round(30)).unwrap();
+        assert!(count1 > 0);
+
+        let part1 = store.get_for_round(&id, Round(50)).unwrap().unwrap();
+        let fb1 = part1.voting.first_batch();
+
+        // Second deletion at the same round — should be idempotent (no change).
+        let count2 = delete_old_key_material(&store, Round(30)).unwrap();
+        assert_eq!(
+            count2, 0,
+            "second call at same round should not change anything"
+        );
+
+        let part2 = store.get_for_round(&id, Round(50)).unwrap().unwrap();
+        assert_eq!(part2.voting.first_batch(), fb1);
     }
 }
