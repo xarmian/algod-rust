@@ -3,26 +3,29 @@
 //! Matches go-algorand's `data/account/participationRegistry.go` schema
 //! with `Keysets` and `Rolling` tables joined by an auto-increment primary key.
 //!
+//! # Security
+//!
+//! **The SQLite database file contains raw private key material** (VRF seeds,
+//! ed25519 signing keys for voting). It should be protected with filesystem
+//! permissions (e.g., mode 0600) and ideally stored on an encrypted volume.
+//! This matches go-algorand's storage model.
+//!
 //! # Blob serialization
 //!
 //! - **VRF**: stored as the raw 32-byte seed. Reconstructed via
 //!   `VrfKeypair::from_seed`.
-//! - **Voting secrets**: stored as an opaque blob. Since `OneTimeSignatureSecrets`
-//!   does not yet support serde, `get_for_round` cannot currently reconstruct
-//!   the full voting secrets from storage. The verifier (32-byte public key)
-//!   is used for `ParticipationRecord` queries.
+//! - **Voting secrets**: serialized via `OneTimeSignatureSecrets::to_msgpack()`
+//!   and deserialized via `OneTimeSignatureSecrets::from_msgpack()`. This allows
+//!   full round-trip persistence including forward-secure key deletion state.
 //! - **State proof**: stored as raw bytes (opaque blob).
 
 use std::path::Path;
 
-use algo_consensus_crypto::VrfKeypair;
+use algo_consensus_crypto::{OneTimeSignatureSecrets, VrfKeypair};
 use algo_types::{Address, Round};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::{Participation, ParticipationAction, ParticipationID, ParticipationRecord};
-
-#[cfg(test)]
-use algo_consensus_crypto::OneTimeSignatureSecrets;
 
 // ---------------------------------------------------------------------------
 // Schema DDL
@@ -114,7 +117,8 @@ impl ParticipationStore {
     /// Insert a participation key, returning its computed `ParticipationID`.
     ///
     /// The VRF seed (32 bytes) is stored in the `vrf` column.
-    /// Voting secrets are not currently serializable; an empty blob is stored.
+    /// Voting secrets are serialized via `OneTimeSignatureSecrets::to_msgpack()`
+    /// and stored as a blob in the Rolling table.
     /// State proof secrets (if any) are stored as-is.
     ///
     /// Returns an error if a key with the same `ParticipationID` already exists
@@ -128,8 +132,8 @@ impl ParticipationStore {
         // VRF: store the 32-byte seed so we can reconstruct later.
         let vrf_seed = participation.vrf.sk.seed().to_vec();
 
-        // Voting: not serializable yet — store empty blob.
-        let voting_blob: Vec<u8> = Vec::new();
+        // Voting: serialize via canonical msgpack encoding.
+        let voting_blob: Vec<u8> = participation.voting.to_msgpack();
 
         // State proof: store raw bytes if present.
         let state_proof_blob: Option<Vec<u8>> = participation.state_proof_secrets.clone();
@@ -149,7 +153,7 @@ impl ParticipationStore {
             ],
         )?;
 
-        let pk = self.conn.last_insert_rowid();
+        let pk = tx.last_insert_rowid();
 
         tx.execute(INSERT_ROLLING, params![pk, voting_blob])?;
 
@@ -185,13 +189,8 @@ impl ParticipationStore {
     /// Returns `None` if the key is not found or the round is outside the
     /// valid range.
     ///
-    /// # Note
-    ///
-    /// A full `Participation` (with signing-capable voting secrets) cannot
-    /// be returned because `OneTimeSignatureSecrets` serialization is not
-    /// yet supported. Use this method to get metadata and VRF info only.
-    /// TODO: Add `get_for_round` returning `Participation` once OTS
-    /// serialization is implemented in the crypto crate.
+    /// For a full `Participation` with signing-capable voting secrets, use
+    /// [`get_for_round`](Self::get_for_round) instead.
     pub fn get_record_for_round(
         &self,
         id: &ParticipationID,
@@ -207,6 +206,135 @@ impl ParticipationStore {
                 Self::scan_record,
             )
             .optional()
+    }
+
+    /// Get a full `Participation` (with signing-capable voting secrets) for a
+    /// specific round.
+    ///
+    /// Queries both Keysets and Rolling tables by participation ID, filters by
+    /// round range (`first_valid <= round <= last_valid`), deserializes the
+    /// voting blob via `OneTimeSignatureSecrets::from_msgpack()`, and
+    /// reconstructs the VRF keypair from the stored seed.
+    ///
+    /// Returns `None` if the key is not found, the round is outside the valid
+    /// range, or the voting blob is empty/missing (legacy records).
+    pub fn get_for_round(
+        &self,
+        id: &ParticipationID,
+        round: Round,
+    ) -> Result<Option<Participation>, rusqlite::Error> {
+        let sql = format!(
+            "{SELECT_RECORDS} WHERE k.participationID = ?1 AND k.firstValidRound <= ?2 AND k.lastValidRound >= ?2"
+        );
+        let result = self
+            .conn
+            .query_row(&sql, params![id.0.as_slice(), round.0 as i64], |row| {
+                let raw_account: Vec<u8> = row.get(1)?;
+                let first_valid: i64 = row.get(2)?;
+                let last_valid: i64 = row.get(3)?;
+                let key_dilution: i64 = row.get(4)?;
+                let raw_vrf: Option<Vec<u8>> = row.get(5)?;
+                let raw_state_proof: Option<Vec<u8>> = row.get(6)?;
+                let voting_blob: Option<Vec<u8>> = row.get(12)?;
+
+                Ok((
+                    raw_account,
+                    first_valid,
+                    last_valid,
+                    key_dilution,
+                    raw_vrf,
+                    raw_state_proof,
+                    voting_blob,
+                ))
+            })
+            .optional()?;
+
+        let (
+            raw_account,
+            first_valid,
+            last_valid,
+            key_dilution,
+            raw_vrf,
+            raw_state_proof,
+            voting_blob,
+        ) = match result {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        // Voting blob must be present and non-empty.
+        let voting_data = match voting_blob {
+            Some(ref blob) if !blob.is_empty() => blob,
+            _ => return Ok(None),
+        };
+
+        // Deserialize voting secrets.
+        let voting = OneTimeSignatureSecrets::from_msgpack(voting_data).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                12,
+                rusqlite::types::Type::Blob,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })?;
+
+        // Reconstruct VRF keypair from seed.
+        let vrf = match raw_vrf {
+            Some(ref blob) if blob.len() == 32 => {
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(blob);
+                VrfKeypair::from_seed(seed)
+            }
+            _ => return Ok(None),
+        };
+
+        // Reconstruct account address.
+        let mut parent = Address([0u8; 32]);
+        if raw_account.len() == 32 {
+            parent.0.copy_from_slice(&raw_account);
+        }
+
+        Ok(Some(Participation {
+            parent,
+            vrf,
+            voting,
+            first_valid: Round(first_valid as u64),
+            last_valid: Round(last_valid as u64),
+            key_dilution: key_dilution as u64,
+            state_proof_secrets: raw_state_proof,
+        }))
+    }
+
+    /// Update the serialized voting secrets for a participation key.
+    ///
+    /// Serializes `secrets` via `OneTimeSignatureSecrets::to_msgpack()` and
+    /// writes the result to the `voting` BLOB in the Rolling table.
+    ///
+    /// This is used for forward-secure deletion persistence: after calling
+    /// `OneTimeSignatureSecrets::delete_before()`, the mutated secrets are
+    /// persisted back to SQLite so that old ephemeral keys are irrecoverably
+    /// deleted from storage.
+    pub fn update_voting_secrets(
+        &self,
+        id: &ParticipationID,
+        secrets: &OneTimeSignatureSecrets,
+    ) -> Result<(), rusqlite::Error> {
+        let pk: Option<i64> = self
+            .conn
+            .query_row(SELECT_PK, params![id.0.as_slice()], |row| row.get(0))
+            .optional()?;
+
+        let pk = match pk {
+            Some(pk) => pk,
+            None => return Err(rusqlite::Error::QueryReturnedNoRows),
+        };
+
+        let voting_blob = secrets.to_msgpack();
+        self.conn.execute(
+            "UPDATE Rolling SET voting = ?1 WHERE pk = ?2",
+            params![voting_blob, pk],
+        )?;
+
+        Ok(())
     }
 
     /// Delete a participation key by ID. Returns `true` if a row was deleted.
@@ -859,5 +987,115 @@ mod tests {
         // Round 250 matches neither.
         let keys = store.voting_keys_for_round(Round(250), Round(250)).unwrap();
         assert!(keys.is_empty());
+    }
+
+    // -- get_for_round and voting secrets roundtrip tests --------------------
+
+    #[test]
+    fn roundtrip_signing_via_get_for_round() {
+        use algo_consensus_crypto::onetimesig::verify_one_time_signature;
+
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let key_dilution = 10u64;
+        let part = make_test_participation(1, 0, 100, key_dilution);
+        let verifier = part.voting.verifier();
+        let id = store.insert(&part).unwrap();
+
+        // Retrieve the full Participation via get_for_round.
+        let restored = store
+            .get_for_round(&id, Round(50))
+            .unwrap()
+            .expect("should find key");
+
+        // Sign a message with the restored voting secrets.
+        let msg = b"test message for roundtrip signing";
+        let round = 5u64;
+        let sig = restored.voting.sign(msg, round, key_dilution);
+
+        // Verify the signature with the original verifier.
+        let batch = round / key_dilution;
+        let offset = round % key_dilution;
+        assert!(
+            verify_one_time_signature(&sig, &verifier, batch, offset, msg),
+            "signature from restored secrets must verify"
+        );
+    }
+
+    #[test]
+    fn get_for_round_restores_all_fields() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let key_dilution = 32u64;
+        let part = make_test_participation(7, 100, 500, key_dilution);
+        let original_verifier = part.voting.verifier();
+        let original_vrf_pk = part.vrf.pk;
+        let id = store.insert(&part).unwrap();
+
+        let restored = store
+            .get_for_round(&id, Round(300))
+            .unwrap()
+            .expect("should find key");
+
+        assert_eq!(restored.parent, Address([7u8; 32]));
+        assert_eq!(restored.first_valid, Round(100));
+        assert_eq!(restored.last_valid, Round(500));
+        assert_eq!(restored.key_dilution, key_dilution);
+        assert_eq!(restored.voting.verifier(), original_verifier);
+        assert_eq!(restored.vrf.pk, original_vrf_pk);
+        assert!(restored.state_proof_secrets.is_none());
+    }
+
+    #[test]
+    fn update_voting_secrets_persists_deletion() {
+        use algo_consensus_crypto::onetimesig::verify_one_time_signature;
+
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let key_dilution = 4u64;
+        let part = make_test_participation(3, 0, 100, key_dilution);
+        let verifier = part.voting.verifier();
+        let id = store.insert(&part).unwrap();
+
+        // Retrieve, delete old keys, and persist.
+        let mut restored = store
+            .get_for_round(&id, Round(0))
+            .unwrap()
+            .expect("should find key");
+        restored.voting.delete_before(8, key_dilution); // advance past batch 0 and 1
+
+        store.update_voting_secrets(&id, &restored.voting).unwrap();
+
+        // Retrieve again and verify the deletion state was persisted.
+        let restored2 = store
+            .get_for_round(&id, Round(50))
+            .unwrap()
+            .expect("should find key");
+
+        // Should be able to sign round 8 (batch 2, offset 0) but not round 3 (deleted).
+        let sig = restored2.voting.sign(b"after delete", 8, key_dilution);
+        assert!(verify_one_time_signature(
+            &sig,
+            &verifier,
+            2,
+            0,
+            b"after delete"
+        ));
+    }
+
+    #[test]
+    fn get_for_round_outside_range_returns_none() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let part = make_test_participation(1, 100, 200, 10);
+        let id = store.insert(&part).unwrap();
+
+        // Before valid range.
+        assert!(store.get_for_round(&id, Round(50)).unwrap().is_none());
+        // After valid range.
+        assert!(store.get_for_round(&id, Round(250)).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_for_round_nonexistent_id_returns_none() {
+        let store = ParticipationStore::open_in_memory().unwrap();
+        let id = ParticipationID([99u8; 32]);
+        assert!(store.get_for_round(&id, Round(100)).unwrap().is_none());
     }
 }
