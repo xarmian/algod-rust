@@ -9,6 +9,7 @@ pub mod heartbeat;
 pub mod lease;
 pub mod merkle_trie;
 pub mod params;
+pub mod participation;
 pub mod rewards;
 pub mod sqlite;
 pub mod state;
