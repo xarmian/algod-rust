@@ -72,7 +72,7 @@ impl BalanceRecord {
 }
 
 /// Errors returned by `LedgerReader` methods.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LedgerError {
     /// The requested round has not yet been confirmed.
     RoundNotAvailable(Round),
@@ -127,6 +127,26 @@ pub trait LedgerReader {
 
     /// Returns the consensus parameters for the given round.
     fn consensus_params(&self, round: Round) -> Result<ConsensusParams, LedgerError>;
+
+    /// Returns the first round for which no Block has been confirmed.
+    ///
+    /// Mirrors Go's `LedgerReader.NextRound()`.
+    fn next_round(&self) -> Round;
+
+    /// Returns the consensus version (protocol version string) for the given round.
+    ///
+    /// Mirrors Go's `LedgerReader.ConsensusVersion()`.
+    fn consensus_version(&self, round: Round) -> Result<String, LedgerError>;
+
+    /// Blocks until the specified round completes and is durably stored.
+    ///
+    /// Mirrors Go's `LedgerReader.Wait()` which returns a channel that fires
+    /// when the round is available. In Rust we use a blocking call instead.
+    ///
+    /// TODO: This is currently a blocking call. When the agreement service is
+    /// implemented, this will need to become async (returning a Future or a
+    /// channel receiver) to avoid blocking the agreement event loop.
+    fn wait_for_round(&self, round: Round) -> Result<(), LedgerError>;
 }
 
 /// Construct a `Membership` from ledger state, matching Go's `membership()` helper

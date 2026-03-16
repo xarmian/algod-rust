@@ -15,6 +15,8 @@ mod proposal;
 mod seed;
 mod selector;
 mod step;
+pub mod stubs;
+pub mod traits;
 mod vote;
 
 pub use bundle::{
@@ -39,6 +41,16 @@ pub use seed::{
 };
 pub use selector::Selector;
 pub use step::{Period, Step, CERT, DOWN, LATE, NEXT, PROPOSE, REDO, SOFT};
+pub use stubs::{
+    SentMessage, StubBlockFactory, StubBlockValidator, StubLedger, StubNetwork, StubRandomSource,
+    StubUnfinishedBlock, StubValidatedBlock, WrittenBlock,
+};
+pub use traits::{
+    AgreementError, AgreementKeyManager, AgreementLedger, AgreementNetwork, BlockFactory,
+    BlockValidator, LedgerWriter, Message, MessageHandle, ParticipationAction,
+    ParticipationRecord, RandomSource, Tag, UnfinishedBlock, ValidatedBlock,
+    AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
+};
 pub use vote::{
     ProposalValue, RawVote, UnauthenticatedVote, Vote, VoteError, VoteVerifyParams, BOTTOM,
 };
