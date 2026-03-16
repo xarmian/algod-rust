@@ -6,6 +6,8 @@
 mod bundle;
 mod certificate;
 mod credential;
+#[cfg(test)]
+mod golden_vectors;
 mod hashable;
 mod ledger_reader;
 mod lookback;

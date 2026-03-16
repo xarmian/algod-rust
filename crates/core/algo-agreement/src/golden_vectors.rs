@@ -1,0 +1,374 @@
+// Golden vector conformance tests for agreement Hashable types.
+//
+// These test vectors were verified on 2026-03-16 by actually running Go test
+// files inside go-algorand v4.5.1-stable. The Go test files live at:
+//   ../go-algorand/agreement/golden_vectors_test.go
+//   ../go-algorand/data/committee/golden_vectors_test.go
+//
+// See tests/golden/gen_agreement_vectors.go for the full Go source and
+// captured output.
+//
+// Each test constructs the same known test data as the Go code, then
+// verifies that:
+//   1. to_be_hashed() produces the same encoding bytes
+//   2. hash_obj() produces the same SHA-512/256 digest
+//   3. hash_rep() produces hash_id || to_be_hashed
+
+#[cfg(test)]
+mod tests {
+    use crate::credential::HashableCredential;
+    use crate::hashable::{hash_obj, hash_rep, Hashable};
+    use crate::seed::{ProposerSeed, Seed, SeedInput};
+    use crate::selector::Selector;
+    use crate::step::{Period, Step};
+    use crate::vote::{ProposalValue, RawVote};
+    use algo_types::{Address, Digest, Round};
+
+    /// Helper to decode a hex string to bytes.
+    fn hex_decode(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // ── Selector (HashID "AS") ────────────────────────────────────────────
+
+    // Go test data:
+    //   Seed=[0x01;32], Round=42, Period=1, Step=2
+    const SELECTOR_ENCODING_HEX: &str = "84a370657201a3726e642aa473656564c4200101010101010101010101010101010101010101010101010101010101010101a47374657002";
+
+    const SELECTOR_DIGEST_HEX: &str =
+        "7c8b20aa6c626486d0ff1102373608105a18cf493c07ab21e72e0c1e71fd61d1";
+
+    #[test]
+    fn golden_selector_encoding() {
+        let sel = Selector {
+            seed: Seed([0x01; 32]),
+            round: Round(42),
+            period: Period(1),
+            step: Step(2),
+        };
+        let encoded = sel.to_be_hashed();
+        let expected = hex_decode(SELECTOR_ENCODING_HEX);
+        assert_eq!(
+            encoded, expected,
+            "Selector encoding mismatch vs Go golden vector"
+        );
+    }
+
+    #[test]
+    fn golden_selector_digest() {
+        let sel = Selector {
+            seed: Seed([0x01; 32]),
+            round: Round(42),
+            period: Period(1),
+            step: Step(2),
+        };
+        let digest = hash_obj(&sel);
+        let expected = hex_decode(SELECTOR_DIGEST_HEX);
+        assert_eq!(
+            digest.0.as_slice(),
+            expected.as_slice(),
+            "Selector digest mismatch vs Go golden vector"
+        );
+    }
+
+    #[test]
+    fn golden_selector_hash_rep() {
+        let sel = Selector {
+            seed: Seed([0x01; 32]),
+            round: Round(42),
+            period: Period(1),
+            step: Step(2),
+        };
+        let rep = hash_rep(&sel);
+        let mut expected = b"AS".to_vec();
+        expected.extend_from_slice(&hex_decode(SELECTOR_ENCODING_HEX));
+        assert_eq!(
+            rep, expected,
+            "Selector hash_rep mismatch vs Go golden vector"
+        );
+    }
+
+    // ── RawVote (HashID "VO") ─────────────────────────────────────────────
+
+    // Go test data:
+    //   Sender=[0x42;32], Round=100, Period=1, Step=2,
+    //   Proposal{OriginalPeriod=1, OriginalProposer=[0x42;32],
+    //            BlockDigest=[0xaa;32], EncodingDigest=[0xbb;32]}
+    const RAW_VOTE_ENCODING_HEX: &str = "85a370657201a470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6656e63646967c420bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbba46f70657201a56f70726f70c4204242424242424242424242424242424242424242424242424242424242424242a3726e6464a3736e64c4204242424242424242424242424242424242424242424242424242424242424242a47374657002";
+
+    const RAW_VOTE_DIGEST_HEX: &str =
+        "657761e958a6a140e8637f727bc5d0eb0e13a6cd823f0be2f87418093ca8ef4c";
+
+    #[test]
+    fn golden_raw_vote_encoding() {
+        let rv = RawVote {
+            sender: Address([0x42; 32]),
+            round: Round(100),
+            period: Period(1),
+            step: Step(2),
+            proposal: ProposalValue {
+                original_period: Period(1),
+                original_proposer: Address([0x42; 32]),
+                block_digest: Digest([0xaa; 32]),
+                encoding_digest: Digest([0xbb; 32]),
+            },
+        };
+        let encoded = rv.to_be_hashed();
+        let expected = hex_decode(RAW_VOTE_ENCODING_HEX);
+        assert_eq!(
+            encoded, expected,
+            "RawVote encoding mismatch vs Go golden vector"
+        );
+    }
+
+    #[test]
+    fn golden_raw_vote_digest() {
+        let rv = RawVote {
+            sender: Address([0x42; 32]),
+            round: Round(100),
+            period: Period(1),
+            step: Step(2),
+            proposal: ProposalValue {
+                original_period: Period(1),
+                original_proposer: Address([0x42; 32]),
+                block_digest: Digest([0xaa; 32]),
+                encoding_digest: Digest([0xbb; 32]),
+            },
+        };
+        let digest = hash_obj(&rv);
+        let expected = hex_decode(RAW_VOTE_DIGEST_HEX);
+        assert_eq!(
+            digest.0.as_slice(),
+            expected.as_slice(),
+            "RawVote digest mismatch vs Go golden vector"
+        );
+    }
+
+    #[test]
+    fn golden_raw_vote_hash_rep() {
+        let rv = RawVote {
+            sender: Address([0x42; 32]),
+            round: Round(100),
+            period: Period(1),
+            step: Step(2),
+            proposal: ProposalValue {
+                original_period: Period(1),
+                original_proposer: Address([0x42; 32]),
+                block_digest: Digest([0xaa; 32]),
+                encoding_digest: Digest([0xbb; 32]),
+            },
+        };
+        let rep = hash_rep(&rv);
+        let mut expected = b"VO".to_vec();
+        expected.extend_from_slice(&hex_decode(RAW_VOTE_ENCODING_HEX));
+        assert_eq!(
+            rep, expected,
+            "RawVote hash_rep mismatch vs Go golden vector"
+        );
+    }
+
+    // ── ProposerSeed (HashID "PS") ────────────────────────────────────────
+
+    // Go test data: Addr=[0x11;32], VRF=[0x22;64]
+    const PROPOSER_SEED_ENCODING_HEX: &str = "82a461646472c4201111111111111111111111111111111111111111111111111111111111111111a3767266c44022222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222";
+
+    const PROPOSER_SEED_DIGEST_HEX: &str =
+        "828ecad04bad2b25f907593d67d3d49df57c8ff397b61a97f9cc0485618d0889";
+
+    #[test]
+    fn golden_proposer_seed_encoding() {
+        let ps = ProposerSeed {
+            addr: Address([0x11; 32]),
+            vrf: [0x22; 64],
+        };
+        let encoded = ps.to_be_hashed();
+        let expected = hex_decode(PROPOSER_SEED_ENCODING_HEX);
+        assert_eq!(
+            encoded, expected,
+            "ProposerSeed encoding mismatch vs Go golden vector"
+        );
+    }
+
+    #[test]
+    fn golden_proposer_seed_digest() {
+        let ps = ProposerSeed {
+            addr: Address([0x11; 32]),
+            vrf: [0x22; 64],
+        };
+        let digest = hash_obj(&ps);
+        let expected = hex_decode(PROPOSER_SEED_DIGEST_HEX);
+        assert_eq!(
+            digest.0.as_slice(),
+            expected.as_slice(),
+            "ProposerSeed digest mismatch vs Go golden vector"
+        );
+    }
+
+    #[test]
+    fn golden_proposer_seed_hash_rep() {
+        let ps = ProposerSeed {
+            addr: Address([0x11; 32]),
+            vrf: [0x22; 64],
+        };
+        let rep = hash_rep(&ps);
+        let mut expected = b"PS".to_vec();
+        expected.extend_from_slice(&hex_decode(PROPOSER_SEED_ENCODING_HEX));
+        assert_eq!(
+            rep, expected,
+            "ProposerSeed hash_rep mismatch vs Go golden vector"
+        );
+    }
+
+    // ── SeedInput (HashID "PS" — intentionally shares HashID with ProposerSeed,
+    //    matching Go's seedInput.ToBeHashed() returning protocol.ProposerSeed) ──
+
+    // Go test data: Alpha=[0x33;32], History=[0x44;32]
+    const SEED_INPUT_ENCODING_HEX: &str = "82a5616c706861c4203333333333333333333333333333333333333333333333333333333333333333a468697374c4204444444444444444444444444444444444444444444444444444444444444444";
+
+    const SEED_INPUT_DIGEST_HEX: &str =
+        "eb82d92e7351392da0390d314f83a69bd9f269486e34b93dcf2bbe27a3d7e64f";
+
+    #[test]
+    fn golden_seed_input_encoding() {
+        let si = SeedInput {
+            alpha: Digest([0x33; 32]),
+            history: Digest([0x44; 32]),
+        };
+        let encoded = si.to_be_hashed();
+        let expected = hex_decode(SEED_INPUT_ENCODING_HEX);
+        assert_eq!(
+            encoded, expected,
+            "SeedInput encoding mismatch vs Go golden vector"
+        );
+    }
+
+    #[test]
+    fn golden_seed_input_digest() {
+        let si = SeedInput {
+            alpha: Digest([0x33; 32]),
+            history: Digest([0x44; 32]),
+        };
+        let digest = hash_obj(&si);
+        let expected = hex_decode(SEED_INPUT_DIGEST_HEX);
+        assert_eq!(
+            digest.0.as_slice(),
+            expected.as_slice(),
+            "SeedInput digest mismatch vs Go golden vector"
+        );
+    }
+
+    #[test]
+    fn golden_seed_input_hash_rep() {
+        let si = SeedInput {
+            alpha: Digest([0x33; 32]),
+            history: Digest([0x44; 32]),
+        };
+        let rep = hash_rep(&si);
+        let mut expected = b"PS".to_vec();
+        expected.extend_from_slice(&hex_decode(SEED_INPUT_ENCODING_HEX));
+        assert_eq!(
+            rep, expected,
+            "SeedInput hash_rep mismatch vs Go golden vector"
+        );
+    }
+
+    // ── HashableCredential (HashID "CR") ──────────────────────────────────
+
+    // Go test data: RawOut=[0x55;64], Member=[0x66;32], Iter=1
+    const HASHABLE_CREDENTIAL_ENCODING_HEX: &str = "83a16901a16dc4206666666666666666666666666666666666666666666666666666666666666666a176c44055555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555";
+
+    const HASHABLE_CREDENTIAL_DIGEST_HEX: &str =
+        "c278c090d775282c0346c3c1b2ba904e82eea9622ed201780c0ace5e14427bad";
+
+    #[test]
+    fn golden_hashable_credential_encoding() {
+        let hc = HashableCredential {
+            raw_out: [0x55; 64],
+            member: Address([0x66; 32]),
+            iter: 1,
+        };
+        let encoded = hc.to_be_hashed();
+        let expected = hex_decode(HASHABLE_CREDENTIAL_ENCODING_HEX);
+        assert_eq!(
+            encoded, expected,
+            "HashableCredential encoding mismatch vs Go golden vector"
+        );
+    }
+
+    #[test]
+    fn golden_hashable_credential_digest() {
+        let hc = HashableCredential {
+            raw_out: [0x55; 64],
+            member: Address([0x66; 32]),
+            iter: 1,
+        };
+        let digest = hash_obj(&hc);
+        let expected = hex_decode(HASHABLE_CREDENTIAL_DIGEST_HEX);
+        assert_eq!(
+            digest.0.as_slice(),
+            expected.as_slice(),
+            "HashableCredential digest mismatch vs Go golden vector"
+        );
+    }
+
+    #[test]
+    fn golden_hashable_credential_hash_rep() {
+        let hc = HashableCredential {
+            raw_out: [0x55; 64],
+            member: Address([0x66; 32]),
+            iter: 1,
+        };
+        let rep = hash_rep(&hc);
+        let mut expected = b"CR".to_vec();
+        expected.extend_from_slice(&hex_decode(HASHABLE_CREDENTIAL_ENCODING_HEX));
+        assert_eq!(
+            rep, expected,
+            "HashableCredential hash_rep mismatch vs Go golden vector"
+        );
+    }
+
+    // ── Seed (HashID "SD") ────────────────────────────────────────────────
+
+    // Go test data: Seed=[0x77;32]
+    // Seed.ToBeHashed() returns raw bytes (not msgpack), which is just the 32 bytes.
+    const SEED_ENCODING_HEX: &str =
+        "7777777777777777777777777777777777777777777777777777777777777777";
+
+    const SEED_DIGEST_HEX: &str =
+        "718a907fa3addcd56ca30ba5768b49b6e4b47dea6c1805be214db6c01c689745";
+
+    #[test]
+    fn golden_seed_encoding() {
+        let seed = Seed([0x77; 32]);
+        let encoded = seed.to_be_hashed();
+        let expected = hex_decode(SEED_ENCODING_HEX);
+        assert_eq!(
+            encoded, expected,
+            "Seed encoding mismatch vs Go golden vector"
+        );
+    }
+
+    #[test]
+    fn golden_seed_digest() {
+        let seed = Seed([0x77; 32]);
+        let digest = hash_obj(&seed);
+        let expected = hex_decode(SEED_DIGEST_HEX);
+        assert_eq!(
+            digest.0.as_slice(),
+            expected.as_slice(),
+            "Seed digest mismatch vs Go golden vector"
+        );
+    }
+
+    #[test]
+    fn golden_seed_hash_rep() {
+        let seed = Seed([0x77; 32]);
+        let rep = hash_rep(&seed);
+        let mut expected = b"SD".to_vec();
+        expected.extend_from_slice(&hex_decode(SEED_ENCODING_HEX));
+        assert_eq!(rep, expected, "Seed hash_rep mismatch vs Go golden vector");
+    }
+}
