@@ -409,46 +409,46 @@ pub struct SentMessage {
 /// inbound message channels.
 pub struct StubNetwork {
     /// Messages sent via `broadcast` or `relay`.
-    pub sent: RefCell<Vec<SentMessage>>,
+    pub sent: Mutex<Vec<SentMessage>>,
     /// Handles that were disconnected.
-    pub disconnected: RefCell<Vec<()>>,
+    pub disconnected: Mutex<Vec<()>>,
     /// Whether `start` has been called.
-    pub started: RefCell<bool>,
+    pub started: Mutex<bool>,
     /// Senders for injecting inbound messages, keyed by tag.
-    inbound_senders: RefCell<HashMap<&'static str, mpsc::Sender<Message>>>,
+    inbound_senders: Mutex<HashMap<&'static str, mpsc::Sender<Message>>>,
     /// Receivers for inbound messages, keyed by tag.
     /// Each tag's receiver is created on first call to `messages()`.
-    inbound_receivers: RefCell<HashMap<&'static str, mpsc::Receiver<Message>>>,
+    inbound_receivers: Mutex<HashMap<&'static str, mpsc::Receiver<Message>>>,
 }
 
 impl StubNetwork {
     /// Creates a new stub network.
     pub fn new() -> Self {
         Self {
-            sent: RefCell::new(Vec::new()),
-            disconnected: RefCell::new(Vec::new()),
-            started: RefCell::new(false),
-            inbound_senders: RefCell::new(HashMap::new()),
-            inbound_receivers: RefCell::new(HashMap::new()),
+            sent: Mutex::new(Vec::new()),
+            disconnected: Mutex::new(Vec::new()),
+            started: Mutex::new(false),
+            inbound_senders: Mutex::new(HashMap::new()),
+            inbound_receivers: Mutex::new(HashMap::new()),
         }
     }
 
     /// Returns a sender that can be used to inject inbound messages for the
     /// given tag. Creates the channel if it does not already exist.
     pub fn inject_sender(&self, tag: &Tag) -> mpsc::Sender<Message> {
-        let mut senders = self.inbound_senders.borrow_mut();
+        let mut senders = self.inbound_senders.lock().unwrap();
         if let Some(sender) = senders.get(tag.0) {
             return sender.clone();
         }
         let (tx, rx) = mpsc::channel();
         senders.insert(tag.0, tx.clone());
-        self.inbound_receivers.borrow_mut().insert(tag.0, rx);
+        self.inbound_receivers.lock().unwrap().insert(tag.0, rx);
         tx
     }
 
     /// Returns all sent messages.
     pub fn get_sent(&self) -> Vec<SentMessage> {
-        self.sent.borrow().clone()
+        self.sent.lock().unwrap().clone()
     }
 }
 
@@ -461,17 +461,17 @@ impl Default for StubNetwork {
 impl AgreementNetwork for StubNetwork {
     fn messages(&self, tag: &Tag) -> mpsc::Receiver<Message> {
         // If a receiver already exists, take it out (can only be called once per tag).
-        if let Some(rx) = self.inbound_receivers.borrow_mut().remove(tag.0) {
+        if let Some(rx) = self.inbound_receivers.lock().unwrap().remove(tag.0) {
             return rx;
         }
         // Otherwise create a new channel and store the sender.
         let (tx, rx) = mpsc::channel();
-        self.inbound_senders.borrow_mut().insert(tag.0, tx);
+        self.inbound_senders.lock().unwrap().insert(tag.0, tx);
         rx
     }
 
     fn broadcast(&self, tag: &Tag, data: &[u8]) -> Result<(), AgreementError> {
-        self.sent.borrow_mut().push(SentMessage {
+        self.sent.lock().unwrap().push(SentMessage {
             tag: tag.clone(),
             data: data.to_vec(),
             is_relay: false,
@@ -485,7 +485,7 @@ impl AgreementNetwork for StubNetwork {
         tag: &Tag,
         data: &[u8],
     ) -> Result<(), AgreementError> {
-        self.sent.borrow_mut().push(SentMessage {
+        self.sent.lock().unwrap().push(SentMessage {
             tag: tag.clone(),
             data: data.to_vec(),
             is_relay: true,
@@ -494,11 +494,11 @@ impl AgreementNetwork for StubNetwork {
     }
 
     fn disconnect(&self, _handle: &MessageHandle) {
-        self.disconnected.borrow_mut().push(());
+        self.disconnected.lock().unwrap().push(());
     }
 
     fn start(&self) {
-        *self.started.borrow_mut() = true;
+        *self.started.lock().unwrap() = true;
     }
 }
 
