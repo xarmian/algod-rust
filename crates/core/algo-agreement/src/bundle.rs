@@ -630,6 +630,10 @@ mod tests {
                 vote_first_valid: Round(0),
                 vote_last_valid: Round(0),
                 vote_key_dilution: 0,
+                incentive_eligible: false,
+                last_proposed: Round(0),
+                last_heartbeat: Round(0),
+                state_proof_id: [0u8; 64],
             },
         );
 
