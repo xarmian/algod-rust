@@ -337,6 +337,26 @@ impl OneTimeSignatureSecrets {
         }
     }
 
+    /// Access the master signing key, asserting that it is available.
+    ///
+    /// Currently unused but provided as the canonical guarded accessor for any
+    /// future code path that needs the master key for signing (e.g., generating
+    /// new batch subkeys at runtime).
+    ///
+    /// # Panics
+    ///
+    /// Panics (debug builds) if this instance was deserialized from msgpack,
+    /// because the master private key is not persisted and the `master` field
+    /// contains a zeroed dummy key.
+    #[allow(dead_code)]
+    fn master_for_signing(&self) -> &SigningKey {
+        debug_assert!(
+            !self.is_restored,
+            "cannot use master key on restored secrets"
+        );
+        &self.master
+    }
+
     /// Return the master public key (the `OneTimeSignatureVerifier`).
     ///
     /// If this struct was deserialized from msgpack, the restored verifier
@@ -664,6 +684,11 @@ fn decode_ephemeral_subkey(data: &[u8]) -> Result<(EphemeralSubkey, &[u8]), Stri
     let mut pk_sig_old = [0u8; 64];
     let mut pk_sig_new = [0u8; 64];
 
+    let mut seen_pk = false;
+    let mut seen_sk = false;
+    let mut seen_pk_sig = false;
+    let mut seen_sig2 = false;
+
     for _ in 0..map_len {
         let (key, rest) = read_str(cur).map_err(|e| format!("ephemeral subkey key: {e}"))?;
         cur = rest;
@@ -675,6 +700,7 @@ fn decode_ephemeral_subkey(data: &[u8]) -> Result<(EphemeralSubkey, &[u8]), Stri
                     return Err(format!("PK: expected 32 bytes, got {}", val.len()));
                 }
                 pk.copy_from_slice(val);
+                seen_pk = true;
                 cur = rest;
             }
             "SK" => {
@@ -683,6 +709,7 @@ fn decode_ephemeral_subkey(data: &[u8]) -> Result<(EphemeralSubkey, &[u8]), Stri
                     return Err(format!("SK: expected 64 bytes, got {}", val.len()));
                 }
                 sk.copy_from_slice(val);
+                seen_sk = true;
                 cur = rest;
             }
             "PKSig" => {
@@ -692,6 +719,7 @@ fn decode_ephemeral_subkey(data: &[u8]) -> Result<(EphemeralSubkey, &[u8]), Stri
                     return Err(format!("PKSig: expected 64 bytes, got {}", val.len()));
                 }
                 pk_sig_old.copy_from_slice(val);
+                seen_pk_sig = true;
                 cur = rest;
             }
             "sig2" => {
@@ -701,6 +729,7 @@ fn decode_ephemeral_subkey(data: &[u8]) -> Result<(EphemeralSubkey, &[u8]), Stri
                     return Err(format!("sig2: expected 64 bytes, got {}", val.len()));
                 }
                 pk_sig_new.copy_from_slice(val);
+                seen_sig2 = true;
                 cur = rest;
             }
             other => {
@@ -710,6 +739,19 @@ fn decode_ephemeral_subkey(data: &[u8]) -> Result<(EphemeralSubkey, &[u8]), Stri
                 cur = rest;
             }
         }
+    }
+
+    if !seen_pk {
+        return Err("ephemeral subkey missing required field 'PK'".to_string());
+    }
+    if !seen_sk {
+        return Err("ephemeral subkey missing required field 'SK'".to_string());
+    }
+    if !seen_pk_sig {
+        return Err("ephemeral subkey missing required field 'PKSig'".to_string());
+    }
+    if !seen_sig2 {
+        return Err("ephemeral subkey missing required field 'sig2'".to_string());
     }
 
     Ok((
@@ -2095,5 +2137,140 @@ mod tests {
         let data = [0xcf, 0x00, 0x00, 0x00, 0x00];
         let result = skip_msgpack_value(&data);
         assert!(result.is_err());
+    }
+
+    // ── delete_before on restored secrets ────────────────────────────────
+
+    /// Serialize secrets to msgpack, deserialize, run `delete_before` on the
+    /// restored copy, and verify signing still works for remaining keys.
+    #[test]
+    fn delete_before_on_restored_secrets() {
+        let key_dilution = 4u64;
+        let secrets = OneTimeSignatureSecrets::generate(0, 5);
+        let verifier = secrets.verifier();
+
+        // Serialize and deserialize (round-trip through msgpack).
+        let blob = secrets.to_msgpack();
+        let mut restored = OneTimeSignatureSecrets::from_msgpack(&blob).unwrap();
+        assert!(restored.is_restored());
+
+        // Delete keys before round 8 (batch 2, offset 0).
+        restored.delete_before(8, key_dilution);
+
+        // Should be able to sign round 8 (batch 2, offset 0).
+        let sig = restored.sign(b"restored signing", 8, key_dilution);
+        assert!(verify_one_time_signature(
+            &sig,
+            &verifier,
+            2,
+            0,
+            b"restored signing"
+        ));
+
+        // Should also be able to sign round 9 (batch 2, offset 1).
+        let sig = restored.sign(b"restored signing 2", 9, key_dilution);
+        assert!(verify_one_time_signature(
+            &sig,
+            &verifier,
+            2,
+            1,
+            b"restored signing 2"
+        ));
+
+        // Re-serialize after delete_before and restore again.
+        let blob2 = restored.to_msgpack();
+        let restored2 = OneTimeSignatureSecrets::from_msgpack(&blob2).unwrap();
+
+        // Should still be able to sign round 10 (batch 2, offset 2).
+        let sig = restored2.sign(b"double restored", 10, key_dilution);
+        assert!(verify_one_time_signature(
+            &sig,
+            &verifier,
+            2,
+            2,
+            b"double restored"
+        ));
+    }
+
+    // ── from_msgpack wrong-length blob rejection ─────────────────────────
+
+    /// `from_msgpack` rejects a verifier blob that is not exactly 32 bytes.
+    #[test]
+    fn from_msgpack_wrong_length_verifier_31() {
+        // Build a minimal msgpack map with a 31-byte verifier.
+        let mut data = Vec::new();
+        data.push(0x81); // fixmap(1)
+        write_fixstr(&mut data, "OneTimeSignatureVerifier");
+        rmp::encode::write_bin(&mut data, &[0u8; 31]).unwrap();
+        let err = OneTimeSignatureSecrets::from_msgpack(&data).err().unwrap();
+        assert!(err.contains("expected 32 bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn from_msgpack_wrong_length_verifier_33() {
+        let mut data = Vec::new();
+        data.push(0x81); // fixmap(1)
+        write_fixstr(&mut data, "OneTimeSignatureVerifier");
+        rmp::encode::write_bin(&mut data, &[0u8; 33]).unwrap();
+        let err = OneTimeSignatureSecrets::from_msgpack(&data).err().unwrap();
+        assert!(err.contains("expected 32 bytes"), "got: {err}");
+    }
+
+    /// `from_msgpack` rejects a subkey with wrong-length PK (not 32 bytes).
+    #[test]
+    fn from_msgpack_wrong_length_pk_in_subkey() {
+        // Build a map with Sub array containing one subkey with 31-byte PK.
+        let mut data = Vec::new();
+        data.push(0x81); // fixmap(1)
+        write_fixstr(&mut data, "Sub");
+        rmp::encode::write_array_len(&mut data, 1).unwrap();
+        // subkey map with 1 field: PK = 31 bytes
+        data.push(0x81); // fixmap(1)
+        write_fixstr(&mut data, "PK");
+        rmp::encode::write_bin(&mut data, &[0u8; 31]).unwrap();
+        let err = OneTimeSignatureSecrets::from_msgpack(&data).err().unwrap();
+        assert!(err.contains("expected 32 bytes"), "got: {err}");
+    }
+
+    /// `from_msgpack` rejects a subkey with wrong-length SK (not 64 bytes).
+    #[test]
+    fn from_msgpack_wrong_length_sk_in_subkey() {
+        // Build a map with Sub array containing one subkey with 63-byte SK.
+        let mut data = Vec::new();
+        data.push(0x81); // fixmap(1)
+        write_fixstr(&mut data, "Sub");
+        rmp::encode::write_array_len(&mut data, 1).unwrap();
+        // subkey map with 1 field: SK = 63 bytes
+        data.push(0x81); // fixmap(1)
+        write_fixstr(&mut data, "SK");
+        rmp::encode::write_bin(&mut data, &[0u8; 63]).unwrap();
+        let err = OneTimeSignatureSecrets::from_msgpack(&data).err().unwrap();
+        assert!(err.contains("expected 64 bytes"), "got: {err}");
+    }
+
+    /// Decoding an ephemeral subkey blob missing a required field must fail.
+    #[test]
+    fn decode_ephemeral_subkey_missing_field_rejected() {
+        // Build a subkey map with 3 fields (missing "SK")
+        let mut data = Vec::new();
+        // fixmap(3)
+        data.push(0x83);
+        // "PK" -> bin(32)
+        write_fixstr(&mut data, "PK");
+        rmp::encode::write_bin(&mut data, &[0xAAu8; 32]).unwrap();
+        // "PKSig" -> bin(64)
+        write_fixstr(&mut data, "PKSig");
+        rmp::encode::write_bin(&mut data, &[0xBBu8; 64]).unwrap();
+        // "sig2" -> bin(64)
+        write_fixstr(&mut data, "sig2");
+        rmp::encode::write_bin(&mut data, &[0xCCu8; 64]).unwrap();
+
+        match decode_ephemeral_subkey(&data) {
+            Ok(_) => panic!("expected error for missing SK field, got Ok"),
+            Err(err) => assert!(
+                err.contains("missing required field 'SK'"),
+                "expected missing-SK error, got: {err}"
+            ),
+        }
     }
 }

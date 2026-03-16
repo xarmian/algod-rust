@@ -288,10 +288,21 @@ impl ParticipationStore {
         };
 
         // Reconstruct account address.
-        let mut parent = Address([0u8; 32]);
-        if raw_account.len() == 32 {
-            parent.0.copy_from_slice(&raw_account);
+        if raw_account.len() != 32 {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Blob,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "account address: expected 32 bytes, got {}",
+                        raw_account.len()
+                    ),
+                )),
+            ));
         }
+        let mut parent = Address([0u8; 32]);
+        parent.0.copy_from_slice(&raw_account);
 
         Ok(Some(Participation {
             parent,
@@ -420,7 +431,10 @@ impl ParticipationStore {
 
         let on = on_round.0 as i64;
         if on < first_valid || on > last_valid {
-            return Err(rusqlite::Error::QueryReturnedNoRows);
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "round {} outside valid range [{}, {}]",
+                on, first_valid, last_valid,
+            )));
         }
 
         let tx = self.conn.unchecked_transaction()?;
