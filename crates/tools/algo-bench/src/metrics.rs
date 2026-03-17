@@ -48,6 +48,16 @@ impl MetricsCollector {
         let peak = Arc::clone(&peak_rss);
         let sample_pid = pid;
 
+        // Take one synchronous sample before spawning the background thread
+        // so that peak_rss is never zero.
+        {
+            let mut sys = System::new();
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+            if let Some(proc) = sys.process(pid) {
+                peak_rss.fetch_max(proc.memory(), Ordering::Relaxed);
+            }
+        }
+
         let sample_handle = thread::spawn(move || {
             let mut sys = System::new();
             while !stop.load(Ordering::Relaxed) {
