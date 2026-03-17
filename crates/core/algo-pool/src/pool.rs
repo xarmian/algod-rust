@@ -369,12 +369,9 @@ impl TransactionPool {
         // Duplicate check.
         self.check_duplicate(tx_group, guard)?;
 
-        // Feed to the evaluator.
-        if let Some(ref mut evaluator) = guard.evaluator {
-            evaluator
-                .transaction_group(tx_group)
-                .map_err(|e| PoolError::Evaluator(e.to_string()))?;
-        }
+        // Feed to the evaluator (with "no space" handling).
+        // Mirrors Go's ingest() which calls addToPendingBlockEvaluator().
+        self.add_to_pending_block_evaluator(tx_group, guard)?;
 
         // Store in remembered collections.
         let group_clone: Vec<SignedTransaction> = tx_group.to_vec();
@@ -533,18 +530,46 @@ impl TransactionPool {
         self.remember_commit(inner, true);
     }
 
-    /// Feed a transaction group to the block evaluator during re-evaluation.
+    /// Feed a transaction group to the pending block evaluator, handling
+    /// "no space" by rolling into the next pending block.
     ///
-    /// Mirrors go-algorand's `add()` / `addToPendingBlockEvaluator()`:
+    /// Mirrors go-algorand's `addToPendingBlockEvaluator()`:
+    /// - Calls `add_to_pending_block_evaluator_once()` (expiry check + evaluator call)
+    /// - If the evaluator returns "no space", increments `num_pending_whole_blocks`,
+    ///   resets txn bytes, and retries once
+    ///
+    /// This is used by both `ingest()` (normal Remember path) and
+    /// `add_to_block_evaluator()` (recompute path). It does NOT store in
+    /// remembered collections — the caller is responsible for that.
+    fn add_to_pending_block_evaluator(
+        &self,
+        txgroup: &[SignedTransaction],
+        inner: &mut PoolInner,
+    ) -> Result<(), PoolError> {
+        match self.add_to_pending_block_evaluator_once(txgroup, inner) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("no space") || err_str.contains("NoSpace") {
+                    inner.num_pending_whole_blocks += 1;
+                    if let Some(ref mut evaluator) = inner.evaluator {
+                        evaluator.reset_txn_bytes();
+                    }
+                    self.add_to_pending_block_evaluator_once(txgroup, inner)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Try to feed a transaction group to the evaluator once.
+    ///
+    /// Mirrors go-algorand's `addToPendingBlockEvaluatorOnce()`:
     /// - Checks if any transaction in the group has expired
     ///   (last_valid < evaluator_round + pending_blocks)
     /// - Feeds the group to the evaluator
-    /// - If the evaluator returns "no space", increments `num_pending_whole_blocks`,
-    ///   resets txn bytes, and retries once
-    /// - On success, stores in remembered collections
-    ///
-    /// This bypasses fee checks (matching Go's `add()` which uses `recomputing: true`).
-    fn add_to_block_evaluator(
+    fn add_to_pending_block_evaluator_once(
         &self,
         txgroup: &[SignedTransaction],
         inner: &mut PoolInner,
@@ -566,28 +591,28 @@ impl TransactionPool {
 
         // Feed to the evaluator.
         if let Some(ref mut evaluator) = inner.evaluator {
-            match evaluator.transaction_group(txgroup) {
-                Ok(()) => {}
-                Err(e) => {
-                    // Check if the error indicates the block is full.
-                    // Go checks for `ledgercore.ErrNoSpace`; we check
-                    // the error message as a proxy.
-                    let err_str = e.to_string();
-                    if err_str.contains("no space") || err_str.contains("NoSpace") {
-                        inner.num_pending_whole_blocks += 1;
-                        evaluator.reset_txn_bytes();
-                        // Retry once.
-                        if let Err(e2) = evaluator.transaction_group(txgroup) {
-                            return Err(PoolError::Evaluator(e2.to_string()));
-                        }
-                    } else {
-                        return Err(PoolError::Evaluator(err_str));
-                    }
-                }
-            }
+            evaluator
+                .transaction_group(txgroup)
+                .map_err(|e| PoolError::Evaluator(e.to_string()))?;
+            Ok(())
         } else {
-            return Err(PoolError::NoPendingBlockEvaluator);
+            Err(PoolError::NoPendingBlockEvaluator)
         }
+    }
+
+    /// Feed a transaction group to the block evaluator during re-evaluation.
+    ///
+    /// Mirrors go-algorand's `add()` which calls `ingest()` with `recomputing: true`.
+    /// Calls `add_to_pending_block_evaluator()` for the "no space" handling, then
+    /// stores in remembered collections on success.
+    ///
+    /// This bypasses fee checks (matching Go's `add()` which uses `recomputing: true`).
+    fn add_to_block_evaluator(
+        &self,
+        txgroup: &[SignedTransaction],
+        inner: &mut PoolInner,
+    ) -> Result<(), PoolError> {
+        self.add_to_pending_block_evaluator(txgroup, inner)?;
 
         // Store in remembered collections (these get flushed to pending later).
         inner.remembered_tx_groups.push(txgroup.to_vec());
@@ -1722,22 +1747,30 @@ mod tests {
 
     #[test]
     fn test_on_new_block_evicts_expired_txns() {
-        let (pool, _ledger) = make_pool_with_advancing_ledger(1000, 1);
+        let (pool, ledger) = make_pool_with_advancing_ledger(1000, 1);
+        // Initial evaluator is at round 2.
 
-        // txn1: expires at round 5 (will survive)
+        // txn1: expires at round 1000 (will survive)
         let txn1 = make_test_txn_with_last_valid(1, Round(1000));
         let txid1 = compute_txn_id(&txn1.txn);
 
-        // txn2: expires at round 1 (will be evicted when evaluator is at round 2)
-        let txn2 = make_test_txn_with_last_valid(2, Round(1));
+        // txn2: expires at round 2 (valid now with evaluator at round 2,
+        // but will be evicted when on_new_block rebuilds the evaluator at round 3)
+        let txn2 = make_test_txn_with_last_valid(2, Round(2));
         let txid2 = compute_txn_id(&txn2.txn);
 
         pool.remember_one(txn1).unwrap();
         pool.remember_one(txn2).unwrap();
         assert_eq!(pool.pending_count(), 2);
 
-        // Process a new block -- the new evaluator will be at round 2,
-        // so txn2 (last_valid=1) should be evicted.
+        // Advance the ledger round to simulate the block being applied.
+        // This ensures recompute_block_evaluator creates a new evaluator at round 3.
+        ledger
+            .round
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+
+        // Process a new block -- the new evaluator will be at round 3,
+        // so txn2 (last_valid=2) should be evicted.
         let block = Block {
             round: Round(2),
             ..Block::default()

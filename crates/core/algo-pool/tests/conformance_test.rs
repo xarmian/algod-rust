@@ -522,19 +522,25 @@ fn test_on_new_block_status_cache_confirmed() {
 /// evicted and recorded in the status cache with an error.
 #[test]
 fn test_on_new_block_evicts_expired() {
-    let (pool, _ledger) = make_pool(1000, 1);
+    let (pool, ledger) = make_pool(1000, 1);
+    // Initial evaluator is at round 2.
 
     // txn1: expires far in the future (survives)
     let txn1 = make_txn_expiring(1, Round(1000));
     let txid1 = compute_txn_id(&txn1.txn);
 
-    // txn2: expires at round 1 (evicted when evaluator moves to round 2)
-    let txn2 = make_txn_expiring(2, Round(1));
+    // txn2: expires at round 2 (valid now with evaluator at round 2,
+    // but will be evicted when on_new_block rebuilds the evaluator at round 3)
+    let txn2 = make_txn_expiring(2, Round(2));
     let txid2 = compute_txn_id(&txn2.txn);
 
     pool.remember_one(txn1).unwrap();
     pool.remember_one(txn2).unwrap();
     assert_eq!(pool.pending_count(), 2);
+
+    // Advance the ledger round to simulate the block being applied.
+    // This ensures recompute_block_evaluator creates a new evaluator at round 3.
+    ledger.advance();
 
     let block = Block {
         round: Round(2),
