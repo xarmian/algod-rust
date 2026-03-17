@@ -55,11 +55,12 @@ use std::io::Cursor;
 
 use algo_codec::canonical_encode_unauthenticated_proposal;
 use algo_consensus_crypto::OneTimeSignature;
-use algo_types::{Address, Digest, Round};
+use algo_types::{Address, Block, Digest, Round};
 
 use crate::bundle::{EquivocationVoteAuthenticator, UnauthenticatedBundle, VoteAuthenticator};
 use crate::credential::UnauthenticatedCredential;
 use crate::events::CompoundMessage;
+use crate::proposal::UnauthenticatedProposal;
 use crate::step::{Period, Step};
 use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, BOTTOM};
 use crate::VRF_PROOF_SIZE;
@@ -544,6 +545,60 @@ pub fn encode_compound_message(cm: &CompoundMessage) -> Vec<u8> {
     buf
 }
 
+/// Decode a `CompoundMessage` from wire-format msgpack bytes.
+///
+/// This is the inverse of `encode_compound_message`. The wire format is a
+/// Go `transmittedPayload`: a flat msgpack map containing all
+/// `unauthenticatedProposal` fields (which embeds `bookkeeping.Block` fields
+/// plus `sdpf`, `oper`, `oprop`) and optionally a `"pv"` key holding the
+/// prior vote (`unauthenticatedVote`).
+///
+/// Decoding strategy:
+/// 1. Decode the bytes as a `Block` via `Block::decode_from_bytes` (which
+///    skips unknown keys like `oper`, `oprop`, `sdpf`, `pv`).
+/// 2. Scan the map a second time to extract the proposal-specific fields
+///    (`oper`, `oprop`, `sdpf`) and the optional prior vote (`pv`).
+pub fn decode_compound_message(bytes: &[u8]) -> Result<CompoundMessage, CodecError> {
+    // Step 1: Decode block fields (skips unknown keys).
+    let block = Block::decode_from_bytes(bytes)
+        .map_err(|e| CodecError::Decode(format!("block decode in compound message: {e}")))?;
+
+    // Step 2: Scan the map to extract proposal-specific fields and prior vote.
+    let mut cursor = Cursor::new(bytes);
+    let map_len = rmp::decode::read_map_len(&mut cursor)
+        .map_err(|e| CodecError::Decode(format!("compound message map: {e}")))?;
+
+    let mut original_period = Period(0);
+    let mut original_proposer = Address([0u8; 32]);
+    let mut seed_proof = [0u8; VRF_PROOF_SIZE];
+    let mut prior_vote = UnauthenticatedVote::default();
+
+    for _ in 0..map_len {
+        let key = read_str_key(&mut cursor)?;
+        match key.as_str() {
+            "oper" => original_period = Period(read_uint64(&mut cursor)?),
+            "oprop" => original_proposer = Address(read_bin_fixed::<32>(&mut cursor)?),
+            "sdpf" => seed_proof = read_bin_fixed::<VRF_PROOF_SIZE>(&mut cursor)?,
+            "pv" => prior_vote = decode_vote_from_cursor(&mut cursor)?,
+            _ => {
+                // Skip all block fields and any other unknown fields.
+                rmpv::decode::read_value(&mut cursor)
+                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+            }
+        }
+    }
+
+    Ok(CompoundMessage {
+        vote: prior_vote,
+        proposal: UnauthenticatedProposal {
+            block,
+            seed_proof,
+            original_period,
+            original_proposer,
+        },
+    })
+}
+
 // ── Decoding helpers ─────────────────────────────────────────────────────
 
 /// Read a msgpack string key from cursor.
@@ -706,19 +761,24 @@ fn decode_one_time_signature(cursor: &mut Cursor<&[u8]>) -> Result<OneTimeSignat
 /// Decode an UnauthenticatedVote from wire-format msgpack bytes.
 pub fn decode_vote(bytes: &[u8]) -> Result<UnauthenticatedVote, CodecError> {
     let mut cursor = Cursor::new(bytes);
-    let map_len = rmp::decode::read_map_len(&mut cursor)
+    decode_vote_from_cursor(&mut cursor)
+}
+
+/// Decode an UnauthenticatedVote from cursor position.
+fn decode_vote_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<UnauthenticatedVote, CodecError> {
+    let map_len = rmp::decode::read_map_len(cursor)
         .map_err(|e| CodecError::Decode(format!("vote map: {e}")))?;
 
     let mut vote = UnauthenticatedVote::default();
 
     for _ in 0..map_len {
-        let key = read_str_key(&mut cursor)?;
+        let key = read_str_key(cursor)?;
         match key.as_str() {
-            "cred" => vote.cred = decode_unauthenticated_credential(&mut cursor)?,
-            "r" => vote.raw_vote = decode_raw_vote(&mut cursor)?,
-            "sig" => vote.sig = decode_one_time_signature(&mut cursor)?,
+            "cred" => vote.cred = decode_unauthenticated_credential(cursor)?,
+            "r" => vote.raw_vote = decode_raw_vote(cursor)?,
+            "sig" => vote.sig = decode_one_time_signature(cursor)?,
             _ => {
-                rmpv::decode::read_value(&mut cursor)
+                rmpv::decode::read_value(cursor)
                     .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
             }
         }
@@ -1385,5 +1445,119 @@ mod tests {
 
         let decoded = decode_vote(&buf).expect("should skip unknown fields");
         assert_eq!(decoded.raw_vote.round, Round(42));
+    }
+
+    // ── Compound message round-trip tests ────────────────────────────────
+
+    #[test]
+    fn compound_message_roundtrip_no_prior_vote() {
+        // A compound message with only a proposal (no prior vote).
+        let cm = CompoundMessage {
+            vote: UnauthenticatedVote::default(),
+            proposal: UnauthenticatedProposal {
+                block: algo_types::Block {
+                    round: Round(42),
+                    genesis_id: "test-v1".to_string(),
+                    ..algo_types::Block::default()
+                },
+                seed_proof: [0xab; VRF_PROOF_SIZE],
+                original_period: Period(1),
+                original_proposer: Address([0x01; 32]),
+            },
+        };
+
+        let encoded = encode_compound_message(&cm);
+        let decoded = decode_compound_message(&encoded).expect("decode should succeed");
+
+        assert_eq!(decoded.proposal.block.round, Round(42));
+        assert_eq!(decoded.proposal.block.genesis_id, "test-v1");
+        assert_eq!(decoded.proposal.seed_proof, [0xab; VRF_PROOF_SIZE]);
+        assert_eq!(decoded.proposal.original_period, Period(1));
+        assert_eq!(decoded.proposal.original_proposer, Address([0x01; 32]));
+        // Prior vote should be default (empty)
+        assert_eq!(decoded.vote.raw_vote.round, Round(0));
+    }
+
+    #[test]
+    fn compound_message_roundtrip_with_prior_vote() {
+        // A compound message with both a proposal and a prior vote.
+        let cm = CompoundMessage {
+            vote: UnauthenticatedVote {
+                raw_vote: RawVote {
+                    sender: Address([0x42; 32]),
+                    round: Round(100),
+                    period: Period(1),
+                    step: Step(2),
+                    proposal: ProposalValue {
+                        original_period: Period(1),
+                        original_proposer: Address([0x42; 32]),
+                        block_digest: Digest([0xaa; 32]),
+                        encoding_digest: Digest([0xbb; 32]),
+                    },
+                },
+                cred: UnauthenticatedCredential::new([0xcc; VRF_PROOF_SIZE]),
+                sig: make_nonzero_sig(),
+            },
+            proposal: UnauthenticatedProposal {
+                block: algo_types::Block {
+                    round: Round(100),
+                    genesis_id: "roundtrip-test".to_string(),
+                    timestamp: 12345,
+                    ..algo_types::Block::default()
+                },
+                seed_proof: [0xdd; VRF_PROOF_SIZE],
+                original_period: Period(0),
+                original_proposer: Address([0x99; 32]),
+            },
+        };
+
+        let encoded = encode_compound_message(&cm);
+        let decoded = decode_compound_message(&encoded).expect("decode should succeed");
+
+        // Verify proposal
+        assert_eq!(decoded.proposal.block.round, Round(100));
+        assert_eq!(decoded.proposal.block.genesis_id, "roundtrip-test");
+        assert_eq!(decoded.proposal.block.timestamp, 12345);
+        assert_eq!(decoded.proposal.seed_proof, [0xdd; VRF_PROOF_SIZE]);
+        assert_eq!(decoded.proposal.original_period, Period(0));
+        assert_eq!(decoded.proposal.original_proposer, Address([0x99; 32]));
+
+        // Verify prior vote
+        assert_eq!(decoded.vote.raw_vote.sender, Address([0x42; 32]));
+        assert_eq!(decoded.vote.raw_vote.round, Round(100));
+        assert_eq!(decoded.vote.raw_vote.period, Period(1));
+        assert_eq!(decoded.vote.raw_vote.step, Step(2));
+        assert_eq!(
+            decoded.vote.raw_vote.proposal.block_digest,
+            Digest([0xaa; 32])
+        );
+        assert_eq!(decoded.vote.cred.proof, [0xcc; VRF_PROOF_SIZE]);
+        assert_eq!(decoded.vote.sig.sig, [0x11; 64]);
+    }
+
+    #[test]
+    fn compound_message_roundtrip_minimal() {
+        // A compound message with a minimal block (round 0 must still be
+        // encoded because Block::decode_from_bytes requires the "rnd" field).
+        let cm = CompoundMessage {
+            vote: UnauthenticatedVote::default(),
+            proposal: UnauthenticatedProposal {
+                block: algo_types::Block {
+                    round: Round(1), // Ensure "rnd" is emitted.
+                    ..algo_types::Block::default()
+                },
+                seed_proof: [0u8; VRF_PROOF_SIZE],
+                original_period: Period(0),
+                original_proposer: Address([0u8; 32]),
+            },
+        };
+        let encoded = encode_compound_message(&cm);
+        let decoded = decode_compound_message(&encoded).expect("decode should succeed");
+
+        assert_eq!(decoded.proposal.block.round, Round(1));
+        assert_eq!(decoded.proposal.original_period, Period(0));
+        assert_eq!(decoded.proposal.original_proposer, Address([0u8; 32]));
+        assert_eq!(decoded.proposal.seed_proof, [0u8; VRF_PROOF_SIZE]);
+        assert_eq!(decoded.vote.raw_vote.round, Round(0));
     }
 }

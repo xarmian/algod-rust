@@ -29,7 +29,7 @@ use crate::actions::{
     StageDigestAction,
 };
 use crate::codec;
-use crate::demux::{make_timeout_event, Demux, ExternalDemuxSignals, ExternalEvent};
+use crate::demux::{Demux, ExternalDemuxSignals, ExternalEvent};
 use crate::events::ConsensusVersionView;
 use crate::ledger_reader::LedgerReader;
 use crate::player::Player;
@@ -37,8 +37,9 @@ use crate::pseudonode::{AsyncPseudonode, Pseudonode};
 use crate::router::RootRouter;
 use crate::step::{Period, Step, PROPOSE, SOFT};
 use crate::traits::{
-    AgreementKeyManager, AgreementNetwork, BlockFactory, BlockValidator, EventsProcessingMonitor,
-    LedgerWriter, RandomSource, Tag, AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
+    AgreementKeyManager, AgreementNetwork, BlockFactory, BlockValidator, CryptoVerifier,
+    EventsProcessingMonitor, LedgerWriter, RandomSource, Tag, AGREEMENT_VOTE_TAG,
+    PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
 };
 use crate::types::{
     filter_timeout, CredentialArrivalHistory, Deadline, TimeoutType,
@@ -52,7 +53,7 @@ use crate::types::{
 /// Parameters necessary to run the agreement protocol.
 ///
 /// Mirrors Go's `agreement.Parameters`.
-pub struct Parameters<N, L, K, BF, BV, R, M>
+pub struct Parameters<N, L, K, BF, BV, R, M, C>
 where
     N: AgreementNetwork + Send + Sync + 'static,
     L: LedgerReader + LedgerWriter + Send + Sync + 'static,
@@ -61,6 +62,7 @@ where
     BV: BlockValidator + Send + 'static,
     R: RandomSource + Send + 'static,
     M: EventsProcessingMonitor + Send + 'static,
+    C: CryptoVerifier + Send + 'static,
 {
     /// The network interface for sending/receiving agreement messages.
     pub network: N,
@@ -76,6 +78,8 @@ where
     pub random_source: R,
     /// Events processing monitor for queue length reporting.
     pub monitor: M,
+    /// Asynchronous crypto verifier for votes, proposals, and bundles.
+    pub crypto: C,
 }
 
 // ---------------------------------------------------------------------------
@@ -117,7 +121,7 @@ impl ServiceHandle {
 /// the returned `ServiceHandle` to stop.
 ///
 /// Mirrors Go's `agreement.Service`.
-pub struct Service<N, L, K, BF, BV, R, M>
+pub struct Service<N, L, K, BF, BV, R, M, C>
 where
     N: AgreementNetwork + Send + Sync + 'static,
     L: LedgerReader + LedgerWriter + Send + Sync + 'static,
@@ -126,11 +130,12 @@ where
     BV: BlockValidator + Send + 'static,
     R: RandomSource + Send + 'static,
     M: EventsProcessingMonitor + Send + 'static,
+    C: CryptoVerifier + Send + 'static,
 {
-    params: Parameters<N, L, K, BF, BV, R, M>,
+    params: Parameters<N, L, K, BF, BV, R, M, C>,
 }
 
-impl<N, L, K, BF, BV, R, M> Service<N, L, K, BF, BV, R, M>
+impl<N, L, K, BF, BV, R, M, C> Service<N, L, K, BF, BV, R, M, C>
 where
     N: AgreementNetwork + Send + Sync + 'static,
     L: LedgerReader + LedgerWriter + Send + Sync + 'static,
@@ -139,11 +144,12 @@ where
     BV: BlockValidator + Send + 'static,
     R: RandomSource + Send + 'static,
     M: EventsProcessingMonitor + Send + 'static,
+    C: CryptoVerifier + Send + 'static,
 {
     /// Create a new Agreement Service.
     ///
     /// Mirrors Go's `MakeService`.
-    pub fn new(params: Parameters<N, L, K, BF, BV, R, M>) -> Self {
+    pub fn new(params: Parameters<N, L, K, BF, BV, R, M, C>) -> Self {
         Self { params }
     }
 
@@ -171,6 +177,7 @@ where
             block_validator,
             random_source,
             monitor: _monitor,
+            crypto,
         } = self.params;
 
         warn!("events monitor not yet wired into service");
@@ -178,6 +185,37 @@ where
         // Wrap shared state in Arc for cross-thread access.
         let ledger = Arc::new(ledger);
         let network = Arc::new(network);
+
+        // --- Obtain channel receivers for the Demux ---
+
+        // Network message channels (one per tag).
+        let av_rx = network.messages(&Tag(AGREEMENT_VOTE_TAG));
+        let pp_rx = network.messages(&Tag(PROPOSAL_PAYLOAD_TAG));
+        let vb_rx = network.messages(&Tag(VOTE_BUNDLE_TAG));
+
+        // Crypto verifier result channels.
+        let verified_votes_rx = crypto.verified_votes().clone();
+        let verified_proposals_rx = crypto.verified(PROPOSAL_PAYLOAD_TAG).clone();
+        let verified_bundles_rx = crypto.verified(VOTE_BUNDLE_TAG).clone();
+
+        // Initial ledger round notification channel.
+        let current_round = ledger.next_round();
+        let ledger_round_rx = ledger.round_notify(current_round);
+
+        // Quit channel for the Demux.
+        let (quit_demux_tx, quit_demux_rx) = crossbeam_channel::bounded(1);
+
+        // Construct the Demux with all channel receivers.
+        let demux = Demux::new(
+            av_rx,
+            pp_rx,
+            vb_rx,
+            verified_votes_rx,
+            verified_proposals_rx,
+            verified_bundles_rx,
+            ledger_round_rx,
+            quit_demux_rx,
+        );
 
         // Create channels for communication between main loop and demux loop.
         // These mirror Go's `input`, `output`, and `ready` channels.
@@ -230,6 +268,9 @@ where
                     output_rx,
                     ready_rx,
                     pseudo_rx,
+                    demux,
+                    quit_demux_tx,
+                    crypto,
                 );
             })
             .expect("failed to spawn agreement demux loop thread");
@@ -260,7 +301,7 @@ fn main_loop<L, K, BF, R>(
     ledger: Arc<L>,
     key_manager: K,
     block_factory: BF,
-    _random_source: R,
+    random_source: R,
     quit: Arc<AtomicBool>,
     input: mpsc::Receiver<Option<ExternalEvent>>,
     output: mpsc::Sender<Vec<Action>>,
@@ -346,10 +387,22 @@ fn main_loop<L, K, BF, R>(
             duration: player.fast_recovery_deadline,
             timeout_type: TimeoutType::FastRecovery,
         };
+        let current_consensus_version = match ledger.consensus_version(player.round) {
+            Ok(v) => ConsensusVersionView {
+                err: None,
+                version: v,
+            },
+            Err(e) => ConsensusVersionView {
+                err: Some(e.to_string()),
+                version: String::new(),
+            },
+        };
         let signals = ExternalDemuxSignals {
             deadline: player.deadline,
             fast_recovery_deadline,
             current_round: player.round,
+            random_source_entropy: random_source.uint64(),
+            current_consensus_version,
         };
         if ready.send(signals).is_err() {
             break;
@@ -503,12 +556,12 @@ fn execute_pseudonode_action(
 /// For each batch of actions from the main loop:
 /// 1. Execute each action (network broadcasts, ledger writes, pseudonode ops).
 /// 2. Wait for signals from the main loop indicating the current deadline.
-/// 3. Retrieve the next external event from the Demux.
+/// 3. Retrieve the next external event from the Demux (blocks on channels).
 /// 4. Send it to the main loop.
 ///
 /// Mirrors Go's `Service.demuxLoop`.
 #[allow(clippy::too_many_arguments)]
-fn demux_loop<N, L, BV>(
+fn demux_loop<N, L, BV, C>(
     network: Arc<N>,
     ledger: Arc<L>,
     block_validator: BV,
@@ -517,13 +570,15 @@ fn demux_loop<N, L, BV>(
     output: mpsc::Receiver<Vec<Action>>,
     ready: mpsc::Receiver<ExternalDemuxSignals>,
     pseudo_rx: mpsc::Receiver<Vec<ExternalEvent>>,
+    mut demux: Demux,
+    quit_demux_tx: crossbeam_channel::Sender<()>,
+    crypto: C,
 ) where
     N: AgreementNetwork + Send + Sync + 'static,
     L: LedgerReader + LedgerWriter + Send + Sync + 'static,
     BV: BlockValidator + Send + 'static,
+    C: CryptoVerifier + Send + 'static,
 {
-    let mut demux = Demux::new();
-
     // Retain old rounds' period 0 start times for late credential tracking.
     let mut historical_clocks: HashMap<Round, Instant> = HashMap::new();
 
@@ -554,12 +609,16 @@ fn demux_loop<N, L, BV>(
             Err(_) => break,
         };
 
-        // Get the next event from the Demux.
-        let event = demux.next(
-            &signals.deadline,
-            &signals.fast_recovery_deadline,
-            signals.current_round,
-        );
+        // Refresh the ledger round notification channel before each select,
+        // matching Go's `ledgerNextRoundCh := s.Ledger.Wait(nextRound)` which
+        // is called on every invocation of `demux.next()`. This ensures the
+        // one-shot channel is always fresh for the current round.
+        let next_round = signals.current_round;
+        demux.set_ledger_round_rx(ledger.round_notify(next_round));
+
+        // Get the next event from the Demux. This blocks on channels via
+        // crossbeam_channel::Select — no polling or sleep needed.
+        let event = demux.next(&signals, Some(&crypto));
 
         match event {
             Some(e) => {
@@ -568,30 +627,16 @@ fn demux_loop<N, L, BV>(
                 }
             }
             None => {
-                // No events available. In a full implementation, this is where
-                // the demux would block waiting on network messages, timeouts,
-                // or ledger round changes. For now, generate a timeout event
-                // if the quit signal is not set.
-                if quit.load(Ordering::SeqCst) {
-                    let _ = input.send(None);
-                    break;
-                }
-
-                // Rate-limit when no real events are available to prevent
-                // tight spinning (100% CPU). This sleep is a temporary measure
-                // until the demux properly blocks on network/ledger channels.
-                std::thread::sleep(std::time::Duration::from_millis(10));
-
-                // Generate a timeout event to keep the main loop progressing.
-                let timeout_event = make_timeout_event(0, signals.current_round);
-                if input.send(Some(timeout_event)).is_err() {
-                    break;
-                }
+                // Demux returned None — quit signal received.
+                let _ = input.send(None);
+                break;
             }
         }
     }
 
     demux.quit();
+    crypto.quit();
+    let _ = quit_demux_tx.send(());
     let _ = input.send(None);
     debug!("agreement demux loop exited");
 }
@@ -856,6 +901,10 @@ impl<L: LedgerReader + Send + Sync + 'static> LedgerReader for LedgerReaderRef<L
     fn wait_for_round(&self, round: Round) -> Result<(), crate::ledger_reader::LedgerError> {
         self.0.wait_for_round(round)
     }
+
+    fn round_notify(&self, round: Round) -> crossbeam_channel::Receiver<Round> {
+        self.0.round_notify(round)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -867,8 +916,8 @@ mod tests {
     use super::*;
     use crate::certificate::Certificate;
     use crate::stubs::{
-        StubBlockFactory, StubBlockValidator, StubEventsProcessingMonitor, StubLedger, StubNetwork,
-        StubRandomSource,
+        StubBlockFactory, StubBlockValidator, StubCryptoVerifier, StubEventsProcessingMonitor,
+        StubLedger, StubNetwork, StubRandomSource,
     };
     use crate::traits::AgreementKeyManager;
     use algo_types::{Address, ConsensusParams, Round};
@@ -909,6 +958,7 @@ mod tests {
             block_validator: StubBlockValidator::accepting(),
             random_source: StubRandomSource::constant(42),
             monitor: StubEventsProcessingMonitor::new(),
+            crypto: StubCryptoVerifier::new(),
         };
 
         let _service = Service::new(params);
@@ -924,6 +974,7 @@ mod tests {
             block_validator: StubBlockValidator::accepting(),
             random_source: StubRandomSource::constant(42),
             monitor: StubEventsProcessingMonitor::new(),
+            crypto: StubCryptoVerifier::new(),
         };
 
         let service = Service::new(params);

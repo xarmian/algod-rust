@@ -14,6 +14,7 @@ use algo_types::Round;
 use crate::bundle::UnauthenticatedBundle;
 use crate::proposal::UnauthenticatedProposal;
 use crate::step::{Period, Step};
+use crate::traits::MessageHandle;
 use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, Vote, BOTTOM};
 
 // ---------------------------------------------------------------------------
@@ -234,8 +235,17 @@ impl SerializableError {
 ///
 /// In Go, this carries authenticated + unauthenticated forms of votes,
 /// proposals, and bundles. Here we use `Option` for the optional fields.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct InternalMessage {
+    /// An opaque handle identifying the network message source.
+    ///
+    /// Mirrors Go's `message.messageHandle`. Carries the network peer handle
+    /// through the event pipeline so the demux can relay or disconnect.
+    ///
+    /// This field is not cloneable — cloning an `InternalMessage` sets
+    /// `message_handle` to `None`.
+    pub message_handle: MessageHandle,
+
     /// The protocol tag identifying the message type.
     pub tag: String,
 
@@ -258,10 +268,29 @@ pub struct InternalMessage {
     pub compound_message: CompoundMessage,
 }
 
+impl Clone for InternalMessage {
+    fn clone(&self) -> Self {
+        Self {
+            // MessageHandle is an opaque, non-cloneable handle.
+            // Cloned messages lose the handle reference.
+            message_handle: None,
+            tag: self.tag.clone(),
+            vote: self.vote.clone(),
+            proposal: self.proposal.clone(),
+            verified_bundle_votes: self.verified_bundle_votes.clone(),
+            unauthenticated_vote: self.unauthenticated_vote.clone(),
+            unauthenticated_proposal: self.unauthenticated_proposal.clone(),
+            unauthenticated_bundle: self.unauthenticated_bundle.clone(),
+            compound_message: self.compound_message.clone(),
+        }
+    }
+}
+
 /// Default for `InternalMessage` — all fields zeroed/empty.
 impl Default for InternalMessage {
     fn default() -> Self {
         Self {
+            message_handle: None,
             tag: String::new(),
             vote: None,
             proposal: None,

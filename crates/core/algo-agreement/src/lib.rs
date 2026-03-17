@@ -61,15 +61,16 @@ pub use seed::{
 pub use selector::Selector;
 pub use step::{Period, Step, CERT, DOWN, LATE, NEXT, PROPOSE, REDO, SOFT};
 pub use stubs::{
-    EventsQueueUpdate, SentMessage, StubBlockFactory, StubBlockValidator,
+    EventsQueueUpdate, SentMessage, StubBlockFactory, StubBlockValidator, StubCryptoVerifier,
     StubEventsProcessingMonitor, StubLedger, StubNetwork, StubRandomSource, StubUnfinishedBlock,
     StubValidatedBlock, WrittenBlock,
 };
 pub use traits::{
     AgreementError, AgreementKeyManager, AgreementLedger, AgreementNetwork, BlockFactory,
-    BlockValidator, EventsProcessingMonitor, LedgerWriter, Message, MessageHandle,
-    ParticipationAction, ParticipationRecord, RandomSource, Tag, UnfinishedBlock, ValidatedBlock,
-    AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
+    BlockValidator, CryptoBundleRequest, CryptoProposalRequest, CryptoResult, CryptoVerifier,
+    CryptoVoteRequest, CryptoVoteVerifyResult, EventsProcessingMonitor, LedgerWriter, Message,
+    MessageHandle, ParticipationAction, ParticipationRecord, RandomSource, Tag, UnfinishedBlock,
+    ValidatedBlock, AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
 };
 pub use vote::{
     ProposalValue, RawVote, UnauthenticatedVote, Vote, VoteError, VoteVerifyParams, BOTTOM,

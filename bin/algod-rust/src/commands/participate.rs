@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use algo_agreement::{
     BlockFactoryBridge, BlockValidatorBridge, Parameters, RandomSource, Service,
-    StubEventsProcessingMonitor,
+    StubCryptoVerifier, StubEventsProcessingMonitor,
 };
 use algo_ledger::participation::ParticipationStore;
 use algo_ledger::store_trait::LedgerStore;
@@ -327,9 +327,11 @@ pub async fn run(
     let block_validator =
         BlockValidatorBridge::new(resolved_genesis_id.clone(), genesis_hash, prev_timestamp);
 
-    // Real random source backed by the OS CSPRNG; stub monitor.
+    // Real random source backed by the OS CSPRNG; stub monitor and crypto verifier.
     let random_source = RealRandomSource;
     let monitor = StubEventsProcessingMonitor::new();
+    // TODO: Replace with a real CryptoVerifier when async verification is implemented.
+    let crypto = StubCryptoVerifier::new();
 
     // -----------------------------------------------------------------------
     // 5. Build and start the agreement Service.
@@ -342,6 +344,7 @@ pub async fn run(
         block_validator,
         random_source,
         monitor,
+        crypto,
     };
 
     let service = Service::new(params);

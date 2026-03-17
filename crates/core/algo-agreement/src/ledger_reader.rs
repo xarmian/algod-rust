@@ -156,6 +156,13 @@ pub trait LedgerReader {
     /// implemented, this will need to become async (returning a Future or a
     /// channel receiver) to avoid blocking the agreement event loop.
     fn wait_for_round(&self, round: Round) -> Result<(), LedgerError>;
+
+    /// Returns a receiver that will receive a notification when the ledger
+    /// reaches or passes the given round. The receiver fires at most once.
+    ///
+    /// Mirrors Go's `ledger.Wait(round)` channel pattern used by the demux
+    /// to select on round-change events without blocking.
+    fn round_notify(&self, round: Round) -> crossbeam_channel::Receiver<Round>;
 }
 
 /// Construct a `Membership` from ledger state, matching Go's `membership()` helper

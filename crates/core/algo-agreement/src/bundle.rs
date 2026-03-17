@@ -457,6 +457,12 @@ mod tests {
         fn wait_for_round(&self, _round: Round) -> Result<(), LedgerError> {
             Ok(())
         }
+
+        fn round_notify(&self, round: Round) -> crossbeam_channel::Receiver<Round> {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let _ = tx.send(round);
+            rx
+        }
     }
 
     fn v41_params() -> ConsensusParams {
