@@ -81,7 +81,7 @@ impl ProposalManager {
                     _ => panic!("proposalManager: expected ThresholdEvent"),
                 };
                 if player_period < te.period {
-                    self.handle_new_period(&te);
+                    self.handle_new_period(player_period, &te);
                 }
                 let round = te.round;
                 let period = te.period;
@@ -94,7 +94,7 @@ impl ProposalManager {
                     Event::Threshold(te) => te,
                     _ => panic!("proposalManager: expected ThresholdEvent"),
                 };
-                self.handle_new_period(&te);
+                self.handle_new_period(player_period, &te);
                 Event::Empty(EmptyEvent)
             }
 
@@ -118,7 +118,12 @@ impl ProposalManager {
     /// Handle a new period triggered by a threshold event.
     ///
     /// Mirrors Go's `proposalManager.handleNewPeriod`.
-    fn handle_new_period(&mut self, e: &ThresholdEvent) {
+    ///
+    /// `player_period` is the player's current period at the time of the call
+    /// (before the period change). In Go, the player object `p` is passed
+    /// through to `proposalStore.handle`, which uses `p.Period` for staging
+    /// queries and authenticator trimming.
+    fn handle_new_period(&mut self, player_period: Period, e: &ThresholdEvent) {
         let target = if e.t == EventType::NextThreshold {
             Period(e.period.0 + 1)
         } else {
@@ -130,7 +135,7 @@ impl ProposalManager {
             proposal: e.proposal,
         };
         let store = self.store_for(e.round);
-        store.handle(Period(0), Event::NewPeriod(en));
+        store.handle(player_period, Event::NewPeriod(en));
     }
 
     /// Handle a filterable message event (vote or payload present/verified).
