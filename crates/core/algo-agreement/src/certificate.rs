@@ -26,6 +26,17 @@ pub struct Certificate {
     pub votes: Vec<VoteAuthenticator>,
 }
 
+impl Default for Certificate {
+    fn default() -> Self {
+        Self {
+            round: Round(0),
+            period: Period(0),
+            proposal: crate::vote::BOTTOM,
+            votes: Vec::new(),
+        }
+    }
+}
+
 /// Errors from certificate authentication.
 #[derive(Debug, Clone)]
 pub enum CertificateError {
@@ -77,6 +88,19 @@ impl From<BundleError> for CertificateError {
 }
 
 impl Certificate {
+    /// Create a Certificate from an UnauthenticatedBundle.
+    ///
+    /// Mirrors Go's `Certificate(e.Bundle)` — in Go, Certificate is a type
+    /// alias for unauthenticatedBundle.
+    pub fn from_bundle(b: &UnauthenticatedBundle) -> Self {
+        Self {
+            round: b.round,
+            period: b.period,
+            proposal: b.proposal,
+            votes: b.votes.clone(),
+        }
+    }
+
     /// Convert this certificate to an `UnauthenticatedBundle` for verification.
     ///
     /// The bundle step is always CERT.
@@ -272,7 +296,12 @@ mod tests {
         let result = cert.authenticate(Round(100), Digest([0xaa; 32]), &ledger);
         // Should fail with insufficient quorum (empty bundle)
         assert!(
-            matches!(result, Err(CertificateError::BundleError(BundleError::InsufficientQuorum { .. }))),
+            matches!(
+                result,
+                Err(CertificateError::BundleError(
+                    BundleError::InsufficientQuorum { .. }
+                ))
+            ),
             "expected InsufficientQuorum, got: {result:?}"
         );
     }

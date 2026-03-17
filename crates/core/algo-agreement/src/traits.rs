@@ -250,12 +250,7 @@ pub trait AgreementNetwork {
     /// Passing `None` as the handle is equivalent to calling `broadcast`.
     ///
     /// Mirrors Go's `Relay(MessageHandle, protocol.Tag, []byte) error`.
-    fn relay(
-        &self,
-        handle: &MessageHandle,
-        tag: &Tag,
-        data: &[u8],
-    ) -> Result<(), AgreementError>;
+    fn relay(&self, handle: &MessageHandle, tag: &Tag, data: &[u8]) -> Result<(), AgreementError>;
 
     /// Hint to the network to disconnect from the peer identified by `handle`.
     ///
@@ -369,8 +364,7 @@ mod tests {
 
     #[test]
     fn agreement_error_is_error() {
-        let err: Box<dyn std::error::Error> =
-            Box::new(AgreementError::RoundStale(Round(1)));
+        let err: Box<dyn std::error::Error> = Box::new(AgreementError::RoundStale(Round(1)));
         assert!(!err.to_string().is_empty());
     }
 

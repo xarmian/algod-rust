@@ -52,8 +52,7 @@ mod tests {
     use algo_types::consensus::consensus_params_for_version;
 
     fn v41_params() -> ConsensusParams {
-        consensus_params_for_version(algo_types::CONSENSUS_V41)
-            .expect("v41 params must exist")
+        consensus_params_for_version(algo_types::CONSENSUS_V41).expect("v41 params must exist")
     }
 
     // ── params_round ────────────────────────────────────────────────
@@ -77,7 +76,10 @@ mod tests {
     fn balance_lookback_v41() {
         let p = v41_params();
         // v41: seed_refresh_interval = 80, seed_lookback = 2 → 2*80*2 = 320
-        assert_eq!(balance_lookback(&p), 2 * p.seed_refresh_interval * p.seed_lookback);
+        assert_eq!(
+            balance_lookback(&p),
+            2 * p.seed_refresh_interval * p.seed_lookback
+        );
         assert_eq!(balance_lookback(&p), 320);
     }
 

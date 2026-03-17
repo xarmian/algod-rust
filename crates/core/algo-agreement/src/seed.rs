@@ -223,10 +223,7 @@ pub fn derive_seed_period_zero(
 /// 3. `new_seed = Seed(HashObj(input))`
 ///
 /// The `history` parameter should be `Some(digest)` when history mixing applies.
-pub fn derive_seed_period_nonzero(
-    prev_seed: &Seed,
-    history: Option<Digest>,
-) -> Seed {
+pub fn derive_seed_period_nonzero(prev_seed: &Seed, history: Option<Digest>) -> Seed {
     let alpha = hash_obj(prev_seed);
 
     let mut input = SeedInput {
@@ -253,11 +250,7 @@ pub fn derive_seed_period_nonzero(
 /// ```
 ///
 /// Returns `Some(digest_round)` if history mixing applies, `None` otherwise.
-pub fn history_mix_round(
-    rnd: u64,
-    seed_lookback: u64,
-    seed_refresh_interval: u64,
-) -> Option<u64> {
+pub fn history_mix_round(rnd: u64, seed_lookback: u64, seed_refresh_interval: u64) -> Option<u64> {
     let cycle = seed_lookback * seed_refresh_interval;
     if cycle == 0 {
         return None;

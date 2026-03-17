@@ -118,9 +118,7 @@ impl BlockValidator for StubBlockValidator {
                 block: block.clone(),
             }))
         } else {
-            Err(AgreementError::ValidationFailed(
-                self.reject_reason.clone(),
-            ))
+            Err(AgreementError::ValidationFailed(self.reject_reason.clone()))
         }
     }
 }
@@ -366,7 +364,10 @@ impl StubRandomSource {
     ///
     /// Panics if `values` is empty.
     pub fn new(values: Vec<u64>) -> Self {
-        assert!(!values.is_empty(), "StubRandomSource needs at least one value");
+        assert!(
+            !values.is_empty(),
+            "StubRandomSource needs at least one value"
+        );
         Self {
             values,
             index: RefCell::new(0),
@@ -479,12 +480,7 @@ impl AgreementNetwork for StubNetwork {
         Ok(())
     }
 
-    fn relay(
-        &self,
-        _handle: &MessageHandle,
-        tag: &Tag,
-        data: &[u8],
-    ) -> Result<(), AgreementError> {
+    fn relay(&self, _handle: &MessageHandle, tag: &Tag, data: &[u8]) -> Result<(), AgreementError> {
         self.sent.lock().unwrap().push(SentMessage {
             tag: tag.clone(),
             data: data.to_vec(),
@@ -711,7 +707,10 @@ mod tests {
         let mut ledger = StubLedger::new(v41_params(), Round(1));
         ledger.set_circulation(Round(5), 99_000_000);
 
-        assert_eq!(ledger.circulation(Round(5), Round(100)).unwrap(), 99_000_000);
+        assert_eq!(
+            ledger.circulation(Round(5), Round(100)).unwrap(),
+            99_000_000
+        );
         // Unconfigured round uses default
         assert_eq!(
             ledger.circulation(Round(6), Round(100)).unwrap(),

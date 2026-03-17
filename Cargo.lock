@@ -39,6 +39,7 @@ dependencies = [
  "num-bigint",
  "rmp",
  "sha2",
+ "tracing",
 ]
 
 [[package]]

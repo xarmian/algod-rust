@@ -169,7 +169,14 @@ pub fn membership_from_ledger(
     round: Round,
     period: Period,
     step: crate::step::Step,
-) -> Result<(crate::credential::Membership, OnlineAccountData, ConsensusParams), LedgerError> {
+) -> Result<
+    (
+        crate::credential::Membership,
+        OnlineAccountData,
+        ConsensusParams,
+    ),
+    LedgerError,
+> {
     let cparams = l.consensus_params(crate::lookback::params_round(round))?;
     let bal_round = crate::lookback::balance_round(round, &cparams);
     let seed_rnd = crate::lookback::seed_round(round, &cparams);
@@ -233,7 +240,10 @@ mod tests {
             round: Round(10),
             source: Some("catchup lag".to_string()),
         };
-        assert_eq!(format!("{err}"), "round 10 dropped from ledger: catchup lag");
+        assert_eq!(
+            format!("{err}"),
+            "round 10 dropped from ledger: catchup lag"
+        );
 
         let err = LedgerError::Other("test error".to_string());
         assert_eq!(format!("{err}"), "test error");

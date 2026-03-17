@@ -69,6 +69,19 @@ pub struct UnauthenticatedBundle {
     pub equivocation_votes: Vec<EquivocationVoteAuthenticator>,
 }
 
+impl Default for UnauthenticatedBundle {
+    fn default() -> Self {
+        Self {
+            round: Round(0),
+            period: Period(0),
+            step: Step(0),
+            proposal: crate::vote::BOTTOM,
+            votes: Vec::new(),
+            equivocation_votes: Vec::new(),
+        }
+    }
+}
+
 // ── Bundle (verified) ───────────────────────────────────────────────────────
 
 /// A verified bundle — all votes have been checked and quorum is reached.
@@ -262,11 +275,12 @@ impl UnauthenticatedBundle {
 
         // Look up membership from ledger
         let (membership, record, proto) =
-            membership_from_ledger(l, &auth.sender, self.round, self.period, self.step)
-                .map_err(|e| BundleError::VoteVerificationFailed {
+            membership_from_ledger(l, &auth.sender, self.round, self.period, self.step).map_err(
+                |e| BundleError::VoteVerificationFailed {
                     index,
                     detail: format!("could not get membership: {e}"),
-                })?;
+                },
+            )?;
 
         let params = VoteVerifyParams {
             membership,
@@ -277,10 +291,11 @@ impl UnauthenticatedBundle {
             consensus_params: proto,
         };
 
-        uv.verify(&params).map_err(|e| BundleError::VoteVerificationFailed {
-            index,
-            detail: e.to_string(),
-        })
+        uv.verify(&params)
+            .map_err(|e| BundleError::VoteVerificationFailed {
+                index,
+                detail: e.to_string(),
+            })
     }
 
     /// Verify an equivocation vote authenticator.
@@ -314,11 +329,12 @@ impl UnauthenticatedBundle {
         };
 
         let (membership, record, proto) =
-            membership_from_ledger(l, &auth.sender, self.round, self.period, self.step)
-                .map_err(|e| BundleError::VoteVerificationFailed {
+            membership_from_ledger(l, &auth.sender, self.round, self.period, self.step).map_err(
+                |e| BundleError::VoteVerificationFailed {
                     index,
                     detail: format!("could not get membership for equivocation vote: {e}"),
-                })?;
+                },
+            )?;
 
         let params = VoteVerifyParams {
             membership: membership.clone(),
@@ -329,10 +345,12 @@ impl UnauthenticatedBundle {
             consensus_params: proto.clone(),
         };
 
-        let vote1 = uv1.verify(&params).map_err(|e| BundleError::VoteVerificationFailed {
-            index,
-            detail: format!("equivocation vote first proposal failed: {e}"),
-        })?;
+        let vote1 = uv1
+            .verify(&params)
+            .map_err(|e| BundleError::VoteVerificationFailed {
+                index,
+                detail: format!("equivocation vote first proposal failed: {e}"),
+            })?;
 
         // Verify the second proposal's OTS signature
         let uv2 = UnauthenticatedVote {
@@ -356,10 +374,11 @@ impl UnauthenticatedBundle {
             consensus_params: proto,
         };
 
-        uv2.verify(&params2).map_err(|e| BundleError::VoteVerificationFailed {
-            index,
-            detail: format!("equivocation vote second proposal failed: {e}"),
-        })?;
+        uv2.verify(&params2)
+            .map_err(|e| BundleError::VoteVerificationFailed {
+                index,
+                detail: format!("equivocation vote second proposal failed: {e}"),
+            })?;
 
         // Return the first vote (weight counts once for equivocation)
         Ok(vote1)
@@ -394,11 +413,7 @@ mod tests {
             }
         }
 
-        fn add_account(
-            &mut self,
-            addr: Address,
-            data: crate::ledger_reader::OnlineAccountData,
-        ) {
+        fn add_account(&mut self, addr: Address, data: crate::ledger_reader::OnlineAccountData) {
             self.accounts.insert(addr, data);
         }
     }
