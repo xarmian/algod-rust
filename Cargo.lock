@@ -232,6 +232,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "algo-pool"
+version = "0.1.0"
+dependencies = [
+ "algo-codec",
+ "algo-error",
+ "algo-types",
+ "hex",
+ "parking_lot",
+ "serde_bytes",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "algo-rest-client"
 version = "0.1.0"
 dependencies = [

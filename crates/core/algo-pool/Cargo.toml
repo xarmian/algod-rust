@@ -1,0 +1,16 @@
+[package]
+name = "algo-pool"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+algo-types.workspace = true
+algo-codec.workspace = true
+algo-error.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+serde_bytes.workspace = true

@@ -13,6 +13,7 @@ members = [
     "crates/core/algo-falcon",
     "crates/core/algo-consensus-crypto",
     "crates/core/algo-agreement",
+    "crates/core/algo-pool",
     "crates/node/algo-network",
     "crates/tools/algo-bench",
     "bin/algod-rust",
@@ -82,6 +83,7 @@ algo-ledger = { path = "crates/core/algo-ledger" }
 algo-avm = { path = "crates/core/algo-avm" }
 algo-consensus-crypto = { path = "crates/core/algo-consensus-crypto" }
 algo-agreement = { path = "crates/core/algo-agreement" }
+algo-pool = { path = "crates/core/algo-pool" }
 algo-falcon = { path = "crates/core/algo-falcon" }
 algo-network = { path = "crates/node/algo-network" }
 algo-bench = { path = "crates/tools/algo-bench" }
@@ -107,6 +109,7 @@ zstd = "0.13"
 # Networking (WebSocket)
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
+parking_lot = "0.12"
 rand = "0.8"
 zeroize = "1"
 http = "1"
