@@ -296,6 +296,26 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
+        Commands::Participate {
+            ledger_path,
+            genesis_id,
+            network,
+            peers,
+            partkey_path,
+            listen_address,
+            genesis_hash,
+        } => {
+            commands::participate::run(
+                &ledger_path,
+                genesis_id.as_deref(),
+                &network,
+                &peers,
+                &partkey_path,
+                listen_address.as_deref(),
+                genesis_hash.as_deref(),
+            )
+            .await?;
+        }
         Commands::Follow {
             algod_url,
             algod_token,

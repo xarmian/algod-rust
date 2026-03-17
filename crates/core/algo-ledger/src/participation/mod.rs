@@ -296,6 +296,11 @@ pub struct ParticipationRecord {
     pub effective_last: Round,
     /// VRF public key (if available).
     pub vrf_public_key: Option<VrfPubkey>,
+    /// OTS master public key (the `OneTimeSignatureVerifier`, 32 bytes).
+    ///
+    /// Extracted from the voting blob (column 12) when available.
+    /// This is the ed25519 verifier used for one-time signature verification.
+    pub vote_id: Option<[u8; 32]>,
     /// State proof verifier (commitment + key lifetime).
     ///
     /// Decoded from the `SignerContext` stored in the Keysets table.
@@ -316,6 +321,7 @@ impl ParticipationRecord {
             && self.effective_first.0 == 0
             && self.effective_last.0 == 0
             && self.vrf_public_key.is_none()
+            && self.vote_id.is_none()
             && self.state_proof_verifier.is_none()
     }
 
@@ -812,6 +818,7 @@ mod tests {
             effective_first: Round(0),
             effective_last: Round(0),
             vrf_public_key: None,
+            vote_id: None,
             state_proof_verifier: None,
         };
         assert!(record.is_zero());
@@ -831,6 +838,7 @@ mod tests {
             effective_first: Round(0),
             effective_last: Round(0),
             vrf_public_key: None,
+            vote_id: None,
             state_proof_verifier: None,
         };
         assert!(!record.is_zero());

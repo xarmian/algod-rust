@@ -7,8 +7,11 @@ rust-version.workspace = true
 [dependencies]
 algo-codec.workspace = true
 algo-consensus-crypto.workspace = true
+algo-pool.workspace = true
 algo-types.workspace = true
+algo-validate.workspace = true
 num-bigint.workspace = true
 rmp.workspace = true
+rmpv.workspace = true
 sha2.workspace = true
 tracing.workspace = true

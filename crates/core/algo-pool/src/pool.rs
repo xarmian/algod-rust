@@ -339,7 +339,10 @@ impl TransactionPool {
             let latest = self.ledger.latest();
             let wait_expires = Instant::now() + self.config.timeout_on_new_block;
 
-            while guard.evaluator.as_ref().is_some_and(|e| e.round() <= latest)
+            while guard
+                .evaluator
+                .as_ref()
+                .is_some_and(|e| e.round() <= latest)
                 && Instant::now() < wait_expires
             {
                 let timeout = wait_expires.saturating_duration_since(Instant::now());
@@ -1765,9 +1768,7 @@ mod tests {
 
         // Advance the ledger round to simulate the block being applied.
         // This ensures recompute_block_evaluator creates a new evaluator at round 3.
-        ledger
-            .round
-            .store(2, std::sync::atomic::Ordering::SeqCst);
+        ledger.round.store(2, std::sync::atomic::Ordering::SeqCst);
 
         // Process a new block -- the new evaluator will be at round 3,
         // so txn2 (last_valid=2) should be evicted.

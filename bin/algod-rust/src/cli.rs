@@ -340,6 +340,38 @@ pub enum Commands {
         action: BenchAction,
     },
 
+    /// Participate in consensus: run the agreement protocol with participation keys.
+    Participate {
+        /// Path to the SQLite ledger database.
+        #[arg(long, short = 'l')]
+        ledger_path: PathBuf,
+
+        /// Genesis ID string (e.g. "mainnet-v1.0").
+        /// If not provided, derived from --network.
+        #[arg(long, short = 'g')]
+        genesis_id: Option<String>,
+
+        /// Network name (mainnet, testnet, betanet).
+        #[arg(long, short = 'n', default_value = "mainnet")]
+        network: String,
+
+        /// Comma-separated initial peer addresses to connect to.
+        #[arg(long, value_delimiter = ',')]
+        peers: Vec<String>,
+
+        /// Path to participation key database file.
+        #[arg(long)]
+        partkey_path: PathBuf,
+
+        /// Address to bind for incoming connections (e.g. "0.0.0.0:4160").
+        #[arg(long, short = 'b')]
+        listen_address: Option<String>,
+
+        /// 32-byte hex genesis hash for block validation.
+        #[arg(long)]
+        genesis_hash: Option<String>,
+    },
+
     /// Follow mode: continuously validate new blocks as they arrive.
     Follow {
         /// Base URL of the algod REST API.
