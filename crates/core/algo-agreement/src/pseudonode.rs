@@ -9,15 +9,19 @@
 // This design simplifies the logic required to test and execute proposing and
 // voting.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use algo_consensus_crypto::vrf::VrfKeypair;
+use algo_consensus_crypto::OneTimeSignatureSecrets;
 use algo_types::{Address, Round};
 
 use crate::credential::UnauthenticatedCredential;
 use crate::events::{EventType, InternalMessage, MessageEvent, Proposal, SerializableError};
+use crate::hashable::{hash_rep, Hashable};
 use crate::ledger_reader::LedgerReader;
 use crate::lookback;
 use crate::proposal::UnauthenticatedProposal;
@@ -187,6 +191,28 @@ pub trait Pseudonode {
 }
 
 // ---------------------------------------------------------------------------
+// SigningKeys — per-account VRF + OTS secrets
+// ---------------------------------------------------------------------------
+
+/// Signing secrets for a single participation account.
+///
+/// This pairs a VRF keypair (for committee selection credentials) with OTS
+/// secrets (for vote signing). When both are present, the pseudonode can
+/// produce cryptographically valid proposals and votes.
+///
+/// In Go, these are carried inside `ParticipationRecord` (which embeds
+/// `*crypto.VRFSecrets` and `*crypto.OneTimeSignatureSecrets`). In Rust,
+/// we keep them separate from `ParticipationRecord` (which only has public
+/// keys) to avoid requiring `Debug` on crypto secret types and to minimize
+/// the blast radius of the change.
+pub struct AccountSigningKeys {
+    /// The VRF keypair for producing sortition proofs.
+    pub vrf: VrfKeypair,
+    /// The OTS secrets for producing vote signatures.
+    pub ots: OneTimeSignatureSecrets,
+}
+
+// ---------------------------------------------------------------------------
 // AsyncPseudonode
 // ---------------------------------------------------------------------------
 
@@ -214,6 +240,12 @@ where
     participation_keys_round: Round,
     /// The cached participation keys.
     participation_keys: Vec<ParticipationRecord>,
+    /// Per-account signing keys (VRF + OTS secrets), keyed by address.
+    ///
+    /// When an account's signing keys are present in this map, the
+    /// pseudonode produces cryptographically valid VRF proofs and OTS
+    /// signatures. Otherwise, placeholder values are used.
+    signing_keys: HashMap<Address, AccountSigningKeys>,
 }
 
 impl<F, K, L> AsyncPseudonode<F, K, L>
@@ -233,7 +265,17 @@ where
             quit: Arc::new(AtomicBool::new(false)),
             participation_keys_round: Round(0),
             participation_keys: Vec::new(),
+            signing_keys: HashMap::new(),
         }
+    }
+
+    /// Register signing keys for an account.
+    ///
+    /// When signing keys are registered, the pseudonode will produce
+    /// real VRF proofs and OTS signatures for that account instead of
+    /// placeholder values.
+    pub fn register_signing_keys(&mut self, address: Address, keys: AccountSigningKeys) {
+        self.signing_keys.insert(address, keys);
     }
 
     /// Load the participation keys from the key manager for the given round,
@@ -295,6 +337,9 @@ where
         let mut proposals = Vec::with_capacity(accounts.len());
 
         for acc in accounts {
+            // Look up signing keys for this account.
+            let signing = self.signing_keys.get(&acc.address);
+
             // Create the proposal for this block/account.
             match proposal_for_block(
                 &acc.address,
@@ -302,6 +347,7 @@ where
                 unfinished_block.as_ref(),
                 period,
                 &self.ledger,
+                signing,
             ) {
                 Ok((proposal, pv)) => {
                     // Attempt to make the proposal vote.
@@ -313,7 +359,7 @@ where
                         proposal: pv,
                     };
 
-                    match make_vote(&rv, acc, &self.ledger) {
+                    match make_vote(&rv, acc, &self.ledger, signing) {
                         Ok(uv) => {
                             proposals.push(proposal);
                             votes.push(uv);
@@ -356,7 +402,8 @@ where
                 proposal,
             };
 
-            match make_vote(&rv, part, &self.ledger) {
+            let signing = self.signing_keys.get(&part.address);
+            match make_vote(&rv, part, &self.ledger, signing) {
                 Ok(uv) => votes.push(uv),
                 Err(_) => {
                     // In Go, this is logged as a warning and we continue.
@@ -542,12 +589,15 @@ struct ProposalData {
 /// Mirrors Go's `proposalForBlock` in agreement/proposal.go.
 ///
 /// This derives a new seed, finishes the block, and computes the proposal value.
+/// When `signing_keys` is provided, real VRF proofs are generated; otherwise
+/// placeholder values are used.
 fn proposal_for_block(
     address: &Address,
     _selection_id: &[u8; 32],
     unfinished_block: &dyn UnfinishedBlock,
     period: Period,
     ledger: &dyn LedgerReader,
+    signing_keys: Option<&AccountSigningKeys>,
 ) -> Result<(ProposalData, ProposalValue), PseudonodeError> {
     let rnd = unfinished_block.round();
 
@@ -555,37 +605,40 @@ fn proposal_for_block(
         .consensus_params(lookback::params_round(rnd))
         .map_err(|e| PseudonodeError::LedgerError(e.to_string()))?;
 
-    // Derive new seed. For the pseudonode we need the VRF secret key to
-    // produce a seed proof, but the trait only gives us the public key.
-    // In the Go code, `deriveNewSeed` uses the VRF secret to create a proof.
-    // Since we don't have VRF secrets in ParticipationRecord (only public keys),
-    // we create a placeholder seed derivation.
-    //
-    // NOTE: In a full implementation, `ParticipationRecord` would include VRF
-    // secrets (or a signing interface) to produce the seed proof. For now, we
-    // derive the seed from the previous round's seed when possible, matching
-    // the structure of the Go code.
     let seed_rnd = lookback::seed_round(rnd, &cparams);
     let prev_seed = ledger
         .seed(seed_rnd)
         .map_err(|e| PseudonodeError::LedgerError(e.to_string()))?;
 
-    // For period 0, seed is derived from proposer VRF output; for period > 0,
-    // seed is derived from previous seed. Since we don't have VRF secrets to
-    // produce a real proof, use the period > 0 path as a fallback.
-    let new_seed = if period == Period(0) {
-        // In a full implementation, we would call VRF.Prove(selector_message)
-        // and use the output. For now, derive deterministically from the
-        // previous seed and the proposer address.
-        crate::seed::derive_seed_period_zero(
-            address,
-            // Use a deterministic placeholder VRF output derived from seed +
-            // address (this will be replaced when VRF signing is available).
-            &derive_placeholder_vrf_output(&prev_seed, address),
-            None,
-        )
+    // Derive new seed and VRF proof.
+    let (new_seed, seed_proof) = if period == Period(0) {
+        if let Some(keys) = signing_keys {
+            // Real VRF: build the selector message and produce a proof.
+            //
+            // In Go, deriveNewSeed calls VRF.Prove(hashRep(selector)) where
+            // selector = {seed: prevSeed, round: rnd, period: 0, step: propose}.
+            // The VRF output (64 bytes) is used to derive the new seed.
+            let selector = crate::selector::Selector {
+                seed: prev_seed,
+                round: rnd,
+                period: Period(0),
+                step: PROPOSE,
+            };
+            let vrf_message = hash_rep(&selector);
+            let (proof, output) = keys.vrf.sk.prove(&vrf_message);
+
+            let seed = crate::seed::derive_seed_period_zero(address, output.as_bytes(), None);
+            (seed, *proof.as_bytes())
+        } else {
+            // Placeholder VRF: derive deterministically from seed + address.
+            let vrf_out = derive_placeholder_vrf_output(&prev_seed, address);
+            let seed = crate::seed::derive_seed_period_zero(address, &vrf_out, None);
+            (seed, [0u8; 80])
+        }
     } else {
-        crate::seed::derive_seed_period_nonzero(&prev_seed, None)
+        // Period > 0: seed is derived from previous seed, no VRF needed.
+        let seed = crate::seed::derive_seed_period_nonzero(&prev_seed, None);
+        (seed, [0u8; 80])
     };
 
     // Check payout eligibility.
@@ -598,7 +651,7 @@ fn proposal_for_block(
     let block_digest = algo_codec::compute_block_digest(&block);
     let uprop = UnauthenticatedProposal {
         block,
-        seed_proof: [0u8; 80], // Placeholder — real VRF proof would go here.
+        seed_proof,
         original_period: period,
         original_proposer: *address,
     };
@@ -625,14 +678,17 @@ fn proposal_for_block(
 /// Mirrors Go's `makeVote` in agreement/vote.go.
 ///
 /// This looks up membership from the ledger, creates the VRF credential,
-/// and signs the vote with the OTS key.
+/// and signs the vote with the OTS key. When `signing_keys` is provided,
+/// real cryptographic signatures are produced; otherwise placeholder values
+/// are used.
 fn make_vote(
     rv: &RawVote,
     part: &ParticipationRecord,
     ledger: &dyn LedgerReader,
+    signing_keys: Option<&AccountSigningKeys>,
 ) -> Result<UnauthenticatedVote, PseudonodeError> {
     // Look up membership from ledger.
-    let (_membership, _record, _cparams) = crate::ledger_reader::membership_from_ledger(
+    let (membership, _record, _cparams) = crate::ledger_reader::membership_from_ledger(
         ledger, &rv.sender, rv.round, rv.period, rv.step,
     )
     .map_err(|e| PseudonodeError::LedgerError(e.to_string()))?;
@@ -670,32 +726,33 @@ fn make_vote(
     // Compute ephemeral key ID for OTS signing.
     let effective_kd =
         lookback::effective_key_dilution(part.vote_key_dilution, cparams.default_key_dilution);
-    let _eph_id = algo_consensus_crypto::one_time_id_for_round(rv.round.0, effective_kd);
 
-    // Sign the raw vote with OTS.
-    // NOTE: In a full implementation, ParticipationRecord would contain the
-    // OTS signing secrets. Since we only have the public verifier key, we
-    // create a placeholder signature. The actual signing will use:
-    //   let msg = [RawVote::hash_id(), rv.to_be_hashed().as_slice()].concat();
-    //   let sig = ots_secrets.sign(&msg, rv.round.0, effective_kd);
-    //
-    // For now, produce a zero signature as a structural placeholder.
-    let sig = algo_consensus_crypto::OneTimeSignature {
-        sig: [0u8; 64],
-        pk: [0u8; 32],
-        pk_sig_old: [0u8; 64],
-        pk2: [0u8; 32],
-        pk1_sig: [0u8; 64],
-        pk2_sig: [0u8; 64],
+    // Sign the raw vote with OTS and create VRF credential.
+    let (sig, cred) = if let Some(keys) = signing_keys {
+        // Real OTS signing: domain-separated message = hash_id || canonical(rawVote).
+        let msg = [RawVote::hash_id(), rv.to_be_hashed().as_slice()].concat();
+        let ots_sig = keys.ots.sign(&msg, rv.round.0, effective_kd);
+
+        // Real VRF credential: VRF.Prove(hashRep(selector)) using the
+        // membership's selector.
+        let vrf_message = hash_rep(&membership.selector);
+        let (proof, _output) = keys.vrf.sk.prove(&vrf_message);
+        let vrf_cred = UnauthenticatedCredential::new(*proof.as_bytes());
+
+        (ots_sig, vrf_cred)
+    } else {
+        // Placeholder: zero signature and zero VRF proof.
+        let placeholder_sig = algo_consensus_crypto::OneTimeSignature {
+            sig: [0u8; 64],
+            pk: [0u8; 32],
+            pk_sig_old: [0u8; 64],
+            pk2: [0u8; 32],
+            pk1_sig: [0u8; 64],
+            pk2_sig: [0u8; 64],
+        };
+        let placeholder_cred = UnauthenticatedCredential::new([0u8; 80]);
+        (placeholder_sig, placeholder_cred)
     };
-
-    // Create VRF credential.
-    // NOTE: In a full implementation, we would use VRF secrets to produce a
-    // real proof:
-    //   let vrf_message = hash_rep(&membership.selector);
-    //   let (proof, _) = vrf_sk.prove(&vrf_message);
-    // For now, use a placeholder proof.
-    let cred = UnauthenticatedCredential::new([0u8; 80]);
 
     Ok(UnauthenticatedVote {
         raw_vote: rv.clone(),

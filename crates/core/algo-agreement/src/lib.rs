@@ -4,8 +4,11 @@
 // and go-algorand/data/committee (Selector, Seed, BalanceRecord).
 
 pub mod actions;
+pub mod block_factory_bridge;
+pub mod block_validator_bridge;
 mod bundle;
 mod certificate;
+pub mod codec;
 mod credential;
 pub mod demux;
 pub mod events;
@@ -23,6 +26,7 @@ pub mod pseudonode;
 pub mod router;
 mod seed;
 mod selector;
+pub mod service;
 mod step;
 pub mod stubs;
 pub mod traits;
@@ -86,7 +90,7 @@ pub use events::{
     RoundInterruptionEvent, SerializableError, StagingValueEvent, ThresholdEvent, TimeoutEvent,
     VoteAcceptedEvent, VoteFilterRequestEvent, PIPELINED_MESSAGE_TIMESTAMP,
 };
-pub use pseudonode::{AsyncPseudonode, Pseudonode, PseudonodeError};
+pub use pseudonode::{AccountSigningKeys, AsyncPseudonode, Pseudonode, PseudonodeError};
 pub use types::{
     CredentialArrivalHistory, Deadline, TimeoutType, BIG_LAMBDA, DEFAULT_DEADLINE_TIMEOUT,
     DYNAMIC_FILTER_CREDENTIAL_ARRIVAL_HISTORY,
@@ -104,7 +108,14 @@ pub use vote_aggregator::VoteAggregator;
 pub use vote_auxiliary::{VoteTrackerPeriod, VoteTrackerRound};
 pub use vote_tracker::{EquivocationVote, VoteTracker};
 
+// Re-exports from bridge implementations
+pub use block_factory_bridge::{BlockFactoryBridge, PoolUnfinishedBlock};
+pub use block_validator_bridge::{BlockValidatorBridge, ValidatedBlockImpl};
+
 // Re-exports from router, demux, and player modules
 pub use demux::{Demux, ExternalDemuxSignals, ExternalEvent};
 pub use player::{Player, Tracer};
 pub use router::{PeriodRouter, RootRouter, RoundRouter, StateMachineTag, StepRouter};
+
+// Re-exports from service module
+pub use service::{Parameters, Service, ServiceHandle};

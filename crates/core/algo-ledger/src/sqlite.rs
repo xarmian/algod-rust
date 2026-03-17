@@ -1992,6 +1992,106 @@ impl SqliteLedger {
         }
     }
 
+    /// Query the total online stake from the `accounttotals` table.
+    ///
+    /// Returns the `online` column (total microAlgos of all online accounts)
+    /// from the `accounttotals` row with `id = ''`. This is the value used by
+    /// go-algorand for circulation / committee membership checks.
+    ///
+    /// Returns `Ok(0)` if the table is empty or the row is missing (e.g.,
+    /// fresh database before catchpoint import).
+    pub fn online_stake(&self) -> Result<u64, AlgoError> {
+        let result: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT online FROM accounttotals WHERE id = ''",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query accounttotals error: {e}"),
+            })?;
+        Ok(result.unwrap_or(0).max(0) as u64)
+    }
+
+    /// Query the online supply for a specific round from the
+    /// `onlineroundparamstail` table.
+    ///
+    /// The `data` column contains msgpack-encoded `OnlineRoundParamsData`
+    /// with codec key `"online"` holding the online supply for that round.
+    ///
+    /// Returns `Ok(None)` if the round is not in the tail table.
+    pub fn online_supply_at_round(&self, round: u64) -> Result<Option<u64>, AlgoError> {
+        let data: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT data FROM onlineroundparamstail WHERE rnd = ?1",
+                params![round as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query onlineroundparamstail error: {e}"),
+            })?;
+
+        let data = match data {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        // Parse msgpack to extract the "online" field.
+        let value: rmpv::Value =
+            rmpv::decode::read_value(&mut &data[..]).map_err(|e| AlgoError::Ledger {
+                message: format!("decode onlineroundparamstail msgpack error: {e}"),
+            })?;
+
+        if let Some(map) = value.as_map() {
+            for (k, v) in map {
+                if k.as_str() == Some("online") {
+                    return Ok(Some(v.as_u64().unwrap_or(0)));
+                }
+            }
+        }
+        Ok(Some(0))
+    }
+
+    /// Look up an account's online data at a specific round from the
+    /// `onlineaccounts` table.
+    ///
+    /// Returns the most recent entry for this address where `updround <= round`.
+    /// The `data` column contains msgpack-encoded online account data.
+    ///
+    /// Returns `Ok(None)` if no entry exists for this address at or before
+    /// the given round.
+    pub fn get_online_account_at_round(
+        &self,
+        addr: &Address,
+        round: u64,
+    ) -> Result<Option<AccountData>, AlgoError> {
+        let data: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT data FROM onlineaccounts WHERE address = ?1 AND updround <= ?2 \
+                 ORDER BY updround DESC LIMIT 1",
+                params![addr.0.as_slice(), round as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query onlineaccounts error: {e}"),
+            })?;
+
+        match data {
+            Some(d) => decode_account_data(&d)
+                .map(Some)
+                .map_err(|e| AlgoError::Ledger {
+                    message: format!("decode onlineaccounts data error: {e}"),
+                }),
+            None => Ok(None),
+        }
+    }
+
     /// Flush cached chain-level state to the meta table.
     fn flush_chain_state(&self) -> Result<(), AlgoError> {
         set_meta_u64(&self.conn, "current_round", self.current_round.0)?;

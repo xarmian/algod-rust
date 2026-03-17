@@ -6,6 +6,7 @@ pub mod catchpoint_sync;
 pub mod follow;
 pub mod network_common;
 pub mod observe;
+pub mod participate;
 pub mod relay;
 pub mod replay;
 pub mod sync;

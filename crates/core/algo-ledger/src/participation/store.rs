@@ -783,7 +783,7 @@ impl ParticipationStore {
         let last_state_proof: Option<i64> = row.get(9)?;
         let effective_first: Option<i64> = row.get(10)?;
         let effective_last: Option<i64> = row.get(11)?;
-        // Column 12 (voting blob) is not used for ParticipationRecord.
+        let raw_voting: Option<Vec<u8>> = row.get(12)?;
 
         let mut participation_id = [0u8; 32];
         if raw_id.len() == 32 {
@@ -818,6 +818,19 @@ impl ParticipationStore {
             }
         });
 
+        // Extract the OTS verifier (vote_id) from the voting blob.
+        // The voting blob is a msgpack-encoded OneTimeSignatureSecrets;
+        // we decode it and extract the 32-byte master public key.
+        let vote_id = raw_voting.and_then(|blob| {
+            if blob.is_empty() {
+                return None;
+            }
+            match OneTimeSignatureSecrets::from_msgpack(&blob) {
+                Ok(secrets) => Some(secrets.verifier()),
+                Err(_) => None,
+            }
+        });
+
         Ok(ParticipationRecord {
             participation_id: ParticipationID(participation_id),
             account,
@@ -830,6 +843,7 @@ impl ParticipationStore {
             effective_first: Round(effective_first.unwrap_or(0) as u64),
             effective_last: Round(effective_last.unwrap_or(0) as u64),
             vrf_public_key,
+            vote_id,
             state_proof_verifier,
         })
     }

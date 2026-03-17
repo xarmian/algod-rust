@@ -1,3 +1,4 @@
+pub mod agreement_network;
 pub mod block_cert;
 pub mod block_fetcher;
 pub mod block_service;
@@ -214,6 +215,17 @@ pub use mesh::{
 pub use broadcast::{
     is_high_priority_tag, BroadcastError, BroadcastHandle, BroadcastPeer, BroadcastThread,
     PeerSendRef, MAX_MESSAGE_QUEUE_DURATION,
+};
+
+// ---------------------------------------------------------------------------
+// Re-exports: Agreement network bridge (GossipNode -> AgreementNetwork)
+// ---------------------------------------------------------------------------
+
+// Bridge adapting GossipNode to algo-agreement's AgreementNetwork trait
+pub use agreement_network::{
+    agreement_tag_to_network_tag, network_tag_to_agreement_tag, AgreementNetworkBridge,
+    AgreementNetworkConfig, DEFAULT_BUNDLE_QUEUE_LEN, DEFAULT_PROPOSAL_QUEUE_LEN,
+    DEFAULT_VOTE_QUEUE_LEN,
 };
 
 // ---------------------------------------------------------------------------

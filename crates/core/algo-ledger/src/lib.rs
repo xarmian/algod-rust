@@ -1,3 +1,5 @@
+pub mod agreement_bridge;
+pub mod agreement_key_manager;
 pub mod apply;
 pub mod avm_context;
 pub mod block_entry;
@@ -41,3 +43,6 @@ pub use rewards::{
 pub use sqlite::SqliteLedger;
 pub use state::{schema_min_balance, LedgerState, StateSnapshot};
 pub use store_trait::LedgerStore;
+
+pub use agreement_bridge::AgreementLedgerBridge;
+pub use agreement_key_manager::AgreementKeyManagerBridge;

@@ -35,9 +35,12 @@ version = "0.1.0"
 dependencies = [
  "algo-codec",
  "algo-consensus-crypto",
+ "algo-pool",
  "algo-types",
+ "algo-validate",
  "num-bigint",
  "rmp",
+ "rmpv",
  "sha2",
  "tracing",
 ]
@@ -164,6 +167,7 @@ dependencies = [
 name = "algo-ledger"
 version = "0.1.0"
 dependencies = [
+ "algo-agreement",
  "algo-avm",
  "algo-codec",
  "algo-consensus-crypto",
@@ -193,6 +197,7 @@ dependencies = [
 name = "algo-network"
 version = "0.1.0"
 dependencies = [
+ "algo-agreement",
  "algo-codec",
  "algo-error",
  "algo-types",
@@ -301,6 +306,7 @@ dependencies = [
 name = "algod-rust"
 version = "0.1.0"
 dependencies = [
+ "algo-agreement",
  "algo-bench",
  "algo-codec",
  "algo-conformance",
@@ -308,6 +314,7 @@ dependencies = [
  "algo-fixtures",
  "algo-ledger",
  "algo-network",
+ "algo-pool",
  "algo-rest-client",
  "algo-types",
  "algo-validate",
@@ -315,6 +322,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "rand 0.8.5",
  "reqwest",
  "rmpv",
  "rusqlite",
