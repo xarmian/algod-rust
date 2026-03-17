@@ -3,6 +3,8 @@
 // Step maps directly to committee-size / threshold parameters in
 // ConsensusParams via `committee_size` and `committee_threshold`.
 
+use std::time::Duration;
+
 use algo_types::ConsensusParams;
 
 /// Proposal step — the leader broadcasts a candidate block.
@@ -23,7 +25,7 @@ pub const DOWN: Step = Step(255);
 /// A step in the agreement protocol, wrapping a `u64`.
 ///
 /// Matches Go: `type step uint64`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Step(pub u64);
 
 impl Step {
@@ -72,6 +74,39 @@ impl Step {
         }
         weight >= self.committee_threshold(params)
     }
+
+    /// Returns the lower and upper time bounds for sending a next-vote at this
+    /// step.
+    ///
+    /// The bounds are calculated relative to the start of the current period.
+    /// The first next-vote fires at `deadline_timeout` and each subsequent step
+    /// doubles the extra timeout.
+    ///
+    /// Mirrors Go's `(step).nextVoteRanges` in agreement/types.go.
+    ///
+    /// # Arguments
+    ///
+    /// * `deadline_timeout` - the deadline timeout for the current period
+    ///   (from `DeadlineTimeout()`).
+    pub fn next_vote_ranges(&self, deadline_timeout: Duration) -> (Duration, Duration) {
+        // recoveryExtraTimeout = SmallLambda = 2000ms
+        let recovery_extra_timeout = Duration::from_millis(2000);
+
+        let mut extra = recovery_extra_timeout;
+        let mut lower = deadline_timeout;
+        let mut upper = lower + extra;
+
+        // For each step above `next`, double the extra timeout
+        let mut i = NEXT.0;
+        while i < self.0 {
+            extra *= 2;
+            lower = upper;
+            upper = lower + extra;
+            i += 1;
+        }
+
+        (lower, upper)
+    }
 }
 
 impl std::fmt::Display for Step {
@@ -108,8 +143,7 @@ mod tests {
 
     /// Helper: get current (v41) consensus params for testing.
     fn v41_params() -> ConsensusParams {
-        consensus_params_for_version(algo_types::CONSENSUS_V41)
-            .expect("v41 params must exist")
+        consensus_params_for_version(algo_types::CONSENSUS_V41).expect("v41 params must exist")
     }
 
     #[test]

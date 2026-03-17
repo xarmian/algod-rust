@@ -47,7 +47,23 @@ pub struct UnauthenticatedProposal {
     pub original_proposer: Address,
 }
 
+impl Default for UnauthenticatedProposal {
+    fn default() -> Self {
+        Self {
+            block: Block::default(),
+            seed_proof: [0u8; VRF_PROOF_SIZE],
+            original_period: Period(0),
+            original_proposer: Address([0u8; 32]),
+        }
+    }
+}
+
 impl UnauthenticatedProposal {
+    /// Returns the block digest of the proposal.
+    pub fn block_digest(&self) -> algo_types::Digest {
+        compute_block_digest(&self.block)
+    }
+
     /// Compute the `ProposalValue` for this proposal.
     ///
     /// Mirrors Go's `unauthenticatedProposal.value()`:
@@ -130,10 +146,7 @@ pub enum ProposalError {
     /// A ledger lookup failed during verification.
     LedgerError(String),
     /// Proposer is ineligible for payouts but block has a non-zero ProposerPayout.
-    IneligibleProposerPayout {
-        proposer: Address,
-        payout: u64,
-    },
+    IneligibleProposerPayout { proposer: Address, payout: u64 },
 }
 
 impl std::fmt::Display for ProposalError {
@@ -252,10 +265,7 @@ pub fn verify_proposer(
     // Check 3 & 4: seed derivation and verification
     let seed_rnd = crate::lookback::seed_round(rnd, &cparams);
     let prev_seed = ledger.seed(seed_rnd).map_err(|e| {
-        ProposalError::LedgerError(format!(
-            "failed to read seed of round {}: {e}",
-            seed_rnd.0
-        ))
+        ProposalError::LedgerError(format!("failed to read seed of round {}: {e}", seed_rnd.0))
     })?;
 
     // Compute history digest for seed rerandomization
@@ -390,10 +400,7 @@ mod tests {
                 .unwrap_or(Digest([0u8; 32])))
         }
 
-        fn consensus_params(
-            &self,
-            round: Round,
-        ) -> Result<ConsensusParams, LedgerError> {
+        fn consensus_params(&self, round: Round) -> Result<ConsensusParams, LedgerError> {
             self.queried_params_rounds.borrow_mut().push(round);
             if let Some(p) = self.params_by_round.get(&round) {
                 Ok(p.clone())
@@ -549,9 +556,7 @@ mod tests {
         };
         let encoded = prop.to_be_hashed();
         // The encoded bytes should contain "sdpf" as a field key
-        let has_sdpf = encoded
-            .windows(4)
-            .any(|w| w == [b's', b'd', b'p', b'f']);
+        let has_sdpf = encoded.windows(4).any(|w| w == [b's', b'd', b'p', b'f']);
         assert!(has_sdpf, "encoding must contain 'sdpf' field");
     }
 
@@ -564,9 +569,7 @@ mod tests {
             original_proposer: Address([0; 32]),
         };
         let encoded = prop.to_be_hashed();
-        let has_oper = encoded
-            .windows(4)
-            .any(|w| w == [b'o', b'p', b'e', b'r']);
+        let has_oper = encoded.windows(4).any(|w| w == [b'o', b'p', b'e', b'r']);
         assert!(has_oper, "encoding must contain 'oper' field");
     }
 
@@ -656,8 +659,7 @@ mod tests {
             original_proposer: Address([0x11; 32]),
         };
 
-        let (ledger, _) =
-            make_ledger_with_proposer(*kp.pk.as_bytes(), prev_seed, false, 0);
+        let (ledger, _) = make_ledger_with_proposer(*kp.pk.as_bytes(), prev_seed, false, 0);
         let result = verify_proposer(&prop, &ledger);
 
         assert_eq!(result, Err(ProposalError::InvalidSeedProof));
@@ -675,8 +677,7 @@ mod tests {
         let vrf_output: VrfOutput = vrf_out.0;
 
         let proposer = Address([0x11; 32]);
-        let expected_seed =
-            crate::seed::derive_seed_period_zero(&proposer, &vrf_output, None);
+        let expected_seed = crate::seed::derive_seed_period_zero(&proposer, &vrf_output, None);
 
         let mut block = make_test_block();
         block.seed = expected_seed.0;
@@ -689,8 +690,7 @@ mod tests {
             original_proposer: proposer,
         };
 
-        let (ledger, _) =
-            make_ledger_with_proposer(*kp.pk.as_bytes(), prev_seed, false, 0);
+        let (ledger, _) = make_ledger_with_proposer(*kp.pk.as_bytes(), prev_seed, false, 0);
         let result = verify_proposer(&prop, &ledger);
 
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
@@ -712,8 +712,7 @@ mod tests {
             original_proposer: Address([0x11; 32]),
         };
 
-        let (ledger, _) =
-            make_ledger_with_proposer([0; 32], prev_seed, false, 0);
+        let (ledger, _) = make_ledger_with_proposer([0; 32], prev_seed, false, 0);
         let result = verify_proposer(&prop, &ledger);
 
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
@@ -734,8 +733,7 @@ mod tests {
             original_proposer: Address([0x11; 32]),
         };
 
-        let (ledger, _) =
-            make_ledger_with_proposer([0; 32], prev_seed, false, 0);
+        let (ledger, _) = make_ledger_with_proposer([0; 32], prev_seed, false, 0);
         let result = verify_proposer(&prop, &ledger);
 
         assert!(matches!(result, Err(ProposalError::SeedMismatch { .. })));
@@ -762,8 +760,7 @@ mod tests {
             original_proposer: Address([0x11; 32]),
         };
 
-        let (ledger, _) =
-            make_ledger_with_proposer([0; 32], prev_seed, false, 0);
+        let (ledger, _) = make_ledger_with_proposer([0; 32], prev_seed, false, 0);
         let result = verify_proposer(&prop, &ledger);
 
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
@@ -781,8 +778,7 @@ mod tests {
 
         let proposer = Address([0x11; 32]);
         // Round 100: rerand = 100 % 160 = 100, >= 2 => no history
-        let expected_seed =
-            crate::seed::derive_seed_period_zero(&proposer, &vrf_output, None);
+        let expected_seed = crate::seed::derive_seed_period_zero(&proposer, &vrf_output, None);
 
         let mut block = make_test_block();
         block.seed = expected_seed.0;
@@ -795,8 +791,7 @@ mod tests {
             original_proposer: proposer,
         };
 
-        let (ledger, _) =
-            make_ledger_with_proposer(*kp.pk.as_bytes(), prev_seed, false, 0);
+        let (ledger, _) = make_ledger_with_proposer(*kp.pk.as_bytes(), prev_seed, false, 0);
         let result = verify_proposer(&prop, &ledger);
 
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
@@ -814,8 +809,7 @@ mod tests {
         let vrf_output: VrfOutput = vrf_out.0;
 
         let proposer = Address([0x11; 32]);
-        let expected_seed =
-            crate::seed::derive_seed_period_zero(&proposer, &vrf_output, None);
+        let expected_seed = crate::seed::derive_seed_period_zero(&proposer, &vrf_output, None);
 
         let mut block = make_test_block();
         block.seed = expected_seed.0;
@@ -828,8 +822,7 @@ mod tests {
             original_proposer: proposer,
         };
 
-        let (ledger, _) =
-            make_ledger_with_proposer(*kp.pk.as_bytes(), prev_seed, false, 0);
+        let (ledger, _) = make_ledger_with_proposer(*kp.pk.as_bytes(), prev_seed, false, 0);
         let result = verify_proposer(&prop, &ledger);
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
     }
@@ -848,8 +841,7 @@ mod tests {
         let vrf_output: VrfOutput = vrf_out.0;
 
         let proposer = Address([0x11; 32]);
-        let expected_seed =
-            crate::seed::derive_seed_period_zero(&proposer, &vrf_output, None);
+        let expected_seed = crate::seed::derive_seed_period_zero(&proposer, &vrf_output, None);
 
         let mut block = make_test_block();
         block.seed = expected_seed.0;
@@ -867,8 +859,8 @@ mod tests {
         let (ledger, _) = make_ledger_with_proposer(
             *kp.pk.as_bytes(),
             prev_seed,
-            true,             // incentive eligible
-            50_000_000_000,   // 50k Algos, within v41 payout range
+            true,           // incentive eligible
+            50_000_000_000, // 50k Algos, within v41 payout range
         );
         let result = verify_proposer(&prop, &ledger);
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
@@ -893,8 +885,7 @@ mod tests {
         };
 
         // Not eligible: incentive_eligible=false
-        let (ledger, _) =
-            make_ledger_with_proposer([0; 32], prev_seed, false, 50_000_000_000);
+        let (ledger, _) = make_ledger_with_proposer([0; 32], prev_seed, false, 50_000_000_000);
         let result = verify_proposer(&prop, &ledger);
 
         assert!(
@@ -922,8 +913,7 @@ mod tests {
             original_proposer: Address([0x11; 32]),
         };
 
-        let (ledger, _) =
-            make_ledger_with_proposer([0; 32], prev_seed, false, 50_000_000_000);
+        let (ledger, _) = make_ledger_with_proposer([0; 32], prev_seed, false, 50_000_000_000);
         let result = verify_proposer(&prop, &ledger);
 
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
@@ -948,8 +938,7 @@ mod tests {
         };
 
         // incentive_eligible=true but balance below MinBalance (30_000_000_000)
-        let (ledger, _) =
-            make_ledger_with_proposer([0; 32], prev_seed, true, 1_000_000);
+        let (ledger, _) = make_ledger_with_proposer([0; 32], prev_seed, true, 1_000_000);
         let result = verify_proposer(&prop, &ledger);
 
         assert!(
@@ -978,8 +967,7 @@ mod tests {
         };
 
         // incentive_eligible=true but balance above MaxBalance (70_000_000_000_000)
-        let (ledger, _) =
-            make_ledger_with_proposer([0; 32], prev_seed, true, 100_000_000_000_000);
+        let (ledger, _) = make_ledger_with_proposer([0; 32], prev_seed, true, 100_000_000_000_000);
         let result = verify_proposer(&prop, &ledger);
 
         assert!(
@@ -1002,8 +990,7 @@ mod tests {
         let vrf_output: VrfOutput = vrf_out.0;
 
         let proposer = Address([0x11; 32]);
-        let expected_seed =
-            crate::seed::derive_seed_period_zero(&proposer, &vrf_output, None);
+        let expected_seed = crate::seed::derive_seed_period_zero(&proposer, &vrf_output, None);
 
         let mut block = make_test_block();
         block.seed = expected_seed.0;
@@ -1017,10 +1004,13 @@ mod tests {
         };
 
         // Register with the correct selection key from the ledger
-        let (ledger, _) =
-            make_ledger_with_proposer(*kp.pk.as_bytes(), prev_seed, false, 0);
+        let (ledger, _) = make_ledger_with_proposer(*kp.pk.as_bytes(), prev_seed, false, 0);
         let result = verify_proposer(&prop, &ledger);
-        assert!(result.is_ok(), "expected Ok with correct selection key from ledger, got {:?}", result);
+        assert!(
+            result.is_ok(),
+            "expected Ok with correct selection key from ledger, got {:?}",
+            result
+        );
 
         // Now register with a WRONG selection key — should fail
         let wrong_kp = VrfKeypair::from_seed([0u8; 32]);
@@ -1061,8 +1051,7 @@ mod tests {
         account.micro_algos = 50_000_000_000;
         ledger.add_account(proposer, account);
 
-        let (eligible, _) =
-            payout_eligible(Round(1000), &proposer, &ledger, &params).unwrap();
+        let (eligible, _) = payout_eligible(Round(1000), &proposer, &ledger, &params).unwrap();
         assert!(!eligible);
     }
 
@@ -1076,8 +1065,7 @@ mod tests {
         account.micro_algos = 100; // way below min
         ledger.add_account(proposer, account);
 
-        let (eligible, _) =
-            payout_eligible(Round(1000), &proposer, &ledger, &params).unwrap();
+        let (eligible, _) = payout_eligible(Round(1000), &proposer, &ledger, &params).unwrap();
         assert!(!eligible);
     }
 
@@ -1091,8 +1079,7 @@ mod tests {
         account.micro_algos = 100_000_000_000_000; // above max
         ledger.add_account(proposer, account);
 
-        let (eligible, _) =
-            payout_eligible(Round(1000), &proposer, &ledger, &params).unwrap();
+        let (eligible, _) = payout_eligible(Round(1000), &proposer, &ledger, &params).unwrap();
         assert!(!eligible);
     }
 

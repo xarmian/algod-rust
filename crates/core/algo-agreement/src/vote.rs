@@ -4,9 +4,7 @@
 // unauthenticatedVote wraps rawVote with a VRF credential and OTS signature.
 // Vote is the verified form with a proven Credential and weight.
 
-use algo_consensus_crypto::{
-    one_time_id_for_round, verify_one_time_signature, OneTimeSignature,
-};
+use algo_consensus_crypto::{one_time_id_for_round, verify_one_time_signature, OneTimeSignature};
 use algo_types::{Address, ConsensusParams, Digest, Round};
 
 use crate::credential::{Credential, Membership, UnauthenticatedCredential};
@@ -24,7 +22,7 @@ use crate::step::{Period, Step, CERT, PROPOSE, SOFT};
 ///
 /// The zero value is called `bottom` in Go and represents the absence of
 /// a proposal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProposalValue {
     /// The period in which this proposal was originally made.
     /// Go: `OriginalPeriod period`, codec:"oper"
@@ -38,6 +36,12 @@ pub struct ProposalValue {
     /// The encoding digest (crypto.HashObj(proposal)).
     /// Go: `EncodingDigest crypto.Digest`, codec:"encdig"
     pub encoding_digest: Digest,
+}
+
+impl Default for ProposalValue {
+    fn default() -> Self {
+        BOTTOM
+    }
 }
 
 /// The "bottom" proposal value — the zero/default value.
@@ -244,6 +248,29 @@ pub struct UnauthenticatedVote {
     pub sig: OneTimeSignature,
 }
 
+impl Default for UnauthenticatedVote {
+    fn default() -> Self {
+        Self {
+            raw_vote: RawVote {
+                sender: Address([0u8; 32]),
+                round: Round(0),
+                period: Period(0),
+                step: Step(0),
+                proposal: BOTTOM,
+            },
+            cred: UnauthenticatedCredential::new([0u8; 80]),
+            sig: OneTimeSignature {
+                sig: [0u8; 64],
+                pk: [0u8; 32],
+                pk_sig_old: [0u8; 64],
+                pk2: [0u8; 32],
+                pk1_sig: [0u8; 64],
+                pk2_sig: [0u8; 64],
+            },
+        }
+    }
+}
+
 // ── Vote (verified) ────────────────────────────────────────────────────────
 
 /// A verified vote with a proven credential and weight.
@@ -257,6 +284,35 @@ pub struct Vote {
     pub cred: Credential,
     /// The one-time signature.
     pub sig: OneTimeSignature,
+}
+
+impl Default for Vote {
+    fn default() -> Self {
+        Self {
+            raw_vote: RawVote {
+                sender: Address([0u8; 32]),
+                round: Round(0),
+                period: Period(0),
+                step: Step(0),
+                proposal: BOTTOM,
+            },
+            cred: Credential {
+                weight: 0,
+                vrf_out: Digest([0u8; 32]),
+                domain_separation_enabled: false,
+                hashable: crate::credential::HashableCredential::default(),
+                proof: [0u8; 80],
+            },
+            sig: OneTimeSignature {
+                sig: [0u8; 64],
+                pk: [0u8; 32],
+                pk_sig_old: [0u8; 64],
+                pk2: [0u8; 32],
+                pk1_sig: [0u8; 64],
+                pk2_sig: [0u8; 64],
+            },
+        }
+    }
 }
 
 impl Vote {
@@ -319,10 +375,7 @@ impl std::fmt::Display for VoteError {
                 )
             }
             Self::RoundAfterLastValid { round, last_valid } => {
-                write!(
-                    f,
-                    "vote in round {round} after VoteLastValid {last_valid}"
-                )
+                write!(f, "vote in round {round} after VoteLastValid {last_valid}")
             }
             Self::OtsVerificationFailed => write!(f, "OTS signature verification failed"),
             Self::CredentialVerificationFailed(msg) => {
@@ -746,7 +799,7 @@ mod tests {
                 period: Period(0),
                 step: PROPOSE,
                 proposal: ProposalValue {
-                    original_period: Period(0), // same as vote period
+                    original_period: Period(0),             // same as vote period
                     original_proposer: Address([0x02; 32]), // different from sender
                     block_digest: Digest([0xaa; 32]),
                     encoding_digest: Digest([0xbb; 32]),
@@ -875,7 +928,7 @@ mod tests {
 
         let mut params = make_verify_params(Round(999_999));
         params.vote_last_valid = Round(0); // 0 = no limit
-        // Should pass the round check but fail on OTS
+                                           // Should pass the round check but fail on OTS
         let err = uv.verify(&params).unwrap_err();
         assert!(
             matches!(err, VoteError::OtsVerificationFailed),
@@ -886,8 +939,8 @@ mod tests {
     #[test]
     fn vote_verify_with_real_ots() {
         // End-to-end test: generate OTS keys, sign a vote, verify it.
-        use algo_consensus_crypto::{OneTimeSignatureSecrets, one_time_id_for_round};
         use algo_consensus_crypto::vrf::VrfKeypair;
+        use algo_consensus_crypto::{one_time_id_for_round, OneTimeSignatureSecrets};
 
         let round = 1000u64;
         let key_dilution = 100u64;

@@ -74,8 +74,7 @@ impl UnauthenticatedCredential {
         };
 
         // Compute sortition weight
-        let expected_selection =
-            membership.selector.committee_size(params) as f64;
+        let expected_selection = membership.selector.committee_size(params) as f64;
 
         if membership.total_money == 0 || expected_selection == 0.0 {
             return Err(CredentialError::InvalidParameters);
@@ -738,7 +737,10 @@ mod tests {
         };
 
         assert!(cred_a.equals(&cred_b), "same vrf_out should be equal");
-        assert!(!cred_a.equals(&cred_c), "different vrf_out should not be equal");
+        assert!(
+            !cred_a.equals(&cred_c),
+            "different vrf_out should not be equal"
+        );
     }
 
     #[test]
@@ -768,7 +770,7 @@ mod tests {
             let membership = Membership {
                 address: Address([seed_byte; 32]),
                 selection_id: *kp.pk.as_bytes(),
-                balance: 9_000_000,   // 90% of total
+                balance: 9_000_000, // 90% of total
                 total_money: 10_000_000,
                 selector: Selector {
                     seed: Seed([seed_byte; 32]),
@@ -791,6 +793,9 @@ mod tests {
                 break;
             }
         }
-        assert!(found_selected, "should have found at least one selected credential in 100 tries with 90% stake");
+        assert!(
+            found_selected,
+            "should have found at least one selected credential in 100 tries with 90% stake"
+        );
     }
 }
