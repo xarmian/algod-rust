@@ -14,6 +14,17 @@ pub struct Address(#[serde(with = "serde_bytes")] pub [u8; 32]);
 impl Address {
     pub const ZERO: Self = Address([0u8; 32]);
 
+    /// The canonical state-proof sender address.
+    ///
+    /// Computed as `SHA512/256("SpecialAddr" || "StateProofSender")`, matching
+    /// go-algorand's `transactions.StateProofSender` which is initialised via
+    /// `crypto.HashObj(specialAddr("StateProofSender"))`.
+    pub const STATE_PROOF_SENDER: Self = Address([
+        0xbb, 0x3c, 0x52, 0x62, 0xa9, 0xd5, 0xc7, 0x4d, 0x20, 0x27, 0xe3, 0xa7, 0xea, 0xe4, 0xd6,
+        0xff, 0x70, 0xcf, 0x6c, 0x4c, 0xe4, 0xc5, 0xe0, 0x57, 0xc1, 0x1e, 0xd3, 0x9b, 0x95, 0x34,
+        0x42, 0x05,
+    ]);
+
     pub fn is_zero(&self) -> bool {
         self.0 == [0u8; 32]
     }
