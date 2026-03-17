@@ -5,7 +5,7 @@
 // delegates to the ledger's block validation and wraps the result as a
 // ValidatedBlock for the agreement protocol.
 
-use std::cell::Cell;
+use std::sync::Mutex;
 
 use algo_types::Block;
 use algo_validate::{validate_block, BlockValidationResult};
@@ -63,9 +63,9 @@ pub struct BlockValidatorBridge {
     /// block's timestamp. For now, it accepts an optional fixed value.
     /// `None` skips timestamp validation (suitable for genesis / round 0).
     ///
-    /// Uses `Cell` for interior mutability so `set_prev_timestamp` can take
-    /// `&self` rather than `&mut self`.
-    prev_timestamp: Cell<Option<i64>>,
+    /// Uses `Mutex` for thread-safe interior mutability so
+    /// `set_prev_timestamp` can take `&self` rather than `&mut self`.
+    prev_timestamp: Mutex<Option<i64>>,
 }
 
 impl BlockValidatorBridge {
@@ -74,21 +74,22 @@ impl BlockValidatorBridge {
         Self {
             genesis_id,
             genesis_hash,
-            prev_timestamp: Cell::new(prev_timestamp),
+            prev_timestamp: Mutex::new(prev_timestamp),
         }
     }
 
     /// Update the previous block timestamp (call after each committed block).
     pub fn set_prev_timestamp(&self, ts: i64) {
-        self.prev_timestamp.set(Some(ts));
+        *self.prev_timestamp.lock().expect("prev_timestamp lock") = Some(ts);
     }
 }
 
 impl BlockValidator for BlockValidatorBridge {
     fn validate(&self, block: &Block) -> Result<Box<dyn ValidatedBlock>, AgreementError> {
+        let prev_ts = *self.prev_timestamp.lock().expect("prev_timestamp lock");
         let result = validate_block(
             block,
-            self.prev_timestamp.get(),
+            prev_ts,
             &self.genesis_id,
             &self.genesis_hash,
             None, // no raw payset blobs in the agreement path

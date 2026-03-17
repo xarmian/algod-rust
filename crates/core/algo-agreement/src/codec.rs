@@ -53,11 +53,13 @@
 
 use std::io::Cursor;
 
+use algo_codec::canonical_encode_unauthenticated_proposal;
 use algo_consensus_crypto::OneTimeSignature;
 use algo_types::{Address, Digest, Round};
 
 use crate::bundle::{EquivocationVoteAuthenticator, UnauthenticatedBundle, VoteAuthenticator};
 use crate::credential::UnauthenticatedCredential;
+use crate::events::CompoundMessage;
 use crate::step::{Period, Step};
 use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, BOTTOM};
 use crate::VRF_PROOF_SIZE;
@@ -113,7 +115,7 @@ fn encode_proposal_value(pv: &ProposalValue) -> Vec<u8> {
         count += 1;
     }
 
-    buf.push(0x80 | count);
+    rmp::encode::write_map_len(&mut buf, count as u32).unwrap();
 
     if !dig_empty {
         write_str_key(&mut buf, "dig");
@@ -163,7 +165,7 @@ fn encode_raw_vote(rv: &RawVote) -> Vec<u8> {
         count += 1;
     }
 
-    buf.push(0x80 | count);
+    rmp::encode::write_map_len(&mut buf, count as u32).unwrap();
 
     if !per_empty {
         write_str_key(&mut buf, "per");
@@ -282,7 +284,7 @@ pub fn encode_vote(vote: &UnauthenticatedVote) -> Vec<u8> {
         count += 1;
     }
 
-    buf.push(0x80 | count);
+    rmp::encode::write_map_len(&mut buf, count as u32).unwrap();
 
     // Fields sorted alphabetically by codec tag: "cred", "r", "sig"
     if !cred_empty {
@@ -459,6 +461,85 @@ pub fn encode_bundle(bundle: &UnauthenticatedBundle) -> Vec<u8> {
             buf.extend_from_slice(&encode_vote_authenticator(v));
         }
     }
+
+    buf
+}
+
+/// Encode a `CompoundMessage` as a `transmittedPayload` in Go-compatible
+/// wire format.
+///
+/// In Go, `transmittedPayload` embeds `unauthenticatedProposal` (fields
+/// flattened into the map) and adds `PriorVote` with codec tag `"pv"`.
+/// All fields are sorted lexicographically.
+///
+/// This function takes the canonical encoding of the unauthenticated
+/// proposal (a sorted msgpack map) and inserts the `"pv"` field at the
+/// correct sorted position.
+pub fn encode_compound_message(cm: &CompoundMessage) -> Vec<u8> {
+    let vote_encoded = encode_vote(&cm.vote);
+    // A vote is "empty" if it encodes to fixmap(0)
+    let vote_empty = vote_encoded == [0x80];
+
+    // Get the canonical encoding of the unauthenticated proposal.
+    let proposal_bytes = canonical_encode_unauthenticated_proposal(
+        &cm.proposal.block,
+        &cm.proposal.seed_proof,
+        cm.proposal.original_period.0,
+        &cm.proposal.original_proposer,
+    );
+
+    if vote_empty {
+        // No prior vote — the transmittedPayload is identical to the
+        // unauthenticatedProposal encoding.
+        return proposal_bytes;
+    }
+
+    // We need to insert a "pv" key-value pair into the sorted map.
+    // The proposal_bytes start with a map header (fixmap, map16, or map32)
+    // followed by sorted key-value pairs. We parse the header, increment
+    // the count, then scan through key-value pairs to find where "pv" belongs.
+    let mut cursor = Cursor::new(proposal_bytes.as_slice());
+    let map_len = rmp::decode::read_map_len(&mut cursor).unwrap_or(0);
+    let header_end = cursor.position() as usize;
+
+    // The key-value pairs start at header_end.
+    let kv_bytes = &proposal_bytes[header_end..];
+
+    // Scan through keys to find insertion point for "pv".
+    let mut scan = Cursor::new(kv_bytes);
+    let mut insert_offset = kv_bytes.len(); // default: append at end
+    for _ in 0..map_len {
+        let key_start = scan.position() as usize;
+        // Read the key
+        let key_val =
+            rmpv::decode::read_value(&mut scan).expect("valid msgpack key in proposal encoding");
+        if let rmpv::Value::String(ref s) = key_val {
+            if let Some(k) = s.as_str() {
+                if k > "pv" {
+                    insert_offset = key_start;
+                    break;
+                }
+            }
+        }
+        // Skip the value
+        let _val =
+            rmpv::decode::read_value(&mut scan).expect("valid msgpack value in proposal encoding");
+    }
+
+    // Build the result: new map header + kv pairs with "pv" inserted.
+    let new_map_len = map_len + 1;
+    let mut buf = Vec::with_capacity(proposal_bytes.len() + vote_encoded.len() + 8);
+    rmp::encode::write_map_len(&mut buf, new_map_len).unwrap();
+
+    // Copy key-value pairs before insertion point.
+    buf.extend_from_slice(&kv_bytes[..insert_offset]);
+
+    // Insert "pv" -> encoded vote.
+    write_str_key(&mut buf, "pv");
+    buf.extend_from_slice(&vote_encoded);
+
+    // Copy remaining key-value pairs after insertion point.
+    buf.extend_from_slice(&kv_bytes[insert_offset..]);
 
     buf
 }

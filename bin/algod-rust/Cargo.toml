@@ -34,3 +34,4 @@ rmpv.workspace = true
 rusqlite.workspace = true
 tokio-util.workspace = true
 reqwest.workspace = true
+rand.workspace = true

@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use algo_agreement::{
-    BlockFactoryBridge, BlockValidatorBridge, Parameters, Service, StubEventsProcessingMonitor,
-    StubRandomSource,
+    BlockFactoryBridge, BlockValidatorBridge, Parameters, RandomSource, Service,
+    StubEventsProcessingMonitor,
 };
 use algo_ledger::participation::ParticipationStore;
 use algo_ledger::store_trait::LedgerStore;
@@ -14,10 +14,80 @@ use algo_network::{
     RELAY_ROLE,
 };
 use algo_pool::{PoolConfig, TransactionPool};
-use algo_types::Round;
+use algo_types::{BlockHeader, Round};
+use rand::Rng;
 use tracing::{info, warn};
 
 use crate::commands::network_common::genesis_id_for;
+
+/// A `RandomSource` backed by the OS/thread-local CSPRNG.
+///
+/// Replaces `StubRandomSource::constant(42)` for production use.
+struct RealRandomSource;
+
+impl RandomSource for RealRandomSource {
+    fn uint64(&self) -> u64 {
+        rand::thread_rng().gen()
+    }
+}
+
+/// A minimal `BlockEvaluator` that builds empty blocks from a header template.
+///
+/// A full implementation would validate and include transactions from the
+/// pool. For now this produces valid-but-empty blocks, which is sufficient
+/// for participating in consensus without proposing transactions.
+struct SimpleBlockEvaluator {
+    hdr: algo_types::BlockHeader,
+}
+
+impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
+    fn round(&self) -> Round {
+        self.hdr.round
+    }
+
+    fn pay_set_size(&self) -> usize {
+        0
+    }
+
+    fn test_transaction_group(
+        &self,
+        _txgroup: &[algo_types::SignedTransaction],
+    ) -> Result<(), algo_error::AlgoError> {
+        // TODO: implement real transaction validation
+        Err(algo_error::AlgoError::Ledger {
+            message: "SimpleBlockEvaluator does not support transaction validation yet".into(),
+        })
+    }
+
+    fn transaction_group(
+        &mut self,
+        _txgroup: &[algo_types::SignedTransaction],
+    ) -> Result<(), algo_error::AlgoError> {
+        // TODO: implement real transaction inclusion
+        Err(algo_error::AlgoError::Ledger {
+            message: "SimpleBlockEvaluator does not support transaction inclusion yet".into(),
+        })
+    }
+
+    fn generate_block(
+        &mut self,
+        _voting_accounts: &[algo_types::Address],
+    ) -> Result<algo_types::Block, algo_error::AlgoError> {
+        // Return an empty block based on the header template.
+        Ok(algo_types::Block {
+            round: self.hdr.round,
+            branch: self.hdr.branch,
+            seed: self.hdr.seed,
+            timestamp: self.hdr.timestamp,
+            genesis_id: self.hdr.genesis_id.clone(),
+            genesis_hash: self.hdr.genesis_hash,
+            current_protocol: self.hdr.current_protocol.clone(),
+            ..Default::default()
+        })
+    }
+
+    fn reset_txn_bytes(&mut self) {}
+}
 
 /// A minimal `PoolLedger` that wraps `SqliteLedger` behind a `Mutex`.
 ///
@@ -36,12 +106,23 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
             .unwrap_or(Round(0))
     }
 
-    fn block_hdr(&self, _round: Round) -> Result<algo_types::BlockHeader, algo_error::AlgoError> {
-        // TODO: Implement proper block header retrieval from SqliteLedger.
-        // This is needed for the pool's evaluator to build on top of the
-        // previous block header.
-        Err(algo_error::AlgoError::Ledger {
-            message: "block_hdr not yet implemented for participate mode".into(),
+    fn block_hdr(&self, round: Round) -> Result<algo_types::BlockHeader, algo_error::AlgoError> {
+        let ledger = self
+            .ledger
+            .lock()
+            .map_err(|e| algo_error::AlgoError::Ledger {
+                message: format!("ledger lock poisoned: {e}"),
+            })?;
+        let hdr_data = ledger
+            .get_block_header_data(round.0)
+            .map_err(|e| algo_error::AlgoError::Ledger {
+                message: format!("block_hdr({}) read error: {e}", round.0),
+            })?
+            .ok_or_else(|| algo_error::AlgoError::Ledger {
+                message: format!("no block header data for round {}", round.0),
+            })?;
+        BlockHeader::decode_from_bytes(&hdr_data).map_err(|e| algo_error::AlgoError::Ledger {
+            message: format!("block_hdr({}) decode error: {e}", round.0),
         })
     }
 
@@ -59,14 +140,11 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
 
     fn start_evaluator(
         &self,
-        _hdr: algo_types::BlockHeader,
+        hdr: algo_types::BlockHeader,
         _payset_hint: usize,
         _max_txn_bytes_per_block: usize,
     ) -> Result<Box<dyn algo_pool::traits::BlockEvaluator>, algo_error::AlgoError> {
-        // TODO: Implement block evaluator for proposal assembly.
-        Err(algo_error::AlgoError::Ledger {
-            message: "start_evaluator not yet implemented for participate mode".into(),
-        })
+        Ok(Box::new(SimpleBlockEvaluator { hdr }))
     }
 }
 
@@ -249,8 +327,8 @@ pub async fn run(
     let block_validator =
         BlockValidatorBridge::new(resolved_genesis_id.clone(), genesis_hash, prev_timestamp);
 
-    // Stub random source and monitor (will be replaced with real impls later).
-    let random_source = StubRandomSource::constant(42);
+    // Real random source backed by the OS CSPRNG; stub monitor.
+    let random_source = RealRandomSource;
     let monitor = StubEventsProcessingMonitor::new();
 
     // -----------------------------------------------------------------------

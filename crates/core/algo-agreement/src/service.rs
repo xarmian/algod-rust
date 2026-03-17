@@ -35,7 +35,7 @@ use crate::ledger_reader::LedgerReader;
 use crate::player::Player;
 use crate::pseudonode::{AsyncPseudonode, Pseudonode};
 use crate::router::RootRouter;
-use crate::step::{Period, Step, SOFT};
+use crate::step::{Period, Step, PROPOSE, SOFT};
 use crate::traits::{
     AgreementKeyManager, AgreementNetwork, BlockFactory, BlockValidator, EventsProcessingMonitor,
     LedgerWriter, RandomSource, Tag, AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
@@ -168,12 +168,11 @@ where
             ledger,
             key_manager,
             block_factory,
-            block_validator: _block_validator,
+            block_validator,
             random_source,
             monitor: _monitor,
         } = self.params;
 
-        warn!("block_validator not yet wired into demux loop action execution");
         warn!("events monitor not yet wired into service");
 
         // Wrap shared state in Arc for cross-thread access.
@@ -185,6 +184,14 @@ where
         let (input_tx, input_rx) = mpsc::channel::<Option<ExternalEvent>>();
         let (output_tx, output_rx) = mpsc::channel::<Vec<Action>>();
         let (ready_tx, ready_rx) = mpsc::channel::<ExternalDemuxSignals>();
+
+        // Channel for pseudonode events from the main loop to the demux loop.
+        // In Go, pseudonode actions are executed in the demux goroutine and
+        // results are prioritized via `s.demux.prioritize()`. Since the
+        // pseudonode is owned by the main loop, we execute pseudonode actions
+        // there and send the resulting events to the demux loop for
+        // prioritization.
+        let (pseudo_tx, pseudo_rx) = mpsc::channel::<Vec<ExternalEvent>>();
 
         let quit_main = quit.clone();
         let quit_demux = quit.clone();
@@ -205,6 +212,7 @@ where
                     input_rx,
                     output_tx,
                     ready_tx,
+                    pseudo_tx,
                 );
             })
             .expect("failed to spawn agreement main loop thread");
@@ -216,10 +224,12 @@ where
                 demux_loop(
                     network_demux,
                     ledger_demux,
+                    block_validator,
                     quit_demux,
                     input_tx,
                     output_rx,
                     ready_rx,
+                    pseudo_rx,
                 );
             })
             .expect("failed to spawn agreement demux loop thread");
@@ -255,6 +265,7 @@ fn main_loop<L, K, BF, R>(
     input: mpsc::Receiver<Option<ExternalEvent>>,
     output: mpsc::Sender<Vec<Action>>,
     ready: mpsc::Sender<ExternalDemuxSignals>,
+    pseudo_events: mpsc::Sender<Vec<ExternalEvent>>,
 ) where
     L: LedgerReader + LedgerWriter + Send + Sync + 'static,
     K: AgreementKeyManager + Send + 'static,
@@ -374,20 +385,113 @@ fn main_loop<L, K, BF, R>(
         player = new_player;
         actions = new_actions;
 
-        // Handle pseudonode actions inline (assemble, repropose, attest).
-        // In Go these are executed in the demux loop's `do()` method, but the
-        // pseudonode events need to be prioritized in the demux. Since we don't
-        // have the async infrastructure for that yet, we handle them here by
-        // filtering them out and executing them, injecting their results as
-        // events in subsequent iterations.
-        // For now, pseudonode actions are left in the action list for the demux
-        // loop to process.
+        // Execute pseudonode actions inline and send resulting events to the
+        // demux loop for prioritization. In Go these are executed in the demux
+        // goroutine's `do()` method; since our pseudonode is owned by the main
+        // loop, we execute them here and forward the results.
+        let mut pseudonode_events = Vec::new();
+        for action in &actions {
+            if let Action::Pseudonode(ref pa) = action {
+                execute_pseudonode_action(pa, &mut *pseudonode, &mut pseudonode_events);
+            }
+        }
+        if !pseudonode_events.is_empty() && pseudo_events.send(pseudonode_events).is_err() {
+            break;
+        }
+
+        // Filter out pseudonode actions before sending to the demux loop
+        // since they have already been executed above.
+        actions.retain(|a| !matches!(a, Action::Pseudonode(_)));
     }
 
     // Clean up.
     pseudonode.quit();
     drop(output);
     info!("agreement main loop exited");
+}
+
+/// Execute a single pseudonode action and collect resulting events.
+///
+/// Mirrors Go's `pseudonodeAction.do(ctx, s)`. Results are converted to
+/// `ExternalEvent`s for prioritization in the demux.
+fn execute_pseudonode_action(
+    pa: &PseudonodeAction,
+    pseudonode: &mut dyn Pseudonode,
+    events_out: &mut Vec<ExternalEvent>,
+) {
+    match pa.t {
+        ActionType::Assemble => {
+            match pseudonode.make_proposals(pa.round, pa.period) {
+                Ok(message_events) => {
+                    let ext_events: Vec<ExternalEvent> = message_events
+                        .into_iter()
+                        .map(|me| ExternalEvent {
+                            event: crate::events::Event::Message(me),
+                        })
+                        .collect();
+                    events_out.extend(ext_events);
+                }
+                Err(crate::pseudonode::PseudonodeError::NoProposals) => {
+                    // No participation keys — do nothing.
+                }
+                Err(e) => {
+                    warn!("pseudonode.make_proposals failed: {}", e);
+                }
+            }
+        }
+        ActionType::Repropose => {
+            info!(
+                "repropose to {:?} at ({}, {}, {})",
+                pa.proposal, pa.round, pa.period, PROPOSE
+            );
+            match pseudonode.make_votes(pa.round, pa.period, PROPOSE, pa.proposal) {
+                Ok(message_events) => {
+                    let ext_events: Vec<ExternalEvent> = message_events
+                        .into_iter()
+                        .map(|me| ExternalEvent {
+                            event: crate::events::Event::Message(me),
+                        })
+                        .collect();
+                    events_out.extend(ext_events);
+                }
+                Err(crate::pseudonode::PseudonodeError::NoVotes) => {
+                    // No participation keys — do nothing.
+                }
+                Err(e) => {
+                    warn!(
+                        "pseudonode.make_votes failed for reproposal({}): {}",
+                        pa.t, e
+                    );
+                }
+            }
+        }
+        ActionType::Attest => {
+            info!(
+                "attested to {:?} at ({}, {}, {})",
+                pa.proposal, pa.round, pa.period, pa.step
+            );
+            match pseudonode.make_votes(pa.round, pa.period, pa.step, pa.proposal) {
+                Ok(message_events) => {
+                    let ext_events: Vec<ExternalEvent> = message_events
+                        .into_iter()
+                        .map(|me| ExternalEvent {
+                            event: crate::events::Event::Message(me),
+                        })
+                        .collect();
+                    events_out.extend(ext_events);
+                }
+                Err(crate::pseudonode::PseudonodeError::NoVotes) => {
+                    // No participation keys — do nothing.
+                }
+                Err(e) => {
+                    warn!("pseudonode.make_votes failed({}): {}", pa.t, e);
+                }
+            }
+        }
+        _ => {
+            warn!("unexpected pseudonode action type: {}", pa.t);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -403,16 +507,20 @@ fn main_loop<L, K, BF, R>(
 /// 4. Send it to the main loop.
 ///
 /// Mirrors Go's `Service.demuxLoop`.
-fn demux_loop<N, L>(
+#[allow(clippy::too_many_arguments)]
+fn demux_loop<N, L, BV>(
     network: Arc<N>,
     ledger: Arc<L>,
+    block_validator: BV,
     quit: Arc<AtomicBool>,
     input: mpsc::Sender<Option<ExternalEvent>>,
     output: mpsc::Receiver<Vec<Action>>,
     ready: mpsc::Receiver<ExternalDemuxSignals>,
+    pseudo_rx: mpsc::Receiver<Vec<ExternalEvent>>,
 ) where
     N: AgreementNetwork + Send + Sync + 'static,
     L: LedgerReader + LedgerWriter + Send + Sync + 'static,
+    BV: BlockValidator + Send + 'static,
 {
     let mut demux = Demux::new();
 
@@ -424,11 +532,18 @@ fn demux_loop<N, L>(
             break;
         }
 
+        // Drain any pseudonode events that the main loop produced and
+        // prioritize them in the demux so they are returned first.
+        while let Ok(events) = pseudo_rx.try_recv() {
+            demux.prioritize(events);
+        }
+
         // Execute each action.
         do_actions(
             &action_batch,
             &*network,
             &*ledger,
+            &block_validator,
             &mut demux,
             &mut historical_clocks,
         );
@@ -488,32 +603,36 @@ fn demux_loop<N, L>(
 /// Execute a batch of actions.
 ///
 /// Mirrors Go's `Service.do(ctx, actions)`.
-fn do_actions<N, L>(
+fn do_actions<N, L, BV>(
     actions: &[Action],
     network: &N,
     ledger: &L,
+    block_validator: &BV,
     _demux: &mut Demux,
     historical_clocks: &mut HashMap<Round, Instant>,
 ) where
     N: AgreementNetwork,
     L: LedgerReader + LedgerWriter,
+    BV: BlockValidator,
 {
     for action in actions {
-        do_action(action, network, ledger, historical_clocks);
+        do_action(action, network, ledger, block_validator, historical_clocks);
     }
 }
 
 /// Execute a single action.
 ///
 /// Mirrors each action type's `do(ctx, s)` in Go.
-fn do_action<N, L>(
+fn do_action<N, L, BV>(
     action: &Action,
     network: &N,
     ledger: &L,
+    block_validator: &BV,
     historical_clocks: &mut HashMap<Round, Instant>,
 ) where
     N: AgreementNetwork,
     L: LedgerReader + LedgerWriter,
+    BV: BlockValidator,
 {
     match action {
         Action::Noop(_) => {}
@@ -530,7 +649,7 @@ fn do_action<N, L>(
         }
 
         Action::Ensure(ref ea) => {
-            do_ensure_action(ea, ledger);
+            do_ensure_action(ea, ledger, block_validator);
         }
 
         Action::StageDigest(ref sda) => {
@@ -542,11 +661,10 @@ fn do_action<N, L>(
         }
 
         Action::Pseudonode(ref pa) => {
-            // In Go, pseudonode actions call the loopback pseudonode and
-            // prioritize the resulting events in the demux. Since the
-            // pseudonode is owned by the main loop, we log and skip here.
-            // The main loop handles these directly.
-            debug!("pseudonode action: {} (handled by main loop)", pa);
+            // Pseudonode actions are executed by the main loop and results
+            // are prioritized in the demux via the pseudo_rx channel.
+            // If we still see one here, it was not filtered — just log.
+            debug!("pseudonode action: {} (already handled by main loop)", pa);
         }
 
         Action::Checkpoint(ref ca) => {
@@ -615,12 +733,11 @@ fn encode_network_payload(na: &NetworkAction) -> Option<(&'static str, Vec<u8>)>
             codec::encode_bundle(&na.unauthenticated_bundle),
         ))
     } else if na.tag == PROPOSAL_PAYLOAD_TAG {
-        // For proposal payloads, we encode the compound message.
-        // The compound message contains a proposal and optionally a prior vote.
-        // For now, encode the vote portion of the compound message.
+        // For proposal payloads, we encode the compound message as a
+        // transmittedPayload (unauthenticatedProposal + PriorVote).
         Some((
             PROPOSAL_PAYLOAD_TAG,
-            codec::encode_vote(&na.compound_message.vote),
+            codec::encode_compound_message(&na.compound_message),
         ))
     } else {
         warn!("unknown network tag: {}, skipping action", na.tag);
@@ -630,13 +747,27 @@ fn encode_network_payload(na: &NetworkAction) -> Option<(&'static str, Vec<u8>)>
 
 /// Execute an ensure action (write a certified block to the ledger).
 ///
-/// Mirrors Go's `ensureAction.do`.
-fn do_ensure_action<L: LedgerWriter>(ea: &EnsureAction, ledger: &L) {
+/// Validates the block before writing it. Mirrors Go's `ensureAction.do`.
+fn do_ensure_action<L: LedgerWriter, BV: BlockValidator>(
+    ea: &EnsureAction,
+    ledger: &L,
+    block_validator: &BV,
+) {
+    let block = &ea.payload.unauthenticated_proposal.block;
+
+    // Validate the block before writing to the ledger.
+    if let Err(e) = block_validator.validate(block) {
+        warn!(
+            "block validation failed for round {}: {}",
+            ea.certificate.round, e
+        );
+        return;
+    }
+
     info!(
         "committed round {} with block {:?}",
         ea.certificate.round, ea.certificate.proposal.block_digest,
     );
-    let block = &ea.payload.unauthenticated_proposal.block;
     ledger.ensure_block(block, &ea.certificate);
 }
 
@@ -864,7 +995,8 @@ mod tests {
             dynamic_filter_timeout: Duration::ZERO,
         };
 
-        do_ensure_action(&ea, &ledger);
+        let validator = StubBlockValidator::accepting();
+        do_ensure_action(&ea, &ledger, &validator);
 
         let written = ledger.get_written_blocks();
         assert_eq!(written.len(), 1);

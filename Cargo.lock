@@ -322,6 +322,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "rand 0.8.5",
  "reqwest",
  "rmpv",
  "rusqlite",

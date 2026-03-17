@@ -4,8 +4,7 @@
 //! Mirrors go-algorand's `node/impls.go` `agreementLedger` struct which wraps
 //! a `*data.Ledger` and implements the `agreement.Ledger` interface.
 
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use tracing::warn;
@@ -33,12 +32,18 @@ use crate::store_trait::LedgerStore;
 /// (block writes, round advancement).
 pub struct AgreementLedgerBridge {
     ledger: Arc<Mutex<SqliteLedger>>,
+    /// Condvar notified when a new block is committed (round advances).
+    /// Paired with the `ledger` mutex.
+    round_advanced: Arc<Condvar>,
 }
 
 impl AgreementLedgerBridge {
     /// Create a new bridge wrapping the given ledger.
     pub fn new(ledger: Arc<Mutex<SqliteLedger>>) -> Self {
-        Self { ledger }
+        Self {
+            ledger,
+            round_advanced: Arc::new(Condvar::new()),
+        }
     }
 
     /// Helper: get the protocol version string for a given round by reading
@@ -109,13 +114,17 @@ impl LedgerReader for AgreementLedgerBridge {
             return Err(LedgerError::RoundNotAvailable(round));
         }
 
-        // Look up the account data.
-        // Note: SqliteLedger stores the latest state snapshot, not per-round
-        // historical data. For a full implementation, we would need to support
-        // historical lookups (using online accounts table or catchpoint data).
-        // For now, we return the current account state which is correct when
-        // agreement is operating at the latest round.
-        let acct = ledger.get_account(addr).unwrap_or_default();
+        // Try historical lookup from the onlineaccounts table first.
+        // This mirrors Go's LookupAgreement which queries the online accounts
+        // tracker at the specified round, not just the latest snapshot.
+        let acct = match ledger.get_online_account_at_round(addr, round.0) {
+            Ok(Some(acct)) => acct,
+            Ok(None) | Err(_) => {
+                // Fall back to current account state if no historical data
+                // is available (e.g., onlineaccounts table not populated).
+                ledger.get_account(addr).unwrap_or_default()
+            }
+        };
 
         Ok(OnlineAccountData {
             micro_algos: acct.micro_algos,
@@ -141,14 +150,19 @@ impl LedgerReader for AgreementLedgerBridge {
             return Err(LedgerError::RoundNotAvailable(rnd));
         }
 
-        // TODO: Implement proper online stake calculation.
-        // The full implementation should query the onlineaccounts table
-        // (or accounttotals) to return the total amount of online money
-        // in circulation that is eligible for voting. For now, return 0
-        // as a placeholder; the agreement service will need this to be
-        // properly implemented for committee membership checks.
-        let _ = &ledger;
-        Ok(0)
+        // Try per-round online supply from onlineroundparamstail first.
+        // This mirrors Go's onlineCirculation which looks up OnlineRoundParamsData
+        // containing the OnlineSupply for the specific round.
+        if let Ok(Some(supply)) = ledger.online_supply_at_round(rnd.0) {
+            return Ok(supply);
+        }
+
+        // Fall back to current totals from the accounttotals table.
+        // This is the aggregate online stake and is correct when operating
+        // at or near the latest round.
+        ledger
+            .online_stake()
+            .map_err(|e| LedgerError::Other(format!("online_stake: {e}")))
     }
 
     fn lookup_digest(&self, round: Round) -> Result<Digest, LedgerError> {
@@ -178,27 +192,36 @@ impl LedgerReader for AgreementLedgerBridge {
     }
 
     fn wait_for_round(&self, round: Round) -> Result<(), LedgerError> {
-        // Polling implementation. A condvar/channel upgrade path is available
-        // once the agreement service event loop is fully async.
-        const POLL_INTERVAL: Duration = Duration::from_millis(50);
-        const MAX_POLLS: u32 = 6000; // 5 minutes max wait
+        const TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes max wait
 
-        for _ in 0..MAX_POLLS {
-            {
-                let ledger = self
-                    .ledger
-                    .lock()
-                    .map_err(|e| LedgerError::Other(format!("ledger lock poisoned: {e}")))?;
-                if ledger.current_round().0 >= round.0 {
-                    return Ok(());
-                }
+        let mut ledger = self
+            .ledger
+            .lock()
+            .map_err(|e| LedgerError::Other(format!("ledger lock poisoned: {e}")))?;
+
+        // Use condvar-based waiting instead of polling.
+        // The condvar is notified by ensure_block when a new block is committed.
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        while ledger.current_round().0 < round.0 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(LedgerError::Other(format!(
+                    "timed out waiting for round {round}"
+                )));
             }
-            thread::sleep(POLL_INTERVAL);
+            let (guard, result) = self
+                .round_advanced
+                .wait_timeout(ledger, remaining)
+                .map_err(|e| LedgerError::Other(format!("ledger lock poisoned: {e}")))?;
+            ledger = guard;
+            if result.timed_out() && ledger.current_round().0 < round.0 {
+                return Err(LedgerError::Other(format!(
+                    "timed out waiting for round {round}"
+                )));
+            }
         }
 
-        Err(LedgerError::Other(format!(
-            "timed out waiting for round {round}"
-        )))
+        Ok(())
     }
 }
 
@@ -213,13 +236,7 @@ impl LedgerWriter for AgreementLedgerBridge {
             return;
         }
 
-        // Store the block and certificate atomically.
-        // In a full implementation, this would also apply the block's
-        // transactions to update account state. For now, we store the
-        // raw block data.
-        //
-        // TODO: Apply block state changes (transactions, rewards, etc.)
-        // when the full block evaluation pipeline is integrated.
+        // Encode the block for storage.
         let blk_data = match algo_codec::encode_block(block) {
             Ok(data) => data,
             Err(e) => {
@@ -234,15 +251,54 @@ impl LedgerWriter for AgreementLedgerBridge {
         // Encode the header portion using canonical encoding.
         let hdr_data = algo_codec::canonical_encode_block_header_from_block(block);
         let proto = &block.current_protocol;
+
+        // Begin a transaction so that block storage and state application
+        // are atomic. If begin_block fails (e.g., already in a transaction),
+        // fall back to non-transactional mode.
+        let in_txn = ledger.begin_block().is_ok();
+
+        // Store the raw block data.
         if let Err(e) = ledger.put_block(block.round.0, proto, &hdr_data, &blk_data) {
             warn!(
                 "ensure_block: failed to put block for round {}: {e}",
                 block.round
             );
+            if in_txn {
+                let _ = ledger.rollback_block();
+            }
+            return;
         }
 
-        // TODO: Serialize and store the certificate once Certificate
-        // implements Serialize/msgpack encoding.
+        // Apply the block's state changes (transactions, rewards, round
+        // advancement). This mirrors Go's EnsureBlock which calls
+        // l.Ledger.EnsureBlock(&e, c) and internally validates + applies.
+        if let Err(e) = crate::apply::apply_block(&mut *ledger, block) {
+            warn!(
+                "ensure_block: failed to apply block for round {}: {e}",
+                block.round
+            );
+            if in_txn {
+                let _ = ledger.rollback_block();
+            }
+            return;
+        }
+
+        // Commit the transaction.
+        if in_txn {
+            if let Err(e) = ledger.commit_block() {
+                warn!(
+                    "ensure_block: failed to commit block for round {}: {e}",
+                    block.round
+                );
+                return;
+            }
+        }
+
+        // Release the lock before notifying waiters.
+        drop(ledger);
+
+        // Notify any threads waiting in wait_for_round.
+        self.round_advanced.notify_all();
     }
 
     fn ensure_validated_block(&self, vb: &dyn algo_agreement::ValidatedBlock, cert: &Certificate) {
