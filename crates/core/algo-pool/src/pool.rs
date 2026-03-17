@@ -126,6 +126,10 @@ pub struct TransactionPool {
     /// Condvar signalled when assembly results become available.
     assembly_cond: Condvar,
 
+    /// Condvar associated with `mu`, signalled by `on_new_block()` after
+    /// rebuilding the evaluator. Mirrors Go's `pool.cond`.
+    cond: Condvar,
+
     /// Atomic fee-per-byte for fast lock-free reads via `fee_per_byte()`.
     fee_per_byte: AtomicU64,
 
@@ -171,6 +175,7 @@ impl TransactionPool {
             pending_mu: RwLock::new(pending),
             assembly_mu: Mutex::new(assembly),
             assembly_cond: Condvar::new(),
+            cond: Condvar::new(),
             fee_per_byte: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
         }
@@ -311,19 +316,46 @@ impl TransactionPool {
 
     /// Internal ingestion: validate and store a transaction group.
     ///
-    /// Assumes `mu` is held by the caller.
-    /// Mirrors `ingest()` in go-algorand.
+    /// The caller must pass in the `MutexGuard` for `mu` (not just the inner
+    /// data) because the wait-for-`OnNewBlock` loop needs to temporarily
+    /// release the lock via a condvar wait.
+    ///
+    /// Mirrors `ingest()` in go-algorand (non-recomputing path).
     fn ingest(
         &self,
         tx_group: &[SignedTransaction],
-        inner: &mut PoolInner,
+        guard: &mut parking_lot::MutexGuard<'_, PoolInner>,
     ) -> Result<(), PoolError> {
-        if inner.evaluator.is_none() {
+        if guard.evaluator.is_none() {
             return Err(PoolError::NoPendingBlockEvaluator);
         }
 
+        // Wait for OnNewBlock to catch up to the ledger.
+        //
+        // Mirrors Go lines 435-450: if the evaluator's round is behind
+        // ledger.Latest(), wait on pool.cond (which temporarily releases mu)
+        // until OnNewBlock rebuilds the evaluator or the timeout expires.
+        {
+            let latest = self.ledger.latest();
+            let wait_expires = Instant::now() + self.config.timeout_on_new_block;
+
+            while guard.evaluator.as_ref().is_some_and(|e| e.round() <= latest)
+                && Instant::now() < wait_expires
+            {
+                let timeout = wait_expires.saturating_duration_since(Instant::now());
+                self.cond.wait_for(guard, timeout);
+
+                if guard.evaluator.is_none() {
+                    return Err(PoolError::NoPendingBlockEvaluator);
+                }
+                if self.is_shutdown() {
+                    return Err(PoolError::PoolShutdown);
+                }
+            }
+        }
+
         // Fee check: use the current fee-per-byte.
-        let fee_per_byte = self.recompute_fee_per_byte(inner);
+        let fee_per_byte = self.recompute_fee_per_byte(guard);
         let consensus = self
             .ledger
             .consensus_params(self.ledger.latest())
@@ -335,10 +367,10 @@ impl TransactionPool {
         }
 
         // Duplicate check.
-        self.check_duplicate(tx_group, inner)?;
+        self.check_duplicate(tx_group, guard)?;
 
         // Feed to the evaluator.
-        if let Some(ref mut evaluator) = inner.evaluator {
+        if let Some(ref mut evaluator) = guard.evaluator {
             evaluator
                 .transaction_group(tx_group)
                 .map_err(|e| PoolError::Evaluator(e.to_string()))?;
@@ -346,10 +378,10 @@ impl TransactionPool {
 
         // Store in remembered collections.
         let group_clone: Vec<SignedTransaction> = tx_group.to_vec();
-        inner.remembered_tx_groups.push(group_clone);
+        guard.remembered_tx_groups.push(group_clone);
         for txn in tx_group {
             let txid = compute_txn_id(&txn.txn);
-            inner.remembered_txids.insert(txid, txn.clone());
+            guard.remembered_txids.insert(txid, txn.clone());
         }
 
         Ok(())
@@ -586,21 +618,22 @@ impl TransactionPool {
         // Capacity check (before acquiring mu, matching Go).
         self.check_pending_queue_size(&tx_group)?;
 
-        let mut inner = self.mu.lock();
+        let mut guard = self.mu.lock();
 
         // Shutdown check.
         if self.is_shutdown() {
             return Err(PoolError::PoolShutdown);
         }
 
-        // Ingest: fee check, duplicate check, evaluator validation, store.
-        let result = self.ingest(&tx_group, &mut inner);
+        // Ingest: wait-for-OnNewBlock, fee check, duplicate check,
+        // evaluator validation, store.
+        let result = self.ingest(&tx_group, &mut guard);
         if let Err(e) = result {
             return Err(PoolError::Remember(Box::new(e)));
         }
 
         // Flush remembered to pending (non-flush mode).
-        self.remember_commit(&mut inner, false);
+        self.remember_commit(&mut guard, false);
         Ok(())
     }
 
@@ -713,6 +746,10 @@ impl TransactionPool {
             // have been committed (or that are otherwise no longer valid).
             self.recompute_block_evaluator(&mut inner, committed_txids);
         }
+
+        // Wake any threads waiting in ingest() for the evaluator to catch up.
+        // Mirrors Go's `defer pool.cond.Broadcast()` in OnNewBlock().
+        self.cond.notify_all();
     }
 
     /// Assemble a block for `round`, spending at most until `deadline`.
@@ -2160,6 +2197,177 @@ mod tests {
             result.is_ok(),
             "assemble_dev_mode_block should succeed: {:?}",
             result.err()
+        );
+    }
+
+    // ── Wait-for-OnNewBlock tests ──────────────────────────────────
+
+    #[test]
+    fn test_ingest_waits_for_on_new_block() {
+        // Setup: evaluator round == ledger.latest(), so ingest() should
+        // block until on_new_block() rebuilds the evaluator.
+        let ledger = Arc::new(AdvancingLedger::new(2));
+        let config = PoolConfig {
+            pool_size: 1000,
+            ..Default::default()
+        };
+        let pool = Arc::new(TransactionPool::new(config, ledger.clone()));
+
+        // Install an evaluator at round 2 (same as ledger.latest()).
+        // Condition: evaluator.round() <= latest() => 2 <= 2 => true => waits.
+        {
+            let mut inner = pool.mu.lock();
+            inner.evaluator = Some(Box::new(FilteringEvaluator {
+                round: Round(2),
+                reject_notes: HashSet::new(),
+            }));
+        }
+
+        let pool_clone = Arc::clone(&pool);
+        let handle = std::thread::spawn(move || {
+            // This should block in ingest()'s wait loop until on_new_block
+            // rebuilds the evaluator past ledger.latest().
+            pool_clone.remember_one(make_test_txn(1))
+        });
+
+        // Give the remember thread time to enter the wait loop.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Call on_new_block, which rebuilds the evaluator (round 3)
+        // and notifies the condvar.
+        let block = Block {
+            round: Round(2),
+            ..Block::default()
+        };
+        pool.on_new_block(&block, &HashSet::new());
+
+        // The remember thread should unblock and succeed.
+        let result = handle.join().expect("remember thread panicked");
+        assert!(
+            result.is_ok(),
+            "remember should succeed after on_new_block: {:?}",
+            result.err()
+        );
+        assert_eq!(pool.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_ingest_wait_times_out_gracefully() {
+        // Setup: evaluator round == ledger.latest(), and nobody calls
+        // on_new_block. The wait loop should time out (1 second default)
+        // and proceed anyway.
+        let ledger = Arc::new(AdvancingLedger::new(2));
+        let config = PoolConfig {
+            pool_size: 1000,
+            // Use a short timeout so the test doesn't take too long.
+            timeout_on_new_block: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let pool = TransactionPool::new(config, ledger);
+
+        // Evaluator at round 2, ledger at round 2: condition is true,
+        // but timeout will expire and ingest will proceed.
+        {
+            let mut inner = pool.mu.lock();
+            inner.evaluator = Some(Box::new(FilteringEvaluator {
+                round: Round(2),
+                reject_notes: HashSet::new(),
+            }));
+        }
+
+        let start = Instant::now();
+        let result = pool.remember_one(make_test_txn(1));
+        let elapsed = start.elapsed();
+
+        // Should succeed (proceeds after timeout).
+        assert!(
+            result.is_ok(),
+            "remember should succeed after timeout: {:?}",
+            result.err()
+        );
+
+        // Should have waited at least close to the timeout.
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "should have waited near timeout_on_new_block, elapsed: {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_ingest_no_wait_when_evaluator_ahead() {
+        // When evaluator.round() > ledger.latest(), there is no wait.
+        let ledger = Arc::new(AdvancingLedger::new(1));
+        let config = PoolConfig {
+            pool_size: 1000,
+            timeout_on_new_block: Duration::from_millis(500),
+            ..Default::default()
+        };
+        let pool = TransactionPool::new(config, ledger);
+
+        // Evaluator at round 2, ledger at round 1: 2 <= 1 is false => no wait.
+        {
+            let mut inner = pool.mu.lock();
+            inner.evaluator = Some(Box::new(FilteringEvaluator {
+                round: Round(2),
+                reject_notes: HashSet::new(),
+            }));
+        }
+
+        let start = Instant::now();
+        let result = pool.remember_one(make_test_txn(1));
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "remember should succeed immediately: {:?}",
+            result.err()
+        );
+        // Should not have waited at all (well under timeout).
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "should not wait when evaluator is ahead, elapsed: {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_ingest_wait_returns_shutdown_error() {
+        // If the pool shuts down while waiting, ingest should return PoolShutdown.
+        let ledger = Arc::new(AdvancingLedger::new(2));
+        let config = PoolConfig {
+            pool_size: 1000,
+            timeout_on_new_block: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let pool = Arc::new(TransactionPool::new(config, ledger));
+
+        // Evaluator at round 2, ledger at round 2: will wait.
+        {
+            let mut inner = pool.mu.lock();
+            inner.evaluator = Some(Box::new(FilteringEvaluator {
+                round: Round(2),
+                reject_notes: HashSet::new(),
+            }));
+        }
+
+        let pool_clone = Arc::clone(&pool);
+        let handle = std::thread::spawn(move || pool_clone.remember_one(make_test_txn(1)));
+
+        // Give the remember thread time to enter the wait loop.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Shutdown and wake the waiter.
+        pool.shutdown.store(true, Ordering::SeqCst);
+        pool.cond.notify_all();
+
+        let result = handle.join().expect("remember thread panicked");
+        assert!(result.is_err(), "should fail after shutdown");
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("shutting down"),
+            "should mention shutdown: {}",
+            err_str
         );
     }
 }
