@@ -313,8 +313,8 @@ pub fn encode_vote(vote: &UnauthenticatedVote) -> Vec<u8> {
 ///
 /// Note: The struct-level `codec:""` means the struct ITSELF is never omitted,
 /// but individual fields still have their own omitempty annotations.
-/// Actually, re-reading Go: voteAuthenticator has `codec:""` (no omitempty),
-/// which means ALL fields are always serialized regardless of zero value.
+/// Specifically: `cred` and `snd` are always present (no omitempty),
+/// while `sig` is omitted when all fields are zero (Go `omitemptycheckstruct`).
 fn encode_vote_authenticator(auth: &VoteAuthenticator) -> Vec<u8> {
     let mut buf = Vec::with_capacity(384);
 
@@ -832,6 +832,9 @@ fn decode_equivocation_vote_authenticator(
 
 /// Decode an UnauthenticatedBundle from wire-format msgpack bytes.
 pub fn decode_bundle(bytes: &[u8]) -> Result<UnauthenticatedBundle, CodecError> {
+    // Go uses allocbound=bounds.MaxVoteThreshold which is typically 10_000.
+    const MAX_BUNDLE_ARRAY_LEN: u32 = 10_000;
+
     let mut cursor = Cursor::new(bytes);
     let map_len = rmp::decode::read_map_len(&mut cursor)
         .map_err(|e| CodecError::Decode(format!("bundle map: {e}")))?;
@@ -844,6 +847,12 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<UnauthenticatedBundle, CodecError> 
             "eqv" => {
                 let arr_len = rmp::decode::read_array_len(&mut cursor)
                     .map_err(|e| CodecError::Decode(format!("eqv array: {e}")))?;
+                if arr_len > MAX_BUNDLE_ARRAY_LEN {
+                    return Err(CodecError::Format(format!(
+                        "eqv array length {} exceeds maximum {}",
+                        arr_len, MAX_BUNDLE_ARRAY_LEN
+                    )));
+                }
                 let mut evs = Vec::with_capacity(arr_len as usize);
                 for _ in 0..arr_len {
                     evs.push(decode_equivocation_vote_authenticator(&mut cursor)?);
@@ -857,6 +866,12 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<UnauthenticatedBundle, CodecError> 
             "vote" => {
                 let arr_len = rmp::decode::read_array_len(&mut cursor)
                     .map_err(|e| CodecError::Decode(format!("vote array: {e}")))?;
+                if arr_len > MAX_BUNDLE_ARRAY_LEN {
+                    return Err(CodecError::Format(format!(
+                        "vote array length {} exceeds maximum {}",
+                        arr_len, MAX_BUNDLE_ARRAY_LEN
+                    )));
+                }
                 let mut vs = Vec::with_capacity(arr_len as usize);
                 for _ in 0..arr_len {
                     vs.push(decode_vote_authenticator(&mut cursor)?);

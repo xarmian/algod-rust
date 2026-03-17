@@ -2012,7 +2012,7 @@ impl SqliteLedger {
             .map_err(|e| AlgoError::Ledger {
                 message: format!("query accounttotals error: {e}"),
             })?;
-        Ok(result.unwrap_or(0) as u64)
+        Ok(result.unwrap_or(0).max(0) as u64)
     }
 
     /// Query the online supply for a specific round from the

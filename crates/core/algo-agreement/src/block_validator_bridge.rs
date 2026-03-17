@@ -7,6 +7,8 @@
 
 use std::sync::Mutex;
 
+use tracing::warn;
+
 use algo_types::Block;
 use algo_validate::{validate_block, BlockValidationResult};
 
@@ -80,13 +82,26 @@ impl BlockValidatorBridge {
 
     /// Update the previous block timestamp (call after each committed block).
     pub fn set_prev_timestamp(&self, ts: i64) {
-        *self.prev_timestamp.lock().expect("prev_timestamp lock") = Some(ts);
+        match self.prev_timestamp.lock() {
+            Ok(mut guard) => *guard = Some(ts),
+            Err(e) => {
+                warn!("prev_timestamp lock poisoned in set_prev_timestamp: {e}");
+            }
+        }
     }
 }
 
 impl BlockValidator for BlockValidatorBridge {
     fn validate(&self, block: &Block) -> Result<Box<dyn ValidatedBlock>, AgreementError> {
-        let prev_ts = *self.prev_timestamp.lock().expect("prev_timestamp lock");
+        let prev_ts = match self.prev_timestamp.lock() {
+            Ok(guard) => *guard,
+            Err(e) => {
+                warn!(
+                    "prev_timestamp lock poisoned in validate: {e}, skipping timestamp validation"
+                );
+                None
+            }
+        };
         let result = validate_block(
             block,
             prev_ts,
@@ -102,6 +117,11 @@ impl BlockValidator for BlockValidatorBridge {
             let error_msgs: Vec<String> = result.errors.iter().map(|e| e.to_string()).collect();
             Err(AgreementError::ValidationFailed(error_msgs.join("; ")))
         }
+    }
+
+    fn set_prev_timestamp(&self, ts: i64) {
+        // Delegate to the inherent method.
+        BlockValidatorBridge::set_prev_timestamp(self, ts);
     }
 }
 

@@ -227,12 +227,23 @@ impl LedgerReader for AgreementLedgerBridge {
 
 impl LedgerWriter for AgreementLedgerBridge {
     fn ensure_block(&self, block: &algo_types::Block, _cert: &Certificate) {
-        let mut ledger = self.ledger.lock().expect("ledger lock poisoned");
+        let mut ledger = match self.ledger.lock() {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("ledger lock poisoned in ensure_block: {e}");
+                return;
+            }
+        };
 
         // Check if this block's round has already been committed.
         let next_round = ledger.current_round().0 + 1;
         if block.round.0 < next_round {
             // Block already committed; idempotent.
+            return;
+        }
+
+        if block.round.0 > next_round {
+            warn!("ensure_block: block round {} is ahead of next expected round {}, skipping (needs catchup)", block.round.0, next_round);
             return;
         }
 

@@ -75,6 +75,13 @@ pub trait ValidatedBlock {
 pub trait BlockValidator {
     /// Validate the given block. Returns a `ValidatedBlock` on success.
     fn validate(&self, block: &Block) -> Result<Box<dyn ValidatedBlock>, AgreementError>;
+
+    /// Update the previous block timestamp after a block is committed.
+    ///
+    /// Default is a no-op. Concrete implementations (e.g., `BlockValidatorBridge`)
+    /// override this to track the latest committed timestamp for subsequent
+    /// validation.
+    fn set_prev_timestamp(&self, _ts: i64) {}
 }
 
 // ---------------------------------------------------------------------------

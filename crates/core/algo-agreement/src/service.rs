@@ -769,6 +769,10 @@ fn do_ensure_action<L: LedgerWriter, BV: BlockValidator>(
         ea.certificate.round, ea.certificate.proposal.block_digest,
     );
     ledger.ensure_block(block, &ea.certificate);
+
+    // Update the block validator's previous timestamp so subsequent
+    // validations use the correct reference point.
+    block_validator.set_prev_timestamp(block.timestamp);
 }
 
 /// Execute a stage-digest action (signal the ledger to fetch a block).

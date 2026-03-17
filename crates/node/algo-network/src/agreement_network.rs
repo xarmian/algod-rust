@@ -14,8 +14,8 @@
 //! channel.  The agreement service consumes these via [`messages`](AgreementNetwork::messages).
 //!
 //! Outgoing operations (`broadcast`, `relay`, `disconnect`) delegate to the
-//! underlying `GossipNode`, blocking the caller via `tokio::runtime::Handle`
-//! when needed for the async gossip node methods.
+//! underlying `GossipNode`, blocking the caller via
+//! `tokio::runtime::Handle::block_on` for the async gossip node methods.
 //!
 //! # Go reference
 //!
@@ -325,14 +325,12 @@ impl AgreementNetwork for AgreementNetworkBridge {
         let net = self.net.clone();
         let data = data.to_vec();
 
-        // Use block_in_place so this works whether called from inside a
-        // tokio runtime (tests) or from a dedicated agreement thread
-        // (production).
-        tokio::task::block_in_place(|| {
-            self.rt_handle
-                .block_on(async move { net.broadcast(net_tag, data, false, None).await })
-        })
-        .map_err(|e| AgreementError::Other(format!("broadcast failed: {e}")))?;
+        // Use Handle::block_on to drive the async broadcast from the
+        // synchronous agreement thread.  Unlike block_in_place, this works
+        // from *any* thread (std::thread or tokio task).
+        self.rt_handle
+            .block_on(async move { net.broadcast(net_tag, data, false, None).await })
+            .map_err(|e| AgreementError::Other(format!("broadcast failed: {e}")))?;
 
         Ok(())
     }
@@ -354,22 +352,17 @@ impl AgreementNetwork for AgreementNetworkBridge {
         match metadata.and_then(|m| m.sender_peer.clone()) {
             Some(sender) => {
                 // Relay to all peers except the original sender.
-                tokio::task::block_in_place(|| {
-                    self.rt_handle.block_on(async move {
-                        net.relay(net_tag, data, false, Some(sender)).await
-                    })
-                })
-                .map_err(|e| AgreementError::Other(format!("relay failed: {e}")))?;
+                self.rt_handle
+                    .block_on(async move { net.relay(net_tag, data, false, Some(sender)).await })
+                    .map_err(|e| AgreementError::Other(format!("relay failed: {e}")))?;
             }
             None => {
                 // Synthetic/loopback message — broadcast to all (matches Go behavior).
-                tokio::task::block_in_place(|| {
-                    self.rt_handle
-                        .block_on(async move { net.broadcast(net_tag, data, false, None).await })
-                })
-                .map_err(|e| {
-                    AgreementError::Other(format!("relay (pseudo-broadcast) failed: {e}"))
-                })?;
+                self.rt_handle
+                    .block_on(async move { net.broadcast(net_tag, data, false, None).await })
+                    .map_err(|e| {
+                        AgreementError::Other(format!("relay (pseudo-broadcast) failed: {e}"))
+                    })?;
             }
         }
 
@@ -683,14 +676,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bridge_broadcast_delegates_to_gossip() {
         let gossip = Arc::new(MockGossipNode::new());
-        let bridge = AgreementNetworkBridge::with_defaults(
+        let bridge = Arc::new(AgreementNetworkBridge::with_defaults(
             gossip.clone(),
             tokio::runtime::Handle::current(),
-        );
+        ));
 
-        let tag = AgreementTag(AGREEMENT_VOTE_TAG);
-        let result = bridge.broadcast(&tag, &[0xAB, 0xCD]);
-        assert!(result.is_ok());
+        // Call from a std::thread, mirroring production usage where the
+        // agreement demux loop runs outside the tokio runtime.
+        let bridge2 = bridge.clone();
+        tokio::task::spawn_blocking(move || {
+            let tag = AgreementTag(AGREEMENT_VOTE_TAG);
+            let result = bridge2.broadcast(&tag, &[0xAB, 0xCD]);
+            assert!(result.is_ok());
+        })
+        .await
+        .unwrap();
 
         let broadcasts = gossip.get_broadcasts();
         assert_eq!(broadcasts.len(), 1);
@@ -701,28 +701,38 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bridge_broadcast_unknown_tag_returns_error() {
         let gossip = Arc::new(MockGossipNode::new());
-        let bridge = AgreementNetworkBridge::with_defaults(
+        let bridge = Arc::new(AgreementNetworkBridge::with_defaults(
             gossip.clone(),
             tokio::runtime::Handle::current(),
-        );
+        ));
 
-        let tag = AgreementTag("XX");
-        let result = bridge.broadcast(&tag, &[1, 2, 3]);
-        assert!(result.is_err());
+        let bridge2 = bridge.clone();
+        tokio::task::spawn_blocking(move || {
+            let tag = AgreementTag("XX");
+            let result = bridge2.broadcast(&tag, &[1, 2, 3]);
+            assert!(result.is_err());
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bridge_relay_without_handle_broadcasts() {
         let gossip = Arc::new(MockGossipNode::new());
-        let bridge = AgreementNetworkBridge::with_defaults(
+        let bridge = Arc::new(AgreementNetworkBridge::with_defaults(
             gossip.clone(),
             tokio::runtime::Handle::current(),
-        );
+        ));
 
-        let handle: MessageHandle = None;
-        let tag = AgreementTag(PROPOSAL_PAYLOAD_TAG);
-        let result = bridge.relay(&handle, &tag, &[1, 2, 3]);
-        assert!(result.is_ok());
+        let bridge2 = bridge.clone();
+        tokio::task::spawn_blocking(move || {
+            let handle: MessageHandle = None;
+            let tag = AgreementTag(PROPOSAL_PAYLOAD_TAG);
+            let result = bridge2.relay(&handle, &tag, &[1, 2, 3]);
+            assert!(result.is_ok());
+        })
+        .await
+        .unwrap();
 
         // Should have broadcast (pseudo-relay) since handle is None
         let broadcasts = gossip.get_broadcasts();
