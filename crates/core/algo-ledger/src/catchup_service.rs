@@ -245,7 +245,7 @@ impl CatchupService {
                 return;
             }
 
-            attempt += 1;
+            attempt = attempt.saturating_add(1);
 
             match fetcher.fetch_block(target_round) {
                 Ok(block) => {
@@ -254,9 +254,18 @@ impl CatchupService {
                         warn!(
                             expected_round = %target_round,
                             fetched_round = %block.round,
-                            "catchup service: fetched block round mismatch"
+                            attempt = attempt,
+                            "catchup service: fetched block round mismatch, retrying"
                         );
-                        return;
+                        let delay = Self::backoff_with_jitter(attempt);
+                        if shutdown_rx.recv_timeout(delay).is_ok() {
+                            debug!(
+                                round = %target_round,
+                                "catchup service: shutdown received during backoff"
+                            );
+                            return;
+                        }
+                        continue;
                     }
 
                     // Validate that the fetched block's digest matches the

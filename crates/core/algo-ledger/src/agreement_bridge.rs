@@ -104,6 +104,34 @@ impl AgreementLedgerBridge {
         }
     }
 
+    /// Create a new bridge with a custom network advancer and a shared condvar.
+    ///
+    /// This is suitable for the catchup service's own bridge: it shares the
+    /// same `round_advanced` condvar as the agreement bridge so that blocks
+    /// committed by the catchup service wake any agreement threads blocked in
+    /// `wait_for_round` or `round_notify`.
+    pub fn new_with_advancer_and_condvar(
+        ledger: Arc<Mutex<SqliteLedger>>,
+        network_advancer: Arc<dyn NetworkAdvancer>,
+        round_advanced: Arc<Condvar>,
+    ) -> Self {
+        Self {
+            ledger,
+            round_advanced,
+            pending_cert_tx: None,
+            pending_cert_rx: None,
+            network_advancer,
+        }
+    }
+
+    /// Returns a clone of the `round_advanced` condvar.
+    ///
+    /// This is used to share the condvar with the catchup bridge so that
+    /// catchup-committed blocks wake agreement waiters.
+    pub fn round_advanced_condvar(&self) -> Arc<Condvar> {
+        Arc::clone(&self.round_advanced)
+    }
+
     /// Create a new bridge with catchup support.
     ///
     /// Returns `(bridge, receiver)` where:

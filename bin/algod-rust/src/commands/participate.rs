@@ -573,9 +573,10 @@ pub async fn run(
     // same underlying `SqliteLedger`. It only needs `ensure_block` to commit
     // fetched blocks, and shares the same ledger mutex so commits are visible
     // to the agreement service immediately.
-    let catchup_bridge = Arc::new(AgreementLedgerBridge::new_with_advancer(
+    let catchup_bridge = Arc::new(AgreementLedgerBridge::new_with_advancer_and_condvar(
         ledger.clone(),
         network_advancer,
+        agreement_ledger.round_advanced_condvar(),
     ));
 
     let block_fetcher: Arc<dyn BlockFetcher> = Arc::new(GossipBlockFetcher {
