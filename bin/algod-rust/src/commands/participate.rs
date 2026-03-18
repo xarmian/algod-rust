@@ -122,6 +122,83 @@ fn compute_txid(txn: &algo_types::Transaction) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Compute the effective minimum balance for an account based on its
+/// resource holdings and consensus parameters.
+///
+/// Mirrors Go's `MinBalance()` in `data/basics/userBalance.go`:
+/// - Base min_balance
+/// - Per asset opted-in: +min_balance each
+/// - Per app created: +app_flat_params_min_balance each
+/// - Per app opted-in: +app_flat_opt_in_min_balance each
+/// - Per extra app page: +app_flat_params_min_balance each
+/// - Schema entries: schema_min_balance_per_entry * num_entries
+/// - Schema uints: schema_uint_min_balance * num_uint
+/// - Schema bytes: schema_bytes_min_balance * num_byte_slice
+/// - Per box: +box_flat_min_balance each
+/// - Per box byte: +box_byte_min_balance each
+fn effective_min_balance(account: &AccountData, params: &algo_types::ConsensusParams) -> u64 {
+    let mut min: u64 = params.min_balance;
+
+    // Per-asset holding cost
+    min = min.saturating_add(
+        params
+            .min_balance
+            .saturating_mul(account.total_assets_opted_in),
+    );
+
+    // Per-app created cost
+    min = min.saturating_add(
+        params
+            .app_flat_params_min_balance
+            .saturating_mul(account.total_created_apps),
+    );
+
+    // Per-app opted-in cost
+    min = min.saturating_add(
+        params
+            .app_flat_opt_in_min_balance
+            .saturating_mul(account.total_apps_opted_in),
+    );
+
+    // Schema cost: flat per entry + per-uint + per-bytes
+    let schema = &account.total_app_schema;
+    let num_entries = schema.num_uint.saturating_add(schema.num_byte_slice);
+    min = min.saturating_add(
+        params
+            .schema_min_balance_per_entry
+            .saturating_mul(num_entries),
+    );
+    min = min.saturating_add(params.schema_uint_min_balance.saturating_mul(schema.num_uint));
+    min = min.saturating_add(
+        params
+            .schema_bytes_min_balance
+            .saturating_mul(schema.num_byte_slice),
+    );
+
+    // Per extra app page cost
+    min = min.saturating_add(
+        params
+            .app_flat_params_min_balance
+            .saturating_mul(account.total_extra_app_pages as u64),
+    );
+
+    // Per-box cost
+    min = min.saturating_add(
+        params
+            .box_flat_min_balance
+            .saturating_mul(account.total_boxes),
+    );
+
+    // Per box byte cost
+    min = min.saturating_add(
+        params
+            .box_byte_min_balance
+            .saturating_mul(account.total_box_bytes),
+    );
+
+    min
+}
+
 /// Read-only snapshot of ledger state captured at evaluator creation.
 ///
 /// Mirrors Go's `roundCowBase` pattern: snapshot the relevant state once at
@@ -135,25 +212,38 @@ struct LedgerSnapshot {
     lease_table: algo_ledger::LeaseTable,
     /// The round being evaluated.
     round: u64,
+    /// The ledger's current round at snapshot creation time.
+    /// Used to verify point-in-time consistency: if the ledger advances
+    /// between snapshot creation and a lazy account lookup, we detect
+    /// the inconsistency rather than silently reading stale/mixed data.
+    snapshot_round: Round,
 }
 
 impl LedgerSnapshot {
     /// Create a new snapshot by briefly locking the ledger to capture lease
-    /// state for the current round.
+    /// state and the current round for consistency verification.
     fn from_ledger(ledger: &Arc<Mutex<SqliteLedger>>, round: u64) -> Self {
         let l = ledger.lock().expect("ledger lock for snapshot");
         // Clone the lease table while holding the lock so the snapshot
         // reflects the actual lease state from prior committed blocks.
         let lease_table = l.lease_table().clone();
+        // Capture the ledger's current round for consistency checks.
+        let snapshot_round = l.current_round();
         drop(l);
         LedgerSnapshot {
             accounts: HashMap::new(),
             lease_table,
             round,
+            snapshot_round,
         }
     }
 
-    /// Look up an account balance, checking the cache first, then the ledger.
+    /// Look up an account, checking the cache first, then the ledger.
+    ///
+    /// On cache miss, verifies that the ledger has not advanced past the
+    /// snapshot round to ensure point-in-time consistency. If the ledger
+    /// has advanced, panics rather than returning data from a different
+    /// round (fail-safe).
     fn get_account(
         &mut self,
         addr: &Address,
@@ -164,6 +254,18 @@ impl LedgerSnapshot {
         }
         let result = {
             let l = ledger.lock().expect("ledger lock for account lookup");
+            // Verify the ledger has not advanced since the snapshot was
+            // taken. If it has, accounts read now could be from a
+            // different round than those read earlier, violating
+            // point-in-time consistency.
+            let current = l.current_round();
+            assert!(
+                current == self.snapshot_round,
+                "ledger advanced from round {} to {} during block evaluation; \
+                 snapshot consistency violated",
+                self.snapshot_round.0,
+                current.0,
+            );
             l.get_account(addr)
         };
         self.accounts.insert(*addr, result.clone());
@@ -316,6 +418,9 @@ struct SimpleBlockEvaluator {
     snapshot: LedgerSnapshot,
     /// COW overlay accumulating mutations from accepted transaction groups.
     overlay: CowOverlay,
+    /// Running total of fees collected in this block.
+    /// Mirrors Go's `eval.block.FeesCollected` used in v39+ headers.
+    fees_collected: u64,
 }
 
 impl SimpleBlockEvaluator {
@@ -561,6 +666,15 @@ impl SimpleBlockEvaluator {
                 .unwrap_or(0),
         }
     }
+
+    /// Get the AccountData for an address from the snapshot.
+    ///
+    /// Used for computing effective min-balance, which depends on account
+    /// resource counts (assets, apps, boxes, schema) that don't change
+    /// during payment-only evaluation.
+    fn get_account_data(&mut self, addr: &Address) -> Option<AccountData> {
+        self.snapshot.get_account(addr, &self.ledger)
+    }
 }
 
 impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
@@ -667,6 +781,12 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // trace. This mirrors Go's child-cow pattern where
         // `cow.commitToParent()` is only called after all checks pass.
         let checkpoint = self.overlay.checkpoint();
+        let fees_collected_checkpoint = self.fees_collected;
+
+        // The FeeSink address from the block header. Fees are credited
+        // to this address in the overlay, mirroring Go's `takeFee()`
+        // which calls `cow.Move(sender, FeeSink, fee)`.
+        let fee_sink = self.hdr.fee_sink;
 
         // Record txids, leases, and balance deltas in the COW overlay.
         // This mirrors Go's cow.addTx() which records txids and leases,
@@ -687,13 +807,22 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             }
 
             // Update balances in overlay following Go's apply.Payment() order:
-            // 1. Debit fee from sender
+            // 1. Debit fee from sender, credit fee to FeeSink (takeFee)
             // 2. Move amount from sender to receiver (cow.Move)
             // 3. If close_remainder_to is set, move remaining balance
             //    to close address and zero the sender (cow.CloseAccount)
             let sender = &stx.txn.sender;
             let sender_balance = self.effective_balance(sender);
             let sender_after_fee = sender_balance.saturating_sub(stx.txn.fee);
+
+            // Credit fee to FeeSink (mirrors Go's takeFee -> cow.Move).
+            // Track fees_collected running total for the block header.
+            if stx.txn.fee > 0 {
+                let fee_sink_balance = self.effective_balance(&fee_sink);
+                self.overlay
+                    .set_balance(&fee_sink, fee_sink_balance.saturating_add(stx.txn.fee));
+                self.fees_collected = self.fees_collected.saturating_add(stx.txn.fee);
+            }
 
             // Credit receiver for payment transactions.
             // This must happen BEFORE close-out so that when receiver == sender,
@@ -738,12 +867,12 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // ── Min-balance check after apply ────────────────────────────
         // After tentatively applying all balance mutations for this
         // group, verify that no affected account has dropped below the
-        // minimum balance. Mirrors Go's `checkMinBalance(cow)` which
-        // iterates over `cow.modifiedAccounts()`.
+        // effective minimum balance. Mirrors Go's `checkMinBalance(cow)`
+        // which calls `dataNew.MinBalance(&eval.proto)` accounting for
+        // assets, apps, schema, boxes, and extra app pages.
         //
         // Accounts at exactly zero are allowed — this represents a
         // closed/deleted account, matching Go's `data.IsZero()` check.
-        let min_balance = self.consensus_params.min_balance;
 
         // Collect addresses modified in this group for the check.
         let mut modified_addrs: HashSet<Address> = HashSet::new();
@@ -761,13 +890,25 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             let balance = self.effective_balance(addr);
             // A zero balance is valid (account closed/deleted), matching
             // Go's `if data.IsZero() { continue }` in checkMinBalance.
-            if balance > 0 && balance < min_balance {
-                // Min-balance violation — rollback overlay and reject.
+            if balance == 0 {
+                continue;
+            }
+            // Compute the effective min balance from the account's
+            // resource counts (assets, apps, schema, boxes).
+            let acct_data = self.get_account_data(addr);
+            let min_bal = match &acct_data {
+                Some(acct) => effective_min_balance(acct, &self.consensus_params),
+                // Unknown account with non-zero balance: use base min.
+                None => self.consensus_params.min_balance,
+            };
+            if balance < min_bal {
+                // Min-balance violation — rollback overlay and fees.
                 self.overlay.restore(checkpoint);
+                self.fees_collected = fees_collected_checkpoint;
                 return Err(algo_error::AlgoError::Validation {
                     message: format!(
                         "account {} balance {} below minimum {} after transaction group",
-                        addr, balance, min_balance,
+                        addr, balance, min_bal,
                     ),
                 });
             }
@@ -815,7 +956,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             next_protocol_switch_on: hdr.next_protocol_switch_on,
             next_protocol_vote_before: hdr.next_protocol_vote_before,
             txn_counter: hdr.txn_counter + txn_count,
-            fees_collected: hdr.fees_collected,
+            fees_collected: self.fees_collected,
             bonus: hdr.bonus,
             proposer_payout: hdr.proposer_payout,
             prev512: hdr.prev512,
@@ -946,6 +1087,7 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
             ledger: self.ledger.clone(),
             snapshot,
             overlay: CowOverlay::new(),
+            fees_collected: 0,
         }))
     }
 }
@@ -1293,14 +1435,26 @@ mod tests {
         round: u64,
         accounts: &[(Address, u64)],
     ) -> SimpleBlockEvaluator {
+        make_evaluator_with_accounts(ledger, params, round, accounts, &[])
+    }
+
+    /// Build an evaluator with full AccountData entries (for min-balance tests).
+    fn make_evaluator_with_accounts(
+        ledger: &Arc<Mutex<SqliteLedger>>,
+        params: &ConsensusParams,
+        round: u64,
+        simple_accounts: &[(Address, u64)],
+        full_accounts: &[(Address, AccountData)],
+    ) -> SimpleBlockEvaluator {
         let mut snapshot = LedgerSnapshot {
             accounts: HashMap::new(),
             lease_table: algo_ledger::LeaseTable::new(),
             round,
+            snapshot_round: Round(0),
         };
         // Pre-populate the snapshot cache so tests don't need the ledger
         // to actually contain accounts.
-        for (addr, balance) in accounts {
+        for (addr, balance) in simple_accounts {
             snapshot.accounts.insert(
                 *addr,
                 Some(algo_types::AccountData {
@@ -1308,6 +1462,9 @@ mod tests {
                     ..Default::default()
                 }),
             );
+        }
+        for (addr, acct) in full_accounts {
+            snapshot.accounts.insert(*addr, Some(acct.clone()));
         }
         SimpleBlockEvaluator {
             hdr: BlockHeader {
@@ -1324,6 +1481,7 @@ mod tests {
             ledger: ledger.clone(),
             snapshot,
             overlay: CowOverlay::new(),
+            fees_collected: 0,
         }
     }
 
@@ -2109,8 +2267,10 @@ mod tests {
                 },
                 lease_table: algo_ledger::LeaseTable::new(),
                 round: 100,
+                snapshot_round: Round(0),
             },
             overlay: CowOverlay::new(),
+            fees_collected: 0,
         };
 
         let stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
@@ -2289,7 +2449,6 @@ mod tests {
                 rewards_residue: 7,
                 rewards_recalculation_round: Round(1000),
                 bonus: 99,
-                fees_collected: 12345,
                 proposer_payout: 6789,
                 ..Default::default()
             },
@@ -2302,8 +2461,10 @@ mod tests {
                 accounts: HashMap::new(),
                 lease_table: algo_ledger::LeaseTable::new(),
                 round: 500,
+                snapshot_round: Round(0),
             },
             overlay: CowOverlay::new(),
+            fees_collected: 12345,
         };
 
         let block = eval.generate_block(&[]).unwrap();
@@ -2337,6 +2498,449 @@ mod tests {
         assert_eq!(
             block.proposer_payout, 6789,
             "proposer_payout should be propagated"
+        );
+    }
+
+    // ====================================================================
+    // 14. Effective min-balance tests
+    // ====================================================================
+
+    #[test]
+    fn effective_min_balance_base_account() {
+        let params = v41_params();
+        let acct = AccountData::default();
+        // Base account with no assets/apps should have just the base min_balance.
+        assert_eq!(effective_min_balance(&acct, &params), params.min_balance);
+    }
+
+    #[test]
+    fn effective_min_balance_with_assets() {
+        let params = v41_params();
+        let acct = AccountData {
+            micro_algos: 1_000_000,
+            total_assets_opted_in: 3,
+            ..Default::default()
+        };
+        // base + 3 * min_balance for assets
+        let expected = params.min_balance + 3 * params.min_balance;
+        assert_eq!(effective_min_balance(&acct, &params), expected);
+    }
+
+    #[test]
+    fn effective_min_balance_with_apps_and_schema() {
+        let params = v41_params();
+        let acct = AccountData {
+            micro_algos: 10_000_000,
+            total_created_apps: 2,
+            total_apps_opted_in: 1,
+            total_extra_app_pages: 3,
+            total_app_schema: algo_types::StateSchema {
+                num_uint: 4,
+                num_byte_slice: 2,
+            },
+            ..Default::default()
+        };
+        // base
+        let mut expected = params.min_balance;
+        // created apps: 2 * app_flat_params_min_balance
+        expected += 2 * params.app_flat_params_min_balance;
+        // opted-in apps: 1 * app_flat_opt_in_min_balance
+        expected += params.app_flat_opt_in_min_balance;
+        // schema entries: (4+2) * schema_min_balance_per_entry
+        expected += 6 * params.schema_min_balance_per_entry;
+        // schema uints: 4 * schema_uint_min_balance
+        expected += 4 * params.schema_uint_min_balance;
+        // schema bytes: 2 * schema_bytes_min_balance
+        expected += 2 * params.schema_bytes_min_balance;
+        // extra pages: 3 * app_flat_params_min_balance
+        expected += 3 * params.app_flat_params_min_balance;
+        assert_eq!(effective_min_balance(&acct, &params), expected);
+    }
+
+    #[test]
+    fn effective_min_balance_with_boxes() {
+        let params = v41_params();
+        let acct = AccountData {
+            micro_algos: 10_000_000,
+            total_boxes: 5,
+            total_box_bytes: 1000,
+            ..Default::default()
+        };
+        let expected = params.min_balance
+            + 5 * params.box_flat_min_balance
+            + 1000 * params.box_byte_min_balance;
+        assert_eq!(effective_min_balance(&acct, &params), expected);
+    }
+
+    #[test]
+    fn min_balance_check_uses_effective_min_balance() {
+        // An account with 3 asset opt-ins has an effective min balance of
+        // 100_000 + 3 * 100_000 = 400_000. A transaction that would leave
+        // the account with 300_000 should be rejected even though 300_000
+        // exceeds the base min_balance of 100_000.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(140);
+        let (receiver, _) = test_keypair(141);
+
+        let sender_acct = AccountData {
+            micro_algos: 500_000,
+            total_assets_opted_in: 3,
+            ..Default::default()
+        };
+
+        let mut eval = make_evaluator_with_accounts(
+            &ledger,
+            &params,
+            100,
+            &[],
+            &[(sender, sender_acct)],
+        );
+
+        // fee=1000, amount=199_000 -> sender after = 500_000 - 200_000 = 300_000
+        // effective min balance = 100_000 + 3*100_000 = 400_000
+        // 300_000 < 400_000 -> should be rejected
+        let stx = make_signed_pay(&key, &sender, &receiver, 199_000, 1000, 100);
+        let err = eval.transaction_group(&[stx]).unwrap_err();
+        assert!(
+            err.to_string().contains("below minimum"),
+            "expected min-balance error for account with assets, got: {err}"
+        );
+    }
+
+    #[test]
+    fn account_with_assets_above_effective_min_accepted() {
+        // Same as above but leaving enough balance above effective min.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(142);
+        let (receiver, _) = test_keypair(143);
+
+        let sender_acct = AccountData {
+            micro_algos: 1_000_000,
+            total_assets_opted_in: 3,
+            ..Default::default()
+        };
+
+        let mut eval = make_evaluator_with_accounts(
+            &ledger,
+            &params,
+            100,
+            &[],
+            &[(sender, sender_acct)],
+        );
+
+        // fee=1000, amount=0 -> sender after = 999_000
+        // effective min balance = 100_000 + 3*100_000 = 400_000
+        // 999_000 >= 400_000 -> should be accepted
+        let stx = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "account with assets above effective min balance should be accepted"
+        );
+    }
+
+    // ====================================================================
+    // 15. FeeSink balance tracking tests
+    // ====================================================================
+
+    #[test]
+    fn fee_sink_credited_after_transaction() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let fee_sink = Address([0xFE; 32]);
+        let (sender, key) = test_keypair(150);
+        let (receiver, _) = test_keypair(151);
+
+        let mut snapshot = LedgerSnapshot {
+            accounts: HashMap::new(),
+            lease_table: algo_ledger::LeaseTable::new(),
+            round: 100,
+            snapshot_round: Round(0),
+        };
+        snapshot.accounts.insert(
+            sender,
+            Some(AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            }),
+        );
+        // FeeSink starts with 1_000_000
+        snapshot.accounts.insert(
+            fee_sink,
+            Some(AccountData {
+                micro_algos: 1_000_000,
+                ..Default::default()
+            }),
+        );
+
+        let mut eval = SimpleBlockEvaluator {
+            hdr: BlockHeader {
+                round: Round(100),
+                genesis_id: "test-v1".to_string(),
+                genesis_hash: [0xAA; 32],
+                current_protocol: CONSENSUS_V41.to_string(),
+                fee_sink,
+                ..Default::default()
+            },
+            consensus_params: params.clone(),
+            included_txns: Vec::new(),
+            txn_bytes: 0,
+            max_txn_bytes: params.max_txn_bytes_per_block as usize,
+            ledger: ledger.clone(),
+            snapshot,
+            overlay: CowOverlay::new(),
+            fees_collected: 0,
+        };
+
+        // Submit a transaction with fee=2000
+        let stx = make_signed_pay(&key, &sender, &receiver, 0, 2000, 100);
+        eval.transaction_group(&[stx]).unwrap();
+
+        // FeeSink should have been credited: 1_000_000 + 2000 = 1_002_000
+        assert_eq!(
+            eval.effective_balance(&fee_sink),
+            1_002_000,
+            "FeeSink should be credited with the transaction fee"
+        );
+        assert_eq!(
+            eval.fees_collected, 2000,
+            "fees_collected should track the running total"
+        );
+    }
+
+    #[test]
+    fn fee_sink_accumulates_across_groups() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let fee_sink = Address([0xFE; 32]);
+        let (sender, key) = test_keypair(152);
+        let (receiver, _) = test_keypair(153);
+
+        let mut snapshot = LedgerSnapshot {
+            accounts: HashMap::new(),
+            lease_table: algo_ledger::LeaseTable::new(),
+            round: 100,
+            snapshot_round: Round(0),
+        };
+        snapshot.accounts.insert(
+            sender,
+            Some(AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            }),
+        );
+        snapshot.accounts.insert(
+            fee_sink,
+            Some(AccountData {
+                micro_algos: 0,
+                ..Default::default()
+            }),
+        );
+
+        let mut eval = SimpleBlockEvaluator {
+            hdr: BlockHeader {
+                round: Round(100),
+                genesis_id: "test-v1".to_string(),
+                genesis_hash: [0xAA; 32],
+                current_protocol: CONSENSUS_V41.to_string(),
+                fee_sink,
+                ..Default::default()
+            },
+            consensus_params: params.clone(),
+            included_txns: Vec::new(),
+            txn_bytes: 0,
+            max_txn_bytes: params.max_txn_bytes_per_block as usize,
+            ledger: ledger.clone(),
+            snapshot,
+            overlay: CowOverlay::new(),
+            fees_collected: 0,
+        };
+
+        // Group 1: fee=1000
+        let stx1 = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
+        eval.transaction_group(&[stx1]).unwrap();
+
+        // Group 2: fee=3000 (different note to get different txid)
+        let txn2 = Transaction {
+            txn_type: TxnType::Pay,
+            sender,
+            receiver,
+            amount: 0,
+            fee: 3000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            note: ByteBuf::from(vec![0x01]),
+            ..Default::default()
+        };
+        let sig2 = sign_txn(&txn2, &key);
+        let stx2 = SignedTransaction {
+            txn: txn2,
+            sig: sig2,
+            ..Default::default()
+        };
+        eval.transaction_group(&[stx2]).unwrap();
+
+        // FeeSink should have accumulated: 0 + 1000 + 3000 = 4000
+        assert_eq!(
+            eval.effective_balance(&fee_sink),
+            4000,
+            "FeeSink should accumulate fees across groups"
+        );
+        assert_eq!(
+            eval.fees_collected, 4000,
+            "fees_collected should accumulate across groups"
+        );
+    }
+
+    #[test]
+    fn fees_collected_in_generated_block() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let fee_sink = Address([0xFE; 32]);
+        let (sender, key) = test_keypair(154);
+        let (receiver, _) = test_keypair(155);
+
+        let mut snapshot = LedgerSnapshot {
+            accounts: HashMap::new(),
+            lease_table: algo_ledger::LeaseTable::new(),
+            round: 100,
+            snapshot_round: Round(0),
+        };
+        snapshot.accounts.insert(
+            sender,
+            Some(AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            }),
+        );
+        snapshot.accounts.insert(
+            fee_sink,
+            Some(AccountData {
+                micro_algos: 0,
+                ..Default::default()
+            }),
+        );
+
+        let mut eval = SimpleBlockEvaluator {
+            hdr: BlockHeader {
+                round: Round(100),
+                genesis_id: "test-v1".to_string(),
+                genesis_hash: [0xAA; 32],
+                current_protocol: CONSENSUS_V41.to_string(),
+                fee_sink,
+                ..Default::default()
+            },
+            consensus_params: params.clone(),
+            included_txns: Vec::new(),
+            txn_bytes: 0,
+            max_txn_bytes: params.max_txn_bytes_per_block as usize,
+            ledger: ledger.clone(),
+            snapshot,
+            overlay: CowOverlay::new(),
+            fees_collected: 0,
+        };
+
+        let stx = make_signed_pay(&key, &sender, &receiver, 0, 5000, 100);
+        eval.transaction_group(&[stx]).unwrap();
+
+        let block = eval.generate_block(&[]).unwrap();
+        assert_eq!(
+            block.fees_collected, 5000,
+            "generated block should contain accumulated fees_collected"
+        );
+    }
+
+    #[test]
+    fn fee_sink_rollback_on_min_balance_violation() {
+        // When a group is rejected due to min-balance violation,
+        // the fees_collected should be rolled back too.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let fee_sink = Address([0xFE; 32]);
+        let (sender, key) = test_keypair(156);
+        let (receiver, _) = test_keypair(157);
+
+        let mut snapshot = LedgerSnapshot {
+            accounts: HashMap::new(),
+            lease_table: algo_ledger::LeaseTable::new(),
+            round: 100,
+            snapshot_round: Round(0),
+        };
+        // Sender has 200_000, min_balance = 100_000
+        snapshot.accounts.insert(
+            sender,
+            Some(AccountData {
+                micro_algos: 200_000,
+                ..Default::default()
+            }),
+        );
+        snapshot.accounts.insert(
+            fee_sink,
+            Some(AccountData {
+                micro_algos: 0,
+                ..Default::default()
+            }),
+        );
+
+        let mut eval = SimpleBlockEvaluator {
+            hdr: BlockHeader {
+                round: Round(100),
+                genesis_id: "test-v1".to_string(),
+                genesis_hash: [0xAA; 32],
+                current_protocol: CONSENSUS_V41.to_string(),
+                fee_sink,
+                ..Default::default()
+            },
+            consensus_params: params.clone(),
+            included_txns: Vec::new(),
+            txn_bytes: 0,
+            max_txn_bytes: params.max_txn_bytes_per_block as usize,
+            ledger: ledger.clone(),
+            snapshot,
+            overlay: CowOverlay::new(),
+            fees_collected: 0,
+        };
+
+        // First: a valid group with fee=1000
+        let stx1 = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
+        eval.transaction_group(&[stx1]).unwrap();
+        assert_eq!(eval.fees_collected, 1000);
+
+        // Second: a group that will fail min-balance (would leave 99_000 < 100_000)
+        let txn2 = Transaction {
+            txn_type: TxnType::Pay,
+            sender,
+            receiver,
+            amount: 99_000,
+            fee: 1000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            note: ByteBuf::from(vec![0x01]),
+            ..Default::default()
+        };
+        let sig2 = sign_txn(&txn2, &key);
+        let stx2 = SignedTransaction {
+            txn: txn2,
+            sig: sig2,
+            ..Default::default()
+        };
+        assert!(eval.transaction_group(&[stx2]).is_err());
+
+        // fees_collected should be rolled back to 1000 (from the first group only)
+        assert_eq!(
+            eval.fees_collected, 1000,
+            "fees_collected should be rolled back on rejection"
+        );
+        // FeeSink balance should also be rolled back
+        assert_eq!(
+            eval.effective_balance(&fee_sink),
+            1000,
+            "FeeSink balance should be rolled back on rejection"
         );
     }
 }
