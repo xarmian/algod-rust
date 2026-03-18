@@ -147,25 +147,29 @@ fn offset_id_message(pk: &[u8; 32], batch: u64, offset: u64) -> Vec<u8> {
 /// 1. `pk2_sig`: master key signs `"OT1" || encode(BatchID{pk2, batch})`
 /// 2. `pk1_sig`: `pk2` signs `"OT2" || encode(OffsetID{pk, batch, offset})`
 /// 3. `sig`: `pk` signs the actual message
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OneTimeSignature {
     /// Signature of the message under the offset (ephemeral) key `pk`.
     /// Go: `Sig ed25519Signature`, codec:"s"
+    #[serde(with = "serde_bytes")]
     pub sig: [u8; 64],
     /// Public key of the offset (ephemeral) key that signed the message.
     /// Go: `PK ed25519PublicKey`, codec:"p"
     pub pk: [u8; 32],
     /// Old-style signature, always zero for new keys but always serialized.
     /// Go: `PKSigOld ed25519Signature`, codec:"ps"
+    #[serde(with = "serde_bytes")]
     pub pk_sig_old: [u8; 64],
     /// Public key of the batch subkey.
     /// Go: `PK2 ed25519PublicKey`, codec:"p2"
     pub pk2: [u8; 32],
     /// Signature of `OffsetID(pk, batch, offset)` under `pk2`.
     /// Go: `PK1Sig ed25519Signature`, codec:"p1s"
+    #[serde(with = "serde_bytes")]
     pub pk1_sig: [u8; 64],
     /// Signature of `BatchID(pk2, batch)` under the master key.
     /// Go: `PK2Sig ed25519Signature`, codec:"p2s"
+    #[serde(with = "serde_bytes")]
     pub pk2_sig: [u8; 64],
 }
 

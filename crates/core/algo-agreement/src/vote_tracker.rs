@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use algo_consensus_crypto::OneTimeSignature;
 use algo_types::{Address, ConsensusParams, Round};
+use serde::{Deserialize, Serialize};
 
 use crate::bundle::{EquivocationVoteAuthenticator, UnauthenticatedBundle, VoteAuthenticator};
 use crate::credential::{Credential, UnauthenticatedCredential};
@@ -30,7 +31,7 @@ use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, Vote};
 /// votes for two different proposals.
 ///
 /// Mirrors Go's `equivocationVote` in agreement/vote.go.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EquivocationVote {
     /// The sender of the equivocating votes.
     pub sender: Address,
@@ -91,7 +92,7 @@ impl EquivocationVote {
 /// Tracks the count and individual votes for a specific proposal value.
 ///
 /// Mirrors Go's `proposalVoteCounter`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ProposalVoteCounter {
     /// Accumulated weight of votes for this proposal.
     count: u64,
@@ -109,7 +110,7 @@ struct ProposalVoteCounter {
 /// threshold events.
 ///
 /// Mirrors Go's `voteTracker` in agreement/voteTracker.go.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VoteTracker {
     /// Set of voters who have voted in this step. Used to detect equivocation.
     voters: HashMap<Address, Vote>,

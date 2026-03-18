@@ -10,6 +10,9 @@ use std::fmt;
 use std::time::Duration;
 
 use algo_types::Round;
+use serde::{Deserialize, Serialize};
+
+use crate::types::duration_serde;
 
 use crate::certificate::Certificate;
 use crate::events::{CompoundMessage, InternalMessage, MessageEvent, Proposal, SerializableError};
@@ -24,7 +27,7 @@ use crate::vote::{ProposalValue, UnauthenticatedVote, BOTTOM};
 /// Identifies the particular type of action to be performed.
 ///
 /// Mirrors Go's `actionType` enum in agreement/actions.go.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ActionType {
     /// No-op action.
@@ -105,7 +108,7 @@ impl fmt::Display for ActionType {
 /// A no-op action. Does nothing.
 ///
 /// Mirrors Go's `noopAction`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoopAction;
 
 impl fmt::Display for NoopAction {
@@ -117,7 +120,7 @@ impl fmt::Display for NoopAction {
 /// A network action: ignore, broadcast, broadcastVotes, relay, or disconnect.
 ///
 /// Mirrors Go's `networkAction`.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkAction {
     /// The specific action type.
     pub t: ActionType,
@@ -140,6 +143,7 @@ pub struct NetworkAction {
     /// The message handle identifying the source peer (for Relay/Disconnect).
     ///
     /// Mirrors Go's `networkAction.h` (`MessageHandle`).
+    #[serde(skip)]
     pub message_handle: MessageHandle,
 }
 
@@ -188,7 +192,7 @@ impl fmt::Display for NetworkAction {
 /// A crypto action: verifyVote, verifyPayload, or verifyBundle.
 ///
 /// Mirrors Go's `cryptoAction`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CryptoAction {
     /// The specific action type.
     pub t: ActionType,
@@ -255,7 +259,7 @@ impl fmt::Display for CryptoAction {
 /// An ensure action: write a block and certificate to the ledger.
 ///
 /// Mirrors Go's `ensureAction`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnsureAction {
     /// The proposal payload to give to the ledger.
     pub payload: Proposal,
@@ -263,8 +267,10 @@ pub struct EnsureAction {
     pub certificate: Certificate,
     /// The time that the lowest proposal-vote was validated for
     /// `credentialRoundLag` rounds ago.
+    #[serde(with = "duration_serde")]
     pub vote_validated_at: Duration,
     /// The dynamic filter timeout calculated for this round (for telemetry).
+    #[serde(with = "duration_serde")]
     pub dynamic_filter_timeout: Duration,
 }
 
@@ -285,7 +291,7 @@ impl fmt::Display for EnsureAction {
 /// A stage-digest action: signal the ledger to fetch a block for a certificate.
 ///
 /// Mirrors Go's `stageDigestAction`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageDigestAction {
     /// The certificate identifying the block.
     pub certificate: Certificate,
@@ -307,7 +313,7 @@ impl fmt::Display for StageDigestAction {
 /// A rezero action: reset the clock to zero.
 ///
 /// Mirrors Go's `rezeroAction`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RezeroAction {
     /// The round that is starting.
     pub round: Round,
@@ -322,7 +328,7 @@ impl fmt::Display for RezeroAction {
 /// A pseudonode action: assemble, repropose, or attest.
 ///
 /// Mirrors Go's `pseudonodeAction`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PseudonodeAction {
     /// The specific action type: Assemble, Repropose, or Attest.
     pub t: ActionType,
@@ -370,7 +376,7 @@ impl fmt::Display for PseudonodeAction {
 /// A checkpoint action: persist agreement state to disk.
 ///
 /// Mirrors Go's `checkpointAction`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CheckpointAction {
     /// Round at the checkpoint.
     pub round: Round,
@@ -395,7 +401,7 @@ impl fmt::Display for CheckpointAction {
 /// The top-level action enum wrapping all action types.
 ///
 /// This models Go's `action` interface with its `t() actionType` method.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Action {
     /// No-op.
     Noop(NoopAction),

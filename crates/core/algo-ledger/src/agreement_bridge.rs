@@ -560,8 +560,7 @@ impl LedgerWriter for AgreementLedgerBridge {
             } else {
                 warn!(
                     "ensure_block: giving up on block {} after {} retries: {err}",
-                    block.round,
-                    MAX_RETRIES
+                    block.round, MAX_RETRIES
                 );
             }
         }
@@ -946,7 +945,10 @@ mod tests {
             .expect("should retrieve cert for round 1");
 
         assert_eq!(recovered.round, cert1.round);
-        assert_eq!(recovered.period, cert1.period, "first cert's period should be retained");
+        assert_eq!(
+            recovered.period, cert1.period,
+            "first cert's period should be retained"
+        );
         assert_eq!(
             recovered.proposal, cert1.proposal,
             "first cert's proposal should be retained"
@@ -967,9 +969,9 @@ mod tests {
                     "expected 'no certificate stored' in error message, got: {msg}"
                 );
             }
-            other => panic!(
-                "expected LedgerError::Other with 'no certificate stored', got: {other:?}"
-            ),
+            other => {
+                panic!("expected LedgerError::Other with 'no certificate stored', got: {other:?}")
+            }
         }
     }
 }

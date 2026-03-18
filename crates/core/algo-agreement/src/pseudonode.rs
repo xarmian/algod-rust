@@ -174,6 +174,10 @@ pub trait Pseudonode {
     ///
     /// Returns a vector of `MessageEvent`s containing verified vote events.
     ///
+    /// When `persist_state_done` is `Some`, the pseudonode waits for the
+    /// persistence confirmation before returning votes, matching Go's pattern
+    /// where persistence completes before votes are broadcast.
+    ///
     /// Mirrors Go's `MakeVotes(ctx, round, period, step, proposalValue, persistStateDone)
     ///     (chan externalEvent, error)`.
     fn make_votes(
@@ -182,6 +186,7 @@ pub trait Pseudonode {
         period: Period,
         step: Step,
         proposal: ProposalValue,
+        persist_state_done: Option<crossbeam_channel::Receiver<Result<(), String>>>,
     ) -> Result<Vec<MessageEvent>, PseudonodeError>;
 
     /// Direct the pseudonode to exit and clean up resources.
@@ -509,6 +514,7 @@ where
         period: Period,
         step: Step,
         proposal: ProposalValue,
+        persist_state_done: Option<crossbeam_channel::Receiver<Result<(), String>>>,
     ) -> Result<Vec<MessageEvent>, PseudonodeError> {
         if self.quit.load(Ordering::SeqCst) {
             return Err(PseudonodeError::Shutdown);
@@ -520,6 +526,28 @@ where
 
         if participation.is_empty() {
             return Err(PseudonodeError::NoVotes);
+        }
+
+        // Wait for persistence to complete before generating votes, matching
+        // Go's pattern where persistence must finish before votes are broadcast.
+        // If persistence fails, drop votes to prevent double-voting after crash
+        // (matches Go behavior in asyncPseudonode.makeVotes).
+        if let Some(rx) = persist_state_done {
+            match rx.recv() {
+                Ok(Ok(())) => {
+                    // Persistence succeeded — proceed with vote generation.
+                }
+                Ok(Err(e)) => {
+                    // Persistence failed — drop votes to prevent double-voting.
+                    tracing::warn!("persistence failed, dropping votes: {}", e);
+                    return Ok(vec![]);
+                }
+                Err(_) => {
+                    // Channel disconnected — persistence loop crashed.
+                    tracing::warn!("persistence channel disconnected, dropping votes");
+                    return Ok(vec![]);
+                }
+            }
         }
 
         // Create the unauthenticated votes.
@@ -996,7 +1024,7 @@ mod tests {
         let ledger = crate::stubs::StubLedger::new(v41_params(), Round(100));
         let mut pn = AsyncPseudonode::new(factory, keys, ledger);
 
-        let result = pn.make_votes(Round(100), Period(0), Step(1), BOTTOM);
+        let result = pn.make_votes(Round(100), Period(0), Step(1), BOTTOM, None);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), PseudonodeError::NoVotes);
     }
@@ -1046,7 +1074,7 @@ mod tests {
             block_digest: Digest([0xaa; 32]),
             encoding_digest: Digest([0xbb; 32]),
         };
-        let result = pn.make_votes(Round(100), Period(0), Step(1), pv);
+        let result = pn.make_votes(Round(100), Period(0), Step(1), pv, None);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), PseudonodeError::Shutdown);
     }

@@ -4,6 +4,7 @@
 // (round, period, step, proposal). Verifying a bundle checks each vote's
 // credential + OTS signature and confirms quorum is reached.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use algo_consensus_crypto::OneTimeSignature;
@@ -20,7 +21,7 @@ use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, Vote, VoteVerifyP
 ///
 /// Mirrors Go's `agreement.voteAuthenticator`. Omits the Round, Period, Step,
 /// and Proposal fields for compression — those are taken from the bundle.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoteAuthenticator {
     /// The address of the voter.
     pub sender: Address,
@@ -36,7 +37,7 @@ pub struct VoteAuthenticator {
 /// different proposals in the same round/period/step.
 ///
 /// Mirrors Go's `agreement.equivocationVoteAuthenticator`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EquivocationVoteAuthenticator {
     /// The address of the equivocating voter.
     pub sender: Address,
@@ -53,7 +54,7 @@ pub struct EquivocationVoteAuthenticator {
 /// A bundle which has not yet been verified.
 ///
 /// Mirrors Go's `agreement.unauthenticatedBundle`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnauthenticatedBundle {
     /// The round this bundle is for.
     pub round: Round,
@@ -87,7 +88,7 @@ impl Default for UnauthenticatedBundle {
 /// A verified bundle — all votes have been checked and quorum is reached.
 ///
 /// Mirrors Go's `agreement.bundle`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bundle {
     /// The original unauthenticated bundle.
     pub u: UnauthenticatedBundle,

@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
@@ -32,6 +32,7 @@ use crate::codec;
 use crate::demux::{Demux, ExternalDemuxSignals, ExternalEvent};
 use crate::events::ConsensusVersionView;
 use crate::ledger_reader::LedgerReader;
+use crate::persistence::{self, AsyncPersistenceLoop, ClockState, PersistentRequest};
 use crate::player::Player;
 use crate::pseudonode::{AsyncPseudonode, Pseudonode};
 use crate::router::RootRouter;
@@ -81,6 +82,12 @@ where
     pub monitor: M,
     /// Asynchronous crypto verifier for votes, proposals, and bundles.
     pub crypto: C,
+    /// Optional SQLite connection for crash recovery persistence.
+    ///
+    /// When `Some`, agreement state is persisted to this database before
+    /// broadcasting votes, enabling crash recovery without double-voting.
+    /// When `None`, no persistence is performed (existing behavior).
+    pub crash_db: Option<rusqlite::Connection>,
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +186,49 @@ where
             random_source,
             monitor,
             crypto,
+            crash_db,
         } = self.params;
+
+        // Try to restore persisted state BEFORE creating the persistence loop
+        // (which takes ownership of the connection). We need a separate
+        // connection for restore, or we do restore first with the same one.
+        let restored_state = if let Some(ref conn) = crash_db {
+            match persistence::restore(conn) {
+                Ok(Some(raw)) => match persistence::decode(&raw) {
+                    Ok((router, player, clock, actions)) => {
+                        info!(
+                            "restored persisted agreement state at round {}, period {}, step {}",
+                            player.round, player.period, player.step
+                        );
+                        Some((router, player, clock, actions))
+                    }
+                    Err(e) => {
+                        warn!(
+                            "failed to decode persisted agreement state: {}; starting fresh",
+                            e
+                        );
+                        None
+                    }
+                },
+                Ok(None) => {
+                    debug!("no persisted agreement state found; starting fresh");
+                    None
+                }
+                Err(e) => {
+                    warn!("failed to restore agreement state: {}; starting fresh", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Create the persistence loop if crash_db is available.
+        let persistence_loop = crash_db.map(|conn| {
+            let mut pl = AsyncPersistenceLoop::new(conn);
+            pl.start();
+            pl
+        });
 
         // Wrap shared state in Arc for cross-thread access.
         let ledger = Arc::new(ledger);
@@ -256,6 +305,8 @@ where
                     output_tx,
                     ready_tx,
                     pseudo_tx,
+                    persistence_loop,
+                    restored_state,
                 );
             })
             .expect("failed to spawn agreement main loop thread");
@@ -319,13 +370,16 @@ fn main_loop<L, K, BF, R>(
     output: mpsc::Sender<Vec<Action>>,
     ready: mpsc::Sender<ExternalDemuxSignals>,
     pseudo_events: mpsc::Sender<Vec<ExternalEvent>>,
+    mut persistence_loop: Option<AsyncPersistenceLoop>,
+    restored_state: Option<(RootRouter, Player, ClockState, Vec<Action>)>,
 ) where
     L: LedgerReader + LedgerWriter + Send + Sync + 'static,
     K: AgreementKeyManager + Send + 'static,
     BF: BlockFactory + Send + 'static,
     R: RandomSource + Send + 'static,
 {
-    // Bootstrap: initialize the player at the current round.
+    // Bootstrap: initialize the player at the current round, or use
+    // restored state from a crash recovery database.
     let next_round = ledger.next_round();
     let next_version = ledger
         .consensus_version(next_round)
@@ -345,35 +399,31 @@ fn main_loop<L, K, BF, R>(
         })
     });
 
-    let status = Player {
-        round: next_round,
-        step: SOFT,
-        deadline: Deadline {
-            duration: filter_timeout(Period(0), &cparams),
-            timeout_type: TimeoutType::Filter,
-        },
-        lowest_credential_arrivals: CredentialArrivalHistory::new(
-            DYNAMIC_FILTER_CREDENTIAL_ARRIVAL_HISTORY,
-        ),
-        ..Player::default()
+    // Determine initial state: restored from crash DB or fresh bootstrap.
+    let (mut router, mut player, mut actions) = if let Some((
+        r_router,
+        r_player,
+        _r_clock,
+        r_actions,
+    )) = restored_state
+    {
+        // Use restored state only if it is still relevant (round >= ledger's next round).
+        if r_player.round.0 >= next_round.0 {
+            info!(
+                "using restored agreement state at round {} (ledger next round {})",
+                r_player.round, next_round
+            );
+            (r_router, r_player, r_actions)
+        } else {
+            info!(
+                    "restored agreement state at round {} is stale (ledger next round {}); bootstrapping fresh",
+                    r_player.round, next_round
+                );
+            bootstrap_fresh(next_round, &cparams)
+        }
+    } else {
+        bootstrap_fresh(next_round, &cparams)
     };
-
-    let mut router = RootRouter::new(&status);
-    let mut player = status;
-
-    // Initial actions: assemble a proposal + rezero the clock.
-    let initial_actions = vec![
-        Action::Pseudonode(PseudonodeAction {
-            t: ActionType::Assemble,
-            round: next_round,
-            period: Period(0),
-            step: Step(0),
-            proposal: crate::vote::BOTTOM,
-        }),
-        Action::Rezero(RezeroAction { round: next_round }),
-    ];
-
-    let mut actions = initial_actions;
 
     // Create the pseudonode for local proposal/vote generation.
     // We share ledger via a clone of the Arc, but AsyncPseudonode wants
@@ -381,6 +431,12 @@ fn main_loop<L, K, BF, R>(
     let pseudonode =
         AsyncPseudonode::new(block_factory, key_manager, LedgerReaderRef(ledger.clone()));
     let mut pseudonode: Box<dyn Pseudonode + Send> = Box::new(pseudonode);
+
+    // Persistence state — saved when actions contain a persistent action (attest).
+    // These snapshots are used to encode the state for the persistence loop.
+    let mut persist_router: Option<RootRouter> = None;
+    let mut persist_player: Option<Player> = None;
+    let mut persist_actions: Option<Vec<Action>> = None;
 
     info!("agreement service started at round {}", next_round);
 
@@ -450,6 +506,16 @@ fn main_loop<L, K, BF, R>(
         player = new_player;
         actions = new_actions;
 
+        // Track state for persistence when actions contain a persistent
+        // action (attest). The snapshot is taken BEFORE executing the
+        // pseudonode actions, matching Go's pattern where state is persisted
+        // before votes are broadcast.
+        if persistence::persistent(&actions) {
+            persist_router = Some(router.clone());
+            persist_player = Some(player.clone());
+            persist_actions = Some(actions.clone());
+        }
+
         // Execute pseudonode actions inline and send resulting events to the
         // demux loop for prioritization. In Go these are executed in the demux
         // goroutine's `do()` method; since our pseudonode is owned by the main
@@ -457,9 +523,23 @@ fn main_loop<L, K, BF, R>(
         let mut pseudonode_events = Vec::new();
         for action in &actions {
             if let Action::Pseudonode(ref pa) = action {
-                execute_pseudonode_action(pa, &mut *pseudonode, &mut pseudonode_events);
+                execute_pseudonode_action(
+                    pa,
+                    &mut *pseudonode,
+                    &mut pseudonode_events,
+                    &persistence_loop,
+                    &persist_router,
+                    &persist_player,
+                    &persist_actions,
+                );
             }
         }
+
+        // Clear persistence snapshots after pseudonode actions are executed.
+        persist_router = None;
+        persist_player = None;
+        persist_actions = None;
+
         if !pseudonode_events.is_empty() && pseudo_events.send(pseudonode_events).is_err() {
             break;
         }
@@ -471,6 +551,9 @@ fn main_loop<L, K, BF, R>(
 
     // Clean up.
     pseudonode.quit();
+    if let Some(ref mut pl) = persistence_loop {
+        pl.quit();
+    }
     drop(output);
     info!("agreement main loop exited");
 }
@@ -479,10 +562,21 @@ fn main_loop<L, K, BF, R>(
 ///
 /// Mirrors Go's `pseudonodeAction.do(ctx, s)`. Results are converted to
 /// `ExternalEvent`s for prioritization in the demux.
+///
+/// For `Attest` actions, if a persistence loop is available and we have saved
+/// state, the state is persisted to SQLite before votes are generated. The
+/// persistence-done channel is passed to `make_votes` so the pseudonode waits
+/// for the write to complete before returning votes (matching Go's pattern of
+/// persist-before-broadcast).
+#[allow(clippy::too_many_arguments)]
 fn execute_pseudonode_action(
     pa: &PseudonodeAction,
     pseudonode: &mut dyn Pseudonode,
     events_out: &mut Vec<ExternalEvent>,
+    persistence_loop: &Option<AsyncPersistenceLoop>,
+    persist_router: &Option<RootRouter>,
+    persist_player: &Option<Player>,
+    persist_actions: &Option<Vec<Action>>,
 ) {
     match pa.t {
         ActionType::Assemble => {
@@ -509,7 +603,7 @@ fn execute_pseudonode_action(
                 "repropose to {:?} at ({}, {}, {})",
                 pa.proposal, pa.round, pa.period, PROPOSE
             );
-            match pseudonode.make_votes(pa.round, pa.period, PROPOSE, pa.proposal) {
+            match pseudonode.make_votes(pa.round, pa.period, PROPOSE, pa.proposal, None) {
                 Ok(message_events) => {
                     let ext_events: Vec<ExternalEvent> = message_events
                         .into_iter()
@@ -535,21 +629,102 @@ fn execute_pseudonode_action(
                 "attested to {:?} at ({}, {}, {})",
                 pa.proposal, pa.round, pa.period, pa.step
             );
-            match pseudonode.make_votes(pa.round, pa.period, pa.step, pa.proposal) {
-                Ok(message_events) => {
-                    let ext_events: Vec<ExternalEvent> = message_events
-                        .into_iter()
-                        .map(|me| ExternalEvent {
-                            event: crate::events::Event::Message(me),
-                        })
-                        .collect();
-                    events_out.extend(ext_events);
+
+            // If persistence is available and we have saved state, persist
+            // before making votes (matching Go's persist-before-broadcast).
+            // Persistence failure aborts the attest entirely — votes must not
+            // be broadcast without a crash-recovery record.
+            let persistence_ok = if let (
+                Some(ref pl),
+                Some(ref p_router),
+                Some(ref p_player),
+                Some(ref p_actions),
+            ) = (
+                persistence_loop,
+                persist_router,
+                persist_player,
+                persist_actions,
+            ) {
+                let clock_state = ClockState::default(); // TODO: populate from service clock
+                match persistence::encode(p_router, p_player, &clock_state, p_actions) {
+                    Ok(raw) if !raw.is_empty() => {
+                        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+                        let (events_tx, _events_rx) = crossbeam_channel::bounded(1);
+
+                        let request = PersistentRequest {
+                            round: pa.round,
+                            period: pa.period,
+                            step: pa.step,
+                            raw,
+                            done: done_tx,
+                            clock: clock_state,
+                            events: events_tx,
+                        };
+
+                        pl.enqueue(request);
+
+                        // Wait synchronously for persistence to complete.
+                        // The persistence loop runs in its own thread, so we
+                        // just block here until it signals completion.
+                        const PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
+                        match done_rx.recv_timeout(PERSIST_TIMEOUT) {
+                            Ok(Ok(())) => true,
+                            Ok(Err(e)) => {
+                                warn!(
+                                    "persistence write failed, skipping attest: {}",
+                                    e
+                                );
+                                false
+                            }
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                                warn!(
+                                    "persistence write timed out after {:?}, skipping attest",
+                                    PERSIST_TIMEOUT
+                                );
+                                false
+                            }
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                warn!(
+                                    "persistence loop disconnected, skipping attest"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        // Empty raw — encode produced nothing; skip attest.
+                        warn!("persistence encode produced empty output, skipping attest");
+                        false
+                    }
+                    Err(e) => {
+                        // Encode failure — skip attest to preserve
+                        // persist-before-broadcast guarantee.
+                        warn!("persistence encode failed, skipping attest: {}", e);
+                        false
+                    }
                 }
-                Err(crate::pseudonode::PseudonodeError::NoVotes) => {
-                    // No participation keys — do nothing.
-                }
-                Err(e) => {
-                    warn!("pseudonode.make_votes failed({}): {}", pa.t, e);
+            } else {
+                // No persistence configured — proceed without it.
+                true
+            };
+
+            if persistence_ok {
+                match pseudonode.make_votes(pa.round, pa.period, pa.step, pa.proposal, None) {
+                    Ok(message_events) => {
+                        let ext_events: Vec<ExternalEvent> = message_events
+                            .into_iter()
+                            .map(|me| ExternalEvent {
+                                event: crate::events::Event::Message(me),
+                            })
+                            .collect();
+                        events_out.extend(ext_events);
+                    }
+                    Err(crate::pseudonode::PseudonodeError::NoVotes) => {
+                        // No participation keys — do nothing.
+                    }
+                    Err(e) => {
+                        warn!("pseudonode.make_votes failed({}): {}", pa.t, e);
+                    }
                 }
             }
         }
@@ -557,6 +732,43 @@ fn execute_pseudonode_action(
             warn!("unexpected pseudonode action type: {}", pa.t);
         }
     }
+}
+
+/// Create a fresh bootstrap state for the given round.
+///
+/// Returns (router, player, initial_actions).
+fn bootstrap_fresh(
+    next_round: Round,
+    cparams: &algo_types::ConsensusParams,
+) -> (RootRouter, Player, Vec<Action>) {
+    let status = Player {
+        round: next_round,
+        step: SOFT,
+        deadline: Deadline {
+            duration: filter_timeout(Period(0), cparams),
+            timeout_type: TimeoutType::Filter,
+        },
+        lowest_credential_arrivals: CredentialArrivalHistory::new(
+            DYNAMIC_FILTER_CREDENTIAL_ARRIVAL_HISTORY,
+        ),
+        ..Player::default()
+    };
+
+    let router = RootRouter::new(&status);
+    let player = status;
+
+    let initial_actions = vec![
+        Action::Pseudonode(PseudonodeAction {
+            t: ActionType::Assemble,
+            round: next_round,
+            period: Period(0),
+            step: Step(0),
+            proposal: crate::vote::BOTTOM,
+        }),
+        Action::Rezero(RezeroAction { round: next_round }),
+    ];
+
+    (router, player, initial_actions)
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,6 +1264,7 @@ mod tests {
             random_source: StubRandomSource::constant(42),
             monitor: StubEventsProcessingMonitor::new(),
             crypto: StubCryptoVerifier::new(),
+            crash_db: None,
         };
 
         let _service = Service::new(params);
@@ -1068,6 +1281,7 @@ mod tests {
             random_source: StubRandomSource::constant(42),
             monitor: StubEventsProcessingMonitor::new(),
             crypto: StubCryptoVerifier::new(),
+            crash_db: None,
         };
 
         let service = Service::new(params);

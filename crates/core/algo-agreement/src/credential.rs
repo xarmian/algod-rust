@@ -3,6 +3,8 @@
 // UnauthenticatedCredential holds a VRF proof that can be verified against
 // a Membership to produce a Credential with a sortition weight.
 
+use serde::{Deserialize, Serialize};
+
 use algo_consensus_crypto::sortition;
 use algo_consensus_crypto::vrf::VrfPubkey;
 use algo_types::{Address, ConsensusParams, Digest};
@@ -18,9 +20,10 @@ const VRF_OUTPUT_SIZE: usize = 64;
 /// An unauthenticated credential — a VRF proof that has not yet been verified.
 ///
 /// Mirrors Go's `committee.UnauthenticatedCredential`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnauthenticatedCredential {
     /// The VRF proof bytes (80 bytes).
+    #[serde(with = "serde_bytes")]
     pub proof: [u8; VRF_PROOF_SIZE],
 }
 
@@ -118,7 +121,7 @@ impl UnauthenticatedCredential {
 /// A verified credential with computed sortition weight.
 ///
 /// Mirrors Go's `committee.Credential`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credential {
     /// The number of sub-committee seats won.
     pub weight: u64,
@@ -129,6 +132,7 @@ pub struct Credential {
     /// The hashable credential (only populated when domain separation is enabled).
     pub hashable: HashableCredential,
     /// The original VRF proof bytes.
+    #[serde(with = "serde_bytes")]
     pub proof: [u8; VRF_PROOF_SIZE],
 }
 
@@ -221,9 +225,10 @@ impl Credential {
 ///   "i" -> Iter (uint64)
 ///   "m" -> Member (Address, 32 bytes)
 ///   "v" -> RawOut (VrfOutput, 64 bytes)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HashableCredential {
     /// Raw VRF output (64 bytes).
+    #[serde(with = "serde_bytes")]
     pub raw_out: [u8; VRF_OUTPUT_SIZE],
     /// Account address.
     pub member: Address,
@@ -310,7 +315,7 @@ impl Hashable for HashableCredential {
 ///
 /// Mirrors Go's `committee.Membership`, but flattened from the Go structure
 /// (which embeds `BalanceRecord` containing `OnlineAccountData` and `Addr`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Membership {
     /// The account's address.
     pub address: Address,

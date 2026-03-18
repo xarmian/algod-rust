@@ -8,6 +8,7 @@
 // tracking hierarchy.
 
 use algo_types::ConsensusParams;
+use serde::{Deserialize, Serialize};
 
 use crate::bundle::UnauthenticatedBundle;
 use crate::events::{
@@ -29,7 +30,7 @@ use crate::vote_auxiliary::VoteTrackerRound;
 /// in the agreement state machine.
 ///
 /// Mirrors Go's `voteAggregator` in agreement/voteAggregator.go.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VoteAggregator {
     /// Per-round vote tracking. Typically contains at most 2 entries (current
     /// round and next round for pipelining).

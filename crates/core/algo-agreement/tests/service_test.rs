@@ -125,6 +125,7 @@ fn service_starts_and_shuts_down_cleanly() {
         random_source: StubRandomSource::constant(0),
         monitor: StubEventsProcessingMonitor::new(),
         crypto: StubCryptoVerifier::new(),
+        crash_db: None,
     };
 
     let service = Service::new(params);
@@ -154,6 +155,7 @@ fn service_start_calls_network_start() {
         random_source: StubRandomSource::constant(0),
         monitor: StubEventsProcessingMonitor::new(),
         crypto: StubCryptoVerifier::new(),
+        crash_db: None,
     };
 
     let service = Service::new(params);
@@ -182,6 +184,7 @@ fn service_bootstrap_at_ledger_round() {
         random_source: StubRandomSource::constant(42),
         monitor: StubEventsProcessingMonitor::new(),
         crypto: StubCryptoVerifier::new(),
+        crash_db: None,
     };
 
     let service = Service::new(params);
@@ -202,6 +205,7 @@ fn service_handles_round_zero() {
         random_source: StubRandomSource::constant(0),
         monitor: StubEventsProcessingMonitor::new(),
         crypto: StubCryptoVerifier::new(),
+        crash_db: None,
     };
 
     let service = Service::new(params);
@@ -224,6 +228,7 @@ fn service_multiple_start_shutdown_cycles() {
             random_source: StubRandomSource::constant(round),
             monitor: StubEventsProcessingMonitor::new(),
             crypto: StubCryptoVerifier::new(),
+            crash_db: None,
         };
 
         let service = Service::new(params);
@@ -245,6 +250,7 @@ fn service_immediate_shutdown() {
         random_source: StubRandomSource::constant(0),
         monitor: StubEventsProcessingMonitor::new(),
         crypto: StubCryptoVerifier::new(),
+        crash_db: None,
     };
 
     let service = Service::new(params);
@@ -649,7 +655,7 @@ fn pseudonode_no_keys_returns_no_votes() {
         encoding_digest: Digest([0xbb; 32]),
     };
 
-    let result = pn.make_votes(Round(100), Period(0), Step(1), pv);
+    let result = pn.make_votes(Round(100), Period(0), Step(1), pv, None);
     assert!(result.is_err());
     match result.unwrap_err() {
         PseudonodeError::NoVotes => {}
@@ -697,7 +703,7 @@ fn pseudonode_shutdown_rejects_votes() {
 
     pn.quit();
 
-    let result = pn.make_votes(Round(100), Period(0), Step(1), BOTTOM);
+    let result = pn.make_votes(Round(100), Period(0), Step(1), BOTTOM, None);
     assert!(result.is_err());
     match result.unwrap_err() {
         PseudonodeError::Shutdown => {}
@@ -947,6 +953,7 @@ fn service_handle_shutdown_completes() {
         random_source: StubRandomSource::constant(0),
         monitor: StubEventsProcessingMonitor::new(),
         crypto: StubCryptoVerifier::new(),
+        crash_db: None,
     };
 
     let handle = Service::new(params).start();
@@ -1059,6 +1066,7 @@ fn make_service_with_injectables(
         random_source: StubRandomSource::constant(42),
         monitor: StubEventsProcessingMonitor::new(),
         crypto: StubCryptoVerifier::new(),
+        crash_db: None,
     };
 
     let handle = Service::new(params).start();
@@ -1217,6 +1225,7 @@ fn service_random_source_provides_entropy() {
         random_source: StubRandomSource::new(vec![111, 222, 333]),
         monitor: StubEventsProcessingMonitor::new(),
         crypto: StubCryptoVerifier::new(),
+        crash_db: None,
     };
 
     let handle = Service::new(params).start();
@@ -1248,6 +1257,7 @@ fn service_with_crypto_verifier_channels() {
         random_source: StubRandomSource::constant(0),
         monitor: StubEventsProcessingMonitor::new(),
         crypto,
+        crash_db: None,
     };
 
     let handle = Service::new(params).start();

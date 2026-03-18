@@ -1,9 +1,10 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A 32-byte cryptographic digest (SHA512/256 output).
 ///
 /// Displayed as base32 (RFC 4648, no padding) to match Go's transaction ID format.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct Digest(pub [u8; 32]);
 

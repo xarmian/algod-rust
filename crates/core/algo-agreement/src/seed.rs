@@ -4,6 +4,8 @@
 // `Seed` is a 32-byte value containing cryptographic entropy used to
 // determine a committee via VRF sortition.
 
+use serde::{Deserialize, Serialize};
+
 use algo_types::{Address, Digest};
 
 use crate::hashable::{hash_obj, Hashable};
@@ -11,7 +13,7 @@ use crate::hashable::{hash_obj, Hashable};
 /// A 32-byte cryptographic seed used for committee sortition.
 ///
 /// Mirrors Go's `committee.Seed` (`[32]byte`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Seed(pub [u8; 32]);
 
 impl From<Digest> for Seed {

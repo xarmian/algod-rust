@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use algo_types::ConsensusParams;
+use serde::{Deserialize, Serialize};
 
 use crate::events::{
     EmptyEvent, Event, EventType, FreshestBundleEvent, NextThresholdStatusEvent, ThresholdEvent,
@@ -25,7 +26,7 @@ use crate::vote_tracker::VoteTracker;
 /// and caches next-threshold status.
 ///
 /// Mirrors Go's `voteTrackerPeriod` in agreement/voteAuxiliary.go.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VoteTrackerPeriod {
     /// Per-step VoteTrackers within this period.
     trackers: HashMap<Step, VoteTracker>,
@@ -129,7 +130,7 @@ impl VoteTrackerPeriod {
 /// and tracks the freshest bundle seen.
 ///
 /// Mirrors Go's `voteTrackerRound` in agreement/voteAuxiliary.go.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VoteTrackerRound {
     /// Per-period VoteTrackerPeriods within this round.
     periods: HashMap<Period, VoteTrackerPeriod>,

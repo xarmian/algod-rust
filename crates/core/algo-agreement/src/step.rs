@@ -3,6 +3,7 @@
 // Step maps directly to committee-size / threshold parameters in
 // ConsensusParams via `committee_size` and `committee_threshold`.
 
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use algo_types::ConsensusParams;
@@ -25,7 +26,9 @@ pub const DOWN: Step = Step(255);
 /// A step in the agreement protocol, wrapping a `u64`.
 ///
 /// Matches Go: `type step uint64`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct Step(pub u64);
 
 impl Step {
@@ -127,7 +130,9 @@ impl std::fmt::Display for Step {
 /// A period in the agreement protocol, wrapping a `u64`.
 ///
 /// Matches Go: `type period uint64`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct Period(pub u64);
 
 impl std::fmt::Display for Period {
