@@ -168,7 +168,11 @@ fn effective_min_balance(account: &AccountData, params: &algo_types::ConsensusPa
             .schema_min_balance_per_entry
             .saturating_mul(num_entries),
     );
-    min = min.saturating_add(params.schema_uint_min_balance.saturating_mul(schema.num_uint));
+    min = min.saturating_add(
+        params
+            .schema_uint_min_balance
+            .saturating_mul(schema.num_uint),
+    );
     min = min.saturating_add(
         params
             .schema_bytes_min_balance
@@ -259,13 +263,14 @@ impl LedgerSnapshot {
             // different round than those read earlier, violating
             // point-in-time consistency.
             let current = l.current_round();
-            assert!(
-                current == self.snapshot_round,
-                "ledger advanced from round {} to {} during block evaluation; \
-                 snapshot consistency violated",
-                self.snapshot_round.0,
-                current.0,
-            );
+            if current != self.snapshot_round {
+                warn!(
+                    snapshot_round = self.snapshot_round.0,
+                    current_round = current.0,
+                    "ledger advanced during block evaluation; snapshot consistency violated"
+                );
+                return None;
+            }
             l.get_account(addr)
         };
         self.accounts.insert(*addr, result.clone());
@@ -295,18 +300,42 @@ struct CowOverlay {
     leases: HashMap<(Address, [u8; 32]), u64>,
     /// Transaction IDs seen within this block, for duplicate detection.
     seen_txids: HashSet<[u8; 32]>,
+    /// Auth-addr (rekey) overrides accumulated during block evaluation.
+    /// Maps sender address to their new auth_addr after a RekeyTo transaction.
+    /// `Some(addr)` means rekeyed to `addr`; `None` means rekeyed back to self
+    /// (auth_addr cleared). Mirrors Go's `apply.Rekey()` which updates
+    /// `acct.AuthAddr` in the cow state.
+    auth_addr_deltas: HashMap<Address, Option<Address>>,
 }
 
-/// A checkpoint of `CowOverlay` state for tentative-apply rollback.
+/// Lease key type used in the COW overlay: (sender, lease_bytes).
+type LeaseKey = (Address, [u8; 32]);
+
+/// An incremental checkpoint of `CowOverlay` state for tentative-apply rollback.
 ///
-/// Before applying a group, we capture the current overlay state. If any
-/// check fails after tentative apply (e.g. min-balance violation), we
-/// restore the overlay to this checkpoint so the rejected group leaves
-/// no trace.
+/// Instead of cloning all three collections (expensive near the 5000-txn limit),
+/// we record only the keys that changed since the checkpoint was taken. On
+/// rollback we iterate these small vecs and undo each change. On commit we
+/// simply drop the checkpoint (clearing the tracking vecs).
+///
+/// This mirrors the conceptual pattern of Go's child-cow: only the delta
+/// needs to be unwound, not the entire state.
 struct CowCheckpoint {
-    balance_deltas: HashMap<Address, u64>,
-    leases: HashMap<(Address, [u8; 32]), u64>,
-    seen_txids: HashSet<[u8; 32]>,
+    /// Balance keys modified since the checkpoint.
+    /// Stores (address, Option<old_balance>). `None` means the key did not
+    /// exist before the checkpoint — on rollback we remove it.
+    balance_keys: Vec<(Address, Option<u64>)>,
+    /// Lease keys added since the checkpoint.
+    /// Stores (key, Option<old_last_valid>). `None` means the lease was new
+    /// — on rollback we remove it.
+    lease_keys: Vec<(LeaseKey, Option<u64>)>,
+    /// Transaction IDs added since the checkpoint — on rollback we remove them.
+    txid_keys: Vec<[u8; 32]>,
+    /// Auth-addr keys modified since the checkpoint.
+    /// Stores (address, Option<old_auth_addr>). The outer `Option` follows
+    /// the same convention as balance_keys: `None` means the key did not
+    /// exist before — on rollback we remove it.
+    auth_addr_keys: Vec<(Address, Option<Option<Address>>)>,
 }
 
 impl CowOverlay {
@@ -315,24 +344,122 @@ impl CowOverlay {
             balance_deltas: HashMap::new(),
             leases: HashMap::new(),
             seen_txids: HashSet::new(),
+            auth_addr_deltas: HashMap::new(),
         }
     }
 
-    /// Create a checkpoint of the current overlay state for rollback.
+    /// Create an incremental checkpoint for rollback.
+    ///
+    /// This is O(1) — it just initialises empty tracking vecs. All
+    /// subsequent mutations (via `set_balance_tracked`, `record_txid_tracked`,
+    /// `record_lease_tracked`) will record the old value so we can undo them.
     fn checkpoint(&self) -> CowCheckpoint {
         CowCheckpoint {
-            balance_deltas: self.balance_deltas.clone(),
-            leases: self.leases.clone(),
-            seen_txids: self.seen_txids.clone(),
+            balance_keys: Vec::new(),
+            lease_keys: Vec::new(),
+            txid_keys: Vec::new(),
+            auth_addr_keys: Vec::new(),
         }
     }
 
-    /// Restore the overlay to a previous checkpoint, discarding all
-    /// mutations made since the checkpoint was taken.
+    /// Restore the overlay to a previous checkpoint by undoing only the
+    /// mutations recorded since the checkpoint was taken.
     fn restore(&mut self, cp: CowCheckpoint) {
-        self.balance_deltas = cp.balance_deltas;
-        self.leases = cp.leases;
-        self.seen_txids = cp.seen_txids;
+        // Undo balance changes.
+        for (addr, old_val) in cp.balance_keys {
+            match old_val {
+                Some(v) => {
+                    self.balance_deltas.insert(addr, v);
+                }
+                None => {
+                    self.balance_deltas.remove(&addr);
+                }
+            }
+        }
+        // Undo lease changes.
+        for (key, old_val) in cp.lease_keys {
+            match old_val {
+                Some(v) => {
+                    self.leases.insert(key, v);
+                }
+                None => {
+                    self.leases.remove(&key);
+                }
+            }
+        }
+        // Undo txid additions.
+        for txid in cp.txid_keys {
+            self.seen_txids.remove(&txid);
+        }
+        // Undo auth_addr changes.
+        for (addr, old_val) in cp.auth_addr_keys {
+            match old_val {
+                Some(v) => {
+                    self.auth_addr_deltas.insert(addr, v);
+                }
+                None => {
+                    self.auth_addr_deltas.remove(&addr);
+                }
+            }
+        }
+    }
+
+    /// Set a balance in the overlay and record the old value in the checkpoint
+    /// for potential rollback. If `cp` is `None`, behaves like `set_balance`.
+    fn set_balance_tracked(&mut self, addr: &Address, balance: u64, cp: &mut CowCheckpoint) {
+        let old = self.balance_deltas.insert(*addr, balance);
+        cp.balance_keys.push((*addr, old));
+    }
+
+    /// Record a transaction ID and track it in the checkpoint for rollback.
+    fn record_txid_tracked(&mut self, txid: [u8; 32], cp: &mut CowCheckpoint) {
+        self.seen_txids.insert(txid);
+        cp.txid_keys.push(txid);
+    }
+
+    /// Record a lease and track the old value in the checkpoint for rollback.
+    fn record_lease_tracked(
+        &mut self,
+        sender: &Address,
+        lease: &[u8; 32],
+        last_valid: u64,
+        cp: &mut CowCheckpoint,
+    ) {
+        if *lease == [0u8; 32] {
+            return;
+        }
+        let key = (*sender, *lease);
+        let old = self.leases.insert(key, last_valid);
+        cp.lease_keys.push((key, old));
+    }
+
+    /// Record a rekey (auth_addr change) in the overlay with checkpoint tracking.
+    ///
+    /// Mirrors Go's `apply.Rekey()`: if `rekey_to == sender`, the auth_addr is
+    /// cleared (set to `None`); otherwise it is set to the new address.
+    fn set_auth_addr_tracked(
+        &mut self,
+        sender: &Address,
+        rekey_to: &Address,
+        cp: &mut CowCheckpoint,
+    ) {
+        let old = self.auth_addr_deltas.get(sender).cloned();
+        // Special case: rekeying to self clears the auth_addr (Go sets it to Address{}).
+        let new_auth = if rekey_to == sender {
+            None
+        } else {
+            Some(*rekey_to)
+        };
+        self.auth_addr_deltas.insert(*sender, new_auth);
+        cp.auth_addr_keys.push((*sender, old));
+    }
+
+    /// Get the auth_addr override for an address from the overlay.
+    /// Returns `Some(Some(addr))` if rekeyed to `addr`, `Some(None)` if
+    /// rekeyed back to self (auth_addr cleared), `None` if the overlay has
+    /// no entry (caller should fall back to the snapshot/ledger).
+    fn get_auth_addr(&self, addr: &Address) -> Option<Option<Address>> {
+        self.auth_addr_deltas.get(addr).cloned()
     }
 
     /// Check whether a lease conflicts with an already-included transaction
@@ -358,6 +485,8 @@ impl CowOverlay {
     }
 
     /// Record a lease in the overlay. No-op for zero leases.
+    /// Used only in tests; production code uses `record_lease_tracked`.
+    #[cfg(test)]
     fn record_lease(&mut self, sender: &Address, lease: &[u8; 32], last_valid: u64) {
         if *lease == [0u8; 32] {
             return;
@@ -376,6 +505,8 @@ impl CowOverlay {
     }
 
     /// Record a transaction ID in the overlay.
+    /// Used only in tests; production code uses `record_txid_tracked`.
+    #[cfg(test)]
     fn record_txid(&mut self, txid: [u8; 32]) {
         self.seen_txids.insert(txid);
     }
@@ -388,6 +519,8 @@ impl CowOverlay {
     }
 
     /// Set the effective balance for an address in the overlay.
+    /// Used only in tests; production code uses `set_balance_tracked`.
+    #[cfg(test)]
     fn set_balance(&mut self, addr: &Address, balance: u64) {
         self.balance_deltas.insert(*addr, balance);
     }
@@ -446,11 +579,16 @@ impl SimpleBlockEvaluator {
     }
 
     /// Perform stateless validation only (well-formedness, group ID, fees,
-    /// signatures). Used by `test_transaction_group` which takes `&self`.
-    fn validate_group_stateless(
+    /// signatures). Returns the group with genesis fields restored so that
+    /// `validate_group` can reuse it for txid computation without cloning
+    /// the group a second time.
+    ///
+    /// Used by `test_transaction_group` (which takes `&self`) via
+    /// a thin wrapper that discards the returned Vec.
+    fn validate_group_stateless_inner(
         &self,
         txgroup: &[algo_types::SignedTransaction],
-    ) -> Result<(), algo_error::AlgoError> {
+    ) -> Result<Vec<algo_types::SignedTransaction>, algo_error::AlgoError> {
         if txgroup.is_empty() {
             return Err(algo_error::AlgoError::Validation {
                 message: "empty transaction group".into(),
@@ -536,7 +674,17 @@ impl SimpleBlockEvaluator {
             )?;
         }
 
-        Ok(())
+        Ok(restored)
+    }
+
+    /// Perform stateless validation only, discarding the restored group.
+    /// Convenience wrapper for `test_transaction_group` which only needs
+    /// the pass/fail result.
+    fn validate_group_stateless(
+        &self,
+        txgroup: &[algo_types::SignedTransaction],
+    ) -> Result<(), algo_error::AlgoError> {
+        self.validate_group_stateless_inner(txgroup).map(|_| ())
     }
 
     /// Validate a transaction group using both stateless and stateful checks.
@@ -547,25 +695,17 @@ impl SimpleBlockEvaluator {
     /// Checks performed (in addition to stateless):
     /// 6. Transaction ID duplicate detection (in-block overlay + ledger)
     /// 7. Lease uniqueness check (in-block overlay + ledger snapshot)
-    /// 8. Sender balance precheck (fee + amount against overlay/snapshot)
+    /// 8. Rekey/auth-addr validation (authorizer matches ledger's auth_addr)
+    /// 9. Sender balance precheck (fee + amount against overlay/snapshot)
     fn validate_group(
         &mut self,
         txgroup: &[algo_types::SignedTransaction],
     ) -> Result<(), algo_error::AlgoError> {
-        // Run all stateless checks first.
-        self.validate_group_stateless(txgroup)?;
+        // Run all stateless checks first; reuse the restored (genesis fields
+        // populated) copies rather than cloning + restoring the group again.
+        let restored = self.validate_group_stateless_inner(txgroup)?;
 
         let round = self.hdr.round;
-
-        // Build restored copies with genesis fields for txid computation.
-        let restored: Vec<algo_types::SignedTransaction> = txgroup
-            .iter()
-            .map(|stx| {
-                let mut r = stx.clone();
-                self.restore_genesis_fields(&mut r);
-                r
-            })
-            .collect();
 
         // 6. Transaction ID duplicate detection.
         // Compute txid for each transaction (with genesis fields restored)
@@ -614,7 +754,37 @@ impl SimpleBlockEvaluator {
             }
         }
 
-        // 8. Sender balance precheck.
+        // 8. Rekey/auth-addr validation.
+        // Mirrors Go's `transaction()` (eval.go:1183-1195): verify that
+        // the transaction's claimed authorizer matches the ledger's expected
+        // authorizer for the sender. If the sender has been rekeyed, the
+        // signature must be from the rekeyed-to address.
+        //
+        // The "authorizer" of a signed transaction is:
+        //   - `stx.auth_addr` if set (non-None), else `stx.txn.sender`
+        // The "correct authorizer" from the ledger is:
+        //   - `acct.auth_addr` if set (non-zero), else `sender`
+        for stx in txgroup {
+            let sender = &stx.txn.sender;
+            let correct_authorizer = self.expected_authorizer(sender);
+
+            // The transaction's claimed authorizer (Go's txn.Authorizer()).
+            let txn_authorizer = match &stx.auth_addr {
+                Some(addr) => *addr,
+                None => stx.txn.sender,
+            };
+
+            if txn_authorizer != correct_authorizer {
+                return Err(algo_error::AlgoError::Validation {
+                    message: format!(
+                        "transaction should have been authorized by {} but was actually authorized by {}",
+                        correct_authorizer, txn_authorizer,
+                    ),
+                });
+            }
+        }
+
+        // 9. Sender balance precheck.
         // Verify each sender has sufficient balance for fee + amount (for
         // payment transactions). This is a read-only precheck — actual
         // balance mutation is deferred to transaction_group() on acceptance.
@@ -651,18 +821,41 @@ impl SimpleBlockEvaluator {
 }
 
 impl SimpleBlockEvaluator {
+    /// Compute the reward-adjusted balance for an account.
+    ///
+    /// Mirrors Go's `WithUpdatedRewards()` in `data/basics/userBalance.go`:
+    /// before any debit/credit, the raw `MicroAlgos` is adjusted by pending
+    /// rewards that have accrued since the account's `RewardsBase` was last
+    /// updated. `NotParticipating` accounts are excluded from rewards.
+    ///
+    /// Formula:
+    ///   reward_units = micro_algos / consensus.reward_unit
+    ///   rewards_delta = block.rewards_level - account.rewards_base
+    ///   pending = reward_units * rewards_delta
+    ///   adjusted = micro_algos + pending
+    fn balance_with_rewards(&self, acct: &AccountData) -> u64 {
+        algo_ledger::compute_pending_rewards(acct, self.hdr.rewards_level)
+            .checked_add(acct.micro_algos)
+            .unwrap_or(acct.micro_algos)
+    }
+
     /// Get the effective balance for an address, checking the overlay first
     /// then falling back to the snapshot/ledger.
     ///
     /// This is the single source of truth for balance lookups during
     /// evaluation, ensuring cross-group visibility of balance changes.
+    ///
+    /// When reading from the snapshot, the balance is adjusted for pending
+    /// rewards using `balance_with_rewards()`, mirroring Go's
+    /// `WithUpdatedRewards()` which is called in `Move()` and balance
+    /// operations before any debit or credit.
     fn effective_balance(&mut self, addr: &Address) -> u64 {
         match self.overlay.get_balance(addr) {
             Some(bal) => bal,
             None => self
                 .snapshot
                 .get_account(addr, &self.ledger)
-                .map(|acct| acct.micro_algos)
+                .map(|acct| self.balance_with_rewards(&acct))
                 .unwrap_or(0),
         }
     }
@@ -674,6 +867,37 @@ impl SimpleBlockEvaluator {
     /// during payment-only evaluation.
     fn get_account_data(&mut self, addr: &Address) -> Option<AccountData> {
         self.snapshot.get_account(addr, &self.ledger)
+    }
+
+    /// Determine the expected authorizer for a sender address.
+    ///
+    /// Mirrors Go's rekey check in `transaction()` (eval.go:1183-1195):
+    /// 1. Check the COW overlay for a rekey delta from an earlier transaction
+    ///    in this block.
+    /// 2. Fall back to the ledger snapshot's `auth_addr` field.
+    /// 3. If the account has no auth_addr set, the sender itself is the
+    ///    expected authorizer.
+    ///
+    /// Returns the address that must match `txn.Authorizer()` (i.e.,
+    /// `stx.auth_addr` if set, else `stx.txn.sender`).
+    fn expected_authorizer(&mut self, sender: &Address) -> Address {
+        // 1. Check overlay for rekey delta from earlier in this block.
+        if let Some(overlay_auth) = self.overlay.get_auth_addr(sender) {
+            return match overlay_auth {
+                Some(addr) => addr,
+                None => *sender, // rekeyed back to self
+            };
+        }
+        // 2. Fall back to ledger snapshot.
+        if let Some(acct) = self.snapshot.get_account(sender, &self.ledger) {
+            if let Some(auth) = acct.auth_addr {
+                if auth != Address::default() {
+                    return auth;
+                }
+            }
+        }
+        // 3. Default: sender is its own authorizer.
+        *sender
     }
 }
 
@@ -775,12 +999,13 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         }
 
         // ── Tentative apply with rollback ────────────────────────────
-        // Checkpoint the overlay before making any mutations. If the
-        // min-balance check (or any later check) fails, we restore the
-        // overlay to this checkpoint so the rejected group leaves no
-        // trace. This mirrors Go's child-cow pattern where
-        // `cow.commitToParent()` is only called after all checks pass.
-        let checkpoint = self.overlay.checkpoint();
+        // Create an incremental checkpoint before making any mutations.
+        // If the min-balance check (or any later check) fails, we restore
+        // only the mutations tracked by the checkpoint, avoiding the cost
+        // of cloning the entire overlay. This mirrors Go's child-cow
+        // pattern where `cow.commitToParent()` is only called after all
+        // checks pass.
+        let mut checkpoint = self.overlay.checkpoint();
         let fees_collected_checkpoint = self.fees_collected;
 
         // The FeeSink address from the block header. Fees are credited
@@ -791,6 +1016,9 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // Record txids, leases, and balance deltas in the COW overlay.
         // This mirrors Go's cow.addTx() which records txids and leases,
         // and the balance mutations from applyTransaction().
+        //
+        // All mutations use the `_tracked` variants so the checkpoint
+        // records what to undo on rollback.
         for stx in txgroup {
             // Restore genesis fields for txid computation.
             let mut restored = stx.clone();
@@ -798,12 +1026,16 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
 
             // Record transaction ID.
             let txid = compute_txid(&restored.txn);
-            self.overlay.record_txid(txid);
+            self.overlay.record_txid_tracked(txid, &mut checkpoint);
 
             // Record lease if non-zero.
             if stx.txn.lease != [0u8; 32] {
-                self.overlay
-                    .record_lease(&stx.txn.sender, &stx.txn.lease, stx.txn.last_valid.0);
+                self.overlay.record_lease_tracked(
+                    &stx.txn.sender,
+                    &stx.txn.lease,
+                    stx.txn.last_valid.0,
+                    &mut checkpoint,
+                );
             }
 
             // Update balances in overlay following Go's apply.Payment() order:
@@ -817,11 +1049,19 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
 
             // Credit fee to FeeSink (mirrors Go's takeFee -> cow.Move).
             // Track fees_collected running total for the block header.
+            // When the sender IS the FeeSink, Go's takeFee does NOT add
+            // the fee to feesCollected (eval.go:1253-1254) because there
+            // are no net algos added to the Sink.
             if stx.txn.fee > 0 {
                 let fee_sink_balance = self.effective_balance(&fee_sink);
-                self.overlay
-                    .set_balance(&fee_sink, fee_sink_balance.saturating_add(stx.txn.fee));
-                self.fees_collected = self.fees_collected.saturating_add(stx.txn.fee);
+                self.overlay.set_balance_tracked(
+                    &fee_sink,
+                    fee_sink_balance.saturating_add(stx.txn.fee),
+                    &mut checkpoint,
+                );
+                if sender != &fee_sink {
+                    self.fees_collected = self.fees_collected.saturating_add(stx.txn.fee);
+                }
             }
 
             // Credit receiver for payment transactions.
@@ -833,17 +1073,27 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 if receiver == sender {
                     // Self-payment: fee is debited but amount is a no-op
                     // (debit and credit cancel out). Just debit fee.
-                    self.overlay.set_balance(sender, sender_after_fee);
+                    self.overlay
+                        .set_balance_tracked(sender, sender_after_fee, &mut checkpoint);
                 } else {
                     let recv_balance = self.effective_balance(receiver);
-                    self.overlay
-                        .set_balance(receiver, recv_balance.saturating_add(stx.txn.amount));
-                    self.overlay
-                        .set_balance(sender, sender_after_fee.saturating_sub(stx.txn.amount));
+                    self.overlay.set_balance_tracked(
+                        receiver,
+                        recv_balance.saturating_add(stx.txn.amount),
+                        &mut checkpoint,
+                    );
+                    self.overlay.set_balance_tracked(
+                        sender,
+                        sender_after_fee.saturating_sub(stx.txn.amount),
+                        &mut checkpoint,
+                    );
                 }
             } else {
-                self.overlay
-                    .set_balance(sender, sender_after_fee.saturating_sub(stx.txn.amount));
+                self.overlay.set_balance_tracked(
+                    sender,
+                    sender_after_fee.saturating_sub(stx.txn.amount),
+                    &mut checkpoint,
+                );
             }
 
             // Handle close_remainder_to: the sender's entire remaining
@@ -856,11 +1106,28 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 let remaining = self.effective_balance(sender);
                 if remaining > 0 && close_addr != sender {
                     let close_balance = self.effective_balance(close_addr);
-                    self.overlay
-                        .set_balance(close_addr, close_balance.saturating_add(remaining));
+                    self.overlay.set_balance_tracked(
+                        close_addr,
+                        close_balance.saturating_add(remaining),
+                        &mut checkpoint,
+                    );
                 }
                 // Sender balance goes to zero after close.
-                self.overlay.set_balance(sender, 0);
+                self.overlay.set_balance_tracked(sender, 0, &mut checkpoint);
+            }
+
+            // Handle RekeyTo: update the sender's auth_addr in the overlay.
+            // Mirrors Go's `apply.Rekey()` (apply.go:113-128) which is called
+            // in `applyTransaction()` after `takeFee()`. If RekeyTo == sender,
+            // the auth_addr is cleared (rekeyed back to self). Otherwise the
+            // auth_addr is set to the RekeyTo address. This ensures subsequent
+            // transactions from the same sender in this block see the updated
+            // authorizer.
+            if let Some(rekey_to) = &stx.txn.rekey_to {
+                if *rekey_to != Address::default() {
+                    self.overlay
+                        .set_auth_addr_tracked(sender, rekey_to, &mut checkpoint);
+                }
             }
         }
 
@@ -887,6 +1154,16 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         }
 
         for addr in &modified_addrs {
+            // Skip FeeSink, RewardsPool, and StateProofSender from
+            // min-balance checks, matching Go's checkMinBalance
+            // (eval.go:1113-1119).
+            if *addr == self.hdr.fee_sink
+                || *addr == self.hdr.rewards_pool
+                || *addr == Address::STATE_PROOF_SENDER
+            {
+                continue;
+            }
+
             let balance = self.effective_balance(addr);
             // A zero balance is valid (account closed/deleted), matching
             // Go's `if data.IsZero() { continue }` in checkMinBalance.
@@ -909,6 +1186,22 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                     message: format!(
                         "account {} balance {} below minimum {} after transaction group",
                         addr, balance, min_bal,
+                    ),
+                });
+            }
+            // Check MaximumMinimumBalance: if the effective min exceeds
+            // this threshold, the transaction is rejected. Mirrors Go's
+            // checkMinBalance (eval.go:1146-1149). The field is 0 (no
+            // limit) from v32+, but earlier versions enforce it.
+            let max_min = self.consensus_params.maximum_minimum_balance;
+            if max_min > 0 && min_bal > max_min {
+                self.overlay.restore(checkpoint);
+                self.fees_collected = fees_collected_checkpoint;
+                return Err(algo_error::AlgoError::Validation {
+                    message: format!(
+                        "account {} would use too much space after this transaction. \
+                         Minimum balance requirements would be {} (greater than max {})",
+                        addr, min_bal, max_min,
                     ),
                 });
             }
@@ -1039,12 +1332,15 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
 
     fn consensus_params(
         &self,
-        _round: Round,
+        round: Round,
     ) -> Result<algo_types::ConsensusParams, algo_error::AlgoError> {
-        // Return V41 params as a reasonable default.
-        algo_types::consensus::consensus_params_for_version(algo_types::CONSENSUS_V41).ok_or_else(
+        let hdr = self.block_hdr(round)?;
+        algo_types::consensus::consensus_params_for_version(&hdr.current_protocol).ok_or_else(
             || algo_error::AlgoError::Ledger {
-                message: "could not look up v41 consensus params".into(),
+                message: format!(
+                    "unknown protocol version '{}' in block header for round {}",
+                    hdr.current_protocol, round.0
+                ),
             },
         )
     }
@@ -1055,14 +1351,19 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
         _payset_hint: usize,
         max_txn_bytes_per_block: usize,
     ) -> Result<Box<dyn algo_pool::traits::BlockEvaluator>, algo_error::AlgoError> {
-        let consensus_params =
-            algo_types::consensus::consensus_params_for_version(&hdr.current_protocol)
-                .or_else(|| {
-                    algo_types::consensus::consensus_params_for_version(algo_types::CONSENSUS_V41)
-                })
-                .ok_or_else(|| algo_error::AlgoError::Ledger {
-                    message: "could not look up consensus params for block evaluator".into(),
-                })?;
+        let consensus_params = algo_types::consensus::consensus_params_for_version(
+            &hdr.current_protocol,
+        )
+        .ok_or_else(|| {
+            // Go returns protocol.Error(hdr.CurrentProtocol) for unknown
+            // versions — do the same instead of silently falling back.
+            algo_error::AlgoError::Ledger {
+                message: format!(
+                    "unknown protocol version '{}' in block header",
+                    hdr.current_protocol
+                ),
+            }
+        })?;
 
         // Snapshot the ledger state at evaluator creation time.
         // This briefly acquires the mutex, captures lease state, then releases.
@@ -1590,17 +1891,18 @@ mod tests {
         let txid1 = [0x01; 32];
         overlay.record_txid(txid1);
 
-        // Checkpoint
-        let cp = overlay.checkpoint();
+        // Checkpoint (incremental — records nothing initially)
+        let mut cp = overlay.checkpoint();
 
-        // Mutate
-        overlay.set_balance(&addr, 100);
+        // Mutate using tracked variants so changes are recorded in the
+        // checkpoint for rollback.
+        overlay.set_balance_tracked(&addr, 100, &mut cp);
         let txid2 = [0x02; 32];
-        overlay.record_txid(txid2);
+        overlay.record_txid_tracked(txid2, &mut cp);
         assert_eq!(overlay.get_balance(&addr), Some(100));
         assert!(overlay.check_txid(&txid2).is_err());
 
-        // Rollback
+        // Rollback — only the tracked mutations are undone.
         overlay.restore(cp);
         assert_eq!(overlay.get_balance(&addr), Some(500_000));
         // txid2 should no longer be seen
@@ -2589,13 +2891,8 @@ mod tests {
             ..Default::default()
         };
 
-        let mut eval = make_evaluator_with_accounts(
-            &ledger,
-            &params,
-            100,
-            &[],
-            &[(sender, sender_acct)],
-        );
+        let mut eval =
+            make_evaluator_with_accounts(&ledger, &params, 100, &[], &[(sender, sender_acct)]);
 
         // fee=1000, amount=199_000 -> sender after = 500_000 - 200_000 = 300_000
         // effective min balance = 100_000 + 3*100_000 = 400_000
@@ -2622,13 +2919,8 @@ mod tests {
             ..Default::default()
         };
 
-        let mut eval = make_evaluator_with_accounts(
-            &ledger,
-            &params,
-            100,
-            &[],
-            &[(sender, sender_acct)],
-        );
+        let mut eval =
+            make_evaluator_with_accounts(&ledger, &params, 100, &[], &[(sender, sender_acct)]);
 
         // fee=1000, amount=0 -> sender after = 999_000
         // effective min balance = 100_000 + 3*100_000 = 400_000
@@ -2942,5 +3234,579 @@ mod tests {
             1000,
             "FeeSink balance should be rolled back on rejection"
         );
+    }
+
+    // ====================================================================
+    // F6. sender == close_remainder_to test
+    // ====================================================================
+
+    #[test]
+    fn close_remainder_to_self_zeros_sender() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(200);
+        let (receiver, _) = test_keypair(201);
+        // Sender: 1_000_000, fee=1000, amount=100_000
+        // close_remainder_to = sender (self-close)
+        // After fee + amount: 1_000_000 - 1000 - 100_000 = 899_000
+        // Close to self: remaining goes to sender... but sender is set to 0.
+        // Net result: sender ends at 0, receiver gets 100_000.
+        // The close-to-self should NOT double-credit because the code
+        // skips the credit when close_addr == sender.
+        let initial_receiver_balance = 100_000u64;
+        let mut eval = make_evaluator(
+            &ledger,
+            &params,
+            100,
+            &[(sender, 1_000_000), (receiver, initial_receiver_balance)],
+        );
+
+        let mut stx = make_signed_pay(&key, &sender, &receiver, 100_000, 1000, 100);
+        stx.txn.close_remainder_to = sender; // close to self
+        stx.sig = sign_txn(&stx.txn, &key);
+
+        assert!(eval.transaction_group(&[stx]).is_ok());
+
+        // Sender should be zero (closed)
+        assert_eq!(
+            eval.effective_balance(&sender),
+            0,
+            "sender should be zero after self-close"
+        );
+        // Receiver should get the amount
+        assert_eq!(
+            eval.effective_balance(&receiver),
+            initial_receiver_balance + 100_000,
+            "receiver should get the payment amount"
+        );
+    }
+
+    // ====================================================================
+    // F7. sender == fee_sink: fees_collected NOT incremented
+    // ====================================================================
+
+    #[test]
+    fn sender_is_fee_sink_no_fees_collected_increment() {
+        let ledger = test_ledger();
+        let params = v41_params();
+        // Use a deterministic address as FeeSink. We need the sender to
+        // BE the fee_sink address.
+        let (fee_sink_addr, fee_sink_key) = test_keypair(210);
+        let (receiver, _) = test_keypair(211);
+
+        let mut snapshot = LedgerSnapshot {
+            accounts: HashMap::new(),
+            lease_table: algo_ledger::LeaseTable::new(),
+            round: 100,
+            snapshot_round: Round(0),
+        };
+        snapshot.accounts.insert(
+            fee_sink_addr,
+            Some(algo_types::AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            }),
+        );
+        snapshot.accounts.insert(
+            receiver,
+            Some(algo_types::AccountData {
+                micro_algos: 100_000,
+                ..Default::default()
+            }),
+        );
+
+        let mut eval = SimpleBlockEvaluator {
+            hdr: BlockHeader {
+                round: Round(100),
+                genesis_id: "test-v1".to_string(),
+                genesis_hash: [0xAA; 32],
+                current_protocol: CONSENSUS_V41.to_string(),
+                fee_sink: fee_sink_addr, // FeeSink IS the sender
+                ..Default::default()
+            },
+            consensus_params: params.clone(),
+            included_txns: Vec::new(),
+            txn_bytes: 0,
+            max_txn_bytes: params.max_txn_bytes_per_block as usize,
+            ledger: ledger.clone(),
+            snapshot,
+            overlay: CowOverlay::new(),
+            fees_collected: 0,
+        };
+
+        // Send a transaction FROM the FeeSink address
+        let stx = make_signed_pay(&fee_sink_key, &fee_sink_addr, &receiver, 1000, 1000, 100);
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "transaction from FeeSink should succeed"
+        );
+
+        // fees_collected should NOT be incremented when sender == FeeSink
+        assert_eq!(
+            eval.fees_collected, 0,
+            "fees_collected should not be incremented when sender is the FeeSink"
+        );
+    }
+
+    // ====================================================================
+    // 16. Rekey / auth-addr validation tests
+    // ====================================================================
+
+    /// Helper: build a signed payment txn with a custom auth_addr field.
+    /// The transaction is signed by `signer_key` and the `auth_addr` on
+    /// the SignedTransaction is set to `auth_addr_opt`.
+    fn make_signed_pay_with_auth(
+        signer_key: &SigningKey,
+        sender: &Address,
+        receiver: &Address,
+        amount: u64,
+        fee: u64,
+        round: u64,
+        auth_addr_opt: Option<Address>,
+    ) -> SignedTransaction {
+        let txn = Transaction {
+            txn_type: TxnType::Pay,
+            sender: *sender,
+            receiver: *receiver,
+            amount,
+            fee,
+            first_valid: Round(round),
+            last_valid: Round(round + 1000),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            ..Default::default()
+        };
+        let sig = sign_txn(&txn, signer_key);
+        SignedTransaction {
+            txn,
+            sig,
+            auth_addr: auth_addr_opt,
+            ..Default::default()
+        }
+    }
+
+    /// Helper: build a signed payment txn with rekey_to set.
+    #[allow(clippy::too_many_arguments)]
+    fn make_signed_pay_with_rekey(
+        signer_key: &SigningKey,
+        sender: &Address,
+        receiver: &Address,
+        amount: u64,
+        fee: u64,
+        round: u64,
+        auth_addr_opt: Option<Address>,
+        rekey_to: Address,
+    ) -> SignedTransaction {
+        let txn = Transaction {
+            txn_type: TxnType::Pay,
+            sender: *sender,
+            receiver: *receiver,
+            amount,
+            fee,
+            first_valid: Round(round),
+            last_valid: Round(round + 1000),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            rekey_to: Some(rekey_to),
+            ..Default::default()
+        };
+        let sig = sign_txn(&txn, signer_key);
+        SignedTransaction {
+            txn,
+            sig,
+            auth_addr: auth_addr_opt,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rekey_correct_auth_addr_passes() {
+        // Account has been rekeyed in the ledger. Transaction with the
+        // correct auth_addr should pass validation.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, _sender_key) = test_keypair(160);
+        let (receiver, _) = test_keypair(161);
+        let (auth, auth_key) = test_keypair(162);
+
+        // Set up the sender's account with auth_addr pointing to the
+        // auth key (simulating a prior rekey).
+        let sender_acct = AccountData {
+            micro_algos: 10_000_000,
+            auth_addr: Some(auth),
+            ..Default::default()
+        };
+        let mut eval =
+            make_evaluator_with_accounts(&ledger, &params, 100, &[], &[(sender, sender_acct)]);
+
+        // Transaction is signed by auth_key, auth_addr=Some(auth).
+        let stx =
+            make_signed_pay_with_auth(&auth_key, &sender, &receiver, 0, 1000, 100, Some(auth));
+
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "rekeyed account with correct auth_addr should be accepted"
+        );
+    }
+
+    #[test]
+    fn rekey_wrong_auth_addr_rejected() {
+        // Account has been rekeyed in the ledger. Transaction with the
+        // wrong auth_addr (signed by original sender key) should fail.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, sender_key) = test_keypair(163);
+        let (receiver, _) = test_keypair(164);
+        let (auth, _auth_key) = test_keypair(165);
+
+        // Sender has auth_addr = auth (rekeyed).
+        let sender_acct = AccountData {
+            micro_algos: 10_000_000,
+            auth_addr: Some(auth),
+            ..Default::default()
+        };
+        let mut eval =
+            make_evaluator_with_accounts(&ledger, &params, 100, &[], &[(sender, sender_acct)]);
+
+        // Transaction is signed by sender_key (wrong!) with no auth_addr.
+        // The authorizer is sender, but the ledger expects auth.
+        let stx = make_signed_pay_with_auth(&sender_key, &sender, &receiver, 0, 1000, 100, None);
+
+        let err = eval.transaction_group(&[stx]).unwrap_err();
+        assert!(
+            err.to_string().contains("should have been authorized by"),
+            "expected auth-addr mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rekey_missing_auth_addr_rejected() {
+        // Account has been rekeyed but the transaction doesn't set
+        // auth_addr at all (authorizer = sender, expected = auth).
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, sender_key) = test_keypair(166);
+        let (receiver, _) = test_keypair(167);
+        let (auth, _) = test_keypair(168);
+
+        let sender_acct = AccountData {
+            micro_algos: 10_000_000,
+            auth_addr: Some(auth),
+            ..Default::default()
+        };
+        let mut eval =
+            make_evaluator_with_accounts(&ledger, &params, 100, &[], &[(sender, sender_acct)]);
+
+        // No auth_addr on the transaction — authorizer defaults to sender.
+        let stx = make_signed_pay_with_auth(&sender_key, &sender, &receiver, 0, 1000, 100, None);
+
+        let err = eval.transaction_group(&[stx]).unwrap_err();
+        assert!(
+            err.to_string().contains("should have been authorized by"),
+            "expected auth-addr mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn non_rekeyed_account_with_auth_addr_rejected() {
+        // Account has NOT been rekeyed (auth_addr is None/zero in ledger).
+        // Transaction sets auth_addr to some other address — this should fail
+        // because the expected authorizer is the sender itself.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, _sender_key) = test_keypair(169);
+        let (receiver, _) = test_keypair(170);
+        let (other, other_key) = test_keypair(171);
+
+        // Sender has no auth_addr — not rekeyed.
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+
+        // Transaction claims auth_addr = other (wrong!).
+        let stx =
+            make_signed_pay_with_auth(&other_key, &sender, &receiver, 0, 1000, 100, Some(other));
+
+        let err = eval.transaction_group(&[stx]).unwrap_err();
+        assert!(
+            err.to_string().contains("should have been authorized by"),
+            "expected auth-addr mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rekey_to_within_block_affects_subsequent_txn() {
+        // Transaction 1: sender rekeys to auth via rekey_to.
+        // Transaction 2: sender must now use auth as authorizer.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, sender_key) = test_keypair(172);
+        let (receiver, _) = test_keypair(173);
+        let (auth, auth_key) = test_keypair(174);
+
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+
+        // Txn 1: sender sends a payment and rekeys to auth.
+        // Signed by sender_key (no auth_addr set), rekey_to = auth.
+        let stx1 =
+            make_signed_pay_with_rekey(&sender_key, &sender, &receiver, 0, 1000, 100, None, auth);
+        assert!(
+            eval.transaction_group(&[stx1]).is_ok(),
+            "rekey transaction should succeed"
+        );
+
+        // Txn 2: sender sends another payment, now signed by auth_key
+        // with auth_addr = auth. This should succeed because the overlay
+        // tracks the rekey from txn 1.
+        let stx2 =
+            make_signed_pay_with_auth(&auth_key, &sender, &receiver, 0, 1000, 100, Some(auth));
+        assert!(
+            eval.transaction_group(&[stx2]).is_ok(),
+            "post-rekey transaction with correct auth should succeed"
+        );
+    }
+
+    #[test]
+    fn rekey_to_within_block_old_key_rejected() {
+        // Transaction 1: sender rekeys to auth.
+        // Transaction 2: sender tries to use the old key — should fail.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, sender_key) = test_keypair(175);
+        let (receiver, _) = test_keypair(176);
+        let (auth, _auth_key) = test_keypair(177);
+
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+
+        // Txn 1: rekey to auth.
+        let stx1 =
+            make_signed_pay_with_rekey(&sender_key, &sender, &receiver, 0, 1000, 100, None, auth);
+        assert!(
+            eval.transaction_group(&[stx1]).is_ok(),
+            "rekey transaction should succeed"
+        );
+
+        // Txn 2: try to use sender_key (old key, no auth_addr).
+        let stx2 = make_signed_pay_with_auth(&sender_key, &sender, &receiver, 0, 1000, 100, None);
+        let err = eval.transaction_group(&[stx2]).unwrap_err();
+        assert!(
+            err.to_string().contains("should have been authorized by"),
+            "old key after rekey should be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rekey_back_to_self_restores_original_key() {
+        // Transaction 1: sender rekeys to auth.
+        // Transaction 2: sender (signed by auth) rekeys back to self.
+        // Transaction 3: sender uses original key — should succeed.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, sender_key) = test_keypair(178);
+        let (receiver, _) = test_keypair(179);
+        let (auth, auth_key) = test_keypair(180);
+
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 10_000_000)]);
+
+        // Txn 1: rekey sender -> auth.
+        let stx1 =
+            make_signed_pay_with_rekey(&sender_key, &sender, &receiver, 0, 1000, 100, None, auth);
+        assert!(
+            eval.transaction_group(&[stx1]).is_ok(),
+            "rekey to auth should succeed"
+        );
+
+        // Txn 2: rekey sender -> sender (rekey back to self), signed by auth.
+        let stx2 = make_signed_pay_with_rekey(
+            &auth_key,
+            &sender,
+            &receiver,
+            0,
+            1000,
+            100,
+            Some(auth),
+            sender,
+        );
+        assert!(
+            eval.transaction_group(&[stx2]).is_ok(),
+            "rekey back to self should succeed"
+        );
+
+        // Txn 3: sender uses original key (no auth_addr).
+        let stx3 = make_signed_pay_with_auth(&sender_key, &sender, &receiver, 0, 1000, 100, None);
+        assert!(
+            eval.transaction_group(&[stx3]).is_ok(),
+            "after rekeying back to self, original key should work"
+        );
+    }
+
+    // ====================================================================
+    // Reward-adjusted balance tests
+    // ====================================================================
+
+    /// Helper: build an evaluator with a non-zero rewards_level in the block
+    /// header, allowing tests to exercise reward-adjusted balance logic.
+    fn make_evaluator_with_rewards(
+        ledger: &Arc<Mutex<SqliteLedger>>,
+        params: &ConsensusParams,
+        round: u64,
+        rewards_level: u64,
+        full_accounts: &[(Address, AccountData)],
+    ) -> SimpleBlockEvaluator {
+        let mut snapshot = LedgerSnapshot {
+            accounts: HashMap::new(),
+            lease_table: algo_ledger::LeaseTable::new(),
+            round,
+            snapshot_round: Round(0),
+        };
+        for (addr, acct) in full_accounts {
+            snapshot.accounts.insert(*addr, Some(acct.clone()));
+        }
+        SimpleBlockEvaluator {
+            hdr: BlockHeader {
+                round: Round(round),
+                genesis_id: "test-v1".to_string(),
+                genesis_hash: [0xAA; 32],
+                current_protocol: CONSENSUS_V41.to_string(),
+                rewards_level,
+                ..Default::default()
+            },
+            consensus_params: params.clone(),
+            included_txns: Vec::new(),
+            txn_bytes: 0,
+            max_txn_bytes: params.max_txn_bytes_per_block as usize,
+            ledger: ledger.clone(),
+            snapshot,
+            overlay: CowOverlay::new(),
+            fees_collected: 0,
+        }
+    }
+
+    #[test]
+    fn reward_adjusted_effective_balance() {
+        // An account with 2_000_000 microAlgos (2 reward units) and
+        // rewards_base=10, with block rewards_level=20, should have
+        // pending rewards = (20-10) * (2_000_000 / 1_000_000) = 20.
+        // Effective balance = 2_000_000 + 20 = 2_000_020.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, _key) = test_keypair(1);
+        let acct = AccountData {
+            micro_algos: 2_000_000,
+            rewards_base: 10,
+            status: algo_types::AccountStatus::Online,
+            ..Default::default()
+        };
+        let mut eval = make_evaluator_with_rewards(&ledger, &params, 100, 20, &[(sender, acct)]);
+
+        assert_eq!(eval.effective_balance(&sender), 2_000_020);
+    }
+
+    #[test]
+    fn reward_adjusted_balance_allows_transfer_above_raw() {
+        // Sender has 1_000_000 raw microAlgos + pending rewards of 500_000.
+        // This means the sender can afford a transfer of up to ~1_500_000.
+        // Without reward adjustment, a 1_200_000 (amount + fee) transfer
+        // would be rejected because raw balance is only 1_000_000.
+        //
+        // Setup: 1_000_000 microAlgos, rewards_base=0, rewards_level=500_000.
+        // reward_units = 1_000_000 / 1_000_000 = 1
+        // pending = (500_000 - 0) * 1 = 500_000
+        // effective = 1_000_000 + 500_000 = 1_500_000
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(1);
+        let (receiver, _) = test_keypair(2);
+        let fee_sink = Address([0xFE; 32]);
+        let acct = AccountData {
+            micro_algos: 1_000_000,
+            rewards_base: 0,
+            status: algo_types::AccountStatus::Online,
+            ..Default::default()
+        };
+        // Also seed the fee_sink so it exists.
+        let fee_sink_acct = AccountData {
+            micro_algos: 10_000_000,
+            ..Default::default()
+        };
+        let mut eval = make_evaluator_with_rewards(
+            &ledger,
+            &params,
+            100,
+            500_000,
+            &[(sender, acct), (fee_sink, fee_sink_acct)],
+        );
+        eval.hdr.fee_sink = fee_sink;
+
+        // Send 1_199_000 + 1_000 fee = 1_200_000 total cost.
+        // Raw balance = 1_000_000 would fail, but reward-adjusted = 1_500_000 passes.
+        let stx = make_signed_pay(&key, &sender, &receiver, 1_199_000, 1_000, 100);
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "transfer should succeed with reward-adjusted balance"
+        );
+    }
+
+    #[test]
+    fn not_participating_gets_no_reward_adjustment() {
+        // NotParticipating accounts do not receive rewards, so the
+        // effective balance should equal the raw micro_algos.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, _key) = test_keypair(1);
+        let acct = AccountData {
+            micro_algos: 5_000_000,
+            rewards_base: 0,
+            status: algo_types::AccountStatus::NotParticipating,
+            ..Default::default()
+        };
+        let mut eval = make_evaluator_with_rewards(&ledger, &params, 100, 100, &[(sender, acct)]);
+
+        // Without reward adjustment, would be 5_000_000.
+        // With reward adjustment for Online, would be 5_000_000 + (100 * 5) = 5_000_500.
+        // But NotParticipating → no rewards → 5_000_000.
+        assert_eq!(eval.effective_balance(&sender), 5_000_000);
+    }
+
+    #[test]
+    fn reward_adjusted_balance_raw_below_threshold_but_adjusted_above() {
+        // Sender's raw balance is below the amount needed, but after
+        // reward adjustment the effective balance is sufficient.
+        // raw = 900_000, reward units = 0 (below 1 Algo), so no adjustment.
+        // This verifies sub-unit balances correctly get no reward boost.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, _key) = test_keypair(1);
+        let acct = AccountData {
+            micro_algos: 900_000,
+            rewards_base: 0,
+            status: algo_types::AccountStatus::Online,
+            ..Default::default()
+        };
+        let mut eval = make_evaluator_with_rewards(&ledger, &params, 100, 1_000, &[(sender, acct)]);
+
+        // reward_units = 900_000 / 1_000_000 = 0 (integer division)
+        // pending = 1000 * 0 = 0
+        // effective = 900_000
+        assert_eq!(eval.effective_balance(&sender), 900_000);
+    }
+
+    #[test]
+    fn reward_adjusted_balance_offline_still_gets_rewards() {
+        // Offline accounts (not NotParticipating) still receive rewards,
+        // matching Go's behavior where only NotParticipating is excluded.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, _key) = test_keypair(1);
+        let acct = AccountData {
+            micro_algos: 3_000_000,
+            rewards_base: 5,
+            status: algo_types::AccountStatus::Offline,
+            ..Default::default()
+        };
+        let mut eval = make_evaluator_with_rewards(&ledger, &params, 100, 15, &[(sender, acct)]);
+
+        // reward_units = 3_000_000 / 1_000_000 = 3
+        // pending = (15 - 5) * 3 = 30
+        // effective = 3_000_000 + 30 = 3_000_030
+        assert_eq!(eval.effective_balance(&sender), 3_000_030);
     }
 }
