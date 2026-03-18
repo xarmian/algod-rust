@@ -151,10 +151,7 @@ pub trait LedgerReader {
     ///
     /// Mirrors Go's `LedgerReader.Wait()` which returns a channel that fires
     /// when the round is available. In Rust we use a blocking call instead.
-    ///
-    /// TODO: This is currently a blocking call. When the agreement service is
-    /// implemented, this will need to become async (returning a Future or a
-    /// channel receiver) to avoid blocking the agreement event loop.
+    /// The non-blocking variant is available via `round_notify()`.
     fn wait_for_round(&self, round: Round) -> Result<(), LedgerError>;
 
     /// Returns a receiver that will receive a notification when the ledger

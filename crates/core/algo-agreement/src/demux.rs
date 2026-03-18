@@ -12,6 +12,7 @@
 //   - Pseudonode events (locally generated proposals/votes)
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
 use algo_types::Round;
@@ -23,9 +24,10 @@ use crate::events::{
     CompoundMessage, ConsensusVersionView, Event, EventType, InternalMessage, MessageEvent,
     RoundInterruptionEvent, TimeoutEvent,
 };
+use crate::ledger_reader::LedgerReader;
 use crate::traits::{
-    CryptoResult, CryptoVerifier, CryptoVoteVerifyResult, Message, AGREEMENT_VOTE_TAG,
-    PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
+    AgreementNetwork, CryptoResult, CryptoVerifier, CryptoVoteVerifyResult, Message,
+    AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
 };
 use crate::types::Deadline;
 use crate::vote::BOTTOM;
@@ -169,6 +171,17 @@ pub struct Demux {
     /// Queued pseudonode events that take priority over all other sources.
     /// These are drained first on each call to `next()`.
     pseudo_queue: VecDeque<ExternalEvent>,
+
+    // -- Network reference for disconnecting peers on decode failures --
+    /// Network handle used to disconnect peers that send malformed messages.
+    ///
+    /// Mirrors Go's `demux.net` used in `demux.next()` for disconnect-on-error.
+    network: Option<Arc<dyn AgreementNetwork + Send + Sync>>,
+
+    // -- Ledger reference for re-sampling round on interruption --
+    /// Ledger handle used to re-sample the current round when the ledger
+    /// round channel fires, matching Go's `nextRound = s.Ledger.NextRound()`.
+    ledger: Option<Arc<dyn LedgerReader + Send + Sync>>,
 }
 
 impl std::fmt::Debug for Demux {
@@ -204,7 +217,19 @@ impl Demux {
             ledger_round_rx,
             quit_rx,
             pseudo_queue: VecDeque::new(),
+            network: None,
+            ledger: None,
         }
+    }
+
+    /// Set the network reference used for disconnecting peers on decode errors.
+    pub fn set_network(&mut self, network: Arc<dyn AgreementNetwork + Send + Sync>) {
+        self.network = Some(network);
+    }
+
+    /// Set the ledger reference used for re-sampling the round on interruption.
+    pub fn set_ledger(&mut self, ledger: Arc<dyn LedgerReader + Send + Sync>) {
+        self.ledger = Some(ledger);
     }
 
     /// Push pseudonode events into the priority queue.
@@ -365,7 +390,14 @@ impl Demux {
             if index == ledger_idx {
                 match oper.recv(&self.ledger_round_rx) {
                     Ok(round) => {
-                        return Some(make_round_interruption_event(round));
+                        // Re-sample the actual current round from the ledger,
+                        // matching Go's `nextRound = s.Ledger.NextRound()`.
+                        let actual_round = self
+                            .ledger
+                            .as_ref()
+                            .map(|l| l.next_round())
+                            .unwrap_or(round);
+                        return Some(make_round_interruption_event(actual_round));
                     }
                     Err(_) => {
                         // Ledger channel closed — log and retry. The channel
@@ -491,10 +523,11 @@ impl Demux {
             }
             Err(e) => {
                 warn!("error decoding vote message: {}", e);
-                // Skip bad messages — don't crash. Match Go behavior of
-                // logging a warning and continuing.
-                // In a full implementation we would also call
-                // network.disconnect(msg.handle) here.
+                // Disconnect the peer that sent the malformed message,
+                // matching Go's behavior.
+                if let Some(ref net) = self.network {
+                    net.disconnect(&msg.handle);
+                }
                 None
             }
         }
@@ -519,6 +552,10 @@ impl Demux {
             )),
             Err(e) => {
                 warn!("error decoding proposal message: {}", e);
+                // Disconnect the peer that sent the malformed message.
+                if let Some(ref net) = self.network {
+                    net.disconnect(&msg.handle);
+                }
                 None
             }
         }
@@ -546,6 +583,10 @@ impl Demux {
             }
             Err(e) => {
                 warn!("error decoding bundle message: {}", e);
+                // Disconnect the peer that sent the malformed message.
+                if let Some(ref net) = self.network {
+                    net.disconnect(&msg.handle);
+                }
                 None
             }
         }

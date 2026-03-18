@@ -14,6 +14,7 @@ use algo_types::Round;
 use crate::certificate::Certificate;
 use crate::events::{CompoundMessage, InternalMessage, MessageEvent, Proposal, SerializableError};
 use crate::step::{Period, Step};
+use crate::traits::MessageHandle;
 use crate::vote::{ProposalValue, UnauthenticatedVote, BOTTOM};
 
 // ---------------------------------------------------------------------------
@@ -116,7 +117,7 @@ impl fmt::Display for NoopAction {
 /// A network action: ignore, broadcast, broadcastVotes, relay, or disconnect.
 ///
 /// Mirrors Go's `networkAction`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct NetworkAction {
     /// The specific action type.
     pub t: ActionType,
@@ -135,6 +136,28 @@ pub struct NetworkAction {
 
     /// Error reason (for Ignore/Disconnect).
     pub err: Option<SerializableError>,
+
+    /// The message handle identifying the source peer (for Relay/Disconnect).
+    ///
+    /// Mirrors Go's `networkAction.h` (`MessageHandle`).
+    pub message_handle: MessageHandle,
+}
+
+impl Clone for NetworkAction {
+    fn clone(&self) -> Self {
+        Self {
+            t: self.t,
+            tag: self.tag.clone(),
+            unauthenticated_vote: self.unauthenticated_vote.clone(),
+            unauthenticated_bundle: self.unauthenticated_bundle.clone(),
+            compound_message: self.compound_message.clone(),
+            unauthenticated_votes: self.unauthenticated_votes.clone(),
+            err: self.err.clone(),
+            // MessageHandle is not cloneable — cloned actions lose the handle,
+            // matching the InternalMessage clone behavior.
+            message_handle: None,
+        }
+    }
 }
 
 impl Default for NetworkAction {
@@ -147,6 +170,7 @@ impl Default for NetworkAction {
             compound_message: CompoundMessage::default(),
             unauthenticated_votes: Vec::new(),
             err: None,
+            message_handle: None,
         }
     }
 }

@@ -205,7 +205,7 @@ where
         let (quit_demux_tx, quit_demux_rx) = crossbeam_channel::bounded(1);
 
         // Construct the Demux with all channel receivers.
-        let demux = Demux::new(
+        let mut demux = Demux::new(
             av_rx,
             pp_rx,
             vb_rx,
@@ -215,6 +215,10 @@ where
             ledger_round_rx,
             quit_demux_rx,
         );
+        // Wire up network and ledger references for peer disconnect on decode
+        // errors (G8) and round re-sampling on interruption (G9).
+        demux.set_network(network.clone() as Arc<dyn AgreementNetwork + Send + Sync>);
+        demux.set_ledger(ledger.clone() as Arc<dyn LedgerReader + Send + Sync>);
 
         // Create channels for communication between main loop and demux loop.
         // These mirror Go's `input`, `output`, and `ready` channels.
@@ -781,14 +785,13 @@ fn do_network_action<N: AgreementNetwork>(na: &NetworkAction, network: &N) {
         ActionType::Relay => {
             if let Some((tag_str, data)) = encode_network_payload(na) {
                 let tag = Tag(tag_str);
-                // Use None as handle since we don't track message handles yet.
-                if let Err(e) = network.relay(&None, &tag, &data) {
+                if let Err(e) = network.relay(&na.message_handle, &tag, &data) {
                     warn!("failed to relay {}: {}", tag_str, e);
                 }
             }
         }
         ActionType::Disconnect => {
-            network.disconnect(&None);
+            network.disconnect(&na.message_handle);
         }
         ActionType::Ignore => {
             // Intentionally do nothing.
@@ -870,22 +873,15 @@ fn encode_network_payload(na: &NetworkAction) -> Option<(&'static str, Vec<u8>)>
 
 /// Execute an ensure action (write a certified block to the ledger).
 ///
-/// Validates the block before writing it. Mirrors Go's `ensureAction.do`.
+/// The block was already validated during proposal verification, so we
+/// trust it here and write directly. Mirrors Go's `ensureAction.do` which
+/// does not re-validate on the ensure path.
 fn do_ensure_action<L: LedgerWriter, BV: BlockValidator>(
     ea: &EnsureAction,
     ledger: &L,
     block_validator: &BV,
 ) {
     let block = &ea.payload.unauthenticated_proposal.block;
-
-    // Validate the block before writing to the ledger.
-    if let Err(e) = block_validator.validate(block) {
-        warn!(
-            "block validation failed for round {}: {}",
-            ea.certificate.round, e
-        );
-        return;
-    }
 
     info!(
         "committed round {} with block {:?}",

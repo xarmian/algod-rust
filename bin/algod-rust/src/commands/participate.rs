@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use algo_agreement::{
-    AsyncCryptoVerifier, BlockFactoryBridge, BlockValidatorBridge, Parameters, RandomSource,
-    Service, StubEventsProcessingMonitor,
+    AsyncCryptoVerifier, BlockFactoryBridge, BlockValidatorBridge, EventsProcessingMonitor,
+    Parameters, RandomSource, Service,
 };
 use algo_ledger::participation::ParticipationStore;
 use algo_ledger::store_trait::LedgerStore;
@@ -19,6 +19,16 @@ use rand::Rng;
 use tracing::{info, warn};
 
 use crate::commands::network_common::genesis_id_for;
+
+/// A no-op `EventsProcessingMonitor` for production use.
+///
+/// Unlike `StubEventsProcessingMonitor` which stores all events in a Vec
+/// (leaking memory), this implementation does nothing.
+struct NoOpMonitor;
+
+impl EventsProcessingMonitor for NoOpMonitor {
+    fn update_events_queue(&self, _queue_name: &str, _queue_length: usize) {}
+}
 
 /// A `RandomSource` backed by the OS/thread-local CSPRNG.
 ///
@@ -475,9 +485,9 @@ pub async fn run(
     let block_validator =
         BlockValidatorBridge::new(resolved_genesis_id.clone(), genesis_hash, prev_timestamp);
 
-    // Real random source backed by the OS CSPRNG; stub monitor.
+    // Real random source backed by the OS CSPRNG; no-op monitor.
     let random_source = RealRandomSource;
-    let monitor = StubEventsProcessingMonitor::new();
+    let monitor = NoOpMonitor;
 
     // Real crypto verifier backed by the agreement ledger bridge.
     // This verifies VRF credentials and OTS signatures on incoming votes
