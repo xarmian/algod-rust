@@ -86,24 +86,6 @@ impl AgreementLedgerBridge {
         }
     }
 
-    /// Create a new bridge with a custom network advancer but no catchup channel.
-    ///
-    /// This is suitable for the catchup service's own bridge, which needs to
-    /// call `on_network_advance()` when committing blocks but does not produce
-    /// pending certificates.
-    pub fn new_with_advancer(
-        ledger: Arc<Mutex<SqliteLedger>>,
-        network_advancer: Arc<dyn NetworkAdvancer>,
-    ) -> Self {
-        Self {
-            ledger,
-            round_advanced: Arc::new(Condvar::new()),
-            pending_cert_tx: None,
-            pending_cert_rx: None,
-            network_advancer,
-        }
-    }
-
     /// Create a new bridge with a custom network advancer and a shared condvar.
     ///
     /// This is suitable for the catchup service's own bridge: it shares the
