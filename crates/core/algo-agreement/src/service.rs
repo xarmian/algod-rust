@@ -37,9 +37,10 @@ use crate::pseudonode::{AsyncPseudonode, Pseudonode};
 use crate::router::RootRouter;
 use crate::step::{Period, Step, PROPOSE, SOFT};
 use crate::traits::{
-    AgreementKeyManager, AgreementNetwork, BlockFactory, BlockValidator, CryptoBundleRequest,
-    CryptoProposalRequest, CryptoVerifier, CryptoVoteRequest, EventsProcessingMonitor,
-    LedgerWriter, RandomSource, Tag, AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
+    AgreementKeyManager, AgreementNetwork, AsyncVoteVerifier, BlockFactory, BlockValidator,
+    CryptoBundleRequest, CryptoProposalRequest, CryptoVerifier, CryptoVoteRequest,
+    EventsProcessingMonitor, LedgerWriter, RandomSource, Tag, AGREEMENT_VOTE_TAG,
+    PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
 };
 use crate::types::{
     filter_timeout, CredentialArrivalHistory, Deadline, TimeoutType,
@@ -259,6 +260,11 @@ where
             })
             .expect("failed to spawn agreement main loop thread");
 
+        // Create the async vote verifier, mirroring Go's `MakeAsyncVoteVerifier`.
+        // This is passed to `EnsureDigest` so the catchup service can
+        // authenticate certificates for blocks it fetches.
+        let vote_verifier = Arc::new(AsyncVoteVerifier::new());
+
         // Spawn demux loop thread.
         let demux_handle = thread::Builder::new()
             .name("agreement-demux".into())
@@ -276,6 +282,7 @@ where
                     quit_demux_tx,
                     crypto,
                     monitor_demux,
+                    vote_verifier,
                 );
             })
             .expect("failed to spawn agreement demux loop thread");
@@ -579,6 +586,7 @@ fn demux_loop<N, L, BV, C, M>(
     quit_demux_tx: crossbeam_channel::Sender<()>,
     crypto: C,
     monitor: Arc<Mutex<M>>,
+    vote_verifier: Arc<AsyncVoteVerifier>,
 ) where
     N: AgreementNetwork + Send + Sync + 'static,
     L: LedgerReader + LedgerWriter + Send + Sync + 'static,
@@ -621,6 +629,7 @@ fn demux_loop<N, L, BV, C, M>(
             &mut demux,
             &mut historical_clocks,
             &crypto,
+            &vote_verifier,
         );
 
         // Actions consumed — report queue drained.
@@ -669,6 +678,7 @@ fn demux_loop<N, L, BV, C, M>(
 
     demux.quit();
     crypto.quit();
+    vote_verifier.quit();
     let _ = quit_demux_tx.send(());
     let _ = input.send(None);
     debug!("agreement demux loop exited");
@@ -681,6 +691,7 @@ fn demux_loop<N, L, BV, C, M>(
 /// Execute a batch of actions.
 ///
 /// Mirrors Go's `Service.do(ctx, actions)`.
+#[allow(clippy::too_many_arguments)]
 fn do_actions<N, L, BV, C>(
     actions: &[Action],
     network: &N,
@@ -689,6 +700,7 @@ fn do_actions<N, L, BV, C>(
     _demux: &mut Demux,
     historical_clocks: &mut HashMap<Round, Instant>,
     crypto: &C,
+    vote_verifier: &AsyncVoteVerifier,
 ) where
     N: AgreementNetwork,
     L: LedgerReader + LedgerWriter,
@@ -703,6 +715,7 @@ fn do_actions<N, L, BV, C>(
             block_validator,
             historical_clocks,
             crypto,
+            vote_verifier,
         );
     }
 }
@@ -710,6 +723,7 @@ fn do_actions<N, L, BV, C>(
 /// Execute a single action.
 ///
 /// Mirrors each action type's `do(ctx, s)` in Go.
+#[allow(clippy::too_many_arguments)]
 fn do_action<N, L, BV, C>(
     action: &Action,
     network: &N,
@@ -717,6 +731,7 @@ fn do_action<N, L, BV, C>(
     block_validator: &BV,
     historical_clocks: &mut HashMap<Round, Instant>,
     crypto: &C,
+    vote_verifier: &AsyncVoteVerifier,
 ) where
     N: AgreementNetwork,
     L: LedgerReader + LedgerWriter,
@@ -739,7 +754,7 @@ fn do_action<N, L, BV, C>(
         }
 
         Action::StageDigest(ref sda) => {
-            do_stage_digest_action(sda, ledger);
+            do_stage_digest_action(sda, ledger, vote_verifier);
         }
 
         Action::Rezero(ref ra) => {
@@ -897,12 +912,16 @@ fn do_ensure_action<L: LedgerWriter, BV: BlockValidator>(
 /// Execute a stage-digest action (signal the ledger to fetch a block).
 ///
 /// Mirrors Go's `stageDigestAction.do`.
-fn do_stage_digest_action<L: LedgerWriter>(sda: &StageDigestAction, ledger: &L) {
+fn do_stage_digest_action<L: LedgerWriter>(
+    sda: &StageDigestAction,
+    ledger: &L,
+    vote_verifier: &AsyncVoteVerifier,
+) {
     info!(
         "round {} concluded without block for {:?}; waiting on ledger",
         sda.certificate.round, sda.certificate.proposal,
     );
-    ledger.ensure_digest(&sda.certificate);
+    ledger.ensure_digest(&sda.certificate, vote_verifier);
 }
 
 /// Execute a rezero action (reset the clock).
@@ -1144,8 +1163,9 @@ mod tests {
         let sda = StageDigestAction {
             certificate: cert.clone(),
         };
+        let verifier = AsyncVoteVerifier::new();
 
-        do_stage_digest_action(&sda, &ledger);
+        do_stage_digest_action(&sda, &ledger, &verifier);
 
         let ensured = ledger.get_ensured_digests();
         assert_eq!(ensured.len(), 1);

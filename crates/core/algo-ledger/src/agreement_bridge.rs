@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use crossbeam_channel;
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 use algo_agreement::{
-    Certificate, LedgerError, LedgerReader, LedgerWriter, OnlineAccountData, Seed,
+    AsyncVoteVerifier, Certificate, LedgerError, LedgerReader, LedgerWriter, NetworkAdvancer,
+    NoOpNetworkAdvancer, OnlineAccountData, PendingUnmatchedCertificate, Seed,
 };
 use algo_types::consensus::consensus_params_for_version;
 use algo_types::{Address, ConsensusParams, Digest, Round};
@@ -37,15 +38,107 @@ pub struct AgreementLedgerBridge {
     /// Condvar notified when a new block is committed (round advances).
     /// Paired with the `ledger` mutex.
     round_advanced: Arc<Condvar>,
+    /// Channel sender for pending unmatched certificates.
+    ///
+    /// When `ensure_digest` is called, a `PendingUnmatchedCertificate` is sent
+    /// on this channel to be picked up by the catchup service.
+    /// Mirrors Go's `agreementLedger.UnmatchedPendingCertificates`.
+    pending_cert_tx: Option<crossbeam_channel::Sender<PendingUnmatchedCertificate>>,
+    /// Receiver clone kept solely for draining stale certificates inside
+    /// `ensure_digest`, mirroring Go's drain-before-send pattern:
+    ///
+    /// ```go
+    /// select {
+    /// case <-l.UnmatchedPendingCertificates:  // drain old
+    /// default:
+    /// }
+    /// l.UnmatchedPendingCertificates <- cert   // send new
+    /// ```
+    ///
+    /// This is safe despite the crossbeam MPMC semantics because:
+    /// 1. `ensure_digest` is only called from the single-threaded agreement
+    ///    service (Go's guarantee #3).
+    /// 2. With MPMC, either this bridge's `try_recv` or the catchup service's
+    ///    `recv` may consume the stale certificate first — either outcome is
+    ///    fine since the stale certificate is being superseded anyway.
+    /// 3. After the drain, the channel has capacity for at least one item, so
+    ///    the subsequent `send` always succeeds and the newest certificate
+    ///    ends up on the channel for the catchup service to consume.
+    pending_cert_rx: Option<crossbeam_channel::Receiver<PendingUnmatchedCertificate>>,
+    /// Network advancer for signaling progress to the network layer.
+    ///
+    /// Mirrors Go's `agreementLedger.n.OnNetworkAdvance()`.
+    network_advancer: Arc<dyn NetworkAdvancer>,
 }
 
 impl AgreementLedgerBridge {
     /// Create a new bridge wrapping the given ledger.
+    ///
+    /// Uses a no-op network advancer and no pending certificate channel.
+    /// This is suitable for tests and for callers that don't need catchup.
     pub fn new(ledger: Arc<Mutex<SqliteLedger>>) -> Self {
         Self {
             ledger,
             round_advanced: Arc::new(Condvar::new()),
+            pending_cert_tx: None,
+            pending_cert_rx: None,
+            network_advancer: Arc::new(NoOpNetworkAdvancer),
         }
+    }
+
+    /// Create a new bridge with a custom network advancer and a shared condvar.
+    ///
+    /// This is suitable for the catchup service's own bridge: it shares the
+    /// same `round_advanced` condvar as the agreement bridge so that blocks
+    /// committed by the catchup service wake any agreement threads blocked in
+    /// `wait_for_round` or `round_notify`.
+    pub fn new_with_advancer_and_condvar(
+        ledger: Arc<Mutex<SqliteLedger>>,
+        network_advancer: Arc<dyn NetworkAdvancer>,
+        round_advanced: Arc<Condvar>,
+    ) -> Self {
+        Self {
+            ledger,
+            round_advanced,
+            pending_cert_tx: None,
+            pending_cert_rx: None,
+            network_advancer,
+        }
+    }
+
+    /// Returns a clone of the `round_advanced` condvar.
+    ///
+    /// This is used to share the condvar with the catchup bridge so that
+    /// catchup-committed blocks wake agreement waiters.
+    pub fn round_advanced_condvar(&self) -> Arc<Condvar> {
+        Arc::clone(&self.round_advanced)
+    }
+
+    /// Create a new bridge with catchup support.
+    ///
+    /// Returns `(bridge, receiver)` where:
+    /// - `bridge` is the `AgreementLedgerBridge` configured with a bounded(1)
+    ///   channel for pending certificates and the given network advancer.
+    /// - `receiver` is the receiving end of the pending certificate channel,
+    ///   to be consumed by the catchup service.
+    ///
+    /// Mirrors Go's `makeAgreementLedger` in `node/impls.go`.
+    pub fn new_with_catchup(
+        ledger: Arc<Mutex<SqliteLedger>>,
+        network_advancer: Arc<dyn NetworkAdvancer>,
+    ) -> (
+        Self,
+        crossbeam_channel::Receiver<PendingUnmatchedCertificate>,
+    ) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let bridge = Self {
+            ledger,
+            round_advanced: Arc::new(Condvar::new()),
+            pending_cert_tx: Some(tx),
+            pending_cert_rx: Some(rx.clone()),
+            network_advancer,
+        };
+        (bridge, rx)
     }
 
     /// Helper: get the protocol version string for a given round by reading
@@ -370,18 +463,75 @@ impl LedgerWriter for AgreementLedgerBridge {
 
         // Notify any threads waiting in wait_for_round.
         self.round_advanced.notify_all();
+
+        // Let the network know that we've made some progress.
+        // Mirrors Go's `l.n.OnNetworkAdvance()` in `EnsureBlock` / `EnsureValidatedBlock`.
+        self.network_advancer.on_network_advance();
     }
 
     fn ensure_validated_block(&self, vb: &dyn algo_agreement::ValidatedBlock, cert: &Certificate) {
         self.ensure_block(vb.block(), cert);
     }
 
-    fn ensure_digest(&self, _cert: &Certificate) {
-        // In Go, this sends the certificate to the catchup service to fetch
-        // the matching block. For now, this is a no-op stub.
-        //
-        // TODO: Integrate with block fetcher / catchup service to retrieve
-        // the block matching this certificate's digest.
+    fn ensure_digest(&self, cert: &Certificate, verifier: &AsyncVoteVerifier) {
+        // Let the network know that we've made some progress.
+        // This might be controversial since we haven't received the entire
+        // block, but we did get the certificate, which means that network
+        // connections are likely to be just fine.
+        // Mirrors Go's `l.n.OnNetworkAdvance()`.
+        self.network_advancer.on_network_advance();
+
+        if let (Some(tx), Some(rx)) = (&self.pending_cert_tx, &self.pending_cert_rx) {
+            // Drain any stale pending certificate from the channel.
+            //
+            // Mirrors Go's pattern in `node/impls.go`:
+            //   select {
+            //   case pendingCert := <-l.UnmatchedPendingCertificates:
+            //       log("flushed pending cert for round %d in favor of round %d", ...)
+            //   default:
+            //   }
+            match rx.try_recv() {
+                Ok(old) => {
+                    debug!(
+                        "ensure_digest: flushed pending certificate for round {} \
+                         in favor of new certificate for round {}",
+                        old.cert.round, cert.round
+                    );
+                }
+                Err(_) => {
+                    // Channel was empty — nothing to drain.
+                }
+            }
+
+            let pending = PendingUnmatchedCertificate {
+                cert: cert.clone(),
+                vote_verifier: verifier.clone(),
+            };
+
+            // The channel send is guaranteed to be non-blocking because:
+            // 1. The channel capacity is 1.
+            // 2. We just drained a single item (if any) above.
+            // 3. EnsureDigest is called with the agreement service's
+            //    single-caller guarantee.
+            // 4. No other senders exist.
+            //
+            // We use `send` (blocking) to match Go's blocking channel send,
+            // but in practice this will never block given the guarantees above.
+            match tx.send(pending) {
+                Ok(()) => {
+                    debug!(
+                        "ensure_digest: sent pending certificate for round {}",
+                        cert.round
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        "ensure_digest: certificate channel disconnected for round {}",
+                        cert.round
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -424,6 +574,9 @@ fn hash_block_header(hdr_data: &[u8]) -> Digest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use algo_agreement::{AsyncVoteVerifier, Certificate, LedgerWriter, NetworkAdvancer};
+    use algo_types::Round;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn hash_block_header_deterministic() {
@@ -443,5 +596,140 @@ mod tests {
     #[test]
     fn extract_seed_from_empty_returns_none() {
         assert!(extract_seed_from_header(&[]).is_none());
+    }
+
+    // -- Helper: tracking network advancer --
+
+    /// A `NetworkAdvancer` that counts how many times `on_network_advance` is called.
+    struct TrackingNetworkAdvancer {
+        call_count: AtomicU64,
+    }
+
+    impl TrackingNetworkAdvancer {
+        fn new() -> Self {
+            Self {
+                call_count: AtomicU64::new(0),
+            }
+        }
+
+        fn call_count(&self) -> u64 {
+            self.call_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl NetworkAdvancer for TrackingNetworkAdvancer {
+        fn on_network_advance(&self) {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn make_cert(round: u64) -> Certificate {
+        Certificate {
+            round: Round(round),
+            ..Certificate::default()
+        }
+    }
+
+    // -- Tests --
+
+    #[test]
+    fn ensure_digest_sends_cert_on_channel() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let advancer = Arc::new(NoOpNetworkAdvancer);
+        let (bridge, rx) = AgreementLedgerBridge::new_with_catchup(ledger, advancer);
+
+        let cert = make_cert(10);
+        let verifier = AsyncVoteVerifier::new();
+        bridge.ensure_digest(&cert, &verifier);
+
+        // The certificate should appear on the channel.
+        let pending = rx
+            .try_recv()
+            .expect("expected a pending certificate on the channel");
+        assert_eq!(pending.cert.round, Round(10));
+    }
+
+    #[test]
+    fn ensure_digest_drain_before_send() {
+        // Send two certs in sequence via ensure_digest; only the latest
+        // should be on the channel (the first is drained by the second call).
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let advancer = Arc::new(NoOpNetworkAdvancer);
+        let (bridge, rx) = AgreementLedgerBridge::new_with_catchup(ledger, advancer);
+
+        let verifier = AsyncVoteVerifier::new();
+
+        // First call: sends cert for round 5.
+        bridge.ensure_digest(&make_cert(5), &verifier);
+
+        // Second call: should drain round 5 and send round 10.
+        bridge.ensure_digest(&make_cert(10), &verifier);
+
+        // Only the latest certificate (round 10) should be on the channel.
+        let pending = rx.try_recv().expect("expected a pending certificate");
+        assert_eq!(pending.cert.round, Round(10));
+
+        // Channel should now be empty.
+        assert!(
+            rx.try_recv().is_err(),
+            "channel should be empty after receiving the latest cert"
+        );
+    }
+
+    #[test]
+    fn ensure_digest_no_channel_does_not_panic() {
+        // Bridge created via `new()` has no channel — ensure_digest should be a no-op.
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(ledger);
+
+        let cert = make_cert(7);
+        let verifier = AsyncVoteVerifier::new();
+
+        // This must not panic.
+        bridge.ensure_digest(&cert, &verifier);
+    }
+
+    #[test]
+    fn ensure_digest_calls_on_network_advance() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let advancer = Arc::new(TrackingNetworkAdvancer::new());
+        let (bridge, _rx) =
+            AgreementLedgerBridge::new_with_catchup(ledger, Arc::clone(&advancer) as _);
+
+        let cert = make_cert(1);
+        let verifier = AsyncVoteVerifier::new();
+
+        assert_eq!(advancer.call_count(), 0);
+        bridge.ensure_digest(&cert, &verifier);
+        assert_eq!(advancer.call_count(), 1);
+
+        // Calling again increments the counter.
+        bridge.ensure_digest(&make_cert(2), &verifier);
+        assert_eq!(advancer.call_count(), 2);
+    }
+
+    #[test]
+    fn new_with_catchup_returns_working_receiver() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let advancer = Arc::new(NoOpNetworkAdvancer);
+        let (bridge, rx) = AgreementLedgerBridge::new_with_catchup(ledger, advancer);
+
+        // The receiver should initially be empty.
+        assert!(
+            rx.try_recv().is_err(),
+            "receiver should be empty before any ensure_digest call"
+        );
+
+        // After an ensure_digest call, the receiver should have a value.
+        let verifier = AsyncVoteVerifier::new();
+        bridge.ensure_digest(&make_cert(42), &verifier);
+
+        let pending = rx
+            .try_recv()
+            .expect("receiver should have a value after ensure_digest");
+        assert_eq!(pending.cert.round, Round(42));
+
+        // And empty again after receiving.
+        assert!(rx.try_recv().is_err(), "receiver should be empty again");
     }
 }

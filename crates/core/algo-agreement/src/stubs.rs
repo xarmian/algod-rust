@@ -13,10 +13,10 @@ use crate::certificate::Certificate;
 use crate::ledger_reader::{LedgerError, LedgerReader, OnlineAccountData};
 use crate::seed::Seed;
 use crate::traits::{
-    AgreementError, AgreementNetwork, BlockFactory, BlockValidator, CryptoBundleRequest,
-    CryptoProposalRequest, CryptoResult, CryptoVerifier, CryptoVoteRequest, CryptoVoteVerifyResult,
-    EventsProcessingMonitor, LedgerWriter, Message, MessageHandle, RandomSource, Tag,
-    UnfinishedBlock, ValidatedBlock, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
+    AgreementError, AgreementNetwork, AsyncVoteVerifier, BlockFactory, BlockValidator,
+    CryptoBundleRequest, CryptoProposalRequest, CryptoResult, CryptoVerifier, CryptoVoteRequest,
+    CryptoVoteVerifyResult, EventsProcessingMonitor, LedgerWriter, Message, MessageHandle,
+    RandomSource, Tag, UnfinishedBlock, ValidatedBlock, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
 };
 
 // ---------------------------------------------------------------------------
@@ -382,7 +382,7 @@ impl LedgerWriter for StubLedger {
         self.ensure_block(vb.block(), cert);
     }
 
-    fn ensure_digest(&self, cert: &Certificate) {
+    fn ensure_digest(&self, cert: &Certificate, _verifier: &AsyncVoteVerifier) {
         self.ensured_digests.lock().unwrap().push(cert.clone());
     }
 }
@@ -934,8 +934,9 @@ mod tests {
     fn stub_ledger_ensure_digest_records() {
         let ledger = StubLedger::new(v41_params(), Round(1));
         let cert = make_certificate(Round(5));
+        let verifier = AsyncVoteVerifier::new();
 
-        ledger.ensure_digest(&cert);
+        ledger.ensure_digest(&cert, &verifier);
 
         let ensured = ledger.get_ensured_digests();
         assert_eq!(ensured.len(), 1);

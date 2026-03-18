@@ -840,7 +840,8 @@ fn stub_ledger_full_lifecycle() {
     assert_eq!(ledger.get_written_blocks().len(), 1);
 
     // Ensure digest and verify.
-    ledger.ensure_digest(&cert);
+    let verifier = algo_agreement::AsyncVoteVerifier::new();
+    ledger.ensure_digest(&cert, &verifier);
     assert_eq!(ledger.get_ensured_digests().len(), 1);
 }
 

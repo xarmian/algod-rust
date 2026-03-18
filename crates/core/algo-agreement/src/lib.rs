@@ -67,11 +67,12 @@ pub use stubs::{
     StubValidatedBlock, WrittenBlock,
 };
 pub use traits::{
-    AgreementError, AgreementKeyManager, AgreementLedger, AgreementNetwork, BlockFactory,
-    BlockValidator, CryptoBundleRequest, CryptoProposalRequest, CryptoResult, CryptoVerifier,
-    CryptoVoteRequest, CryptoVoteVerifyResult, EventsProcessingMonitor, LedgerWriter, Message,
-    MessageHandle, ParticipationAction, ParticipationRecord, RandomSource, Tag, UnfinishedBlock,
-    ValidatedBlock, AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
+    AgreementError, AgreementKeyManager, AgreementLedger, AgreementNetwork, AsyncVoteVerifier,
+    BlockFactory, BlockValidator, CryptoBundleRequest, CryptoProposalRequest, CryptoResult,
+    CryptoVerifier, CryptoVoteRequest, CryptoVoteVerifyResult, EventsProcessingMonitor,
+    LedgerWriter, Message, MessageHandle, NetworkAdvancer, NoOpNetworkAdvancer,
+    ParticipationAction, ParticipationRecord, PendingUnmatchedCertificate, RandomSource, Tag,
+    UnfinishedBlock, ValidatedBlock, AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
 };
 pub use vote::{
     ProposalValue, RawVote, UnauthenticatedVote, Vote, VoteError, VoteVerifyParams, BOTTOM,
