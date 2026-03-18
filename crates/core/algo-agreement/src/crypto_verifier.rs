@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::ledger_reader::LedgerReader;
 use crate::traits::{
@@ -54,6 +54,9 @@ pub struct AsyncCryptoVerifier<L: LedgerReader + Send + Sync + 'static> {
     /// Channel pair for bundle verification results.
     bundle_tx: crossbeam_channel::Sender<CryptoResult>,
     bundle_rx: crossbeam_channel::Receiver<CryptoResult>,
+
+    /// A receiver that never yields, returned for unknown tags.
+    never_rx: crossbeam_channel::Receiver<CryptoResult>,
 }
 
 impl<L: LedgerReader + Send + Sync + 'static> AsyncCryptoVerifier<L> {
@@ -73,6 +76,7 @@ impl<L: LedgerReader + Send + Sync + 'static> AsyncCryptoVerifier<L> {
             proposal_rx,
             bundle_tx,
             bundle_rx,
+            never_rx: crossbeam_channel::never(),
         }
     }
 
@@ -337,7 +341,10 @@ impl<L: LedgerReader + Send + Sync + 'static> CryptoVerifier for AsyncCryptoVeri
         match tag {
             PROPOSAL_PAYLOAD_TAG => &self.proposal_rx,
             VOTE_BUNDLE_TAG => &self.bundle_rx,
-            _ => panic!("AsyncCryptoVerifier::verified called with unknown tag: {tag}"),
+            _ => {
+                warn!("AsyncCryptoVerifier::verified called with unknown tag: {tag}");
+                &self.never_rx
+            }
         }
     }
 

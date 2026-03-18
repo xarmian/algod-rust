@@ -292,7 +292,14 @@ impl AgreementNetwork for AgreementNetworkBridge {
             }
         };
 
-        let mut guard = mutex.lock().expect("messages lock poisoned");
+        let mut guard = match mutex.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                warn!("messages lock poisoned for tag {}", tag.0);
+                let (_tx, rx) = crossbeam_channel::bounded(0);
+                return rx;
+            }
+        };
         match guard.take() {
             Some(rx) => rx,
             None => {

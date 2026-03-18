@@ -400,11 +400,11 @@ impl Demux {
                         return Some(make_round_interruption_event(actual_round));
                     }
                     Err(_) => {
-                        // Ledger channel closed — log and retry. The channel
-                        // will remain disconnected so future selects will not
-                        // include it (recv always returns Err immediately on
-                        // a disconnected channel, but Select skips it).
-                        warn!("ledger round notification channel closed, will retry");
+                        // Ledger channel closed — replace with a never-channel
+                        // so it is no longer selected (a disconnected channel
+                        // would be selected immediately, causing a busy-loop).
+                        warn!("ledger round notification channel closed");
+                        self.ledger_round_rx = crossbeam_channel::never();
                         continue;
                     }
                 }
@@ -421,7 +421,8 @@ impl Demux {
                         continue;
                     }
                     Err(_) => {
-                        warn!("agreement vote channel closed, continuing");
+                        warn!("agreement vote channel closed");
+                        self.av_rx = crossbeam_channel::never();
                         continue;
                     }
                 }
@@ -439,7 +440,8 @@ impl Demux {
                         continue;
                     }
                     Err(_) => {
-                        warn!("proposal payload channel closed, continuing");
+                        warn!("proposal payload channel closed");
+                        self.pp_rx = crossbeam_channel::never();
                         continue;
                     }
                 }
@@ -455,7 +457,8 @@ impl Demux {
                         continue;
                     }
                     Err(_) => {
-                        warn!("vote bundle channel closed, continuing");
+                        warn!("vote bundle channel closed");
+                        self.vb_rx = crossbeam_channel::never();
                         continue;
                     }
                 }
@@ -466,7 +469,8 @@ impl Demux {
                 match oper.recv(&self.verified_votes_rx) {
                     Ok(r) => return Some(self.handle_verified_vote(r)),
                     Err(_) => {
-                        warn!("verified votes channel closed, continuing");
+                        warn!("verified votes channel closed");
+                        self.verified_votes_rx = crossbeam_channel::never();
                         continue;
                     }
                 }
@@ -477,7 +481,8 @@ impl Demux {
                 match oper.recv(&self.verified_proposals_rx) {
                     Ok(r) => return Some(self.handle_verified_proposal(r)),
                     Err(_) => {
-                        warn!("verified proposals channel closed, continuing");
+                        warn!("verified proposals channel closed");
+                        self.verified_proposals_rx = crossbeam_channel::never();
                         continue;
                     }
                 }
@@ -488,7 +493,8 @@ impl Demux {
                 match oper.recv(&self.verified_bundles_rx) {
                     Ok(r) => return Some(self.handle_verified_bundle(r)),
                     Err(_) => {
-                        warn!("verified bundles channel closed, continuing");
+                        warn!("verified bundles channel closed");
+                        self.verified_bundles_rx = crossbeam_channel::never();
                         continue;
                     }
                 }
