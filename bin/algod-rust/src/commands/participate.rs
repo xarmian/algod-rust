@@ -77,6 +77,9 @@ struct GossipBlockFetcher {
 
 impl BlockFetcher for GossipBlockFetcher {
     fn fetch_block(&self, round: Round) -> Result<Block, String> {
+        // SAFETY: This is called from the CatchupService's background std::thread,
+        // NOT from a tokio worker thread. Calling block_on from within the tokio
+        // runtime would panic.
         self.rt_handle.block_on(async {
             let peers = self.ws_network.get_unicast_peers().await;
             if peers.is_empty() {
@@ -492,7 +495,7 @@ pub async fn run(
     // Uses `new_with_catchup` to enable the certificate-driven catchup path.
     // The returned `cert_rx` is consumed by the CatchupService below.
     let (agreement_ledger, cert_rx) =
-        AgreementLedgerBridge::new_with_catchup(ledger.clone(), network_advancer);
+        AgreementLedgerBridge::new_with_catchup(ledger.clone(), network_advancer.clone());
 
     // Key manager bridge: wraps ParticipationStore for voting key lookups.
     let key_manager = AgreementKeyManagerBridge::new(part_store);
@@ -570,7 +573,10 @@ pub async fn run(
     // same underlying `SqliteLedger`. It only needs `ensure_block` to commit
     // fetched blocks, and shares the same ledger mutex so commits are visible
     // to the agreement service immediately.
-    let catchup_bridge = Arc::new(AgreementLedgerBridge::new(ledger.clone()));
+    let catchup_bridge = Arc::new(AgreementLedgerBridge::new_with_advancer(
+        ledger.clone(),
+        network_advancer,
+    ));
 
     let block_fetcher: Arc<dyn BlockFetcher> = Arc::new(GossipBlockFetcher {
         ws_network: gossip_node.clone(),

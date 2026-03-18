@@ -55,13 +55,15 @@ pub struct AgreementLedgerBridge {
     /// l.UnmatchedPendingCertificates <- cert   // send new
     /// ```
     ///
-    /// This is safe because:
+    /// This is safe despite the crossbeam MPMC semantics because:
     /// 1. `ensure_digest` is only called from the single-threaded agreement
     ///    service (Go's guarantee #3).
-    /// 2. Between the drain and the send the channel is empty, so the catchup
-    ///    service's receiver cannot interfere.
-    /// 3. The `try_recv` here only discards a stale certificate — the catchup
-    ///    service will process the *newest* one we send immediately after.
+    /// 2. With MPMC, either this bridge's `try_recv` or the catchup service's
+    ///    `recv` may consume the stale certificate first — either outcome is
+    ///    fine since the stale certificate is being superseded anyway.
+    /// 3. After the drain, the channel has capacity for at least one item, so
+    ///    the subsequent `send` always succeeds and the newest certificate
+    ///    ends up on the channel for the catchup service to consume.
     pending_cert_rx: Option<crossbeam_channel::Receiver<PendingUnmatchedCertificate>>,
     /// Network advancer for signaling progress to the network layer.
     ///
@@ -81,6 +83,24 @@ impl AgreementLedgerBridge {
             pending_cert_tx: None,
             pending_cert_rx: None,
             network_advancer: Arc::new(NoOpNetworkAdvancer),
+        }
+    }
+
+    /// Create a new bridge with a custom network advancer but no catchup channel.
+    ///
+    /// This is suitable for the catchup service's own bridge, which needs to
+    /// call `on_network_advance()` when committing blocks but does not produce
+    /// pending certificates.
+    pub fn new_with_advancer(
+        ledger: Arc<Mutex<SqliteLedger>>,
+        network_advancer: Arc<dyn NetworkAdvancer>,
+    ) -> Self {
+        Self {
+            ledger,
+            round_advanced: Arc::new(Condvar::new()),
+            pending_cert_tx: None,
+            pending_cert_rx: None,
+            network_advancer,
         }
     }
 
@@ -433,6 +453,10 @@ impl LedgerWriter for AgreementLedgerBridge {
 
         // Notify any threads waiting in wait_for_round.
         self.round_advanced.notify_all();
+
+        // Let the network know that we've made some progress.
+        // Mirrors Go's `l.n.OnNetworkAdvance()` in `EnsureBlock` / `EnsureValidatedBlock`.
+        self.network_advancer.on_network_advance();
     }
 
     fn ensure_validated_block(&self, vb: &dyn algo_agreement::ValidatedBlock, cert: &Certificate) {

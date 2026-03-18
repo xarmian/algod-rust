@@ -156,7 +156,7 @@ impl CatchupService {
                 i if i == cert_idx => {
                     match oper.recv(&cert_rx) {
                         Ok(pending) => {
-                            Self::sync_cert(&pending, &ledger, &bridge, &fetcher);
+                            Self::sync_cert(&pending, &ledger, &bridge, &fetcher, &shutdown_rx);
                         }
                         Err(_) => {
                             // Certificate channel closed — the agreement service
@@ -173,13 +173,12 @@ impl CatchupService {
         info!("catchup service exiting");
     }
 
-    /// Maximum number of fetch attempts before giving up on a single
-    /// certificate. Mirrors Go's retry-until-shutdown approach, but with a
-    /// bounded limit to avoid infinite loops.
-    const MAX_FETCH_ATTEMPTS: u32 = 3;
-
-    /// Base delay between retry attempts (doubles with each attempt).
+    /// Base delay between retry attempts (doubles with each attempt,
+    /// capped at [`Self::MAX_RETRY_DELAY`]).
     const RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+
+    /// Maximum delay between retry attempts (cap for exponential backoff).
+    const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 
     /// Process a single pending unmatched certificate.
     ///
@@ -188,11 +187,16 @@ impl CatchupService {
     /// 2. If not, fetch it from the network (with retries).
     /// 3. Validate the fetched block's digest against the certificate.
     /// 4. Commit it to the ledger via `ensure_block`.
+    ///
+    /// Unlike a bounded retry loop, this mirrors Go's `fetchRound` which
+    /// retries indefinitely (`for s.ledger.LastRound() < cert.Round`) until
+    /// either the block is committed (by any path) or shutdown is signaled.
     fn sync_cert(
         pending: &PendingUnmatchedCertificate,
         ledger: &Arc<Mutex<SqliteLedger>>,
         bridge: &Arc<AgreementLedgerBridge>,
         fetcher: &Arc<dyn BlockFetcher>,
+        shutdown_rx: &Receiver<()>,
     ) {
         let cert = &pending.cert;
         let target_round = cert.round;
@@ -202,52 +206,50 @@ impl CatchupService {
             "catchup service: processing certificate for round"
         );
 
-        // Step 1: Check if the ledger already has this block.
-        {
-            let ledger_guard = match ledger.lock() {
-                Ok(l) => l,
-                Err(e) => {
-                    warn!(
-                        round = %target_round,
-                        "catchup service: ledger lock poisoned: {e}"
-                    );
-                    return;
-                }
-            };
-
-            let current = ledger_guard.current_round();
-            if current.0 >= target_round.0 {
-                debug!(
-                    round = %target_round,
-                    current_round = %current,
-                    "catchup service: ledger already has block, skipping"
-                );
-                return;
-            }
-        }
-
-        // Step 2: Fetch the block from the network with retries.
-        // Mirrors Go's fetchRound which retries across peers until the
-        // block is obtained or the service shuts down.
-        let mut last_err = String::new();
-        for attempt in 1..=Self::MAX_FETCH_ATTEMPTS {
-            // Re-check the ledger on each attempt — the block may have been
-            // committed by the normal agreement path while we were retrying.
-            if attempt > 1 {
-                if let Ok(lg) = ledger.lock() {
-                    if lg.current_round().0 >= target_round.0 {
-                        debug!(
+        // Retry loop: mirrors Go's `for s.ledger.LastRound() < cert.Round`.
+        // Continues until the ledger has the block, shutdown is signaled,
+        // or the block is successfully fetched and committed.
+        let mut attempt: u32 = 0;
+        loop {
+            // Check if the ledger already has this block (committed by
+            // agreement or a previous iteration of this loop).
+            {
+                let ledger_guard = match ledger.lock() {
+                    Ok(l) => l,
+                    Err(e) => {
+                        warn!(
                             round = %target_round,
-                            "catchup service: ledger caught up during retry, skipping"
+                            "catchup service: ledger lock poisoned: {e}"
                         );
                         return;
                     }
+                };
+
+                let current = ledger_guard.current_round();
+                if current.0 >= target_round.0 {
+                    debug!(
+                        round = %target_round,
+                        current_round = %current,
+                        "catchup service: ledger already has block, skipping"
+                    );
+                    return;
                 }
             }
 
+            // Check for shutdown before attempting a fetch.
+            if shutdown_rx.try_recv().is_ok() {
+                debug!(
+                    round = %target_round,
+                    "catchup service: shutdown received during sync_cert"
+                );
+                return;
+            }
+
+            attempt += 1;
+
             match fetcher.fetch_block(target_round) {
                 Ok(block) => {
-                    // Step 3a: Validate round match.
+                    // Validate round match.
                     if block.round != target_round {
                         warn!(
                             expected_round = %target_round,
@@ -257,8 +259,8 @@ impl CatchupService {
                         return;
                     }
 
-                    // Step 3b: Validate that the fetched block's digest
-                    // matches the certificate's proposal digest.
+                    // Validate that the fetched block's digest matches the
+                    // certificate's proposal digest.
                     //
                     // Mirrors Go's `block.Hash() == blockHash` check in
                     // fetchRound (catchup/service.go). The block hash is
@@ -269,22 +271,26 @@ impl CatchupService {
                     if block_digest != cert_digest {
                         warn!(
                             round = %target_round,
+                            attempt = attempt,
                             block_digest = ?block_digest,
                             cert_digest = ?cert_digest,
-                            "catchup service: fetched block digest does not match certificate"
+                            "catchup service: fetched block digest does not match certificate, retrying"
                         );
                         // A malicious or wrong peer returned a bad block.
                         // Retry with a different peer (the fetcher may rotate).
-                        last_err = format!(
-                            "block digest mismatch: got {:?}, want {:?}",
-                            block_digest, cert_digest
-                        );
-                        let delay = Self::RETRY_BASE_DELAY * 2u32.saturating_pow(attempt - 1);
-                        std::thread::sleep(delay);
+                        let delay = Self::backoff_with_jitter(attempt);
+                        // Use recv_timeout so shutdown can interrupt the wait.
+                        if shutdown_rx.recv_timeout(delay).is_ok() {
+                            debug!(
+                                round = %target_round,
+                                "catchup service: shutdown received during backoff"
+                            );
+                            return;
+                        }
                         continue;
                     }
 
-                    // Step 4: Commit the block to the ledger.
+                    // Commit the block to the ledger.
                     // EnsureBlock is idempotent — if the block was already
                     // committed by normal agreement between fetch and now,
                     // this is a harmless no-op.
@@ -301,28 +307,49 @@ impl CatchupService {
                     return;
                 }
                 Err(e) => {
-                    last_err = e.clone();
                     warn!(
                         round = %target_round,
                         attempt = attempt,
-                        max_attempts = Self::MAX_FETCH_ATTEMPTS,
                         error = %e,
                         "catchup service: failed to fetch block, will retry"
                     );
-                    // Exponential backoff between retries.
-                    let delay = Self::RETRY_BASE_DELAY * 2u32.saturating_pow(attempt - 1);
-                    std::thread::sleep(delay);
+                    // Exponential backoff with jitter between retries.
+                    // Use recv_timeout so shutdown can interrupt the wait.
+                    let delay = Self::backoff_with_jitter(attempt);
+                    if shutdown_rx.recv_timeout(delay).is_ok() {
+                        debug!(
+                            round = %target_round,
+                            "catchup service: shutdown received during backoff"
+                        );
+                        return;
+                    }
                 }
             }
         }
+    }
 
-        // All retry attempts exhausted.
-        warn!(
-            round = %target_round,
-            attempts = Self::MAX_FETCH_ATTEMPTS,
-            last_error = %last_err,
-            "catchup service: exhausted all fetch attempts for block"
-        );
+    /// Compute an exponential backoff delay with jitter, capped at
+    /// [`Self::MAX_RETRY_DELAY`].
+    ///
+    /// The jitter is derived from the current timestamp to avoid adding a
+    /// `rand` dependency to this crate. It adds ±50% variation to the base
+    /// exponential delay, preventing thundering-herd effects when multiple
+    /// nodes retry simultaneously.
+    fn backoff_with_jitter(attempt: u32) -> Duration {
+        let base = Self::RETRY_BASE_DELAY * 2u32.saturating_pow(attempt.saturating_sub(1));
+        let base = std::cmp::min(base, Self::MAX_RETRY_DELAY);
+
+        // Lightweight jitter: use the low bits of the current timestamp
+        // (nanoseconds) to add ±50% variation.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        // Map nanos to [0.5, 1.5) multiplier: 0.5 + (nanos % 1000) / 1000.0
+        let jitter_frac = 0.5 + (nanos % 1000) as f64 / 1000.0;
+        let jittered_millis = (base.as_millis() as f64 * jitter_frac) as u64;
+
+        Duration::from_millis(jittered_millis)
     }
 }
 
@@ -460,9 +487,9 @@ mod tests {
 
     #[test]
     fn fetch_failure_does_not_crash() {
-        // If the block fetcher fails, the service should log and continue.
-        // The service retries up to MAX_FETCH_ATTEMPTS times with exponential
-        // backoff, so we need to wait long enough for all retries to complete.
+        // If the block fetcher fails, the service retries indefinitely.
+        // Verify it stays alive and handles failures gracefully, then
+        // shut it down to stop the retry loop.
         let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
         let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
         let bridge = Arc::new(AgreementLedgerBridge::new(Arc::clone(&ledger)));
@@ -473,9 +500,8 @@ mod tests {
         // Send a cert — the fetch will fail but the service should survive.
         tx.send(make_pending_cert(5)).unwrap();
 
-        // Give it time to process all retry attempts (3 retries with
-        // exponential backoff: 500ms + 1000ms + 2000ms = 3.5s max).
-        thread::sleep(Duration::from_secs(5));
+        // Give it time to attempt a few retries, then stop via shutdown.
+        thread::sleep(Duration::from_secs(2));
         svc.stop();
     }
 
@@ -613,7 +639,7 @@ mod tests {
     fn digest_mismatch_triggers_retry() {
         // Create a block for round 1, but make the certificate have a
         // different digest. This should cause digest validation to fail
-        // and trigger retries.
+        // and trigger retries indefinitely until shutdown.
         let block = Block {
             round: Round(1),
             ..Default::default()
@@ -635,18 +661,18 @@ mod tests {
         tx.send(make_pending_cert_with_digest(1, wrong_digest))
             .unwrap();
 
-        // Wait for all retry attempts to complete.
-        // MAX_FETCH_ATTEMPTS = 3, backoff: 500ms + 1000ms + 2000ms = 3.5s
-        thread::sleep(Duration::from_secs(5));
+        // Let the service retry for a bit.
+        thread::sleep(Duration::from_secs(2));
 
-        // The fetcher should have been called MAX_FETCH_ATTEMPTS times
-        // because each attempt fails digest validation.
-        assert_eq!(
-            fetcher.fetch_count(),
-            3, // CatchupService::MAX_FETCH_ATTEMPTS
-            "fetcher should retry MAX_FETCH_ATTEMPTS times on digest mismatch"
+        // The fetcher should have been called multiple times since the
+        // service retries indefinitely on digest mismatch.
+        assert!(
+            fetcher.fetch_count() >= 2,
+            "fetcher should retry on digest mismatch, got {} calls",
+            fetcher.fetch_count()
         );
 
+        // Shutdown stops the retry loop.
         svc.stop();
     }
 
@@ -724,9 +750,10 @@ mod tests {
     }
 
     #[test]
-    fn retry_logic_exhausts_all_attempts_on_persistent_failure() {
-        // Use the FailingBlockFetcher and verify the exact number of fetch calls.
-        // We wrap it in an Arc<CountingFailFetcher> that always fails.
+    fn persistent_failure_retries_until_shutdown() {
+        // The service now retries indefinitely on persistent failure,
+        // mirroring Go's fetchRound. Verify that it keeps retrying
+        // and stops cleanly on shutdown.
         let block = Block::default(); // won't be used since we always fail
         let fetcher = Arc::new(CountingFailFetcher::new(block, 999)); // always fail
 
@@ -739,16 +766,17 @@ mod tests {
 
         tx.send(make_pending_cert(5)).unwrap();
 
-        // Wait for all retries: 500ms + 1000ms + 2000ms = 3.5s
-        thread::sleep(Duration::from_secs(5));
+        // Let the service retry for a bit.
+        thread::sleep(Duration::from_secs(2));
 
-        // Should be called exactly MAX_FETCH_ATTEMPTS (3) times.
-        assert_eq!(
-            fetcher.total_calls(),
-            3, // CatchupService::MAX_FETCH_ATTEMPTS
-            "fetcher should be called exactly MAX_FETCH_ATTEMPTS times"
+        // Should have been called multiple times (retries indefinitely).
+        assert!(
+            fetcher.total_calls() >= 2,
+            "fetcher should be called multiple times during indefinite retry, got {}",
+            fetcher.total_calls()
         );
 
+        // Shutdown should interrupt the retry loop cleanly.
         svc.stop();
     }
 }
