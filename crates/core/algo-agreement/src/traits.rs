@@ -20,6 +20,95 @@ use crate::step::Period;
 use crate::vote::Vote;
 
 // ---------------------------------------------------------------------------
+// AsyncVoteVerifier
+// ---------------------------------------------------------------------------
+
+/// A handle to the asynchronous vote verification machinery.
+///
+/// Mirrors Go's `agreement.AsyncVoteVerifier` — a worker pool that verifies
+/// agreement votes in the background.  The `EnsureDigest` method on
+/// `LedgerWriter` passes a reference to this verifier so the catchup service
+/// can authenticate certificates for blocks it fetches.
+///
+/// The current implementation is a lightweight placeholder: the real
+/// verification logic is handled by `CryptoVerifier` / `AsyncCryptoVerifier`.
+/// This struct exists to give `PendingUnmatchedCertificate` an owned reference
+/// that can travel across threads to the catchup service.
+#[derive(Debug, Clone)]
+pub struct AsyncVoteVerifier {
+    // Intentionally empty for now.
+    // The Go struct wraps an exec pool, done channel, context, etc.
+    // These will be added when the catchup service needs real verification.
+    _private: (),
+}
+
+impl AsyncVoteVerifier {
+    /// Create a new `AsyncVoteVerifier`.
+    pub fn new() -> Self {
+        Self { _private: () }
+    }
+
+    /// Shut down the verifier and wait for all workers to finish.
+    ///
+    /// Mirrors Go's `AsyncVoteVerifier.Quit()`.
+    pub fn quit(&self) {
+        // No background workers to shut down yet.
+    }
+}
+
+impl Default for AsyncVoteVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PendingUnmatchedCertificate
+// ---------------------------------------------------------------------------
+
+/// A certificate paired with a vote verifier, queued for the catchup service.
+///
+/// Mirrors Go's `catchup.PendingUnmatchedCertificate`.  When the agreement
+/// service calls `EnsureDigest`, it packages the certificate and vote verifier
+/// into this struct and sends it on a channel to the catchup service, which
+/// will fetch the matching block and authenticate it.
+#[derive(Debug, Clone)]
+pub struct PendingUnmatchedCertificate {
+    /// The certificate identifying the block to fetch.
+    pub cert: Certificate,
+    /// The vote verifier for authenticating the fetched block's certificate.
+    pub vote_verifier: AsyncVoteVerifier,
+}
+
+// ---------------------------------------------------------------------------
+// NetworkAdvancer
+// ---------------------------------------------------------------------------
+
+/// Trait for signaling network progress.
+///
+/// Mirrors the `OnNetworkAdvance()` method on Go's `network.GossipNode`.
+/// The agreement service calls this when it makes progress (e.g., a block is
+/// committed or a certificate is received) so the network layer can perform
+/// mesh maintenance, refresh peer connections, etc.
+///
+/// This trait decouples `algo-agreement` and `algo-ledger` from the network
+/// crate.  Concrete implementations wrap a `GossipNode` or similar.
+pub trait NetworkAdvancer: Send + Sync {
+    /// Notify the network that the agreement protocol made progress.
+    fn on_network_advance(&self);
+}
+
+/// A no-op `NetworkAdvancer` for tests and stubs.
+#[derive(Debug, Clone, Default)]
+pub struct NoOpNetworkAdvancer;
+
+impl NetworkAdvancer for NoOpNetworkAdvancer {
+    fn on_network_advance(&self) {
+        // No-op.
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AgreementError
 // ---------------------------------------------------------------------------
 
@@ -156,10 +245,7 @@ pub trait LedgerWriter {
     /// use `LedgerReader::wait_for_round` for that.
     ///
     /// Mirrors Go's `EnsureDigest(Certificate, *AsyncVoteVerifier)`.
-    ///
-    /// TODO: Add `&AsyncVoteVerifier` parameter once async vote verification
-    /// is implemented (Go passes `*AsyncVoteVerifier` here).
-    fn ensure_digest(&self, cert: &Certificate);
+    fn ensure_digest(&self, cert: &Certificate, verifier: &AsyncVoteVerifier);
 }
 
 // ---------------------------------------------------------------------------

@@ -4,17 +4,20 @@ use std::time::Duration;
 
 use algo_agreement::{
     AsyncCryptoVerifier, BlockFactoryBridge, BlockValidatorBridge, EventsProcessingMonitor,
-    Parameters, RandomSource, Service,
+    NetworkAdvancer, Parameters, RandomSource, Service,
 };
 use algo_ledger::participation::ParticipationStore;
 use algo_ledger::store_trait::LedgerStore;
-use algo_ledger::{AgreementKeyManagerBridge, AgreementLedgerBridge, SqliteLedger};
+use algo_ledger::{
+    AgreementKeyManagerBridge, AgreementLedgerBridge, BlockFetcher, CatchupService, SqliteLedger,
+};
 use algo_network::{
     AgreementNetworkBridge, GossipNode, Phonebook, WebsocketNetwork, WebsocketNetworkConfig,
     RELAY_ROLE,
 };
 use algo_pool::{PoolConfig, TransactionPool};
-use algo_types::{BlockHeader, Round};
+use algo_rest_client::GossipBlockSource;
+use algo_types::{Block, BlockHeader, Round};
 use rand::Rng;
 use tracing::{info, warn};
 
@@ -38,6 +41,58 @@ struct RealRandomSource;
 impl RandomSource for RealRandomSource {
     fn uint64(&self) -> u64 {
         rand::thread_rng().gen()
+    }
+}
+
+/// A concrete [`NetworkAdvancer`] that wraps the gossip node.
+///
+/// When the agreement service makes progress (e.g. a certificate arrives or a
+/// block is committed), it calls `on_network_advance()`. This adapter
+/// delegates to the `GossipNode::on_network_advance()` method, which triggers
+/// mesh maintenance (e.g. clique-resolution peer cycling).
+///
+/// Mirrors Go's `agreementLedger.n.OnNetworkAdvance()` in `node/impls.go`.
+struct GossipNetworkAdvancer {
+    node: Arc<dyn GossipNode>,
+}
+
+impl NetworkAdvancer for GossipNetworkAdvancer {
+    fn on_network_advance(&self) {
+        self.node.on_network_advance();
+    }
+}
+
+/// A concrete [`BlockFetcher`] that fetches blocks from peers via the gossip
+/// network's WebSocket unicast protocol.
+///
+/// The catchup service runs on a dedicated background thread and calls
+/// `fetch_block` synchronously. This adapter bridges the async
+/// `GossipBlockSource` to the sync trait by using `tokio::runtime::Handle::block_on`.
+///
+/// Mirrors Go's `universalFetcher` used in `catchup/service.go`.
+struct GossipBlockFetcher {
+    ws_network: Arc<WebsocketNetwork>,
+    rt_handle: tokio::runtime::Handle,
+}
+
+impl BlockFetcher for GossipBlockFetcher {
+    fn fetch_block(&self, round: Round) -> Result<Block, String> {
+        self.rt_handle.block_on(async {
+            let peers = self.ws_network.get_unicast_peers().await;
+            if peers.is_empty() {
+                return Err(format!(
+                    "no unicast peers available to fetch block for round {}",
+                    round
+                ));
+            }
+            let source = GossipBlockSource::new(peers);
+            use algo_rest_client::BlockSource;
+            let response = source
+                .get_block(round)
+                .await
+                .map_err(|e| format!("block fetch failed for round {}: {}", round, e))?;
+            Ok(response.block)
+        })
     }
 }
 
@@ -424,11 +479,20 @@ pub async fn run(
     let rt_handle = tokio::runtime::Handle::current();
     let agreement_network = AgreementNetworkBridge::with_defaults(
         gossip_node.clone() as Arc<dyn GossipNode>,
-        rt_handle,
+        rt_handle.clone(),
     );
 
+    // Network advancer: wraps the gossip node so the ledger bridge can
+    // signal network progress when certificates arrive.
+    let network_advancer: Arc<dyn NetworkAdvancer> = Arc::new(GossipNetworkAdvancer {
+        node: gossip_node.clone() as Arc<dyn GossipNode>,
+    });
+
     // Ledger bridge: wraps SqliteLedger for agreement read/write access.
-    let agreement_ledger = AgreementLedgerBridge::new(ledger.clone());
+    // Uses `new_with_catchup` to enable the certificate-driven catchup path.
+    // The returned `cert_rx` is consumed by the CatchupService below.
+    let (agreement_ledger, cert_rx) =
+        AgreementLedgerBridge::new_with_catchup(ledger.clone(), network_advancer);
 
     // Key manager bridge: wraps ParticipationStore for voting key lookups.
     let key_manager = AgreementKeyManagerBridge::new(part_store);
@@ -496,7 +560,29 @@ pub async fn run(
     let crypto = AsyncCryptoVerifier::new(crypto_ledger);
 
     // -----------------------------------------------------------------------
-    // 5. Build and start the agreement Service.
+    // 5. Build and start the catchup service.
+    // -----------------------------------------------------------------------
+    // The catchup service runs a background thread that receives certificates
+    // from the agreement service (via `cert_rx`) and fetches the corresponding
+    // blocks from peers when the ledger doesn't have them yet.
+    //
+    // The catchup bridge is a separate `AgreementLedgerBridge` wrapping the
+    // same underlying `SqliteLedger`. It only needs `ensure_block` to commit
+    // fetched blocks, and shares the same ledger mutex so commits are visible
+    // to the agreement service immediately.
+    let catchup_bridge = Arc::new(AgreementLedgerBridge::new(ledger.clone()));
+
+    let block_fetcher: Arc<dyn BlockFetcher> = Arc::new(GossipBlockFetcher {
+        ws_network: gossip_node.clone(),
+        rt_handle,
+    });
+
+    let mut catchup_service =
+        CatchupService::start(cert_rx, ledger.clone(), catchup_bridge, block_fetcher);
+    info!("catchup service started");
+
+    // -----------------------------------------------------------------------
+    // 6. Build and start the agreement Service.
     // -----------------------------------------------------------------------
     let params = Parameters {
         network: agreement_network,
@@ -519,12 +605,18 @@ pub async fn run(
     );
 
     // -----------------------------------------------------------------------
-    // 6. Wait for shutdown signal (Ctrl+C).
+    // 7. Wait for shutdown signal (Ctrl+C).
     // -----------------------------------------------------------------------
     tokio::signal::ctrl_c().await?;
 
     info!("shutting down consensus participation...");
+
+    // Stop the agreement service first, then the catchup service (mirrors
+    // Go's shutdown order where the agreement service is stopped before the
+    // catchup service, ensuring no new certificates are sent after the
+    // catchup service shuts down).
     handle.shutdown();
+    catchup_service.stop();
     gossip_node.stop().await;
     info!("consensus participation stopped");
 

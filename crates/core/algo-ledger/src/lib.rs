@@ -4,6 +4,7 @@ pub mod apply;
 pub mod avm_context;
 pub mod block_entry;
 pub mod catchpoint;
+pub mod catchup_service;
 pub mod eval_compare;
 pub mod eval_delta;
 pub mod genesis;
@@ -46,3 +47,4 @@ pub use store_trait::LedgerStore;
 
 pub use agreement_bridge::AgreementLedgerBridge;
 pub use agreement_key_manager::AgreementKeyManagerBridge;
+pub use catchup_service::{BlockFetcher, CatchupService};
