@@ -1707,6 +1707,14 @@ impl SqliteLedger {
         })
     }
 
+    /// Return a reference to the in-memory lease table.
+    ///
+    /// Used by the block evaluator to snapshot the current lease state
+    /// while holding the ledger lock.
+    pub fn lease_table(&self) -> &LeaseTable {
+        &self.lease_table
+    }
+
     /// Load the trie from the `merkle_trie` table or rebuild from DB contents.
     ///
     /// If the table contains a serialized trie, it is deserialized.
