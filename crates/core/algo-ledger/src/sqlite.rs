@@ -3488,9 +3488,10 @@ impl LedgerStore for SqliteLedger {
             .query_row(
                 "SELECT certdata FROM blocks WHERE rnd = ?1",
                 params![round as i64],
-                |row| row.get(0),
+                |row| row.get::<_, Option<Vec<u8>>>(0),
             )
             .optional()
+            .map(|opt| opt.flatten())
             .map_err(|e| AlgoError::Ledger {
                 message: format!("get_block_cert error: {e}"),
             })
@@ -3510,7 +3511,8 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn put_block_cert(&mut self, round: u64, certdata: &[u8]) -> Result<(), AlgoError> {
-        self.conn
+        let rows_affected = self
+            .conn
             .execute(
                 "UPDATE blocks SET certdata = ?2 WHERE rnd = ?1",
                 params![round as i64, certdata],
@@ -3518,6 +3520,11 @@ impl LedgerStore for SqliteLedger {
             .map_err(|e| AlgoError::Ledger {
                 message: format!("put_block_cert error: {e}"),
             })?;
+        if rows_affected == 0 {
+            return Err(AlgoError::Ledger {
+                message: format!("put_block_cert: no block row for round {round}"),
+            });
+        }
         Ok(())
     }
 
