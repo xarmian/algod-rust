@@ -7,16 +7,16 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use std::sync::mpsc;
-
 use algo_types::{Address, Block, ConsensusParams, Digest, Round};
 
 use crate::certificate::Certificate;
 use crate::ledger_reader::{LedgerError, LedgerReader, OnlineAccountData};
 use crate::seed::Seed;
 use crate::traits::{
-    AgreementError, AgreementNetwork, BlockFactory, BlockValidator, EventsProcessingMonitor,
-    LedgerWriter, Message, MessageHandle, RandomSource, Tag, UnfinishedBlock, ValidatedBlock,
+    AgreementError, AgreementNetwork, BlockFactory, BlockValidator, CryptoBundleRequest,
+    CryptoProposalRequest, CryptoResult, CryptoVerifier, CryptoVoteRequest, CryptoVoteVerifyResult,
+    EventsProcessingMonitor, LedgerWriter, Message, MessageHandle, RandomSource, Tag,
+    UnfinishedBlock, ValidatedBlock, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
 };
 
 // ---------------------------------------------------------------------------
@@ -215,6 +215,9 @@ pub struct StubLedger {
     pub written_blocks: Mutex<Vec<WrittenBlock>>,
     /// Certificates passed to `ensure_digest`.
     pub ensured_digests: Mutex<Vec<Certificate>>,
+    /// Pending round notification waiters: (requested_round, sender).
+    /// Protected by a Mutex so `round_notify(&self)` can push entries.
+    round_waiters: Mutex<Vec<(Round, crossbeam_channel::Sender<Round>)>>,
 }
 
 impl StubLedger {
@@ -232,6 +235,7 @@ impl StubLedger {
             consensus_ver: algo_types::CONSENSUS_V41.to_string(),
             written_blocks: Mutex::new(Vec::new()),
             ensured_digests: Mutex::new(Vec::new()),
+            round_waiters: Mutex::new(Vec::new()),
         }
     }
 
@@ -268,6 +272,28 @@ impl StubLedger {
     /// Returns the certificates that were passed to `ensure_digest`.
     pub fn get_ensured_digests(&self) -> Vec<Certificate> {
         self.ensured_digests.lock().unwrap().clone()
+    }
+
+    /// Advance the stub ledger to the given round and fire any pending
+    /// round-notify waiters whose requested round has been reached.
+    ///
+    /// This is a test helper that mirrors the real ledger's round advancement
+    /// triggered by `ensure_block`.
+    pub fn advance_round(&mut self, new_next_round: Round) {
+        self.next_rnd = new_next_round;
+
+        // Drain waiters whose requested round is now available
+        // (i.e., requested_round < new_next_round, since next_round = latest + 1).
+        let mut waiters = self.round_waiters.lock().unwrap();
+        waiters.retain(|(requested_round, sender)| {
+            if requested_round.0 < new_next_round.0 {
+                // Round is available — fire the notification.
+                let _ = sender.send(*requested_round);
+                false // remove from list
+            } else {
+                true // keep waiting
+            }
+        });
     }
 }
 
@@ -328,6 +354,19 @@ impl LedgerReader for StubLedger {
         } else {
             Err(LedgerError::RoundNotAvailable(round))
         }
+    }
+
+    fn round_notify(&self, round: Round) -> crossbeam_channel::Receiver<Round> {
+        // If the round is already available, return an immediately-ready channel.
+        if round.0 < self.next_rnd.0 {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let _ = tx.send(round);
+            return rx;
+        }
+        // Otherwise register a waiter that will be fired when advance_round is called.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.round_waiters.lock().unwrap().push((round, tx));
+        rx
     }
 }
 
@@ -416,10 +455,10 @@ pub struct StubNetwork {
     /// Whether `start` has been called.
     pub started: Mutex<bool>,
     /// Senders for injecting inbound messages, keyed by tag.
-    inbound_senders: Mutex<HashMap<&'static str, mpsc::Sender<Message>>>,
+    inbound_senders: Mutex<HashMap<&'static str, crossbeam_channel::Sender<Message>>>,
     /// Receivers for inbound messages, keyed by tag.
     /// Each tag's receiver is created on first call to `messages()`.
-    inbound_receivers: Mutex<HashMap<&'static str, mpsc::Receiver<Message>>>,
+    inbound_receivers: Mutex<HashMap<&'static str, crossbeam_channel::Receiver<Message>>>,
 }
 
 impl StubNetwork {
@@ -436,12 +475,12 @@ impl StubNetwork {
 
     /// Returns a sender that can be used to inject inbound messages for the
     /// given tag. Creates the channel if it does not already exist.
-    pub fn inject_sender(&self, tag: &Tag) -> mpsc::Sender<Message> {
+    pub fn inject_sender(&self, tag: &Tag) -> crossbeam_channel::Sender<Message> {
         let mut senders = self.inbound_senders.lock().unwrap();
         if let Some(sender) = senders.get(tag.0) {
             return sender.clone();
         }
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = crossbeam_channel::unbounded();
         senders.insert(tag.0, tx.clone());
         self.inbound_receivers.lock().unwrap().insert(tag.0, rx);
         tx
@@ -460,13 +499,13 @@ impl Default for StubNetwork {
 }
 
 impl AgreementNetwork for StubNetwork {
-    fn messages(&self, tag: &Tag) -> mpsc::Receiver<Message> {
+    fn messages(&self, tag: &Tag) -> crossbeam_channel::Receiver<Message> {
         // If a receiver already exists, take it out (can only be called once per tag).
         if let Some(rx) = self.inbound_receivers.lock().unwrap().remove(tag.0) {
             return rx;
         }
         // Otherwise create a new channel and store the sender.
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = crossbeam_channel::unbounded();
         self.inbound_senders.lock().unwrap().insert(tag.0, tx);
         rx
     }
@@ -543,6 +582,110 @@ impl EventsProcessingMonitor for StubEventsProcessingMonitor {
             queue_name: queue_name.to_string(),
             queue_length,
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StubCryptoVerifier
+// ---------------------------------------------------------------------------
+
+/// A synchronous stub `CryptoVerifier` for testing.
+///
+/// Performs no actual cryptographic verification. Votes are accepted
+/// immediately and pushed onto the output channel. Proposals and bundles
+/// are similarly passed through with no verification.
+pub struct StubCryptoVerifier {
+    /// Channel pair for vote verification results.
+    vote_tx: crossbeam_channel::Sender<CryptoVoteVerifyResult>,
+    vote_rx: crossbeam_channel::Receiver<CryptoVoteVerifyResult>,
+
+    /// Channel pair for proposal verification results.
+    proposal_tx: crossbeam_channel::Sender<CryptoResult>,
+    proposal_rx: crossbeam_channel::Receiver<CryptoResult>,
+
+    /// Channel pair for bundle verification results.
+    bundle_tx: crossbeam_channel::Sender<CryptoResult>,
+    bundle_rx: crossbeam_channel::Receiver<CryptoResult>,
+}
+
+impl StubCryptoVerifier {
+    /// Creates a new stub crypto verifier with unbounded channels.
+    pub fn new() -> Self {
+        let (vote_tx, vote_rx) = crossbeam_channel::unbounded();
+        let (proposal_tx, proposal_rx) = crossbeam_channel::unbounded();
+        let (bundle_tx, bundle_rx) = crossbeam_channel::unbounded();
+        Self {
+            vote_tx,
+            vote_rx,
+            proposal_tx,
+            proposal_rx,
+            bundle_tx,
+            bundle_rx,
+        }
+    }
+}
+
+impl Default for StubCryptoVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CryptoVerifier for StubCryptoVerifier {
+    fn verify_vote(&self, request: CryptoVoteRequest) {
+        // Synchronous pass-through: immediately produce a successful result.
+        let result = CryptoVoteVerifyResult {
+            // In a real verifier, the vote field would be set to the verified
+            // vote. The stub leaves it as the already-authenticated vote from
+            // the message (if present).
+            vote: request.message.vote.clone(),
+            message: request.message,
+            task_index: request.task_index,
+            err: None,
+            cancelled: false,
+        };
+        let _ = self.vote_tx.send(result);
+    }
+
+    fn verify_proposal(&self, request: CryptoProposalRequest) {
+        let result = CryptoResult {
+            message: request.message,
+            task_index: request.task_index,
+            err: None,
+            cancelled: false,
+        };
+        let _ = self.proposal_tx.send(result);
+    }
+
+    fn verify_bundle(&self, request: CryptoBundleRequest) {
+        let result = CryptoResult {
+            message: request.message,
+            task_index: request.task_index,
+            err: None,
+            cancelled: false,
+        };
+        let _ = self.bundle_tx.send(result);
+    }
+
+    fn verified_votes(&self) -> &crossbeam_channel::Receiver<CryptoVoteVerifyResult> {
+        &self.vote_rx
+    }
+
+    fn verified(&self, tag: &str) -> &crossbeam_channel::Receiver<CryptoResult> {
+        match tag {
+            PROPOSAL_PAYLOAD_TAG => &self.proposal_rx,
+            VOTE_BUNDLE_TAG => &self.bundle_rx,
+            _ => panic!("StubCryptoVerifier::verified called with unknown tag: {tag}"),
+        }
+    }
+
+    fn channel_full(&self, _tag: &str) -> bool {
+        // Unbounded channels are never full.
+        false
+    }
+
+    fn quit(&self) {
+        // No background workers to shut down in the stub.
     }
 }
 
@@ -864,5 +1007,111 @@ mod tests {
     fn stub_events_monitor_default() {
         let monitor = StubEventsProcessingMonitor::default();
         assert!(monitor.get_updates().is_empty());
+    }
+
+    // -- StubCryptoVerifier --
+
+    #[test]
+    fn stub_crypto_verifier_vote_passthrough() {
+        use crate::events::InternalMessage;
+        use crate::traits::CryptoVoteRequest;
+        use crate::vote::UnauthenticatedVote;
+
+        let verifier = StubCryptoVerifier::new();
+
+        let request = CryptoVoteRequest {
+            message: InternalMessage {
+                tag: "AV".to_string(),
+                unauthenticated_vote: UnauthenticatedVote::default(),
+                ..InternalMessage::default()
+            },
+            task_index: 42,
+            round: Round(10),
+            period: Period(0),
+        };
+
+        verifier.verify_vote(request);
+
+        // Result should be immediately available on the channel.
+        let result = verifier
+            .verified_votes()
+            .try_recv()
+            .expect("should have a result");
+        assert_eq!(result.task_index, 42);
+        assert!(result.err.is_none());
+        assert!(!result.cancelled);
+    }
+
+    #[test]
+    fn stub_crypto_verifier_proposal_passthrough() {
+        use crate::events::InternalMessage;
+        use crate::traits::{CryptoProposalRequest, PROPOSAL_PAYLOAD_TAG};
+
+        let verifier = StubCryptoVerifier::new();
+
+        let request = CryptoProposalRequest {
+            message: InternalMessage {
+                tag: "PP".to_string(),
+                ..InternalMessage::default()
+            },
+            task_index: 7,
+            round: Round(5),
+            period: Period(0),
+            pinned: false,
+        };
+
+        verifier.verify_proposal(request);
+
+        let result = verifier
+            .verified(PROPOSAL_PAYLOAD_TAG)
+            .try_recv()
+            .expect("should have a result");
+        assert_eq!(result.task_index, 7);
+        assert!(result.err.is_none());
+        assert!(!result.cancelled);
+    }
+
+    #[test]
+    fn stub_crypto_verifier_bundle_passthrough() {
+        use crate::events::InternalMessage;
+        use crate::traits::{CryptoBundleRequest, VOTE_BUNDLE_TAG};
+
+        let verifier = StubCryptoVerifier::new();
+
+        let request = CryptoBundleRequest {
+            message: InternalMessage {
+                tag: "VB".to_string(),
+                ..InternalMessage::default()
+            },
+            task_index: 99,
+            round: Round(20),
+            period: Period(1),
+            certify: true,
+        };
+
+        verifier.verify_bundle(request);
+
+        let result = verifier
+            .verified(VOTE_BUNDLE_TAG)
+            .try_recv()
+            .expect("should have a result");
+        assert_eq!(result.task_index, 99);
+        assert!(result.err.is_none());
+        assert!(!result.cancelled);
+    }
+
+    #[test]
+    fn stub_crypto_verifier_channel_never_full() {
+        let verifier = StubCryptoVerifier::new();
+        assert!(!verifier.channel_full("AV"));
+        assert!(!verifier.channel_full("PP"));
+        assert!(!verifier.channel_full("VB"));
+    }
+
+    #[test]
+    fn stub_crypto_verifier_is_crypto_verifier() {
+        // Compile-time check: StubCryptoVerifier implements CryptoVerifier
+        fn _assert<T: CryptoVerifier>() {}
+        _assert::<StubCryptoVerifier>();
     }
 }

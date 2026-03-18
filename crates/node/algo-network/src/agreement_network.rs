@@ -8,7 +8,7 @@
 //! # Architecture
 //!
 //! `AgreementNetworkBridge` holds an `Arc<dyn GossipNode>` and creates bounded
-//! `std::sync::mpsc` channels for each agreement message tag (AV, PP, VB).
+//! `crossbeam_channel` channels for each agreement message tag (AV, PP, VB).
 //! On [`start`](AgreementNetworkBridge::start), it registers message handlers
 //! with the gossip node that forward incoming messages into the appropriate
 //! channel.  The agreement service consumes these via [`messages`](AgreementNetwork::messages).
@@ -22,7 +22,7 @@
 //! - `agreement/gossip/network.go` — `networkImpl`, `WrapNetwork`, `Start`,
 //!   `Messages`, `Broadcast`, `Relay`, `Disconnect`
 
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -140,7 +140,7 @@ pub fn network_tag_to_agreement_tag(tag: &Tag) -> Option<AgreementTag> {
 // ---------------------------------------------------------------------------
 
 /// A `MessageHandler` that forwards incoming messages into a bounded
-/// `std::sync::mpsc` channel for consumption by the agreement service.
+/// crossbeam channel for consumption by the agreement service.
 ///
 /// Mirrors Go's `processVoteMessage` / `processProposalMessage` /
 /// `processBundleMessage` functions in `agreement/gossip/network.go`.
@@ -148,14 +148,12 @@ pub fn network_tag_to_agreement_tag(tag: &Tag) -> Option<AgreementTag> {
 /// If the channel is full, the message is silently dropped (matching Go's
 /// `select { case submit <- msg: ... default: dropped++ }` pattern).
 struct ChannelForwarder {
-    sender: Mutex<mpsc::SyncSender<Message>>,
+    sender: crossbeam_channel::Sender<Message>,
 }
 
 impl ChannelForwarder {
-    fn new(sender: mpsc::SyncSender<Message>) -> Self {
-        Self {
-            sender: Mutex::new(sender),
-        }
+    fn new(sender: crossbeam_channel::Sender<Message>) -> Self {
+        Self { sender }
     }
 }
 
@@ -176,8 +174,7 @@ impl MessageHandler for ChannelForwarder {
         };
 
         // Non-blocking send — drop if channel is full (matches Go behavior).
-        let sender = self.sender.lock().expect("channel forwarder lock poisoned");
-        let _ = sender.try_send(agreement_msg);
+        let _ = self.sender.try_send(agreement_msg);
 
         // Always return Ignore — agreement handles relay/broadcast decisions
         // itself through the AgreementNetwork trait methods.
@@ -230,18 +227,18 @@ pub struct AgreementNetworkBridge {
     rt_handle: tokio::runtime::Handle,
 
     /// Receiver end of the vote channel (AV tag).
-    vote_rx: Mutex<Option<mpsc::Receiver<Message>>>,
+    vote_rx: Mutex<Option<crossbeam_channel::Receiver<Message>>>,
     /// Receiver end of the proposal channel (PP tag).
-    proposal_rx: Mutex<Option<mpsc::Receiver<Message>>>,
+    proposal_rx: Mutex<Option<crossbeam_channel::Receiver<Message>>>,
     /// Receiver end of the bundle channel (VB tag).
-    bundle_rx: Mutex<Option<mpsc::Receiver<Message>>>,
+    bundle_rx: Mutex<Option<crossbeam_channel::Receiver<Message>>>,
 
     /// Sender end of the vote channel (kept for handler registration).
-    vote_tx: mpsc::SyncSender<Message>,
+    vote_tx: crossbeam_channel::Sender<Message>,
     /// Sender end of the proposal channel.
-    proposal_tx: mpsc::SyncSender<Message>,
+    proposal_tx: crossbeam_channel::Sender<Message>,
     /// Sender end of the bundle channel.
-    bundle_tx: mpsc::SyncSender<Message>,
+    bundle_tx: crossbeam_channel::Sender<Message>,
 }
 
 impl AgreementNetworkBridge {
@@ -256,9 +253,9 @@ impl AgreementNetworkBridge {
         rt_handle: tokio::runtime::Handle,
         config: AgreementNetworkConfig,
     ) -> Self {
-        let (vote_tx, vote_rx) = mpsc::sync_channel(config.vote_queue_len);
-        let (proposal_tx, proposal_rx) = mpsc::sync_channel(config.proposal_queue_len);
-        let (bundle_tx, bundle_rx) = mpsc::sync_channel(config.bundle_queue_len);
+        let (vote_tx, vote_rx) = crossbeam_channel::bounded(config.vote_queue_len);
+        let (proposal_tx, proposal_rx) = crossbeam_channel::bounded(config.proposal_queue_len);
+        let (bundle_tx, bundle_rx) = crossbeam_channel::bounded(config.bundle_queue_len);
 
         Self {
             net,
@@ -279,7 +276,7 @@ impl AgreementNetworkBridge {
 }
 
 impl AgreementNetwork for AgreementNetworkBridge {
-    fn messages(&self, tag: &AgreementTag) -> mpsc::Receiver<Message> {
+    fn messages(&self, tag: &AgreementTag) -> crossbeam_channel::Receiver<Message> {
         let mutex = match tag.0 {
             AGREEMENT_VOTE_TAG => &self.vote_rx,
             PROPOSAL_PAYLOAD_TAG => &self.proposal_rx,
@@ -289,19 +286,26 @@ impl AgreementNetwork for AgreementNetworkBridge {
                     "AgreementNetworkBridge::messages called with unknown tag: {other}; \
                      returning immediately-closed channel"
                 );
-                let (tx, rx) = mpsc::sync_channel(0);
+                let (tx, rx) = crossbeam_channel::bounded(0);
                 drop(tx);
                 return rx;
             }
         };
 
-        let mut guard = mutex.lock().expect("messages lock poisoned");
+        let mut guard = match mutex.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                warn!("messages lock poisoned for tag {}", tag.0);
+                let (_tx, rx) = crossbeam_channel::bounded(0);
+                return rx;
+            }
+        };
         match guard.take() {
             Some(rx) => rx,
             None => {
                 // Channel was already consumed. Create a new one (the previous
                 // receiver is lost, matching Go's semantics).
-                let (tx, rx) = mpsc::sync_channel(match tag.0 {
+                let (tx, rx) = crossbeam_channel::bounded(match tag.0 {
                     AGREEMENT_VOTE_TAG => DEFAULT_VOTE_QUEUE_LEN,
                     PROPOSAL_PAYLOAD_TAG => DEFAULT_PROPOSAL_QUEUE_LEN,
                     VOTE_BUNDLE_TAG => DEFAULT_BUNDLE_QUEUE_LEN,
@@ -468,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_forwarder_delivers_message() {
-        let (tx, rx) = mpsc::sync_channel(10);
+        let (tx, rx) = crossbeam_channel::bounded(10);
         let forwarder = ChannelForwarder::new(tx);
 
         let incoming = IncomingMessage::new(
@@ -492,7 +496,7 @@ mod tests {
     #[tokio::test]
     async fn channel_forwarder_drops_when_full() {
         // Channel with capacity 1
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = crossbeam_channel::bounded(1);
         let forwarder = ChannelForwarder::new(tx);
 
         // Fill the channel

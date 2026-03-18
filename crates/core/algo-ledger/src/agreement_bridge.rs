@@ -7,6 +7,8 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crossbeam_channel;
+
 use tracing::warn;
 
 use algo_agreement::{
@@ -222,6 +224,64 @@ impl LedgerReader for AgreementLedgerBridge {
         }
 
         Ok(())
+    }
+
+    fn round_notify(&self, round: Round) -> crossbeam_channel::Receiver<Round> {
+        // Check if the round is already available.
+        {
+            let ledger = match self.ledger.lock() {
+                Ok(l) => l,
+                Err(_) => {
+                    // Lock poisoned — return a channel that never fires.
+                    let (_tx, rx) = crossbeam_channel::bounded(1);
+                    return rx;
+                }
+            };
+            if ledger.current_round().0 >= round.0 {
+                // Already available — return an immediately-ready channel.
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                let _ = tx.send(round);
+                return rx;
+            }
+        }
+
+        // Spawn a short-lived thread that waits on the Condvar for the round
+        // to be reached, then sends a single notification on the channel.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ledger = Arc::clone(&self.ledger);
+        let condvar = Arc::clone(&self.round_advanced);
+
+        std::thread::Builder::new()
+            .name(format!("round-notify-{}", round.0))
+            .spawn(move || {
+                const TIMEOUT: Duration = Duration::from_secs(300);
+                let deadline = std::time::Instant::now() + TIMEOUT;
+
+                let mut guard = match ledger.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+
+                while guard.current_round().0 < round.0 {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return; // timed out — drop the sender, receiver sees disconnect
+                    }
+                    let (g, result) = match condvar.wait_timeout(guard, remaining) {
+                        Ok(pair) => pair,
+                        Err(_) => return,
+                    };
+                    guard = g;
+                    if result.timed_out() && guard.current_round().0 < round.0 {
+                        return;
+                    }
+                }
+
+                let _ = tx.send(round);
+            })
+            .expect("failed to spawn round-notify thread");
+
+        rx
     }
 }
 

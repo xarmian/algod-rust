@@ -10,6 +10,7 @@ mod bundle;
 mod certificate;
 pub mod codec;
 mod credential;
+pub mod crypto_verifier;
 pub mod demux;
 pub mod events;
 #[cfg(test)]
@@ -61,15 +62,16 @@ pub use seed::{
 pub use selector::Selector;
 pub use step::{Period, Step, CERT, DOWN, LATE, NEXT, PROPOSE, REDO, SOFT};
 pub use stubs::{
-    EventsQueueUpdate, SentMessage, StubBlockFactory, StubBlockValidator,
+    EventsQueueUpdate, SentMessage, StubBlockFactory, StubBlockValidator, StubCryptoVerifier,
     StubEventsProcessingMonitor, StubLedger, StubNetwork, StubRandomSource, StubUnfinishedBlock,
     StubValidatedBlock, WrittenBlock,
 };
 pub use traits::{
     AgreementError, AgreementKeyManager, AgreementLedger, AgreementNetwork, BlockFactory,
-    BlockValidator, EventsProcessingMonitor, LedgerWriter, Message, MessageHandle,
-    ParticipationAction, ParticipationRecord, RandomSource, Tag, UnfinishedBlock, ValidatedBlock,
-    AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
+    BlockValidator, CryptoBundleRequest, CryptoProposalRequest, CryptoResult, CryptoVerifier,
+    CryptoVoteRequest, CryptoVoteVerifyResult, EventsProcessingMonitor, LedgerWriter, Message,
+    MessageHandle, ParticipationAction, ParticipationRecord, RandomSource, Tag, UnfinishedBlock,
+    ValidatedBlock, AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
 };
 pub use vote::{
     ProposalValue, RawVote, UnauthenticatedVote, Vote, VoteError, VoteVerifyParams, BOTTOM,
@@ -116,6 +118,9 @@ pub use block_validator_bridge::{BlockValidatorBridge, ValidatedBlockImpl};
 pub use demux::{Demux, ExternalDemuxSignals, ExternalEvent};
 pub use player::{Player, Tracer};
 pub use router::{PeriodRouter, RootRouter, RoundRouter, StateMachineTag, StepRouter};
+
+// Re-exports from crypto verifier module
+pub use crypto_verifier::AsyncCryptoVerifier;
 
 // Re-exports from service module
 pub use service::{Parameters, Service, ServiceHandle};

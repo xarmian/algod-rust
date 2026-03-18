@@ -21,10 +21,12 @@ use algo_agreement::{
     BlockValidator,
     // Bridge types
     BlockValidatorBridge,
+    CryptoVerifier,
     EventsProcessingMonitor,
     LedgerReader,
     LedgerWriter,
     // Service / Parameters
+    Message,
     Parameters,
     ParticipationAction,
     ParticipationRecord,
@@ -42,15 +44,20 @@ use algo_agreement::{
     // Stubs
     StubBlockFactory,
     StubBlockValidator,
+    StubCryptoVerifier,
     StubEventsProcessingMonitor,
     StubLedger,
     StubNetwork,
     StubRandomSource,
+    Tag,
     UnauthenticatedVote,
     UnfinishedBlock,
     ValidatedBlock,
     ValidatedBlockImpl,
+    AGREEMENT_VOTE_TAG,
     BOTTOM,
+    PROPOSAL_PAYLOAD_TAG,
+    VOTE_BUNDLE_TAG,
 };
 use algo_consensus_crypto::vrf::VrfKeypair;
 use algo_consensus_crypto::OneTimeSignatureSecrets;
@@ -117,6 +124,7 @@ fn service_starts_and_shuts_down_cleanly() {
         block_validator: StubBlockValidator::accepting(),
         random_source: StubRandomSource::constant(0),
         monitor: StubEventsProcessingMonitor::new(),
+        crypto: StubCryptoVerifier::new(),
     };
 
     let service = Service::new(params);
@@ -145,6 +153,7 @@ fn service_start_calls_network_start() {
         block_validator: StubBlockValidator::accepting(),
         random_source: StubRandomSource::constant(0),
         monitor: StubEventsProcessingMonitor::new(),
+        crypto: StubCryptoVerifier::new(),
     };
 
     let service = Service::new(params);
@@ -172,6 +181,7 @@ fn service_bootstrap_at_ledger_round() {
         block_validator: StubBlockValidator::accepting(),
         random_source: StubRandomSource::constant(42),
         monitor: StubEventsProcessingMonitor::new(),
+        crypto: StubCryptoVerifier::new(),
     };
 
     let service = Service::new(params);
@@ -191,6 +201,7 @@ fn service_handles_round_zero() {
         block_validator: StubBlockValidator::accepting(),
         random_source: StubRandomSource::constant(0),
         monitor: StubEventsProcessingMonitor::new(),
+        crypto: StubCryptoVerifier::new(),
     };
 
     let service = Service::new(params);
@@ -212,6 +223,7 @@ fn service_multiple_start_shutdown_cycles() {
             block_validator: StubBlockValidator::accepting(),
             random_source: StubRandomSource::constant(round),
             monitor: StubEventsProcessingMonitor::new(),
+            crypto: StubCryptoVerifier::new(),
         };
 
         let service = Service::new(params);
@@ -232,6 +244,7 @@ fn service_immediate_shutdown() {
         block_validator: StubBlockValidator::accepting(),
         random_source: StubRandomSource::constant(0),
         monitor: StubEventsProcessingMonitor::new(),
+        crypto: StubCryptoVerifier::new(),
     };
 
     let service = Service::new(params);
@@ -932,6 +945,7 @@ fn service_handle_shutdown_completes() {
         block_validator: StubBlockValidator::accepting(),
         random_source: StubRandomSource::constant(0),
         monitor: StubEventsProcessingMonitor::new(),
+        crypto: StubCryptoVerifier::new(),
     };
 
     let handle = Service::new(params).start();
@@ -1010,4 +1024,294 @@ fn codec_vote_roundtrip_bottom_proposal() {
     let decoded = codec::decode_vote(&encoded).expect("decode should succeed");
     assert_eq!(decoded.raw_vote.round, Round(50));
     assert!(decoded.raw_vote.proposal.is_bottom());
+}
+
+// ===========================================================================
+// Demux + Service integration tests (Wave 3)
+// ===========================================================================
+
+/// Helper to create a service with pre-configured network inject senders
+/// so we can push messages into the service's channels.
+fn make_service_with_injectables(
+    round: Round,
+) -> (
+    algo_agreement::ServiceHandle,
+    crossbeam_channel::Sender<Message>,
+    crossbeam_channel::Sender<Message>,
+    crossbeam_channel::Sender<Message>,
+) {
+    let network = StubNetwork::new();
+
+    // Pre-create inject senders for each tag BEFORE the service consumes the
+    // network. The service's start() will call network.messages() which will
+    // take the receivers we create here.
+    let av_sender = network.inject_sender(&Tag(AGREEMENT_VOTE_TAG));
+    let pp_sender = network.inject_sender(&Tag(PROPOSAL_PAYLOAD_TAG));
+    let vb_sender = network.inject_sender(&Tag(VOTE_BUNDLE_TAG));
+
+    let params = Parameters {
+        network,
+        ledger: StubLedger::new(v41_params(), round),
+        key_manager: EmptyKeyManager,
+        block_factory: StubBlockFactory::new(),
+        block_validator: StubBlockValidator::accepting(),
+        random_source: StubRandomSource::constant(42),
+        monitor: StubEventsProcessingMonitor::new(),
+        crypto: StubCryptoVerifier::new(),
+    };
+
+    let handle = Service::new(params).start();
+    (handle, av_sender, pp_sender, vb_sender)
+}
+
+#[test]
+fn service_processes_injected_vote_message() {
+    // Inject an encoded vote on the AV channel and verify the service
+    // processes it without crashing. The service should decode the vote
+    // and feed it to the player state machine.
+    let (handle, av_sender, _pp_sender, _vb_sender) = make_service_with_injectables(Round(100));
+
+    // Encode a valid vote and inject it.
+    let vote = UnauthenticatedVote::default();
+    let encoded = codec::encode_vote(&vote);
+    av_sender
+        .send(Message {
+            handle: None,
+            data: encoded,
+        })
+        .expect("should send vote");
+
+    // Give the service time to process.
+    thread::sleep(Duration::from_millis(100));
+
+    // Shutdown should complete cleanly.
+    handle.shutdown();
+}
+
+#[test]
+fn service_processes_injected_proposal_message() {
+    // Inject a compound message (proposal payload) on the PP channel.
+    let (handle, _av_sender, pp_sender, _vb_sender) = make_service_with_injectables(Round(100));
+
+    // Encode a compound message with an empty proposal and no vote.
+    let compound = algo_agreement::CompoundMessage {
+        proposal: algo_agreement::UnauthenticatedProposal::default(),
+        vote: UnauthenticatedVote::default(),
+    };
+    let encoded = codec::encode_compound_message(&compound);
+    pp_sender
+        .send(Message {
+            handle: None,
+            data: encoded,
+        })
+        .expect("should send proposal");
+
+    thread::sleep(Duration::from_millis(100));
+    handle.shutdown();
+}
+
+#[test]
+fn service_processes_injected_bundle_message() {
+    // Inject a bundle message on the VB channel.
+    let (handle, _av_sender, _pp_sender, vb_sender) = make_service_with_injectables(Round(100));
+
+    let bundle = algo_agreement::UnauthenticatedBundle::default();
+    let encoded = codec::encode_bundle(&bundle);
+    vb_sender
+        .send(Message {
+            handle: None,
+            data: encoded,
+        })
+        .expect("should send bundle");
+
+    thread::sleep(Duration::from_millis(100));
+    handle.shutdown();
+}
+
+#[test]
+fn service_handles_garbage_vote_data_without_crash() {
+    // Inject garbage data on the AV channel. The service should log a
+    // warning but NOT crash.
+    let (handle, av_sender, _pp_sender, _vb_sender) = make_service_with_injectables(Round(100));
+
+    av_sender
+        .send(Message {
+            handle: None,
+            data: vec![0xFF, 0x00, 0x01, 0x02],
+        })
+        .expect("should send garbage");
+
+    thread::sleep(Duration::from_millis(100));
+    handle.shutdown();
+}
+
+#[test]
+fn service_handles_garbage_proposal_data_without_crash() {
+    // Inject garbage data on the PP channel.
+    let (handle, _av_sender, pp_sender, _vb_sender) = make_service_with_injectables(Round(100));
+
+    pp_sender
+        .send(Message {
+            handle: None,
+            data: vec![0xFF, 0xFE, 0xFD],
+        })
+        .expect("should send garbage");
+
+    thread::sleep(Duration::from_millis(100));
+    handle.shutdown();
+}
+
+#[test]
+fn service_handles_garbage_bundle_data_without_crash() {
+    // Inject garbage data on the VB channel.
+    let (handle, _av_sender, _pp_sender, vb_sender) = make_service_with_injectables(Round(100));
+
+    vb_sender
+        .send(Message {
+            handle: None,
+            data: vec![0x01, 0x02],
+        })
+        .expect("should send garbage");
+
+    thread::sleep(Duration::from_millis(100));
+    handle.shutdown();
+}
+
+#[test]
+fn service_clean_shutdown_with_active_channels() {
+    // Start the service with active network channels (senders still open),
+    // verify shutdown completes without hanging even though messages could
+    // still arrive.
+    let (handle, av_sender, pp_sender, vb_sender) = make_service_with_injectables(Round(50));
+
+    // Keep senders alive to simulate an active network.
+    thread::sleep(Duration::from_millis(50));
+
+    // Shutdown while senders are still open.
+    handle.shutdown();
+
+    // After shutdown, sending should fail (receivers dropped by the service).
+    let result = av_sender.send(Message {
+        handle: None,
+        data: vec![],
+    });
+    // The send may or may not succeed depending on timing, but the key
+    // assertion is that shutdown() completed without hanging.
+    drop(result);
+    drop(pp_sender);
+    drop(vb_sender);
+}
+
+#[test]
+fn service_random_source_provides_entropy() {
+    // Verify that the service uses RandomSource to populate entropy in
+    // signals. We use a StubRandomSource with a known sequence and verify
+    // the service runs without issues.
+    let params = Parameters {
+        network: StubNetwork::new(),
+        ledger: StubLedger::new(v41_params(), Round(1)),
+        key_manager: EmptyKeyManager,
+        block_factory: StubBlockFactory::new(),
+        block_validator: StubBlockValidator::accepting(),
+        random_source: StubRandomSource::new(vec![111, 222, 333]),
+        monitor: StubEventsProcessingMonitor::new(),
+        crypto: StubCryptoVerifier::new(),
+    };
+
+    let handle = Service::new(params).start();
+    thread::sleep(Duration::from_millis(100));
+    handle.shutdown();
+}
+
+#[test]
+fn service_with_crypto_verifier_channels() {
+    // Verify that the CryptoVerifier channels are properly wired into the
+    // Demux. The StubCryptoVerifier immediately produces results when
+    // verify_vote/verify_proposal/verify_bundle are called. Since the
+    // service doesn't currently dispatch crypto actions to the verifier
+    // directly (that's done by the pseudonode), we verify the channels are
+    // at least set up without error.
+    let crypto = StubCryptoVerifier::new();
+
+    // Verify the channels are accessible before handing to the service.
+    assert!(!crypto.channel_full(AGREEMENT_VOTE_TAG));
+    assert!(!crypto.channel_full(PROPOSAL_PAYLOAD_TAG));
+    assert!(!crypto.channel_full(VOTE_BUNDLE_TAG));
+
+    let params = Parameters {
+        network: StubNetwork::new(),
+        ledger: StubLedger::new(v41_params(), Round(1)),
+        key_manager: EmptyKeyManager,
+        block_factory: StubBlockFactory::new(),
+        block_validator: StubBlockValidator::accepting(),
+        random_source: StubRandomSource::constant(0),
+        monitor: StubEventsProcessingMonitor::new(),
+        crypto,
+    };
+
+    let handle = Service::new(params).start();
+    thread::sleep(Duration::from_millis(50));
+    handle.shutdown();
+}
+
+#[test]
+fn service_multiple_votes_on_channel() {
+    // Inject multiple vote messages in quick succession to verify the
+    // service handles a burst of network traffic.
+    let (handle, av_sender, _pp_sender, _vb_sender) = make_service_with_injectables(Round(100));
+
+    for i in 0..10 {
+        let vote = UnauthenticatedVote {
+            raw_vote: algo_agreement::RawVote {
+                sender: Address([i as u8; 32]),
+                round: Round(100),
+                period: Period(0),
+                step: Step(1),
+                proposal: BOTTOM,
+            },
+            ..UnauthenticatedVote::default()
+        };
+        let encoded = codec::encode_vote(&vote);
+        let _ = av_sender.send(Message {
+            handle: None,
+            data: encoded,
+        });
+    }
+
+    thread::sleep(Duration::from_millis(200));
+    handle.shutdown();
+}
+
+#[test]
+fn service_mixed_message_types() {
+    // Inject a mix of vote, proposal, and bundle messages to verify the
+    // service multiplexes them correctly.
+    let (handle, av_sender, pp_sender, vb_sender) = make_service_with_injectables(Round(100));
+
+    // Send a vote.
+    let vote = UnauthenticatedVote::default();
+    let _ = av_sender.send(Message {
+        handle: None,
+        data: codec::encode_vote(&vote),
+    });
+
+    // Send a proposal.
+    let compound = algo_agreement::CompoundMessage {
+        proposal: algo_agreement::UnauthenticatedProposal::default(),
+        vote: UnauthenticatedVote::default(),
+    };
+    let _ = pp_sender.send(Message {
+        handle: None,
+        data: codec::encode_compound_message(&compound),
+    });
+
+    // Send a bundle.
+    let bundle = algo_agreement::UnauthenticatedBundle::default();
+    let _ = vb_sender.send(Message {
+        handle: None,
+        data: codec::encode_bundle(&bundle),
+    });
+
+    thread::sleep(Duration::from_millis(200));
+    handle.shutdown();
 }

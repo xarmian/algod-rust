@@ -8,12 +8,16 @@
 // - LedgerWriter: writes certified blocks to the ledger
 // - AgreementLedger: full ledger interface (reader + writer)
 // - RandomSource: random number generator for sortition timing
+// - CryptoVerifier: async cryptographic verification of votes, proposals, bundles
 
 use algo_types::{Address, Block, Round};
 
 use crate::certificate::Certificate;
+use crate::events::{InternalMessage, SerializableError};
 use crate::ledger_reader::LedgerReader;
 use crate::seed::Seed;
+use crate::step::Period;
+use crate::vote::Vote;
 
 // ---------------------------------------------------------------------------
 // AgreementError
@@ -243,7 +247,7 @@ pub trait AgreementNetwork {
     /// channel semantics where `Messages()` returns a moved `<-chan`.
     ///
     /// Mirrors Go's `Messages(protocol.Tag) <-chan Message`.
-    fn messages(&self, tag: &Tag) -> std::sync::mpsc::Receiver<Message>;
+    fn messages(&self, tag: &Tag) -> crossbeam_channel::Receiver<Message>;
 
     /// Broadcast a message with the given tag to all neighbors.
     ///
@@ -344,6 +348,140 @@ pub trait EventsProcessingMonitor {
     ///
     /// Mirrors Go's `UpdateEventsQueue(queueName string, queueLength int)`.
     fn update_events_queue(&self, queue_name: &str, queue_length: usize);
+}
+
+// ---------------------------------------------------------------------------
+// CryptoVerifier
+// ---------------------------------------------------------------------------
+
+/// Result of asynchronous vote verification.
+///
+/// Mirrors Go's `asyncVerifyVoteResponse` in agreement/asyncVoteVerifier.go.
+#[derive(Debug)]
+pub struct CryptoVoteVerifyResult {
+    /// The verified vote (set on success).
+    pub vote: Option<Vote>,
+    /// The internal message associated with the verification request.
+    pub message: InternalMessage,
+    /// Task index for tracking through the pipeline.
+    pub task_index: u64,
+    /// Error from verification (set on failure).
+    pub err: Option<SerializableError>,
+    /// Whether the request was cancelled before verification completed.
+    pub cancelled: bool,
+}
+
+/// Result of asynchronous proposal or bundle verification.
+///
+/// Mirrors Go's `cryptoResult` in agreement/cryptoVerifier.go.
+#[derive(Debug)]
+pub struct CryptoResult {
+    /// The internal message associated with the verification request.
+    pub message: InternalMessage,
+    /// Task index for tracking through the pipeline.
+    pub task_index: u64,
+    /// Error from verification (set on failure).
+    pub err: Option<SerializableError>,
+    /// Whether the request was cancelled before verification completed.
+    pub cancelled: bool,
+}
+
+/// Request to verify a vote asynchronously.
+///
+/// Mirrors Go's `cryptoVoteRequest`.
+#[derive(Debug)]
+pub struct CryptoVoteRequest {
+    /// The message containing the vote to verify.
+    pub message: InternalMessage,
+    /// Caller-specific index, passed back in the response.
+    pub task_index: u64,
+    /// The round to verify against.
+    pub round: Round,
+    /// The period associated with the message.
+    pub period: Period,
+}
+
+/// Request to verify a proposal asynchronously.
+///
+/// Mirrors Go's `cryptoProposalRequest`.
+#[derive(Debug)]
+pub struct CryptoProposalRequest {
+    /// The message containing the proposal to verify.
+    pub message: InternalMessage,
+    /// Caller-specific index, passed back in the response.
+    pub task_index: u64,
+    /// The round to verify against.
+    pub round: Round,
+    /// The period associated with the message.
+    pub period: Period,
+    /// Whether this is a pinned value for the given round.
+    pub pinned: bool,
+}
+
+/// Request to verify a bundle asynchronously.
+///
+/// Mirrors Go's `cryptoBundleRequest`.
+#[derive(Debug)]
+pub struct CryptoBundleRequest {
+    /// The message containing the bundle to verify.
+    pub message: InternalMessage,
+    /// Caller-specific index, passed back in the response.
+    pub task_index: u64,
+    /// The round to verify against.
+    pub round: Round,
+    /// The period associated with the message.
+    pub period: Period,
+    /// Whether this is a cert bundle.
+    pub certify: bool,
+}
+
+/// Asynchronous cryptographic verifier for agreement messages.
+///
+/// Mirrors Go's `cryptoVerifier` interface in agreement/cryptoVerifier.go.
+///
+/// Callers submit verification requests via `verify_vote`, `verify_proposal`,
+/// and `verify_bundle`, and obtain results by receiving from the channels
+/// returned by `verified_votes` and `verified`.
+pub trait CryptoVerifier: Send + 'static {
+    /// Enqueue a vote for asynchronous verification.
+    ///
+    /// Mirrors Go's `VerifyVote(ctx, cryptoVoteRequest)`.
+    fn verify_vote(&self, request: CryptoVoteRequest);
+
+    /// Enqueue a proposal for asynchronous verification.
+    ///
+    /// Mirrors Go's `VerifyProposal(ctx, cryptoProposalRequest)`.
+    fn verify_proposal(&self, request: CryptoProposalRequest);
+
+    /// Enqueue a bundle for asynchronous verification.
+    ///
+    /// Mirrors Go's `VerifyBundle(ctx, cryptoBundleRequest)`.
+    fn verify_bundle(&self, request: CryptoBundleRequest);
+
+    /// Returns a receiver for verified vote results.
+    ///
+    /// Mirrors Go's `VerifiedVotes() <-chan asyncVerifyVoteResponse`.
+    fn verified_votes(&self) -> &crossbeam_channel::Receiver<CryptoVoteVerifyResult>;
+
+    /// Returns a receiver for verified proposal/bundle results for the given tag.
+    ///
+    /// - If `tag == "PP"` (ProposalPayloadTag): returns proposal verification results.
+    /// - If `tag == "VB"` (VoteBundleTag): returns bundle verification results.
+    ///
+    /// Mirrors Go's `Verified(tag protocol.Tag) <-chan cryptoResult`.
+    fn verified(&self, tag: &str) -> &crossbeam_channel::Receiver<CryptoResult>;
+
+    /// Returns whether the input channel for the given tag is full.
+    ///
+    /// The demux uses this to apply backpressure and avoid deadlocks.
+    ///
+    /// Mirrors Go's `ChannelFull(tag protocol.Tag) bool`.
+    fn channel_full(&self, tag: &str) -> bool;
+
+    /// Shut down the verifier goroutines.
+    ///
+    /// Mirrors Go's `Quit()`.
+    fn quit(&self);
 }
 
 // ---------------------------------------------------------------------------
