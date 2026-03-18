@@ -18,6 +18,8 @@ use algo_agreement::{
 use algo_types::consensus::consensus_params_for_version;
 use algo_types::{Address, ConsensusParams, Digest, Round};
 
+use algo_error::AlgoError;
+
 use crate::sqlite::SqliteLedger;
 use crate::store_trait::LedgerStore;
 
@@ -163,6 +165,43 @@ impl AgreementLedgerBridge {
             .map_err(|e| LedgerError::Other(format!("decode_bundle: {e}")))?;
 
         Ok(Certificate::from_bundle(&bundle))
+    }
+
+    /// Attempt to commit a block + certificate + state application in a single
+    /// transaction.  Returns `Ok(())` on success or an `AlgoError` on failure
+    /// (the transaction is rolled back automatically on error).
+    fn try_commit_block(
+        ledger: &mut SqliteLedger,
+        block: &algo_types::Block,
+        proto: &str,
+        hdr_data: &[u8],
+        blk_data: &[u8],
+        cert_bytes: &[u8],
+    ) -> Result<(), AlgoError> {
+        // Begin a transaction so that block storage and state application
+        // are atomic. If begin_block fails (e.g., already in a transaction),
+        // fall back to non-transactional mode.
+        let in_txn = ledger.begin_block().is_ok();
+
+        let result = (|| -> Result<(), AlgoError> {
+            ledger.put_block(block.round.0, proto, hdr_data, blk_data)?;
+            ledger.put_block_cert(block.round.0, cert_bytes)?;
+            crate::apply::apply_block(ledger, block)?;
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            if in_txn {
+                let _ = ledger.rollback_block();
+            }
+            return Err(e);
+        }
+
+        if in_txn {
+            ledger.commit_block()?;
+        }
+
+        Ok(())
     }
 
     /// Helper: get the protocol version string for a given round by reading
@@ -404,27 +443,23 @@ impl LedgerReader for AgreementLedgerBridge {
 
 impl LedgerWriter for AgreementLedgerBridge {
     fn ensure_block(&self, block: &algo_types::Block, cert: &Certificate) {
-        let mut ledger = match self.ledger.lock() {
-            Ok(l) => l,
-            Err(e) => {
-                warn!("ledger lock poisoned in ensure_block: {e}");
-                return;
-            }
-        };
+        // Retry loop mirrors Go's `EnsureBlock` in `data/ledger.go`:
+        //
+        //   for l.LastRound() < round {
+        //       err := l.AddBlock(*block, c)
+        //       if err == nil { break }
+        //       ...
+        //       time.Sleep(100 * time.Millisecond)
+        //   }
+        //
+        // Transient errors (SQLite busy, lock contention) are retried up to a
+        // maximum count. Permanent errors (encoding failures) return immediately.
+        const MAX_RETRIES: u32 = 100;
+        const RETRY_DELAY: Duration = Duration::from_millis(100);
 
-        // Check if this block's round has already been committed.
-        let next_round = ledger.current_round().0 + 1;
-        if block.round.0 < next_round {
-            // Block already committed; idempotent.
-            return;
-        }
-
-        if block.round.0 > next_round {
-            warn!("ensure_block: block round {} is ahead of next expected round {}, skipping (needs catchup)", block.round.0, next_round);
-            return;
-        }
-
-        // Encode the block for storage.
+        // Pre-encode the block and header outside the retry loop — these are
+        // deterministic and will not change between attempts. Encoding failure
+        // is permanent and not retryable.
         let blk_data = match algo_codec::encode_block(block) {
             Ok(data) => data,
             Err(e) => {
@@ -435,76 +470,101 @@ impl LedgerWriter for AgreementLedgerBridge {
                 return;
             }
         };
-
-        // Encode the header portion using canonical encoding.
         let hdr_data = algo_codec::canonical_encode_block_header_from_block(block);
         let proto = &block.current_protocol;
 
-        // Begin a transaction so that block storage and state application
-        // are atomic. If begin_block fails (e.g., already in a transaction),
-        // fall back to non-transactional mode.
-        let in_txn = ledger.begin_block().is_ok();
-
-        // Store the raw block data.
-        if let Err(e) = ledger.put_block(block.round.0, proto, &hdr_data, &blk_data) {
-            warn!(
-                "ensure_block: failed to put block for round {}: {e}",
-                block.round
-            );
-            if in_txn {
-                let _ = ledger.rollback_block();
-            }
-            return;
-        }
-
-        // Encode and store the certificate alongside the block.
+        // Pre-encode the certificate.
         let bundle = cert.to_unauthenticated_bundle();
         let cert_bytes = algo_agreement::codec::encode_bundle(&bundle);
-        if let Err(e) = ledger.put_block_cert(block.round.0, &cert_bytes) {
-            warn!(
-                "ensure_block: failed to put block cert for round {}: {e}",
-                block.round
-            );
-            if in_txn {
-                let _ = ledger.rollback_block();
-            }
-            return;
-        }
 
-        // Apply the block's state changes (transactions, rewards, round
-        // advancement). This mirrors Go's EnsureBlock which calls
-        // l.Ledger.EnsureBlock(&e, c) and internally validates + applies.
-        if let Err(e) = crate::apply::apply_block(&mut *ledger, block) {
-            warn!(
-                "ensure_block: failed to apply block for round {}: {e}",
-                block.round
-            );
-            if in_txn {
-                let _ = ledger.rollback_block();
-            }
-            return;
-        }
+        for attempt in 0..=MAX_RETRIES {
+            let mut ledger = match self.ledger.lock() {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!("ledger lock poisoned in ensure_block: {e}");
+                    return;
+                }
+            };
 
-        // Commit the transaction.
-        if in_txn {
-            if let Err(e) = ledger.commit_block() {
+            // Check if this block's round has already been committed.
+            let next_round = ledger.current_round().0 + 1;
+            if block.round.0 < next_round {
+                // Block already committed (by us or by catchup); idempotent.
+                debug!(
+                    "ensure_block: block round {} already committed, current round {}",
+                    block.round.0,
+                    next_round - 1
+                );
+                return;
+            }
+
+            if block.round.0 > next_round {
                 warn!(
-                    "ensure_block: failed to commit block for round {}: {e}",
+                    "ensure_block: block round {} is ahead of next expected round {}, \
+                     skipping (needs catchup)",
+                    block.round.0, next_round
+                );
+                return;
+            }
+
+            // Attempt to commit the block.
+            let err = match Self::try_commit_block(
+                &mut ledger,
+                block,
+                proto,
+                &hdr_data,
+                &blk_data,
+                &cert_bytes,
+            ) {
+                Ok(()) => {
+                    // Success — release the lock before notifying waiters.
+                    drop(ledger);
+
+                    // Notify any threads waiting in wait_for_round.
+                    self.round_advanced.notify_all();
+
+                    // Let the network know that we've made some progress.
+                    // Mirrors Go's `l.n.OnNetworkAdvance()`.
+                    self.network_advancer.on_network_advance();
+                    return;
+                }
+                Err(e) => e,
+            };
+
+            // Determine if the error is transient (retryable).
+            let err_msg = format!("{err}");
+            let is_transient = err_msg.contains("database is locked")
+                || err_msg.contains("SQLITE_BUSY")
+                || err_msg.contains("busy");
+
+            if !is_transient {
+                // Permanent error — no point retrying.
+                warn!(
+                    "ensure_block: permanent error writing block {} to ledger: {err}",
                     block.round
                 );
                 return;
             }
+
+            // Transient error — release the lock, sleep, and retry.
+            if attempt < MAX_RETRIES {
+                warn!(
+                    "ensure_block: transient error writing block {} to ledger \
+                     (attempt {}/{}): {err}",
+                    block.round,
+                    attempt + 1,
+                    MAX_RETRIES
+                );
+                drop(ledger);
+                std::thread::sleep(RETRY_DELAY);
+            } else {
+                warn!(
+                    "ensure_block: giving up on block {} after {} retries: {err}",
+                    block.round,
+                    MAX_RETRIES
+                );
+            }
         }
-
-        // Release the lock before notifying waiters.
-        drop(ledger);
-
-        // Notify any threads waiting in wait_for_round.
-        self.round_advanced.notify_all();
-
-        // Let the network know that we've made some progress.
-        // Mirrors Go's `l.n.OnNetworkAdvance()` in `EnsureBlock` / `EnsureValidatedBlock`.
-        self.network_advancer.on_network_advance();
     }
 
     fn ensure_validated_block(&self, vb: &dyn algo_agreement::ValidatedBlock, cert: &Certificate) {
