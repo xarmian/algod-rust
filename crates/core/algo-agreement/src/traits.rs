@@ -165,7 +165,7 @@ pub trait ValidatedBlock: Send + Sync {
 /// The correctness of `validate` is essential to the correctness of the
 /// protocol. A false positive may cause a fork; a false negative may cause
 /// liveness loss.
-pub trait BlockValidator {
+pub trait BlockValidator: Send + Sync {
     /// Validate the given block. Returns a `ValidatedBlock` on success.
     fn validate(&self, block: &Block) -> Result<Box<dyn ValidatedBlock>, AgreementError>;
 
@@ -177,9 +177,12 @@ pub trait BlockValidator {
     fn set_prev_timestamp(&self, _ts: i64) {}
 }
 
-/// Blanket impl so `Arc<T>` can be used wherever a `BlockValidator` is
-/// expected (e.g., sharing a single `BlockValidatorBridge` between
-/// `Parameters` and `AsyncCryptoVerifier`).
+/// Blanket implementation: `Arc<T>` delegates to the inner `T`.
+///
+/// This allows a single `Arc<BlockValidatorBridge>` to be shared between
+/// `Parameters` (which takes `BV: BlockValidator` by value) and
+/// `AsyncCryptoVerifier` (which takes `Arc<BV>`), ensuring both see the
+/// same mutable state (e.g., `prev_timestamp`).
 impl<T: BlockValidator> BlockValidator for std::sync::Arc<T> {
     fn validate(&self, block: &Block) -> Result<Box<dyn ValidatedBlock>, AgreementError> {
         (**self).validate(block)

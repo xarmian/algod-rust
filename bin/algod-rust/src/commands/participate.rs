@@ -573,9 +573,7 @@ pub async fn run(
     // proposal verification validates the block eagerly and caches the
     // `ValidatedBlock` — mirroring Go's `makeCryptoVerifier(l, v, ...)`.
     let crypto_ledger = Arc::new(AgreementLedgerBridge::new(ledger.clone()));
-    let crypto_block_validator: Arc<dyn algo_agreement::BlockValidator + Send + Sync> =
-        Arc::clone(&block_validator) as Arc<dyn algo_agreement::BlockValidator + Send + Sync>;
-    let crypto = AsyncCryptoVerifier::new(crypto_ledger, crypto_block_validator);
+    let crypto = AsyncCryptoVerifier::new_with_validator(crypto_ledger, Arc::clone(&block_validator));
 
     // -----------------------------------------------------------------------
     // 5. Build and start the catchup service.
