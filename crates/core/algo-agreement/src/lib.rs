@@ -10,6 +10,7 @@ mod bundle;
 mod certificate;
 pub mod codec;
 mod credential;
+pub mod crypto_verifier;
 pub mod demux;
 pub mod events;
 #[cfg(test)]
@@ -117,6 +118,9 @@ pub use block_validator_bridge::{BlockValidatorBridge, ValidatedBlockImpl};
 pub use demux::{Demux, ExternalDemuxSignals, ExternalEvent};
 pub use player::{Player, Tracer};
 pub use router::{PeriodRouter, RootRouter, RoundRouter, StateMachineTag, StepRouter};
+
+// Re-exports from crypto verifier module
+pub use crypto_verifier::AsyncCryptoVerifier;
 
 // Re-exports from service module
 pub use service::{Parameters, Service, ServiceHandle};

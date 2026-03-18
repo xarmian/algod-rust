@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 use algo_types::Round;
 
 use crate::actions::{
-    Action, ActionType, EnsureAction, NetworkAction, PseudonodeAction, RezeroAction,
+    Action, ActionType, CryptoAction, EnsureAction, NetworkAction, PseudonodeAction, RezeroAction,
     StageDigestAction,
 };
 use crate::codec;
@@ -37,9 +37,9 @@ use crate::pseudonode::{AsyncPseudonode, Pseudonode};
 use crate::router::RootRouter;
 use crate::step::{Period, Step, PROPOSE, SOFT};
 use crate::traits::{
-    AgreementKeyManager, AgreementNetwork, BlockFactory, BlockValidator, CryptoVerifier,
-    EventsProcessingMonitor, LedgerWriter, RandomSource, Tag, AGREEMENT_VOTE_TAG,
-    PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
+    AgreementKeyManager, AgreementNetwork, BlockFactory, BlockValidator, CryptoBundleRequest,
+    CryptoProposalRequest, CryptoVerifier, CryptoVoteRequest, EventsProcessingMonitor,
+    LedgerWriter, RandomSource, Tag, AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
 };
 use crate::types::{
     filter_timeout, CredentialArrivalHistory, Deadline, TimeoutType,
@@ -176,15 +176,14 @@ where
             block_factory,
             block_validator,
             random_source,
-            monitor: _monitor,
+            monitor,
             crypto,
         } = self.params;
-
-        warn!("events monitor not yet wired into service");
 
         // Wrap shared state in Arc for cross-thread access.
         let ledger = Arc::new(ledger);
         let network = Arc::new(network);
+        let monitor: Arc<Mutex<M>> = Arc::new(Mutex::new(monitor));
 
         // --- Obtain channel receivers for the Demux ---
 
@@ -236,6 +235,7 @@ where
         let ledger_main = ledger.clone();
         let ledger_demux = ledger.clone();
         let network_demux = network.clone();
+        let monitor_demux = monitor.clone();
 
         // Spawn main loop thread.
         let main_handle = thread::Builder::new()
@@ -271,6 +271,7 @@ where
                     demux,
                     quit_demux_tx,
                     crypto,
+                    monitor_demux,
                 );
             })
             .expect("failed to spawn agreement demux loop thread");
@@ -561,7 +562,7 @@ fn execute_pseudonode_action(
 ///
 /// Mirrors Go's `Service.demuxLoop`.
 #[allow(clippy::too_many_arguments)]
-fn demux_loop<N, L, BV, C>(
+fn demux_loop<N, L, BV, C, M>(
     network: Arc<N>,
     ledger: Arc<L>,
     block_validator: BV,
@@ -573,11 +574,13 @@ fn demux_loop<N, L, BV, C>(
     mut demux: Demux,
     quit_demux_tx: crossbeam_channel::Sender<()>,
     crypto: C,
+    monitor: Arc<Mutex<M>>,
 ) where
     N: AgreementNetwork + Send + Sync + 'static,
     L: LedgerReader + LedgerWriter + Send + Sync + 'static,
     BV: BlockValidator + Send + 'static,
     C: CryptoVerifier + Send + 'static,
+    M: EventsProcessingMonitor + Send + 'static,
 {
     // Retain old rounds' period 0 start times for late credential tracking.
     let mut historical_clocks: HashMap<Round, Instant> = HashMap::new();
@@ -589,8 +592,20 @@ fn demux_loop<N, L, BV, C>(
 
         // Drain any pseudonode events that the main loop produced and
         // prioritize them in the demux so they are returned first.
+        let mut pseudo_count = 0usize;
         while let Ok(events) = pseudo_rx.try_recv() {
+            pseudo_count += events.len();
             demux.prioritize(events);
+        }
+        if pseudo_count > 0 {
+            if let Ok(m) = monitor.lock() {
+                m.update_events_queue(crate::demux::EVENT_QUEUE_PSEUDONODE, pseudo_count);
+            }
+        }
+
+        // Report the action batch size before executing.
+        if let Ok(m) = monitor.lock() {
+            m.update_events_queue(crate::demux::EVENT_QUEUE_DEMUX, action_batch.len());
         }
 
         // Execute each action.
@@ -601,7 +616,13 @@ fn demux_loop<N, L, BV, C>(
             &block_validator,
             &mut demux,
             &mut historical_clocks,
+            &crypto,
         );
+
+        // Actions consumed — report queue drained.
+        if let Ok(m) = monitor.lock() {
+            m.update_events_queue(crate::demux::EVENT_QUEUE_DEMUX, 0);
+        }
 
         // Get the signals from the main loop.
         let signals = match ready.recv() {
@@ -622,8 +643,16 @@ fn demux_loop<N, L, BV, C>(
 
         match event {
             Some(e) => {
+                // Report that we received an event from the demux.
+                if let Ok(m) = monitor.lock() {
+                    m.update_events_queue(crate::demux::EVENT_QUEUE_DEMUX, 1);
+                }
                 if input.send(Some(e)).is_err() {
                     break;
+                }
+                // Pseudonode events consumed by demux.next().
+                if let Ok(m) = monitor.lock() {
+                    m.update_events_queue(crate::demux::EVENT_QUEUE_PSEUDONODE, 0);
                 }
             }
             None => {
@@ -648,36 +677,47 @@ fn demux_loop<N, L, BV, C>(
 /// Execute a batch of actions.
 ///
 /// Mirrors Go's `Service.do(ctx, actions)`.
-fn do_actions<N, L, BV>(
+fn do_actions<N, L, BV, C>(
     actions: &[Action],
     network: &N,
     ledger: &L,
     block_validator: &BV,
     _demux: &mut Demux,
     historical_clocks: &mut HashMap<Round, Instant>,
+    crypto: &C,
 ) where
     N: AgreementNetwork,
     L: LedgerReader + LedgerWriter,
     BV: BlockValidator,
+    C: CryptoVerifier,
 {
     for action in actions {
-        do_action(action, network, ledger, block_validator, historical_clocks);
+        do_action(
+            action,
+            network,
+            ledger,
+            block_validator,
+            historical_clocks,
+            crypto,
+        );
     }
 }
 
 /// Execute a single action.
 ///
 /// Mirrors each action type's `do(ctx, s)` in Go.
-fn do_action<N, L, BV>(
+fn do_action<N, L, BV, C>(
     action: &Action,
     network: &N,
     ledger: &L,
     block_validator: &BV,
     historical_clocks: &mut HashMap<Round, Instant>,
+    crypto: &C,
 ) where
     N: AgreementNetwork,
     L: LedgerReader + LedgerWriter,
     BV: BlockValidator,
+    C: CryptoVerifier,
 {
     match action {
         Action::Noop(_) => {}
@@ -686,11 +726,8 @@ fn do_action<N, L, BV>(
             do_network_action(na, network);
         }
 
-        Action::Crypto(ref _ca) => {
-            // In Go, crypto actions are dispatched to the demux's async vote
-            // verifier. For now, crypto verification is done inline in the
-            // pseudonode, so we log and skip.
-            debug!("crypto action: async verification not yet implemented");
+        Action::Crypto(ref ca) => {
+            do_crypto_action(ca, crypto);
         }
 
         Action::Ensure(ref ea) => {
@@ -758,6 +795,47 @@ fn do_network_action<N: AgreementNetwork>(na: &NetworkAction, network: &N) {
         }
         _ => {
             warn!("unexpected network action type: {}", na.t);
+        }
+    }
+}
+
+/// Execute a crypto action (verify vote, verify payload, verify bundle).
+///
+/// Dispatches the verification request to the crypto verifier, which places
+/// the result on its output channel. The demux loop will later pick up the
+/// result via `verified_votes()` or `verified(tag)`.
+///
+/// Mirrors Go's `cryptoAction.do(ctx, s)` in agreement/actions.go.
+fn do_crypto_action<C: CryptoVerifier>(ca: &CryptoAction, crypto: &C) {
+    match ca.t {
+        ActionType::VerifyVote => {
+            crypto.verify_vote(CryptoVoteRequest {
+                message: ca.m.clone(),
+                task_index: ca.task_index,
+                round: ca.round,
+                period: ca.period,
+            });
+        }
+        ActionType::VerifyPayload => {
+            crypto.verify_proposal(CryptoProposalRequest {
+                message: ca.m.clone(),
+                task_index: ca.task_index,
+                round: ca.round,
+                period: ca.period,
+                pinned: ca.pinned,
+            });
+        }
+        ActionType::VerifyBundle => {
+            crypto.verify_bundle(CryptoBundleRequest {
+                message: ca.m.clone(),
+                task_index: ca.task_index,
+                round: ca.round,
+                period: ca.period,
+                certify: ca.step == crate::step::CERT,
+            });
+        }
+        _ => {
+            warn!("unexpected crypto action type: {}", ca.t);
         }
     }
 }
