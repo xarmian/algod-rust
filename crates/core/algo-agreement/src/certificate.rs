@@ -104,7 +104,7 @@ impl Certificate {
     /// Convert this certificate to an `UnauthenticatedBundle` for verification.
     ///
     /// The bundle step is always CERT.
-    fn to_unauthenticated_bundle(&self) -> UnauthenticatedBundle {
+    pub fn to_unauthenticated_bundle(&self) -> UnauthenticatedBundle {
         UnauthenticatedBundle {
             round: self.round,
             period: self.period,

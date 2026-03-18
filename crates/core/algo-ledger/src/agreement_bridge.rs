@@ -141,6 +141,30 @@ impl AgreementLedgerBridge {
         (bridge, rx)
     }
 
+    /// Retrieve the certificate for a given round.
+    ///
+    /// Decodes the stored certificate bytes back into a `Certificate`.
+    /// Returns an error if no certificate is stored for the round or if
+    /// decoding fails.
+    pub fn get_cert_for_round(&self, round: Round) -> Result<Certificate, LedgerError> {
+        let ledger = self
+            .ledger
+            .lock()
+            .map_err(|e| LedgerError::Other(format!("ledger lock poisoned: {e}")))?;
+
+        let cert_bytes = ledger
+            .get_block_cert(round.0)
+            .map_err(|e| LedgerError::Other(format!("get_block_cert: {e}")))?
+            .ok_or_else(|| {
+                LedgerError::Other(format!("no certificate stored for round {round}"))
+            })?;
+
+        let bundle = algo_agreement::codec::decode_bundle(&cert_bytes)
+            .map_err(|e| LedgerError::Other(format!("decode_bundle: {e}")))?;
+
+        Ok(Certificate::from_bundle(&bundle))
+    }
+
     /// Helper: get the protocol version string for a given round by reading
     /// the block header's proto field from the blocks table.
     fn protocol_for_round(&self, round: Round) -> Result<String, LedgerError> {
@@ -379,7 +403,7 @@ impl LedgerReader for AgreementLedgerBridge {
 }
 
 impl LedgerWriter for AgreementLedgerBridge {
-    fn ensure_block(&self, block: &algo_types::Block, _cert: &Certificate) {
+    fn ensure_block(&self, block: &algo_types::Block, cert: &Certificate) {
         let mut ledger = match self.ledger.lock() {
             Ok(l) => l,
             Err(e) => {
@@ -425,6 +449,20 @@ impl LedgerWriter for AgreementLedgerBridge {
         if let Err(e) = ledger.put_block(block.round.0, proto, &hdr_data, &blk_data) {
             warn!(
                 "ensure_block: failed to put block for round {}: {e}",
+                block.round
+            );
+            if in_txn {
+                let _ = ledger.rollback_block();
+            }
+            return;
+        }
+
+        // Encode and store the certificate alongside the block.
+        let bundle = cert.to_unauthenticated_bundle();
+        let cert_bytes = algo_agreement::codec::encode_bundle(&bundle);
+        if let Err(e) = ledger.put_block_cert(block.round.0, &cert_bytes) {
+            warn!(
+                "ensure_block: failed to put block cert for round {}: {e}",
                 block.round
             );
             if in_txn {
@@ -731,5 +769,147 @@ mod tests {
 
         // And empty again after receiving.
         assert!(rx.try_recv().is_err(), "receiver should be empty again");
+    }
+
+    // -- Certificate storage tests --
+
+    /// Build a minimal block for round 1 that can be committed via ensure_block.
+    fn make_round1_block() -> algo_types::Block {
+        algo_types::Block {
+            round: Round(1),
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            ..algo_types::Block::default()
+        }
+    }
+
+    /// Build a certificate with non-default fields so we can verify round-trip fidelity.
+    fn make_cert_with_proposal(round: u64) -> Certificate {
+        use algo_agreement::{Period, ProposalValue};
+        Certificate {
+            round: Round(round),
+            period: Period(2),
+            proposal: ProposalValue {
+                original_period: Period(1),
+                original_proposer: Address([0x42; 32]),
+                block_digest: Digest([0xaa; 32]),
+                encoding_digest: Digest([0xbb; 32]),
+            },
+            votes: vec![],
+        }
+    }
+
+    #[test]
+    fn ensure_block_stores_cert_and_round_trip() {
+        // Create a bridge with an in-memory ledger.
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+
+        let block = make_round1_block();
+        let cert = make_cert_with_proposal(1);
+
+        // Commit the block with the certificate.
+        bridge.ensure_block(&block, &cert);
+
+        // Round-trip: retrieve the certificate and verify it matches.
+        let recovered = bridge
+            .get_cert_for_round(Round(1))
+            .expect("should retrieve cert for round 1");
+
+        assert_eq!(recovered.round, cert.round);
+        assert_eq!(recovered.period, cert.period);
+        assert_eq!(recovered.proposal, cert.proposal);
+        assert_eq!(recovered.votes.len(), cert.votes.len());
+    }
+
+    #[test]
+    fn ensure_block_stores_cert_raw_bytes() {
+        // Verify that get_block_cert returns Some(bytes) after ensure_block.
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+
+        let block = make_round1_block();
+        let cert = make_cert_with_proposal(1);
+
+        bridge.ensure_block(&block, &cert);
+
+        // Directly check the store has cert bytes.
+        let ledger_guard = ledger.lock().unwrap();
+        let cert_bytes = ledger_guard
+            .get_block_cert(1)
+            .expect("get_block_cert should not error");
+        assert!(
+            cert_bytes.is_some(),
+            "cert bytes should be present after ensure_block"
+        );
+
+        // The bytes should be decodable back to a bundle.
+        let bundle = algo_agreement::codec::decode_bundle(cert_bytes.as_ref().unwrap())
+            .expect("cert bytes should decode to a valid bundle");
+        assert_eq!(bundle.round, Round(1));
+    }
+
+    #[test]
+    fn ensure_block_idempotent_retains_first_cert() {
+        // Calling ensure_block twice for the same round should be a no-op the
+        // second time: the first certificate is retained.
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(Arc::clone(&ledger));
+
+        let block = make_round1_block();
+        let cert1 = make_cert_with_proposal(1);
+
+        // First call commits the block and certificate.
+        bridge.ensure_block(&block, &cert1);
+
+        // Build a second certificate with different fields for the same round.
+        let cert2 = {
+            use algo_agreement::{Period, ProposalValue};
+            Certificate {
+                round: Round(1),
+                period: Period(99),
+                proposal: ProposalValue {
+                    original_period: Period(77),
+                    original_proposer: Address([0xff; 32]),
+                    block_digest: Digest([0x11; 32]),
+                    encoding_digest: Digest([0x22; 32]),
+                },
+                votes: vec![],
+            }
+        };
+
+        // Second call with a different cert should be a no-op (round already committed).
+        bridge.ensure_block(&block, &cert2);
+
+        // The stored certificate should still be the first one.
+        let recovered = bridge
+            .get_cert_for_round(Round(1))
+            .expect("should retrieve cert for round 1");
+
+        assert_eq!(recovered.round, cert1.round);
+        assert_eq!(recovered.period, cert1.period, "first cert's period should be retained");
+        assert_eq!(
+            recovered.proposal, cert1.proposal,
+            "first cert's proposal should be retained"
+        );
+    }
+
+    #[test]
+    fn get_cert_for_round_missing_returns_error() {
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let bridge = AgreementLedgerBridge::new(ledger);
+
+        // No block committed for round 5 — should return an error.
+        let result = bridge.get_cert_for_round(Round(5));
+        match &result {
+            Err(LedgerError::Other(msg)) => {
+                assert!(
+                    msg.contains("no certificate stored"),
+                    "expected 'no certificate stored' in error message, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected LedgerError::Other with 'no certificate stored', got: {other:?}"
+            ),
+        }
     }
 }
