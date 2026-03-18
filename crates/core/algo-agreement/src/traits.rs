@@ -580,7 +580,7 @@ pub trait CryptoVerifier: Send + 'static {
     /// Mirrors Go's `ChannelFull(tag protocol.Tag) bool`.
     fn channel_full(&self, tag: &str) -> bool;
 
-    /// Shut down the verifier goroutines.
+    /// Shut down the verifier worker threads.
     ///
     /// Mirrors Go's `Quit()`.
     fn quit(&self);

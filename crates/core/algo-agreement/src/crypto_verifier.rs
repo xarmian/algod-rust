@@ -193,7 +193,7 @@ impl PendingRequestsContext {
 
         // Cancel the old proposal for this (round, period).
         if let Some(ref old_cancel) = period_ctx.proposal_cancelled {
-            old_cancel.store(true, Ordering::Relaxed);
+            old_cancel.store(true, Ordering::Release);
         }
 
         // Create a new proposal-specific cancellation token.
@@ -237,12 +237,12 @@ impl PendingRequestsContext {
             .collect();
         for old_round in old_rounds {
             if let Some(round_ctx) = self.rounds.remove(&old_round) {
-                round_ctx.cancelled.store(true, Ordering::Relaxed);
+                round_ctx.cancelled.store(true, Ordering::Release);
                 // Also cancel all period-level tokens.
                 for period_ctx in round_ctx.periods.values() {
-                    period_ctx.cancelled.store(true, Ordering::Relaxed);
+                    period_ctx.cancelled.store(true, Ordering::Release);
                     if let Some(ref prop) = period_ctx.proposal_cancelled {
-                        prop.store(true, Ordering::Relaxed);
+                        prop.store(true, Ordering::Release);
                     }
                 }
             }
@@ -263,9 +263,9 @@ impl PendingRequestsContext {
                 .collect();
             for pkey in old_periods {
                 if let Some(period_ctx) = round_ctx.periods.remove(&pkey) {
-                    period_ctx.cancelled.store(true, Ordering::Relaxed);
+                    period_ctx.cancelled.store(true, Ordering::Release);
                     if let Some(ref prop) = period_ctx.proposal_cancelled {
-                        prop.store(true, Ordering::Relaxed);
+                        prop.store(true, Ordering::Release);
                     }
                 }
             }
@@ -380,7 +380,7 @@ fn vote_worker<L: LedgerReader + Send + Sync + 'static>(
         let request = &internal.request;
 
         // Check cancellation before doing expensive work.
-        if internal.cancel.load(Ordering::Relaxed) {
+        if internal.cancel.load(Ordering::Acquire) {
             let result = CryptoVoteVerifyResult {
                 vote: None,
                 message: request.message.clone(),
@@ -401,7 +401,7 @@ fn vote_worker<L: LedgerReader + Send + Sync + 'static>(
         let mut result = verify_vote_impl(ledger.as_ref(), request);
 
         // Check cancellation again after verification.
-        if internal.cancel.load(Ordering::Relaxed) {
+        if internal.cancel.load(Ordering::Acquire) {
             result.cancelled = true;
         }
 
@@ -436,7 +436,7 @@ fn proposal_worker<BV: BlockValidator + Send + Sync + 'static>(
         let request = &internal.request;
 
         // Check cancellation before doing expensive work.
-        if internal.cancel.load(Ordering::Relaxed) {
+        if internal.cancel.load(Ordering::Acquire) {
             let mut m = request.message.clone();
             // Set proposal on the message even when cancelled, matching Go.
             m.proposal = Some(Proposal {
@@ -461,7 +461,7 @@ fn proposal_worker<BV: BlockValidator + Send + Sync + 'static>(
         let mut result = verify_proposal_impl(validator.as_ref(), request);
 
         // Check cancellation again after verification.
-        if internal.cancel.load(Ordering::Relaxed) {
+        if internal.cancel.load(Ordering::Acquire) {
             result.cancelled = true;
             if result.err.is_none() {
                 result.err = Some(crate::events::SerializableError::new(
@@ -500,7 +500,7 @@ fn bundle_worker<L: LedgerReader + Send + Sync + 'static>(
         let request = &internal.request;
 
         // Check cancellation before doing expensive work.
-        if internal.cancel.load(Ordering::Relaxed) {
+        if internal.cancel.load(Ordering::Acquire) {
             let result = CryptoResult {
                 message: request.message.clone(),
                 task_index: request.task_index,
@@ -519,7 +519,7 @@ fn bundle_worker<L: LedgerReader + Send + Sync + 'static>(
         let mut result = verify_bundle_impl(ledger.as_ref(), request);
 
         // Check cancellation again after verification.
-        if internal.cancel.load(Ordering::Relaxed) {
+        if internal.cancel.load(Ordering::Acquire) {
             result.cancelled = true;
         }
 
@@ -959,13 +959,21 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
         };
         if let Some(tx) = tx {
             // Try non-blocking first; fall back to blocking (matches Go's channel send).
-            if let Err(crossbeam_channel::TrySendError::Full(req)) = tx.try_send(internal) {
-                warn!(
-                    task_index = req.request.task_index,
-                    round = %req.request.round,
-                    "vote input channel full, blocking send"
-                );
-                let _ = tx.send(req);
+            match tx.try_send(internal) {
+                Ok(()) => {}
+                Err(crossbeam_channel::TrySendError::Full(req)) => {
+                    warn!(
+                        task_index = req.request.task_index,
+                        round = %req.request.round,
+                        "vote input channel full, blocking send"
+                    );
+                    let _ = tx.send(req).map_err(|_| {
+                        warn!("vote input channel disconnected during blocking send");
+                    });
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    warn!("vote input channel disconnected, request dropped (verifier shutting down)");
+                }
             }
         }
     }
@@ -984,13 +992,21 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
             guard.as_ref().map(|tx| tx.clone())
         };
         if let Some(tx) = tx {
-            if let Err(crossbeam_channel::TrySendError::Full(req)) = tx.try_send(internal) {
-                debug!(
-                    task_index = req.request.task_index,
-                    round = %req.request.round,
-                    "proposal input channel full, blocking send"
-                );
-                let _ = tx.send(req);
+            match tx.try_send(internal) {
+                Ok(()) => {}
+                Err(crossbeam_channel::TrySendError::Full(req)) => {
+                    debug!(
+                        task_index = req.request.task_index,
+                        round = %req.request.round,
+                        "proposal input channel full, blocking send"
+                    );
+                    let _ = tx.send(req).map_err(|_| {
+                        warn!("proposal input channel disconnected during blocking send");
+                    });
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    warn!("proposal input channel disconnected, request dropped (verifier shutting down)");
+                }
             }
         }
     }
@@ -1009,13 +1025,21 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
             guard.as_ref().map(|tx| tx.clone())
         };
         if let Some(tx) = tx {
-            if let Err(crossbeam_channel::TrySendError::Full(req)) = tx.try_send(internal) {
-                debug!(
-                    task_index = req.request.task_index,
-                    round = %req.request.round,
-                    "bundle input channel full, blocking send"
-                );
-                let _ = tx.send(req);
+            match tx.try_send(internal) {
+                Ok(()) => {}
+                Err(crossbeam_channel::TrySendError::Full(req)) => {
+                    debug!(
+                        task_index = req.request.task_index,
+                        round = %req.request.round,
+                        "bundle input channel full, blocking send"
+                    );
+                    let _ = tx.send(req).map_err(|_| {
+                        warn!("bundle input channel disconnected during blocking send");
+                    });
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    warn!("bundle input channel disconnected, request dropped (verifier shutting down)");
+                }
             }
         }
     }
@@ -1168,9 +1192,8 @@ mod tests {
     #[test]
     fn async_crypto_verifier_vote_with_bad_keys_returns_error() {
         let ledger = Arc::new(StubLedger::new(v41_params(), Round(100)));
-        let validator: Arc<dyn BlockValidator + Send + Sync> =
-            Arc::new(StubBlockValidator::accepting());
-        let verifier = AsyncCryptoVerifier::new(ledger, validator);
+        let validator = Arc::new(StubBlockValidator::accepting());
+        let verifier = AsyncCryptoVerifier::new_with_validator(ledger, validator);
 
         let request = CryptoVoteRequest {
             message: InternalMessage {
@@ -1202,9 +1225,8 @@ mod tests {
     #[test]
     fn async_crypto_verifier_proposal_passthrough() {
         let ledger = Arc::new(StubLedger::new(v41_params(), Round(100)));
-        let validator: Arc<dyn BlockValidator + Send + Sync> =
-            Arc::new(StubBlockValidator::accepting());
-        let verifier = AsyncCryptoVerifier::new(ledger, validator);
+        let validator = Arc::new(StubBlockValidator::accepting());
+        let verifier = AsyncCryptoVerifier::new_with_validator(ledger, validator);
 
         let request = CryptoProposalRequest {
             message: InternalMessage {
@@ -1244,9 +1266,8 @@ mod tests {
     #[test]
     fn async_crypto_verifier_proposal_rejected_no_validated_block() {
         let ledger = Arc::new(StubLedger::new(v41_params(), Round(100)));
-        let validator: Arc<dyn BlockValidator + Send + Sync> =
-            Arc::new(StubBlockValidator::rejecting("bad block"));
-        let verifier = AsyncCryptoVerifier::new(ledger, validator);
+        let validator = Arc::new(StubBlockValidator::rejecting("bad block"));
+        let verifier = AsyncCryptoVerifier::new_with_validator(ledger, validator);
 
         let request = CryptoProposalRequest {
             message: InternalMessage {
@@ -1263,8 +1284,8 @@ mod tests {
 
         let result = verifier
             .verified(PROPOSAL_PAYLOAD_TAG)
-            .try_recv()
-            .expect("should have a result");
+            .recv_timeout(Duration::from_secs(5))
+            .expect("should have a result within 5s");
         assert_eq!(result.task_index, 8);
         assert!(
             result.err.is_some(),
@@ -1291,7 +1312,7 @@ mod tests {
     fn pending_requests_context_add_vote() {
         let mut ctx = PendingRequestsContext::new();
         let token = ctx.add_vote(Round(10), Period(1));
-        assert!(!token.load(Ordering::Relaxed));
+        assert!(!token.load(Ordering::Acquire));
 
         // Same round+period returns the same token.
         let token2 = ctx.add_vote(Round(10), Period(1));
@@ -1302,12 +1323,12 @@ mod tests {
     fn pending_requests_context_add_proposal_cancels_old() {
         let mut ctx = PendingRequestsContext::new();
         let token1 = ctx.add_proposal(Round(10), Period(1), false);
-        assert!(!token1.load(Ordering::Relaxed));
+        assert!(!token1.load(Ordering::Acquire));
 
         // Adding a new proposal for the same (round, period) cancels the old one.
         let token2 = ctx.add_proposal(Round(10), Period(1), false);
-        assert!(token1.load(Ordering::Relaxed), "old proposal should be cancelled");
-        assert!(!token2.load(Ordering::Relaxed), "new proposal should not be cancelled");
+        assert!(token1.load(Ordering::Acquire), "old proposal should be cancelled");
+        assert!(!token2.load(Ordering::Acquire), "new proposal should not be cancelled");
     }
 
     #[test]
@@ -1320,9 +1341,9 @@ mod tests {
         // At round 10, rounds where round + 2 <= 10 (i.e., round <= 8) are stale.
         ctx.clear_stale_contexts(Round(10), Period(0), false, false);
 
-        assert!(token_r8.load(Ordering::Relaxed), "round 8 should be cancelled");
-        assert!(!token_r9.load(Ordering::Relaxed), "round 9 should NOT be cancelled");
-        assert!(!token_r10.load(Ordering::Relaxed), "round 10 should NOT be cancelled");
+        assert!(token_r8.load(Ordering::Acquire), "round 8 should be cancelled");
+        assert!(!token_r9.load(Ordering::Acquire), "round 9 should NOT be cancelled");
+        assert!(!token_r10.load(Ordering::Acquire), "round 10 should NOT be cancelled");
     }
 
     #[test]
@@ -1335,9 +1356,9 @@ mod tests {
         // At period 3, periods where period + 3 <= 3 (i.e., period <= 0) are stale.
         ctx.clear_stale_contexts(Round(10), Period(3), false, false);
 
-        assert!(token_p0.load(Ordering::Relaxed), "period 0 should be cancelled");
-        assert!(!token_p1.load(Ordering::Relaxed), "period 1 should NOT be cancelled");
-        assert!(!token_p3.load(Ordering::Relaxed), "period 3 should NOT be cancelled");
+        assert!(token_p0.load(Ordering::Acquire), "period 0 should be cancelled");
+        assert!(!token_p1.load(Ordering::Acquire), "period 1 should NOT be cancelled");
+        assert!(!token_p3.load(Ordering::Acquire), "period 3 should NOT be cancelled");
     }
 
     #[test]
@@ -1348,7 +1369,7 @@ mod tests {
         // With pinned=true, period clearing is skipped.
         ctx.clear_stale_contexts(Round(10), Period(5), true, false);
 
-        assert!(!token_p0.load(Ordering::Relaxed), "period 0 should NOT be cancelled when pinned");
+        assert!(!token_p0.load(Ordering::Acquire), "period 0 should NOT be cancelled when pinned");
     }
 
     #[test]
@@ -1360,7 +1381,7 @@ mod tests {
         ctx.clear_stale_contexts(Round(10), Period(5), false, true);
 
         assert!(
-            !token_p0.load(Ordering::Relaxed),
+            !token_p0.load(Ordering::Acquire),
             "period 0 should NOT be cancelled when certify"
         );
     }
@@ -1581,12 +1602,12 @@ mod tests {
         {
             let mut ctx = PendingRequestsContext::new();
             let token_r5 = ctx.add_vote(Round(5), Period(0));
-            assert!(!token_r5.load(Ordering::Relaxed));
+            assert!(!token_r5.load(Ordering::Acquire));
 
             // A vote at round 8 triggers clearing for round 5 (5 + 2 <= 8).
             ctx.clear_stale_contexts(Round(8), Period(0), false, false);
             assert!(
-                token_r5.load(Ordering::Relaxed),
+                token_r5.load(Ordering::Acquire),
                 "round 5 vote should be cancelled when round 8 arrives"
             );
         }
