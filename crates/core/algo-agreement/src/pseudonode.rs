@@ -487,6 +487,11 @@ where
                                     .clone(),
                                 validated_at: Duration::ZERO,
                                 received_at: Duration::ZERO,
+                                // Pseudonode proposals don't carry a pre-validated block,
+                                // matching Go's makeProposalFromProposableBlock which sets
+                                // ve to nil. Self-proposed blocks will take the
+                                // ensure_block path rather than ensure_validated_block.
+                                validated_block: None,
                             }),
                             ..InternalMessage::default()
                         };

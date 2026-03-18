@@ -12,10 +12,12 @@ use std::sync::Arc;
 
 use tracing::{debug, warn};
 
+use crate::events::Proposal;
 use crate::ledger_reader::LedgerReader;
 use crate::traits::{
-    CryptoBundleRequest, CryptoProposalRequest, CryptoResult, CryptoVerifier, CryptoVoteRequest,
-    CryptoVoteVerifyResult, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
+    BlockValidator, CryptoBundleRequest, CryptoProposalRequest, CryptoResult, CryptoVerifier,
+    CryptoVoteRequest, CryptoVoteVerifyResult, ValidatedBlock, PROPOSAL_PAYLOAD_TAG,
+    VOTE_BUNDLE_TAG,
 };
 use crate::vote::{RawVote, UnauthenticatedVote, VoteVerifyParams};
 
@@ -43,6 +45,12 @@ use crate::vote::{RawVote, UnauthenticatedVote, VoteVerifyParams};
 pub struct AsyncCryptoVerifier<L: LedgerReader + Send + Sync + 'static> {
     ledger: Arc<L>,
 
+    /// Block validator used during proposal verification to validate the
+    /// proposed block and cache the `ValidatedBlock` result.
+    ///
+    /// Mirrors Go's `poolCryptoVerifier.validator` field.
+    block_validator: Arc<dyn BlockValidator + Send + Sync>,
+
     /// Channel pair for vote verification results.
     vote_tx: crossbeam_channel::Sender<CryptoVoteVerifyResult>,
     vote_rx: crossbeam_channel::Receiver<CryptoVoteVerifyResult>,
@@ -60,16 +68,25 @@ pub struct AsyncCryptoVerifier<L: LedgerReader + Send + Sync + 'static> {
 }
 
 impl<L: LedgerReader + Send + Sync + 'static> AsyncCryptoVerifier<L> {
-    /// Create a new `AsyncCryptoVerifier` backed by the given ledger.
+    /// Create a new `AsyncCryptoVerifier` backed by the given ledger and
+    /// block validator.
     ///
     /// The ledger is used to look up account data (vote keys, VRF selection
-    /// keys, balances) needed for vote verification.
-    pub fn new(ledger: Arc<L>) -> Self {
+    /// keys, balances) needed for vote verification. The block validator is
+    /// called during proposal verification to validate proposed blocks and
+    /// cache the resulting `ValidatedBlock`.
+    ///
+    /// Mirrors Go's `makeCryptoVerifier(l LedgerReader, v BlockValidator, ...)`.
+    pub fn new(
+        ledger: Arc<L>,
+        block_validator: Arc<dyn BlockValidator + Send + Sync>,
+    ) -> Self {
         let (vote_tx, vote_rx) = crossbeam_channel::unbounded();
         let (proposal_tx, proposal_rx) = crossbeam_channel::unbounded();
         let (bundle_tx, bundle_rx) = crossbeam_channel::unbounded();
         Self {
             ledger,
+            block_validator,
             vote_tx,
             vote_rx,
             proposal_tx,
@@ -296,28 +313,67 @@ impl<L: LedgerReader + Send + Sync + 'static> CryptoVerifier for AsyncCryptoVeri
     }
 
     fn verify_proposal(&self, request: CryptoProposalRequest) {
-        // For proposals, the verification is primarily about the block content
-        // (which is handled by the block validator in the ensure action).
-        // The crypto action for proposals in Go validates the proposal payload
-        // via `up.validate()` which checks block validity.
-        //
-        // For now, we pass the proposal through — the block validator will
-        // catch invalid blocks when they are ensured. This matches the Go
-        // behavior where proposal verification is about block validation, not
-        // signature verification (votes carry the signatures).
+        // Mirrors Go's `verifyProposalPayload` in agreement/cryptoVerifier.go.
+        // Validates the proposed block via `BlockValidator::validate()` and,
+        // on success, attaches the `ValidatedBlock` to the `Proposal` so that
+        // the ensure action can call `ensure_validated_block` instead of the
+        // slower `ensure_block` (which would re-validate from scratch).
         debug!(
             task_index = request.task_index,
             round = %request.round,
             pinned = request.pinned,
-            "proposal verification (pass-through to block validator)"
+            "verifying proposal via block validator"
         );
-        let result = CryptoResult {
-            message: request.message,
-            task_index: request.task_index,
-            err: None,
-            cancelled: false,
-        };
-        let _ = self.proposal_tx.send(result);
+
+        let mut message = request.message;
+        let block = &message.unauthenticated_proposal.block;
+
+        match self.block_validator.validate(block) {
+            Ok(validated) => {
+                // Attach the validated block to the proposal, mirroring Go's
+                // `makeProposalFromValidatedBlock` which stores `ve` in the
+                // proposal struct.
+                let proposal = Proposal {
+                    unauthenticated_proposal: message.unauthenticated_proposal.clone(),
+                    // Populated downstream by the demux/player when the event is delivered
+                    validated_at: std::time::Duration::ZERO,
+                    received_at: std::time::Duration::ZERO,
+                    validated_block: Some({
+                        // BlockValidator::validate returns Box<dyn ValidatedBlock>.
+                        // The ValidatedBlock trait requires Send + Sync, so this
+                        // coercion is safe.
+                        let boxed: Box<dyn ValidatedBlock + Send + Sync> = validated;
+                        Arc::from(boxed)
+                    }),
+                };
+                message.proposal = Some(proposal);
+
+                let result = CryptoResult {
+                    message,
+                    task_index: request.task_index,
+                    err: None,
+                    cancelled: false,
+                };
+                let _ = self.proposal_tx.send(result);
+            }
+            Err(e) => {
+                warn!(
+                    task_index = request.task_index,
+                    round = %request.round,
+                    error = %e,
+                    "block validation failed during proposal verification"
+                );
+                let result = CryptoResult {
+                    message,
+                    task_index: request.task_index,
+                    err: Some(crate::events::SerializableError::new(format!(
+                        "rejected invalid proposalPayload: {e}"
+                    ))),
+                    cancelled: false,
+                };
+                let _ = self.proposal_tx.send(result);
+            }
+        }
     }
 
     fn verify_bundle(&self, request: CryptoBundleRequest) {
@@ -367,7 +423,7 @@ mod tests {
     use super::*;
     use crate::events::InternalMessage;
     use crate::step::Period;
-    use crate::stubs::StubLedger;
+    use crate::stubs::{StubBlockValidator, StubLedger};
     use crate::vote::UnauthenticatedVote;
     use algo_types::{ConsensusParams, Round};
 
@@ -385,7 +441,9 @@ mod tests {
     #[test]
     fn async_crypto_verifier_vote_with_bad_keys_returns_error() {
         let ledger = Arc::new(StubLedger::new(v41_params(), Round(100)));
-        let verifier = AsyncCryptoVerifier::new(ledger);
+        let validator: Arc<dyn BlockValidator + Send + Sync> =
+            Arc::new(StubBlockValidator::accepting());
+        let verifier = AsyncCryptoVerifier::new(ledger, validator);
 
         let request = CryptoVoteRequest {
             message: InternalMessage {
@@ -417,7 +475,9 @@ mod tests {
     #[test]
     fn async_crypto_verifier_proposal_passthrough() {
         let ledger = Arc::new(StubLedger::new(v41_params(), Round(100)));
-        let verifier = AsyncCryptoVerifier::new(ledger);
+        let validator: Arc<dyn BlockValidator + Send + Sync> =
+            Arc::new(StubBlockValidator::accepting());
+        let verifier = AsyncCryptoVerifier::new(ledger, validator);
 
         let request = CryptoProposalRequest {
             message: InternalMessage {
@@ -438,12 +498,64 @@ mod tests {
             .expect("should have a result");
         assert_eq!(result.task_index, 7);
         assert!(result.err.is_none());
+
+        // The verifier should attach a Proposal with a ValidatedBlock to the
+        // message on success, so that the ensure action can use the fast path.
+        let proposal = result
+            .message
+            .proposal
+            .as_ref()
+            .expect("proposal should be populated after successful verification");
+        assert!(
+            proposal.validated_block.is_some(),
+            "validated_block should be Some after successful block validation"
+        );
+    }
+
+    /// When the block validator rejects the block, verify_proposal should
+    /// return an error and NOT attach a validated block.
+    #[test]
+    fn async_crypto_verifier_proposal_rejected_no_validated_block() {
+        let ledger = Arc::new(StubLedger::new(v41_params(), Round(100)));
+        let validator: Arc<dyn BlockValidator + Send + Sync> =
+            Arc::new(StubBlockValidator::rejecting("bad block"));
+        let verifier = AsyncCryptoVerifier::new(ledger, validator);
+
+        let request = CryptoProposalRequest {
+            message: InternalMessage {
+                tag: "PP".to_string(),
+                ..InternalMessage::default()
+            },
+            task_index: 8,
+            round: Round(5),
+            period: Period(0),
+            pinned: false,
+        };
+
+        verifier.verify_proposal(request);
+
+        let result = verifier
+            .verified(PROPOSAL_PAYLOAD_TAG)
+            .try_recv()
+            .expect("should have a result");
+        assert_eq!(result.task_index, 8);
+        assert!(
+            result.err.is_some(),
+            "expected error when block validation fails"
+        );
+        // When validation fails, the proposal field should not be set.
+        assert!(
+            result.message.proposal.is_none(),
+            "proposal should remain None when block validation fails"
+        );
     }
 
     #[test]
     fn async_crypto_verifier_channel_never_full() {
         let ledger = Arc::new(StubLedger::new(v41_params(), Round(100)));
-        let verifier = AsyncCryptoVerifier::new(ledger);
+        let validator: Arc<dyn BlockValidator + Send + Sync> =
+            Arc::new(StubBlockValidator::accepting());
+        let verifier = AsyncCryptoVerifier::new(ledger, validator);
         assert!(!verifier.channel_full("AV"));
         assert!(!verifier.channel_full("PP"));
         assert!(!verifier.channel_full("VB"));

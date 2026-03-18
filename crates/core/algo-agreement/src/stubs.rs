@@ -173,11 +173,15 @@ impl BlockFactory for StubBlockFactory {
 // StubLedger
 // ---------------------------------------------------------------------------
 
-/// A record of a block written to the stub ledger via `ensure_block`.
+/// A record of a block written to the stub ledger via `ensure_block` or
+/// `ensure_validated_block`.
 #[derive(Debug, Clone)]
 pub struct WrittenBlock {
     pub block: Block,
     pub cert: Certificate,
+    /// `true` when the block was committed via the `ensure_validated_block`
+    /// fast-path (pre-validated), `false` for the regular `ensure_block` path.
+    pub pre_validated: bool,
 }
 
 /// A configurable stub that implements both `LedgerReader` and `LedgerWriter`.
@@ -375,11 +379,16 @@ impl LedgerWriter for StubLedger {
         self.written_blocks.lock().unwrap().push(WrittenBlock {
             block: block.clone(),
             cert: cert.clone(),
+            pre_validated: false,
         });
     }
 
     fn ensure_validated_block(&self, vb: &dyn ValidatedBlock, cert: &Certificate) {
-        self.ensure_block(vb.block(), cert);
+        self.written_blocks.lock().unwrap().push(WrittenBlock {
+            block: vb.block().clone(),
+            cert: cert.clone(),
+            pre_validated: true,
+        });
     }
 
     fn ensure_digest(&self, cert: &Certificate, _verifier: &AsyncVoteVerifier) {

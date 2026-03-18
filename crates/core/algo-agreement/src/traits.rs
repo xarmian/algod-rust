@@ -148,7 +148,7 @@ impl std::error::Error for AgreementError {}
 /// A block that has been successfully validated and can be recorded in the ledger.
 ///
 /// Mirrors Go's `agreement.ValidatedBlock` interface.
-pub trait ValidatedBlock {
+pub trait ValidatedBlock: Send + Sync {
     /// Returns a reference to the underlying block that has been validated.
     fn block(&self) -> &Block;
 }
@@ -175,6 +175,19 @@ pub trait BlockValidator {
     /// override this to track the latest committed timestamp for subsequent
     /// validation.
     fn set_prev_timestamp(&self, _ts: i64) {}
+}
+
+/// Blanket impl so `Arc<T>` can be used wherever a `BlockValidator` is
+/// expected (e.g., sharing a single `BlockValidatorBridge` between
+/// `Parameters` and `AsyncCryptoVerifier`).
+impl<T: BlockValidator> BlockValidator for std::sync::Arc<T> {
+    fn validate(&self, block: &Block) -> Result<Box<dyn ValidatedBlock>, AgreementError> {
+        (**self).validate(block)
+    }
+
+    fn set_prev_timestamp(&self, ts: i64) {
+        (**self).set_prev_timestamp(ts);
+    }
 }
 
 // ---------------------------------------------------------------------------
