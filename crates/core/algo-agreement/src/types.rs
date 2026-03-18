@@ -5,6 +5,7 @@
 // go-algorand/agreement/dynamicFilterTimeoutParams.go, and
 // go-algorand/agreement/credentialArrivalHistory.go.
 
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use algo_types::{ConsensusParams, Round};
@@ -21,7 +22,7 @@ use crate::vote::UnauthenticatedVote;
 /// set by agreement.
 ///
 /// Mirrors Go's `TimeoutType` in agreement/types.go.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[repr(i8)]
 pub enum TimeoutType {
     /// Annotates timeout events in the agreement protocol (e.g., for receiving
@@ -52,10 +53,11 @@ impl std::fmt::Display for TimeoutType {
 /// time.
 ///
 /// Mirrors Go's `Deadline` struct in agreement/types.go.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Deadline {
     /// How long until this deadline fires (relative to the start of the current
     /// period).
+    #[serde(with = "duration_serde")]
     pub duration: Duration,
     /// The type of timeout this deadline represents.
     pub timeout_type: TimeoutType,
@@ -372,9 +374,10 @@ pub use crate::events::FreshnessData;
 ///
 /// Mirrors Go's `credentialArrivalHistory` in
 /// agreement/credentialArrivalHistory.go.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialArrivalHistory {
     /// The circular buffer of samples.
+    #[serde(with = "duration_vec_serde")]
     history: Vec<Duration>,
     /// Current write position in the circular buffer.
     write_ptr: usize,
@@ -493,6 +496,47 @@ pub fn dynamic_filter_timeout(history: &CredentialArrivalHistory) -> Option<Dura
     let timeout = timeout.max(DYNAMIC_FILTER_TIMEOUT_LOWER_BOUND);
 
     Some(timeout)
+}
+
+/// Serde helper for `Duration` — serializes as nanoseconds (u128).
+///
+/// Deserializes losslessly via u128 to avoid truncation that `Duration::from_nanos(u64)` would cause.
+pub mod duration_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        d.as_nanos().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        let nanos = u128::deserialize(d)?;
+        Ok(Duration::new(
+            (nanos / 1_000_000_000) as u64,
+            (nanos % 1_000_000_000) as u32,
+        ))
+    }
+}
+
+/// Serde helper for `Vec<Duration>` — serializes each element as nanoseconds (u128).
+///
+/// Deserializes losslessly via u128 to avoid truncation.
+mod duration_vec_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(v: &[Duration], s: S) -> Result<S::Ok, S::Error> {
+        let nanos: Vec<u128> = v.iter().map(|d| d.as_nanos()).collect();
+        nanos.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Duration>, D::Error> {
+        let nanos: Vec<u128> = Vec::deserialize(d)?;
+        Ok(nanos
+            .into_iter()
+            .map(|n| Duration::new((n / 1_000_000_000) as u64, (n % 1_000_000_000) as u32))
+            .collect())
+    }
 }
 
 #[cfg(test)]

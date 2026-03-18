@@ -3,6 +3,8 @@
 // A Certificate is essentially an unauthenticatedBundle for the cert step.
 // It proves that agreement was reached on a block in a given round.
 
+use serde::{Deserialize, Serialize};
+
 use algo_types::{Digest, Round};
 
 use crate::bundle::{BundleError, UnauthenticatedBundle, VoteAuthenticator};
@@ -14,7 +16,7 @@ use crate::vote::ProposalValue;
 ///
 /// Mirrors Go's `agreement.Certificate`, which is a type alias for
 /// `unauthenticatedBundle`. A valid certificate always has step = CERT.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Certificate {
     /// The round this certificate is for.
     pub round: Round,

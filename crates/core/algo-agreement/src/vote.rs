@@ -4,6 +4,8 @@
 // unauthenticatedVote wraps rawVote with a VRF credential and OTS signature.
 // Vote is the verified form with a proven Credential and weight.
 
+use serde::{Deserialize, Serialize};
+
 use algo_consensus_crypto::{one_time_id_for_round, verify_one_time_signature, OneTimeSignature};
 use algo_types::{Address, ConsensusParams, Digest, Round};
 
@@ -22,7 +24,7 @@ use crate::step::{Period, Step, CERT, PROPOSE, SOFT};
 ///
 /// The zero value is called `bottom` in Go and represents the absence of
 /// a proposal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProposalValue {
     /// The period in which this proposal was originally made.
     /// Go: `OriginalPeriod period`, codec:"oper"
@@ -137,7 +139,7 @@ fn encode_proposal_value(pv: &ProposalValue) -> Vec<u8> {
 ///   "rnd"  -> Round (uint64)
 ///   "snd"  -> Sender (bin32)
 ///   "step" -> Step (uint64)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawVote {
     /// The voter's address.
     pub sender: Address,
@@ -238,7 +240,7 @@ impl Hashable for RawVote {
 /// Contains a raw vote, a VRF credential proof, and a one-time signature.
 ///
 /// Mirrors Go's `agreement.unauthenticatedVote`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnauthenticatedVote {
     /// The raw vote content.
     pub raw_vote: RawVote,
@@ -276,7 +278,7 @@ impl Default for UnauthenticatedVote {
 /// A verified vote with a proven credential and weight.
 ///
 /// Mirrors Go's `agreement.vote`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vote {
     /// The raw vote content.
     pub raw_vote: RawVote,

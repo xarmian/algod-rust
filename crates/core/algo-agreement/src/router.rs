@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 
 use algo_types::{ConsensusParams, Round};
+use serde::{Deserialize, Serialize};
 
 use crate::actions::Action;
 use crate::events::{Event, PinnedValueEvent, StagingValueEvent};
@@ -43,7 +44,7 @@ use crate::vote_tracker::VoteTracker;
 /// state machine instances of the same type.
 ///
 /// Mirrors Go's `stateMachineTag`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum StateMachineTag {
     /// The demux (event multiplexer).
@@ -100,7 +101,7 @@ use crate::player::Player;
 /// RoundRouters.
 ///
 /// Mirrors Go's `rootRouter`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RootRouter {
     /// The proposal manager (proposalMachine).
     pub proposal_manager: ProposalManager,
@@ -212,7 +213,7 @@ impl RootRouter {
 /// PeriodRouters.
 ///
 /// Mirrors Go's `roundRouter`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoundRouter {
     /// Per-round proposal storage.
     pub proposal_store: ProposalStore,
@@ -284,7 +285,7 @@ impl RoundRouter {
 /// and per-step StepRouters.
 ///
 /// Mirrors Go's `periodRouter`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeriodRouter {
     /// Per-period proposal tracking.
     pub proposal_tracker: ProposalTracker,
@@ -340,7 +341,7 @@ impl PeriodRouter {
 /// Per-(round, period, step) router containing a VoteTracker.
 ///
 /// Mirrors Go's `stepRouter`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StepRouter {
     /// Per-step vote tracking.
     pub vote_tracker: VoteTracker,

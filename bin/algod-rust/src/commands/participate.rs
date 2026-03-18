@@ -600,6 +600,7 @@ pub async fn run(
         random_source,
         monitor,
         crypto,
+        crash_db: None, // TODO: wire up crash recovery database
     };
 
     let service = Service::new(params);

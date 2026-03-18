@@ -12,6 +12,9 @@
 use std::time::Duration;
 
 use algo_types::{ConsensusParams, Round};
+use serde::{Deserialize, Serialize};
+
+use crate::types::duration_serde;
 
 use crate::actions::{
     Action, ActionType, CheckpointAction, EnsureAction, NetworkAction, PseudonodeAction,
@@ -42,7 +45,7 @@ use crate::vote::{UnauthenticatedVote, BOTTOM};
 /// some vote has been verified.
 ///
 /// Mirrors Go's `proposalTable`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProposalTableImpl {
     /// Pending tail events, indexed by task index.
     pending: std::collections::HashMap<u64, Box<MessageEvent>>,
@@ -81,7 +84,7 @@ impl ProposalTableImpl {
 /// and timeouts, and dispatches events to produce actions.
 ///
 /// Mirrors Go's `player` struct.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Player {
     /// Current round.
     pub round: Round,
@@ -102,10 +105,12 @@ pub struct Player {
     pub napping: bool,
 
     /// The next timeout expected for fast partition recovery.
+    #[serde(with = "duration_serde")]
     pub fast_recovery_deadline: Duration,
 
     /// Pending proposals which must be verified after some vote has been
     /// verified.
+    #[serde(skip)]
     pub pending: ProposalTableImpl,
 
     /// History of arrival times of the lowest credential from previous rounds,
@@ -114,6 +119,7 @@ pub struct Player {
 
     /// The period 0 dynamic filter timeout calculated for this round (if set),
     /// even if dynamic filter timeouts are not enabled. Used for telemetry.
+    #[serde(with = "duration_serde")]
     pub dynamic_filter_timeout: Duration,
 }
 

@@ -7,6 +7,8 @@
 //
 // `ProposalValue` is defined in vote.rs and re-exported from lib.rs.
 
+use serde::{Deserialize, Serialize};
+
 use algo_codec::{canonical_encode_unauthenticated_proposal, compute_block_digest};
 use algo_consensus_crypto::vrf::VrfPubkey;
 use algo_types::{Address, Block, Round};
@@ -35,11 +37,12 @@ use crate::VRF_PROOF_SIZE;
 /// ```
 ///
 /// The `Hashable` implementation uses HashID `"PL"` (protocol.Payload).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnauthenticatedProposal {
     /// The block being proposed.
     pub block: Block,
     /// VRF proof for the seed derivation (80 bytes).
+    #[serde(with = "serde_bytes")]
     pub seed_proof: [u8; VRF_PROOF_SIZE],
     /// The period in which the proposal was originally made.
     pub original_period: Period,

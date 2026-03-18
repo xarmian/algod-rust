@@ -10,12 +10,15 @@ use std::fmt;
 use std::time::Duration;
 
 use algo_types::Round;
+use serde::{Deserialize, Serialize};
 
 use crate::bundle::UnauthenticatedBundle;
 use crate::proposal::UnauthenticatedProposal;
 use crate::step::{Period, Step};
 use crate::traits::MessageHandle;
 use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, Vote, BOTTOM};
+
+use crate::types::duration_serde;
 
 // ---------------------------------------------------------------------------
 // EventType
@@ -25,7 +28,7 @@ use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, Vote, BOTTOM};
 /// machine.
 ///
 /// Mirrors Go's `eventType` enum in agreement/events.go.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum EventType {
     /// No event.
@@ -191,7 +194,7 @@ impl fmt::Display for EventType {
 /// with some round.
 ///
 /// Mirrors Go's `ConsensusVersionView`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsensusVersionView {
     /// Error encountered when looking up the consensus version (if any).
     pub err: Option<String>,
@@ -207,7 +210,7 @@ pub struct ConsensusVersionView {
 ///
 /// This is a simple newtype around `String` that can be serialized to cadaver
 /// files (for debugging / autopsy).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SerializableError(pub String);
 
 impl fmt::Display for SerializableError {
@@ -235,7 +238,7 @@ impl SerializableError {
 ///
 /// In Go, this carries authenticated + unauthenticated forms of votes,
 /// proposals, and bundles. Here we use `Option` for the optional fields.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct InternalMessage {
     /// An opaque handle identifying the network message source.
     ///
@@ -244,6 +247,7 @@ pub struct InternalMessage {
     ///
     /// This field is not cloneable — cloning an `InternalMessage` sets
     /// `message_handle` to `None`.
+    #[serde(skip)]
     pub message_handle: MessageHandle,
 
     /// The protocol tag identifying the message type.
@@ -314,13 +318,15 @@ impl Default for InternalMessage {
 ///
 /// Note: `UnauthenticatedProposal` is defined in the `proposal` module.
 /// This struct wraps it with validation-time metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proposal {
     /// The unauthenticated proposal that was verified.
     pub unauthenticated_proposal: UnauthenticatedProposal,
     /// Time at which this proposal was validated (relative to round zero).
+    #[serde(with = "duration_serde")]
     pub validated_at: Duration,
     /// Time at which this proposal was received (relative to round zero).
+    #[serde(with = "duration_serde")]
     pub received_at: Duration,
 }
 
@@ -341,7 +347,7 @@ impl Default for Proposal {
 /// A compound message concatenating a proposal-vote and a proposal payload.
 ///
 /// Mirrors Go's `compoundMessage` in agreement/message.go.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompoundMessage {
     /// The proposal-vote.
     pub vote: UnauthenticatedVote,
@@ -356,7 +362,7 @@ pub struct CompoundMessage {
 /// Data bundled with a filterable message event for freshness computation.
 ///
 /// Mirrors Go's `freshnessData` struct.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FreshnessData {
     /// The player's current round.
     pub player_round: Round,
@@ -401,7 +407,7 @@ pub struct EmptyEvent;
 /// A message event carrying a vote, payload, or bundle message.
 ///
 /// Mirrors Go's `messageEvent`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageEvent {
     /// The event type: one of {vote,payload,bundle}{Present,Verified}.
     pub t: EventType,
@@ -885,7 +891,7 @@ impl fmt::Display for PinnedValueEvent {
 /// A threshold event — a threshold of votes has been reached for a given step.
 ///
 /// Mirrors Go's `thresholdEvent`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThresholdEvent {
     /// The event type: `SoftThreshold`, `CertThreshold`, `NextThreshold`, or
     /// `None`.
@@ -1057,7 +1063,7 @@ impl fmt::Display for NextThresholdStatusRequestEvent {
 /// - `proposal`: set to non-bottom if saw a threshold for some proposal
 ///
 /// Mirrors Go's `nextThresholdStatusEvent`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NextThresholdStatusEvent {
     /// True if saw a next-vote bottom threshold.
     pub bottom: bool,
@@ -1086,7 +1092,7 @@ impl fmt::Display for FreshestBundleRequestEvent {
 /// A freshest-bundle event — response to a freshest-bundle request.
 ///
 /// Mirrors Go's `freshestBundleEvent`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FreshestBundleEvent {
     /// True if any threshold event was seen.
     pub ok: bool,
@@ -1130,7 +1136,7 @@ impl fmt::Display for DumpVotesEvent {
 /// A checkpoint event — a checkpoint has been persisted to disk.
 ///
 /// Mirrors Go's `checkpointEvent`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CheckpointEvent {
     /// Round at the checkpoint.
     pub round: Round,

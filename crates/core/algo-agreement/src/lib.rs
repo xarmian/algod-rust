@@ -18,6 +18,7 @@ mod golden_vectors;
 mod hashable;
 mod ledger_reader;
 mod lookback;
+pub mod persistence;
 pub mod player;
 mod proposal;
 pub mod proposal_manager;
@@ -125,3 +126,9 @@ pub use crypto_verifier::AsyncCryptoVerifier;
 
 // Re-exports from service module
 pub use service::{Parameters, Service, ServiceHandle};
+
+// Re-exports from persistence module
+pub use persistence::{
+    decode, encode, persist, persistent, reset, restore, AsyncPersistenceLoop, ClockState,
+    DiskState, PersistenceError, PersistentRequest,
+};

@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 
 use algo_types::Round;
+use serde::{Deserialize, Serialize};
 
 use crate::events::{
     CommittableEvent, EmptyEvent, Event, EventType, PayloadProcessedEvent, Proposal,
@@ -34,7 +35,7 @@ use crate::vote::{ProposalValue, Vote, BOTTOM};
 /// blockAssembler.
 ///
 /// Mirrors Go's `blockAssembler`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BlockAssembler {
     /// A proposal which has not yet been validated. The proposal might be
     /// inside the cryptoVerifier, or it might be a pipelined proposal from
@@ -136,7 +137,7 @@ impl BlockAssembler {
 /// `ReadLowestVote`, `ReadPinned`.
 ///
 /// Mirrors Go's `proposalStore` (the `proposalMachineRound`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposalStore {
     /// Current collection of important proposal-values in the round.
     /// Indexed by period; the `ProposalValue` is the last one reported by

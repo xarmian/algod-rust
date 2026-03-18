@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use algo_types::{Address, Round};
+use serde::{Deserialize, Serialize};
 
 use crate::events::{
     EmptyEvent, Event, EventType, FilteredEvent, LateCredentialTrackingEffect,
@@ -118,7 +119,7 @@ impl std::error::Error for ErrProposalTrackerPS {}
 /// Finds the vote with the lowest credential until `freeze()` is called.
 ///
 /// Mirrors Go's `proposalSeeker`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProposalSeeker {
     /// The vote with the lowest credential seen so far.
     pub lowest: Vote,
@@ -220,7 +221,7 @@ impl ProposalSeeker {
 /// `ProposalFrozen`, `ReadLowestVote`.
 ///
 /// Mirrors Go's `proposalTracker` (the `proposalMachinePeriod`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposalTracker {
     /// The set of senders which have been seen by this tracker.
     /// A duplicate or equivocating proposal-vote is dropped.

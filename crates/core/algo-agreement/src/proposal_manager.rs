@@ -15,6 +15,7 @@
 // Mirrors Go's `proposalManager` (the `proposalMachine`).
 
 use algo_types::Round;
+use serde::{Deserialize, Serialize};
 
 use crate::events::{
     EmptyEvent, Event, EventType, FilterableMessageEvent, FilteredEvent,
@@ -36,7 +37,7 @@ use crate::vote::UnauthenticatedVote;
 /// proposals become committable.
 ///
 /// Mirrors Go's `proposalManager` (the `proposalMachine`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProposalManager {
     /// Per-round proposal stores. In Go, the router maintains these; here
     /// we track them directly. The key is the round number.

@@ -3,6 +3,8 @@
 // A Selector deterministically defines a cryptographic sortition committee.
 // It contains the input to the sortition VRF and the size of the committee.
 
+use serde::{Deserialize, Serialize};
+
 use algo_types::{ConsensusParams, Round};
 
 use crate::hashable::Hashable;
@@ -13,7 +15,7 @@ use crate::step::{Period, Step};
 /// voting committees.
 ///
 /// Mirrors Go's `agreement.selector` struct.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selector {
     pub seed: Seed,
     pub round: Round,
