@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
@@ -632,7 +632,9 @@ fn execute_pseudonode_action(
 
             // If persistence is available and we have saved state, persist
             // before making votes (matching Go's persist-before-broadcast).
-            let persist_done = if let (
+            // Persistence failure aborts the attest entirely — votes must not
+            // be broadcast without a crash-recovery record.
+            let persistence_ok = if let (
                 Some(ref pl),
                 Some(ref p_router),
                 Some(ref p_player),
@@ -661,63 +663,68 @@ fn execute_pseudonode_action(
 
                         pl.enqueue(request);
 
-                        // Map Receiver<Result<(), PersistenceError>> to
-                        // Receiver<Result<(), String>> by spawning a small
-                        // adapter thread.
-                        let (mapped_tx, mapped_rx) = crossbeam_channel::bounded(1);
-                        let fallback_tx = mapped_tx.clone();
-                        match std::thread::Builder::new()
-                            .name("persist-map".into())
-                            .spawn(move || match done_rx.recv() {
-                                Ok(result) => {
-                                    let _ = mapped_tx.send(result.map_err(|e| e.to_string()));
-                                }
-                                Err(_) => {
-                                    // Channel disconnected — persistence loop crashed;
-                                    // signal error so pseudonode drops votes.
-                                    let _ =
-                                        mapped_tx.send(Err("persistence loop disconnected".into()));
-                                }
-                            }) {
-                            Ok(_) => Some(mapped_rx),
-                            Err(e) => {
-                                // Thread spawn failed — signal error so pseudonode
-                                // drops votes rather than hanging forever.
-                                warn!("failed to spawn persistence adapter thread: {}", e);
-                                let _ = fallback_tx
-                                    .send(Err("failed to spawn persistence adapter thread".into()));
-                                Some(mapped_rx)
+                        // Wait synchronously for persistence to complete.
+                        // The persistence loop runs in its own thread, so we
+                        // just block here until it signals completion.
+                        const PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
+                        match done_rx.recv_timeout(PERSIST_TIMEOUT) {
+                            Ok(Ok(())) => true,
+                            Ok(Err(e)) => {
+                                warn!(
+                                    "persistence write failed, skipping attest: {}",
+                                    e
+                                );
+                                false
+                            }
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                                warn!(
+                                    "persistence write timed out after {:?}, skipping attest",
+                                    PERSIST_TIMEOUT
+                                );
+                                false
+                            }
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                warn!(
+                                    "persistence loop disconnected, skipping attest"
+                                );
+                                false
                             }
                         }
                     }
                     Ok(_) => {
-                        // Empty raw — encode produced nothing.
-                        None
+                        // Empty raw — encode produced nothing; skip attest.
+                        warn!("persistence encode produced empty output, skipping attest");
+                        false
                     }
                     Err(e) => {
-                        warn!("persistence encode failed: {}", e);
-                        None
+                        // Encode failure — skip attest to preserve
+                        // persist-before-broadcast guarantee.
+                        warn!("persistence encode failed, skipping attest: {}", e);
+                        false
                     }
                 }
             } else {
-                None
+                // No persistence configured — proceed without it.
+                true
             };
 
-            match pseudonode.make_votes(pa.round, pa.period, pa.step, pa.proposal, persist_done) {
-                Ok(message_events) => {
-                    let ext_events: Vec<ExternalEvent> = message_events
-                        .into_iter()
-                        .map(|me| ExternalEvent {
-                            event: crate::events::Event::Message(me),
-                        })
-                        .collect();
-                    events_out.extend(ext_events);
-                }
-                Err(crate::pseudonode::PseudonodeError::NoVotes) => {
-                    // No participation keys — do nothing.
-                }
-                Err(e) => {
-                    warn!("pseudonode.make_votes failed({}): {}", pa.t, e);
+            if persistence_ok {
+                match pseudonode.make_votes(pa.round, pa.period, pa.step, pa.proposal, None) {
+                    Ok(message_events) => {
+                        let ext_events: Vec<ExternalEvent> = message_events
+                            .into_iter()
+                            .map(|me| ExternalEvent {
+                                event: crate::events::Event::Message(me),
+                            })
+                            .collect();
+                        events_out.extend(ext_events);
+                    }
+                    Err(crate::pseudonode::PseudonodeError::NoVotes) => {
+                        // No participation keys — do nothing.
+                    }
+                    Err(e) => {
+                        warn!("pseudonode.make_votes failed({}): {}", pa.t, e);
+                    }
                 }
             }
         }
