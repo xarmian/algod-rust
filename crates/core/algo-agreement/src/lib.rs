@@ -122,7 +122,7 @@ pub use player::{Player, Tracer};
 pub use router::{PeriodRouter, RootRouter, RoundRouter, StateMachineTag, StepRouter};
 
 // Re-exports from crypto verifier module
-pub use crypto_verifier::AsyncCryptoVerifier;
+pub use crypto_verifier::{AsyncCryptoVerifier, NoOpValidator};
 
 // Re-exports from service module
 pub use service::{Parameters, Service, ServiceHandle};
