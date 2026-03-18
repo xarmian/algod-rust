@@ -549,8 +549,17 @@ pub async fn run(
             None
         }
     };
-    let block_validator =
-        BlockValidatorBridge::new(resolved_genesis_id.clone(), genesis_hash, prev_timestamp);
+    // A single shared BlockValidatorBridge is used by both the Parameters
+    // (demux loop / ensure action) and the AsyncCryptoVerifier (proposal
+    // verification). This mirrors Go where the same BlockValidator is passed
+    // to both. Sharing ensures that `set_prev_timestamp` updates made in
+    // `do_ensure_action` are visible to the crypto verifier's proposal
+    // validation, keeping timestamp validation accurate.
+    let block_validator: Arc<BlockValidatorBridge> = Arc::new(BlockValidatorBridge::new(
+        resolved_genesis_id.clone(),
+        genesis_hash,
+        prev_timestamp,
+    ));
 
     // Real random source backed by the OS CSPRNG; no-op monitor.
     let random_source = RealRandomSource;
@@ -559,8 +568,14 @@ pub async fn run(
     // Real crypto verifier backed by the agreement ledger bridge.
     // This verifies VRF credentials and OTS signatures on incoming votes
     // and bundles, rather than blindly accepting them.
+    //
+    // The block validator is also threaded into the crypto verifier so that
+    // proposal verification validates the block eagerly and caches the
+    // `ValidatedBlock` — mirroring Go's `makeCryptoVerifier(l, v, ...)`.
     let crypto_ledger = Arc::new(AgreementLedgerBridge::new(ledger.clone()));
-    let crypto = AsyncCryptoVerifier::new(crypto_ledger);
+    let crypto_block_validator: Arc<dyn algo_agreement::BlockValidator + Send + Sync> =
+        Arc::clone(&block_validator) as Arc<dyn algo_agreement::BlockValidator + Send + Sync>;
+    let crypto = AsyncCryptoVerifier::new(crypto_ledger, crypto_block_validator);
 
     // -----------------------------------------------------------------------
     // 5. Build and start the catchup service.

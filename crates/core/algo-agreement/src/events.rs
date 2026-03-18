@@ -7,6 +7,7 @@
 // the corresponding event struct.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use algo_types::Round;
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::bundle::UnauthenticatedBundle;
 use crate::proposal::UnauthenticatedProposal;
 use crate::step::{Period, Step};
-use crate::traits::MessageHandle;
+use crate::traits::{MessageHandle, ValidatedBlock};
 use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, Vote, BOTTOM};
 
 use crate::types::duration_serde;
@@ -318,7 +319,7 @@ impl Default for InternalMessage {
 ///
 /// Note: `UnauthenticatedProposal` is defined in the `proposal` module.
 /// This struct wraps it with validation-time metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Proposal {
     /// The unauthenticated proposal that was verified.
     pub unauthenticated_proposal: UnauthenticatedProposal,
@@ -328,6 +329,33 @@ pub struct Proposal {
     /// Time at which this proposal was received (relative to round zero).
     #[serde(with = "duration_serde")]
     pub received_at: Duration,
+    /// Pre-validated block, if available. Allows `ensure_validated_block` to
+    /// skip re-validation on commit. Not serialized — mirrors Go where `ve` is
+    /// not persisted.
+    #[serde(skip)]
+    pub validated_block: Option<Arc<dyn ValidatedBlock + Send + Sync>>,
+}
+
+impl Clone for Proposal {
+    fn clone(&self) -> Self {
+        Self {
+            unauthenticated_proposal: self.unauthenticated_proposal.clone(),
+            validated_at: self.validated_at,
+            received_at: self.received_at,
+            validated_block: self.validated_block.as_ref().map(Arc::clone),
+        }
+    }
+}
+
+impl fmt::Debug for Proposal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Proposal")
+            .field("unauthenticated_proposal", &self.unauthenticated_proposal)
+            .field("validated_at", &self.validated_at)
+            .field("received_at", &self.received_at)
+            .field("validated_block", &self.validated_block.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 impl Default for Proposal {
@@ -336,6 +364,7 @@ impl Default for Proposal {
             unauthenticated_proposal: UnauthenticatedProposal::default(),
             validated_at: Duration::ZERO,
             received_at: Duration::ZERO,
+            validated_block: None,
         }
     }
 }
@@ -1515,5 +1544,47 @@ mod tests {
     fn event_display() {
         let e = Event::Empty(EmptyEvent);
         assert_eq!(format!("{e}"), "none");
+    }
+
+    /// Serde round-trip: a `Proposal` with `validated_block: Some(...)` must
+    /// deserialize with `validated_block: None` because the field is marked
+    /// `#[serde(skip)]`. This validates crash recovery behavior — after a
+    /// restart the agreement service will not have a cached `ValidatedBlock`
+    /// and must fall back to the slow `ensure_block` path.
+    #[test]
+    fn proposal_serde_round_trip_drops_validated_block() {
+        use crate::stubs::StubValidatedBlock;
+
+        let stub_vb = StubValidatedBlock {
+            block: algo_types::Block::default(),
+        };
+        let validated: Arc<dyn ValidatedBlock + Send + Sync> = Arc::new(stub_vb);
+
+        let original = Proposal {
+            unauthenticated_proposal: crate::proposal::UnauthenticatedProposal::default(),
+            validated_at: std::time::Duration::from_millis(42),
+            received_at: std::time::Duration::from_millis(100),
+            validated_block: Some(validated),
+        };
+
+        // Sanity: the original has a validated block.
+        assert!(original.validated_block.is_some());
+
+        // Round-trip through msgpack using named (map) format, since Block
+        // uses `skip_serializing_if` and `rename` attributes that require
+        // named fields for correct deserialization.
+        let encoded =
+            rmp_serde::encode::to_vec_named(&original).expect("msgpack serialize (named)");
+        let decoded: Proposal = rmp_serde::from_slice(&encoded).expect("msgpack deserialize");
+
+        // The non-skip fields must survive.
+        assert_eq!(decoded.validated_at, std::time::Duration::from_millis(42));
+        assert_eq!(decoded.received_at, std::time::Duration::from_millis(100));
+
+        // The validated_block must be None after deserialization.
+        assert!(
+            decoded.validated_block.is_none(),
+            "validated_block must be None after serde round-trip (crash recovery)"
+        );
     }
 }

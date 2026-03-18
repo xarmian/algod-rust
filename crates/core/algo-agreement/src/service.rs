@@ -1100,9 +1100,10 @@ fn encode_network_payload(na: &NetworkAction) -> Option<(&'static str, Vec<u8>)>
 
 /// Execute an ensure action (write a certified block to the ledger).
 ///
-/// The block was already validated during proposal verification, so we
-/// trust it here and write directly. Mirrors Go's `ensureAction.do` which
-/// does not re-validate on the ensure path.
+/// When the proposal carries a pre-validated block (`validated_block` is
+/// `Some`), we use `ensure_validated_block` which skips re-validation.
+/// Otherwise we fall back to `ensure_block`.  Mirrors Go's
+/// `ensureAction.do` which checks `a.Payload.ve != nil`.
 fn do_ensure_action<L: LedgerWriter, BV: BlockValidator>(
     ea: &EnsureAction,
     ledger: &L,
@@ -1110,11 +1111,19 @@ fn do_ensure_action<L: LedgerWriter, BV: BlockValidator>(
 ) {
     let block = &ea.payload.unauthenticated_proposal.block;
 
-    info!(
-        "committed round {} with block {:?}",
-        ea.certificate.round, ea.certificate.proposal.block_digest,
-    );
-    ledger.ensure_block(block, &ea.certificate);
+    if let Some(ref vb) = ea.payload.validated_block {
+        info!(
+            "committed round {} with pre-validated block {:?}",
+            ea.certificate.round, ea.certificate.proposal.block_digest,
+        );
+        ledger.ensure_validated_block(vb.as_ref(), &ea.certificate);
+    } else {
+        info!(
+            "committed round {} with block {:?}",
+            ea.certificate.round, ea.certificate.proposal.block_digest,
+        );
+        ledger.ensure_block(block, &ea.certificate);
+    }
 
     // Update the block validator's previous timestamp so subsequent
     // validations use the correct reference point.
@@ -1363,6 +1372,93 @@ mod tests {
         let written = ledger.get_written_blocks();
         assert_eq!(written.len(), 1);
         assert_eq!(written[0].cert.round, Round(100));
+    }
+
+    /// When the proposal has `validated_block: None`, the ensure action must
+    /// take the slow path (`ensure_block`) and the written block record must
+    /// have `pre_validated: false`.
+    #[test]
+    fn do_ensure_action_none_validated_block_uses_slow_path() {
+        let ledger = StubLedger::new(v41_params(), Round(100));
+        let cert = Certificate {
+            round: Round(100),
+            period: Period(0),
+            proposal: crate::vote::ProposalValue {
+                original_period: Period(0),
+                original_proposer: Address([0x01; 32]),
+                block_digest: algo_types::Digest([0xaa; 32]),
+                encoding_digest: algo_types::Digest([0xbb; 32]),
+            },
+            votes: vec![],
+        };
+        let ea = EnsureAction {
+            payload: crate::events::Proposal {
+                validated_block: None,
+                ..crate::events::Proposal::default()
+            },
+            certificate: cert,
+            vote_validated_at: Duration::ZERO,
+            dynamic_filter_timeout: Duration::ZERO,
+        };
+
+        let validator = StubBlockValidator::accepting();
+        do_ensure_action(&ea, &ledger, &validator);
+
+        let written = ledger.get_written_blocks();
+        assert_eq!(written.len(), 1);
+        assert!(
+            !written[0].pre_validated,
+            "expected slow path (pre_validated: false) when validated_block is None"
+        );
+    }
+
+    /// When the proposal carries a pre-validated block (`validated_block:
+    /// Some(...)`), the ensure action must take the fast path
+    /// (`ensure_validated_block`) and the written block record must have
+    /// `pre_validated: true`.
+    #[test]
+    fn do_ensure_action_with_pre_validated_block_uses_fast_path() {
+        use crate::stubs::StubValidatedBlock;
+        use std::sync::Arc;
+
+        let ledger = StubLedger::new(v41_params(), Round(100));
+        let cert = Certificate {
+            round: Round(100),
+            period: Period(0),
+            proposal: crate::vote::ProposalValue {
+                original_period: Period(0),
+                original_proposer: Address([0x01; 32]),
+                block_digest: algo_types::Digest([0xaa; 32]),
+                encoding_digest: algo_types::Digest([0xbb; 32]),
+            },
+            votes: vec![],
+        };
+
+        let stub_vb = StubValidatedBlock {
+            block: algo_types::Block::default(),
+        };
+        let validated_block: Arc<dyn crate::traits::ValidatedBlock + Send + Sync> =
+            Arc::new(stub_vb);
+
+        let ea = EnsureAction {
+            payload: crate::events::Proposal {
+                validated_block: Some(validated_block),
+                ..crate::events::Proposal::default()
+            },
+            certificate: cert,
+            vote_validated_at: Duration::ZERO,
+            dynamic_filter_timeout: Duration::ZERO,
+        };
+
+        let validator = StubBlockValidator::accepting();
+        do_ensure_action(&ea, &ledger, &validator);
+
+        let written = ledger.get_written_blocks();
+        assert_eq!(written.len(), 1);
+        assert!(
+            written[0].pre_validated,
+            "expected fast path (pre_validated: true) when validated_block is Some"
+        );
     }
 
     #[test]
