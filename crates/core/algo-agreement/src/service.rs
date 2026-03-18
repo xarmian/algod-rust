@@ -670,7 +670,10 @@ fn execute_pseudonode_action(
                         match done_rx.recv_timeout(PERSIST_TIMEOUT) {
                             Ok(Ok(())) => true,
                             Ok(Err(e)) => {
-                                warn!("persistence write failed, skipping attest: {}", e);
+                                warn!(
+                                    "persistence write failed, skipping attest: {}",
+                                    e
+                                );
                                 false
                             }
                             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -681,7 +684,9 @@ fn execute_pseudonode_action(
                                 false
                             }
                             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                                warn!("persistence loop disconnected, skipping attest");
+                                warn!(
+                                    "persistence loop disconnected, skipping attest"
+                                );
                                 false
                             }
                         }
