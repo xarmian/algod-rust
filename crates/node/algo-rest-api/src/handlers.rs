@@ -14,6 +14,10 @@
 //! - `GET /v2/accounts/:address` -- account information
 //! - `GET /v2/accounts/:address/assets/:asset-id` -- account asset information
 //! - `GET /v2/accounts/:address/applications/:application-id` -- account application information
+//! - `GET /v2/applications/:application-id` -- application information by ID
+//! - `GET /v2/assets/:asset-id` -- asset information by ID
+//! - `GET /v2/applications/:application-id/box` -- application box by name
+//! - `GET /v2/applications/:application-id/boxes` -- application box descriptors
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -790,7 +794,7 @@ pub async fn account_application_information<N: NodeInterface>(
     };
 
     if let Some(ref app_params) = lookup.app_params {
-        let app = models::app_params_to_api(app_id, app_params);
+        let app = models::app_params_to_api(app_id, &addr.to_algorand_string(), app_params);
         response.created_app = Some(app.params);
     }
 
@@ -799,6 +803,243 @@ pub async fn account_application_information<N: NodeInterface>(
     }
 
     format::encode_response(&response, resp_format)
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/applications/:application-id
+// ---------------------------------------------------------------------------
+
+/// Query parameters for the `get_application_box_by_name` endpoint.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BoxNameParams {
+    /// Box name in goal-style encoding (e.g. "str:hello", "b64:AQID").
+    pub name: String,
+}
+
+/// Query parameters for the `get_application_boxes` endpoint.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BoxesParams {
+    /// Maximum number of box descriptors to return.
+    pub max: Option<u64>,
+}
+
+/// Returns application information for the given application ID.
+///
+/// Matches go-algorand's `Handlers.GetApplicationByID` in
+/// `daemon/algod/api/server/v2/handlers.go`.
+///
+/// Returns 404 if the application does not exist.
+pub async fn get_application_by_id<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(app_id): Path<u64>,
+) -> Response {
+    let lookup = match node.lookup_application(app_id).await {
+        Ok(l) => l,
+        Err(_) => return error::internal_error("failed to retrieve information from the ledger"),
+    };
+
+    let app_params = match lookup.app_params {
+        Some(params) => params,
+        None => return error::not_found("application does not exist"),
+    };
+
+    let response =
+        models::app_params_to_api(app_id, &lookup.creator.to_algorand_string(), &app_params);
+
+    match serde_json::to_vec(&response) {
+        Ok(body) => (StatusCode::OK, [("content-type", "application/json")], body).into_response(),
+        Err(_) => error::internal_error("failed to encode response"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/assets/:asset-id
+// ---------------------------------------------------------------------------
+
+/// Returns asset information for the given asset ID.
+///
+/// Matches go-algorand's `Handlers.GetAssetByID` in
+/// `daemon/algod/api/server/v2/handlers.go`.
+///
+/// Returns 404 if the asset does not exist.
+pub async fn get_asset_by_id<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(asset_id): Path<u64>,
+) -> Response {
+    let lookup = match node.lookup_asset_by_id(asset_id).await {
+        Ok(l) => l,
+        Err(_) => return error::internal_error("failed to retrieve information from the ledger"),
+    };
+
+    let asset_params = match lookup.asset_params {
+        Some(params) => params,
+        None => return error::not_found("asset does not exist"),
+    };
+
+    let creator = lookup.creator.to_algorand_string();
+    let response = models::asset_params_to_api(asset_id, &creator, &asset_params);
+
+    match serde_json::to_vec(&response) {
+        Ok(body) => (StatusCode::OK, [("content-type", "application/json")], body).into_response(),
+        Err(_) => error::internal_error("failed to encode response"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/applications/:application-id/box
+// ---------------------------------------------------------------------------
+
+/// Returns the value of an application's box by name.
+///
+/// Matches go-algorand's `Handlers.GetApplicationBoxByName` in
+/// `daemon/algod/api/server/v2/handlers.go`.
+///
+/// Returns 404 if the box does not exist.
+pub async fn get_application_box_by_name<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(app_id): Path<u64>,
+    Query(params): Query<BoxNameParams>,
+) -> Response {
+    use crate::box_name;
+
+    // Parse the goal-style encoded box name
+    let box_name = match box_name::parse_box_name(&params.name) {
+        Ok(name) => name,
+        Err(e) => return error::bad_request(e.to_string()),
+    };
+
+    // Look up the box value
+    let (value, last_round) = match node.lookup_kv(app_id, &box_name).await {
+        Ok(result) => result,
+        Err(_) => return error::internal_error("failed to retrieve information from the ledger"),
+    };
+
+    let value = match value {
+        Some(v) => v,
+        None => return error::not_found("box not found"),
+    };
+
+    let response = models::BoxResponse {
+        name: box_name,
+        round: last_round,
+        value,
+    };
+
+    match serde_json::to_vec(&response) {
+        Ok(body) => (StatusCode::OK, [("content-type", "application/json")], body).into_response(),
+        Err(_) => error::internal_error("failed to encode response"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/applications/:application-id/boxes
+// ---------------------------------------------------------------------------
+
+/// Returns the box descriptors for an application.
+///
+/// Matches go-algorand's `Handlers.GetApplicationBoxes` in
+/// `daemon/algod/api/server/v2/handlers.go`.
+///
+/// Returns 400 if the result limit is exceeded.
+pub async fn get_application_boxes<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(app_id): Path<u64>,
+    Query(params): Query<BoxesParams>,
+) -> Response {
+    let requested_max = params.max.unwrap_or(0);
+    let algod_max = node.max_api_box_per_application();
+
+    // Compute effective max using the same logic as go-algorand's
+    // applicationBoxesMaxKeys function.
+    let max = application_boxes_max_keys(requested_max, algod_max);
+
+    // If max is not unlimited, check total boxes against the limit via an
+    // O(1) account record lookup BEFORE scanning all box keys. This matches
+    // go-algorand's approach of checking `record.TotalBoxes` first.
+    //
+    // `application_boxes_max_keys` may return `algod_max + 1` as a sentinel
+    // to detect overflow during key scanning. For the pre-scan total-boxes
+    // check we strip that sentinel so we compare against the true limit,
+    // avoiding returning one more box than allowed.
+    let pre_scan_limit = if algod_max > 0 && max == algod_max.saturating_add(1) {
+        algod_max
+    } else {
+        max
+    };
+    if max != u64::MAX {
+        let (total_box_count, _round) = match node.total_boxes(app_id).await {
+            Ok(result) => result,
+            Err(_) => {
+                return error::internal_error("failed to retrieve information from the ledger")
+            }
+        };
+
+        if total_box_count > pre_scan_limit {
+            let mut data = serde_json::Map::new();
+            data.insert(
+                "max-api-box-per-application".to_string(),
+                serde_json::Value::Number(algod_max.into()),
+            );
+            data.insert(
+                "max".to_string(),
+                serde_json::Value::Number(requested_max.into()),
+            );
+            data.insert(
+                "total-boxes".to_string(),
+                serde_json::Value::Number(total_box_count.into()),
+            );
+            let body = error::ErrorResponse {
+                message: "Result limit exceeded".to_string(),
+                data: Some(data),
+            };
+            let json = serde_json::to_string(&body)
+                .unwrap_or_else(|_| r#"{"message":"Result limit exceeded"}"#.to_string());
+            return (
+                StatusCode::BAD_REQUEST,
+                [("content-type", "application/json")],
+                json,
+            )
+                .into_response();
+        }
+    }
+
+    // Look up all box keys for the application (only reached if limit is
+    // not exceeded or max is unlimited).
+    let (box_keys, _last_round) = match node.lookup_keys_by_prefix(app_id, &[]).await {
+        Ok(result) => result,
+        Err(_) => return error::internal_error("failed to retrieve information from the ledger"),
+    };
+
+    // Build response: box_keys from lookup_keys_by_prefix are already the
+    // raw box names (the node implementation handles prefix stripping).
+    let boxes: Vec<models::BoxDescriptor> = box_keys
+        .into_iter()
+        .map(|name| models::BoxDescriptor { name })
+        .collect();
+
+    let response = models::BoxesResponse { boxes };
+
+    match serde_json::to_vec(&response) {
+        Ok(body) => (StatusCode::OK, [("content-type", "application/json")], body).into_response(),
+        Err(_) => error::internal_error("failed to encode response"),
+    }
+}
+
+/// Compute the effective max keys for the application boxes endpoint,
+/// matching go-algorand's `applicationBoxesMaxKeys` function.
+fn application_boxes_max_keys(requested_max: u64, algod_max: u64) -> u64 {
+    if requested_max == 0 {
+        if algod_max == 0 {
+            return u64::MAX; // unlimited results when both requested and algod max are 0
+        }
+        return algod_max.saturating_add(1); // API limit dominates. Increments by 1 to test if more than max supported results exist.
+    }
+
+    if requested_max <= algod_max || algod_max == 0 {
+        return requested_max; // requested limit dominates
+    }
+
+    algod_max.saturating_add(1) // API limit dominates. Increments by 1 to test if more than max supported results exist.
 }
 
 // ---------------------------------------------------------------------------

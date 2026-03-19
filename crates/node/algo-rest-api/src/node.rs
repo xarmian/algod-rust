@@ -200,6 +200,38 @@ pub struct AppResourceLookup {
     pub last_round: u64,
 }
 
+/// Result of looking up an application by its ID.
+///
+/// Mirrors the fields used by go-algorand's `GetApplicationByID` handler.
+/// The handler resolves the app creator via `GetCreator`, then looks up the
+/// `AppParams` from the ledger.
+#[derive(Debug, Clone)]
+pub struct ApplicationLookup {
+    /// The application parameters (approval program, clear program, schemas, etc.).
+    /// `None` when the application does not exist.
+    pub app_params: Option<AppParams>,
+    /// The address that created this application.
+    pub creator: Address,
+    /// The last committed round at the time of the lookup.
+    pub last_round: u64,
+}
+
+/// Result of looking up an asset by its ID.
+///
+/// Mirrors the fields used by go-algorand's `GetAssetByID` handler.
+/// The handler resolves the asset creator via `GetCreator`, then looks up the
+/// `AssetParams` from the ledger.
+#[derive(Debug, Clone)]
+pub struct AssetLookup {
+    /// The asset parameters (total, decimals, name, etc.).
+    /// `None` when the asset does not exist.
+    pub asset_params: Option<AssetParams>,
+    /// The address that created this asset.
+    pub creator: Address,
+    /// The last committed round at the time of the lookup.
+    pub last_round: u64,
+}
+
 /// Trait abstracting the node state needed by REST API handlers.
 ///
 /// Implementations provide access to genesis information, node status,
@@ -313,6 +345,86 @@ pub trait NodeInterface: Send + Sync + 'static {
     /// Configurable, default 100,000. Mirrors go-algorand's
     /// `config.MaxAPIResourcesPerAccount`.
     fn max_api_resources_per_account(&self) -> u64 {
+        100_000
+    }
+
+    // ---- Application / asset / box lookup methods ----
+
+    /// Look up an application by its ID.
+    ///
+    /// Resolves the creator via `GetCreator`, then looks up the `AppParams`.
+    /// Returns `ApplicationLookup` with `app_params: None` when the
+    /// application does not exist.
+    async fn lookup_application(
+        &self,
+        _app_id: u64,
+    ) -> Result<ApplicationLookup, Box<dyn std::error::Error + Send + Sync>> {
+        Err("lookup_application not implemented".into())
+    }
+
+    /// Look up an asset by its ID.
+    ///
+    /// Resolves the creator via `GetCreator`, then looks up the `AssetParams`.
+    /// Returns `AssetLookup` with `asset_params: None` when the asset does
+    /// not exist.
+    async fn lookup_asset_by_id(
+        &self,
+        _asset_id: u64,
+    ) -> Result<AssetLookup, Box<dyn std::error::Error + Send + Sync>> {
+        Err("lookup_asset_by_id not implemented".into())
+    }
+
+    /// Look up a single application box by its raw box name.
+    ///
+    /// Returns the raw box value bytes, or `None` if the box does not exist,
+    /// together with the current round. The `key` parameter is the raw box
+    /// name (not the full KV-store key). The implementation is responsible
+    /// for constructing the full KV key internally (e.g. via `MakeBoxKey`).
+    ///
+    /// Mirrors go-algorand's `ledger.LookupKv(round, key)`.
+    async fn lookup_kv(
+        &self,
+        _app_id: u64,
+        _key: &[u8],
+    ) -> Result<(Option<Vec<u8>>, u64), Box<dyn std::error::Error + Send + Sync>> {
+        Err("lookup_kv not implemented".into())
+    }
+
+    /// List all box names for an application that match a given prefix.
+    ///
+    /// Returns already-stripped box names (without the KV prefix) together
+    /// with the current round. The `prefix` parameter is typically empty to
+    /// list all boxes. The implementation handles KV prefix construction and
+    /// stripping internally.
+    ///
+    /// Mirrors go-algorand's `ledger.LookupKeysByPrefix(round, prefix, maxKeys)`.
+    async fn lookup_keys_by_prefix(
+        &self,
+        _app_id: u64,
+        _prefix: &[u8],
+    ) -> Result<(Vec<Vec<u8>>, u64), Box<dyn std::error::Error + Send + Sync>> {
+        Err("lookup_keys_by_prefix not implemented".into())
+    }
+
+    /// Return the total number of boxes for an application, via an O(1)
+    /// account record lookup.
+    ///
+    /// Returns `(total_boxes, round)`. This is used by the boxes endpoint
+    /// to check the box count against the API limit *before* scanning all
+    /// box keys, matching go-algorand's approach of checking
+    /// `record.TotalBoxes` from the account record.
+    async fn total_boxes(
+        &self,
+        _app_id: u64,
+    ) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
+        Err("total_boxes not implemented".into())
+    }
+
+    /// Maximum number of boxes per application that the API will return.
+    ///
+    /// Configurable, default 100,000. Mirrors go-algorand's
+    /// `config.MaxAPIBoxPerApplication`.
+    fn max_api_box_per_application(&self) -> u64 {
         100_000
     }
 }

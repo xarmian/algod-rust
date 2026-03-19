@@ -477,6 +477,59 @@ pub struct AccountApplicationResponse {
 }
 
 // ---------------------------------------------------------------------------
+// ApplicationResponse / AssetResponse (aliases for endpoint responses)
+// ---------------------------------------------------------------------------
+
+/// Response for the `/v2/applications/{application-id}` endpoint.
+///
+/// Matches go-algorand's `model.ApplicationResponse = Application`.
+pub type ApplicationResponse = ApiApplication;
+
+/// Response for the `/v2/assets/{asset-id}` endpoint.
+///
+/// Matches go-algorand's `model.AssetResponse = Asset`.
+pub type AssetResponse = ApiAsset;
+
+// ---------------------------------------------------------------------------
+// Box / BoxDescriptor / BoxesResponse
+// ---------------------------------------------------------------------------
+
+/// Box name and its content.
+///
+/// Matches go-algorand's `model.Box` (aliased as `BoxResponse`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoxResponse {
+    /// The box name, base64 encoded.
+    #[serde(with = "base64_bytes")]
+    pub name: Vec<u8>,
+
+    /// The round for which this information is relevant.
+    pub round: u64,
+
+    /// The box value, base64 encoded.
+    #[serde(with = "base64_bytes")]
+    pub value: Vec<u8>,
+}
+
+/// Box descriptor describes a Box.
+///
+/// Matches go-algorand's `model.BoxDescriptor`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoxDescriptor {
+    /// Base64 encoded box name.
+    #[serde(with = "base64_bytes")]
+    pub name: Vec<u8>,
+}
+
+/// Response for the `/v2/applications/{application-id}/boxes` endpoint.
+///
+/// Matches go-algorand's `model.BoxesResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoxesResponse {
+    pub boxes: Vec<BoxDescriptor>,
+}
+
+// ---------------------------------------------------------------------------
 // Serde helpers for base64-encoded byte fields
 // ---------------------------------------------------------------------------
 
@@ -656,7 +709,7 @@ pub fn account_data_to_response(
     let created_apps: Vec<ApiApplication> = lookup
         .created_apps
         .iter()
-        .map(|(&id, params)| app_params_to_api(id, params))
+        .map(|(&id, params)| app_params_to_api(id, &addr_str, params))
         .collect();
 
     AccountResponse {
@@ -876,8 +929,11 @@ pub fn asset_params_to_api(asset_id: u64, creator: &str, params: &AssetParams) -
 
 /// Convert `AppParams` to `ApiApplication`, matching go-algorand's
 /// `AppParamsToApplication`.
-pub fn app_params_to_api(app_id: u64, params: &AppParams) -> ApiApplication {
-    let creator = params.creator.to_algorand_string();
+///
+/// The `creator` parameter is the Algorand address string of the app creator,
+/// passed separately (matching go-algorand's `GetCreator()` pattern) rather
+/// than being extracted from `params.creator`.
+pub fn app_params_to_api(app_id: u64, creator: &str, params: &AppParams) -> ApiApplication {
     let global_state = convert_teal_key_value(&params.global_state);
     let extra_program_pages = {
         let v = params.extra_program_pages as u64;
@@ -891,7 +947,7 @@ pub fn app_params_to_api(app_id: u64, params: &AppParams) -> ApiApplication {
     ApiApplication {
         id: app_id,
         params: ApiApplicationParams {
-            creator,
+            creator: creator.to_string(),
             approval_program: params.approval_program.clone(),
             clear_state_program: params.clear_state_program.clone(),
             extra_program_pages,

@@ -24,6 +24,7 @@ hyper.workspace = true
 rand.workspace = true
 async-trait.workspace = true
 hex.workspace = true
+data-encoding.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

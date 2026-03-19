@@ -269,6 +269,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "data-encoding",
  "hex",
  "http",
  "hyper",
