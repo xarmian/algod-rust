@@ -13,7 +13,7 @@ use algo_ledger::participation::ParticipationStore;
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{
     AgreementKeyManagerBridge, AgreementLedgerBridge, BlockFetcher, CatchupService, FetchError,
-    SqliteLedger,
+    FetchedBlockCert, SqliteLedger,
 };
 use algo_network::{
     AgreementNetworkBridge, GossipNode, Phonebook, WebsocketNetwork, WebsocketNetworkConfig,
@@ -21,7 +21,7 @@ use algo_network::{
 };
 use algo_pool::{PoolConfig, TransactionPool};
 use algo_rest_client::GossipBlockSource;
-use algo_types::{AccountData, Address, Block, BlockHeader, Round, TxnType};
+use algo_types::{AccountData, Address, BlockHeader, Round, TxnType};
 use algo_validate::merkle::{compute_payset_merkle_root, compute_vector_commitment, HashAlgo};
 use algo_validate::rules::{has_txn256, has_txn512};
 use algo_validate::signature::verify_transaction_signature;
@@ -84,7 +84,7 @@ struct GossipBlockFetcher {
 }
 
 impl BlockFetcher for GossipBlockFetcher {
-    fn fetch_block(&self, round: Round) -> Result<Block, FetchError> {
+    fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
         // SAFETY: This is called from the CatchupService's background std::thread,
         // NOT from a tokio worker thread. Calling block_on from within the tokio
         // runtime would panic.
@@ -98,7 +98,37 @@ impl BlockFetcher for GossipBlockFetcher {
             let response = source.get_block(round).await.map_err(|e| {
                 FetchError::NetworkError(format!("block fetch failed for round {}: {}", round, e))
             })?;
-            Ok(response.block)
+
+            // Try to parse the gossip response's certificate data
+            // (rmpv::Value) into a typed Certificate for fork detection.
+            // If parsing fails, gracefully degrade to cert: None — the
+            // catchup service already has the agreement cert and can
+            // still commit blocks; fork detection just won't fire.
+            //
+            // The rmpv::Value preserves Go's codec tags ("rnd", "per",
+            // "prop", etc.) as map keys. We re-encode to bytes and then
+            // use the agreement codec's `decode_bundle` which understands
+            // those tags, rather than rmp_serde which expects Rust field
+            // names.
+            let cert = response.cert.and_then(|val| {
+                let mut bytes = Vec::new();
+                rmpv::encode::write_value(&mut bytes, &val).ok()?;
+                match algo_agreement::codec::decode_bundle(&bytes) {
+                    Ok(bundle) => Some(algo_agreement::Certificate::from_bundle(&bundle)),
+                    Err(e) => {
+                        tracing::debug!(
+                            round = %round,
+                            error = %e,
+                            "could not parse fetched certificate, fork detection unavailable for this block"
+                        );
+                        None
+                    }
+                }
+            });
+            Ok(FetchedBlockCert {
+                block: response.block,
+                cert,
+            })
         })
     }
 }
@@ -2003,8 +2033,9 @@ pub async fn run(
         rt_handle,
     });
 
-    let mut catchup_service =
-        CatchupService::start(cert_rx, ledger.clone(), catchup_bridge, block_fetcher);
+    let catchup_ledger: Arc<dyn algo_ledger::CatchupLedger> = catchup_bridge;
+
+    let mut catchup_service = CatchupService::start(cert_rx, catchup_ledger, block_fetcher);
     info!("catchup service started");
 
     // -----------------------------------------------------------------------
