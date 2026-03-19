@@ -9,6 +9,7 @@
 //! specifically the `syncCert` / `fetchRound` path that handles certificate-
 //! driven single-block fetches.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -132,6 +133,10 @@ pub struct CatchupService {
     shutdown_tx: Option<crossbeam_channel::Sender<()>>,
     /// Join handle for the background worker thread.
     join_handle: Option<JoinHandle<()>>,
+    /// Counter tracking the number of fork detections observed.
+    /// Callers can query this via [`CatchupService::fork_count`] for
+    /// monitoring / alerting purposes.
+    fork_count: Arc<AtomicU64>,
 }
 
 impl CatchupService {
@@ -151,18 +156,28 @@ impl CatchupService {
         fetcher: Arc<dyn BlockFetcher>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
+        let fork_count = Arc::new(AtomicU64::new(0));
+        let fork_count_inner = Arc::clone(&fork_count);
 
         let join_handle = thread::Builder::new()
             .name("catchup-service".to_string())
             .spawn(move || {
-                Self::run_loop(cert_rx, shutdown_rx, ledger, fetcher);
+                Self::run_loop(cert_rx, shutdown_rx, ledger, fetcher, fork_count_inner);
             })
             .expect("failed to spawn catchup-service thread");
 
         Self {
             shutdown_tx: Some(shutdown_tx),
             join_handle: Some(join_handle),
+            fork_count,
         }
+    }
+
+    /// Returns the number of fork detections observed so far.
+    ///
+    /// Callers can poll this to detect forks for monitoring or alerting.
+    pub fn fork_count(&self) -> u64 {
+        self.fork_count.load(Ordering::SeqCst)
     }
 
     /// Signal the service to stop and wait for the background thread to exit.
@@ -195,6 +210,7 @@ impl CatchupService {
         shutdown_rx: Receiver<()>,
         ledger: Arc<dyn CatchupLedger>,
         fetcher: Arc<dyn BlockFetcher>,
+        fork_count: Arc<AtomicU64>,
     ) {
         info!("catchup service started");
 
@@ -213,7 +229,13 @@ impl CatchupService {
                 i if i == cert_idx => {
                     match oper.recv(&cert_rx) {
                         Ok(pending) => {
-                            Self::sync_cert(&pending, &ledger, &fetcher, &shutdown_rx);
+                            Self::sync_cert(
+                                &pending,
+                                &ledger,
+                                &fetcher,
+                                &shutdown_rx,
+                                &fork_count,
+                            );
                         }
                         Err(_) => {
                             // Certificate channel closed — the agreement service
@@ -253,6 +275,7 @@ impl CatchupService {
         ledger: &Arc<dyn CatchupLedger>,
         fetcher: &Arc<dyn BlockFetcher>,
         shutdown_rx: &Receiver<()>,
+        fork_count: &Arc<AtomicU64>,
     ) {
         let cert = &pending.cert;
         let target_round = cert.round;
@@ -368,27 +391,43 @@ impl CatchupService {
                         // verification, since full authentication requires a
                         // LedgerReader which is not available through the
                         // CatchupLedger trait.
+                        //
+                        // TODO(fork-auth): Go's implementation (catchup/service.go ~line 822)
+                        // calls `fetchedCert.Authenticate(*block, s.ledger, verifier)` which
+                        // performs full quorum verification before raising a fork alarm. Our
+                        // current lightweight digest comparison could produce false positives
+                        // if a malicious peer sends a fabricated certificate. We should
+                        // eventually perform full certificate authentication (signature +
+                        // quorum check) here to prevent false fork alarms from untrusted peers.
                         if let Some(ref fetched_cert) = fetched.cert {
                             let fetched_cert_digest = fetched_cert.proposal.block_digest;
                             if fetched_cert.round == cert.round
                                 && fetched_cert_digest != cert_digest
                                 && fetched_cert_digest == block_digest
                             {
+                                // Increment the fork detection counter so callers
+                                // can observe fork events programmatically.
+                                fork_count.fetch_add(1, Ordering::SeqCst);
+
                                 error!(
                                     round = %target_round,
                                     agreement_digest = ?cert_digest,
                                     fetched_digest = ?fetched_cert_digest,
-                                    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\
-                                     !!!!!!!!!! FORK DETECTED !!!!!!!!!!!\n\
-                                     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\
-                                     Agreement cert authenticates block with digest {:?}.\n\
-                                     Fetched cert authenticates a different block with digest {:?}.\n\
-                                     This indicates a fork for round {}.\n\
-                                     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\
-                                     !!!!!!!!!! FORK DETECTED !!!!!!!!!!!\n\
-                                     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+                                    fork_count = fork_count.load(Ordering::SeqCst),
+                                    "FORK DETECTED: two certificates authenticate \
+                                     different blocks for the same round. \
+                                     Agreement cert digest={:?}, \
+                                     fetched cert digest={:?}, \
+                                     round={}",
                                     cert_digest, fetched_cert_digest, target_round,
                                 );
+
+                                // TODO(fork-response): Future work for fork detection response:
+                                // - Expose a metrics counter (e.g. Prometheus gauge) for fork events
+                                // - Integrate with an alerting system (e.g. webhook, PagerDuty)
+                                // - Add an optional configurable halt mechanism that stops the node
+                                //   on fork detection, similar to Go's `logging.Base().EventWithDetails()`
+                                //   which can trigger external monitoring
                             }
                         }
 
@@ -488,7 +527,6 @@ mod tests {
     use super::*;
     use algo_agreement::{AsyncVoteVerifier, PendingUnmatchedCertificate};
     use algo_types::Round;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -585,6 +623,27 @@ mod tests {
         }
     }
 
+    // -- Helpers --
+
+    /// Poll a condition function until it returns `true`, sleeping briefly
+    /// between checks.  Panics if the timeout elapses before the condition
+    /// is met.  This replaces fixed `thread::sleep` calls in tests,
+    /// reducing flakiness on slow CI runners while still being responsive.
+    fn poll_until(
+        condition: impl Fn() -> bool,
+        poll_interval: Duration,
+        timeout: Duration,
+        msg: &str,
+    ) {
+        let start = std::time::Instant::now();
+        while !condition() {
+            if start.elapsed() >= timeout {
+                panic!("poll_until timed out after {timeout:?}: {msg}");
+            }
+            thread::sleep(poll_interval);
+        }
+    }
+
     // -- Tests --
 
     #[test]
@@ -642,8 +701,8 @@ mod tests {
         // Send a cert — the fetch will fail but the service should survive.
         tx.send(make_pending_cert(5)).unwrap();
 
-        // Give it time to attempt a few retries, then stop via shutdown.
-        thread::sleep(Duration::from_secs(2));
+        // Give it time to attempt at least one retry, then stop via shutdown.
+        thread::sleep(Duration::from_millis(500));
         svc.stop();
     }
 
@@ -754,8 +813,14 @@ mod tests {
         // Send a cert for round 1 with the correct digest.
         tx.send(make_pending_cert_with_digest(1, digest)).unwrap();
 
-        // Wait for the service to process the cert and commit the block.
-        thread::sleep(Duration::from_millis(500));
+        // Poll until the fetcher has been called, rather than a fixed sleep.
+        let fetcher_poll = Arc::clone(&fetcher);
+        poll_until(
+            move || fetcher_poll.fetch_count() >= 1,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            "fetcher should be called for a valid block",
+        );
 
         // The fetcher should have been called exactly once (no retries needed).
         assert_eq!(
@@ -798,15 +863,14 @@ mod tests {
         tx.send(make_pending_cert_with_digest(1, wrong_digest))
             .unwrap();
 
-        // Let the service retry for a bit.
-        thread::sleep(Duration::from_secs(2));
-
-        // The fetcher should have been called multiple times since the
-        // service retries indefinitely on digest mismatch.
-        assert!(
-            fetcher.fetch_count() >= 2,
-            "fetcher should retry on digest mismatch, got {} calls",
-            fetcher.fetch_count()
+        // Poll until the fetcher has been called at least twice (retry on
+        // digest mismatch), rather than using a fixed sleep.
+        let fetcher_poll = Arc::clone(&fetcher);
+        poll_until(
+            move || fetcher_poll.fetch_count() >= 2,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            "fetcher should retry on digest mismatch",
         );
 
         // Shutdown stops the retry loop.
@@ -875,14 +939,14 @@ mod tests {
         // Send a cert for round 1 with the correct digest.
         tx.send(make_pending_cert_with_digest(1, digest)).unwrap();
 
-        // Wait for retry: first attempt fails (500ms backoff), second succeeds.
-        thread::sleep(Duration::from_secs(2));
-
-        // The fetcher should have been called at least 2 times: 1 failure + 1 success.
-        assert!(
-            fetcher.total_calls() >= 2,
-            "expected at least 2 fetch calls (1 fail + 1 success), got {}",
-            fetcher.total_calls()
+        // Poll until the fetcher has been called at least twice
+        // (1 failure + 1 success), rather than using a fixed sleep.
+        let fetcher_poll = Arc::clone(&fetcher);
+        poll_until(
+            move || fetcher_poll.total_calls() >= 2,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            "expected at least 2 fetch calls (1 fail + 1 success)",
         );
 
         svc.stop();
@@ -904,14 +968,14 @@ mod tests {
 
         tx.send(make_pending_cert(5)).unwrap();
 
-        // Let the service retry for a bit.
-        thread::sleep(Duration::from_secs(2));
-
-        // Should have been called multiple times (retries indefinitely).
-        assert!(
-            fetcher.total_calls() >= 2,
-            "fetcher should be called multiple times during indefinite retry, got {}",
-            fetcher.total_calls()
+        // Poll until the fetcher has been called at least twice
+        // (verifies indefinite retry), rather than using a fixed sleep.
+        let fetcher_poll = Arc::clone(&fetcher);
+        poll_until(
+            move || fetcher_poll.total_calls() >= 2,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            "fetcher should be called multiple times during indefinite retry",
         );
 
         // Shutdown should interrupt the retry loop cleanly.
@@ -989,15 +1053,21 @@ mod tests {
         tx.send(make_pending_cert_with_digest(1, agreement_digest))
             .unwrap();
 
-        // Let the service process the cert and hit the fork detection path.
-        thread::sleep(Duration::from_secs(2));
+        // Poll until the fetcher has been called at least once (the service
+        // retries on digest mismatch), rather than using a fixed sleep.
+        let fetcher_poll = Arc::clone(&fetcher);
+        poll_until(
+            move || fetcher_poll.fetch_count() >= 1,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            "fetcher should have been called at least once",
+        );
 
-        // The fetcher should have been called at least once (the service
-        // retries on digest mismatch).
+        // Verify that the fork counter was incremented.
         assert!(
-            fetcher.fetch_count() >= 1,
-            "fetcher should have been called, got {} calls",
-            fetcher.fetch_count()
+            svc.fork_count() >= 1,
+            "fork_count should be >= 1 after fork detection, got {}",
+            svc.fork_count()
         );
 
         // The service should still be alive (fork detection logs but
@@ -1029,14 +1099,14 @@ mod tests {
         tx.send(make_pending_cert_with_digest(1, wrong_digest))
             .unwrap();
 
-        // Let the service retry for a bit.
-        thread::sleep(Duration::from_secs(2));
-
-        // Should have retried (digest mismatch) without panicking.
-        assert!(
-            fetcher.fetch_count() >= 2,
-            "fetcher should retry on digest mismatch, got {} calls",
-            fetcher.fetch_count()
+        // Poll until the fetcher has retried at least twice (digest
+        // mismatch), rather than using a fixed sleep.
+        let fetcher_poll = Arc::clone(&fetcher);
+        poll_until(
+            move || fetcher_poll.fetch_count() >= 2,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            "fetcher should retry on digest mismatch",
         );
 
         svc.stop();
@@ -1069,13 +1139,15 @@ mod tests {
         tx.send(make_pending_cert_with_digest(1, agreement_digest))
             .unwrap();
 
-        // Let the service process. It will retry because the block
-        // digest won't match agreement_digest, but no fork alarm.
-        thread::sleep(Duration::from_secs(2));
-
-        assert!(
-            fetcher.fetch_count() >= 1,
-            "fetcher should have been called"
+        // Poll until the fetcher has been called at least once. It will
+        // retry because the block digest won't match agreement_digest,
+        // but no fork alarm should fire.
+        let fetcher_poll = Arc::clone(&fetcher);
+        poll_until(
+            move || fetcher_poll.fetch_count() >= 1,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            "fetcher should have been called at least once",
         );
 
         svc.stop();
