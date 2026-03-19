@@ -400,10 +400,6 @@ pub struct NodeStatusResponse {
     )]
     pub upgrade_votes_required: Option<u64>,
 
-    /// The protocol version being proposed for upgrade.
-    #[serde(rename = "upgrade-propose", skip_serializing_if = "Option::is_none")]
-    pub upgrade_propose: Option<String>,
-
     /// Yes votes cast for consensus upgrade.
     #[serde(rename = "upgrade-yes-votes", skip_serializing_if = "Option::is_none")]
     pub upgrade_yes_votes: Option<u64>,
@@ -446,7 +442,6 @@ pub async fn get_status<N: NodeInterface>(State(node): State<AppState<N>>) -> Re
         upgrade_next_protocol_vote_before: None,
         upgrade_no_votes: None,
         upgrade_node_vote: None,
-        upgrade_propose: None,
         upgrade_vote_rounds: None,
         upgrade_votes: None,
         upgrade_votes_required: None,
@@ -472,7 +467,6 @@ pub async fn get_status<N: NodeInterface>(State(node): State<AppState<N>>) -> Re
         response.upgrade_votes_required = Some(upgrade_threshold);
         response.upgrade_node_vote = Some(status.upgrade_approve);
         response.upgrade_delay = Some(status.upgrade_delay);
-        response.upgrade_propose = Some(status.upgrade_propose);
         response.upgrade_votes = Some(votes);
         response.upgrade_yes_votes = Some(votes_yes);
         response.upgrade_no_votes = Some(votes_no);

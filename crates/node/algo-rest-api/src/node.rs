@@ -84,9 +84,6 @@ pub struct NodeStatus {
 
     /// Delay (in rounds) requested for the upgrade.
     pub upgrade_delay: u64,
-
-    /// The protocol version being proposed for upgrade (may be empty).
-    pub upgrade_propose: String,
 }
 
 /// Build version information for the `/versions` endpoint.

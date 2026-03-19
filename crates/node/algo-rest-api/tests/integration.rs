@@ -119,7 +119,6 @@ impl MockNode {
                 next_protocol_approvals: 0,
                 upgrade_approve: false,
                 upgrade_delay: 0,
-                upgrade_propose: String::new(),
             })),
             suggested_fee: 1000,
             min_txn_fee: 1000,
@@ -170,7 +169,6 @@ impl MockNode {
             next_protocol_approvals: 0,
             upgrade_approve: false,
             upgrade_delay: 0,
-            upgrade_propose: String::new(),
         }));
         node
     }
@@ -201,7 +199,6 @@ impl MockNode {
             next_protocol_approvals: 0,
             upgrade_approve: false,
             upgrade_delay: 0,
-            upgrade_propose: String::new(),
         }));
         node
     }
@@ -232,7 +229,6 @@ impl MockNode {
             next_protocol_approvals: 3500,
             upgrade_approve: true,
             upgrade_delay: 100,
-            upgrade_propose: "v42".to_string(),
         }));
         node
     }
@@ -270,7 +266,6 @@ impl MockNode {
             next_protocol_approvals: 0,
             upgrade_approve: false,
             upgrade_delay: 0,
-            upgrade_propose: String::new(),
         }));
         node
     }
@@ -1047,10 +1042,6 @@ async fn status_omits_upgrade_fields_when_no_upgrade() {
         body.get("upgrade-yes-votes").is_none(),
         "upgrade-yes-votes should be absent when no upgrade"
     );
-    assert!(
-        body.get("upgrade-propose").is_none(),
-        "upgrade-propose should be absent when no upgrade"
-    );
 }
 
 #[tokio::test]
@@ -1111,11 +1102,6 @@ async fn status_includes_upgrade_fields_during_upgrade() {
         body["upgrade-next-protocol-vote-before"].as_u64().unwrap(),
         10000,
         "upgrade-next-protocol-vote-before should be set"
-    );
-    assert_eq!(
-        body["upgrade-propose"].as_str().unwrap(),
-        "v42",
-        "upgrade-propose should be the proposed protocol version"
     );
 }
 
