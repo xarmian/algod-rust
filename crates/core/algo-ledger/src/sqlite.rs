@@ -1623,10 +1623,12 @@ impl ReadSnapshot {
             });
 
         result.and_then(|data| {
-            decode_account_data(&data).map_err(|e| {
-                tracing::error!("ReadSnapshot: failed to decode account data: {}", e);
-                e
-            }).ok()
+            decode_account_data(&data)
+                .map_err(|e| {
+                    tracing::error!("ReadSnapshot: failed to decode account data: {}", e);
+                    e
+                })
+                .ok()
         })
     }
 }

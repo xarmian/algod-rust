@@ -12,7 +12,8 @@ use algo_codec::{canonical_encode_signed_txn_in_block, canonical_encode_transact
 use algo_ledger::participation::ParticipationStore;
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{
-    AgreementKeyManagerBridge, AgreementLedgerBridge, BlockFetcher, CatchupService, SqliteLedger,
+    AgreementKeyManagerBridge, AgreementLedgerBridge, BlockFetcher, CatchupService, FetchError,
+    SqliteLedger,
 };
 use algo_network::{
     AgreementNetworkBridge, GossipNode, Phonebook, WebsocketNetwork, WebsocketNetworkConfig,
@@ -83,24 +84,20 @@ struct GossipBlockFetcher {
 }
 
 impl BlockFetcher for GossipBlockFetcher {
-    fn fetch_block(&self, round: Round) -> Result<Block, String> {
+    fn fetch_block(&self, round: Round) -> Result<Block, FetchError> {
         // SAFETY: This is called from the CatchupService's background std::thread,
         // NOT from a tokio worker thread. Calling block_on from within the tokio
         // runtime would panic.
         self.rt_handle.block_on(async {
             let peers = self.ws_network.get_unicast_peers().await;
             if peers.is_empty() {
-                return Err(format!(
-                    "no unicast peers available to fetch block for round {}",
-                    round
-                ));
+                return Err(FetchError::NoPeersAvailable);
             }
             let source = GossipBlockSource::new(peers);
             use algo_rest_client::BlockSource;
-            let response = source
-                .get_block(round)
-                .await
-                .map_err(|e| format!("block fetch failed for round {}: {}", round, e))?;
+            let response = source.get_block(round).await.map_err(|e| {
+                FetchError::NetworkError(format!("block fetch failed for round {}: {}", round, e))
+            })?;
             Ok(response.block)
         })
     }
@@ -1009,8 +1006,10 @@ impl SimpleBlockEvaluator {
     fn get_account_data(&mut self, addr: &Address) -> Option<AccountData> {
         let mut acct = self.snapshot.get_account(addr, &self.ledger)?;
         if let Some(deltas) = self.overlay.get_resource_deltas(addr) {
-            acct.total_assets_opted_in =
-                apply_delta(acct.total_assets_opted_in, deltas.delta_total_assets_opted_in);
+            acct.total_assets_opted_in = apply_delta(
+                acct.total_assets_opted_in,
+                deltas.delta_total_assets_opted_in,
+            );
             acct.total_created_assets =
                 apply_delta(acct.total_created_assets, deltas.delta_total_created_assets);
             acct.total_apps_opted_in =
@@ -1340,26 +1339,20 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                         // Asset create: creator gets +1 total_created_assets
                         // and +1 total_assets_opted_in (auto-holding).
                         // Mirrors Go's asset.go:87-88.
-                        self.overlay.mutate_resource_deltas_tracked(
-                            sender,
-                            &mut checkpoint,
-                            |d| {
+                        self.overlay
+                            .mutate_resource_deltas_tracked(sender, &mut checkpoint, |d| {
                                 d.delta_total_created_assets += 1;
                                 d.delta_total_assets_opted_in += 1;
-                            },
-                        );
+                            });
                     } else if stx.txn.asset_params.is_none() {
                         // Asset destroy: creator gets -1 total_created_assets
                         // and -1 total_assets_opted_in (holding removed).
                         // Mirrors Go's asset.go:149-150.
-                        self.overlay.mutate_resource_deltas_tracked(
-                            sender,
-                            &mut checkpoint,
-                            |d| {
+                        self.overlay
+                            .mutate_resource_deltas_tracked(sender, &mut checkpoint, |d| {
                                 d.delta_total_created_assets -= 1;
                                 d.delta_total_assets_opted_in -= 1;
-                            },
-                        );
+                            });
                     }
                     // Reconfigure (config_asset != 0 && asset_params.is_some())
                     // does not change resource counts.
@@ -1373,13 +1366,10 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                         && stx.txn.asset_amount == 0
                         && stx.txn.asset_close_to.is_none()
                     {
-                        self.overlay.mutate_resource_deltas_tracked(
-                            sender,
-                            &mut checkpoint,
-                            |d| {
+                        self.overlay
+                            .mutate_resource_deltas_tracked(sender, &mut checkpoint, |d| {
                                 d.delta_total_assets_opted_in += 1;
-                            },
-                        );
+                            });
                     }
                     // Close-out: asset_close_to is set.
                     // Mirrors Go's asset.go:419 (TotalAssets -= 1).
@@ -1403,20 +1393,21 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                         // App create: creator gets +1 total_created_apps,
                         // plus schema and extra pages.
                         // Mirrors Go's application.go:106-115.
-                        let global_schema =
-                            stx.txn.global_state_schema.as_ref().cloned().unwrap_or_default();
+                        let global_schema = stx
+                            .txn
+                            .global_state_schema
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_default();
                         let extra_pages = stx.txn.extra_program_pages;
-                        self.overlay.mutate_resource_deltas_tracked(
-                            sender,
-                            &mut checkpoint,
-                            |d| {
+                        self.overlay
+                            .mutate_resource_deltas_tracked(sender, &mut checkpoint, |d| {
                                 d.delta_total_created_apps += 1;
                                 d.delta_total_extra_app_pages += extra_pages as i64;
                                 d.delta_schema_num_uint += global_schema.num_uint as i64;
                                 d.delta_schema_num_byte_slice +=
                                     global_schema.num_byte_slice as i64;
-                            },
-                        );
+                            });
                     } else {
                         match stx.txn.on_completion {
                             1 => {
@@ -4777,9 +4768,9 @@ mod tests {
             last_valid: Round(1100),
             genesis_id: "test-v1".to_string(),
             genesis_hash: [0xAA; 32],
-            xaid: 99,                           // existing asset
-            asset_amount: 0,                    // opt-in amount
-            asset_receiver: Some(sender),       // self-transfer = opt-in
+            xaid: 99,                     // existing asset
+            asset_amount: 0,              // opt-in amount
+            asset_receiver: Some(sender), // self-transfer = opt-in
             ..Default::default()
         };
         let sig = sign_txn(&txn, &key);
@@ -4952,7 +4943,10 @@ mod tests {
             &ledger,
             &params,
             100,
-            &[(sender, sender_balance), (receiver, initial_receiver_balance)],
+            &[
+                (sender, sender_balance),
+                (receiver, initial_receiver_balance),
+            ],
         );
 
         // Build payment where receiver == close_remainder_to
