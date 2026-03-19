@@ -8,18 +8,39 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use algo_rest_api::auth::generate_token;
-use algo_rest_api::node::{BuildVersion, NodeInterface, NodeStatus};
+use algo_rest_api::node::{BuildVersion, NodeInterface, NodeStatus, ProtocolSwitchInfo};
 use algo_rest_api::router::{build_router, TokenConfig};
 use algo_types::Digest;
 use async_trait::async_trait;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 
 // ---------------------------------------------------------------------------
 // Mock node implementation
 // ---------------------------------------------------------------------------
 
-/// A configurable mock implementation of `NodeInterface` for testing.
+/// Controls how `MockNode::wait_for_round()` behaves.
 #[derive(Debug, Clone)]
+enum MockWaitBehavior {
+    /// Return immediately (round already available).
+    Immediate,
+    /// Wait on a `Notify` (caller signals when ready; used for timeout tests).
+    WaitForever,
+    /// Return an error immediately.
+    Error(String),
+}
+
+/// Controls how `MockNode::latest_block_header_protocol_info()` behaves.
+#[derive(Debug, Clone)]
+enum MockProtocolInfoBehavior {
+    /// Return the configured `ProtocolSwitchInfo`.
+    Ok,
+    /// Return an error.
+    Err(String),
+}
+
+/// A configurable mock implementation of `NodeInterface` for testing.
+#[derive(Debug)]
 struct MockNode {
     genesis_id: String,
     genesis_hash: Digest,
@@ -28,13 +49,40 @@ struct MockNode {
     suggested_fee: u64,
     min_txn_fee: u64,
     build_version: BuildVersion,
+    upgrade_vote_rounds: u64,
+    upgrade_threshold: u64,
+    wait_behavior: MockWaitBehavior,
+    /// Notify used when `wait_behavior` is `WaitForever`.
+    wait_notify: Arc<Notify>,
+    protocol_switch_info: ProtocolSwitchInfo,
+    protocol_info_behavior: MockProtocolInfoBehavior,
+}
+
+impl Clone for MockNode {
+    fn clone(&self) -> Self {
+        Self {
+            genesis_id: self.genesis_id.clone(),
+            genesis_hash: self.genesis_hash,
+            genesis_json: self.genesis_json.clone(),
+            status: self.status.clone(),
+            suggested_fee: self.suggested_fee,
+            min_txn_fee: self.min_txn_fee,
+            build_version: self.build_version.clone(),
+            upgrade_vote_rounds: self.upgrade_vote_rounds,
+            upgrade_threshold: self.upgrade_threshold,
+            wait_behavior: self.wait_behavior.clone(),
+            wait_notify: Arc::clone(&self.wait_notify),
+            protocol_switch_info: self.protocol_switch_info.clone(),
+            protocol_info_behavior: self.protocol_info_behavior.clone(),
+        }
+    }
 }
 
 /// Controls how `MockNode::status()` behaves.
 #[derive(Debug, Clone)]
 enum MockStatus {
     /// Return a successful `NodeStatus` with the given values.
-    Ok(NodeStatus),
+    Ok(Box<NodeStatus>),
     /// Return an error (simulating a node failure).
     Err(String),
 }
@@ -46,7 +94,7 @@ impl MockNode {
             genesis_id: "testnet-v1.0".to_string(),
             genesis_hash: Digest([0xAB; 32]),
             genesis_json: r#"{"network":"testnet"}"#.to_string(),
-            status: MockStatus::Ok(NodeStatus {
+            status: MockStatus::Ok(Box::new(NodeStatus {
                 last_round: 1000,
                 time_since_last_round: 2_000_000_000, // 2 seconds in ns
                 catchup_time: 0,
@@ -59,7 +107,20 @@ impl MockNode {
                 stopped_at_unsupported_round: false,
                 catchpoint: String::new(),
                 last_catchpoint: String::new(),
-            }),
+                catchpoint_total_accounts: 0,
+                catchpoint_processed_accounts: 0,
+                catchpoint_verified_accounts: 0,
+                catchpoint_total_kvs: 0,
+                catchpoint_processed_kvs: 0,
+                catchpoint_verified_kvs: 0,
+                catchpoint_total_blocks: 0,
+                catchpoint_acquired_blocks: 0,
+                next_protocol_vote_before: 0,
+                next_protocol_approvals: 0,
+                upgrade_approve: false,
+                upgrade_delay: 0,
+                upgrade_propose: String::new(),
+            })),
             suggested_fee: 1000,
             min_txn_fee: 1000,
             build_version: BuildVersion {
@@ -70,13 +131,23 @@ impl MockNode {
                 branch: "main".to_string(),
                 channel: "dev".to_string(),
             },
+            upgrade_vote_rounds: 10000,
+            upgrade_threshold: 9000,
+            wait_behavior: MockWaitBehavior::Immediate,
+            wait_notify: Arc::new(Notify::new()),
+            protocol_switch_info: ProtocolSwitchInfo {
+                next_protocol: String::new(),
+                next_protocol_supported: true,
+                next_protocol_switch_on: 0,
+            },
+            protocol_info_behavior: MockProtocolInfoBehavior::Ok,
         }
     }
 
     /// Return a mock node that is catching up (non-zero catchup_time).
     fn catching_up() -> Self {
         let mut node = Self::synced();
-        node.status = MockStatus::Ok(NodeStatus {
+        node.status = MockStatus::Ok(Box::new(NodeStatus {
             last_round: 500,
             time_since_last_round: 30_000_000_000, // 30 seconds in ns
             catchup_time: 5_000_000_000,           // 5 seconds in ns
@@ -87,14 +158,27 @@ impl MockNode {
             stopped_at_unsupported_round: false,
             catchpoint: String::new(),
             last_catchpoint: String::new(),
-        });
+            catchpoint_total_accounts: 0,
+            catchpoint_processed_accounts: 0,
+            catchpoint_verified_accounts: 0,
+            catchpoint_total_kvs: 0,
+            catchpoint_processed_kvs: 0,
+            catchpoint_verified_kvs: 0,
+            catchpoint_total_blocks: 0,
+            catchpoint_acquired_blocks: 0,
+            next_protocol_vote_before: 0,
+            next_protocol_approvals: 0,
+            upgrade_approve: false,
+            upgrade_delay: 0,
+            upgrade_propose: String::new(),
+        }));
         node
     }
 
     /// Return a mock node that has stopped at an unsupported round.
     fn stopped_at_unsupported() -> Self {
         let mut node = Self::synced();
-        node.status = MockStatus::Ok(NodeStatus {
+        node.status = MockStatus::Ok(Box::new(NodeStatus {
             last_round: 999,
             time_since_last_round: 1_000_000_000,
             catchup_time: 0,
@@ -105,7 +189,51 @@ impl MockNode {
             stopped_at_unsupported_round: true,
             catchpoint: String::new(),
             last_catchpoint: String::new(),
-        });
+            catchpoint_total_accounts: 0,
+            catchpoint_processed_accounts: 0,
+            catchpoint_verified_accounts: 0,
+            catchpoint_total_kvs: 0,
+            catchpoint_processed_kvs: 0,
+            catchpoint_verified_kvs: 0,
+            catchpoint_total_blocks: 0,
+            catchpoint_acquired_blocks: 0,
+            next_protocol_vote_before: 0,
+            next_protocol_approvals: 0,
+            upgrade_approve: false,
+            upgrade_delay: 0,
+            upgrade_propose: String::new(),
+        }));
+        node
+    }
+
+    /// Return a mock node that is in the middle of an upgrade vote.
+    fn upgrading() -> Self {
+        let mut node = Self::synced();
+        node.status = MockStatus::Ok(Box::new(NodeStatus {
+            last_round: 5000,
+            time_since_last_round: 3_000_000_000, // 3 seconds in ns
+            catchup_time: 0,
+            last_version: "v41".to_string(),
+            next_version: "v42".to_string(),
+            next_version_round: 15000,
+            next_version_supported: true,
+            stopped_at_unsupported_round: false,
+            catchpoint: String::new(),
+            last_catchpoint: "4000#DEADBEEF".to_string(),
+            catchpoint_total_accounts: 0,
+            catchpoint_processed_accounts: 0,
+            catchpoint_verified_accounts: 0,
+            catchpoint_total_kvs: 0,
+            catchpoint_processed_kvs: 0,
+            catchpoint_verified_kvs: 0,
+            catchpoint_total_blocks: 0,
+            catchpoint_acquired_blocks: 0,
+            next_protocol_vote_before: 10000,
+            next_protocol_approvals: 3500,
+            upgrade_approve: true,
+            upgrade_delay: 100,
+            upgrade_propose: "v42".to_string(),
+        }));
         node
     }
 
@@ -119,7 +247,7 @@ impl MockNode {
     /// Return a mock node that is catching up to a catchpoint.
     fn catchpoint_catchup() -> Self {
         let mut node = Self::synced();
-        node.status = MockStatus::Ok(NodeStatus {
+        node.status = MockStatus::Ok(Box::new(NodeStatus {
             last_round: 100,
             time_since_last_round: 1_000_000_000,
             catchup_time: 0,
@@ -130,7 +258,56 @@ impl MockNode {
             stopped_at_unsupported_round: false,
             catchpoint: "1000#ABCDEF".to_string(),
             last_catchpoint: String::new(),
-        });
+            catchpoint_total_accounts: 5000,
+            catchpoint_processed_accounts: 2500,
+            catchpoint_verified_accounts: 2000,
+            catchpoint_total_kvs: 1000,
+            catchpoint_processed_kvs: 500,
+            catchpoint_verified_kvs: 400,
+            catchpoint_total_blocks: 100,
+            catchpoint_acquired_blocks: 50,
+            next_protocol_vote_before: 0,
+            next_protocol_approvals: 0,
+            upgrade_approve: false,
+            upgrade_delay: 0,
+            upgrade_propose: String::new(),
+        }));
+        node
+    }
+
+    /// Return a mock node with an upcoming unsupported protocol switch.
+    ///
+    /// The switch happens at round 1005, and the next protocol is not supported.
+    fn unsupported_protocol_switch() -> Self {
+        let mut node = Self::synced();
+        node.protocol_switch_info = ProtocolSwitchInfo {
+            next_protocol: "future-v99".to_string(),
+            next_protocol_supported: false,
+            next_protocol_switch_on: 1005,
+        };
+        node
+    }
+
+    /// Return a mock node whose `wait_for_round` blocks forever
+    /// (until the notify is signalled).
+    fn wait_forever() -> Self {
+        let mut node = Self::synced();
+        node.wait_behavior = MockWaitBehavior::WaitForever;
+        node
+    }
+
+    /// Return a mock node whose `latest_block_header_protocol_info()` returns an error.
+    fn protocol_info_error() -> Self {
+        let mut node = Self::synced();
+        node.protocol_info_behavior =
+            MockProtocolInfoBehavior::Err("ledger unavailable".to_string());
+        node
+    }
+
+    /// Return a mock node whose `wait_for_round()` returns an error.
+    fn wait_error() -> Self {
+        let mut node = Self::synced();
+        node.wait_behavior = MockWaitBehavior::Error("ledger read failed".to_string());
         node
     }
 }
@@ -151,7 +328,7 @@ impl NodeInterface for MockNode {
 
     async fn status(&self) -> Result<NodeStatus, Box<dyn std::error::Error + Send + Sync>> {
         match &self.status {
-            MockStatus::Ok(s) => Ok(s.clone()),
+            MockStatus::Ok(s) => Ok(*s.clone()),
             MockStatus::Err(msg) => Err(msg.clone().into()),
         }
     }
@@ -166,6 +343,37 @@ impl NodeInterface for MockNode {
 
     fn build_version(&self) -> &BuildVersion {
         &self.build_version
+    }
+
+    fn upgrade_vote_rounds(&self) -> u64 {
+        self.upgrade_vote_rounds
+    }
+
+    fn upgrade_threshold(&self) -> u64 {
+        self.upgrade_threshold
+    }
+
+    async fn wait_for_round(
+        &self,
+        _round: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match &self.wait_behavior {
+            MockWaitBehavior::Immediate => Ok(()),
+            MockWaitBehavior::WaitForever => {
+                self.wait_notify.notified().await;
+                Ok(())
+            }
+            MockWaitBehavior::Error(msg) => Err(msg.clone().into()),
+        }
+    }
+
+    async fn latest_block_header_protocol_info(
+        &self,
+    ) -> Result<ProtocolSwitchInfo, Box<dyn std::error::Error + Send + Sync>> {
+        match &self.protocol_info_behavior {
+            MockProtocolInfoBehavior::Ok => Ok(self.protocol_switch_info.clone()),
+            MockProtocolInfoBehavior::Err(msg) => Err(msg.clone().into()),
+        }
     }
 }
 
@@ -691,4 +899,524 @@ async fn transaction_params_always_returns_json() {
 
     // Should parse as valid JSON
     let _body: serde_json::Value = resp.json().await.unwrap();
+}
+
+// ===========================================================================
+// Status endpoint tests
+// ===========================================================================
+
+#[tokio::test]
+async fn status_returns_200_with_correct_fields() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/status"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    // Always-present fields
+    assert_eq!(body["last-round"].as_u64().unwrap(), 1000);
+    assert_eq!(
+        body["time-since-last-round"].as_i64().unwrap(),
+        2_000_000_000
+    );
+    assert_eq!(body["catchup-time"].as_i64().unwrap(), 0);
+    assert_eq!(
+        body["last-version"].as_str().unwrap(),
+        "https://github.com/algorandfoundation/specs/tree/abc/v41"
+    );
+    assert_eq!(
+        body["next-version"].as_str().unwrap(),
+        "https://github.com/algorandfoundation/specs/tree/abc/v41"
+    );
+    assert_eq!(body["next-version-round"].as_u64().unwrap(), 1001);
+    assert!(body["next-version-supported"].as_bool().unwrap());
+    assert!(!body["stopped-at-unsupported-round"].as_bool().unwrap());
+
+    // Catchpoint string fields (always present even when empty)
+    assert!(
+        body.get("catchpoint").is_some(),
+        "should have catchpoint field"
+    );
+    assert!(
+        body.get("last-catchpoint").is_some(),
+        "should have last-catchpoint field"
+    );
+}
+
+#[tokio::test]
+async fn status_returns_correct_catchpoint_fields() {
+    let server = TestServer::start(MockNode::catchpoint_catchup()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/status"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    // All catchpoint fields should be present with their mock values
+    assert_eq!(body["catchpoint-total-accounts"].as_u64().unwrap(), 5000);
+    assert_eq!(
+        body["catchpoint-processed-accounts"].as_u64().unwrap(),
+        2500
+    );
+    assert_eq!(body["catchpoint-verified-accounts"].as_u64().unwrap(), 2000);
+    assert_eq!(body["catchpoint-total-kvs"].as_u64().unwrap(), 1000);
+    assert_eq!(body["catchpoint-processed-kvs"].as_u64().unwrap(), 500);
+    assert_eq!(body["catchpoint-verified-kvs"].as_u64().unwrap(), 400);
+    assert_eq!(body["catchpoint-total-blocks"].as_u64().unwrap(), 100);
+    assert_eq!(body["catchpoint-acquired-blocks"].as_u64().unwrap(), 50);
+
+    // Catchpoint fields should also be present when zero (synced node)
+    let server2 = TestServer::start(MockNode::synced()).await;
+    let body2: serde_json::Value = server2
+        .client
+        .get(server2.url("/v2/status"))
+        .header("X-Algo-API-Token", &server2.api_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Even when zero, these fields should be present (matching go-algorand)
+    assert!(
+        body2.get("catchpoint-total-accounts").is_some(),
+        "catchpoint-total-accounts should be present even when zero"
+    );
+    assert_eq!(body2["catchpoint-total-accounts"].as_u64().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn status_omits_upgrade_fields_when_no_upgrade() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let body: serde_json::Value = server
+        .client
+        .get(server.url("/v2/status"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // When next_protocol_vote_before == 0, all upgrade-* fields should be absent
+    assert!(
+        body.get("upgrade-delay").is_none(),
+        "upgrade-delay should be absent when no upgrade"
+    );
+    assert!(
+        body.get("upgrade-next-protocol-vote-before").is_none(),
+        "upgrade-next-protocol-vote-before should be absent when no upgrade"
+    );
+    assert!(
+        body.get("upgrade-no-votes").is_none(),
+        "upgrade-no-votes should be absent when no upgrade"
+    );
+    assert!(
+        body.get("upgrade-node-vote").is_none(),
+        "upgrade-node-vote should be absent when no upgrade"
+    );
+    assert!(
+        body.get("upgrade-vote-rounds").is_none(),
+        "upgrade-vote-rounds should be absent when no upgrade"
+    );
+    assert!(
+        body.get("upgrade-votes").is_none(),
+        "upgrade-votes should be absent when no upgrade"
+    );
+    assert!(
+        body.get("upgrade-votes-required").is_none(),
+        "upgrade-votes-required should be absent when no upgrade"
+    );
+    assert!(
+        body.get("upgrade-yes-votes").is_none(),
+        "upgrade-yes-votes should be absent when no upgrade"
+    );
+    assert!(
+        body.get("upgrade-propose").is_none(),
+        "upgrade-propose should be absent when no upgrade"
+    );
+}
+
+#[tokio::test]
+async fn status_includes_upgrade_fields_during_upgrade() {
+    let server = TestServer::start(MockNode::upgrading()).await;
+
+    let body: serde_json::Value = server
+        .client
+        .get(server.url("/v2/status"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // With next_protocol_vote_before = 10000 and last_round = 5000:
+    // votes_to_go = 10000 - 5000 - 1 = 4999
+    // votes = upgrade_vote_rounds - votes_to_go = 10000 - 4999 = 5001
+    // votes_yes = next_protocol_approvals = 3500
+    // votes_no = votes - votes_yes = 5001 - 3500 = 1501
+    assert_eq!(
+        body["upgrade-votes-required"].as_u64().unwrap(),
+        9000,
+        "upgrade-votes-required should be upgrade_threshold"
+    );
+    assert_eq!(
+        body["upgrade-vote-rounds"].as_u64().unwrap(),
+        10000,
+        "upgrade-vote-rounds should be upgrade_vote_rounds"
+    );
+    assert!(
+        body["upgrade-node-vote"].as_bool().unwrap(),
+        "upgrade-node-vote should match upgrade_approve"
+    );
+    assert_eq!(
+        body["upgrade-delay"].as_u64().unwrap(),
+        100,
+        "upgrade-delay should match upgrade_delay"
+    );
+    assert_eq!(
+        body["upgrade-votes"].as_u64().unwrap(),
+        5001,
+        "upgrade-votes should be total votes cast"
+    );
+    assert_eq!(
+        body["upgrade-yes-votes"].as_u64().unwrap(),
+        3500,
+        "upgrade-yes-votes should be next_protocol_approvals"
+    );
+    assert_eq!(
+        body["upgrade-no-votes"].as_u64().unwrap(),
+        1501,
+        "upgrade-no-votes should be votes - yes_votes"
+    );
+    assert_eq!(
+        body["upgrade-next-protocol-vote-before"].as_u64().unwrap(),
+        10000,
+        "upgrade-next-protocol-vote-before should be set"
+    );
+    assert_eq!(
+        body["upgrade-propose"].as_str().unwrap(),
+        "v42",
+        "upgrade-propose should be the proposed protocol version"
+    );
+}
+
+#[tokio::test]
+async fn status_requires_auth_token() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    // No token
+    let resp = server
+        .client
+        .get(server.url("/v2/status"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn status_returns_500_on_error() {
+    let server = TestServer::start(MockNode::status_error()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/status"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "failed retrieving node status"
+    );
+}
+
+// ===========================================================================
+// Wait-for-block-after endpoint tests
+// ===========================================================================
+
+#[tokio::test]
+async fn wait_for_block_returns_200_immediately_when_round_passed() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    // last_round is 1000, so requesting wait after round 999 should return immediately
+    let resp = server
+        .client
+        .get(server.url("/v2/status/wait-for-block-after/999"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["last-round"].as_u64().unwrap(), 1000);
+    // Verify it has the full NodeStatusResponse structure
+    assert!(body.get("last-version").is_some());
+    assert!(body.get("next-version").is_some());
+    assert!(body.get("catchup-time").is_some());
+}
+
+#[tokio::test]
+async fn wait_for_block_returns_200_on_timeout() {
+    // Use a wait_forever mock so the wait never completes.
+    // The handler will time out after WAIT_FOR_BLOCK_TIMEOUT and still return 200.
+    // We use tokio::time::pause to avoid actually waiting 60s.
+    tokio::time::pause();
+
+    let node = MockNode::wait_forever();
+    let server = TestServer::start(node).await;
+
+    // Spawn the request in a task
+    let client = server.client.clone();
+    let url = server.url("/v2/status/wait-for-block-after/9999");
+    let token = server.api_token.clone();
+
+    let handle = tokio::spawn(async move {
+        client
+            .get(url)
+            .header("X-Algo-API-Token", token)
+            .send()
+            .await
+            .unwrap()
+    });
+
+    // Advance time past the 60s timeout
+    tokio::time::advance(std::time::Duration::from_secs(61)).await;
+
+    let resp = handle.await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // Should still return a valid NodeStatusResponse
+    assert_eq!(body["last-round"].as_u64().unwrap(), 1000);
+}
+
+#[tokio::test]
+async fn wait_for_block_returns_400_when_stopped_at_unsupported() {
+    let server = TestServer::start(MockNode::stopped_at_unsupported()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/status/wait-for-block-after/1000"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "requested round would reach only after the protocol upgrade which isn't supported"
+    );
+}
+
+#[tokio::test]
+async fn wait_for_block_returns_503_during_catchup() {
+    let server = TestServer::start(MockNode::catchpoint_catchup()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/status/wait-for-block-after/500"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "operation not available during catchup"
+    );
+}
+
+#[tokio::test]
+async fn wait_for_block_returns_400_for_unsupported_protocol_switch() {
+    let server = TestServer::start(MockNode::unsupported_protocol_switch()).await;
+
+    // protocol_switch_on is 1005; requesting round 1004 means we wait for
+    // round 1005, which is >= next_protocol_switch_on (1005), so 400.
+    let resp = server
+        .client
+        .get(server.url("/v2/status/wait-for-block-after/1004"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "requested round would reach only after the protocol upgrade which isn't supported"
+    );
+}
+
+#[tokio::test]
+async fn wait_for_block_allows_round_before_unsupported_protocol_switch() {
+    let server = TestServer::start(MockNode::unsupported_protocol_switch()).await;
+
+    // protocol_switch_on is 1005; requesting round 1003 means we wait for
+    // round 1004, which is < next_protocol_switch_on (1005), so 200.
+    let resp = server
+        .client
+        .get(server.url("/v2/status/wait-for-block-after/1003"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn wait_for_block_requires_auth_token() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    // No token
+    let resp = server
+        .client
+        .get(server.url("/v2/status/wait-for-block-after/999"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn wait_for_block_returns_500_when_status_errors() {
+    let server = TestServer::start(MockNode::status_error()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/status/wait-for-block-after/100"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "failed retrieving node status"
+    );
+}
+
+#[tokio::test]
+async fn wait_for_block_returns_200_when_round_notified() {
+    let node = MockNode::wait_forever();
+    let notify = Arc::clone(&node.wait_notify);
+    let server = TestServer::start(node).await;
+
+    let client = server.client.clone();
+    let url = server.url("/v2/status/wait-for-block-after/9999");
+    let token = server.api_token.clone();
+
+    // Spawn the request in a task
+    let handle = tokio::spawn(async move {
+        client
+            .get(url)
+            .header("X-Algo-API-Token", token)
+            .send()
+            .await
+            .unwrap()
+    });
+
+    // Give the handler time to start waiting, then signal the notify
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    notify.notify_one();
+
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("handler should return promptly after notify")
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["last-round"].as_u64().unwrap(), 1000);
+}
+
+#[tokio::test]
+async fn wait_for_block_returns_500_when_protocol_info_errors() {
+    let server = TestServer::start(MockNode::protocol_info_error()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/status/wait-for-block-after/100"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "failed retrieving latest block header"
+    );
+}
+
+#[tokio::test]
+async fn wait_for_block_returns_500_when_wait_for_round_errors() {
+    let server = TestServer::start(MockNode::wait_error()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/status/wait-for-block-after/100"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("waiting for round failed"),
+        "expected error message about wait failure, got: {}",
+        body["message"]
+    );
+}
+
+#[tokio::test]
+async fn wait_for_block_returns_400_on_round_overflow() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/status/wait-for-block-after/{}", u64::MAX)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["message"].as_str().unwrap(), "round overflow");
 }

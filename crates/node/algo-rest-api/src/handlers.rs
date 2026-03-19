@@ -13,8 +13,9 @@
 //! - `GET /v2/transactions/params` -- suggested transaction parameters
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
@@ -248,6 +249,326 @@ pub async fn transaction_params<N: NodeInterface>(State(node): State<AppState<N>
         Ok(body) => (StatusCode::OK, [("content-type", "application/json")], body).into_response(),
         Err(_) => error::internal_error("failed to encode response"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/status
+// ---------------------------------------------------------------------------
+
+/// Response body for `GET /v2/status`, matching go-algorand's
+/// `model.NodeStatusResponse`.
+///
+/// Field names use hyphens in JSON to match the Go struct tags.
+/// Fields that are pointer types with `omitempty` in Go are represented as
+/// `Option<T>` and skipped when `None`.
+///
+/// Note: In go-algorand's `GetStatus` handler, catchpoint-related pointer
+/// fields are **always** set (even when zero), so they always appear in the
+/// response. Upgrade-related fields are only set when `NextProtocolVoteBefore > 0`.
+#[derive(Debug, Serialize)]
+pub struct NodeStatusResponse {
+    /// The current catchpoint that is being caught up to.
+    #[serde(rename = "catchpoint", skip_serializing_if = "Option::is_none")]
+    pub catchpoint: Option<String>,
+
+    /// The number of blocks acquired as part of catchpoint catchup.
+    #[serde(
+        rename = "catchpoint-acquired-blocks",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub catchpoint_acquired_blocks: Option<u64>,
+
+    /// The number of accounts processed during catchpoint catchup.
+    #[serde(
+        rename = "catchpoint-processed-accounts",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub catchpoint_processed_accounts: Option<u64>,
+
+    /// The number of KVs processed during catchpoint catchup.
+    #[serde(
+        rename = "catchpoint-processed-kvs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub catchpoint_processed_kvs: Option<u64>,
+
+    /// The total number of accounts in the current catchpoint.
+    #[serde(
+        rename = "catchpoint-total-accounts",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub catchpoint_total_accounts: Option<u64>,
+
+    /// The total number of blocks required for catchpoint catchup.
+    #[serde(
+        rename = "catchpoint-total-blocks",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub catchpoint_total_blocks: Option<u64>,
+
+    /// The total number of KVs in the current catchpoint.
+    #[serde(
+        rename = "catchpoint-total-kvs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub catchpoint_total_kvs: Option<u64>,
+
+    /// The number of accounts verified during catchpoint catchup.
+    #[serde(
+        rename = "catchpoint-verified-accounts",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub catchpoint_verified_accounts: Option<u64>,
+
+    /// The number of KVs verified during catchpoint catchup.
+    #[serde(
+        rename = "catchpoint-verified-kvs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub catchpoint_verified_kvs: Option<u64>,
+
+    /// CatchupTime in nanoseconds.
+    #[serde(rename = "catchup-time")]
+    pub catchup_time: i64,
+
+    /// The last catchpoint seen by the node.
+    #[serde(rename = "last-catchpoint", skip_serializing_if = "Option::is_none")]
+    pub last_catchpoint: Option<String>,
+
+    /// Last round seen.
+    #[serde(rename = "last-round")]
+    pub last_round: u64,
+
+    /// Last consensus version supported.
+    #[serde(rename = "last-version")]
+    pub last_version: String,
+
+    /// Next consensus protocol version to use.
+    #[serde(rename = "next-version")]
+    pub next_version: String,
+
+    /// Round at which the next consensus version will apply.
+    #[serde(rename = "next-version-round")]
+    pub next_version_round: u64,
+
+    /// Whether the next consensus version is supported by this node.
+    #[serde(rename = "next-version-supported")]
+    pub next_version_supported: bool,
+
+    /// Whether the node has stopped at an unsupported round.
+    #[serde(rename = "stopped-at-unsupported-round")]
+    pub stopped_at_unsupported_round: bool,
+
+    /// TimeSinceLastRound in nanoseconds.
+    #[serde(rename = "time-since-last-round")]
+    pub time_since_last_round: i64,
+
+    /// Upgrade delay.
+    #[serde(rename = "upgrade-delay", skip_serializing_if = "Option::is_none")]
+    pub upgrade_delay: Option<u64>,
+
+    /// Next protocol round (vote-before).
+    #[serde(
+        rename = "upgrade-next-protocol-vote-before",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub upgrade_next_protocol_vote_before: Option<u64>,
+
+    /// No-votes cast for consensus upgrade.
+    #[serde(rename = "upgrade-no-votes", skip_serializing_if = "Option::is_none")]
+    pub upgrade_no_votes: Option<u64>,
+
+    /// This node's upgrade vote.
+    #[serde(rename = "upgrade-node-vote", skip_serializing_if = "Option::is_none")]
+    pub upgrade_node_vote: Option<bool>,
+
+    /// Total voting rounds for current upgrade.
+    #[serde(
+        rename = "upgrade-vote-rounds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub upgrade_vote_rounds: Option<u64>,
+
+    /// Total votes cast for consensus upgrade.
+    #[serde(rename = "upgrade-votes", skip_serializing_if = "Option::is_none")]
+    pub upgrade_votes: Option<u64>,
+
+    /// Yes votes required for consensus upgrade.
+    #[serde(
+        rename = "upgrade-votes-required",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub upgrade_votes_required: Option<u64>,
+
+    /// The protocol version being proposed for upgrade.
+    #[serde(rename = "upgrade-propose", skip_serializing_if = "Option::is_none")]
+    pub upgrade_propose: Option<String>,
+
+    /// Yes votes cast for consensus upgrade.
+    #[serde(rename = "upgrade-yes-votes", skip_serializing_if = "Option::is_none")]
+    pub upgrade_yes_votes: Option<u64>,
+}
+
+/// Returns the full node status.
+///
+/// Matches go-algorand's `Handlers.GetStatus` in
+/// `daemon/algod/api/server/v2/handlers.go`.
+///
+/// Always returns JSON. Returns 500 if the node status cannot be retrieved.
+pub async fn get_status<N: NodeInterface>(State(node): State<AppState<N>>) -> Response {
+    let status = match node.status().await {
+        Ok(s) => s,
+        Err(_) => return error::internal_error("failed retrieving node status"),
+    };
+
+    let mut response = NodeStatusResponse {
+        last_round: status.last_round,
+        last_version: status.last_version,
+        next_version: status.next_version,
+        next_version_round: status.next_version_round,
+        next_version_supported: status.next_version_supported,
+        time_since_last_round: status.time_since_last_round,
+        catchup_time: status.catchup_time,
+        stopped_at_unsupported_round: status.stopped_at_unsupported_round,
+        // Catchpoint fields: always set (matching go-algorand which always assigns &stat.*)
+        last_catchpoint: Some(status.last_catchpoint),
+        catchpoint: Some(status.catchpoint),
+        catchpoint_total_accounts: Some(status.catchpoint_total_accounts),
+        catchpoint_processed_accounts: Some(status.catchpoint_processed_accounts),
+        catchpoint_verified_accounts: Some(status.catchpoint_verified_accounts),
+        catchpoint_total_kvs: Some(status.catchpoint_total_kvs),
+        catchpoint_processed_kvs: Some(status.catchpoint_processed_kvs),
+        catchpoint_verified_kvs: Some(status.catchpoint_verified_kvs),
+        catchpoint_total_blocks: Some(status.catchpoint_total_blocks),
+        catchpoint_acquired_blocks: Some(status.catchpoint_acquired_blocks),
+        // Upgrade fields: conditionally set below
+        upgrade_delay: None,
+        upgrade_next_protocol_vote_before: None,
+        upgrade_no_votes: None,
+        upgrade_node_vote: None,
+        upgrade_propose: None,
+        upgrade_vote_rounds: None,
+        upgrade_votes: None,
+        upgrade_votes_required: None,
+        upgrade_yes_votes: None,
+    };
+
+    // Set upgrade fields only when a vote is happening
+    // (matching go-algorand: `if stat.NextProtocolVoteBefore > 0`)
+    if status.next_protocol_vote_before > 0 {
+        let votes_to_go = if status.next_protocol_vote_before > status.last_round {
+            // subtract 1 because the variables refer to "Last" round and "VoteBefore"
+            status.next_protocol_vote_before - status.last_round - 1
+        } else {
+            0
+        };
+
+        let upgrade_vote_rounds = node.upgrade_vote_rounds();
+        let upgrade_threshold = node.upgrade_threshold();
+        let votes = upgrade_vote_rounds.saturating_sub(votes_to_go);
+        let votes_yes = status.next_protocol_approvals;
+        let votes_no = votes.saturating_sub(votes_yes);
+
+        response.upgrade_votes_required = Some(upgrade_threshold);
+        response.upgrade_node_vote = Some(status.upgrade_approve);
+        response.upgrade_delay = Some(status.upgrade_delay);
+        response.upgrade_propose = Some(status.upgrade_propose);
+        response.upgrade_votes = Some(votes);
+        response.upgrade_yes_votes = Some(votes_yes);
+        response.upgrade_no_votes = Some(votes_no);
+        response.upgrade_vote_rounds = Some(upgrade_vote_rounds);
+        response.upgrade_next_protocol_vote_before = Some(status.next_protocol_vote_before);
+    }
+
+    match serde_json::to_vec(&response) {
+        Ok(body) => (StatusCode::OK, [("content-type", "application/json")], body).into_response(),
+        Err(_) => error::internal_error("failed to encode response"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/status/wait-for-block-after/:round
+// ---------------------------------------------------------------------------
+
+/// Timeout for the wait-for-block-after endpoint, matching go-algorand's
+/// `WaitForBlockTimeout` of 1 minute.
+const WAIT_FOR_BLOCK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Waits for the node to reach the round *after* `round`, then returns
+/// the current `NodeStatusResponse`.
+///
+/// Matches go-algorand's `Handlers.WaitForBlock` in
+/// `daemon/algod/api/server/v2/handlers.go`.
+///
+/// Behaviour:
+/// - Returns 400 if the node is stopped at an unsupported round.
+/// - Returns 503 if the node is performing catchpoint catchup.
+/// - Returns 400 if an upcoming unsupported protocol switch would be reached.
+/// - Otherwise waits (up to 1 minute) for round+1, then returns 200 with
+///   the current node status.
+/// - On timeout, returns 200 with current status (matching go-algorand).
+pub async fn wait_for_block<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(round): Path<u64>,
+) -> Response {
+    // 0. Guard against round+1 overflow
+    let next_round = match round.checked_add(1) {
+        Some(r) => r,
+        None => return error::bad_request("round overflow"),
+    };
+
+    // 1. Get current status
+    let status = match node.status().await {
+        Ok(s) => s,
+        Err(_) => return error::internal_error("failed retrieving node status"),
+    };
+
+    // 2. Check stopped at unsupported round
+    if status.stopped_at_unsupported_round {
+        return error::bad_request(
+            "requested round would reach only after the protocol upgrade which isn't supported",
+        );
+    }
+
+    // 3. Check catchpoint catchup
+    if !status.catchpoint.is_empty() {
+        return error::service_unavailable("operation not available during catchup");
+    }
+
+    // 4. Check for upcoming unsupported protocol switch
+    match node.latest_block_header_protocol_info().await {
+        Ok(info) => {
+            if !info.next_protocol.is_empty()
+                && !info.next_protocol_supported
+                && info.next_protocol_switch_on <= next_round
+            {
+                return error::bad_request(
+                    "requested round would reach only after the protocol upgrade which isn't supported",
+                );
+            }
+        }
+        Err(_) => {
+            return error::internal_error("failed retrieving latest block header");
+        }
+    }
+
+    // 5. Wait for round+1 with timeout.
+    //
+    // Cancel-safety: when the client disconnects, axum drops the handler
+    // future, which drops this `tokio::select!`, cancelling both branches.
+    // `wait_for_round` is cancel-safe (it only waits on a Notify/channel).
+    tokio::select! {
+        _ = tokio::time::sleep(WAIT_FOR_BLOCK_TIMEOUT) => {},
+        result = node.wait_for_round(next_round) => {
+            if let Err(e) = result {
+                tracing::warn!("wait_for_round error: {}", e);
+                return error::internal_error(format!("waiting for round failed: {e}"));
+            }
+        },
+    }
+
+    // 6. Return status after wait (re-fetch to get the latest)
+    get_status(State(node)).await
 }
 
 // ---------------------------------------------------------------------------
