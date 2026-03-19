@@ -299,6 +299,43 @@ impl CatchupService {
                         continue;
                     }
 
+                    // Validate that the block body matches header commitments.
+                    // Mirrors Go's `block.ContentsMatchHeader()` check in
+                    // fetchRound (catchup/service.go). The block hash only
+                    // authenticates the header; this ensures the transactions
+                    // are consistent with it.
+                    match algo_validate::contents_match_header(&block) {
+                        Ok(true) => { /* commitments match, proceed */ }
+                        Ok(false) => {
+                            warn!(
+                                round = %target_round,
+                                attempt = attempt,
+                                "catchup service: block contents do not match header commitments, retrying"
+                            );
+                            let delay = Self::backoff_with_jitter(attempt);
+                            if shutdown_rx.recv_timeout(delay).is_ok() {
+                                debug!(
+                                    round = %target_round,
+                                    "catchup service: shutdown received during backoff"
+                                );
+                                return;
+                            }
+                            continue;
+                        }
+                        Err(reason) => {
+                            // An Err means the protocol version is empty or
+                            // unsupported — a deterministic failure that won't
+                            // resolve on retry. Abort instead of looping forever.
+                            warn!(
+                                round = %target_round,
+                                attempt = attempt,
+                                error = %reason,
+                                "catchup service: cannot verify block contents (fatal), aborting"
+                            );
+                            return;
+                        }
+                    }
+
                     // Commit the block to the ledger.
                     // EnsureBlock is idempotent — if the block was already
                     // committed by normal agreement between fetch and now,
@@ -446,6 +483,29 @@ mod tests {
             cert: make_cert(round),
             vote_verifier: AsyncVoteVerifier::new(),
         }
+    }
+
+    /// Create a block with a known protocol version and correct commitments
+    /// for an empty payset. This ensures `contents_match_header` passes.
+    fn make_valid_empty_block(round: u64) -> Block {
+        use algo_validate::merkle::{compute_vector_commitment, HashAlgo};
+
+        let mut block = Block {
+            round: Round(round),
+            current_protocol: "future".to_string(),
+            ..Default::default()
+        };
+
+        // For "future" protocol with empty payset:
+        // - txn_commitment: Merkle root of empty payset = [0u8; 32] (already default)
+        // - txn256: SHA-256 vector commitment of empty payset
+        // - txn512: SHA-512 vector commitment of empty payset
+        let vc256 = compute_vector_commitment(&block, HashAlgo::Sha256);
+        let vc512 = compute_vector_commitment(&block, HashAlgo::Sha512);
+        block.txn256.copy_from_slice(&vc256);
+        block.txn512.copy_from_slice(&vc512);
+
+        block
     }
 
     // -- Tests --
@@ -604,11 +664,8 @@ mod tests {
 
     #[test]
     fn happy_path_fetch_and_commit() {
-        // Create a block for round 1 and compute its digest.
-        let block = Block {
-            round: Round(1),
-            ..Default::default()
-        };
+        // Create a block for round 1 with valid commitments and compute its digest.
+        let block = make_valid_empty_block(1);
         let digest = algo_codec::compute_block_digest(&block);
 
         // Set up the service with a fetcher that returns this block.
@@ -649,10 +706,7 @@ mod tests {
         // Create a block for round 1, but make the certificate have a
         // different digest. This should cause digest validation to fail
         // and trigger retries indefinitely until shutdown.
-        let block = Block {
-            round: Round(1),
-            ..Default::default()
-        };
+        let block = make_valid_empty_block(1);
         // The actual digest of this block will NOT match the cert.
 
         let wrong_digest = algo_types::Digest([0xff; 32]);
@@ -726,10 +780,7 @@ mod tests {
     fn retry_logic_retries_on_fetch_failure() {
         // The fetcher fails on the first call, succeeds on the second.
         // Verify that fetch is called multiple times.
-        let block = Block {
-            round: Round(1),
-            ..Default::default()
-        };
+        let block = make_valid_empty_block(1);
         let digest = algo_codec::compute_block_digest(&block);
 
         let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
@@ -763,7 +814,7 @@ mod tests {
         // The service now retries indefinitely on persistent failure,
         // mirroring Go's fetchRound. Verify that it keeps retrying
         // and stops cleanly on shutdown.
-        let block = Block::default(); // won't be used since we always fail
+        let block = make_valid_empty_block(0); // won't be used since we always fail
         let fetcher = Arc::new(CountingFailFetcher::new(block, 999)); // always fail
 
         let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
@@ -786,6 +837,43 @@ mod tests {
         );
 
         // Shutdown should interrupt the retry loop cleanly.
+        svc.stop();
+    }
+
+    #[test]
+    fn contents_mismatch_triggers_retry() {
+        // Create a block with a valid digest but tampered txn_commitment.
+        // The digest check passes but contents_match_header should fail,
+        // triggering retries.
+        let mut block = make_valid_empty_block(1);
+        // Tamper the txn_commitment so contents_match_header returns Ok(false).
+        block.txn_commitment = [0xFF; 32];
+        let digest = algo_codec::compute_block_digest(&block);
+
+        let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+
+        let bridge = Arc::new(AgreementLedgerBridge::new(Arc::clone(&ledger)));
+        let fetcher = Arc::new(DigestMatchingBlockFetcher::new(block));
+        let fetcher_ref: Arc<dyn BlockFetcher> = Arc::clone(&fetcher) as Arc<dyn BlockFetcher>;
+
+        let mut svc = CatchupService::start(rx, Arc::clone(&ledger), bridge, fetcher_ref);
+
+        // Send a cert with the correct digest (header matches) but the block
+        // body won't match the header commitments.
+        tx.send(make_pending_cert_with_digest(1, digest)).unwrap();
+
+        // Let the service retry for a bit.
+        thread::sleep(Duration::from_secs(2));
+
+        // The fetcher should have been called multiple times since
+        // contents_match_header fails and triggers retries.
+        assert!(
+            fetcher.fetch_count() >= 2,
+            "fetcher should retry on contents mismatch, got {} calls",
+            fetcher.fetch_count()
+        );
+
         svc.stop();
     }
 }

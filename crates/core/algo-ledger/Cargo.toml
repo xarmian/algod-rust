@@ -10,6 +10,7 @@ algo-avm = { workspace = true }
 algo-agreement = { workspace = true }
 algo-consensus-crypto = { workspace = true }
 algo-codec = { workspace = true }
+algo-validate = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_bytes = { workspace = true }
