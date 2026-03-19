@@ -3370,14 +3370,14 @@ impl LedgerStore for SqliteLedger {
             let upper = b"by:".to_vec();
             stmt.query_map(params![prefix, upper], |row| row.get::<_, Vec<u8>>(0))
                 .expect("query box_keys_for_app")
-                .filter_map(|r| r.ok())
+                .map(|r| r.expect("read box key row"))
                 .map(|full_key| full_key[prefix_len..].to_vec())
                 .collect()
         } else {
             let upper = make_box_key(app_id + 1, b"");
             stmt.query_map(params![prefix, upper], |row| row.get::<_, Vec<u8>>(0))
                 .expect("query box_keys_for_app")
-                .filter_map(|r| r.ok())
+                .map(|r| r.expect("read box key row"))
                 .map(|full_key| full_key[prefix_len..].to_vec())
                 .collect()
         };

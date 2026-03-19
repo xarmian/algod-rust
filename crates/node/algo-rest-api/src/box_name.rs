@@ -27,9 +27,6 @@ use data_encoding::BASE32;
 /// Returns an error if the input is malformed or contains invalid data for the
 /// specified encoding.
 pub fn parse_box_name(arg: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    /// Maximum box name length in bytes, matching go-algorand's `MaxBoxNameLen`.
-    const MAX_BOX_NAME_LEN: usize = 64;
-
     let (encoding, value) = arg
         .split_once(':')
         .ok_or("all arguments and box names should be of the form 'encoding:value'")?;
@@ -68,15 +65,6 @@ pub fn parse_box_name(arg: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + 
 
         _ => return Err(format!("Unknown encoding: {encoding}").into()),
     };
-
-    if decoded.len() > MAX_BOX_NAME_LEN {
-        return Err(format!(
-            "box name too long (max {} bytes, got {})",
-            MAX_BOX_NAME_LEN,
-            decoded.len()
-        )
-        .into());
-    }
 
     Ok(decoded)
 }
