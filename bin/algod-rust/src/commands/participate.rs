@@ -20,7 +20,7 @@ use algo_network::{
 };
 use algo_pool::{PoolConfig, TransactionPool};
 use algo_rest_client::GossipBlockSource;
-use algo_types::{AccountData, Address, Block, BlockHeader, Round};
+use algo_types::{AccountData, Address, Block, BlockHeader, Round, TxnType};
 use algo_validate::merkle::{compute_payset_merkle_root, compute_vector_commitment, HashAlgo};
 use algo_validate::rules::{has_txn256, has_txn512};
 use algo_validate::signature::verify_transaction_signature;
@@ -203,11 +203,44 @@ fn effective_min_balance(account: &AccountData, params: &algo_types::ConsensusPa
     min
 }
 
+/// Apply a signed delta to an unsigned u64 value, clamping at 0.
+/// Mirrors Go's `basics.AddSaturate` / `basics.SubSaturate` pattern.
+fn apply_delta(base: u64, delta: i64) -> u64 {
+    if delta >= 0 {
+        base.saturating_add(delta as u64)
+    } else {
+        base.saturating_sub(delta.unsigned_abs())
+    }
+}
+
+/// Apply a signed delta to an unsigned u32 value, clamping at 0.
+fn apply_delta_u32(base: u32, delta: i64) -> u32 {
+    if delta >= 0 {
+        base.saturating_add(delta as u32)
+    } else {
+        base.saturating_sub(delta.unsigned_abs() as u32)
+    }
+}
+
 /// Read-only snapshot of ledger state captured at evaluator creation.
 ///
 /// Mirrors Go's `roundCowBase` pattern: snapshot the relevant state once at
 /// the start of block evaluation, then release the ledger lock so agreement
 /// and catchup can proceed concurrently.
+///
+/// Account reads use a dedicated read-only SQLite connection (via
+/// [`algo_ledger::ReadSnapshot`]) that holds a deferred read transaction.
+/// In WAL mode this provides true MVCC snapshot isolation — all account
+/// reads see the database state as of snapshot creation, regardless of
+/// concurrent writes by the main ledger connection (catchup, block commit).
+/// The main ledger mutex is acquired only once during construction to
+/// capture the lease table and open the snapshot connection; no further
+/// locking is needed for individual account lookups.
+///
+/// For in-memory databases (tests), the `ReadSnapshot` is unavailable
+/// because each in-memory connection is independent. In that case we fall
+/// back to locking the ledger per account lookup with a round-consistency
+/// guard that returns `None` if the ledger has advanced.
 struct LedgerSnapshot {
     /// Cached account balances (sender address -> AccountData).
     /// Populated lazily on first access and cached for the block.
@@ -217,37 +250,48 @@ struct LedgerSnapshot {
     /// The round being evaluated.
     round: u64,
     /// The ledger's current round at snapshot creation time.
-    /// Used to verify point-in-time consistency: if the ledger advances
-    /// between snapshot creation and a lazy account lookup, we detect
-    /// the inconsistency rather than silently reading stale/mixed data.
+    /// Used to verify point-in-time consistency when falling back to the
+    /// ledger mutex (in-memory DB path).
     snapshot_round: Round,
+    /// Read-only snapshot connection for point-in-time account lookups.
+    /// `Some` for file-backed databases (production), `None` for in-memory
+    /// databases (tests) where a separate connection cannot share state.
+    read_snapshot: Option<algo_ledger::ReadSnapshot>,
 }
 
 impl LedgerSnapshot {
     /// Create a new snapshot by briefly locking the ledger to capture lease
-    /// state and the current round for consistency verification.
+    /// state, open a read-only snapshot connection, and record the current
+    /// round. The ledger lock is released before returning; subsequent
+    /// account lookups go through the snapshot connection without locking.
     fn from_ledger(ledger: &Arc<Mutex<SqliteLedger>>, round: u64) -> Self {
         let l = ledger.lock().expect("ledger lock for snapshot");
         // Clone the lease table while holding the lock so the snapshot
         // reflects the actual lease state from prior committed blocks.
         let lease_table = l.lease_table().clone();
-        // Capture the ledger's current round for consistency checks.
+        // Capture the ledger's current round for consistency checks
+        // (used only in the in-memory fallback path).
         let snapshot_round = l.current_round();
+        // Open a read-only snapshot connection. In WAL mode this begins a
+        // deferred read transaction that pins the reader to the current DB
+        // state. For in-memory databases this returns None.
+        let read_snapshot = l.open_read_snapshot();
         drop(l);
         LedgerSnapshot {
             accounts: HashMap::new(),
             lease_table,
             round,
             snapshot_round,
+            read_snapshot,
         }
     }
 
-    /// Look up an account, checking the cache first, then the ledger.
+    /// Look up an account, checking the cache first, then the snapshot.
     ///
-    /// On cache miss, verifies that the ledger has not advanced past the
-    /// snapshot round to ensure point-in-time consistency. If the ledger
-    /// has advanced, panics rather than returning data from a different
-    /// round (fail-safe).
+    /// When a `ReadSnapshot` is available (file-backed DB), account reads
+    /// go directly through the snapshot connection — no mutex acquisition.
+    /// For in-memory databases, falls back to locking the ledger with a
+    /// round-consistency guard.
     fn get_account(
         &mut self,
         addr: &Address,
@@ -256,12 +300,13 @@ impl LedgerSnapshot {
         if let Some(cached) = self.accounts.get(addr) {
             return cached.clone();
         }
-        let result = {
+        let result = if let Some(ref snap) = self.read_snapshot {
+            // Fast path: read from the snapshot connection (no mutex).
+            snap.get_account(addr)
+        } else {
+            // Fallback for in-memory databases: acquire the ledger lock
+            // and verify round consistency before reading.
             let l = ledger.lock().expect("ledger lock for account lookup");
-            // Verify the ledger has not advanced since the snapshot was
-            // taken. If it has, accounts read now could be from a
-            // different round than those read earlier, violating
-            // point-in-time consistency.
             let current = l.current_round();
             if current != self.snapshot_round {
                 warn!(
@@ -286,6 +331,40 @@ impl LedgerSnapshot {
     }
 }
 
+/// Per-address resource count deltas tracked in the COW overlay.
+///
+/// In Go, the cow layer stores modified `AccountData` records that include
+/// updated `TotalAssets`, `TotalAppLocalStates`, `TotalAppParams`, etc.
+/// We cannot store full `AccountData` because the block evaluator only
+/// has snapshot access — so instead we track *deltas* that are merged with
+/// snapshot data when computing effective min-balance.
+///
+/// Each field is a signed delta (i64) so it can represent both additions
+/// (asset create, app opt-in) and removals (asset close-out, app delete).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ResourceCountDeltas {
+    /// Delta for `total_assets_opted_in` (asset holdings).
+    /// +1 on acfg create (creator auto-holds), +1 on axfer opt-in,
+    /// -1 on axfer close-out.
+    delta_total_assets_opted_in: i64,
+    /// Delta for `total_created_assets` (asset params owned by creator).
+    /// +1 on acfg create, -1 on acfg destroy.
+    delta_total_created_assets: i64,
+    /// Delta for `total_apps_opted_in` (app local states).
+    /// +1 on appl opt-in, -1 on appl close-out / clear-state.
+    delta_total_apps_opted_in: i64,
+    /// Delta for `total_created_apps` (app params owned by creator).
+    /// +1 on appl create, -1 on appl delete.
+    delta_total_created_apps: i64,
+    /// Delta for `total_extra_app_pages`.
+    /// +extra_program_pages on appl create.
+    delta_total_extra_app_pages: i64,
+    /// Delta for `total_app_schema.num_uint`.
+    delta_schema_num_uint: i64,
+    /// Delta for `total_app_schema.num_byte_slice`.
+    delta_schema_num_byte_slice: i64,
+}
+
 /// Copy-on-write overlay that accumulates mutations during block evaluation.
 ///
 /// Mirrors Go's `roundCowState` pattern: reads check the overlay first, then
@@ -306,6 +385,11 @@ struct CowOverlay {
     /// (auth_addr cleared). Mirrors Go's `apply.Rekey()` which updates
     /// `acct.AuthAddr` in the cow state.
     auth_addr_deltas: HashMap<Address, Option<Address>>,
+    /// Resource count deltas accumulated during block evaluation.
+    /// Tracks changes to asset/app counts that affect min-balance computation.
+    /// Mirrors Go's cow layer where modified AccountData includes updated
+    /// TotalAssets, TotalAppLocalStates, TotalAppParams, etc.
+    resource_deltas: HashMap<Address, ResourceCountDeltas>,
 }
 
 /// Lease key type used in the COW overlay: (sender, lease_bytes).
@@ -336,6 +420,10 @@ struct CowCheckpoint {
     /// the same convention as balance_keys: `None` means the key did not
     /// exist before — on rollback we remove it.
     auth_addr_keys: Vec<(Address, Option<Option<Address>>)>,
+    /// Resource delta keys modified since the checkpoint.
+    /// Stores (address, Option<old_deltas>). `None` means the key did not
+    /// exist before — on rollback we remove it.
+    resource_delta_keys: Vec<(Address, Option<ResourceCountDeltas>)>,
 }
 
 impl CowOverlay {
@@ -345,6 +433,7 @@ impl CowOverlay {
             leases: HashMap::new(),
             seen_txids: HashSet::new(),
             auth_addr_deltas: HashMap::new(),
+            resource_deltas: HashMap::new(),
         }
     }
 
@@ -359,6 +448,7 @@ impl CowOverlay {
             lease_keys: Vec::new(),
             txid_keys: Vec::new(),
             auth_addr_keys: Vec::new(),
+            resource_delta_keys: Vec::new(),
         }
     }
 
@@ -399,6 +489,17 @@ impl CowOverlay {
                 }
                 None => {
                     self.auth_addr_deltas.remove(&addr);
+                }
+            }
+        }
+        // Undo resource delta changes.
+        for (addr, old_val) in cp.resource_delta_keys {
+            match old_val {
+                Some(v) => {
+                    self.resource_deltas.insert(addr, v);
+                }
+                None => {
+                    self.resource_deltas.remove(&addr);
                 }
             }
         }
@@ -452,6 +553,30 @@ impl CowOverlay {
         };
         self.auth_addr_deltas.insert(*sender, new_auth);
         cp.auth_addr_keys.push((*sender, old));
+    }
+
+    /// Apply a mutation to the resource count deltas for an address,
+    /// recording the old value in the checkpoint for rollback.
+    ///
+    /// The `mutate` closure receives a mutable reference to the current
+    /// `ResourceCountDeltas` for the address (initialised to the default
+    /// zero-delta if no entry exists yet).
+    fn mutate_resource_deltas_tracked(
+        &mut self,
+        addr: &Address,
+        cp: &mut CowCheckpoint,
+        mutate: impl FnOnce(&mut ResourceCountDeltas),
+    ) {
+        let old = self.resource_deltas.get(addr).cloned();
+        let entry = self.resource_deltas.entry(*addr).or_default();
+        mutate(entry);
+        cp.resource_delta_keys.push((*addr, old));
+    }
+
+    /// Get the resource count deltas for an address from the overlay.
+    /// Returns `None` if the overlay has no resource delta entry.
+    fn get_resource_deltas(&self, addr: &Address) -> Option<&ResourceCountDeltas> {
+        self.resource_deltas.get(addr)
     }
 
     /// Get the auth_addr override for an address from the overlay.
@@ -602,13 +727,13 @@ impl SimpleBlockEvaluator {
         // State proof (stpf) and heartbeat (hb) transactions are injected by
         // the consensus layer, not submitted by users through the pool.
         for stx in txgroup {
-            if stx.txn.txn_type == "stpf" {
+            if stx.txn.txn_type == TxnType::Stpf {
                 return Err(algo_error::AlgoError::Validation {
                     message: "state proof transactions (stpf) cannot be submitted via the pool"
                         .into(),
                 });
             }
-            if stx.txn.txn_type == "hb" {
+            if stx.txn.txn_type == TxnType::Hb {
                 return Err(algo_error::AlgoError::Validation {
                     message: "heartbeat transactions (hb) cannot be submitted via the pool".into(),
                 });
@@ -764,6 +889,10 @@ impl SimpleBlockEvaluator {
         //   - `stx.auth_addr` if set (non-None), else `stx.txn.sender`
         // The "correct authorizer" from the ledger is:
         //   - `acct.auth_addr` if set (non-zero), else `sender`
+        //
+        // We iterate `txgroup` (not `restored`) here because `auth_addr`
+        // lives on SignedTransaction and is unaffected by genesis field
+        // restoration.
         for stx in txgroup {
             let sender = &stx.txn.sender;
             let correct_authorizer = self.expected_authorizer(sender);
@@ -793,10 +922,18 @@ impl SimpleBlockEvaluator {
         //
         // We accumulate per-sender costs within this group to handle groups
         // where the same sender appears multiple times.
+        //
+        // Only payment transactions include the `amount` field in the Algo
+        // cost. Other transaction types (axfer, acfg, afrz, appl, keyreg,
+        // stpf, hb) only cost the fee in Algos.
         let mut group_costs: HashMap<Address, u64> = HashMap::new();
         for stx in txgroup {
             let sender = &stx.txn.sender;
-            let cost = stx.txn.fee.saturating_add(stx.txn.amount);
+            let cost = if stx.txn.txn_type == TxnType::Pay {
+                stx.txn.fee.saturating_add(stx.txn.amount)
+            } else {
+                stx.txn.fee
+            };
             let entry = group_costs.entry(*sender).or_insert(0);
             *entry = entry.saturating_add(cost);
         }
@@ -836,7 +973,7 @@ impl SimpleBlockEvaluator {
     fn balance_with_rewards(&self, acct: &AccountData) -> u64 {
         algo_ledger::compute_pending_rewards(acct, self.hdr.rewards_level)
             .checked_add(acct.micro_algos)
-            .unwrap_or(acct.micro_algos)
+            .expect("reward overflow: account rewards exceeded u64 max")
     }
 
     /// Get the effective balance for an address, checking the overlay first
@@ -860,13 +997,38 @@ impl SimpleBlockEvaluator {
         }
     }
 
-    /// Get the AccountData for an address from the snapshot.
+    /// Get the AccountData for an address, merging snapshot data with any
+    /// overlay resource-count deltas.
     ///
-    /// Used for computing effective min-balance, which depends on account
-    /// resource counts (assets, apps, boxes, schema) that don't change
-    /// during payment-only evaluation.
+    /// Mirrors Go's `cow.lookup(addr)` which returns modified account data
+    /// from the cow layer. Resource count fields (total_assets_opted_in,
+    /// total_created_assets, total_apps_opted_in, total_created_apps,
+    /// total_extra_app_pages, total_app_schema) are adjusted by the
+    /// overlay deltas so that effective_min_balance sees the up-to-date
+    /// resource counts.
     fn get_account_data(&mut self, addr: &Address) -> Option<AccountData> {
-        self.snapshot.get_account(addr, &self.ledger)
+        let mut acct = self.snapshot.get_account(addr, &self.ledger)?;
+        if let Some(deltas) = self.overlay.get_resource_deltas(addr) {
+            acct.total_assets_opted_in =
+                apply_delta(acct.total_assets_opted_in, deltas.delta_total_assets_opted_in);
+            acct.total_created_assets =
+                apply_delta(acct.total_created_assets, deltas.delta_total_created_assets);
+            acct.total_apps_opted_in =
+                apply_delta(acct.total_apps_opted_in, deltas.delta_total_apps_opted_in);
+            acct.total_created_apps =
+                apply_delta(acct.total_created_apps, deltas.delta_total_created_apps);
+            acct.total_extra_app_pages = apply_delta_u32(
+                acct.total_extra_app_pages,
+                deltas.delta_total_extra_app_pages,
+            );
+            acct.total_app_schema.num_uint =
+                apply_delta(acct.total_app_schema.num_uint, deltas.delta_schema_num_uint);
+            acct.total_app_schema.num_byte_slice = apply_delta(
+                acct.total_app_schema.num_byte_slice,
+                deltas.delta_schema_num_byte_slice,
+            );
+        }
+        Some(acct)
     }
 
     /// Determine the expected authorizer for a sender address.
@@ -1005,6 +1167,9 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // of cloning the entire overlay. This mirrors Go's child-cow
         // pattern where `cow.commitToParent()` is only called after all
         // checks pass.
+        // Note: `included_txns` and `txn_bytes` do not need checkpointing —
+        // they are only extended AFTER the min-balance check passes, so
+        // rollback never needs to undo them.
         let mut checkpoint = self.overlay.checkpoint();
         let fees_collected_checkpoint = self.fees_collected;
 
@@ -1045,75 +1210,109 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             //    to close address and zero the sender (cow.CloseAccount)
             let sender = &stx.txn.sender;
             let sender_balance = self.effective_balance(sender);
-            let sender_after_fee = sender_balance.saturating_sub(stx.txn.fee);
 
             // Credit fee to FeeSink (mirrors Go's takeFee -> cow.Move).
             // Track fees_collected running total for the block header.
+            //
+            // Go's cow.Move(sender, FeeSink, fee) is a no-op when sender
+            // IS the FeeSink (src == dst), so the fee neither leaves nor
+            // arrives — the balance is unchanged. We mirror this by
+            // skipping the fee debit/credit entirely when sender == fee_sink.
+            //
             // When the sender IS the FeeSink, Go's takeFee does NOT add
             // the fee to feesCollected (eval.go:1253-1254) because there
             // are no net algos added to the Sink.
-            if stx.txn.fee > 0 {
-                let fee_sink_balance = self.effective_balance(&fee_sink);
-                self.overlay.set_balance_tracked(
-                    &fee_sink,
-                    fee_sink_balance.saturating_add(stx.txn.fee),
-                    &mut checkpoint,
-                );
-                if sender != &fee_sink {
+            let sender_after_fee = if sender == &fee_sink {
+                // Self-transfer of fee: balance unchanged, no fees_collected bump.
+                sender_balance
+            } else {
+                if stx.txn.fee > 0 {
+                    let fee_sink_balance = self.effective_balance(&fee_sink);
+                    self.overlay.set_balance_tracked(
+                        &fee_sink,
+                        fee_sink_balance.saturating_add(stx.txn.fee),
+                        &mut checkpoint,
+                    );
                     self.fees_collected = self.fees_collected.saturating_add(stx.txn.fee);
                 }
-            }
+                sender_balance.saturating_sub(stx.txn.fee)
+            };
 
-            // Credit receiver for payment transactions.
-            // This must happen BEFORE close-out so that when receiver == sender,
-            // the balance is correctly computed before zeroing. Mirrors Go's
-            // cow.Move(sender, receiver, amount).
-            if stx.txn.amount > 0 && !stx.txn.receiver.is_zero() {
-                let receiver = &stx.txn.receiver;
-                if receiver == sender {
-                    // Self-payment: fee is debited but amount is a no-op
-                    // (debit and credit cancel out). Just debit fee.
+            // ── Transaction-type-specific balance mutations ────────
+            // In Go, `applyTransaction()` (eval.go:1276) switches on the
+            // transaction type after `takeFee()`. Only payment transactions
+            // move Algos (amount + close_remainder_to). All other types
+            // (keyreg, acfg, axfer, afrz, appl, stpf, hb) only pay the
+            // fee — any type-specific side effects (asset units for axfer,
+            // app state for appl, etc.) do not affect Algo balances.
+            match stx.txn.txn_type {
+                TxnType::Pay => {
+                    // Credit receiver for payment transactions.
+                    // This must happen BEFORE close-out so that when
+                    // receiver == sender, the balance is correctly computed
+                    // before zeroing. Mirrors Go's cow.Move(sender,
+                    // receiver, amount).
+                    if stx.txn.amount > 0 && !stx.txn.receiver.is_zero() {
+                        let receiver = &stx.txn.receiver;
+                        if receiver == sender {
+                            // Self-payment: fee is debited but amount is a
+                            // no-op (debit and credit cancel out). Just
+                            // debit fee.
+                            self.overlay.set_balance_tracked(
+                                sender,
+                                sender_after_fee,
+                                &mut checkpoint,
+                            );
+                        } else {
+                            let recv_balance = self.effective_balance(receiver);
+                            self.overlay.set_balance_tracked(
+                                receiver,
+                                recv_balance.saturating_add(stx.txn.amount),
+                                &mut checkpoint,
+                            );
+                            self.overlay.set_balance_tracked(
+                                sender,
+                                sender_after_fee.saturating_sub(stx.txn.amount),
+                                &mut checkpoint,
+                            );
+                        }
+                    } else {
+                        self.overlay.set_balance_tracked(
+                            sender,
+                            sender_after_fee.saturating_sub(stx.txn.amount),
+                            &mut checkpoint,
+                        );
+                    }
+
+                    // Handle close_remainder_to: the sender's entire
+                    // remaining balance (after fee + amount + receiver
+                    // credit) goes to the close address and the sender's
+                    // balance becomes 0. Closing an account to zero is
+                    // valid (the account is deleted). Mirrors Go's
+                    // apply.Payment() -> cow.CloseAccount().
+                    if !stx.txn.close_remainder_to.is_zero() {
+                        let close_addr = &stx.txn.close_remainder_to;
+                        let remaining = self.effective_balance(sender);
+                        if remaining > 0 && close_addr != sender {
+                            let close_balance = self.effective_balance(close_addr);
+                            self.overlay.set_balance_tracked(
+                                close_addr,
+                                close_balance.saturating_add(remaining),
+                                &mut checkpoint,
+                            );
+                        }
+                        // Sender balance goes to zero after close.
+                        self.overlay.set_balance_tracked(sender, 0, &mut checkpoint);
+                    }
+                }
+                // All non-payment transaction types: only the fee (already
+                // deducted above) affects Algo balances. Asset transfers
+                // move asset units (not Algos), and all other types have no
+                // Algo balance side effects beyond the fee.
+                _ => {
                     self.overlay
                         .set_balance_tracked(sender, sender_after_fee, &mut checkpoint);
-                } else {
-                    let recv_balance = self.effective_balance(receiver);
-                    self.overlay.set_balance_tracked(
-                        receiver,
-                        recv_balance.saturating_add(stx.txn.amount),
-                        &mut checkpoint,
-                    );
-                    self.overlay.set_balance_tracked(
-                        sender,
-                        sender_after_fee.saturating_sub(stx.txn.amount),
-                        &mut checkpoint,
-                    );
                 }
-            } else {
-                self.overlay.set_balance_tracked(
-                    sender,
-                    sender_after_fee.saturating_sub(stx.txn.amount),
-                    &mut checkpoint,
-                );
-            }
-
-            // Handle close_remainder_to: the sender's entire remaining
-            // balance (after fee + amount + receiver credit) goes to the
-            // close address and the sender's balance becomes 0. Closing
-            // an account to zero is valid (the account is deleted).
-            // Mirrors Go's apply.Payment() -> cow.CloseAccount().
-            if !stx.txn.close_remainder_to.is_zero() {
-                let close_addr = &stx.txn.close_remainder_to;
-                let remaining = self.effective_balance(sender);
-                if remaining > 0 && close_addr != sender {
-                    let close_balance = self.effective_balance(close_addr);
-                    self.overlay.set_balance_tracked(
-                        close_addr,
-                        close_balance.saturating_add(remaining),
-                        &mut checkpoint,
-                    );
-                }
-                // Sender balance goes to zero after close.
-                self.overlay.set_balance_tracked(sender, 0, &mut checkpoint);
             }
 
             // Handle RekeyTo: update the sender's auth_addr in the overlay.
@@ -1127,6 +1326,157 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                 if *rekey_to != Address::default() {
                     self.overlay
                         .set_auth_addr_tracked(sender, rekey_to, &mut checkpoint);
+                }
+            }
+
+            // ── Resource count delta tracking ────────────────────────
+            // Track changes to resource counts that affect min-balance
+            // computation. Mirrors Go's cow layer where apply.AssetConfig,
+            // apply.AssetTransfer, and apply.ApplicationCall update
+            // TotalAssets, TotalAppLocalStates, TotalAppParams, etc.
+            match stx.txn.txn_type {
+                TxnType::Acfg => {
+                    if stx.txn.config_asset == 0 {
+                        // Asset create: creator gets +1 total_created_assets
+                        // and +1 total_assets_opted_in (auto-holding).
+                        // Mirrors Go's asset.go:87-88.
+                        self.overlay.mutate_resource_deltas_tracked(
+                            sender,
+                            &mut checkpoint,
+                            |d| {
+                                d.delta_total_created_assets += 1;
+                                d.delta_total_assets_opted_in += 1;
+                            },
+                        );
+                    } else if stx.txn.asset_params.is_none() {
+                        // Asset destroy: creator gets -1 total_created_assets
+                        // and -1 total_assets_opted_in (holding removed).
+                        // Mirrors Go's asset.go:149-150.
+                        self.overlay.mutate_resource_deltas_tracked(
+                            sender,
+                            &mut checkpoint,
+                            |d| {
+                                d.delta_total_created_assets -= 1;
+                                d.delta_total_assets_opted_in -= 1;
+                            },
+                        );
+                    }
+                    // Reconfigure (config_asset != 0 && asset_params.is_some())
+                    // does not change resource counts.
+                }
+                TxnType::Axfer => {
+                    // Opt-in: sender == asset_receiver, amount == 0, no
+                    // close-to. The sender is opting into the asset.
+                    // Mirrors Go's asset.go:305 (TotalAssets += 1).
+                    let asset_receiver = stx.txn.asset_receiver.unwrap_or_default();
+                    if asset_receiver == *sender
+                        && stx.txn.asset_amount == 0
+                        && stx.txn.asset_close_to.is_none()
+                    {
+                        self.overlay.mutate_resource_deltas_tracked(
+                            sender,
+                            &mut checkpoint,
+                            |d| {
+                                d.delta_total_assets_opted_in += 1;
+                            },
+                        );
+                    }
+                    // Close-out: asset_close_to is set.
+                    // Mirrors Go's asset.go:419 (TotalAssets -= 1).
+                    if let Some(close_to) = &stx.txn.asset_close_to {
+                        if !close_to.is_zero() {
+                            // The source of the close-out is the sender
+                            // (or asset_sender for clawback, but clawback
+                            // close is rejected by Go).
+                            self.overlay.mutate_resource_deltas_tracked(
+                                sender,
+                                &mut checkpoint,
+                                |d| {
+                                    d.delta_total_assets_opted_in -= 1;
+                                },
+                            );
+                        }
+                    }
+                }
+                TxnType::Appl => {
+                    if stx.txn.application_id == 0 {
+                        // App create: creator gets +1 total_created_apps,
+                        // plus schema and extra pages.
+                        // Mirrors Go's application.go:106-115.
+                        let global_schema =
+                            stx.txn.global_state_schema.as_ref().cloned().unwrap_or_default();
+                        let extra_pages = stx.txn.extra_program_pages;
+                        self.overlay.mutate_resource_deltas_tracked(
+                            sender,
+                            &mut checkpoint,
+                            |d| {
+                                d.delta_total_created_apps += 1;
+                                d.delta_total_extra_app_pages += extra_pages as i64;
+                                d.delta_schema_num_uint += global_schema.num_uint as i64;
+                                d.delta_schema_num_byte_slice +=
+                                    global_schema.num_byte_slice as i64;
+                            },
+                        );
+                    } else {
+                        match stx.txn.on_completion {
+                            1 => {
+                                // OptIn: sender gets +1 total_apps_opted_in
+                                // plus local schema added to total_app_schema.
+                                // Mirrors Go's application.go:301-306.
+                                //
+                                // NOTE: We don't have access to the app's
+                                // local schema from the txn fields alone
+                                // (it's stored in app params). For now we
+                                // track the opt-in count; the local schema
+                                // contribution would require looking up the
+                                // app params which the block evaluator doesn't
+                                // currently do.
+                                self.overlay.mutate_resource_deltas_tracked(
+                                    sender,
+                                    &mut checkpoint,
+                                    |d| {
+                                        d.delta_total_apps_opted_in += 1;
+                                    },
+                                );
+                            }
+                            2 | 3 => {
+                                // CloseOut (2) or ClearState (3): sender gets
+                                // -1 total_apps_opted_in.
+                                // Mirrors Go's application.go:354.
+                                self.overlay.mutate_resource_deltas_tracked(
+                                    sender,
+                                    &mut checkpoint,
+                                    |d| {
+                                        d.delta_total_apps_opted_in -= 1;
+                                    },
+                                );
+                            }
+                            5 => {
+                                // DeleteApplication: creator gets -1
+                                // total_created_apps.
+                                // Mirrors Go's application.go:150.
+                                //
+                                // NOTE: The schema and extra pages removal
+                                // would require looking up the app params.
+                                // For now we track the app count.
+                                self.overlay.mutate_resource_deltas_tracked(
+                                    sender,
+                                    &mut checkpoint,
+                                    |d| {
+                                        d.delta_total_created_apps -= 1;
+                                    },
+                                );
+                            }
+                            _ => {
+                                // NoOp (0), UpdateApplication (4): no
+                                // resource count changes.
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // Pay, KeyReg, AssetFreeze, StateProof, Heartbeat:
+                    // no resource count changes.
                 }
             }
         }
@@ -1145,11 +1495,14 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         let mut modified_addrs: HashSet<Address> = HashSet::new();
         for stx in txgroup {
             modified_addrs.insert(stx.txn.sender);
-            if !stx.txn.receiver.is_zero() {
-                modified_addrs.insert(stx.txn.receiver);
-            }
-            if !stx.txn.close_remainder_to.is_zero() {
-                modified_addrs.insert(stx.txn.close_remainder_to);
+            // Only payment transactions modify receiver/close-to balances.
+            if stx.txn.txn_type == TxnType::Pay {
+                if !stx.txn.receiver.is_zero() {
+                    modified_addrs.insert(stx.txn.receiver);
+                }
+                if !stx.txn.close_remainder_to.is_zero() {
+                    modified_addrs.insert(stx.txn.close_remainder_to);
+                }
             }
         }
 
@@ -1248,7 +1601,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             next_protocol_approvals: hdr.next_protocol_approvals,
             next_protocol_switch_on: hdr.next_protocol_switch_on,
             next_protocol_vote_before: hdr.next_protocol_vote_before,
-            txn_counter: hdr.txn_counter + txn_count,
+            txn_counter: hdr.txn_counter.saturating_add(txn_count),
             fees_collected: self.fees_collected,
             bonus: hdr.bonus,
             proposer_payout: hdr.proposer_payout,
@@ -1634,7 +1987,8 @@ pub async fn run(
     // proposal verification validates the block eagerly and caches the
     // `ValidatedBlock` — mirroring Go's `makeCryptoVerifier(l, v, ...)`.
     let crypto_ledger = Arc::new(AgreementLedgerBridge::new(ledger.clone()));
-    let crypto = AsyncCryptoVerifier::new_with_validator(crypto_ledger, Arc::clone(&block_validator));
+    let crypto =
+        AsyncCryptoVerifier::new_with_validator(crypto_ledger, Arc::clone(&block_validator));
 
     // -----------------------------------------------------------------------
     // 5. Build and start the catchup service.
@@ -1752,6 +2106,7 @@ mod tests {
             lease_table: algo_ledger::LeaseTable::new(),
             round,
             snapshot_round: Round(0),
+            read_snapshot: None,
         };
         // Pre-populate the snapshot cache so tests don't need the ledger
         // to actually contain accounts.
@@ -2570,6 +2925,7 @@ mod tests {
                 lease_table: algo_ledger::LeaseTable::new(),
                 round: 100,
                 snapshot_round: Round(0),
+                read_snapshot: None,
             },
             overlay: CowOverlay::new(),
             fees_collected: 0,
@@ -2764,6 +3120,7 @@ mod tests {
                 lease_table: algo_ledger::LeaseTable::new(),
                 round: 500,
                 snapshot_round: Round(0),
+                read_snapshot: None,
             },
             overlay: CowOverlay::new(),
             fees_collected: 12345,
@@ -2949,6 +3306,7 @@ mod tests {
             lease_table: algo_ledger::LeaseTable::new(),
             round: 100,
             snapshot_round: Round(0),
+            read_snapshot: None,
         };
         snapshot.accounts.insert(
             sender,
@@ -3014,6 +3372,7 @@ mod tests {
             lease_table: algo_ledger::LeaseTable::new(),
             round: 100,
             snapshot_round: Round(0),
+            read_snapshot: None,
         };
         snapshot.accounts.insert(
             sender,
@@ -3100,6 +3459,7 @@ mod tests {
             lease_table: algo_ledger::LeaseTable::new(),
             round: 100,
             snapshot_round: Round(0),
+            read_snapshot: None,
         };
         snapshot.accounts.insert(
             sender,
@@ -3160,6 +3520,7 @@ mod tests {
             lease_table: algo_ledger::LeaseTable::new(),
             round: 100,
             snapshot_round: Round(0),
+            read_snapshot: None,
         };
         // Sender has 200_000, min_balance = 100_000
         snapshot.accounts.insert(
@@ -3299,6 +3660,7 @@ mod tests {
             lease_table: algo_ledger::LeaseTable::new(),
             round: 100,
             snapshot_round: Round(0),
+            read_snapshot: None,
         };
         snapshot.accounts.insert(
             fee_sink_addr,
@@ -3345,6 +3707,15 @@ mod tests {
         assert_eq!(
             eval.fees_collected, 0,
             "fees_collected should not be incremented when sender is the FeeSink"
+        );
+
+        // The fee_sink balance should reflect only the amount debit (1000),
+        // NOT the fee debit, because the fee is a self-transfer (no-op).
+        // Original: 10_000_000, amount sent: 1000 => expected: 9_999_000
+        assert_eq!(
+            eval.effective_balance(&fee_sink_addr),
+            10_000_000 - 1000, // amount only, fee is self-transfer
+            "fee_sink balance should only be debited by the payment amount, not the fee"
         );
     }
 
@@ -3656,6 +4027,7 @@ mod tests {
             lease_table: algo_ledger::LeaseTable::new(),
             round,
             snapshot_round: Round(0),
+            read_snapshot: None,
         };
         for (addr, acct) in full_accounts {
             snapshot.accounts.insert(*addr, Some(acct.clone()));
@@ -3808,5 +4180,931 @@ mod tests {
         // pending = (15 - 5) * 3 = 30
         // effective = 3_000_000 + 30 = 3_000_030
         assert_eq!(eval.effective_balance(&sender), 3_000_030);
+    }
+
+    // ====================================================================
+    // 16. Non-payment transaction type balance handling tests
+    // ====================================================================
+
+    /// Helper: build a signed non-payment transaction (only fee deducted).
+    fn make_signed_txn(
+        sender_key: &SigningKey,
+        sender: &Address,
+        txn_type: TxnType,
+        fee: u64,
+        round: u64,
+    ) -> SignedTransaction {
+        let txn = Transaction {
+            txn_type,
+            sender: *sender,
+            fee,
+            first_valid: Round(round),
+            last_valid: Round(round + 1000),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            ..Default::default()
+        };
+        let sig = sign_txn(&txn, sender_key);
+        SignedTransaction {
+            txn,
+            sig,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn keyreg_only_deducts_fee() {
+        // Key registration transactions should only deduct the fee from the
+        // sender's Algo balance — no amount or close-remainder-to handling.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(110);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 1_000_000)]);
+
+        let stx = make_signed_txn(&key, &sender, TxnType::Keyreg, 1000, 100);
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "keyreg transaction should be accepted"
+        );
+        // Only fee deducted: 1_000_000 - 1000 = 999_000
+        assert_eq!(eval.effective_balance(&sender), 999_000);
+    }
+
+    #[test]
+    fn acfg_only_deducts_fee() {
+        // Asset config transactions should only deduct the fee.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(111);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 1_000_000)]);
+
+        let stx = make_signed_txn(&key, &sender, TxnType::Acfg, 1000, 100);
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "acfg transaction should be accepted"
+        );
+        assert_eq!(eval.effective_balance(&sender), 999_000);
+    }
+
+    #[test]
+    fn afrz_only_deducts_fee() {
+        // Asset freeze transactions should only deduct the fee.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(112);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 1_000_000)]);
+
+        let stx = make_signed_txn(&key, &sender, TxnType::Afrz, 1000, 100);
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "afrz transaction should be accepted"
+        );
+        assert_eq!(eval.effective_balance(&sender), 999_000);
+    }
+
+    #[test]
+    fn appl_only_deducts_fee() {
+        // Application call transactions should only deduct the fee from Algo
+        // balance (inner transactions are handled separately).
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(113);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 1_000_000)]);
+
+        let stx = make_signed_txn(&key, &sender, TxnType::Appl, 1000, 100);
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "appl transaction should be accepted"
+        );
+        assert_eq!(eval.effective_balance(&sender), 999_000);
+    }
+
+    #[test]
+    fn axfer_does_not_deduct_algo_amount() {
+        // Asset transfer transactions move asset units (not Algos).
+        // The `amount` field on Transaction is the payment-specific `amt`
+        // field. For axfer, the asset amount is in `asset_amount` (`aamt`).
+        // Only the fee should be deducted from the sender's Algo balance.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(114);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 1_000_000)]);
+
+        let stx = make_signed_txn(&key, &sender, TxnType::Axfer, 1000, 100);
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "axfer transaction should be accepted"
+        );
+        // Only fee deducted, asset_amount does not affect Algo balance.
+        assert_eq!(eval.effective_balance(&sender), 999_000);
+    }
+
+    #[test]
+    fn axfer_with_receiver_does_not_credit_algo_balance() {
+        // Even when an axfer has receiver and amount fields set (which they
+        // could be due to the flat Transaction struct), the Algo balance of
+        // the receiver should NOT be credited. Only payment transactions
+        // move Algos via the receiver/amount fields.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(115);
+        let (receiver, _) = test_keypair(116);
+        let mut eval = make_evaluator(
+            &ledger,
+            &params,
+            100,
+            &[(sender, 1_000_000), (receiver, 500_000)],
+        );
+
+        // Build an axfer that happens to have payment fields set (should be
+        // ignored for balance purposes).
+        let txn = Transaction {
+            txn_type: TxnType::Axfer,
+            sender,
+            fee: 1000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            // These are payment fields — should be ignored for axfer:
+            receiver,
+            amount: 100_000,
+            ..Default::default()
+        };
+        let sig = sign_txn(&txn, &key);
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            ..Default::default()
+        };
+
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "axfer should be accepted even with payment fields set"
+        );
+        // Sender: only fee deducted (amount is payment-specific, ignored for axfer)
+        assert_eq!(eval.effective_balance(&sender), 999_000);
+        // Receiver: unchanged (amount is not credited for non-payment txns)
+        assert_eq!(eval.effective_balance(&receiver), 500_000);
+    }
+
+    #[test]
+    fn non_payment_close_remainder_to_ignored() {
+        // The close_remainder_to field is a payment-specific field. If a
+        // non-payment transaction somehow has it set, it should NOT cause
+        // the sender's balance to be closed out.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(117);
+        let (close_addr, _) = test_keypair(118);
+        let mut eval = make_evaluator(
+            &ledger,
+            &params,
+            100,
+            &[(sender, 1_000_000), (close_addr, 500_000)],
+        );
+
+        // Build a keyreg with close_remainder_to set (should be ignored).
+        let txn = Transaction {
+            txn_type: TxnType::Keyreg,
+            sender,
+            fee: 1000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            close_remainder_to: close_addr,
+            ..Default::default()
+        };
+        let sig = sign_txn(&txn, &key);
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            ..Default::default()
+        };
+
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "keyreg with close_remainder_to should be accepted (field ignored)"
+        );
+        // Sender: only fee deducted, NOT closed out
+        assert_eq!(eval.effective_balance(&sender), 999_000);
+        // Close address: unchanged
+        assert_eq!(eval.effective_balance(&close_addr), 500_000);
+    }
+
+    #[test]
+    fn non_payment_precheck_only_requires_fee() {
+        // The balance precheck should only require fee (not fee+amount) for
+        // non-payment transactions. A sender with just enough for the fee
+        // plus min-balance should pass.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(119);
+        // Sender has min_balance (100_000) + fee (1000) = 101_000.
+        // For a payment with amount=50_000, this would fail the precheck.
+        // For a keyreg (fee-only), this should succeed.
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 101_000)]);
+
+        let stx = make_signed_txn(&key, &sender, TxnType::Keyreg, 1000, 100);
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "keyreg with exact fee + min_balance should be accepted"
+        );
+        assert_eq!(eval.effective_balance(&sender), 100_000);
+    }
+
+    #[test]
+    fn multiple_non_payment_txn_types_in_sequence() {
+        // Multiple non-payment transactions from the same sender should
+        // each only deduct their fee, not any amount field.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(120);
+        let mut eval = make_evaluator(&ledger, &params, 100, &[(sender, 1_000_000)]);
+
+        // Three different non-payment transaction types in sequence.
+        // All use round=100 (the block round) but different fees/types
+        // to produce unique txids.
+        let stx1 = make_signed_txn(&key, &sender, TxnType::Keyreg, 1000, 100);
+        let stx2 = make_signed_txn(&key, &sender, TxnType::Acfg, 2000, 100);
+        let stx3 = make_signed_txn(&key, &sender, TxnType::Afrz, 1500, 100);
+
+        eval.transaction_group(&[stx1])
+            .expect("stx1 keyreg should succeed");
+        eval.transaction_group(&[stx2])
+            .expect("stx2 acfg should succeed");
+        eval.transaction_group(&[stx3])
+            .expect("stx3 afrz should succeed");
+
+        // Total fees: 1000 + 2000 + 1500 = 4500
+        assert_eq!(eval.effective_balance(&sender), 1_000_000 - 4500);
+    }
+
+    #[test]
+    fn payment_still_deducts_amount_and_handles_close() {
+        // Regression test: ensure payment transactions still correctly
+        // deduct amount, credit receiver, and handle close_remainder_to
+        // after the transaction-type gating was added.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(121);
+        let (receiver, _) = test_keypair(122);
+        let (close_addr, _) = test_keypair(123);
+        let mut eval = make_evaluator(
+            &ledger,
+            &params,
+            100,
+            &[
+                (sender, 2_000_000),
+                (receiver, 100_000),
+                (close_addr, 300_000),
+            ],
+        );
+
+        let mut stx = make_signed_pay(&key, &sender, &receiver, 500_000, 1000, 100);
+        stx.txn.close_remainder_to = close_addr;
+        stx.sig = sign_txn(&stx.txn, &key);
+
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "payment with close_remainder_to should be accepted"
+        );
+        // Sender: closed to 0
+        assert_eq!(eval.effective_balance(&sender), 0);
+        // Receiver: 100_000 + 500_000 = 600_000
+        assert_eq!(eval.effective_balance(&receiver), 600_000);
+        // Close addr: 300_000 + remainder (2_000_000 - 1000 - 500_000 = 1_499_000)
+        assert_eq!(eval.effective_balance(&close_addr), 300_000 + 1_499_000);
+    }
+
+    // ====================================================================
+    // Resource count delta tracking tests
+    // ====================================================================
+
+    #[test]
+    fn acfg_create_raises_sender_min_balance() {
+        // Creating an asset (acfg with config_asset=0) should raise the
+        // sender's effective min-balance by 2 * min_balance: one for the
+        // created asset (total_created_assets) counted via
+        // total_assets_opted_in, plus a second for the auto-holding.
+        // Go reference: asset.go:87-88 sets TotalAssets += 1 and
+        // TotalAssetParams += 1. Our effective_min_balance uses
+        // total_assets_opted_in (asset holdings) which maps to TotalAssets.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(200);
+
+        // Sender has exactly enough for fee + base min_balance. After the
+        // acfg create, the overlay should reflect +1 total_created_assets
+        // and +1 total_assets_opted_in, raising effective min to:
+        //   base (100_000) + 1*min_balance (assets) = 200_000
+        // But we also need the created-asset cost. Total effective min:
+        //   100_000 + 1*100_000 (opted-in asset) + 0 (created assets not
+        //   counted separately by effective_min_balance) ... wait, let me
+        //   check: effective_min_balance counts total_assets_opted_in and
+        //   total_created_apps, not total_created_assets directly.
+        //
+        // Actually, checking the Go code: `MinBalance` uses `TotalAssets`
+        // (which includes both holdings and created) for asset cost.
+        // Our effective_min_balance uses `total_assets_opted_in` for asset
+        // cost. On asset create, Go increments TotalAssets by 1 (for the
+        // auto-holding). We do the same with delta_total_assets_opted_in.
+        //
+        // So effective min after create: base + 1*min_balance = 200_000.
+        // Give sender 201_000 (fee=1000, so after fee = 200_000 = min_bal).
+        let sender_acct = AccountData {
+            micro_algos: 201_000,
+            ..Default::default()
+        };
+        let mut eval =
+            make_evaluator_with_accounts(&ledger, &params, 100, &[], &[(sender, sender_acct)]);
+
+        // Build acfg create transaction (config_asset=0 means create).
+        let txn = Transaction {
+            txn_type: TxnType::Acfg,
+            sender,
+            fee: 1000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            config_asset: 0,
+            asset_params: Some(algo_types::AssetParams::default()),
+            ..Default::default()
+        };
+        let sig = sign_txn(&txn, &key);
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            ..Default::default()
+        };
+
+        // After create: balance = 200_000, effective min = 200_000.
+        // This should just barely pass.
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "acfg create with exact min balance should be accepted"
+        );
+
+        // Verify resource deltas were applied.
+        let acct_data = eval.get_account_data(&sender).unwrap();
+        assert_eq!(
+            acct_data.total_assets_opted_in, 1,
+            "total_assets_opted_in should be 1 after asset create"
+        );
+        assert_eq!(
+            acct_data.total_created_assets, 1,
+            "total_created_assets should be 1 after asset create"
+        );
+    }
+
+    #[test]
+    fn acfg_create_rejected_when_min_balance_too_low() {
+        // Creating an asset raises min-balance. If the sender doesn't have
+        // enough balance to cover the new min-balance, the txn is rejected.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(201);
+
+        // Sender has 150_000. After fee (1000): 149_000.
+        // After acfg create: effective min = 100_000 + 1*100_000 = 200_000.
+        // 149_000 < 200_000 -> should be rejected.
+        let sender_acct = AccountData {
+            micro_algos: 150_000,
+            ..Default::default()
+        };
+        let mut eval =
+            make_evaluator_with_accounts(&ledger, &params, 100, &[], &[(sender, sender_acct)]);
+
+        let txn = Transaction {
+            txn_type: TxnType::Acfg,
+            sender,
+            fee: 1000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            config_asset: 0,
+            asset_params: Some(algo_types::AssetParams::default()),
+            ..Default::default()
+        };
+        let sig = sign_txn(&txn, &key);
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            ..Default::default()
+        };
+
+        let err = eval.transaction_group(&[stx]).unwrap_err();
+        assert!(
+            err.to_string().contains("below minimum"),
+            "acfg create should be rejected when balance < new min: {err}"
+        );
+    }
+
+    #[test]
+    fn appl_optin_raises_sender_min_balance() {
+        // Opting into an app (on_completion=1 with existing app_id) should
+        // raise the sender's effective min-balance by app_flat_opt_in_min_balance.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(202);
+
+        // After opt-in: effective min = base + 1*app_flat_opt_in_min_balance
+        // = 100_000 + 100_000 = 200_000.
+        // Give sender 201_000 (fee=1000, after fee=200_000).
+        let sender_acct = AccountData {
+            micro_algos: 201_000,
+            ..Default::default()
+        };
+        let mut eval =
+            make_evaluator_with_accounts(&ledger, &params, 100, &[], &[(sender, sender_acct)]);
+
+        let txn = Transaction {
+            txn_type: TxnType::Appl,
+            sender,
+            fee: 1000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            application_id: 42, // existing app
+            on_completion: 1,   // OptIn
+            ..Default::default()
+        };
+        let sig = sign_txn(&txn, &key);
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            ..Default::default()
+        };
+
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "appl opt-in with exact min balance should be accepted"
+        );
+
+        let acct_data = eval.get_account_data(&sender).unwrap();
+        assert_eq!(
+            acct_data.total_apps_opted_in, 1,
+            "total_apps_opted_in should be 1 after app opt-in"
+        );
+    }
+
+    #[test]
+    fn appl_optin_rejected_when_min_balance_too_low() {
+        // Opting into an app raises min-balance. If the sender doesn't have
+        // enough to cover it, the txn is rejected.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(203);
+
+        // After fee (1000): 149_000. Effective min after opt-in: 200_000.
+        // 149_000 < 200_000 -> rejected.
+        let sender_acct = AccountData {
+            micro_algos: 150_000,
+            ..Default::default()
+        };
+        let mut eval =
+            make_evaluator_with_accounts(&ledger, &params, 100, &[], &[(sender, sender_acct)]);
+
+        let txn = Transaction {
+            txn_type: TxnType::Appl,
+            sender,
+            fee: 1000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            application_id: 42,
+            on_completion: 1, // OptIn
+            ..Default::default()
+        };
+        let sig = sign_txn(&txn, &key);
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            ..Default::default()
+        };
+
+        let err = eval.transaction_group(&[stx]).unwrap_err();
+        assert!(
+            err.to_string().contains("below minimum"),
+            "appl opt-in should be rejected when balance < new min: {err}"
+        );
+    }
+
+    #[test]
+    fn resource_deltas_rolled_back_on_min_balance_violation() {
+        // When a min-balance check fails, the resource count deltas
+        // should be rolled back along with balance changes.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(204);
+
+        // Sender has 150_000. After fee: 149_000.
+        // acfg create raises min to 200_000 -> violation -> rollback.
+        let sender_acct = AccountData {
+            micro_algos: 150_000,
+            ..Default::default()
+        };
+        let mut eval =
+            make_evaluator_with_accounts(&ledger, &params, 100, &[], &[(sender, sender_acct)]);
+
+        let txn = Transaction {
+            txn_type: TxnType::Acfg,
+            sender,
+            fee: 1000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            config_asset: 0,
+            asset_params: Some(algo_types::AssetParams::default()),
+            ..Default::default()
+        };
+        let sig = sign_txn(&txn, &key);
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            ..Default::default()
+        };
+
+        assert!(eval.transaction_group(&[stx]).is_err());
+
+        // After rollback, resource deltas should be empty and
+        // account data should show no changes.
+        let acct_data = eval.get_account_data(&sender).unwrap();
+        assert_eq!(
+            acct_data.total_assets_opted_in, 0,
+            "total_assets_opted_in should be 0 after rollback"
+        );
+        assert_eq!(
+            acct_data.total_created_assets, 0,
+            "total_created_assets should be 0 after rollback"
+        );
+        // Balance should also be unchanged (rollback).
+        assert_eq!(
+            eval.effective_balance(&sender),
+            150_000,
+            "balance should be restored after rollback"
+        );
+    }
+
+    #[test]
+    fn axfer_optin_raises_sender_min_balance() {
+        // Asset opt-in via axfer (sender == asset_receiver, amount == 0)
+        // should raise the sender's effective min-balance.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(205);
+
+        // After opt-in: effective min = base + 1*min_balance = 200_000.
+        // Give sender 201_000 (fee=1000, after fee=200_000).
+        let sender_acct = AccountData {
+            micro_algos: 201_000,
+            ..Default::default()
+        };
+        let mut eval =
+            make_evaluator_with_accounts(&ledger, &params, 100, &[], &[(sender, sender_acct)]);
+
+        let txn = Transaction {
+            txn_type: TxnType::Axfer,
+            sender,
+            fee: 1000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            xaid: 99,                           // existing asset
+            asset_amount: 0,                    // opt-in amount
+            asset_receiver: Some(sender),       // self-transfer = opt-in
+            ..Default::default()
+        };
+        let sig = sign_txn(&txn, &key);
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            ..Default::default()
+        };
+
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "axfer opt-in with exact min balance should be accepted"
+        );
+
+        let acct_data = eval.get_account_data(&sender).unwrap();
+        assert_eq!(
+            acct_data.total_assets_opted_in, 1,
+            "total_assets_opted_in should be 1 after axfer opt-in"
+        );
+    }
+
+    #[test]
+    fn appl_create_raises_sender_min_balance() {
+        // Creating an app (application_id=0) should raise the sender's
+        // effective min-balance by app_flat_params_min_balance plus
+        // schema costs and extra page costs.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(206);
+
+        // App create with global schema: 2 uints, 1 byte-slice, 1 extra page.
+        // Effective min after create:
+        //   base: 100_000
+        //   + 1 * app_flat_params_min_balance (created app): 100_000
+        //   + 1 * app_flat_params_min_balance (extra page): 100_000
+        //   + 3 * schema_min_balance_per_entry (2 uint + 1 byte): 75_000
+        //   + 2 * schema_uint_min_balance: 7_000
+        //   + 1 * schema_bytes_min_balance: 25_000
+        //   = 407_000
+        // Give sender 408_000 (fee=1000, after fee=407_000).
+        let sender_acct = AccountData {
+            micro_algos: 408_000,
+            ..Default::default()
+        };
+        let mut eval =
+            make_evaluator_with_accounts(&ledger, &params, 100, &[], &[(sender, sender_acct)]);
+
+        let txn = Transaction {
+            txn_type: TxnType::Appl,
+            sender,
+            fee: 1000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            application_id: 0, // create
+            on_completion: 0,  // NoOp
+            global_state_schema: Some(algo_types::StateSchema {
+                num_uint: 2,
+                num_byte_slice: 1,
+            }),
+            extra_program_pages: 1,
+            approval_program: Some(serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01])),
+            clear_state_program: Some(serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01])),
+            ..Default::default()
+        };
+        let sig = sign_txn(&txn, &key);
+        let stx = SignedTransaction {
+            txn,
+            sig,
+            ..Default::default()
+        };
+
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "appl create with exact min balance should be accepted"
+        );
+
+        let acct_data = eval.get_account_data(&sender).unwrap();
+        assert_eq!(
+            acct_data.total_created_apps, 1,
+            "total_created_apps should be 1 after app create"
+        );
+        assert_eq!(
+            acct_data.total_extra_app_pages, 1,
+            "total_extra_app_pages should be 1 after app create"
+        );
+        assert_eq!(
+            acct_data.total_app_schema.num_uint, 2,
+            "schema num_uint should be 2 after app create"
+        );
+        assert_eq!(
+            acct_data.total_app_schema.num_byte_slice, 1,
+            "schema num_byte_slice should be 1 after app create"
+        );
+    }
+
+    #[test]
+    fn multiple_acfg_creates_accumulate_resource_deltas() {
+        // Two asset creates in sequence should accumulate resource deltas.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(207);
+
+        // After 2 creates: effective min = base + 2*min_balance = 300_000.
+        // Give sender enough for 2 fees + 300_000.
+        let sender_acct = AccountData {
+            micro_algos: 302_000,
+            ..Default::default()
+        };
+        let mut eval =
+            make_evaluator_with_accounts(&ledger, &params, 100, &[], &[(sender, sender_acct)]);
+
+        for i in 0..2u64 {
+            let txn = Transaction {
+                txn_type: TxnType::Acfg,
+                sender,
+                fee: 1000,
+                first_valid: Round(100),
+                last_valid: Round(1100),
+                genesis_id: "test-v1".to_string(),
+                genesis_hash: [0xAA; 32],
+                config_asset: 0,
+                asset_params: Some(algo_types::AssetParams::default()),
+                // Use note field to make txids unique.
+                note: serde_bytes::ByteBuf::from(vec![i as u8]),
+                ..Default::default()
+            };
+            let sig = sign_txn(&txn, &key);
+            let stx = SignedTransaction {
+                txn,
+                sig,
+                ..Default::default()
+            };
+            eval.transaction_group(&[stx])
+                .unwrap_or_else(|e| panic!("acfg create {i} should succeed: {e}"));
+        }
+
+        let acct_data = eval.get_account_data(&sender).unwrap();
+        assert_eq!(
+            acct_data.total_assets_opted_in, 2,
+            "total_assets_opted_in should be 2 after two asset creates"
+        );
+        assert_eq!(
+            acct_data.total_created_assets, 2,
+            "total_created_assets should be 2 after two asset creates"
+        );
+    }
+
+    // ====================================================================
+    // F9. receiver == close_remainder_to: credits accumulate
+    // ====================================================================
+
+    #[test]
+    fn receiver_equals_close_remainder_to_accumulates_credits() {
+        // When receiver and close_remainder_to are the SAME address, the
+        // receiver should get both the payment amount AND the remaining
+        // close-out balance. The sender should end at 0 (closed).
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(220);
+        let (receiver, _) = test_keypair(221);
+
+        let initial_receiver_balance = 100_000u64;
+        let sender_balance = 1_000_000u64;
+        let amount = 200_000u64;
+        let fee = 1_000u64;
+
+        let mut eval = make_evaluator(
+            &ledger,
+            &params,
+            100,
+            &[(sender, sender_balance), (receiver, initial_receiver_balance)],
+        );
+
+        // Build payment where receiver == close_remainder_to
+        let mut stx = make_signed_pay(&key, &sender, &receiver, amount, fee, 100);
+        stx.txn.close_remainder_to = receiver; // same as receiver
+        stx.sig = sign_txn(&stx.txn, &key);
+
+        assert!(
+            eval.transaction_group(&[stx]).is_ok(),
+            "payment with receiver == close_remainder_to should be accepted"
+        );
+
+        // Sender should be zero (closed out)
+        assert_eq!(
+            eval.effective_balance(&sender),
+            0,
+            "sender should be zero after close"
+        );
+
+        // Receiver gets: amount + remainder
+        // remainder = sender_balance - fee - amount = 1_000_000 - 1_000 - 200_000 = 799_000
+        // total credit to receiver = amount + remainder = 200_000 + 799_000 = 999_000
+        let remainder = sender_balance - fee - amount;
+        assert_eq!(
+            eval.effective_balance(&receiver),
+            initial_receiver_balance + amount + remainder,
+            "receiver should get both payment amount and close remainder"
+        );
+    }
+
+    // ====================================================================
+    // F10. Empty group rejection
+    // ====================================================================
+
+    #[test]
+    fn empty_group_rejected() {
+        // Calling transaction_group with an empty slice should return an
+        // error mentioning the empty group.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let mut eval = make_evaluator(&ledger, &params, 100, &[]);
+
+        let err = eval
+            .transaction_group(&[])
+            .expect_err("empty group should be rejected");
+        assert!(
+            err.to_string().contains("empty"),
+            "expected error mentioning 'empty', got: {err}"
+        );
+    }
+
+    // ====================================================================
+    // F11. generate_block txn_counter increment
+    // ====================================================================
+
+    #[test]
+    fn generate_block_txn_counter_incremented() {
+        // After processing N transactions, generate_block() should produce
+        // a block header whose txn_counter equals the original txn_counter + N.
+        let ledger = test_ledger();
+        let params = v41_params();
+        let (sender, key) = test_keypair(230);
+        let (receiver, _) = test_keypair(231);
+
+        let starting_txn_counter = 42_000u64;
+
+        let mut snapshot = LedgerSnapshot {
+            accounts: HashMap::new(),
+            lease_table: algo_ledger::LeaseTable::new(),
+            round: 100,
+            snapshot_round: Round(0),
+            read_snapshot: None,
+        };
+        snapshot.accounts.insert(
+            sender,
+            Some(AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            }),
+        );
+
+        let mut eval = SimpleBlockEvaluator {
+            hdr: BlockHeader {
+                round: Round(100),
+                genesis_id: "test-v1".to_string(),
+                genesis_hash: [0xAA; 32],
+                current_protocol: CONSENSUS_V41.to_string(),
+                txn_counter: starting_txn_counter,
+                ..Default::default()
+            },
+            consensus_params: params.clone(),
+            included_txns: Vec::new(),
+            txn_bytes: 0,
+            max_txn_bytes: params.max_txn_bytes_per_block as usize,
+            ledger: ledger.clone(),
+            snapshot,
+            overlay: CowOverlay::new(),
+            fees_collected: 0,
+        };
+
+        // Submit 3 individual transaction groups (1 txn each)
+        let stx1 = make_signed_pay(&key, &sender, &receiver, 0, 1000, 100);
+        eval.transaction_group(&[stx1]).unwrap();
+
+        let txn2 = Transaction {
+            txn_type: TxnType::Pay,
+            sender,
+            receiver,
+            amount: 0,
+            fee: 1000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            note: ByteBuf::from(vec![0x01]),
+            ..Default::default()
+        };
+        let sig2 = sign_txn(&txn2, &key);
+        let stx2 = SignedTransaction {
+            txn: txn2,
+            sig: sig2,
+            ..Default::default()
+        };
+        eval.transaction_group(&[stx2]).unwrap();
+
+        let txn3 = Transaction {
+            txn_type: TxnType::Pay,
+            sender,
+            receiver,
+            amount: 0,
+            fee: 1000,
+            first_valid: Round(100),
+            last_valid: Round(1100),
+            genesis_id: "test-v1".to_string(),
+            genesis_hash: [0xAA; 32],
+            note: ByteBuf::from(vec![0x02]),
+            ..Default::default()
+        };
+        let sig3 = sign_txn(&txn3, &key);
+        let stx3 = SignedTransaction {
+            txn: txn3,
+            sig: sig3,
+            ..Default::default()
+        };
+        eval.transaction_group(&[stx3]).unwrap();
+
+        let block = eval.generate_block(&[]).unwrap();
+
+        assert_eq!(
+            block.txn_counter,
+            starting_txn_counter + 3,
+            "txn_counter should equal starting value + number of transactions"
+        );
     }
 }

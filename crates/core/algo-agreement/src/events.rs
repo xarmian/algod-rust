@@ -353,7 +353,10 @@ impl fmt::Debug for Proposal {
             .field("unauthenticated_proposal", &self.unauthenticated_proposal)
             .field("validated_at", &self.validated_at)
             .field("received_at", &self.received_at)
-            .field("validated_block", &self.validated_block.as_ref().map(|_| "..."))
+            .field(
+                "validated_block",
+                &self.validated_block.as_ref().map(|_| "..."),
+            )
             .finish()
     }
 }
