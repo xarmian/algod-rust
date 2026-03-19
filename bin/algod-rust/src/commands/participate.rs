@@ -12,7 +12,7 @@ use algo_codec::{canonical_encode_signed_txn_in_block, canonical_encode_transact
 use algo_ledger::participation::ParticipationStore;
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{
-    AgreementKeyManagerBridge, AgreementLedgerBridge, BlockFetcher, CatchupService,
+    AgreementKeyManagerBridge, AgreementLedgerBridge, BlockFetcher, CatchupService, FetchError,
     FetchedBlockCert, SqliteLedger,
 };
 use algo_network::{
@@ -84,24 +84,20 @@ struct GossipBlockFetcher {
 }
 
 impl BlockFetcher for GossipBlockFetcher {
-    fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, String> {
+    fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
         // SAFETY: This is called from the CatchupService's background std::thread,
         // NOT from a tokio worker thread. Calling block_on from within the tokio
         // runtime would panic.
         self.rt_handle.block_on(async {
             let peers = self.ws_network.get_unicast_peers().await;
             if peers.is_empty() {
-                return Err(format!(
-                    "no unicast peers available to fetch block for round {}",
-                    round
-                ));
+                return Err(FetchError::NoPeersAvailable);
             }
             let source = GossipBlockSource::new(peers);
             use algo_rest_client::BlockSource;
-            let response = source
-                .get_block(round)
-                .await
-                .map_err(|e| format!("block fetch failed for round {}: {}", round, e))?;
+            let response = source.get_block(round).await.map_err(|e| {
+                FetchError::NetworkError(format!("block fetch failed for round {}: {}", round, e))
+            })?;
 
             // Try to parse the gossip response's certificate data
             // (rmpv::Value) into a typed Certificate for fork detection.

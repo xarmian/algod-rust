@@ -436,116 +436,17 @@ pub fn validate_block(
         });
     }
 
-    // 7. Payset commitment.
-    // The `txn` field in the block header is the commitment over the payset.
-    // For v26+ this uses a Merkle tree; for older versions it uses a flat hash.
-    //
-    // When raw_payset_blobs is provided, we use the raw bytes directly for STIB
-    // hashing (preserving unknown fields), and commitment mismatches are errors.
-    // When None (unit tests, backward compat), we use typed re-encoding and
-    // mismatches are warn-only.
-    let version = &block.current_protocol;
-    // Only use raw blobs if the count matches the payset; otherwise fall back
-    // to warn-only typed path to avoid panics on malformed input.
+    // 7. Payset commitment (7, 7b, 7c).
+    // Delegate to the shared helper that checks txn_commitment, txn256, txn512.
     let raw_payset_blobs = raw_payset_blobs.filter(|blobs| blobs.len() == block.payset.len());
     let has_raw = raw_payset_blobs.is_some();
-    if block.txn_commitment != [0u8; 32] || !block.payset.is_empty() {
-        if has_payset_commit_merkle(version) {
-            // Merkle tree commitment (v26+).
-            let computed_root = if let Some(raw_blobs) = raw_payset_blobs {
-                compute_payset_merkle_root_raw(block, raw_blobs)
-            } else {
-                compute_payset_merkle_root(block)
-            };
-            let expected = block.txn_commitment.as_ref();
-            if expected != computed_root.as_slice() {
-                if has_raw {
-                    errors.push(BlockValidationError::PaysetCommitmentMismatch {
-                        expected: hex::encode(expected),
-                        computed: hex::encode(computed_root),
-                    });
-                } else {
-                    eprintln!(
-                        "WARNING: round {}: payset commitment mismatch: header={}, computed={}",
-                        round,
-                        hex::encode(expected),
-                        hex::encode(computed_root),
-                    );
-                }
-            }
+    let commitment_errors = verify_payset_commitments(block, raw_payset_blobs);
+    for ce in commitment_errors {
+        if has_raw {
+            errors.push(ce);
         } else {
-            // Flat commitment (pre-v26).
-            let computed_flat = if let Some(raw_blobs) = raw_payset_blobs {
-                compute_payset_flat_commitment_raw(raw_blobs)
-            } else {
-                compute_payset_flat_commitment(&block.payset)
-            };
-            let expected = block.txn_commitment.as_ref();
-            if expected != computed_flat.as_slice() {
-                if has_raw {
-                    errors.push(BlockValidationError::PaysetCommitmentMismatch {
-                        expected: hex::encode(expected),
-                        computed: hex::encode(computed_flat),
-                    });
-                } else {
-                    eprintln!(
-                        "WARNING: round {}: payset commitment mismatch: header={}, computed={}",
-                        round,
-                        hex::encode(expected),
-                        hex::encode(computed_flat),
-                    );
-                }
-            }
-        }
-    }
-
-    // 7b. Vector commitment: txn256 (SHA-256, v34+).
-    if has_txn256(version) && block.txn256 != [0u8; 32] {
-        let computed = if let Some(raw_blobs) = raw_payset_blobs {
-            compute_vector_commitment_raw(block, HashAlgo::Sha256, raw_blobs)
-        } else {
-            compute_vector_commitment(block, HashAlgo::Sha256)
-        };
-        if block.txn256.as_ref() != computed.as_slice() {
-            if has_raw {
-                errors.push(BlockValidationError::VectorCommitmentMismatch {
-                    field: "txn256".into(),
-                    expected: hex::encode(block.txn256),
-                    computed: hex::encode(&computed),
-                });
-            } else {
-                eprintln!(
-                    "WARNING: round {}: txn256 vector commitment mismatch: header={}, computed={}",
-                    round,
-                    hex::encode(block.txn256),
-                    hex::encode(&computed),
-                );
-            }
-        }
-    }
-
-    // 7c. Vector commitment: txn512 (SHA-512, v41+).
-    if has_txn512(version) && block.txn512 != [0u8; 64] {
-        let computed = if let Some(raw_blobs) = raw_payset_blobs {
-            compute_vector_commitment_raw(block, HashAlgo::Sha512, raw_blobs)
-        } else {
-            compute_vector_commitment(block, HashAlgo::Sha512)
-        };
-        if block.txn512.as_ref() != computed.as_slice() {
-            if has_raw {
-                errors.push(BlockValidationError::VectorCommitmentMismatch {
-                    field: "txn512".into(),
-                    expected: hex::encode(block.txn512),
-                    computed: hex::encode(&computed),
-                });
-            } else {
-                eprintln!(
-                    "WARNING: round {}: txn512 vector commitment mismatch: header={}, computed={}",
-                    round,
-                    hex::encode(block.txn512),
-                    hex::encode(&computed),
-                );
-            }
+            // Warn-only when no raw blobs (unit tests, backward compat).
+            eprintln!("WARNING: round {}: {}", round, ce);
         }
     }
 
@@ -569,6 +470,131 @@ pub fn validate_block(
         txn_count,
         total_txn_bytes,
     }
+}
+
+/// Shared helper: verify all payset commitment fields (txn_commitment, txn256, txn512).
+///
+/// Returns a list of `BlockValidationError`s for any mismatches. An empty vec means
+/// all commitments match. When `raw_payset_blobs` is `Some`, raw bytes are used for
+/// STIB hashing; otherwise typed re-encoding is used.
+///
+/// This is the core logic behind both `validate_block` (step 7) and
+/// `contents_match_header`.
+fn verify_payset_commitments(
+    block: &Block,
+    raw_payset_blobs: Option<&[Vec<u8>]>,
+) -> Vec<BlockValidationError> {
+    let mut errors = Vec::new();
+    let version = &block.current_protocol;
+
+    // 7. Primary payset commitment (txn field).
+    if block.txn_commitment != [0u8; 32] || !block.payset.is_empty() {
+        if has_payset_commit_merkle(version) {
+            let computed_root = if let Some(raw_blobs) = raw_payset_blobs {
+                compute_payset_merkle_root_raw(block, raw_blobs)
+            } else {
+                compute_payset_merkle_root(block)
+            };
+            if block.txn_commitment.as_ref() != computed_root.as_slice() {
+                errors.push(BlockValidationError::PaysetCommitmentMismatch {
+                    expected: hex::encode(block.txn_commitment),
+                    computed: hex::encode(computed_root),
+                });
+            }
+        } else {
+            let computed_flat = if let Some(raw_blobs) = raw_payset_blobs {
+                compute_payset_flat_commitment_raw(raw_blobs)
+            } else {
+                compute_payset_flat_commitment(&block.payset)
+            };
+            if block.txn_commitment.as_ref() != computed_flat.as_slice() {
+                errors.push(BlockValidationError::PaysetCommitmentMismatch {
+                    expected: hex::encode(block.txn_commitment),
+                    computed: hex::encode(computed_flat),
+                });
+            }
+        }
+    }
+
+    // 7b. Vector commitment: txn256 (SHA-256, v34+).
+    if has_txn256(version) {
+        let computed = if let Some(raw_blobs) = raw_payset_blobs {
+            compute_vector_commitment_raw(block, HashAlgo::Sha256, raw_blobs)
+        } else {
+            compute_vector_commitment(block, HashAlgo::Sha256)
+        };
+        if block.txn256.as_ref() != computed.as_slice() {
+            errors.push(BlockValidationError::VectorCommitmentMismatch {
+                field: "txn256".into(),
+                expected: hex::encode(block.txn256),
+                computed: hex::encode(&computed),
+            });
+        }
+    }
+
+    // 7c. Vector commitment: txn512 (SHA-512, v41+).
+    if has_txn512(version) {
+        let computed = if let Some(raw_blobs) = raw_payset_blobs {
+            compute_vector_commitment_raw(block, HashAlgo::Sha512, raw_blobs)
+        } else {
+            compute_vector_commitment(block, HashAlgo::Sha512)
+        };
+        if block.txn512.as_ref() != computed.as_slice() {
+            errors.push(BlockValidationError::VectorCommitmentMismatch {
+                field: "txn512".into(),
+                expected: hex::encode(block.txn512),
+                computed: hex::encode(&computed),
+            });
+        }
+    }
+
+    // 7d. Disabled commitment fields must be zero.
+    // Go's ContentsMatchHeader does full struct equality on TxnCommitments,
+    // so if a field is not enabled for this protocol version but is non-zero,
+    // it's a mismatch.
+    if !has_txn256(version) && block.txn256.iter().any(|&b| b != 0) {
+        errors.push(BlockValidationError::VectorCommitmentMismatch {
+            field: "txn256".into(),
+            expected: hex::encode(block.txn256),
+            computed: hex::encode([0u8; 32]),
+        });
+    }
+    if !has_txn512(version) && block.txn512.iter().any(|&b| b != 0) {
+        errors.push(BlockValidationError::VectorCommitmentMismatch {
+            field: "txn512".into(),
+            expected: hex::encode(block.txn512),
+            computed: hex::encode([0u8; 64]),
+        });
+    }
+
+    errors
+}
+
+/// Check that a block's body (payset) matches its header commitments.
+///
+/// Mirrors Go's `block.ContentsMatchHeader()` from `data/bookkeeping/block.go`.
+/// This is used by the catchup service to validate that an untrusted block's
+/// transactions are consistent with the block header (which is what the block
+/// hash authenticates).
+///
+/// Returns:
+/// - `Err(reason)` if the protocol version is empty or unknown (cannot compute commitments).
+/// - `Ok(false)` if any commitment field mismatches.
+/// - `Ok(true)` if all commitment fields match.
+pub fn contents_match_header(block: &Block) -> Result<bool, String> {
+    // Validate protocol version — we need it to determine which commitments apply.
+    if block.current_protocol.is_empty() {
+        return Err("block protocol version is empty".to_string());
+    }
+    if crate::rules::validate_protocol_version(&block.current_protocol).is_err() {
+        return Err(format!(
+            "unsupported protocol version: {}",
+            block.current_protocol
+        ));
+    }
+
+    let errors = verify_payset_commitments(block, None);
+    Ok(errors.is_empty())
 }
 
 /// Detect transaction groups within a payset for per-group LogicSig budget pooling.
@@ -1008,5 +1034,152 @@ mod tests {
             "expected heartbeat proof verification error, got errors: {:?}",
             result.errors
         );
+    }
+
+    // ── Tests for contents_match_header ──
+
+    /// Build a block with valid commitments for the "future" protocol.
+    fn valid_empty_future_block() -> Block {
+        use crate::merkle::{compute_vector_commitment, HashAlgo};
+
+        let mut block = empty_block();
+        // txn_commitment for empty Merkle payset is [0u8; 32] (already default).
+        // Compute the correct vector commitments for empty payset.
+        let vc256 = compute_vector_commitment(&block, HashAlgo::Sha256);
+        let vc512 = compute_vector_commitment(&block, HashAlgo::Sha512);
+        block.txn256.copy_from_slice(&vc256);
+        block.txn512.copy_from_slice(&vc512);
+        block
+    }
+
+    #[test]
+    fn contents_match_header_valid_empty_payset() {
+        let block = valid_empty_future_block();
+        let result = contents_match_header(&block);
+        assert_eq!(result, Ok(true), "valid empty block should match header");
+    }
+
+    #[test]
+    fn contents_match_header_tampered_txn_commitment() {
+        let mut block = valid_empty_future_block();
+        block.payset = vec![]; // still empty
+        block.txn_commitment = [0xFF; 32]; // tampered
+        let result = contents_match_header(&block);
+        assert_eq!(
+            result,
+            Ok(false),
+            "tampered txn_commitment should not match"
+        );
+    }
+
+    #[test]
+    fn contents_match_header_tampered_txn256() {
+        let mut block = valid_empty_future_block();
+        block.txn256 = [0xFF; 32]; // tampered
+        let result = contents_match_header(&block);
+        assert_eq!(result, Ok(false), "tampered txn256 should not match");
+    }
+
+    #[test]
+    fn contents_match_header_tampered_txn512() {
+        let mut block = valid_empty_future_block();
+        block.txn512 = [0xFF; 64]; // tampered
+        let result = contents_match_header(&block);
+        assert_eq!(result, Ok(false), "tampered txn512 should not match");
+    }
+
+    #[test]
+    fn contents_match_header_valid_nonempty_payset() {
+        use crate::merkle::{compute_vector_commitment, HashAlgo};
+
+        let key = test_signing_key();
+        let stx = make_signed_txn(&key, 5000);
+
+        let mut block = empty_block();
+        block.payset = vec![stx];
+
+        // Compute all commitments for the non-empty payset.
+        let root = compute_payset_merkle_root(&block);
+        block.txn_commitment = root;
+        let vc256 = compute_vector_commitment(&block, HashAlgo::Sha256);
+        let vc512 = compute_vector_commitment(&block, HashAlgo::Sha512);
+        block.txn256.copy_from_slice(&vc256);
+        block.txn512.copy_from_slice(&vc512);
+
+        let result = contents_match_header(&block);
+        assert_eq!(
+            result,
+            Ok(true),
+            "valid block with non-empty payset should match header"
+        );
+    }
+
+    #[test]
+    fn contents_match_header_nonempty_payset_tampered() {
+        use crate::merkle::{compute_vector_commitment, HashAlgo};
+
+        let key = test_signing_key();
+        let stx = make_signed_txn(&key, 5000);
+
+        let mut block = empty_block();
+        block.payset = vec![stx];
+
+        // Compute correct commitments, then tamper txn_commitment.
+        let root = compute_payset_merkle_root(&block);
+        block.txn_commitment = root;
+        let vc256 = compute_vector_commitment(&block, HashAlgo::Sha256);
+        let vc512 = compute_vector_commitment(&block, HashAlgo::Sha512);
+        block.txn256.copy_from_slice(&vc256);
+        block.txn512.copy_from_slice(&vc512);
+
+        // Tamper the primary commitment.
+        block.txn_commitment = [0xFF; 32];
+        let result = contents_match_header(&block);
+        assert_eq!(
+            result,
+            Ok(false),
+            "tampered txn_commitment on non-empty payset should not match"
+        );
+    }
+
+    #[test]
+    fn contents_match_header_disabled_field_nonzero() {
+        // Use a protocol version that does NOT enable txn256/txn512,
+        // but set those fields to non-zero. Should return Ok(false).
+        let mut block = empty_block();
+        // V31 does not enable txn256 (pre-v34) or txn512 (pre-v41).
+        block.current_protocol = algo_types::consensus::CONSENSUS_V31.to_string();
+        // txn_commitment for empty Merkle payset is [0u8; 32] (matches default).
+        // Set disabled fields to non-zero.
+        block.txn256 = [0x01; 32];
+        block.txn512 = [0x02; 64];
+        let result = contents_match_header(&block);
+        assert_eq!(
+            result,
+            Ok(false),
+            "non-zero disabled commitment fields should cause mismatch"
+        );
+    }
+
+    #[test]
+    fn contents_match_header_empty_protocol_returns_err() {
+        let mut block = valid_empty_future_block();
+        block.current_protocol = String::new();
+        let result = contents_match_header(&block);
+        assert!(result.is_err(), "empty protocol should return Err");
+        assert!(result
+            .unwrap_err()
+            .contains("empty"));
+    }
+
+    #[test]
+    fn contents_match_header_unknown_protocol_returns_err() {
+        let mut block = valid_empty_future_block();
+        block.current_protocol = "v99-nonexistent".into();
+        let result = contents_match_header(&block);
+        assert!(result.is_err(), "unknown protocol should return Err");
+        assert!(result
+            .unwrap_err()
+            .contains("unsupported"));
     }
 }
