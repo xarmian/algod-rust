@@ -642,13 +642,16 @@ async fn admin_token_does_not_work_on_public_token_routes() {
 }
 
 // ===========================================================================
-// Format negotiation tests
+// Transaction params always returns JSON (no format negotiation)
 // ===========================================================================
 
 #[tokio::test]
-async fn transaction_params_format_json_returns_json() {
+async fn transaction_params_always_returns_json() {
     let server = TestServer::start(MockNode::synced()).await;
 
+    // go-algorand's TransactionParams does not support format negotiation.
+    // Query params like ?format=json are simply ignored; the response is
+    // always JSON.
     let resp = server
         .client
         .get(server.url("/v2/transactions/params?format=json"))
@@ -668,45 +671,4 @@ async fn transaction_params_format_json_returns_json() {
 
     // Should parse as valid JSON
     let _body: serde_json::Value = resp.json().await.unwrap();
-}
-
-#[tokio::test]
-async fn transaction_params_format_msgpack_returns_msgpack() {
-    let server = TestServer::start(MockNode::synced()).await;
-
-    let resp = server
-        .client
-        .get(server.url("/v2/transactions/params?format=msgpack"))
-        .header("X-Algo-API-Token", &server.api_token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert_eq!(content_type, "application/msgpack");
-
-    // Should be decodable as msgpack
-    let bytes = resp.bytes().await.unwrap();
-    let decoded: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
-    assert!(decoded.get("consensus-version").is_some());
-}
-
-#[tokio::test]
-async fn transaction_params_invalid_format_returns_400() {
-    let server = TestServer::start(MockNode::synced()).await;
-
-    let resp = server
-        .client
-        .get(server.url("/v2/transactions/params?format=xml"))
-        .header("X-Algo-API-Token", &server.api_token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 400);
 }

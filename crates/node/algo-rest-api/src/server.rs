@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 
 use crate::auth;
 use crate::node::NodeInterface;
@@ -157,14 +158,17 @@ impl ApiServer {
     /// 2. Builds the router with authentication middleware
     /// 3. Binds to the configured address
     /// 4. Writes `algod.net` to the data directory (if configured)
-    /// 5. Serves requests until the shutdown future completes
+    /// 5. Spawns the server task and returns immediately
     ///
-    /// Returns the actual bound address (useful when binding to port 0).
+    /// Returns the actual bound address (useful when binding to port 0)
+    /// and a `JoinHandle` that completes when the server shuts down.
+    /// Callers can await the handle to detect server failures or wait
+    /// for graceful shutdown to finish.
     pub async fn serve<N: NodeInterface>(
         &self,
         node: Arc<N>,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-    ) -> Result<SocketAddr, std::io::Error> {
+    ) -> Result<(SocketAddr, JoinHandle<()>), std::io::Error> {
         // Resolve tokens
         let api_token = Self::resolve_token(
             self.config.data_dir.as_deref(),
@@ -193,7 +197,7 @@ impl ApiServer {
 
         tracing::info!(addr = %local_addr, "REST API server listening");
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown)
                 .await
@@ -202,6 +206,6 @@ impl ApiServer {
             }
         });
 
-        Ok(local_addr)
+        Ok((local_addr, handle))
     }
 }

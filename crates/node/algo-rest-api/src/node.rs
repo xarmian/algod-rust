@@ -66,6 +66,24 @@ pub struct BuildVersion {
     pub channel: String,
 }
 
+impl BuildVersion {
+    /// Create a `BuildVersion` populated from build-time environment variables.
+    ///
+    /// Uses `CARGO_PKG_VERSION_MAJOR`, `CARGO_PKG_VERSION_MINOR`, and
+    /// `CARGO_PKG_VERSION_PATCH` for version numbers, plus
+    /// `ALGO_BUILD_COMMIT_HASH` and `ALGO_BUILD_BRANCH` emitted by `build.rs`.
+    pub fn from_build_env() -> Self {
+        Self {
+            major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0),
+            minor: env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0),
+            build_number: env!("CARGO_PKG_VERSION_PATCH").parse().unwrap_or(0),
+            commit_hash: env!("ALGO_BUILD_COMMIT_HASH").to_string(),
+            branch: env!("ALGO_BUILD_BRANCH").to_string(),
+            channel: String::new(),
+        }
+    }
+}
+
 /// Trait abstracting the node state needed by REST API handlers.
 ///
 /// Implementations provide access to genesis information, node status,

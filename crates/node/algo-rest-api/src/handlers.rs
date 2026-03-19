@@ -14,13 +14,12 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
 use crate::error;
-use crate::format::{self, FormatParams};
 use crate::node::NodeInterface;
 
 /// Shared application state threaded through axum handlers.
@@ -218,16 +217,13 @@ pub struct TransactionParametersResponse {
 /// Matches go-algorand's `Handlers.TransactionParams` in
 /// `daemon/algod/api/server/v2/handlers.go`.
 ///
+/// Always returns JSON (go-algorand does not support format negotiation
+/// on this endpoint -- it uses `ctx.JSON()` directly).
+///
 /// Returns 503 if the node is currently catching up to a catchpoint.
 pub async fn transaction_params<N: NodeInterface>(
     State(node): State<AppState<N>>,
-    Query(params): Query<FormatParams>,
 ) -> Response {
-    let fmt = match format::negotiate_format(&params) {
-        Ok(f) => f,
-        Err(resp) => return *resp,
-    };
-
     let status = match node.status().await {
         Ok(s) => s,
         Err(_) => return error::internal_error("failed retrieving node status"),
@@ -250,7 +246,10 @@ pub async fn transaction_params<N: NodeInterface>(
         min_fee,
     };
 
-    format::encode_response(&response, fmt)
+    match serde_json::to_vec(&response) {
+        Ok(body) => (StatusCode::OK, [("content-type", "application/json")], body).into_response(),
+        Err(_) => error::internal_error("failed to encode response"),
+    }
 }
 
 // ---------------------------------------------------------------------------
