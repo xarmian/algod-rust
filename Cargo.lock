@@ -260,6 +260,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "algo-rest-api"
+version = "0.1.0"
+dependencies = [
+ "algo-codec",
+ "algo-error",
+ "algo-types",
+ "async-trait",
+ "axum",
+ "base64",
+ "hex",
+ "http",
+ "hyper",
+ "rand 0.8.5",
+ "reqwest",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+]
+
+[[package]]
 name = "algo-rest-client"
 version = "0.1.0"
 dependencies = [
@@ -326,6 +352,7 @@ dependencies = [
  "algo-ledger",
  "algo-network",
  "algo-pool",
+ "algo-rest-api",
  "algo-rest-client",
  "algo-types",
  "algo-validate",
@@ -3464,6 +3491,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]

@@ -22,6 +22,7 @@ algo-agreement.workspace = true
 algo-pool.workspace = true
 algo-avm.workspace = true
 algo-fixtures.workspace = true
+algo-rest-api.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 tokio.workspace = true
