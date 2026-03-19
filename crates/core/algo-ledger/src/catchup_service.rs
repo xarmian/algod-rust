@@ -14,7 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crossbeam_channel::{self, Receiver, Select};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use algo_agreement::{LedgerWriter, PendingUnmatchedCertificate};
 use algo_types::{Block, Round};
@@ -22,6 +22,34 @@ use algo_types::{Block, Round};
 use crate::agreement_bridge::AgreementLedgerBridge;
 use crate::sqlite::SqliteLedger;
 use crate::store_trait::LedgerStore;
+
+// ---------------------------------------------------------------------------
+// FetchError
+// ---------------------------------------------------------------------------
+
+/// Error type returned by [`BlockFetcher::fetch_block`].
+///
+/// Provides structured error variants so callers can distinguish between
+/// transient failures (network, timeout) and permanent ones (no peers),
+/// enabling smarter retry logic in the catchup service.
+#[derive(Debug, thiserror::Error)]
+pub enum FetchError {
+    /// The peer(s) did not have a block for the requested round.
+    #[error("no block available for round {round}")]
+    NoBlockForRound { round: Round },
+
+    /// A network-level error occurred while fetching.
+    #[error("network error: {0}")]
+    NetworkError(String),
+
+    /// The fetch request timed out.
+    #[error("fetch timed out")]
+    Timeout,
+
+    /// No peers are available to fetch from.
+    #[error("no peers available")]
+    NoPeersAvailable,
+}
 
 // ---------------------------------------------------------------------------
 // BlockFetcher trait
@@ -47,7 +75,7 @@ pub trait BlockFetcher: Send + Sync {
     /// `GossipBlockFetcher` in `participate.rs` inherits the 4-second
     /// per-peer timeout from `GossipBlockSource`, and `HttpBlockFetcher`
     /// uses a 30-second default.
-    fn fetch_block(&self, round: Round) -> Result<Block, String>;
+    fn fetch_block(&self, round: Round) -> Result<Block, FetchError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -316,15 +344,35 @@ impl CatchupService {
                     return;
                 }
                 Err(e) => {
-                    warn!(
-                        round = %target_round,
-                        attempt = attempt,
-                        error = %e,
-                        "catchup service: failed to fetch block, will retry"
-                    );
-                    // Exponential backoff with jitter between retries.
+                    // Mirror Go's pattern: NoBlockForRound is a normal
+                    // condition during catchup (the peer simply doesn't
+                    // have it yet), so log at trace/debug level and use a
+                    // shorter backoff.  Other errors are unexpected and
+                    // warrant warning-level logging.
+                    let delay = match &e {
+                        FetchError::NoBlockForRound { .. } => {
+                            trace!(
+                                round = %target_round,
+                                attempt = attempt,
+                                "catchup service: block not yet available, will retry"
+                            );
+                            // Use base delay without exponential backoff —
+                            // the block may appear momentarily.
+                            Self::RETRY_BASE_DELAY
+                        }
+                        FetchError::NetworkError(_)
+                        | FetchError::Timeout
+                        | FetchError::NoPeersAvailable => {
+                            warn!(
+                                round = %target_round,
+                                attempt = attempt,
+                                error = %e,
+                                "catchup service: failed to fetch block, will retry"
+                            );
+                            Self::backoff_with_jitter(attempt)
+                        }
+                    };
                     // Use recv_timeout so shutdown can interrupt the wait.
-                    let delay = Self::backoff_with_jitter(attempt);
                     if shutdown_rx.recv_timeout(delay).is_ok() {
                         debug!(
                             round = %target_round,
@@ -408,7 +456,7 @@ mod tests {
     }
 
     impl BlockFetcher for MockBlockFetcher {
-        fn fetch_block(&self, round: Round) -> Result<Block, String> {
+        fn fetch_block(&self, round: Round) -> Result<Block, FetchError> {
             self.fetch_count.fetch_add(1, Ordering::SeqCst);
             let guard = self.block.lock().unwrap();
             match guard.as_ref() {
@@ -417,7 +465,7 @@ mod tests {
                     block.round = round;
                     Ok(block)
                 }
-                None => Err(format!("no block available for round {round}")),
+                None => Err(FetchError::NoBlockForRound { round }),
             }
         }
     }
@@ -427,8 +475,8 @@ mod tests {
     struct FailingBlockFetcher;
 
     impl BlockFetcher for FailingBlockFetcher {
-        fn fetch_block(&self, round: Round) -> Result<Block, String> {
-            Err(format!("network error fetching round {round}"))
+        fn fetch_block(&self, _round: Round) -> Result<Block, FetchError> {
+            Err(FetchError::NetworkError("simulated network failure".into()))
         }
     }
 
@@ -573,7 +621,7 @@ mod tests {
     }
 
     impl BlockFetcher for DigestMatchingBlockFetcher {
-        fn fetch_block(&self, _round: Round) -> Result<Block, String> {
+        fn fetch_block(&self, _round: Round) -> Result<Block, FetchError> {
             self.fetch_count.fetch_add(1, Ordering::SeqCst);
             Ok(self.block.clone())
         }
@@ -711,11 +759,13 @@ mod tests {
     }
 
     impl BlockFetcher for CountingFailFetcher {
-        fn fetch_block(&self, _round: Round) -> Result<Block, String> {
+        fn fetch_block(&self, _round: Round) -> Result<Block, FetchError> {
             let call_num = self.total_calls.fetch_add(1, Ordering::SeqCst) + 1;
             if call_num <= self.fail_until {
                 self.fail_count.fetch_add(1, Ordering::SeqCst);
-                Err(format!("transient error on attempt {call_num}"))
+                Err(FetchError::NetworkError(format!(
+                    "transient error on attempt {call_num}"
+                )))
             } else {
                 Ok(self.block.clone())
             }
