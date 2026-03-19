@@ -271,6 +271,9 @@ pub struct ConsensusParams {
     pub box_flat_min_balance: u64,
     /// MBR per box byte (Go: `BoxByteMinBalance`).
     pub box_byte_min_balance: u64,
+    /// Maximum allowed effective minimum balance (Go: `MaximumMinimumBalance`).
+    /// 0 means no limit (v32+ removes the cap). Set to 100_100_000 in v24.
+    pub maximum_minimum_balance: u64,
 
     // ── Asset parameters ────────────────────────────────────────
     /// Max assets per account (Go: `MaxAssetsPerAccount`). 0 = unlimited (v32+).
@@ -507,6 +510,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         schema_bytes_min_balance: 0,
         box_flat_min_balance: 0,
         box_byte_min_balance: 0,
+        maximum_minimum_balance: 0,
         max_assets_per_account: 0,
         max_log_size: 1024,
         max_log_calls: 32,
@@ -721,6 +725,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v24.application = true;
     v24.min_inner_appl_version = 6;
     v24.support_rekeying = true;
+    // 100.1 Algos (MinBalance for creating 1,000 assets)
+    v24.maximum_minimum_balance = 100_100_000;
     v24.max_app_args = 16;
     v24.max_app_total_arg_len = 2048;
     v24.max_app_program_len = 1024;
@@ -817,6 +823,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v32.max_assets_per_account = 0; // unlimited
     v32.max_apps_created = 0; // unlimited
     v32.max_apps_opted_in = 0; // unlimited
+    v32.maximum_minimum_balance = 0; // remove limit
     if version == CONSENSUS_V32 {
         return Some(v32);
     }

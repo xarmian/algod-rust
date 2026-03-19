@@ -141,21 +141,31 @@ impl PendingRequestsContext {
     /// Get or create the period-level context for a given round + key.
     ///
     /// Mirrors Go's `getReqCtx`.
-    fn get_req_ctx(&mut self, round: Round, pkey: CryptoRequestCtxKey) -> &mut PeriodRequestsContext {
+    fn get_req_ctx(
+        &mut self,
+        round: Round,
+        pkey: CryptoRequestCtxKey,
+    ) -> &mut PeriodRequestsContext {
         // Create round context if needed.
-        let round_ctx = self.rounds.entry(round).or_insert_with(|| RoundRequestsContext {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            periods: HashMap::new(),
-        });
+        let round_ctx = self
+            .rounds
+            .entry(round)
+            .or_insert_with(|| RoundRequestsContext {
+                cancelled: Arc::new(AtomicBool::new(false)),
+                periods: HashMap::new(),
+            });
 
         // Create period context if needed, deriving from round context.
         // (In Go, the period context is derived from the round context via
         // context.WithCancel. Here we just create a fresh AtomicBool; the
         // round-level token is checked separately by clear_stale_contexts.)
-        round_ctx.periods.entry(pkey).or_insert_with(|| PeriodRequestsContext {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            proposal_cancelled: None,
-        })
+        round_ctx
+            .periods
+            .entry(pkey)
+            .or_insert_with(|| PeriodRequestsContext {
+                cancelled: Arc::new(AtomicBool::new(false)),
+                proposal_cancelled: None,
+            })
     }
 
     /// Returns a cancellation token for a vote request.
@@ -300,7 +310,10 @@ impl PendingRequestsContext {
 /// never blocking on verification itself.
 ///
 /// Mirrors Go's `poolCryptoVerifier`.
-pub struct AsyncCryptoVerifier<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync + 'static = NoOpValidator> {
+pub struct AsyncCryptoVerifier<
+    L: LedgerReader + Send + Sync + 'static,
+    BV: BlockValidator + Send + Sync + 'static = NoOpValidator,
+> {
     #[allow(dead_code)]
     ledger: Arc<L>,
 
@@ -658,10 +671,7 @@ fn verify_proposal_impl<BV: BlockValidator>(
 /// each one individually.
 ///
 /// If any vote fails verification, the entire bundle is rejected.
-fn verify_bundle_impl<L: LedgerReader>(
-    ledger: &L,
-    request: &CryptoBundleRequest,
-) -> CryptoResult {
+fn verify_bundle_impl<L: LedgerReader>(ledger: &L, request: &CryptoBundleRequest) -> CryptoResult {
     let ub = &request.message.unauthenticated_bundle;
 
     // Verify each regular vote authenticator in the bundle.
@@ -864,8 +874,7 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
         let (proposal_out_tx, proposal_out_rx) =
             crossbeam_channel::bounded::<CryptoResult>(max_votes + base_buffer);
 
-        let (bundle_in_tx, bundle_in_rx) =
-            crossbeam_channel::bounded::<InternalBundleRequest>(1);
+        let (bundle_in_tx, bundle_in_rx) = crossbeam_channel::bounded::<InternalBundleRequest>(1);
         let (bundle_out_tx, bundle_out_rx) = crossbeam_channel::bounded::<CryptoResult>(3);
 
         // Quit signal channel: dropping the sender closes it, which makes all
@@ -875,9 +884,8 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
         let (quit_signal_tx, quit_signal_rx) = crossbeam_channel::bounded::<()>(0);
 
         // Spawn workers.
-        let mut handles = Vec::with_capacity(
-            VOTE_PARALLELISM + PROPOSAL_PARALLELISM + BUNDLE_PARALLELISM,
-        );
+        let mut handles =
+            Vec::with_capacity(VOTE_PARALLELISM + PROPOSAL_PARALLELISM + BUNDLE_PARALLELISM);
 
         for i in 0..VOTE_PARALLELISM {
             let rx = vote_in_rx.clone();
@@ -972,7 +980,9 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
                     });
                 }
                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                    warn!("vote input channel disconnected, request dropped (verifier shutting down)");
+                    warn!(
+                        "vote input channel disconnected, request dropped (verifier shutting down)"
+                    );
                 }
             }
         }
@@ -1065,7 +1075,11 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
             AGREEMENT_VOTE_TAG => {
                 // votes.in full OR insufficient output capacity to absorb pending work
                 self.vote_in_rx.len() == self.vote_in_rx.capacity().unwrap_or(0)
-                    || self.vote_out_rx.capacity().unwrap_or(0).saturating_sub(self.vote_out_rx.len())
+                    || self
+                        .vote_out_rx
+                        .capacity()
+                        .unwrap_or(0)
+                        .saturating_sub(self.vote_out_rx.len())
                         < VOTE_PARALLELISM + self.vote_in_rx.len()
             }
             PROPOSAL_PAYLOAD_TAG => {
@@ -1076,7 +1090,12 @@ impl<L: LedgerReader + Send + Sync + 'static, BV: BlockValidator + Send + Sync +
             VOTE_BUNDLE_TAG => {
                 // bundles.in full OR insufficient output capacity
                 self.bundle_in_rx.len() == self.bundle_in_rx.capacity().unwrap_or(0)
-                    || self.bundle_out_rx.capacity().unwrap_or(0).saturating_sub(self.bundle_out_rx.len()) < 2
+                    || self
+                        .bundle_out_rx
+                        .capacity()
+                        .unwrap_or(0)
+                        .saturating_sub(self.bundle_out_rx.len())
+                        < 2
             }
             _ => {
                 warn!("AsyncCryptoVerifier::channel_full called with unknown tag: {tag}");
@@ -1327,8 +1346,14 @@ mod tests {
 
         // Adding a new proposal for the same (round, period) cancels the old one.
         let token2 = ctx.add_proposal(Round(10), Period(1), false);
-        assert!(token1.load(Ordering::Acquire), "old proposal should be cancelled");
-        assert!(!token2.load(Ordering::Acquire), "new proposal should not be cancelled");
+        assert!(
+            token1.load(Ordering::Acquire),
+            "old proposal should be cancelled"
+        );
+        assert!(
+            !token2.load(Ordering::Acquire),
+            "new proposal should not be cancelled"
+        );
     }
 
     #[test]
@@ -1341,9 +1366,18 @@ mod tests {
         // At round 10, rounds where round + 2 <= 10 (i.e., round <= 8) are stale.
         ctx.clear_stale_contexts(Round(10), Period(0), false, false);
 
-        assert!(token_r8.load(Ordering::Acquire), "round 8 should be cancelled");
-        assert!(!token_r9.load(Ordering::Acquire), "round 9 should NOT be cancelled");
-        assert!(!token_r10.load(Ordering::Acquire), "round 10 should NOT be cancelled");
+        assert!(
+            token_r8.load(Ordering::Acquire),
+            "round 8 should be cancelled"
+        );
+        assert!(
+            !token_r9.load(Ordering::Acquire),
+            "round 9 should NOT be cancelled"
+        );
+        assert!(
+            !token_r10.load(Ordering::Acquire),
+            "round 10 should NOT be cancelled"
+        );
     }
 
     #[test]
@@ -1356,9 +1390,18 @@ mod tests {
         // At period 3, periods where period + 3 <= 3 (i.e., period <= 0) are stale.
         ctx.clear_stale_contexts(Round(10), Period(3), false, false);
 
-        assert!(token_p0.load(Ordering::Acquire), "period 0 should be cancelled");
-        assert!(!token_p1.load(Ordering::Acquire), "period 1 should NOT be cancelled");
-        assert!(!token_p3.load(Ordering::Acquire), "period 3 should NOT be cancelled");
+        assert!(
+            token_p0.load(Ordering::Acquire),
+            "period 0 should be cancelled"
+        );
+        assert!(
+            !token_p1.load(Ordering::Acquire),
+            "period 1 should NOT be cancelled"
+        );
+        assert!(
+            !token_p3.load(Ordering::Acquire),
+            "period 3 should NOT be cancelled"
+        );
     }
 
     #[test]
@@ -1369,7 +1412,10 @@ mod tests {
         // With pinned=true, period clearing is skipped.
         ctx.clear_stale_contexts(Round(10), Period(5), true, false);
 
-        assert!(!token_p0.load(Ordering::Acquire), "period 0 should NOT be cancelled when pinned");
+        assert!(
+            !token_p0.load(Ordering::Acquire),
+            "period 0 should NOT be cancelled when pinned"
+        );
     }
 
     #[test]
@@ -1410,7 +1456,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("should have a result within 5s");
         assert_eq!(result.task_index, 99);
-        assert!(result.err.is_none(), "accepting validator should pass: {:?}", result.err);
+        assert!(
+            result.err.is_none(),
+            "accepting validator should pass: {:?}",
+            result.err
+        );
     }
 
     #[test]
@@ -1636,10 +1686,7 @@ mod tests {
 
         // The round-8 result should not be cancelled.
         let r8_result = results.iter().find(|r| r.task_index == 201).unwrap();
-        assert!(
-            !r8_result.cancelled,
-            "round 8 vote should NOT be cancelled"
-        );
+        assert!(!r8_result.cancelled, "round 8 vote should NOT be cancelled");
 
         // The round-5 result may or may not be cancelled depending on worker
         // timing, but the cancellation token mechanism works (verified above).
@@ -1713,13 +1760,8 @@ mod tests {
             let _ = done_tx.send(());
         });
 
-        let quit_completed = done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .is_ok();
-        assert!(
-            quit_completed,
-            "quit() should complete within 5 seconds"
-        );
+        let quit_completed = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        assert!(quit_completed, "quit() should complete within 5 seconds");
         handle.join().expect("quit thread should not panic");
     }
 
@@ -1793,9 +1835,7 @@ mod tests {
             let _ = done_tx.send(());
         });
 
-        let quit_completed = done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .is_ok();
+        let quit_completed = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
         assert!(
             quit_completed,
             "quit() should complete promptly even when workers are blocked on full output"
@@ -1821,13 +1861,8 @@ mod tests {
             let _ = done_tx.send(());
         });
 
-        let drop_completed = done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .is_ok();
-        assert!(
-            drop_completed,
-            "drop should complete within 5 seconds"
-        );
+        let drop_completed = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        assert!(drop_completed, "drop should complete within 5 seconds");
         handle.join().expect("drop thread should not panic");
     }
 

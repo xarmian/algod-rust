@@ -316,6 +316,7 @@ name = "algod-rust"
 version = "0.1.0"
 dependencies = [
  "algo-agreement",
+ "algo-avm",
  "algo-bench",
  "algo-codec",
  "algo-conformance",
@@ -331,12 +332,15 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "ed25519-dalek",
  "rand 0.8.5",
  "reqwest",
  "rmpv",
  "rusqlite",
  "serde",
+ "serde_bytes",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-util",
  "tracing",

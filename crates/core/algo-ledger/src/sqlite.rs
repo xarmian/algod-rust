@@ -1590,8 +1590,61 @@ enum SqlitePreMutation {
     },
 }
 
+/// A read-only point-in-time snapshot of the ledger database.
+///
+/// Holds a separate SQLite connection with a deferred read transaction,
+/// providing MVCC snapshot isolation in WAL mode. Account lookups through
+/// this snapshot see a consistent view of the database as it existed when
+/// the snapshot was created, regardless of concurrent writes on the main
+/// connection.
+///
+/// The read transaction is released when this struct is dropped.
+pub struct ReadSnapshot {
+    conn: Connection,
+}
+
+impl ReadSnapshot {
+    /// Look up an account by address from the snapshot connection.
+    ///
+    /// Returns the decoded `AccountData` if the account exists, or `None`
+    /// if it does not. This read is isolated from concurrent writes.
+    pub fn get_account(&self, addr: &Address) -> Option<AccountData> {
+        let result: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT data FROM accountbase WHERE address = ?1",
+                params![addr.0.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                tracing::error!("ReadSnapshot: SQLite error querying account: {}", e);
+                None
+            });
+
+        result.and_then(|data| {
+            decode_account_data(&data).map_err(|e| {
+                tracing::error!("ReadSnapshot: failed to decode account data: {}", e);
+                e
+            }).ok()
+        })
+    }
+}
+
+impl Drop for ReadSnapshot {
+    fn drop(&mut self) {
+        // End the read transaction. Errors are non-fatal — the connection
+        // will be closed immediately after this anyway.
+        let _ = self.conn.execute_batch("ROLLBACK");
+    }
+}
+
 pub struct SqliteLedger {
     conn: Connection,
+    /// Path to the SQLite database file, or `None` for in-memory databases.
+    /// Used to open read-only snapshot connections for point-in-time account
+    /// lookups without holding the main ledger mutex.
+    db_path: Option<std::path::PathBuf>,
     /// In-memory lease table (leases are short-lived, no persistence needed).
     lease_table: LeaseTable,
     /// Cached chain-level state (loaded from DB, flushed on commit).
@@ -1623,7 +1676,7 @@ impl SqliteLedger {
         let conn = Connection::open(path).map_err(|e| AlgoError::Ledger {
             message: format!("sqlite open error: {e}"),
         })?;
-        Self::init(conn)
+        Self::init(conn, Some(path.to_path_buf()))
     }
 
     /// Open an in-memory database (for testing).
@@ -1631,10 +1684,10 @@ impl SqliteLedger {
         let conn = Connection::open_in_memory().map_err(|e| AlgoError::Ledger {
             message: format!("sqlite open error: {e}"),
         })?;
-        Self::init(conn)
+        Self::init(conn, None)
     }
 
-    fn init(conn: Connection) -> Result<Self, AlgoError> {
+    fn init(conn: Connection, db_path: Option<std::path::PathBuf>) -> Result<Self, AlgoError> {
         // Enable WAL mode for better concurrent read performance.
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|e| AlgoError::Ledger {
@@ -1688,6 +1741,7 @@ impl SqliteLedger {
 
         Ok(Self {
             conn,
+            db_path,
             lease_table: LeaseTable::new(),
             current_round,
             rewards_level,
@@ -1705,6 +1759,47 @@ impl SqliteLedger {
             trie: None,
             pre_mutations: Vec::new(),
         })
+    }
+
+    /// Return a reference to the in-memory lease table.
+    ///
+    /// Used by the block evaluator to snapshot the current lease state
+    /// while holding the ledger lock.
+    pub fn lease_table(&self) -> &LeaseTable {
+        &self.lease_table
+    }
+
+    /// Open a read-only snapshot connection to the same database file.
+    ///
+    /// The returned [`ReadSnapshot`] holds a separate SQLite connection with
+    /// a deferred read transaction, which in WAL mode provides a
+    /// point-in-time consistent view of the database. This allows the block
+    /// evaluator to read account data without re-acquiring the main ledger
+    /// mutex, eliminating the risk of seeing data from a different round if
+    /// the ledger advances concurrently (e.g., from catchup).
+    ///
+    /// Returns `None` for in-memory databases (which cannot share state
+    /// across connections).
+    pub fn open_read_snapshot(&self) -> Option<ReadSnapshot> {
+        let path = self.db_path.as_ref()?;
+        let conn = match Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("failed to open read snapshot: {}", e);
+                return None;
+            }
+        };
+        // Begin a deferred read transaction. In WAL mode this pins the
+        // reader to the current database state, so subsequent reads see a
+        // consistent snapshot even if the writer commits new data.
+        if let Err(e) = conn.execute_batch("BEGIN DEFERRED") {
+            tracing::warn!("failed to open read snapshot: {}", e);
+            return None;
+        }
+        Some(ReadSnapshot { conn })
     }
 
     /// Load the trie from the `merkle_trie` table or rebuild from DB contents.
