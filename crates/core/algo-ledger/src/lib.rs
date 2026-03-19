@@ -47,4 +47,4 @@ pub use store_trait::LedgerStore;
 
 pub use agreement_bridge::AgreementLedgerBridge;
 pub use agreement_key_manager::AgreementKeyManagerBridge;
-pub use catchup_service::{BlockFetcher, CatchupService};
+pub use catchup_service::{BlockFetcher, CatchupLedger, CatchupService, FetchedBlockCert};

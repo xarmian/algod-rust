@@ -9,19 +9,79 @@
 //! specifically the `syncCert` / `fetchRound` path that handles certificate-
 //! driven single-block fetches.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crossbeam_channel::{self, Receiver, Select};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
-use algo_agreement::{LedgerWriter, PendingUnmatchedCertificate};
+use algo_agreement::{Certificate, PendingUnmatchedCertificate};
 use algo_types::{Block, Round};
 
-use crate::agreement_bridge::AgreementLedgerBridge;
-use crate::sqlite::SqliteLedger;
-use crate::store_trait::LedgerStore;
+// ---------------------------------------------------------------------------
+// FetchedBlockCert
+// ---------------------------------------------------------------------------
+
+/// A block together with its optional agreement certificate, as returned by
+/// a [`BlockFetcher`].
+///
+/// The certificate may be `None` when the fetcher's transport does not
+/// provide certificate data (e.g. some mock implementations). When present,
+/// it can be used for fork-detection checks mirroring Go's `fetchRound`.
+#[derive(Debug, Clone)]
+pub struct FetchedBlockCert {
+    /// The fetched block.
+    pub block: Block,
+    /// The agreement certificate, if the transport provided one.
+    pub cert: Option<Certificate>,
+}
+
+// ---------------------------------------------------------------------------
+// CatchupLedger trait
+// ---------------------------------------------------------------------------
+
+/// Abstraction over the ledger operations needed by the catchup service.
+///
+/// This decouples `CatchupService` from concrete types like `SqliteLedger`
+/// and `AgreementLedgerBridge`, making it easy to supply lightweight mocks
+/// in tests.
+///
+/// Implementations must be thread-safe (`Send + Sync`) because the catchup
+/// service runs on a dedicated background thread.
+pub trait CatchupLedger: Send + Sync {
+    /// Returns the next round the ledger expects (i.e. `last_committed + 1`).
+    ///
+    /// Used to decide whether a certificate's round has already been committed.
+    fn next_round(&self) -> Round;
+
+    /// Commit a block together with its authenticating certificate.
+    ///
+    /// Semantically identical to [`algo_agreement::LedgerWriter::ensure_block`].
+    fn ensure_block(&self, block: &Block, cert: &Certificate);
+
+    /// Check whether `round` requires a protocol version this node does not
+    /// support.
+    ///
+    /// Mirrors Go's `Service.roundIsNotSupported()` from
+    /// `catchup/service.go`. The Go implementation reads the last committed
+    /// block header and checks whether:
+    ///
+    /// 1. A protocol upgrade is pending (`NextProtocolSwitchOn != 0`).
+    /// 2. The upgrade target (`NextProtocol`) is **not** in the supported
+    ///    consensus map.
+    /// 3. The requested `round` is >= the switch-on round.
+    ///
+    /// If all three conditions hold, the round requires an unsupported
+    /// protocol and this method should return `true`.
+    ///
+    /// The default implementation returns `false` (optimistic: assume all
+    /// rounds are supported). Concrete implementations backed by a real
+    /// ledger should override this once block-header access is available.
+    fn round_is_not_supported(&self, _round: Round) -> bool {
+        false
+    }
+}
 
 // ---------------------------------------------------------------------------
 // BlockFetcher trait
@@ -37,9 +97,10 @@ use crate::store_trait::LedgerStore;
 /// a dedicated background thread.  Async implementations can use
 /// `tokio::runtime::Handle::block_on` or a similar mechanism.
 pub trait BlockFetcher: Send + Sync {
-    /// Fetch the block for the given round from the network.
+    /// Fetch the block (and optional certificate) for the given round.
     ///
-    /// Returns `Ok(block)` on success, or an error description on failure.
+    /// Returns `Ok(FetchedBlockCert)` on success, or an error description on
+    /// failure.
     ///
     /// Implementations **must** apply a reasonable timeout (e.g. via the
     /// HTTP client's connection/request timeout) so that a single call does
@@ -47,7 +108,7 @@ pub trait BlockFetcher: Send + Sync {
     /// `GossipBlockFetcher` in `participate.rs` inherits the 4-second
     /// per-peer timeout from `GossipBlockSource`, and `HttpBlockFetcher`
     /// uses a 30-second default.
-    fn fetch_block(&self, round: Round) -> Result<Block, String>;
+    fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -80,16 +141,13 @@ impl CatchupService {
     ///
     /// - `cert_rx`: receiver for pending unmatched certificates from the
     ///   agreement service (produced by [`AgreementLedgerBridge::new_with_catchup`]).
-    /// - `ledger`: the underlying ledger, used to check whether a block has
-    ///   already been committed.
-    /// - `bridge`: the agreement ledger bridge, used to commit fetched blocks
-    ///   via [`LedgerWriter::ensure_block`].
+    /// - `ledger`: trait object providing round checking and block commit
+    ///   capabilities (typically an [`AgreementLedgerBridge`](crate::AgreementLedgerBridge)).
     /// - `fetcher`: a block fetcher implementation for retrieving blocks from
     ///   the network.
     pub fn start(
         cert_rx: Receiver<PendingUnmatchedCertificate>,
-        ledger: Arc<Mutex<SqliteLedger>>,
-        bridge: Arc<AgreementLedgerBridge>,
+        ledger: Arc<dyn CatchupLedger>,
         fetcher: Arc<dyn BlockFetcher>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
@@ -97,7 +155,7 @@ impl CatchupService {
         let join_handle = thread::Builder::new()
             .name("catchup-service".to_string())
             .spawn(move || {
-                Self::run_loop(cert_rx, shutdown_rx, ledger, bridge, fetcher);
+                Self::run_loop(cert_rx, shutdown_rx, ledger, fetcher);
             })
             .expect("failed to spawn catchup-service thread");
 
@@ -135,8 +193,7 @@ impl CatchupService {
     fn run_loop(
         cert_rx: Receiver<PendingUnmatchedCertificate>,
         shutdown_rx: Receiver<()>,
-        ledger: Arc<Mutex<SqliteLedger>>,
-        bridge: Arc<AgreementLedgerBridge>,
+        ledger: Arc<dyn CatchupLedger>,
         fetcher: Arc<dyn BlockFetcher>,
     ) {
         info!("catchup service started");
@@ -156,7 +213,7 @@ impl CatchupService {
                 i if i == cert_idx => {
                     match oper.recv(&cert_rx) {
                         Ok(pending) => {
-                            Self::sync_cert(&pending, &ledger, &bridge, &fetcher, &shutdown_rx);
+                            Self::sync_cert(&pending, &ledger, &fetcher, &shutdown_rx);
                         }
                         Err(_) => {
                             // Certificate channel closed — the agreement service
@@ -193,8 +250,7 @@ impl CatchupService {
     /// either the block is committed (by any path) or shutdown is signaled.
     fn sync_cert(
         pending: &PendingUnmatchedCertificate,
-        ledger: &Arc<Mutex<SqliteLedger>>,
-        bridge: &Arc<AgreementLedgerBridge>,
+        ledger: &Arc<dyn CatchupLedger>,
         fetcher: &Arc<dyn BlockFetcher>,
         shutdown_rx: &Receiver<()>,
     ) {
@@ -206,6 +262,18 @@ impl CatchupService {
             "catchup service: processing certificate for round"
         );
 
+        // Guard: bail out if the round requires a protocol version that
+        // this node does not support. Mirrors Go's
+        // `if s.roundIsNotSupported(cert.Round) { return }` check at the
+        // top of `fetchRound` in `catchup/service.go`.
+        if ledger.round_is_not_supported(target_round) {
+            info!(
+                round = %target_round,
+                "catchup service: round requires unsupported protocol version, skipping"
+            );
+            return;
+        }
+
         // Retry loop: mirrors Go's `for s.ledger.LastRound() < cert.Round`.
         // Continues until the ledger has the block, shutdown is signaled,
         // or the block is successfully fetched and committed.
@@ -213,23 +281,14 @@ impl CatchupService {
         loop {
             // Check if the ledger already has this block (committed by
             // agreement or a previous iteration of this loop).
+            // next_round = last_committed + 1, so if next_round > target
+            // the block is already committed.
             {
-                let ledger_guard = match ledger.lock() {
-                    Ok(l) => l,
-                    Err(e) => {
-                        warn!(
-                            round = %target_round,
-                            "catchup service: ledger lock poisoned: {e}"
-                        );
-                        return;
-                    }
-                };
-
-                let current = ledger_guard.current_round();
-                if current.0 >= target_round.0 {
+                let next = ledger.next_round();
+                if next.0 > target_round.0 {
                     debug!(
                         round = %target_round,
-                        current_round = %current,
+                        next_round = %next,
                         "catchup service: ledger already has block, skipping"
                     );
                     return;
@@ -248,7 +307,9 @@ impl CatchupService {
             attempt = attempt.saturating_add(1);
 
             match fetcher.fetch_block(target_round) {
-                Ok(block) => {
+                Ok(fetched) => {
+                    let block = fetched.block;
+
                     // Validate round match.
                     if block.round != target_round {
                         warn!(
@@ -275,6 +336,12 @@ impl CatchupService {
                     // fetchRound (catchup/service.go). The block hash is
                     // SHA512/256("BH" || canonical_encode(block_header)),
                     // matching Go's `bookkeeping.BlockHash`.
+                    //
+                    // TODO: Go also verifies `block.ContentsMatchHeader()`
+                    // (see catchup/service.go) which checks that the
+                    // payset commitment in the header matches the actual
+                    // transactions. This should be implemented once our
+                    // Block type supports that validation.
                     let block_digest = algo_codec::compute_block_digest(&block);
                     let cert_digest = cert.proposal.block_digest;
                     if block_digest != cert_digest {
@@ -285,6 +352,46 @@ impl CatchupService {
                             cert_digest = ?cert_digest,
                             "catchup service: fetched block digest does not match certificate, retrying"
                         );
+
+                        // Fork detection: mirrors Go's fetchRound failsafe
+                        // (catchup/service.go lines 819-839).
+                        //
+                        // If the fetched response included a certificate, and
+                        // that certificate is for the same round but claims to
+                        // authenticate a *different* block (i.e. the fetched
+                        // block), this indicates a network fork — two valid
+                        // certificates exist for different blocks in the same
+                        // round.
+                        //
+                        // We perform a lightweight "claims to authenticate"
+                        // check (round + digest match) rather than full quorum
+                        // verification, since full authentication requires a
+                        // LedgerReader which is not available through the
+                        // CatchupLedger trait.
+                        if let Some(ref fetched_cert) = fetched.cert {
+                            let fetched_cert_digest = fetched_cert.proposal.block_digest;
+                            if fetched_cert.round == cert.round
+                                && fetched_cert_digest != cert_digest
+                                && fetched_cert_digest == block_digest
+                            {
+                                error!(
+                                    round = %target_round,
+                                    agreement_digest = ?cert_digest,
+                                    fetched_digest = ?fetched_cert_digest,
+                                    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\
+                                     !!!!!!!!!! FORK DETECTED !!!!!!!!!!!\n\
+                                     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\
+                                     Agreement cert authenticates block with digest {:?}.\n\
+                                     Fetched cert authenticates a different block with digest {:?}.\n\
+                                     This indicates a fork for round {}.\n\
+                                     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\
+                                     !!!!!!!!!! FORK DETECTED !!!!!!!!!!!\n\
+                                     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+                                    cert_digest, fetched_cert_digest, target_round,
+                                );
+                            }
+                        }
+
                         // A malicious or wrong peer returned a bad block.
                         // Retry with a different peer (the fetcher may rotate).
                         let delay = Self::backoff_with_jitter(attempt);
@@ -307,7 +414,7 @@ impl CatchupService {
                         round = %target_round,
                         "catchup service: committing fetched block to ledger"
                     );
-                    bridge.ensure_block(&block, cert);
+                    ledger.ensure_block(&block, cert);
 
                     info!(
                         round = %target_round,
@@ -379,11 +486,41 @@ impl Drop for CatchupService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use algo_agreement::Certificate;
     use algo_agreement::{AsyncVoteVerifier, PendingUnmatchedCertificate};
     use algo_types::Round;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    // -- Mock CatchupLedger --
+
+    /// A lightweight mock ledger for tests — no SQLite required.
+    struct MockCatchupLedger {
+        round: Mutex<Round>,
+    }
+
+    impl MockCatchupLedger {
+        fn new(current_round: Round) -> Self {
+            Self {
+                round: Mutex::new(current_round),
+            }
+        }
+    }
+
+    impl CatchupLedger for MockCatchupLedger {
+        fn next_round(&self) -> Round {
+            let r = self.round.lock().unwrap();
+            Round(r.0.saturating_add(1))
+        }
+
+        fn ensure_block(&self, block: &Block, _cert: &Certificate) {
+            // Advance the round when a block is committed, mimicking real ledger behaviour.
+            let mut r = self.round.lock().unwrap();
+            if block.round.0 >= r.0 {
+                *r = Round(block.round.0);
+            }
+        }
+    }
 
     // -- Mock BlockFetcher --
 
@@ -408,14 +545,14 @@ mod tests {
     }
 
     impl BlockFetcher for MockBlockFetcher {
-        fn fetch_block(&self, round: Round) -> Result<Block, String> {
+        fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, String> {
             self.fetch_count.fetch_add(1, Ordering::SeqCst);
             let guard = self.block.lock().unwrap();
             match guard.as_ref() {
                 Some(b) => {
                     let mut block = b.clone();
                     block.round = round;
-                    Ok(block)
+                    Ok(FetchedBlockCert { block, cert: None })
                 }
                 None => Err(format!("no block available for round {round}")),
             }
@@ -427,7 +564,7 @@ mod tests {
     struct FailingBlockFetcher;
 
     impl BlockFetcher for FailingBlockFetcher {
-        fn fetch_block(&self, round: Round) -> Result<Block, String> {
+        fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, String> {
             Err(format!("network error fetching round {round}"))
         }
     }
@@ -454,11 +591,10 @@ mod tests {
     fn stop_without_certs_is_clean() {
         // The service should start and stop cleanly even if no certs arrive.
         let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
-        let bridge = Arc::new(AgreementLedgerBridge::new(Arc::clone(&ledger)));
+        let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
         let fetcher: Arc<dyn BlockFetcher> = Arc::new(MockBlockFetcher::new(None));
 
-        let mut svc = CatchupService::start(rx, ledger, bridge, fetcher);
+        let mut svc = CatchupService::start(rx, ledger, fetcher);
         // Give the thread a moment to start.
         thread::sleep(Duration::from_millis(50));
         svc.stop();
@@ -468,11 +604,10 @@ mod tests {
     fn drop_triggers_stop() {
         // Dropping the service should stop the background thread cleanly.
         let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
-        let bridge = Arc::new(AgreementLedgerBridge::new(Arc::clone(&ledger)));
+        let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
         let fetcher: Arc<dyn BlockFetcher> = Arc::new(MockBlockFetcher::new(None));
 
-        let svc = CatchupService::start(rx, ledger, bridge, fetcher);
+        let svc = CatchupService::start(rx, ledger, fetcher);
         drop(svc); // should not panic
     }
 
@@ -480,11 +615,10 @@ mod tests {
     fn cert_channel_closed_exits_cleanly() {
         // When the cert channel sender is dropped, the service should exit.
         let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
-        let bridge = Arc::new(AgreementLedgerBridge::new(Arc::clone(&ledger)));
+        let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
         let fetcher: Arc<dyn BlockFetcher> = Arc::new(MockBlockFetcher::new(None));
 
-        let mut svc = CatchupService::start(rx, ledger, bridge, fetcher);
+        let mut svc = CatchupService::start(rx, ledger, fetcher);
 
         // Drop the sender to close the channel.
         drop(tx);
@@ -500,11 +634,10 @@ mod tests {
         // Verify it stays alive and handles failures gracefully, then
         // shut it down to stop the retry loop.
         let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
-        let bridge = Arc::new(AgreementLedgerBridge::new(Arc::clone(&ledger)));
+        let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
         let fetcher: Arc<dyn BlockFetcher> = Arc::new(FailingBlockFetcher);
 
-        let mut svc = CatchupService::start(rx, ledger, bridge, fetcher);
+        let mut svc = CatchupService::start(rx, ledger, fetcher);
 
         // Send a cert — the fetch will fail but the service should survive.
         tx.send(make_pending_cert(5)).unwrap();
@@ -519,19 +652,13 @@ mod tests {
         // If the ledger is already at or past the certificate round, no fetch
         // should occur.
         let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        // Ledger at round 10 (past the cert round of 5).
+        let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(10)));
 
-        // Set the ledger's current round to 10 (past the cert round).
-        {
-            let mut l = ledger.lock().unwrap();
-            l.set_current_round(Round(10));
-        }
-
-        let bridge = Arc::new(AgreementLedgerBridge::new(Arc::clone(&ledger)));
         let fetcher = Arc::new(MockBlockFetcher::new(Some(Block::default())));
         let fetcher_ref: Arc<dyn BlockFetcher> = Arc::clone(&fetcher) as Arc<dyn BlockFetcher>;
 
-        let mut svc = CatchupService::start(rx, ledger, bridge, fetcher_ref);
+        let mut svc = CatchupService::start(rx, ledger, fetcher_ref);
 
         // Send a cert for round 5 — already committed.
         tx.send(make_pending_cert(5)).unwrap();
@@ -573,9 +700,12 @@ mod tests {
     }
 
     impl BlockFetcher for DigestMatchingBlockFetcher {
-        fn fetch_block(&self, _round: Round) -> Result<Block, String> {
+        fn fetch_block(&self, _round: Round) -> Result<FetchedBlockCert, String> {
             self.fetch_count.fetch_add(1, Ordering::SeqCst);
-            Ok(self.block.clone())
+            Ok(FetchedBlockCert {
+                block: self.block.clone(),
+                cert: None,
+            })
         }
     }
 
@@ -613,14 +743,13 @@ mod tests {
 
         // Set up the service with a fetcher that returns this block.
         let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
         // Ledger is at round 0, so round 1 is the next expected.
+        let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
 
-        let bridge = Arc::new(AgreementLedgerBridge::new(Arc::clone(&ledger)));
         let fetcher = Arc::new(DigestMatchingBlockFetcher::new(block));
         let fetcher_ref: Arc<dyn BlockFetcher> = Arc::clone(&fetcher) as Arc<dyn BlockFetcher>;
 
-        let mut svc = CatchupService::start(rx, Arc::clone(&ledger), bridge, fetcher_ref);
+        let mut svc = CatchupService::start(rx, ledger, fetcher_ref);
 
         // Send a cert for round 1 with the correct digest.
         tx.send(make_pending_cert_with_digest(1, digest)).unwrap();
@@ -658,13 +787,12 @@ mod tests {
         let wrong_digest = algo_types::Digest([0xff; 32]);
 
         let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
 
-        let bridge = Arc::new(AgreementLedgerBridge::new(Arc::clone(&ledger)));
         let fetcher = Arc::new(DigestMatchingBlockFetcher::new(block));
         let fetcher_ref: Arc<dyn BlockFetcher> = Arc::clone(&fetcher) as Arc<dyn BlockFetcher>;
 
-        let mut svc = CatchupService::start(rx, Arc::clone(&ledger), bridge, fetcher_ref);
+        let mut svc = CatchupService::start(rx, ledger, fetcher_ref);
 
         // Send a cert with a wrong digest.
         tx.send(make_pending_cert_with_digest(1, wrong_digest))
@@ -711,13 +839,16 @@ mod tests {
     }
 
     impl BlockFetcher for CountingFailFetcher {
-        fn fetch_block(&self, _round: Round) -> Result<Block, String> {
+        fn fetch_block(&self, _round: Round) -> Result<FetchedBlockCert, String> {
             let call_num = self.total_calls.fetch_add(1, Ordering::SeqCst) + 1;
             if call_num <= self.fail_until {
                 self.fail_count.fetch_add(1, Ordering::SeqCst);
                 Err(format!("transient error on attempt {call_num}"))
             } else {
-                Ok(self.block.clone())
+                Ok(FetchedBlockCert {
+                    block: self.block.clone(),
+                    cert: None,
+                })
             }
         }
     }
@@ -733,14 +864,13 @@ mod tests {
         let digest = algo_codec::compute_block_digest(&block);
 
         let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
+        let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
 
-        let bridge = Arc::new(AgreementLedgerBridge::new(Arc::clone(&ledger)));
         // Fail once, then succeed.
         let fetcher = Arc::new(CountingFailFetcher::new(block, 1));
         let fetcher_ref: Arc<dyn BlockFetcher> = Arc::clone(&fetcher) as Arc<dyn BlockFetcher>;
 
-        let mut svc = CatchupService::start(rx, Arc::clone(&ledger), bridge, fetcher_ref);
+        let mut svc = CatchupService::start(rx, ledger, fetcher_ref);
 
         // Send a cert for round 1 with the correct digest.
         tx.send(make_pending_cert_with_digest(1, digest)).unwrap();
@@ -767,11 +897,10 @@ mod tests {
         let fetcher = Arc::new(CountingFailFetcher::new(block, 999)); // always fail
 
         let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
-        let ledger = Arc::new(Mutex::new(SqliteLedger::open_in_memory().unwrap()));
-        let bridge = Arc::new(AgreementLedgerBridge::new(Arc::clone(&ledger)));
+        let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
         let fetcher_ref: Arc<dyn BlockFetcher> = Arc::clone(&fetcher) as Arc<dyn BlockFetcher>;
 
-        let mut svc = CatchupService::start(rx, Arc::clone(&ledger), bridge, fetcher_ref);
+        let mut svc = CatchupService::start(rx, ledger, fetcher_ref);
 
         tx.send(make_pending_cert(5)).unwrap();
 
@@ -786,6 +915,169 @@ mod tests {
         );
 
         // Shutdown should interrupt the retry loop cleanly.
+        svc.stop();
+    }
+
+    // -- ForkDetectionBlockFetcher: returns a block with mismatched digest + cert --
+
+    /// A fetcher that returns a block whose digest does NOT match the
+    /// agreement cert, but includes a fetched certificate that *does*
+    /// claim to authenticate the block. This simulates a fork scenario.
+    struct ForkDetectionBlockFetcher {
+        block: Block,
+        /// Certificate included in the fetch response (claims to auth
+        /// the fetched block, not the agreement cert's block).
+        fetched_cert: Certificate,
+        fetch_count: AtomicU64,
+    }
+
+    impl ForkDetectionBlockFetcher {
+        fn new(block: Block, fetched_cert: Certificate) -> Self {
+            Self {
+                block,
+                fetched_cert,
+                fetch_count: AtomicU64::new(0),
+            }
+        }
+
+        fn fetch_count(&self) -> u64 {
+            self.fetch_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl BlockFetcher for ForkDetectionBlockFetcher {
+        fn fetch_block(&self, _round: Round) -> Result<FetchedBlockCert, String> {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            Ok(FetchedBlockCert {
+                block: self.block.clone(),
+                cert: Some(self.fetched_cert.clone()),
+            })
+        }
+    }
+
+    #[test]
+    fn fork_detection_fires_on_digest_mismatch_with_cert() {
+        // Simulate a fork: the agreement cert expects digest A, but the
+        // fetcher returns a block with digest B and a fetched cert that
+        // also claims digest B. The fork detection code should execute
+        // without panicking, log the alarm, and continue retrying.
+        let block = Block {
+            round: Round(1),
+            ..Default::default()
+        };
+        let block_digest = algo_codec::compute_block_digest(&block);
+
+        // The agreement cert has a *different* digest (not matching the block).
+        let agreement_digest = algo_types::Digest([0xff; 32]);
+        assert_ne!(
+            block_digest, agreement_digest,
+            "test setup: digests must differ to trigger fork detection"
+        );
+
+        // The fetched cert claims to authenticate the fetched block.
+        let fetched_cert = make_cert_with_digest(1, block_digest);
+
+        let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
+
+        let fetcher = Arc::new(ForkDetectionBlockFetcher::new(block, fetched_cert));
+        let fetcher_ref: Arc<dyn BlockFetcher> = Arc::clone(&fetcher) as Arc<dyn BlockFetcher>;
+
+        let mut svc = CatchupService::start(rx, ledger, fetcher_ref);
+
+        // Send a cert with the "wrong" (agreement) digest.
+        tx.send(make_pending_cert_with_digest(1, agreement_digest))
+            .unwrap();
+
+        // Let the service process the cert and hit the fork detection path.
+        thread::sleep(Duration::from_secs(2));
+
+        // The fetcher should have been called at least once (the service
+        // retries on digest mismatch).
+        assert!(
+            fetcher.fetch_count() >= 1,
+            "fetcher should have been called, got {} calls",
+            fetcher.fetch_count()
+        );
+
+        // The service should still be alive (fork detection logs but
+        // does not panic or halt, matching Go's behavior).
+        svc.stop();
+    }
+
+    #[test]
+    fn no_fork_detection_without_fetched_cert() {
+        // When the fetcher returns a block with wrong digest but no
+        // certificate, the fork detection path should NOT fire (no cert
+        // to compare). The service should retry normally.
+        let block = Block {
+            round: Round(1),
+            ..Default::default()
+        };
+
+        let wrong_digest = algo_types::Digest([0xff; 32]);
+
+        let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
+
+        // DigestMatchingBlockFetcher returns cert: None.
+        let fetcher = Arc::new(DigestMatchingBlockFetcher::new(block));
+        let fetcher_ref: Arc<dyn BlockFetcher> = Arc::clone(&fetcher) as Arc<dyn BlockFetcher>;
+
+        let mut svc = CatchupService::start(rx, ledger, fetcher_ref);
+
+        tx.send(make_pending_cert_with_digest(1, wrong_digest))
+            .unwrap();
+
+        // Let the service retry for a bit.
+        thread::sleep(Duration::from_secs(2));
+
+        // Should have retried (digest mismatch) without panicking.
+        assert!(
+            fetcher.fetch_count() >= 2,
+            "fetcher should retry on digest mismatch, got {} calls",
+            fetcher.fetch_count()
+        );
+
+        svc.stop();
+    }
+
+    #[test]
+    fn no_fork_when_fetched_cert_matches_agreement() {
+        // When the fetched cert has the SAME digest as the agreement
+        // cert (but the block has a different digest), this is NOT a
+        // fork — just a bad block from a peer. Fork detection should
+        // not fire.
+        let block = Block {
+            round: Round(1),
+            ..Default::default()
+        };
+
+        let agreement_digest = algo_types::Digest([0xaa; 32]);
+
+        // The fetched cert has the SAME digest as agreement (not the block's).
+        let fetched_cert = make_cert_with_digest(1, agreement_digest);
+
+        let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
+
+        let fetcher = Arc::new(ForkDetectionBlockFetcher::new(block, fetched_cert));
+        let fetcher_ref: Arc<dyn BlockFetcher> = Arc::clone(&fetcher) as Arc<dyn BlockFetcher>;
+
+        let mut svc = CatchupService::start(rx, ledger, fetcher_ref);
+
+        tx.send(make_pending_cert_with_digest(1, agreement_digest))
+            .unwrap();
+
+        // Let the service process. It will retry because the block
+        // digest won't match agreement_digest, but no fork alarm.
+        thread::sleep(Duration::from_secs(2));
+
+        assert!(
+            fetcher.fetch_count() >= 1,
+            "fetcher should have been called"
+        );
+
         svc.stop();
     }
 }

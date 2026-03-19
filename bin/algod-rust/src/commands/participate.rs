@@ -12,7 +12,8 @@ use algo_codec::{canonical_encode_signed_txn_in_block, canonical_encode_transact
 use algo_ledger::participation::ParticipationStore;
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{
-    AgreementKeyManagerBridge, AgreementLedgerBridge, BlockFetcher, CatchupService, SqliteLedger,
+    AgreementKeyManagerBridge, AgreementLedgerBridge, BlockFetcher, CatchupService,
+    FetchedBlockCert, SqliteLedger,
 };
 use algo_network::{
     AgreementNetworkBridge, GossipNode, Phonebook, WebsocketNetwork, WebsocketNetworkConfig,
@@ -20,7 +21,7 @@ use algo_network::{
 };
 use algo_pool::{PoolConfig, TransactionPool};
 use algo_rest_client::GossipBlockSource;
-use algo_types::{AccountData, Address, Block, BlockHeader, Round, TxnType};
+use algo_types::{AccountData, Address, BlockHeader, Round, TxnType};
 use algo_validate::merkle::{compute_payset_merkle_root, compute_vector_commitment, HashAlgo};
 use algo_validate::rules::{has_txn256, has_txn512};
 use algo_validate::signature::verify_transaction_signature;
@@ -83,7 +84,7 @@ struct GossipBlockFetcher {
 }
 
 impl BlockFetcher for GossipBlockFetcher {
-    fn fetch_block(&self, round: Round) -> Result<Block, String> {
+    fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, String> {
         // SAFETY: This is called from the CatchupService's background std::thread,
         // NOT from a tokio worker thread. Calling block_on from within the tokio
         // runtime would panic.
@@ -101,7 +102,37 @@ impl BlockFetcher for GossipBlockFetcher {
                 .get_block(round)
                 .await
                 .map_err(|e| format!("block fetch failed for round {}: {}", round, e))?;
-            Ok(response.block)
+
+            // Try to parse the gossip response's certificate data
+            // (rmpv::Value) into a typed Certificate for fork detection.
+            // If parsing fails, gracefully degrade to cert: None — the
+            // catchup service already has the agreement cert and can
+            // still commit blocks; fork detection just won't fire.
+            //
+            // The rmpv::Value preserves Go's codec tags ("rnd", "per",
+            // "prop", etc.) as map keys. We re-encode to bytes and then
+            // use the agreement codec's `decode_bundle` which understands
+            // those tags, rather than rmp_serde which expects Rust field
+            // names.
+            let cert = response.cert.and_then(|val| {
+                let mut bytes = Vec::new();
+                rmpv::encode::write_value(&mut bytes, &val).ok()?;
+                match algo_agreement::codec::decode_bundle(&bytes) {
+                    Ok(bundle) => Some(algo_agreement::Certificate::from_bundle(&bundle)),
+                    Err(e) => {
+                        tracing::debug!(
+                            round = %round,
+                            error = %e,
+                            "could not parse fetched certificate, fork detection unavailable for this block"
+                        );
+                        None
+                    }
+                }
+            });
+            Ok(FetchedBlockCert {
+                block: response.block,
+                cert,
+            })
         })
     }
 }
@@ -1009,8 +1040,10 @@ impl SimpleBlockEvaluator {
     fn get_account_data(&mut self, addr: &Address) -> Option<AccountData> {
         let mut acct = self.snapshot.get_account(addr, &self.ledger)?;
         if let Some(deltas) = self.overlay.get_resource_deltas(addr) {
-            acct.total_assets_opted_in =
-                apply_delta(acct.total_assets_opted_in, deltas.delta_total_assets_opted_in);
+            acct.total_assets_opted_in = apply_delta(
+                acct.total_assets_opted_in,
+                deltas.delta_total_assets_opted_in,
+            );
             acct.total_created_assets =
                 apply_delta(acct.total_created_assets, deltas.delta_total_created_assets);
             acct.total_apps_opted_in =
@@ -1340,26 +1373,20 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                         // Asset create: creator gets +1 total_created_assets
                         // and +1 total_assets_opted_in (auto-holding).
                         // Mirrors Go's asset.go:87-88.
-                        self.overlay.mutate_resource_deltas_tracked(
-                            sender,
-                            &mut checkpoint,
-                            |d| {
+                        self.overlay
+                            .mutate_resource_deltas_tracked(sender, &mut checkpoint, |d| {
                                 d.delta_total_created_assets += 1;
                                 d.delta_total_assets_opted_in += 1;
-                            },
-                        );
+                            });
                     } else if stx.txn.asset_params.is_none() {
                         // Asset destroy: creator gets -1 total_created_assets
                         // and -1 total_assets_opted_in (holding removed).
                         // Mirrors Go's asset.go:149-150.
-                        self.overlay.mutate_resource_deltas_tracked(
-                            sender,
-                            &mut checkpoint,
-                            |d| {
+                        self.overlay
+                            .mutate_resource_deltas_tracked(sender, &mut checkpoint, |d| {
                                 d.delta_total_created_assets -= 1;
                                 d.delta_total_assets_opted_in -= 1;
-                            },
-                        );
+                            });
                     }
                     // Reconfigure (config_asset != 0 && asset_params.is_some())
                     // does not change resource counts.
@@ -1373,13 +1400,10 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                         && stx.txn.asset_amount == 0
                         && stx.txn.asset_close_to.is_none()
                     {
-                        self.overlay.mutate_resource_deltas_tracked(
-                            sender,
-                            &mut checkpoint,
-                            |d| {
+                        self.overlay
+                            .mutate_resource_deltas_tracked(sender, &mut checkpoint, |d| {
                                 d.delta_total_assets_opted_in += 1;
-                            },
-                        );
+                            });
                     }
                     // Close-out: asset_close_to is set.
                     // Mirrors Go's asset.go:419 (TotalAssets -= 1).
@@ -1403,20 +1427,21 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
                         // App create: creator gets +1 total_created_apps,
                         // plus schema and extra pages.
                         // Mirrors Go's application.go:106-115.
-                        let global_schema =
-                            stx.txn.global_state_schema.as_ref().cloned().unwrap_or_default();
+                        let global_schema = stx
+                            .txn
+                            .global_state_schema
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_default();
                         let extra_pages = stx.txn.extra_program_pages;
-                        self.overlay.mutate_resource_deltas_tracked(
-                            sender,
-                            &mut checkpoint,
-                            |d| {
+                        self.overlay
+                            .mutate_resource_deltas_tracked(sender, &mut checkpoint, |d| {
                                 d.delta_total_created_apps += 1;
                                 d.delta_total_extra_app_pages += extra_pages as i64;
                                 d.delta_schema_num_uint += global_schema.num_uint as i64;
                                 d.delta_schema_num_byte_slice +=
                                     global_schema.num_byte_slice as i64;
-                            },
-                        );
+                            });
                     } else {
                         match stx.txn.on_completion {
                             1 => {
@@ -2012,8 +2037,9 @@ pub async fn run(
         rt_handle,
     });
 
-    let mut catchup_service =
-        CatchupService::start(cert_rx, ledger.clone(), catchup_bridge, block_fetcher);
+    let catchup_ledger: Arc<dyn algo_ledger::CatchupLedger> = catchup_bridge;
+
+    let mut catchup_service = CatchupService::start(cert_rx, catchup_ledger, block_fetcher);
     info!("catchup service started");
 
     // -----------------------------------------------------------------------
@@ -4777,9 +4803,9 @@ mod tests {
             last_valid: Round(1100),
             genesis_id: "test-v1".to_string(),
             genesis_hash: [0xAA; 32],
-            xaid: 99,                           // existing asset
-            asset_amount: 0,                    // opt-in amount
-            asset_receiver: Some(sender),       // self-transfer = opt-in
+            xaid: 99,                     // existing asset
+            asset_amount: 0,              // opt-in amount
+            asset_receiver: Some(sender), // self-transfer = opt-in
             ..Default::default()
         };
         let sig = sign_txn(&txn, &key);
@@ -4952,7 +4978,10 @@ mod tests {
             &ledger,
             &params,
             100,
-            &[(sender, sender_balance), (receiver, initial_receiver_balance)],
+            &[
+                (sender, sender_balance),
+                (receiver, initial_receiver_balance),
+            ],
         );
 
         // Build payment where receiver == close_remainder_to

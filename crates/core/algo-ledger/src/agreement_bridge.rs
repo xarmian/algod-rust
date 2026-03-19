@@ -632,6 +632,19 @@ impl LedgerWriter for AgreementLedgerBridge {
     }
 }
 
+impl crate::catchup_service::CatchupLedger for AgreementLedgerBridge {
+    fn next_round(&self) -> Round {
+        // Delegate to the LedgerReader implementation which already
+        // locks the inner SqliteLedger and returns current_round + 1.
+        <Self as LedgerReader>::next_round(self)
+    }
+
+    fn ensure_block(&self, block: &algo_types::Block, cert: &Certificate) {
+        // Delegate to the LedgerWriter implementation.
+        <Self as LedgerWriter>::ensure_block(self, block, cert);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
