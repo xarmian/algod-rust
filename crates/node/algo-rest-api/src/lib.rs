@@ -7,6 +7,7 @@ pub mod auth;
 pub mod error;
 pub mod format;
 pub mod handlers;
+pub mod models;
 pub mod node;
 pub mod router;
 pub mod server;

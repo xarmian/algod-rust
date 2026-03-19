@@ -140,6 +140,21 @@ pub trait LedgerStore {
     /// Returns `Vec<(u64, AppLocalState)>` — the app ID and local state.
     fn app_local_states_for_addr(&self, addr: &Address) -> Vec<(u64, AppLocalState)>;
 
+    /// Collect all asset holdings for a given address.
+    ///
+    /// Returns `Vec<(u64, AssetHolding)>` — the asset ID and holding.
+    fn asset_holdings_for_addr(&self, addr: &Address) -> Vec<(u64, AssetHolding)>;
+
+    /// Collect all created asset params for a given address.
+    ///
+    /// Returns `Vec<(u64, AssetParamsRecord)>` — the asset ID and params record.
+    fn created_assets_for_addr(&self, addr: &Address) -> Vec<(u64, AssetParamsRecord)>;
+
+    /// Collect all created app params for a given address.
+    ///
+    /// Returns `Vec<(u64, AppParams)>` — the app ID and params.
+    fn created_apps_for_addr(&self, addr: &Address) -> Vec<(u64, AppParams)>;
+
     // ---- Box Storage ----
 
     /// Read a box value. Returns `None` if the box does not exist.

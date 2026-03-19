@@ -4,13 +4,20 @@
 //! using `reqwest`, exercising the full request/response pipeline including
 //! routing, auth middleware, and handler logic.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use algo_rest_api::auth::generate_token;
-use algo_rest_api::node::{BuildVersion, NodeInterface, NodeStatus, ProtocolSwitchInfo};
+use algo_rest_api::node::{
+    AccountLookup, AppResourceLookup, AssetResourceLookup, BuildVersion, NodeInterface, NodeStatus,
+    ProtocolSwitchInfo,
+};
 use algo_rest_api::router::{build_router, TokenConfig};
-use algo_types::Digest;
+use algo_types::{
+    AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParams, ConsensusParams,
+    Digest, StateSchema,
+};
 use async_trait::async_trait;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -56,6 +63,16 @@ struct MockNode {
     wait_notify: Arc<Notify>,
     protocol_switch_info: ProtocolSwitchInfo,
     protocol_info_behavior: MockProtocolInfoBehavior,
+    /// Account lookup result. Keyed by address bytes for per-address control.
+    account_lookup: Option<AccountLookup>,
+    /// Asset resource lookup results, keyed by (address, asset_id).
+    asset_resource_lookups: BTreeMap<([u8; 32], u64), AssetResourceLookup>,
+    /// App resource lookup results, keyed by (address, app_id).
+    app_resource_lookups: BTreeMap<([u8; 32], u64), AppResourceLookup>,
+    /// Consensus params to return.
+    consensus_params: ConsensusParams,
+    /// Max API resources per account.
+    max_api_resources: u64,
 }
 
 impl Clone for MockNode {
@@ -74,6 +91,11 @@ impl Clone for MockNode {
             wait_notify: Arc::clone(&self.wait_notify),
             protocol_switch_info: self.protocol_switch_info.clone(),
             protocol_info_behavior: self.protocol_info_behavior.clone(),
+            account_lookup: self.account_lookup.clone(),
+            asset_resource_lookups: self.asset_resource_lookups.clone(),
+            app_resource_lookups: self.app_resource_lookups.clone(),
+            consensus_params: self.consensus_params.clone(),
+            max_api_resources: self.max_api_resources,
         }
     }
 }
@@ -140,6 +162,11 @@ impl MockNode {
                 next_protocol_switch_on: 0,
             },
             protocol_info_behavior: MockProtocolInfoBehavior::Ok,
+            account_lookup: None,
+            asset_resource_lookups: BTreeMap::new(),
+            app_resource_lookups: BTreeMap::new(),
+            consensus_params: ConsensusParams::default(),
+            max_api_resources: 100_000,
         }
     }
 
@@ -369,6 +396,70 @@ impl NodeInterface for MockNode {
             MockProtocolInfoBehavior::Ok => Ok(self.protocol_switch_info.clone()),
             MockProtocolInfoBehavior::Err(msg) => Err(msg.clone().into()),
         }
+    }
+
+    async fn lookup_account(
+        &self,
+        _addr: &Address,
+    ) -> Result<AccountLookup, Box<dyn std::error::Error + Send + Sync>> {
+        match &self.account_lookup {
+            Some(lookup) => Ok(lookup.clone()),
+            None => {
+                // Return zeroed account (matching go-algorand: non-existent accounts
+                // return zero values, not an error).
+                Ok(AccountLookup {
+                    account_data: AccountData::default(),
+                    last_round: 1000,
+                    amount_without_pending_rewards: 0,
+                    assets: BTreeMap::new(),
+                    created_assets: BTreeMap::new(),
+                    app_local_states: BTreeMap::new(),
+                    created_apps: BTreeMap::new(),
+                })
+            }
+        }
+    }
+
+    async fn lookup_asset_resource(
+        &self,
+        addr: &Address,
+        asset_id: u64,
+    ) -> Result<AssetResourceLookup, Box<dyn std::error::Error + Send + Sync>> {
+        let key = (addr.0, asset_id);
+        match self.asset_resource_lookups.get(&key) {
+            Some(lookup) => Ok(lookup.clone()),
+            None => Ok(AssetResourceLookup {
+                asset_holding: None,
+                asset_params: None,
+                last_round: 1000,
+            }),
+        }
+    }
+
+    async fn lookup_app_resource(
+        &self,
+        addr: &Address,
+        app_id: u64,
+    ) -> Result<AppResourceLookup, Box<dyn std::error::Error + Send + Sync>> {
+        let key = (addr.0, app_id);
+        match self.app_resource_lookups.get(&key) {
+            Some(lookup) => Ok(lookup.clone()),
+            None => Ok(AppResourceLookup {
+                app_local_state: None,
+                app_params: None,
+                last_round: 1000,
+            }),
+        }
+    }
+
+    async fn consensus_params(
+        &self,
+    ) -> Result<ConsensusParams, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.consensus_params.clone())
+    }
+
+    fn max_api_resources_per_account(&self) -> u64 {
+        self.max_api_resources
     }
 }
 
@@ -1405,4 +1496,953 @@ async fn wait_for_block_returns_400_on_round_overflow() {
 
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["message"].as_str().unwrap(), "round overflow");
+}
+
+// ===========================================================================
+// Account information endpoint tests (GET /v2/accounts/:address)
+// ===========================================================================
+
+/// Helper: a valid Algorand address string for use in tests.
+/// This is the zero address (all zeros + valid checksum).
+const TEST_ADDR: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ";
+
+/// Helper: create a MockNode with a configured account lookup.
+fn mock_node_with_account(lookup: AccountLookup) -> MockNode {
+    let mut node = MockNode::synced();
+    node.account_lookup = Some(lookup);
+    node
+}
+
+/// Helper: create a MockNode with an asset resource lookup for (addr, asset_id).
+fn mock_node_with_asset_resource(
+    addr: &Address,
+    asset_id: u64,
+    lookup: AssetResourceLookup,
+) -> MockNode {
+    let mut node = MockNode::synced();
+    node.asset_resource_lookups
+        .insert((addr.0, asset_id), lookup);
+    node
+}
+
+/// Helper: create a MockNode with an app resource lookup for (addr, app_id).
+fn mock_node_with_app_resource(addr: &Address, app_id: u64, lookup: AppResourceLookup) -> MockNode {
+    let mut node = MockNode::synced();
+    node.app_resource_lookups.insert((addr.0, app_id), lookup);
+    node
+}
+
+#[tokio::test]
+async fn account_info_returns_200_with_correct_fields() {
+    let lookup = AccountLookup {
+        account_data: AccountData {
+            micro_algos: 5_000_000,
+            rewards_base: 100,
+            rewarded_micro_algos: 500,
+            status: algo_types::AccountStatus::Online,
+            total_assets_opted_in: 2,
+            total_created_assets: 1,
+            total_apps_opted_in: 1,
+            total_created_apps: 0,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 4_999_500,
+        assets: BTreeMap::new(),
+        created_assets: BTreeMap::new(),
+        app_local_states: BTreeMap::new(),
+        created_apps: BTreeMap::new(),
+    };
+    let server = TestServer::start(mock_node_with_account(lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    // Verify key fields
+    assert_eq!(body["address"].as_str().unwrap(), TEST_ADDR);
+    assert_eq!(body["amount"].as_u64().unwrap(), 5_000_000);
+    assert_eq!(
+        body["amount-without-pending-rewards"].as_u64().unwrap(),
+        4_999_500
+    );
+    assert_eq!(body["pending-rewards"].as_u64().unwrap(), 500);
+    assert_eq!(body["rewards"].as_u64().unwrap(), 500);
+    assert_eq!(body["status"].as_str().unwrap(), "Online");
+    assert_eq!(body["round"].as_u64().unwrap(), 1000);
+    assert_eq!(body["total-assets-opted-in"].as_u64().unwrap(), 2);
+    assert_eq!(body["total-created-assets"].as_u64().unwrap(), 1);
+    assert_eq!(body["total-apps-opted-in"].as_u64().unwrap(), 1);
+    assert_eq!(body["total-created-apps"].as_u64().unwrap(), 0);
+    // min-balance should be present
+    assert!(
+        body.get("min-balance").is_some(),
+        "should have min-balance field"
+    );
+}
+
+#[tokio::test]
+async fn account_info_nonexistent_account_returns_200_with_zeros() {
+    // MockNode with no account_lookup configured returns zeroed AccountData
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    // Non-existent accounts return 200 with zero values, NOT 404
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["amount"].as_u64().unwrap(), 0);
+    assert_eq!(body["status"].as_str().unwrap(), "Offline");
+    assert_eq!(body["round"].as_u64().unwrap(), 1000);
+}
+
+#[tokio::test]
+async fn account_info_exclude_all_omits_resource_lists() {
+    let lookup = AccountLookup {
+        account_data: AccountData {
+            micro_algos: 1_000_000,
+            total_assets_opted_in: 1,
+            total_created_assets: 1,
+            total_apps_opted_in: 1,
+            total_created_apps: 1,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 1_000_000,
+        assets: BTreeMap::new(),
+        created_assets: BTreeMap::new(),
+        app_local_states: BTreeMap::new(),
+        created_apps: BTreeMap::new(),
+    };
+    let server = TestServer::start(mock_node_with_account(lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}?exclude=all", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    // Resource lists should be absent with exclude=all
+    assert!(
+        body.get("assets").is_none(),
+        "assets should be absent with exclude=all"
+    );
+    assert!(
+        body.get("created-assets").is_none(),
+        "created-assets should be absent with exclude=all"
+    );
+    assert!(
+        body.get("apps-local-state").is_none(),
+        "apps-local-state should be absent with exclude=all"
+    );
+    assert!(
+        body.get("created-apps").is_none(),
+        "created-apps should be absent with exclude=all"
+    );
+
+    // But counts should still be present
+    assert_eq!(body["total-assets-opted-in"].as_u64().unwrap(), 1);
+    assert_eq!(body["total-created-assets"].as_u64().unwrap(), 1);
+    assert_eq!(body["total-apps-opted-in"].as_u64().unwrap(), 1);
+    assert_eq!(body["total-created-apps"].as_u64().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn account_info_exclude_none_returns_full_info() {
+    let lookup = AccountLookup {
+        account_data: AccountData {
+            micro_algos: 1_000_000,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 1_000_000,
+        assets: BTreeMap::new(),
+        created_assets: BTreeMap::new(),
+        app_local_states: BTreeMap::new(),
+        created_apps: BTreeMap::new(),
+    };
+    let server = TestServer::start(mock_node_with_account(lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}?exclude=none", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    // Resource lists should be present (as empty arrays) with exclude=none
+    assert!(
+        body.get("assets").is_some(),
+        "assets should be present with exclude=none"
+    );
+    assert!(
+        body.get("created-assets").is_some(),
+        "created-assets should be present with exclude=none"
+    );
+    assert!(
+        body.get("apps-local-state").is_some(),
+        "apps-local-state should be present with exclude=none"
+    );
+    assert!(
+        body.get("created-apps").is_some(),
+        "created-apps should be present with exclude=none"
+    );
+}
+
+#[tokio::test]
+async fn account_info_invalid_exclude_returns_400() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}?exclude=invalid", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["message"].as_str().unwrap(), "failed to parse exclude");
+}
+
+#[tokio::test]
+async fn account_info_invalid_address_returns_400() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/accounts/not-a-valid-address"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "failed to parse the address"
+    );
+}
+
+#[tokio::test]
+async fn account_info_msgpack_format_returns_msgpack_content_type() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}?format=msgpack", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(content_type, "application/msgpack");
+}
+
+#[tokio::test]
+async fn account_info_requires_auth_token() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    // No token
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", TEST_ADDR)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+// ===========================================================================
+// Account asset information endpoint tests
+// (GET /v2/accounts/:address/assets/:asset-id)
+// ===========================================================================
+
+#[tokio::test]
+async fn account_asset_info_returns_200_with_valid_holding() {
+    let addr: Address = TEST_ADDR.parse().unwrap();
+    let lookup = AssetResourceLookup {
+        asset_holding: Some(AssetHolding {
+            amount: 1000,
+            frozen: false,
+        }),
+        asset_params: None,
+        last_round: 1000,
+    };
+    let server = TestServer::start(mock_node_with_asset_resource(&addr, 42, lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/assets/42", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["round"].as_u64().unwrap(), 1000);
+
+    // asset-holding should be present
+    let holding = &body["asset-holding"];
+    assert_eq!(holding["amount"].as_u64().unwrap(), 1000);
+    assert_eq!(holding["asset-id"].as_u64().unwrap(), 42);
+    assert!(!holding["is-frozen"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn account_asset_info_returns_404_when_not_found() {
+    // No asset resource configured for the (address, asset_id) pair
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/assets/999", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "account asset info not found"
+    );
+}
+
+#[tokio::test]
+async fn account_asset_info_invalid_address_returns_400() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/accounts/not-valid/assets/42"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "failed to parse the address"
+    );
+}
+
+// ===========================================================================
+// Account application information endpoint tests
+// (GET /v2/accounts/:address/applications/:application-id)
+// ===========================================================================
+
+#[tokio::test]
+async fn account_app_info_returns_200_with_valid_local_state() {
+    let addr: Address = TEST_ADDR.parse().unwrap();
+    let lookup = AppResourceLookup {
+        app_local_state: Some(AppLocalState {
+            schema: StateSchema {
+                num_uint: 2,
+                num_byte_slice: 1,
+            },
+            key_value: BTreeMap::new(),
+        }),
+        app_params: None,
+        last_round: 1000,
+    };
+    let server = TestServer::start(mock_node_with_app_resource(&addr, 100, lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/applications/100", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["round"].as_u64().unwrap(), 1000);
+
+    // app-local-state should be present
+    let local_state = &body["app-local-state"];
+    assert_eq!(local_state["id"].as_u64().unwrap(), 100);
+    assert_eq!(local_state["schema"]["num-uint"].as_u64().unwrap(), 2);
+    assert_eq!(local_state["schema"]["num-byte-slice"].as_u64().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn account_app_info_returns_404_when_not_found() {
+    // No app resource configured for the (address, app_id) pair
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/applications/999", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "account application info not found"
+    );
+}
+
+#[tokio::test]
+async fn account_app_info_invalid_address_returns_400() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/accounts/not-valid/applications/100"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "failed to parse the address"
+    );
+}
+
+// ===========================================================================
+// Account information: resource data population tests (FIX 1 / FIX 10)
+// ===========================================================================
+
+#[tokio::test]
+async fn account_info_returns_populated_asset_holdings() {
+    let mut assets = BTreeMap::new();
+    assets.insert(
+        42,
+        AssetHolding {
+            amount: 1000,
+            frozen: false,
+        },
+    );
+    assets.insert(
+        99,
+        AssetHolding {
+            amount: 500,
+            frozen: true,
+        },
+    );
+
+    let lookup = AccountLookup {
+        account_data: AccountData {
+            micro_algos: 2_000_000,
+            total_assets_opted_in: 2,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 2_000_000,
+        assets,
+        created_assets: BTreeMap::new(),
+        app_local_states: BTreeMap::new(),
+        created_apps: BTreeMap::new(),
+    };
+    let server = TestServer::start(mock_node_with_account(lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let assets_arr = body["assets"].as_array().unwrap();
+    assert_eq!(assets_arr.len(), 2);
+
+    // Should be sorted by asset-id
+    assert_eq!(assets_arr[0]["asset-id"].as_u64().unwrap(), 42);
+    assert_eq!(assets_arr[0]["amount"].as_u64().unwrap(), 1000);
+    assert!(!assets_arr[0]["is-frozen"].as_bool().unwrap());
+    assert_eq!(assets_arr[1]["asset-id"].as_u64().unwrap(), 99);
+    assert_eq!(assets_arr[1]["amount"].as_u64().unwrap(), 500);
+    assert!(assets_arr[1]["is-frozen"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn account_info_returns_populated_created_assets() {
+    let mut created_assets = BTreeMap::new();
+    created_assets.insert(
+        10,
+        AssetParams {
+            total: 1_000_000,
+            decimals: 6,
+            asset_name: "TestCoin".to_string(),
+            unit_name: "TC".to_string(),
+            ..AssetParams::default()
+        },
+    );
+
+    let lookup = AccountLookup {
+        account_data: AccountData {
+            micro_algos: 1_000_000,
+            total_created_assets: 1,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 1_000_000,
+        assets: BTreeMap::new(),
+        created_assets,
+        app_local_states: BTreeMap::new(),
+        created_apps: BTreeMap::new(),
+    };
+    let server = TestServer::start(mock_node_with_account(lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let created = body["created-assets"].as_array().unwrap();
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0]["index"].as_u64().unwrap(), 10);
+    assert_eq!(created[0]["params"]["total"].as_u64().unwrap(), 1_000_000);
+    assert_eq!(created[0]["params"]["decimals"].as_u64().unwrap(), 6);
+    assert_eq!(created[0]["params"]["name"].as_str().unwrap(), "TestCoin");
+    assert_eq!(created[0]["params"]["unit-name"].as_str().unwrap(), "TC");
+}
+
+#[tokio::test]
+async fn account_info_returns_populated_app_local_states() {
+    let mut app_local_states = BTreeMap::new();
+    app_local_states.insert(
+        100,
+        AppLocalState {
+            schema: StateSchema {
+                num_uint: 3,
+                num_byte_slice: 1,
+            },
+            key_value: BTreeMap::new(),
+        },
+    );
+
+    let lookup = AccountLookup {
+        account_data: AccountData {
+            micro_algos: 1_000_000,
+            total_apps_opted_in: 1,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 1_000_000,
+        assets: BTreeMap::new(),
+        created_assets: BTreeMap::new(),
+        app_local_states,
+        created_apps: BTreeMap::new(),
+    };
+    let server = TestServer::start(mock_node_with_account(lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let local_states = body["apps-local-state"].as_array().unwrap();
+    assert_eq!(local_states.len(), 1);
+    assert_eq!(local_states[0]["id"].as_u64().unwrap(), 100);
+    assert_eq!(local_states[0]["schema"]["num-uint"].as_u64().unwrap(), 3);
+    assert_eq!(
+        local_states[0]["schema"]["num-byte-slice"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn account_info_returns_populated_created_apps() {
+    let mut created_apps = BTreeMap::new();
+    created_apps.insert(
+        200,
+        AppParams {
+            creator: Address([0u8; 32]),
+            approval_program: vec![0x06, 0x81, 0x01],
+            clear_state_program: vec![0x06, 0x81, 0x01],
+            global_state: BTreeMap::new(),
+            local_state_schema: StateSchema {
+                num_uint: 0,
+                num_byte_slice: 0,
+            },
+            global_state_schema: StateSchema {
+                num_uint: 1,
+                num_byte_slice: 0,
+            },
+            extra_program_pages: 0,
+        },
+    );
+
+    let lookup = AccountLookup {
+        account_data: AccountData {
+            micro_algos: 1_000_000,
+            total_created_apps: 1,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 1_000_000,
+        assets: BTreeMap::new(),
+        created_assets: BTreeMap::new(),
+        app_local_states: BTreeMap::new(),
+        created_apps,
+    };
+    let server = TestServer::start(mock_node_with_account(lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let apps = body["created-apps"].as_array().unwrap();
+    assert_eq!(apps.len(), 1);
+    assert_eq!(apps[0]["id"].as_u64().unwrap(), 200);
+    assert!(
+        apps[0]["params"]["approval-program"].is_string(),
+        "approval-program should be base64 string"
+    );
+}
+
+// ===========================================================================
+// Resource limit exceeded test (FIX 4 / FIX 10)
+// ===========================================================================
+
+#[tokio::test]
+async fn account_info_resource_limit_exceeded_returns_400_with_data() {
+    let mut node = MockNode::synced();
+    // Set a low resource limit
+    node.max_api_resources = 5;
+    // Configure an account that exceeds the limit
+    node.account_lookup = Some(AccountLookup {
+        account_data: AccountData {
+            micro_algos: 1_000_000,
+            total_assets_opted_in: 3,
+            total_created_assets: 2,
+            total_apps_opted_in: 2,
+            total_created_apps: 1,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 1_000_000,
+        assets: BTreeMap::new(),
+        created_assets: BTreeMap::new(),
+        app_local_states: BTreeMap::new(),
+        created_apps: BTreeMap::new(),
+    });
+
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["message"].as_str().unwrap(), "Result limit exceeded");
+
+    // Verify data field is present with the right keys
+    let data = body["data"].as_object().expect("data should be an object");
+    assert_eq!(data["max-results"].as_u64().unwrap(), 5);
+    assert_eq!(data["total-assets-opted-in"].as_u64().unwrap(), 3);
+    assert_eq!(data["total-created-assets"].as_u64().unwrap(), 2);
+    assert_eq!(data["total-apps-opted-in"].as_u64().unwrap(), 2);
+    assert_eq!(data["total-created-apps"].as_u64().unwrap(), 1);
+}
+
+// ===========================================================================
+// Min-balance specific value test (FIX 10)
+// ===========================================================================
+
+#[tokio::test]
+async fn account_info_min_balance_has_expected_value() {
+    let mut node = MockNode::synced();
+    // Set consensus params with known values
+    node.consensus_params = ConsensusParams {
+        min_balance: 100_000,
+        app_flat_params_min_balance: 100_000,
+        app_flat_opt_in_min_balance: 100_000,
+        schema_min_balance_per_entry: 25_000,
+        schema_uint_min_balance: 3_500,
+        schema_bytes_min_balance: 25_000,
+        box_flat_min_balance: 2_500,
+        box_byte_min_balance: 400,
+        ..ConsensusParams::default()
+    };
+    node.account_lookup = Some(AccountLookup {
+        account_data: AccountData {
+            micro_algos: 10_000_000,
+            total_assets_opted_in: 2,
+            total_created_assets: 0,
+            total_apps_opted_in: 1,
+            total_created_apps: 0,
+            total_app_schema: StateSchema {
+                num_uint: 2,
+                num_byte_slice: 1,
+            },
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 10_000_000,
+        assets: BTreeMap::new(),
+        created_assets: BTreeMap::new(),
+        app_local_states: BTreeMap::new(),
+        created_apps: BTreeMap::new(),
+    });
+
+    let server = TestServer::start(node).await;
+
+    let body: serde_json::Value = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Expected min balance:
+    // base: 100_000
+    // + 2 assets * 100_000 = 200_000
+    // + 0 created apps * 100_000 = 0
+    // + 1 opted-in app * 100_000 = 100_000
+    // + schema: 3 entries * 25_000 = 75_000
+    //         + 2 uints * 3_500 = 7_000
+    //         + 1 bytes * 25_000 = 25_000
+    // + 0 extra pages * 100_000 = 0
+    // + 0 boxes * 2_500 = 0
+    // + 0 box bytes * 400 = 0
+    // Total: 100_000 + 200_000 + 0 + 100_000 + 75_000 + 7_000 + 25_000 = 507_000
+    assert_eq!(body["min-balance"].as_u64().unwrap(), 507_000);
+}
+
+// ===========================================================================
+// FIX 6: Min-balance with created assets should not double-count
+// ===========================================================================
+
+#[tokio::test]
+async fn account_info_min_balance_does_not_double_count_created_assets() {
+    let mut node = MockNode::synced();
+    node.consensus_params = ConsensusParams {
+        min_balance: 100_000,
+        app_flat_params_min_balance: 100_000,
+        app_flat_opt_in_min_balance: 100_000,
+        schema_min_balance_per_entry: 25_000,
+        schema_uint_min_balance: 3_500,
+        schema_bytes_min_balance: 25_000,
+        box_flat_min_balance: 2_500,
+        box_byte_min_balance: 400,
+        ..ConsensusParams::default()
+    };
+    // Account with 3 asset holdings, 2 of which are created assets.
+    // In go-algorand, TotalAssets (= total_assets_opted_in) already includes
+    // created assets, so min-balance should only count holdings once.
+    node.account_lookup = Some(AccountLookup {
+        account_data: AccountData {
+            micro_algos: 10_000_000,
+            total_assets_opted_in: 3,
+            total_created_assets: 2,
+            total_apps_opted_in: 0,
+            total_created_apps: 0,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 10_000_000,
+        assets: BTreeMap::new(),
+        created_assets: BTreeMap::new(),
+        app_local_states: BTreeMap::new(),
+        created_apps: BTreeMap::new(),
+    });
+
+    let server = TestServer::start(node).await;
+
+    let body: serde_json::Value = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Expected min balance:
+    // base: 100_000
+    // + 3 asset holdings * 100_000 = 300_000  (NOT + 2 * 100_000 extra for created)
+    // Total: 100_000 + 300_000 = 400_000
+    assert_eq!(
+        body["min-balance"].as_u64().unwrap(),
+        400_000,
+        "min-balance should not double-count created assets; \
+         expected base (100k) + 3 holdings (300k) = 400k"
+    );
+}
+
+// ===========================================================================
+// FIX 7: Participation key serialization test
+// ===========================================================================
+
+#[tokio::test]
+async fn account_info_includes_participation_keys() {
+    let mut vote_id = [0u8; 32];
+    vote_id[0] = 0xAA;
+    vote_id[31] = 0xBB;
+
+    let mut selection_id = [0u8; 32];
+    selection_id[0] = 0xCC;
+
+    let mut state_proof_id = [0u8; 64];
+    state_proof_id[0] = 0xDD;
+
+    let lookup = AccountLookup {
+        account_data: AccountData {
+            micro_algos: 5_000_000,
+            status: algo_types::AccountStatus::Online,
+            vote_id: Some(vote_id),
+            selection_id: Some(selection_id),
+            state_proof_id: Some(state_proof_id),
+            vote_first_valid: 1000,
+            vote_last_valid: 2000,
+            vote_key_dilution: 100,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 5_000_000,
+        assets: BTreeMap::new(),
+        created_assets: BTreeMap::new(),
+        app_local_states: BTreeMap::new(),
+        created_apps: BTreeMap::new(),
+    };
+    let server = TestServer::start(mock_node_with_account(lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    // participation object should be present
+    let participation = body
+        .get("participation")
+        .expect("participation should be present for online account with vote_id");
+    assert!(
+        participation.is_object(),
+        "participation should be an object"
+    );
+
+    // Check field names match go-algorand's hyphenated JSON names
+    assert!(
+        participation.get("vote-participation-key").is_some(),
+        "should have vote-participation-key"
+    );
+    assert!(
+        participation.get("selection-participation-key").is_some(),
+        "should have selection-participation-key"
+    );
+    assert!(
+        participation.get("state-proof-key").is_some(),
+        "should have state-proof-key"
+    );
+    assert_eq!(
+        participation["vote-first-valid"].as_u64().unwrap(),
+        1000,
+        "vote-first-valid should be 1000"
+    );
+    assert_eq!(
+        participation["vote-last-valid"].as_u64().unwrap(),
+        2000,
+        "vote-last-valid should be 2000"
+    );
+    assert_eq!(
+        participation["vote-key-dilution"].as_u64().unwrap(),
+        100,
+        "vote-key-dilution should be 100"
+    );
+
+    // Keys should be base64-encoded strings
+    let vote_key = participation["vote-participation-key"]
+        .as_str()
+        .expect("vote key should be a string");
+    assert!(!vote_key.is_empty(), "vote key should be non-empty");
+
+    let selection_key = participation["selection-participation-key"]
+        .as_str()
+        .expect("selection key should be a string");
+    assert!(
+        !selection_key.is_empty(),
+        "selection key should be non-empty"
+    );
+
+    let state_proof_key = participation["state-proof-key"]
+        .as_str()
+        .expect("state proof key should be a string");
+    assert!(
+        !state_proof_key.is_empty(),
+        "state proof key should be non-empty"
+    );
 }

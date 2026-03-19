@@ -59,6 +59,18 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             "/v2/transactions/params",
             get(handlers::transaction_params::<N>),
         )
+        .route(
+            "/v2/accounts/:address",
+            get(handlers::account_information::<N>),
+        )
+        .route(
+            "/v2/accounts/:address/assets/:asset-id",
+            get(handlers::account_asset_information::<N>),
+        )
+        .route(
+            "/v2/accounts/:address/applications/:application-id",
+            get(handlers::account_application_information::<N>),
+        )
         .layer(middleware::from_fn_with_state(
             tokens.api_token.clone(),
             auth::require_token,
