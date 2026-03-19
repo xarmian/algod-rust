@@ -50,6 +50,11 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
 
     // Authenticated routes (public API token required)
     let authenticated = Router::new()
+        .route("/v2/status", get(handlers::get_status::<N>))
+        .route(
+            "/v2/status/wait-for-block-after/:round",
+            get(handlers::wait_for_block::<N>),
+        )
         .route(
             "/v2/transactions/params",
             get(handlers::transaction_params::<N>),
