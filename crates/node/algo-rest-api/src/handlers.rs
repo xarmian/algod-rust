@@ -11,16 +11,23 @@
 //! - `GET /genesis` -- genesis JSON (no auth required)
 //! - `GET /swagger.json` -- OpenAPI spec (no auth required)
 //! - `GET /v2/transactions/params` -- suggested transaction parameters
+//! - `GET /v2/accounts/:address` -- account information
+//! - `GET /v2/accounts/:address/assets/:asset-id` -- account asset information
+//! - `GET /v2/accounts/:address/applications/:application-id` -- account application information
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use algo_types::Address;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error;
+use crate::format::{self, FormatParams};
+use crate::models;
 use crate::node::NodeInterface;
 
 /// Shared application state threaded through axum handlers.
@@ -563,6 +570,235 @@ pub async fn wait_for_block<N: NodeInterface>(
 
     // 6. Return status after wait (re-fetch to get the latest)
     get_status(State(node)).await
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/accounts/:address
+// ---------------------------------------------------------------------------
+
+/// Query parameters for the account information endpoint.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AccountInfoParams {
+    /// Response format: "json" (default) or "msgpack"/"msgp".
+    pub format: Option<String>,
+    /// Exclude resources: "all", "none", or absent.
+    pub exclude: Option<String>,
+}
+
+/// Returns account information for the given address.
+///
+/// Matches go-algorand's `Handlers.AccountInformation` in
+/// `daemon/algod/api/server/v2/handlers.go`.
+///
+/// Non-existent accounts return 200 with zero balances (not 404).
+/// The `exclude` query parameter controls whether resource lists
+/// (assets, apps) are included. Only "all" and "none" are valid.
+pub async fn account_information<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(address): Path<String>,
+    Query(params): Query<AccountInfoParams>,
+) -> Response {
+    // Negotiate response format
+    let fmt_params = FormatParams {
+        format: params.format,
+    };
+    let resp_format = match format::negotiate_format(&fmt_params) {
+        Ok(f) => f,
+        Err(resp) => return *resp,
+    };
+
+    // Validate address
+    let addr = match Address::from_str(&address) {
+        Ok(a) => a,
+        Err(_) => return error::bad_request("failed to parse the address"),
+    };
+
+    // Validate exclude parameter
+    let exclude = params.exclude.as_deref().unwrap_or("");
+    match exclude {
+        "all" | "none" | "" => {}
+        _ => return error::bad_request("failed to parse exclude"),
+    }
+
+    // Look up account (single call, reused for resource count check and response)
+    let lookup = match node.lookup_account(&addr).await {
+        Ok(l) => l,
+        Err(_) => return error::internal_error("failed looking up account"),
+    };
+
+    // Check resource count vs max limit (when not excluding and max is set)
+    if exclude != "all" {
+        let max_results = node.max_api_resources_per_account();
+        if max_results != 0 {
+            let record = &lookup.account_data;
+            let total_results = record.total_assets_opted_in
+                + record.total_created_assets
+                + record.total_apps_opted_in
+                + record.total_created_apps;
+            if total_results > max_results {
+                // Return structured error with data matching go-algorand
+                let mut data = serde_json::Map::new();
+                data.insert(
+                    "max-results".to_string(),
+                    serde_json::Value::Number(max_results.into()),
+                );
+                data.insert(
+                    "total-assets-opted-in".to_string(),
+                    serde_json::Value::Number(record.total_assets_opted_in.into()),
+                );
+                data.insert(
+                    "total-created-assets".to_string(),
+                    serde_json::Value::Number(record.total_created_assets.into()),
+                );
+                data.insert(
+                    "total-apps-opted-in".to_string(),
+                    serde_json::Value::Number(record.total_apps_opted_in.into()),
+                );
+                data.insert(
+                    "total-created-apps".to_string(),
+                    serde_json::Value::Number(record.total_created_apps.into()),
+                );
+                let body = error::ErrorResponse {
+                    message: "Result limit exceeded".to_string(),
+                    data: Some(data),
+                };
+                let json = serde_json::to_string(&body)
+                    .unwrap_or_else(|_| r#"{"message":"Result limit exceeded"}"#.to_string());
+                return (
+                    StatusCode::BAD_REQUEST,
+                    [("content-type", "application/json")],
+                    json,
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Get consensus params for min balance computation
+    let consensus = match node.consensus_params().await {
+        Ok(c) => c,
+        Err(_) => return error::internal_error("failed retrieving consensus params"),
+    };
+
+    // Convert to API response
+    let response = models::account_data_to_response(&lookup, &addr, exclude, &consensus);
+    format::encode_response(&response, resp_format)
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/accounts/:address/assets/:asset-id
+// ---------------------------------------------------------------------------
+
+/// Returns asset information for the given account and asset ID.
+///
+/// Matches go-algorand's `Handlers.AccountAssetInformation` in
+/// `daemon/algod/api/server/v2/handlers.go`.
+///
+/// Returns 404 if neither a holding nor asset params exist for this
+/// address/asset pair.
+pub async fn account_asset_information<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path((address, asset_id)): Path<(String, u64)>,
+    Query(params): Query<FormatParams>,
+) -> Response {
+    // Negotiate response format
+    let resp_format = match format::negotiate_format(&params) {
+        Ok(f) => f,
+        Err(resp) => return *resp,
+    };
+
+    // Validate address
+    let addr = match Address::from_str(&address) {
+        Ok(a) => a,
+        Err(_) => return error::bad_request("failed to parse the address"),
+    };
+
+    // Look up asset resource
+    let lookup = match node.lookup_asset_resource(&addr, asset_id).await {
+        Ok(l) => l,
+        Err(_) => return error::internal_error("failed looking up asset resource"),
+    };
+
+    // If neither holding nor params exist → 404
+    if lookup.asset_holding.is_none() && lookup.asset_params.is_none() {
+        return error::not_found("account asset info not found");
+    }
+
+    // Build response
+    let mut response = models::AccountAssetResponse {
+        round: lookup.last_round,
+        asset_holding: None,
+        created_asset: None,
+    };
+
+    if let Some(ref holding) = lookup.asset_holding {
+        response.asset_holding = Some(models::asset_holding_to_api(asset_id, holding));
+    }
+
+    if let Some(ref params) = lookup.asset_params {
+        let asset = models::asset_params_to_api(asset_id, &addr.to_algorand_string(), params);
+        response.created_asset = Some(asset.params);
+    }
+
+    format::encode_response(&response, resp_format)
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/accounts/:address/applications/:application-id
+// ---------------------------------------------------------------------------
+
+/// Returns application information for the given account and application ID.
+///
+/// Matches go-algorand's `Handlers.AccountApplicationInformation` in
+/// `daemon/algod/api/server/v2/handlers.go`.
+///
+/// Returns 404 if neither local state nor app params exist for this
+/// address/app pair.
+pub async fn account_application_information<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path((address, app_id)): Path<(String, u64)>,
+    Query(params): Query<FormatParams>,
+) -> Response {
+    // Negotiate response format
+    let resp_format = match format::negotiate_format(&params) {
+        Ok(f) => f,
+        Err(resp) => return *resp,
+    };
+
+    // Validate address
+    let addr = match Address::from_str(&address) {
+        Ok(a) => a,
+        Err(_) => return error::bad_request("failed to parse the address"),
+    };
+
+    // Look up app resource
+    let lookup = match node.lookup_app_resource(&addr, app_id).await {
+        Ok(l) => l,
+        Err(_) => return error::internal_error("failed looking up app resource"),
+    };
+
+    // If neither local state nor params exist → 404
+    if lookup.app_local_state.is_none() && lookup.app_params.is_none() {
+        return error::not_found("account application info not found");
+    }
+
+    // Build response
+    let mut response = models::AccountApplicationResponse {
+        round: lookup.last_round,
+        app_local_state: None,
+        created_app: None,
+    };
+
+    if let Some(ref app_params) = lookup.app_params {
+        let app = models::app_params_to_api(app_id, app_params);
+        response.created_app = Some(app.params);
+    }
+
+    if let Some(ref local_state) = lookup.app_local_state {
+        response.app_local_state = Some(models::app_local_state_to_api(app_id, local_state));
+    }
+
+    format::encode_response(&response, resp_format)
 }
 
 // ---------------------------------------------------------------------------

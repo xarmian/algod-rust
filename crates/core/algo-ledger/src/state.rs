@@ -885,6 +885,30 @@ impl crate::store_trait::LedgerStore for LedgerState {
             .collect()
     }
 
+    fn asset_holdings_for_addr(&self, addr: &Address) -> Vec<(u64, AssetHolding)> {
+        self.asset_holdings
+            .iter()
+            .filter(|((a, _), _)| a == addr)
+            .map(|((_, asset_id), holding)| (*asset_id, holding.clone()))
+            .collect()
+    }
+
+    fn created_assets_for_addr(&self, addr: &Address) -> Vec<(u64, AssetParamsRecord)> {
+        self.asset_params
+            .iter()
+            .filter(|(_, record)| record.creator == *addr)
+            .map(|(asset_id, record)| (*asset_id, record.clone()))
+            .collect()
+    }
+
+    fn created_apps_for_addr(&self, addr: &Address) -> Vec<(u64, AppParams)> {
+        self.app_params
+            .iter()
+            .filter(|(_, params)| params.creator == *addr)
+            .map(|(app_id, params)| (*app_id, params.clone()))
+            .collect()
+    }
+
     // ---- Box Storage ----
 
     fn get_box(&self, app_id: u64, key: &[u8]) -> Option<Vec<u8>> {

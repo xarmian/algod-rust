@@ -7,7 +7,12 @@
 //! The trait methods are modeled after go-algorand's `v2.NodeInterface` in
 //! `daemon/algod/api/server/v2/handlers.go`.
 
-use algo_types::Digest;
+use std::collections::BTreeMap;
+
+use algo_types::{
+    AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParams, ConsensusParams,
+    Digest,
+};
 use async_trait::async_trait;
 use serde::Serialize;
 
@@ -141,6 +146,60 @@ pub struct ProtocolSwitchInfo {
     pub next_protocol_switch_on: u64,
 }
 
+/// Result of looking up a single account by address.
+///
+/// Mirrors go-algorand's `AccountInformationResponse`. Non-existent accounts
+/// return a zero-valued `AccountData` with the current round (not an error).
+#[derive(Debug, Clone)]
+pub struct AccountLookup {
+    /// The account data (zero-valued if the account does not exist on-chain).
+    pub account_data: AccountData,
+    /// The last committed round at the time of the lookup.
+    pub last_round: u64,
+    /// The account balance excluding pending rewards. For simplicity this is
+    /// currently set equal to `account_data.micro_algos`; a proper computation
+    /// from reward tracking fields can be added later.
+    pub amount_without_pending_rewards: u64,
+    /// Asset holdings keyed by asset ID (populated by LookupLatest).
+    pub assets: BTreeMap<u64, AssetHolding>,
+    /// Created asset params keyed by asset ID (populated by LookupLatest).
+    pub created_assets: BTreeMap<u64, AssetParams>,
+    /// App local states keyed by app ID (populated by LookupLatest).
+    pub app_local_states: BTreeMap<u64, AppLocalState>,
+    /// Created app params keyed by app ID (populated by LookupLatest).
+    pub created_apps: BTreeMap<u64, AppParams>,
+}
+
+/// Result of looking up a single asset resource (holding + params) for an
+/// address/asset-id pair.
+///
+/// `asset_holding` is `Some` when the address has opted in to the asset.
+/// `asset_params` is `Some` when the address is the asset creator.
+#[derive(Debug, Clone)]
+pub struct AssetResourceLookup {
+    /// The asset holding, if the address has opted in.
+    pub asset_holding: Option<AssetHolding>,
+    /// The asset params, present only if the address is the creator.
+    pub asset_params: Option<AssetParams>,
+    /// The last committed round at the time of the lookup.
+    pub last_round: u64,
+}
+
+/// Result of looking up a single app resource (local state + params) for an
+/// address/app-id pair.
+///
+/// `app_local_state` is `Some` when the address has opted in to the app.
+/// `app_params` is `Some` when the address is the app creator.
+#[derive(Debug, Clone)]
+pub struct AppResourceLookup {
+    /// The app local state, if the address has opted in.
+    pub app_local_state: Option<AppLocalState>,
+    /// The app params, present only if the address is the creator.
+    pub app_params: Option<AppParams>,
+    /// The last committed round at the time of the lookup.
+    pub last_round: u64,
+}
+
 /// Trait abstracting the node state needed by REST API handlers.
 ///
 /// Implementations provide access to genesis information, node status,
@@ -204,4 +263,56 @@ pub trait NodeInterface: Send + Sync + 'static {
     async fn latest_block_header_protocol_info(
         &self,
     ) -> Result<ProtocolSwitchInfo, Box<dyn std::error::Error + Send + Sync>>;
+
+    // ---- Account / resource lookup methods ----
+
+    /// Look up an account by address.
+    ///
+    /// Non-existent accounts return a zero-valued `AccountData` with the
+    /// current round — they do NOT produce an error.
+    async fn lookup_account(
+        &self,
+        _addr: &Address,
+    ) -> Result<AccountLookup, Box<dyn std::error::Error + Send + Sync>> {
+        Err("lookup_account not implemented".into())
+    }
+
+    /// Look up a single asset resource (holding + params) for an address.
+    ///
+    /// Returns the asset holding (if opted in) and asset params (if the
+    /// address is the creator).
+    async fn lookup_asset_resource(
+        &self,
+        _addr: &Address,
+        _asset_id: u64,
+    ) -> Result<AssetResourceLookup, Box<dyn std::error::Error + Send + Sync>> {
+        Err("lookup_asset_resource not implemented".into())
+    }
+
+    /// Look up a single app resource (local state + params) for an address.
+    ///
+    /// Returns the app local state (if opted in) and app params (if the
+    /// address is the creator).
+    async fn lookup_app_resource(
+        &self,
+        _addr: &Address,
+        _app_id: u64,
+    ) -> Result<AppResourceLookup, Box<dyn std::error::Error + Send + Sync>> {
+        Err("lookup_app_resource not implemented".into())
+    }
+
+    /// Return the consensus parameters for the current protocol version.
+    async fn consensus_params(
+        &self,
+    ) -> Result<ConsensusParams, Box<dyn std::error::Error + Send + Sync>> {
+        Err("consensus_params not implemented".into())
+    }
+
+    /// Maximum number of asset/app resources returned per account lookup.
+    ///
+    /// Configurable, default 100,000. Mirrors go-algorand's
+    /// `config.MaxAPIResourcesPerAccount`.
+    fn max_api_resources_per_account(&self) -> u64 {
+        100_000
+    }
 }

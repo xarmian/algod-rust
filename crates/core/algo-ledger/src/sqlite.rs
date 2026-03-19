@@ -3167,6 +3167,112 @@ impl LedgerStore for SqliteLedger {
         results
     }
 
+    fn asset_holdings_for_addr(&self, addr: &Address) -> Vec<(u64, AssetHolding)> {
+        let rowid = match self.get_rowid(addr) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT aidx, data FROM resources WHERE addrid = ?1 AND ctype = ?2")
+            .expect("prepare asset_holdings_for_addr");
+
+        let results: Vec<(u64, AssetHolding)> = stmt
+            .query_map(params![rowid, CTYPE_ASSET], |row| {
+                let aidx: i64 = row.get(0)?;
+                let data: Vec<u8> = row.get(1)?;
+                Ok((aidx, data))
+            })
+            .expect("query asset_holdings_for_addr")
+            .filter_map(|r| r.ok())
+            .filter_map(|(aidx, data)| {
+                // Check that the holding flag is set.
+                let flags = extract_resource_flags(&data);
+                if flags & RESOURCE_FLAGS_HOLDING == 0 {
+                    return None;
+                }
+                let holding = decode_asset_holding(&data).ok()?;
+                Some((aidx as u64, holding))
+            })
+            .collect();
+
+        results
+    }
+
+    fn created_assets_for_addr(&self, addr: &Address) -> Vec<(u64, AssetParamsRecord)> {
+        let rowid = match self.get_rowid(addr) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT aidx, data FROM resources WHERE addrid = ?1 AND ctype = ?2")
+            .expect("prepare created_assets_for_addr");
+
+        let results: Vec<(u64, AssetParamsRecord)> = stmt
+            .query_map(params![rowid, CTYPE_ASSET], |row| {
+                let aidx: i64 = row.get(0)?;
+                let data: Vec<u8> = row.get(1)?;
+                Ok((aidx, data))
+            })
+            .expect("query created_assets_for_addr")
+            .filter_map(|r| r.ok())
+            .filter_map(|(aidx, data)| {
+                // Only include blobs with ownership flag (creator/params data).
+                let flags = extract_resource_flags(&data);
+                if flags & RESOURCE_FLAGS_OWNERSHIP == 0 {
+                    return None;
+                }
+                let params = decode_asset_params(&data).ok()?;
+                Some((
+                    aidx as u64,
+                    AssetParamsRecord {
+                        params,
+                        creator: *addr,
+                    },
+                ))
+            })
+            .collect();
+
+        results
+    }
+
+    fn created_apps_for_addr(&self, addr: &Address) -> Vec<(u64, AppParams)> {
+        let rowid = match self.get_rowid(addr) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT aidx, data FROM resources WHERE addrid = ?1 AND ctype = ?2")
+            .expect("prepare created_apps_for_addr");
+
+        let results: Vec<(u64, AppParams)> = stmt
+            .query_map(params![rowid, CTYPE_APP], |row| {
+                let aidx: i64 = row.get(0)?;
+                let data: Vec<u8> = row.get(1)?;
+                Ok((aidx, data))
+            })
+            .expect("query created_apps_for_addr")
+            .filter_map(|r| r.ok())
+            .filter_map(|(aidx, data)| {
+                // Only include blobs with ownership flag.
+                let flags = extract_resource_flags(&data);
+                if flags & RESOURCE_FLAGS_OWNERSHIP == 0 {
+                    return None;
+                }
+                decode_app_params(&data, *addr)
+                    .ok()
+                    .map(|p| (aidx as u64, p))
+            })
+            .collect();
+
+        results
+    }
+
     // ---- Box Storage ----
 
     fn get_box(&self, app_id: u64, key: &[u8]) -> Option<Vec<u8>> {
