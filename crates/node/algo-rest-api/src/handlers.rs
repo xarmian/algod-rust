@@ -111,7 +111,7 @@ pub struct VersionsResponse {
     pub genesis_id: String,
 
     /// Genesis hash, base64-encoded in JSON.
-    #[serde(with = "base64_bytes")]
+    #[serde(with = "models::base64_bytes")]
     pub genesis_hash_b64: Vec<u8>,
 
     /// Build version information.
@@ -208,7 +208,7 @@ pub struct TransactionParametersResponse {
     pub fee: u64,
 
     /// Hash of the genesis block, base64-encoded.
-    #[serde(rename = "genesis-hash", with = "base64_bytes")]
+    #[serde(rename = "genesis-hash", with = "models::base64_bytes")]
     pub genesis_hash: Vec<u8>,
 
     /// Genesis ID string.
@@ -955,17 +955,9 @@ pub async fn get_application_boxes<N: NodeInterface>(
 
     // If max is not unlimited, check total boxes against the limit via an
     // O(1) account record lookup BEFORE scanning all box keys. This matches
-    // go-algorand's approach of checking `record.TotalBoxes` first.
-    //
-    // `application_boxes_max_keys` may return `algod_max + 1` as a sentinel
-    // to detect overflow during key scanning. For the pre-scan total-boxes
-    // check we strip that sentinel so we compare against the true limit,
-    // avoiding returning one more box than allowed.
-    let pre_scan_limit = if algod_max > 0 && max == algod_max.saturating_add(1) {
-        algod_max
-    } else {
-        max
-    };
+    // go-algorand's approach of checking `record.TotalBoxes > max` first
+    // (handlers.go:1746). The `max` value from `application_boxes_max_keys`
+    // may include a +1 sentinel for overflow detection, which is intentional.
     if max != u64::MAX {
         let (total_box_count, _round) = match node.total_boxes(app_id).await {
             Ok(result) => result,
@@ -974,7 +966,7 @@ pub async fn get_application_boxes<N: NodeInterface>(
             }
         };
 
-        if total_box_count > pre_scan_limit {
+        if total_box_count > max {
             let mut data = serde_json::Map::new();
             data.insert(
                 "max-api-box-per-application".to_string(),
@@ -1040,21 +1032,4 @@ fn application_boxes_max_keys(requested_max: u64, algod_max: u64) -> u64 {
     }
 
     algod_max.saturating_add(1) // API limit dominates. Increments by 1 to test if more than max supported results exist.
-}
-
-// ---------------------------------------------------------------------------
-// Base64 serialization helper
-// ---------------------------------------------------------------------------
-
-/// Serde helper module for serializing `Vec<u8>` as standard base64.
-///
-/// go-algorand uses `genesis_hash_b64` with standard base64 encoding.
-mod base64_bytes {
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine;
-    use serde::Serializer;
-
-    pub fn serialize<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&STANDARD.encode(bytes))
-    }
 }

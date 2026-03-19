@@ -27,50 +27,58 @@ use data_encoding::BASE32;
 /// Returns an error if the input is malformed or contains invalid data for the
 /// specified encoding.
 pub fn parse_box_name(arg: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    /// Maximum box name length in bytes, matching go-algorand's `MaxBoxNameLen`.
+    const MAX_BOX_NAME_LEN: usize = 64;
+
     let (encoding, value) = arg
         .split_once(':')
         .ok_or("all arguments and box names should be of the form 'encoding:value'")?;
 
-    match encoding {
-        "str" | "string" => Ok(value.as_bytes().to_vec()),
+    let decoded = match encoding {
+        "str" | "string" => value.as_bytes().to_vec(),
 
         "int" | "integer" => {
             let num: u64 = value
                 .parse()
                 .map_err(|e| format!("Could not parse uint64 from string ({value}): {e}"))?;
-            Ok(num.to_be_bytes().to_vec())
+            num.to_be_bytes().to_vec()
         }
 
         "addr" | "address" => {
             let addr = Address::from_algorand_string(value).map_err(|e| {
                 format!("Could not unmarshal checksummed address from string ({value}): {e}")
             })?;
-            Ok(addr.0.to_vec())
+            addr.0.to_vec()
         }
 
-        "b32" | "base32" | "byte base32" => {
-            let data = BASE32
-                .decode(value.as_bytes())
-                .map_err(|e| format!("Could not decode base32-encoded string ({value}): {e}"))?;
-            Ok(data)
-        }
+        "b32" | "base32" | "byte base32" => BASE32
+            .decode(value.as_bytes())
+            .map_err(|e| format!("Could not decode base32-encoded string ({value}): {e}"))?,
 
-        "b64" | "base64" | "byte base64" => {
-            let data = BASE64_STANDARD
-                .decode(value)
-                .map_err(|e| format!("Could not decode base64-encoded string ({value}): {e}"))?;
-            Ok(data)
-        }
+        "b64" | "base64" | "byte base64" => BASE64_STANDARD
+            .decode(value)
+            .map_err(|e| format!("Could not decode base64-encoded string ({value}): {e}"))?,
 
         "abi" => {
             let (abi_type_str, abi_value_str) = value.split_once(':').ok_or(format!(
                 "Could not decode abi string ({value}): should split abi-type and abi-value with colon"
             ))?;
-            parse_abi_encoded(abi_type_str, abi_value_str)
+            parse_abi_encoded(abi_type_str, abi_value_str)?
         }
 
-        _ => Err(format!("Unknown encoding: {encoding}").into()),
+        _ => return Err(format!("Unknown encoding: {encoding}").into()),
+    };
+
+    if decoded.len() > MAX_BOX_NAME_LEN {
+        return Err(format!(
+            "box name too long (max {} bytes, got {})",
+            MAX_BOX_NAME_LEN,
+            decoded.len()
+        )
+        .into());
     }
+
+    Ok(decoded)
 }
 
 /// Parse and ABI-encode a value given a type descriptor and a JSON value string.

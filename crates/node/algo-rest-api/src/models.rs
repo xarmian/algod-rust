@@ -536,7 +536,7 @@ pub struct BoxesResponse {
 /// Serde helper for serializing/deserializing `Vec<u8>` as standard base64.
 ///
 /// In go-algorand, `[]byte` fields are automatically base64-encoded in JSON.
-mod base64_bytes {
+pub mod base64_bytes {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     use serde::{Deserialize, Deserializer, Serializer};
