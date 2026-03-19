@@ -623,7 +623,7 @@ pub async fn account_information<N: NodeInterface>(
     // Look up account (single call, reused for resource count check and response)
     let lookup = match node.lookup_account(&addr).await {
         Ok(l) => l,
-        Err(_) => return error::internal_error("failed looking up account"),
+        Err(_) => return error::internal_error("failed to retrieve information from the ledger"),
     };
 
     // Check resource count vs max limit (when not excluding and max is set)
@@ -716,7 +716,7 @@ pub async fn account_asset_information<N: NodeInterface>(
     // Look up asset resource
     let lookup = match node.lookup_asset_resource(&addr, asset_id).await {
         Ok(l) => l,
-        Err(_) => return error::internal_error("failed looking up asset resource"),
+        Err(_) => return error::internal_error("failed to retrieve information from the ledger"),
     };
 
     // If neither holding nor params exist → 404
@@ -774,7 +774,7 @@ pub async fn account_application_information<N: NodeInterface>(
     // Look up app resource
     let lookup = match node.lookup_app_resource(&addr, app_id).await {
         Ok(l) => l,
-        Err(_) => return error::internal_error("failed looking up app resource"),
+        Err(_) => return error::internal_error("failed to retrieve information from the ledger"),
     };
 
     // If neither local state nor params exist → 404

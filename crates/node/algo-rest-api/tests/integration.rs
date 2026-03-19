@@ -2274,3 +2274,175 @@ async fn account_info_min_balance_has_expected_value() {
     // Total: 100_000 + 200_000 + 0 + 100_000 + 75_000 + 7_000 + 25_000 = 507_000
     assert_eq!(body["min-balance"].as_u64().unwrap(), 507_000);
 }
+
+// ===========================================================================
+// FIX 6: Min-balance with created assets should not double-count
+// ===========================================================================
+
+#[tokio::test]
+async fn account_info_min_balance_does_not_double_count_created_assets() {
+    let mut node = MockNode::synced();
+    node.consensus_params = ConsensusParams {
+        min_balance: 100_000,
+        app_flat_params_min_balance: 100_000,
+        app_flat_opt_in_min_balance: 100_000,
+        schema_min_balance_per_entry: 25_000,
+        schema_uint_min_balance: 3_500,
+        schema_bytes_min_balance: 25_000,
+        box_flat_min_balance: 2_500,
+        box_byte_min_balance: 400,
+        ..ConsensusParams::default()
+    };
+    // Account with 3 asset holdings, 2 of which are created assets.
+    // In go-algorand, TotalAssets (= total_assets_opted_in) already includes
+    // created assets, so min-balance should only count holdings once.
+    node.account_lookup = Some(AccountLookup {
+        account_data: AccountData {
+            micro_algos: 10_000_000,
+            total_assets_opted_in: 3,
+            total_created_assets: 2,
+            total_apps_opted_in: 0,
+            total_created_apps: 0,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 10_000_000,
+        assets: BTreeMap::new(),
+        created_assets: BTreeMap::new(),
+        app_local_states: BTreeMap::new(),
+        created_apps: BTreeMap::new(),
+    });
+
+    let server = TestServer::start(node).await;
+
+    let body: serde_json::Value = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Expected min balance:
+    // base: 100_000
+    // + 3 asset holdings * 100_000 = 300_000  (NOT + 2 * 100_000 extra for created)
+    // Total: 100_000 + 300_000 = 400_000
+    assert_eq!(
+        body["min-balance"].as_u64().unwrap(),
+        400_000,
+        "min-balance should not double-count created assets; \
+         expected base (100k) + 3 holdings (300k) = 400k"
+    );
+}
+
+// ===========================================================================
+// FIX 7: Participation key serialization test
+// ===========================================================================
+
+#[tokio::test]
+async fn account_info_includes_participation_keys() {
+    let mut vote_id = [0u8; 32];
+    vote_id[0] = 0xAA;
+    vote_id[31] = 0xBB;
+
+    let mut selection_id = [0u8; 32];
+    selection_id[0] = 0xCC;
+
+    let mut state_proof_id = [0u8; 64];
+    state_proof_id[0] = 0xDD;
+
+    let lookup = AccountLookup {
+        account_data: AccountData {
+            micro_algos: 5_000_000,
+            status: algo_types::AccountStatus::Online,
+            vote_id: Some(vote_id),
+            selection_id: Some(selection_id),
+            state_proof_id: Some(state_proof_id),
+            vote_first_valid: 1000,
+            vote_last_valid: 2000,
+            vote_key_dilution: 100,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 5_000_000,
+        assets: BTreeMap::new(),
+        created_assets: BTreeMap::new(),
+        app_local_states: BTreeMap::new(),
+        created_apps: BTreeMap::new(),
+    };
+    let server = TestServer::start(mock_node_with_account(lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    // participation object should be present
+    let participation = body
+        .get("participation")
+        .expect("participation should be present for online account with vote_id");
+    assert!(
+        participation.is_object(),
+        "participation should be an object"
+    );
+
+    // Check field names match go-algorand's hyphenated JSON names
+    assert!(
+        participation.get("vote-participation-key").is_some(),
+        "should have vote-participation-key"
+    );
+    assert!(
+        participation.get("selection-participation-key").is_some(),
+        "should have selection-participation-key"
+    );
+    assert!(
+        participation.get("state-proof-key").is_some(),
+        "should have state-proof-key"
+    );
+    assert_eq!(
+        participation["vote-first-valid"].as_u64().unwrap(),
+        1000,
+        "vote-first-valid should be 1000"
+    );
+    assert_eq!(
+        participation["vote-last-valid"].as_u64().unwrap(),
+        2000,
+        "vote-last-valid should be 2000"
+    );
+    assert_eq!(
+        participation["vote-key-dilution"].as_u64().unwrap(),
+        100,
+        "vote-key-dilution should be 100"
+    );
+
+    // Keys should be base64-encoded strings
+    let vote_key = participation["vote-participation-key"]
+        .as_str()
+        .expect("vote key should be a string");
+    assert!(!vote_key.is_empty(), "vote key should be non-empty");
+
+    let selection_key = participation["selection-participation-key"]
+        .as_str()
+        .expect("selection key should be a string");
+    assert!(
+        !selection_key.is_empty(),
+        "selection key should be non-empty"
+    );
+
+    let state_proof_key = participation["state-proof-key"]
+        .as_str()
+        .expect("state proof key should be a string");
+    assert!(
+        !state_proof_key.is_empty(),
+        "state proof key should be non-empty"
+    );
+}

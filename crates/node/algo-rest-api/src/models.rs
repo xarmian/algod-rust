@@ -695,17 +695,13 @@ pub fn account_data_to_response(
 fn compute_min_balance(record: &AccountData, consensus: &ConsensusParams) -> u64 {
     let mut min = consensus.min_balance;
 
-    // Per-asset cost (holdings + created assets)
+    // Per-asset cost (asset holdings already include created assets,
+    // so we only count total_assets_opted_in, matching go-algorand's
+    // MinBalance which uses TotalAssets alone).
     let asset_cost = consensus
         .min_balance
         .saturating_mul(record.total_assets_opted_in);
     min = min.saturating_add(asset_cost);
-
-    // Per-created-asset cost
-    let created_asset_cost = consensus
-        .min_balance
-        .saturating_mul(record.total_created_assets);
-    min = min.saturating_add(created_asset_cost);
 
     // Per-created-app cost
     let app_creation_cost = consensus
@@ -752,11 +748,6 @@ fn compute_min_balance(record: &AccountData, consensus: &ConsensusParams) -> u64
         .box_byte_min_balance
         .saturating_mul(record.total_box_bytes);
     min = min.saturating_add(box_byte_cost);
-
-    // Cap at maximum_minimum_balance if set (pre-v32 consensus)
-    if consensus.maximum_minimum_balance > 0 {
-        min = min.min(consensus.maximum_minimum_balance);
-    }
 
     min
 }
@@ -867,7 +858,7 @@ pub fn asset_params_to_api(asset_id: u64, creator: &str, params: &AssetParams) -
             creator: creator.to_string(),
             total: params.total,
             decimals: params.decimals as u64,
-            default_frozen: if frozen { Some(true) } else { None },
+            default_frozen: Some(frozen),
             name,
             name_b64,
             unit_name,

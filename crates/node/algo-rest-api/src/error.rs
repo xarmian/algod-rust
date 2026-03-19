@@ -15,13 +15,15 @@ use serde::Serialize;
 /// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorResponse {
-    /// Human-readable error message.
-    pub message: String,
-
     /// Optional structured error data. Matches go-algorand's
     /// `Data *map[string]interface{}` field -- almost always `None`/null.
+    /// Placed before `message` to match go-algorand's field ordering
+    /// (serde serializes in declaration order).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Map<String, serde_json::Value>>,
+
+    /// Human-readable error message.
+    pub message: String,
 }
 
 impl ErrorResponse {
