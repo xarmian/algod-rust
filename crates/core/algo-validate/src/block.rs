@@ -1167,9 +1167,7 @@ mod tests {
         block.current_protocol = String::new();
         let result = contents_match_header(&block);
         assert!(result.is_err(), "empty protocol should return Err");
-        assert!(result
-            .unwrap_err()
-            .contains("empty"));
+        assert!(result.unwrap_err().contains("empty"));
     }
 
     #[test]
@@ -1178,8 +1176,6 @@ mod tests {
         block.current_protocol = "v99-nonexistent".into();
         let result = contents_match_header(&block);
         assert!(result.is_err(), "unknown protocol should return Err");
-        assert!(result
-            .unwrap_err()
-            .contains("unsupported"));
+        assert!(result.unwrap_err().contains("unsupported"));
     }
 }

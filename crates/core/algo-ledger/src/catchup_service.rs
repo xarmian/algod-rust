@@ -257,13 +257,7 @@ impl CatchupService {
                 i if i == cert_idx => {
                     match oper.recv(&cert_rx) {
                         Ok(pending) => {
-                            Self::sync_cert(
-                                &pending,
-                                &ledger,
-                                &fetcher,
-                                &shutdown_rx,
-                                &fork_count,
-                            );
+                            Self::sync_cert(&pending, &ledger, &fetcher, &shutdown_rx, &fork_count);
                         }
                         Err(_) => {
                             // Certificate channel closed — the agreement service

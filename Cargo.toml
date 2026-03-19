@@ -15,6 +15,7 @@ members = [
     "crates/core/algo-agreement",
     "crates/core/algo-pool",
     "crates/node/algo-network",
+    "crates/node/algo-rest-api",
     "crates/tools/algo-bench",
     "bin/algod-rust",
 ]
@@ -40,6 +41,9 @@ rmpv = { version = "1", features = ["with-serde"] }
 axum = { version = "0.7", features = ["ws"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+hyper = { version = "1", features = ["server", "http1"] }
+subtle = "2"
 
 # Async
 tokio = { version = "1", features = ["full"] }
@@ -86,6 +90,7 @@ algo-agreement = { path = "crates/core/algo-agreement" }
 algo-pool = { path = "crates/core/algo-pool" }
 algo-falcon = { path = "crates/core/algo-falcon" }
 algo-network = { path = "crates/node/algo-network" }
+algo-rest-api = { path = "crates/node/algo-rest-api" }
 algo-bench = { path = "crates/tools/algo-bench" }
 num-bigint = "0.4"
 statrs = "0.18"
