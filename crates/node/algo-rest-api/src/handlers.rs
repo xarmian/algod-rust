@@ -64,7 +64,7 @@ pub async fn ready<N: NodeInterface>(State(node): State<AppState<N>>) -> Respons
 
                 let is_ready = status.catchpoint.is_empty()
                     && (0..DEADLINE_TIMEOUT_MS).contains(&time_since_last_ms)
-                    && status.catchup_time == 0;
+                    && status.catchup_time / 1_000_000 == 0;
 
                 if is_ready {
                     StatusCode::OK
@@ -221,9 +221,7 @@ pub struct TransactionParametersResponse {
 /// on this endpoint -- it uses `ctx.JSON()` directly).
 ///
 /// Returns 503 if the node is currently catching up to a catchpoint.
-pub async fn transaction_params<N: NodeInterface>(
-    State(node): State<AppState<N>>,
-) -> Response {
+pub async fn transaction_params<N: NodeInterface>(State(node): State<AppState<N>>) -> Response {
     let status = match node.status().await {
         Ok(s) => s,
         Err(_) => return error::internal_error("failed retrieving node status"),

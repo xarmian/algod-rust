@@ -80,10 +80,13 @@ pub async fn require_token(
     if provided.as_bytes().ct_eq(expected_token.as_bytes()).into() {
         next.run(request).await
     } else {
+        let body = crate::error::ErrorResponse::new(INVALID_TOKEN_MESSAGE);
+        let json = serde_json::to_string(&body)
+            .unwrap_or_else(|_| r#"{"message":"internal error"}"#.to_string());
         (
             StatusCode::UNAUTHORIZED,
             [("content-type", "application/json")],
-            format!(r#"{{"message":"{}"}}"#, INVALID_TOKEN_MESSAGE),
+            json,
         )
             .into_response()
     }

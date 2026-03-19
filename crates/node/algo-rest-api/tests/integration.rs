@@ -2,7 +2,7 @@
 //!
 //! These tests start a real HTTP server on localhost:0 and send requests
 //! using `reqwest`, exercising the full request/response pipeline including
-//! routing, auth middleware, format negotiation, and handler logic.
+//! routing, auth middleware, and handler logic.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -509,6 +509,26 @@ async fn transaction_params_returns_503_when_catchpoint_catchup() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 503);
+}
+
+#[tokio::test]
+async fn transaction_params_returns_500_when_status_errors() {
+    let server = TestServer::start(MockNode::status_error()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/transactions/params"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "failed retrieving node status"
+    );
 }
 
 #[tokio::test]
