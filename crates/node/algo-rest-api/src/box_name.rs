@@ -7,7 +7,7 @@
 //! - `addr:AAAA...` — 32-byte decoded Algorand address
 //! - `b64:AQID` — base64-decoded bytes
 //! - `b32:MFRGG...` — base32-decoded bytes (RFC 4648, standard alphabet, with padding)
-//! - `abi:(uint64)42` — ABI-encoded value based on type descriptor
+//! - `abi:uint64:42` — ABI-encoded value based on type descriptor
 //!
 //! Reference: `github.com/algorand/avm-abi/apps/parsing.go`
 
@@ -71,90 +71,17 @@ pub fn parse_box_name(arg: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + 
 
 /// Parse and ABI-encode a value given a type descriptor and a JSON value string.
 ///
-/// Supports the subset of ABI types commonly used with box names:
-/// - `uint<N>` (uint8 through uint512, in increments of 8)
-/// - `bool`
-/// - `address`
-/// - `byte` (alias for uint8)
-///
-/// More complex ABI types (tuples, arrays, strings) are not yet implemented;
-/// they can be added as needed.
+/// Delegates to the full ABI type parser, JSON unmarshaler, and encoder in the
+/// `abi` module, supporting all ABI types including tuples, arrays, and strings.
 fn parse_abi_encoded(
     abi_type_str: &str,
     abi_value_str: &str,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    // Remove surrounding parentheses if present: (uint64) -> uint64
-    let abi_type_str = abi_type_str
-        .strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
-        .unwrap_or(abi_type_str);
-
-    if abi_type_str == "bool" {
-        let val: bool = abi_value_str
-            .parse()
-            .map_err(|e| format!("Could not decode abi value string ({abi_value_str}): {e}"))?;
-        // ABI bool is encoded as a single byte
-        return Ok(vec![if val { 1 } else { 0 }]);
-    }
-
-    if abi_type_str == "address" {
-        let addr = Address::from_algorand_string(abi_value_str.trim_matches('"'))
-            .map_err(|e| format!("Could not decode abi value string ({abi_value_str}): {e}"))?;
-        return Ok(addr.0.to_vec());
-    }
-
-    if abi_type_str == "byte" {
-        let num: u8 = abi_value_str
-            .parse()
-            .map_err(|e| format!("Could not decode abi value string ({abi_value_str}): {e}"))?;
-        return Ok(vec![num]);
-    }
-
-    // uint<N> types
-    if let Some(bits_str) = abi_type_str.strip_prefix("uint") {
-        let bits: usize = bits_str
-            .parse()
-            .map_err(|e| format!("Could not decode abi type string ({abi_type_str}): {e}"))?;
-        if bits == 0 || bits > 512 || bits % 8 != 0 {
-            return Err(
-                format!("Could not decode abi type string ({abi_type_str}): bit size must be between 8 and 512 and a multiple of 8").into(),
-            );
-        }
-        let byte_len = bits / 8;
-
-        // Parse the value as a u128 (covers up to uint128). For larger types
-        // we would need a big-int library, but uint64 covers the vast majority
-        // of real-world box name use cases.
-        let num: u128 = abi_value_str
-            .parse()
-            .map_err(|e| format!("Could not decode abi value string ({abi_value_str}): {e}"))?;
-
-        // Encode as big-endian with the correct byte length
-        let full_bytes = num.to_be_bytes(); // 16 bytes
-        if byte_len <= 16 {
-            // Take the last `byte_len` bytes from the 16-byte big-endian
-            let start = 16 - byte_len;
-            // Verify no overflow: the leading bytes we're discarding must be zero
-            if full_bytes[..start].iter().any(|&b| b != 0) {
-                return Err(format!(
-                    "Could not decode abi value string ({abi_value_str}): value too large for {abi_type_str}"
-                )
-                .into());
-            }
-            Ok(full_bytes[start..].to_vec())
-        } else {
-            // For types larger than 128 bits, left-pad with zeros
-            let mut result = vec![0u8; byte_len];
-            let start = byte_len - 16;
-            result[start..].copy_from_slice(&full_bytes);
-            Ok(result)
-        }
-    } else {
-        Err(
-            format!("Could not decode abi type string ({abi_type_str}): unsupported ABI type")
-                .into(),
-        )
-    }
+    super::abi::parse_and_encode_abi(abi_type_str, abi_value_str).map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("Could not decode abi string ({abi_type_str}:{abi_value_str}): {e}").into()
+        },
+    )
 }
 
 #[cfg(test)]
@@ -261,39 +188,41 @@ mod tests {
 
     #[test]
     fn test_abi_uint64() {
-        // Format: abi:(uint64):42 — two colons total
-        let result = parse_box_name("abi:(uint64):42").unwrap();
+        // Format: abi:uint64:42 — type without parens, matching Go's TypeOf
+        let result = parse_box_name("abi:uint64:42").unwrap();
         assert_eq!(result, vec![0, 0, 0, 0, 0, 0, 0, 42]);
     }
 
     #[test]
     fn test_abi_uint8() {
-        let result = parse_box_name("abi:(uint8):255").unwrap();
+        let result = parse_box_name("abi:uint8:255").unwrap();
         assert_eq!(result, vec![255]);
     }
 
     #[test]
     fn test_abi_uint16() {
-        let result = parse_box_name("abi:(uint16):256").unwrap();
+        let result = parse_box_name("abi:uint16:256").unwrap();
         assert_eq!(result, vec![1, 0]);
     }
 
     #[test]
     fn test_abi_bool_true() {
-        let result = parse_box_name("abi:(bool):true").unwrap();
-        assert_eq!(result, vec![1]);
+        // ABI bool encodes as 0x80 for true (matching Go)
+        let result = parse_box_name("abi:bool:true").unwrap();
+        assert_eq!(result, vec![0x80]);
     }
 
     #[test]
     fn test_abi_bool_false() {
-        let result = parse_box_name("abi:(bool):false").unwrap();
-        assert_eq!(result, vec![0]);
+        // ABI bool encodes as 0x00 for false (matching Go)
+        let result = parse_box_name("abi:bool:false").unwrap();
+        assert_eq!(result, vec![0x00]);
     }
 
     #[test]
     fn test_abi_invalid_type() {
-        assert!(parse_box_name("abi:(uint7):42").is_err());
-        assert!(parse_box_name("abi:(uint0):42").is_err());
+        assert!(parse_box_name("abi:uint7:42").is_err());
+        assert!(parse_box_name("abi:uint0:42").is_err());
     }
 
     #[test]
@@ -304,6 +233,25 @@ mod tests {
 
     #[test]
     fn test_abi_overflow() {
-        assert!(parse_box_name("abi:(uint8):256").is_err());
+        assert!(parse_box_name("abi:uint8:256").is_err());
+    }
+
+    #[test]
+    fn test_abi_tuple() {
+        // Tuple type: (uint8,uint16) with JSON array value [1,256]
+        let result = parse_box_name("abi:(uint8,uint16):[1,256]").unwrap();
+        assert_eq!(result, vec![1, 1, 0]);
+    }
+
+    #[test]
+    fn test_abi_string() {
+        let result = parse_box_name("abi:string:\"hello\"").unwrap();
+        assert_eq!(result, vec![0, 5, b'h', b'e', b'l', b'l', b'o']);
+    }
+
+    #[test]
+    fn test_abi_dynamic_array() {
+        let result = parse_box_name("abi:uint8[]:[1,2,3]").unwrap();
+        assert_eq!(result, vec![0, 3, 1, 2, 3]);
     }
 }

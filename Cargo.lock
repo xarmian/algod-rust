@@ -274,6 +274,7 @@ dependencies = [
  "hex",
  "http",
  "hyper",
+ "num-bigint",
  "rand 0.8.5",
  "reqwest",
  "rmp-serde",

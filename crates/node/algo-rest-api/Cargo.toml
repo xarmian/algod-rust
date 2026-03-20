@@ -28,6 +28,7 @@ async-trait.workspace = true
 hex.workspace = true
 data-encoding.workspace = true
 rmpv.workspace = true
+num-bigint.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
