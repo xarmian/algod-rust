@@ -3611,3 +3611,345 @@ async fn get_light_block_header_proof_requires_auth() {
         .unwrap();
     assert_eq!(resp.status(), 401);
 }
+
+// ===========================================================================
+// Protocol-codec msgpack integration tests
+// ===========================================================================
+
+/// Helper: extract the top-level map keys from an rmpv Value.
+fn extract_map_keys(val: &rmpv::Value) -> Vec<String> {
+    match val {
+        rmpv::Value::Map(entries) => entries
+            .iter()
+            .filter_map(|(k, _)| match k {
+                rmpv::Value::String(s) => s.as_str().map(|s| s.to_string()),
+                _ => None,
+            })
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// Helper: find a nested map value by key in an rmpv Value.
+fn find_map_value<'a>(val: &'a rmpv::Value, key: &str) -> Option<&'a rmpv::Value> {
+    match val {
+        rmpv::Value::Map(entries) => entries.iter().find_map(|(k, v)| match k {
+            rmpv::Value::String(s) if s.as_str() == Some(key) => Some(v),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn account_msgpack_uses_protocol_codec_tags() {
+    // Set up account with non-zero balance so "algo" field is present
+    let lookup = AccountLookup {
+        account_data: AccountData {
+            micro_algos: 5_000_000,
+            status: algo_types::AccountStatus::Online,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 5_000_000,
+        assets: BTreeMap::new(),
+        created_assets: BTreeMap::new(),
+        app_local_states: BTreeMap::new(),
+        created_apps: BTreeMap::new(),
+    };
+    let server = TestServer::start(mock_node_with_account(lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}?format=msgpack", TEST_ADDR)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/msgpack"
+    );
+
+    let body = resp.bytes().await.unwrap();
+    let val = rmpv::decode::read_value(&mut &body[..]).expect("valid msgpack");
+
+    let keys = extract_map_keys(&val);
+    // Protocol-codec short tag "algo" must be present (non-zero balance)
+    assert!(
+        keys.contains(&"algo".to_string()),
+        "protocol-codec account msgpack should contain 'algo' field, got keys: {:?}",
+        keys
+    );
+    // Protocol-codec short tag "onl" for status (Online = 1, non-zero so present)
+    assert!(
+        keys.contains(&"onl".to_string()),
+        "protocol-codec account msgpack should contain 'onl' field, got keys: {:?}",
+        keys
+    );
+    // Verify long serde names are NOT present
+    assert!(
+        !keys.contains(&"amount".to_string()),
+        "protocol-codec account msgpack should NOT contain serde 'amount' field"
+    );
+    assert!(
+        !keys.contains(&"status".to_string()),
+        "protocol-codec account msgpack should NOT contain serde 'status' field"
+    );
+}
+
+#[tokio::test]
+async fn account_asset_msgpack_uses_protocol_codec_tags() {
+    let addr: Address = TEST_ADDR.parse().unwrap();
+    let lookup = AssetResourceLookup {
+        asset_holding: Some(AssetHolding {
+            amount: 1000,
+            frozen: true,
+        }),
+        asset_params: Some(AssetParams {
+            total: 1_000_000,
+            unit_name: "TST".to_string(),
+            asset_name: "TestAsset".to_string(),
+            ..AssetParams::default()
+        }),
+        last_round: 1000,
+    };
+    let server = TestServer::start(mock_node_with_asset_resource(&addr, 42, lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!(
+            "/v2/accounts/{}/assets/42?format=msgpack",
+            TEST_ADDR
+        )))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/msgpack"
+    );
+
+    let body = resp.bytes().await.unwrap();
+    let val = rmpv::decode::read_value(&mut &body[..]).expect("valid msgpack");
+
+    let keys = extract_map_keys(&val);
+    // Protocol-codec model uses "asset-holding" and "asset-params" as envelope keys
+    assert!(
+        keys.contains(&"asset-holding".to_string()),
+        "account asset msgpack should contain 'asset-holding' key, got: {:?}",
+        keys
+    );
+    assert!(
+        keys.contains(&"asset-params".to_string()),
+        "account asset msgpack should contain 'asset-params' key, got: {:?}",
+        keys
+    );
+
+    // Verify the nested holding uses protocol-codec short tags ("a", "f")
+    let holding_val = find_map_value(&val, "asset-holding").unwrap();
+    let holding_keys = extract_map_keys(holding_val);
+    assert!(
+        holding_keys.contains(&"a".to_string()),
+        "asset-holding should have 'a' (amount) key, got: {:?}",
+        holding_keys
+    );
+    assert!(
+        holding_keys.contains(&"f".to_string()),
+        "asset-holding should have 'f' (frozen) key, got: {:?}",
+        holding_keys
+    );
+
+    // Verify the nested params uses protocol-codec short tags ("an", "t", "un")
+    let params_val = find_map_value(&val, "asset-params").unwrap();
+    let params_keys = extract_map_keys(params_val);
+    assert!(
+        params_keys.contains(&"an".to_string()),
+        "asset-params should have 'an' (asset name) key, got: {:?}",
+        params_keys
+    );
+    assert!(
+        params_keys.contains(&"t".to_string()),
+        "asset-params should have 't' (total) key, got: {:?}",
+        params_keys
+    );
+    assert!(
+        params_keys.contains(&"un".to_string()),
+        "asset-params should have 'un' (unit name) key, got: {:?}",
+        params_keys
+    );
+}
+
+#[tokio::test]
+async fn account_app_msgpack_uses_protocol_codec_tags() {
+    let addr: Address = TEST_ADDR.parse().unwrap();
+    let lookup = AppResourceLookup {
+        app_local_state: Some(AppLocalState {
+            schema: StateSchema {
+                num_uint: 2,
+                num_byte_slice: 1,
+            },
+            key_value: BTreeMap::new(),
+        }),
+        app_params: Some(AppParams {
+            approval_program: vec![0x06, 0x81, 0x01],
+            clear_state_program: vec![0x06, 0x81, 0x01],
+            global_state: BTreeMap::new(),
+            local_state_schema: StateSchema {
+                num_uint: 0,
+                num_byte_slice: 0,
+            },
+            global_state_schema: StateSchema {
+                num_uint: 1,
+                num_byte_slice: 0,
+            },
+            extra_program_pages: 0,
+            creator: Address([0u8; 32]),
+        }),
+        last_round: 1000,
+    };
+    let server = TestServer::start(mock_node_with_app_resource(&addr, 100, lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!(
+            "/v2/accounts/{}/applications/100?format=msgpack",
+            TEST_ADDR
+        )))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/msgpack"
+    );
+
+    let body = resp.bytes().await.unwrap();
+    let val = rmpv::decode::read_value(&mut &body[..]).expect("valid msgpack");
+
+    let keys = extract_map_keys(&val);
+    // Protocol-codec model uses "app-local-state" and "app-params" as envelope keys
+    assert!(
+        keys.contains(&"app-local-state".to_string()),
+        "account app msgpack should contain 'app-local-state' key, got: {:?}",
+        keys
+    );
+    assert!(
+        keys.contains(&"app-params".to_string()),
+        "account app msgpack should contain 'app-params' key, got: {:?}",
+        keys
+    );
+
+    // Verify nested app-params uses protocol-codec short tags
+    let app_params_val = find_map_value(&val, "app-params").unwrap();
+    let app_keys = extract_map_keys(app_params_val);
+    assert!(
+        app_keys.contains(&"approv".to_string()),
+        "app-params should have 'approv' key, got: {:?}",
+        app_keys
+    );
+    assert!(
+        app_keys.contains(&"clearp".to_string()),
+        "app-params should have 'clearp' key, got: {:?}",
+        app_keys
+    );
+
+    // Verify nested app-local-state uses protocol-codec short tags
+    let als_val = find_map_value(&val, "app-local-state").unwrap();
+    let als_keys = extract_map_keys(als_val);
+    assert!(
+        als_keys.contains(&"hsch".to_string()),
+        "app-local-state should have 'hsch' (schema) key, got: {:?}",
+        als_keys
+    );
+}
+
+#[tokio::test]
+async fn block_header_only_msgpack_uses_protocol_codec_tags() {
+    let mut node = MockNode::synced();
+    let header = make_test_block_header(1);
+    node.block_headers.insert(1, header);
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/1?format=msgpack&header-only=true"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/msgpack"
+    );
+
+    let body = resp.bytes().await.unwrap();
+    let val = rmpv::decode::read_value(&mut &body[..]).expect("valid msgpack");
+
+    // Top-level should be a map with a "block" key (envelope)
+    let keys = extract_map_keys(&val);
+    assert!(
+        keys.contains(&"block".to_string()),
+        "block header-only msgpack should have 'block' envelope key, got: {:?}",
+        keys
+    );
+
+    // Inside the "block" envelope, verify protocol-codec short tags
+    let block_val = find_map_value(&val, "block").unwrap();
+    let block_keys = extract_map_keys(block_val);
+    // "rnd" should be present (round = 1, non-zero)
+    assert!(
+        block_keys.contains(&"rnd".to_string()),
+        "block header should have 'rnd' key, got: {:?}",
+        block_keys
+    );
+    // "gen" should be present (genesis_id is non-empty)
+    assert!(
+        block_keys.contains(&"gen".to_string()),
+        "block header should have 'gen' key, got: {:?}",
+        block_keys
+    );
+    // "proto" should be present (current_protocol is non-empty)
+    assert!(
+        block_keys.contains(&"proto".to_string()),
+        "block header should have 'proto' key, got: {:?}",
+        block_keys
+    );
+    // "gh" should be present (genesis_hash is non-zero)
+    assert!(
+        block_keys.contains(&"gh".to_string()),
+        "block header should have 'gh' key, got: {:?}",
+        block_keys
+    );
+    // Verify long serde names are NOT present
+    assert!(
+        !block_keys.contains(&"round".to_string()),
+        "block header should NOT have serde 'round' field"
+    );
+    assert!(
+        !block_keys.contains(&"genesis-id".to_string()),
+        "block header should NOT have serde 'genesis-id' field"
+    );
+}

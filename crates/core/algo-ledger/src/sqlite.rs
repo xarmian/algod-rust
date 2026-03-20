@@ -4128,6 +4128,10 @@ mod tests {
             total_box_bytes: 100,
             total_boxes: 5,
             update_round: 42,
+            asset_params: BTreeMap::new(),
+            assets: BTreeMap::new(),
+            app_local_states: BTreeMap::new(),
+            app_params: BTreeMap::new(),
         };
         let encoded = encode_account_data(&acct);
         let decoded = decode_account_data(&encoded).unwrap();

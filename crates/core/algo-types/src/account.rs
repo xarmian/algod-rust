@@ -66,6 +66,23 @@ pub struct AccountData {
     pub last_heartbeat: u64,
     /// Round at which this account was last modified (Go codec key "z").
     pub update_round: u64,
+
+    // --- Full resource maps (matching go-algorand basics.AccountData) ---
+    /// Created asset parameters, keyed by asset index.
+    /// Go codec tag: `"apar"`.
+    pub asset_params: BTreeMap<u64, AssetParams>,
+
+    /// Asset holdings (opted-in assets), keyed by asset index.
+    /// Go codec tag: `"asset"`.
+    pub assets: BTreeMap<u64, AssetHolding>,
+
+    /// App local states (opted-in apps), keyed by app index.
+    /// Go codec tag: `"appl"`.
+    pub app_local_states: BTreeMap<u64, AppLocalState>,
+
+    /// Created application parameters, keyed by app index.
+    /// Go codec tag: `"appp"`.
+    pub app_params: BTreeMap<u64, AppParams>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

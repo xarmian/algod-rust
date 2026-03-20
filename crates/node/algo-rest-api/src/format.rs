@@ -83,6 +83,20 @@ pub fn encode_response<T: Serialize>(value: &T, format: ResponseFormat) -> Respo
     }
 }
 
+/// Build a response from pre-encoded protocol-codec (canonical) msgpack bytes.
+///
+/// This is used when the handler has already produced canonical msgpack via
+/// `algo_codec::canonical_encode_*` and needs to return raw bytes with the
+/// correct `application/msgpack` content type. No further encoding is applied.
+pub fn encode_protocol_codec_response(bytes: Vec<u8>) -> Response {
+    (
+        StatusCode::OK,
+        [("content-type", ResponseFormat::Msgpack.content_type())],
+        bytes,
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
