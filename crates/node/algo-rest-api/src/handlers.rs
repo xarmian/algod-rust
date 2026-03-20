@@ -1330,13 +1330,7 @@ pub async fn get_transaction_proof<N: NodeInterface>(
     Path(path): Path<TransactionProofPath>,
     Query(params): Query<TransactionProofParams>,
 ) -> Response {
-    // Validate hashtype query parameter first (matching go-algorand's order).
-    let hashtype = params.hashtype.as_deref().unwrap_or("sha512_256");
-    if hashtype != "sha512_256" && hashtype != "sha256" {
-        return error::bad_request("invalid hash type");
-    }
-
-    // Parse the transaction ID from the path (base32, no padding).
+    // Parse the transaction ID from the path first (matching go-algorand's validation order).
     let txid_bytes = match data_encoding::BASE32_NOPAD.decode(path.txid.as_bytes()) {
         Ok(b) if b.len() == 32 => {
             let mut arr = [0u8; 32];
@@ -1347,6 +1341,12 @@ pub async fn get_transaction_proof<N: NodeInterface>(
             return error::bad_request("no valid transaction ID was specified");
         }
     };
+
+    // Validate hashtype query parameter (after txid, matching go-algorand's order).
+    let hashtype = params.hashtype.as_deref().unwrap_or("sha512_256");
+    if hashtype != "sha512_256" && hashtype != "sha256" {
+        return error::bad_request("invalid hash type");
+    }
 
     // Fetch the block. go-algorand always returns 500 (internalError) on
     // block lookup failures, regardless of the underlying cause.
@@ -1764,7 +1764,13 @@ pub async fn get_light_block_header_proof<N: NodeInterface>(
             }
         };
 
-    let state_proof_interval = last_attested_round - first_attested_round + 1;
+    let state_proof_interval = last_attested_round
+        .saturating_sub(first_attested_round)
+        .saturating_add(1);
+
+    if state_proof_interval > 1_000_000 {
+        return error::internal_error("state proof interval exceeds reasonable bounds");
+    }
 
     // Fetch all block headers in the attested range and convert to light headers.
     let mut light_headers = Vec::with_capacity(state_proof_interval as usize);
