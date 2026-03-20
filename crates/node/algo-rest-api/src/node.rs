@@ -10,8 +10,8 @@
 use std::collections::BTreeMap;
 
 use algo_types::{
-    AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParams, ConsensusParams,
-    Digest,
+    AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParams, Block, BlockHeader,
+    ConsensusParams, Digest,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -296,6 +296,22 @@ pub trait NodeInterface: Send + Sync + 'static {
         &self,
     ) -> Result<ProtocolSwitchInfo, Box<dyn std::error::Error + Send + Sync>>;
 
+    // ---- Block lookup methods ----
+
+    /// Return the block hash (digest) for a given round.
+    ///
+    /// Returns `Ok(Some(digest))` when the block exists, `Ok(None)` when
+    /// the round is not yet available (analogous to go-algorand's
+    /// `ErrNoEntry`), and `Err` for internal errors.
+    ///
+    /// Used by `GET /v2/blocks/{round}/hash`.
+    async fn get_block_hash(
+        &self,
+        _round: u64,
+    ) -> Result<Option<Digest>, Box<dyn std::error::Error + Send + Sync>> {
+        Err("get_block_hash not implemented".into())
+    }
+
     // ---- Account / resource lookup methods ----
 
     /// Look up an account by address.
@@ -426,5 +442,65 @@ pub trait NodeInterface: Send + Sync + 'static {
     /// `config.MaxAPIBoxPerApplication`.
     fn max_api_box_per_application(&self) -> u64 {
         100_000
+    }
+
+    // ---- Block lookup methods ----
+
+    /// Look up a block by round number.
+    ///
+    /// Returns the parsed `Block` for JSON-mode responses.
+    /// Returns a "not found" error when the round has not been committed.
+    ///
+    /// Mirrors go-algorand's `ledger.Block(round)`.
+    async fn get_block(
+        &self,
+        _round: u64,
+    ) -> Result<Block, Box<dyn std::error::Error + Send + Sync>> {
+        Err("get_block not implemented".into())
+    }
+
+    /// Look up a block header by round number.
+    ///
+    /// Returns the parsed `BlockHeader` for header-only responses.
+    /// Returns a "not found" error when the round has not been committed.
+    ///
+    /// Mirrors go-algorand's `ledger.BlockHdr(round)`.
+    async fn get_block_header(
+        &self,
+        _round: u64,
+    ) -> Result<BlockHeader, Box<dyn std::error::Error + Send + Sync>> {
+        Err("get_block_header not implemented".into())
+    }
+
+    /// Find the state proof transaction that covers the given round.
+    ///
+    /// Scans blocks from `round + 1` up to the latest round looking for
+    /// a state proof transaction whose `Message.FirstAttestedRound ..=
+    /// Message.LastAttestedRound` range contains `round`.
+    ///
+    /// Returns `(first_attested_round, last_attested_round)` on success.
+    /// Returns an error if no state proof is found or state proofs are
+    /// not enabled for this round's protocol version.
+    ///
+    /// Mirrors go-algorand's `GetStateProofTransactionForRound`.
+    async fn get_state_proof_transaction_for_round(
+        &self,
+        _round: u64,
+    ) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
+        Err("get_state_proof_transaction_for_round not implemented".into())
+    }
+
+    /// Return raw block+cert bytes for a given round (msgpack pass-through).
+    ///
+    /// The returned bytes are the exact msgpack encoding of the block
+    /// response (block + certificate), suitable for returning directly
+    /// with the `X-Algorand-Struct: block-v1` header.
+    ///
+    /// Mirrors go-algorand's `rpcs.RawBlockBytes(ledger, round)`.
+    async fn get_block_raw_msgpack(
+        &self,
+        _round: u64,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        Err("get_block_raw_msgpack not implemented".into())
     }
 }

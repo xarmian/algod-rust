@@ -264,6 +264,7 @@ name = "algo-rest-api"
 version = "0.1.0"
 dependencies = [
  "algo-codec",
+ "algo-consensus-crypto",
  "algo-error",
  "algo-types",
  "async-trait",
@@ -276,8 +277,10 @@ dependencies = [
  "rand 0.8.5",
  "reqwest",
  "rmp-serde",
+ "rmpv",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "thiserror 2.0.18",
  "tokio",
