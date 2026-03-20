@@ -127,6 +127,10 @@ impl AbiType {
 // Parser
 // ---------------------------------------------------------------------------
 
+/// Maximum nesting depth for ABI type parsing, to prevent stack overflow from
+/// deeply nested types (e.g. `(((((...))))` or `uint8[][][]...[]`).
+const MAX_ABI_DEPTH: usize = 64;
+
 /// Parse an ABI type string into an [`AbiType`].
 ///
 /// Handles all types supported by go-algorand's `abi.TypeOf`:
@@ -137,17 +141,29 @@ impl AbiType {
 ///
 /// # Errors
 ///
-/// Returns an error string if the input is malformed.
+/// Returns an error string if the input is malformed or exceeds the maximum
+/// nesting depth of 64.
 pub fn type_of(s: &str) -> Result<AbiType, String> {
+    type_of_inner(s, 0)
+}
+
+/// Inner recursive parser with depth tracking.
+fn type_of_inner(s: &str, depth: usize) -> Result<AbiType, String> {
+    if depth > MAX_ABI_DEPTH {
+        return Err(format!(
+            "ABI type nesting depth exceeds maximum of {MAX_ABI_DEPTH}"
+        ));
+    }
+
     // Dynamic array: ends with "[]"
     if let Some(inner) = s.strip_suffix("[]") {
-        let elem = type_of(inner)?;
+        let elem = type_of_inner(inner, depth + 1)?;
         return Ok(AbiType::ArrayDynamic(Box::new(elem)));
     }
 
     // Static array: ends with "[<N>]"
     if s.ends_with(']') {
-        return parse_static_array(s);
+        return parse_static_array(s, depth);
     }
 
     // uint<N>
@@ -195,7 +211,7 @@ pub fn type_of(s: &str) -> Result<AbiType, String> {
         let parts = parse_tuple_content(inner)?;
         let mut types = Vec::with_capacity(parts.len());
         for part in &parts {
-            types.push(type_of(part)?);
+            types.push(type_of_inner(part, depth + 1)?);
         }
         if types.len() >= u16::MAX as usize {
             return Err("tuple type child type number larger than maximum uint16 error".into());
@@ -207,7 +223,7 @@ pub fn type_of(s: &str) -> Result<AbiType, String> {
 }
 
 /// Parse a static array type string like `uint64[3]`.
-fn parse_static_array(s: &str) -> Result<AbiType, String> {
+fn parse_static_array(s: &str, depth: usize) -> Result<AbiType, String> {
     // Find the matching '[' by scanning from the end.
     // The regex from Go is: ^([a-z\d\[\](),]+)\[(0|[1-9][\d]*)]$
     // We replicate the logic: find the last '[', validate the length part,
@@ -232,7 +248,7 @@ fn parse_static_array(s: &str) -> Result<AbiType, String> {
         as usize;
 
     let elem_str = &s[..bracket_pos];
-    let elem = type_of(elem_str)?;
+    let elem = type_of_inner(elem_str, depth + 1)?;
 
     Ok(AbiType::ArrayStatic(Box::new(elem), array_len))
 }
@@ -728,6 +744,7 @@ fn find_bool_lr(type_list: &[AbiType], index: usize, delta: i32) -> usize {
                 break;
             }
         } else {
+            debug_assert!(until > 0, "find_bool_lr: non-bool at starting index");
             until = until.saturating_sub(1);
             break;
         }
@@ -2202,5 +2219,42 @@ mod tests {
         let result = parse_and_encode_abi("(bool,uint8,bool,bool)", "[true,1,false,true]").unwrap();
         // First bool: 0x80, uint8: 1, then two consecutive bools packed: false=0, true=1 → 0b01000000 = 0x40
         assert_eq!(result, vec![0x80, 1, 0x40]);
+    }
+
+    // --- Recursion depth limit tests ---
+
+    #[test]
+    fn test_type_of_rejects_deep_nested_tuples() {
+        // 65 levels of nested tuples exceeds MAX_ABI_DEPTH (64)
+        let deep = "(".repeat(65) + "uint8" + &")".repeat(65);
+        let result = type_of(&deep);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("nesting depth exceeds maximum"),
+            "expected depth limit error"
+        );
+    }
+
+    #[test]
+    fn test_type_of_rejects_deep_nested_arrays() {
+        // 65 levels of dynamic array nesting exceeds MAX_ABI_DEPTH (64)
+        let deep = "uint8".to_string() + &"[]".repeat(65);
+        let result = type_of(&deep);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("nesting depth exceeds maximum"),
+            "expected depth limit error"
+        );
+    }
+
+    #[test]
+    fn test_type_of_allows_moderate_nesting() {
+        // 30 levels of nesting should be fine
+        let moderate = "(".repeat(30) + "uint8" + &")".repeat(30);
+        assert!(type_of(&moderate).is_ok());
     }
 }
