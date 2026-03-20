@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -423,6 +423,10 @@ impl From<&CatchpointBaseAccountData> for AccountData {
             vote_last_valid: src.vote_last_valid,
             vote_key_dilution: src.vote_key_dilution,
             update_round: src.update_round,
+            asset_params: BTreeMap::new(),
+            assets: BTreeMap::new(),
+            app_local_states: BTreeMap::new(),
+            app_params: BTreeMap::new(),
         }
     }
 }

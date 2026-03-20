@@ -9,12 +9,15 @@
 // 6. Strings use msgpack String format (fixstr/str8/str16)
 // 7. Deterministic — identical inputs always produce identical bytes
 
+use std::collections::BTreeMap;
+
 use algo_types::{
-    Address, AssetParams, Block, BlockHeader, BoxRef, Digest, FalconVerifier, HashFactory,
-    HeartbeatProof, HeartbeatTxnFields, HoldingRef, LocalsRef, LogicSig, MerkleProof,
-    MerkleSignature, MerkleSignatureVerifier, MultisigSig, MultisigSubsig, Participant,
-    ResourceRef, Reveal, SigSlotCommit, SignedTransaction, StateProofBody, StateProofMessage,
-    StateSchema, Transaction, TxTailRound, TxTailRoundLease,
+    AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParams, Block, BlockHeader,
+    BoxRef, Digest, FalconVerifier, HashFactory, HeartbeatProof, HeartbeatTxnFields, HoldingRef,
+    LocalsRef, LogicSig, MerkleProof, MerkleSignature, MerkleSignatureVerifier, MultisigSig,
+    MultisigSubsig, Participant, ResourceRef, Reveal, SigSlotCommit, SignedTransaction,
+    StateProofBody, StateProofMessage, StateSchema, TealValue, Transaction, TxTailRound,
+    TxTailRoundLease,
 };
 use serde_bytes::ByteBuf;
 
@@ -69,6 +72,20 @@ impl CanonicalMap {
         if !val.is_empty() && val.iter().any(|&b| b != 0) {
             let mut buf = Vec::new();
             rmp::encode::write_bin(&mut buf, val).unwrap();
+            self.fields.push((key, buf));
+        }
+    }
+
+    /// Encode a byte slice using msgpack `str` format (not `bin`).
+    ///
+    /// In Go, fields typed as `string` are encoded by go-codec as msgpack str,
+    /// even when the Rust model stores them as `Vec<u8>`. This is needed for
+    /// `TealValue.Bytes` (`"tb"` field) which is `string` in Go, not `[]byte`.
+    fn add_str_bytes(&mut self, key: &'static str, val: &[u8]) {
+        if !val.is_empty() {
+            let mut buf = Vec::new();
+            rmp::encode::write_str_len(&mut buf, val.len() as u32).unwrap();
+            buf.extend_from_slice(val);
             self.fields.push((key, buf));
         }
     }
@@ -624,6 +641,19 @@ pub fn canonical_encode_block_header(header: &BlockHeader) -> Vec<u8> {
     m.encode()
 }
 
+/// Canonically encode a block-header-only response as `{"block": <header>}`.
+///
+/// Matches go-algorand's `getBlockHeader` helper which encodes
+/// `struct { Block bookkeeping.BlockHeader "codec:\"block\"" }` via protocol codec.
+pub fn canonical_encode_block_header_response(header: &BlockHeader) -> Vec<u8> {
+    let header_bytes = canonical_encode_block_header(header);
+    let mut buf = Vec::new();
+    rmp::encode::write_map_len(&mut buf, 1).unwrap();
+    rmp::encode::write_str(&mut buf, "block").unwrap();
+    buf.extend_from_slice(&header_bytes);
+    buf
+}
+
 /// Canonically encode AssetParams as a nested msgpack map.
 pub fn canonical_encode_asset_params(apar: &AssetParams) -> Vec<u8> {
     let mut m = CanonicalMap::new();
@@ -1077,6 +1107,262 @@ pub fn build_txtail_from_block(block: &Block) -> TxTailRound {
     }
 }
 
+// ── Account-related encoding functions ──────────────────────────
+
+/// Canonically encode an AssetHolding.
+///
+/// Go codec tags from `data/basics/userBalance.go`:
+///   Amount → `"a"`, Frozen → `"f"`
+pub fn canonical_encode_asset_holding(h: &AssetHolding) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_u64("a", h.amount);
+    m.add_bool("f", h.frozen);
+    m.encode()
+}
+
+/// Canonically encode a single TealValue.
+///
+/// Go codec tags from `data/basics/teal.go`:
+///   Type → `"tt"`, Bytes → `"tb"`, Uint → `"ui"`
+///
+/// In Go, TealBytesType = 1 and TealUintType = 2.
+/// The `Bytes` field in Go is a `string` (binary-safe); we encode it as
+/// msgpack string since Go's codec encodes `string` fields as str format.
+fn canonical_encode_teal_value(tv: &TealValue) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    match tv {
+        TealValue::Bytes(bytes) => {
+            // TealBytesType = 1
+            // Go's TealValue.Bytes is typed `string`, so go-codec encodes it
+            // as msgpack str (not bin). Use add_str_bytes to match.
+            m.add_str_bytes("tb", bytes);
+            m.add_u64("tt", 1);
+        }
+        TealValue::Uint(val) => {
+            // TealUintType = 2
+            m.add_u64("tt", 2);
+            m.add_u64("ui", *val);
+        }
+    }
+    m.encode()
+}
+
+/// Canonically encode a TealKeyValue map (used for global state and local state key/value).
+///
+/// In Go, `TealKeyValue` is `map[string]TealValue`. The map keys are encoded
+/// as msgpack strings (Go's canonical encoding uses str format for map keys
+/// in `map[string]T`). The map is sorted by key bytes.
+///
+/// In the Rust model, keys are `Vec<u8>`. We encode them as msgpack strings
+/// to match Go's behavior (Go `string` is just a byte sequence).
+pub fn canonical_encode_teal_key_value(tkv: &BTreeMap<Vec<u8>, TealValue>) -> Vec<u8> {
+    if tkv.is_empty() {
+        let mut buf = Vec::new();
+        rmp::encode::write_map_len(&mut buf, 0).unwrap();
+        return buf;
+    }
+
+    // BTreeMap is already sorted by key, which matches Go's canonical map encoding
+    // (sorted by raw key bytes).
+    let mut buf = Vec::new();
+    rmp::encode::write_map_len(&mut buf, tkv.len() as u32).unwrap();
+    for (key, val) in tkv {
+        // Go encodes map[string]TealValue keys as msgpack strings
+        rmp::encode::write_str_len(&mut buf, key.len() as u32).unwrap();
+        buf.extend_from_slice(key);
+        let encoded_val = canonical_encode_teal_value(val);
+        buf.extend_from_slice(&encoded_val);
+    }
+    buf
+}
+
+/// Canonically encode an AppLocalState.
+///
+/// Go codec tags from `data/basics/userBalance.go`:
+///   Schema → `"hsch"`, KeyValue → `"tkv"`
+pub fn canonical_encode_app_local_state(als: &AppLocalState) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_map("hsch", canonical_encode_state_schema(&als.schema));
+    m.add_map("tkv", canonical_encode_teal_key_value(&als.key_value));
+    m.encode()
+}
+
+/// Canonically encode AppParams.
+///
+/// Go codec tags from `data/basics/userBalance.go`:
+///   ApprovalProgram → `"approv"`, ClearStateProgram → `"clearp"`,
+///   GlobalState → `"gs"`, ExtraProgramPages → `"epp"`,
+///   LocalStateSchema → `"lsch"`, GlobalStateSchema → `"gsch"`,
+///   Version → `"v"`, SizeSponsor → `"ss"`
+///
+/// Note: The Rust `AppParams` struct does not yet have `version` or
+/// `size_sponsor` fields. When those are added, encoding should be updated.
+/// The `creator` field in the Rust struct is not part of Go's AppParams codec
+/// and is not encoded here.
+pub fn canonical_encode_app_params(ap: &AppParams) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_bytes("approv", &ap.approval_program);
+    m.add_bytes("clearp", &ap.clear_state_program);
+    m.add_u64("epp", ap.extra_program_pages as u64);
+    m.add_map(
+        "gsch",
+        canonical_encode_state_schema(&ap.global_state_schema),
+    );
+    m.add_map("gs", canonical_encode_teal_key_value(&ap.global_state));
+    m.add_map(
+        "lsch",
+        canonical_encode_state_schema(&ap.local_state_schema),
+    );
+    // TODO: encode "ss" (SizeSponsor) when added to Rust AppParams
+    // TODO: encode "v" (Version) when added to Rust AppParams
+    m.encode()
+}
+
+/// Encode a `BTreeMap<u64, AssetParams>` as a canonical msgpack map.
+///
+/// Go's `map[basics.AssetIndex]basics.AssetParams` uses uint64 keys.
+/// Keys are sorted numerically (BTreeMap guarantees this).
+fn encode_asset_params_map(map: &BTreeMap<u64, AssetParams>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    rmp::encode::write_map_len(&mut buf, map.len() as u32).unwrap();
+    for (&key, val) in map {
+        write_uint(&mut buf, key);
+        buf.extend_from_slice(&canonical_encode_asset_params(val));
+    }
+    buf
+}
+
+/// Encode a `BTreeMap<u64, AssetHolding>` as a canonical msgpack map.
+///
+/// Go's `map[basics.AssetIndex]basics.AssetHolding` uses uint64 keys.
+fn encode_asset_holdings_map(map: &BTreeMap<u64, AssetHolding>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    rmp::encode::write_map_len(&mut buf, map.len() as u32).unwrap();
+    for (&key, val) in map {
+        write_uint(&mut buf, key);
+        buf.extend_from_slice(&canonical_encode_asset_holding(val));
+    }
+    buf
+}
+
+/// Encode a `BTreeMap<u64, AppLocalState>` as a canonical msgpack map.
+///
+/// Go's `map[basics.AppIndex]basics.AppLocalState` uses uint64 keys.
+fn encode_app_local_states_map(map: &BTreeMap<u64, AppLocalState>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    rmp::encode::write_map_len(&mut buf, map.len() as u32).unwrap();
+    for (&key, val) in map {
+        write_uint(&mut buf, key);
+        buf.extend_from_slice(&canonical_encode_app_local_state(val));
+    }
+    buf
+}
+
+/// Encode a `BTreeMap<u64, AppParams>` as a canonical msgpack map.
+///
+/// Go's `map[basics.AppIndex]basics.AppParams` uses uint64 keys.
+fn encode_app_params_map(map: &BTreeMap<u64, AppParams>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    rmp::encode::write_map_len(&mut buf, map.len() as u32).unwrap();
+    for (&key, val) in map {
+        write_uint(&mut buf, key);
+        buf.extend_from_slice(&canonical_encode_app_params(val));
+    }
+    buf
+}
+
+/// Canonically encode AccountData.
+///
+/// Go codec tags from `data/basics/userBalance.go`:
+///   Status → `"onl"`, MicroAlgos → `"algo"`, RewardsBase → `"ebase"`,
+///   RewardedMicroAlgos → `"ern"`, VoteID → `"vote"`, SelectionID → `"sel"`,
+///   StateProofID → `"stprf"`, VoteFirstValid → `"voteFst"`,
+///   VoteLastValid → `"voteLst"`, VoteKeyDilution → `"voteKD"`,
+///   LastProposed → `"lpr"`, LastHeartbeat → `"lhb"`,
+///   AssetParams → `"apar"`, Assets → `"asset"`,
+///   AuthAddr → `"spend"`, IncentiveEligible → `"ie"`,
+///   AppLocalStates → `"appl"`, AppParams → `"appp"`,
+///   TotalAppSchema → `"tsch"`, TotalExtraAppPages → `"teap"`,
+///   TotalBoxes → `"tbx"`, TotalBoxBytes → `"tbxb"`
+pub fn canonical_encode_account_data(ad: &AccountData) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    // MicroAlgos — Go's MicroAlgos is encoded as a plain uint64 via CodecEncodeSelf
+    m.add_u64("algo", ad.micro_algos);
+
+    // Resource maps
+    m.add_map("apar", encode_asset_params_map(&ad.asset_params));
+    m.add_map("appl", encode_app_local_states_map(&ad.app_local_states));
+    m.add_map("appp", encode_app_params_map(&ad.app_params));
+    m.add_map("asset", encode_asset_holdings_map(&ad.assets));
+
+    m.add_u64("ebase", ad.rewards_base);
+
+    // RewardedMicroAlgos — also encoded as plain uint64
+    m.add_u64("ern", ad.rewarded_micro_algos);
+
+    m.add_bool("ie", ad.incentive_eligible);
+
+    m.add_u64("lhb", ad.last_heartbeat);
+    m.add_u64("lpr", ad.last_proposed);
+
+    // Status — Go's Status type is a byte, encoded as uint
+    m.add_u64("onl", ad.status as u64);
+
+    m.add_option_fixed_bytes("sel", &ad.selection_id);
+    m.add_option_address("spend", &ad.auth_addr);
+    m.add_option_fixed_bytes("stprf", &ad.state_proof_id);
+
+    m.add_u64("tbx", ad.total_boxes);
+    m.add_u64("tbxb", ad.total_box_bytes);
+    m.add_u64("teap", ad.total_extra_app_pages as u64);
+
+    m.add_map("tsch", canonical_encode_state_schema(&ad.total_app_schema));
+
+    m.add_option_fixed_bytes("vote", &ad.vote_id);
+    m.add_u64("voteFst", ad.vote_first_valid);
+    m.add_u64("voteKD", ad.vote_key_dilution);
+    m.add_u64("voteLst", ad.vote_last_valid);
+
+    m.encode()
+}
+
+/// Canonically encode an AccountAssetModel (REST API v2 response type).
+///
+/// Go codec tags from `daemon/algod/api/spec/v2/model.go`:
+///   AssetHolding → `"asset-holding"`, AssetParams → `"asset-params"`
+pub fn canonical_encode_account_asset_model(
+    asset_params: Option<&AssetParams>,
+    asset_holding: Option<&AssetHolding>,
+) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    if let Some(ah) = asset_holding {
+        m.add_map("asset-holding", canonical_encode_asset_holding(ah));
+    }
+    if let Some(ap) = asset_params {
+        m.add_map("asset-params", canonical_encode_asset_params(ap));
+    }
+    m.encode()
+}
+
+/// Canonically encode an AccountApplicationModel (REST API v2 response type).
+///
+/// Go codec tags from `daemon/algod/api/spec/v2/model.go`:
+///   AppLocalState → `"app-local-state"`, AppParams → `"app-params"`
+pub fn canonical_encode_account_application_model(
+    app_params: Option<&AppParams>,
+    app_local_state: Option<&AppLocalState>,
+) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    if let Some(als) = app_local_state {
+        m.add_map("app-local-state", canonical_encode_app_local_state(als));
+    }
+    if let Some(ap) = app_params {
+        m.add_map("app-params", canonical_encode_app_params(ap));
+    }
+    m.encode()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1430,5 +1716,176 @@ mod tests {
         assert_eq!(tail.leases[0].sender, sender);
         assert_eq!(tail.leases[0].lease.as_ref(), &lease_bytes);
         assert_eq!(tail.leases[0].txn_idx, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Protocol-codec encoder unit tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: extract string keys from a top-level msgpack map.
+    fn extract_map_keys(bytes: &[u8]) -> Vec<String> {
+        let val = rmpv::decode::read_value(&mut &bytes[..]).expect("valid msgpack");
+        match val {
+            rmpv::Value::Map(entries) => entries
+                .iter()
+                .filter_map(|(k, _)| match k {
+                    rmpv::Value::String(s) => s.as_str().map(|s| s.to_string()),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    #[test]
+    fn canonical_encode_asset_holding_tags() {
+        let holding = AssetHolding {
+            amount: 1000,
+            frozen: true,
+        };
+        let bytes = canonical_encode_asset_holding(&holding);
+        let keys = extract_map_keys(&bytes);
+
+        assert!(
+            keys.contains(&"a".to_string()),
+            "asset holding should have 'a' (amount) tag, got: {:?}",
+            keys
+        );
+        assert!(
+            keys.contains(&"f".to_string()),
+            "asset holding should have 'f' (frozen) tag, got: {:?}",
+            keys
+        );
+        // Should NOT have serde-style long names
+        assert!(
+            !keys.contains(&"amount".to_string()),
+            "asset holding should NOT have serde 'amount' tag"
+        );
+        assert!(
+            !keys.contains(&"frozen".to_string()),
+            "asset holding should NOT have serde 'frozen' tag"
+        );
+    }
+
+    #[test]
+    fn canonical_encode_asset_holding_omitempty() {
+        // Zero amount, not frozen => both fields omitted
+        let holding = AssetHolding {
+            amount: 0,
+            frozen: false,
+        };
+        let bytes = canonical_encode_asset_holding(&holding);
+        let keys = extract_map_keys(&bytes);
+        assert!(
+            keys.is_empty(),
+            "zero-value asset holding should produce empty map, got keys: {:?}",
+            keys
+        );
+    }
+
+    #[test]
+    fn canonical_encode_app_params_tags() {
+        let params = AppParams {
+            approval_program: vec![0x06, 0x81, 0x01],
+            clear_state_program: vec![0x06, 0x81, 0x01],
+            global_state: BTreeMap::new(),
+            local_state_schema: StateSchema {
+                num_uint: 0,
+                num_byte_slice: 0,
+            },
+            global_state_schema: StateSchema {
+                num_uint: 1,
+                num_byte_slice: 0,
+            },
+            extra_program_pages: 0,
+            creator: Address([0u8; 32]),
+        };
+        let bytes = canonical_encode_app_params(&params);
+        let keys = extract_map_keys(&bytes);
+
+        assert!(
+            keys.contains(&"approv".to_string()),
+            "app params should have 'approv' tag, got: {:?}",
+            keys
+        );
+        assert!(
+            keys.contains(&"clearp".to_string()),
+            "app params should have 'clearp' tag, got: {:?}",
+            keys
+        );
+        assert!(
+            keys.contains(&"gsch".to_string()),
+            "app params should have 'gsch' (global schema) tag, got: {:?}",
+            keys
+        );
+        // Should NOT have serde-style long names
+        assert!(
+            !keys.contains(&"approval-program".to_string()),
+            "app params should NOT have serde 'approval-program' tag"
+        );
+        assert!(
+            !keys.contains(&"clear-state-program".to_string()),
+            "app params should NOT have serde 'clear-state-program' tag"
+        );
+    }
+
+    #[test]
+    fn canonical_encode_account_data_tags() {
+        use algo_types::AccountStatus;
+
+        let ad = AccountData {
+            micro_algos: 5_000_000,
+            status: AccountStatus::Online,
+            ..AccountData::default()
+        };
+        let bytes = canonical_encode_account_data(&ad);
+        let keys = extract_map_keys(&bytes);
+
+        assert!(
+            keys.contains(&"algo".to_string()),
+            "account data should have 'algo' tag, got: {:?}",
+            keys
+        );
+        assert!(
+            keys.contains(&"onl".to_string()),
+            "account data should have 'onl' (status) tag, got: {:?}",
+            keys
+        );
+        // Should NOT have serde-style long names
+        assert!(
+            !keys.contains(&"amount".to_string()),
+            "account data should NOT have serde 'amount' tag"
+        );
+        assert!(
+            !keys.contains(&"status".to_string()),
+            "account data should NOT have serde 'status' tag"
+        );
+        assert!(
+            !keys.contains(&"micro-algos".to_string()),
+            "account data should NOT have 'micro-algos' tag"
+        );
+    }
+
+    #[test]
+    fn canonical_encode_account_data_keys_are_sorted() {
+        use algo_types::AccountStatus;
+
+        let ad = AccountData {
+            micro_algos: 5_000_000,
+            status: AccountStatus::Online,
+            rewards_base: 100,
+            rewarded_micro_algos: 50,
+            ..AccountData::default()
+        };
+        let bytes = canonical_encode_account_data(&ad);
+        let keys = extract_map_keys(&bytes);
+
+        // Verify keys are in sorted order (canonical encoding rule)
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+        assert_eq!(
+            keys, sorted_keys,
+            "account data keys should be sorted lexicographically"
+        );
     }
 }

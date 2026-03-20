@@ -684,13 +684,30 @@ pub async fn account_information<N: NodeInterface>(
         }
     }
 
+    // Msgpack path: canonical-encode the raw AccountData (matching go-algorand)
+    if resp_format == format::ResponseFormat::Msgpack {
+        if exclude == "all" {
+            // No resource maps needed — encode directly without cloning
+            let bytes = algo_codec::canonical_encode_account_data(&lookup.account_data);
+            return format::encode_protocol_codec_response(bytes);
+        } else {
+            let mut account_data = lookup.account_data.clone();
+            account_data.asset_params = lookup.created_assets.clone();
+            account_data.assets = lookup.assets.clone();
+            account_data.app_local_states = lookup.app_local_states.clone();
+            account_data.app_params = lookup.created_apps.clone();
+            let bytes = algo_codec::canonical_encode_account_data(&account_data);
+            return format::encode_protocol_codec_response(bytes);
+        }
+    }
+
     // Get consensus params for min balance computation
     let consensus = match node.consensus_params().await {
         Ok(c) => c,
         Err(_) => return error::internal_error("failed retrieving consensus params"),
     };
 
-    // Convert to API response
+    // Convert to API response (JSON path)
     let response = models::account_data_to_response(&lookup, &addr, exclude, &consensus);
     format::encode_response(&response, resp_format)
 }
@@ -734,7 +751,17 @@ pub async fn account_asset_information<N: NodeInterface>(
         return error::not_found("account asset info not found");
     }
 
-    // Build response
+    // Msgpack path: canonical-encode the AccountAssetModel (matching go-algorand's
+    // AssetResourceToAccountAssetModel)
+    if resp_format == format::ResponseFormat::Msgpack {
+        let bytes = algo_codec::canonical_encode_account_asset_model(
+            lookup.asset_params.as_ref(),
+            lookup.asset_holding.as_ref(),
+        );
+        return format::encode_protocol_codec_response(bytes);
+    }
+
+    // Build JSON response
     let mut response = models::AccountAssetResponse {
         round: lookup.last_round,
         asset_holding: None,
@@ -792,7 +819,17 @@ pub async fn account_application_information<N: NodeInterface>(
         return error::not_found("account application info not found");
     }
 
-    // Build response
+    // Msgpack path: canonical-encode the AccountApplicationModel (matching go-algorand's
+    // AppResourceToAccountApplicationModel)
+    if resp_format == format::ResponseFormat::Msgpack {
+        let bytes = algo_codec::canonical_encode_account_application_model(
+            lookup.app_params.as_ref(),
+            lookup.app_local_state.as_ref(),
+        );
+        return format::encode_protocol_codec_response(bytes);
+    }
+
+    // Build JSON response
     let mut response = models::AccountApplicationResponse {
         round: lookup.last_round,
         app_local_state: None,
@@ -1113,7 +1150,11 @@ pub async fn get_block<N: NodeInterface>(
 /// Handle the header-only block response for both JSON and msgpack.
 ///
 /// Matches go-algorand's `getBlockHeader` helper which encodes a
-/// `struct { Block bookkeeping.BlockHeader }` in the requested format.
+/// `struct { Block bookkeeping.BlockHeader "codec:\"block\"" }` in the
+/// requested format.
+///
+/// For msgpack: uses canonical encoding to produce `{"block": <header>}`.
+/// For JSON: uses serde serialization of the typed response struct.
 async fn get_block_header_response<N: NodeInterface>(
     node: &AppState<N>,
     round: u64,
@@ -1121,6 +1162,11 @@ async fn get_block_header_response<N: NodeInterface>(
 ) -> Response {
     match node.get_block_header(round).await {
         Ok(header) => {
+            if resp_format == format::ResponseFormat::Msgpack {
+                // Canonical-encode: wrap in {"block": <header>} envelope
+                let bytes = algo_codec::canonical_encode_block_header_response(&header);
+                return format::encode_protocol_codec_response(bytes);
+            }
             let response = models::BlockHeaderJsonResponse { block: header };
             format::encode_response(&response, resp_format)
         }
