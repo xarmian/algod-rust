@@ -688,7 +688,7 @@ pub async fn account_information<N: NodeInterface>(
     if resp_format == format::ResponseFormat::Msgpack {
         if exclude == "all" {
             // No resource maps needed — encode directly without cloning
-            let bytes = algo_codec::canonical_encode_account_data(&lookup.account_data);
+            let bytes = algo_codec::canonical_encode_ledgercore_account_data(&lookup.account_data);
             return format::encode_protocol_codec_response(bytes);
         } else {
             let mut account_data = lookup.account_data.clone();

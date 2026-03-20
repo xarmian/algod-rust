@@ -223,6 +223,61 @@ impl CanonicalMap {
         }
     }
 
+    // ── "always" variants: write even when the value is zero ──────────
+    // Used for structs whose Go definition does NOT have `_struct codec:",omitempty"`,
+    // meaning all fields are always present in the encoded output.
+
+    fn add_u64_always(&mut self, key: &'static str, val: u64) {
+        let mut buf = Vec::new();
+        write_uint(&mut buf, val);
+        self.fields.push((key, buf));
+    }
+
+    fn add_u32_always(&mut self, key: &'static str, val: u32) {
+        let mut buf = Vec::new();
+        write_uint(&mut buf, val as u64);
+        self.fields.push((key, buf));
+    }
+
+    fn add_bool_always(&mut self, key: &'static str, val: bool) {
+        let mut buf = Vec::new();
+        rmp::encode::write_bool(&mut buf, val).unwrap();
+        self.fields.push((key, buf));
+    }
+
+    fn add_fixed_bytes_always<const N: usize>(&mut self, key: &'static str, val: &[u8; N]) {
+        let mut buf = Vec::new();
+        rmp::encode::write_bin(&mut buf, val).unwrap();
+        self.fields.push((key, buf));
+    }
+
+    fn add_address_always(&mut self, key: &'static str, val: &Address) {
+        let mut buf = Vec::new();
+        rmp::encode::write_bin(&mut buf, &val.0).unwrap();
+        self.fields.push((key, buf));
+    }
+
+    fn add_option_fixed_bytes_always<const N: usize>(
+        &mut self,
+        key: &'static str,
+        val: &Option<[u8; N]>,
+    ) {
+        let zero = [0u8; N];
+        let bytes = val.as_ref().unwrap_or(&zero);
+        self.add_fixed_bytes_always(key, bytes);
+    }
+
+    fn add_option_address_always(&mut self, key: &'static str, val: &Option<Address>) {
+        let zero = Address([0u8; 32]);
+        let addr = val.as_ref().unwrap_or(&zero);
+        self.add_address_always(key, addr);
+    }
+
+    #[allow(dead_code)] // Part of the _always API; will be used when needed
+    fn add_map_always(&mut self, key: &'static str, val: Vec<u8>) {
+        self.fields.push((key, val));
+    }
+
     /// Sort fields by key in lexicographic order (raw UTF-8 bytes).
     ///
     /// Go's go-codec sorts struct field codec tags alphabetically.
@@ -1327,6 +1382,45 @@ pub fn canonical_encode_account_data(ad: &AccountData) -> Vec<u8> {
     m.encode()
 }
 
+/// Canonically encode an AccountData using **ledgercore** field names.
+///
+/// This matches the encoding produced by `go-algorand/ledger/ledgercore.AccountData`,
+/// which uses PascalCase Go struct field names as msgpack keys and does NOT apply
+/// omitempty at the struct level (all 22 fields are always present). The only
+/// exception is `TotalAppSchema` whose inner `StateSchema` has `_struct codec:",omitempty"`.
+pub fn canonical_encode_ledgercore_account_data(ad: &AccountData) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    m.add_option_address_always("AuthAddr", &ad.auth_addr);
+    m.add_bool_always("IncentiveEligible", ad.incentive_eligible);
+    m.add_u64_always("LastHeartbeat", ad.last_heartbeat);
+    m.add_u64_always("LastProposed", ad.last_proposed);
+    m.add_u64_always("MicroAlgos", ad.micro_algos);
+    m.add_u64_always("RewardedMicroAlgos", ad.rewarded_micro_algos);
+    m.add_u64_always("RewardsBase", ad.rewards_base);
+    m.add_option_fixed_bytes_always("SelectionID", &ad.selection_id);
+    m.add_option_fixed_bytes_always("StateProofID", &ad.state_proof_id);
+    m.add_u64_always("Status", ad.status as u64);
+    m.add_u64_always("TotalAppLocalStates", ad.total_apps_opted_in);
+    m.add_u64_always("TotalAppParams", ad.total_created_apps);
+    // StateSchema has `_struct codec:",omitempty"` → use add_map (omits when empty)
+    m.add_map(
+        "TotalAppSchema",
+        canonical_encode_state_schema(&ad.total_app_schema),
+    );
+    m.add_u64_always("TotalAssetParams", ad.total_created_assets);
+    m.add_u64_always("TotalAssets", ad.total_assets_opted_in);
+    m.add_u64_always("TotalBoxBytes", ad.total_box_bytes);
+    m.add_u64_always("TotalBoxes", ad.total_boxes);
+    m.add_u32_always("TotalExtraAppPages", ad.total_extra_app_pages);
+    m.add_u64_always("VoteFirstValid", ad.vote_first_valid);
+    m.add_option_fixed_bytes_always("VoteID", &ad.vote_id);
+    m.add_u64_always("VoteKeyDilution", ad.vote_key_dilution);
+    m.add_u64_always("VoteLastValid", ad.vote_last_valid);
+
+    m.encode()
+}
+
 /// Canonically encode an AccountAssetModel (REST API v2 response type).
 ///
 /// Go codec tags from `daemon/algod/api/spec/v2/model.go`:
@@ -1886,6 +1980,119 @@ mod tests {
         assert_eq!(
             keys, sorted_keys,
             "account data keys should be sorted lexicographically"
+        );
+    }
+
+    #[test]
+    fn ledgercore_encode_zero_account_has_21_keys() {
+        let ad = AccountData::default();
+        let bytes = canonical_encode_ledgercore_account_data(&ad);
+        let keys = extract_map_keys(&bytes);
+
+        // All 22 fields present, but TotalAppSchema is omitted (StateSchema has omitempty
+        // and all fields are zero), so we expect 21 keys.
+        assert_eq!(
+            keys.len(),
+            21,
+            "zero AccountData should encode 21 keys (22 minus TotalAppSchema which is omitempty); got: {:?}",
+            keys
+        );
+    }
+
+    #[test]
+    fn ledgercore_encode_uses_pascal_case_keys() {
+        let ad = AccountData::default();
+        let bytes = canonical_encode_ledgercore_account_data(&ad);
+        let keys = extract_map_keys(&bytes);
+
+        let expected_always_keys = vec![
+            "AuthAddr",
+            "IncentiveEligible",
+            "LastHeartbeat",
+            "LastProposed",
+            "MicroAlgos",
+            "RewardedMicroAlgos",
+            "RewardsBase",
+            "SelectionID",
+            "StateProofID",
+            "Status",
+            "TotalAppLocalStates",
+            "TotalAppParams",
+            "TotalAssetParams",
+            "TotalAssets",
+            "TotalBoxBytes",
+            "TotalBoxes",
+            "TotalExtraAppPages",
+            "VoteFirstValid",
+            "VoteID",
+            "VoteKeyDilution",
+            "VoteLastValid",
+        ];
+        for k in &expected_always_keys {
+            assert!(
+                keys.contains(&k.to_string()),
+                "expected key '{}' in encoded output, got: {:?}",
+                k,
+                keys
+            );
+        }
+        // Should NOT contain codec tag style keys
+        assert!(
+            !keys.contains(&"algo".to_string()),
+            "should not contain codec tag 'algo'"
+        );
+    }
+
+    #[test]
+    fn ledgercore_encode_total_app_schema_omitted_when_zero() {
+        let ad = AccountData::default();
+        let bytes = canonical_encode_ledgercore_account_data(&ad);
+        let keys = extract_map_keys(&bytes);
+
+        assert!(
+            !keys.contains(&"TotalAppSchema".to_string()),
+            "TotalAppSchema should be omitted when zero (StateSchema has omitempty)"
+        );
+    }
+
+    #[test]
+    fn ledgercore_encode_total_app_schema_present_when_nonzero() {
+        let ad = AccountData {
+            total_app_schema: StateSchema {
+                num_uint: 5,
+                num_byte_slice: 3,
+            },
+            ..AccountData::default()
+        };
+        let bytes = canonical_encode_ledgercore_account_data(&ad);
+        let keys = extract_map_keys(&bytes);
+
+        assert!(
+            keys.contains(&"TotalAppSchema".to_string()),
+            "TotalAppSchema should be present when non-zero; got keys: {:?}",
+            keys
+        );
+        // Total keys: 22 (21 always + TotalAppSchema)
+        assert_eq!(keys.len(), 22);
+    }
+
+    #[test]
+    fn ledgercore_encode_keys_are_sorted() {
+        let ad = AccountData {
+            total_app_schema: StateSchema {
+                num_uint: 1,
+                num_byte_slice: 0,
+            },
+            ..AccountData::default()
+        };
+        let bytes = canonical_encode_ledgercore_account_data(&ad);
+        let keys = extract_map_keys(&bytes);
+
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+        assert_eq!(
+            keys, sorted_keys,
+            "ledgercore account data keys should be sorted lexicographically"
         );
     }
 }
