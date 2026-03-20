@@ -3345,6 +3345,46 @@ impl LedgerStore for SqliteLedger {
         rows > 0
     }
 
+    fn box_keys_for_app(&self, app_id: u64) -> Vec<Vec<u8>> {
+        // Build the prefix: "bx:" + big-endian app_id
+        let prefix = make_box_key(app_id, b"");
+        let prefix_len = prefix.len();
+
+        // Use a range query: keys that start with the prefix.
+        // SQLite BLOB comparison works lexicographically, so we query for
+        // keys >= prefix AND < prefix with the last byte incremented (or use
+        // LIKE with the X'...' hex literal). A simpler approach: fetch all
+        // matching keys and strip the prefix in Rust.
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key FROM kvstore WHERE key >= ?1 AND key < ?2")
+            .expect("prepare box_keys_for_app");
+
+        // Upper bound: increment the last byte of the app_id portion.
+        // Since the prefix is "bx:" + 8-byte BE app_id, the upper bound is
+        // "bx:" + BE(app_id + 1). For app_id == u64::MAX this would overflow,
+        // so handle that edge case by using "by:" as the upper bound (next
+        // prefix after "bx:"), which constrains results to keys that start
+        // with "bx:" and avoids matching unrelated kvstore keys.
+        let results: Vec<Vec<u8>> = if app_id == u64::MAX {
+            let upper = b"by:".to_vec();
+            stmt.query_map(params![prefix, upper], |row| row.get::<_, Vec<u8>>(0))
+                .expect("query box_keys_for_app")
+                .map(|r| r.expect("read box key row"))
+                .map(|full_key| full_key[prefix_len..].to_vec())
+                .collect()
+        } else {
+            let upper = make_box_key(app_id + 1, b"");
+            stmt.query_map(params![prefix, upper], |row| row.get::<_, Vec<u8>>(0))
+                .expect("query box_keys_for_app")
+                .map(|r| r.expect("read box key row"))
+                .map(|full_key| full_key[prefix_len..].to_vec())
+                .collect()
+        };
+
+        results
+    }
+
     // ---- Leases ----
 
     fn check_lease(

@@ -172,6 +172,14 @@ pub trait LedgerStore {
         self.get_box(app_id, key).map(|v| v.len())
     }
 
+    /// Enumerate all box names (raw keys, not the full KV-store keys) for a
+    /// given application.
+    ///
+    /// Used by the REST API to implement `GET /v2/applications/{id}/boxes`.
+    /// The returned `Vec<u8>` items are the raw box names without the
+    /// `"bx:" + app_id` prefix.
+    fn box_keys_for_app(&self, app_id: u64) -> Vec<Vec<u8>>;
+
     // ---- Leases ----
 
     /// Check whether a lease is active for (sender, lease) at the given round.

@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use algo_rest_api::auth::generate_token;
 use algo_rest_api::node::{
-    AccountLookup, AppResourceLookup, AssetResourceLookup, BuildVersion, NodeInterface, NodeStatus,
-    ProtocolSwitchInfo,
+    AccountLookup, AppResourceLookup, ApplicationLookup, AssetLookup, AssetResourceLookup,
+    BuildVersion, NodeInterface, NodeStatus, ProtocolSwitchInfo,
 };
 use algo_rest_api::router::{build_router, TokenConfig};
 use algo_types::{
@@ -48,6 +48,7 @@ enum MockProtocolInfoBehavior {
 
 /// A configurable mock implementation of `NodeInterface` for testing.
 #[derive(Debug)]
+#[allow(clippy::type_complexity)]
 struct MockNode {
     genesis_id: String,
     genesis_hash: Digest,
@@ -73,6 +74,18 @@ struct MockNode {
     consensus_params: ConsensusParams,
     /// Max API resources per account.
     max_api_resources: u64,
+    /// Application lookup results, keyed by app_id.
+    application_lookups: BTreeMap<u64, ApplicationLookup>,
+    /// Asset lookup results, keyed by asset_id.
+    asset_lookups: BTreeMap<u64, AssetLookup>,
+    /// KV lookup results, keyed by (app_id, key).
+    kv_lookups: BTreeMap<(u64, Vec<u8>), (Option<Vec<u8>>, u64)>,
+    /// Keys-by-prefix results, keyed by app_id.
+    keys_by_prefix: BTreeMap<u64, (Vec<Vec<u8>>, u64)>,
+    /// Total boxes count results, keyed by app_id. Returns (total_boxes, round).
+    total_boxes_map: BTreeMap<u64, (u64, u64)>,
+    /// Max API boxes per application.
+    max_api_boxes: u64,
 }
 
 impl Clone for MockNode {
@@ -96,6 +109,12 @@ impl Clone for MockNode {
             app_resource_lookups: self.app_resource_lookups.clone(),
             consensus_params: self.consensus_params.clone(),
             max_api_resources: self.max_api_resources,
+            application_lookups: self.application_lookups.clone(),
+            asset_lookups: self.asset_lookups.clone(),
+            kv_lookups: self.kv_lookups.clone(),
+            keys_by_prefix: self.keys_by_prefix.clone(),
+            total_boxes_map: self.total_boxes_map.clone(),
+            max_api_boxes: self.max_api_boxes,
         }
     }
 }
@@ -167,6 +186,12 @@ impl MockNode {
             app_resource_lookups: BTreeMap::new(),
             consensus_params: ConsensusParams::default(),
             max_api_resources: 100_000,
+            application_lookups: BTreeMap::new(),
+            asset_lookups: BTreeMap::new(),
+            kv_lookups: BTreeMap::new(),
+            keys_by_prefix: BTreeMap::new(),
+            total_boxes_map: BTreeMap::new(),
+            max_api_boxes: 100_000,
         }
     }
 
@@ -460,6 +485,70 @@ impl NodeInterface for MockNode {
 
     fn max_api_resources_per_account(&self) -> u64 {
         self.max_api_resources
+    }
+
+    async fn lookup_application(
+        &self,
+        app_id: u64,
+    ) -> Result<ApplicationLookup, Box<dyn std::error::Error + Send + Sync>> {
+        match self.application_lookups.get(&app_id) {
+            Some(lookup) => Ok(lookup.clone()),
+            None => Ok(ApplicationLookup {
+                app_params: None,
+                creator: Address([0u8; 32]),
+                last_round: 1000,
+            }),
+        }
+    }
+
+    async fn lookup_asset_by_id(
+        &self,
+        asset_id: u64,
+    ) -> Result<AssetLookup, Box<dyn std::error::Error + Send + Sync>> {
+        match self.asset_lookups.get(&asset_id) {
+            Some(lookup) => Ok(lookup.clone()),
+            None => Ok(AssetLookup {
+                asset_params: None,
+                creator: Address([0u8; 32]),
+                last_round: 1000,
+            }),
+        }
+    }
+
+    async fn lookup_kv(
+        &self,
+        app_id: u64,
+        key: &[u8],
+    ) -> Result<(Option<Vec<u8>>, u64), Box<dyn std::error::Error + Send + Sync>> {
+        match self.kv_lookups.get(&(app_id, key.to_vec())) {
+            Some(result) => Ok(result.clone()),
+            None => Ok((None, 1000)),
+        }
+    }
+
+    async fn lookup_keys_by_prefix(
+        &self,
+        app_id: u64,
+        _prefix: &[u8],
+    ) -> Result<(Vec<Vec<u8>>, u64), Box<dyn std::error::Error + Send + Sync>> {
+        match self.keys_by_prefix.get(&app_id) {
+            Some(result) => Ok(result.clone()),
+            None => Ok((vec![], 1000)),
+        }
+    }
+
+    async fn total_boxes(
+        &self,
+        app_id: u64,
+    ) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
+        match self.total_boxes_map.get(&app_id) {
+            Some(result) => Ok(*result),
+            None => Ok((0, 1000)),
+        }
+    }
+
+    fn max_api_box_per_application(&self) -> u64 {
+        self.max_api_boxes
     }
 }
 
@@ -2445,4 +2534,460 @@ async fn account_info_includes_participation_keys() {
         !state_proof_key.is_empty(),
         "state proof key should be non-empty"
     );
+}
+
+// ===========================================================================
+// Application query endpoint tests (GET /v2/applications/:application-id)
+// ===========================================================================
+
+/// Helper: create a MockNode with an application lookup configured.
+fn mock_node_with_application(app_id: u64, lookup: ApplicationLookup) -> MockNode {
+    let mut node = MockNode::synced();
+    node.application_lookups.insert(app_id, lookup);
+    node
+}
+
+/// Helper: create a MockNode with an asset lookup configured.
+fn mock_node_with_asset(asset_id: u64, lookup: AssetLookup) -> MockNode {
+    let mut node = MockNode::synced();
+    node.asset_lookups.insert(asset_id, lookup);
+    node
+}
+
+#[tokio::test]
+async fn get_application_returns_200_with_correct_json() {
+    let creator = Address([0xAA; 32]);
+    let lookup = ApplicationLookup {
+        app_params: Some(AppParams {
+            creator,
+            approval_program: vec![0x06, 0x81, 0x01],
+            clear_state_program: vec![0x06, 0x81, 0x01],
+            global_state: BTreeMap::new(),
+            local_state_schema: StateSchema {
+                num_uint: 2,
+                num_byte_slice: 1,
+            },
+            global_state_schema: StateSchema {
+                num_uint: 4,
+                num_byte_slice: 2,
+            },
+            extra_program_pages: 0,
+        }),
+        creator,
+        last_round: 1000,
+    };
+    let server = TestServer::start(mock_node_with_application(123, lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/123"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["id"].as_u64().unwrap(), 123);
+    assert!(
+        body["params"]["approval-program"].is_string(),
+        "approval-program should be base64 string"
+    );
+    assert!(
+        body["params"]["clear-state-program"].is_string(),
+        "clear-state-program should be base64 string"
+    );
+    assert!(
+        body["params"]["creator"].is_string(),
+        "creator should be a string"
+    );
+    assert_eq!(
+        body["params"]["local-state-schema"]["num-uint"]
+            .as_u64()
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        body["params"]["local-state-schema"]["num-byte-slice"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        body["params"]["global-state-schema"]["num-uint"]
+            .as_u64()
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        body["params"]["global-state-schema"]["num-byte-slice"]
+            .as_u64()
+            .unwrap(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn get_application_returns_404_when_not_found() {
+    // No application configured for app_id 999
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/999"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "application does not exist"
+    );
+}
+
+#[tokio::test]
+async fn get_application_requires_auth_token() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/123"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+// ===========================================================================
+// Asset query endpoint tests (GET /v2/assets/:asset-id)
+// ===========================================================================
+
+#[tokio::test]
+async fn get_asset_returns_200_with_correct_json() {
+    let creator = Address([0xBB; 32]);
+    let lookup = AssetLookup {
+        asset_params: Some(AssetParams {
+            total: 1_000_000,
+            decimals: 6,
+            default_frozen: false,
+            asset_name: "TestCoin".to_string(),
+            unit_name: "TC".to_string(),
+            url: "https://example.com".to_string(),
+            metadata_hash: None,
+            manager: None,
+            reserve: None,
+            freeze: None,
+            clawback: None,
+        }),
+        creator,
+        last_round: 1000,
+    };
+    let server = TestServer::start(mock_node_with_asset(456, lookup)).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/assets/456"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["index"].as_u64().unwrap(), 456);
+    assert_eq!(body["params"]["total"].as_u64().unwrap(), 1_000_000);
+    assert_eq!(body["params"]["decimals"].as_u64().unwrap(), 6);
+    assert_eq!(body["params"]["name"].as_str().unwrap(), "TestCoin");
+    assert_eq!(body["params"]["unit-name"].as_str().unwrap(), "TC");
+    assert!(
+        body["params"]["creator"].is_string(),
+        "creator should be a string"
+    );
+}
+
+#[tokio::test]
+async fn get_asset_returns_404_when_not_found() {
+    // No asset configured for asset_id 999
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/assets/999"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["message"].as_str().unwrap(), "asset does not exist");
+}
+
+#[tokio::test]
+async fn get_asset_requires_auth_token() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/assets/456"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+// ===========================================================================
+// Application box endpoint tests (GET /v2/applications/:id/box)
+// ===========================================================================
+
+#[tokio::test]
+async fn get_application_box_returns_200_with_box_value() {
+    let mut node = MockNode::synced();
+    // Box name "mybox" encoded as raw bytes
+    let box_name = b"mybox".to_vec();
+    let box_value = b"hello world".to_vec();
+    node.kv_lookups
+        .insert((123, box_name), (Some(box_value), 1000));
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/123/box?name=str:mybox"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // name and value should be base64-encoded strings
+    assert!(body["name"].is_string(), "name should be a base64 string");
+    assert!(body["value"].is_string(), "value should be a base64 string");
+    assert_eq!(body["round"].as_u64().unwrap(), 1000);
+
+    // Decode and verify the value
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let decoded_value = STANDARD.decode(body["value"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded_value, b"hello world");
+}
+
+#[tokio::test]
+async fn get_application_box_returns_404_when_not_found() {
+    // No box configured for this app_id/name
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/123/box?name=str:nonexistent"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["message"].as_str().unwrap(), "box not found");
+}
+
+#[tokio::test]
+async fn get_application_box_requires_auth_token() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/123/box?name=str:mybox"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+// ===========================================================================
+// Application boxes endpoint tests (GET /v2/applications/:id/boxes)
+// ===========================================================================
+
+#[tokio::test]
+async fn get_application_boxes_returns_200_with_box_list() {
+    let mut node = MockNode::synced();
+    let box_names = vec![b"box1".to_vec(), b"box2".to_vec(), b"box3".to_vec()];
+    node.keys_by_prefix.insert(123, (box_names, 1000));
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/123/boxes"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let boxes = body["boxes"].as_array().unwrap();
+    assert_eq!(boxes.len(), 3);
+    // Each box descriptor should have a "name" field (base64 encoded)
+    for b in boxes {
+        assert!(
+            b["name"].is_string(),
+            "box descriptor name should be a string"
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_application_boxes_returns_400_when_limit_exceeded() {
+    let mut node = MockNode::synced();
+    // Set a low limit: algod_max = 2
+    // With requested_max = 0 (no query param), application_boxes_max_keys
+    // returns algod_max + 1 = 3. So we need > 3 boxes to trigger the error.
+    node.max_api_boxes = 2;
+    // The handler checks total_boxes() first (O(1) lookup) before scanning keys.
+    node.total_boxes_map.insert(123, (4, 1000));
+    let box_names = vec![
+        b"box1".to_vec(),
+        b"box2".to_vec(),
+        b"box3".to_vec(),
+        b"box4".to_vec(),
+    ];
+    node.keys_by_prefix.insert(123, (box_names, 1000));
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/123/boxes"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["message"].as_str().unwrap(), "Result limit exceeded");
+}
+
+#[tokio::test]
+async fn get_application_boxes_requires_auth_token() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/123/boxes"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn get_application_box_with_int_encoding() {
+    let mut node = MockNode::synced();
+    // int:42 encodes as 8-byte big-endian
+    let box_name = 42u64.to_be_bytes().to_vec();
+    let box_value = b"int-box-value".to_vec();
+    node.kv_lookups
+        .insert((100, box_name), (Some(box_value), 1000));
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/100/box?name=int:42"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let decoded_value = STANDARD.decode(body["value"].as_str().unwrap()).unwrap();
+    assert_eq!(decoded_value, b"int-box-value");
+}
+
+#[tokio::test]
+async fn get_application_box_invalid_encoding_returns_400() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/100/box?name=bogus:value"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn get_application_boxes_empty_list() {
+    // App with zero boxes returns an empty array
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/999/boxes"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let boxes = body["boxes"].as_array().unwrap();
+    assert!(boxes.is_empty(), "expected empty boxes array");
+}
+
+#[tokio::test]
+async fn get_application_boxes_with_max_query_param() {
+    let mut node = MockNode::synced();
+    // Set total_boxes and actual box keys
+    node.total_boxes_map.insert(200, (2, 1000));
+    let box_names = vec![b"a".to_vec(), b"b".to_vec()];
+    node.keys_by_prefix.insert(200, (box_names, 1000));
+    // algod_max is large (default 100_000), requested_max=5 dominates
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/200/boxes?max=5"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let boxes = body["boxes"].as_array().unwrap();
+    assert_eq!(boxes.len(), 2);
+}
+
+#[tokio::test]
+async fn get_application_boxes_max_param_triggers_limit() {
+    let mut node = MockNode::synced();
+    // Set max=1 query param, total_boxes=3; since requested_max(1) <= algod_max(100000),
+    // effective max = 1. total_boxes(3) > 1 triggers the limit.
+    node.total_boxes_map.insert(300, (3, 1000));
+    let box_names = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+    node.keys_by_prefix.insert(300, (box_names, 1000));
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/300/boxes?max=1"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["message"].as_str().unwrap(), "Result limit exceeded");
+    // Verify the data includes total-boxes from the O(1) lookup
+    let data = &body["data"];
+    assert_eq!(data["total-boxes"].as_u64().unwrap(), 3);
+    assert_eq!(data["max"].as_u64().unwrap(), 1);
 }

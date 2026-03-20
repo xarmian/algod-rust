@@ -923,6 +923,14 @@ impl crate::store_trait::LedgerStore for LedgerState {
         self.boxes.remove(&(app_id, key.to_vec())).is_some()
     }
 
+    fn box_keys_for_app(&self, app_id: u64) -> Vec<Vec<u8>> {
+        self.boxes
+            .keys()
+            .filter(|(aid, _)| *aid == app_id)
+            .map(|(_, name)| name.clone())
+            .collect()
+    }
+
     // ---- Leases ----
 
     fn check_lease(

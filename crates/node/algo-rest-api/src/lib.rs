@@ -4,6 +4,7 @@
 //! including `/versions`, `/v2/status`, `/v2/transactions/params`, and more.
 
 pub mod auth;
+pub mod box_name;
 pub mod error;
 pub mod format;
 pub mod handlers;
