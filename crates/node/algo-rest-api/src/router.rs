@@ -84,6 +84,21 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             "/v2/applications/:application-id/boxes",
             get(handlers::get_application_boxes::<N>),
         )
+        .route("/v2/blocks/:round", get(handlers::get_block::<N>))
+        .route("/v2/blocks/:round/hash", get(handlers::get_block_hash::<N>))
+        .route(
+            "/v2/blocks/:round/txids",
+            get(handlers::get_block_txids::<N>),
+        )
+        .route("/v2/blocks/:round/logs", get(handlers::get_block_logs::<N>))
+        .route(
+            "/v2/blocks/:round/transactions/:txid/proof",
+            get(handlers::get_transaction_proof::<N>),
+        )
+        .route(
+            "/v2/blocks/:round/lightheader/proof",
+            get(handlers::get_light_block_header_proof::<N>),
+        )
         .layer(middleware::from_fn_with_state(
             tokens.api_token.clone(),
             auth::require_token,

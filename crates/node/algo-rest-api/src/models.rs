@@ -491,6 +491,117 @@ pub type ApplicationResponse = ApiApplication;
 pub type AssetResponse = ApiAsset;
 
 // ---------------------------------------------------------------------------
+// BlockHashResponse
+// ---------------------------------------------------------------------------
+
+/// Response for the `/v2/blocks/{round}/hash` endpoint.
+///
+/// Matches go-algorand's `model.BlockHashResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockHashResponse {
+    /// Block header hash, base32-encoded (no padding).
+    #[serde(rename = "blockHash")]
+    pub block_hash: String,
+}
+
+// ---------------------------------------------------------------------------
+// BlockTxidsResponse
+// ---------------------------------------------------------------------------
+
+/// Response for the `/v2/blocks/{round}/txids` endpoint.
+///
+/// Matches go-algorand's `model.BlockTxidsResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockTxidsResponse {
+    /// Transaction IDs in the block, base32-encoded (no padding).
+    #[serde(rename = "blockTxids")]
+    pub block_txids: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// BlockLogsResponse / AppCallLogs
+// ---------------------------------------------------------------------------
+
+/// Logs from an app call, including the outer transaction ID and app index.
+///
+/// Matches go-algorand's `model.AppCallLogs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppCallLogs {
+    /// The application from which the logs were generated.
+    #[serde(rename = "application-index")]
+    pub application_index: u64,
+
+    /// An array of logs (each log is base64-encoded bytes).
+    #[serde(with = "base64_bytes_array")]
+    pub logs: Vec<Vec<u8>>,
+
+    /// The transaction ID of the outer app call that lead to these logs.
+    #[serde(rename = "txId")]
+    pub tx_id: String,
+}
+
+/// Response for the `/v2/blocks/{round}/logs` endpoint.
+///
+/// Matches go-algorand's `model.BlockLogsResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockLogsResponse {
+    pub logs: Vec<AppCallLogs>,
+}
+
+// ---------------------------------------------------------------------------
+// TransactionProofResponse
+// ---------------------------------------------------------------------------
+
+/// Response for the `/v2/blocks/{round}/transactions/{txid}/proof` endpoint.
+///
+/// Matches go-algorand's `model.TransactionProofResponse` (aliased from
+/// `model.TransactionProof`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionProofResponse {
+    /// The type of hash function used to create the proof, must be one of:
+    /// * sha512_256
+    /// * sha256
+    pub hashtype: String,
+
+    /// Index of the transaction in the block's payset.
+    pub idx: u64,
+
+    /// Proof of transaction membership, base64 encoded.
+    #[serde(with = "base64_bytes")]
+    pub proof: Vec<u8>,
+
+    /// Hash of SignedTxnInBlock for verifying proof, base64 encoded.
+    #[serde(with = "base64_bytes")]
+    pub stibhash: Vec<u8>,
+
+    /// Represents the depth of the tree that is being proven, i.e. the number
+    /// of edges from a leaf to the root.
+    pub treedepth: u64,
+}
+
+// ---------------------------------------------------------------------------
+// LightBlockHeaderProofResponse
+// ---------------------------------------------------------------------------
+
+/// Response for the `/v2/blocks/{round}/lightheader/proof` endpoint.
+///
+/// Matches go-algorand's `model.LightBlockHeaderProofResponse` (aliased from
+/// `model.LightBlockHeaderProof`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LightBlockHeaderProofResponse {
+    /// The index of the light block header in the vector commitment tree.
+    pub index: u64,
+
+    /// The encoded proof of membership, base64 encoded.
+    #[serde(with = "base64_bytes")]
+    pub proof: Vec<u8>,
+
+    /// Represents the depth of the tree that is being proven, i.e. the number
+    /// of edges from a leaf to the root.
+    pub treedepth: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Box / BoxDescriptor / BoxesResponse
 // ---------------------------------------------------------------------------
 
@@ -527,6 +638,39 @@ pub struct BoxDescriptor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoxesResponse {
     pub boxes: Vec<BoxDescriptor>,
+}
+
+// ---------------------------------------------------------------------------
+// BlockResponse (for GET /v2/blocks/{round})
+// ---------------------------------------------------------------------------
+
+/// Response for the `GET /v2/blocks/{round}` endpoint (JSON mode, full block).
+///
+/// Matches go-algorand's `BlockResponseJSON` which wraps the block in a
+/// `{"block": ...}` envelope.
+///
+/// **Note:** The certificate (`cert`) is intentionally omitted for JSON
+/// responses.  go-algorand only includes the certificate in the msgpack
+/// format response (via `rpcs.RawBlockBytes`).  See the comment in
+/// `handlers.go` at `GetBlock`: "Currently, the certificate is only
+/// returned in messagepack format requests for a complete block."
+///
+/// For msgpack mode, the handler returns raw bytes directly with the
+/// `X-Algorand-Struct: block-v1` header, bypassing this struct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockJsonResponse {
+    /// The block content.
+    pub block: algo_types::Block,
+}
+
+/// Response for the `GET /v2/blocks/{round}?header-only=true` endpoint.
+///
+/// Matches go-algorand's header-only response which wraps the block header
+/// in a `{"block": ...}` envelope (same field name as the full block response).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockHeaderJsonResponse {
+    /// The block header content.
+    pub block: algo_types::BlockHeader,
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,6 +1155,34 @@ pub fn convert_teal_key_value(kv: &BTreeMap<Vec<u8>, TealValue>) -> Option<TealK
         .collect();
 
     Some(converted)
+}
+
+/// Serde helper for serializing/deserializing `Vec<Vec<u8>>` as an array of
+/// standard base64 strings.
+///
+/// In go-algorand, `[][]byte` fields (like `AppCallLogs.Logs`) are serialized
+/// as JSON arrays of base64-encoded strings.
+mod base64_bytes_array {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use serde::ser::SerializeSeq;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(items: &Vec<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(items.len()))?;
+        for item in items {
+            seq.serialize_element(&STANDARD.encode(item))?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<u8>>, D::Error> {
+        let strings: Vec<String> = Vec::deserialize(d)?;
+        strings
+            .into_iter()
+            .map(|s| STANDARD.decode(&s).map_err(serde::de::Error::custom))
+            .collect()
+    }
 }
 
 /// Serde helper for serializing/deserializing `Option<Vec<u8>>` as standard

@@ -7,7 +7,9 @@ rust-version.workspace = true
 [dependencies]
 algo-types.workspace = true
 algo-codec.workspace = true
+algo-consensus-crypto.workspace = true
 algo-error.workspace = true
+sha2.workspace = true
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
@@ -25,6 +27,7 @@ rand.workspace = true
 async-trait.workspace = true
 hex.workspace = true
 data-encoding.workspace = true
+rmpv.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -32,3 +35,6 @@ reqwest = { workspace = true }
 rmp-serde = { workspace = true }
 async-trait = { workspace = true }
 algo-types = { workspace = true }
+algo-codec = { workspace = true }
+data-encoding = { workspace = true }
+rmpv = { workspace = true }

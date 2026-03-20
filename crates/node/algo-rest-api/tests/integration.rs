@@ -15,8 +15,8 @@ use algo_rest_api::node::{
 };
 use algo_rest_api::router::{build_router, TokenConfig};
 use algo_types::{
-    AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParams, ConsensusParams,
-    Digest, StateSchema,
+    AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParams, Block, BlockHeader,
+    ConsensusParams, Digest, Round, SignedTransaction, StateSchema, Transaction, TxnType,
 };
 use async_trait::async_trait;
 use tokio::net::TcpListener;
@@ -86,6 +86,16 @@ struct MockNode {
     total_boxes_map: BTreeMap<u64, (u64, u64)>,
     /// Max API boxes per application.
     max_api_boxes: u64,
+    /// Block lookup results, keyed by round.
+    blocks: BTreeMap<u64, Block>,
+    /// Block header lookup results, keyed by round.
+    block_headers: BTreeMap<u64, BlockHeader>,
+    /// Block hash lookup results, keyed by round.
+    block_hashes: BTreeMap<u64, Digest>,
+    /// Raw msgpack block bytes, keyed by round.
+    block_raw_msgpack: BTreeMap<u64, Vec<u8>>,
+    /// State proof transaction results, keyed by round. Returns (first_attested, last_attested).
+    state_proof_txns: BTreeMap<u64, (u64, u64)>,
 }
 
 impl Clone for MockNode {
@@ -115,6 +125,11 @@ impl Clone for MockNode {
             keys_by_prefix: self.keys_by_prefix.clone(),
             total_boxes_map: self.total_boxes_map.clone(),
             max_api_boxes: self.max_api_boxes,
+            blocks: self.blocks.clone(),
+            block_headers: self.block_headers.clone(),
+            block_hashes: self.block_hashes.clone(),
+            block_raw_msgpack: self.block_raw_msgpack.clone(),
+            state_proof_txns: self.state_proof_txns.clone(),
         }
     }
 }
@@ -192,6 +207,11 @@ impl MockNode {
             keys_by_prefix: BTreeMap::new(),
             total_boxes_map: BTreeMap::new(),
             max_api_boxes: 100_000,
+            blocks: BTreeMap::new(),
+            block_headers: BTreeMap::new(),
+            block_hashes: BTreeMap::new(),
+            block_raw_msgpack: BTreeMap::new(),
+            state_proof_txns: BTreeMap::new(),
         }
     }
 
@@ -549,6 +569,53 @@ impl NodeInterface for MockNode {
 
     fn max_api_box_per_application(&self) -> u64 {
         self.max_api_boxes
+    }
+
+    async fn get_block(
+        &self,
+        round: u64,
+    ) -> Result<Block, Box<dyn std::error::Error + Send + Sync>> {
+        match self.blocks.get(&round) {
+            Some(block) => Ok(block.clone()),
+            None => Err("block not found".into()),
+        }
+    }
+
+    async fn get_block_header(
+        &self,
+        round: u64,
+    ) -> Result<BlockHeader, Box<dyn std::error::Error + Send + Sync>> {
+        match self.block_headers.get(&round) {
+            Some(header) => Ok(header.clone()),
+            None => Err("block header not found".into()),
+        }
+    }
+
+    async fn get_block_hash(
+        &self,
+        round: u64,
+    ) -> Result<Option<Digest>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.block_hashes.get(&round).copied())
+    }
+
+    async fn get_block_raw_msgpack(
+        &self,
+        round: u64,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        match self.block_raw_msgpack.get(&round) {
+            Some(bytes) => Ok(bytes.clone()),
+            None => Err("block not found".into()),
+        }
+    }
+
+    async fn get_state_proof_transaction_for_round(
+        &self,
+        round: u64,
+    ) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
+        match self.state_proof_txns.get(&round) {
+            Some(result) => Ok(*result),
+            None => Err("no state proof found for round".into()),
+        }
     }
 }
 
@@ -2990,4 +3057,557 @@ async fn get_application_boxes_max_param_triggers_limit() {
     let data = &body["data"];
     assert_eq!(data["total-boxes"].as_u64().unwrap(), 3);
     assert_eq!(data["max"].as_u64().unwrap(), 1);
+}
+
+// ===========================================================================
+// Block endpoint tests: GET /v2/blocks/{round}
+// ===========================================================================
+
+/// Helper: create a minimal mock block at the given round with optional transactions.
+fn make_test_block(round: u64, txns: Vec<SignedTransaction>) -> Block {
+    Block {
+        round: Round(round),
+        genesis_id: "testnet-v1.0".to_string(),
+        genesis_hash: [0xAB; 32],
+        current_protocol: algo_types::CONSENSUS_V41.to_string(),
+        timestamp: 1_700_000_000,
+        payset: txns,
+        ..Block::default()
+    }
+}
+
+/// Helper: create a minimal mock block header at the given round.
+fn make_test_block_header(round: u64) -> BlockHeader {
+    BlockHeader {
+        round: Round(round),
+        genesis_id: "testnet-v1.0".to_string(),
+        genesis_hash: [0xAB; 32],
+        current_protocol: algo_types::CONSENSUS_V41.to_string(),
+        timestamp: 1_700_000_000,
+        ..BlockHeader::default()
+    }
+}
+
+/// Helper: create a simple payment transaction for testing.
+fn make_test_signed_txn() -> SignedTransaction {
+    let txn = Transaction {
+        txn_type: TxnType::Pay,
+        sender: Address([1u8; 32]),
+        fee: 1000,
+        first_valid: Round(1),
+        last_valid: Round(1000),
+        genesis_id: "testnet-v1.0".to_string(),
+        genesis_hash: [0xAB; 32],
+        ..Transaction::default()
+    };
+
+    SignedTransaction {
+        txn,
+        has_genesis_id: true,
+        has_genesis_hash: true,
+        ..SignedTransaction::default()
+    }
+}
+
+#[tokio::test]
+async fn get_block_json_happy_path() {
+    let mut node = MockNode::synced();
+    let block = make_test_block(1, vec![make_test_signed_txn()]);
+    node.blocks.insert(1, block);
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/1"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // Response has a "block" envelope
+    assert!(
+        body.get("block").is_some(),
+        "response should have 'block' field"
+    );
+    let block_val = &body["block"];
+    assert_eq!(block_val["rnd"].as_u64().unwrap(), 1);
+    assert_eq!(block_val["gen"].as_str().unwrap(), "testnet-v1.0");
+
+    // go-algorand only includes the certificate in msgpack format responses.
+    // JSON responses must NOT have a "cert" field (see BlockResponseJSON in handlers.go).
+    assert!(
+        body.get("cert").is_none(),
+        "JSON response should NOT contain 'cert' -- cert is only in msgpack format"
+    );
+}
+
+#[tokio::test]
+async fn get_block_header_only() {
+    let mut node = MockNode::synced();
+    let header = make_test_block_header(1);
+    node.block_headers.insert(1, header);
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/1?header-only=true"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.get("block").is_some(),
+        "response should have 'block' field"
+    );
+    let block_val = &body["block"];
+    assert_eq!(block_val["rnd"].as_u64().unwrap(), 1);
+    // Header-only should not have "txns" (payset)
+    assert!(
+        block_val.get("txns").is_none(),
+        "header-only response should not have 'txns'"
+    );
+}
+
+#[tokio::test]
+async fn get_block_msgpack_format() {
+    let mut node = MockNode::synced();
+    let raw_bytes = vec![0x82, 0xa5, 0x62, 0x6c, 0x6f, 0x63, 0x6b]; // some raw msgpack bytes
+    node.block_raw_msgpack.insert(1, raw_bytes.clone());
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/1?format=msgpack"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Check content-type and X-Algorand-Struct headers
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/msgpack"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("X-Algorand-Struct")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "block-v1"
+    );
+
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), raw_bytes.as_slice());
+}
+
+#[tokio::test]
+async fn get_block_not_found() {
+    let node = MockNode::synced();
+    // No blocks inserted -- round 999 does not exist
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/999"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn get_block_requires_auth() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+// ===========================================================================
+// Block hash endpoint tests: GET /v2/blocks/{round}/hash
+// ===========================================================================
+
+#[tokio::test]
+async fn get_block_hash_happy_path() {
+    let mut node = MockNode::synced();
+    let digest = Digest([0xDE; 32]);
+    node.block_hashes.insert(1, digest);
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/1/hash"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let hash_str = body["blockHash"].as_str().unwrap();
+    // Should be base32-no-pad encoding of [0xDE; 32]
+    let expected = data_encoding::BASE32_NOPAD.encode(&[0xDE; 32]);
+    assert_eq!(hash_str, expected);
+}
+
+#[tokio::test]
+async fn get_block_hash_not_found() {
+    let node = MockNode::synced();
+    // No block hashes inserted
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/999/hash"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn get_block_hash_requires_auth() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/1/hash"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+// ===========================================================================
+// Block txids endpoint tests: GET /v2/blocks/{round}/txids
+// ===========================================================================
+
+#[tokio::test]
+async fn get_block_txids_happy_path() {
+    let mut node = MockNode::synced();
+    let stxn = make_test_signed_txn();
+    let block = make_test_block(1, vec![stxn.clone()]);
+    node.blocks.insert(1, block);
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/1/txids"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let txids = body["blockTxids"].as_array().unwrap();
+    assert_eq!(txids.len(), 1);
+    // Each txid should be a base32-encoded string
+    let txid_str = txids[0].as_str().unwrap();
+    assert!(!txid_str.is_empty(), "txid should be non-empty");
+    // Verify it's valid base32 (no padding)
+    assert!(
+        data_encoding::BASE32_NOPAD
+            .decode(txid_str.as_bytes())
+            .is_ok(),
+        "txid should be valid base32"
+    );
+}
+
+#[tokio::test]
+async fn get_block_txids_empty_block() {
+    let mut node = MockNode::synced();
+    let block = make_test_block(1, vec![]);
+    node.blocks.insert(1, block);
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/1/txids"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let txids = body["blockTxids"].as_array().unwrap();
+    assert!(txids.is_empty(), "empty block should have no txids");
+}
+
+#[tokio::test]
+async fn get_block_txids_requires_auth() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/1/txids"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+// ===========================================================================
+// Block logs endpoint tests: GET /v2/blocks/{round}/logs
+// ===========================================================================
+
+#[tokio::test]
+async fn get_block_logs_happy_path() {
+    let mut node = MockNode::synced();
+
+    // Create an app call transaction with logs in eval_delta
+    let mut stxn = make_test_signed_txn();
+    stxn.txn.txn_type = TxnType::Appl;
+    stxn.txn.application_id = 42;
+
+    // Build an eval_delta with "lg" (logs) array
+    let log_entry = rmpv::Value::Binary(b"hello world".to_vec());
+    let eval_delta = rmpv::Value::Map(vec![(
+        rmpv::Value::String("lg".into()),
+        rmpv::Value::Array(vec![log_entry]),
+    )]);
+    stxn.eval_delta = Some(eval_delta);
+
+    let block = make_test_block(1, vec![stxn]);
+    node.blocks.insert(1, block);
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/1/logs"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let logs = body["logs"].as_array().unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0]["application-index"].as_u64().unwrap(), 42);
+    assert!(!logs[0]["txId"].as_str().unwrap().is_empty());
+    // logs[0]["logs"] should be an array with one base64-encoded entry
+    let log_entries = logs[0]["logs"].as_array().unwrap();
+    assert_eq!(log_entries.len(), 1);
+}
+
+#[tokio::test]
+async fn get_block_logs_no_logs() {
+    let mut node = MockNode::synced();
+
+    // Create a payment transaction (no logs)
+    let stxn = make_test_signed_txn();
+    let block = make_test_block(1, vec![stxn]);
+    node.blocks.insert(1, block);
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/1/logs"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let logs = body["logs"].as_array().unwrap();
+    assert!(
+        logs.is_empty(),
+        "block with no app calls should have empty logs"
+    );
+}
+
+#[tokio::test]
+async fn get_block_logs_requires_auth() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/1/logs"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+// ===========================================================================
+// Transaction proof endpoint tests: GET /v2/blocks/{round}/transactions/{txid}/proof
+// ===========================================================================
+
+#[tokio::test]
+async fn get_transaction_proof_happy_path() {
+    let mut node = MockNode::synced();
+
+    let stxn = make_test_signed_txn();
+
+    // Compute the expected transaction ID so we can request the proof.
+    let txid = algo_codec::compute_txn_id(&stxn.txn);
+    let txid_str = txid.to_string();
+
+    let block = make_test_block(1, vec![stxn]);
+    node.blocks.insert(1, block);
+    let server = TestServer::start(node).await;
+
+    let url = format!("/v2/blocks/1/transactions/{}/proof", txid_str);
+    let resp = server
+        .client
+        .get(server.url(&url))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["idx"].as_u64().unwrap(), 0);
+    assert!(body.get("proof").is_some(), "should have 'proof' field");
+    assert!(
+        body.get("stibhash").is_some(),
+        "should have 'stibhash' field"
+    );
+    assert!(
+        body.get("treedepth").is_some(),
+        "should have 'treedepth' field"
+    );
+    assert_eq!(body["hashtype"].as_str().unwrap(), "sha512_256");
+}
+
+#[tokio::test]
+async fn get_transaction_proof_txid_not_found() {
+    let mut node = MockNode::synced();
+
+    let stxn = make_test_signed_txn();
+    let block = make_test_block(1, vec![stxn]);
+    node.blocks.insert(1, block);
+    let server = TestServer::start(node).await;
+
+    // Use a txid that doesn't match any transaction in the block
+    let fake_txid = data_encoding::BASE32_NOPAD.encode(&[0xFF; 32]);
+    let url = format!("/v2/blocks/1/transactions/{}/proof", fake_txid);
+    let resp = server
+        .client
+        .get(server.url(&url))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("could not find the transaction"),
+        "error should mention transaction not found"
+    );
+}
+
+#[tokio::test]
+async fn get_transaction_proof_requires_auth() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let fake_txid = data_encoding::BASE32_NOPAD.encode(&[0xFF; 32]);
+    let url = format!("/v2/blocks/1/transactions/{}/proof", fake_txid);
+    let resp = server.client.get(server.url(&url)).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+// ===========================================================================
+// Light block header proof endpoint tests: GET /v2/blocks/{round}/lightheader/proof
+// ===========================================================================
+
+#[tokio::test]
+async fn get_light_block_header_proof_happy_path() {
+    let mut node = MockNode::synced();
+
+    // Set up state proof transaction covering rounds 1-4
+    node.state_proof_txns.insert(2, (1, 4));
+
+    // Add block headers for all rounds in the range
+    for r in 1..=4 {
+        node.block_headers.insert(r, make_test_block_header(r));
+    }
+
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/2/lightheader/proof"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body.get("index").is_some(), "should have 'index' field");
+    assert!(body.get("proof").is_some(), "should have 'proof' field");
+    assert!(
+        body.get("treedepth").is_some(),
+        "should have 'treedepth' field"
+    );
+    // index should be relative to first_attested_round
+    assert_eq!(body["index"].as_u64().unwrap(), 1); // round 2 - first_attested 1 = 1
+}
+
+#[tokio::test]
+async fn get_light_block_header_proof_no_state_proof() {
+    let node = MockNode::synced();
+    // No state proof transaction configured for any round
+    // But status.last_round is 1000, so round 5 is valid
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/5/lightheader/proof"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    // Should return an error (no state proof found)
+    assert!(
+        resp.status() == 404 || resp.status() == 500,
+        "should return error when no state proof is available, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn get_light_block_header_proof_requires_auth() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/1/lightheader/proof"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
 }

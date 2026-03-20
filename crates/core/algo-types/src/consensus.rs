@@ -328,6 +328,12 @@ pub struct ConsensusParams {
     // ── State proofs ────────────────────────────────────────────
     /// Enable state proof keyreg check (Go: `EnableStateProofKeyregCheck`, v31+).
     pub enable_state_proof_keyreg_check: bool,
+    /// Frequency of state proofs in rounds (Go: `StateProofInterval`, v34+).
+    /// 0 means state proofs are disabled.
+    pub state_proof_interval: u64,
+    /// Whether the light block header includes the block hash instead of the seed
+    /// (Go: `StateProofBlockHashInLightHeader`, v39+).
+    pub state_proof_block_hash_in_light_header: bool,
 
     // ── Clear state isolation ───────────────────────────────────
     /// Greater isolation for clear state programs (Go: `IsolateClearState`, v31+).
@@ -528,6 +534,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         max_keyreg_valid_period: 0,
         enable_keyreg_coherency_check: false,
         enable_state_proof_keyreg_check: false,
+        state_proof_interval: 0,
+        state_proof_block_hash_in_light_header: false,
         isolate_clear_state: false,
         max_asset_url_bytes: 0,
         max_asset_name_bytes: 0,
@@ -841,6 +849,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v34.logic_sig_version = 7;
     v34.min_inner_appl_version = 4;
     v34.enable_sha256_txn_commitment_header = true;
+    v34.state_proof_interval = 256;
     v34.agreement_filter_timeout_period0 = Duration::from_millis(3400);
     if version == CONSENSUS_V34 {
         return Some(v34);
@@ -883,6 +892,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     let mut v39 = v38.clone();
     v39.logic_sig_version = 10;
     v39.enable_logicsig_cost_pooling = true;
+    v39.state_proof_block_hash_in_light_header = true;
     v39.agreement_deadline_timeout_period0 = Duration::from_secs(4);
     v39.dynamic_filter_timeout = true;
     if version == CONSENSUS_V39 {
