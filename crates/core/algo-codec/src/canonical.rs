@@ -1127,8 +1127,7 @@ pub fn canonical_encode_asset_holding(h: &AssetHolding) -> Vec<u8> {
 ///
 /// In Go, TealBytesType = 1 and TealUintType = 2.
 /// The `Bytes` field in Go is a `string` (binary-safe); we encode it as
-/// msgpack binary since Algorand's canonical encoding uses bin format for
-/// byte-like data.
+/// msgpack string since Go's codec encodes `string` fields as str format.
 fn canonical_encode_teal_value(tv: &TealValue) -> Vec<u8> {
     let mut m = CanonicalMap::new();
     match tv {
@@ -1314,14 +1313,9 @@ pub fn canonical_encode_account_data(ad: &AccountData) -> Vec<u8> {
     m.add_option_address("spend", &ad.auth_addr);
     m.add_option_fixed_bytes("stprf", &ad.state_proof_id);
 
-    m.add_u64("tapl", ad.total_apps_opted_in);
-    m.add_u64("tapp", ad.total_created_apps);
-    m.add_u64("tast", ad.total_assets_opted_in);
-
     m.add_u64("tbx", ad.total_boxes);
     m.add_u64("tbxb", ad.total_box_bytes);
     m.add_u64("teap", ad.total_extra_app_pages as u64);
-    m.add_u64("tpap", ad.total_created_assets);
 
     m.add_map("tsch", canonical_encode_state_schema(&ad.total_app_schema));
 
