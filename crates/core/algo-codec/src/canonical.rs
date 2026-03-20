@@ -1984,7 +1984,7 @@ mod tests {
     }
 
     #[test]
-    fn ledgercore_encode_zero_account_has_22_keys() {
+    fn ledgercore_encode_zero_account_has_21_keys() {
         let ad = AccountData::default();
         let bytes = canonical_encode_ledgercore_account_data(&ad);
         let keys = extract_map_keys(&bytes);
