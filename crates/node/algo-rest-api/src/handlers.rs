@@ -2128,3 +2128,274 @@ fn application_boxes_max_keys(requested_max: u64, algod_max: u64) -> u64 {
 
     algod_max.saturating_add(1) // API limit dominates. Increments by 1 to test if more than max supported results exist.
 }
+
+// ---------------------------------------------------------------------------
+// POST /v2/transactions
+// ---------------------------------------------------------------------------
+
+/// Submit a raw transaction (or transaction group) to the network.
+///
+/// Accepts a msgpack-encoded `SignedTxn` (or concatenated group of SignedTxns)
+/// in the request body. Validates, adds to pool, and broadcasts via gossip.
+///
+/// Returns the txid of the first transaction in the group.
+///
+/// Matches go-algorand's `Handlers.RawTransaction`.
+pub async fn raw_transaction<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    body: axum::body::Bytes,
+) -> Response {
+    // Check catchpoint status
+    let status = match node.status().await {
+        Ok(s) => s,
+        Err(_) => return error::internal_error("failed retrieving node status"),
+    };
+    if !status.catchpoint.is_empty() {
+        return error::service_unavailable("operation not available during catchup");
+    }
+
+    // Decode concatenated msgpack SignedTxn objects
+    let max_group_size = node.max_tx_group_size();
+    let mut txgroup: Vec<algo_types::SignedTransaction> = Vec::new();
+    let mut cursor = &body[..];
+
+    while !cursor.is_empty() {
+        match algo_types::SignedTransaction::decode_from_reader(&mut cursor) {
+            Ok(stxn) => {
+                txgroup.push(stxn);
+                if txgroup.len() > max_group_size {
+                    return error::bad_request(format!("max group size is {}", max_group_size));
+                }
+            }
+            Err(e) => {
+                return error::bad_request(format!("could not decode transaction: {e}"));
+            }
+        }
+    }
+
+    if txgroup.is_empty() {
+        return error::bad_request("empty txgroup");
+    }
+
+    // Compute txid of first transaction before broadcasting
+    let txid = algo_codec::compute_txn_id(&txgroup[0].txn).to_string();
+
+    // Broadcast
+    if let Err(e) = node.broadcast_signed_tx_group(txgroup).await {
+        return error::bad_request(e.to_string());
+    }
+
+    // Return txid of first transaction (for backwards compatibility)
+    let response = models::PostTransactionsResponse { tx_id: txid };
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        serde_json::to_string(&response).unwrap_or_default(),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/transactions/pending/{txid}
+// ---------------------------------------------------------------------------
+
+/// Query parameters for pending transaction information.
+#[derive(Debug, Deserialize)]
+pub struct PendingTxnInfoParams {
+    /// Response format: "json" (default) or "msgpack"/"msgp".
+    pub format: Option<String>,
+}
+
+/// Return details about a pending transaction by its txid.
+///
+/// Matches go-algorand's `Handlers.PendingTransactionInformation`.
+pub async fn pending_transaction_information<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(txid): Path<String>,
+    Query(params): Query<PendingTxnInfoParams>,
+) -> Response {
+    // Check catchpoint status
+    let status = match node.status().await {
+        Ok(s) => s,
+        Err(_) => return error::internal_error("failed retrieving node status"),
+    };
+    if !status.catchpoint.is_empty() {
+        return error::service_unavailable("operation not available during catchup");
+    }
+
+    // Parse txid — go-algorand expects base32 (no padding) encoded 32 bytes.
+    // Parsed before format negotiation to match go-algorand's error precedence.
+    let txid_bytes = match data_encoding::BASE32_NOPAD.decode(txid.as_bytes()) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            algo_types::Digest(arr)
+        }
+        _ => return error::bad_request("no valid transaction ID was specified"),
+    };
+
+    // Lookup
+    let txn_status = match node.get_pending_transaction(&txid_bytes).await {
+        Ok(Some(ts)) => ts,
+        Ok(None) => {
+            return error::not_found(
+                "could not find the transaction in the transaction pool or in the last 1000 confirmed rounds",
+            );
+        }
+        Err(_) => return error::internal_error("failed to retrieve pending transaction"),
+    };
+
+    // Negotiate format (after lookup, matching go-algorand's ordering)
+    let fmt_params = FormatParams {
+        format: params.format,
+    };
+    let resp_format = match format::negotiate_format(&fmt_params) {
+        Ok(f) => f,
+        Err(resp) => return *resp,
+    };
+
+    // Build response
+    let mut response = models::PreEncodedTxInfo {
+        txn: txn_status.txn,
+        pool_error: txn_status.pool_error,
+        confirmed_round: None,
+        closing_amount: None,
+        asset_closing_amount: None,
+        sender_rewards: None,
+        receiver_rewards: None,
+        close_rewards: None,
+        asset_index: None,
+        application_index: None,
+        global_state_delta: None,
+        local_state_delta: None,
+        logs: None,
+        inner_txns: None,
+    };
+
+    if txn_status.confirmed_round != 0 {
+        response.confirmed_round = Some(txn_status.confirmed_round);
+        response.closing_amount = Some(txn_status.closing_amount);
+        response.asset_closing_amount = Some(txn_status.asset_closing_amount);
+        response.sender_rewards = Some(txn_status.sender_rewards);
+        response.receiver_rewards = Some(txn_status.receiver_rewards);
+        response.close_rewards = Some(txn_status.close_rewards);
+        response.asset_index = txn_status.asset_index;
+        response.application_index = txn_status.application_index;
+        response.logs = txn_status.logs;
+        // inner_txns and state deltas would be populated from eval_delta
+        // TODO: Convert eval_delta to inner_txns, global_state_delta, local_state_delta
+    }
+
+    format::encode_response(&response, resp_format)
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/transactions/pending
+// ---------------------------------------------------------------------------
+
+/// Query parameters for pending transactions list.
+#[derive(Debug, Deserialize)]
+pub struct PendingTxnsParams {
+    /// Response format.
+    pub format: Option<String>,
+    /// Maximum number of transactions to return.
+    pub max: Option<u64>,
+}
+
+/// Return all pending transactions in the pool.
+///
+/// Matches go-algorand's `Handlers.GetPendingTransactions`.
+pub async fn get_pending_transactions<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Query(params): Query<PendingTxnsParams>,
+) -> Response {
+    get_pending_transactions_inner(node, params, None).await
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/accounts/{address}/transactions/pending
+// ---------------------------------------------------------------------------
+
+/// Return pending transactions filtered by address.
+///
+/// Matches go-algorand's `Handlers.GetPendingTransactionsByAddress`.
+pub async fn get_pending_transactions_by_address<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(address): Path<String>,
+    Query(params): Query<PendingTxnsParams>,
+) -> Response {
+    let addr = match Address::from_str(&address) {
+        Ok(a) => a,
+        Err(_) => return error::bad_request("failed to parse the address"),
+    };
+    get_pending_transactions_inner(node, params, Some(addr)).await
+}
+
+/// Shared implementation for pending transactions list endpoints.
+///
+/// Used by both `get_pending_transactions` and
+/// `get_pending_transactions_by_address`.
+async fn get_pending_transactions_inner<N: NodeInterface>(
+    node: Arc<N>,
+    params: PendingTxnsParams,
+    addr_filter: Option<Address>,
+) -> Response {
+    // Check catchpoint status
+    let status = match node.status().await {
+        Ok(s) => s,
+        Err(_) => return error::internal_error("failed retrieving node status"),
+    };
+    if !status.catchpoint.is_empty() {
+        return error::service_unavailable("operation not available during catchup");
+    }
+
+    // Negotiate format
+    let fmt_params = FormatParams {
+        format: params.format,
+    };
+    let resp_format = match format::negotiate_format(&fmt_params) {
+        Ok(f) => f,
+        Err(resp) => return *resp,
+    };
+
+    // Get pool contents
+    let txn_pool = match node.get_pending_txns_from_pool().await {
+        Ok(txns) => txns,
+        Err(_) => {
+            return error::internal_error(
+                "failed to retrieve information from the transaction pool",
+            );
+        }
+    };
+
+    let total = txn_pool.len() as u64;
+    let txn_limit = if let Some(max) = params.max {
+        if max == 0 {
+            u64::MAX
+        } else {
+            max
+        }
+    } else {
+        u64::MAX
+    };
+
+    let mut top_txns: Vec<algo_types::SignedTransaction> = Vec::new();
+    for txn in &txn_pool {
+        if top_txns.len() as u64 >= txn_limit {
+            break;
+        }
+        if let Some(ref addr) = addr_filter {
+            if !txn.txn.match_address(addr) {
+                continue;
+            }
+        }
+        top_txns.push(txn.clone());
+    }
+
+    let response = models::PendingTransactionsResponse {
+        top_transactions: top_txns,
+        total_transactions: total,
+    };
+
+    format::encode_response(&response, resp_format)
+}

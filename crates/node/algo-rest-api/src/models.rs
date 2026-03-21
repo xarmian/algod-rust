@@ -703,7 +703,7 @@ use std::collections::BTreeMap;
 
 use algo_types::{
     AccountData, AccountStatus, Address, AppLocalState, AppParams, AssetHolding, AssetParams,
-    ConsensusParams, TealValue,
+    ConsensusParams, SignedTransaction, TealValue,
 };
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -1209,4 +1209,106 @@ mod optional_base64_bytes {
             None => Ok(None),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// PostTransactionsResponse
+// ---------------------------------------------------------------------------
+
+/// Response for `POST /v2/transactions`.
+///
+/// Matches go-algorand's `model.PostTransactionsResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostTransactionsResponse {
+    /// Encoding of the transaction hash.
+    #[serde(rename = "txId")]
+    pub tx_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// PendingTransactionsResponse
+// ---------------------------------------------------------------------------
+
+/// Response for `GET /v2/transactions/pending` and
+/// `GET /v2/accounts/{address}/transactions/pending`.
+///
+/// Matches go-algorand's inline response struct in `getPendingTransactions`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingTransactionsResponse {
+    /// An array of signed transaction objects.
+    #[serde(rename = "top-transactions")]
+    pub top_transactions: Vec<SignedTransaction>,
+
+    /// Total number of transactions in the pool.
+    #[serde(rename = "total-transactions")]
+    pub total_transactions: u64,
+}
+
+// ---------------------------------------------------------------------------
+// PreEncodedTxInfo
+// ---------------------------------------------------------------------------
+
+/// Pre-encoded pending transaction information.
+///
+/// Matches go-algorand's `PreEncodedTxInfo` struct in handlers.go.
+/// Used for `GET /v2/transactions/pending/{txid}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreEncodedTxInfo {
+    /// The signed transaction.
+    pub txn: SignedTransaction,
+
+    /// Non-empty when the transaction was kicked from the pool.
+    #[serde(rename = "pool-error")]
+    pub pool_error: String,
+
+    /// The round in which this transaction was confirmed (omitted if pending).
+    #[serde(rename = "confirmed-round", skip_serializing_if = "Option::is_none")]
+    pub confirmed_round: Option<u64>,
+
+    /// Closing amount in microAlgos.
+    #[serde(rename = "closing-amount", skip_serializing_if = "Option::is_none")]
+    pub closing_amount: Option<u64>,
+
+    /// Asset closing amount.
+    #[serde(
+        rename = "asset-closing-amount",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub asset_closing_amount: Option<u64>,
+
+    /// Rewards to sender.
+    #[serde(rename = "sender-rewards", skip_serializing_if = "Option::is_none")]
+    pub sender_rewards: Option<u64>,
+
+    /// Rewards to receiver.
+    #[serde(rename = "receiver-rewards", skip_serializing_if = "Option::is_none")]
+    pub receiver_rewards: Option<u64>,
+
+    /// Rewards to close-to address.
+    #[serde(rename = "close-rewards", skip_serializing_if = "Option::is_none")]
+    pub close_rewards: Option<u64>,
+
+    /// Created/configured asset index.
+    #[serde(rename = "asset-index", skip_serializing_if = "Option::is_none")]
+    pub asset_index: Option<u64>,
+
+    /// Created application index.
+    #[serde(rename = "application-index", skip_serializing_if = "Option::is_none")]
+    pub application_index: Option<u64>,
+
+    /// Global state delta.
+    #[serde(rename = "global-state-delta", skip_serializing_if = "Option::is_none")]
+    pub global_state_delta: Option<serde_json::Value>,
+
+    /// Local state deltas.
+    #[serde(rename = "local-state-delta", skip_serializing_if = "Option::is_none")]
+    pub local_state_delta: Option<serde_json::Value>,
+
+    /// Logs from application execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<Vec<Vec<u8>>>,
+
+    /// Inner transactions.
+    #[serde(rename = "inner-txns", skip_serializing_if = "Option::is_none")]
+    pub inner_txns: Option<Vec<PreEncodedTxInfo>>,
 }

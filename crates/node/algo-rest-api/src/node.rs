@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use algo_types::{
     AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParams, Block, BlockHeader,
-    ConsensusParams, Digest,
+    ConsensusParams, Digest, SignedTransaction,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -230,6 +230,54 @@ pub struct AssetLookup {
     pub creator: Address,
     /// The last committed round at the time of the lookup.
     pub last_round: u64,
+}
+
+/// Information about a single transaction: whether it has appeared in a
+/// block yet, and whether it was kicked out of the txpool.
+///
+/// Mirrors go-algorand's `node.TxnWithStatus`.
+#[derive(Debug, Clone)]
+pub struct TxnWithStatus {
+    /// The signed transaction.
+    pub txn: SignedTransaction,
+
+    /// Zero indicates the transaction has not been confirmed.
+    pub confirmed_round: u64,
+
+    /// Non-empty when the transaction was kicked out of the pool.
+    pub pool_error: String,
+
+    // -- ApplyData fields (populated when confirmed_round != 0) --
+    /// Closing amount in microAlgos.
+    pub closing_amount: u64,
+
+    /// Asset closing amount.
+    pub asset_closing_amount: u64,
+
+    /// Rewards to sender.
+    pub sender_rewards: u64,
+
+    /// Rewards to receiver.
+    pub receiver_rewards: u64,
+
+    /// Rewards to close-to address.
+    pub close_rewards: u64,
+
+    /// Created/configured asset ID (from ApplyData).
+    pub asset_index: Option<u64>,
+
+    /// Created application ID (from ApplyData).
+    pub application_index: Option<u64>,
+
+    /// Eval delta (opaque, passed through for JSON/msgpack encoding).
+    /// Contains global-state-delta, local-state-delta, inner-txns, logs.
+    pub eval_delta: Option<rmpv::Value>,
+
+    /// Logs from app execution.
+    pub logs: Option<Vec<Vec<u8>>>,
+
+    /// Inner transactions.
+    pub inner_txns: Option<Vec<TxnWithStatus>>,
 }
 
 /// Trait abstracting the node state needed by REST API handlers.
@@ -514,5 +562,50 @@ pub trait NodeInterface: Send + Sync + 'static {
         _round: u64,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         Err("get_block_raw_msgpack not implemented".into())
+    }
+
+    // ---- Transaction pool / broadcast methods ----
+
+    /// Broadcast a signed transaction group to the network.
+    ///
+    /// Validates the transactions, adds them to the pool, and relays
+    /// via gossip. Returns an error if validation or pool insertion fails.
+    ///
+    /// Mirrors go-algorand's `Node.BroadcastSignedTxGroup`.
+    async fn broadcast_signed_tx_group(
+        &self,
+        _tx_group: Vec<SignedTransaction>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err("broadcast_signed_tx_group not implemented".into())
+    }
+
+    /// Look up a pending transaction by its ID.
+    ///
+    /// Searches the transaction pool first, then recent confirmed blocks.
+    /// Returns `None` if the transaction is not found in either place.
+    ///
+    /// Mirrors go-algorand's `Node.GetPendingTransaction`.
+    async fn get_pending_transaction(
+        &self,
+        _txid: &Digest,
+    ) -> Result<Option<TxnWithStatus>, Box<dyn std::error::Error + Send + Sync>> {
+        Err("get_pending_transaction not implemented".into())
+    }
+
+    /// Return all pending transactions from the pool.
+    ///
+    /// Mirrors go-algorand's `Node.GetPendingTxnsFromPool`.
+    async fn get_pending_txns_from_pool(
+        &self,
+    ) -> Result<Vec<SignedTransaction>, Box<dyn std::error::Error + Send + Sync>> {
+        Err("get_pending_txns_from_pool not implemented".into())
+    }
+
+    /// Maximum transaction group size from consensus params.
+    ///
+    /// Used by the raw transaction handler to validate group size
+    /// before broadcasting.
+    fn max_tx_group_size(&self) -> usize {
+        16 // Default from go-algorand consensus
     }
 }
