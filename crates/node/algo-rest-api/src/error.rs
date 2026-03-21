@@ -74,6 +74,11 @@ pub fn timeout(msg: impl Into<String>) -> Response {
     error_response(StatusCode::REQUEST_TIMEOUT, msg)
 }
 
+/// Return a 501 Not Implemented JSON error response.
+pub fn not_implemented(msg: impl Into<String>) -> Response {
+    error_response(StatusCode::NOT_IMPLEMENTED, msg)
+}
+
 /// Return a 503 Service Unavailable JSON error response.
 pub fn service_unavailable(msg: impl Into<String>) -> Response {
     error_response(StatusCode::SERVICE_UNAVAILABLE, msg)
@@ -137,6 +142,12 @@ mod tests {
     async fn service_unavailable_returns_503() {
         let resp = service_unavailable("node is catching up");
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn not_implemented_returns_501() {
+        let resp = not_implemented("not supported");
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
