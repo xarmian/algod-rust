@@ -140,7 +140,14 @@ impl GossipBlockSource {
     /// with the desired timeout (e.g. [`GossipBlockSourceConfig::request_timeout`])
     /// rather than wrapping with an outer `tokio::time::timeout`, which
     /// would leak tracker entries.
-    async fn fetch_from_peer(&self, peer: &dyn UnicastPeer, round: Round) -> Result<BlockResponse> {
+    /// Fetch a block from a single peer, returning both the decoded
+    /// [`BlockResponse`] and the raw block msgpack bytes (for payset blob
+    /// extraction).
+    async fn fetch_from_peer(
+        &self,
+        peer: &dyn UnicastPeer,
+        round: Round,
+    ) -> Result<(BlockResponse, Vec<u8>)> {
         let topics = make_block_request_topics(round.0);
 
         // Send the request and await the response. The peer's own timeout
@@ -168,8 +175,68 @@ impl GossipBlockSource {
             ),
         })?;
 
+        let raw_block_data = data.block_data.clone();
+
         // Decode block+cert from their raw msgpack bytes.
-        decode_block_cert(&data.block_data, &data.cert_data)
+        let response = decode_block_cert(&data.block_data, &data.cert_data)?;
+        Ok((response, raw_block_data))
+    }
+
+    /// Fetch a block with the same retry/failover logic as [`get_block`], but
+    /// also return the raw block msgpack bytes alongside the decoded response.
+    ///
+    /// The raw bytes can be fed to [`algo_codec::extract_raw_payset_blobs_from_block`]
+    /// to obtain the original wire-format STIB blobs for payset commitment verification.
+    pub async fn get_block_with_raw_data(&self, round: Round) -> Result<(BlockResponse, Vec<u8>)> {
+        if self.peers.is_empty() {
+            return Err(AlgoError::Network {
+                message: "no peers available for block fetch".into(),
+            });
+        }
+
+        let attempts = self.config.max_peer_attempts.min(self.peers.len());
+        let mut last_err = None;
+
+        for attempt in 0..attempts {
+            let peer = match self.select_peer() {
+                Some(p) => p,
+                None => {
+                    return Err(AlgoError::Network {
+                        message: "no peers available for block fetch".into(),
+                    })
+                }
+            };
+
+            debug!(
+                round = %round,
+                peer = peer.get_address(),
+                attempt = attempt + 1,
+                max_attempts = attempts,
+                "requesting block (with raw data) via WS unicast"
+            );
+
+            match self.fetch_from_peer(peer.as_ref(), round).await {
+                Ok((response, raw_block_data)) => {
+                    self.last_fetched_round
+                        .fetch_max(round.0, Ordering::Relaxed);
+                    return Ok((response, raw_block_data));
+                }
+                Err(e) => {
+                    warn!(
+                        round = %round,
+                        peer = peer.get_address(),
+                        attempt = attempt + 1,
+                        error = %e,
+                        "WS block fetch failed, trying next peer"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| AlgoError::Network {
+            message: format!("all {attempts} peers failed for round {round}"),
+        }))
     }
 }
 
@@ -248,7 +315,7 @@ impl BlockSource for GossipBlockSource {
             );
 
             match self.fetch_from_peer(peer.as_ref(), round).await {
-                Ok(response) => {
+                Ok((response, _raw_block_data)) => {
                     // Update our tracked last-fetched round.
                     self.last_fetched_round
                         .fetch_max(round.0, Ordering::Relaxed);

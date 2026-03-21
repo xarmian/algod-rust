@@ -94,10 +94,29 @@ impl BlockFetcher for GossipBlockFetcher {
                 return Err(FetchError::NoPeersAvailable);
             }
             let source = GossipBlockSource::new(peers);
-            use algo_rest_client::BlockSource;
-            let response = source.get_block(round).await.map_err(|e| {
-                FetchError::NetworkError(format!("block fetch failed for round {}: {}", round, e))
-            })?;
+            let (response, raw_block_data) =
+                source.get_block_with_raw_data(round).await.map_err(|e| {
+                    FetchError::NetworkError(format!(
+                        "block fetch failed for round {}: {}",
+                        round, e
+                    ))
+                })?;
+
+            // Extract raw payset blobs from the wire-format block bytes.
+            // These are used for payset commitment verification, avoiding
+            // re-encoding from typed structs which may lose unknown fields.
+            let raw_payset_blobs =
+                match algo_codec::extract_raw_payset_blobs_from_block(&raw_block_data) {
+                    Ok(blobs) => Some(blobs),
+                    Err(e) => {
+                        tracing::debug!(
+                            round = %round,
+                            error = %e,
+                            "could not extract raw payset blobs, falling back to typed re-encoding"
+                        );
+                        None
+                    }
+                };
 
             // Try to parse the gossip response's certificate data
             // (rmpv::Value) into a typed Certificate for fork detection.
@@ -128,6 +147,7 @@ impl BlockFetcher for GossipBlockFetcher {
             Ok(FetchedBlockCert {
                 block: response.block,
                 cert,
+                raw_payset_blobs,
             })
         })
     }

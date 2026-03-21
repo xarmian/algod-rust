@@ -124,18 +124,45 @@ pub fn extract_raw_payset_blobs(response_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
         context: "extract_raw_payset_blobs".into(),
     })?;
 
-    // Now parse inside the block map to find "txns"
-    let mut block_cursor = Cursor::new(response_bytes);
-    block_cursor.set_position(block_start as u64);
+    // Delegate to the shared block-map scanner, using a sub-slice starting
+    // at the block map but capturing byte spans from the original buffer.
+    extract_txns_from_block_map(&response_bytes[block_start..], response_bytes)
+}
 
-    let block_map_len =
-        rmp::decode::read_map_len(&mut block_cursor).map_err(|e| AlgoError::Codec {
-            source: Box::new(e),
-            context: "failed to read block map length".into(),
-        })?;
+/// Extract the raw msgpack bytes for each SignedTxnInBlock entry from raw
+/// block bytes (not wrapped in a REST/gossip envelope).
+///
+/// Unlike [`extract_raw_payset_blobs`] which navigates a `{"block": ..., "cert": ...}`
+/// envelope first, this function takes the block map bytes directly and scans
+/// for the `txns` array.
+///
+/// Returns an empty Vec if the block has no `txns` field.
+pub fn extract_raw_payset_blobs_from_block(block_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    extract_txns_from_block_map(block_bytes, block_bytes)
+}
+
+/// Shared helper: scan a block-level msgpack map starting at position 0 of `cursor_bytes`
+/// for a `txns` array and extract each element's raw byte span from `source_bytes`.
+///
+/// `source_bytes` is the buffer from which byte slices are captured; `cursor_bytes`
+/// provides the read cursor (they may be the same buffer or cursor_bytes may be a
+/// sub-slice positioned at the block map within a larger buffer).
+fn extract_txns_from_block_map(cursor_bytes: &[u8], source_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    use std::io::Cursor;
+
+    // Compute the offset of cursor_bytes within source_bytes so we can
+    // translate cursor positions back to source positions.
+    let base_offset = cursor_bytes.as_ptr() as usize - source_bytes.as_ptr() as usize;
+
+    let mut cursor = Cursor::new(cursor_bytes);
+
+    let block_map_len = rmp::decode::read_map_len(&mut cursor).map_err(|e| AlgoError::Codec {
+        source: Box::new(e),
+        context: "failed to read block map length".into(),
+    })?;
 
     for _ in 0..block_map_len {
-        let key = rmpv::decode::read_value(&mut block_cursor).map_err(|e| AlgoError::Codec {
+        let key = rmpv::decode::read_value(&mut cursor).map_err(|e| AlgoError::Codec {
             source: Box::new(e),
             context: "failed to read block map key".into(),
         })?;
@@ -143,28 +170,26 @@ pub fn extract_raw_payset_blobs(response_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
         let is_txns = matches!(&key, rmpv::Value::String(s) if s.as_str() == Some("txns"));
 
         if is_txns {
-            // Read the array length
             let array_len =
-                rmp::decode::read_array_len(&mut block_cursor).map_err(|e| AlgoError::Codec {
+                rmp::decode::read_array_len(&mut cursor).map_err(|e| AlgoError::Codec {
                     source: Box::new(e),
                     context: "failed to read txns array length".into(),
                 })?;
 
             let mut blobs = Vec::with_capacity(array_len as usize);
             for _ in 0..array_len {
-                let elem_start = block_cursor.position() as usize;
-                rmpv::decode::read_value(&mut block_cursor).map_err(|e| AlgoError::Codec {
+                let elem_start = cursor.position() as usize + base_offset;
+                rmpv::decode::read_value(&mut cursor).map_err(|e| AlgoError::Codec {
                     source: Box::new(e),
                     context: "failed to read txns array element".into(),
                 })?;
-                let elem_end = block_cursor.position() as usize;
-                blobs.push(response_bytes[elem_start..elem_end].to_vec());
+                let elem_end = cursor.position() as usize + base_offset;
+                blobs.push(source_bytes[elem_start..elem_end].to_vec());
             }
 
             return Ok(blobs);
         } else {
-            // Skip this value
-            rmpv::decode::read_value(&mut block_cursor).map_err(|e| AlgoError::Codec {
+            rmpv::decode::read_value(&mut cursor).map_err(|e| AlgoError::Codec {
                 source: Box::new(e),
                 context: "failed to skip block map value".into(),
             })?;
@@ -173,4 +198,125 @@ pub fn extract_raw_payset_blobs(response_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
 
     // No "txns" key found — empty payset
     Ok(Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal block msgpack map with the given round and optional txns array.
+    fn make_block_msgpack_with_txns(round: u64, txns: Option<&[rmpv::Value]>) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Determine map size: "rnd" + optionally "txns"
+        let map_len: u32 = if txns.is_some() { 2 } else { 1 };
+        rmp::encode::write_map_len(&mut buf, map_len).unwrap();
+
+        // "rnd" key
+        rmp::encode::write_str(&mut buf, "rnd").unwrap();
+        rmpv::encode::write_value(&mut buf, &rmpv::Value::from(round)).unwrap();
+
+        // "txns" key (optional)
+        if let Some(txn_values) = txns {
+            rmp::encode::write_str(&mut buf, "txns").unwrap();
+            rmp::encode::write_array_len(&mut buf, txn_values.len() as u32).unwrap();
+            for v in txn_values {
+                rmpv::encode::write_value(&mut buf, v).unwrap();
+            }
+        }
+
+        buf
+    }
+
+    #[test]
+    fn extract_from_block_empty_payset() {
+        // Block with no "txns" key at all.
+        let block_bytes = make_block_msgpack_with_txns(1, None);
+        let blobs = extract_raw_payset_blobs_from_block(&block_bytes).unwrap();
+        assert!(blobs.is_empty());
+    }
+
+    #[test]
+    fn extract_from_block_empty_txns_array() {
+        // Block with an empty "txns" array.
+        let block_bytes = make_block_msgpack_with_txns(1, Some(&[]));
+        let blobs = extract_raw_payset_blobs_from_block(&block_bytes).unwrap();
+        assert!(blobs.is_empty());
+    }
+
+    #[test]
+    fn extract_from_block_single_txn() {
+        // Create a single transaction-like map value.
+        let txn = rmpv::Value::Map(vec![(
+            rmpv::Value::String("type".into()),
+            rmpv::Value::String("pay".into()),
+        )]);
+        let block_bytes = make_block_msgpack_with_txns(5, Some(std::slice::from_ref(&txn)));
+        let blobs = extract_raw_payset_blobs_from_block(&block_bytes).unwrap();
+        assert_eq!(blobs.len(), 1);
+
+        // The extracted blob should decode back to the same value.
+        let decoded = rmpv::decode::read_value(&mut &blobs[0][..]).unwrap();
+        assert_eq!(decoded, txn);
+    }
+
+    #[test]
+    fn extract_from_block_multiple_txns() {
+        let txn1 = rmpv::Value::Map(vec![(
+            rmpv::Value::String("type".into()),
+            rmpv::Value::String("pay".into()),
+        )]);
+        let txn2 = rmpv::Value::Map(vec![(
+            rmpv::Value::String("type".into()),
+            rmpv::Value::String("axfer".into()),
+        )]);
+        let block_bytes = make_block_msgpack_with_txns(10, Some(&[txn1.clone(), txn2.clone()]));
+        let blobs = extract_raw_payset_blobs_from_block(&block_bytes).unwrap();
+        assert_eq!(blobs.len(), 2);
+
+        let decoded1 = rmpv::decode::read_value(&mut &blobs[0][..]).unwrap();
+        let decoded2 = rmpv::decode::read_value(&mut &blobs[1][..]).unwrap();
+        assert_eq!(decoded1, txn1);
+        assert_eq!(decoded2, txn2);
+    }
+
+    #[test]
+    fn extract_from_block_matches_envelope_extraction() {
+        // Build a block with txns, then wrap it in a REST envelope.
+        // Both extraction methods should produce identical blobs.
+        let txn = rmpv::Value::Map(vec![
+            (
+                rmpv::Value::String("type".into()),
+                rmpv::Value::String("pay".into()),
+            ),
+            (
+                rmpv::Value::String("amt".into()),
+                rmpv::Value::from(1000u64),
+            ),
+        ]);
+        let block_bytes = make_block_msgpack_with_txns(42, Some(&[txn]));
+
+        // Build envelope: {"block": <block_bytes_as_value>, "cert": {}}
+        let block_value = rmpv::decode::read_value(&mut &block_bytes[..]).unwrap();
+        let mut envelope = Vec::new();
+        rmp::encode::write_map_len(&mut envelope, 2).unwrap();
+        rmp::encode::write_str(&mut envelope, "block").unwrap();
+        rmpv::encode::write_value(&mut envelope, &block_value).unwrap();
+        rmp::encode::write_str(&mut envelope, "cert").unwrap();
+        rmpv::encode::write_value(&mut envelope, &rmpv::Value::Map(vec![])).unwrap();
+
+        let blobs_from_block = extract_raw_payset_blobs_from_block(&block_bytes).unwrap();
+        let blobs_from_envelope = extract_raw_payset_blobs(&envelope).unwrap();
+
+        assert_eq!(blobs_from_block.len(), blobs_from_envelope.len());
+        for (a, b) in blobs_from_block.iter().zip(blobs_from_envelope.iter()) {
+            assert_eq!(a, b, "blobs should be byte-identical");
+        }
+    }
+
+    #[test]
+    fn extract_from_block_invalid_bytes() {
+        let result = extract_raw_payset_blobs_from_block(b"not-valid-msgpack");
+        assert!(result.is_err());
+    }
 }
