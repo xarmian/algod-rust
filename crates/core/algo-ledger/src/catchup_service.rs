@@ -644,26 +644,18 @@ mod tests {
     struct MockBlockFetcher {
         /// The block to return for any fetch request.
         block: Mutex<Option<Block>>,
-        /// Count of fetch calls.
-        fetch_count: AtomicU64,
     }
 
     impl MockBlockFetcher {
         fn new(block: Option<Block>) -> Self {
             Self {
                 block: Mutex::new(block),
-                fetch_count: AtomicU64::new(0),
             }
-        }
-
-        fn fetch_count(&self) -> u64 {
-            self.fetch_count.load(Ordering::SeqCst)
         }
     }
 
     impl BlockFetcher for MockBlockFetcher {
         fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
-            self.fetch_count.fetch_add(1, Ordering::SeqCst);
             let guard = self.block.lock().unwrap();
             match guard.as_ref() {
                 Some(b) => {
@@ -673,16 +665,6 @@ mod tests {
                 }
                 None => Err(FetchError::NoBlockForRound { round }),
             }
-        }
-    }
-
-    // -- Failing BlockFetcher --
-
-    struct FailingBlockFetcher;
-
-    impl BlockFetcher for FailingBlockFetcher {
-        fn fetch_block(&self, _round: Round) -> Result<FetchedBlockCert, FetchError> {
-            Err(FetchError::NetworkError("simulated network failure".into()))
         }
     }
 
@@ -756,8 +738,6 @@ mod tests {
         let fetcher: Arc<dyn BlockFetcher> = Arc::new(MockBlockFetcher::new(None));
 
         let mut svc = CatchupService::start(rx, ledger, fetcher);
-        // Give the thread a moment to start.
-        thread::sleep(Duration::from_millis(50));
         svc.stop();
     }
 
@@ -784,8 +764,6 @@ mod tests {
         // Drop the sender to close the channel.
         drop(tx);
 
-        // The service should exit on its own.
-        thread::sleep(Duration::from_millis(100));
         svc.stop();
     }
 
@@ -796,42 +774,75 @@ mod tests {
         // shut it down to stop the retry loop.
         let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
         let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
-        let fetcher: Arc<dyn BlockFetcher> = Arc::new(FailingBlockFetcher);
 
-        let mut svc = CatchupService::start(rx, ledger, fetcher);
+        let fetcher = Arc::new(CountingFailFetcher::new(make_valid_empty_block(0), 999));
+        let fetcher_ref: Arc<dyn BlockFetcher> = Arc::clone(&fetcher) as Arc<dyn BlockFetcher>;
+
+        let mut svc = CatchupService::start(rx, ledger, fetcher_ref);
 
         // Send a cert — the fetch will fail but the service should survive.
         tx.send(make_pending_cert(5)).unwrap();
 
-        // Give it time to attempt at least one retry, then stop via shutdown.
-        thread::sleep(Duration::from_millis(500));
+        // Poll until at least two retries have been attempted, verifying
+        // the service survives failures and keeps retrying.
+        let fetcher_poll = Arc::clone(&fetcher);
+        poll_until(
+            move || fetcher_poll.total_calls() >= 2,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            "fetcher should have been called at least twice (retry after failure)",
+        );
+
+        assert!(
+            fetcher.total_calls() >= 2,
+            "expected at least two fetch attempts (verifying retry), got {}",
+            fetcher.total_calls()
+        );
+
         svc.stop();
     }
 
     #[test]
     fn skips_already_committed_round() {
         // If the ledger is already at or past the certificate round, no fetch
-        // should occur.
-        let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        // should occur. We verify this using a sentinel cert: after sending
+        // the skipped cert, we send a second cert for the next expected round.
+        // When that sentinel is fetched, we know the first cert was processed
+        // (and skipped) without any fetch.
+        let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(2);
         // Ledger at round 10 (past the cert round of 5).
         let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(10)));
 
-        let fetcher = Arc::new(MockBlockFetcher::new(Some(Block::default())));
+        // Create a block for the sentinel round (11 = next expected round).
+        let sentinel_block = make_valid_empty_block(11);
+        let sentinel_digest = algo_codec::compute_block_digest(&sentinel_block);
+
+        let fetcher = Arc::new(DigestMatchingBlockFetcher::new(sentinel_block));
         let fetcher_ref: Arc<dyn BlockFetcher> = Arc::clone(&fetcher) as Arc<dyn BlockFetcher>;
 
         let mut svc = CatchupService::start(rx, ledger, fetcher_ref);
 
-        // Send a cert for round 5 — already committed.
+        // Send a cert for round 5 — already committed, should be skipped.
         tx.send(make_pending_cert(5)).unwrap();
+        // Send a sentinel cert for round 11 — should be fetched.
+        tx.send(make_pending_cert_with_digest(11, sentinel_digest))
+            .unwrap();
 
-        // Give it time to process.
-        thread::sleep(Duration::from_millis(100));
+        // Poll until the sentinel fetch completes.
+        let fetcher_poll = Arc::clone(&fetcher);
+        poll_until(
+            move || fetcher_poll.fetch_count() >= 1,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            "sentinel cert for round 11 should have been fetched",
+        );
 
-        // The fetcher should NOT have been called.
+        // The fetcher should have been called exactly once (only for the
+        // sentinel round 11, not for the skipped round 5).
         assert_eq!(
             fetcher.fetch_count(),
-            0,
-            "fetcher should not be called for already-committed round"
+            1,
+            "fetcher should be called only for the sentinel, not for the skipped round"
         );
 
         svc.stop();
@@ -902,7 +913,8 @@ mod tests {
         // Set up the service with a fetcher that returns this block.
         let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
         // Ledger is at round 0, so round 1 is the next expected.
-        let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
+        let ledger_ref = Arc::new(MockCatchupLedger::new(Round(0)));
+        let ledger: Arc<dyn CatchupLedger> = Arc::clone(&ledger_ref) as Arc<dyn CatchupLedger>;
 
         let fetcher = Arc::new(DigestMatchingBlockFetcher::new(block));
         let fetcher_ref: Arc<dyn BlockFetcher> = Arc::clone(&fetcher) as Arc<dyn BlockFetcher>;
@@ -929,10 +941,20 @@ mod tests {
         );
 
         // The block should have been committed to the ledger.
-        // Note: ensure_block may or may not succeed in applying the block
-        // (depends on block content), but the fetch and digest validation
-        // path was exercised. We verify by checking fetch_count == 1
-        // (meaning digest validation passed, no retry).
+        // Poll until the ledger has advanced (ensure_block was called).
+        let ledger_poll = Arc::clone(&ledger_ref);
+        poll_until(
+            move || ledger_poll.next_round() == Round(2),
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            "ledger should have advanced to round 1 (next_round == 2)",
+        );
+
+        assert_eq!(
+            ledger_ref.next_round(),
+            Round(2),
+            "ledger should have advanced to round 1"
+        );
 
         svc.stop();
     }
