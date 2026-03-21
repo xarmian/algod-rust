@@ -2285,6 +2285,319 @@ pub async fn raw_transaction<N: NodeInterface>(
 }
 
 // ---------------------------------------------------------------------------
+// EvalDelta conversion helpers (rmpv::Value → typed model structs)
+// ---------------------------------------------------------------------------
+
+/// Convert a single state delta entry (rmpv map with "at", "bs", "ui" keys)
+/// into an `ApiEvalDelta`.
+fn parse_value_delta(val: &rmpv::Value) -> Option<models::ApiEvalDelta> {
+    let map = match val {
+        rmpv::Value::Map(m) => m,
+        _ => return None,
+    };
+    let mut action: u64 = 0;
+    let mut bytes_val: Option<Vec<u8>> = None;
+    let mut uint_val: u64 = 0;
+
+    for (k, v) in map {
+        if let Some(key) = rmpv_key_str(k) {
+            match key {
+                "at" => action = rmpv_as_u64(v).unwrap_or(0),
+                "bs" => bytes_val = rmpv_as_bytes(v),
+                "ui" => uint_val = rmpv_as_u64(v).unwrap_or(0),
+                _ => {}
+            }
+        }
+    }
+
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let bytes =
+        bytes_val.map(|b| STANDARD.encode(&b)).and_then(
+            |s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            },
+        );
+    let uint = if uint_val == 0 { None } else { Some(uint_val) };
+
+    Some(models::ApiEvalDelta {
+        action,
+        bytes,
+        uint,
+    })
+}
+
+/// Convert a state delta map (rmpv map of key→value_delta) into a `StateDelta`.
+fn parse_state_delta(val: &rmpv::Value) -> models::StateDelta {
+    let map = match val {
+        rmpv::Value::Map(m) => m,
+        _ => return Vec::new(),
+    };
+
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let mut delta = Vec::with_capacity(map.len());
+    for (k, v) in map {
+        let key_bytes = match rmpv_as_bytes(k) {
+            Some(b) => b,
+            None => continue,
+        };
+        let key = STANDARD.encode(&key_bytes);
+        if let Some(value) = parse_value_delta(v) {
+            delta.push(models::EvalDeltaKeyValue { key, value });
+        }
+    }
+    delta
+}
+
+/// Extract the global state delta ("gd" key) from an eval_delta rmpv::Value.
+fn convert_global_state_delta(eval_delta: &rmpv::Value) -> Option<models::StateDelta> {
+    let map = match eval_delta {
+        rmpv::Value::Map(m) => m,
+        _ => return None,
+    };
+    for (k, v) in map {
+        if rmpv_key_str(k) == Some("gd") {
+            let delta = parse_state_delta(v);
+            if delta.is_empty() {
+                return None;
+            }
+            return Some(delta);
+        }
+    }
+    None
+}
+
+/// Resolve an account index to an address string, matching go-algorand's
+/// `edIndexToAddress`.
+fn ed_index_to_address(
+    index: u64,
+    txn: &algo_types::SignedTransaction,
+    shared_accts: &[algo_types::Address],
+) -> String {
+    if index == 0 {
+        return txn.txn.sender.to_string();
+    }
+    let accounts = txn.txn.accounts.as_deref().unwrap_or(&[]);
+    let idx = (index - 1) as usize;
+    if idx < accounts.len() {
+        return accounts[idx].to_string();
+    }
+    let shared_idx = idx - accounts.len();
+    if shared_idx < shared_accts.len() {
+        return shared_accts[shared_idx].to_string();
+    }
+    format!("Invalid Account Index {} in LocalDelta", index)
+}
+
+/// Parse shared accounts ("sa" key) from eval_delta into a Vec<Address>.
+fn parse_shared_accts(eval_delta: &rmpv::Value) -> Vec<algo_types::Address> {
+    let map = match eval_delta {
+        rmpv::Value::Map(m) => m,
+        _ => return Vec::new(),
+    };
+    for (k, v) in map {
+        if rmpv_key_str(k) == Some("sa") {
+            if let rmpv::Value::Array(arr) = v {
+                return arr
+                    .iter()
+                    .filter_map(|item| {
+                        let bytes = rmpv_as_bytes(item)?;
+                        if bytes.len() == 32 {
+                            let mut addr = [0u8; 32];
+                            addr.copy_from_slice(&bytes);
+                            Some(algo_types::Address(addr))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Extract the local state deltas ("ld" key) from an eval_delta rmpv::Value.
+fn convert_local_state_delta(
+    eval_delta: &rmpv::Value,
+    txn: &algo_types::SignedTransaction,
+) -> Option<Vec<models::AccountStateDelta>> {
+    let map = match eval_delta {
+        rmpv::Value::Map(m) => m,
+        _ => return None,
+    };
+
+    let shared_accts = parse_shared_accts(eval_delta);
+
+    for (k, v) in map {
+        if rmpv_key_str(k) == Some("ld") {
+            if let rmpv::Value::Map(ld_map) = v {
+                if ld_map.is_empty() {
+                    return None;
+                }
+                let mut result = Vec::with_capacity(ld_map.len());
+                for (idx_key, state_delta_val) in ld_map {
+                    let index = rmpv_as_u64(idx_key).unwrap_or(0);
+                    let address = ed_index_to_address(index, txn, &shared_accts);
+                    let delta = parse_state_delta(state_delta_val);
+                    result.push(models::AccountStateDelta { address, delta });
+                }
+                if result.is_empty() {
+                    return None;
+                }
+                return Some(result);
+            }
+        }
+    }
+    None
+}
+
+/// Extract logs ("lg" key) from an eval_delta rmpv::Value.
+fn convert_logs(eval_delta: &rmpv::Value) -> Option<Vec<Vec<u8>>> {
+    let map = match eval_delta {
+        rmpv::Value::Map(m) => m,
+        _ => return None,
+    };
+    for (k, v) in map {
+        if rmpv_key_str(k) == Some("lg") {
+            if let rmpv::Value::Array(lg_arr) = v {
+                if lg_arr.is_empty() {
+                    return None;
+                }
+                let logs: Vec<Vec<u8>> = lg_arr.iter().filter_map(rmpv_as_bytes).collect();
+                if logs.is_empty() {
+                    return None;
+                }
+                return Some(logs);
+            }
+        }
+    }
+    None
+}
+
+/// Extract inner transactions ("itx" key) from an eval_delta rmpv::Value.
+///
+/// Each inner transaction is a full SignedTransaction map with its own "dt"
+/// eval_delta. This function recursively builds `PreEncodedTxInfo` for each.
+fn convert_inner_txns(eval_delta: &rmpv::Value) -> Option<Vec<models::PreEncodedTxInfo>> {
+    let map = match eval_delta {
+        rmpv::Value::Map(m) => m,
+        _ => return None,
+    };
+    for (k, v) in map {
+        if rmpv_key_str(k) == Some("itx") {
+            if let rmpv::Value::Array(itx_arr) = v {
+                if itx_arr.is_empty() {
+                    return None;
+                }
+                let mut inner = Vec::with_capacity(itx_arr.len());
+                for itx in itx_arr {
+                    if let Some(info) = convert_inner_txn(itx) {
+                        inner.push(info);
+                    }
+                }
+                if inner.is_empty() {
+                    return None;
+                }
+                return Some(inner);
+            }
+        }
+    }
+    None
+}
+
+/// Convert a single inner transaction rmpv::Value into a `PreEncodedTxInfo`.
+fn convert_inner_txn(itx: &rmpv::Value) -> Option<models::PreEncodedTxInfo> {
+    // The inner txn is a full SignedTransaction msgpack map. We need to
+    // deserialize it to get the SignedTransaction, then extract its eval_delta.
+    let stxn: algo_types::SignedTransaction = rmpv::ext::from_value(itx.clone()).ok()?;
+
+    // Find the "dt" (eval_delta) key in the map.
+    let inner_eval_delta = if let rmpv::Value::Map(m) = itx {
+        m.iter().find_map(|(k, v)| {
+            if rmpv_key_str(k) == Some("dt") {
+                Some(v)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+
+    // Populate apply-data fields from the SignedTransaction, matching
+    // go-algorand's ConvertInnerTxn which always sets these for inner txns.
+    let closing_amount = if stxn.closing_amount != 0 {
+        Some(stxn.closing_amount)
+    } else {
+        None
+    };
+    let asset_closing_amount = if stxn.asset_closing_amount != 0 {
+        Some(stxn.asset_closing_amount)
+    } else {
+        None
+    };
+    let sender_rewards = if stxn.sender_rewards != 0 {
+        Some(stxn.sender_rewards)
+    } else {
+        None
+    };
+    let receiver_rewards = if stxn.receiver_rewards != 0 {
+        Some(stxn.receiver_rewards)
+    } else {
+        None
+    };
+    let close_rewards = if stxn.close_rewards != 0 {
+        Some(stxn.close_rewards)
+    } else {
+        None
+    };
+    let asset_index = if stxn.apply_data_config_asset != 0 {
+        Some(stxn.apply_data_config_asset)
+    } else {
+        None
+    };
+    let application_index = if stxn.apply_data_application_id != 0 {
+        Some(stxn.apply_data_application_id)
+    } else {
+        None
+    };
+
+    let mut info = models::PreEncodedTxInfo {
+        txn: stxn.clone(),
+        pool_error: String::new(),
+        confirmed_round: None,
+        closing_amount,
+        asset_closing_amount,
+        sender_rewards,
+        receiver_rewards,
+        close_rewards,
+        asset_index,
+        application_index,
+        global_state_delta: None,
+        local_state_delta: None,
+        logs: None,
+        inner_txns: None,
+    };
+
+    if let Some(dt) = inner_eval_delta {
+        info.global_state_delta = convert_global_state_delta(dt);
+        info.local_state_delta = convert_local_state_delta(dt, &stxn);
+        info.logs = convert_logs(dt);
+        info.inner_txns = convert_inner_txns(dt);
+    }
+
+    Some(info)
+}
+
+// ---------------------------------------------------------------------------
 // GET /v2/transactions/pending/{txid}
 // ---------------------------------------------------------------------------
 
@@ -2371,8 +2684,14 @@ pub async fn pending_transaction_information<N: NodeInterface>(
         response.asset_index = txn_status.asset_index;
         response.application_index = txn_status.application_index;
         response.logs = txn_status.logs;
-        // inner_txns and state deltas would be populated from eval_delta
-        // TODO: Convert eval_delta to inner_txns, global_state_delta, local_state_delta
+        if let Some(ref eval_delta) = txn_status.eval_delta {
+            response.global_state_delta = convert_global_state_delta(eval_delta);
+            response.local_state_delta = convert_local_state_delta(eval_delta, &response.txn);
+            if response.logs.is_none() {
+                response.logs = convert_logs(eval_delta);
+            }
+            response.inner_txns = convert_inner_txns(eval_delta);
+        }
     }
 
     format::encode_response(&response, resp_format)

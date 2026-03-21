@@ -1301,6 +1301,56 @@ pub struct PendingTransactionsResponse {
 }
 
 // ---------------------------------------------------------------------------
+// EvalDelta / StateDelta types for pending txn response
+// ---------------------------------------------------------------------------
+
+/// Represents a TEAL value delta in a state change.
+///
+/// Matches go-algorand's `model.EvalDelta`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiEvalDelta {
+    /// Delta action: 1 = SetUint, 2 = SetBytes, 3 = Delete.
+    pub action: u64,
+
+    /// Base64-encoded bytes value (omitted when empty).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<String>,
+
+    /// Uint value (omitted when 0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uint: Option<u64>,
+}
+
+/// A key-value pair in a state delta.
+///
+/// Matches go-algorand's `model.EvalDeltaKeyValue`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalDeltaKeyValue {
+    /// Base64-encoded state key.
+    pub key: String,
+
+    /// The value delta.
+    pub value: ApiEvalDelta,
+}
+
+/// Application state delta (array of key-value pairs).
+///
+/// Matches go-algorand's `model.StateDelta = []EvalDeltaKeyValue`.
+pub type StateDelta = Vec<EvalDeltaKeyValue>;
+
+/// Per-account application state delta.
+///
+/// Matches go-algorand's `model.AccountStateDelta`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountStateDelta {
+    /// The account address.
+    pub address: String,
+
+    /// Application state delta for this account.
+    pub delta: StateDelta,
+}
+
+// ---------------------------------------------------------------------------
 // PreEncodedTxInfo
 // ---------------------------------------------------------------------------
 
@@ -1354,11 +1404,11 @@ pub struct PreEncodedTxInfo {
 
     /// Global state delta.
     #[serde(rename = "global-state-delta", skip_serializing_if = "Option::is_none")]
-    pub global_state_delta: Option<serde_json::Value>,
+    pub global_state_delta: Option<StateDelta>,
 
     /// Local state deltas.
     #[serde(rename = "local-state-delta", skip_serializing_if = "Option::is_none")]
-    pub local_state_delta: Option<serde_json::Value>,
+    pub local_state_delta: Option<Vec<AccountStateDelta>>,
 
     /// Logs from application execution.
     #[serde(skip_serializing_if = "Option::is_none")]
