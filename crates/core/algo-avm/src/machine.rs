@@ -288,15 +288,26 @@ impl AvmMachine {
         // Record opcode hit for coverage tracking.
         self.opcode_hits[instr.opcode as usize] = true;
 
+        // Tracer: before opcode (called before cost charge so budget-
+        // exhaustion opcodes are visible in the trace, matching go-algorand).
+        tracer.before_opcode(self.pc, instr.opcode);
+
         // Charge static cost.
         if let Some(spec) = opcode::lookup(instr.opcode) {
             if let CostKind::Static(cost) = spec.cost {
-                self.charge_cost(cost)?;
+                if let Err(e) = self.charge_cost(cost) {
+                    let msg = e.to_string();
+                    tracer.after_opcode(
+                        old_pc,
+                        instr.opcode,
+                        &self.stack,
+                        &self.scratch,
+                        Some(&msg),
+                    );
+                    return Err(e);
+                }
             }
         }
-
-        // Tracer: before opcode.
-        tracer.before_opcode(self.pc, instr.opcode);
 
         // Dispatch to opcode handler.
         let result = ops::dispatch(self, &instr, ctx);

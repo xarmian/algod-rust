@@ -27,7 +27,7 @@ use std::cell::Cell;
 use std::fmt;
 
 use algo_error::AlgoError;
-use algo_types::consensus::ConsensusParams;
+use algo_types::consensus::consensus_params_for_version;
 use algo_types::{Address, Round, SignedTransaction};
 
 use crate::apply::{apply_transaction, ApplyContext, ApplyMode};
@@ -213,7 +213,8 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
         // Collect all addresses involved in the transaction group for
         // snapshotting. This ensures we can restore state after simulation.
-        let mut addrs: Vec<Address> = Vec::new();
+        // Include the fee sink since every transaction credits fees to it.
+        let mut addrs: Vec<Address> = vec![self.store.fee_sink()];
         for stx in txn_group {
             addrs.push(stx.txn.sender);
             if stx.txn.receiver != Address::ZERO {
@@ -221,6 +222,9 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             }
             if stx.txn.close_remainder_to != Address::ZERO {
                 addrs.push(stx.txn.close_remainder_to);
+            }
+            if let Some(ref ar) = stx.txn.asset_receiver {
+                addrs.push(*ar);
             }
         }
         // Deduplicate addresses.
@@ -231,7 +235,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
         // --- Build apply context ---
 
-        let consensus = ConsensusParams::default();
+        let consensus = consensus_params_for_version(self.store.protocol()).unwrap_or_default();
         let apply_ctx = ApplyContext {
             rewards_level: self.store.rewards_level(),
             fee_sink: self.store.fee_sink(),
@@ -264,8 +268,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // the apply pipeline requires changes to apply_transaction, LedgerAvmContext,
             // and the AVM execution entry points. For now, exec-trace results
             // will be empty even when tracing is requested.
-            let mut tracer = SimulationTracer::new(request.trace_config.clone());
-            let _ = &mut tracer;
+            let mut _tracer = SimulationTracer::new(request.trace_config.clone());
 
             match apply_transaction(self.store, stx, &apply_ctx, 0) {
                 Ok(()) => {
@@ -282,7 +285,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             }
 
             // Collect tracer results.
-            txn_result.trace = tracer.into_transaction_trace();
+            txn_result.trace = _tracer.into_transaction_trace();
             group_result.txn_results.push(txn_result);
         }
 
