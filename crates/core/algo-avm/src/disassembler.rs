@@ -3,7 +3,7 @@
 //! Uses the existing `bytecode::parse()` to parse the program, then reconstructs
 //! TEAL source text matching go-algorand's `Disassemble()` output.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::{self, Immediates, Instruction, Program};
 use crate::fields;
@@ -167,10 +167,7 @@ pub fn disassemble(program: &[u8]) -> Result<String, String> {
     let end_offset = parsed
         .instructions
         .last()
-        .map(|i| {
-            let spec = opcode::lookup(i.opcode);
-            i.offset + instruction_size(i, spec)
-        })
+        .map(|i| i.offset + instruction_size(i))
         .unwrap_or(0);
     if let Some(label) = labels.get(&end_offset) {
         out.push_str(&format!("{}:\n", label));
@@ -198,8 +195,7 @@ fn compute_labels_end(instr: &Instruction, count: usize) -> usize {
 }
 
 /// Compute the total size (in bytes) of an instruction including its immediates.
-fn instruction_size(instr: &Instruction, spec: Option<&opcode::OpSpec>) -> usize {
-    let _ = spec;
+fn instruction_size(instr: &Instruction) -> usize {
     match &instr.immediates {
         Immediates::None => 1,
         Immediates::Uint8(_) => 2,
@@ -249,12 +245,13 @@ fn varuint_size(mut v: u64) -> usize {
 /// Collect all branch targets from the program and assign label names.
 fn collect_labels(program: &Program) -> HashMap<usize, String> {
     let mut targets: Vec<usize> = Vec::new();
+    let mut seen: HashSet<usize> = HashSet::new();
 
     for instr in &program.instructions {
         match &instr.immediates {
             Immediates::Int16(offset) => {
                 let target = compute_branch_target(instr);
-                if !targets.contains(&target) {
+                if seen.insert(target) {
                     targets.push(target);
                 }
                 let _ = offset;
@@ -263,7 +260,7 @@ fn collect_labels(program: &Program) -> HashMap<usize, String> {
                 let end_of_instr = compute_labels_end(instr, offsets.len());
                 for offset in offsets {
                     let target = (end_of_instr as isize + *offset as isize) as usize;
-                    if !targets.contains(&target) {
+                    if seen.insert(target) {
                         targets.push(target);
                     }
                 }

@@ -603,6 +603,13 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
         // Handle pragma
         if code.starts_with('#') {
             if code.starts_with("#pragma") {
+                if !ops.pending.is_empty() {
+                    ops.record_error(
+                        ops.source_line,
+                        0,
+                        "#pragma version is only allowed before instructions".into(),
+                    );
+                }
                 let parts: Vec<&str> = code.split_whitespace().collect();
                 if parts.len() >= 3 && parts[1] == "version" {
                     if let Ok(v) = parts[2].parse::<u8>() {
@@ -665,6 +672,15 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
 
     if !version_set && ops.version == 0 {
         ops.version = ASSEMBLER_DEFAULT_VERSION;
+    }
+
+    // Empty program check (comment-only or pragma-only programs)
+    if ops.pending.is_empty() && ops.errors.is_empty() {
+        ops.record_error(
+            0,
+            0,
+            "empty program; at least one instruction is required".into(),
+        );
     }
 
     // Constant optimization for v4+
@@ -773,15 +789,19 @@ fn asm_push_int(ops: &mut OpStream, args: &[&str]) {
         );
         return;
     }
-    let val = match args[0].parse::<u64>() {
-        Ok(v) => v,
-        Err(_) => {
-            ops.record_error(
-                ops.source_line,
-                0,
-                format!("unable to parse {:?} as integer", args[0]),
-            );
-            return;
+    let val = if let Some(v) = parse_named_int(args[0]) {
+        v
+    } else {
+        match parse_u64(args[0]) {
+            Ok(v) => v,
+            Err(_) => {
+                ops.record_error(
+                    ops.source_line,
+                    0,
+                    format!("unable to parse {:?} as integer", args[0]),
+                );
+                return;
+            }
         }
     };
     ops.pending.push(0x81); // pushint
@@ -885,13 +905,10 @@ fn asm_method(ops: &mut OpStream, args: &[&str]) {
 }
 
 fn asm_intc_block(ops: &mut OpStream, args: &[&str]) {
-    ops.pending.push(0x20); // intcblock opcode
     let mut vals = Vec::new();
-    write_varuint_to_vec(&mut ops.pending, args.len() as u64);
     for arg in args {
         match parse_u64(arg) {
             Ok(v) => {
-                write_varuint_to_vec(&mut ops.pending, v);
                 vals.push(v);
             }
             Err(_) => ops.record_error(
@@ -900,6 +917,11 @@ fn asm_intc_block(ops: &mut OpStream, args: &[&str]) {
                 format!("unable to parse {:?} as integer", arg),
             ),
         }
+    }
+    ops.pending.push(0x20); // intcblock opcode
+    write_varuint_to_vec(&mut ops.pending, vals.len() as u64);
+    for v in &vals {
+        write_varuint_to_vec(&mut ops.pending, *v);
     }
     if ops.has_pseudo_int {
         ops.record_error(ops.source_line, 0, "intcblock following int".into());
