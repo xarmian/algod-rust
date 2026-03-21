@@ -10,6 +10,20 @@
 
 use crate::machine::AvmValue;
 
+/// The type of AVM program being executed.
+///
+/// Used by [`EvalTracer`] callbacks to distinguish between approval,
+/// clear-state, and LogicSig programs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramType {
+    /// Application approval program.
+    Approval,
+    /// Application clear-state program.
+    ClearState,
+    /// LogicSig (stateless signature) program.
+    LogicSig,
+}
+
 /// Trait for observing AVM program execution.
 ///
 /// All methods have no-op default implementations so that callers only need
@@ -21,16 +35,13 @@ use crate::machine::AvmValue;
 /// 3. `after_program` — called once after execution completes or errors.
 pub trait EvalTracer {
     /// Called before a program begins executing.
-    ///
-    /// `is_logicsig` is `true` when the program is a LogicSig (stateless),
-    /// `false` for application programs (approval / clear-state).
-    fn before_program(&mut self, _is_logicsig: bool) {}
+    fn before_program(&mut self, _program_type: ProgramType) {}
 
     /// Called after a program finishes executing.
     ///
     /// `pass` indicates whether the program approved (`true`) or rejected
     /// (`false`). `error` is `Some` if the program terminated with an error.
-    fn after_program(&mut self, _is_logicsig: bool, _pass: bool, _error: Option<&str>) {}
+    fn after_program(&mut self, _program_type: ProgramType, _pass: bool, _error: Option<&str>) {}
 
     /// Called before each opcode is dispatched.
     ///
@@ -69,10 +80,10 @@ mod tests {
     #[test]
     fn test_null_tracer_is_usable() {
         let mut tracer = NullTracer;
-        tracer.before_program(false);
+        tracer.before_program(ProgramType::Approval);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[], &[], None);
-        tracer.after_program(false, true, None);
+        tracer.after_program(ProgramType::Approval, true, None);
     }
 
     /// Verify that a custom tracer can capture events.

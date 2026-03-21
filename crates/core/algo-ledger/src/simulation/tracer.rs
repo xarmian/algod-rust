@@ -5,7 +5,7 @@
 //! [`TransactionTrace`] structures for the simulation result.
 
 use algo_avm::machine::AvmValue;
-use algo_avm::tracer::EvalTracer;
+use algo_avm::tracer::{EvalTracer, ProgramType};
 
 use super::trace::{
     AvmValueTrace, ExecTraceConfig, OpcodeTraceUnit, ProgramTrace, TransactionTrace,
@@ -17,14 +17,6 @@ fn to_trace_value(v: &AvmValue) -> AvmValueTrace {
         AvmValue::Uint64(n) => AvmValueTrace::Uint64(*n),
         AvmValue::Bytes(b) => AvmValueTrace::Bytes(b.clone()),
     }
-}
-
-/// The type of program currently being traced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProgramType {
-    Approval,
-    ClearState,
-    LogicSig,
 }
 
 /// State tracked during a single program's execution.
@@ -88,23 +80,10 @@ impl SimulationTracer {
 }
 
 impl EvalTracer for SimulationTracer {
-    fn before_program(&mut self, is_logicsig: bool) {
+    fn before_program(&mut self, program_type: ProgramType) {
         if !self.config.is_enabled() {
             return;
         }
-
-        let program_type = if is_logicsig {
-            ProgramType::LogicSig
-        } else {
-            // Distinguish approval vs clear-state by checking if the
-            // approval trace is already populated. If so, this must be
-            // the clear-state program.
-            if self.transaction_trace.approval_program_trace.is_some() {
-                ProgramType::ClearState
-            } else {
-                ProgramType::Approval
-            }
-        };
 
         self.current_program = Some(ProgramTraceState {
             program_type,
@@ -114,7 +93,7 @@ impl EvalTracer for SimulationTracer {
         });
     }
 
-    fn after_program(&mut self, _is_logicsig: bool, _pass: bool, _error: Option<&str>) {
+    fn after_program(&mut self, _program_type: ProgramType, _pass: bool, _error: Option<&str>) {
         if !self.config.is_enabled() {
             return;
         }
@@ -237,10 +216,10 @@ mod tests {
         let config = ExecTraceConfig::default();
         let mut tracer = SimulationTracer::new(config);
 
-        tracer.before_program(false);
+        tracer.before_program(ProgramType::Approval);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
-        tracer.after_program(false, true, None);
+        tracer.after_program(ProgramType::Approval, true, None);
 
         let trace = tracer.into_transaction_trace();
         assert!(trace.is_none());
@@ -256,12 +235,12 @@ mod tests {
         };
         let mut tracer = SimulationTracer::new(config);
 
-        tracer.before_program(false);
+        tracer.before_program(ProgramType::Approval);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
         tracer.before_opcode(1, 0x43);
         tracer.after_opcode(1, 0x43, &[AvmValue::Uint64(1)], &[], None);
-        tracer.after_program(false, true, None);
+        tracer.after_program(ProgramType::Approval, true, None);
 
         let trace = tracer.into_transaction_trace().unwrap();
         let approval = trace.approval_program_trace.unwrap();
@@ -280,10 +259,10 @@ mod tests {
         };
         let mut tracer = SimulationTracer::new(config);
 
-        tracer.before_program(true);
+        tracer.before_program(ProgramType::LogicSig);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
-        tracer.after_program(true, true, None);
+        tracer.after_program(ProgramType::LogicSig, true, None);
 
         let trace = tracer.into_transaction_trace().unwrap();
         assert!(trace.logicsig_trace.is_some());
@@ -300,7 +279,7 @@ mod tests {
         };
         let mut tracer = SimulationTracer::new(config);
 
-        tracer.before_program(false);
+        tracer.before_program(ProgramType::Approval);
 
         // First opcode pushes 1 value.
         tracer.before_opcode(0, 0x81);
@@ -320,6 +299,6 @@ mod tests {
         assert_eq!(unit.stack_pop_count, 1);
         assert_eq!(unit.stack_additions.len(), 0);
 
-        tracer.after_program(false, true, None);
+        tracer.after_program(ProgramType::Approval, true, None);
     }
 }

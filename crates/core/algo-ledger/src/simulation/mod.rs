@@ -242,6 +242,9 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             round: sim_round.0,
             mode: ApplyMode::Execute,
             validate: false,
+            // TODO(#188): Read latest_timestamp from the block header at
+            // sim_round. Currently requires deserializing raw block header
+            // bytes from the store, which needs a helper method on LedgerStore.
             latest_timestamp: 0,
             genesis_hash: *self.store.genesis_hash(),
             txn_counter: Cell::new(self.store.txn_counter()),

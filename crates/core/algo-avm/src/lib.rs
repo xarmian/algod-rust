@@ -32,6 +32,6 @@ pub use machine::{AvmMachine, AvmValue, CallFrame, ExecMode, OpcodeCoverage};
 pub use opcode::{
     all_opcodes, defined_opcode_count, lookup, CostKind, ImmKind, Mode, OpSpec, MAX_AVM_VERSION,
 };
-pub use tracer::{EvalTracer, NullTracer};
+pub use tracer::{EvalTracer, NullTracer, ProgramType};
 pub use txn_fields::{read_txn_field, type_enum};
 pub use validator::check_program;

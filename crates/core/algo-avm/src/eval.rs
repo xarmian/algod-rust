@@ -14,7 +14,7 @@ use crate::bytecode;
 use crate::context::AvmContext;
 use crate::group::GroupBudget;
 use crate::machine::{AvmMachine, ExecMode, OpcodeCoverage};
-use crate::tracer::EvalTracer;
+use crate::tracer::{EvalTracer, ProgramType};
 
 // ---------------------------------------------------------------------------
 // Budget constants — sourced from ConsensusParams (V41 defaults).
@@ -252,18 +252,27 @@ pub fn run_approval_program_with_tracer(
     budget: &mut GroupBudget,
     tracer: &mut dyn EvalTracer,
 ) -> Result<AvmResult, AlgoError> {
-    let parsed = bytecode::parse(program)?;
+    let parsed = match bytecode::parse(program) {
+        Ok(p) => p,
+        Err(e) => {
+            // Notify tracer of the failed program so it sees balanced
+            // before/after calls even on parse errors.
+            tracer.before_program(ProgramType::Approval);
+            tracer.after_program(ProgramType::Approval, false, Some(&e.to_string()));
+            return Err(e);
+        }
+    };
     let budget_before = budget.remaining();
     let mut machine = AvmMachine::new(parsed, ExecMode::Application, budget_before);
 
-    tracer.before_program(false);
+    tracer.before_program(ProgramType::Approval);
 
     match machine.run_with_tracer(ctx, tracer) {
         Ok(pass) => {
             let cost_used = budget_before - machine.budget;
             budget.consume(cost_used)?;
 
-            tracer.after_program(false, pass, None);
+            tracer.after_program(ProgramType::Approval, pass, None);
 
             let coverage = machine.opcode_coverage();
             let result = AvmResult {
@@ -282,7 +291,7 @@ pub fn run_approval_program_with_tracer(
             let _ = budget.consume(cost_used);
 
             let msg = e.to_string();
-            tracer.after_program(false, false, Some(&msg));
+            tracer.after_program(ProgramType::Approval, false, Some(&msg));
 
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
@@ -305,7 +314,11 @@ pub fn run_clear_state_program_with_tracer(
 ) -> AvmResult {
     let parsed = match bytecode::parse(program) {
         Ok(p) => p,
-        Err(_) => {
+        Err(e) => {
+            // Notify tracer of the failed program so it sees balanced
+            // before/after calls even on parse errors.
+            tracer.before_program(ProgramType::ClearState);
+            tracer.after_program(ProgramType::ClearState, false, Some(&e.to_string()));
             return AvmResult::empty();
         }
     };
@@ -313,11 +326,11 @@ pub fn run_clear_state_program_with_tracer(
     let clear_budget = consensus.max_app_program_cost as i64;
     let mut machine = AvmMachine::new(parsed, ExecMode::Application, clear_budget);
 
-    tracer.before_program(false);
+    tracer.before_program(ProgramType::ClearState);
 
     match machine.run_with_tracer(ctx, tracer) {
         Ok(true) => {
-            tracer.after_program(false, true, None);
+            tracer.after_program(ProgramType::ClearState, true, None);
             let coverage = machine.opcode_coverage();
             AvmResult {
                 global_delta: ctx.take_global_delta(),
@@ -330,14 +343,14 @@ pub fn run_clear_state_program_with_tracer(
             }
         }
         Ok(false) => {
-            tracer.after_program(false, false, None);
+            tracer.after_program(ProgramType::ClearState, false, None);
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
             result
         }
         Err(e) => {
             let msg = e.to_string();
-            tracer.after_program(false, false, Some(&msg));
+            tracer.after_program(ProgramType::ClearState, false, Some(&msg));
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
             result.error = Some(msg);
@@ -356,24 +369,31 @@ pub fn run_logicsig_program_with_tracer(
     budget: &mut GroupBudget,
     tracer: &mut dyn EvalTracer,
 ) -> Result<bool, AlgoError> {
-    let parsed = bytecode::parse(program)?;
+    let parsed = match bytecode::parse(program) {
+        Ok(p) => p,
+        Err(e) => {
+            tracer.before_program(ProgramType::LogicSig);
+            tracer.after_program(ProgramType::LogicSig, false, Some(&e.to_string()));
+            return Err(e);
+        }
+    };
     let budget_before = budget.remaining();
     let mut machine = AvmMachine::new(parsed, ExecMode::LogicSig, budget_before);
 
-    tracer.before_program(true);
+    tracer.before_program(ProgramType::LogicSig);
 
     match machine.run_with_tracer(ctx, tracer) {
         Ok(pass) => {
             let cost_used = budget_before - machine.budget;
             budget.consume(cost_used)?;
-            tracer.after_program(true, pass, None);
+            tracer.after_program(ProgramType::LogicSig, pass, None);
             Ok(pass)
         }
         Err(e) => {
             let cost_used = budget_before - machine.budget;
             let _ = budget.consume(cost_used);
             let msg = e.to_string();
-            tracer.after_program(true, false, Some(&msg));
+            tracer.after_program(ProgramType::LogicSig, false, Some(&msg));
             Err(e)
         }
     }
