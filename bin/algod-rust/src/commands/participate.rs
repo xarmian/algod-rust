@@ -109,7 +109,7 @@ impl BlockFetcher for GossipBlockFetcher {
                 match algo_codec::extract_raw_payset_blobs_from_block(&raw_block_data) {
                     Ok(blobs) => Some(blobs),
                     Err(e) => {
-                        tracing::debug!(
+                        tracing::warn!(
                             round = %round,
                             error = %e,
                             "could not extract raw payset blobs, falling back to typed re-encoding"

@@ -152,6 +152,12 @@ fn extract_txns_from_block_map(cursor_bytes: &[u8], source_bytes: &[u8]) -> Resu
 
     // Compute the offset of cursor_bytes within source_bytes so we can
     // translate cursor positions back to source positions.
+    debug_assert!(
+        cursor_bytes.as_ptr() >= source_bytes.as_ptr()
+            && cursor_bytes.as_ptr() as usize + cursor_bytes.len()
+                <= source_bytes.as_ptr() as usize + source_bytes.len(),
+        "cursor_bytes must be a sub-slice of source_bytes"
+    );
     let base_offset = cursor_bytes.as_ptr() as usize - source_bytes.as_ptr() as usize;
 
     let mut cursor = Cursor::new(cursor_bytes);
