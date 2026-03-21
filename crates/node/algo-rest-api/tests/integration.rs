@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use algo_ledger::StateDelta;
 use algo_rest_api::auth::generate_token;
 use algo_rest_api::node::{
     AccountLookup, AppResourceLookup, ApplicationLookup, AssetLookup, AssetResourceLookup,
@@ -109,6 +110,8 @@ struct MockNode {
     broadcast_result: Option<String>,
     /// Simulate result to return (None = use default NotImplemented).
     simulate_result: Option<algo_rest_api::models::SimulateResponse>,
+    /// State deltas by round.
+    state_deltas: BTreeMap<u64, StateDelta>,
 }
 
 impl Clone for MockNode {
@@ -149,6 +152,7 @@ impl Clone for MockNode {
             pending_txn_lookup: self.pending_txn_lookup.clone(),
             broadcast_result: self.broadcast_result.clone(),
             simulate_result: self.simulate_result.clone(),
+            state_deltas: self.state_deltas.clone(),
         }
     }
 }
@@ -237,6 +241,7 @@ impl MockNode {
             pending_txn_lookup: BTreeMap::new(),
             broadcast_result: None,
             simulate_result: None,
+            state_deltas: BTreeMap::new(),
         }
     }
 
@@ -681,6 +686,13 @@ impl NodeInterface for MockNode {
         match &self.simulate_result {
             Some(resp) => Ok(resp.clone()),
             None => Err(NodeError::NotImplemented("simulate")),
+        }
+    }
+
+    async fn get_state_delta_for_round(&self, round: u64) -> Result<StateDelta, NodeError> {
+        match self.state_deltas.get(&round) {
+            Some(delta) => Ok(delta.clone()),
+            None => Err(NodeError::NotFound(format!("no delta for round {round}"))),
         }
     }
 }
@@ -5271,7 +5283,7 @@ async fn get_state_delta_invalid_format_returns_400() {
 }
 
 #[tokio::test]
-async fn get_state_delta_default_not_implemented_returns_500() {
+async fn get_state_delta_unknown_round_returns_404() {
     let server = TestServer::start(MockNode::synced()).await;
 
     let resp = server
@@ -5281,7 +5293,7 @@ async fn get_state_delta_default_not_implemented_returns_500() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 500);
+    assert_eq!(resp.status(), 404);
 
     let body: serde_json::Value = resp.json().await.unwrap();
     let msg = body["message"].as_str().unwrap();
@@ -5385,4 +5397,110 @@ async fn get_txn_group_deltas_for_round_returns_501() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let msg = body["message"].as_str().unwrap();
     assert_eq!(msg, "failed retrieving the expected tracer from ledger");
+}
+
+// ===========================================================================
+// State delta endpoint tests — typed StateDelta responses
+// ===========================================================================
+
+/// Helper: build a MockNode with a StateDelta pre-loaded for round 42.
+fn mock_with_delta() -> MockNode {
+    use algo_ledger::state_delta::{
+        AccountDeltas, AccountTotals, BalanceRecord, LedgercoreAccountData, Txlease,
+    };
+    use std::collections::HashMap;
+
+    let mut node = MockNode::synced();
+
+    let delta = StateDelta {
+        accts: AccountDeltas {
+            accts: vec![BalanceRecord {
+                addr: Address([1u8; 32]),
+                account_data: LedgercoreAccountData::default(),
+            }],
+            app_resources: Vec::new(),
+            asset_resources: Vec::new(),
+        },
+        kv_mods: HashMap::new(),
+        txids: HashMap::new(),
+        txleases: Some(vec![(
+            Txlease {
+                sender: Address([2u8; 32]),
+                lease: [3u8; 32],
+            },
+            Round(100),
+        )]),
+        creatables: HashMap::new(),
+        hdr: None,
+        state_proof_next: Round(0),
+        prev_timestamp: 0,
+        totals: AccountTotals::default(),
+    };
+    node.state_deltas.insert(42, delta);
+    node
+}
+
+#[tokio::test]
+async fn get_state_delta_json_returns_200() {
+    let server = TestServer::start(mock_with_delta()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/deltas/42"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "application/json");
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // Txleases should be zeroed out (None) in JSON responses.
+    assert!(
+        body.get("Txleases").is_none(),
+        "Txleases should be absent in JSON: {body}"
+    );
+    // Accts should be present.
+    assert!(
+        body.get("Accts").is_some(),
+        "Accts should be present in JSON"
+    );
+}
+
+#[tokio::test]
+async fn get_state_delta_msgpack_returns_200_with_txleases() {
+    let server = TestServer::start(mock_with_delta()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/deltas/42?format=msgpack"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "application/msgpack");
+
+    let body = resp.bytes().await.unwrap();
+    let decoded: StateDelta = rmp_serde::from_slice(&body).unwrap();
+    // Txleases should be PRESENT in msgpack responses.
+    assert!(
+        decoded.txleases.is_some(),
+        "Txleases should be present in msgpack"
+    );
+    assert_eq!(decoded.txleases.as_ref().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn get_state_delta_not_found_returns_404() {
+    let server = TestServer::start(mock_with_delta()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/deltas/999"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
 }

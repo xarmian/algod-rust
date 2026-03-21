@@ -128,6 +128,235 @@ pub fn apply_block_validating<L: crate::store_trait::LedgerStore>(
     apply_block_impl(store, block, ApplyMode::Replay, true)
 }
 
+/// Apply a full block and return the resulting [`StateDelta`].
+///
+/// Wraps [`apply_block_impl`]: snapshots pre-state for all addresses
+/// referenced in the payset (and end-of-block participation lists), applies
+/// the block, then diffs pre vs post state to build the delta.
+pub fn apply_block_with_delta<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+) -> Result<crate::state_delta::StateDelta, AlgoError> {
+    use std::collections::{HashMap, HashSet};
+
+    use crate::state_delta::{
+        AccountBaseData, AccountDeltas, AccountTotals, BalanceRecord, IncludedTransactions,
+        LedgercoreAccountData, StateDelta, Txlease, VotingData,
+    };
+
+    // ── 1. Collect all addresses referenced in the payset ──────────
+    let mut addrs = HashSet::new();
+    for stx in &block.payset {
+        collect_txn_addresses(&stx.txn, &mut addrs);
+    }
+    // End-of-block participation accounts.
+    if let Some(ref expired) = block.expired_participation_accounts {
+        for a in expired {
+            addrs.insert(*a);
+        }
+    }
+    if let Some(ref absent) = block.absent_participation_accounts {
+        for a in absent {
+            addrs.insert(*a);
+        }
+    }
+    // Always include fee sink and rewards pool.
+    addrs.insert(block.fee_sink);
+    addrs.insert(block.rewards_pool);
+
+    // ── 2. Snapshot pre-state for all collected addresses ──────────
+    let addr_list: Vec<Address> = addrs.iter().copied().collect();
+    let mut pre_accounts: HashMap<Address, Option<algo_types::AccountData>> = HashMap::new();
+    for addr in &addr_list {
+        pre_accounts.insert(*addr, store.get_account(addr));
+    }
+    // TODO(#190): prev_timestamp should be the previous block's timestamp.
+    // We don't have easy access to it here; callers can fill it in if needed.
+    let prev_timestamp = 0i64;
+
+    // ── 3. Apply the block ────────────────────────────────────────
+    apply_block_impl(store, block, ApplyMode::Replay, false)?;
+
+    // ── 4. Build the StateDelta by diffing pre vs post state ──────
+    let mut accts = Vec::new();
+    for addr in &addr_list {
+        let post = store.get_account(addr);
+        let pre = pre_accounts.get(addr).cloned().flatten();
+        // Only include in delta if something actually changed.
+        if pre != post {
+            let ad = post.unwrap_or_default();
+            let voting = VotingData {
+                vote_id: ad.vote_id.unwrap_or([0u8; 32]),
+                selection_id: ad.selection_id.unwrap_or([0u8; 32]),
+                state_proof_id: ad.state_proof_id.unwrap_or([0u8; 64]),
+                vote_first_valid: Round(ad.vote_first_valid),
+                vote_last_valid: Round(ad.vote_last_valid),
+                vote_key_dilution: ad.vote_key_dilution,
+            };
+            let base = AccountBaseData {
+                status: ad.status as u64,
+                micro_algos: ad.micro_algos,
+                rewards_base: ad.rewards_base,
+                rewarded_micro_algos: ad.rewarded_micro_algos,
+                auth_addr: ad.auth_addr.unwrap_or(Address::ZERO),
+                incentive_eligible: ad.incentive_eligible,
+                total_app_schema: ad.total_app_schema.clone(),
+                total_extra_app_pages: ad.total_extra_app_pages,
+                total_app_params: ad.total_created_apps,
+                total_app_local_states: ad.total_apps_opted_in,
+                total_asset_params: ad.total_created_assets,
+                total_assets: ad.total_assets_opted_in,
+                total_boxes: ad.total_boxes,
+                total_box_bytes: ad.total_box_bytes,
+                last_proposed: Round(ad.last_proposed),
+                last_heartbeat: Round(ad.last_heartbeat),
+            };
+            accts.push(BalanceRecord {
+                addr: *addr,
+                account_data: LedgercoreAccountData { base, voting },
+            });
+        }
+    }
+
+    // ── 5. Build Txids from the payset ────────────────────────────
+    let mut txids: HashMap<algo_types::Digest, IncludedTransactions> = HashMap::new();
+    for (i, stx) in block.payset.iter().enumerate() {
+        let canonical = algo_codec::canonical_encode_transaction(&stx.txn);
+        let mut hasher = Sha512_256::new();
+        hasher.update(b"TX");
+        hasher.update(&canonical);
+        let hash: [u8; 32] = hasher.finalize().into();
+        txids.insert(
+            algo_types::Digest(hash),
+            IncludedTransactions {
+                last_valid: stx.txn.last_valid,
+                intra: i as u64,
+            },
+        );
+    }
+
+    // ── 6. Build Txleases from the payset ─────────────────────────
+    let mut txleases: Vec<(Txlease, Round)> = Vec::new();
+    for stx in &block.payset {
+        if stx.txn.lease != [0u8; 32] {
+            txleases.push((
+                Txlease {
+                    sender: stx.txn.sender,
+                    lease: stx.txn.lease,
+                },
+                stx.txn.last_valid,
+            ));
+        }
+    }
+
+    // ── 7. Build block header ─────────────────────────────────────
+    let hdr = algo_types::BlockHeader {
+        round: block.round,
+        branch: block.branch,
+        seed: block.seed,
+        txn_commitment: block.txn_commitment,
+        timestamp: block.timestamp,
+        genesis_id: block.genesis_id.clone(),
+        genesis_hash: block.genesis_hash,
+        proposer: block.proposer,
+        fee_sink: block.fee_sink,
+        rewards_pool: block.rewards_pool,
+        fees_collected: block.fees_collected,
+        bonus: block.bonus,
+        proposer_payout: block.proposer_payout,
+        rewards_level: block.rewards_level,
+        rewards_rate: block.rewards_rate,
+        rewards_residue: block.rewards_residue,
+        rewards_recalculation_round: block.rewards_recalculation_round,
+        current_protocol: block.current_protocol.clone(),
+        next_protocol: block.next_protocol.clone(),
+        next_protocol_approvals: block.next_protocol_approvals,
+        next_protocol_vote_before: block.next_protocol_vote_before,
+        next_protocol_switch_on: block.next_protocol_switch_on,
+        txn_counter: block.txn_counter,
+        state_proof_tracking: block.state_proof_tracking.clone(),
+        prev512: block.prev512,
+        txn256: block.txn256,
+        txn512: block.txn512,
+        upgrade_propose: block.upgrade_propose.clone(),
+        upgrade_delay: block.upgrade_delay,
+        upgrade_approve: block.upgrade_approve,
+        expired_participation_accounts: block.expired_participation_accounts.clone(),
+        absent_participation_accounts: block.absent_participation_accounts.clone(),
+    };
+
+    let delta = StateDelta {
+        accts: AccountDeltas {
+            accts,
+            // TODO(#190): Track app resource deltas (app params + local state changes).
+            app_resources: Vec::new(),
+            // TODO(#190): Track asset resource deltas (asset params + holding changes).
+            asset_resources: Vec::new(),
+        },
+        // TODO(#190): Track KV (box) modifications during block apply.
+        kv_mods: HashMap::new(),
+        txids,
+        txleases: if txleases.is_empty() {
+            None
+        } else {
+            Some(txleases)
+        },
+        // TODO(#190): Track creatable (asset/app) creation and deletion.
+        creatables: HashMap::new(),
+        hdr: Some(hdr),
+        // TODO(#190): Set StateProofNext when block contains a valid state proof txn.
+        state_proof_next: Round(0),
+        prev_timestamp,
+        // TODO(#190): Compute actual AccountTotals from store after block apply.
+        totals: AccountTotals::default(),
+    };
+
+    Ok(delta)
+}
+
+/// Collect all addresses referenced by a transaction (sender, receiver, etc.).
+///
+/// TODO(#190): Recurse into inner transactions so that accounts only
+/// referenced by inner app calls are included in the pre-state snapshot.
+fn collect_txn_addresses(
+    txn: &algo_types::Transaction,
+    addrs: &mut std::collections::HashSet<Address>,
+) {
+    addrs.insert(txn.sender);
+    if !txn.receiver.is_zero() {
+        addrs.insert(txn.receiver);
+    }
+    if !txn.close_remainder_to.is_zero() {
+        addrs.insert(txn.close_remainder_to);
+    }
+    if let Some(ar) = txn.asset_receiver {
+        if !ar.is_zero() {
+            addrs.insert(ar);
+        }
+    }
+    if let Some(asnd) = txn.asset_sender {
+        if !asnd.is_zero() {
+            addrs.insert(asnd);
+        }
+    }
+    if let Some(ac) = txn.asset_close_to {
+        if !ac.is_zero() {
+            addrs.insert(ac);
+        }
+    }
+    if let Some(fa) = txn.freeze_account {
+        if !fa.is_zero() {
+            addrs.insert(fa);
+        }
+    }
+    // App call accounts array.
+    if let Some(ref accts) = txn.accounts {
+        for a in accts {
+            addrs.insert(*a);
+        }
+    }
+}
+
 /// Apply a full block to the ledger state (internal implementation).
 ///
 /// Updates rewards parameters from the block header, then applies each
