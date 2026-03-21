@@ -2288,6 +2288,9 @@ pub async fn raw_transaction<N: NodeInterface>(
 // EvalDelta conversion helpers (rmpv::Value → typed model structs)
 // ---------------------------------------------------------------------------
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
+
 /// Convert a single state delta entry (rmpv map with "at", "bs", "ui" keys)
 /// into an `ApiEvalDelta`.
 fn parse_value_delta(val: &rmpv::Value) -> Option<models::ApiEvalDelta> {
@@ -2310,19 +2313,13 @@ fn parse_value_delta(val: &rmpv::Value) -> Option<models::ApiEvalDelta> {
         }
     }
 
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine;
-
-    let bytes =
-        bytes_val.map(|b| STANDARD.encode(&b)).and_then(
-            |s| {
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s)
-                }
-            },
-        );
+    let bytes = bytes_val.map(|b| BASE64_STANDARD.encode(&b)).and_then(|s| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    });
     let uint = if uint_val == 0 { None } else { Some(uint_val) };
 
     Some(models::ApiEvalDelta {
@@ -2339,16 +2336,13 @@ fn parse_state_delta(val: &rmpv::Value) -> models::StateDelta {
         _ => return Vec::new(),
     };
 
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine;
-
     let mut delta = Vec::with_capacity(map.len());
     for (k, v) in map {
         let key_bytes = match rmpv_as_bytes(k) {
             Some(b) => b,
             None => continue,
         };
-        let key = STANDARD.encode(&key_bytes);
+        let key = BASE64_STANDARD.encode(&key_bytes);
         if let Some(value) = parse_value_delta(v) {
             delta.push(models::EvalDeltaKeyValue { key, value });
         }
@@ -2444,7 +2438,10 @@ fn convert_local_state_delta(
                 }
                 let mut result = Vec::with_capacity(ld_map.len());
                 for (idx_key, state_delta_val) in ld_map {
-                    let index = rmpv_as_u64(idx_key).unwrap_or(0);
+                    let index = match rmpv_as_u64(idx_key) {
+                        Some(i) => i,
+                        None => continue,
+                    };
                     let address = ed_index_to_address(index, txn, &shared_accts);
                     let delta = parse_state_delta(state_delta_val);
                     result.push(models::AccountStateDelta { address, delta });
@@ -2533,32 +2530,14 @@ fn convert_inner_txn(itx: &rmpv::Value) -> Option<models::PreEncodedTxInfo> {
     };
 
     // Populate apply-data fields from the SignedTransaction, matching
-    // go-algorand's ConvertInnerTxn which always sets these for inner txns.
-    let closing_amount = if stxn.closing_amount != 0 {
-        Some(stxn.closing_amount)
-    } else {
-        None
-    };
-    let asset_closing_amount = if stxn.asset_closing_amount != 0 {
-        Some(stxn.asset_closing_amount)
-    } else {
-        None
-    };
-    let sender_rewards = if stxn.sender_rewards != 0 {
-        Some(stxn.sender_rewards)
-    } else {
-        None
-    };
-    let receiver_rewards = if stxn.receiver_rewards != 0 {
-        Some(stxn.receiver_rewards)
-    } else {
-        None
-    };
-    let close_rewards = if stxn.close_rewards != 0 {
-        Some(stxn.close_rewards)
-    } else {
-        None
-    };
+    // go-algorand's ConvertInnerTxn which always sets these as pointers
+    // (even when 0). The Go codec includes non-nil pointers in output.
+    let closing_amount = Some(stxn.closing_amount);
+    let asset_closing_amount = Some(stxn.asset_closing_amount);
+    let sender_rewards = Some(stxn.sender_rewards);
+    let receiver_rewards = Some(stxn.receiver_rewards);
+    let close_rewards = Some(stxn.close_rewards);
+    // Asset/app indices use omitEmpty in Go (nil when 0).
     let asset_index = if stxn.apply_data_config_asset != 0 {
         Some(stxn.apply_data_config_asset)
     } else {
