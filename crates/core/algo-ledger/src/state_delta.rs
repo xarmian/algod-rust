@@ -78,7 +78,7 @@ pub struct AccountTotals {
 // ---------------------------------------------------------------------------
 
 /// Delta for a single key-value box entry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KvValueDelta {
     /// New value (empty if deleted).
     #[serde(rename = "Data", default, skip_serializing_if = "Vec::is_empty")]
@@ -163,7 +163,7 @@ pub struct Txlease {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VotingData {
     /// VoteID (one-time-signature verifier).
-    #[serde(rename = "VoteID", default, skip_serializing_if = "is_zero_vote_id")]
+    #[serde(rename = "VoteID", default, skip_serializing_if = "is_zero_bytes_32")]
     #[serde(with = "serde_bytes")]
     pub vote_id: [u8; 32],
 
@@ -171,7 +171,7 @@ pub struct VotingData {
     #[serde(
         rename = "SelectionID",
         default,
-        skip_serializing_if = "is_zero_selection_id"
+        skip_serializing_if = "is_zero_bytes_32"
     )]
     #[serde(with = "serde_bytes")]
     pub selection_id: [u8; 32],
@@ -180,7 +180,7 @@ pub struct VotingData {
     #[serde(
         rename = "StateProofID",
         default = "default_64_bytes",
-        skip_serializing_if = "is_zero_state_proof_id"
+        skip_serializing_if = "is_zero_bytes_64"
     )]
     #[serde(with = "serde_bytes")]
     pub state_proof_id: [u8; 64],
@@ -227,15 +227,11 @@ fn default_64_bytes() -> [u8; 64] {
     [0u8; 64]
 }
 
-fn is_zero_vote_id(v: &[u8; 32]) -> bool {
+fn is_zero_bytes_32(v: &[u8; 32]) -> bool {
     *v == [0u8; 32]
 }
 
-fn is_zero_selection_id(v: &[u8; 32]) -> bool {
-    *v == [0u8; 32]
-}
-
-fn is_zero_state_proof_id(v: &[u8; 64]) -> bool {
+fn is_zero_bytes_64(v: &[u8; 64]) -> bool {
     *v == [0u8; 64]
 }
 
@@ -641,7 +637,7 @@ pub struct AccountDeltas {
 /// The complete set of state changes produced by evaluating a block.
 ///
 /// This mirrors go-algorand's `ledgercore.StateDelta`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StateDelta {
     /// Account deltas (balance + resource changes).
     #[serde(rename = "Accts", default)]
@@ -658,6 +654,10 @@ pub struct StateDelta {
     /// Transaction leases. Represented as a Vec of pairs since `Txlease`
     /// (a struct) cannot be used as a JSON map key. Go-algorand nils this
     /// field in JSON anyway. For msgpack we use a list of (key, value) pairs.
+    ///
+    /// TODO: go-algorand's codec encodes this as a msgpack map, not an array
+    /// of pairs. A custom serde implementation may be needed for byte-level
+    /// msgpack conformance.
     #[serde(rename = "Txleases", default, skip_serializing_if = "Option::is_none")]
     pub txleases: Option<Vec<(Txlease, Round)>>,
 
@@ -688,20 +688,4 @@ pub struct StateDelta {
     /// Aggregate account totals after applying this block.
     #[serde(rename = "Totals", default)]
     pub totals: AccountTotals,
-}
-
-impl Default for StateDelta {
-    fn default() -> Self {
-        StateDelta {
-            accts: AccountDeltas::default(),
-            kv_mods: HashMap::new(),
-            txids: HashMap::new(),
-            txleases: None,
-            creatables: HashMap::new(),
-            hdr: None,
-            state_proof_next: Round(0),
-            prev_timestamp: 0,
-            totals: AccountTotals::default(),
-        }
-    }
 }

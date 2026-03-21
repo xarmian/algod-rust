@@ -170,13 +170,9 @@ pub fn apply_block_with_delta<L: crate::store_trait::LedgerStore>(
     for addr in &addr_list {
         pre_accounts.insert(*addr, store.get_account(addr));
     }
-    let prev_timestamp = if block.round.0 > 0 {
-        // We don't have easy access to the previous block's timestamp.
-        // Use 0 as a safe default; callers can fill it in if needed.
-        0i64
-    } else {
-        0i64
-    };
+    // TODO(#190): prev_timestamp should be the previous block's timestamp.
+    // We don't have easy access to it here; callers can fill it in if needed.
+    let prev_timestamp = 0i64;
 
     // ── 3. Apply the block ────────────────────────────────────────
     apply_block_impl(store, block, ApplyMode::Replay, false)?;
@@ -292,9 +288,12 @@ pub fn apply_block_with_delta<L: crate::store_trait::LedgerStore>(
     let delta = StateDelta {
         accts: AccountDeltas {
             accts,
+            // TODO(#190): Track app resource deltas (app params + local state changes).
             app_resources: Vec::new(),
+            // TODO(#190): Track asset resource deltas (asset params + holding changes).
             asset_resources: Vec::new(),
         },
+        // TODO(#190): Track KV (box) modifications during block apply.
         kv_mods: HashMap::new(),
         txids,
         txleases: if txleases.is_empty() {
@@ -302,10 +301,13 @@ pub fn apply_block_with_delta<L: crate::store_trait::LedgerStore>(
         } else {
             Some(txleases)
         },
+        // TODO(#190): Track creatable (asset/app) creation and deletion.
         creatables: HashMap::new(),
         hdr: Some(hdr),
+        // TODO(#190): Set StateProofNext when block contains a valid state proof txn.
         state_proof_next: Round(0),
         prev_timestamp,
+        // TODO(#190): Compute actual AccountTotals from store after block apply.
         totals: AccountTotals::default(),
     };
 
@@ -313,6 +315,9 @@ pub fn apply_block_with_delta<L: crate::store_trait::LedgerStore>(
 }
 
 /// Collect all addresses referenced by a transaction (sender, receiver, etc.).
+///
+/// TODO(#190): Recurse into inner transactions so that accounts only
+/// referenced by inner app calls are included in the pre-state snapshot.
 fn collect_txn_addresses(
     txn: &algo_types::Transaction,
     addrs: &mut std::collections::HashSet<Address>,
