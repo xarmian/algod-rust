@@ -107,6 +107,8 @@ struct MockNode {
     pending_txn_lookup: BTreeMap<[u8; 32], TxnWithStatus>,
     /// Broadcast result: None = success, Some(msg) = error.
     broadcast_result: Option<String>,
+    /// Simulate result to return (None = use default NotImplemented).
+    simulate_result: Option<algo_rest_api::models::SimulateResponse>,
 }
 
 impl Clone for MockNode {
@@ -146,6 +148,7 @@ impl Clone for MockNode {
             pending_txns: self.pending_txns.clone(),
             pending_txn_lookup: self.pending_txn_lookup.clone(),
             broadcast_result: self.broadcast_result.clone(),
+            simulate_result: self.simulate_result.clone(),
         }
     }
 }
@@ -233,6 +236,7 @@ impl MockNode {
             pending_txns: Vec::new(),
             pending_txn_lookup: BTreeMap::new(),
             broadcast_result: None,
+            simulate_result: None,
         }
     }
 
@@ -668,6 +672,16 @@ impl NodeInterface for MockNode {
 
     async fn get_pending_txns_from_pool(&self) -> Result<Vec<SignedTransaction>, NodeError> {
         Ok(self.pending_txns.clone())
+    }
+
+    async fn simulate(
+        &self,
+        _request: algo_rest_api::models::SimulateRequest,
+    ) -> Result<algo_rest_api::models::SimulateResponse, NodeError> {
+        match &self.simulate_result {
+            Some(resp) => Ok(resp.clone()),
+            None => Err(NodeError::NotImplemented("simulate")),
+        }
     }
 }
 
@@ -4931,4 +4945,296 @@ async fn pending_transaction_info_no_eval_delta_when_unconfirmed() {
         json.get("logs").is_none(),
         "unconfirmed txn should not have logs"
     );
+}
+
+// ===========================================================================
+// Simulate endpoint tests (POST /v2/transactions/simulate)
+// ===========================================================================
+
+#[tokio::test]
+async fn simulate_requires_auth() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let request_json = serde_json::json!({
+        "txn-groups": [{
+            "txns": [{"type": "pay"}]
+        }]
+    });
+    let body = serde_json::to_vec(&request_json).unwrap();
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/simulate"))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn simulate_empty_body_returns_400() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/simulate"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/json")
+        .body(Vec::<u8>::new())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn simulate_empty_txn_groups_returns_400() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let request_json = serde_json::json!({
+        "txn-groups": []
+    });
+    let body = serde_json::to_vec(&request_json).unwrap();
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/simulate"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn simulate_catchpoint_returns_503() {
+    let node = MockNode::catchpoint_catchup();
+    let server = TestServer::start(node).await;
+
+    let request_json = serde_json::json!({
+        "txn-groups": [{
+            "txns": [{"type": "pay"}]
+        }]
+    });
+    let body = serde_json::to_vec(&request_json).unwrap();
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/simulate"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+}
+
+#[tokio::test]
+async fn simulate_not_implemented_returns_500() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let request_json = serde_json::json!({
+        "txn-groups": [{
+            "txns": [{"type": "pay"}]
+        }]
+    });
+    let body = serde_json::to_vec(&request_json).unwrap();
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/simulate"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("not implemented"),
+        "expected 'not implemented' in response body, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn simulate_returns_response() {
+    use algo_rest_api::models::{
+        PreEncodedTxInfo, SimulateResponse, SimulateTransactionGroupResult,
+        SimulateTransactionResult,
+    };
+
+    let mut node = MockNode::synced();
+    node.simulate_result = Some(SimulateResponse {
+        version: 2,
+        last_round: 1000,
+        txn_groups: vec![SimulateTransactionGroupResult {
+            txn_results: vec![SimulateTransactionResult {
+                txn_result: PreEncodedTxInfo {
+                    txn: SignedTransaction::default(),
+                    pool_error: String::new(),
+                    confirmed_round: None,
+                    closing_amount: None,
+                    asset_closing_amount: None,
+                    sender_rewards: None,
+                    receiver_rewards: None,
+                    close_rewards: None,
+                    asset_index: None,
+                    application_index: None,
+                    global_state_delta: None,
+                    local_state_delta: None,
+                    logs: None,
+                    inner_txns: None,
+                },
+                app_budget_consumed: None,
+                exec_trace: None,
+                fixed_signer: None,
+                logic_sig_budget_consumed: None,
+                unnamed_resources_accessed: None,
+            }],
+            app_budget_added: None,
+            app_budget_consumed: None,
+            failed_at: None,
+            failure_message: None,
+            unnamed_resources_accessed: None,
+        }],
+        eval_overrides: None,
+        exec_trace_config: None,
+        initial_states: None,
+    });
+    let server = TestServer::start(node).await;
+
+    let request_json = serde_json::json!({
+        "txn-groups": [{
+            "txns": [{"type": "pay"}]
+        }]
+    });
+    let body = serde_json::to_vec(&request_json).unwrap();
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/simulate"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["version"], 2);
+    assert_eq!(json["last-round"], 1000);
+    assert!(json["txn-groups"].is_array());
+    assert_eq!(json["txn-groups"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn simulate_format_msgpack() {
+    use algo_rest_api::models::{
+        PreEncodedTxInfo, SimulateResponse, SimulateTransactionGroupResult,
+        SimulateTransactionResult,
+    };
+
+    let mut node = MockNode::synced();
+    node.simulate_result = Some(SimulateResponse {
+        version: 2,
+        last_round: 1000,
+        txn_groups: vec![SimulateTransactionGroupResult {
+            txn_results: vec![SimulateTransactionResult {
+                txn_result: PreEncodedTxInfo {
+                    txn: SignedTransaction::default(),
+                    pool_error: String::new(),
+                    confirmed_round: None,
+                    closing_amount: None,
+                    asset_closing_amount: None,
+                    sender_rewards: None,
+                    receiver_rewards: None,
+                    close_rewards: None,
+                    asset_index: None,
+                    application_index: None,
+                    global_state_delta: None,
+                    local_state_delta: None,
+                    logs: None,
+                    inner_txns: None,
+                },
+                app_budget_consumed: None,
+                exec_trace: None,
+                fixed_signer: None,
+                logic_sig_budget_consumed: None,
+                unnamed_resources_accessed: None,
+            }],
+            app_budget_added: None,
+            app_budget_consumed: None,
+            failed_at: None,
+            failure_message: None,
+            unnamed_resources_accessed: None,
+        }],
+        eval_overrides: None,
+        exec_trace_config: None,
+        initial_states: None,
+    });
+    let server = TestServer::start(node).await;
+
+    let request_json = serde_json::json!({
+        "txn-groups": [{
+            "txns": [{"type": "pay"}]
+        }]
+    });
+    let body = serde_json::to_vec(&request_json).unwrap();
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/simulate?format=msgpack"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content_type.contains("application/msgpack"),
+        "expected msgpack content type, got: {content_type}"
+    );
+}
+
+#[tokio::test]
+async fn simulate_invalid_format_returns_400() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let request_json = serde_json::json!({
+        "txn-groups": [{
+            "txns": [{"type": "pay"}]
+        }]
+    });
+    let body = serde_json::to_vec(&request_json).unwrap();
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/simulate?format=xml"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
 }

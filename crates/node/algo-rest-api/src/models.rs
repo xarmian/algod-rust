@@ -1418,3 +1418,424 @@ pub struct PreEncodedTxInfo {
     #[serde(rename = "inner-txns", skip_serializing_if = "Option::is_none")]
     pub inner_txns: Option<Vec<PreEncodedTxInfo>>,
 }
+
+// ---------------------------------------------------------------------------
+// Simulate endpoint types
+// ---------------------------------------------------------------------------
+
+/// Trace configuration for simulation execution traces.
+///
+/// Matches go-algorand's `model.SimulateTraceConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SimulateTraceConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable: Option<bool>,
+
+    #[serde(rename = "scratch-change", skip_serializing_if = "Option::is_none")]
+    pub scratch_change: Option<bool>,
+
+    #[serde(rename = "stack-change", skip_serializing_if = "Option::is_none")]
+    pub stack_change: Option<bool>,
+
+    #[serde(rename = "state-change", skip_serializing_if = "Option::is_none")]
+    pub state_change: Option<bool>,
+}
+
+/// A transaction group in a simulate request.
+///
+/// Matches go-algorand's `model.SimulateRequestTransactionGroup`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulateRequestTransactionGroup {
+    /// Signed transactions in this group. Uses `serde_json::Value` to match
+    /// go-algorand's `json.RawMessage` -- the handler handles msgpack
+    /// decoding separately.
+    pub txns: Vec<serde_json::Value>,
+}
+
+/// Request body for `POST /v2/transactions/simulate`.
+///
+/// Matches go-algorand's `model.SimulateRequest`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulateRequest {
+    #[serde(
+        rename = "allow-empty-signatures",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allow_empty_signatures: Option<bool>,
+
+    #[serde(rename = "allow-more-logging", skip_serializing_if = "Option::is_none")]
+    pub allow_more_logging: Option<bool>,
+
+    #[serde(
+        rename = "allow-unnamed-resources",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allow_unnamed_resources: Option<bool>,
+
+    #[serde(rename = "exec-trace-config", skip_serializing_if = "Option::is_none")]
+    pub exec_trace_config: Option<SimulateTraceConfig>,
+
+    #[serde(
+        rename = "extra-opcode-budget",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub extra_opcode_budget: Option<i64>,
+
+    #[serde(rename = "fix-signers", skip_serializing_if = "Option::is_none")]
+    pub fix_signers: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<u64>,
+
+    #[serde(rename = "txn-groups")]
+    pub txn_groups: Vec<SimulateRequestTransactionGroup>,
+}
+
+/// AVM value (bytes or uint).
+///
+/// Matches go-algorand's `model.AvmValue`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AvmValue {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "optional_base64_bytes"
+    )]
+    pub bytes: Option<Vec<u8>>,
+
+    #[serde(rename = "type")]
+    pub value_type: u64,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uint: Option<u64>,
+}
+
+/// AVM key-value pair.
+///
+/// Matches go-algorand's `model.AvmKeyValue`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AvmKeyValue {
+    #[serde(with = "base64_bytes")]
+    pub key: Vec<u8>,
+    pub value: AvmValue,
+}
+
+/// Scratch space change from an opcode.
+///
+/// Matches go-algorand's `model.ScratchChange`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScratchChange {
+    #[serde(rename = "new-value")]
+    pub new_value: AvmValue,
+    pub slot: u64,
+}
+
+/// Application state operation (write or delete).
+///
+/// Matches go-algorand's `model.ApplicationStateOperation`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplicationStateOperation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+
+    #[serde(rename = "app-state-type")]
+    pub app_state_type: String,
+
+    #[serde(with = "base64_bytes")]
+    pub key: Vec<u8>,
+
+    #[serde(rename = "new-value", skip_serializing_if = "Option::is_none")]
+    pub new_value: Option<AvmValue>,
+
+    pub operation: String,
+}
+
+/// A single opcode trace unit within an execution trace.
+///
+/// Matches go-algorand's `model.SimulationOpcodeTraceUnit`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulationOpcodeTraceUnit {
+    pub pc: u64,
+
+    #[serde(rename = "scratch-changes", skip_serializing_if = "Option::is_none")]
+    pub scratch_changes: Option<Vec<ScratchChange>>,
+
+    #[serde(rename = "spawned-inners", skip_serializing_if = "Option::is_none")]
+    pub spawned_inners: Option<Vec<u64>>,
+
+    #[serde(rename = "stack-additions", skip_serializing_if = "Option::is_none")]
+    pub stack_additions: Option<Vec<AvmValue>>,
+
+    #[serde(rename = "stack-pop-count", skip_serializing_if = "Option::is_none")]
+    pub stack_pop_count: Option<u64>,
+
+    #[serde(rename = "state-changes", skip_serializing_if = "Option::is_none")]
+    pub state_changes: Option<Vec<ApplicationStateOperation>>,
+}
+
+/// Full execution trace for a simulated transaction.
+///
+/// Matches go-algorand's `model.SimulationTransactionExecTrace`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulationTransactionExecTrace {
+    #[serde(
+        rename = "approval-program-hash",
+        skip_serializing_if = "Option::is_none",
+        with = "optional_base64_bytes"
+    )]
+    pub approval_program_hash: Option<Vec<u8>>,
+
+    #[serde(
+        rename = "approval-program-trace",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub approval_program_trace: Option<Vec<SimulationOpcodeTraceUnit>>,
+
+    #[serde(
+        rename = "clear-state-program-hash",
+        skip_serializing_if = "Option::is_none",
+        with = "optional_base64_bytes"
+    )]
+    pub clear_state_program_hash: Option<Vec<u8>>,
+
+    #[serde(
+        rename = "clear-state-program-trace",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub clear_state_program_trace: Option<Vec<SimulationOpcodeTraceUnit>>,
+
+    #[serde(
+        rename = "clear-state-rollback",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub clear_state_rollback: Option<bool>,
+
+    #[serde(
+        rename = "clear-state-rollback-error",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub clear_state_rollback_error: Option<String>,
+
+    #[serde(rename = "inner-trace", skip_serializing_if = "Option::is_none")]
+    pub inner_trace: Option<Vec<SimulationTransactionExecTrace>>,
+
+    #[serde(
+        rename = "logic-sig-hash",
+        skip_serializing_if = "Option::is_none",
+        with = "optional_base64_bytes"
+    )]
+    pub logic_sig_hash: Option<Vec<u8>>,
+
+    #[serde(rename = "logic-sig-trace", skip_serializing_if = "Option::is_none")]
+    pub logic_sig_trace: Option<Vec<SimulationOpcodeTraceUnit>>,
+}
+
+/// Reference to a local state account+app pair for unnamed resource tracking.
+///
+/// Matches go-algorand's `model.ApplicationLocalReference`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplicationLocalReference {
+    pub account: String,
+    pub app: u64,
+}
+
+/// Reference to an asset holding (account + asset) for unnamed resource tracking.
+///
+/// Matches go-algorand's `model.AssetHoldingReference`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetHoldingReference {
+    pub account: String,
+    pub asset: u64,
+}
+
+/// Reference to a box (app + name) for unnamed resource tracking.
+///
+/// Matches go-algorand's `model.BoxReference`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoxReference {
+    pub app: u64,
+    #[serde(with = "base64_bytes")]
+    pub name: Vec<u8>,
+}
+
+/// Unnamed resources accessed during simulation.
+///
+/// Matches go-algorand's `model.SimulateUnnamedResourcesAccessed`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SimulateUnnamedResourcesAccessed {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<Vec<String>>,
+
+    #[serde(rename = "app-locals", skip_serializing_if = "Option::is_none")]
+    pub app_locals: Option<Vec<ApplicationLocalReference>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apps: Option<Vec<u64>>,
+
+    #[serde(rename = "asset-holdings", skip_serializing_if = "Option::is_none")]
+    pub asset_holdings: Option<Vec<AssetHoldingReference>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assets: Option<Vec<u64>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boxes: Option<Vec<BoxReference>>,
+
+    #[serde(rename = "extra-box-refs", skip_serializing_if = "Option::is_none")]
+    pub extra_box_refs: Option<u64>,
+}
+
+/// Result for a single simulated transaction.
+///
+/// Matches go-algorand's `model.SimulateTransactionResult`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulateTransactionResult {
+    #[serde(
+        rename = "app-budget-consumed",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub app_budget_consumed: Option<u64>,
+
+    #[serde(rename = "exec-trace", skip_serializing_if = "Option::is_none")]
+    pub exec_trace: Option<SimulationTransactionExecTrace>,
+
+    #[serde(rename = "fixed-signer", skip_serializing_if = "Option::is_none")]
+    pub fixed_signer: Option<String>,
+
+    #[serde(
+        rename = "logic-sig-budget-consumed",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub logic_sig_budget_consumed: Option<u64>,
+
+    #[serde(rename = "txn-result")]
+    pub txn_result: PreEncodedTxInfo,
+
+    #[serde(
+        rename = "unnamed-resources-accessed",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub unnamed_resources_accessed: Option<SimulateUnnamedResourcesAccessed>,
+}
+
+/// Result for a simulated transaction group.
+///
+/// Matches go-algorand's `model.SimulateTransactionGroupResult`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulateTransactionGroupResult {
+    #[serde(rename = "app-budget-added", skip_serializing_if = "Option::is_none")]
+    pub app_budget_added: Option<u64>,
+
+    #[serde(
+        rename = "app-budget-consumed",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub app_budget_consumed: Option<u64>,
+
+    #[serde(rename = "failed-at", skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<Vec<u64>>,
+
+    #[serde(rename = "failure-message", skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
+
+    #[serde(rename = "txn-results")]
+    pub txn_results: Vec<SimulateTransactionResult>,
+
+    #[serde(
+        rename = "unnamed-resources-accessed",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub unnamed_resources_accessed: Option<SimulateUnnamedResourcesAccessed>,
+}
+
+/// Eval overrides applied during simulation.
+///
+/// Matches go-algorand's `model.SimulationEvalOverrides`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SimulationEvalOverrides {
+    #[serde(
+        rename = "allow-empty-signatures",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allow_empty_signatures: Option<bool>,
+
+    #[serde(
+        rename = "allow-unnamed-resources",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allow_unnamed_resources: Option<bool>,
+
+    #[serde(
+        rename = "extra-opcode-budget",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub extra_opcode_budget: Option<i64>,
+
+    #[serde(rename = "fix-signers", skip_serializing_if = "Option::is_none")]
+    pub fix_signers: Option<bool>,
+
+    #[serde(rename = "max-log-calls", skip_serializing_if = "Option::is_none")]
+    pub max_log_calls: Option<u64>,
+
+    #[serde(rename = "max-log-size", skip_serializing_if = "Option::is_none")]
+    pub max_log_size: Option<u64>,
+}
+
+/// KV storage for an application (global, local, or boxes).
+///
+/// Matches go-algorand's `model.ApplicationKVStorage`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplicationKVStorage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+
+    pub kvs: Vec<AvmKeyValue>,
+}
+
+/// Initial states for a single application.
+///
+/// Matches go-algorand's `model.ApplicationInitialStates`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplicationInitialStates {
+    #[serde(rename = "app-boxes", skip_serializing_if = "Option::is_none")]
+    pub app_boxes: Option<ApplicationKVStorage>,
+
+    #[serde(rename = "app-globals", skip_serializing_if = "Option::is_none")]
+    pub app_globals: Option<ApplicationKVStorage>,
+
+    #[serde(rename = "app-locals", skip_serializing_if = "Option::is_none")]
+    pub app_locals: Option<Vec<ApplicationKVStorage>>,
+
+    pub id: u64,
+}
+
+/// Initial states snapshot before simulation.
+///
+/// Matches go-algorand's `model.SimulateInitialStates`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SimulateInitialStates {
+    #[serde(rename = "app-initial-states", skip_serializing_if = "Option::is_none")]
+    pub app_initial_states: Option<Vec<ApplicationInitialStates>>,
+}
+
+/// Response from `POST /v2/transactions/simulate`.
+///
+/// Matches go-algorand's `model.SimulateResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulateResponse {
+    #[serde(rename = "eval-overrides", skip_serializing_if = "Option::is_none")]
+    pub eval_overrides: Option<SimulationEvalOverrides>,
+
+    #[serde(rename = "exec-trace-config", skip_serializing_if = "Option::is_none")]
+    pub exec_trace_config: Option<SimulateTraceConfig>,
+
+    #[serde(rename = "initial-states", skip_serializing_if = "Option::is_none")]
+    pub initial_states: Option<SimulateInitialStates>,
+
+    #[serde(rename = "last-round")]
+    pub last_round: u64,
+
+    #[serde(rename = "txn-groups")]
+    pub txn_groups: Vec<SimulateTransactionGroupResult>,
+
+    pub version: u64,
+}
