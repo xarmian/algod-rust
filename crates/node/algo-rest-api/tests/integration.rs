@@ -11,8 +11,8 @@ use std::sync::Arc;
 use algo_rest_api::auth::generate_token;
 use algo_rest_api::node::{
     AccountLookup, AppResourceLookup, ApplicationLookup, AssetLookup, AssetResourceLookup,
-    BuildVersion, NodeInterface, NodeStatus, ProtocolSwitchInfo, StateProofData, SupplyInfo,
-    TxnWithStatus,
+    BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo, StateProofData,
+    SupplyInfo, TxnWithStatus,
 };
 use algo_rest_api::router::{build_router, TokenConfig};
 use algo_types::{
@@ -414,10 +414,10 @@ impl NodeInterface for MockNode {
         &self.genesis_json
     }
 
-    async fn status(&self) -> Result<NodeStatus, Box<dyn std::error::Error + Send + Sync>> {
+    async fn status(&self) -> Result<NodeStatus, NodeError> {
         match &self.status {
             MockStatus::Ok(s) => Ok(*s.clone()),
-            MockStatus::Err(msg) => Err(msg.clone().into()),
+            MockStatus::Err(msg) => Err(NodeError::Internal(msg.clone())),
         }
     }
 
@@ -441,33 +441,25 @@ impl NodeInterface for MockNode {
         self.upgrade_threshold
     }
 
-    async fn wait_for_round(
-        &self,
-        _round: u64,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn wait_for_round(&self, _round: u64) -> Result<(), NodeError> {
         match &self.wait_behavior {
             MockWaitBehavior::Immediate => Ok(()),
             MockWaitBehavior::WaitForever => {
                 self.wait_notify.notified().await;
                 Ok(())
             }
-            MockWaitBehavior::Error(msg) => Err(msg.clone().into()),
+            MockWaitBehavior::Error(msg) => Err(NodeError::Internal(msg.clone())),
         }
     }
 
-    async fn latest_block_header_protocol_info(
-        &self,
-    ) -> Result<ProtocolSwitchInfo, Box<dyn std::error::Error + Send + Sync>> {
+    async fn latest_block_header_protocol_info(&self) -> Result<ProtocolSwitchInfo, NodeError> {
         match &self.protocol_info_behavior {
             MockProtocolInfoBehavior::Ok => Ok(self.protocol_switch_info.clone()),
-            MockProtocolInfoBehavior::Err(msg) => Err(msg.clone().into()),
+            MockProtocolInfoBehavior::Err(msg) => Err(NodeError::Internal(msg.clone())),
         }
     }
 
-    async fn lookup_account(
-        &self,
-        _addr: &Address,
-    ) -> Result<AccountLookup, Box<dyn std::error::Error + Send + Sync>> {
+    async fn lookup_account(&self, _addr: &Address) -> Result<AccountLookup, NodeError> {
         match &self.account_lookup {
             Some(lookup) => Ok(lookup.clone()),
             None => {
@@ -486,10 +478,7 @@ impl NodeInterface for MockNode {
         }
     }
 
-    async fn lookup_account_basic(
-        &self,
-        _addr: &Address,
-    ) -> Result<AccountLookup, Box<dyn std::error::Error + Send + Sync>> {
+    async fn lookup_account_basic(&self, _addr: &Address) -> Result<AccountLookup, NodeError> {
         match &self.account_lookup {
             Some(lookup) => Ok(AccountLookup {
                 account_data: lookup.account_data.clone(),
@@ -516,7 +505,7 @@ impl NodeInterface for MockNode {
         &self,
         addr: &Address,
         asset_id: u64,
-    ) -> Result<AssetResourceLookup, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<AssetResourceLookup, NodeError> {
         let key = (addr.0, asset_id);
         match self.asset_resource_lookups.get(&key) {
             Some(lookup) => Ok(lookup.clone()),
@@ -532,7 +521,7 @@ impl NodeInterface for MockNode {
         &self,
         addr: &Address,
         app_id: u64,
-    ) -> Result<AppResourceLookup, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<AppResourceLookup, NodeError> {
         let key = (addr.0, app_id);
         match self.app_resource_lookups.get(&key) {
             Some(lookup) => Ok(lookup.clone()),
@@ -544,9 +533,7 @@ impl NodeInterface for MockNode {
         }
     }
 
-    async fn consensus_params(
-        &self,
-    ) -> Result<ConsensusParams, Box<dyn std::error::Error + Send + Sync>> {
+    async fn consensus_params(&self) -> Result<ConsensusParams, NodeError> {
         Ok(self.consensus_params.clone())
     }
 
@@ -554,10 +541,7 @@ impl NodeInterface for MockNode {
         self.max_api_resources
     }
 
-    async fn lookup_application(
-        &self,
-        app_id: u64,
-    ) -> Result<ApplicationLookup, Box<dyn std::error::Error + Send + Sync>> {
+    async fn lookup_application(&self, app_id: u64) -> Result<ApplicationLookup, NodeError> {
         match self.application_lookups.get(&app_id) {
             Some(lookup) => Ok(lookup.clone()),
             None => Ok(ApplicationLookup {
@@ -568,10 +552,7 @@ impl NodeInterface for MockNode {
         }
     }
 
-    async fn lookup_asset_by_id(
-        &self,
-        asset_id: u64,
-    ) -> Result<AssetLookup, Box<dyn std::error::Error + Send + Sync>> {
+    async fn lookup_asset_by_id(&self, asset_id: u64) -> Result<AssetLookup, NodeError> {
         match self.asset_lookups.get(&asset_id) {
             Some(lookup) => Ok(lookup.clone()),
             None => Ok(AssetLookup {
@@ -586,7 +567,7 @@ impl NodeInterface for MockNode {
         &self,
         app_id: u64,
         key: &[u8],
-    ) -> Result<(Option<Vec<u8>>, u64), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Option<Vec<u8>>, u64), NodeError> {
         match self.kv_lookups.get(&(app_id, key.to_vec())) {
             Some(result) => Ok(result.clone()),
             None => Ok((None, 1000)),
@@ -597,17 +578,14 @@ impl NodeInterface for MockNode {
         &self,
         app_id: u64,
         _prefix: &[u8],
-    ) -> Result<(Vec<Vec<u8>>, u64), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Vec<Vec<u8>>, u64), NodeError> {
         match self.keys_by_prefix.get(&app_id) {
             Some(result) => Ok(result.clone()),
             None => Ok((vec![], 1000)),
         }
     }
 
-    async fn total_boxes(
-        &self,
-        app_id: u64,
-    ) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
+    async fn total_boxes(&self, app_id: u64) -> Result<(u64, u64), NodeError> {
         match self.total_boxes_map.get(&app_id) {
             Some(result) => Ok(*result),
             None => Ok((0, 1000)),
@@ -618,90 +596,77 @@ impl NodeInterface for MockNode {
         self.max_api_boxes
     }
 
-    async fn get_block(
-        &self,
-        round: u64,
-    ) -> Result<Block, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_block(&self, round: u64) -> Result<Block, NodeError> {
         match self.blocks.get(&round) {
             Some(block) => Ok(block.clone()),
-            None => Err("block not found".into()),
+            None => Err(NodeError::NotFound("block not found".to_string())),
         }
     }
 
-    async fn get_block_header(
-        &self,
-        round: u64,
-    ) -> Result<BlockHeader, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_block_header(&self, round: u64) -> Result<BlockHeader, NodeError> {
         match self.block_headers.get(&round) {
             Some(header) => Ok(header.clone()),
-            None => Err("block header not found".into()),
+            None => Err(NodeError::NotFound("block header not found".to_string())),
         }
     }
 
-    async fn get_block_hash(
-        &self,
-        round: u64,
-    ) -> Result<Option<Digest>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_block_hash(&self, round: u64) -> Result<Option<Digest>, NodeError> {
         Ok(self.block_hashes.get(&round).copied())
     }
 
-    async fn get_block_raw_msgpack(
-        &self,
-        round: u64,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_block_raw_msgpack(&self, round: u64) -> Result<Vec<u8>, NodeError> {
         match self.block_raw_msgpack.get(&round) {
             Some(bytes) => Ok(bytes.clone()),
-            None => Err("block not found".into()),
+            None => Err(NodeError::NotFound("block not found".to_string())),
         }
     }
 
     async fn get_state_proof_transaction_for_round(
         &self,
         round: u64,
-    ) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(u64, u64), NodeError> {
         match self.state_proof_txns.get(&round) {
             Some(result) => Ok(*result),
-            None => Err("no state proof found for round".into()),
+            None => Err(NodeError::NotFound(
+                "no state proof found for round".to_string(),
+            )),
         }
     }
 
-    async fn get_supply(&self) -> Result<SupplyInfo, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_supply(&self) -> Result<SupplyInfo, NodeError> {
         match &self.supply_info {
             Some(info) => Ok(info.clone()),
-            None => Err("get_supply not implemented".into()),
+            None => Err(NodeError::NotImplemented("get_supply")),
         }
     }
 
-    async fn get_state_proof_for_round(
-        &self,
-        round: u64,
-    ) -> Result<StateProofData, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_state_proof_for_round(&self, round: u64) -> Result<StateProofData, NodeError> {
         match self.state_proof_data.get(&round) {
             Some(data) => Ok(data.clone()),
-            None => Err("no state proof found for round".into()),
+            None => Err(NodeError::NotFound(
+                "no state proof found for round".to_string(),
+            )),
         }
     }
 
     async fn broadcast_signed_tx_group(
         &self,
         _tx_group: Vec<SignedTransaction>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), NodeError> {
         match &self.broadcast_result {
             None => Ok(()),
-            Some(msg) => Err(msg.clone().into()),
+            Some(msg) => Err(NodeError::Internal(msg.clone())),
         }
     }
 
     async fn get_pending_transaction(
         &self,
         txid: &Digest,
-    ) -> Result<Option<TxnWithStatus>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<TxnWithStatus>, NodeError> {
         Ok(self.pending_txn_lookup.get(&txid.0).cloned())
     }
 
-    async fn get_pending_txns_from_pool(
-        &self,
-    ) -> Result<Vec<SignedTransaction>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_pending_txns_from_pool(&self) -> Result<Vec<SignedTransaction>, NodeError> {
         Ok(self.pending_txns.clone())
     }
 }

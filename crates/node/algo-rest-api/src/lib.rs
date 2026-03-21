@@ -17,6 +17,6 @@ pub mod server;
 // Re-export key types for convenience.
 pub use error::ErrorResponse;
 pub use format::ResponseFormat;
-pub use node::{BuildVersion, NodeInterface, NodeStatus, ProtocolSwitchInfo};
+pub use node::{BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo};
 pub use router::TokenConfig;
 pub use server::{ApiServer, ApiServerConfig};

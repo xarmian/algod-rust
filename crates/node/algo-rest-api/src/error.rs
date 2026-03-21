@@ -87,6 +87,25 @@ fn error_response(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, [("content-type", "application/json")], json).into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Typed-error helpers
+// ---------------------------------------------------------------------------
+
+use crate::node::NodeError;
+
+/// Map a `NodeError` from a ledger lookup to an HTTP error response.
+///
+/// Used by block-related handlers where the error message is always
+/// "failed to retrieve information from the ledger".
+pub fn ledger_error_response(e: NodeError) -> Response {
+    match e {
+        NodeError::NotFound(_) => not_found("failed to retrieve information from the ledger"),
+        NodeError::Timeout(_) | NodeError::NotImplemented(_) | NodeError::Internal(_) => {
+            internal_error("failed to retrieve information from the ledger")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

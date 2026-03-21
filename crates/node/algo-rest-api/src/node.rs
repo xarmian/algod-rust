@@ -16,6 +16,29 @@ use algo_types::{
 use async_trait::async_trait;
 use serde::Serialize;
 
+/// Typed error enum for `NodeInterface` methods.
+///
+/// Replaces `Box<dyn std::error::Error + Send + Sync>` to enable type-safe
+/// error dispatch in handlers (instead of fragile string matching).
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum NodeError {
+    /// Resource not found (block, state proof, etc.) — handlers map to 404.
+    #[error("{0}")]
+    NotFound(String),
+
+    /// Operation timed out — handlers map to 408.
+    #[error("{0}")]
+    Timeout(String),
+
+    /// Default trait method stub — handlers map to 500.
+    #[error("{0} not implemented")]
+    NotImplemented(&'static str),
+
+    /// Internal / unexpected error — handlers map to 500.
+    #[error("{0}")]
+    Internal(String),
+}
+
 /// Status of the node, consumed by REST API handlers.
 ///
 /// Modeled after go-algorand's `node.StatusReport`.
@@ -331,7 +354,7 @@ pub trait NodeInterface: Send + Sync + 'static {
     fn genesis_json(&self) -> &str;
 
     /// Current node status (last round, sync state, protocol version, etc.).
-    async fn status(&self) -> Result<NodeStatus, Box<dyn std::error::Error + Send + Sync>>;
+    async fn status(&self) -> Result<NodeStatus, NodeError>;
 
     /// The suggested transaction fee in microAlgos.
     ///
@@ -363,18 +386,13 @@ pub trait NodeInterface: Send + Sync + 'static {
     ///
     /// Mirrors go-algorand's `ledger.WaitWithCancel(round)` -- the handler
     /// wraps this with `tokio::select!` to apply a timeout.
-    async fn wait_for_round(
-        &self,
-        round: u64,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn wait_for_round(&self, round: u64) -> Result<(), NodeError>;
 
     /// Return protocol switch information from the latest block header.
     ///
     /// Used by `wait-for-block-after` to reject requests that would land
     /// after an unsupported protocol upgrade.
-    async fn latest_block_header_protocol_info(
-        &self,
-    ) -> Result<ProtocolSwitchInfo, Box<dyn std::error::Error + Send + Sync>>;
+    async fn latest_block_header_protocol_info(&self) -> Result<ProtocolSwitchInfo, NodeError>;
 
     // ---- Block lookup methods ----
 
@@ -385,11 +403,8 @@ pub trait NodeInterface: Send + Sync + 'static {
     /// `ErrNoEntry`), and `Err` for internal errors.
     ///
     /// Used by `GET /v2/blocks/{round}/hash`.
-    async fn get_block_hash(
-        &self,
-        _round: u64,
-    ) -> Result<Option<Digest>, Box<dyn std::error::Error + Send + Sync>> {
-        Err("get_block_hash not implemented".into())
+    async fn get_block_hash(&self, _round: u64) -> Result<Option<Digest>, NodeError> {
+        Err(NodeError::NotImplemented("get_block_hash"))
     }
 
     // ---- Account / resource lookup methods ----
@@ -398,11 +413,8 @@ pub trait NodeInterface: Send + Sync + 'static {
     ///
     /// Non-existent accounts return a zero-valued `AccountData` with the
     /// current round — they do NOT produce an error.
-    async fn lookup_account(
-        &self,
-        _addr: &Address,
-    ) -> Result<AccountLookup, Box<dyn std::error::Error + Send + Sync>> {
-        Err("lookup_account not implemented".into())
+    async fn lookup_account(&self, _addr: &Address) -> Result<AccountLookup, NodeError> {
+        Err(NodeError::NotImplemented("lookup_account"))
     }
 
     /// Lightweight account lookup that skips resource maps (assets, apps, etc.).
@@ -410,11 +422,8 @@ pub trait NodeInterface: Send + Sync + 'static {
     /// Used when `exclude=all` is passed to the account information endpoint,
     /// allowing implementations to avoid loading potentially large resource
     /// collections from the ledger.
-    async fn lookup_account_basic(
-        &self,
-        _addr: &Address,
-    ) -> Result<AccountLookup, Box<dyn std::error::Error + Send + Sync>> {
-        Err("lookup_account_basic not implemented".into())
+    async fn lookup_account_basic(&self, _addr: &Address) -> Result<AccountLookup, NodeError> {
+        Err(NodeError::NotImplemented("lookup_account_basic"))
     }
 
     /// Look up a single asset resource (holding + params) for an address.
@@ -425,8 +434,8 @@ pub trait NodeInterface: Send + Sync + 'static {
         &self,
         _addr: &Address,
         _asset_id: u64,
-    ) -> Result<AssetResourceLookup, Box<dyn std::error::Error + Send + Sync>> {
-        Err("lookup_asset_resource not implemented".into())
+    ) -> Result<AssetResourceLookup, NodeError> {
+        Err(NodeError::NotImplemented("lookup_asset_resource"))
     }
 
     /// Look up a single app resource (local state + params) for an address.
@@ -437,15 +446,13 @@ pub trait NodeInterface: Send + Sync + 'static {
         &self,
         _addr: &Address,
         _app_id: u64,
-    ) -> Result<AppResourceLookup, Box<dyn std::error::Error + Send + Sync>> {
-        Err("lookup_app_resource not implemented".into())
+    ) -> Result<AppResourceLookup, NodeError> {
+        Err(NodeError::NotImplemented("lookup_app_resource"))
     }
 
     /// Return the consensus parameters for the current protocol version.
-    async fn consensus_params(
-        &self,
-    ) -> Result<ConsensusParams, Box<dyn std::error::Error + Send + Sync>> {
-        Err("consensus_params not implemented".into())
+    async fn consensus_params(&self) -> Result<ConsensusParams, NodeError> {
+        Err(NodeError::NotImplemented("consensus_params"))
     }
 
     /// Maximum number of asset/app resources returned per account lookup.
@@ -463,11 +470,8 @@ pub trait NodeInterface: Send + Sync + 'static {
     /// Resolves the creator via `GetCreator`, then looks up the `AppParams`.
     /// Returns `ApplicationLookup` with `app_params: None` when the
     /// application does not exist.
-    async fn lookup_application(
-        &self,
-        _app_id: u64,
-    ) -> Result<ApplicationLookup, Box<dyn std::error::Error + Send + Sync>> {
-        Err("lookup_application not implemented".into())
+    async fn lookup_application(&self, _app_id: u64) -> Result<ApplicationLookup, NodeError> {
+        Err(NodeError::NotImplemented("lookup_application"))
     }
 
     /// Look up an asset by its ID.
@@ -475,11 +479,8 @@ pub trait NodeInterface: Send + Sync + 'static {
     /// Resolves the creator via `GetCreator`, then looks up the `AssetParams`.
     /// Returns `AssetLookup` with `asset_params: None` when the asset does
     /// not exist.
-    async fn lookup_asset_by_id(
-        &self,
-        _asset_id: u64,
-    ) -> Result<AssetLookup, Box<dyn std::error::Error + Send + Sync>> {
-        Err("lookup_asset_by_id not implemented".into())
+    async fn lookup_asset_by_id(&self, _asset_id: u64) -> Result<AssetLookup, NodeError> {
+        Err(NodeError::NotImplemented("lookup_asset_by_id"))
     }
 
     /// Look up a single application box by its raw box name.
@@ -494,8 +495,8 @@ pub trait NodeInterface: Send + Sync + 'static {
         &self,
         _app_id: u64,
         _key: &[u8],
-    ) -> Result<(Option<Vec<u8>>, u64), Box<dyn std::error::Error + Send + Sync>> {
-        Err("lookup_kv not implemented".into())
+    ) -> Result<(Option<Vec<u8>>, u64), NodeError> {
+        Err(NodeError::NotImplemented("lookup_kv"))
     }
 
     /// List all box names for an application that match a given prefix.
@@ -510,8 +511,8 @@ pub trait NodeInterface: Send + Sync + 'static {
         &self,
         _app_id: u64,
         _prefix: &[u8],
-    ) -> Result<(Vec<Vec<u8>>, u64), Box<dyn std::error::Error + Send + Sync>> {
-        Err("lookup_keys_by_prefix not implemented".into())
+    ) -> Result<(Vec<Vec<u8>>, u64), NodeError> {
+        Err(NodeError::NotImplemented("lookup_keys_by_prefix"))
     }
 
     /// Return the total number of boxes for an application, via an O(1)
@@ -521,11 +522,8 @@ pub trait NodeInterface: Send + Sync + 'static {
     /// to check the box count against the API limit *before* scanning all
     /// box keys, matching go-algorand's approach of checking
     /// `record.TotalBoxes` from the account record.
-    async fn total_boxes(
-        &self,
-        _app_id: u64,
-    ) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
-        Err("total_boxes not implemented".into())
+    async fn total_boxes(&self, _app_id: u64) -> Result<(u64, u64), NodeError> {
+        Err(NodeError::NotImplemented("total_boxes"))
     }
 
     /// Maximum number of boxes per application that the API will return.
@@ -544,11 +542,8 @@ pub trait NodeInterface: Send + Sync + 'static {
     /// Returns a "not found" error when the round has not been committed.
     ///
     /// Mirrors go-algorand's `ledger.Block(round)`.
-    async fn get_block(
-        &self,
-        _round: u64,
-    ) -> Result<Block, Box<dyn std::error::Error + Send + Sync>> {
-        Err("get_block not implemented".into())
+    async fn get_block(&self, _round: u64) -> Result<Block, NodeError> {
+        Err(NodeError::NotImplemented("get_block"))
     }
 
     /// Look up a block header by round number.
@@ -557,11 +552,8 @@ pub trait NodeInterface: Send + Sync + 'static {
     /// Returns a "not found" error when the round has not been committed.
     ///
     /// Mirrors go-algorand's `ledger.BlockHdr(round)`.
-    async fn get_block_header(
-        &self,
-        _round: u64,
-    ) -> Result<BlockHeader, Box<dyn std::error::Error + Send + Sync>> {
-        Err("get_block_header not implemented".into())
+    async fn get_block_header(&self, _round: u64) -> Result<BlockHeader, NodeError> {
+        Err(NodeError::NotImplemented("get_block_header"))
     }
 
     /// Find the state proof transaction that covers the given round.
@@ -578,26 +570,25 @@ pub trait NodeInterface: Send + Sync + 'static {
     async fn get_state_proof_transaction_for_round(
         &self,
         _round: u64,
-    ) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
-        Err("get_state_proof_transaction_for_round not implemented".into())
+    ) -> Result<(u64, u64), NodeError> {
+        Err(NodeError::NotImplemented(
+            "get_state_proof_transaction_for_round",
+        ))
     }
 
     /// Return supply information (round, total money, online money).
     ///
     /// Mirrors go-algorand's `ledger.LatestTotals()`.
-    async fn get_supply(&self) -> Result<SupplyInfo, Box<dyn std::error::Error + Send + Sync>> {
-        Err("get_supply not implemented".into())
+    async fn get_supply(&self) -> Result<SupplyInfo, NodeError> {
+        Err(NodeError::NotImplemented("get_supply"))
     }
 
     /// Return full state proof data for a given round.
     ///
     /// Mirrors go-algorand's `GetStateProof` handler which finds the state
     /// proof transaction covering the round and extracts all message fields.
-    async fn get_state_proof_for_round(
-        &self,
-        _round: u64,
-    ) -> Result<StateProofData, Box<dyn std::error::Error + Send + Sync>> {
-        Err("get_state_proof_for_round not implemented".into())
+    async fn get_state_proof_for_round(&self, _round: u64) -> Result<StateProofData, NodeError> {
+        Err(NodeError::NotImplemented("get_state_proof_for_round"))
     }
 
     /// Return raw block+cert bytes for a given round (msgpack pass-through).
@@ -607,11 +598,8 @@ pub trait NodeInterface: Send + Sync + 'static {
     /// with the `X-Algorand-Struct: block-v1` header.
     ///
     /// Mirrors go-algorand's `rpcs.RawBlockBytes(ledger, round)`.
-    async fn get_block_raw_msgpack(
-        &self,
-        _round: u64,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        Err("get_block_raw_msgpack not implemented".into())
+    async fn get_block_raw_msgpack(&self, _round: u64) -> Result<Vec<u8>, NodeError> {
+        Err(NodeError::NotImplemented("get_block_raw_msgpack"))
     }
 
     // ---- Transaction pool / broadcast methods ----
@@ -625,8 +613,8 @@ pub trait NodeInterface: Send + Sync + 'static {
     async fn broadcast_signed_tx_group(
         &self,
         _tx_group: Vec<SignedTransaction>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Err("broadcast_signed_tx_group not implemented".into())
+    ) -> Result<(), NodeError> {
+        Err(NodeError::NotImplemented("broadcast_signed_tx_group"))
     }
 
     /// Look up a pending transaction by its ID.
@@ -638,17 +626,15 @@ pub trait NodeInterface: Send + Sync + 'static {
     async fn get_pending_transaction(
         &self,
         _txid: &Digest,
-    ) -> Result<Option<TxnWithStatus>, Box<dyn std::error::Error + Send + Sync>> {
-        Err("get_pending_transaction not implemented".into())
+    ) -> Result<Option<TxnWithStatus>, NodeError> {
+        Err(NodeError::NotImplemented("get_pending_transaction"))
     }
 
     /// Return all pending transactions from the pool.
     ///
     /// Mirrors go-algorand's `Node.GetPendingTxnsFromPool`.
-    async fn get_pending_txns_from_pool(
-        &self,
-    ) -> Result<Vec<SignedTransaction>, Box<dyn std::error::Error + Send + Sync>> {
-        Err("get_pending_txns_from_pool not implemented".into())
+    async fn get_pending_txns_from_pool(&self) -> Result<Vec<SignedTransaction>, NodeError> {
+        Err(NodeError::NotImplemented("get_pending_txns_from_pool"))
     }
 
     /// Maximum transaction group size from consensus params.

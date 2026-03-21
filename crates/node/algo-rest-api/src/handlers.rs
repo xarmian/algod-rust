@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use crate::error;
 use crate::format::{self, FormatParams};
 use crate::models;
-use crate::node::NodeInterface;
+use crate::node::{NodeError, NodeInterface};
 
 /// Shared application state threaded through axum handlers.
 pub type AppState<N> = Arc<N>;
@@ -1135,11 +1135,7 @@ pub async fn get_block<N: NodeInterface>(
                     .into_response();
             }
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("not found") || msg.contains("no entry") {
-                    return error::not_found("failed to retrieve information from the ledger");
-                }
-                return error::internal_error("failed to retrieve information from the ledger");
+                return error::ledger_error_response(e);
             }
         }
     }
@@ -1150,14 +1146,7 @@ pub async fn get_block<N: NodeInterface>(
             let response = models::BlockJsonResponse { block };
             format::encode_response(&response, resp_format)
         }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("not found") || msg.contains("no entry") {
-                error::not_found("failed to retrieve information from the ledger")
-            } else {
-                error::internal_error("failed to retrieve information from the ledger")
-            }
-        }
+        Err(e) => error::ledger_error_response(e),
     }
 }
 
@@ -1184,14 +1173,7 @@ async fn get_block_header_response<N: NodeInterface>(
             let response = models::BlockHeaderJsonResponse { block: header };
             format::encode_response(&response, resp_format)
         }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("not found") || msg.contains("no entry") {
-                error::not_found("failed to retrieve information from the ledger")
-            } else {
-                error::internal_error("failed to retrieve information from the ledger")
-            }
-        }
+        Err(e) => error::ledger_error_response(e),
     }
 }
 
@@ -1273,13 +1255,7 @@ pub async fn get_block_txids<N: NodeInterface>(
 ) -> Response {
     let block = match node.get_block(round).await {
         Ok(b) => b,
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("not found") || msg.contains("no entry") {
-                return error::not_found("failed to retrieve information from the ledger");
-            }
-            return error::internal_error("failed to retrieve information from the ledger");
-        }
+        Err(e) => return error::ledger_error_response(e),
     };
 
     // Compute transaction IDs, restoring genesis fields as go-algorand's
@@ -1322,13 +1298,7 @@ pub async fn get_block_logs<N: NodeInterface>(
 ) -> Response {
     let block = match node.get_block(round).await {
         Ok(b) => b,
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("not found") || msg.contains("no entry") {
-                return error::not_found("failed to retrieve information from the ledger");
-            }
-            return error::internal_error("failed to retrieve information from the ledger");
-        }
+        Err(e) => return error::ledger_error_response(e),
     };
 
     let mut block_logs: Vec<models::AppCallLogs> = Vec::new();
@@ -1815,13 +1785,8 @@ pub async fn get_light_block_header_proof<N: NodeInterface>(
     let (first_attested_round, last_attested_round) =
         match node.get_state_proof_transaction_for_round(round).await {
             Ok(range) => range,
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("no state proof") || msg.contains("not found") {
-                    return error::not_found(msg);
-                }
-                return error::internal_error(msg);
-            }
+            Err(NodeError::NotFound(msg)) => return error::not_found(msg),
+            Err(e) => return error::internal_error(e.to_string()),
         };
 
     let state_proof_interval = last_attested_round
@@ -2187,16 +2152,11 @@ pub async fn get_state_proof<N: NodeInterface>(
                 Err(_) => error::internal_error("failed to encode response"),
             }
         }
-        Ok(Err(e)) => {
-            let msg = e.to_string();
-            if msg.contains("no state proof") {
-                error::not_found(msg)
-            } else if msg.contains("timeout") || msg.contains("timed out") {
-                error::timeout(msg)
-            } else {
-                error::internal_error(msg)
-            }
-        }
+        Ok(Err(e)) => match e {
+            NodeError::NotFound(msg) => error::not_found(msg),
+            NodeError::Timeout(msg) => error::timeout(msg),
+            e => error::internal_error(e.to_string()),
+        },
         Err(_elapsed) => error::timeout("operation timed out"),
     }
 }
