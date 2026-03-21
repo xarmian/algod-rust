@@ -213,8 +213,9 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
         // Collect all addresses involved in the transaction group for
         // snapshotting. This ensures we can restore state after simulation.
-        // Include the fee sink since every transaction credits fees to it.
-        let mut addrs: Vec<Address> = vec![self.store.fee_sink()];
+        // Include the fee sink and rewards pool since apply_transaction
+        // credits fees and distributes rewards through these accounts.
+        let mut addrs: Vec<Address> = vec![self.store.fee_sink(), self.store.rewards_pool()];
         for stx in txn_group {
             addrs.push(stx.txn.sender);
             if stx.txn.receiver != Address::ZERO {
@@ -223,8 +224,17 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             if stx.txn.close_remainder_to != Address::ZERO {
                 addrs.push(stx.txn.close_remainder_to);
             }
-            if let Some(ref ar) = stx.txn.asset_receiver {
-                addrs.push(*ar);
+            if let Some(ref a) = stx.txn.asset_receiver {
+                addrs.push(*a);
+            }
+            if let Some(ref a) = stx.txn.asset_sender {
+                addrs.push(*a);
+            }
+            if let Some(ref a) = stx.txn.asset_close_to {
+                addrs.push(*a);
+            }
+            if let Some(ref a) = stx.txn.freeze_account {
+                addrs.push(*a);
             }
         }
         // Deduplicate addresses.
@@ -271,24 +281,26 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // the apply pipeline requires changes to apply_transaction, LedgerAvmContext,
             // and the AVM execution entry points. For now, exec-trace results
             // will be empty even when tracing is requested.
-            let mut _tracer = SimulationTracer::new(request.trace_config.clone());
+            let tracer = SimulationTracer::new(request.trace_config.clone());
 
             match apply_transaction(self.store, stx, &apply_ctx, 0) {
                 Ok(()) => {
                     // Transaction applied successfully.
                 }
                 Err(e) => {
-                    // Record failure but continue to build results.
+                    // Record failure. Collect any partial trace data before
+                    // stopping (the tracer may have captured events up to
+                    // the point of failure once wired in).
                     failure_message = Some(e.to_string());
                     failed_at = Some(vec![i]);
-                    // Collect what we have for this txn and stop processing.
+                    txn_result.trace = tracer.into_transaction_trace();
                     group_result.txn_results.push(txn_result);
                     break;
                 }
             }
 
             // Collect tracer results.
-            txn_result.trace = _tracer.into_transaction_trace();
+            txn_result.trace = tracer.into_transaction_trace();
             group_result.txn_results.push(txn_result);
         }
 
