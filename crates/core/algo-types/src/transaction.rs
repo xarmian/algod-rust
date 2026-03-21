@@ -1541,6 +1541,63 @@ impl ResourceRef {
     }
 }
 
+// ── Transaction address matching ────────────────────────────────
+
+impl Transaction {
+    /// Return `true` when `addr` is involved in this transaction.
+    ///
+    /// Mirrors go-algorand's `Transaction.MatchAddress` — checks sender
+    /// and, depending on the transaction type, receiver / close-to /
+    /// asset-receiver / asset-close-to / asset-sender / heartbeat address.
+    ///
+    /// NOTE: go-algorand does *not* check `freeze_account` and neither
+    /// do we.
+    pub fn match_address(&self, addr: &Address) -> bool {
+        // Sender always matches.
+        if *addr == self.sender {
+            return true;
+        }
+
+        match self.txn_type {
+            TxnType::Pay => {
+                if *addr == self.receiver {
+                    return true;
+                }
+                if !self.close_remainder_to.is_zero() && *addr == self.close_remainder_to {
+                    return true;
+                }
+            }
+            TxnType::Axfer => {
+                if let Some(ref a) = self.asset_receiver {
+                    if a == addr {
+                        return true;
+                    }
+                }
+                if let Some(ref a) = self.asset_close_to {
+                    if !a.is_zero() && a == addr {
+                        return true;
+                    }
+                }
+                if let Some(ref a) = self.asset_sender {
+                    if !a.is_zero() && a == addr {
+                        return true;
+                    }
+                }
+            }
+            TxnType::Hb => {
+                if let Some(ref hb) = self.heartbeat {
+                    if *addr == hb.address {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        false
+    }
+}
+
 // ── Transaction decoder ────────────────────────────────────────
 
 impl Transaction {

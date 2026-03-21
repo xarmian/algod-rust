@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::middleware;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 
 use crate::auth;
@@ -91,6 +91,19 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             get(handlers::get_block_txids::<N>),
         )
         .route("/v2/blocks/:round/logs", get(handlers::get_block_logs::<N>))
+        .route("/v2/transactions", post(handlers::raw_transaction::<N>))
+        .route(
+            "/v2/transactions/pending",
+            get(handlers::get_pending_transactions::<N>),
+        )
+        .route(
+            "/v2/transactions/pending/:txid",
+            get(handlers::pending_transaction_information::<N>),
+        )
+        .route(
+            "/v2/accounts/:address/transactions/pending",
+            get(handlers::get_pending_transactions_by_address::<N>),
+        )
         .route(
             "/v2/blocks/:round/transactions/:txid/proof",
             get(handlers::get_transaction_proof::<N>),

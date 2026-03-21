@@ -12,6 +12,7 @@ use algo_rest_api::auth::generate_token;
 use algo_rest_api::node::{
     AccountLookup, AppResourceLookup, ApplicationLookup, AssetLookup, AssetResourceLookup,
     BuildVersion, NodeInterface, NodeStatus, ProtocolSwitchInfo, StateProofData, SupplyInfo,
+    TxnWithStatus,
 };
 use algo_rest_api::router::{build_router, TokenConfig};
 use algo_types::{
@@ -100,6 +101,12 @@ struct MockNode {
     supply_info: Option<SupplyInfo>,
     /// State proof data results, keyed by round.
     state_proof_data: BTreeMap<u64, StateProofData>,
+    /// Pending transactions in the pool (for get_pending_txns_from_pool).
+    pending_txns: Vec<SignedTransaction>,
+    /// Pending transaction lookup (for get_pending_transaction), keyed by txid bytes.
+    pending_txn_lookup: BTreeMap<[u8; 32], TxnWithStatus>,
+    /// Broadcast result: None = success, Some(msg) = error.
+    broadcast_result: Option<String>,
 }
 
 impl Clone for MockNode {
@@ -136,6 +143,9 @@ impl Clone for MockNode {
             state_proof_txns: self.state_proof_txns.clone(),
             supply_info: self.supply_info.clone(),
             state_proof_data: self.state_proof_data.clone(),
+            pending_txns: self.pending_txns.clone(),
+            pending_txn_lookup: self.pending_txn_lookup.clone(),
+            broadcast_result: self.broadcast_result.clone(),
         }
     }
 }
@@ -220,6 +230,9 @@ impl MockNode {
             state_proof_txns: BTreeMap::new(),
             supply_info: None,
             state_proof_data: BTreeMap::new(),
+            pending_txns: Vec::new(),
+            pending_txn_lookup: BTreeMap::new(),
+            broadcast_result: None,
         }
     }
 
@@ -667,6 +680,29 @@ impl NodeInterface for MockNode {
             Some(data) => Ok(data.clone()),
             None => Err("no state proof found for round".into()),
         }
+    }
+
+    async fn broadcast_signed_tx_group(
+        &self,
+        _tx_group: Vec<SignedTransaction>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match &self.broadcast_result {
+            None => Ok(()),
+            Some(msg) => Err(msg.clone().into()),
+        }
+    }
+
+    async fn get_pending_transaction(
+        &self,
+        txid: &Digest,
+    ) -> Result<Option<TxnWithStatus>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.pending_txn_lookup.get(&txid.0).cloned())
+    }
+
+    async fn get_pending_txns_from_pool(
+        &self,
+    ) -> Result<Vec<SignedTransaction>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.pending_txns.clone())
     }
 }
 
@@ -4176,4 +4212,407 @@ async fn state_proof_requires_auth() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
+}
+
+// ===========================================================================
+// Transaction submission and pending transaction endpoint tests
+// ===========================================================================
+
+/// Helper: encode a SignedTransaction to canonical msgpack bytes suitable for
+/// POST /v2/transactions.
+fn encode_signed_txn_for_post(stxn: &SignedTransaction) -> Vec<u8> {
+    algo_codec::canonical_encode_signed_transaction(stxn)
+}
+
+// ---------------------------------------------------------------------------
+// POST /v2/transactions
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn raw_transaction_returns_txid() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let stxn = make_test_signed_txn();
+    let expected_txid = algo_codec::compute_txn_id(&stxn.txn).to_string();
+    let body = encode_signed_txn_for_post(&stxn);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["txId"].as_str().unwrap(), expected_txid);
+}
+
+#[tokio::test]
+async fn raw_transaction_requires_auth() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let stxn = make_test_signed_txn();
+    let body = encode_signed_txn_for_post(&stxn);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn raw_transaction_empty_body_returns_400() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(Vec::<u8>::new())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        json["message"].as_str().unwrap().contains("empty txgroup"),
+        "error should contain 'empty txgroup', got: {}",
+        json["message"]
+    );
+}
+
+#[tokio::test]
+async fn raw_transaction_invalid_msgpack_returns_400() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(vec![0xFF, 0xFE, 0xFD])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("could not decode transaction"),
+        "error should mention decode failure, got: {}",
+        json["message"]
+    );
+}
+
+#[tokio::test]
+async fn raw_transaction_catchpoint_returns_503() {
+    let node = MockNode::catchpoint_catchup();
+    let server = TestServer::start(node).await;
+
+    let stxn = make_test_signed_txn();
+    let body = encode_signed_txn_for_post(&stxn);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("operation not available during catchup"),
+        "error should mention catchup, got: {}",
+        json["message"]
+    );
+}
+
+#[tokio::test]
+async fn raw_transaction_broadcast_error_returns_400() {
+    let mut node = MockNode::synced();
+    node.broadcast_result = Some("transaction already in pool".to_string());
+    let server = TestServer::start(node).await;
+
+    let stxn = make_test_signed_txn();
+    let body = encode_signed_txn_for_post(&stxn);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("transaction already in pool"),
+        "error should contain broadcast error message, got: {}",
+        json["message"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/transactions/pending
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_pending_transactions_returns_list() {
+    let mut node = MockNode::synced();
+    let stxn1 = make_test_signed_txn();
+    let mut stxn2 = make_test_signed_txn();
+    stxn2.txn.fee = 2000; // make it distinct
+    node.pending_txns = vec![stxn1, stxn2];
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/transactions/pending"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["total-transactions"].as_u64().unwrap(), 2);
+    let top = json["top-transactions"].as_array().unwrap();
+    assert_eq!(top.len(), 2);
+}
+
+#[tokio::test]
+async fn get_pending_transactions_with_max() {
+    let mut node = MockNode::synced();
+    let stxn1 = make_test_signed_txn();
+    let mut stxn2 = make_test_signed_txn();
+    stxn2.txn.fee = 2000;
+    node.pending_txns = vec![stxn1, stxn2];
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/transactions/pending?max=1"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    // total-transactions reflects full pool size
+    assert_eq!(json["total-transactions"].as_u64().unwrap(), 2);
+    // but only 1 returned due to max
+    let top = json["top-transactions"].as_array().unwrap();
+    assert_eq!(top.len(), 1);
+}
+
+#[tokio::test]
+async fn get_pending_transactions_empty_pool() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/transactions/pending"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["total-transactions"].as_u64().unwrap(), 0);
+    let top = json["top-transactions"].as_array().unwrap();
+    assert_eq!(top.len(), 0);
+}
+
+#[tokio::test]
+async fn get_pending_transactions_requires_auth() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/transactions/pending"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/transactions/pending/:txid
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pending_transaction_info_found() {
+    let mut node = MockNode::synced();
+    let stxn = make_test_signed_txn();
+    let txid = algo_codec::compute_txn_id(&stxn.txn);
+    let txid_str = txid.to_string();
+
+    node.pending_txn_lookup.insert(
+        txid.0,
+        TxnWithStatus {
+            txn: stxn,
+            confirmed_round: 0,
+            pool_error: String::new(),
+            closing_amount: 0,
+            asset_closing_amount: 0,
+            sender_rewards: 0,
+            receiver_rewards: 0,
+            close_rewards: 0,
+            asset_index: None,
+            application_index: None,
+            eval_delta: None,
+            logs: None,
+            inner_txns: None,
+        },
+    );
+    let server = TestServer::start(node).await;
+
+    let url = format!("/v2/transactions/pending/{}", txid_str);
+    let resp = server
+        .client
+        .get(server.url(&url))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        json.get("txn").is_some(),
+        "response should have 'txn' field"
+    );
+    assert!(
+        json.get("pool-error").is_some(),
+        "response should have 'pool-error' field"
+    );
+}
+
+#[tokio::test]
+async fn pending_transaction_info_not_found() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let fake_txid = data_encoding::BASE32_NOPAD.encode(&[0xAA; 32]);
+    let url = format!("/v2/transactions/pending/{}", fake_txid);
+    let resp = server
+        .client
+        .get(server.url(&url))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("could not find the transaction in the transaction pool"),
+        "error should mention transaction not found, got: {}",
+        json["message"]
+    );
+}
+
+#[tokio::test]
+async fn pending_transaction_info_invalid_txid() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/transactions/pending/not-a-valid-txid"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("no valid transaction ID was specified"),
+        "error should mention invalid txid, got: {}",
+        json["message"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/accounts/:address/transactions/pending
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pending_transactions_by_address_filters() {
+    let mut node = MockNode::synced();
+
+    // Create two transactions with different senders
+    let mut stxn1 = make_test_signed_txn();
+    stxn1.txn.sender = Address([0x01; 32]);
+
+    let mut stxn2 = make_test_signed_txn();
+    stxn2.txn.sender = Address([0x02; 32]);
+
+    node.pending_txns = vec![stxn1.clone(), stxn2];
+    let server = TestServer::start(node).await;
+
+    // Filter by the first sender's address
+    let addr_str = Address([0x01; 32]).to_string();
+    let url = format!("/v2/accounts/{}/transactions/pending", addr_str);
+    let resp = server
+        .client
+        .get(server.url(&url))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    // total-transactions is the full pool size (unfiltered)
+    assert_eq!(json["total-transactions"].as_u64().unwrap(), 2);
+    // but top-transactions should only contain the matching one
+    let top = json["top-transactions"].as_array().unwrap();
+    assert_eq!(
+        top.len(),
+        1,
+        "should only return transactions matching the address filter"
+    );
 }
