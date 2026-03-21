@@ -16,6 +16,8 @@ use algo_types::{
 use async_trait::async_trait;
 use serde::Serialize;
 
+use crate::models;
+
 /// Typed error enum for `NodeInterface` methods.
 ///
 /// Replaces `Box<dyn std::error::Error + Send + Sync>` to enable type-safe
@@ -643,5 +645,20 @@ pub trait NodeInterface: Send + Sync + 'static {
     /// before broadcasting.
     fn max_tx_group_size(&self) -> usize {
         16 // Default from go-algorand consensus
+    }
+
+    // ---- Simulation methods ----
+
+    /// Simulate a transaction group without submitting it.
+    ///
+    /// Mirrors go-algorand's `Node.Simulate` which takes a
+    /// `simulation.Request` and returns a `simulation.Result`.
+    /// The handler passes the REST model types directly for now;
+    /// a dedicated simulation engine will be added later.
+    async fn simulate(
+        &self,
+        _request: models::SimulateRequest,
+    ) -> Result<models::SimulateResponse, NodeError> {
+        Err(NodeError::NotImplemented("simulate"))
     }
 }

@@ -93,6 +93,10 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
         .route("/v2/blocks/:round/logs", get(handlers::get_block_logs::<N>))
         .route("/v2/transactions", post(handlers::raw_transaction::<N>))
         .route(
+            "/v2/transactions/simulate",
+            post(handlers::simulate_transaction::<N>),
+        )
+        .route(
             "/v2/transactions/pending",
             get(handlers::get_pending_transactions::<N>),
         )

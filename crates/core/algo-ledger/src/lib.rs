@@ -14,6 +14,7 @@ pub mod merkle_trie;
 pub mod params;
 pub mod participation;
 pub mod rewards;
+pub mod simulation;
 pub mod sqlite;
 pub mod state;
 pub mod store_trait;

@@ -26,6 +26,7 @@
 //! - `GET /v2/blocks/:round/lightheader/proof` -- light block header proof for state proofs
 //! - `GET /v2/ledger/supply` -- ledger supply (current round, total money, online money)
 //! - `GET /v2/stateproofs/:round` -- state proof for a given round
+//! - `POST /v2/transactions/simulate` -- simulate transaction groups
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -2745,4 +2746,80 @@ async fn get_pending_transactions_inner<N: NodeInterface>(
     };
 
     format::encode_response(&response, resp_format)
+}
+
+// ---------------------------------------------------------------------------
+// POST /v2/transactions/simulate
+// ---------------------------------------------------------------------------
+
+/// Simulate a transaction group without submitting it to the network.
+///
+/// Accepts JSON or msgpack-encoded `SimulateRequest` in the request body.
+/// Tries msgpack decode first, then falls back to JSON (matching go-algorand's
+/// `SimulateTransaction` handler behavior).
+///
+/// Supports `?format=json` (default) or `?format=msgpack` for response encoding.
+///
+/// Matches go-algorand's `Handlers.SimulateTransaction`.
+pub async fn simulate_transaction<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Query(format_params): Query<FormatParams>,
+    body: axum::body::Bytes,
+) -> Response {
+    // Negotiate response format
+    let resp_format = match format::negotiate_format(&format_params) {
+        Ok(f) => f,
+        Err(e) => return *e,
+    };
+
+    // Check catchpoint status
+    let status = match node.status().await {
+        Ok(s) => s,
+        Err(_) => return error::internal_error("failed retrieving node status"),
+    };
+    if !status.catchpoint.is_empty() {
+        return error::service_unavailable("operation not available during catchup");
+    }
+
+    // Decode request body: try msgpack first, then JSON
+    let request: models::SimulateRequest =
+        match rmp_serde::from_slice::<models::SimulateRequest>(&body) {
+            Ok(req) => req,
+            Err(_) => match serde_json::from_slice::<models::SimulateRequest>(&body) {
+                Ok(req) => req,
+                Err(e) => {
+                    return error::bad_request(format!("could not decode simulate request: {e}"));
+                }
+            },
+        };
+
+    // Validate: must have at least one transaction group
+    if request.txn_groups.is_empty() {
+        return error::bad_request("empty txn-groups");
+    }
+
+    // Validate: check group sizes
+    let max_group_size = node.max_tx_group_size();
+    for (i, group) in request.txn_groups.iter().enumerate() {
+        if group.txns.is_empty() {
+            return error::bad_request(format!("txn-groups[{i}] has no transactions"));
+        }
+        if group.txns.len() > max_group_size {
+            return error::bad_request(format!(
+                "txn-groups[{i}] has {} transactions, max group size is {}",
+                group.txns.len(),
+                max_group_size
+            ));
+        }
+    }
+
+    // Call the node's simulate method
+    match node.simulate(request).await {
+        Ok(response) => format::encode_response(&response, resp_format),
+        Err(NodeError::NotFound(msg)) => error::not_found(msg),
+        Err(NodeError::NotImplemented(method)) => {
+            error::internal_error(format!("{method} not implemented"))
+        }
+        Err(e) => error::internal_error(e.to_string()),
+    }
 }

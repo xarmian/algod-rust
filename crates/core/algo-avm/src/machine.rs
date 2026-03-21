@@ -12,6 +12,7 @@ use crate::bytecode::Program;
 use crate::context::AvmContext;
 use crate::opcode::{self, CostKind};
 use crate::ops;
+use crate::tracer::EvalTracer;
 
 /// Maximum stack depth allowed by the AVM.
 const MAX_STACK_DEPTH: usize = 1000;
@@ -256,6 +257,83 @@ impl AvmMachine {
     pub fn run(&mut self, ctx: &mut dyn AvmContext) -> Result<bool, AlgoError> {
         while !self.finished {
             self.step(ctx)?;
+        }
+        Ok(self.pass)
+    }
+
+    /// Execute one instruction with tracer callbacks.
+    ///
+    /// Identical to [`step`] but invokes `tracer.before_opcode` before
+    /// dispatch and `tracer.after_opcode` after dispatch (or on error).
+    pub fn step_with_tracer(
+        &mut self,
+        ctx: &mut dyn AvmContext,
+        tracer: &mut dyn EvalTracer,
+    ) -> Result<(), AlgoError> {
+        if self.finished {
+            return Err(AlgoError::Avm {
+                message: "step called after execution finished".to_string(),
+            });
+        }
+
+        // If PC is past end of instructions, program finishes.
+        if self.pc >= self.program.instructions.len() {
+            self.finish_implicit();
+            return Ok(());
+        }
+
+        let instr = self.program.instructions[self.pc].clone();
+        let old_pc = self.pc;
+
+        // Record opcode hit for coverage tracking.
+        self.opcode_hits[instr.opcode as usize] = true;
+
+        // Charge static cost.
+        if let Some(spec) = opcode::lookup(instr.opcode) {
+            if let CostKind::Static(cost) = spec.cost {
+                self.charge_cost(cost)?;
+            }
+        }
+
+        // Tracer: before opcode.
+        tracer.before_opcode(self.pc, instr.opcode);
+
+        // Dispatch to opcode handler.
+        let result = ops::dispatch(self, &instr, ctx);
+
+        // Tracer: after opcode (with error if any).
+        match &result {
+            Ok(()) => {
+                tracer.after_opcode(old_pc, instr.opcode, &self.stack, &self.scratch, None);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                tracer.after_opcode(old_pc, instr.opcode, &self.stack, &self.scratch, Some(&msg));
+            }
+        }
+
+        result?;
+
+        // If the handler didn't change the PC (no branch), advance by 1.
+        if !self.finished && self.pc == old_pc {
+            self.pc += 1;
+        }
+
+        Ok(())
+    }
+
+    /// Run the program to completion with tracer callbacks.
+    ///
+    /// Identical to [`run`] but calls [`step_with_tracer`] so that
+    /// `before_opcode` / `after_opcode` events are emitted for each
+    /// instruction.
+    pub fn run_with_tracer(
+        &mut self,
+        ctx: &mut dyn AvmContext,
+        tracer: &mut dyn EvalTracer,
+    ) -> Result<bool, AlgoError> {
+        while !self.finished {
+            self.step_with_tracer(ctx, tracer)?;
         }
         Ok(self.pass)
     }
