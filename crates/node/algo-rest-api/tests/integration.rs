@@ -4616,3 +4616,354 @@ async fn pending_transactions_by_address_filters() {
         "should only return transactions matching the address filter"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pending transaction eval delta tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pending_transaction_info_with_global_state_delta() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let mut node = MockNode::synced();
+    let stxn = make_test_signed_txn();
+    let txid = algo_codec::compute_txn_id(&stxn.txn);
+    let txid_str = txid.to_string();
+
+    // Build an eval_delta with a global state delta: key="counter", action=1 (SetUint), ui=42
+    let eval_delta = rmpv::Value::Map(vec![(
+        rmpv::Value::String("gd".into()),
+        rmpv::Value::Map(vec![(
+            rmpv::Value::Binary(b"counter".to_vec()),
+            rmpv::Value::Map(vec![
+                (
+                    rmpv::Value::String("at".into()),
+                    rmpv::Value::Integer(1.into()),
+                ),
+                (
+                    rmpv::Value::String("ui".into()),
+                    rmpv::Value::Integer(42.into()),
+                ),
+            ]),
+        )]),
+    )]);
+
+    node.pending_txn_lookup.insert(
+        txid.0,
+        TxnWithStatus {
+            txn: stxn,
+            confirmed_round: 100,
+            pool_error: String::new(),
+            closing_amount: 0,
+            asset_closing_amount: 0,
+            sender_rewards: 0,
+            receiver_rewards: 0,
+            close_rewards: 0,
+            asset_index: None,
+            application_index: None,
+            eval_delta: Some(eval_delta),
+            logs: None,
+            inner_txns: None,
+        },
+    );
+    let server = TestServer::start(node).await;
+
+    let url = format!("/v2/transactions/pending/{}", txid_str);
+    let resp = server
+        .client
+        .get(server.url(&url))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    let gsd = json
+        .get("global-state-delta")
+        .expect("should have global-state-delta");
+    let gsd_arr = gsd.as_array().expect("global-state-delta should be array");
+    assert_eq!(gsd_arr.len(), 1);
+
+    let entry = &gsd_arr[0];
+    assert_eq!(entry["key"].as_str().unwrap(), STANDARD.encode(b"counter"));
+    assert_eq!(entry["value"]["action"].as_u64().unwrap(), 1);
+    assert_eq!(entry["value"]["uint"].as_u64().unwrap(), 42);
+    // bytes should be omitted when empty
+    assert!(entry["value"].get("bytes").is_none());
+}
+
+#[tokio::test]
+async fn pending_transaction_info_with_local_state_delta() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let mut node = MockNode::synced();
+
+    // Create a txn with accounts so local delta address resolution works
+    let mut stxn = make_test_signed_txn();
+    let account1 = Address([0x02; 32]);
+    stxn.txn.accounts = Some(vec![account1]);
+    let txid = algo_codec::compute_txn_id(&stxn.txn);
+    let txid_str = txid.to_string();
+
+    // Build an eval_delta with local state delta: index=1 (first account), key="balance", action=1, ui=100
+    let eval_delta = rmpv::Value::Map(vec![(
+        rmpv::Value::String("ld".into()),
+        rmpv::Value::Map(vec![(
+            rmpv::Value::Integer(1.into()),
+            rmpv::Value::Map(vec![(
+                rmpv::Value::Binary(b"balance".to_vec()),
+                rmpv::Value::Map(vec![
+                    (
+                        rmpv::Value::String("at".into()),
+                        rmpv::Value::Integer(1.into()),
+                    ),
+                    (
+                        rmpv::Value::String("ui".into()),
+                        rmpv::Value::Integer(100.into()),
+                    ),
+                ]),
+            )]),
+        )]),
+    )]);
+
+    node.pending_txn_lookup.insert(
+        txid.0,
+        TxnWithStatus {
+            txn: stxn,
+            confirmed_round: 100,
+            pool_error: String::new(),
+            closing_amount: 0,
+            asset_closing_amount: 0,
+            sender_rewards: 0,
+            receiver_rewards: 0,
+            close_rewards: 0,
+            asset_index: None,
+            application_index: None,
+            eval_delta: Some(eval_delta),
+            logs: None,
+            inner_txns: None,
+        },
+    );
+    let server = TestServer::start(node).await;
+
+    let url = format!("/v2/transactions/pending/{}", txid_str);
+    let resp = server
+        .client
+        .get(server.url(&url))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    let lsd = json
+        .get("local-state-delta")
+        .expect("should have local-state-delta");
+    let lsd_arr = lsd.as_array().expect("local-state-delta should be array");
+    assert_eq!(lsd_arr.len(), 1);
+
+    let entry = &lsd_arr[0];
+    // Index 1 should resolve to account1 (the first in the accounts array)
+    assert_eq!(entry["address"].as_str().unwrap(), account1.to_string());
+    let delta = entry["delta"].as_array().unwrap();
+    assert_eq!(delta.len(), 1);
+    assert_eq!(
+        delta[0]["key"].as_str().unwrap(),
+        STANDARD.encode(b"balance")
+    );
+    assert_eq!(delta[0]["value"]["action"].as_u64().unwrap(), 1);
+    assert_eq!(delta[0]["value"]["uint"].as_u64().unwrap(), 100);
+}
+
+#[tokio::test]
+async fn pending_transaction_info_with_logs_from_eval_delta() {
+    let mut node = MockNode::synced();
+    let stxn = make_test_signed_txn();
+    let txid = algo_codec::compute_txn_id(&stxn.txn);
+    let txid_str = txid.to_string();
+
+    // Build an eval_delta with logs
+    let eval_delta = rmpv::Value::Map(vec![(
+        rmpv::Value::String("lg".into()),
+        rmpv::Value::Array(vec![
+            rmpv::Value::Binary(b"hello".to_vec()),
+            rmpv::Value::Binary(b"world".to_vec()),
+        ]),
+    )]);
+
+    node.pending_txn_lookup.insert(
+        txid.0,
+        TxnWithStatus {
+            txn: stxn,
+            confirmed_round: 100,
+            pool_error: String::new(),
+            closing_amount: 0,
+            asset_closing_amount: 0,
+            sender_rewards: 0,
+            receiver_rewards: 0,
+            close_rewards: 0,
+            asset_index: None,
+            application_index: None,
+            eval_delta: Some(eval_delta),
+            logs: None, // logs not set directly, should come from eval_delta
+            inner_txns: None,
+        },
+    );
+    let server = TestServer::start(node).await;
+
+    let url = format!("/v2/transactions/pending/{}", txid_str);
+    let resp = server
+        .client
+        .get(server.url(&url))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    let logs = json.get("logs").expect("should have logs");
+    let logs_arr = logs.as_array().expect("logs should be array");
+    assert_eq!(logs_arr.len(), 2);
+}
+
+#[tokio::test]
+async fn pending_transaction_info_with_bytes_state_delta() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let mut node = MockNode::synced();
+    let stxn = make_test_signed_txn();
+    let txid = algo_codec::compute_txn_id(&stxn.txn);
+    let txid_str = txid.to_string();
+
+    // Build an eval_delta with a global state delta: action=2 (SetBytes), bs=b"data"
+    let eval_delta = rmpv::Value::Map(vec![(
+        rmpv::Value::String("gd".into()),
+        rmpv::Value::Map(vec![(
+            rmpv::Value::Binary(b"mykey".to_vec()),
+            rmpv::Value::Map(vec![
+                (
+                    rmpv::Value::String("at".into()),
+                    rmpv::Value::Integer(2.into()),
+                ),
+                (
+                    rmpv::Value::String("bs".into()),
+                    rmpv::Value::Binary(b"data".to_vec()),
+                ),
+            ]),
+        )]),
+    )]);
+
+    node.pending_txn_lookup.insert(
+        txid.0,
+        TxnWithStatus {
+            txn: stxn,
+            confirmed_round: 100,
+            pool_error: String::new(),
+            closing_amount: 0,
+            asset_closing_amount: 0,
+            sender_rewards: 0,
+            receiver_rewards: 0,
+            close_rewards: 0,
+            asset_index: None,
+            application_index: None,
+            eval_delta: Some(eval_delta),
+            logs: None,
+            inner_txns: None,
+        },
+    );
+    let server = TestServer::start(node).await;
+
+    let url = format!("/v2/transactions/pending/{}", txid_str);
+    let resp = server
+        .client
+        .get(server.url(&url))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    let gsd = json
+        .get("global-state-delta")
+        .expect("should have global-state-delta");
+    let entry = &gsd.as_array().unwrap()[0];
+    assert_eq!(entry["value"]["action"].as_u64().unwrap(), 2);
+    assert_eq!(
+        entry["value"]["bytes"].as_str().unwrap(),
+        STANDARD.encode(b"data")
+    );
+    // uint should be omitted when 0
+    assert!(entry["value"].get("uint").is_none());
+}
+
+#[tokio::test]
+async fn pending_transaction_info_no_eval_delta_when_unconfirmed() {
+    let mut node = MockNode::synced();
+    let stxn = make_test_signed_txn();
+    let txid = algo_codec::compute_txn_id(&stxn.txn);
+    let txid_str = txid.to_string();
+
+    // Build an eval_delta, but confirmed_round=0 (unconfirmed)
+    let eval_delta = rmpv::Value::Map(vec![(
+        rmpv::Value::String("gd".into()),
+        rmpv::Value::Map(vec![(
+            rmpv::Value::Binary(b"counter".to_vec()),
+            rmpv::Value::Map(vec![(
+                rmpv::Value::String("at".into()),
+                rmpv::Value::Integer(1.into()),
+            )]),
+        )]),
+    )]);
+
+    node.pending_txn_lookup.insert(
+        txid.0,
+        TxnWithStatus {
+            txn: stxn,
+            confirmed_round: 0, // unconfirmed
+            pool_error: String::new(),
+            closing_amount: 0,
+            asset_closing_amount: 0,
+            sender_rewards: 0,
+            receiver_rewards: 0,
+            close_rewards: 0,
+            asset_index: None,
+            application_index: None,
+            eval_delta: Some(eval_delta),
+            logs: None,
+            inner_txns: None,
+        },
+    );
+    let server = TestServer::start(node).await;
+
+    let url = format!("/v2/transactions/pending/{}", txid_str);
+    let resp = server
+        .client
+        .get(server.url(&url))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let json: serde_json::Value = resp.json().await.unwrap();
+    // Unconfirmed txns should not have eval delta fields
+    assert!(
+        json.get("global-state-delta").is_none(),
+        "unconfirmed txn should not have global-state-delta"
+    );
+    assert!(
+        json.get("local-state-delta").is_none(),
+        "unconfirmed txn should not have local-state-delta"
+    );
+    assert!(
+        json.get("logs").is_none(),
+        "unconfirmed txn should not have logs"
+    );
+}
