@@ -18,7 +18,7 @@ use serde::Serialize;
 
 /// Typed error enum for `NodeInterface` methods.
 ///
-/// Replaces `NodeError` to enable type-safe
+/// Replaces `Box<dyn std::error::Error + Send + Sync>` to enable type-safe
 /// error dispatch in handlers (instead of fragile string matching).
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum NodeError {

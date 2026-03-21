@@ -100,7 +100,9 @@ use crate::node::NodeError;
 pub fn ledger_error_response(e: NodeError) -> Response {
     match e {
         NodeError::NotFound(_) => not_found("failed to retrieve information from the ledger"),
-        _ => internal_error("failed to retrieve information from the ledger"),
+        NodeError::Timeout(_) | NodeError::NotImplemented(_) | NodeError::Internal(_) => {
+            internal_error("failed to retrieve information from the ledger")
+        }
     }
 }
 
