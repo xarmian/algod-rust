@@ -581,7 +581,10 @@ fn verify_payset_commitments(
 /// - `Err(reason)` if the protocol version is empty or unknown (cannot compute commitments).
 /// - `Ok(false)` if any commitment field mismatches.
 /// - `Ok(true)` if all commitment fields match.
-pub fn contents_match_header(block: &Block) -> Result<bool, String> {
+pub fn contents_match_header(
+    block: &Block,
+    raw_payset_blobs: Option<&[Vec<u8>]>,
+) -> Result<bool, String> {
     // Validate protocol version — we need it to determine which commitments apply.
     if block.current_protocol.is_empty() {
         return Err("block protocol version is empty".to_string());
@@ -593,7 +596,11 @@ pub fn contents_match_header(block: &Block) -> Result<bool, String> {
         ));
     }
 
-    let errors = verify_payset_commitments(block, None);
+    // Guard: if the number of raw blobs doesn't match the decoded payset
+    // length, fall back to typed re-encoding (same check as validate_block).
+    let raw_payset_blobs = raw_payset_blobs.filter(|blobs| blobs.len() == block.payset.len());
+
+    let errors = verify_payset_commitments(block, raw_payset_blobs);
     Ok(errors.is_empty())
 }
 
@@ -1055,7 +1062,7 @@ mod tests {
     #[test]
     fn contents_match_header_valid_empty_payset() {
         let block = valid_empty_future_block();
-        let result = contents_match_header(&block);
+        let result = contents_match_header(&block, None);
         assert_eq!(result, Ok(true), "valid empty block should match header");
     }
 
@@ -1064,7 +1071,7 @@ mod tests {
         let mut block = valid_empty_future_block();
         block.payset = vec![]; // still empty
         block.txn_commitment = [0xFF; 32]; // tampered
-        let result = contents_match_header(&block);
+        let result = contents_match_header(&block, None);
         assert_eq!(
             result,
             Ok(false),
@@ -1076,7 +1083,7 @@ mod tests {
     fn contents_match_header_tampered_txn256() {
         let mut block = valid_empty_future_block();
         block.txn256 = [0xFF; 32]; // tampered
-        let result = contents_match_header(&block);
+        let result = contents_match_header(&block, None);
         assert_eq!(result, Ok(false), "tampered txn256 should not match");
     }
 
@@ -1084,7 +1091,7 @@ mod tests {
     fn contents_match_header_tampered_txn512() {
         let mut block = valid_empty_future_block();
         block.txn512 = [0xFF; 64]; // tampered
-        let result = contents_match_header(&block);
+        let result = contents_match_header(&block, None);
         assert_eq!(result, Ok(false), "tampered txn512 should not match");
     }
 
@@ -1106,7 +1113,7 @@ mod tests {
         block.txn256.copy_from_slice(&vc256);
         block.txn512.copy_from_slice(&vc512);
 
-        let result = contents_match_header(&block);
+        let result = contents_match_header(&block, None);
         assert_eq!(
             result,
             Ok(true),
@@ -1134,7 +1141,7 @@ mod tests {
 
         // Tamper the primary commitment.
         block.txn_commitment = [0xFF; 32];
-        let result = contents_match_header(&block);
+        let result = contents_match_header(&block, None);
         assert_eq!(
             result,
             Ok(false),
@@ -1153,7 +1160,7 @@ mod tests {
         // Set disabled fields to non-zero.
         block.txn256 = [0x01; 32];
         block.txn512 = [0x02; 64];
-        let result = contents_match_header(&block);
+        let result = contents_match_header(&block, None);
         assert_eq!(
             result,
             Ok(false),
@@ -1165,7 +1172,7 @@ mod tests {
     fn contents_match_header_empty_protocol_returns_err() {
         let mut block = valid_empty_future_block();
         block.current_protocol = String::new();
-        let result = contents_match_header(&block);
+        let result = contents_match_header(&block, None);
         assert!(result.is_err(), "empty protocol should return Err");
         assert!(result.unwrap_err().contains("empty"));
     }
@@ -1174,7 +1181,7 @@ mod tests {
     fn contents_match_header_unknown_protocol_returns_err() {
         let mut block = valid_empty_future_block();
         block.current_protocol = "v99-nonexistent".into();
-        let result = contents_match_header(&block);
+        let result = contents_match_header(&block, None);
         assert!(result.is_err(), "unknown protocol should return Err");
         assert!(result.unwrap_err().contains("unsupported"));
     }

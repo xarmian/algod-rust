@@ -36,6 +36,10 @@ pub struct FetchedBlockCert {
     pub block: Block,
     /// The agreement certificate, if the transport provided one.
     pub cert: Option<Certificate>,
+    /// Raw msgpack blobs for each SignedTxnInBlock entry, preserved from the
+    /// wire format. When present these are used for payset commitment
+    /// verification instead of re-encoding from typed structs.
+    pub raw_payset_blobs: Option<Vec<Vec<u8>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +357,7 @@ impl CatchupService {
 
             match fetcher.fetch_block(target_round) {
                 Ok(fetched) => {
+                    let raw_payset_blobs = fetched.raw_payset_blobs;
                     let block = fetched.block;
 
                     // Validate round match.
@@ -381,12 +386,6 @@ impl CatchupService {
                     // fetchRound (catchup/service.go). The block hash is
                     // SHA512/256("BH" || canonical_encode(block_header)),
                     // matching Go's `bookkeeping.BlockHash`.
-                    //
-                    // TODO: Go also verifies `block.ContentsMatchHeader()`
-                    // (see catchup/service.go) which checks that the
-                    // payset commitment in the header matches the actual
-                    // transactions. This should be implemented once our
-                    // Block type supports that validation.
                     let block_digest = algo_codec::compute_block_digest(&block);
                     let cert_digest = cert.proposal.block_digest;
                     if block_digest != cert_digest {
@@ -472,7 +471,8 @@ impl CatchupService {
                     // fetchRound (catchup/service.go). The block hash only
                     // authenticates the header; this ensures the transactions
                     // are consistent with it.
-                    match algo_validate::contents_match_header(&block) {
+                    match algo_validate::contents_match_header(&block, raw_payset_blobs.as_deref())
+                    {
                         Ok(true) => { /* commitments match, proceed */ }
                         Ok(false) => {
                             warn!(
@@ -661,7 +661,11 @@ mod tests {
                 Some(b) => {
                     let mut block = b.clone();
                     block.round = round;
-                    Ok(FetchedBlockCert { block, cert: None })
+                    Ok(FetchedBlockCert {
+                        block,
+                        cert: None,
+                        raw_payset_blobs: None,
+                    })
                 }
                 None => Err(FetchError::NoBlockForRound { round }),
             }
@@ -877,6 +881,7 @@ mod tests {
             Ok(FetchedBlockCert {
                 block: self.block.clone(),
                 cert: None,
+                raw_payset_blobs: None,
             })
         }
     }
@@ -1032,6 +1037,7 @@ mod tests {
                 Ok(FetchedBlockCert {
                     block: self.block.clone(),
                     cert: None,
+                    raw_payset_blobs: None,
                 })
             }
         }
@@ -1132,6 +1138,7 @@ mod tests {
             Ok(FetchedBlockCert {
                 block: self.block.clone(),
                 cert: Some(self.fetched_cert.clone()),
+                raw_payset_blobs: None,
             })
         }
     }
