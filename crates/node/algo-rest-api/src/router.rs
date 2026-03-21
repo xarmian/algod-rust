@@ -121,6 +121,15 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             "/v2/stateproofs/:round",
             get(handlers::get_state_proof::<N>),
         )
+        .route("/v2/deltas/:round", get(handlers::get_state_delta::<N>))
+        .route(
+            "/v2/deltas/txn/group/:id",
+            get(handlers::get_txn_group_delta::<N>),
+        )
+        .route(
+            "/v2/deltas/:round/txn/group",
+            get(handlers::get_txn_group_deltas_for_round::<N>),
+        )
         .layer(middleware::from_fn_with_state(
             tokens.api_token.clone(),
             auth::require_token,

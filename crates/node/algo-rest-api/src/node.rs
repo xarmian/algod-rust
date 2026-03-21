@@ -661,4 +661,30 @@ pub trait NodeInterface: Send + Sync + 'static {
     ) -> Result<models::SimulateResponse, NodeError> {
         Err(NodeError::NotImplemented("simulate"))
     }
+
+    // ---- Ledger state delta methods ----
+
+    /// Return the ledger state delta for a given round as opaque bytes.
+    ///
+    /// The returned bytes are the encoded state delta (msgpack or JSON,
+    /// depending on the implementation), suitable for returning directly.
+    ///
+    /// Mirrors go-algorand's `LedgerForAPI().GetStateDeltaForRound(round)`.
+    async fn get_state_delta_for_round(&self, _round: u64) -> Result<Vec<u8>, NodeError> {
+        Err(NodeError::NotImplemented("get_state_delta_for_round"))
+    }
+
+    /// Return the state delta for a specific transaction group by its ID.
+    ///
+    /// Mirrors go-algorand's tracer-based transaction group delta lookup.
+    async fn get_txn_group_delta(&self, _id: &Digest) -> Result<Vec<u8>, NodeError> {
+        Err(NodeError::NotImplemented("get_txn_group_delta"))
+    }
+
+    /// Return all transaction group deltas for a given round.
+    ///
+    /// Mirrors go-algorand's tracer-based round transaction group delta lookup.
+    async fn get_txn_group_deltas_for_round(&self, _round: u64) -> Result<Vec<u8>, NodeError> {
+        Err(NodeError::NotImplemented("get_txn_group_deltas_for_round"))
+    }
 }

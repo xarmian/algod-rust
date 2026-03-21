@@ -27,6 +27,9 @@
 //! - `GET /v2/ledger/supply` -- ledger supply (current round, total money, online money)
 //! - `GET /v2/stateproofs/:round` -- state proof for a given round
 //! - `POST /v2/transactions/simulate` -- simulate transaction groups
+//! - `GET /v2/deltas/:round` -- ledger state delta for a round
+//! - `GET /v2/deltas/txn/group/:id` -- state delta for a transaction group (501)
+//! - `GET /v2/deltas/:round/txn/group` -- transaction group deltas for a round (501)
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -2822,4 +2825,78 @@ pub async fn simulate_transaction<N: NodeInterface>(
         }
         Err(e) => error::internal_error(e.to_string()),
     }
+}
+
+// ===========================================================================
+// Ledger state delta endpoints
+// ===========================================================================
+
+/// Handler for `GET /v2/deltas/{round}`.
+///
+/// Returns the ledger state delta for the given round. The response format
+/// is controlled by the `?format=json|msgpack` query parameter.
+///
+/// Mirrors go-algorand's `GetLedgerStateDelta` handler.
+pub async fn get_state_delta<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(round): Path<u64>,
+    Query(params): Query<format::FormatParams>,
+) -> Response {
+    let resp_format = match format::negotiate_format(&params) {
+        Ok(f) => f,
+        Err(resp) => return *resp,
+    };
+
+    match node.get_state_delta_for_round(round).await {
+        Ok(raw_bytes) => {
+            let content_type = resp_format.content_type();
+            (StatusCode::OK, [("content-type", content_type)], raw_bytes).into_response()
+        }
+        Err(NodeError::NotFound(msg)) => {
+            error::not_found(format!("failed retrieving State Delta: {msg}"))
+        }
+        Err(e) => error::internal_error(format!("failed retrieving State Delta: {e}")),
+    }
+}
+
+/// Handler for `GET /v2/deltas/txn/group/{id}`.
+///
+/// Returns the state delta for a specific transaction group identified by its
+/// group ID. Currently returns 501 Not Implemented since no tracer is
+/// available, matching go-algorand's behavior.
+///
+/// Mirrors go-algorand's `GetLedgerStateDeltaForTransactionGroup` handler.
+pub async fn get_txn_group_delta<N: NodeInterface>(
+    State(_node): State<AppState<N>>,
+    Path(_id): Path<String>,
+    Query(params): Query<format::FormatParams>,
+) -> Response {
+    // Validate format first, matching go-algorand's ordering.
+    if let Err(resp) = format::negotiate_format(&params) {
+        return *resp;
+    }
+
+    // No tracer available — return 501 matching go-algorand.
+    error::not_implemented("failed retrieving the expected tracer from ledger")
+}
+
+/// Handler for `GET /v2/deltas/{round}/txn/group`.
+///
+/// Returns all transaction group deltas for the given round. Currently
+/// returns 501 Not Implemented since no tracer is available, matching
+/// go-algorand's behavior.
+///
+/// Mirrors go-algorand's `GetTransactionGroupLedgerStateDeltasForRound` handler.
+pub async fn get_txn_group_deltas_for_round<N: NodeInterface>(
+    State(_node): State<AppState<N>>,
+    Path(_round): Path<u64>,
+    Query(params): Query<format::FormatParams>,
+) -> Response {
+    // Validate format first, matching go-algorand's ordering.
+    if let Err(resp) = format::negotiate_format(&params) {
+        return *resp;
+    }
+
+    // No tracer available — return 501 matching go-algorand.
+    error::not_implemented("failed retrieving the expected tracer from ledger")
 }

@@ -5238,3 +5238,151 @@ async fn simulate_invalid_format_returns_400() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 }
+
+// ===========================================================================
+// Ledger state delta endpoint tests
+// ===========================================================================
+
+#[tokio::test]
+async fn get_state_delta_requires_auth() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/deltas/1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn get_state_delta_invalid_format_returns_400() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/deltas/1?format=xml"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn get_state_delta_default_not_implemented_returns_500() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/deltas/1"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body["message"].as_str().unwrap();
+    assert!(
+        msg.contains("failed retrieving State Delta"),
+        "unexpected error message: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn get_txn_group_delta_requires_auth() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(
+            server.url("/v2/deltas/txn/group/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn get_txn_group_delta_invalid_format_returns_400() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url(
+            "/v2/deltas/txn/group/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA?format=xml",
+        ))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn get_txn_group_delta_returns_501() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(
+            server.url("/v2/deltas/txn/group/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        )
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 501);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body["message"].as_str().unwrap();
+    assert_eq!(msg, "failed retrieving the expected tracer from ledger");
+}
+
+#[tokio::test]
+async fn get_txn_group_deltas_for_round_requires_auth() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/deltas/1/txn/group"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn get_txn_group_deltas_for_round_invalid_format_returns_400() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/deltas/1/txn/group?format=xml"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn get_txn_group_deltas_for_round_returns_501() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/deltas/1/txn/group"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 501);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body["message"].as_str().unwrap();
+    assert_eq!(msg, "failed retrieving the expected tracer from ledger");
+}
