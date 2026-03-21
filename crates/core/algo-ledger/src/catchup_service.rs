@@ -644,22 +644,18 @@ mod tests {
     struct MockBlockFetcher {
         /// The block to return for any fetch request.
         block: Mutex<Option<Block>>,
-        /// Count of fetch calls.
-        fetch_count: AtomicU64,
     }
 
     impl MockBlockFetcher {
         fn new(block: Option<Block>) -> Self {
             Self {
                 block: Mutex::new(block),
-                fetch_count: AtomicU64::new(0),
             }
         }
     }
 
     impl BlockFetcher for MockBlockFetcher {
         fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
-            self.fetch_count.fetch_add(1, Ordering::SeqCst);
             let guard = self.block.lock().unwrap();
             match guard.as_ref() {
                 Some(b) => {
@@ -787,18 +783,19 @@ mod tests {
         // Send a cert — the fetch will fail but the service should survive.
         tx.send(make_pending_cert(5)).unwrap();
 
-        // Poll until at least one retry has been attempted.
+        // Poll until at least two retries have been attempted, verifying
+        // the service survives failures and keeps retrying.
         let fetcher_poll = Arc::clone(&fetcher);
         poll_until(
-            move || fetcher_poll.total_calls() >= 1,
+            move || fetcher_poll.total_calls() >= 2,
             Duration::from_millis(50),
             Duration::from_secs(5),
-            "fetcher should have been called at least once",
+            "fetcher should have been called at least twice (retry after failure)",
         );
 
         assert!(
-            fetcher.total_calls() >= 1,
-            "expected at least one fetch attempt, got {}",
+            fetcher.total_calls() >= 2,
+            "expected at least two fetch attempts (verifying retry), got {}",
             fetcher.total_calls()
         );
 
