@@ -24,6 +24,8 @@
 //! - `GET /v2/blocks/:round/transactions/:txid/proof` -- Merkle proof for a transaction
 //! - `GET /v2/blocks/:round/logs` -- app call logs from a block
 //! - `GET /v2/blocks/:round/lightheader/proof` -- light block header proof for state proofs
+//! - `GET /v2/ledger/supply` -- ledger supply (current round, total money, online money)
+//! - `GET /v2/stateproofs/:round` -- state proof for a given round
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -2131,8 +2133,10 @@ pub async fn get_supply<N: NodeInterface>(State(node): State<AppState<N>>) -> Re
         total_money: supply.total_money,
     };
 
-    let json = serde_json::to_string(&resp).unwrap_or_default();
-    (StatusCode::OK, [("content-type", "application/json")], json).into_response()
+    match serde_json::to_vec(&resp) {
+        Ok(body) => (StatusCode::OK, [("content-type", "application/json")], body).into_response(),
+        Err(_) => error::internal_error("failed to encode response"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2156,8 +2160,15 @@ pub async fn get_state_proof<N: NodeInterface>(
         return error::internal_error("given round is greater than the latest round");
     }
 
-    match node.get_state_proof_for_round(round).await {
-        Ok(data) => {
+    // Apply a 1-minute timeout matching go-algorand's context.WithTimeout.
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        node.get_state_proof_for_round(round),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(data)) => {
             let resp = models::StateProofResponse {
                 state_proof: data.state_proof,
                 message: models::StateProofMessage {
@@ -2169,10 +2180,14 @@ pub async fn get_state_proof<N: NodeInterface>(
                 },
             };
 
-            let json = serde_json::to_string(&resp).unwrap_or_default();
-            (StatusCode::OK, [("content-type", "application/json")], json).into_response()
+            match serde_json::to_vec(&resp) {
+                Ok(body) => {
+                    (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+                }
+                Err(_) => error::internal_error("failed to encode response"),
+            }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let msg = e.to_string();
             if msg.contains("no state proof") {
                 error::not_found(msg)
@@ -2182,6 +2197,7 @@ pub async fn get_state_proof<N: NodeInterface>(
                 error::internal_error(msg)
             }
         }
+        Err(_elapsed) => error::timeout("operation timed out"),
     }
 }
 

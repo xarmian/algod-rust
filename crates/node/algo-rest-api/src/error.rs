@@ -121,6 +121,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeout_returns_408() {
+        let resp = timeout("operation timed out");
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
     async fn error_response_omits_null_data() {
         let body = ErrorResponse::new("test");
         let json = serde_json::to_string(&body).unwrap();
