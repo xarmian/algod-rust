@@ -596,6 +596,10 @@ pub fn contents_match_header(
         ));
     }
 
+    // Guard: if the number of raw blobs doesn't match the decoded payset
+    // length, fall back to typed re-encoding (same check as validate_block).
+    let raw_payset_blobs = raw_payset_blobs.filter(|blobs| blobs.len() == block.payset.len());
+
     let errors = verify_payset_commitments(block, raw_payset_blobs);
     Ok(errors.is_empty())
 }

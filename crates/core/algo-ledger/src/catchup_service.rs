@@ -386,12 +386,6 @@ impl CatchupService {
                     // fetchRound (catchup/service.go). The block hash is
                     // SHA512/256("BH" || canonical_encode(block_header)),
                     // matching Go's `bookkeeping.BlockHash`.
-                    //
-                    // TODO: Go also verifies `block.ContentsMatchHeader()`
-                    // (see catchup/service.go) which checks that the
-                    // payset commitment in the header matches the actual
-                    // transactions. This should be implemented once our
-                    // Block type supports that validation.
                     let block_digest = algo_codec::compute_block_digest(&block);
                     let cert_digest = cert.proposal.block_digest;
                     if block_digest != cert_digest {
