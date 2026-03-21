@@ -325,6 +325,18 @@ pub trait NodeInterface: Send + Sync + 'static {
         Err("lookup_account not implemented".into())
     }
 
+    /// Lightweight account lookup that skips resource maps (assets, apps, etc.).
+    ///
+    /// Used when `exclude=all` is passed to the account information endpoint,
+    /// allowing implementations to avoid loading potentially large resource
+    /// collections from the ledger.
+    async fn lookup_account_basic(
+        &self,
+        _addr: &Address,
+    ) -> Result<AccountLookup, Box<dyn std::error::Error + Send + Sync>> {
+        Err("lookup_account_basic not implemented".into())
+    }
+
     /// Look up a single asset resource (holding + params) for an address.
     ///
     /// Returns the asset holding (if opted in) and asset params (if the

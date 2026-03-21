@@ -630,10 +630,22 @@ pub async fn account_information<N: NodeInterface>(
         _ => return error::bad_request("failed to parse exclude"),
     }
 
-    // Look up account (single call, reused for resource count check and response)
-    let lookup = match node.lookup_account(&addr).await {
-        Ok(l) => l,
-        Err(_) => return error::internal_error("failed to retrieve information from the ledger"),
+    // Look up account — use the lightweight basic lookup when exclude=all to
+    // avoid loading resource maps from the ledger.
+    let lookup = if exclude == "all" {
+        match node.lookup_account_basic(&addr).await {
+            Ok(l) => l,
+            Err(_) => {
+                return error::internal_error("failed to retrieve information from the ledger")
+            }
+        }
+    } else {
+        match node.lookup_account(&addr).await {
+            Ok(l) => l,
+            Err(_) => {
+                return error::internal_error("failed to retrieve information from the ledger")
+            }
+        }
     };
 
     // Check resource count vs max limit (when not excluding and max is set)

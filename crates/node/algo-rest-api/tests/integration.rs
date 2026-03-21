@@ -465,6 +465,32 @@ impl NodeInterface for MockNode {
         }
     }
 
+    async fn lookup_account_basic(
+        &self,
+        _addr: &Address,
+    ) -> Result<AccountLookup, Box<dyn std::error::Error + Send + Sync>> {
+        match &self.account_lookup {
+            Some(lookup) => Ok(AccountLookup {
+                account_data: lookup.account_data.clone(),
+                last_round: lookup.last_round,
+                amount_without_pending_rewards: lookup.amount_without_pending_rewards,
+                assets: BTreeMap::new(),
+                created_assets: BTreeMap::new(),
+                app_local_states: BTreeMap::new(),
+                created_apps: BTreeMap::new(),
+            }),
+            None => Ok(AccountLookup {
+                account_data: AccountData::default(),
+                last_round: 1000,
+                amount_without_pending_rewards: 0,
+                assets: BTreeMap::new(),
+                created_assets: BTreeMap::new(),
+                app_local_states: BTreeMap::new(),
+                created_apps: BTreeMap::new(),
+            }),
+        }
+    }
+
     async fn lookup_asset_resource(
         &self,
         addr: &Address,
