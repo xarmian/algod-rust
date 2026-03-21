@@ -2848,9 +2848,12 @@ pub async fn get_state_delta<N: NodeInterface>(
     };
 
     match node.get_state_delta_for_round(round).await {
-        Ok(raw_bytes) => {
-            let content_type = resp_format.content_type();
-            (StatusCode::OK, [("content-type", content_type)], raw_bytes).into_response()
+        Ok(mut delta) => {
+            // go-algorand nils Txleases in JSON responses.
+            if resp_format == format::ResponseFormat::Json {
+                delta.txleases = None;
+            }
+            format::encode_response(&delta, resp_format)
         }
         Err(NodeError::NotFound(msg)) => {
             error::not_found(format!("failed retrieving State Delta: {msg}"))

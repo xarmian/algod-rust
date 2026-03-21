@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 
+use algo_ledger::StateDelta;
 use algo_types::{
     AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParams, Block, BlockHeader,
     ConsensusParams, Digest, SignedTransaction,
@@ -664,13 +665,13 @@ pub trait NodeInterface: Send + Sync + 'static {
 
     // ---- Ledger state delta methods ----
 
-    /// Return the ledger state delta for a given round as opaque bytes.
+    /// Return the ledger state delta for a given round.
     ///
-    /// The returned bytes are the encoded state delta (msgpack or JSON,
-    /// depending on the implementation), suitable for returning directly.
+    /// Returns a typed `StateDelta` that the handler encodes in the
+    /// negotiated format (JSON or msgpack).
     ///
     /// Mirrors go-algorand's `LedgerForAPI().GetStateDeltaForRound(round)`.
-    async fn get_state_delta_for_round(&self, _round: u64) -> Result<Vec<u8>, NodeError> {
+    async fn get_state_delta_for_round(&self, _round: u64) -> Result<StateDelta, NodeError> {
         Err(NodeError::NotImplemented("get_state_delta_for_round"))
     }
 

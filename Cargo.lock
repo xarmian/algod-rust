@@ -266,6 +266,7 @@ dependencies = [
  "algo-codec",
  "algo-consensus-crypto",
  "algo-error",
+ "algo-ledger",
  "algo-types",
  "async-trait",
  "axum",
