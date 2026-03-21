@@ -648,6 +648,14 @@ pub trait NodeInterface: Send + Sync + 'static {
         16 // Default from go-algorand consensus
     }
 
+    /// Whether the Developer API is enabled in the node configuration.
+    ///
+    /// When false, `/v2/teal/compile` and `/v2/teal/disassemble` return 404.
+    /// Mirrors go-algorand's `Config().EnableDeveloperAPI`.
+    fn enable_developer_api(&self) -> bool {
+        false
+    }
+
     // ---- Simulation methods ----
 
     /// Simulate a transaction group without submitting it.

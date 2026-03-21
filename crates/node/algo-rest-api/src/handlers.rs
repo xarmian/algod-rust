@@ -2903,3 +2903,147 @@ pub async fn get_txn_group_deltas_for_round<N: NodeInterface>(
     // No tracer available — return 501 matching go-algorand.
     error::not_implemented("failed retrieving the expected tracer from ledger")
 }
+
+// ---------------------------------------------------------------------------
+// POST /v2/teal/compile
+// ---------------------------------------------------------------------------
+
+/// Maximum size of TEAL source accepted by compile/disassemble endpoints.
+///
+/// Matches go-algorand's `MaxTealSourceBytes = 512 * 1024`.
+const MAX_TEAL_SOURCE_BYTES: usize = 512 * 1024;
+
+/// Query parameters for the TEAL compile endpoint.
+#[derive(Debug, Deserialize)]
+pub struct TealCompileParams {
+    /// When true, include a source map in the response.
+    #[serde(default)]
+    pub sourcemap: Option<bool>,
+}
+
+/// Compile TEAL source to AVM bytecode.
+///
+/// Accepts TEAL source text in the request body and returns the compiled
+/// program as base64 along with the program hash as an Algorand address.
+///
+/// Matches go-algorand's `Handlers.TealCompile`.
+pub async fn teal_compile<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Query(params): Query<TealCompileParams>,
+    body: axum::body::Bytes,
+) -> Response {
+    // Check if developer API is enabled
+    if !node.enable_developer_api() {
+        return (
+            StatusCode::NOT_FOUND,
+            "/teal/compile was not enabled in the configuration file by setting the EnableDeveloperAPI to true",
+        )
+            .into_response();
+    }
+
+    // Enforce body size limit
+    if body.len() > MAX_TEAL_SOURCE_BYTES {
+        return error::bad_request("request body too large");
+    }
+
+    // Parse body as UTF-8 source text
+    let source = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(e) => return error::bad_request(e.to_string()),
+    };
+
+    // Assemble the TEAL source
+    let ops = match algo_avm::assembler::assemble_string(source) {
+        Ok(ops) => ops,
+        Err(errors) => {
+            let mut sb = String::new();
+            for err in &errors {
+                if !sb.is_empty() {
+                    sb.push('\n');
+                }
+                sb.push_str(&err.to_string());
+            }
+            return error::bad_request(sb);
+        }
+    };
+
+    // Hash the program: SHA512/256("Program" || program_bytes)
+    use sha2::{Digest as _, Sha512_256};
+    let mut hasher = Sha512_256::new();
+    hasher.update(b"Program");
+    hasher.update(&ops.program);
+    let program_hash: [u8; 32] = hasher.finalize().into();
+
+    // Convert hash to Algorand address string
+    let addr = algo_types::Address(program_hash);
+    let hash_str = addr.to_algorand_string();
+
+    // Base64-encode the compiled program
+    let result = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ops.program);
+
+    // Build source map if requested
+    let sourcemap = if params.sourcemap.unwrap_or(false) {
+        let sm =
+            algo_avm::sourcemap::get_source_map(vec!["<body>".to_string()], &ops.offset_to_source);
+        Some(serde_json::to_value(sm).unwrap_or(serde_json::Value::Null))
+    } else {
+        None
+    };
+
+    let response = models::CompileResponse {
+        hash: hash_str,
+        result,
+        sourcemap,
+    };
+
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        serde_json::to_string(&response).unwrap_or_default(),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /v2/teal/disassemble
+// ---------------------------------------------------------------------------
+
+/// Disassemble AVM bytecode to TEAL source.
+///
+/// Accepts raw AVM bytecode in the request body and returns the
+/// disassembled TEAL source text.
+///
+/// Matches go-algorand's `Handlers.TealDisassemble`.
+pub async fn teal_disassemble<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    body: axum::body::Bytes,
+) -> Response {
+    // Check if developer API is enabled
+    if !node.enable_developer_api() {
+        return (
+            StatusCode::NOT_FOUND,
+            "/teal/disassemble was not enabled in the configuration file by setting the EnableDeveloperAPI to true",
+        )
+            .into_response();
+    }
+
+    // Enforce body size limit
+    if body.len() > MAX_TEAL_SOURCE_BYTES {
+        return error::bad_request("request body too large");
+    }
+
+    // Disassemble the program
+    let program = match algo_avm::disassembler::disassemble(&body) {
+        Ok(source) => source,
+        Err(e) => return error::bad_request(e),
+    };
+
+    let response = models::DisassembleResponse { result: program };
+
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        serde_json::to_string(&response).unwrap_or_default(),
+    )
+        .into_response()
+}

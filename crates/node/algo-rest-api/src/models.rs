@@ -1839,3 +1839,32 @@ pub struct SimulateResponse {
 
     pub version: u64,
 }
+
+// ---------------------------------------------------------------------------
+// CompileResponse / DisassembleResponse
+// ---------------------------------------------------------------------------
+
+/// Response from `POST /v2/teal/compile`.
+///
+/// Matches go-algorand's `model.CompileResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompileResponse {
+    /// Hash of the compiled program, as an Algorand address string.
+    pub hash: String,
+
+    /// Base64-encoded compiled program bytes.
+    pub result: String,
+
+    /// Source map (only present when `sourcemap=true` query param is set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sourcemap: Option<serde_json::Value>,
+}
+
+/// Response from `POST /v2/teal/disassemble`.
+///
+/// Matches go-algorand's `model.DisassembleResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisassembleResponse {
+    /// The disassembled TEAL source text.
+    pub result: String,
+}
