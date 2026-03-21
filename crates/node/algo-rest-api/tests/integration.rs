@@ -11,7 +11,8 @@ use std::sync::Arc;
 use algo_rest_api::auth::generate_token;
 use algo_rest_api::node::{
     AccountLookup, AppResourceLookup, ApplicationLookup, AssetLookup, AssetResourceLookup,
-    BuildVersion, NodeInterface, NodeStatus, ProtocolSwitchInfo, TxnWithStatus,
+    BuildVersion, NodeInterface, NodeStatus, ProtocolSwitchInfo, StateProofData, SupplyInfo,
+    TxnWithStatus,
 };
 use algo_rest_api::router::{build_router, TokenConfig};
 use algo_types::{
@@ -96,6 +97,10 @@ struct MockNode {
     block_raw_msgpack: BTreeMap<u64, Vec<u8>>,
     /// State proof transaction results, keyed by round. Returns (first_attested, last_attested).
     state_proof_txns: BTreeMap<u64, (u64, u64)>,
+    /// Supply info to return from get_supply().
+    supply_info: Option<SupplyInfo>,
+    /// State proof data results, keyed by round.
+    state_proof_data: BTreeMap<u64, StateProofData>,
     /// Pending transactions in the pool (for get_pending_txns_from_pool).
     pending_txns: Vec<SignedTransaction>,
     /// Pending transaction lookup (for get_pending_transaction), keyed by txid bytes.
@@ -136,6 +141,8 @@ impl Clone for MockNode {
             block_hashes: self.block_hashes.clone(),
             block_raw_msgpack: self.block_raw_msgpack.clone(),
             state_proof_txns: self.state_proof_txns.clone(),
+            supply_info: self.supply_info.clone(),
+            state_proof_data: self.state_proof_data.clone(),
             pending_txns: self.pending_txns.clone(),
             pending_txn_lookup: self.pending_txn_lookup.clone(),
             broadcast_result: self.broadcast_result.clone(),
@@ -221,6 +228,8 @@ impl MockNode {
             block_hashes: BTreeMap::new(),
             block_raw_msgpack: BTreeMap::new(),
             state_proof_txns: BTreeMap::new(),
+            supply_info: None,
+            state_proof_data: BTreeMap::new(),
             pending_txns: Vec::new(),
             pending_txn_lookup: BTreeMap::new(),
             broadcast_result: None,
@@ -652,6 +661,23 @@ impl NodeInterface for MockNode {
     ) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
         match self.state_proof_txns.get(&round) {
             Some(result) => Ok(*result),
+            None => Err("no state proof found for round".into()),
+        }
+    }
+
+    async fn get_supply(&self) -> Result<SupplyInfo, Box<dyn std::error::Error + Send + Sync>> {
+        match &self.supply_info {
+            Some(info) => Ok(info.clone()),
+            None => Err("get_supply not implemented".into()),
+        }
+    }
+
+    async fn get_state_proof_for_round(
+        &self,
+        round: u64,
+    ) -> Result<StateProofData, Box<dyn std::error::Error + Send + Sync>> {
+        match self.state_proof_data.get(&round) {
+            Some(data) => Ok(data.clone()),
             None => Err("no state proof found for round".into()),
         }
     }
@@ -4013,6 +4039,179 @@ async fn block_header_only_msgpack_uses_protocol_codec_tags() {
         !block_keys.contains(&"genesis-id".to_string()),
         "block header should NOT have serde 'genesis-id' field"
     );
+}
+
+// ===========================================================================
+// Supply endpoint tests
+// ===========================================================================
+
+#[tokio::test]
+async fn supply_success() {
+    let mut node = MockNode::synced();
+    node.supply_info = Some(SupplyInfo {
+        round: 42,
+        total_money: 10_000_000_000,
+        online_money: 5_000_000_000,
+    });
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/ledger/supply"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["current_round"], 42);
+    assert_eq!(body["online-money"], 5_000_000_000u64);
+    assert_eq!(body["total-money"], 10_000_000_000u64);
+}
+
+#[tokio::test]
+async fn supply_error() {
+    // supply_info is None so get_supply() will return an error
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/ledger/supply"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+}
+
+#[tokio::test]
+async fn supply_requires_auth() {
+    let mut node = MockNode::synced();
+    node.supply_info = Some(SupplyInfo {
+        round: 1,
+        total_money: 100,
+        online_money: 50,
+    });
+    let server = TestServer::start(node).await;
+
+    // No auth header
+    let resp = server
+        .client
+        .get(server.url("/v2/ledger/supply"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+// ===========================================================================
+// State proof endpoint tests
+// ===========================================================================
+
+#[tokio::test]
+async fn state_proof_success() {
+    let mut node = MockNode::synced();
+    node.state_proof_data.insert(
+        100,
+        StateProofData {
+            state_proof: vec![1, 2, 3, 4],
+            block_headers_commitment: vec![0xAA, 0xBB],
+            voters_commitment: vec![0xCC, 0xDD],
+            ln_proven_weight: 12345,
+            first_attested_round: 90,
+            last_attested_round: 110,
+        },
+    );
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/stateproofs/100"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // PascalCase keys
+    assert!(body.get("Message").is_some());
+    assert!(body.get("StateProof").is_some());
+
+    let msg = &body["Message"];
+    assert_eq!(msg["FirstAttestedRound"], 90);
+    assert_eq!(msg["LastAttestedRound"], 110);
+    assert_eq!(msg["LnProvenWeight"], 12345);
+
+    // StateProof and byte fields should be base64 strings
+    assert!(body["StateProof"].is_string());
+    assert!(msg["BlockHeadersCommitment"].is_string());
+    assert!(msg["VotersCommitment"].is_string());
+
+    // Verify base64 content
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let sp_bytes = STANDARD
+        .decode(body["StateProof"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(sp_bytes, vec![1, 2, 3, 4]);
+}
+
+#[tokio::test]
+async fn state_proof_round_too_high() {
+    // MockNode last_round = 1000, request round 2000
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/stateproofs/2000"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("given round is greater than the latest round"),);
+}
+
+#[tokio::test]
+async fn state_proof_not_found() {
+    // Round 100 is within range but no state proof data configured
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/stateproofs/100"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["message"].as_str().unwrap().contains("no state proof"));
+}
+
+#[tokio::test]
+async fn state_proof_requires_auth() {
+    let node = MockNode::synced();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/stateproofs/100"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
 }
 
 // ===========================================================================

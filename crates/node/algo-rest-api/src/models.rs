@@ -1185,6 +1185,62 @@ mod base64_bytes_array {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Supply response
+// ---------------------------------------------------------------------------
+
+/// Response for `GET /v2/ledger/supply`.
+///
+/// Matches go-algorand's `model.SupplyResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupplyResponse {
+    /// The round at which the supply was computed.
+    pub current_round: u64,
+    /// Total money of online accounts, in microAlgos.
+    #[serde(rename = "online-money")]
+    pub online_money: u64,
+    /// Total money of participating accounts, in microAlgos.
+    #[serde(rename = "total-money")]
+    pub total_money: u64,
+}
+
+// ---------------------------------------------------------------------------
+// State proof response
+// ---------------------------------------------------------------------------
+
+/// Response for `GET /v2/stateproofs/:round`.
+///
+/// Matches go-algorand's `model.StateProofResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct StateProofResponse {
+    /// The state proof message.
+    pub message: StateProofMessage,
+    /// The msgpack-encoded state proof, base64-encoded in JSON.
+    #[serde(with = "base64_bytes")]
+    pub state_proof: Vec<u8>,
+}
+
+/// State proof message fields.
+///
+/// Matches go-algorand's `model.StateProofMessage`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct StateProofMessage {
+    /// Block headers commitment, base64-encoded in JSON.
+    #[serde(with = "base64_bytes")]
+    pub block_headers_commitment: Vec<u8>,
+    /// First attested round.
+    pub first_attested_round: u64,
+    /// Last attested round.
+    pub last_attested_round: u64,
+    /// Natural log of proven weight.
+    pub ln_proven_weight: u64,
+    /// Voters commitment, base64-encoded in JSON.
+    #[serde(with = "base64_bytes")]
+    pub voters_commitment: Vec<u8>,
+}
+
 /// Serde helper for serializing/deserializing `Option<Vec<u8>>` as standard
 /// base64 (skipped when `None`).
 mod optional_base64_bytes {

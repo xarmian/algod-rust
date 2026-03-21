@@ -69,6 +69,11 @@ pub fn internal_error(msg: impl Into<String>) -> Response {
     error_response(StatusCode::INTERNAL_SERVER_ERROR, msg)
 }
 
+/// Return a 408 Request Timeout JSON error response.
+pub fn timeout(msg: impl Into<String>) -> Response {
+    error_response(StatusCode::REQUEST_TIMEOUT, msg)
+}
+
 /// Return a 503 Service Unavailable JSON error response.
 pub fn service_unavailable(msg: impl Into<String>) -> Response {
     error_response(StatusCode::SERVICE_UNAVAILABLE, msg)
@@ -113,6 +118,12 @@ mod tests {
     async fn service_unavailable_returns_503() {
         let resp = service_unavailable("node is catching up");
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_408() {
+        let resp = timeout("operation timed out");
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
     }
 
     #[tokio::test]
