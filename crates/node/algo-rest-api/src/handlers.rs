@@ -2112,6 +2112,79 @@ fn rmpv_as_u64(val: &rmpv::Value) -> Option<u64> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GET /v2/ledger/supply
+// ---------------------------------------------------------------------------
+
+/// Supply endpoint. Returns the current round, total money, and online money.
+///
+/// Mirrors go-algorand's `GetSupply` handler.
+pub async fn get_supply<N: NodeInterface>(State(node): State<AppState<N>>) -> Response {
+    let supply = match node.get_supply().await {
+        Ok(s) => s,
+        Err(_e) => return error::internal_error("internal failure"),
+    };
+
+    let resp = models::SupplyResponse {
+        current_round: supply.round,
+        online_money: supply.online_money,
+        total_money: supply.total_money,
+    };
+
+    let json = serde_json::to_string(&resp).unwrap_or_default();
+    (StatusCode::OK, [("content-type", "application/json")], json).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/stateproofs/:round
+// ---------------------------------------------------------------------------
+
+/// State proof endpoint. Returns the state proof for a given round.
+///
+/// Mirrors go-algorand's `GetStateProof` handler.
+pub async fn get_state_proof<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(round): Path<u64>,
+) -> Response {
+    // Check that the requested round is not greater than the latest round
+    let status = match node.status().await {
+        Ok(s) => s,
+        Err(e) => return error::internal_error(e.to_string()),
+    };
+
+    if round > status.last_round {
+        return error::internal_error("given round is greater than the latest round");
+    }
+
+    match node.get_state_proof_for_round(round).await {
+        Ok(data) => {
+            let resp = models::StateProofResponse {
+                state_proof: data.state_proof,
+                message: models::StateProofMessage {
+                    block_headers_commitment: data.block_headers_commitment,
+                    voters_commitment: data.voters_commitment,
+                    ln_proven_weight: data.ln_proven_weight,
+                    first_attested_round: data.first_attested_round,
+                    last_attested_round: data.last_attested_round,
+                },
+            };
+
+            let json = serde_json::to_string(&resp).unwrap_or_default();
+            (StatusCode::OK, [("content-type", "application/json")], json).into_response()
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("no state proof") {
+                error::not_found(msg)
+            } else if msg.contains("timeout") || msg.contains("timed out") {
+                error::timeout(msg)
+            } else {
+                error::internal_error(msg)
+            }
+        }
+    }
+}
+
 /// Compute the effective max keys for the application boxes endpoint,
 /// matching go-algorand's `applicationBoxesMaxKeys` function.
 fn application_boxes_max_keys(requested_max: u64, algod_max: u64) -> u64 {

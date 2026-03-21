@@ -99,6 +99,11 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             "/v2/blocks/:round/lightheader/proof",
             get(handlers::get_light_block_header_proof::<N>),
         )
+        .route("/v2/ledger/supply", get(handlers::get_supply::<N>))
+        .route(
+            "/v2/stateproofs/:round",
+            get(handlers::get_state_proof::<N>),
+        )
         .layer(middleware::from_fn_with_state(
             tokens.api_token.clone(),
             auth::require_token,

@@ -232,6 +232,38 @@ pub struct AssetLookup {
     pub last_round: u64,
 }
 
+/// Supply information returned by the ledger.
+///
+/// Mirrors go-algorand's `ledger.LatestTotals()` output.
+#[derive(Debug, Clone)]
+pub struct SupplyInfo {
+    /// The round at which the totals were computed.
+    pub round: u64,
+    /// Total money of participating accounts, in microAlgos.
+    pub total_money: u64,
+    /// Total money of online accounts, in microAlgos.
+    pub online_money: u64,
+}
+
+/// State proof data returned by the node.
+///
+/// Mirrors the fields used to build go-algorand's `model.StateProofResponse`.
+#[derive(Debug, Clone)]
+pub struct StateProofData {
+    /// The msgpack-encoded state proof bytes.
+    pub state_proof: Vec<u8>,
+    /// Block headers commitment from the state proof message.
+    pub block_headers_commitment: Vec<u8>,
+    /// Voters commitment from the state proof message.
+    pub voters_commitment: Vec<u8>,
+    /// Natural log of proven weight.
+    pub ln_proven_weight: u64,
+    /// First attested round in the state proof message.
+    pub first_attested_round: u64,
+    /// Last attested round in the state proof message.
+    pub last_attested_round: u64,
+}
+
 /// Trait abstracting the node state needed by REST API handlers.
 ///
 /// Implementations provide access to genesis information, node status,
@@ -500,6 +532,24 @@ pub trait NodeInterface: Send + Sync + 'static {
         _round: u64,
     ) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
         Err("get_state_proof_transaction_for_round not implemented".into())
+    }
+
+    /// Return supply information (round, total money, online money).
+    ///
+    /// Mirrors go-algorand's `ledger.LatestTotals()`.
+    async fn get_supply(&self) -> Result<SupplyInfo, Box<dyn std::error::Error + Send + Sync>> {
+        Err("get_supply not implemented".into())
+    }
+
+    /// Return full state proof data for a given round.
+    ///
+    /// Mirrors go-algorand's `GetStateProof` handler which finds the state
+    /// proof transaction covering the round and extracts all message fields.
+    async fn get_state_proof_for_round(
+        &self,
+        _round: u64,
+    ) -> Result<StateProofData, Box<dyn std::error::Error + Send + Sync>> {
+        Err("get_state_proof_for_round not implemented".into())
     }
 
     /// Return raw block+cert bytes for a given round (msgpack pass-through).
