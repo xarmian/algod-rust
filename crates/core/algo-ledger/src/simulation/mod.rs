@@ -275,7 +275,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             let mut txn_result = TxnResult::default();
 
             // Create a per-transaction tracer if tracing is enabled.
-            // TODO(#121): Wire tracer into apply_transaction → AVM execution.
+            // TODO(#187): Wire tracer into apply_transaction → AVM execution.
             // Currently the tracer captures no events because apply_transaction
             // does not accept a tracer parameter. Threading EvalTracer through
             // the apply pipeline requires changes to apply_transaction, LedgerAvmContext,
