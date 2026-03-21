@@ -550,10 +550,9 @@ impl OpStream {
         let mut out = pre;
         out.extend_from_slice(&self.pending);
 
-        // Fixup offset-to-source mapping
-        if pbl > 1 {
-            // pbl includes the version byte; the pending bytes start at offset pbl
-            // but the Go code shifts by pbl (which includes the version byte).
+        // Fixup offset-to-source mapping: shift all offsets by pbl (which
+        // includes the version byte). Matches go-algorand's unconditional shift.
+        {
             let shift = pbl;
             let mut new_map = HashMap::new();
             for (&pos, &loc) in &self.offset_to_source {
@@ -922,7 +921,8 @@ fn asm_bytec_block(ops: &mut OpStream, args: &[&str]) {
             }
             Err(e) => {
                 ops.record_error(ops.source_line, 0, format!("bytecblock {e}"));
-                break;
+                // Skip this arg and continue to accumulate further errors
+                remaining = &remaining[1..];
             }
         }
     }
@@ -1423,35 +1423,36 @@ fn parse_string_literal(input: &str) -> Result<Vec<u8>, String> {
         return Err("no quotes".into());
     }
     let inner = &input[1..input.len() - 1];
+    let bytes = inner.as_bytes();
     let mut result = Vec::new();
-    let chars: Vec<char> = inner.chars().collect();
     let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '\\' {
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
             i += 1;
-            if i >= chars.len() {
+            if i >= bytes.len() {
                 return Err("non-terminated escape sequence".into());
             }
-            match chars[i] {
-                'n' => result.push(b'\n'),
-                'r' => result.push(b'\r'),
-                't' => result.push(b'\t'),
-                '\\' => result.push(b'\\'),
-                '"' => result.push(b'"'),
-                'x' => {
+            match bytes[i] {
+                b'n' => result.push(b'\n'),
+                b'r' => result.push(b'\r'),
+                b't' => result.push(b'\t'),
+                b'\\' => result.push(b'\\'),
+                b'"' => result.push(b'"'),
+                b'x' => {
                     i += 1;
-                    if i + 1 >= chars.len() {
+                    if i + 1 >= bytes.len() {
                         return Err("non-terminated hex sequence".into());
                     }
-                    let hex_str: String = chars[i..i + 2].iter().collect();
-                    let byte = u8::from_str_radix(&hex_str, 16).map_err(|e| e.to_string())?;
+                    let hex_str =
+                        std::str::from_utf8(&bytes[i..i + 2]).map_err(|e| e.to_string())?;
+                    let byte = u8::from_str_radix(hex_str, 16).map_err(|e| e.to_string())?;
                     result.push(byte);
                     i += 1; // will be incremented again below
                 }
-                c => return Err(format!("invalid escape sequence \\{c}")),
+                c => return Err(format!("invalid escape sequence \\{}", c as char)),
             }
         } else {
-            result.push(chars[i] as u8);
+            result.push(bytes[i]);
         }
         i += 1;
     }
