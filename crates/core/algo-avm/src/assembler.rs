@@ -295,7 +295,7 @@ impl OpStream {
             }
 
             let jump = dest as isize - lr.offset_position as isize;
-            if jump > 0x7fff {
+            if !(-0x8000..=0x7fff).contains(&jump) {
                 self.errors.push(AssemblyError {
                     line: lr.line,
                     col: 0,
@@ -889,7 +889,7 @@ fn asm_intc_block(ops: &mut OpStream, args: &[&str]) {
     let mut vals = Vec::new();
     write_varuint_to_vec(&mut ops.pending, args.len() as u64);
     for arg in args {
-        match arg.parse::<u64>() {
+        match parse_u64(arg) {
             Ok(v) => {
                 write_varuint_to_vec(&mut ops.pending, v);
                 vals.push(v);

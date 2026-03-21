@@ -73,12 +73,10 @@ pub fn int_to_vlq(v: i32) -> String {
 }
 
 fn int_to_vlq_buf(v: i32, buf: &mut Vec<u8>) {
-    let mut val = v << 1;
-    if val < 0 {
-        val = -val;
-        val |= 1;
-    }
-    let mut uval = val as u32;
+    // Use unsigned arithmetic to avoid overflow on i32::MIN.
+    // Signed-magnitude: LSB is sign bit, remaining bits are magnitude.
+    let sign_bit = if v < 0 { 1u32 } else { 0u32 };
+    let mut uval = (v.unsigned_abs() << 1) | sign_bit;
     loop {
         if uval >= 32 {
             buf.push(B64_TABLE[(32 | (uval & 31)) as usize]);

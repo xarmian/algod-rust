@@ -2908,10 +2908,10 @@ pub async fn get_txn_group_deltas_for_round<N: NodeInterface>(
 // POST /v2/teal/compile
 // ---------------------------------------------------------------------------
 
-/// Maximum size of TEAL source accepted by compile/disassemble endpoints.
+/// Maximum body size accepted by TEAL compile/disassemble endpoints.
 ///
 /// Matches go-algorand's `MaxTealSourceBytes = 512 * 1024`.
-const MAX_TEAL_SOURCE_BYTES: usize = 512 * 1024;
+const MAX_TEAL_BODY_BYTES: usize = 512 * 1024;
 
 /// Query parameters for the TEAL compile endpoint.
 #[derive(Debug, Deserialize)]
@@ -2942,7 +2942,7 @@ pub async fn teal_compile<N: NodeInterface>(
     }
 
     // Enforce body size limit
-    if body.len() > MAX_TEAL_SOURCE_BYTES {
+    if body.len() > MAX_TEAL_BODY_BYTES {
         return error::bad_request("request body too large");
     }
 
@@ -2996,12 +2996,15 @@ pub async fn teal_compile<N: NodeInterface>(
         sourcemap,
     };
 
-    (
-        StatusCode::OK,
-        [("content-type", "application/json")],
-        serde_json::to_string(&response).unwrap_or_default(),
-    )
-        .into_response()
+    match serde_json::to_vec(&response) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => error::internal_error(format!("failed to encode response: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3028,7 +3031,7 @@ pub async fn teal_disassemble<N: NodeInterface>(
     }
 
     // Enforce body size limit
-    if body.len() > MAX_TEAL_SOURCE_BYTES {
+    if body.len() > MAX_TEAL_BODY_BYTES {
         return error::bad_request("request body too large");
     }
 
@@ -3040,10 +3043,13 @@ pub async fn teal_disassemble<N: NodeInterface>(
 
     let response = models::DisassembleResponse { result: program };
 
-    (
-        StatusCode::OK,
-        [("content-type", "application/json")],
-        serde_json::to_string(&response).unwrap_or_default(),
-    )
-        .into_response()
+    match serde_json::to_vec(&response) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => error::internal_error(format!("failed to encode response: {e}")),
+    }
 }
