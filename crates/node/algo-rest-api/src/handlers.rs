@@ -2223,16 +2223,8 @@ pub async fn pending_transaction_information<N: NodeInterface>(
         return error::service_unavailable("operation not available during catchup");
     }
 
-    // Parse format
-    let fmt_params = FormatParams {
-        format: params.format,
-    };
-    let resp_format = match format::negotiate_format(&fmt_params) {
-        Ok(f) => f,
-        Err(resp) => return *resp,
-    };
-
-    // Parse txid — go-algorand expects base32 (no padding) encoded 32 bytes
+    // Parse txid — go-algorand expects base32 (no padding) encoded 32 bytes.
+    // Parsed before format negotiation to match go-algorand's error precedence.
     let txid_bytes = match data_encoding::BASE32_NOPAD.decode(txid.as_bytes()) {
         Ok(b) if b.len() == 32 => {
             let mut arr = [0u8; 32];
@@ -2251,6 +2243,15 @@ pub async fn pending_transaction_information<N: NodeInterface>(
             );
         }
         Err(_) => return error::internal_error("failed to retrieve pending transaction"),
+    };
+
+    // Negotiate format (after lookup, matching go-algorand's ordering)
+    let fmt_params = FormatParams {
+        format: params.format,
+    };
+    let resp_format = match format::negotiate_format(&fmt_params) {
+        Ok(f) => f,
+        Err(resp) => return *resp,
     };
 
     // Build response
@@ -2325,7 +2326,7 @@ pub async fn get_pending_transactions_by_address<N: NodeInterface>(
 ) -> Response {
     let addr = match Address::from_str(&address) {
         Ok(a) => a,
-        Err(_) => return error::bad_request(format!("failed to parse address: {address}")),
+        Err(_) => return error::bad_request("failed to parse the address"),
     };
     get_pending_transactions_inner(node, params, Some(addr)).await
 }
