@@ -3053,3 +3053,56 @@ pub async fn teal_disassemble<N: NodeInterface>(
         Err(e) => error::internal_error(format!("failed to encode response: {e}")),
     }
 }
+
+// ---------------------------------------------------------------------------
+// POST /v2/teal/dryrun
+// ---------------------------------------------------------------------------
+
+/// Maximum body size accepted by the TEAL dryrun endpoint.
+///
+/// Matches go-algorand's `MaxTealDryrunBytes = 1_000_000`.
+const MAX_TEAL_DRYRUN_BYTES: usize = 1_000_000;
+
+/// Execute a TEAL dryrun against the provided programs and inputs.
+///
+/// Accepts a JSON `DryrunRequest` body and returns a `DryrunResponse`
+/// containing execution traces and results for each transaction.
+///
+/// Matches go-algorand's `Handlers.TealDryrun`.
+pub async fn teal_dryrun<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    body: axum::body::Bytes,
+) -> Response {
+    // Check if developer API is enabled
+    if !node.enable_developer_api() {
+        return (
+            StatusCode::NOT_FOUND,
+            "/teal/dryrun was not enabled in the configuration file by setting the EnableDeveloperAPI to true",
+        )
+            .into_response();
+    }
+
+    // Enforce body size limit
+    if body.len() > MAX_TEAL_DRYRUN_BYTES {
+        return error::bad_request("request body too large");
+    }
+
+    // Parse body as JSON into DryrunRequest
+    let req: models::DryrunRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return error::bad_request(format!("failed to parse dryrun request: {e}")),
+    };
+
+    // Execute the dryrun
+    let response = crate::dryrun::do_dryrun_request(req);
+
+    match serde_json::to_vec(&response) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => error::internal_error(format!("failed to encode response: {e}")),
+    }
+}
