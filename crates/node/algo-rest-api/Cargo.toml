@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 algo-types.workspace = true
 algo-codec.workspace = true
+algo-avm.workspace = true
 algo-ledger.workspace = true
 algo-consensus-crypto.workspace = true
 algo-error.workspace = true
@@ -41,3 +42,4 @@ algo-codec = { workspace = true }
 algo-ledger = { workspace = true }
 data-encoding = { workspace = true }
 rmpv = { workspace = true }
+base64 = { workspace = true }

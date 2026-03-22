@@ -130,6 +130,11 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             "/v2/deltas/:round/txn/group",
             get(handlers::get_txn_group_deltas_for_round::<N>),
         )
+        .route("/v2/teal/compile", post(handlers::teal_compile::<N>))
+        .route(
+            "/v2/teal/disassemble",
+            post(handlers::teal_disassemble::<N>),
+        )
         .layer(middleware::from_fn_with_state(
             tokens.api_token.clone(),
             auth::require_token,

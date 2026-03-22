@@ -112,6 +112,8 @@ struct MockNode {
     simulate_result: Option<algo_rest_api::models::SimulateResponse>,
     /// State deltas by round.
     state_deltas: BTreeMap<u64, StateDelta>,
+    /// Whether the developer API is enabled.
+    enable_developer_api: bool,
 }
 
 impl Clone for MockNode {
@@ -153,6 +155,7 @@ impl Clone for MockNode {
             broadcast_result: self.broadcast_result.clone(),
             simulate_result: self.simulate_result.clone(),
             state_deltas: self.state_deltas.clone(),
+            enable_developer_api: self.enable_developer_api,
         }
     }
 }
@@ -242,6 +245,7 @@ impl MockNode {
             broadcast_result: None,
             simulate_result: None,
             state_deltas: BTreeMap::new(),
+            enable_developer_api: false,
         }
     }
 
@@ -694,6 +698,10 @@ impl NodeInterface for MockNode {
             Some(delta) => Ok(delta.clone()),
             None => Err(NodeError::NotFound(format!("no delta for round {round}"))),
         }
+    }
+
+    fn enable_developer_api(&self) -> bool {
+        self.enable_developer_api
     }
 }
 
@@ -5503,4 +5511,203 @@ async fn get_state_delta_not_found_returns_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+// ===========================================================================
+// TEAL compile / disassemble endpoint tests
+// ===========================================================================
+
+/// Create a mock node with developer API enabled.
+fn mock_with_developer_api() -> MockNode {
+    let mut node = MockNode::synced();
+    node.enable_developer_api = true;
+    node
+}
+
+#[tokio::test]
+async fn teal_compile_happy_path() {
+    let server = TestServer::start(mock_with_developer_api()).await;
+
+    let source = "#pragma version 2\nint 1\n";
+    let resp = server
+        .client
+        .post(server.url("/v2/teal/compile"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .body(source)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // Should have hash and result fields
+    assert!(body["hash"].is_string(), "response should have hash field");
+    assert!(
+        body["result"].is_string(),
+        "response should have result field"
+    );
+    // result should be valid base64
+    let result_b64 = body["result"].as_str().unwrap();
+    let program_bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, result_b64)
+            .expect("result should be valid base64");
+    // Program should start with version byte 2
+    assert_eq!(
+        program_bytes[0], 0x02,
+        "program should start with version 2"
+    );
+    // hash should be a 58-char Algorand address
+    let hash_str = body["hash"].as_str().unwrap();
+    assert_eq!(
+        hash_str.len(),
+        58,
+        "hash should be 58-char Algorand address"
+    );
+    // sourcemap should not be present by default
+    assert!(
+        body.get("sourcemap").is_none(),
+        "sourcemap should not be present by default"
+    );
+}
+
+#[tokio::test]
+async fn teal_compile_with_sourcemap() {
+    let server = TestServer::start(mock_with_developer_api()).await;
+
+    let source = "#pragma version 2\nint 1\n";
+    let resp = server
+        .client
+        .post(server.url("/v2/teal/compile?sourcemap=true"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .body(source)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["hash"].is_string());
+    assert!(body["result"].is_string());
+    // sourcemap should be present
+    assert!(
+        body["sourcemap"].is_object(),
+        "sourcemap should be present when requested"
+    );
+    assert!(body["sourcemap"]["version"].is_number());
+    assert!(body["sourcemap"]["mappings"].is_string());
+}
+
+#[tokio::test]
+async fn teal_compile_error_returns_400() {
+    let server = TestServer::start(mock_with_developer_api()).await;
+
+    let source = "this is not valid TEAL";
+    let resp = server
+        .client
+        .post(server.url("/v2/teal/compile"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .body(source)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn teal_disassemble_happy_path() {
+    let server = TestServer::start(mock_with_developer_api()).await;
+
+    // First compile a program, then disassemble it
+    let source = "#pragma version 2\nint 1\n";
+    let compile_resp = server
+        .client
+        .post(server.url("/v2/teal/compile"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .body(source)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(compile_resp.status(), 200);
+    let compile_body: serde_json::Value = compile_resp.json().await.unwrap();
+    let result_b64 = compile_body["result"].as_str().unwrap();
+    let program_bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, result_b64).unwrap();
+
+    // Now disassemble
+    let resp = server
+        .client
+        .post(server.url("/v2/teal/disassemble"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .body(program_bytes)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["result"].is_string());
+    let result = body["result"].as_str().unwrap();
+    // Disassembler outputs raw opcodes: intcblock/intc_0 rather than "int 1"
+    assert!(
+        result.contains("intc") || result.contains("pushint") || result.contains("#pragma version"),
+        "disassembled output should contain valid TEAL instructions, got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn teal_disassemble_error_returns_400() {
+    let server = TestServer::start(mock_with_developer_api()).await;
+
+    // Send invalid bytecode
+    let resp = server
+        .client
+        .post(server.url("/v2/teal/disassemble"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .body(vec![0xFF, 0xFF])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn teal_compile_disabled_returns_404() {
+    // Default MockNode has enable_developer_api = false
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/teal/compile"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .body("#pragma version 2\nint 1\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("EnableDeveloperAPI"),
+        "404 message should mention EnableDeveloperAPI"
+    );
+}
+
+#[tokio::test]
+async fn teal_disassemble_disabled_returns_404() {
+    // Default MockNode has enable_developer_api = false
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/teal/disassemble"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .body(vec![0x02, 0x20, 0x01, 0x01, 0x22])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("EnableDeveloperAPI"),
+        "404 message should mention EnableDeveloperAPI"
+    );
 }

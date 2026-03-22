@@ -3,8 +3,10 @@
 //! Provides the opcode table, bytecode parser, program validator,
 //! stack machine, and opcode implementations for TEAL program execution.
 
+pub mod assembler;
 pub mod bytecode;
 pub mod context;
+pub mod disassembler;
 pub mod eval;
 pub mod fields;
 pub mod group;
@@ -13,6 +15,7 @@ pub mod logicsig_context;
 pub mod machine;
 pub mod opcode;
 pub mod ops;
+pub mod sourcemap;
 pub mod tracer;
 pub mod txn_fields;
 pub mod validator;
@@ -35,3 +38,8 @@ pub use opcode::{
 pub use tracer::{EvalTracer, NullTracer, ProgramType};
 pub use txn_fields::{read_txn_field, type_enum};
 pub use validator::check_program;
+
+// Assembler / disassembler / source map re-exports.
+pub use assembler::{assemble_string, OpStream as AssemblerOpStream};
+pub use disassembler::disassemble;
+pub use sourcemap::{get_source_map, SourceMap};
