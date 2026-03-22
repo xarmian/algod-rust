@@ -929,7 +929,9 @@ impl AvmContext for DryrunAvmContext {
     }
 
     fn online_stake(&self) -> Result<u64, AlgoError> {
-        Ok(0)
+        // Match go-algorand's dryrunLedger.OnlineCirculation: Algos(1_000_000_000)
+        // = 1,000,000,000 * 1,000,000 microAlgos
+        Ok(1_000_000_000_000_000)
     }
 
     // ---- Result extraction ----
@@ -1109,9 +1111,11 @@ pub fn do_dryrun_request(mut req: DryrunRequest) -> DryrunResponse {
         }
     }
 
-    // Execute each transaction
+    // Execute each transaction.
+    // Go dryrun uses an inflated budget (100x normal) so users can debug
+    // costly programs without hitting the budget limit.
     let mut results = Vec::new();
-    let mut group_budget = GroupBudget::new(signed_txns.len());
+    let mut group_budget = GroupBudget::new(signed_txns.len() * 100);
 
     for (i, stxn) in signed_txns.iter().enumerate() {
         let result = execute_single_txn(
@@ -1223,78 +1227,58 @@ fn execute_single_txn(
         let app_id = txn.application_id;
         let is_clear_state = txn.on_completion == ON_COMPLETION_CLEAR_STATE;
 
-        // Determine which program to run
-        let (program_bytes, creator) = if app_id == 0 {
-            // App creation — program is in the transaction
-            let prog = if is_clear_state {
-                txn.clear_state_program
-                    .as_ref()
-                    .map(|b| b.to_vec())
-                    .unwrap_or_default()
-            } else {
-                txn.approval_program
-                    .as_ref()
-                    .map(|b| b.to_vec())
-                    .unwrap_or_default()
-            };
-            (prog, txn.sender.0)
-        } else {
-            // Look up the app's programs from apps array (matching Go behavior)
-            let mut found_program = None;
-            for app in apps {
-                if app.id == app_id {
-                    let prog = if is_clear_state {
-                        app.params.clear_state_program.clone()
-                    } else {
-                        app.params.approval_program.clone()
-                    };
-                    found_program = Some((
-                        prog,
-                        Address::from_str(&app.params.creator)
-                            .map(|a| a.0)
-                            .unwrap_or([0u8; 32]),
-                    ));
-                    break;
+        // Resolve effective app ID.
+        // Go (dryrun.go:478-485): for app creation (app_id == 0), use
+        // dr.Apps[0].Id if the creator matches the sender.
+        let mut effective_app_id = app_id;
+        if app_id == 0 {
+            let sender_str = txn.sender.to_algorand_string();
+            if let Some(first_app) = apps.first() {
+                if first_app.params.creator == sender_str {
+                    effective_app_id = first_app.id;
                 }
             }
-            match found_program {
-                Some(p) => p,
-                None => {
-                    result.app_call_messages =
-                        Some(vec![format!(
-                            "uploaded state did not include app id {app_id} referenced in txn[{txn_index}]"
-                        )]);
-                    result.disassembly = vec![];
-                    return result;
-                }
+        }
+
+        // Look up the app's programs from the apps array (matching Go behavior).
+        // Go always looks up programs from dr.Apps, never from the transaction.
+        let mut found_app = false;
+        let mut program_bytes = Vec::new();
+        let mut creator = [0u8; 32];
+        for app in apps {
+            if app.id == effective_app_id {
+                program_bytes = if is_clear_state {
+                    app.params.clear_state_program.clone()
+                } else {
+                    app.params.approval_program.clone()
+                };
+                creator = Address::from_str(&app.params.creator)
+                    .map(|a| a.0)
+                    .unwrap_or([0u8; 32]);
+                found_app = true;
+                break;
             }
-        };
+        }
+        if !found_app {
+            result.app_call_messages = Some(vec![format!(
+                "uploaded state did not include app id {effective_app_id} referenced in txn[{txn_index}]"
+            )]);
+            result.disassembly = vec![];
+            return result;
+        }
 
         if program_bytes.is_empty() {
-            result.app_call_messages = Some(vec!["approval program is empty".to_string()]);
+            let label = if is_clear_state {
+                "clear state program"
+            } else {
+                "approval program"
+            };
+            result.app_call_messages = Some(vec![format!("{label} is empty")]);
             return result;
         }
 
         let mut tracer = DryrunDebugReceiver::new();
         tracer.init_program(&program_bytes);
-
-        let effective_app_id = if app_id == 0 {
-            // For app creation, check if dr.Apps[0].creator matches sender
-            if let Some(first_app) = apps.first() {
-                let app_creator = Address::from_str(&first_app.params.creator)
-                    .map(|a| a.0)
-                    .unwrap_or([0u8; 32]);
-                if app_creator == txn.sender.0 {
-                    first_app.id
-                } else {
-                    1
-                }
-            } else {
-                1
-            }
-        } else {
-            app_id
-        };
 
         let mut ctx = DryrunAvmContext::new(
             group.to_vec(),
@@ -1367,7 +1351,9 @@ fn execute_single_txn(
         result.app_call_trace = Some(tracer.history);
 
         // Budget tracking
-        result.budget_added = Some(algo_avm::APP_BUDGET_PER_CALL as u64);
+        // Go: budgetAdded = proto.MaxAppProgramCost * numInnerTxns(delta)
+        // Since dryrun doesn't support inner transactions, budget_added is always 0.
+        result.budget_added = Some(0);
         result.budget_consumed = Some(budget_consumed as u64);
 
         // Collect logs
