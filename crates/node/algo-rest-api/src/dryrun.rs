@@ -673,16 +673,12 @@ impl AvmContext for DryrunAvmContext {
     }
 
     fn asset_params_get(&self, asset_id: u64, field: u8) -> Result<(TealValue, bool), AlgoError> {
-        if self.asset_params.contains_key(&asset_id) {
+        if let Some(creator) = self.asset_params.get(&asset_id) {
             // Return minimal params — for full dryrun support more fields would
             // need to be stored; for now return the creator for field 5 and
             // zeros for others.
             let val = match field {
-                5 => {
-                    // AssetCreator
-                    let creator = self.asset_params.get(&asset_id).unwrap();
-                    TealValue::Bytes(creator.to_vec())
-                }
+                5 => TealValue::Bytes(creator.to_vec()), // AssetCreator
                 _ => TealValue::Uint(0),
             };
             Ok((val, true))
@@ -760,10 +756,9 @@ impl AvmContext for DryrunAvmContext {
     }
 
     fn block_field(&self, _round: u64, _field: u8) -> Result<AvmValue, AlgoError> {
-        // Dryrun does not have block history
-        Err(AlgoError::Avm {
-            message: "block field not available in dryrun".into(),
-        })
+        // Dryrun does not have block history — return zero/empty defaults
+        // so programs using the `block` opcode don't error out.
+        Ok(AvmValue::Uint64(0))
     }
 
     // ---- Inner transactions (not supported in basic dryrun) ----
@@ -1112,10 +1107,10 @@ pub fn do_dryrun_request(mut req: DryrunRequest) -> DryrunResponse {
     }
 
     // Execute each transaction.
-    // Go dryrun uses an inflated budget (100x normal) so users can debug
-    // costly programs without hitting the budget limit.
+    // Go dryrun uses an inflated budget: maxCurrentBudget = MaxAppProgramCost * 100
+    // (= 70,000), independent of group size, so users can debug costly programs.
     let mut results = Vec::new();
-    let mut group_budget = GroupBudget::new(signed_txns.len() * 100);
+    let mut group_budget = GroupBudget::new(100);
 
     for (i, stxn) in signed_txns.iter().enumerate() {
         let result = execute_single_txn(
@@ -1196,8 +1191,15 @@ fn execute_single_txn(
             ctx.lsig_args = args.iter().map(|a| a.to_vec()).collect();
         }
 
-        let lsig_result =
-            run_logicsig_program_with_tracer(program_bytes, &mut ctx, group_budget, &mut tracer);
+        // LogicSig uses a separate budget from app calls (20,000 per txn in the
+        // group), not the pooled app-call budget. Create a one-off logicsig budget.
+        let mut lsig_budget = GroupBudget::for_logicsig(group.len());
+        let lsig_result = run_logicsig_program_with_tracer(
+            program_bytes,
+            &mut ctx,
+            &mut lsig_budget,
+            &mut tracer,
+        );
 
         let disasm_lines: Vec<String> = tracer.disassembly_lines().to_vec();
 
