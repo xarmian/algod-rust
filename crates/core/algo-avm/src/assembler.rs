@@ -603,15 +603,36 @@ pub fn assemble_string(text: &str) -> Result<OpStream, Vec<AssemblyError>> {
         // Handle pragma
         if code.starts_with('#') {
             if code.starts_with("#pragma") {
-                if !ops.pending.is_empty() {
+                let parts: Vec<&str> = code.split_whitespace().collect();
+                if parts.len() == 1 {
+                    // #pragma with no keyword
+                    ops.record_error(ops.source_line, 0, "empty pragma".into());
+                } else if parts[1] != "version" {
+                    // #pragma <unknown>
                     ops.record_error(
                         ops.source_line,
                         0,
-                        "#pragma version is only allowed before instructions".into(),
+                        format!("unsupported pragma directive: {}", parts[1]),
                     );
-                }
-                let parts: Vec<&str> = code.split_whitespace().collect();
-                if parts.len() >= 3 && parts[1] == "version" {
+                } else if parts.len() == 2 {
+                    // #pragma version (no number)
+                    ops.record_error(ops.source_line, 0, "no version value".into());
+                } else if parts.len() > 3 {
+                    // #pragma version N extra
+                    ops.record_error(
+                        ops.source_line,
+                        0,
+                        "unexpected tokens after version value".into(),
+                    );
+                } else {
+                    // #pragma version N
+                    if !ops.pending.is_empty() {
+                        ops.record_error(
+                            ops.source_line,
+                            0,
+                            "#pragma version is only allowed before instructions".into(),
+                        );
+                    }
                     if let Ok(v) = parts[2].parse::<u8>() {
                         if v == 0 || v > MAX_AVM_VERSION {
                             ops.record_error(
