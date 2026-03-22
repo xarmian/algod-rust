@@ -27,6 +27,13 @@ use crate::models::{
 };
 
 // ---------------------------------------------------------------------------
+// On-completion constants (matching go-algorand transactions.OnCompletion)
+// ---------------------------------------------------------------------------
+
+const ON_COMPLETION_OPT_IN: u64 = 1;
+const ON_COMPLETION_CLEAR_STATE: u64 = 3;
+
+// ---------------------------------------------------------------------------
 // Helper: AvmValue / TealValue → DryrunTealValue
 // ---------------------------------------------------------------------------
 
@@ -972,44 +979,50 @@ pub fn expand_sources(req: &mut DryrunRequest) -> Result<(), String> {
         })?;
         let program_bytes = compiled.program;
 
-        if !src.field_name.is_empty() {
-            match src.field_name.as_str() {
-                "approv" => {
-                    // Find the app by app_index
-                    for app in &mut req.apps {
-                        if app.id == src.app_index {
-                            app.params.approval_program = program_bytes.clone();
+        match src.field_name.as_str() {
+            "approv" => {
+                // Find the app by app_index
+                for app in &mut req.apps {
+                    if app.id == src.app_index {
+                        app.params.approval_program = program_bytes.clone();
+                    }
+                }
+            }
+            "clearp" => {
+                for app in &mut req.apps {
+                    if app.id == src.app_index {
+                        app.params.clear_state_program = program_bytes.clone();
+                    }
+                }
+            }
+            "lsig" => {
+                // Patch the logicsig program in the txn JSON
+                let idx = src.txn_index;
+                if idx >= req.txns.len() {
+                    return Err(format!(
+                        "dryrun Source[{si}]: txn index {} out of range ({})",
+                        idx,
+                        req.txns.len()
+                    ));
+                }
+                {
+                    let encoded = BASE64.encode(&program_bytes);
+                    if let Some(obj) = req.txns[idx].as_object_mut() {
+                        let lsig = obj.entry("lsig").or_insert_with(|| serde_json::json!({}));
+                        if let Some(lsig_obj) = lsig.as_object_mut() {
+                            lsig_obj.insert("l".to_string(), serde_json::Value::String(encoded));
                         }
                     }
                 }
-                "clearp" => {
-                    for app in &mut req.apps {
-                        if app.id == src.app_index {
-                            app.params.clear_state_program = program_bytes.clone();
-                        }
-                    }
-                }
-                "lsig" => {
-                    // Patch the logicsig program in the txn JSON
-                    let idx = src.txn_index;
-                    if idx < req.txns.len() {
-                        let encoded = BASE64.encode(&program_bytes);
-                        if let Some(obj) = req.txns[idx].as_object_mut() {
-                            let lsig = obj.entry("lsig").or_insert_with(|| serde_json::json!({}));
-                            if let Some(lsig_obj) = lsig.as_object_mut() {
-                                lsig_obj
-                                    .insert("l".to_string(), serde_json::Value::String(encoded));
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    return Err(format!("unknown field-name: {}", src.field_name));
-                }
+            }
+            _ => {
+                return Err(format!(
+                    "dryrun Source[{si}]: bad field name {:?}",
+                    src.field_name
+                ));
             }
         }
     }
-    req.sources = sources;
     Ok(())
 }
 
@@ -1208,7 +1221,7 @@ fn execute_single_txn(
     // --- Application call execution ---
     if is_app_call {
         let app_id = txn.application_id;
-        let is_clear_state = txn.on_completion == 3;
+        let is_clear_state = txn.on_completion == ON_COMPLETION_CLEAR_STATE;
 
         // Determine which program to run
         let (program_bytes, creator) = if app_id == 0 {
@@ -1297,7 +1310,7 @@ fn execute_single_txn(
         );
 
         // OptIn: pre-create local state for sender (matching Go behavior)
-        if txn.on_completion == 1 {
+        if txn.on_completion == ON_COMPLETION_OPT_IN {
             ctx.app_local_state
                 .entry((txn.sender.0, effective_app_id))
                 .or_default();

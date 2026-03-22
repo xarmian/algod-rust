@@ -3088,10 +3088,34 @@ pub async fn teal_dryrun<N: NodeInterface>(
     }
 
     // Parse body as JSON into DryrunRequest
-    let req: models::DryrunRequest = match serde_json::from_slice(&body) {
+    let mut req: models::DryrunRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return error::bad_request(format!("failed to parse dryrun request: {e}")),
     };
+
+    // Fill defaults from node state when not provided (matching go-algorand
+    // handlers.go:1367-1396).
+    if req.protocol_version.is_empty() || req.round == 0 || req.latest_timestamp == 0 {
+        match node.status().await {
+            Ok(status) => {
+                if req.protocol_version.is_empty() {
+                    req.protocol_version = status.last_version.clone();
+                }
+                if req.round == 0 {
+                    req.round = status.last_round + 1;
+                }
+                // For timestamp, try to get block header; fall back to 0.
+                if req.latest_timestamp == 0 {
+                    if let Ok(hdr) = node.get_block_header(status.last_round).await {
+                        req.latest_timestamp = hdr.timestamp;
+                    }
+                }
+            }
+            Err(e) => {
+                return error::internal_error(format!("current block error: {e}"));
+            }
+        }
+    }
 
     // Execute the dryrun
     let response = crate::dryrun::do_dryrun_request(req);

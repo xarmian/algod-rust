@@ -1185,6 +1185,42 @@ mod base64_bytes_array {
     }
 }
 
+/// Serde helper for serializing/deserializing `Option<Vec<Vec<u8>>>` as an
+/// array of base64 strings (skipped when `None`).
+mod optional_base64_bytes_array {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use serde::ser::SerializeSeq;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(items: &Option<Vec<Vec<u8>>>, s: S) -> Result<S::Ok, S::Error> {
+        match items {
+            Some(items) => {
+                let mut seq = s.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(&STANDARD.encode(item))?;
+                }
+                seq.end()
+            }
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<Vec<u8>>>, D::Error> {
+        let opt: Option<Vec<String>> = Option::deserialize(d)?;
+        match opt {
+            Some(strings) => {
+                let result: Result<Vec<Vec<u8>>, _> = strings
+                    .into_iter()
+                    .map(|s| STANDARD.decode(&s).map_err(serde::de::Error::custom))
+                    .collect();
+                result.map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Supply response
 // ---------------------------------------------------------------------------
@@ -1982,8 +2018,11 @@ pub struct DryrunTxnResult {
     #[serde(rename = "logic-sig-trace", skip_serializing_if = "Option::is_none")]
     pub logic_sig_trace: Option<Vec<DryrunState>>,
 
-    /// Log messages emitted during execution.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Log messages emitted during execution (base64-encoded).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "optional_base64_bytes_array"
+    )]
     pub logs: Option<Vec<Vec<u8>>>,
 }
 
