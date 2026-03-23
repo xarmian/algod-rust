@@ -75,6 +75,8 @@ pub struct DryrunDebugReceiver {
     pub passed: bool,
     /// Error message from execution (if any).
     pub error: Option<String>,
+    /// Final scratch space captured from the last `after_opcode` call.
+    pub final_scratch: Option<Vec<AvmValue>>,
 }
 
 impl DryrunDebugReceiver {
@@ -169,6 +171,9 @@ impl EvalTracer for DryrunDebugReceiver {
         let stack_vals: Vec<DryrunTealValue> = stack.iter().map(avm_value_to_dryrun).collect();
         let scratch_vals = Self::trim_scratch(scratch);
 
+        // Always capture the latest scratch for gload support
+        self.final_scratch = Some(scratch.to_vec());
+
         let state = DryrunState {
             error: error.map(|s| s.to_string()),
             line,
@@ -236,6 +241,10 @@ pub struct DryrunAvmContext {
     /// Opted-in apps per account: address → set of app_ids.
     pub opted_in_apps: HashMap<[u8; 32], Vec<u64>>,
 
+    // ---- Group scratch space ----
+    /// Scratch space from each completed txn in the group, indexed by group_index.
+    pub group_scratch: Vec<Vec<AvmValue>>,
+
     // ---- Delta tracking ----
     /// Global state delta: app_id → (key → Option<TealValue>).
     pub global_deltas: HashMap<u64, HashMap<Vec<u8>, Option<TealValue>>>,
@@ -245,57 +254,55 @@ pub struct DryrunAvmContext {
     pub logs: Vec<Vec<u8>>,
 }
 
-impl DryrunAvmContext {
-    /// Build a new context from dryrun request data for a specific transaction.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        group: Vec<SignedTransaction>,
-        group_index: usize,
-        round: u64,
-        latest_timestamp: i64,
-        app_id: u64,
-        creator: [u8; 32],
-        consensus: ConsensusParams,
-        app_mode: bool,
+/// Shared mutable state that persists across transactions in a dryrun group.
+///
+/// Built once from the `DryrunRequest` data, then swapped in/out of each
+/// per-txn `DryrunAvmContext` so that state mutations (e.g. `app_global_put`)
+/// are visible to subsequent transactions.
+struct DryrunSharedState {
+    app_global_state: HashMap<u64, HashMap<Vec<u8>, TealValue>>,
+    app_local_state: HashMap<([u8; 32], u64), HashMap<Vec<u8>, TealValue>>,
+    app_params: HashMap<u64, AppParamsEntry>,
+    account_balances: HashMap<[u8; 32], u64>,
+    account_min_balances: HashMap<[u8; 32], u64>,
+    account_status: HashMap<[u8; 32], String>,
+    asset_holdings: HashMap<([u8; 32], u64), (u64, bool)>,
+    asset_params: HashMap<u64, [u8; 32]>,
+    opted_in_apps: HashMap<[u8; 32], Vec<u64>>,
+    group_scratch: Vec<Vec<AvmValue>>,
+}
+
+impl DryrunSharedState {
+    /// Build shared state from the request's `accounts` and `apps` arrays.
+    fn from_request(
         accounts: &[AccountResponse],
         apps: &[ApiApplication],
+        group_size: usize,
     ) -> Self {
-        let mut ctx = Self {
-            group,
-            group_index,
-            round,
-            latest_timestamp,
-            app_id,
-            creator,
-            consensus,
-            genesis_hash: [0u8; 32],
-            app_mode,
-            lsig_args: Vec::new(),
-            account_balances: HashMap::new(),
-            account_min_balances: HashMap::new(),
-            account_status: HashMap::new(),
+        let mut state = Self {
             app_global_state: HashMap::new(),
             app_local_state: HashMap::new(),
             app_params: HashMap::new(),
+            account_balances: HashMap::new(),
+            account_min_balances: HashMap::new(),
+            account_status: HashMap::new(),
             asset_holdings: HashMap::new(),
             asset_params: HashMap::new(),
             opted_in_apps: HashMap::new(),
-            global_deltas: HashMap::new(),
-            local_deltas: HashMap::new(),
-            logs: Vec::new(),
+            group_scratch: vec![Vec::new(); group_size],
         };
 
         // Load accounts
         for acct in accounts {
             if let Ok(addr) = Address::from_str(&acct.address) {
-                ctx.account_balances.insert(addr.0, acct.amount);
-                ctx.account_min_balances.insert(addr.0, acct.min_balance);
-                ctx.account_status.insert(addr.0, acct.status.clone());
+                state.account_balances.insert(addr.0, acct.amount);
+                state.account_min_balances.insert(addr.0, acct.min_balance);
+                state.account_status.insert(addr.0, acct.status.clone());
 
                 // Load asset holdings
                 if let Some(ref assets) = acct.assets {
                     for holding in assets {
-                        ctx.asset_holdings.insert(
+                        state.asset_holdings.insert(
                             (addr.0, holding.asset_id),
                             (holding.amount, holding.is_frozen),
                         );
@@ -313,8 +320,12 @@ impl DryrunAvmContext {
                                 kv.insert(key, val);
                             }
                         }
-                        ctx.app_local_state.insert((addr.0, local.id), kv);
-                        ctx.opted_in_apps.entry(addr.0).or_default().push(local.id);
+                        state.app_local_state.insert((addr.0, local.id), kv);
+                        state
+                            .opted_in_apps
+                            .entry(addr.0)
+                            .or_default()
+                            .push(local.id);
                     }
                 }
 
@@ -329,8 +340,8 @@ impl DryrunAvmContext {
                                 global_state.insert(key, val);
                             }
                         }
-                        ctx.app_global_state.insert(app.id, global_state);
-                        ctx.app_params.insert(
+                        state.app_global_state.insert(app.id, global_state);
+                        state.app_params.insert(
                             app.id,
                             (
                                 app.params.approval_program.clone(),
@@ -350,7 +361,7 @@ impl DryrunAvmContext {
                 .unwrap_or([0u8; 32]);
 
             // Only insert if not already loaded from accounts
-            ctx.app_params.entry(app.id).or_insert_with(|| {
+            state.app_params.entry(app.id).or_insert_with(|| {
                 (
                     app.params.approval_program.clone(),
                     app.params.clear_state_program.clone(),
@@ -358,7 +369,7 @@ impl DryrunAvmContext {
                 )
             });
 
-            ctx.app_global_state.entry(app.id).or_insert_with(|| {
+            state.app_global_state.entry(app.id).or_insert_with(|| {
                 let mut gs = HashMap::new();
                 if let Some(ref kvs) = app.params.global_state {
                     for entry in kvs {
@@ -371,7 +382,78 @@ impl DryrunAvmContext {
             });
         }
 
-        ctx
+        state
+    }
+
+    /// Move shared state maps into a `DryrunAvmContext`, leaving empty maps behind.
+    fn take_into_ctx(&mut self, ctx: &mut DryrunAvmContext) {
+        ctx.app_global_state = std::mem::take(&mut self.app_global_state);
+        ctx.app_local_state = std::mem::take(&mut self.app_local_state);
+        ctx.app_params = std::mem::take(&mut self.app_params);
+        ctx.account_balances = std::mem::take(&mut self.account_balances);
+        ctx.account_min_balances = std::mem::take(&mut self.account_min_balances);
+        ctx.account_status = std::mem::take(&mut self.account_status);
+        ctx.asset_holdings = std::mem::take(&mut self.asset_holdings);
+        ctx.asset_params = std::mem::take(&mut self.asset_params);
+        ctx.opted_in_apps = std::mem::take(&mut self.opted_in_apps);
+        ctx.group_scratch = std::mem::take(&mut self.group_scratch);
+    }
+
+    /// Move (possibly mutated) state maps back from the context into shared state.
+    fn restore_from_ctx(&mut self, ctx: &mut DryrunAvmContext) {
+        self.app_global_state = std::mem::take(&mut ctx.app_global_state);
+        self.app_local_state = std::mem::take(&mut ctx.app_local_state);
+        self.app_params = std::mem::take(&mut ctx.app_params);
+        self.account_balances = std::mem::take(&mut ctx.account_balances);
+        self.account_min_balances = std::mem::take(&mut ctx.account_min_balances);
+        self.account_status = std::mem::take(&mut ctx.account_status);
+        self.asset_holdings = std::mem::take(&mut ctx.asset_holdings);
+        self.asset_params = std::mem::take(&mut ctx.asset_params);
+        self.opted_in_apps = std::mem::take(&mut ctx.opted_in_apps);
+        self.group_scratch = std::mem::take(&mut ctx.group_scratch);
+    }
+}
+
+impl DryrunAvmContext {
+    /// Build a new context for a specific transaction, with empty state maps.
+    ///
+    /// State maps are populated via `DryrunSharedState::take_into_ctx()`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        group: Vec<SignedTransaction>,
+        group_index: usize,
+        round: u64,
+        latest_timestamp: i64,
+        app_id: u64,
+        creator: [u8; 32],
+        consensus: ConsensusParams,
+        app_mode: bool,
+    ) -> Self {
+        Self {
+            group,
+            group_index,
+            round,
+            latest_timestamp,
+            app_id,
+            creator,
+            consensus,
+            genesis_hash: [0u8; 32],
+            app_mode,
+            lsig_args: Vec::new(),
+            account_balances: HashMap::new(),
+            account_min_balances: HashMap::new(),
+            account_status: HashMap::new(),
+            app_global_state: HashMap::new(),
+            app_local_state: HashMap::new(),
+            app_params: HashMap::new(),
+            asset_holdings: HashMap::new(),
+            asset_params: HashMap::new(),
+            opted_in_apps: HashMap::new(),
+            group_scratch: Vec::new(),
+            global_deltas: HashMap::new(),
+            local_deltas: HashMap::new(),
+            logs: Vec::new(),
+        }
     }
 }
 
@@ -765,9 +847,19 @@ impl AvmContext for DryrunAvmContext {
 
     // ---- Group scratch space ----
 
-    fn gload(&self, _group_index: usize, _slot: u8) -> Result<TealValue, AlgoError> {
-        // Dryrun does not support cross-txn scratch reads
-        Ok(TealValue::Uint(0))
+    fn gload(&self, group_index: usize, slot: u8) -> Result<TealValue, AlgoError> {
+        if group_index >= self.group_scratch.len() {
+            return Ok(TealValue::Uint(0));
+        }
+        let scratch = &self.group_scratch[group_index];
+        let slot = slot as usize;
+        if slot >= scratch.len() {
+            return Ok(TealValue::Uint(0));
+        }
+        match &scratch[slot] {
+            AvmValue::Uint64(n) => Ok(TealValue::Uint(*n)),
+            AvmValue::Bytes(b) => Ok(TealValue::Bytes(b.clone())),
+        }
     }
 
     fn created_id(&self, _group_index: usize) -> Result<u64, AlgoError> {
@@ -1144,17 +1236,20 @@ pub fn do_dryrun_request(mut req: DryrunRequest) -> DryrunResponse {
     let mut results = Vec::new();
     let mut group_budget = GroupBudget::new(100);
 
+    // Build shared state once from the request data.
+    let mut shared = DryrunSharedState::from_request(&req.accounts, &req.apps, signed_txns.len());
+
     for (i, stxn) in signed_txns.iter().enumerate() {
         let result = execute_single_txn(
             i,
             stxn,
             &signed_txns,
-            &req.accounts,
             &req.apps,
             req.round,
             req.latest_timestamp,
             &consensus,
             &mut group_budget,
+            &mut shared,
         );
         results.push(result);
     }
@@ -1167,17 +1262,20 @@ pub fn do_dryrun_request(mut req: DryrunRequest) -> DryrunResponse {
 }
 
 /// Execute a single transaction in the dryrun.
+///
+/// State maps are swapped in from `shared` before execution and swapped back
+/// afterwards, so mutations persist across transactions in the group.
 #[allow(clippy::too_many_arguments)]
 fn execute_single_txn(
     txn_index: usize,
     stxn: &SignedTransaction,
     group: &[SignedTransaction],
-    accounts: &[AccountResponse],
     apps: &[ApiApplication],
     round: u64,
     latest_timestamp: i64,
     consensus: &ConsensusParams,
     group_budget: &mut GroupBudget,
+    shared: &mut DryrunSharedState,
 ) -> DryrunTxnResult {
     let txn = &stxn.txn;
     let is_app_call = txn.txn_type.as_str() == "appl";
@@ -1214,9 +1312,8 @@ fn execute_single_txn(
             [0u8; 32],
             consensus.clone(),
             false,
-            accounts,
-            apps,
         );
+        shared.take_into_ctx(&mut ctx);
 
         // Set lsig args
         if let Some(ref args) = lsig.args {
@@ -1232,6 +1329,16 @@ fn execute_single_txn(
             &mut lsig_budget,
             &mut tracer,
         );
+
+        // Store logicsig scratch for gload conformance (Go saves scratch
+        // for all program types, even though gload is not allowed in ModeSig).
+        if let Some(ref scratch) = tracer.final_scratch {
+            if txn_index < ctx.group_scratch.len() {
+                ctx.group_scratch[txn_index] = scratch.clone();
+            }
+        }
+
+        shared.restore_from_ctx(&mut ctx);
 
         let disasm_lines: Vec<String> = tracer.disassembly_lines().to_vec();
 
@@ -1323,9 +1430,8 @@ fn execute_single_txn(
             creator,
             consensus.clone(),
             true,
-            accounts,
-            apps,
         );
+        shared.take_into_ctx(&mut ctx);
 
         // OptIn: pre-create local state for sender (matching Go behavior)
         if txn.on_completion == ON_COMPLETION_OPT_IN {
@@ -1344,7 +1450,7 @@ fn execute_single_txn(
         // programs in dryrun. Go's dryrun uses StatefulEval (pooled budget) for
         // both. Using the separate clear-state runner would create an isolated
         // budget and budget_consumed would always report 0.
-        let _app_result =
+        let app_result =
             run_approval_program_with_tracer(&program_bytes, &mut ctx, group_budget, &mut tracer);
 
         let budget_after = group_budget.remaining();
@@ -1381,43 +1487,45 @@ fn execute_single_txn(
         result.budget_added = Some(0);
         result.budget_consumed = Some(budget_consumed as u64);
 
-        // Collect logs
-        let logs = ctx.take_logs();
-        if !logs.is_empty() {
-            result.logs = Some(logs);
-        }
+        // Use AvmResult for deltas/logs (fixes the delta drain bug where
+        // run_approval_program_with_tracer calls take_global_delta/take_local_deltas/take_logs
+        // which drains the maps before we can read them).
+        if let Ok(ref avm_result) = app_result {
+            // Collect logs from AvmResult
+            if !avm_result.logs.is_empty() {
+                result.logs = Some(avm_result.logs.clone());
+            }
 
-        // Collect global delta
-        let global_delta = ctx
-            .global_deltas
-            .remove(&effective_app_id)
-            .unwrap_or_default();
-        if !global_delta.is_empty() {
-            result.global_delta = Some(deltas_to_api_state_delta(&global_delta));
-        }
+            // Collect global delta from AvmResult
+            if !avm_result.global_delta.is_empty() {
+                result.global_delta = Some(deltas_to_api_state_delta(&avm_result.global_delta));
+            }
 
-        // Collect local deltas
-        let mut local_deltas_list: Vec<AccountStateDelta> = Vec::new();
-        let local_keys: Vec<([u8; 32], u64)> = ctx
-            .local_deltas
-            .keys()
-            .filter(|(_, aid)| *aid == effective_app_id)
-            .cloned()
-            .collect();
-        for (addr, _) in local_keys {
-            if let Some(deltas) = ctx.local_deltas.remove(&(addr, effective_app_id)) {
+            // Collect local deltas from AvmResult
+            let mut local_deltas_list: Vec<AccountStateDelta> = Vec::new();
+            for (addr, deltas) in &avm_result.local_deltas {
                 if !deltas.is_empty() {
-                    let addr_str = Address(addr).to_string();
                     local_deltas_list.push(AccountStateDelta {
-                        address: addr_str,
-                        delta: deltas_to_api_state_delta(&deltas),
+                        address: addr.to_string(),
+                        delta: deltas_to_api_state_delta(deltas),
                     });
                 }
             }
+            if !local_deltas_list.is_empty() {
+                result.local_deltas = Some(local_deltas_list);
+            }
         }
-        if !local_deltas_list.is_empty() {
-            result.local_deltas = Some(local_deltas_list);
+
+        // Store final scratch in shared state for gload support.
+        // Note: on parse errors (the only Err case), final_scratch is None,
+        // so group_scratch stays empty for that index — correct behavior.
+        if let Some(ref scratch) = tracer.final_scratch {
+            if txn_index < ctx.group_scratch.len() {
+                ctx.group_scratch[txn_index] = scratch.clone();
+            }
         }
+
+        shared.restore_from_ctx(&mut ctx);
     }
 
     result
@@ -1941,35 +2049,17 @@ mod tests {
             msgs
         );
 
-        // NOTE: global_delta is currently None because
-        // run_approval_program_with_tracer calls ctx.take_global_delta()
-        // before execute_single_txn reads ctx.global_deltas directly.
-        // This assertion documents the known bug — update this test when the
-        // production code is fixed to properly collect deltas.
-        assert!(
-            resp.txns[0].global_delta.is_none(),
-            "known bug: deltas drained by run_approval_program_with_tracer — \
-             if this fails, the bug is fixed; update to assert is_some() and verify delta values"
-        );
-
-        // We verify the program executed app_global_put by checking the
-        // trace shows the opcode ran without error.
-        let trace = resp.txns[0]
-            .app_call_trace
+        // Verify global_delta is populated from AvmResult
+        let delta = resp.txns[0]
+            .global_delta
             .as_ref()
-            .expect("should have trace");
-        // app_global_put is instruction index 2 (0=pushbytes, 1=pushint, 2=app_global_put)
-        // The trace entry for app_global_put should have no error.
-        assert!(trace.len() >= 3, "trace should have at least 3 entries");
-        assert!(
-            trace[2].error.is_none(),
-            "app_global_put should succeed without error"
-        );
-        // After app_global_put, the stack should be empty (it consumed 2 items)
-        assert!(
-            trace[2].stack.is_empty(),
-            "stack should be empty after app_global_put"
-        );
+            .expect("global_delta should be Some after fix");
+        assert_eq!(delta.len(), 1, "should have exactly 1 delta entry");
+        let entry = &delta[0];
+        // key = base64("key")
+        assert_eq!(entry.key, BASE64.encode(b"key"));
+        assert_eq!(entry.value.action, 2, "action should be SetUint (2)");
+        assert_eq!(entry.value.uint, Some(42), "uint should be 42");
     }
 
     #[test]
@@ -2003,32 +2093,18 @@ mod tests {
             msgs
         );
 
-        // NOTE: local_deltas is currently None because
-        // run_approval_program_with_tracer calls ctx.take_local_deltas()
-        // before execute_single_txn reads ctx.local_deltas directly.
-        // This assertion documents the known bug — update this test when fixed.
-        assert!(
-            resp.txns[0].local_deltas.is_none(),
-            "known bug: deltas drained by run_approval_program_with_tracer — \
-             if this fails, the bug is fixed; update to assert is_some() and verify delta values"
-        );
-
-        // Verify the program ran app_local_put successfully via trace.
-        let trace = resp.txns[0]
-            .app_call_trace
+        // Verify local_deltas is populated from AvmResult
+        let locals = resp.txns[0]
+            .local_deltas
             .as_ref()
-            .expect("should have trace");
-        // Instructions: 0=pushint 0, 1=pushbytes "lkey", 2=pushint 7, 3=app_local_put
-        assert!(trace.len() >= 4, "trace should have at least 4 entries");
-        assert!(
-            trace[3].error.is_none(),
-            "app_local_put should succeed without error"
-        );
-        // After app_local_put, the stack should be empty (consumed 3 items)
-        assert!(
-            trace[3].stack.is_empty(),
-            "stack should be empty after app_local_put"
-        );
+            .expect("local_deltas should be Some after fix");
+        assert_eq!(locals.len(), 1, "should have exactly 1 local delta");
+        let local = &locals[0];
+        assert_eq!(local.delta.len(), 1, "should have 1 key-value delta");
+        let kv = &local.delta[0];
+        assert_eq!(kv.key, BASE64.encode(b"lkey"));
+        assert_eq!(kv.value.action, 2, "action should be SetUint (2)");
+        assert_eq!(kv.value.uint, Some(7), "uint should be 7");
     }
 
     // -----------------------------------------------------------------------
@@ -2266,5 +2342,115 @@ mod tests {
         // Stack after `int 1` should contain [1]
         assert_eq!(entry.stack.len(), 1);
         assert_eq!(entry.stack[0].uint, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-txn shared state tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dryrun_cross_txn_global_state() {
+        // Txn 0: writes global key "xkey" = 100
+        // Txn 1: reads global key "xkey" via app_global_get, asserts non-zero
+        // Both should PASS, proving state from txn 0 is visible to txn 1.
+        let sender = test_sender();
+        let creator_str = test_sender_str();
+
+        let teal_writer = "#pragma version 10\nbyte \"xkey\"\nint 100\napp_global_put\nint 1";
+        // Use foreign app index 1 (= first foreign app = app 100) to read its state
+        let teal_reader =
+            "#pragma version 10\nint 1\nbyte \"xkey\"\napp_global_get_ex\nassert\nint 100\n==\nassert\nint 1";
+
+        let app = make_app(100, &creator_str, teal_writer, "#pragma version 10\nint 1");
+        let app2 = make_app(200, &creator_str, teal_reader, "#pragma version 10\nint 1");
+
+        let account = make_simple_account(&creator_str, 1_000_000);
+
+        // Txn 0 calls app 100 (writer), txn 1 calls app 200 (reader)
+        // App 200 needs app 100 in foreign apps to read its state
+        let txn0 = make_app_call_txn_json(&sender, 100, 0);
+        let mut txn1 = make_app_call_txn_json(&sender, 200, 0);
+        // Add app 100 as foreign app for txn 1
+        txn1["txn"]["apfa"] = json!([100u64]);
+
+        let req = DryrunRequest {
+            accounts: vec![account],
+            apps: vec![app, app2],
+            latest_timestamp: 0,
+            protocol_version: String::new(),
+            round: 1,
+            sources: vec![],
+            txns: vec![txn0, txn1],
+        };
+
+        let resp = do_dryrun_request(req);
+        assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
+        assert_eq!(resp.txns.len(), 2);
+
+        // Txn 0 should PASS
+        let msgs0 = resp.txns[0].app_call_messages.as_ref().unwrap();
+        assert!(
+            msgs0.contains(&"PASS".to_string()),
+            "txn 0 should PASS: {:?}",
+            msgs0
+        );
+
+        // Txn 1 should PASS (it reads the state written by txn 0)
+        let msgs1 = resp.txns[1].app_call_messages.as_ref().unwrap();
+        assert!(
+            msgs1.contains(&"PASS".to_string()),
+            "txn 1 should PASS (cross-txn state read): {:?}",
+            msgs1
+        );
+    }
+
+    #[test]
+    fn test_dryrun_gload() {
+        // Txn 0: stores 77 in scratch slot 0
+        // Txn 1: reads txn 0's scratch slot 0 via gload, asserts == 77
+        // Both should PASS.
+        let sender = test_sender();
+        let creator_str = test_sender_str();
+
+        let teal_store = "#pragma version 10\nint 77\nstore 0\nint 1";
+        let teal_load = "#pragma version 10\ngload 0 0\nint 77\n==\nassert\nint 1";
+
+        let app = make_app(100, &creator_str, teal_store, "#pragma version 10\nint 1");
+        let app2 = make_app(200, &creator_str, teal_load, "#pragma version 10\nint 1");
+
+        let account = make_simple_account(&creator_str, 1_000_000);
+
+        let txn0 = make_app_call_txn_json(&sender, 100, 0);
+        let txn1 = make_app_call_txn_json(&sender, 200, 0);
+
+        let req = DryrunRequest {
+            accounts: vec![account],
+            apps: vec![app, app2],
+            latest_timestamp: 0,
+            protocol_version: String::new(),
+            round: 1,
+            sources: vec![],
+            txns: vec![txn0, txn1],
+        };
+
+        let resp = do_dryrun_request(req);
+        assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
+        assert_eq!(resp.txns.len(), 2);
+
+        // Txn 0 should PASS
+        let msgs0 = resp.txns[0].app_call_messages.as_ref().unwrap();
+        assert!(
+            msgs0.contains(&"PASS".to_string()),
+            "txn 0 should PASS: {:?}",
+            msgs0
+        );
+
+        // Txn 1 should PASS (gload reads scratch from txn 0)
+        let msgs1 = resp.txns[1].app_call_messages.as_ref().unwrap();
+        assert!(
+            msgs1.contains(&"PASS".to_string()),
+            "txn 1 should PASS (gload from txn 0): {:?}",
+            msgs1
+        );
     }
 }
