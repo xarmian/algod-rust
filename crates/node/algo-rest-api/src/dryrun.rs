@@ -1313,6 +1313,7 @@ fn execute_single_txn(
             consensus.clone(),
             false,
         );
+        // INVARIANT: restore_from_ctx MUST be called on ALL code paths below.
         shared.take_into_ctx(&mut ctx);
 
         // Set lsig args
@@ -1431,6 +1432,8 @@ fn execute_single_txn(
             consensus.clone(),
             true,
         );
+        // INVARIANT: take_into_ctx moves shared state into ctx. restore_from_ctx
+        // MUST be called on ALL code paths below — do not add early returns.
         shared.take_into_ctx(&mut ctx);
 
         // OptIn: pre-create local state for sender (matching Go behavior)
