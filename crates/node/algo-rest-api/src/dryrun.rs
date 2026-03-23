@@ -1560,11 +1560,12 @@ mod tests {
             txns: vec![],
         };
 
-        let original_approval = req.apps[0].params.approval_program.clone();
         expand_sources(&mut req).expect("expand_sources should succeed");
-        // The approval program should have been replaced with the compiled source.
-        assert_ne!(req.apps[0].params.approval_program, original_approval);
-        assert!(!req.apps[0].params.approval_program.is_empty());
+        // The approval program should match the independently compiled source.
+        let expected = assemble_string("#pragma version 10\nint 99\nint 99\npop")
+            .unwrap()
+            .program;
+        assert_eq!(req.apps[0].params.approval_program, expected);
     }
 
     #[test]
@@ -1590,10 +1591,11 @@ mod tests {
             txns: vec![],
         };
 
-        let original_clear = req.apps[0].params.clear_state_program.clone();
         expand_sources(&mut req).expect("expand_sources should succeed");
-        assert_ne!(req.apps[0].params.clear_state_program, original_clear);
-        assert!(!req.apps[0].params.clear_state_program.is_empty());
+        let expected = assemble_string("#pragma version 10\nint 99\nint 99\npop")
+            .unwrap()
+            .program;
+        assert_eq!(req.apps[0].params.clear_state_program, expected);
     }
 
     #[test]
@@ -1879,7 +1881,7 @@ mod tests {
         );
         let account = make_simple_account(&creator_str, 1_000_000);
         // on_completion = 3 means ClearState
-        let txn = make_app_call_txn_json(&sender, 100, 3);
+        let txn = make_app_call_txn_json(&sender, 100, ON_COMPLETION_CLEAR_STATE);
 
         let req = DryrunRequest {
             accounts: vec![account],
@@ -1946,7 +1948,8 @@ mod tests {
         // production code is fixed to properly collect deltas.
         assert!(
             resp.txns[0].global_delta.is_none(),
-            "known bug: deltas drained by run_approval_program_with_tracer"
+            "known bug: deltas drained by run_approval_program_with_tracer — \
+             if this fails, the bug is fixed; update to assert is_some() and verify delta values"
         );
 
         // We verify the program executed app_global_put by checking the
@@ -1977,8 +1980,8 @@ mod tests {
         let teal = "#pragma version 10\nint 0\nbyte \"lkey\"\nint 7\napp_local_put\nint 1";
         let app = make_app(100, &creator_str, teal, "#pragma version 10\nint 1");
         let account = make_simple_account(&creator_str, 1_000_000);
-        // on_completion=1 (OptIn) so dryrun pre-creates local state
-        let txn = make_app_call_txn_json(&sender, 100, 1);
+        // OptIn so dryrun pre-creates local state
+        let txn = make_app_call_txn_json(&sender, 100, ON_COMPLETION_OPT_IN);
 
         let req = DryrunRequest {
             accounts: vec![account],
@@ -2006,7 +2009,8 @@ mod tests {
         // This assertion documents the known bug — update this test when fixed.
         assert!(
             resp.txns[0].local_deltas.is_none(),
-            "known bug: deltas drained by run_approval_program_with_tracer"
+            "known bug: deltas drained by run_approval_program_with_tracer — \
+             if this fails, the bug is fixed; update to assert is_some() and verify delta values"
         );
 
         // Verify the program ran app_local_put successfully via trace.
@@ -2041,7 +2045,7 @@ mod tests {
         let teal = "#pragma version 10\nint 0\nint 0\napp_opted_in\nassert\nint 1";
         let app = make_app(100, &creator_str, teal, "#pragma version 10\nint 1");
         let account = make_simple_account(&creator_str, 1_000_000);
-        let txn = make_app_call_txn_json(&sender, 100, 1); // OptIn
+        let txn = make_app_call_txn_json(&sender, 100, ON_COMPLETION_OPT_IN);
 
         let req = DryrunRequest {
             accounts: vec![account],
