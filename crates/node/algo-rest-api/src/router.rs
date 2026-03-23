@@ -135,6 +135,7 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             "/v2/teal/disassemble",
             post(handlers::teal_disassemble::<N>),
         )
+        .route("/v2/teal/dryrun", post(handlers::teal_dryrun::<N>))
         .layer(middleware::from_fn_with_state(
             tokens.api_token.clone(),
             auth::require_token,

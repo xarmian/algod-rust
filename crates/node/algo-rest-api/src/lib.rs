@@ -6,6 +6,7 @@
 pub mod abi;
 pub mod auth;
 pub mod box_name;
+pub mod dryrun;
 pub mod error;
 pub mod format;
 pub mod handlers;
