@@ -17,8 +17,9 @@ use algo_error::AlgoError;
 use algo_ledger::avm_context::app_address;
 use algo_types::{
     consensus::{consensus_params_for_version, ConsensusParams, CONSENSUS_CURRENT_VERSION},
-    Address, SignedTransaction, TealValue,
+    Address, LogicSig, SignedTransaction, TealValue,
 };
+use serde_bytes::ByteBuf;
 
 use crate::models::{
     AccountResponse, AccountStateDelta, ApiApplication, ApiEvalDelta, DryrunRequest,
@@ -1090,6 +1091,9 @@ impl AvmContext for DryrunAvmContext {
 
 /// Compile DryrunSource entries and patch compiled bytecode into the request's
 /// transactions or apps, matching go-algorand's `ExpandSources()`.
+///
+/// This variant patches lsig programs in the JSON `txns` values and is used
+/// by the JSON decode path.
 pub fn expand_sources(req: &mut DryrunRequest) -> Result<(), String> {
     let sources: Vec<DryrunSource> = std::mem::take(&mut req.sources);
     for (si, src) in sources.iter().enumerate() {
@@ -1146,6 +1150,61 @@ pub fn expand_sources(req: &mut DryrunRequest) -> Result<(), String> {
     Ok(())
 }
 
+/// Compile DryrunSource entries and patch compiled bytecode into the request's
+/// apps and pre-parsed transactions, matching go-algorand's `ExpandSources()`.
+///
+/// This variant patches lsig programs directly on `SignedTransaction` values
+/// and is used by the msgpack decode path.
+pub fn expand_sources_with_txns(
+    req: &mut DryrunRequest,
+    txns: &mut [SignedTransaction],
+) -> Result<(), String> {
+    let sources: Vec<DryrunSource> = std::mem::take(&mut req.sources);
+    for (si, src) in sources.iter().enumerate() {
+        let compiled = assemble_string(&src.source).map_err(|errs| {
+            let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
+            format!("dryrun Source[{si}]: {}", msgs.join("; "))
+        })?;
+        let program_bytes = compiled.program;
+
+        match src.field_name.as_str() {
+            "approv" => {
+                for app in &mut req.apps {
+                    if app.id == src.app_index {
+                        app.params.approval_program = program_bytes.clone();
+                    }
+                }
+            }
+            "clearp" => {
+                for app in &mut req.apps {
+                    if app.id == src.app_index {
+                        app.params.clear_state_program = program_bytes.clone();
+                    }
+                }
+            }
+            "lsig" => {
+                let idx = src.txn_index;
+                if idx >= txns.len() {
+                    return Err(format!(
+                        "dryrun Source[{si}]: txn index {} out of range ({})",
+                        idx,
+                        txns.len()
+                    ));
+                }
+                let lsig = txns[idx].lsig.get_or_insert_with(LogicSig::default);
+                lsig.logic = ByteBuf::from(program_bytes);
+            }
+            _ => {
+                return Err(format!(
+                    "dryrun Source[{si}]: bad field name {:?}",
+                    src.field_name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // do_dryrun_request — main execution loop
 // ---------------------------------------------------------------------------
@@ -1184,10 +1243,32 @@ fn deltas_to_api_state_delta(deltas: &HashMap<Vec<u8>, Option<TealValue>>) -> St
     result
 }
 
+/// Expand sources and parse JSON transaction values into `SignedTransaction`s.
+///
+/// This is a convenience helper for the JSON dryrun path: it runs
+/// `expand_sources` (which may patch lsig programs in the JSON txn values),
+/// then converts each `serde_json::Value` into a `SignedTransaction`.
+pub fn prepare_dryrun_request(req: &mut DryrunRequest) -> Result<Vec<SignedTransaction>, String> {
+    expand_sources(req)?;
+    let mut signed_txns = Vec::with_capacity(req.txns.len());
+    for txn_val in &req.txns {
+        match serde_json::from_value::<SignedTransaction>(txn_val.clone()) {
+            Ok(stxn) => signed_txns.push(stxn),
+            Err(e) => return Err(format!("failed to parse transaction: {e}")),
+        }
+    }
+    Ok(signed_txns)
+}
+
 /// Execute a dryrun request and return the response.
 ///
 /// This is the main entry point, matching go-algorand's `doDryrunRequest()`.
-pub fn do_dryrun_request(mut req: DryrunRequest) -> DryrunResponse {
+/// The caller provides the request metadata and pre-parsed transactions
+/// (from either JSON or msgpack decoding).
+pub fn do_dryrun_request(
+    req: DryrunRequest,
+    signed_txns: Vec<SignedTransaction>,
+) -> DryrunResponse {
     // Determine protocol version and consensus params
     let proto_version = if req.protocol_version.is_empty() {
         CONSENSUS_CURRENT_VERSION.to_string()
@@ -1205,30 +1286,6 @@ pub fn do_dryrun_request(mut req: DryrunRequest) -> DryrunResponse {
             };
         }
     };
-
-    // Expand sources (compile and patch)
-    if let Err(e) = expand_sources(&mut req) {
-        return DryrunResponse {
-            error: e,
-            protocol_version: proto_version,
-            txns: Vec::new(),
-        };
-    }
-
-    // Parse transactions from JSON
-    let mut signed_txns: Vec<SignedTransaction> = Vec::new();
-    for txn_val in &req.txns {
-        match serde_json::from_value::<SignedTransaction>(txn_val.clone()) {
-            Ok(stxn) => signed_txns.push(stxn),
-            Err(e) => {
-                return DryrunResponse {
-                    error: format!("failed to parse transaction: {e}"),
-                    protocol_version: proto_version,
-                    txns: Vec::new(),
-                };
-            }
-        }
-    }
 
     // Execute each transaction.
     // Go dryrun uses an inflated budget: maxCurrentBudget = MaxAppProgramCost * 100
@@ -1546,6 +1603,12 @@ mod tests {
     // Test helpers
     // -----------------------------------------------------------------------
 
+    /// Convenience wrapper: expand sources, parse JSON txns, and execute.
+    fn run_dryrun(mut req: DryrunRequest) -> DryrunResponse {
+        let txns = prepare_dryrun_request(&mut req).expect("prepare_dryrun_request failed");
+        do_dryrun_request(req, txns)
+    }
+
     /// Build an AccountResponse with sensible defaults.
     fn make_simple_account(address_str: &str, amount: u64) -> AccountResponse {
         AccountResponse {
@@ -1819,7 +1882,7 @@ mod tests {
             txns: vec![txn],
         };
 
-        let resp = do_dryrun_request(req);
+        let resp = run_dryrun(req);
         assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
         assert_eq!(resp.txns.len(), 1);
         let msgs = resp.txns[0]
@@ -1857,7 +1920,7 @@ mod tests {
             txns: vec![txn],
         };
 
-        let resp = do_dryrun_request(req);
+        let resp = run_dryrun(req);
         assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
         assert_eq!(resp.txns.len(), 1);
         let msgs = resp.txns[0]
@@ -1883,7 +1946,7 @@ mod tests {
             txns: vec![],
         };
 
-        let resp = do_dryrun_request(req);
+        let resp = run_dryrun(req);
         assert!(resp.error.is_empty());
         assert!(resp.txns.is_empty());
     }
@@ -1921,7 +1984,7 @@ mod tests {
             txns: vec![txn],
         };
 
-        let resp = do_dryrun_request(req);
+        let resp = run_dryrun(req);
         assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
         assert_eq!(resp.txns.len(), 1);
         let msgs = resp.txns[0]
@@ -1964,7 +2027,7 @@ mod tests {
             txns: vec![txn],
         };
 
-        let resp = do_dryrun_request(req);
+        let resp = run_dryrun(req);
         assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
         assert_eq!(resp.txns.len(), 1);
         let msgs = resp.txns[0]
@@ -2006,7 +2069,7 @@ mod tests {
             txns: vec![txn],
         };
 
-        let resp = do_dryrun_request(req);
+        let resp = run_dryrun(req);
         assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
         assert_eq!(resp.txns.len(), 1);
         let msgs = resp.txns[0]
@@ -2044,7 +2107,7 @@ mod tests {
             txns: vec![txn],
         };
 
-        let resp = do_dryrun_request(req);
+        let resp = run_dryrun(req);
         assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
         assert_eq!(resp.txns.len(), 1);
         let msgs = resp.txns[0].app_call_messages.as_ref().unwrap();
@@ -2088,7 +2151,7 @@ mod tests {
             txns: vec![txn],
         };
 
-        let resp = do_dryrun_request(req);
+        let resp = run_dryrun(req);
         assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
         assert_eq!(resp.txns.len(), 1);
         let msgs = resp.txns[0].app_call_messages.as_ref().unwrap();
@@ -2138,7 +2201,7 @@ mod tests {
             txns: vec![txn],
         };
 
-        let resp = do_dryrun_request(req);
+        let resp = run_dryrun(req);
         assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
         let msgs = resp.txns[0].app_call_messages.as_ref().unwrap();
         assert!(
@@ -2169,7 +2232,7 @@ mod tests {
             txns: vec![txn],
         };
 
-        let resp = do_dryrun_request(req);
+        let resp = run_dryrun(req);
         assert!(resp.error.is_empty()); // per-txn error, not top-level
         assert_eq!(resp.txns.len(), 1);
         let msgs = resp.txns[0]
@@ -2196,7 +2259,7 @@ mod tests {
             txns: vec![],
         };
 
-        let resp = do_dryrun_request(req);
+        let resp = run_dryrun(req);
         assert!(!resp.error.is_empty(), "should have a top-level error");
         assert!(resp.error.contains("unsupported protocol version"));
     }
@@ -2227,7 +2290,7 @@ mod tests {
             txns: vec![txn],
         };
 
-        let resp = do_dryrun_request(req);
+        let resp = run_dryrun(req);
         assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
         assert_eq!(resp.txns.len(), 1);
         let msgs = resp.txns[0]
@@ -2325,7 +2388,7 @@ mod tests {
             txns: vec![txn],
         };
 
-        let resp = do_dryrun_request(req);
+        let resp = run_dryrun(req);
         assert!(resp.error.is_empty());
         let trace = resp.txns[0]
             .app_call_trace
@@ -2388,7 +2451,7 @@ mod tests {
             txns: vec![txn0, txn1],
         };
 
-        let resp = do_dryrun_request(req);
+        let resp = run_dryrun(req);
         assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
         assert_eq!(resp.txns.len(), 2);
 
@@ -2438,7 +2501,7 @@ mod tests {
             txns: vec![txn0, txn1],
         };
 
-        let resp = do_dryrun_request(req);
+        let resp = run_dryrun(req);
         assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
         assert_eq!(resp.txns.len(), 2);
 
@@ -2456,6 +2519,77 @@ mod tests {
             msgs1.contains(&"PASS".to_string()),
             "txn 1 should PASS (gload from txn 0): {:?}",
             msgs1
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Msgpack decoding test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_msgpack_dryrun_request_decode() {
+        use crate::models::MsgpackDryrunRequest;
+
+        let sender = test_sender();
+        let creator_str = test_sender_str();
+        let app = make_app(
+            100,
+            &creator_str,
+            "#pragma version 10\nint 1",
+            "#pragma version 10\nint 1",
+        );
+        let account = make_simple_account(&creator_str, 1_000_000);
+
+        // Build a SignedTransaction directly (as msgpack would provide).
+        let stxn = SignedTransaction {
+            txn: algo_types::Transaction {
+                txn_type: algo_types::TxnType::Appl,
+                sender: Address(sender),
+                application_id: 100,
+                on_completion: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mp_req = MsgpackDryrunRequest {
+            accounts: vec![account],
+            apps: vec![app],
+            latest_timestamp: 0,
+            protocol_version: String::new(),
+            round: 1,
+            sources: vec![],
+            txns: vec![stxn],
+        };
+
+        // Round-trip through msgpack encoding/decoding.
+        let encoded = rmp_serde::to_vec_named(&mp_req).expect("msgpack encode should succeed");
+        let decoded: MsgpackDryrunRequest =
+            rmp_serde::from_slice(&encoded).expect("msgpack decode should succeed");
+
+        assert_eq!(decoded.txns.len(), 1);
+        assert_eq!(decoded.apps.len(), 1);
+        assert_eq!(decoded.accounts.len(), 1);
+
+        // Convert to parts and execute.
+        let (req, signed_txns) = decoded.into_parts();
+        assert!(
+            req.txns.is_empty(),
+            "DryrunRequest txns should be empty after into_parts"
+        );
+        assert_eq!(signed_txns.len(), 1);
+
+        let resp = do_dryrun_request(req, signed_txns);
+        assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
+        assert_eq!(resp.txns.len(), 1);
+        let msgs = resp.txns[0]
+            .app_call_messages
+            .as_ref()
+            .expect("should have messages");
+        assert!(
+            msgs.contains(&"PASS".to_string()),
+            "expected PASS in messages: {:?}",
+            msgs
         );
     }
 }

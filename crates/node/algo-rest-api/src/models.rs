@@ -2060,6 +2060,59 @@ pub struct DryrunRequest {
     pub txns: Vec<serde_json::Value>,
 }
 
+/// A dryrun request decoded from msgpack.
+///
+/// Same fields as `DryrunRequest` but transactions are already decoded as
+/// `SignedTransaction` values (matching go-algorand's native `DryrunRequest`
+/// struct used on the msgpack path).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MsgpackDryrunRequest {
+    /// Accounts to load into the dryrun sandbox.
+    #[serde(default)]
+    pub accounts: Vec<AccountResponse>,
+
+    /// Applications to load into the dryrun sandbox.
+    #[serde(default)]
+    pub apps: Vec<ApiApplication>,
+
+    /// Latest confirmed round timestamp (seconds since epoch).
+    #[serde(rename = "latest-timestamp", default)]
+    pub latest_timestamp: i64,
+
+    /// Protocol version string.
+    #[serde(rename = "protocol-version", default)]
+    pub protocol_version: String,
+
+    /// Round number.
+    #[serde(default)]
+    pub round: u64,
+
+    /// Sources to compile and inject into transactions or apps.
+    #[serde(default)]
+    pub sources: Vec<DryrunSource>,
+
+    /// Transactions to execute (already decoded).
+    #[serde(default)]
+    pub txns: Vec<SignedTransaction>,
+}
+
+impl MsgpackDryrunRequest {
+    /// Split into a `DryrunRequest` (with empty txns) and the pre-parsed
+    /// transactions.
+    pub fn into_parts(self) -> (DryrunRequest, Vec<SignedTransaction>) {
+        let req = DryrunRequest {
+            accounts: self.accounts,
+            apps: self.apps,
+            latest_timestamp: self.latest_timestamp,
+            protocol_version: self.protocol_version,
+            round: self.round,
+            sources: self.sources,
+            txns: Vec::new(),
+        };
+        (req, self.txns)
+    }
+}
+
 /// Response from a dryrun request.
 ///
 /// Matches go-algorand's `model.DryrunResponse`.

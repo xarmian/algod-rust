@@ -3065,8 +3065,10 @@ const MAX_TEAL_DRYRUN_BYTES: usize = 1_000_000;
 
 /// Execute a TEAL dryrun against the provided programs and inputs.
 ///
-/// Accepts a JSON `DryrunRequest` body and returns a `DryrunResponse`
-/// containing execution traces and results for each transaction.
+/// Accepts either a JSON `DryrunRequest` body or a msgpack-encoded
+/// `MsgpackDryrunRequest` body (tried in that order, matching go-algorand)
+/// and returns a `DryrunResponse` containing execution traces and results
+/// for each transaction.
 ///
 /// Matches go-algorand's `Handlers.TealDryrun`.
 pub async fn teal_dryrun<N: NodeInterface>(
@@ -3087,10 +3089,37 @@ pub async fn teal_dryrun<N: NodeInterface>(
         return error::bad_request("request body too large");
     }
 
-    // Parse body as JSON into DryrunRequest
-    let mut req: models::DryrunRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(e) => return error::bad_request(format!("failed to parse dryrun request: {e}")),
+    // Decode request body: try JSON first, then msgpack (matching go-algorand
+    // handlers.go:1350-1363).
+    let (mut req, signed_txns) = match serde_json::from_slice::<models::DryrunRequest>(&body) {
+        Ok(mut json_req) => {
+            // JSON path: expand sources (may patch lsig in JSON txns),
+            // then convert JSON values to SignedTransaction.
+            match crate::dryrun::prepare_dryrun_request(&mut json_req) {
+                Ok(txns) => (json_req, txns),
+                Err(e) => {
+                    return error::bad_request(format!("failed to parse dryrun request: {e}"))
+                }
+            }
+        }
+        Err(_) => {
+            // Msgpack path: decode directly into MsgpackDryrunRequest
+            // where txns are already SignedTransaction values.
+            match rmp_serde::from_slice::<models::MsgpackDryrunRequest>(&body) {
+                Ok(mp_req) => {
+                    let (mut req, mut txns) = mp_req.into_parts();
+                    // Expand sources for the msgpack path (patches apps
+                    // and lsig programs on SignedTransaction directly).
+                    if let Err(e) = crate::dryrun::expand_sources_with_txns(&mut req, &mut txns) {
+                        return error::bad_request(format!("failed to parse dryrun request: {e}"));
+                    }
+                    (req, txns)
+                }
+                Err(e) => {
+                    return error::bad_request(format!("could not decode dryrun request: {e}"));
+                }
+            }
+        }
     };
 
     // Fill defaults from node state when not provided (matching go-algorand
@@ -3118,7 +3147,7 @@ pub async fn teal_dryrun<N: NodeInterface>(
     }
 
     // Execute the dryrun
-    let response = crate::dryrun::do_dryrun_request(req);
+    let response = crate::dryrun::do_dryrun_request(req, signed_txns);
 
     match serde_json::to_vec(&response) {
         Ok(bytes) => (
