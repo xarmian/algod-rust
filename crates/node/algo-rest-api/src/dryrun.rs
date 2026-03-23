@@ -2592,4 +2592,86 @@ mod tests {
             msgs
         );
     }
+
+    // -----------------------------------------------------------------------
+    // expand_sources_with_txns tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_expand_sources_with_txns_lsig() {
+        use crate::models::DryrunSource;
+
+        let sender = test_sender();
+
+        // Build a SignedTransaction with no lsig initially.
+        let stxn = SignedTransaction {
+            txn: algo_types::Transaction {
+                txn_type: algo_types::TxnType::Pay,
+                sender: Address(sender),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(stxn.lsig.is_none());
+
+        let mut req = DryrunRequest {
+            accounts: vec![],
+            apps: vec![],
+            latest_timestamp: 0,
+            protocol_version: String::new(),
+            round: 1,
+            sources: vec![DryrunSource {
+                field_name: "lsig".to_string(),
+                source: "#pragma version 10\nint 1".to_string(),
+                txn_index: 0,
+                app_index: 0,
+            }],
+            txns: vec![],
+        };
+
+        let mut txns = vec![stxn];
+        expand_sources_with_txns(&mut req, &mut txns).expect("expand_sources_with_txns failed");
+
+        // The lsig should now be populated with compiled program bytes.
+        let lsig = txns[0].lsig.as_ref().expect("lsig should be set");
+        assert!(!lsig.logic.is_empty(), "lsig program should not be empty");
+    }
+
+    #[test]
+    fn test_expand_sources_with_txns_approv() {
+        use crate::models::DryrunSource;
+
+        let creator_str = test_sender_str();
+        let app = make_app(
+            100,
+            &creator_str,
+            "#pragma version 10\nint 0", // will be overwritten
+            "#pragma version 10\nint 1",
+        );
+        let original_approval = app.params.approval_program.clone();
+
+        let mut req = DryrunRequest {
+            accounts: vec![],
+            apps: vec![app],
+            latest_timestamp: 0,
+            protocol_version: String::new(),
+            round: 1,
+            sources: vec![DryrunSource {
+                field_name: "approv".to_string(),
+                source: "#pragma version 10\nint 1".to_string(),
+                txn_index: 0,
+                app_index: 100,
+            }],
+            txns: vec![],
+        };
+
+        let mut txns: Vec<SignedTransaction> = vec![];
+        expand_sources_with_txns(&mut req, &mut txns).expect("expand_sources_with_txns failed");
+
+        // The approval program should have been replaced.
+        assert_ne!(
+            req.apps[0].params.approval_program, original_approval,
+            "approval program should have been patched"
+        );
+    }
 }
