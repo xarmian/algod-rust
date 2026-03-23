@@ -1345,7 +1345,7 @@ pub struct PendingTransactionsResponse {
 /// Matches go-algorand's `model.EvalDelta`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiEvalDelta {
-    /// Delta action: 1 = SetUint, 2 = SetBytes, 3 = Delete.
+    /// Delta action: 1 = SetBytes, 2 = SetUint, 3 = Delete.
     pub action: u64,
 
     /// Base64-encoded bytes value (omitted when empty).

@@ -10,8 +10,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use algo_avm::{
     assemble_string, disassemble, parse, run_approval_program_with_tracer,
-    run_clear_state_program_with_tracer, run_logicsig_program_with_tracer, AvmContext, AvmValue,
-    EvalTracer, GroupBudget, Program, ProgramType,
+    run_logicsig_program_with_tracer, AvmContext, AvmValue, EvalTracer, GroupBudget, Program,
+    ProgramType,
 };
 use algo_error::AlgoError;
 use algo_ledger::avm_context::app_address;
@@ -424,7 +424,16 @@ impl AvmContext for DryrunAvmContext {
             4 => Ok(TealValue::Uint(self.group.len() as u64)),
             5 => Ok(TealValue::Uint(self.consensus.logic_sig_version)),
             6 => Ok(TealValue::Uint(self.round)),
-            7 => Ok(TealValue::Uint(self.latest_timestamp as u64)),
+            7 => {
+                // Go returns 0 for negative timestamps. Treat as unsigned
+                // reinterpretation, clamping negatives to 0.
+                let ts = if self.latest_timestamp < 0 {
+                    0u64
+                } else {
+                    self.latest_timestamp as u64
+                };
+                Ok(TealValue::Uint(ts))
+            }
             8 => Ok(TealValue::Uint(self.app_id)),
             9 => Ok(TealValue::Bytes(self.creator.to_vec())),
             10 => Ok(TealValue::Bytes(app_address(self.app_id).to_vec())),
@@ -674,11 +683,21 @@ impl AvmContext for DryrunAvmContext {
 
     fn asset_params_get(&self, asset_id: u64, field: u8) -> Result<(TealValue, bool), AlgoError> {
         if let Some(creator) = self.asset_params.get(&asset_id) {
-            // Return minimal params — for full dryrun support more fields would
-            // need to be stored; for now return the creator for field 5 and
-            // zeros for others.
+            // Return minimal params with correct types. Byte-typed fields
+            // return empty bytes; uint-typed fields return 0.
             let val = match field {
+                0 => TealValue::Uint(0),                 // AssetTotal
+                1 => TealValue::Bytes(vec![]),           // AssetUnitName
+                2 => TealValue::Bytes(vec![]),           // AssetName
+                3 => TealValue::Bytes(vec![]),           // AssetURL
+                4 => TealValue::Bytes(vec![]),           // AssetMetadataHash
                 5 => TealValue::Bytes(creator.to_vec()), // AssetCreator
+                6 => TealValue::Bytes(vec![0u8; 32]),    // AssetManager
+                7 => TealValue::Bytes(vec![0u8; 32]),    // AssetReserve
+                8 => TealValue::Bytes(vec![0u8; 32]),    // AssetFreeze
+                9 => TealValue::Bytes(vec![0u8; 32]),    // AssetClawback
+                10 => TealValue::Uint(0),                // AssetDecimals
+                11 => TealValue::Uint(0),                // AssetDefaultFrozen
                 _ => TealValue::Uint(0),
             };
             Ok((val, true))
@@ -1033,14 +1052,15 @@ fn deltas_to_api_state_delta(deltas: &HashMap<Vec<u8>, Option<TealValue>>) -> St
         .iter()
         .map(|(key, val)| {
             let key_b64 = BASE64.encode(key);
+            // Go's DeltaAction: SetBytesAction=1, SetUintAction=2, DeleteAction=3
             let eval_delta = match val {
                 Some(TealValue::Uint(n)) => ApiEvalDelta {
-                    action: 1,
+                    action: 2, // SetUintAction
                     bytes: None,
                     uint: Some(*n),
                 },
                 Some(TealValue::Bytes(b)) => ApiEvalDelta {
-                    action: 2,
+                    action: 1, // SetBytesAction
                     bytes: Some(BASE64.encode(b)),
                     uint: None,
                 },
@@ -1308,21 +1328,12 @@ fn execute_single_txn(
 
         let budget_before = group_budget.remaining();
 
-        if is_clear_state {
-            let _app_result = run_clear_state_program_with_tracer(
-                &program_bytes,
-                &mut ctx,
-                consensus,
-                &mut tracer,
-            );
-        } else {
-            let _app_result = run_approval_program_with_tracer(
-                &program_bytes,
-                &mut ctx,
-                group_budget,
-                &mut tracer,
-            );
-        }
+        // Use run_approval_program_with_tracer for both approval and clear-state
+        // programs in dryrun. Go's dryrun uses StatefulEval (pooled budget) for
+        // both. Using the separate clear-state runner would create an isolated
+        // budget and budget_consumed would always report 0.
+        let _app_result =
+            run_approval_program_with_tracer(&program_bytes, &mut ctx, group_budget, &mut tracer);
 
         let budget_after = group_budget.remaining();
         let budget_consumed = if budget_before > budget_after {
