@@ -1090,12 +1090,18 @@ impl AvmContext for DryrunAvmContext {
 // ---------------------------------------------------------------------------
 
 /// Compile DryrunSource entries and patch compiled bytecode into the request's
-/// transactions or apps, matching go-algorand's `ExpandSources()`.
+/// apps and transactions, matching go-algorand's `ExpandSources()`.
 ///
-/// This variant patches lsig programs in the JSON `txns` values and is used
-/// by the JSON decode path.
-pub fn expand_sources(req: &mut DryrunRequest) -> Result<(), String> {
-    let sources: Vec<DryrunSource> = std::mem::take(&mut req.sources);
+/// The `patch_lsig` callback handles the lsig case differently depending on
+/// the decode path (JSON values vs pre-parsed `SignedTransaction`s).
+fn expand_sources_inner<F>(
+    sources: Vec<DryrunSource>,
+    apps: &mut [ApiApplication],
+    mut patch_lsig: F,
+) -> Result<(), String>
+where
+    F: FnMut(usize, usize, Vec<u8>) -> Result<(), String>,
+{
     for (si, src) in sources.iter().enumerate() {
         let compiled = assemble_string(&src.source).map_err(|errs| {
             let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
@@ -1105,39 +1111,21 @@ pub fn expand_sources(req: &mut DryrunRequest) -> Result<(), String> {
 
         match src.field_name.as_str() {
             "approv" => {
-                // Find the app by app_index
-                for app in &mut req.apps {
+                for app in apps.iter_mut() {
                     if app.id == src.app_index {
                         app.params.approval_program = program_bytes.clone();
                     }
                 }
             }
             "clearp" => {
-                for app in &mut req.apps {
+                for app in apps.iter_mut() {
                     if app.id == src.app_index {
                         app.params.clear_state_program = program_bytes.clone();
                     }
                 }
             }
             "lsig" => {
-                // Patch the logicsig program in the txn JSON
-                let idx = src.txn_index;
-                if idx >= req.txns.len() {
-                    return Err(format!(
-                        "dryrun Source[{si}]: txn index {} out of range ({})",
-                        idx,
-                        req.txns.len()
-                    ));
-                }
-                {
-                    let encoded = BASE64.encode(&program_bytes);
-                    if let Some(obj) = req.txns[idx].as_object_mut() {
-                        let lsig = obj.entry("lsig").or_insert_with(|| serde_json::json!({}));
-                        if let Some(lsig_obj) = lsig.as_object_mut() {
-                            lsig_obj.insert("l".to_string(), serde_json::Value::String(encoded));
-                        }
-                    }
-                }
+                patch_lsig(si, src.txn_index, program_bytes)?;
             }
             _ => {
                 return Err(format!(
@@ -1150,59 +1138,47 @@ pub fn expand_sources(req: &mut DryrunRequest) -> Result<(), String> {
     Ok(())
 }
 
-/// Compile DryrunSource entries and patch compiled bytecode into the request's
-/// apps and pre-parsed transactions, matching go-algorand's `ExpandSources()`.
-///
-/// This variant patches lsig programs directly on `SignedTransaction` values
-/// and is used by the msgpack decode path.
+/// Compile DryrunSource entries, patching lsig programs in the JSON `txns`
+/// values. Used by the JSON decode path.
+pub fn expand_sources(req: &mut DryrunRequest) -> Result<(), String> {
+    let sources = std::mem::take(&mut req.sources);
+    let txns = &mut req.txns;
+    expand_sources_inner(sources, &mut req.apps, |si, idx, program_bytes| {
+        if idx >= txns.len() {
+            return Err(format!(
+                "dryrun Source[{si}]: txn index {idx} out of range ({})",
+                txns.len()
+            ));
+        }
+        let encoded = BASE64.encode(&program_bytes);
+        if let Some(obj) = txns[idx].as_object_mut() {
+            let lsig = obj.entry("lsig").or_insert_with(|| serde_json::json!({}));
+            if let Some(lsig_obj) = lsig.as_object_mut() {
+                lsig_obj.insert("l".to_string(), serde_json::Value::String(encoded));
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Compile DryrunSource entries, patching lsig programs directly on
+/// `SignedTransaction` values. Used by the msgpack decode path.
 pub fn expand_sources_with_txns(
     req: &mut DryrunRequest,
     txns: &mut [SignedTransaction],
 ) -> Result<(), String> {
-    let sources: Vec<DryrunSource> = std::mem::take(&mut req.sources);
-    for (si, src) in sources.iter().enumerate() {
-        let compiled = assemble_string(&src.source).map_err(|errs| {
-            let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
-            format!("dryrun Source[{si}]: {}", msgs.join("; "))
-        })?;
-        let program_bytes = compiled.program;
-
-        match src.field_name.as_str() {
-            "approv" => {
-                for app in &mut req.apps {
-                    if app.id == src.app_index {
-                        app.params.approval_program = program_bytes.clone();
-                    }
-                }
-            }
-            "clearp" => {
-                for app in &mut req.apps {
-                    if app.id == src.app_index {
-                        app.params.clear_state_program = program_bytes.clone();
-                    }
-                }
-            }
-            "lsig" => {
-                let idx = src.txn_index;
-                if idx >= txns.len() {
-                    return Err(format!(
-                        "dryrun Source[{si}]: txn index {} out of range ({})",
-                        idx,
-                        txns.len()
-                    ));
-                }
-                let lsig = txns[idx].lsig.get_or_insert_with(LogicSig::default);
-                lsig.logic = ByteBuf::from(program_bytes);
-            }
-            _ => {
-                return Err(format!(
-                    "dryrun Source[{si}]: bad field name {:?}",
-                    src.field_name
-                ));
-            }
+    let sources = std::mem::take(&mut req.sources);
+    expand_sources_inner(sources, &mut req.apps, |si, idx, program_bytes| {
+        if idx >= txns.len() {
+            return Err(format!(
+                "dryrun Source[{si}]: txn index {idx} out of range ({})",
+                txns.len()
+            ));
         }
-    }
-    Ok(())
+        let lsig = txns[idx].lsig.get_or_insert_with(LogicSig::default);
+        lsig.logic = ByteBuf::from(program_bytes);
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2591,6 +2567,67 @@ mod tests {
             "expected PASS in messages: {:?}",
             msgs
         );
+    }
+
+    /// Test that `MsgpackDryrunRequest` can deserialize canonical msgpack
+    /// matching go-algorand's codec output (sorted keys, zero-value omission,
+    /// raw binary addresses).
+    #[test]
+    fn test_msgpack_dryrun_request_from_canonical_bytes() {
+        use crate::models::MsgpackDryrunRequest;
+        use rmpv::Value;
+
+        let sender = test_sender();
+
+        // Build canonical msgpack matching go-algorand's codec output.
+        // Go's codec: Canonical=true (sorted keys), RecursiveEmptyCheck=true
+        // (omit zero-value fields), uses `codec:"..."` tags for field names.
+        //
+        // DryrunRequest fields (sorted): "latest-timestamp", "protocol-version",
+        //   "round", "txns"
+        // SignedTxn fields: "txn"
+        // Transaction fields (sorted): "amt", "fee", "rcv", "snd", "type"
+        let txn_map = Value::Map(vec![
+            (Value::String("amt".into()), Value::Integer(42.into())),
+            (Value::String("fee".into()), Value::Integer(1000.into())),
+            (Value::String("rcv".into()), Value::Binary(sender.to_vec())),
+            (Value::String("snd".into()), Value::Binary(sender.to_vec())),
+            (Value::String("type".into()), Value::String("pay".into())),
+        ]);
+
+        let stxn_map = Value::Map(vec![(Value::String("txn".into()), txn_map)]);
+
+        let dryrun_map = Value::Map(vec![
+            (
+                Value::String("latest-timestamp".into()),
+                Value::Integer(100.into()),
+            ),
+            (
+                Value::String("protocol-version".into()),
+                Value::String("future".into()),
+            ),
+            (Value::String("round".into()), Value::Integer(1.into())),
+            (Value::String("txns".into()), Value::Array(vec![stxn_map])),
+        ]);
+
+        // Encode the rmpv::Value to msgpack bytes.
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &dryrun_map).expect("rmpv encode failed");
+
+        // Deserialize using our MsgpackDryrunRequest.
+        let decoded: MsgpackDryrunRequest =
+            rmp_serde::from_slice(&buf).expect("failed to decode canonical msgpack");
+
+        assert_eq!(decoded.protocol_version, "future");
+        assert_eq!(decoded.round, 1);
+        assert_eq!(decoded.latest_timestamp, 100);
+        assert_eq!(decoded.txns.len(), 1);
+        assert_eq!(decoded.txns[0].txn.sender, Address(sender));
+        assert_eq!(decoded.txns[0].txn.txn_type, algo_types::TxnType::Pay);
+        // Accounts, apps, sources should default to empty.
+        assert!(decoded.accounts.is_empty());
+        assert!(decoded.apps.is_empty());
+        assert!(decoded.sources.is_empty());
     }
 
     // -----------------------------------------------------------------------
