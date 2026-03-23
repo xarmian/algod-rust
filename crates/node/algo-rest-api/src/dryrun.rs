@@ -1333,6 +1333,8 @@ fn execute_single_txn(
 
         // Store logicsig scratch for gload conformance (Go saves scratch
         // for all program types, even though gload is not allowed in ModeSig).
+        // If this txn also has an app call, the app-call path below will
+        // overwrite this with the app's final scratch, which is correct.
         if let Some(ref scratch) = tracer.final_scratch {
             if txn_index < ctx.group_scratch.len() {
                 ctx.group_scratch[txn_index] = scratch.clone();
@@ -1441,10 +1443,10 @@ fn execute_single_txn(
             ctx.app_local_state
                 .entry((txn.sender.0, effective_app_id))
                 .or_default();
-            ctx.opted_in_apps
-                .entry(txn.sender.0)
-                .or_default()
-                .push(effective_app_id);
+            let opted = ctx.opted_in_apps.entry(txn.sender.0).or_default();
+            if !opted.contains(&effective_app_id) {
+                opted.push(effective_app_id);
+            }
         }
 
         let budget_before = group_budget.remaining();
