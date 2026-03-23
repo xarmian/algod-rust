@@ -774,10 +774,22 @@ impl AvmContext for DryrunAvmContext {
         Ok(0)
     }
 
-    fn block_field(&self, _round: u64, _field: u8) -> Result<AvmValue, AlgoError> {
-        // Dryrun does not have block history — return zero/empty defaults
-        // so programs using the `block` opcode don't error out.
-        Ok(AvmValue::Uint64(0))
+    fn block_field(&self, _round: u64, field: u8) -> Result<AvmValue, AlgoError> {
+        // Dryrun does not have block history — return zero-value defaults
+        // with correct types per go-algorand's blockFieldSpecs.
+        match field {
+            0 => Ok(AvmValue::Bytes(vec![0u8; 32])), // BlkSeed (VRF output)
+            1 => Ok(AvmValue::Uint64(0)),            // BlkTimestamp
+            2 => Ok(AvmValue::Bytes(vec![0u8; 32])), // BlkProposer (address)
+            3 => Ok(AvmValue::Uint64(0)),            // BlkFeesCollected
+            4 => Ok(AvmValue::Uint64(0)),            // BlkBonus
+            5 => Ok(AvmValue::Bytes(vec![0u8; 32])), // BlkBranch (digest)
+            6 => Ok(AvmValue::Bytes(vec![0u8; 32])), // BlkFeeSink (address)
+            7 => Ok(AvmValue::Bytes(vec![])),        // BlkProtocol (string)
+            8 => Ok(AvmValue::Uint64(0)),            // BlkTxnCounter
+            9 => Ok(AvmValue::Uint64(0)),            // BlkProposerPayout
+            _ => Ok(AvmValue::Uint64(0)),
+        }
     }
 
     // ---- Inner transactions (not supported in basic dryrun) ----
