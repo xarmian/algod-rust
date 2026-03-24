@@ -3341,9 +3341,10 @@ pub async fn generate_participation_keys<N: NodeInterface>(
     Query(params): Query<GenerateParticipationKeysParams>,
 ) -> Response {
     // Validate the address
-    if Address::from_str(&address).is_err() {
-        return error::bad_request(format!("invalid address: {address}"));
-    }
+    let parsed_addr = match Address::from_str(&address) {
+        Ok(addr) => addr,
+        Err(_) => return error::bad_request(format!("invalid address: {address}")),
+    };
 
     // Try to acquire the semaphore (non-blocking, like Go's TryAcquire)
     let permit = match KEYGEN_SEMAPHORE.try_acquire() {
@@ -3354,22 +3355,36 @@ pub async fn generate_participation_keys<N: NodeInterface>(
     };
 
     // Move the permit into the spawned task so it's released when done
-    let _first = params.first;
-    let _last = params.last;
-    let _dilution = params.dilution;
+    let first = params.first;
+    let last = params.last;
+    let dilution = params.dilution;
     tokio::spawn(async move {
         let _permit = permit;
-        // TODO: actual key generation not yet implemented.
-        // When available, this should call the equivalent of Go's
-        // generateKeyHandler(address, params) which generates keys
-        // and installs them via node.install_participation_key().
-        let _ = (node, _first, _last, _dilution);
-        tracing::warn!("generate_participation_keys: key generation not yet implemented");
+        match node
+            .generate_participation_keys(parsed_addr, first, last, dilution)
+            .await
+        {
+            Ok(part_id) => {
+                tracing::info!(
+                    "generated participation keys for {}: {}",
+                    address,
+                    part_id.to_base32()
+                );
+            }
+            Err(e) => {
+                tracing::warn!("error generating participation keys: {e}");
+            }
+        }
     });
 
     // Return immediately with empty JSON object, matching Go behavior.
     // Go uses ctx.String() which sets text/plain content-type.
-    (StatusCode::OK, [("content-type", "text/plain; charset=UTF-8")], "{}").into_response()
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; charset=UTF-8")],
+        "{}",
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

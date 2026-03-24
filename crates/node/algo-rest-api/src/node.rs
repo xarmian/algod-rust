@@ -744,4 +744,18 @@ pub trait NodeInterface: Send + Sync + 'static {
     ) -> Result<(), NodeError> {
         Err(NodeError::NotImplemented("append_participation_keys"))
     }
+
+    /// Generate participation keys and install them.
+    ///
+    /// Mirrors go-algorand's `generateKeyHandler` which generates keys
+    /// and installs them via `InstallParticipationKey`.
+    async fn generate_participation_keys(
+        &self,
+        _address: Address,
+        _first: u64,
+        _last: u64,
+        _dilution: Option<u64>,
+    ) -> Result<ParticipationID, NodeError> {
+        Err(NodeError::NotImplemented("generate_participation_keys"))
+    }
 }

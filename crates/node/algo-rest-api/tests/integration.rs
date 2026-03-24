@@ -780,6 +780,16 @@ impl NodeInterface for MockNode {
             None => Ok(()),
         }
     }
+
+    async fn generate_participation_keys(
+        &self,
+        _address: Address,
+        _first: u64,
+        _last: u64,
+        _dilution: Option<u64>,
+    ) -> Result<ParticipationID, NodeError> {
+        Ok(ParticipationID([0x42; 32]))
+    }
 }
 
 // ---------------------------------------------------------------------------

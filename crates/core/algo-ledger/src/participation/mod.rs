@@ -17,7 +17,9 @@ pub use equivocation::AntiEquivocationTracker;
 pub use store::ParticipationStore;
 
 use algo_consensus_crypto::merklesig;
-use algo_consensus_crypto::{OneTimeSignatureSecrets, VrfKeypair, VrfPubkey};
+use algo_consensus_crypto::{
+    one_time_id_for_round, OneTimeSignatureSecrets, VrfKeypair, VrfPubkey,
+};
 use algo_types::{AccountData, AccountStatus};
 use algo_types::{Address, Digest, Round};
 use rusqlite;
@@ -264,6 +266,64 @@ impl Participation {
     /// Return a reference to the VRF public key.
     pub fn vrf_pubkey(&self) -> &VrfPubkey {
         &self.vrf.pk
+    }
+
+    /// Generate a fresh participation key set for the given account.
+    ///
+    /// Matches Go's `FillDBWithParticipationKeys` in `participation.go`.
+    /// Generates VRF keys, one-time signing keys, and state proof keys.
+    ///
+    /// If `key_dilution` is 0, uses `default_key_dilution(first, last)`.
+    /// `key_lifetime` controls state proof key granularity (use
+    /// `merklesig::KEY_LIFETIME_DEFAULT` = 256 for production).
+    ///
+    /// Returns an error if `last < first` or the validity period exceeds limits.
+    pub fn generate(
+        parent: Address,
+        first_valid: Round,
+        last_valid: Round,
+        key_dilution: u64,
+        key_lifetime: u64,
+    ) -> Result<Self, String> {
+        if last_valid < first_valid {
+            return Err(format!(
+                "firstValid {} is after lastValid {}",
+                first_valid.0, last_valid.0
+            ));
+        }
+
+        let key_dilution = if key_dilution == 0 {
+            default_key_dilution(first_valid, last_valid)
+        } else {
+            key_dilution
+        };
+
+        // Compute batch range for one-time signature keys
+        let first_id = one_time_id_for_round(first_valid.0, key_dilution);
+        let last_id = one_time_id_for_round(last_valid.0, key_dilution);
+        let num_batches = last_id.batch - first_id.batch + 1;
+
+        // Generate cryptographic material
+        let voting = OneTimeSignatureSecrets::generate(first_id.batch, num_batches);
+        let vrf = VrfKeypair::generate();
+        let state_proof_secrets = if key_lifetime > 0 {
+            match merklesig::Secrets::new(first_valid.0, last_valid.0, key_lifetime) {
+                Ok(secrets) => Some(secrets),
+                Err(e) => return Err(format!("state proof key generation failed: {e}")),
+            }
+        } else {
+            None
+        };
+
+        Ok(Self {
+            parent,
+            vrf,
+            voting,
+            first_valid,
+            last_valid,
+            key_dilution,
+            state_proof_secrets,
+        })
     }
 }
 
