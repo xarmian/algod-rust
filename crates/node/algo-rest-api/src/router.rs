@@ -136,6 +136,22 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             post(handlers::teal_disassemble::<N>),
         )
         .route("/v2/teal/dryrun", post(handlers::teal_dryrun::<N>))
+        .route(
+            "/v2/devmode/blocks/offset",
+            get(handlers::get_block_timestamp_offset::<N>),
+        )
+        .route(
+            "/v2/devmode/blocks/offset/:offset",
+            post(handlers::set_block_timestamp_offset::<N>),
+        )
+        .route(
+            "/v2/ledger/sync",
+            get(handlers::get_sync_round::<N>).delete(handlers::unset_sync_round::<N>),
+        )
+        .route(
+            "/v2/ledger/sync/:round",
+            post(handlers::set_sync_round::<N>),
+        )
         .layer(middleware::from_fn_with_state(
             tokens.api_token.clone(),
             auth::require_token,
@@ -143,6 +159,16 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
 
     // Admin routes (admin API token required)
     let admin = Router::new()
+        .route(
+            "/v2/catchup/:catchpoint",
+            post(handlers::start_catchup::<N>).delete(handlers::abort_catchup::<N>),
+        )
+        .route("/v2/shutdown", post(handlers::shutdown_node::<N>))
+        .route(
+            "/debug/settings/pprof",
+            get(handlers::get_debug_settings_prof::<N>).put(handlers::put_debug_settings_prof::<N>),
+        )
+        .route("/debug/settings/config", get(handlers::get_config::<N>))
         .route(
             "/v2/participation",
             get(handlers::get_participation_keys::<N>).post(handlers::add_participation_key::<N>),

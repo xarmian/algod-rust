@@ -3472,3 +3472,355 @@ pub async fn append_keys<N: NodeInterface>(
         Err(e) => error::internal_error(e.to_string()),
     }
 }
+
+// ---------------------------------------------------------------------------
+// POST /v2/catchup/{catchpoint}  —  Start catchup
+// ---------------------------------------------------------------------------
+
+/// Query parameters for the start-catchup endpoint.
+#[derive(Debug, Deserialize)]
+pub struct StartCatchupParams {
+    /// Minimum number of rounds the ledger must be behind before starting
+    /// catchup. If the catchpoint round is within `min` rounds of the
+    /// current ledger round, catchup is skipped.
+    #[serde(default)]
+    pub min: u64,
+}
+
+/// Validate a catchpoint label string.
+///
+/// Matches go-algorand's `ParseCatchpointLabel`: the format is
+/// `{round}#{base32hash}` where round is a non-negative integer and hash
+/// is a base32 (no-pad) encoded 32-byte digest.
+fn is_valid_catchpoint(catchpoint: &str) -> bool {
+    let Some((round_str, hash_str)) = catchpoint.split_once('#') else {
+        return false;
+    };
+    if round_str.parse::<u64>().is_err() {
+        return false;
+    }
+    match data_encoding::BASE32_NOPAD.decode(hash_str.as_bytes()) {
+        Ok(bytes) => bytes.len() == 32,
+        Err(_) => false,
+    }
+}
+
+/// Extract the round number from a validated catchpoint label.
+fn catchpoint_round(catchpoint: &str) -> u64 {
+    catchpoint
+        .split_once('#')
+        .and_then(|(r, _)| r.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Start a catchpoint catchup.
+///
+/// Matches go-algorand's `Handlers.StartCatchup`.
+pub async fn start_catchup<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(catchpoint): Path<String>,
+    Query(params): Query<StartCatchupParams>,
+) -> Response {
+    use crate::node::CatchupStartResult;
+
+    if !is_valid_catchpoint(&catchpoint) {
+        return error::bad_request("failed to parse catchpoint");
+    }
+
+    // min-rounds check
+    if params.min > 0 {
+        let ledger_round = node.latest_round_for_catchup();
+        let cp_round = catchpoint_round(&catchpoint);
+        if cp_round < ledger_round.saturating_add(params.min) {
+            let response = models::CatchpointStartResponse {
+                catchup_message: "the node has already been initialized".to_string(),
+            };
+            return match serde_json::to_vec(&response) {
+                Ok(body) => {
+                    (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+                }
+                Err(_) => error::internal_error("failed to encode response"),
+            };
+        }
+    }
+
+    match node.start_catchup(&catchpoint, params.min).await {
+        Ok(CatchupStartResult::Created) => {
+            let response = models::CatchpointStartResponse {
+                catchup_message: catchpoint,
+            };
+            match serde_json::to_vec(&response) {
+                Ok(body) => (
+                    StatusCode::CREATED,
+                    [("content-type", "application/json")],
+                    body,
+                )
+                    .into_response(),
+                Err(_) => error::internal_error("failed to encode response"),
+            }
+        }
+        Ok(CatchupStartResult::AlreadyInProgress) => {
+            let response = models::CatchpointStartResponse {
+                catchup_message: catchpoint,
+            };
+            match serde_json::to_vec(&response) {
+                Ok(body) => {
+                    (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+                }
+                Err(_) => error::internal_error("failed to encode response"),
+            }
+        }
+        Ok(CatchupStartResult::Unable(msg)) => error::bad_request(msg),
+        Ok(CatchupStartResult::StartError(msg)) => error::timeout(msg),
+        Err(e) => error::internal_error(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /v2/catchup/{catchpoint}  —  Abort catchup
+// ---------------------------------------------------------------------------
+
+/// Abort a catchpoint catchup.
+///
+/// Matches go-algorand's `Handlers.AbortCatchup`.
+pub async fn abort_catchup<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(catchpoint): Path<String>,
+) -> Response {
+    if !is_valid_catchpoint(&catchpoint) {
+        return error::bad_request("failed to parse catchpoint");
+    }
+
+    match node.abort_catchup(&catchpoint).await {
+        Ok(()) => {
+            let response = models::CatchpointAbortResponse {
+                catchup_message: catchpoint,
+            };
+            match serde_json::to_vec(&response) {
+                Ok(body) => {
+                    (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+                }
+                Err(_) => error::internal_error("failed to encode response"),
+            }
+        }
+        Err(e) => error::internal_error(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /v2/shutdown  —  Shutdown node (stub)
+// ---------------------------------------------------------------------------
+
+/// Shutdown the node.
+///
+/// Matches go-algorand's `Handlers.ShutdownNode` which returns 501
+/// "Endpoint not implemented."
+pub async fn shutdown_node<N: NodeInterface>(State(_node): State<AppState<N>>) -> Response {
+    (StatusCode::NOT_IMPLEMENTED, "Endpoint not implemented.").into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/devmode/blocks/offset  —  Get block timestamp offset
+// ---------------------------------------------------------------------------
+
+/// Get the block timestamp offset (dev mode only).
+///
+/// Matches go-algorand's `Handlers.GetBlockTimeStampOffset`.
+pub async fn get_block_timestamp_offset<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+) -> Response {
+    match node.get_block_timestamp_offset().await {
+        Ok(Some(offset)) => {
+            let response = models::GetBlockTimeStampOffsetResponse { offset };
+            match serde_json::to_vec(&response) {
+                Ok(body) => {
+                    (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+                }
+                Err(_) => error::internal_error("failed to encode response"),
+            }
+        }
+        Ok(None) => error::not_found(
+            "failed to retrieve timestamp offset from node: block timestamp offset was never set, using real clock for timestamps",
+        ),
+        Err(_) => error::bad_request(
+            "failed to retrieve timestamp offset from node: cannot get block timestamp offset because we are not in dev mode",
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /v2/devmode/blocks/offset/{offset}  —  Set block timestamp offset
+// ---------------------------------------------------------------------------
+
+/// Set the block timestamp offset (dev mode only).
+///
+/// Matches go-algorand's `Handlers.SetBlockTimeStampOffset`.
+pub async fn set_block_timestamp_offset<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(offset): Path<u64>,
+) -> Response {
+    if offset > i64::MAX as u64 {
+        return error::bad_request(
+            "failed to set timestamp offset on the node: block timestamp offset cannot be larger than max int64 value",
+        );
+    }
+
+    match node.set_block_timestamp_offset(offset as i64).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(_) => error::bad_request(
+            "failed to set timestamp offset on the node: cannot set block timestamp offset because we are not in dev mode",
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /debug/settings/pprof  —  Get debug profiling settings
+// ---------------------------------------------------------------------------
+
+/// Get debug profiling settings.
+///
+/// Matches go-algorand's `Handlers.GetDebugSettingsProf`.
+pub async fn get_debug_settings_prof<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+) -> Response {
+    match node.get_debug_settings_prof().await {
+        Ok((mutex_rate, block_rate)) => {
+            let response = models::DebugSettingsProf {
+                mutex_rate: Some(mutex_rate),
+                block_rate: Some(block_rate),
+            };
+            match serde_json::to_vec(&response) {
+                Ok(body) => {
+                    (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+                }
+                Err(_) => error::internal_error("failed to encode response"),
+            }
+        }
+        Err(e) => error::internal_error(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PUT /debug/settings/pprof  —  Set debug profiling settings
+// ---------------------------------------------------------------------------
+
+/// Set debug profiling settings.
+///
+/// Matches go-algorand's `Handlers.PutDebugSettingsProf`.
+pub async fn put_debug_settings_prof<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let settings: models::DebugSettingsProf = match serde_json::from_slice(&body) {
+        Ok(s) => s,
+        Err(e) => return error::bad_request(format!("failed to parse request body: {e}")),
+    };
+
+    // Validate rates <= max i32
+    const MAX_RATE: u64 = i32::MAX as u64;
+    if let Some(rate) = settings.mutex_rate {
+        if rate > MAX_RATE {
+            return error::bad_request("blocking rate cannot be larger than max int32 value");
+        }
+    }
+    if let Some(rate) = settings.block_rate {
+        if rate > MAX_RATE {
+            return error::bad_request("blocking rate cannot be larger than max int32 value");
+        }
+    }
+
+    match node
+        .set_debug_settings_prof(settings.mutex_rate, settings.block_rate)
+        .await
+    {
+        Ok((old_mutex, old_block)) => {
+            let response = models::DebugSettingsProf {
+                mutex_rate: old_mutex,
+                block_rate: old_block,
+            };
+            match serde_json::to_vec(&response) {
+                Ok(body) => {
+                    (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+                }
+                Err(_) => error::internal_error("failed to encode response"),
+            }
+        }
+        Err(e) => error::internal_error(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /debug/settings/config  —  Get node config
+// ---------------------------------------------------------------------------
+
+/// Get the node configuration.
+///
+/// Matches go-algorand's `Handlers.GetConfig`.
+pub async fn get_config<N: NodeInterface>(State(node): State<AppState<N>>) -> Response {
+    match node.get_config_json().await {
+        Ok(config) => match serde_json::to_vec(&config) {
+            Ok(body) => {
+                (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+            }
+            Err(_) => error::internal_error("failed to encode response"),
+        },
+        Err(e) => error::internal_error(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/ledger/sync  —  Get sync round
+// ---------------------------------------------------------------------------
+
+/// Get the sync round (follower mode).
+///
+/// Matches go-algorand's `Handlers.GetSyncRound`.
+pub async fn get_sync_round<N: NodeInterface>(State(node): State<AppState<N>>) -> Response {
+    match node.get_sync_round().await {
+        Ok(0) => error::not_found("failed retrieving sync round from ledger"),
+        Ok(round) => {
+            let response = models::GetSyncRoundResponse { round };
+            match serde_json::to_vec(&response) {
+                Ok(body) => {
+                    (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+                }
+                Err(_) => error::internal_error("failed to encode response"),
+            }
+        }
+        Err(e) => error::internal_error(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /v2/ledger/sync/{round}  —  Set sync round
+// ---------------------------------------------------------------------------
+
+/// Set the sync round (follower mode).
+///
+/// Matches go-algorand's `Handlers.SetSyncRound`.
+pub async fn set_sync_round<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(round): Path<u64>,
+) -> Response {
+    match node.set_sync_round(round).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(NodeError::Internal(msg)) if msg.contains("invalid") => {
+            error::bad_request("failed to set sync round on the ledger")
+        }
+        Err(_) => error::internal_error("failed to set sync round on the ledger"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /v2/ledger/sync  —  Unset sync round
+// ---------------------------------------------------------------------------
+
+/// Unset the sync round (follower mode).
+///
+/// Matches go-algorand's `Handlers.UnsetSyncRound`.
+pub async fn unset_sync_round<N: NodeInterface>(State(node): State<AppState<N>>) -> Response {
+    match node.unset_sync_round().await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => error::internal_error(e.to_string()),
+    }
+}
