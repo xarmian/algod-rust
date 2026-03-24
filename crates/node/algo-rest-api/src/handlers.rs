@@ -3467,6 +3467,7 @@ pub async fn append_keys<N: NodeInterface>(
 
     match node.append_participation_keys(&decoded_id, data).await {
         Ok(()) => StatusCode::OK.into_response(),
+        Err(NodeError::NotFound(msg)) => error::not_found(msg),
         Err(e) => error::internal_error(e.to_string()),
     }
 }

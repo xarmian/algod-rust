@@ -786,12 +786,18 @@ impl ParticipationStore {
             .query_row(SELECT_PK, params![id.0.as_slice()], |row| row.get(0))?;
 
         // Read the SignerContext blob from the Keysets table to get first_valid
-        // and key_lifetime.
-        let ctx_blob: Vec<u8> = self.conn.query_row(
+        // and key_lifetime. The column is NULL when state proofs are disabled.
+        let ctx_blob: Option<Vec<u8>> = self.conn.query_row(
             "SELECT stateProof FROM Keysets WHERE pk = ?1",
             params![pk],
             |row| row.get(0),
         )?;
+
+        let ctx_blob = match ctx_blob {
+            Some(b) if !b.is_empty() => b,
+            // No state proof context — nothing to append.
+            _ => return Ok(()),
+        };
 
         let (ctx, _) = merklesig::SignerContext::from_msgpack(&ctx_blob).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -807,14 +813,16 @@ impl ParticipationStore {
             return Ok(());
         }
 
+        // Use a transaction so the COUNT and INSERTs are atomic — prevents
+        // concurrent callers from computing the same starting round.
+        let tx = self.conn.unchecked_transaction()?;
+
         // Count existing keys to determine the starting index for new keys.
-        let existing_count: i64 = self.conn.query_row(
+        let existing_count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM StateProofKeys WHERE pk = ?1",
             params![pk],
             |row| row.get(0),
         )?;
-
-        let tx = self.conn.unchecked_transaction()?;
 
         let mut round = index_to_round(ctx.first_valid, ctx.key_lifetime, existing_count as u64);
 
