@@ -3572,7 +3572,7 @@ pub async fn start_catchup<N: NodeInterface>(
         }
         Ok(CatchupStartResult::Unable(msg)) => error::bad_request(msg),
         Ok(CatchupStartResult::StartError(msg)) => error::timeout(msg),
-        Err(e) => error::internal_error(e.to_string()),
+        Err(e) => error::internal_error(format!("failed to start catchup : {e}")),
     }
 }
 
@@ -3603,7 +3603,7 @@ pub async fn abort_catchup<N: NodeInterface>(
                 Err(_) => error::internal_error("failed to encode response"),
             }
         }
-        Err(e) => error::internal_error(e.to_string()),
+        Err(e) => error::internal_error(format!("failed to abort catchup : {e}")),
     }
 }
 
