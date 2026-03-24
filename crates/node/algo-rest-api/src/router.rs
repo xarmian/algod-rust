@@ -144,6 +144,8 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             "/v2/devmode/blocks/offset/:offset",
             post(handlers::set_block_timestamp_offset::<N>),
         )
+        // TODO: In go-algorand, /v2/ledger/sync endpoints are on the "data" API
+        // with a separate auth token. For now they use the public API token.
         .route(
             "/v2/ledger/sync",
             get(handlers::get_sync_round::<N>).delete(handlers::unset_sync_round::<N>),

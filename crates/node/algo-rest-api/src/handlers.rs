@@ -3487,30 +3487,24 @@ pub struct StartCatchupParams {
     pub min: u64,
 }
 
-/// Validate a catchpoint label string.
+/// Parse and validate a catchpoint label string.
 ///
 /// Matches go-algorand's `ParseCatchpointLabel`: the format is
 /// `{round}#{base32hash}` where round is a non-negative integer and hash
 /// is a base32 (no-pad) encoded 32-byte digest.
-fn is_valid_catchpoint(catchpoint: &str) -> bool {
-    let Some((round_str, hash_str)) = catchpoint.split_once('#') else {
-        return false;
-    };
-    if round_str.parse::<u64>().is_err() {
-        return false;
+///
+/// Returns the round number on success, or `None` if the label is invalid.
+fn parse_catchpoint(catchpoint: &str) -> Option<u64> {
+    let (round_str, hash_str) = catchpoint.split_once('#')?;
+    let round = round_str.parse::<u64>().ok()?;
+    let bytes = data_encoding::BASE32_NOPAD
+        .decode(hash_str.as_bytes())
+        .ok()?;
+    if bytes.len() == 32 {
+        Some(round)
+    } else {
+        None
     }
-    match data_encoding::BASE32_NOPAD.decode(hash_str.as_bytes()) {
-        Ok(bytes) => bytes.len() == 32,
-        Err(_) => false,
-    }
-}
-
-/// Extract the round number from a validated catchpoint label.
-fn catchpoint_round(catchpoint: &str) -> u64 {
-    catchpoint
-        .split_once('#')
-        .and_then(|(r, _)| r.parse().ok())
-        .unwrap_or(0)
 }
 
 /// Start a catchpoint catchup.
@@ -3523,14 +3517,13 @@ pub async fn start_catchup<N: NodeInterface>(
 ) -> Response {
     use crate::node::CatchupStartResult;
 
-    if !is_valid_catchpoint(&catchpoint) {
+    let Some(cp_round) = parse_catchpoint(&catchpoint) else {
         return error::bad_request("failed to parse catchpoint");
-    }
+    };
 
     // min-rounds check
     if params.min > 0 {
         let ledger_round = node.latest_round_for_catchup();
-        let cp_round = catchpoint_round(&catchpoint);
         if cp_round < ledger_round.saturating_add(params.min) {
             let response = models::CatchpointStartResponse {
                 catchup_message: "the node has already been initialized".to_string(),
@@ -3587,7 +3580,7 @@ pub async fn abort_catchup<N: NodeInterface>(
     State(node): State<AppState<N>>,
     Path(catchpoint): Path<String>,
 ) -> Response {
-    if !is_valid_catchpoint(&catchpoint) {
+    if parse_catchpoint(&catchpoint).is_none() {
         return error::bad_request("failed to parse catchpoint");
     }
 
