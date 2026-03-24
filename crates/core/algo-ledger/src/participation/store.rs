@@ -760,6 +760,72 @@ impl ParticipationStore {
         }
     }
 
+    /// Append state proof keys to an existing participation key.
+    ///
+    /// Looks up the internal primary key from the `ParticipationID`, reads the
+    /// `SignerContext` (for `first_valid` and `key_lifetime`) from the `Keysets`
+    /// table, then inserts each `FalconSigner` key into the `StateProofKeys`
+    /// table at the appropriate round.
+    ///
+    /// `keys` is a slice of `FalconSigner` values to append.  The round for
+    /// each key is computed from the existing key count in the table (i.e.
+    /// keys are appended starting after the last existing key).
+    ///
+    /// Mirrors go-algorand's `Registry.AppendKeys`.
+    pub fn append_state_proof_keys(
+        &self,
+        id: &ParticipationID,
+        keys: &[FalconSigner],
+    ) -> Result<(), rusqlite::Error> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let pk: i64 = self
+            .conn
+            .query_row(SELECT_PK, params![id.0.as_slice()], |row| row.get(0))?;
+
+        // Read the SignerContext blob from the Keysets table to get first_valid
+        // and key_lifetime.
+        let ctx_blob: Vec<u8> = self.conn.query_row(
+            "SELECT stateProof FROM Keysets WHERE pk = ?1",
+            params![pk],
+            |row| row.get(0),
+        )?;
+
+        let (ctx, _) = merklesig::SignerContext::from_msgpack(&ctx_blob).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Blob,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })?;
+
+        if ctx.key_lifetime == 0 {
+            return Ok(());
+        }
+
+        // Count existing keys to determine the starting index for new keys.
+        let existing_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM StateProofKeys WHERE pk = ?1",
+            params![pk],
+            |row| row.get(0),
+        )?;
+
+        let tx = self.conn.unchecked_transaction()?;
+
+        let mut round = index_to_round(ctx.first_valid, ctx.key_lifetime, existing_count as u64);
+
+        for key in keys {
+            let key_blob = key.to_msgpack();
+            tx.execute(INSERT_STATE_PROOF_KEY, params![pk, round as i64, key_blob])?;
+            round += ctx.key_lifetime;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     // -- Internal helpers ---------------------------------------------------
 
     /// Scan a single row from the joined `Keysets`/`Rolling` query into a

@@ -142,11 +142,25 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
         ));
 
     // Admin routes (admin API token required)
-    // Future admin endpoints will be added here.
-    let admin = Router::new().layer(middleware::from_fn_with_state(
-        tokens.admin_token.clone(),
-        auth::require_token,
-    ));
+    let admin = Router::new()
+        .route(
+            "/v2/participation",
+            get(handlers::get_participation_keys::<N>).post(handlers::add_participation_key::<N>),
+        )
+        .route(
+            "/v2/participation/generate/:address",
+            post(handlers::generate_participation_keys::<N>),
+        )
+        .route(
+            "/v2/participation/:participation-id",
+            get(handlers::get_participation_key_by_id::<N>)
+                .delete(handlers::delete_participation_key_by_id::<N>)
+                .post(handlers::append_keys::<N>),
+        )
+        .layer(middleware::from_fn_with_state(
+            tokens.admin_token.clone(),
+            auth::require_token,
+        ));
 
     // Merge all route groups with shared node state
     public.merge(authenticated).merge(admin).with_state(node)

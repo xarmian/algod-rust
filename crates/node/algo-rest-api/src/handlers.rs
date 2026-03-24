@@ -35,6 +35,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use algo_ledger::participation::{ParticipationID, ParticipationRecord};
 use algo_types::Address;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -3186,5 +3187,261 @@ pub async fn teal_dryrun<N: NodeInterface>(
         )
             .into_response(),
         Err(e) => error::internal_error(format!("failed to encode response: {e}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Participation key endpoints
+// ---------------------------------------------------------------------------
+
+/// Helper to convert zero rounds to None (matching go-algorand's `omitEmpty`).
+fn omit_empty_round(r: algo_types::Round) -> Option<u64> {
+    if r.0 == 0 {
+        None
+    } else {
+        Some(r.0)
+    }
+}
+
+/// Convert a `ParticipationRecord` into the REST API `ParticipationKey` model.
+///
+/// Matches go-algorand's `convertParticipationRecord` exactly.
+fn convert_participation_record(record: &ParticipationRecord) -> models::ParticipationKey {
+    let mut key = models::ApiAccountParticipation {
+        vote_first_valid: record.first_valid.0,
+        vote_last_valid: record.last_valid.0,
+        vote_key_dilution: record.key_dilution,
+        selection_participation_key: Vec::new(),
+        vote_participation_key: Vec::new(),
+        state_proof_key: None,
+    };
+
+    if let Some(ref verifier) = record.state_proof_verifier {
+        key.state_proof_key = Some(verifier.commitment.to_vec());
+    }
+
+    if let Some(ref vote_id) = record.vote_id {
+        key.vote_participation_key = vote_id.to_vec();
+    }
+
+    if let Some(ref vrf) = record.vrf_public_key {
+        key.selection_participation_key = vrf.0.to_vec();
+    }
+
+    // Effective first/last logic matches Go exactly:
+    // If effective_last != 0 && effective_first == 0, set effective_first to Some(0).
+    // Otherwise, omitEmpty on effective_first.
+    let effective_first_valid = if record.effective_last.0 != 0 && record.effective_first.0 == 0 {
+        Some(0)
+    } else {
+        omit_empty_round(record.effective_first)
+    };
+
+    models::ParticipationKey {
+        id: record.participation_id.to_base32(),
+        address: record.account.to_algorand_string(),
+        key,
+        effective_first_valid,
+        effective_last_valid: omit_empty_round(record.effective_last),
+        last_vote: omit_empty_round(record.last_vote),
+        last_block_proposal: omit_empty_round(record.last_block_proposal),
+        last_state_proof: omit_empty_round(record.last_state_proof),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/participation
+// ---------------------------------------------------------------------------
+
+/// List all participation keys.
+///
+/// Matches go-algorand's `GetParticipationKeys`.
+pub async fn get_participation_keys<N: NodeInterface>(State(node): State<AppState<N>>) -> Response {
+    match node.list_participation_keys().await {
+        Ok(records) => {
+            let response: Vec<models::ParticipationKey> =
+                records.iter().map(convert_participation_record).collect();
+            match serde_json::to_vec(&response) {
+                Ok(body) => {
+                    (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+                }
+                Err(e) => error::internal_error(format!("failed to encode response: {e}")),
+            }
+        }
+        Err(e) => error::bad_request(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /v2/participation
+// ---------------------------------------------------------------------------
+
+/// Install a participation key from raw binary data.
+///
+/// Matches go-algorand's `AddParticipationKey`.
+pub async fn add_participation_key<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let data = body.to_vec();
+    if data.is_empty() {
+        return error::bad_request("payload length is zero");
+    }
+
+    match node.install_participation_key(data).await {
+        Ok(part_id) => {
+            let response = models::PostParticipationResponse {
+                part_id: part_id.to_base32(),
+            };
+            match serde_json::to_vec(&response) {
+                Ok(body) => {
+                    (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+                }
+                Err(e) => error::internal_error(format!("failed to encode response: {e}")),
+            }
+        }
+        Err(e) => error::bad_request(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /v2/participation/generate/:address
+// ---------------------------------------------------------------------------
+
+/// Query parameters for the generate participation keys endpoint.
+#[derive(Debug, Deserialize)]
+pub struct GenerateParticipationKeysParams {
+    /// First valid round (required).
+    pub first: u64,
+    /// Last valid round (required).
+    pub last: u64,
+    /// Key dilution (optional).
+    pub dilution: Option<u64>,
+}
+
+/// Semaphore limiting concurrent key generation to 1 at a time.
+static KEYGEN_SEMAPHORE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Generate participation keys for an address.
+///
+/// Matches go-algorand's `GenerateParticipationKeys` — spawns a background
+/// task and immediately returns 200 with "{}".
+pub async fn generate_participation_keys<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(address): Path<String>,
+    Query(params): Query<GenerateParticipationKeysParams>,
+) -> Response {
+    // Validate the address
+    if Address::from_str(&address).is_err() {
+        return error::bad_request(format!("invalid address: {address}"));
+    }
+
+    // Try to acquire the semaphore (non-blocking, like Go's TryAcquire)
+    let permit = match KEYGEN_SEMAPHORE.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error::bad_request("participation key generation already in progress");
+        }
+    };
+
+    // Move the permit into the spawned task so it's released when done
+    let _first = params.first;
+    let _last = params.last;
+    let _dilution = params.dilution;
+    tokio::spawn(async move {
+        let _permit = permit;
+        // TODO: actual key generation not yet implemented.
+        // When available, this should call the equivalent of Go's
+        // generateKeyHandler(address, params) which generates keys
+        // and installs them via node.install_participation_key().
+        let _ = (node, _first, _last, _dilution);
+        tracing::warn!("generate_participation_keys: key generation not yet implemented");
+    });
+
+    // Return immediately with empty JSON object, matching Go behavior
+    (StatusCode::OK, [("content-type", "application/json")], "{}").into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/participation/:participation-id
+// ---------------------------------------------------------------------------
+
+/// Get a participation key by its ID.
+///
+/// Matches go-algorand's `GetParticipationKeyByID`.
+pub async fn get_participation_key_by_id<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(participation_id): Path<String>,
+) -> Response {
+    let decoded_id = match ParticipationID::from_base32(&participation_id) {
+        Ok(id) => id,
+        Err(e) => return error::bad_request(e),
+    };
+
+    match node.get_participation_key(&decoded_id).await {
+        Ok(record) => {
+            if record.is_zero() {
+                return error::not_found("participation id not found");
+            }
+            let response = convert_participation_record(&record);
+            match serde_json::to_vec(&response) {
+                Ok(body) => {
+                    (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+                }
+                Err(e) => error::internal_error(format!("failed to encode response: {e}")),
+            }
+        }
+        Err(e) => error::internal_error(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /v2/participation/:participation-id
+// ---------------------------------------------------------------------------
+
+/// Delete a participation key by its ID.
+///
+/// Matches go-algorand's `DeleteParticipationKeyByID`.
+pub async fn delete_participation_key_by_id<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(participation_id): Path<String>,
+) -> Response {
+    let decoded_id = match ParticipationID::from_base32(&participation_id) {
+        Ok(id) => id,
+        Err(e) => return error::bad_request(e),
+    };
+
+    match node.remove_participation_key(&decoded_id).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(NodeError::NotFound(msg)) => error::not_found(msg),
+        Err(e) => error::internal_error(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /v2/participation/:participation-id  (append keys)
+// ---------------------------------------------------------------------------
+
+/// Append state proof keys to an existing participation key.
+///
+/// Matches go-algorand's `AppendKeys`.
+pub async fn append_keys<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(participation_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let decoded_id = match ParticipationID::from_base32(&participation_id) {
+        Ok(id) => id,
+        Err(e) => return error::bad_request(e),
+    };
+
+    let data = body.to_vec();
+    if data.is_empty() {
+        return error::bad_request("empty request, please attach keys to request body");
+    }
+
+    match node.append_participation_keys(&decoded_id, data).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => error::internal_error(e.to_string()),
     }
 }

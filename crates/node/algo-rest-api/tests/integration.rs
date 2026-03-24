@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use algo_ledger::participation::{ParticipationID, ParticipationRecord};
 use algo_ledger::StateDelta;
 use algo_rest_api::auth::generate_token;
 use algo_rest_api::node::{
@@ -114,6 +115,14 @@ struct MockNode {
     state_deltas: BTreeMap<u64, StateDelta>,
     /// Whether the developer API is enabled.
     enable_developer_api: bool,
+    /// Participation records to return from list/get.
+    participation_records: Vec<ParticipationRecord>,
+    /// Install result: None = return new ID, Some(msg) = error.
+    install_result: Option<String>,
+    /// Remove result: None = success, Some(msg) = error (use "not found" for NotFound variant).
+    remove_result: Option<String>,
+    /// Append result: None = success, Some(msg) = error.
+    append_result: Option<String>,
 }
 
 impl Clone for MockNode {
@@ -156,6 +165,10 @@ impl Clone for MockNode {
             simulate_result: self.simulate_result.clone(),
             state_deltas: self.state_deltas.clone(),
             enable_developer_api: self.enable_developer_api,
+            participation_records: self.participation_records.clone(),
+            install_result: self.install_result.clone(),
+            remove_result: self.remove_result.clone(),
+            append_result: self.append_result.clone(),
         }
     }
 }
@@ -246,6 +259,10 @@ impl MockNode {
             simulate_result: None,
             state_deltas: BTreeMap::new(),
             enable_developer_api: false,
+            participation_records: Vec::new(),
+            install_result: None,
+            remove_result: None,
+            append_result: None,
         }
     }
 
@@ -702,6 +719,66 @@ impl NodeInterface for MockNode {
 
     fn enable_developer_api(&self) -> bool {
         self.enable_developer_api
+    }
+
+    async fn list_participation_keys(&self) -> Result<Vec<ParticipationRecord>, NodeError> {
+        Ok(self.participation_records.clone())
+    }
+
+    async fn get_participation_key(
+        &self,
+        id: &ParticipationID,
+    ) -> Result<ParticipationRecord, NodeError> {
+        for record in &self.participation_records {
+            if record.participation_id.0 == id.0 {
+                return Ok(record.clone());
+            }
+        }
+        // Return a zero record (handler converts to 404).
+        Ok(ParticipationRecord {
+            participation_id: ParticipationID([0u8; 32]),
+            account: Address([0u8; 32]),
+            first_valid: Round(0),
+            last_valid: Round(0),
+            key_dilution: 0,
+            last_vote: Round(0),
+            last_block_proposal: Round(0),
+            last_state_proof: Round(0),
+            effective_first: Round(0),
+            effective_last: Round(0),
+            vrf_public_key: None,
+            vote_id: None,
+            state_proof_verifier: None,
+        })
+    }
+
+    async fn install_participation_key(
+        &self,
+        _data: Vec<u8>,
+    ) -> Result<ParticipationID, NodeError> {
+        match &self.install_result {
+            Some(msg) => Err(NodeError::Internal(msg.clone())),
+            None => Ok(ParticipationID([0x42; 32])),
+        }
+    }
+
+    async fn remove_participation_key(&self, _id: &ParticipationID) -> Result<(), NodeError> {
+        match &self.remove_result {
+            Some(msg) if msg.contains("not found") => Err(NodeError::NotFound(msg.clone())),
+            Some(msg) => Err(NodeError::Internal(msg.clone())),
+            None => Ok(()),
+        }
+    }
+
+    async fn append_participation_keys(
+        &self,
+        _id: &ParticipationID,
+        _keys: Vec<u8>,
+    ) -> Result<(), NodeError> {
+        match &self.append_result {
+            Some(msg) => Err(NodeError::Internal(msg.clone())),
+            None => Ok(()),
+        }
     }
 }
 
@@ -5710,4 +5787,291 @@ async fn teal_disassemble_disabled_returns_404() {
         body.contains("EnableDeveloperAPI"),
         "404 message should mention EnableDeveloperAPI"
     );
+}
+
+// ===========================================================================
+// Participation key endpoint tests
+// ===========================================================================
+
+fn mock_participation_record() -> ParticipationRecord {
+    let mut id_bytes = [0u8; 32];
+    id_bytes[0] = 0x01;
+    id_bytes[1] = 0x02;
+
+    let mut account_bytes = [0u8; 32];
+    account_bytes[0] = 0xAA;
+
+    ParticipationRecord {
+        participation_id: ParticipationID(id_bytes),
+        account: Address(account_bytes),
+        first_valid: Round(100),
+        last_valid: Round(3_000_000),
+        key_dilution: 1000,
+        last_vote: Round(50),
+        last_block_proposal: Round(40),
+        last_state_proof: Round(30),
+        effective_first: Round(100),
+        effective_last: Round(200),
+        vrf_public_key: None,
+        vote_id: Some([0xBB; 32]),
+        state_proof_verifier: None,
+    }
+}
+
+#[tokio::test]
+async fn participation_list_empty() {
+    let server = TestServer::start(MockNode::synced()).await;
+    let resp = server
+        .client
+        .get(server.url("/v2/participation"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert_eq!(body, "[]");
+}
+
+#[tokio::test]
+async fn participation_list_with_records() {
+    let mut node = MockNode::synced();
+    let record = mock_participation_record();
+    let expected_id = record.participation_id.to_base32();
+    node.participation_records.push(record);
+
+    let server = TestServer::start(node).await;
+    let resp = server
+        .client
+        .get(server.url("/v2/participation"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    let arr: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let arr = arr.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    let obj = &arr[0];
+    assert_eq!(obj["id"].as_str().unwrap(), expected_id);
+    // Check key fields
+    assert_eq!(obj["key"]["vote-first-valid"].as_u64().unwrap(), 100);
+    assert_eq!(obj["key"]["vote-last-valid"].as_u64().unwrap(), 3_000_000);
+    assert_eq!(obj["key"]["vote-key-dilution"].as_u64().unwrap(), 1000);
+}
+
+#[tokio::test]
+async fn participation_list_requires_admin_token() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    // API token should be rejected (admin-only endpoint)
+    let resp = server
+        .client
+        .get(server.url("/v2/participation"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // No token at all should also be rejected
+    let resp = server
+        .client
+        .get(server.url("/v2/participation"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn participation_get_by_id_found() {
+    let mut node = MockNode::synced();
+    let record = mock_participation_record();
+    let id_base32 = record.participation_id.to_base32();
+    node.participation_records.push(record);
+
+    let server = TestServer::start(node).await;
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/participation/{id_base32}")))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    let obj: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(obj["id"].as_str().unwrap(), id_base32);
+    assert_eq!(obj["key"]["vote-first-valid"].as_u64().unwrap(), 100);
+}
+
+#[tokio::test]
+async fn participation_get_by_id_not_found() {
+    let server = TestServer::start(MockNode::synced()).await;
+    // Use a valid base32 ID that doesn't match any record
+    let id = ParticipationID([0xFF; 32]);
+    let id_base32 = id.to_base32();
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/participation/{id_base32}")))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn participation_get_by_id_invalid_id() {
+    let server = TestServer::start(MockNode::synced()).await;
+    let resp = server
+        .client
+        .get(server.url("/v2/participation/INVALID!!!"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn participation_add_key_success() {
+    let server = TestServer::start(MockNode::synced()).await;
+    let resp = server
+        .client
+        .post(server.url("/v2/participation"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .body(vec![0x01, 0x02, 0x03])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    let obj: serde_json::Value = serde_json::from_str(&body).unwrap();
+    // The mock returns ParticipationID([0x42; 32])
+    let expected_id = ParticipationID([0x42; 32]).to_base32();
+    assert_eq!(obj["partId"].as_str().unwrap(), expected_id);
+}
+
+#[tokio::test]
+async fn participation_add_key_error() {
+    let mut node = MockNode::synced();
+    node.install_result = Some("invalid key data".to_string());
+    let server = TestServer::start(node).await;
+    let resp = server
+        .client
+        .post(server.url("/v2/participation"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .body(vec![0x01, 0x02, 0x03])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn participation_add_key_empty_body() {
+    let server = TestServer::start(MockNode::synced()).await;
+    let resp = server
+        .client
+        .post(server.url("/v2/participation"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .body(Vec::<u8>::new())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn participation_delete_success() {
+    let server = TestServer::start(MockNode::synced()).await;
+    let id = ParticipationID([0x01; 32]);
+    let id_base32 = id.to_base32();
+
+    let resp = server
+        .client
+        .delete(server.url(&format!("/v2/participation/{id_base32}")))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn participation_delete_not_found() {
+    let mut node = MockNode::synced();
+    node.remove_result = Some("not found".to_string());
+
+    let server = TestServer::start(node).await;
+    let id = ParticipationID([0x01; 32]);
+    let id_base32 = id.to_base32();
+
+    let resp = server
+        .client
+        .delete(server.url(&format!("/v2/participation/{id_base32}")))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn participation_generate_returns_200() {
+    let server = TestServer::start(MockNode::synced()).await;
+    // Use a valid Algorand address (all zeros with correct checksum)
+    let addr = Address([0u8; 32]);
+    let addr_str = addr.to_algorand_string();
+
+    let resp = server
+        .client
+        .post(server.url(&format!(
+            "/v2/participation/generate/{addr_str}?first=1&last=100"
+        )))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert_eq!(body, "{}");
+}
+
+#[tokio::test]
+async fn participation_append_keys_success() {
+    let server = TestServer::start(MockNode::synced()).await;
+    let id = ParticipationID([0x01; 32]);
+    let id_base32 = id.to_base32();
+
+    let resp = server
+        .client
+        .post(server.url(&format!("/v2/participation/{id_base32}")))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .body(vec![0xAA, 0xBB, 0xCC])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn participation_append_keys_empty_body() {
+    let server = TestServer::start(MockNode::synced()).await;
+    let id = ParticipationID([0x01; 32]);
+    let id_base32 = id.to_base32();
+
+    let resp = server
+        .client
+        .post(server.url(&format!("/v2/participation/{id_base32}")))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .body(Vec::<u8>::new())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
 }

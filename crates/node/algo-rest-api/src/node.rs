@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 
+use algo_ledger::participation::{ParticipationID, ParticipationRecord};
 use algo_ledger::StateDelta;
 use algo_types::{
     AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParams, Block, BlockHeader,
@@ -695,5 +696,52 @@ pub trait NodeInterface: Send + Sync + 'static {
     /// Mirrors go-algorand's tracer-based round transaction group delta lookup.
     async fn get_txn_group_deltas_for_round(&self, _round: u64) -> Result<Vec<u8>, NodeError> {
         Err(NodeError::NotImplemented("get_txn_group_deltas_for_round"))
+    }
+
+    // ---- Participation key methods ----
+
+    /// List all participation keys.
+    ///
+    /// Mirrors go-algorand's `Node.ListParticipationKeys`.
+    async fn list_participation_keys(&self) -> Result<Vec<ParticipationRecord>, NodeError> {
+        Err(NodeError::NotImplemented("list_participation_keys"))
+    }
+
+    /// Get a single participation key by its ID.
+    ///
+    /// Mirrors go-algorand's `Node.GetParticipationKey`.
+    async fn get_participation_key(
+        &self,
+        _id: &ParticipationID,
+    ) -> Result<ParticipationRecord, NodeError> {
+        Err(NodeError::NotImplemented("get_participation_key"))
+    }
+
+    /// Install a participation key from raw bytes (e.g. from a key file).
+    ///
+    /// Mirrors go-algorand's `Node.InstallParticipationKey`.
+    async fn install_participation_key(
+        &self,
+        _data: Vec<u8>,
+    ) -> Result<ParticipationID, NodeError> {
+        Err(NodeError::NotImplemented("install_participation_key"))
+    }
+
+    /// Remove a participation key by its ID.
+    ///
+    /// Mirrors go-algorand's `Node.RemoveParticipationKey`.
+    async fn remove_participation_key(&self, _id: &ParticipationID) -> Result<(), NodeError> {
+        Err(NodeError::NotImplemented("remove_participation_key"))
+    }
+
+    /// Append state proof keys to an existing participation key.
+    ///
+    /// Mirrors go-algorand's `Node.AppendParticipationKeys`.
+    async fn append_participation_keys(
+        &self,
+        _id: &ParticipationID,
+        _keys: Vec<u8>,
+    ) -> Result<(), NodeError> {
+        Err(NodeError::NotImplemented("append_participation_keys"))
     }
 }
