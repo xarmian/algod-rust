@@ -31,6 +31,7 @@ hex.workspace = true
 data-encoding.workspace = true
 rmpv.workspace = true
 num-bigint.workspace = true
+serde_bytes.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
