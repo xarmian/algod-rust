@@ -2113,6 +2113,61 @@ impl MsgpackDryrunRequest {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Participation key models
+// ---------------------------------------------------------------------------
+
+/// Participation key response — matches go-algorand's `model.ParticipationKey`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParticipationKey {
+    /// The address of the participating account.
+    pub address: String,
+
+    /// The effective first valid round for this participation key.
+    #[serde(
+        rename = "effective-first-valid",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub effective_first_valid: Option<u64>,
+
+    /// The effective last valid round for this participation key.
+    #[serde(
+        rename = "effective-last-valid",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub effective_last_valid: Option<u64>,
+
+    /// The participation key ID (base32-encoded).
+    pub id: String,
+
+    /// The account participation information.
+    pub key: ApiAccountParticipation,
+
+    /// The last round this key was used to propose a block.
+    #[serde(
+        rename = "last-block-proposal",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_block_proposal: Option<u64>,
+
+    /// The last round this key was used to generate a state proof.
+    #[serde(rename = "last-state-proof", skip_serializing_if = "Option::is_none")]
+    pub last_state_proof: Option<u64>,
+
+    /// The last round this key was used to vote.
+    #[serde(rename = "last-vote", skip_serializing_if = "Option::is_none")]
+    pub last_vote: Option<u64>,
+}
+
+/// Response for `POST /v2/participation` — matches go-algorand's
+/// `model.PostParticipationResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostParticipationResponse {
+    /// The participation key ID.
+    #[serde(rename = "partId")]
+    pub part_id: String,
+}
+
 /// Response from a dryrun request.
 ///
 /// Matches go-algorand's `model.DryrunResponse`.

@@ -760,6 +760,87 @@ impl ParticipationStore {
         }
     }
 
+    /// Append state proof keys to an existing participation key.
+    ///
+    /// Looks up the internal primary key from the `ParticipationID`, reads the
+    /// `SignerContext` (for `first_valid` and `key_lifetime`) from the `Keysets`
+    /// table, then inserts each `FalconSigner` key into the `StateProofKeys`
+    /// table at the appropriate round.
+    ///
+    /// `keys` is a slice of `FalconSigner` values to append.  The round for
+    /// each key is computed from the existing key count in the table (i.e.
+    /// keys are appended starting after the last existing key).
+    ///
+    /// Mirrors go-algorand's `Registry.AppendKeys`.
+    pub fn append_state_proof_keys(
+        &self,
+        id: &ParticipationID,
+        keys: &[FalconSigner],
+    ) -> Result<(), rusqlite::Error> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let pk: i64 = self
+            .conn
+            .query_row(SELECT_PK, params![id.0.as_slice()], |row| row.get(0))?;
+
+        // Read the SignerContext blob from the Keysets table to get first_valid
+        // and key_lifetime. The column is NULL when state proofs are disabled.
+        let ctx_blob: Option<Vec<u8>> = self.conn.query_row(
+            "SELECT stateProof FROM Keysets WHERE pk = ?1",
+            params![pk],
+            |row| row.get(0),
+        )?;
+
+        let ctx_blob = match ctx_blob {
+            Some(b) if !b.is_empty() => b,
+            // No state proof context — nothing to append.
+            _ => return Ok(()),
+        };
+
+        let (ctx, _) = merklesig::SignerContext::from_msgpack(&ctx_blob).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Blob,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })?;
+
+        // key_lifetime of 0 means state proofs are disabled; no rounds to map
+        // keys to. Matches Go's behavior where round computation would degenerate.
+        if ctx.key_lifetime == 0 {
+            return Ok(());
+        }
+
+        // Use a transaction so the COUNT and INSERTs are atomic — prevents
+        // concurrent callers from computing the same starting round.
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Determine the starting round for new keys. Use MAX(round) rather
+        // than COUNT(*) so that pruned (deleted) early keys don't cause
+        // collisions — after pruning, COUNT would undercount the index.
+        let max_round: Option<i64> = tx.query_row(
+            "SELECT MAX(round) FROM StateProofKeys WHERE pk = ?1",
+            params![pk],
+            |row| row.get(0),
+        )?;
+
+        let mut round = match max_round {
+            Some(r) => r as u64 + ctx.key_lifetime,
+            None => index_to_round(ctx.first_valid, ctx.key_lifetime, 0),
+        };
+
+        for key in keys {
+            let key_blob = key.to_msgpack();
+            tx.execute(INSERT_STATE_PROOF_KEY, params![pk, round as i64, key_blob])?;
+            round += ctx.key_lifetime;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     // -- Internal helpers ---------------------------------------------------
 
     /// Scan a single row from the joined `Keysets`/`Rolling` query into a
