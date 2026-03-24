@@ -6071,6 +6071,23 @@ async fn participation_generate_returns_200() {
 }
 
 #[tokio::test]
+async fn participation_generate_missing_params_returns_400() {
+    let server = TestServer::start(MockNode::synced()).await;
+    let addr = Address([0u8; 32]);
+    let addr_str = addr.to_algorand_string();
+
+    // Missing required 'first' and 'last' query params
+    let resp = server
+        .client
+        .post(server.url(&format!("/v2/participation/generate/{addr_str}")))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
 async fn participation_append_keys_success() {
     let server = TestServer::start(MockNode::synced()).await;
     let id = ParticipationID([0x01; 32]);

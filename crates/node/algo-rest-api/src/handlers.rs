@@ -3367,8 +3367,9 @@ pub async fn generate_participation_keys<N: NodeInterface>(
         tracing::warn!("generate_participation_keys: key generation not yet implemented");
     });
 
-    // Return immediately with empty JSON object, matching Go behavior
-    (StatusCode::OK, [("content-type", "application/json")], "{}").into_response()
+    // Return immediately with empty JSON object, matching Go behavior.
+    // Go uses ctx.String() which sets text/plain content-type.
+    (StatusCode::OK, [("content-type", "text/plain; charset=UTF-8")], "{}").into_response()
 }
 
 // ---------------------------------------------------------------------------
