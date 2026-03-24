@@ -3416,6 +3416,7 @@ pub async fn get_participation_key_by_id<N: NodeInterface>(
                 Err(e) => error::internal_error(format!("failed to encode response: {e}")),
             }
         }
+        Err(NodeError::NotFound(msg)) => error::not_found(msg),
         Err(e) => error::internal_error(e.to_string()),
     }
 }

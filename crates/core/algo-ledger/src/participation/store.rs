@@ -817,14 +817,19 @@ impl ParticipationStore {
         // concurrent callers from computing the same starting round.
         let tx = self.conn.unchecked_transaction()?;
 
-        // Count existing keys to determine the starting index for new keys.
-        let existing_count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM StateProofKeys WHERE pk = ?1",
+        // Determine the starting round for new keys. Use MAX(round) rather
+        // than COUNT(*) so that pruned (deleted) early keys don't cause
+        // collisions — after pruning, COUNT would undercount the index.
+        let max_round: Option<i64> = tx.query_row(
+            "SELECT MAX(round) FROM StateProofKeys WHERE pk = ?1",
             params![pk],
             |row| row.get(0),
         )?;
 
-        let mut round = index_to_round(ctx.first_valid, ctx.key_lifetime, existing_count as u64);
+        let mut round = match max_round {
+            Some(r) => r as u64 + ctx.key_lifetime,
+            None => index_to_round(ctx.first_valid, ctx.key_lifetime, 0),
+        };
 
         for key in keys {
             let key_blob = key.to_msgpack();
