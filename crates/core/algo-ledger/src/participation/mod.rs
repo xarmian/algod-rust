@@ -277,7 +277,7 @@ impl Participation {
     /// `key_lifetime` controls state proof key granularity (use
     /// `merklesig::KEY_LIFETIME_DEFAULT` = 256 for production).
     ///
-    /// Returns an error if `last < first` or the validity period exceeds limits.
+    /// Returns an error if `last < first` or state proof key generation fails.
     pub fn generate(
         parent: Address,
         first_valid: Round,
