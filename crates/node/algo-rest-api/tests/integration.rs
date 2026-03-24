@@ -5830,7 +5830,8 @@ async fn participation_list_empty() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert_eq!(body, "[]");
+    // Go returns null for a nil/empty slice, not [].
+    assert_eq!(body, "null\n");
 }
 
 #[tokio::test]
@@ -5859,6 +5860,33 @@ async fn participation_list_with_records() {
     assert_eq!(obj["key"]["vote-first-valid"].as_u64().unwrap(), 100);
     assert_eq!(obj["key"]["vote-last-valid"].as_u64().unwrap(), 3_000_000);
     assert_eq!(obj["key"]["vote-key-dilution"].as_u64().unwrap(), 1000);
+}
+
+#[tokio::test]
+async fn participation_effective_first_special_case() {
+    // When effective_last != 0 && effective_first == 0, Go returns effective-first-valid: 0
+    // (not omitted). This tests the special case in convertParticipationRecord.
+    let mut node = MockNode::synced();
+    let mut record = mock_participation_record();
+    record.effective_first = Round(0);
+    record.effective_last = Round(200);
+    node.participation_records.push(record);
+
+    let server = TestServer::start(node).await;
+    let resp = server
+        .client
+        .get(server.url("/v2/participation"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    let arr: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let obj = &arr.as_array().unwrap()[0];
+    // effective-first-valid should be present and 0, NOT omitted
+    assert_eq!(obj["effective-first-valid"].as_u64().unwrap(), 0);
+    assert_eq!(obj["effective-last-valid"].as_u64().unwrap(), 200);
 }
 
 #[tokio::test]

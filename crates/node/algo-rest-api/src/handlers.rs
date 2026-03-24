@@ -3259,6 +3259,15 @@ fn convert_participation_record(record: &ParticipationRecord) -> models::Partici
 pub async fn get_participation_keys<N: NodeInterface>(State(node): State<AppState<N>>) -> Response {
     match node.list_participation_keys().await {
         Ok(records) => {
+            // Go returns `null` for an empty slice (nil), not `[]`.
+            if records.is_empty() {
+                return (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    "null\n",
+                )
+                    .into_response();
+            }
             let response: Vec<models::ParticipationKey> =
                 records.iter().map(convert_participation_record).collect();
             match serde_json::to_vec(&response) {

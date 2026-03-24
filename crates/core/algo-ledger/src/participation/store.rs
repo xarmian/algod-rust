@@ -801,6 +801,8 @@ impl ParticipationStore {
             )
         })?;
 
+        // key_lifetime of 0 means state proofs are disabled; no rounds to map
+        // keys to. Matches Go's behavior where round computation would degenerate.
         if ctx.key_lifetime == 0 {
             return Ok(());
         }
