@@ -3941,7 +3941,13 @@ pub async fn account_assets_information<N: NodeInterface>(
     for record in &records {
         let holding = match &record.asset_holding {
             Some(h) => h,
-            None => continue,
+            None => {
+                tracing::warn!(
+                    asset_id = record.asset_id,
+                    "AccountAssetsInformation: asset has no holding - should not be possible"
+                );
+                continue;
+            }
         };
         let mut aah = models::AccountAssetHolding {
             asset_holding: models::ApiAssetHolding {
