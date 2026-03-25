@@ -27,6 +27,12 @@ pub struct TokenConfig {
     /// The admin API token (from `algod.admin.token`).
     /// Required for admin-only endpoints (shutdown, catchup management, etc.).
     pub admin_token: String,
+
+    /// Whether the Experimental API is enabled.
+    ///
+    /// When true, experimental endpoints are registered in the router.
+    /// Mirrors go-algorand's `Config().EnableExperimentalAPI`.
+    pub enable_experimental_api: bool,
 }
 
 /// Build the complete API router.
@@ -190,6 +196,28 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             auth::require_token,
         ));
 
-    // Merge all route groups with shared node state
-    public.merge(authenticated).merge(admin).with_state(node)
+    // Merge all route groups
+    let mut router = public.merge(authenticated).merge(admin);
+
+    // Conditionally register experimental API routes (router-level gating).
+    // Handlers also check enable_experimental_api() as a belt-and-suspenders safety net.
+    if tokens.enable_experimental_api {
+        let experimental = Router::new()
+            .route("/v2/experimental", get(handlers::experimental_check::<N>))
+            .route(
+                "/v2/accounts/:address/assets",
+                get(handlers::account_assets_information::<N>),
+            )
+            .route(
+                "/v2/transactions/async",
+                post(handlers::raw_transaction_async::<N>),
+            )
+            .layer(middleware::from_fn_with_state(
+                tokens.api_token.clone(),
+                auth::require_token,
+            ));
+        router = router.merge(experimental);
+    }
+
+    router.with_state(node)
 }
