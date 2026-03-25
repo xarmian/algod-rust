@@ -184,7 +184,7 @@ impl ApiServer {
         let tokens = TokenConfig {
             api_token,
             admin_token,
-            enable_experimental_api: false,
+            enable_experimental_api: node.enable_experimental_api(),
         };
 
         let router = router::build_router(node, tokens);

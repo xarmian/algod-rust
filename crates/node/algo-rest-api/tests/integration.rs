@@ -6970,3 +6970,45 @@ async fn raw_transaction_async_broadcast_error_returns_503() {
         .unwrap();
     assert_eq!(resp.status(), 503);
 }
+
+#[tokio::test]
+async fn account_assets_information_limit_zero_returns_400() {
+    let addr = Address([0x01; 32]);
+    let server = TestServer::start(mock_with_experimental_api()).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/assets?limit=0", addr)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("positive"),
+        "error should mention positive: {body}"
+    );
+}
+
+#[tokio::test]
+async fn raw_transaction_async_empty_body_returns_400() {
+    let node = mock_with_experimental_and_developer_api();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/async"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(Vec::<u8>::new())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("empty txgroup"),
+        "error should mention empty txgroup: {body}"
+    );
+}

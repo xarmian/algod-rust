@@ -3835,14 +3835,9 @@ const DEFAULT_ASSET_RESULTS: u64 = 1000;
 /// Check whether the Experimental API is enabled.
 ///
 /// Matches go-algorand's `Handlers.ExperimentalCheck`.
-pub async fn experimental_check<N: NodeInterface>(State(node): State<AppState<N>>) -> Response {
-    if !node.enable_experimental_api() {
-        return (
-            StatusCode::NOT_FOUND,
-            "/v2/experimental was not enabled in the configuration file by setting the EnableExperimentalAPI to true",
-        )
-            .into_response();
-    }
+/// Note: go-algorand has no handler-level check here — the route is only
+/// registered when `EnableExperimentalAPI` is true (router-level gating).
+pub async fn experimental_check<N: NodeInterface>(State(_node): State<AppState<N>>) -> Response {
     (
         StatusCode::OK,
         [("content-type", "application/json")],
@@ -3901,7 +3896,7 @@ pub async fn account_assets_information<N: NodeInterface>(
     // Validate and default limit
     let limit = if let Some(l) = params.limit {
         if l == 0 {
-            return error::bad_request("limit must be a positive value");
+            return error::bad_request("limit parameter must be a positive integer");
         }
         if l > MAX_ASSET_RESULTS {
             return error::bad_request(format!(
@@ -3956,41 +3951,13 @@ pub async fn account_assets_information<N: NodeInterface>(
             },
             asset_params: None,
         };
-        // Include asset params if the creator is non-zero
-        if record.creator != Address([0u8; 32]) {
+        // Include asset params if the creator is non-zero (matches go-algorand's
+        // `AssetParamsToAsset` — reuse the existing conversion function).
+        if !record.creator.is_zero() {
             if let Some(ref ap) = record.asset_params {
-                aah.asset_params = Some(models::ApiAssetParams {
-                    creator: record.creator.to_string(),
-                    total: ap.total,
-                    decimals: ap.decimals as u64,
-                    default_frozen: Some(ap.default_frozen),
-                    unit_name: if ap.unit_name.is_empty() {
-                        None
-                    } else {
-                        Some(ap.unit_name.clone())
-                    },
-                    name: if ap.asset_name.is_empty() {
-                        None
-                    } else {
-                        Some(ap.asset_name.clone())
-                    },
-                    url: if ap.url.is_empty() {
-                        None
-                    } else {
-                        Some(ap.url.clone())
-                    },
-                    metadata_hash: ap
-                        .metadata_hash
-                        .filter(|h| !h.iter().all(|&b| b == 0))
-                        .map(|h| h.to_vec()),
-                    manager: ap.manager.map(|a| a.to_string()),
-                    reserve: ap.reserve.map(|a| a.to_string()),
-                    freeze: ap.freeze.map(|a| a.to_string()),
-                    clawback: ap.clawback.map(|a| a.to_string()),
-                    name_b64: None,
-                    unit_name_b64: None,
-                    url_b64: None,
-                });
+                let asset =
+                    models::asset_params_to_api(record.asset_id, &record.creator.to_string(), ap);
+                aah.asset_params = Some(asset.params);
             }
         }
         asset_holdings.push(aah);
