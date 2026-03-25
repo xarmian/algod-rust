@@ -758,4 +758,107 @@ pub trait NodeInterface: Send + Sync + 'static {
     ) -> Result<ParticipationID, NodeError> {
         Err(NodeError::NotImplemented("generate_participation_keys"))
     }
+
+    // ---- Operational control methods ----
+
+    /// Start a catchpoint catchup.
+    ///
+    /// Mirrors go-algorand's `Node.StartCatchup(catchpoint)`.
+    async fn start_catchup(
+        &self,
+        _catchpoint: &str,
+        _min_rounds: u64,
+    ) -> Result<CatchupStartResult, NodeError> {
+        Err(NodeError::NotImplemented("start_catchup"))
+    }
+
+    /// Abort a catchpoint catchup.
+    ///
+    /// Mirrors go-algorand's `Node.AbortCatchup(catchpoint)`.
+    async fn abort_catchup(&self, _catchpoint: &str) -> Result<(), NodeError> {
+        Err(NodeError::NotImplemented("abort_catchup"))
+    }
+
+    /// Whether the node is running in dev mode.
+    fn is_dev_mode(&self) -> bool {
+        false
+    }
+
+    /// Whether the node is running in follower mode.
+    fn is_follower_mode(&self) -> bool {
+        false
+    }
+
+    /// Get the block timestamp offset (dev mode only).
+    ///
+    /// Returns `Err` if not in dev mode, `Ok(None)` if never set,
+    /// `Ok(Some(offset))` otherwise.
+    async fn get_block_timestamp_offset(&self) -> Result<Option<u64>, NodeError> {
+        Err(NodeError::NotImplemented("get_block_timestamp_offset"))
+    }
+
+    /// Set the block timestamp offset (dev mode only).
+    async fn set_block_timestamp_offset(&self, _offset: i64) -> Result<(), NodeError> {
+        Err(NodeError::NotImplemented("set_block_timestamp_offset"))
+    }
+
+    /// Get the sync round (follower mode).
+    ///
+    /// Returns 0 if not set.
+    async fn get_sync_round(&self) -> Result<u64, NodeError> {
+        Err(NodeError::NotImplemented("get_sync_round"))
+    }
+
+    /// Set the sync round (follower mode).
+    async fn set_sync_round(&self, _round: u64) -> Result<(), NodeError> {
+        Err(NodeError::NotImplemented("set_sync_round"))
+    }
+
+    /// Unset the sync round (follower mode).
+    async fn unset_sync_round(&self) -> Result<(), NodeError> {
+        Err(NodeError::NotImplemented("unset_sync_round"))
+    }
+
+    /// Get the node configuration as a JSON value.
+    async fn get_config_json(&self) -> Result<serde_json::Value, NodeError> {
+        Err(NodeError::NotImplemented("get_config_json"))
+    }
+
+    /// Get debug profiling settings.
+    ///
+    /// Returns `(mutex_rate, block_rate)`.
+    async fn get_debug_settings_prof(&self) -> Result<(u64, u64), NodeError> {
+        Err(NodeError::NotImplemented("get_debug_settings_prof"))
+    }
+
+    /// Set debug profiling settings.
+    ///
+    /// Returns the old values as `(old_mutex_rate, old_block_rate)`.
+    async fn set_debug_settings_prof(
+        &self,
+        _mutex_rate: Option<u64>,
+        _block_rate: Option<u64>,
+    ) -> Result<(Option<u64>, Option<u64>), NodeError> {
+        Err(NodeError::NotImplemented("set_debug_settings_prof"))
+    }
+
+    /// The latest round available for catchup min-rounds check.
+    fn latest_round_for_catchup(&self) -> u64 {
+        0
+    }
+}
+
+/// Result of a catchup start operation.
+///
+/// Mirrors the possible outcomes from go-algorand's `Node.StartCatchup`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatchupStartResult {
+    /// Catchup was newly created (201).
+    Created,
+    /// Catchup was already in progress for this catchpoint (200).
+    AlreadyInProgress,
+    /// Unable to start catchup (400).
+    Unable(String),
+    /// Error starting catchup (408).
+    StartError(String),
 }

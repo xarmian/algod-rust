@@ -123,6 +123,26 @@ struct MockNode {
     remove_result: Option<String>,
     /// Append result: None = success, Some(msg) = error.
     append_result: Option<String>,
+    /// Catchup start result (None = use default NotImplemented).
+    catchup_start_result: Option<algo_rest_api::node::CatchupStartResult>,
+    /// Catchup abort result: None = success, Some(msg) = error.
+    catchup_abort_result: Option<String>,
+    /// Whether dev mode is enabled.
+    is_dev_mode: bool,
+    /// Whether follower mode is enabled.
+    is_follower_mode: bool,
+    /// Block timestamp offset (None = never set, Some = set).
+    block_timestamp_offset: Option<u64>,
+    /// Sync round (0 = not set).
+    sync_round: u64,
+    /// Config JSON to return.
+    config_json: Option<serde_json::Value>,
+    /// Debug profiling rates: (mutex_rate, block_rate).
+    debug_prof_rates: (u64, u64),
+    /// Latest round for catchup min-rounds check.
+    latest_round_for_catchup: u64,
+    /// Set sync round result: None = success, Some(msg) = error.
+    set_sync_round_result: Option<String>,
 }
 
 impl Clone for MockNode {
@@ -169,6 +189,16 @@ impl Clone for MockNode {
             install_result: self.install_result.clone(),
             remove_result: self.remove_result.clone(),
             append_result: self.append_result.clone(),
+            catchup_start_result: self.catchup_start_result.clone(),
+            catchup_abort_result: self.catchup_abort_result.clone(),
+            is_dev_mode: self.is_dev_mode,
+            is_follower_mode: self.is_follower_mode,
+            block_timestamp_offset: self.block_timestamp_offset,
+            sync_round: self.sync_round,
+            config_json: self.config_json.clone(),
+            debug_prof_rates: self.debug_prof_rates,
+            latest_round_for_catchup: self.latest_round_for_catchup,
+            set_sync_round_result: self.set_sync_round_result.clone(),
         }
     }
 }
@@ -263,6 +293,16 @@ impl MockNode {
             install_result: None,
             remove_result: None,
             append_result: None,
+            catchup_start_result: None,
+            catchup_abort_result: None,
+            is_dev_mode: false,
+            is_follower_mode: false,
+            block_timestamp_offset: None,
+            sync_round: 0,
+            config_json: None,
+            debug_prof_rates: (0, 0),
+            latest_round_for_catchup: 0,
+            set_sync_round_result: None,
         }
     }
 
@@ -789,6 +829,85 @@ impl NodeInterface for MockNode {
         _dilution: Option<u64>,
     ) -> Result<ParticipationID, NodeError> {
         Ok(ParticipationID([0x42; 32]))
+    }
+
+    async fn start_catchup(
+        &self,
+        _catchpoint: &str,
+        _min_rounds: u64,
+    ) -> Result<algo_rest_api::node::CatchupStartResult, NodeError> {
+        match &self.catchup_start_result {
+            Some(result) => Ok(result.clone()),
+            None => Err(NodeError::NotImplemented("start_catchup")),
+        }
+    }
+
+    async fn abort_catchup(&self, _catchpoint: &str) -> Result<(), NodeError> {
+        match &self.catchup_abort_result {
+            Some(msg) => Err(NodeError::Internal(msg.clone())),
+            None => Ok(()),
+        }
+    }
+
+    fn is_dev_mode(&self) -> bool {
+        self.is_dev_mode
+    }
+
+    fn is_follower_mode(&self) -> bool {
+        self.is_follower_mode
+    }
+
+    async fn get_block_timestamp_offset(&self) -> Result<Option<u64>, NodeError> {
+        if !self.is_dev_mode {
+            return Err(NodeError::Internal("not in dev mode".to_string()));
+        }
+        Ok(self.block_timestamp_offset)
+    }
+
+    async fn set_block_timestamp_offset(&self, _offset: i64) -> Result<(), NodeError> {
+        if !self.is_dev_mode {
+            return Err(NodeError::Internal("not in dev mode".to_string()));
+        }
+        Ok(())
+    }
+
+    async fn get_sync_round(&self) -> Result<u64, NodeError> {
+        Ok(self.sync_round)
+    }
+
+    async fn set_sync_round(&self, _round: u64) -> Result<(), NodeError> {
+        match &self.set_sync_round_result {
+            Some(msg) => Err(NodeError::Internal(msg.clone())),
+            None => Ok(()),
+        }
+    }
+
+    async fn unset_sync_round(&self) -> Result<(), NodeError> {
+        Ok(())
+    }
+
+    async fn get_config_json(&self) -> Result<serde_json::Value, NodeError> {
+        match &self.config_json {
+            Some(json) => Ok(json.clone()),
+            None => Ok(serde_json::json!({})),
+        }
+    }
+
+    async fn get_debug_settings_prof(&self) -> Result<(u64, u64), NodeError> {
+        Ok(self.debug_prof_rates)
+    }
+
+    async fn set_debug_settings_prof(
+        &self,
+        _mutex_rate: Option<u64>,
+        _block_rate: Option<u64>,
+    ) -> Result<(Option<u64>, Option<u64>), NodeError> {
+        let (old_mutex, old_block) = self.debug_prof_rates;
+        Ok((Some(old_mutex), Some(old_block)))
+    }
+
+    fn latest_round_for_catchup(&self) -> u64 {
+        self.latest_round_for_catchup
     }
 }
 
@@ -6129,4 +6248,399 @@ async fn participation_append_keys_empty_body() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+}
+
+// ===========================================================================
+// Catchup endpoint tests
+// ===========================================================================
+
+#[tokio::test]
+async fn start_catchup_created() {
+    let mut node = MockNode::synced();
+    node.catchup_start_result = Some(algo_rest_api::node::CatchupStartResult::Created);
+    let server = TestServer::start(node).await;
+
+    // Valid catchpoint: round#base32hash (32 bytes = 52 chars base32 no-pad)
+    let hash = data_encoding::BASE32_NOPAD.encode(&[0xAB; 32]);
+    let catchpoint_url = format!("1000%23{hash}");
+    let catchpoint_decoded = format!("1000#{hash}");
+
+    let resp = server
+        .client
+        .post(server.url(&format!("/v2/catchup/{catchpoint_url}")))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["catchup-message"], catchpoint_decoded);
+}
+
+#[tokio::test]
+async fn start_catchup_already_in_progress() {
+    let mut node = MockNode::synced();
+    node.catchup_start_result = Some(algo_rest_api::node::CatchupStartResult::AlreadyInProgress);
+    let server = TestServer::start(node).await;
+
+    let hash = data_encoding::BASE32_NOPAD.encode(&[0xAB; 32]);
+    let catchpoint_url = format!("1000%23{hash}");
+
+    let resp = server
+        .client
+        .post(server.url(&format!("/v2/catchup/{catchpoint_url}")))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn start_catchup_invalid_label() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/catchup/invalid-label"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn abort_catchup_success() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let hash = data_encoding::BASE32_NOPAD.encode(&[0xAB; 32]);
+    let catchpoint_url = format!("1000%23{hash}");
+    let catchpoint_decoded = format!("1000#{hash}");
+
+    let resp = server
+        .client
+        .delete(server.url(&format!("/v2/catchup/{catchpoint_url}")))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["catchup-message"], catchpoint_decoded);
+}
+
+#[tokio::test]
+async fn abort_catchup_invalid_label() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .delete(server.url("/v2/catchup/bad"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+// ===========================================================================
+// Shutdown endpoint tests
+// ===========================================================================
+
+#[tokio::test]
+async fn shutdown_returns_501() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/shutdown"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 501);
+    let body = resp.text().await.unwrap();
+    assert_eq!(body, "Endpoint not implemented.");
+}
+
+// ===========================================================================
+// Dev-mode block timestamp offset tests
+// ===========================================================================
+
+#[tokio::test]
+async fn get_block_timestamp_offset_success() {
+    let mut node = MockNode::synced();
+    node.is_dev_mode = true;
+    node.block_timestamp_offset = Some(42);
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/devmode/blocks/offset"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["offset"], 42);
+}
+
+#[tokio::test]
+async fn get_block_timestamp_offset_not_dev_mode() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/devmode/blocks/offset"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn get_block_timestamp_offset_never_set() {
+    let mut node = MockNode::synced();
+    node.is_dev_mode = true;
+    // block_timestamp_offset is None by default
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/devmode/blocks/offset"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn set_block_timestamp_offset_success() {
+    let mut node = MockNode::synced();
+    node.is_dev_mode = true;
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/devmode/blocks/offset/100"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn set_block_timestamp_offset_too_large() {
+    let mut node = MockNode::synced();
+    node.is_dev_mode = true;
+    let server = TestServer::start(node).await;
+
+    // i64::MAX + 1 = 9223372036854775808
+    let resp = server
+        .client
+        .post(server.url("/v2/devmode/blocks/offset/9223372036854775808"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+// ===========================================================================
+// Debug profiling settings tests
+// ===========================================================================
+
+#[tokio::test]
+async fn get_debug_settings_prof_success() {
+    let mut node = MockNode::synced();
+    node.debug_prof_rates = (10, 20);
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/debug/settings/pprof"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["mutex-rate"], 10);
+    assert_eq!(body["block-rate"], 20);
+}
+
+#[tokio::test]
+async fn put_debug_settings_prof_success() {
+    let mut node = MockNode::synced();
+    node.debug_prof_rates = (5, 15);
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .put(server.url("/debug/settings/pprof"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .header("content-type", "application/json")
+        .body(r#"{"mutex-rate": 100, "block-rate": 200}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // Returns old values
+    assert_eq!(body["mutex-rate"], 5);
+    assert_eq!(body["block-rate"], 15);
+}
+
+#[tokio::test]
+async fn put_debug_settings_prof_rate_too_large() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .put(server.url("/debug/settings/pprof"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .header("content-type", "application/json")
+        .body(r#"{"block-rate": 2147483648}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+// ===========================================================================
+// Config endpoint tests
+// ===========================================================================
+
+#[tokio::test]
+async fn get_config_success() {
+    let mut node = MockNode::synced();
+    node.config_json = Some(serde_json::json!({"key": "value"}));
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/debug/settings/config"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["key"], "value");
+}
+
+// ===========================================================================
+// Ledger sync round tests
+// ===========================================================================
+
+#[tokio::test]
+async fn get_sync_round_success() {
+    let mut node = MockNode::synced();
+    node.sync_round = 500;
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/ledger/sync"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["round"], 500);
+}
+
+#[tokio::test]
+async fn get_sync_round_not_set() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/ledger/sync"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn set_sync_round_success() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/ledger/sync/100"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn set_sync_round_invalid() {
+    let mut node = MockNode::synced();
+    node.set_sync_round_result = Some("sync round invalid".to_string());
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/ledger/sync/100"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn unset_sync_round_success() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .delete(server.url("/v2/ledger/sync"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+// ===========================================================================
+// Min-rounds catchup check test
+// ===========================================================================
+
+#[tokio::test]
+async fn start_catchup_min_rounds_skip() {
+    let mut node = MockNode::synced();
+    node.latest_round_for_catchup = 900;
+    node.catchup_start_result = Some(algo_rest_api::node::CatchupStartResult::Created);
+    let server = TestServer::start(node).await;
+
+    let hash = data_encoding::BASE32_NOPAD.encode(&[0xAB; 32]);
+    let catchpoint_url = format!("1000%23{hash}");
+
+    // min=200 means we need catchpoint round >= ledger_round + 200 = 1100
+    // But catchpoint round is 1000, so this should return 200 with skip message
+    let resp = server
+        .client
+        .post(server.url(&format!("/v2/catchup/{catchpoint_url}?min=200")))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["catchup-message"].as_str().unwrap(),
+        "the node has already been initialized"
+    );
 }

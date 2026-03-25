@@ -2183,3 +2183,54 @@ pub struct DryrunResponse {
     /// Results for each transaction.
     pub txns: Vec<DryrunTxnResult>,
 }
+
+// ---------------------------------------------------------------------------
+// Operational endpoint response types
+// ---------------------------------------------------------------------------
+
+/// Response for `POST /v2/catchup/{catchpoint}` — matches go-algorand's
+/// `model.CatchpointStartResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatchpointStartResponse {
+    /// Status message about the catchup operation.
+    #[serde(rename = "catchup-message")]
+    pub catchup_message: String,
+}
+
+/// Response for `DELETE /v2/catchup/{catchpoint}` — matches go-algorand's
+/// `model.CatchpointAbortResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatchpointAbortResponse {
+    /// Status message about the catchup abort operation.
+    #[serde(rename = "catchup-message")]
+    pub catchup_message: String,
+}
+
+/// Response for `GET /v2/ledger/sync` — matches go-algorand's
+/// `model.GetSyncRoundResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetSyncRoundResponse {
+    /// The sync round.
+    pub round: u64,
+}
+
+/// Response for `GET /v2/devmode/blocks/offset` — matches go-algorand's
+/// `model.GetBlockTimeStampOffsetResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetBlockTimeStampOffsetResponse {
+    /// The timestamp offset in seconds.
+    pub offset: u64,
+}
+
+/// Debug profiling settings — matches go-algorand's
+/// `model.DebugSettingsProf`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugSettingsProf {
+    /// The block profiling rate.
+    #[serde(rename = "block-rate", skip_serializing_if = "Option::is_none")]
+    pub block_rate: Option<u64>,
+
+    /// The mutex profiling rate.
+    #[serde(rename = "mutex-rate", skip_serializing_if = "Option::is_none")]
+    pub mutex_rate: Option<u64>,
+}
