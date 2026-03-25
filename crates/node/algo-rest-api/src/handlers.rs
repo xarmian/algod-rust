@@ -3823,9 +3823,13 @@ pub async fn unset_sync_round<N: NodeInterface>(State(node): State<AppState<N>>)
 // ===========================================================================
 
 /// Maximum number of asset results per page for account assets information.
+/// Used for *validation*: requests with `limit > MAX_ASSET_RESULTS` are rejected.
+/// Matches go-algorand's `MaxAssetResults`.
 const MAX_ASSET_RESULTS: u64 = 1000;
 
-/// Default number of asset results per page when no limit is specified.
+/// Default number of asset results per page when no `limit` is specified.
+/// Matches go-algorand's `DefaultAssetResults` (same value as `MaxAssetResults`
+/// in the current protocol, but kept as a separate constant for clarity).
 const DEFAULT_ASSET_RESULTS: u64 = 1000;
 
 // ---------------------------------------------------------------------------
@@ -3915,7 +3919,8 @@ pub async fn account_assets_information<N: NodeInterface>(
         .await
     {
         Ok(result) => result,
-        Err(_) => {
+        Err(e) => {
+            tracing::error!(error = %e, "lookup_assets failed");
             return error::internal_error("failed to retrieve information from the ledger");
         }
     };
