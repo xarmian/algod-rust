@@ -1,7 +1,11 @@
 use std::cell::{Cell, RefCell};
 
-use algo_avm::eval::{run_approval_program, run_clear_state_program};
+use algo_avm::eval::{
+    run_approval_program, run_approval_program_with_tracer, run_clear_state_program,
+    run_clear_state_program_with_tracer,
+};
 use algo_avm::group::GroupBudget;
+use algo_avm::tracer::EvalTracer;
 use algo_error::AlgoError;
 use algo_types::consensus::{consensus_params_for_version, ConsensusParams};
 use algo_types::{
@@ -102,7 +106,7 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<(), AlgoError> {
-    apply_block_impl(store, block, ApplyMode::Replay, false)
+    apply_block_impl(store, block, ApplyMode::Replay, false, None)
 }
 
 /// Apply a full block to the ledger state with the specified mode.
@@ -113,7 +117,7 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
     block: &Block,
     mode: ApplyMode,
 ) -> Result<(), AlgoError> {
-    apply_block_impl(store, block, mode, false)
+    apply_block_impl(store, block, mode, false, None)
 }
 
 /// Apply a full block to the ledger state with validation enabled.
@@ -125,7 +129,7 @@ pub fn apply_block_validating<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<(), AlgoError> {
-    apply_block_impl(store, block, ApplyMode::Replay, true)
+    apply_block_impl(store, block, ApplyMode::Replay, true, None)
 }
 
 /// Apply a full block and return the resulting [`StateDelta`].
@@ -175,7 +179,7 @@ pub fn apply_block_with_delta<L: crate::store_trait::LedgerStore>(
     let prev_timestamp = 0i64;
 
     // ── 3. Apply the block ────────────────────────────────────────
-    apply_block_impl(store, block, ApplyMode::Replay, false)?;
+    apply_block_impl(store, block, ApplyMode::Replay, false, None)?;
 
     // ── 4. Build the StateDelta by diffing pre vs post state ──────
     let mut accts = Vec::new();
@@ -379,6 +383,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     block: &Block,
     mode: ApplyMode,
     validate: bool,
+    tracer: Option<&mut dyn EvalTracer>,
 ) -> Result<(), AlgoError> {
     // Validate round monotonicity.
     let expected = Round(store.current_round().0 + 1);
@@ -433,6 +438,12 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
         consensus: consensus.clone(),
     };
 
+    // Convert tracer to a raw pointer so it can be used inside the
+    // immediately-invoked closure without lifetime conflicts. SAFETY: the
+    // closure is invoked synchronously and does not outlive this scope, so
+    // the pointer remains valid for its entire use.
+    let tracer_ptr: Option<*mut dyn EvalTracer> = tracer.map(|t| t as *mut dyn EvalTracer);
+
     let result = (|| {
         match ctx.mode {
             ApplyMode::Replay => {
@@ -465,6 +476,10 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                             index: gi_idx,
                         };
                         if stx.txn.txn_type == "appl" {
+                            // SAFETY: tracer_ptr is valid for the duration of
+                            // this synchronous closure; only one mutable ref
+                            // is created at a time.
+                            let tracer_ref = tracer_ptr.map(|p| unsafe { &mut *p });
                             apply_transaction_with_budget(
                                 store,
                                 stx,
@@ -472,6 +487,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                                 0,
                                 Some(&mut group_budget),
                                 Some(&gi),
+                                tracer_ref,
                             )?;
                         } else {
                             apply_transaction(store, stx, &ctx, 0)?;
@@ -953,8 +969,9 @@ fn apply_transaction_with_budget<L: crate::store_trait::LedgerStore>(
     depth: u32,
     group_budget: Option<&mut GroupBudget>,
     group_info: Option<&GroupInfo<'_>>,
+    tracer: Option<&mut dyn EvalTracer>,
 ) -> Result<(), AlgoError> {
-    apply_transaction_inner(store, stx, ctx, depth, group_budget, group_info)
+    apply_transaction_inner(store, stx, ctx, depth, group_budget, group_info, tracer)
 }
 
 /// Apply a single signed transaction to the ledger state.
@@ -979,11 +996,25 @@ pub fn apply_transaction<L: crate::store_trait::LedgerStore>(
     ctx: &ApplyContext,
     depth: u32,
 ) -> Result<(), AlgoError> {
-    apply_transaction_inner(store, stx, ctx, depth, None, None)
+    apply_transaction_inner(store, stx, ctx, depth, None, None, None)
 }
 
-/// Core transaction application logic, shared by `apply_transaction` and
-/// `apply_transaction_with_budget`.
+/// Apply a single signed transaction with an optional execution tracer.
+///
+/// Like [`apply_transaction`] but accepts an [`EvalTracer`] for capturing
+/// opcode-level execution details (used by the simulation engine).
+pub fn apply_transaction_with_tracer<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    stx: &SignedTransaction,
+    ctx: &ApplyContext,
+    depth: u32,
+    tracer: &mut dyn EvalTracer,
+) -> Result<(), AlgoError> {
+    apply_transaction_inner(store, stx, ctx, depth, None, None, Some(tracer))
+}
+
+/// Core transaction application logic, shared by `apply_transaction`,
+/// `apply_transaction_with_tracer`, and `apply_transaction_with_budget`.
 fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     stx: &SignedTransaction,
@@ -991,6 +1022,7 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
     depth: u32,
     group_budget: Option<&mut GroupBudget>,
     group_info: Option<&GroupInfo<'_>>,
+    tracer: Option<&mut dyn EvalTracer>,
 ) -> Result<(), AlgoError> {
     let txn = &stx.txn;
 
@@ -1141,6 +1173,11 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
         store.snapshot_with_ids(&snapshot_addrs, &asset_ids_to_snap, &app_ids_to_snap)
     };
 
+    // Convert tracer to a raw pointer so it can be used inside the
+    // immediately-invoked closure without lifetime conflicts. SAFETY: the
+    // closure is invoked synchronously and does not outlive this scope.
+    let tracer_ptr: Option<*mut dyn EvalTracer> = tracer.map(|t| t as *mut dyn EvalTracer);
+
     // Execute all transaction logic inside a closure so that ANY error
     // (fee, type-specific, EvalDelta, rewards-pool debit, rekey) triggers
     // a full rollback via restore_snapshot.
@@ -1183,7 +1220,12 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
                 apply_afrz(store, &stx.txn)?;
             }
-            "appl" => apply_appl(store, stx, ctx, depth, group_budget, group_info)?,
+            "appl" => {
+                // SAFETY: tracer_ptr is valid for the duration of this
+                // synchronous closure; only one mutable ref is live at a time.
+                let tracer_ref = tracer_ptr.map(|p| unsafe { &mut *p });
+                apply_appl(store, stx, ctx, depth, group_budget, group_info, tracer_ref)?
+            }
             "keyreg" => {
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
                 apply_keyreg(store, &stx.txn, ctx.round, &ctx.consensus)?;
@@ -2102,6 +2144,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
     depth: u32,
     group_budget: Option<&mut GroupBudget>,
     group_info: Option<&GroupInfo<'_>>,
+    mut tracer: Option<&mut dyn EvalTracer>,
 ) -> Result<(), AlgoError> {
     let txn = &stx.txn;
 
@@ -2213,8 +2256,16 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     avm_ctx.fee_sink = ctx.fee_sink;
                     avm_ctx.txn_counter = ctx.txn_counter.get();
                     avm_ctx.fee_credit = ctx.fee_credit.get();
-                    let result =
-                        run_clear_state_program(&clear_program, &mut avm_ctx, &ctx.consensus);
+                    let result = if let Some(ref mut t) = tracer {
+                        run_clear_state_program_with_tracer(
+                            &clear_program,
+                            &mut avm_ctx,
+                            &ctx.consensus,
+                            *t,
+                        )
+                    } else {
+                        run_clear_state_program(&clear_program, &mut avm_ctx, &ctx.consensus)
+                    };
                     // Propagate updated counters back to context.
                     ctx.txn_counter.set(avm_ctx.txn_counter);
                     ctx.fee_credit.set(avm_ctx.fee_credit);
@@ -2287,7 +2338,11 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 // Use the group budget if provided, otherwise create a single-call budget.
                 let mut fallback_budget = GroupBudget::new(1);
                 let budget = group_budget.unwrap_or(&mut fallback_budget);
-                let result = run_approval_program(&approval_program, &mut avm_ctx, budget)?;
+                let result = if let Some(ref mut t) = tracer {
+                    run_approval_program_with_tracer(&approval_program, &mut avm_ctx, budget, *t)?
+                } else {
+                    run_approval_program(&approval_program, &mut avm_ctx, budget)?
+                };
 
                 // Propagate updated counters back to context.
                 ctx.txn_counter.set(avm_ctx.txn_counter);
