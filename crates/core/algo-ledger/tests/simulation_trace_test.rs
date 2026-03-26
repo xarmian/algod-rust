@@ -42,7 +42,7 @@ fn setup_state(sender: Address, app_id: u64, approval_program: Vec<u8>) -> Ledge
     let app_params = AppParams {
         creator: sender,
         approval_program,
-        clear_state_program: vec![0x06, 0x81, 0x01], // v6: pushint 1
+        clear_state_program: vec![0x06, 0x81, 0x01, 0x43], // v6: pushint 1, return
         global_state: BTreeMap::new(),
         local_state_schema: StateSchema::default(),
         global_state_schema: StateSchema::default(),

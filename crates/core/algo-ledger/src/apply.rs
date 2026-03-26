@@ -1013,8 +1013,8 @@ pub fn apply_transaction_with_tracer<L: crate::store_trait::LedgerStore>(
     apply_transaction_inner(store, stx, ctx, depth, None, None, Some(tracer))
 }
 
-/// Core transaction application logic, shared by `apply_transaction` and
-/// `apply_transaction_with_budget`.
+/// Core transaction application logic, shared by `apply_transaction`,
+/// `apply_transaction_with_tracer`, and `apply_transaction_with_budget`.
 fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     stx: &SignedTransaction,

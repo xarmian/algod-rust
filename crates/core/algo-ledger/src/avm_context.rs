@@ -2534,7 +2534,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     caller_box_state,
                     self.created_apps.clone(),
                     self.consensus.clone(),
-                    None, // TODO: wire tracer from LedgerAvmContext for inner txn tracing
+                    None, // TODO(#210): wire tracer from LedgerAvmContext for inner txn tracing
                 );
                 match result {
                     Ok(ad) => {
