@@ -1,6 +1,7 @@
 use algo_error::AlgoError;
 use algo_types::{
-    AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParamsRecord, Round,
+    AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParamsRecord, BlockHeader,
+    Round,
 };
 
 /// Abstraction over ledger storage backends.
@@ -298,6 +299,20 @@ pub trait LedgerStore {
     fn get_block_header_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
         let _ = round;
         Ok(None)
+    }
+
+    /// Retrieve and decode a block header by round.
+    ///
+    /// Default implementation calls [`get_block_header_data`] and decodes
+    /// via `BlockHeader::decode_from_reader`.
+    fn get_block_header(&self, round: u64) -> Result<Option<BlockHeader>, AlgoError> {
+        match self.get_block_header_data(round)? {
+            Some(data) => {
+                let hdr = BlockHeader::decode_from_reader(&mut data.as_slice())?;
+                Ok(Some(hdr))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Retrieve certificate data for a block round.

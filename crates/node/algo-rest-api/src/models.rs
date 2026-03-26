@@ -1525,6 +1525,11 @@ pub struct SimulateRequest {
 
     #[serde(rename = "txn-groups")]
     pub txn_groups: Vec<SimulateRequestTransactionGroup>,
+
+    /// Decoded transaction groups. Populated by the handler after decoding
+    /// the raw `txns` values. Not serialized/deserialized from the wire format.
+    #[serde(skip)]
+    pub decoded_txn_groups: Vec<Vec<SignedTransaction>>,
 }
 
 /// AVM value (bytes or uint).

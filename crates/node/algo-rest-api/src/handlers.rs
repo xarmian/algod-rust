@@ -2786,7 +2786,7 @@ pub async fn simulate_transaction<N: NodeInterface>(
     }
 
     // Decode request body: try msgpack first, then JSON
-    let request: models::SimulateRequest =
+    let mut request: models::SimulateRequest =
         match rmp_serde::from_slice::<models::SimulateRequest>(&body) {
             Ok(req) => req,
             Err(_) => match serde_json::from_slice::<models::SimulateRequest>(&body) {
@@ -2816,6 +2816,26 @@ pub async fn simulate_transaction<N: NodeInterface>(
             ));
         }
     }
+
+    // Decode each serde_json::Value transaction to SignedTransaction.
+    // This validates that the submitted transactions are well-formed
+    // before passing them to the simulation engine.
+    let mut decoded_groups = Vec::with_capacity(request.txn_groups.len());
+    for (i, group) in request.txn_groups.iter().enumerate() {
+        let mut decoded_txns = Vec::with_capacity(group.txns.len());
+        for (j, txn_val) in group.txns.iter().enumerate() {
+            match serde_json::from_value::<algo_types::SignedTransaction>(txn_val.clone()) {
+                Ok(stx) => decoded_txns.push(stx),
+                Err(e) => {
+                    return error::bad_request(format!(
+                        "could not decode transaction {j} in group {i}: {e}"
+                    ));
+                }
+            }
+        }
+        decoded_groups.push(decoded_txns);
+    }
+    request.decoded_txn_groups = decoded_groups;
 
     // Call the node's simulate method
     match node.simulate(request).await {
