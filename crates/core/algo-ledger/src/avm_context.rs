@@ -1152,8 +1152,12 @@ fn execute_inner_appl<L: LedgerStore>(
     box_state: crate::apply::BoxBudgetState,
     created_apps_snapshot: Vec<u64>,
     consensus: ConsensusParams,
+    mut tracer: Option<&mut dyn algo_avm::tracer::EvalTracer>,
 ) -> Result<crate::apply::InnerApplyData, AlgoError> {
-    use algo_avm::eval::{run_approval_program, run_clear_state_program};
+    use algo_avm::eval::{
+        run_approval_program, run_approval_program_with_tracer, run_clear_state_program,
+        run_clear_state_program_with_tracer,
+    };
     use algo_avm::group::GroupBudget;
 
     let mut ad = crate::apply::InnerApplyData::default();
@@ -1264,9 +1268,18 @@ fn execute_inner_appl<L: LedgerStore>(
     // ── Execute the program ──
     let avm_result = if on_completion == ON_COMPLETION_CLEAR_STATE {
         // ClearStateOC: run clear state program. On failure, still clear state.
-        run_clear_state_program(&program, &mut inner_ctx, &consensus)
+        if let Some(ref mut t) = tracer {
+            run_clear_state_program_with_tracer(&program, &mut inner_ctx, &consensus, *t)
+        } else {
+            run_clear_state_program(&program, &mut inner_ctx, &consensus)
+        }
     } else {
-        match run_approval_program(&program, &mut inner_ctx, &mut budget) {
+        let res = if let Some(ref mut t) = tracer {
+            run_approval_program_with_tracer(&program, &mut inner_ctx, &mut budget, *t)
+        } else {
+            run_approval_program(&program, &mut inner_ctx, &mut budget)
+        };
+        match res {
             Ok(result) => result,
             Err(e) => {
                 // Update the shared budget with what was consumed.
@@ -2521,6 +2534,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     caller_box_state,
                     self.created_apps.clone(),
                     self.consensus.clone(),
+                    None, // tracer: inner tracing wired by simulation engine
                 );
                 match result {
                     Ok(ad) => {

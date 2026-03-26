@@ -26,7 +26,8 @@ pub mod trie_hash;
 pub use apply::{
     apply_acfg, apply_afrz, apply_axfer, apply_block, apply_block_validating,
     apply_block_with_comparison, apply_block_with_delta, apply_block_with_mode, apply_keyreg,
-    apply_pay, apply_transaction, ApplyContext, ApplyMode, InnerApplyData,
+    apply_pay, apply_transaction, apply_transaction_with_tracer, ApplyContext, ApplyMode,
+    InnerApplyData,
 };
 pub use avm_context::{type_enum, LedgerAvmContext};
 pub use eval_compare::{

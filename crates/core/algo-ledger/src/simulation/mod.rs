@@ -30,7 +30,7 @@ use algo_error::AlgoError;
 use algo_types::consensus::consensus_params_for_version;
 use algo_types::{Address, Round, SignedTransaction};
 
-use crate::apply::{apply_transaction, ApplyContext, ApplyMode};
+use crate::apply::{apply_transaction_with_tracer, ApplyContext, ApplyMode};
 use crate::store_trait::LedgerStore;
 
 // ---------------------------------------------------------------------------
@@ -274,16 +274,10 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
             let mut txn_result = TxnResult::default();
 
-            // Create a per-transaction tracer if tracing is enabled.
-            // TODO(#187): Wire tracer into apply_transaction → AVM execution.
-            // Currently the tracer captures no events because apply_transaction
-            // does not accept a tracer parameter. Threading EvalTracer through
-            // the apply pipeline requires changes to apply_transaction, LedgerAvmContext,
-            // and the AVM execution entry points. For now, exec-trace results
-            // will be empty even when tracing is requested.
-            let tracer = SimulationTracer::new(request.trace_config.clone());
+            // Create a per-transaction tracer to capture execution details.
+            let mut tracer = SimulationTracer::new(request.trace_config.clone());
 
-            match apply_transaction(self.store, stx, &apply_ctx, 0) {
+            match apply_transaction_with_tracer(self.store, stx, &apply_ctx, 0, &mut tracer) {
                 Ok(()) => {
                     // Transaction applied successfully.
                 }
