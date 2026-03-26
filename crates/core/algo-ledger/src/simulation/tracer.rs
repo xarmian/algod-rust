@@ -50,6 +50,14 @@ pub struct SimulationTracer {
     current_program: Option<ProgramTraceState>,
     /// The accumulated transaction trace being built.
     transaction_trace: TransactionTrace,
+    /// Path from root to the current active TransactionTrace.
+    /// Empty = operating on the root `transaction_trace`.
+    /// Each element is an index into `inner_traces` at that depth level.
+    trace_path: Vec<usize>,
+    /// Saved program states when descending into inner transactions.
+    /// When `before_txn` is called, the current program state is pushed here
+    /// so it can be restored after the inner transaction completes.
+    program_state_stack: Vec<Option<ProgramTraceState>>,
 }
 
 impl SimulationTracer {
@@ -59,6 +67,8 @@ impl SimulationTracer {
             config,
             current_program: None,
             transaction_trace: TransactionTrace::default(),
+            trace_path: Vec::new(),
+            program_state_stack: Vec::new(),
         }
     }
 
@@ -76,6 +86,17 @@ impl SimulationTracer {
     /// Get a reference to the trace config.
     pub fn config(&self) -> &ExecTraceConfig {
         &self.config
+    }
+
+    /// Get a mutable reference to the currently active `TransactionTrace`.
+    /// When `trace_path` is empty, returns the root trace.
+    /// When `trace_path` has entries, follows the path through `inner_traces`.
+    fn current_trace_mut(&mut self) -> &mut TransactionTrace {
+        let mut trace = &mut self.transaction_trace;
+        for &idx in &self.trace_path {
+            trace = &mut trace.inner_traces[idx];
+        }
+        trace
     }
 }
 
@@ -99,18 +120,43 @@ impl EvalTracer for SimulationTracer {
         }
 
         if let Some(state) = self.current_program.take() {
+            let trace = self.current_trace_mut();
             match state.program_type {
                 ProgramType::Approval => {
-                    self.transaction_trace.approval_program_trace = Some(state.trace);
+                    trace.approval_program_trace = Some(state.trace);
                 }
                 ProgramType::ClearState => {
-                    self.transaction_trace.clear_state_program_trace = Some(state.trace);
+                    trace.clear_state_program_trace = Some(state.trace);
                 }
                 ProgramType::LogicSig => {
-                    self.transaction_trace.logicsig_trace = Some(state.trace);
+                    trace.logicsig_trace = Some(state.trace);
                 }
             }
         }
+    }
+
+    fn before_txn(&mut self, _group_index: usize) {
+        if !self.config.is_enabled() {
+            return;
+        }
+        // Save the current program state (the outer program is mid-execution).
+        self.program_state_stack.push(self.current_program.take());
+        // Push a new TransactionTrace onto the current trace's inner_traces
+        // and descend into it.
+        let current = self.current_trace_mut();
+        current.inner_traces.push(TransactionTrace::default());
+        let idx = current.inner_traces.len() - 1;
+        self.trace_path.push(idx);
+    }
+
+    fn after_txn(&mut self, _group_index: usize, _error: Option<&str>) {
+        if !self.config.is_enabled() {
+            return;
+        }
+        // Pop back to the parent trace.
+        self.trace_path.pop();
+        // Restore the saved program state.
+        self.current_program = self.program_state_stack.pop().flatten();
     }
 
     fn before_opcode(&mut self, _pc: usize, _opcode: u8) {
@@ -300,5 +346,176 @@ mod tests {
         assert_eq!(unit.stack_additions.len(), 0);
 
         tracer.after_program(ProgramType::Approval, true, None);
+    }
+
+    #[test]
+    fn test_simulation_tracer_inner_txn_traces() {
+        let config = ExecTraceConfig {
+            enable: true,
+            stack: false,
+            scratch: false,
+            state: false,
+        };
+        let mut tracer = SimulationTracer::new(config);
+
+        // Top-level approval program begins
+        tracer.before_program(ProgramType::Approval);
+        tracer.before_opcode(0, 0x81);
+        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+
+        // Inner transaction group (simulating itxn_submit hook calls)
+        tracer.before_txn_group(1);
+        tracer.before_txn(0);
+
+        // Inner program executes
+        tracer.before_program(ProgramType::Approval);
+        tracer.before_opcode(0, 0x81);
+        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.after_program(ProgramType::Approval, true, None);
+
+        tracer.after_txn(0, None);
+        tracer.after_txn_group(None);
+
+        // Continue top-level program
+        tracer.before_opcode(3, 0x43);
+        tracer.after_opcode(3, 0x43, &[AvmValue::Uint64(1)], &[], None);
+        tracer.after_program(ProgramType::Approval, true, None);
+
+        let trace = tracer.into_transaction_trace().unwrap();
+
+        // Top-level approval trace should have 2 opcodes
+        let approval = trace.approval_program_trace.unwrap();
+        assert_eq!(approval.opcodes.len(), 2);
+
+        // Should have one inner trace
+        assert_eq!(trace.inner_traces.len(), 1);
+        let inner = &trace.inner_traces[0];
+        let inner_approval = inner.approval_program_trace.as_ref().unwrap();
+        assert_eq!(inner_approval.opcodes.len(), 1);
+    }
+
+    #[test]
+    fn test_simulation_tracer_nested_inner_txns() {
+        let config = ExecTraceConfig {
+            enable: true,
+            stack: false,
+            scratch: false,
+            state: false,
+        };
+        let mut tracer = SimulationTracer::new(config);
+
+        // Top-level program
+        tracer.before_program(ProgramType::Approval);
+        tracer.before_opcode(0, 0x81);
+        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+
+        // First inner txn
+        tracer.before_txn_group(1);
+        tracer.before_txn(0);
+
+        tracer.before_program(ProgramType::Approval);
+        tracer.before_opcode(0, 0x81);
+        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+
+        // Nested inner txn (depth 2)
+        tracer.before_txn_group(1);
+        tracer.before_txn(0);
+
+        tracer.before_program(ProgramType::Approval);
+        tracer.before_opcode(0, 0x81);
+        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.after_program(ProgramType::Approval, true, None);
+
+        tracer.after_txn(0, None);
+        tracer.after_txn_group(None);
+
+        // Continue first inner program
+        tracer.before_opcode(3, 0x43);
+        tracer.after_opcode(3, 0x43, &[AvmValue::Uint64(1)], &[], None);
+        tracer.after_program(ProgramType::Approval, true, None);
+
+        tracer.after_txn(0, None);
+        tracer.after_txn_group(None);
+
+        // Continue top-level
+        tracer.before_opcode(3, 0x43);
+        tracer.after_opcode(3, 0x43, &[AvmValue::Uint64(1)], &[], None);
+        tracer.after_program(ProgramType::Approval, true, None);
+
+        let trace = tracer.into_transaction_trace().unwrap();
+
+        // Top-level: 2 opcodes, 1 inner
+        assert_eq!(
+            trace.approval_program_trace.as_ref().unwrap().opcodes.len(),
+            2
+        );
+        assert_eq!(trace.inner_traces.len(), 1);
+
+        // First inner: 2 opcodes, 1 nested inner
+        let inner = &trace.inner_traces[0];
+        assert_eq!(
+            inner.approval_program_trace.as_ref().unwrap().opcodes.len(),
+            2
+        );
+        assert_eq!(inner.inner_traces.len(), 1);
+
+        // Nested inner: 1 opcode, no further inners
+        let nested = &inner.inner_traces[0];
+        assert_eq!(
+            nested
+                .approval_program_trace
+                .as_ref()
+                .unwrap()
+                .opcodes
+                .len(),
+            1
+        );
+        assert_eq!(nested.inner_traces.len(), 0);
+    }
+
+    #[test]
+    fn test_simulation_tracer_multiple_sibling_inner_txns() {
+        let config = ExecTraceConfig {
+            enable: true,
+            stack: false,
+            scratch: false,
+            state: false,
+        };
+        let mut tracer = SimulationTracer::new(config);
+
+        tracer.before_program(ProgramType::Approval);
+        tracer.before_opcode(0, 0x81);
+        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+
+        // Inner txn group with 2 siblings
+        tracer.before_txn_group(2);
+
+        // Sibling 1
+        tracer.before_txn(0);
+        tracer.before_program(ProgramType::Approval);
+        tracer.before_opcode(0, 0x81);
+        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.after_program(ProgramType::Approval, true, None);
+        tracer.after_txn(0, None);
+
+        // Sibling 2
+        tracer.before_txn(1);
+        tracer.before_program(ProgramType::Approval);
+        tracer.before_opcode(0, 0x81);
+        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(2)], &[], None);
+        tracer.after_program(ProgramType::Approval, true, None);
+        tracer.after_txn(1, None);
+
+        tracer.after_txn_group(None);
+
+        tracer.before_opcode(3, 0x43);
+        tracer.after_opcode(3, 0x43, &[AvmValue::Uint64(1)], &[], None);
+        tracer.after_program(ProgramType::Approval, true, None);
+
+        let trace = tracer.into_transaction_trace().unwrap();
+
+        assert_eq!(trace.inner_traces.len(), 2);
+        assert!(trace.inner_traces[0].approval_program_trace.is_some());
+        assert!(trace.inner_traces[1].approval_program_trace.is_some());
     }
 }
