@@ -276,7 +276,10 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             Some(hdr) => consensus_params_for_version(&hdr.current_protocol).unwrap_or_default(),
             None => consensus_params_for_version(self.store.protocol()).unwrap_or_default(),
         };
-        let latest_timestamp = block_hdr.as_ref().map(|h| h.timestamp as u64).unwrap_or(0);
+        let latest_timestamp = block_hdr
+            .as_ref()
+            .map(|h| h.timestamp.max(0) as u64)
+            .unwrap_or(0);
 
         // Run validation (signature verification + well-formedness) before execution.
         if let Err(e) = self.check(txn_group, request.allow_empty_signatures, &consensus) {
@@ -368,8 +371,18 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
         let proxy_key = SigningKey::from_bytes(&PROXY_SIGNER_SEED);
 
+        // Pass 1: reject unsupported transaction types, check well-formedness,
+        // and proxy-sign unsigned transactions. Matches go-algorand's ordering
+        // where all proxy-signing happens before group verification.
         for stx in &mut verify_group {
-            // Check well-formedness first.
+            // Reject StateProof transactions (go-algorand: simulator.go:164).
+            if stx.txn.txn_type == "stpf" {
+                return Err(SimulatorError::InvalidRequest(InvalidRequestError {
+                    message: "cannot simulate StateProof transactions".to_string(),
+                }));
+            }
+
+            // Check well-formedness.
             validate_transaction_wellformed(&stx.txn, true, consensus, Some(&spec)).map_err(
                 |e| {
                     SimulatorError::InvalidRequest(InvalidRequestError {
@@ -403,7 +416,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             }
         }
 
-        // Verify signatures on the (possibly proxy-signed) group.
+        // Pass 2: verify signatures on the (possibly proxy-signed) group.
         let mut budget = GroupBudget::for_logicsig(verify_group.len());
         for (i, stx) in verify_group.iter().enumerate() {
             verify_transaction_signature(stx, &verify_group, i, &mut budget, consensus).map_err(
