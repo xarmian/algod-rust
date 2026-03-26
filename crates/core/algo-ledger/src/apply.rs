@@ -2256,6 +2256,9 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     avm_ctx.fee_sink = ctx.fee_sink;
                     avm_ctx.txn_counter = ctx.txn_counter.get();
                     avm_ctx.fee_credit = ctx.fee_credit.get();
+                    if let Some(ref mut t) = tracer {
+                        avm_ctx.tracer_ptr = Some(*t as *mut dyn EvalTracer);
+                    }
                     let result = if let Some(ref mut t) = tracer {
                         run_clear_state_program_with_tracer(
                             &clear_program,
@@ -2334,6 +2337,9 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 avm_ctx.fee_sink = ctx.fee_sink;
                 avm_ctx.txn_counter = ctx.txn_counter.get();
                 avm_ctx.fee_credit = ctx.fee_credit.get();
+                if let Some(ref mut t) = tracer {
+                    avm_ctx.tracer_ptr = Some(*t as *mut dyn EvalTracer);
+                }
 
                 // Use the group budget if provided, otherwise create a single-call budget.
                 let mut fallback_budget = GroupBudget::new(1);

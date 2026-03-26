@@ -737,6 +737,14 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// Tracks local state changes made during execution (dual-write with store).
     /// Key: (account address, state key bytes), Value: the new TealValue (or absent for deletes).
     local_delta_tracker: HashMap<(Address, Vec<u8>), Option<TealValue>>,
+
+    /// Optional execution tracer for capturing opcode-level details.
+    /// Used by the simulation engine for tracing inner transactions.
+    ///
+    /// Stored as a raw pointer to avoid borrow-checker conflicts when both
+    /// `self.store` and the tracer need to be accessed during `itxn_submit`.
+    /// SAFETY: the tracer outlives the context (guaranteed by the call stack).
+    pub tracer_ptr: Option<*mut (dyn algo_avm::tracer::EvalTracer + 'a)>,
 }
 
 // Helper to create a default scratch row (256 zero-uint slots).
@@ -798,6 +806,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             unnamed_access: 0,
             global_delta_tracker: HashMap::new(),
             local_delta_tracker: HashMap::new(),
+            tracer_ptr: None,
         }
     }
 
@@ -1264,6 +1273,13 @@ fn execute_inner_appl<L: LedgerStore>(
     inner_ctx.unnamed_access = box_state.unnamed_access;
     // Inherit created_apps so newAppAccess fallback works for apps created earlier.
     inner_ctx.created_apps = created_apps_snapshot;
+
+    // Propagate tracer to inner context for recursive inner tracing.
+    // SAFETY: tracer_ptr derived from the mutable reference in `tracer`, which
+    // outlives `inner_ctx`. Only one mutable ref is created at a time.
+    if let Some(ref mut t) = tracer {
+        inner_ctx.tracer_ptr = Some(*t as *mut dyn algo_avm::tracer::EvalTracer);
+    }
 
     // ── Execute the program ──
     let avm_result = if on_completion == ON_COMPLETION_CLEAR_STATE {
@@ -2441,6 +2457,13 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         let mut extra_created_asset_ids: Vec<u64> = Vec::new();
         let mut extra_created_app_ids: Vec<u64> = Vec::new();
 
+        // Notify tracer of the inner transaction group.
+        if let Some(p) = self.tracer_ptr {
+            // SAFETY: tracer_ptr is valid for the duration of this context
+            // and only one mutable ref is live at a time.
+            unsafe { &mut *p }.before_txn_group(txns.len());
+        }
+
         for (i, stxn) in txns.iter_mut().enumerate() {
             // Deduct fee from sender to fee_sink (matches go-algorand takeFee).
             let fee = stxn.txn.fee;
@@ -2455,9 +2478,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         self.store.remove_app_params(id);
                         self.store.remove_all_app_local_states_for_app(id);
                     }
-                    return Err(AlgoError::Avm {
-                        message: format!("inner tx {}: fee_sink not configured (zero address)", i,),
-                    });
+                    let err_msg = format!("inner tx {}: fee_sink not configured (zero address)", i);
+                    if let Some(p) = self.tracer_ptr {
+                        unsafe { &mut *p }.after_txn_group(Some(&err_msg));
+                    }
+                    return Err(AlgoError::Avm { message: err_msg });
                 }
                 let mut sender_acct = self.store.get_or_default_account(&stxn.txn.sender);
                 if sender_acct.micro_algos < fee {
@@ -2470,12 +2495,14 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         self.store.remove_app_params(id);
                         self.store.remove_all_app_local_states_for_app(id);
                     }
-                    return Err(AlgoError::Avm {
-                        message: format!(
-                            "inner tx {}: sender {} has insufficient balance {} for fee {}",
-                            i, stxn.txn.sender, sender_acct.micro_algos, fee,
-                        ),
-                    });
+                    let err_msg = format!(
+                        "inner tx {}: sender {} has insufficient balance {} for fee {}",
+                        i, stxn.txn.sender, sender_acct.micro_algos, fee,
+                    );
+                    if let Some(p) = self.tracer_ptr {
+                        unsafe { &mut *p }.after_txn_group(Some(&err_msg));
+                    }
+                    return Err(AlgoError::Avm { message: err_msg });
                 }
                 sender_acct.micro_algos -= fee;
                 self.store.set_account(&stxn.txn.sender, sender_acct);
@@ -2488,6 +2515,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             // Increment txn counter before execution (matches go-algorand incTxnCount).
             current_counter += 1;
             self.txn_counter = current_counter;
+
+            // Notify tracer before dispatching this inner transaction.
+            if let Some(p) = self.tracer_ptr {
+                unsafe { &mut *p }.before_txn(i);
+            }
 
             // Dispatch to the appropriate apply function.
             if stxn.txn.txn_type == "appl" {
@@ -2518,6 +2550,9 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     boxes_initialized: self.boxes_initialized,
                     unnamed_access: self.unnamed_access,
                 };
+                // SAFETY: tracer_ptr is valid for the duration of this context
+                // and only one mutable ref is live at a time.
+                let tracer_ref = self.tracer_ptr.map(|p| unsafe { &mut *p });
                 let result = execute_inner_appl(
                     self.store,
                     stxn,
@@ -2534,7 +2569,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     caller_box_state,
                     self.created_apps.clone(),
                     self.consensus.clone(),
-                    None, // TODO(#210): wire tracer from LedgerAvmContext for inner txn tracing
+                    tracer_ref,
                 );
                 match result {
                     Ok(ad) => {
@@ -2582,8 +2617,17 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                             self.boxes_initialized = bs.boxes_initialized;
                             self.unnamed_access = bs.unnamed_access;
                         }
+                        // Notify tracer of successful inner transaction.
+                        if let Some(p) = self.tracer_ptr {
+                            unsafe { &mut *p }.after_txn(i, None);
+                        }
                     }
                     Err(e) => {
+                        // Notify tracer of failed inner transaction.
+                        let err_msg = format!("inner tx {} failed: {}", i, e);
+                        if let Some(p) = self.tracer_ptr {
+                            unsafe { &mut *p }.after_txn(i, Some(&err_msg));
+                        }
                         self.store.restore_snapshot(snapshot);
                         for &id in &extra_created_asset_ids {
                             self.store.remove_asset_params(id);
@@ -2593,9 +2637,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                             self.store.remove_app_params(id);
                             self.store.remove_all_app_local_states_for_app(id);
                         }
-                        return Err(AlgoError::Avm {
-                            message: format!("inner tx {} failed: {}", i, e),
-                        });
+                        // Notify tracer of group failure.
+                        if let Some(p) = self.tracer_ptr {
+                            unsafe { &mut *p }.after_txn_group(Some(&err_msg));
+                        }
+                        return Err(AlgoError::Avm { message: err_msg });
                     }
                 }
             } else {
@@ -2607,6 +2653,11 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     "keyreg" => apply_keyreg(self.store, &stxn.txn, round, &self.consensus),
                     _ => {
                         // Should not reach here due to earlier validation.
+                        let err_msg =
+                            format!("inner tx {}: unsupported type {}", i, stxn.txn.txn_type);
+                        if let Some(p) = self.tracer_ptr {
+                            unsafe { &mut *p }.after_txn(i, Some(&err_msg));
+                        }
                         self.store.restore_snapshot(snapshot);
                         for &id in &extra_created_asset_ids {
                             self.store.remove_asset_params(id);
@@ -2616,12 +2667,10 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                             self.store.remove_app_params(id);
                             self.store.remove_all_app_local_states_for_app(id);
                         }
-                        return Err(AlgoError::Avm {
-                            message: format!(
-                                "inner tx {}: unsupported type {}",
-                                i, stxn.txn.txn_type
-                            ),
-                        });
+                        if let Some(p) = self.tracer_ptr {
+                            unsafe { &mut *p }.after_txn_group(Some(&err_msg));
+                        }
+                        return Err(AlgoError::Avm { message: err_msg });
                     }
                 };
 
@@ -2641,8 +2690,16 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                         {
                             extra_created_app_ids.push(ad.application_id);
                         }
+                        // Notify tracer of successful inner transaction.
+                        if let Some(p) = self.tracer_ptr {
+                            unsafe { &mut *p }.after_txn(i, None);
+                        }
                     }
                     Err(e) => {
+                        let err_msg = format!("inner tx {} failed: {}", i, e);
+                        if let Some(p) = self.tracer_ptr {
+                            unsafe { &mut *p }.after_txn(i, Some(&err_msg));
+                        }
                         self.store.restore_snapshot(snapshot);
                         for &id in &extra_created_asset_ids {
                             self.store.remove_asset_params(id);
@@ -2652,12 +2709,18 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                             self.store.remove_app_params(id);
                             self.store.remove_all_app_local_states_for_app(id);
                         }
-                        return Err(AlgoError::Avm {
-                            message: format!("inner tx {} failed: {}", i, e),
-                        });
+                        if let Some(p) = self.tracer_ptr {
+                            unsafe { &mut *p }.after_txn_group(Some(&err_msg));
+                        }
+                        return Err(AlgoError::Avm { message: err_msg });
                     }
                 }
             }
+        }
+
+        // Notify tracer of successful inner transaction group completion.
+        if let Some(p) = self.tracer_ptr {
+            unsafe { &mut *p }.after_txn_group(None);
         }
 
         // ── Compute inner transaction IDs ──

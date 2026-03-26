@@ -34,6 +34,25 @@ pub enum ProgramType {
 /// 2. For each opcode: `before_opcode` → dispatch → `after_opcode`.
 /// 3. `after_program` — called once after execution completes or errors.
 pub trait EvalTracer {
+    /// Called before a block is evaluated.
+    fn before_block(&mut self, _round: u64) {}
+
+    /// Called after a block has been evaluated.
+    fn after_block(&mut self, _round: u64) {}
+
+    /// Called before a transaction group is executed (top-level or inner).
+    fn before_txn_group(&mut self, _group_size: usize) {}
+
+    /// Called after a transaction group has been executed.
+    fn after_txn_group(&mut self, _error: Option<&str>) {}
+
+    /// Called before a transaction within a group is executed.
+    /// `group_index` is the index within the current group.
+    fn before_txn(&mut self, _group_index: usize) {}
+
+    /// Called after a transaction within a group has been executed.
+    fn after_txn(&mut self, _group_index: usize, _error: Option<&str>) {}
+
     /// Called before a program begins executing.
     fn before_program(&mut self, _program_type: ProgramType) {}
 
