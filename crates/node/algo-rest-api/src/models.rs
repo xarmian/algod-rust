@@ -2234,3 +2234,37 @@ pub struct DebugSettingsProf {
     #[serde(rename = "mutex-rate", skip_serializing_if = "Option::is_none")]
     pub mutex_rate: Option<u64>,
 }
+
+// ---------------------------------------------------------------------------
+// Experimental API: AccountAssetsInformation
+// ---------------------------------------------------------------------------
+
+/// A single asset holding with optional asset params.
+///
+/// Matches go-algorand's `model.AccountAssetHolding`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountAssetHolding {
+    /// The asset holding information.
+    #[serde(rename = "asset-holding")]
+    pub asset_holding: ApiAssetHolding,
+
+    /// The asset params (present when the account is the asset creator).
+    #[serde(rename = "asset-params", skip_serializing_if = "Option::is_none")]
+    pub asset_params: Option<ApiAssetParams>,
+}
+
+/// Response for `GET /v2/accounts/{address}/assets` — matches go-algorand's
+/// `model.AccountAssetsInformationResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountAssetsInformationResponse {
+    /// The round at which the lookup was performed.
+    pub round: u64,
+
+    /// The asset holdings for this account.
+    #[serde(rename = "asset-holdings", skip_serializing_if = "Option::is_none")]
+    pub asset_holdings: Option<Vec<AccountAssetHolding>>,
+
+    /// Pagination token for the next page of results.
+    #[serde(rename = "next-token", skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+}

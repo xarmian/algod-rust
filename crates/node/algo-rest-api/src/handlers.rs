@@ -3817,3 +3817,222 @@ pub async fn unset_sync_round<N: NodeInterface>(State(node): State<AppState<N>>)
         Err(e) => error::internal_error(e.to_string()),
     }
 }
+
+// ===========================================================================
+// Experimental API endpoints
+// ===========================================================================
+
+/// Maximum number of asset results per page for account assets information.
+/// Used for *validation*: requests with `limit > MAX_ASSET_RESULTS` are rejected.
+/// Matches go-algorand's `MaxAssetResults`.
+const MAX_ASSET_RESULTS: u64 = 1000;
+
+/// Default number of asset results per page when no `limit` is specified.
+/// Matches go-algorand's `DefaultAssetResults` (same value as `MaxAssetResults`
+/// in the current protocol, but kept as a separate constant for clarity).
+const DEFAULT_ASSET_RESULTS: u64 = 1000;
+
+// ---------------------------------------------------------------------------
+// GET /v2/experimental  —  Experimental API check
+// ---------------------------------------------------------------------------
+
+/// Check whether the Experimental API is enabled.
+///
+/// Matches go-algorand's `Handlers.ExperimentalCheck`.
+/// Note: go-algorand has no handler-level check here — the route is only
+/// registered when `EnableExperimentalAPI` is true (router-level gating).
+pub async fn experimental_check<N: NodeInterface>(State(_node): State<AppState<N>>) -> Response {
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        "true\n",
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/accounts/:address/assets  —  Account assets information
+// ---------------------------------------------------------------------------
+
+/// Query parameters for the account assets information endpoint.
+#[derive(Debug, Deserialize)]
+pub struct AccountAssetsInformationParams {
+    /// Maximum number of results to return.
+    pub limit: Option<u64>,
+    /// Pagination cursor: return assets with ID greater than this value.
+    pub next: Option<String>,
+}
+
+/// Return paginated asset holdings for an account.
+///
+/// Matches go-algorand's `Handlers.AccountAssetsInformation`.
+pub async fn account_assets_information<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(address): Path<String>,
+    Query(params): Query<AccountAssetsInformationParams>,
+) -> Response {
+    if !node.enable_experimental_api() {
+        return (
+            StatusCode::NOT_FOUND,
+            "/v2/accounts/{address}/assets was not enabled in the configuration file by setting the EnableExperimentalAPI to true",
+        )
+            .into_response();
+    }
+
+    // Parse address
+    let addr = match Address::from_str(&address) {
+        Ok(a) => a,
+        Err(_) => return error::bad_request("failed to parse the address"),
+    };
+
+    // Parse "next" pagination token
+    let asset_greater_than: u64 = if let Some(ref next_str) = params.next {
+        match next_str.parse::<u64>() {
+            Ok(v) => v,
+            Err(e) => {
+                return error::bad_request(format!("unable to parse next token: {e}"));
+            }
+        }
+    } else {
+        0
+    };
+
+    // Validate and default limit
+    let limit = if let Some(l) = params.limit {
+        if l == 0 {
+            return error::bad_request("limit parameter must be a positive integer");
+        }
+        if l > MAX_ASSET_RESULTS {
+            return error::bad_request(format!(
+                "limit {} exceeds max assets single batch limit {}",
+                l, MAX_ASSET_RESULTS
+            ));
+        }
+        l
+    } else {
+        DEFAULT_ASSET_RESULTS
+    };
+
+    // Look up assets (request limit+1 to detect pagination)
+    let (records, lookup_round) = match node
+        .lookup_assets(&addr, asset_greater_than, limit + 1)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!(error = %e, "lookup_assets failed");
+            return error::internal_error("failed to retrieve information from the ledger");
+        }
+    };
+
+    let mut response = models::AccountAssetsInformationResponse {
+        round: lookup_round,
+        asset_holdings: None,
+        next_token: None,
+    };
+
+    let mut records = records;
+
+    // Detect pagination
+    if records.len() as u64 > limit {
+        records.truncate(limit as usize);
+        if let Some(last) = records.last() {
+            response.next_token = Some(last.asset_id.to_string());
+        }
+    }
+
+    // Build asset holdings
+    let mut asset_holdings = Vec::with_capacity(records.len());
+    for record in &records {
+        let holding = match &record.asset_holding {
+            Some(h) => h,
+            None => {
+                tracing::warn!(
+                    asset_id = record.asset_id,
+                    "AccountAssetsInformation: asset has no holding - should not be possible"
+                );
+                continue;
+            }
+        };
+        let mut aah = models::AccountAssetHolding {
+            asset_holding: models::ApiAssetHolding {
+                amount: holding.amount,
+                asset_id: record.asset_id,
+                is_frozen: holding.frozen,
+            },
+            asset_params: None,
+        };
+        // Include asset params if the creator is non-zero (matches go-algorand's
+        // `AssetParamsToAsset` — reuse the existing conversion function).
+        if !record.creator.is_zero() {
+            if let Some(ref ap) = record.asset_params {
+                let asset =
+                    models::asset_params_to_api(record.asset_id, &record.creator.to_string(), ap);
+                aah.asset_params = Some(asset.params);
+            }
+        }
+        asset_holdings.push(aah);
+    }
+    response.asset_holdings = Some(asset_holdings);
+
+    let body = match serde_json::to_string(&response) {
+        Ok(b) => b,
+        Err(_) => return error::internal_error("failed to encode response"),
+    };
+    (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /v2/transactions/async  —  Async raw transaction broadcast
+// ---------------------------------------------------------------------------
+
+/// Broadcast a signed transaction group asynchronously.
+///
+/// Matches go-algorand's `Handlers.RawTransactionAsync`.
+pub async fn raw_transaction_async<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    body: axum::body::Bytes,
+) -> Response {
+    if !node.enable_experimental_api() {
+        return (
+            StatusCode::NOT_FOUND,
+            "/transactions/async was not enabled in the configuration file by setting the EnableExperimentalAPI to true",
+        )
+            .into_response();
+    }
+    if !node.enable_developer_api() {
+        return (
+            StatusCode::NOT_FOUND,
+            "/transactions/async was not enabled in the configuration file by setting the EnableDeveloperAPI to true",
+        )
+            .into_response();
+    }
+
+    let max_group_size = node.max_tx_group_size();
+    let mut txgroup: Vec<algo_types::SignedTransaction> = Vec::new();
+    let mut cursor = &body[..];
+
+    while !cursor.is_empty() {
+        match algo_types::SignedTransaction::decode_from_reader(&mut cursor) {
+            Ok(stxn) => {
+                txgroup.push(stxn);
+                if txgroup.len() > max_group_size {
+                    return error::bad_request(format!("max group size is {}", max_group_size));
+                }
+            }
+            Err(e) => {
+                return error::bad_request(format!("could not decode transaction: {e}"));
+            }
+        }
+    }
+
+    if txgroup.is_empty() {
+        return error::bad_request("empty txgroup");
+    }
+
+    if let Err(e) = node.async_broadcast_signed_tx_group(txgroup).await {
+        return error::service_unavailable(e.to_string());
+    }
+
+    StatusCode::OK.into_response()
+}

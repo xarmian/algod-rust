@@ -13,8 +13,8 @@ use algo_ledger::StateDelta;
 use algo_rest_api::auth::generate_token;
 use algo_rest_api::node::{
     AccountLookup, AppResourceLookup, ApplicationLookup, AssetLookup, AssetResourceLookup,
-    BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo, StateProofData,
-    SupplyInfo, TxnWithStatus,
+    AssetResourceWithIDs, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
+    StateProofData, SupplyInfo, TxnWithStatus,
 };
 use algo_rest_api::router::{build_router, TokenConfig};
 use algo_types::{
@@ -115,6 +115,10 @@ struct MockNode {
     state_deltas: BTreeMap<u64, StateDelta>,
     /// Whether the developer API is enabled.
     enable_developer_api: bool,
+    /// Whether the experimental API is enabled.
+    enable_experimental_api: bool,
+    /// Asset resource records for lookup_assets, keyed by address bytes.
+    asset_resources_by_addr: BTreeMap<[u8; 32], Vec<AssetResourceWithIDs>>,
     /// Participation records to return from list/get.
     participation_records: Vec<ParticipationRecord>,
     /// Install result: None = return new ID, Some(msg) = error.
@@ -185,6 +189,8 @@ impl Clone for MockNode {
             simulate_result: self.simulate_result.clone(),
             state_deltas: self.state_deltas.clone(),
             enable_developer_api: self.enable_developer_api,
+            enable_experimental_api: self.enable_experimental_api,
+            asset_resources_by_addr: self.asset_resources_by_addr.clone(),
             participation_records: self.participation_records.clone(),
             install_result: self.install_result.clone(),
             remove_result: self.remove_result.clone(),
@@ -289,6 +295,8 @@ impl MockNode {
             simulate_result: None,
             state_deltas: BTreeMap::new(),
             enable_developer_api: false,
+            enable_experimental_api: false,
+            asset_resources_by_addr: BTreeMap::new(),
             participation_records: Vec::new(),
             install_result: None,
             remove_result: None,
@@ -761,6 +769,38 @@ impl NodeInterface for MockNode {
         self.enable_developer_api
     }
 
+    fn enable_experimental_api(&self) -> bool {
+        self.enable_experimental_api
+    }
+
+    async fn async_broadcast_signed_tx_group(
+        &self,
+        _tx_group: Vec<SignedTransaction>,
+    ) -> Result<(), NodeError> {
+        match &self.broadcast_result {
+            None => Ok(()),
+            Some(msg) => Err(NodeError::Internal(msg.clone())),
+        }
+    }
+
+    async fn lookup_assets(
+        &self,
+        addr: &Address,
+        asset_id_gt: u64,
+        limit: u64,
+    ) -> Result<(Vec<AssetResourceWithIDs>, u64), NodeError> {
+        let records = match self.asset_resources_by_addr.get(&addr.0) {
+            Some(r) => r
+                .iter()
+                .filter(|r| r.asset_id > asset_id_gt)
+                .take(limit as usize)
+                .cloned()
+                .collect(),
+            None => vec![],
+        };
+        Ok((records, 1000))
+    }
+
     async fn list_participation_keys(&self) -> Result<Vec<ParticipationRecord>, NodeError> {
         Ok(self.participation_records.clone())
     }
@@ -927,10 +967,12 @@ impl TestServer {
     async fn start(node: MockNode) -> Self {
         let api_token = generate_token();
         let admin_token = generate_token();
+        let enable_experimental_api = node.enable_experimental_api;
 
         let tokens = TokenConfig {
             api_token: api_token.clone(),
             admin_token: admin_token.clone(),
+            enable_experimental_api,
         };
 
         let router = build_router(Arc::new(node), tokens);
@@ -6642,5 +6684,331 @@ async fn start_catchup_min_rounds_skip() {
     assert_eq!(
         body["catchup-message"].as_str().unwrap(),
         "the node has already been initialized"
+    );
+}
+
+// ===========================================================================
+// Experimental API tests
+// ===========================================================================
+
+fn mock_with_experimental_api() -> MockNode {
+    let mut node = MockNode::synced();
+    node.enable_experimental_api = true;
+    node
+}
+
+fn mock_with_experimental_and_developer_api() -> MockNode {
+    let mut node = MockNode::synced();
+    node.enable_experimental_api = true;
+    node.enable_developer_api = true;
+    node
+}
+
+#[tokio::test]
+async fn experimental_check_enabled_returns_200() {
+    let server = TestServer::start(mock_with_experimental_api()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/experimental"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert_eq!(body.trim(), "true");
+}
+
+#[tokio::test]
+async fn experimental_check_disabled_not_accessible() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/experimental"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    // Route not registered — axum returns 404 or auth middleware returns 401
+    let status = resp.status().as_u16();
+    assert!(
+        status == 404 || status == 401,
+        "expected 404 or 401 when experimental is disabled, got {status}"
+    );
+}
+
+#[tokio::test]
+async fn account_assets_information_enabled_returns_200() {
+    let addr = Address([0x01; 32]);
+    let mut node = mock_with_experimental_api();
+    node.asset_resources_by_addr.insert(
+        addr.0,
+        vec![AssetResourceWithIDs {
+            asset_id: 42,
+            asset_holding: Some(AssetHolding {
+                amount: 100,
+                frozen: false,
+            }),
+            creator: Address([0u8; 32]),
+            asset_params: None,
+        }],
+    );
+
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/assets", addr)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["round"], 1000);
+    let holdings = body["asset-holdings"].as_array().unwrap();
+    assert_eq!(holdings.len(), 1);
+    assert_eq!(holdings[0]["asset-holding"]["asset-id"], 42);
+    assert_eq!(holdings[0]["asset-holding"]["amount"], 100);
+}
+
+#[tokio::test]
+async fn account_assets_information_disabled_not_accessible() {
+    let addr = Address([0x01; 32]);
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/assets", addr)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    assert!(
+        status == 404 || status == 401,
+        "expected 404 or 401 when experimental is disabled, got {status}"
+    );
+}
+
+#[tokio::test]
+async fn account_assets_information_pagination() {
+    let addr = Address([0x01; 32]);
+    let mut node = mock_with_experimental_api();
+
+    // Create 3 assets
+    let assets: Vec<AssetResourceWithIDs> = (1..=3)
+        .map(|i| AssetResourceWithIDs {
+            asset_id: i,
+            asset_holding: Some(AssetHolding {
+                amount: i * 10,
+                frozen: false,
+            }),
+            creator: Address([0u8; 32]),
+            asset_params: None,
+        })
+        .collect();
+    node.asset_resources_by_addr.insert(addr.0, assets);
+
+    let server = TestServer::start(node).await;
+
+    // Request with limit=2 — should get 2 results and a next-token
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/assets?limit=2", addr)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let holdings = body["asset-holdings"].as_array().unwrap();
+    assert_eq!(holdings.len(), 2);
+    assert!(
+        body["next-token"].is_string(),
+        "should have next-token for pagination"
+    );
+
+    // Request second page using the next token
+    let next_token = body["next-token"].as_str().unwrap();
+    let resp = server
+        .client
+        .get(server.url(&format!(
+            "/v2/accounts/{}/assets?limit=2&next={}",
+            addr, next_token
+        )))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let holdings = body["asset-holdings"].as_array().unwrap();
+    assert_eq!(holdings.len(), 1);
+    assert!(
+        body["next-token"].is_null(),
+        "should not have next-token on last page"
+    );
+}
+
+#[tokio::test]
+async fn account_assets_information_limit_exceeds_max() {
+    let addr = Address([0x01; 32]);
+    let server = TestServer::start(mock_with_experimental_api()).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/assets?limit=1001", addr)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("exceeds max"),
+        "error should mention exceeds max"
+    );
+}
+
+#[tokio::test]
+async fn raw_transaction_async_enabled_returns_200() {
+    let node = mock_with_experimental_and_developer_api();
+    let server = TestServer::start(node).await;
+
+    let stxn = make_test_signed_txn();
+    let body = encode_signed_txn_for_post(&stxn);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/async"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // Should have empty body (NoContent equivalent)
+    let resp_body = resp.text().await.unwrap();
+    assert!(
+        resp_body.is_empty(),
+        "async endpoint should return empty body on success"
+    );
+}
+
+#[tokio::test]
+async fn raw_transaction_async_disabled_not_accessible() {
+    // experimental disabled (default)
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let stxn = make_test_signed_txn();
+    let body = encode_signed_txn_for_post(&stxn);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/async"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    // Route not registered — axum returns 404 or auth middleware returns 401
+    let status = resp.status().as_u16();
+    assert!(
+        status == 404 || status == 401,
+        "expected 404 or 401 when experimental is disabled, got {status}"
+    );
+}
+
+#[tokio::test]
+async fn raw_transaction_async_developer_disabled_returns_404() {
+    // experimental enabled but developer disabled
+    let node = mock_with_experimental_api();
+    let server = TestServer::start(node).await;
+
+    let stxn = make_test_signed_txn();
+    let body = encode_signed_txn_for_post(&stxn);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/async"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let resp_body = resp.text().await.unwrap();
+    assert!(
+        resp_body.contains("EnableDeveloperAPI"),
+        "404 message should mention EnableDeveloperAPI"
+    );
+}
+
+#[tokio::test]
+async fn raw_transaction_async_broadcast_error_returns_503() {
+    let mut node = mock_with_experimental_and_developer_api();
+    node.broadcast_result = Some("pool full".to_string());
+    let server = TestServer::start(node).await;
+
+    let stxn = make_test_signed_txn();
+    let body = encode_signed_txn_for_post(&stxn);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/async"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+}
+
+#[tokio::test]
+async fn account_assets_information_limit_zero_returns_400() {
+    let addr = Address([0x01; 32]);
+    let server = TestServer::start(mock_with_experimental_api()).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/assets?limit=0", addr)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("positive"),
+        "error should mention positive: {body}"
+    );
+}
+
+#[tokio::test]
+async fn raw_transaction_async_empty_body_returns_400() {
+    let node = mock_with_experimental_and_developer_api();
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/async"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/x-binary")
+        .body(Vec::<u8>::new())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("empty txgroup"),
+        "error should mention empty txgroup: {body}"
     );
 }

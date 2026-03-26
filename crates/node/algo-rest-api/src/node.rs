@@ -657,6 +657,43 @@ pub trait NodeInterface: Send + Sync + 'static {
         false
     }
 
+    /// Whether the Experimental API is enabled in the node configuration.
+    ///
+    /// When false, experimental endpoints (`/v2/experimental`,
+    /// `/v2/accounts/:address/assets`, `/v2/transactions/async`) return 404.
+    /// Mirrors go-algorand's `Config().EnableExperimentalAPI`.
+    fn enable_experimental_api(&self) -> bool {
+        false
+    }
+
+    /// Broadcast a signed transaction group asynchronously (fire-and-forget).
+    ///
+    /// Unlike `broadcast_signed_tx_group`, this does not wait for pool
+    /// validation to complete before returning.
+    ///
+    /// Mirrors go-algorand's `Node.AsyncBroadcastSignedTxGroup`.
+    async fn async_broadcast_signed_tx_group(
+        &self,
+        _tx_group: Vec<SignedTransaction>,
+    ) -> Result<(), NodeError> {
+        Err(NodeError::NotImplemented("async_broadcast_signed_tx_group"))
+    }
+
+    /// Look up multiple asset resources for an address, paginated by asset ID.
+    ///
+    /// Returns assets with `asset_id > asset_id_gt`, up to `limit` records,
+    /// along with the round at which the lookup was performed.
+    ///
+    /// Mirrors go-algorand's `ledger.LookupAssets(addr, asset_id_gt, limit)`.
+    async fn lookup_assets(
+        &self,
+        _addr: &Address,
+        _asset_id_gt: u64,
+        _limit: u64,
+    ) -> Result<(Vec<AssetResourceWithIDs>, u64), NodeError> {
+        Err(NodeError::NotImplemented("lookup_assets"))
+    }
+
     // ---- Simulation methods ----
 
     /// Simulate a transaction group without submitting it.
@@ -861,4 +898,20 @@ pub enum CatchupStartResult {
     Unable(String),
     /// Error starting catchup (408).
     StartError(String),
+}
+
+/// A single asset resource record with identifying fields, used for
+/// paginated asset lookups.
+///
+/// Mirrors go-algorand's `ledgercore.AssetResourceWithIDs`.
+#[derive(Debug, Clone)]
+pub struct AssetResourceWithIDs {
+    /// The asset ID.
+    pub asset_id: u64,
+    /// The asset holding, if the address has opted in.
+    pub asset_holding: Option<AssetHolding>,
+    /// The address that created this asset. Zero address if not the creator.
+    pub creator: Address,
+    /// The asset params, present only if the address is the creator.
+    pub asset_params: Option<AssetParams>,
 }
