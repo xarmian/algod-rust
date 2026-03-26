@@ -284,7 +284,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 Err(e) => {
                     // Record failure. Collect any partial trace data before
                     // stopping (the tracer may have captured events up to
-                    // the point of failure once wired in).
+                    // the point of failure).
                     failure_message = Some(e.to_string());
                     failed_at = Some(vec![i]);
                     txn_result.trace = tracer.into_transaction_trace();
