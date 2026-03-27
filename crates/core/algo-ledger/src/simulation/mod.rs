@@ -37,7 +37,7 @@ use algo_validate::{
 use ed25519_dalek::{Signer, SigningKey};
 
 use crate::apply::{
-    apply_transaction_with_tracer, compute_group_fee_credit, ApplyContext, ApplyMode,
+    apply_transaction_with_budget, compute_group_fee_credit, ApplyContext, ApplyMode, GroupInfo,
 };
 use crate::store_trait::LedgerStore;
 
@@ -308,23 +308,58 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             consensus,
         };
 
-        // --- Execute each transaction in the group ---
+        // --- Execute the transaction group ---
 
+        // Pre-populate TxnResult for ALL txns (Go returns results even for
+        // transactions past the failure point).
         let mut group_result = TxnGroupResult::default();
+        for stx in txn_group {
+            group_result.txn_results.push(TxnResult {
+                txn: Some(stx.clone()),
+                ..Default::default()
+            });
+        }
+
         let mut failure_message: Option<String> = None;
         let mut failed_at: Option<TxnPath> = None;
+
+        // Build group references for GroupInfo
+        let group_refs: Vec<&SignedTransaction> = txn_group.iter().collect();
+
+        // Count app calls for group budget
+        let num_app_calls = txn_group
+            .iter()
+            .filter(|stx| stx.txn.txn_type == "appl")
+            .count();
+        let mut group_budget = GroupBudget::new(num_app_calls);
 
         for (i, stx) in txn_group.iter().enumerate() {
             apply_ctx.txn_index.set(i);
 
-            let mut txn_result = TxnResult::default();
+            let gi = GroupInfo {
+                txns: &group_refs,
+                index: i,
+            };
 
             // Create a per-transaction tracer to capture execution details.
             let mut tracer = SimulationTracer::new(request.trace_config.clone());
 
-            match apply_transaction_with_tracer(self.store, stx, &apply_ctx, 0, &mut tracer) {
-                Ok(()) => {
-                    // Transaction applied successfully.
+            // Use apply_transaction_with_budget for ALL transactions (not just appl)
+            // so they all share the group context.
+            let apply_result = apply_transaction_with_budget(
+                self.store,
+                stx,
+                &apply_ctx,
+                0,
+                Some(&mut group_budget),
+                Some(&gi),
+                Some(&mut tracer),
+            );
+
+            match apply_result {
+                Ok(apply_data) => {
+                    group_result.txn_results[i].apply_data = Some(apply_data);
+                    group_result.txn_results[i].trace = tracer.into_transaction_trace();
                 }
                 Err(e) => {
                     // Record failure. Collect any partial trace data before
@@ -332,15 +367,10 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     // the point of failure).
                     failure_message = Some(e.to_string());
                     failed_at = Some(vec![i]);
-                    txn_result.trace = tracer.into_transaction_trace();
-                    group_result.txn_results.push(txn_result);
+                    group_result.txn_results[i].trace = tracer.into_transaction_trace();
                     break;
                 }
             }
-
-            // Collect tracer results.
-            txn_result.trace = tracer.into_transaction_trace();
-            group_result.txn_results.push(txn_result);
         }
 
         group_result.failure_message = failure_message;

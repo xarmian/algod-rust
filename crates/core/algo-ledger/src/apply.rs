@@ -27,6 +27,31 @@ use crate::rewards::apply_rewards;
 // which would shadow LedgerState's inherent `get_or_default_account(&mut self)
 // -> &mut AccountData` with the trait's `get_or_default_account(&self) -> AccountData`.
 
+/// Results of applying a transaction, capturing all side-effect data.
+///
+/// Mirrors go-algorand's `transactions.ApplyData`. Returned from
+/// `apply_transaction_inner` so callers (especially the simulation engine)
+/// can capture execution results without re-reading state.
+#[derive(Debug, Clone, Default)]
+pub struct ApplyData {
+    /// Closing amount for payment transactions.
+    pub closing_amount: u64,
+    /// Closing amount for asset transfer transactions.
+    pub asset_closing_amount: u64,
+    /// Rewards applied to sender.
+    pub sender_rewards: u64,
+    /// Rewards applied to receiver.
+    pub receiver_rewards: u64,
+    /// Rewards applied to close-to address.
+    pub close_rewards: u64,
+    /// Created/configured asset ID (from acfg creates).
+    pub config_asset: u64,
+    /// Created application ID (from appl creates).
+    pub application_id: u64,
+    /// Eval delta (opaque msgpack, contains state changes, logs, inner txns).
+    pub eval_delta: Option<rmpv::Value>,
+}
+
 /// Determines whether the ledger replays recorded block data or actively
 /// executes AVM programs to produce results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,7 +474,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
             ApplyMode::Replay => {
                 // Replay mode: process transactions individually (no AVM execution).
                 for stx in &block.payset {
-                    apply_transaction(store, stx, &ctx, 0)?;
+                    let _ = apply_transaction(store, stx, &ctx, 0)?;
                 }
             }
             ApplyMode::Execute => {
@@ -480,7 +505,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                             // this synchronous closure; only one mutable ref
                             // is created at a time.
                             let tracer_ref = tracer_ptr.map(|p| unsafe { &mut *p });
-                            apply_transaction_with_budget(
+                            let _ = apply_transaction_with_budget(
                                 store,
                                 stx,
                                 &ctx,
@@ -490,7 +515,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                                 tracer_ref,
                             )?;
                         } else {
-                            apply_transaction(store, stx, &ctx, 0)?;
+                            let _ = apply_transaction(store, stx, &ctx, 0)?;
                         }
                         global_txn_idx += 1;
                     }
@@ -951,18 +976,18 @@ fn detect_transaction_groups(payset: &[SignedTransaction]) -> Vec<Vec<&SignedTra
 
 /// Information about the current transaction's group, used to provide correct
 /// group context to AVM execution (gtxn opcodes, global GroupSize, etc.).
-struct GroupInfo<'a> {
+pub struct GroupInfo<'a> {
     /// All transactions in the atomic group.
-    txns: &'a [&'a SignedTransaction],
+    pub txns: &'a [&'a SignedTransaction],
     /// Index of the current transaction within the group.
-    index: usize,
+    pub index: usize,
 }
 
 /// Apply a single signed transaction with a group budget for AVM execution.
 ///
 /// Same as `apply_transaction` but threads the group budget and group info
 /// through to `apply_appl` for Execute-mode pooled budget accounting.
-fn apply_transaction_with_budget<L: crate::store_trait::LedgerStore>(
+pub fn apply_transaction_with_budget<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     stx: &SignedTransaction,
     ctx: &ApplyContext,
@@ -970,7 +995,7 @@ fn apply_transaction_with_budget<L: crate::store_trait::LedgerStore>(
     group_budget: Option<&mut GroupBudget>,
     group_info: Option<&GroupInfo<'_>>,
     tracer: Option<&mut dyn EvalTracer>,
-) -> Result<(), AlgoError> {
+) -> Result<ApplyData, AlgoError> {
     apply_transaction_inner(store, stx, ctx, depth, group_budget, group_info, tracer)
 }
 
@@ -995,7 +1020,7 @@ pub fn apply_transaction<L: crate::store_trait::LedgerStore>(
     stx: &SignedTransaction,
     ctx: &ApplyContext,
     depth: u32,
-) -> Result<(), AlgoError> {
+) -> Result<ApplyData, AlgoError> {
     apply_transaction_inner(store, stx, ctx, depth, None, None, None)
 }
 
@@ -1009,7 +1034,7 @@ pub fn apply_transaction_with_tracer<L: crate::store_trait::LedgerStore>(
     ctx: &ApplyContext,
     depth: u32,
     tracer: &mut dyn EvalTracer,
-) -> Result<(), AlgoError> {
+) -> Result<ApplyData, AlgoError> {
     apply_transaction_inner(store, stx, ctx, depth, None, None, Some(tracer))
 }
 
@@ -1023,13 +1048,13 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
     group_budget: Option<&mut GroupBudget>,
     group_info: Option<&GroupInfo<'_>>,
     tracer: Option<&mut dyn EvalTracer>,
-) -> Result<(), AlgoError> {
+) -> Result<ApplyData, AlgoError> {
     let txn = &stx.txn;
 
     // State proof transactions are protocol-injected and skip all processing
     // (no rewards, no fees, no state changes).
     if txn.txn_type == "stpf" {
-        return Ok(());
+        return Ok(ApplyData::default());
     }
 
     // Convert lease bytes to [u8; 32] for lease table operations.
@@ -1181,13 +1206,25 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
     // Execute all transaction logic inside a closure so that ANY error
     // (fee, type-specific, EvalDelta, rewards-pool debit, rekey) triggers
     // a full rollback via restore_snapshot.
-    let result = (|| -> Result<(), AlgoError> {
+    let result = (|| -> Result<ApplyData, AlgoError> {
+        let mut apply_data = ApplyData::default();
+
         // Apply rewards to transaction participants only (not snapshot-only addresses).
         let mut total_rewards: u64 = 0;
         for addr in &reward_addrs {
             let mut account = store.get_or_default_account(addr);
-            total_rewards += apply_rewards(&mut account, ctx.rewards_level);
+            let reward = apply_rewards(&mut account, ctx.rewards_level);
+            total_rewards += reward;
             store.set_account(addr, account);
+
+            // Track per-address rewards.
+            if *addr == txn.sender {
+                apply_data.sender_rewards += reward;
+            } else if *addr == txn.receiver {
+                apply_data.receiver_rewards += reward;
+            } else if *addr == txn.close_remainder_to {
+                apply_data.close_rewards += reward;
+            }
         }
 
         // Handle rekey_to BEFORE type-specific apply (matching Go's ordering:
@@ -1202,19 +1239,22 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
             store.set_account(&txn.sender, account);
         }
 
-        // Dispatch by transaction type.
+        // Dispatch by transaction type and capture InnerApplyData.
         match txn.txn_type.as_str() {
             "pay" => {
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
-                apply_pay(store, &stx.txn)?;
+                let ad = apply_pay(store, &stx.txn)?;
+                apply_data.closing_amount = ad.closing_amount;
             }
             "acfg" => {
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
-                apply_acfg(store, &stx.txn, ctx.txn_counter.get())?;
+                let ad = apply_acfg(store, &stx.txn, ctx.txn_counter.get())?;
+                apply_data.config_asset = ad.config_asset;
             }
             "axfer" => {
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
-                apply_axfer(store, &stx.txn)?;
+                let ad = apply_axfer(store, &stx.txn)?;
+                apply_data.asset_closing_amount = ad.asset_closing_amount;
             }
             "afrz" => {
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
@@ -1224,7 +1264,11 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
                 // SAFETY: tracer_ptr is valid for the duration of this
                 // synchronous closure; only one mutable ref is live at a time.
                 let tracer_ref = tracer_ptr.map(|p| unsafe { &mut *p });
-                apply_appl(store, stx, ctx, depth, group_budget, group_info, tracer_ref)?
+                apply_appl(store, stx, ctx, depth, group_budget, group_info, tracer_ref)?;
+                // For appl creates, capture the created application ID.
+                if txn.application_id == 0 {
+                    apply_data.application_id = stx.apply_data_application_id;
+                }
             }
             "keyreg" => {
                 apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
@@ -1254,6 +1298,11 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
                 let delta = parse_eval_delta(dt)?;
                 apply_eval_delta(stx, &delta, store, ctx, depth)?;
             }
+        }
+
+        // Capture EvalDelta in Replay mode (from block data).
+        if ctx.mode == ApplyMode::Replay {
+            apply_data.eval_delta = stx.eval_delta.clone();
         }
 
         // Debit rewards pool for distributed rewards.
@@ -1319,7 +1368,7 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
             }
         }
 
-        Ok(())
+        Ok(apply_data)
     })();
 
     if result.is_err() {
