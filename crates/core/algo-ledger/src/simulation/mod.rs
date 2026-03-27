@@ -332,6 +332,10 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             .filter(|stx| stx.txn.txn_type == "appl")
             .count();
         let mut group_budget = GroupBudget::new(num_app_calls);
+        // Apply extra opcode budget from the simulation request.
+        if request.extra_opcode_budget > 0 {
+            group_budget.add(request.extra_opcode_budget);
+        }
 
         for (i, stx) in txn_group.iter().enumerate() {
             apply_ctx.txn_index.set(i);
@@ -375,6 +379,12 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
         group_result.failure_message = failure_message;
         group_result.failed_at = failed_at;
+
+        // Compute group-level budget metrics.
+        let total_budget = (num_app_calls as i64) * 700 + request.extra_opcode_budget;
+        group_result.app_budget_added = total_budget.max(0) as u64;
+        group_result.app_budget_consumed = (total_budget - group_budget.remaining()).max(0) as u64;
+
         result.txn_groups.push(group_result);
 
         // --- Restore the store to its pre-simulation state ---

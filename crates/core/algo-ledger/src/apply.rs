@@ -1264,10 +1264,17 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
                 // SAFETY: tracer_ptr is valid for the duration of this
                 // synchronous closure; only one mutable ref is live at a time.
                 let tracer_ref = tracer_ptr.map(|p| unsafe { &mut *p });
+                // Capture the app ID that will be created (txn_counter + 1)
+                // before apply_appl runs, in case we need it for ApplyData.
+                let pre_apply_counter = ctx.txn_counter.get();
                 apply_appl(store, stx, ctx, depth, group_budget, group_info, tracer_ref)?;
                 // For appl creates, capture the created application ID.
                 if txn.application_id == 0 {
-                    apply_data.application_id = stx.apply_data_application_id;
+                    apply_data.application_id = if stx.apply_data_application_id != 0 {
+                        stx.apply_data_application_id // Replay: from block data
+                    } else {
+                        pre_apply_counter + 1 // Execute: derived from txn_counter
+                    };
                 }
             }
             "keyreg" => {
@@ -2202,7 +2209,14 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
 
     let is_create = txn.application_id == 0;
     let app_id = if is_create {
-        stx.apply_data_application_id
+        // In Replay mode, use the recorded ID from block data.
+        // In Execute mode (simulation), derive from txn_counter
+        // (matching inner transaction create behavior).
+        if stx.apply_data_application_id != 0 {
+            stx.apply_data_application_id
+        } else {
+            ctx.txn_counter.get() + 1
+        }
     } else {
         txn.application_id
     };
