@@ -901,7 +901,7 @@ fn build_avm_group(
 /// Mirrors go-algorand's `feeCredit()`: sum all fees paid in the group, subtract
 /// `MinTxnFee * num_non_stpf_txns`, return the difference (saturating at 0).
 /// State proof transactions are exempt from fees per go-algorand.
-fn compute_group_fee_credit(group: &[&SignedTransaction], min_txn_fee: u64) -> u64 {
+pub(crate) fn compute_group_fee_credit(group: &[&SignedTransaction], min_txn_fee: u64) -> u64 {
     let mut min_fee_count: u64 = 0;
     let mut fees_paid: u64 = 0;
     for stx in group {

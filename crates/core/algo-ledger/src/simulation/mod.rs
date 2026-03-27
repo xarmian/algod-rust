@@ -36,7 +36,9 @@ use algo_validate::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 
-use crate::apply::{apply_transaction_with_tracer, ApplyContext, ApplyMode};
+use crate::apply::{
+    apply_transaction_with_tracer, compute_group_fee_credit, ApplyContext, ApplyMode,
+};
 use crate::store_trait::LedgerStore;
 
 /// Fixed proxy signing key seed (first 32 bytes of go-algorand's `proxySigner`).
@@ -287,6 +289,11 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             return Err(e);
         }
 
+        // Compute group fee credit so inner transactions can draw from
+        // overpayment by outer transactions (matches go-algorand's feeCredit).
+        let group_refs: Vec<&SignedTransaction> = txn_group.iter().collect();
+        let fee_credit = compute_group_fee_credit(&group_refs, consensus.min_txn_fee);
+
         let apply_ctx = ApplyContext {
             rewards_level: self.store.rewards_level(),
             fee_sink: self.store.fee_sink(),
@@ -296,7 +303,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             latest_timestamp,
             genesis_hash: *self.store.genesis_hash(),
             txn_counter: Cell::new(self.store.txn_counter()),
-            fee_credit: Cell::new(0),
+            fee_credit: Cell::new(fee_credit),
             txn_index: Cell::new(0),
             consensus,
         };

@@ -2785,17 +2785,18 @@ pub async fn simulate_transaction<N: NodeInterface>(
         return error::service_unavailable("operation not available during catchup");
     }
 
-    // Decode request body: try msgpack first, then JSON
-    let mut request: models::SimulateRequest =
-        match rmp_serde::from_slice::<models::SimulateRequest>(&body) {
-            Ok(req) => req,
-            Err(_) => match serde_json::from_slice::<models::SimulateRequest>(&body) {
-                Ok(req) => req,
-                Err(e) => {
-                    return error::bad_request(format!("could not decode simulate request: {e}"));
-                }
-            },
-        };
+    // Decode request body: try msgpack first, then JSON.
+    // Track the input format so we can decode individual transactions
+    // correctly (msgpack binary data cannot round-trip through serde_json::Value).
+    let (mut request, is_msgpack) = match rmp_serde::from_slice::<models::SimulateRequest>(&body) {
+        Ok(req) => (req, true),
+        Err(_) => match serde_json::from_slice::<models::SimulateRequest>(&body) {
+            Ok(req) => (req, false),
+            Err(e) => {
+                return error::bad_request(format!("could not decode simulate request: {e}"));
+            }
+        },
+    };
 
     // Validate: must have at least one transaction group
     if request.txn_groups.is_empty() {
@@ -2818,13 +2819,25 @@ pub async fn simulate_transaction<N: NodeInterface>(
     }
 
     // Decode each serde_json::Value transaction to SignedTransaction.
-    // This validates that the submitted transactions are well-formed
-    // before passing them to the simulation engine.
+    // For msgpack requests, re-serialize each Value to msgpack bytes and decode
+    // with rmp_serde (serde_json::Value cannot represent msgpack binary data).
+    // For JSON requests, use serde_json::from_value directly.
     let mut decoded_groups = Vec::with_capacity(request.txn_groups.len());
     for (i, group) in request.txn_groups.iter().enumerate() {
         let mut decoded_txns = Vec::with_capacity(group.txns.len());
         for (j, txn_val) in group.txns.iter().enumerate() {
-            match serde_json::from_value::<algo_types::SignedTransaction>(txn_val.clone()) {
+            let decode_result = if is_msgpack {
+                rmp_serde::to_vec(txn_val)
+                    .map_err(|e| e.to_string())
+                    .and_then(|bytes| {
+                        rmp_serde::from_slice::<algo_types::SignedTransaction>(&bytes)
+                            .map_err(|e| e.to_string())
+                    })
+            } else {
+                serde_json::from_value::<algo_types::SignedTransaction>(txn_val.clone())
+                    .map_err(|e| e.to_string())
+            };
+            match decode_result {
                 Ok(stx) => decoded_txns.push(stx),
                 Err(e) => {
                     return error::bad_request(format!(
