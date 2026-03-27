@@ -268,7 +268,52 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         addrs.sort_by(|a, b| a.0.cmp(&b.0));
         addrs.dedup();
 
-        let snapshot = self.store.snapshot(&addrs);
+        // Collect app/asset IDs that may be created or modified during
+        // simulation so the snapshot can roll them back. For creates
+        // (application_id == 0 or config_asset == 0), pre-compute the
+        // derived ID from the running txn_counter.
+        let mut asset_ids: Vec<u64> = Vec::new();
+        let mut app_ids: Vec<u64> = Vec::new();
+        let mut sim_counter = self.store.txn_counter();
+        for stx in txn_group {
+            match stx.txn.txn_type.as_str() {
+                "acfg" => {
+                    if stx.txn.config_asset != 0 {
+                        asset_ids.push(stx.txn.config_asset);
+                    } else {
+                        // Asset create: derived ID = txn_counter + 1
+                        asset_ids.push(sim_counter + 1);
+                    }
+                }
+                "axfer" => {
+                    if stx.txn.xaid != 0 {
+                        asset_ids.push(stx.txn.xaid);
+                    }
+                }
+                "afrz" => {
+                    if stx.txn.freeze_asset != 0 {
+                        asset_ids.push(stx.txn.freeze_asset);
+                    }
+                }
+                "appl" => {
+                    if stx.txn.application_id != 0 {
+                        app_ids.push(stx.txn.application_id);
+                    } else {
+                        // App create: derived ID = txn_counter + 1
+                        app_ids.push(sim_counter + 1);
+                    }
+                }
+                _ => {}
+            }
+            // Each top-level txn increments the counter
+            sim_counter += 1;
+        }
+
+        let snapshot = if asset_ids.is_empty() && app_ids.is_empty() {
+            self.store.snapshot(&addrs)
+        } else {
+            self.store.snapshot_with_ids(&addrs, &asset_ids, &app_ids)
+        };
 
         // --- Build apply context ---
 
@@ -322,9 +367,6 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
         let mut failure_message: Option<String> = None;
         let mut failed_at: Option<TxnPath> = None;
-
-        // Build group references for GroupInfo
-        let group_refs: Vec<&SignedTransaction> = txn_group.iter().collect();
 
         // Count app calls for group budget
         let num_app_calls = txn_group
