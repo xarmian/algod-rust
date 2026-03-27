@@ -32,7 +32,7 @@ use crate::rewards::apply_rewards;
 /// Mirrors go-algorand's `transactions.ApplyData`. Returned from
 /// `apply_transaction_inner` so callers (especially the simulation engine)
 /// can capture execution results without re-reading state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ApplyData {
     /// Closing amount for payment transactions.
     pub closing_amount: u64,

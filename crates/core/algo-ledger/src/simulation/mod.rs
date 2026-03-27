@@ -333,7 +333,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             .count();
         let mut group_budget = GroupBudget::new(num_app_calls);
         // Apply extra opcode budget from the simulation request.
-        if request.extra_opcode_budget > 0 {
+        if request.extra_opcode_budget != 0 {
             group_budget.add(request.extra_opcode_budget);
         }
 
