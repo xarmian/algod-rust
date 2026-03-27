@@ -5226,7 +5226,7 @@ async fn simulate_requires_auth() {
 
     let request_json = serde_json::json!({
         "txn-groups": [{
-            "txns": [{"type": "pay"}]
+            "txns": [{"txn": {"type": "pay"}}]
         }]
     });
     let body = serde_json::to_vec(&request_json).unwrap();
@@ -5288,7 +5288,7 @@ async fn simulate_catchpoint_returns_503() {
 
     let request_json = serde_json::json!({
         "txn-groups": [{
-            "txns": [{"type": "pay"}]
+            "txns": [{"txn": {"type": "pay"}}]
         }]
     });
     let body = serde_json::to_vec(&request_json).unwrap();
@@ -5310,9 +5310,10 @@ async fn simulate_not_implemented_returns_500() {
     let node = MockNode::synced();
     let server = TestServer::start(node).await;
 
+    let stx_val = serde_json::to_value(SignedTransaction::default()).unwrap();
     let request_json = serde_json::json!({
         "txn-groups": [{
-            "txns": [{"type": "pay"}]
+            "txns": [stx_val]
         }]
     });
     let body = serde_json::to_vec(&request_json).unwrap();
@@ -5381,9 +5382,10 @@ async fn simulate_returns_response() {
     });
     let server = TestServer::start(node).await;
 
+    let stx_val = serde_json::to_value(SignedTransaction::default()).unwrap();
     let request_json = serde_json::json!({
         "txn-groups": [{
-            "txns": [{"type": "pay"}]
+            "txns": [stx_val]
         }]
     });
     let body = serde_json::to_vec(&request_json).unwrap();
@@ -5453,9 +5455,10 @@ async fn simulate_format_msgpack() {
     });
     let server = TestServer::start(node).await;
 
+    let stx_val = serde_json::to_value(SignedTransaction::default()).unwrap();
     let request_json = serde_json::json!({
         "txn-groups": [{
-            "txns": [{"type": "pay"}]
+            "txns": [stx_val]
         }]
     });
     let body = serde_json::to_vec(&request_json).unwrap();
@@ -5490,7 +5493,7 @@ async fn simulate_invalid_format_returns_400() {
 
     let request_json = serde_json::json!({
         "txn-groups": [{
-            "txns": [{"type": "pay"}]
+            "txns": [{"txn": {"type": "pay"}}]
         }]
     });
     let body = serde_json::to_vec(&request_json).unwrap();

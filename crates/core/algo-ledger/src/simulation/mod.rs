@@ -26,12 +26,30 @@ pub use tracer::SimulationTracer;
 use std::cell::Cell;
 use std::fmt;
 
+use algo_avm::group::GroupBudget;
+use algo_codec::canonical_encode_transaction;
 use algo_error::AlgoError;
-use algo_types::consensus::consensus_params_for_version;
+use algo_types::consensus::{consensus_params_for_version, ConsensusParams};
 use algo_types::{Address, Round, SignedTransaction};
+use algo_validate::{
+    validate_transaction_wellformed, verify_transaction_signature, SpecialAddresses,
+};
+use ed25519_dalek::{Signer, SigningKey};
 
-use crate::apply::{apply_transaction_with_tracer, ApplyContext, ApplyMode};
+use crate::apply::{
+    apply_transaction_with_tracer, compute_group_fee_credit, ApplyContext, ApplyMode,
+};
 use crate::store_trait::LedgerStore;
+
+/// Fixed proxy signing key seed (first 32 bytes of go-algorand's `proxySigner`).
+///
+/// Used to create valid signatures for unsigned transactions when
+/// `allow_empty_signatures` is enabled, matching go-algorand's
+/// `simulation.proxySigner` behaviour.
+const PROXY_SIGNER_SEED: [u8; 32] = [
+    128, 128, 92, 23, 212, 119, 175, 51, 157, 2, 165, 215, 137, 37, 82, 42, 52, 227, 54, 41, 243,
+    67, 141, 76, 208, 17, 199, 17, 140, 46, 113, 0,
+];
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -236,6 +254,15 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             if let Some(ref a) = stx.txn.freeze_account {
                 addrs.push(*a);
             }
+            if let Some(ref a) = stx.txn.rekey_to {
+                addrs.push(*a);
+            }
+            // Foreign accounts from app calls
+            if let Some(ref accounts) = stx.txn.accounts {
+                for a in accounts {
+                    addrs.push(*a);
+                }
+            }
         }
         // Deduplicate addresses.
         addrs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -245,20 +272,38 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
         // --- Build apply context ---
 
-        let consensus = consensus_params_for_version(self.store.protocol()).unwrap_or_default();
+        // Fetch block header for consensus params and timestamp
+        let block_hdr = self.store.get_block_header(sim_round.0)?;
+        let consensus = match &block_hdr {
+            Some(hdr) => consensus_params_for_version(&hdr.current_protocol).unwrap_or_default(),
+            None => consensus_params_for_version(self.store.protocol()).unwrap_or_default(),
+        };
+        let latest_timestamp = block_hdr
+            .as_ref()
+            .map(|h| h.timestamp.max(0) as u64)
+            .unwrap_or(0);
+
+        // Run validation (signature verification + well-formedness) before execution.
+        if let Err(e) = self.check(txn_group, request.allow_empty_signatures, &consensus) {
+            self.store.restore_snapshot(snapshot);
+            return Err(e);
+        }
+
+        // Compute group fee credit so inner transactions can draw from
+        // overpayment by outer transactions (matches go-algorand's feeCredit).
+        let group_refs: Vec<&SignedTransaction> = txn_group.iter().collect();
+        let fee_credit = compute_group_fee_credit(&group_refs, consensus.min_txn_fee);
+
         let apply_ctx = ApplyContext {
             rewards_level: self.store.rewards_level(),
             fee_sink: self.store.fee_sink(),
             round: sim_round.0,
             mode: ApplyMode::Execute,
-            validate: false,
-            // TODO(#188): Read latest_timestamp from the block header at
-            // sim_round. Currently requires deserializing raw block header
-            // bytes from the store, which needs a helper method on LedgerStore.
-            latest_timestamp: 0,
+            validate: true,
+            latest_timestamp,
             genesis_hash: *self.store.genesis_hash(),
             txn_counter: Cell::new(self.store.txn_counter()),
-            fee_credit: Cell::new(0),
+            fee_credit: Cell::new(fee_credit),
             txn_index: Cell::new(0),
             consensus,
         };
@@ -307,6 +352,90 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         self.store.restore_snapshot(snapshot);
 
         Ok(result)
+    }
+
+    /// Validate a transaction group before execution.
+    ///
+    /// Mirrors go-algorand's `Simulator.check()`:
+    /// 1. Well-formedness check on each transaction.
+    /// 2. Signature verification — when `allow_empty_signatures` is true,
+    ///    unsigned transactions are proxy-signed with a fixed key so that
+    ///    signature verification passes without requiring the caller to
+    ///    provide real signatures.
+    fn check(
+        &self,
+        txn_group: &[SignedTransaction],
+        allow_empty_signatures: bool,
+        consensus: &ConsensusParams,
+    ) -> Result<(), SimulatorError> {
+        let spec = SpecialAddresses {
+            fee_sink: self.store.fee_sink(),
+            rewards_pool: self.store.rewards_pool(),
+        };
+
+        // Build a mutable copy for proxy-signing unsigned transactions.
+        let mut verify_group: Vec<SignedTransaction> = txn_group.to_vec();
+
+        let proxy_key = SigningKey::from_bytes(&PROXY_SIGNER_SEED);
+
+        // Pass 1: reject unsupported transaction types, check well-formedness,
+        // and proxy-sign unsigned transactions. Matches go-algorand's ordering
+        // where all proxy-signing happens before group verification.
+        for stx in &mut verify_group {
+            // Reject StateProof transactions (go-algorand: simulator.go:164).
+            if stx.txn.txn_type == "stpf" {
+                return Err(SimulatorError::InvalidRequest(InvalidRequestError {
+                    message: "cannot simulate StateProof transactions".to_string(),
+                }));
+            }
+
+            // Check well-formedness.
+            validate_transaction_wellformed(&stx.txn, true, consensus, Some(&spec)).map_err(
+                |e| {
+                    SimulatorError::InvalidRequest(InvalidRequestError {
+                        message: e.to_string(),
+                    })
+                },
+            )?;
+
+            // Handle empty signatures when allowed.
+            let has_sig = stx.sig != [0u8; 64];
+            let has_msig = stx.msig.is_some();
+            let has_lsig = stx.lsig.is_some();
+            if allow_empty_signatures && !has_sig && !has_msig && !has_lsig {
+                // Proxy-sign: create a valid ed25519 signature so verification
+                // passes. Mirrors go-algorand's `Transaction.Sign()` which
+                // sets `AuthAddr` to the signing key's public key when it
+                // differs from the sender.
+                let canonical = canonical_encode_transaction(&stx.txn);
+                let mut msg = Vec::with_capacity(2 + canonical.len());
+                msg.extend_from_slice(b"TX");
+                msg.extend_from_slice(&canonical);
+                let sig = proxy_key.sign(&msg);
+                stx.sig = sig.to_bytes();
+
+                // Set auth_addr to proxy key's public key so the verifier
+                // checks the signature against the correct key.
+                let proxy_pub = proxy_key.verifying_key().to_bytes();
+                if proxy_pub != stx.txn.sender.0 {
+                    stx.auth_addr = Some(Address(proxy_pub));
+                }
+            }
+        }
+
+        // Pass 2: verify signatures on the (possibly proxy-signed) group.
+        let mut budget = GroupBudget::for_logicsig(verify_group.len());
+        for (i, stx) in verify_group.iter().enumerate() {
+            verify_transaction_signature(stx, &verify_group, i, &mut budget, consensus).map_err(
+                |e| {
+                    SimulatorError::InvalidRequest(InvalidRequestError {
+                        message: e.to_string(),
+                    })
+                },
+            )?;
+        }
+
+        Ok(())
     }
 }
 
