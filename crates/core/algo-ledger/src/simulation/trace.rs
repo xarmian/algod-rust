@@ -4,7 +4,9 @@
 //! the internal simulation result structure. They are separate from the REST
 //! API model types; conversion to REST types happens in the API layer.
 
-use algo_types::{Address, Round};
+use algo_types::{Address, Round, SignedTransaction};
+
+use crate::apply::ApplyData;
 
 /// Configuration controlling what execution details to capture during simulation.
 ///
@@ -127,6 +129,10 @@ pub struct TxnResult {
     pub trace: Option<TransactionTrace>,
     /// If FixSigners was requested, the corrected signer address.
     pub fixed_signer: Option<Address>,
+    /// The original signed transaction.
+    pub txn: Option<SignedTransaction>,
+    /// Apply data from execution.
+    pub apply_data: Option<ApplyData>,
 }
 
 /// Result for a transaction group.

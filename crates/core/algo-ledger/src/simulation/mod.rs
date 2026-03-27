@@ -37,7 +37,7 @@ use algo_validate::{
 use ed25519_dalek::{Signer, SigningKey};
 
 use crate::apply::{
-    apply_transaction_with_tracer, compute_group_fee_credit, ApplyContext, ApplyMode,
+    apply_transaction_with_budget, compute_group_fee_credit, ApplyContext, ApplyMode, GroupInfo,
 };
 use crate::store_trait::LedgerStore;
 
@@ -268,7 +268,52 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         addrs.sort_by(|a, b| a.0.cmp(&b.0));
         addrs.dedup();
 
-        let snapshot = self.store.snapshot(&addrs);
+        // Collect app/asset IDs that may be created or modified during
+        // simulation so the snapshot can roll them back. For creates
+        // (application_id == 0 or config_asset == 0), pre-compute the
+        // derived ID from the running txn_counter.
+        let mut asset_ids: Vec<u64> = Vec::new();
+        let mut app_ids: Vec<u64> = Vec::new();
+        let mut sim_counter = self.store.txn_counter();
+        for stx in txn_group {
+            match stx.txn.txn_type.as_str() {
+                "acfg" => {
+                    if stx.txn.config_asset != 0 {
+                        asset_ids.push(stx.txn.config_asset);
+                    } else {
+                        // Asset create: derived ID = txn_counter + 1
+                        asset_ids.push(sim_counter + 1);
+                    }
+                }
+                "axfer" => {
+                    if stx.txn.xaid != 0 {
+                        asset_ids.push(stx.txn.xaid);
+                    }
+                }
+                "afrz" => {
+                    if stx.txn.freeze_asset != 0 {
+                        asset_ids.push(stx.txn.freeze_asset);
+                    }
+                }
+                "appl" => {
+                    if stx.txn.application_id != 0 {
+                        app_ids.push(stx.txn.application_id);
+                    } else {
+                        // App create: derived ID = txn_counter + 1
+                        app_ids.push(sim_counter + 1);
+                    }
+                }
+                _ => {}
+            }
+            // Each top-level txn increments the counter
+            sim_counter += 1;
+        }
+
+        let snapshot = if asset_ids.is_empty() && app_ids.is_empty() {
+            self.store.snapshot(&addrs)
+        } else {
+            self.store.snapshot_with_ids(&addrs, &asset_ids, &app_ids)
+        };
 
         // --- Build apply context ---
 
@@ -308,23 +353,59 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             consensus,
         };
 
-        // --- Execute each transaction in the group ---
+        // --- Execute the transaction group ---
 
+        // Pre-populate TxnResult for ALL txns (Go returns results even for
+        // transactions past the failure point).
         let mut group_result = TxnGroupResult::default();
+        for stx in txn_group {
+            group_result.txn_results.push(TxnResult {
+                txn: Some(stx.clone()),
+                ..Default::default()
+            });
+        }
+
         let mut failure_message: Option<String> = None;
         let mut failed_at: Option<TxnPath> = None;
+
+        // Count app calls for group budget
+        let num_app_calls = txn_group
+            .iter()
+            .filter(|stx| stx.txn.txn_type == "appl")
+            .count();
+        let mut group_budget = GroupBudget::new(num_app_calls);
+        // Apply extra opcode budget from the simulation request.
+        if request.extra_opcode_budget != 0 {
+            group_budget.add(request.extra_opcode_budget);
+        }
 
         for (i, stx) in txn_group.iter().enumerate() {
             apply_ctx.txn_index.set(i);
 
-            let mut txn_result = TxnResult::default();
+            let gi = GroupInfo {
+                txns: &group_refs,
+                index: i,
+            };
 
             // Create a per-transaction tracer to capture execution details.
             let mut tracer = SimulationTracer::new(request.trace_config.clone());
 
-            match apply_transaction_with_tracer(self.store, stx, &apply_ctx, 0, &mut tracer) {
-                Ok(()) => {
-                    // Transaction applied successfully.
+            // Use apply_transaction_with_budget for ALL transactions (not just appl)
+            // so they all share the group context.
+            let apply_result = apply_transaction_with_budget(
+                self.store,
+                stx,
+                &apply_ctx,
+                0,
+                Some(&mut group_budget),
+                Some(&gi),
+                Some(&mut tracer),
+            );
+
+            match apply_result {
+                Ok(apply_data) => {
+                    group_result.txn_results[i].apply_data = Some(apply_data);
+                    group_result.txn_results[i].trace = tracer.into_transaction_trace();
                 }
                 Err(e) => {
                     // Record failure. Collect any partial trace data before
@@ -332,19 +413,20 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     // the point of failure).
                     failure_message = Some(e.to_string());
                     failed_at = Some(vec![i]);
-                    txn_result.trace = tracer.into_transaction_trace();
-                    group_result.txn_results.push(txn_result);
+                    group_result.txn_results[i].trace = tracer.into_transaction_trace();
                     break;
                 }
             }
-
-            // Collect tracer results.
-            txn_result.trace = tracer.into_transaction_trace();
-            group_result.txn_results.push(txn_result);
         }
 
         group_result.failure_message = failure_message;
         group_result.failed_at = failed_at;
+
+        // Compute group-level budget metrics.
+        let total_budget = (num_app_calls as i64) * 700 + request.extra_opcode_budget;
+        group_result.app_budget_added = total_budget.max(0) as u64;
+        group_result.app_budget_consumed = (total_budget - group_budget.remaining()).max(0) as u64;
+
         result.txn_groups.push(group_result);
 
         // --- Restore the store to its pre-simulation state ---
