@@ -144,6 +144,30 @@ func verifyGoAlgorandPin(allowUnpinned bool) error {
 	return nil
 }
 
+// clearFixtureSubdirs removes every immediate subdirectory of `dir`
+// (each holds one wire type's fixtures) so a regeneration starts from
+// a known-empty state. Top-level files are preserved — specifically
+// the committed `README.md`.
+//
+// Factored out of `main` to keep that function linear and so tests
+// (future) can exercise the clearing logic independently.
+func clearFixtureSubdirs(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", dir, err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		sub := filepath.Join(dir, e.Name())
+		if err := os.RemoveAll(sub); err != nil {
+			return fmt.Errorf("clear %s: %w", sub, err)
+		}
+	}
+	return nil
+}
+
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -194,6 +218,25 @@ func main() {
 
 	// Ensure the fixture output dir exists before go test runs.
 	if err := os.MkdirAll(*out, 0o755); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	// Clear stale fixtures before regenerating. Without this, a
+	// renamed/removed case in the template (e.g. `zero` → `empty`)
+	// leaves its prior `.msgpack` + `.json` files on disk; since the
+	// staged test's coverage floor is only a `>= 40 files` lower
+	// bound per subdirectory, the check silently passes and obsolete
+	// vectors re-commit as if the tool had generated them. That
+	// would weaken downstream roundtrip and fuzz coverage and break
+	// the tool's "deterministic regeneration" guarantee (Codex P2 on
+	// PR #228).
+	//
+	// Approach: remove every immediate subdirectory of `out` (each
+	// corresponds to one wire type and is rebuilt by the test).
+	// Files at the top level — specifically the committed `README.md`
+	// — are preserved.
+	if err := clearFixtureSubdirs(*out); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
