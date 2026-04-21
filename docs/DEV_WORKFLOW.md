@@ -317,3 +317,68 @@ the capture environment is broken, not the corpus.
 - go-algorand `crypto/util.go:38` — `HashRep[H Hashable]` (empty HashID ⇒ identity,
   used to feed raw alpha through `sk.Prove` in the capture tool)
 - IETF draft-irtf-cfrg-vrf-03 §A.4 — TV1 / TV2 anchor vectors
+
+## Sortition Vector Regeneration
+
+Rust's `algo_consensus_crypto::sortition::select` must agree with Go's
+`github.com/algorand/sortition v1.0.0` on every committee-weight decision —
+disagreement at precision-boundary money values (stakes in the `2^59..2^62`
+microalgo range) would cause committee-selection disagreement and fork the
+network. Parity is captured from a standalone Go tool and checked against
+Rust via an integration test.
+
+### Fixture location
+
+- `crates/core/algo-consensus-crypto/tests/fixtures/sortition/vectors.jsonl`
+  — JSONL corpus (≥5,000 entries; ~200 in the precision-stress band).
+
+### One-time prerequisites
+
+The capture tool depends on `github.com/algorand/sortition v1.0.0`, which
+is a CGo wrapper around Boost 1.65.1's binomial CDF (`sortition.cpp`).
+Boost 1.65.1 headers are vendored under the module directory, so no system
+Boost is required, but a working C++ toolchain is. On Debian/Ubuntu that
+means `g++` (installed by default with `build-essential`); the stock
+toolchain worked locally with no extra setup.
+
+### Regenerating
+
+```bash
+cd tools/sortition-vector-capture
+go run .
+```
+
+Runtime: ~4 seconds for the default 5,189-vector corpus. Output is
+deterministic (fixed RNG seed + stable iteration order); two runs produce
+byte-identical `vectors.jsonl`. Module pinning is enforced through
+`go.sum` — a mismatched `github.com/algorand/sortition` version breaks
+module resolution at build time, so there's no runtime pin check needed
+(unlike the VRF tool, which links a locally-replaced go-algorand).
+
+### Known parity gap — ratio == 1.0 edge cases
+
+The parity harness at `crates/core/algo-consensus-crypto/tests/sortition_parity.rs`
+allowlists **13 `digest_max` fixture divergences**. These are ratio=1.0
+exactly (VRF output = 0xff…ff), where Rust's numerically-stable log-PMF
+recurrence saturates the CDF one f64 ulp below 1.0 while Boost's
+regularized-incomplete-beta evaluation rounds up to exactly 1.0 at a
+specific j. Production impact is nil: a 256-bit uniform VRF output
+producing exactly 0xff…ff is cryptographically unreachable (~2^-256 per
+query). Follow-up work is tracked separately — see `is_known_boost_saturation_divergence`
+in the parity test for the exhaustive list; any divergence outside that
+list hard-fails the test.
+
+### When to regenerate
+
+- Bumping `github.com/algorand/sortition` in `tools/sortition-vector-capture/go.sum`
+  (effectively never — v1.0.0 is stable).
+- Extending the fixed parameter or digest matrix in `main.go`. Append
+  only, never renumber — downstream harness allowlists reference fixtures
+  by the `name` field.
+
+### References
+
+- go-algorand `data/committee/credential.go:106` — `sortition.Select` production call site
+- sortition@v1.0.0 `sortition.go:44` — Go `Select` signature
+- sortition@v1.0.0 `sortition.cpp:10` — Boost-backed CDF walk
+- Rust `crates/core/algo-consensus-crypto/src/sortition.rs:92` — `select` under test
