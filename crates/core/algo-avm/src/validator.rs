@@ -10,6 +10,44 @@ use algo_error::AlgoError;
 use crate::bytecode::{Immediates, Program};
 use crate::opcode::{self, CostKind, Mode};
 
+/// Reject a program whose declared version byte exceeds the active
+/// consensus parameters' `LogicSigVersion` ceiling.
+///
+/// This matches go-algorand's pre-eval check in
+/// `data/transactions/logic/eval.go` where `program[0] > proto.LogicSigVersion`
+/// is rejected. Even when the Rust AVM is built with `MAX_AVM_VERSION` higher
+/// than the network's current consensus ceiling, programs declaring a version
+/// above the ceiling must be rejected to match Go's accept/reject behavior.
+///
+/// # Parameters
+/// - `declared_version`: the first byte of the program (the AVM version).
+/// - `max_logic_sig_version`: `ConsensusParams::logic_sig_version` for the
+///   active consensus protocol.
+///
+/// # Returns
+/// - `Ok(())` if the declared version is within the ceiling.
+/// - `Err(AlgoError::Avm { .. })` if the declared version exceeds the ceiling.
+///
+/// # References
+/// - go-algorand `config/consensus.go:233` — `LogicSigVersion uint64` on
+///   `ConsensusParams`.
+/// - go-algorand `config/consensus.go:1440` — `v41.LogicSigVersion = 12`.
+/// - go-algorand `data/transactions/logic/eval.go` — program-header parse and
+///   `proto.LogicSigVersion` ceiling check.
+pub fn check_program_version_allowed(
+    declared_version: u8,
+    max_logic_sig_version: u64,
+) -> Result<(), AlgoError> {
+    if declared_version as u64 > max_logic_sig_version {
+        return Err(AlgoError::Avm {
+            message: format!(
+                "program version {declared_version} exceeds consensus LogicSigVersion ceiling {max_logic_sig_version}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Maximum stack depth allowed by the AVM.
 const MAX_STACK_DEPTH: i32 = 1000;
 
@@ -568,6 +606,54 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("exceeds limit 2048"), "{msg}");
+    }
+
+    // ---- Program-version ceiling gating (go-algorand eval.go) ----
+
+    #[test]
+    fn test_program_v11_under_v40_consensus_accepted() {
+        // V40 consensus: LogicSigVersion = 11. Program v11 is at the ceiling.
+        assert!(check_program_version_allowed(11, 11).is_ok());
+    }
+
+    #[test]
+    fn test_program_v12_under_v40_consensus_rejected() {
+        // V40 consensus: LogicSigVersion = 11. A v12 program exceeds it.
+        let err = check_program_version_allowed(12, 11).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeds consensus LogicSigVersion ceiling"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn test_program_v12_under_v41_consensus_accepted() {
+        // V41 consensus: LogicSigVersion = 12. Program v12 is at the ceiling.
+        assert!(check_program_version_allowed(12, 12).is_ok());
+    }
+
+    #[test]
+    fn test_program_v13_under_v41_consensus_rejected() {
+        // V41 consensus: LogicSigVersion = 12. A v13 program exceeds it.
+        let err = check_program_version_allowed(13, 12).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("program version 13"), "{msg}");
+        assert!(msg.contains("ceiling 12"), "{msg}");
+    }
+
+    #[test]
+    fn test_program_v0_ceiling_0_accepted() {
+        // Defensive: a network with LogicSigVersion=0 (pre-logicsig) and a
+        // program header reading 0 should pass the ceiling check. (The
+        // bytecode parser separately rejects v0 via MAX_AVM_VERSION.)
+        assert!(check_program_version_allowed(0, 0).is_ok());
+    }
+
+    #[test]
+    fn test_program_v1_ceiling_0_rejected() {
+        // Pre-logicsig consensus (LogicSigVersion=0) rejects any logicsig.
+        assert!(check_program_version_allowed(1, 0).is_err());
     }
 
     #[test]
