@@ -157,7 +157,20 @@ fn binomial_cdf_walk(n: u64, p: f64, ratio: f64) -> u64 {
     //   - `p >= 1.0`: all mass is at j = n; CDF(j < n) = 0, so only
     //     `ratio == 0` hits (via `<=`) at j = 0. Any positive ratio
     //     walks past every j and returns n.
+    //   - NaN inputs: both `p <= 0.0` and `p >= 1.0` evaluate to false
+    //     for any NaN operand, so without this explicit guard a NaN
+    //     `p` or `ratio` (e.g. caller passed `expected_size = NaN`)
+    //     would propagate into the main loop — log/exp/Kahan state
+    //     all go NaN, the iteration cap degenerates to `n` (since
+    //     `mean + 50*std + 1024` is NaN and fails the `>= n as f64`
+    //     check through NaN semantics), and the walk runs j in 0..n
+    //     doing useless work before returning n. Fail fast and cheap:
+    //     return 0, which is also what the prior `Binomial::new`
+    //     construction did by propagating the NaN rejection.
     if n == 0 {
+        return 0;
+    }
+    if p.is_nan() || ratio.is_nan() {
         return 0;
     }
     if p <= 0.0 {
@@ -352,6 +365,23 @@ mod tests {
     #[test]
     fn test_select_zero_money() {
         assert_eq!(select(0, 10000, 20.0, make_vrf(0x80)), 0);
+    }
+
+    #[test]
+    fn test_select_nan_expected_size() {
+        // NaN expected_size must not propagate into the CDF walk —
+        // it would produce NaN p + NaN iteration cap and churn through
+        // j in 0..n doing useless work. Guarded; returns 0 cheaply
+        // (matches the prior statrs-backed `Binomial::new` rejection
+        // path). Regression guard for Codex P2 on PR #227.
+        assert_eq!(select(1000, 10000, f64::NAN, make_vrf(0x80)), 0);
+        // Degenerate-stake NaN tests are belt-and-suspenders: even
+        // without the NaN guard, `money == 0` / `total_money == 0`
+        // short-circuit at the top of `select`, so these already
+        // returned 0. Capture them here so a future refactor that
+        // moves the guards around can't silently regress them either.
+        assert_eq!(select(0, 10000, f64::NAN, make_vrf(0x80)), 0);
+        assert_eq!(select(1000, 0, f64::NAN, make_vrf(0x80)), 0);
     }
 
     #[test]
