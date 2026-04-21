@@ -1,10 +1,16 @@
-//! Complete AVM opcode table covering all opcodes from AVM v1 through v12.
+//! Complete AVM opcode table covering all opcodes from AVM v1 through v13.
 //!
 //! This table matches go-algorand v4.5.1's `data/transactions/logic/opcodes.go`.
 //! Each opcode has metadata for parsing, validation, and (future) execution.
 
 /// Maximum supported AVM version.
-pub const MAX_AVM_VERSION: u8 = 12;
+///
+/// Matches `go-algorand/data/transactions/logic/opcodes.go:31`
+/// (`const LogicVersion = 13`). Note that consensus-level acceptance of a v13
+/// program is additionally gated on `ConsensusParams::logic_sig_version` via
+/// [`crate::validator::check_program_version_allowed`]; under V41 that ceiling
+/// is still 12.
+pub const MAX_AVM_VERSION: u8 = 13;
 
 /// Execution mode for an opcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

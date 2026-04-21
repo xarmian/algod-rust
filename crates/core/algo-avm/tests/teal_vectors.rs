@@ -2033,9 +2033,18 @@ fn version_gate_max_version_accepted() {
 
 #[test]
 fn version_gate_over_max_rejected() {
-    // Version 13 is not supported
-    let raw = prog(13, &[0x81, 0x01, 0x43]);
+    // Versions above MAX_AVM_VERSION (13 per go-algorand opcodes.go:31) must
+    // be rejected at parse time.
+    let raw = prog(14, &[0x81, 0x01, 0x43]);
     assert!(parse(&raw).is_err());
+}
+
+#[test]
+fn version_gate_v13_accepted_by_parser() {
+    // Version 13 is now the supported ceiling (consensus-level acceptance is
+    // still gated separately on ConsensusParams::logic_sig_version).
+    let raw = prog(13, &[0x81, 0x01, 0x43]);
+    assert!(parse(&raw).is_ok());
 }
 
 #[test]
