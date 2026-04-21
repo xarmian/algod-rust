@@ -138,7 +138,7 @@ static OPCODE_TABLE: [Option<OpSpec>; 256] = {
     op!(0x1c, "~", 1, Static(1), 1, 1, Any, None);
     op!(0x1d, "mulw", 1, Static(1), 2, 2, Any, None);
     op!(0x1e, "addw", 2, Static(1), 2, 2, Any, None);
-    op!(0x1f, "divmodw", 4, Static(1), 4, 4, Any, None);
+    op!(0x1f, "divmodw", 4, Static(20), 4, 4, Any, None);
 
     // ---- Constants ----
     op!(0x20, "intcblock", 1, Static(1), 0, 0, Any, IntcBlock);
@@ -551,6 +551,15 @@ mod tests {
         let spec = lookup_by_name("sha256").unwrap();
         assert_eq!(spec.opcode, 0x01);
         assert!(lookup_by_name("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_divmodw_cost_is_20() {
+        // Matches go-algorand data/transactions/logic/opcodes.go:545:
+        // `{0x1f, "divmodw", opDivModw, proto("iiii:iiii"), 4, costly(20)}`
+        let spec = lookup(0x1f).unwrap();
+        assert_eq!(spec.name, "divmodw");
+        assert_eq!(spec.cost, CostKind::Static(20));
     }
 
     #[test]
