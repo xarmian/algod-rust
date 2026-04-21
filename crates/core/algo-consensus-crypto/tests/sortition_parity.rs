@@ -96,6 +96,17 @@ fn sortition_parity_vs_go_algorand() {
 
         let got = sortition::select(money, total_money, rec.expected_size, digest);
 
+        // Always count the record in the corpus totals, EVEN when it
+        // hits the allowlist — otherwise removing every allowlisted
+        // fixture from vectors.jsonl could silently pass the
+        // `total >= 5_000` floor and drop coverage of the
+        // ratio-exactly-1.0 boundary without any test failure
+        // (Codex P2 on PR #227, r2).
+        total += 1;
+        if rec.name.starts_with("precision/") {
+            precision_stress += 1;
+        }
+
         if got != rec.weight {
             // KNOWN DIVERGENCE ALLOWLIST — ratio-exactly-1.0 edge cases.
             //
@@ -135,11 +146,6 @@ fn sortition_parity_vs_go_algorand() {
                 rust = got,
             ));
         }
-
-        if rec.name.starts_with("precision/") {
-            precision_stress += 1;
-        }
-        total += 1;
     }
 
     if !divergences.is_empty() {
