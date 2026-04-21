@@ -39,6 +39,7 @@ dependencies = [
  "algo-types",
  "algo-validate",
  "crossbeam-channel",
+ "hex",
  "num-bigint",
  "rmp",
  "rmp-serde",
