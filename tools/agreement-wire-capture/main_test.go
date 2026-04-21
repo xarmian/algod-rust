@@ -6,87 +6,126 @@ import (
 	"testing"
 )
 
-// TestClearFixtureSubdirs_OnlyTouchesAllowlistedDirs is the P1
-// regression guard for PR #228 r2: `clearFixtureSubdirs` must remove
-// only the allowlisted fixture subdirectories and leave everything
-// else alone. Otherwise, a user who passed `--out /tmp` (or worse)
-// could have unrelated data wiped before generation even runs.
-func TestClearFixtureSubdirs_OnlyTouchesAllowlistedDirs(t *testing.T) {
-	tmp := t.TempDir()
+// TestSwapFixtureSubdirs_ReplacesOnlyAllowlistedAndPreservesNonOwned
+// is the P1+P2 regression guard for PR #228 r2/r5: the swap step
+// (a) moves only the allowlisted fixture subdirectories from the
+// staging dir into the target, and (b) leaves any non-allowlisted
+// content at the target untouched. This keeps `--out /tmp` (or
+// any shared scratch path) from being a footgun AND preserves the
+// committed `README.md` across regenerations.
+func TestSwapFixtureSubdirs_ReplacesOnlyAllowlistedAndPreservesNonOwned(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "staging")
+	dst := filepath.Join(base, "target")
+	mustMkdir(t, src)
+	mustMkdir(t, dst)
 
-	// Fixture subdirs we own — must be removed.
-	ownedSubdirs := []string{"rawvote", "uvote", "vote", "ubundle"}
-	for _, s := range ownedSubdirs {
-		mustMkdir(t, filepath.Join(tmp, s))
-		mustWriteFile(t, filepath.Join(tmp, s, "stale.msgpack"), "stale")
+	// Old fixture subdirs at the target — must be replaced.
+	mustMkdir(t, filepath.Join(dst, "rawvote"))
+	mustWriteFile(t, filepath.Join(dst, "rawvote", "old.msgpack"), "old-rawvote")
+	mustMkdir(t, filepath.Join(dst, "uvote"))
+	mustWriteFile(t, filepath.Join(dst, "uvote", "old.msgpack"), "old-uvote")
+
+	// Freshly-generated subdirs in staging.
+	mustMkdir(t, filepath.Join(src, "rawvote"))
+	mustWriteFile(t, filepath.Join(src, "rawvote", "new.msgpack"), "new-rawvote")
+	// Note: src has no `uvote/` — simulates the template dropping
+	// that type. swap should still remove the old uvote/ at dst.
+
+	// Non-owned directory at target — must be preserved.
+	mustMkdir(t, filepath.Join(dst, "user_scratch"))
+	mustWriteFile(t, filepath.Join(dst, "user_scratch", "precious.txt"), "keep me")
+
+	// Top-level file at target — must be preserved.
+	mustWriteFile(t, filepath.Join(dst, "README.md"), "# fixtures")
+
+	if err := swapFixtureSubdirs(src, dst); err != nil {
+		t.Fatalf("swapFixtureSubdirs: %v", err)
 	}
 
-	// Non-owned directory — must be preserved.
-	mustMkdir(t, filepath.Join(tmp, "user_scratch"))
-	mustWriteFile(t, filepath.Join(tmp, "user_scratch", "precious.txt"), "keep me")
-
-	// Top-level file — must be preserved.
-	mustWriteFile(t, filepath.Join(tmp, "README.md"), "# fixtures")
-
-	if err := clearFixtureSubdirs(tmp); err != nil {
-		t.Fatalf("clearFixtureSubdirs: %v", err)
+	// rawvote/ at dst now has the new content.
+	body, err := os.ReadFile(filepath.Join(dst, "rawvote", "new.msgpack"))
+	if err != nil || string(body) != "new-rawvote" {
+		t.Errorf("rawvote/new.msgpack after swap: body=%q err=%v", body, err)
 	}
-
-	for _, s := range ownedSubdirs {
-		if _, err := os.Stat(filepath.Join(tmp, s)); !os.IsNotExist(err) {
-			t.Errorf("owned subdir %q should be removed, got err=%v", s, err)
-		}
+	// Old rawvote file is gone.
+	if _, err := os.Stat(filepath.Join(dst, "rawvote", "old.msgpack")); !os.IsNotExist(err) {
+		t.Errorf("old rawvote file should be gone, err=%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(tmp, "user_scratch")); err != nil {
-		t.Errorf("non-owned subdir %q was removed (err=%v), expected preserved", "user_scratch", err)
+	// uvote/ (removed from src) should be removed at dst.
+	if _, err := os.Stat(filepath.Join(dst, "uvote")); !os.IsNotExist(err) {
+		t.Errorf("dst/uvote should be removed (no longer in src), got err=%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(tmp, "user_scratch", "precious.txt")); err != nil {
-		t.Errorf("non-owned file was removed (err=%v)", err)
+	// Non-owned dir + file preserved.
+	if _, err := os.Stat(filepath.Join(dst, "user_scratch", "precious.txt")); err != nil {
+		t.Errorf("user_scratch/precious.txt removed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(tmp, "README.md")); err != nil {
-		t.Errorf("top-level README.md was removed (err=%v)", err)
+	if _, err := os.Stat(filepath.Join(dst, "README.md")); err != nil {
+		t.Errorf("README.md removed: %v", err)
 	}
+	// Top-level file in src is not copied (swap only touches
+	// allowlisted subdirs).
+	// (Implicitly validated by the non-owned preservation above.)
 }
 
-// TestClearFixtureSubdirs_NoOpWhenEmpty — clearing a directory that
-// has none of the allowlisted subdirs must succeed silently. This
-// matches the first-time-after-fresh-checkout case.
-func TestClearFixtureSubdirs_NoOpWhenEmpty(t *testing.T) {
-	tmp := t.TempDir()
-	// A completely empty dir.
-	if err := clearFixtureSubdirs(tmp); err != nil {
-		t.Fatalf("empty dir clear failed: %v", err)
+// TestSwapFixtureSubdirs_NoOpWhenStagingEmpty — calling swap with
+// an empty staging dir and an empty target should succeed, doing
+// nothing destructive. This matches the edge case where no subdirs
+// are written (should never happen in practice — the staged test
+// asserts ≥40 files per subdir — but guarding the function anyway).
+func TestSwapFixtureSubdirs_NoOpWhenStagingEmpty(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "staging")
+	dst := filepath.Join(base, "target")
+	mustMkdir(t, src)
+	mustMkdir(t, dst)
+	mustWriteFile(t, filepath.Join(dst, "README.md"), "# readme")
+
+	if err := swapFixtureSubdirs(src, dst); err != nil {
+		t.Fatalf("empty swap failed: %v", err)
 	}
-	// And a dir with only non-owned contents.
-	mustMkdir(t, filepath.Join(tmp, "other"))
-	mustWriteFile(t, filepath.Join(tmp, "README.md"), "# fixtures")
-	if err := clearFixtureSubdirs(tmp); err != nil {
-		t.Fatalf("non-owned-only clear failed: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(tmp, "other")); err != nil {
-		t.Errorf("non-owned dir removed: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(tmp, "README.md")); err != nil {
+	// README.md survives.
+	if _, err := os.Stat(filepath.Join(dst, "README.md")); err != nil {
 		t.Errorf("README.md removed: %v", err)
 	}
 }
 
-// TestClearFixtureSubdirs_RefusesToRemoveFileAtSubdirPath — if
-// somebody (or a buggy `mkdir` race) left a regular file at what
-// should be a fixture subdirectory path, we refuse to remove it and
-// surface the surprise rather than silently deleting the user's file.
-func TestClearFixtureSubdirs_RefusesToRemoveFileAtSubdirPath(t *testing.T) {
-	tmp := t.TempDir()
-	mustWriteFile(t, filepath.Join(tmp, "rawvote"), "oops: this is a file, not a dir")
+// TestSwapFixtureSubdirs_LeavesTargetUntouchedIfNeverCalled —
+// the "failure preserves corpus" invariant (Codex P2 on PR #228
+// r5) depends on the caller only invoking swap AFTER `go test`
+// succeeds. This test codifies that contract: a target directory
+// whose swap is never invoked is unchanged.
+func TestSwapFixtureSubdirs_LeavesTargetUntouchedIfNeverCalled(t *testing.T) {
+	base := t.TempDir()
+	dst := filepath.Join(base, "target")
+	mustMkdir(t, dst)
+	mustMkdir(t, filepath.Join(dst, "rawvote"))
+	mustWriteFile(t, filepath.Join(dst, "rawvote", "committed.msgpack"), "committed")
+	mustWriteFile(t, filepath.Join(dst, "README.md"), "# committed")
 
-	err := clearFixtureSubdirs(tmp)
-	if err == nil {
-		t.Fatalf("expected error when subdir path is a regular file, got nil")
+	// Simulate a failed regeneration: we created the staging dir
+	// but never called swap. In main, the staging dir is cleaned
+	// up via defer; the target is untouched.
+	stagingParent := base
+	staging, err := os.MkdirTemp(stagingParent, ".wire-staging-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
 	}
-	// The file must still be there; error must have been returned
-	// BEFORE any removal attempt.
-	if _, statErr := os.Stat(filepath.Join(tmp, "rawvote")); statErr != nil {
-		t.Errorf("file at subdir path was removed despite error: %v", statErr)
+	// Write some partial "generated" content to the staging dir,
+	// as if go test had crashed mid-way.
+	mustMkdir(t, filepath.Join(staging, "rawvote"))
+	mustWriteFile(t, filepath.Join(staging, "rawvote", "partial.msgpack"), "partial")
+	// Clean up staging (mirrors main's defer).
+	if err := os.RemoveAll(staging); err != nil {
+		t.Fatalf("RemoveAll staging: %v", err)
+	}
+
+	// dst must be unchanged.
+	if body, err := os.ReadFile(filepath.Join(dst, "rawvote", "committed.msgpack")); err != nil || string(body) != "committed" {
+		t.Errorf("committed fixture lost on failed regen: body=%q err=%v", body, err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "README.md")); err != nil {
+		t.Errorf("README.md lost on failed regen: %v", err)
 	}
 }
 

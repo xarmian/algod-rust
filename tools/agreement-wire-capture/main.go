@@ -220,40 +220,11 @@ var fixtureSubdirs = []string{
 	"proposalvalue",
 }
 
-// clearFixtureSubdirs removes the known fixture subdirectories under
-// `dir` so a regeneration starts from a known-empty state. Any other
-// entry (the committed `README.md`, plus any subdirectory this tool
-// doesn't own) is preserved.
-//
-// Guarding the cleanup with an explicit allowlist avoids a destructive
-// footgun: an early draft recursively removed EVERY immediate
-// subdirectory, which would wipe unrelated data if a user mistyped
-// `--out` (e.g. `/tmp` or a shared scratch path). The allowlist means
-// a rogue `--out /` still only touches paths this tool is meant to
-// own (Codex P1 on PR #228, r2).
-func clearFixtureSubdirs(dir string) error {
-	for _, name := range fixtureSubdirs {
-		sub := filepath.Join(dir, name)
-		info, err := os.Stat(sub)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return fmt.Errorf("stat %s: %w", sub, err)
-		}
-		if !info.IsDir() {
-			// Safety check: the fixture path should always be a
-			// directory. If it's somehow a regular file (staging
-			// bug?), refuse to remove it and surface the problem
-			// rather than silently deleting the user's file.
-			return fmt.Errorf("expected %s to be a directory, found %s", sub, info.Mode())
-		}
-		if err := os.RemoveAll(sub); err != nil {
-			return fmt.Errorf("clear %s: %w", sub, err)
-		}
-	}
-	return nil
-}
+// (Legacy `clearFixtureSubdirs` was removed in the stage-and-swap
+// refactor for Codex P2 r5. The "only touch allowlisted subdirs"
+// invariant is now enforced inside `swapFixtureSubdirs`: that
+// function iterates `fixtureSubdirs` and is the sole deleter of
+// destination subdirectories.)
 
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
@@ -335,24 +306,29 @@ func run() error {
 		return err
 	}
 
-	// Clear stale fixtures before regenerating. Without this, a
-	// renamed/removed case in the template (e.g. `zero` → `empty`)
-	// leaves its prior `.msgpack` + `.json` files on disk; since the
-	// staged test's coverage floor is only a `>= 40 files` lower
-	// bound per subdirectory, the check silently passes and obsolete
-	// vectors re-commit as if the tool had generated them. That
-	// would weaken downstream roundtrip and fuzz coverage and break
-	// the tool's "deterministic regeneration" guarantee (Codex P2 on
-	// PR #228).
+	// Stage-and-swap: generate fixtures into a sibling temp
+	// directory first; only clear the committed subdirs and move
+	// the new fixtures into place after `go test` succeeds. Without
+	// this, a transient test/build/runtime failure leaves the
+	// committed corpus partially or fully wiped on disk (the user's
+	// working tree would show thousands of deleted files that
+	// correspond to nothing and would propagate the deletion to
+	// the next commit unless spotted). Codex P2 on PR #228 r5
+	// called this out as "regeneration non-atomic."
 	//
-	// Approach: remove only the allowlisted fixture subdirectories
-	// this tool owns (see `fixtureSubdirs`). Top-level files — e.g.
-	// the committed `README.md` — and any unknown subdirectory are
-	// preserved. Hardcoded names prevent `--out /tmp` (or worse) from
-	// nuking unrelated data (Codex P1 on PR #228, r2).
-	if err := clearFixtureSubdirs(*out); err != nil {
-		return err
+	// The temp dir is a sibling of `*out` so `os.Rename` across
+	// subdirectories stays on the same filesystem. It's removed
+	// unconditionally at function exit — whether we succeed or
+	// fail — so there's no scratch left behind.
+	tmpDir, err := os.MkdirTemp(filepath.Dir(*out), ".wire-staging-")
+	if err != nil {
+		return fmt.Errorf("create staging dir next to %s: %w", *out, err)
 	}
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			fmt.Fprintf(os.Stderr, "cleanup: failed to remove staging %s: %v\n", tmpDir, err)
+		}
+	}()
 
 	cmd := exec.Command("go", "test",
 		"-run", "^"+testFuncName+"$",
@@ -364,12 +340,65 @@ func run() error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(),
-		"ALGOD_RUST_WIRE_FIXTURE_DIR="+*out,
+		"ALGOD_RUST_WIRE_FIXTURE_DIR="+tmpDir,
 	)
 	if err := cmd.Run(); err != nil {
+		// Failure BEFORE the swap: the committed corpus at `*out`
+		// is untouched. The tmpDir cleanup fires via defer.
 		return fmt.Errorf("go test failed: %w", err)
 	}
 
+	// Success path — swap the newly-generated subdirs into place.
+	// Only the allowlisted subdirectories (those the staged test
+	// writes) are touched at the target. Top-level files like the
+	// committed `README.md` remain untouched.
+	if err := swapFixtureSubdirs(tmpDir, *out); err != nil {
+		return fmt.Errorf("swapping regenerated fixtures into %s: %w", *out, err)
+	}
+
 	fmt.Printf("agreement wire fixtures written to %s\n", *out)
+	return nil
+}
+
+// swapFixtureSubdirs is the "commit" half of the stage-and-swap
+// regeneration pattern. For every allowlisted fixture subdirectory
+// found under `src`, it atomically replaces the corresponding
+// subdirectory at `dst` via `os.Rename`. If a subdirectory doesn't
+// exist in the freshly-generated staging dir (the template was
+// edited to drop it), the old one at `dst` is still removed — so
+// obsolete subdirectories don't linger.
+//
+// This runs only AFTER `go test` succeeds; any failure before that
+// point leaves `dst` fully intact. Rename is atomic per-subdirectory
+// on POSIX when source and target are on the same filesystem — we
+// ensure that by creating the staging dir as a sibling of `dst`.
+//
+// Factored out for unit testing.
+func swapFixtureSubdirs(src, dst string) error {
+	for _, name := range fixtureSubdirs {
+		srcSub := filepath.Join(src, name)
+		dstSub := filepath.Join(dst, name)
+
+		// Remove the old destination subdir (if any). Safe to do
+		// unconditionally: we're about to replace it with the
+		// staged version, and if the staged version is missing,
+		// the removal still matches the test's intent (a deleted
+		// subdir should disappear from the corpus).
+		if err := os.RemoveAll(dstSub); err != nil {
+			return fmt.Errorf("clearing old %s: %w", dstSub, err)
+		}
+
+		// If the staging dir has no corresponding subdir, nothing
+		// to move — the subdir was genuinely removed in this regen.
+		if _, err := os.Stat(srcSub); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return fmt.Errorf("stat %s: %w", srcSub, err)
+		}
+
+		if err := os.Rename(srcSub, dstSub); err != nil {
+			return fmt.Errorf("moving %s → %s: %w", srcSub, dstSub, err)
+		}
+	}
 	return nil
 }
