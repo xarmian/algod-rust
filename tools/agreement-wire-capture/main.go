@@ -144,23 +144,54 @@ func verifyGoAlgorandPin(allowUnpinned bool) error {
 	return nil
 }
 
-// clearFixtureSubdirs removes every immediate subdirectory of `dir`
-// (each holds one wire type's fixtures) so a regeneration starts from
-// a known-empty state. Top-level files are preserved — specifically
-// the committed `README.md`.
+// fixtureSubdirs lists every subdirectory this tool owns under the
+// output directory. clearFixtureSubdirs only removes entries whose
+// name matches this list — any unknown subdirectory (perhaps a
+// sibling fixture set, or user scratch data if `--out` was pointed
+// at a shared path like `/tmp`) is left untouched. The staged test
+// inside go-algorand writes exactly these names; extending this
+// slice requires a corresponding change in the test template.
+var fixtureSubdirs = []string{
+	"rawvote",
+	"uvote",
+	"vote",
+	"ubundle",
+	"cert",
+	"bundle",
+	"uproposal",
+	"proposal",
+	"tpayload",
+	"proposalvalue",
+}
+
+// clearFixtureSubdirs removes the known fixture subdirectories under
+// `dir` so a regeneration starts from a known-empty state. Any other
+// entry (the committed `README.md`, plus any subdirectory this tool
+// doesn't own) is preserved.
 //
-// Factored out of `main` to keep that function linear and so tests
-// (future) can exercise the clearing logic independently.
+// Guarding the cleanup with an explicit allowlist avoids a destructive
+// footgun: an early draft recursively removed EVERY immediate
+// subdirectory, which would wipe unrelated data if a user mistyped
+// `--out` (e.g. `/tmp` or a shared scratch path). The allowlist means
+// a rogue `--out /` still only touches paths this tool is meant to
+// own (Codex P1 on PR #228, r2).
 func clearFixtureSubdirs(dir string) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", dir, err)
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
+	for _, name := range fixtureSubdirs {
+		sub := filepath.Join(dir, name)
+		info, err := os.Stat(sub)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("stat %s: %w", sub, err)
 		}
-		sub := filepath.Join(dir, e.Name())
+		if !info.IsDir() {
+			// Safety check: the fixture path should always be a
+			// directory. If it's somehow a regular file (staging
+			// bug?), refuse to remove it and surface the problem
+			// rather than silently deleting the user's file.
+			return fmt.Errorf("expected %s to be a directory, found %s", sub, info.Mode())
+		}
 		if err := os.RemoveAll(sub); err != nil {
 			return fmt.Errorf("clear %s: %w", sub, err)
 		}
@@ -232,10 +263,11 @@ func main() {
 	// the tool's "deterministic regeneration" guarantee (Codex P2 on
 	// PR #228).
 	//
-	// Approach: remove every immediate subdirectory of `out` (each
-	// corresponds to one wire type and is rebuilt by the test).
-	// Files at the top level — specifically the committed `README.md`
-	// — are preserved.
+	// Approach: remove only the allowlisted fixture subdirectories
+	// this tool owns (see `fixtureSubdirs`). Top-level files — e.g.
+	// the committed `README.md` — and any unknown subdirectory are
+	// preserved. Hardcoded names prevent `--out /tmp` (or worse) from
+	// nuking unrelated data (Codex P1 on PR #228, r2).
 	if err := clearFixtureSubdirs(*out); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
