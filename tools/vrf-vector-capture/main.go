@@ -395,29 +395,69 @@ func filterDirtyPaths(porcelain string, prefixes []string) []string {
 		}
 		body := strings.TrimSpace(line[3:])
 		paths := []string{body}
-		if idx := strings.Index(body, " -> "); idx >= 0 {
-			paths = []string{strings.TrimSpace(body[:idx]), strings.TrimSpace(body[idx+4:])}
+		if src, dst, ok := splitRename(body); ok {
+			paths = []string{strings.TrimSpace(src), strings.TrimSpace(dst)}
 		}
 		for _, p := range paths {
-			// A path may be quoted if it contains spaces or non-ASCII (see
-			// core.quotePath); strip a leading/trailing double-quote before
-			// matching.
-			p = strings.TrimPrefix(p, `"`)
-			p = strings.TrimSuffix(p, `"`)
-			matched := false
-			for _, pref := range prefixes {
-				if strings.HasPrefix(p, pref) {
-					matched = true
-					break
-				}
-			}
-			if matched {
+			if anyPrefixMatches(unquotePath(p), prefixes) {
 				dirty = append(dirty, line)
 				break
 			}
 		}
 	}
 	return dirty
+}
+
+// splitRename splits a porcelain rename/copy body at the first ` -> `
+// separator that lies OUTSIDE any quoted filename. A path literally
+// containing the substring " -> " is emitted by git as `"…"`-quoted with
+// the arrow kept as-is, so a naive `strings.Index(body, " -> ")` would
+// cut inside the quoted source and misclassify the destination. Tracking
+// quote state — and honoring backslash-escaped quotes within a quoted
+// path — avoids that bypass.
+func splitRename(body string) (src, dst string, ok bool) {
+	inQuotes := false
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if inQuotes {
+			if c == '\\' && i+1 < len(body) {
+				// Skip the escaped byte (covers `\"`, `\\`, `\t`, etc.).
+				i++
+				continue
+			}
+			if c == '"' {
+				inQuotes = false
+			}
+			continue
+		}
+		if c == '"' {
+			inQuotes = true
+			continue
+		}
+		if c == ' ' && i+3 < len(body) && body[i+1] == '-' && body[i+2] == '>' && body[i+3] == ' ' {
+			return body[:i], body[i+4:], true
+		}
+	}
+	return "", "", false
+}
+
+// unquotePath strips enclosing double-quotes from a single porcelain path
+// token. Paths with spaces or non-ASCII bytes are quoted by git (see
+// core.quotePath); for prefix matching we want the bare content.
+func unquotePath(p string) string {
+	if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
+		return p[1 : len(p)-1]
+	}
+	return p
+}
+
+func anyPrefixMatches(p string, prefixes []string) bool {
+	for _, pref := range prefixes {
+		if strings.HasPrefix(p, pref) {
+			return true
+		}
+	}
+	return false
 }
 
 func main() {

@@ -81,6 +81,43 @@ func TestFilterDirtyPaths_RenamesBothSides(t *testing.T) {
 			prefixes:  []string{"crypto/", "protocol/"},
 			wantDirty: []string{" M crypto/vrf.go", "R  other/y.go -> crypto/y.go"},
 		},
+		{
+			// PR-#225 round-3 Codex P2: a source filename literally
+			// containing " -> " is quoted by git, and a naive
+			// strings.Index(body, " -> ") would split inside the quoted
+			// name — producing a "destination" that doesn't start with
+			// crypto/ and bypassing the guard. splitRename must ignore
+			// separators inside quoted tokens.
+			name:      "rename with literal ' -> ' in quoted source",
+			porcelain: `R  "other/a -> b.go" -> crypto/c.go`,
+			prefixes:  []string{"crypto/", "protocol/"},
+			wantDirty: []string{`R  "other/a -> b.go" -> crypto/c.go`},
+		},
+		{
+			// Symmetric: both tokens quoted, destination under protocol/.
+			name:      "rename with literal ' -> ' in quoted source, quoted dst",
+			porcelain: `R  "other/a -> b.go" -> "protocol/c d.go"`,
+			prefixes:  []string{"crypto/", "protocol/"},
+			wantDirty: []string{`R  "other/a -> b.go" -> "protocol/c d.go"`},
+		},
+		{
+			// Escaped double-quote inside a quoted path must NOT close the
+			// quoted region prematurely (would otherwise surface a bogus
+			// " -> " split right after the escaped quote).
+			name:      "rename with escaped quote in quoted source",
+			porcelain: `R  "weird\"name -> notreally.go" -> crypto/real.go`,
+			prefixes:  []string{"crypto/", "protocol/"},
+			wantDirty: []string{`R  "weird\"name -> notreally.go" -> crypto/real.go`},
+		},
+		{
+			// Benign quoted paths with neither side touching guarded dirs
+			// must NOT be flagged — guards against an over-eager fix that
+			// loses selectivity.
+			name:      "rename with literal ' -> ' but neither side under guarded dir",
+			porcelain: `R  "a -> b.go" -> "c -> d.go"`,
+			prefixes:  []string{"crypto/", "protocol/"},
+			wantDirty: nil,
+		},
 	}
 
 	for _, tc := range cases {
@@ -88,6 +125,49 @@ func TestFilterDirtyPaths_RenamesBothSides(t *testing.T) {
 			got := filterDirtyPaths(tc.porcelain, tc.prefixes)
 			if !reflect.DeepEqual(got, tc.wantDirty) {
 				t.Fatalf("filterDirtyPaths(%q):\n  got  = %#v\n  want = %#v", tc.porcelain, got, tc.wantDirty)
+			}
+		})
+	}
+}
+
+// TestSplitRename verifies the quote-aware rename splitter directly, so a
+// regression in splitRename is localized even if filterDirtyPaths itself is
+// refactored later.
+func TestSplitRename(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     string
+		wantSrc  string
+		wantDst  string
+		wantOK   bool
+	}{
+		{"bare", "a -> b", "a", "b", true},
+		{"no separator", "a b c", "", "", false},
+		{"empty", "", "", "", false},
+		{"quoted src+dst", `"a" -> "b"`, `"a"`, `"b"`, true},
+		{
+			"arrow in quoted src",
+			`"a -> b.go" -> c.go`,
+			`"a -> b.go"`, `c.go`, true,
+		},
+		{
+			"arrow in quoted dst",
+			`a.go -> "c -> d.go"`,
+			`a.go`, `"c -> d.go"`, true,
+		},
+		{
+			"escaped quote in quoted src",
+			`"a\"x -> y.go" -> b.go`,
+			`"a\"x -> y.go"`, `b.go`, true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src, dst, ok := splitRename(tc.body)
+			if ok != tc.wantOK || src != tc.wantSrc || dst != tc.wantDst {
+				t.Fatalf("splitRename(%q):\n  got  = (%q, %q, %v)\n  want = (%q, %q, %v)",
+					tc.body, src, dst, ok, tc.wantSrc, tc.wantDst, tc.wantOK)
 			}
 		})
 	}
