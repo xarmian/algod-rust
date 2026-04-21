@@ -103,45 +103,101 @@ func verifyGoAlgorandPin(allowUnpinned bool) error {
 		return fmt.Errorf("go-algorand at %q is on tag %q, expected %q (pass --allow-unpinned to override)",
 			gaDir, got, expectedGoAlgorandPin)
 	}
-	// Dirty-tree check limited to agreement/ — that's the only directory
-	// whose contents influence the staged test's encoding output.
+	// Dirty-tree check: every package the staged test
+	// (`fixtures_test.go.tmpl`) transitively references in the
+	// encoded struct values can influence the fixture output's
+	// byte pattern. A local edit under any of these directories
+	// makes the output no longer canonical for the pinned tag.
+	// Ignoring the rest (CLAUDE.md, README, docker/, etc.) so
+	// unrelated workspace state doesn't block regeneration.
+	// Codex P2 (PR #228, r4) flagged that an earlier version
+	// scoped this to agreement/ only.
 	statusOut, err := exec.Command("git", "-C", gaDir, "status", "--porcelain").Output()
 	if err != nil {
 		return fmt.Errorf("checking %s working tree: %w", gaDir, err)
 	}
-	var dirty []string
-	for _, line := range strings.Split(strings.TrimRight(string(statusOut), "\n"), "\n") {
-		if len(line) < 4 {
-			continue
-		}
-		body := strings.TrimSpace(line[3:])
-		// Consider both rename sides.
-		paths := []string{body}
-		if idx := strings.Index(body, " -> "); idx >= 0 {
-			paths = []string{strings.TrimSpace(body[:idx]), strings.TrimSpace(body[idx+4:])}
-		}
-		for _, p := range paths {
-			p = strings.TrimPrefix(strings.TrimSuffix(p, `"`), `"`)
-			// Ignore our own staged file if a previous run crashed
-			// mid-flight; we'll clean it up below. Also ignore
-			// golden_vectors_test.go which existed before this work.
-			if p == "agreement/"+stagedFileName || p == "agreement/golden_vectors_test.go" {
-				continue
-			}
-			if strings.HasPrefix(p, "agreement/") {
-				dirty = append(dirty, line)
-				break
-			}
-		}
-	}
+	dirty := filterDirtyAgreementPaths(string(statusOut))
 	if len(dirty) > 0 {
 		return fmt.Errorf(
-			"go-algorand at %q has uncommitted changes under agreement/ "+
-				"that could change wire encodings:\n%s\nClean the tree or pass --allow-unpinned.",
+			"go-algorand at %q has uncommitted changes under directories whose "+
+				"contents feed into the agreement wire fixture output:\n%s\n"+
+				"Clean the tree or pass --allow-unpinned.",
 			gaDir, strings.Join(dirty, "\n"),
 		)
 	}
 	return nil
+}
+
+// guardedPrefixes enumerates go-algorand subdirectories whose contents
+// can change the wire-fixture output. Any of these being dirty means a
+// regeneration is no longer canonical for the pinned tag.
+//
+//   - `agreement/`           — types + msgp_gen.go encoders under test.
+//   - `crypto/`              — OneTimeSignature, VrfProof, Digest, Hashable.
+//   - `data/basics/`         — basics.Address, basics.Round.
+//   - `data/bookkeeping/`    — bookkeeping.Block / BlockHeader (proposal).
+//   - `data/committee/`      — UnauthenticatedCredential, Credential.
+//   - `protocol/`            — protocol.Encode + HashID identifiers.
+var guardedPrefixes = []string{
+	"agreement/",
+	"crypto/",
+	"data/basics/",
+	"data/bookkeeping/",
+	"data/committee/",
+	"protocol/",
+}
+
+// ignoredPaths carries files the regen tool is known to create or that
+// are legitimately present in a fresh checkout. Listed as exact paths
+// (not prefixes) to keep the allowlist tight.
+func ignoredPaths() map[string]bool {
+	return map[string]bool{
+		"agreement/" + stagedFileName:              true,
+		"agreement/golden_vectors_test.go":         true,
+		"data/committee/golden_vectors_test.go":    true,
+	}
+}
+
+// filterDirtyAgreementPaths returns porcelain lines whose (any) path
+// is under a guarded prefix AND not in the ignored-paths set.
+//
+// Factored out for unit testing — this is identical in spirit to the
+// helper in tools/vrf-vector-capture/main.go but with a different
+// prefix list.
+func filterDirtyAgreementPaths(porcelain string) []string {
+	ignored := ignoredPaths()
+	var dirty []string
+	for _, line := range strings.Split(strings.TrimRight(porcelain, "\n"), "\n") {
+		if len(line) < 4 {
+			continue
+		}
+		body := strings.TrimSpace(line[3:])
+		paths := []string{body}
+		// Rename/copy: `XY old -> new` → inspect both sides.
+		if idx := strings.Index(body, " -> "); idx >= 0 {
+			paths = []string{strings.TrimSpace(body[:idx]), strings.TrimSpace(body[idx+4:])}
+		}
+		matched := false
+		for _, p := range paths {
+			p = strings.TrimPrefix(strings.TrimSuffix(p, `"`), `"`)
+			if ignored[p] {
+				continue
+			}
+			for _, pref := range guardedPrefixes {
+				if strings.HasPrefix(p, pref) {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				break
+			}
+		}
+		if matched {
+			dirty = append(dirty, line)
+		}
+	}
+	return dirty
 }
 
 // fixtureSubdirs lists every subdirectory this tool owns under the

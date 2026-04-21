@@ -90,6 +90,111 @@ func TestClearFixtureSubdirs_RefusesToRemoveFileAtSubdirPath(t *testing.T) {
 	}
 }
 
+// TestFilterDirtyAgreementPaths_ExpandedGuard is the regression guard
+// for PR #228 r4: the pin's dirty-tree scan must cover every
+// go-algorand directory whose contents contribute to the wire-fixture
+// encoding — not just `agreement/`. Before the expansion, a local
+// edit in `crypto/` (e.g. changing a Hashable ToBeHashed prefix) or
+// `data/bookkeeping/` (a renamed Block field) would silently produce
+// non-canonical fixtures while the tool reported success.
+func TestFilterDirtyAgreementPaths_ExpandedGuard(t *testing.T) {
+	cases := []struct {
+		name      string
+		porcelain string
+		want      []string
+	}{
+		{
+			name:      "empty tree",
+			porcelain: "",
+			want:      nil,
+		},
+		{
+			name:      "only ignored staged file",
+			porcelain: "?? agreement/" + stagedFileName,
+			want:      nil,
+		},
+		{
+			name:      "only known pre-existing golden vectors",
+			porcelain: "?? agreement/golden_vectors_test.go\n?? data/committee/golden_vectors_test.go",
+			want:      nil,
+		},
+		{
+			name:      "root-level changes are ignored",
+			porcelain: " T CLAUDE.md\n M README.md",
+			want:      nil,
+		},
+		{
+			name:      "agreement/ edit is flagged",
+			porcelain: " M agreement/vote.go",
+			want:      []string{" M agreement/vote.go"},
+		},
+		{
+			name:      "crypto/ edit is flagged",
+			porcelain: " M crypto/onetimesig.go",
+			want:      []string{" M crypto/onetimesig.go"},
+		},
+		{
+			name:      "data/basics/ edit is flagged",
+			porcelain: " M data/basics/address.go",
+			want:      []string{" M data/basics/address.go"},
+		},
+		{
+			name:      "data/bookkeeping/ edit is flagged",
+			porcelain: " M data/bookkeeping/block.go",
+			want:      []string{" M data/bookkeeping/block.go"},
+		},
+		{
+			name:      "data/committee/ edit is flagged",
+			porcelain: " M data/committee/credential.go",
+			want:      []string{" M data/committee/credential.go"},
+		},
+		{
+			name:      "protocol/ edit is flagged",
+			porcelain: " M protocol/hash.go",
+			want:      []string{" M protocol/hash.go"},
+		},
+		{
+			name:      "rename into guarded dir from unrelated source",
+			porcelain: "R  scratch/x.go -> agreement/x.go",
+			want:      []string{"R  scratch/x.go -> agreement/x.go"},
+		},
+		{
+			name:      "unrelated subdirs (data/transactions/) stay clean",
+			porcelain: " M data/transactions/logic/eval.go",
+			want:      nil,
+		},
+		{
+			name: "mixed: one guarded + one ignored + one unrelated",
+			porcelain: " M agreement/vote.go\n" +
+				"?? agreement/" + stagedFileName + "\n" +
+				" M README.md",
+			want: []string{" M agreement/vote.go"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := filterDirtyAgreementPaths(tc.porcelain)
+			if !stringSlicesEqual(got, tc.want) {
+				t.Fatalf("filterDirtyAgreementPaths(%q):\n  got  = %#v\n  want = %#v",
+					tc.porcelain, got, tc.want)
+			}
+		})
+	}
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func mustMkdir(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(path, 0o755); err != nil {
