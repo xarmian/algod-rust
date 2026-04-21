@@ -4,6 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[dev-dependencies]
+hex.workspace = true
+
 [dependencies]
 algo-codec.workspace = true
 algo-consensus-crypto.workspace = true
