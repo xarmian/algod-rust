@@ -96,6 +96,13 @@ pub fn run_approval_program(
     ctx: &mut dyn AvmContext,
     budget: &mut GroupBudget,
 ) -> Result<AvmResult, AlgoError> {
+    // Reject programs declaring a version above the active consensus
+    // LogicSigVersion ceiling (go-algorand eval.go pre-eval check). Contexts
+    // that don't carry consensus (NullContext) return None and skip this.
+    if let (Some(ceiling), Some(&version)) = (ctx.consensus_logic_sig_version(), program.first()) {
+        crate::validator::check_program_version_allowed(version, ceiling)?;
+    }
+
     let parsed = bytecode::parse(program)?;
     let budget_before = budget.remaining();
     let mut machine = AvmMachine::new(parsed, ExecMode::Application, budget_before);
@@ -227,6 +234,12 @@ pub fn run_logicsig_program(
     ctx: &mut dyn AvmContext,
     budget: &mut GroupBudget,
 ) -> Result<bool, AlgoError> {
+    // Reject programs declaring a version above the active consensus
+    // LogicSigVersion ceiling (go-algorand eval.go pre-eval check).
+    if let (Some(ceiling), Some(&version)) = (ctx.consensus_logic_sig_version(), program.first()) {
+        crate::validator::check_program_version_allowed(version, ceiling)?;
+    }
+
     let parsed = bytecode::parse(program)?;
     let budget_before = budget.remaining();
     let mut machine = AvmMachine::new(parsed, ExecMode::LogicSig, budget_before);
@@ -261,6 +274,16 @@ pub fn run_approval_program_with_tracer(
     budget: &mut GroupBudget,
     tracer: &mut dyn EvalTracer,
 ) -> Result<AvmResult, AlgoError> {
+    // Reject programs declaring a version above the active consensus
+    // LogicSigVersion ceiling (go-algorand eval.go pre-eval check).
+    if let (Some(ceiling), Some(&version)) = (ctx.consensus_logic_sig_version(), program.first()) {
+        if let Err(e) = crate::validator::check_program_version_allowed(version, ceiling) {
+            tracer.before_program(ProgramType::Approval);
+            tracer.after_program(ProgramType::Approval, false, Some(&e.to_string()));
+            return Err(e);
+        }
+    }
+
     let parsed = match bytecode::parse(program) {
         Ok(p) => p,
         Err(e) => {
@@ -390,6 +413,16 @@ pub fn run_logicsig_program_with_tracer(
     budget: &mut GroupBudget,
     tracer: &mut dyn EvalTracer,
 ) -> Result<bool, AlgoError> {
+    // Reject programs declaring a version above the active consensus
+    // LogicSigVersion ceiling (go-algorand eval.go pre-eval check).
+    if let (Some(ceiling), Some(&version)) = (ctx.consensus_logic_sig_version(), program.first()) {
+        if let Err(e) = crate::validator::check_program_version_allowed(version, ceiling) {
+            tracer.before_program(ProgramType::LogicSig);
+            tracer.after_program(ProgramType::LogicSig, false, Some(&e.to_string()));
+            return Err(e);
+        }
+    }
+
     let parsed = match bytecode::parse(program) {
         Ok(p) => p,
         Err(e) => {
