@@ -4,5 +4,5 @@
   "hex_head": "85a3706572cd01f4a470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaaaaaa",
   "name": "high_period",
   "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
-  "type": "*agreement.unauthenticatedBundle"
+  "type": "*agreement.Certificate"
 }

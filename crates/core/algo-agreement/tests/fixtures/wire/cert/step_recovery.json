@@ -4,5 +4,5 @@
   "hex_head": "85a370657201a470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "name": "step_recovery",
   "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
-  "type": "*agreement.unauthenticatedBundle"
+  "type": "*agreement.Certificate"
 }

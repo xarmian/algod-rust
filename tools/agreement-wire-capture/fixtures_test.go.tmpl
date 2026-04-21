@@ -147,6 +147,15 @@ func writeFixture(t *testing.T, dir, subdir, name, doc string, v interface{}) {
 
 	// protocol.Encode takes an interface; the underlying types all
 	// implement it via msgp_gen.go. We pass a pointer where required.
+	// `*Certificate` is listed distinctly from `*unauthenticatedBundle`
+	// so cert fixtures go through Certificate's own encoder path —
+	// today the wire bytes match (Certificate is `type Certificate
+	// unauthenticatedBundle`), but if go-algorand ever adds
+	// Certificate-specific codec behavior, this test would catch it
+	// rather than silently skipping over it via a named-type cast.
+	// Also keeps the sidecar metadata honest (`*agreement.Certificate`
+	// instead of `*agreement.unauthenticatedBundle`) — Codex P2 on
+	// PR #228 r6.
 	var encoded []byte
 	switch x := v.(type) {
 	case *rawVote:
@@ -158,6 +167,8 @@ func writeFixture(t *testing.T, dir, subdir, name, doc string, v interface{}) {
 	case *unauthenticatedBundle:
 		encoded = protocol.Encode(x)
 	case *bundle:
+		encoded = protocol.Encode(x)
+	case *Certificate:
 		encoded = protocol.Encode(x)
 	case *unauthenticatedProposal:
 		encoded = protocol.Encode(x)
@@ -422,13 +433,17 @@ func TestAlgodRustGenerateWireFixtures(t *testing.T) {
 		c := &ubundleCases[i]
 		writeFixture(t, dir, "ubundle", c.name, c.doc, &c.value)
 	}
-	// Certificate corpus mirrors ubundle — Certificate is a type alias.
-	// We cast via `unauthenticatedBundle(cert) = cert` conceptually;
-	// here we just write the same struct under cert/ with identical names.
+	// Certificate corpus mirrors ubundle. `type Certificate
+	// unauthenticatedBundle` → the wire bytes match today, but we
+	// exercise Certificate's OWN encoder path (`*Certificate`, not a
+	// named-type cast back to `*unauthenticatedBundle`) so the
+	// fixture genuinely probes Certificate-specific codec behavior
+	// and the sidecar metadata correctly reports
+	// `*agreement.Certificate`.
 	for i := range ubundleCases {
 		c := &ubundleCases[i]
-		cert := Certificate(c.value) // named-type conversion; same wire bytes
-		writeFixture(t, dir, "cert", c.name, c.doc+" (as Certificate)", (*unauthenticatedBundle)(&cert))
+		cert := Certificate(c.value)
+		writeFixture(t, dir, "cert", c.name, c.doc+" (as Certificate)", &cert)
 	}
 
 	// ---- authenticated bundle (agreement.bundle) fixtures (20) --

@@ -4,5 +4,5 @@
   "hex_head": "84a470726f7084a3646967c420cccccccccccccccccccccccccccccccccccccc",
   "name": "fifteen_votes_distinct_prop",
   "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
-  "type": "*agreement.unauthenticatedBundle"
+  "type": "*agreement.Certificate"
 }

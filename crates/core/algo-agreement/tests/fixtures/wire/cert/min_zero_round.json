@@ -4,5 +4,5 @@
   "hex_head": "83a470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "name": "min_zero_round",
   "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
-  "type": "*agreement.unauthenticatedBundle"
+  "type": "*agreement.Certificate"
 }
