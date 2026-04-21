@@ -1,0 +1,8 @@
+{
+  "byte_count": 809,
+  "doc": "round 10M + PriorVote/step_cert",
+  "hex_head": "85a56f70726f70c4204242424242424242424242424242424242424242424242",
+  "name": "high_round",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.transmittedPayload"
+}

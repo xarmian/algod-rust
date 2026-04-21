@@ -1,0 +1,8 @@
+{
+  "byte_count": 630,
+  "doc": "uvote wrapping rawVote/step_cert",
+  "hex_head": "83a46372656481a27066c450333435363738393a3b3c3d3e3f40414243444546",
+  "name": "r_step_cert",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedVote"
+}

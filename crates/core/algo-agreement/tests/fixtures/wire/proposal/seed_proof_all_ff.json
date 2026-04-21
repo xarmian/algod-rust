@@ -1,0 +1,8 @@
+{
+  "byte_count": 172,
+  "doc": "seed proof filled with 0xff (as proposal; unexported fields unserialized)",
+  "hex_head": "84a56f70726f70c4204242424242424242424242424242424242424242424242",
+  "name": "seed_proof_all_ff",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.proposal"
+}

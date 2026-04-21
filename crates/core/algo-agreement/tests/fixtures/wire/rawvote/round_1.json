@@ -1,0 +1,8 @@
+{
+  "byte_count": 181,
+  "doc": "smallest nonzero round",
+  "hex_head": "84a470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "name": "round_1",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.rawVote"
+}

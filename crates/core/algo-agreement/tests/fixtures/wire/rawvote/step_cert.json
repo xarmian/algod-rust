@@ -1,0 +1,8 @@
+{
+  "byte_count": 181,
+  "doc": "cert step (2)",
+  "hex_head": "84a470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "name": "step_cert",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.rawVote"
+}

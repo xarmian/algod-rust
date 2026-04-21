@@ -1,0 +1,8 @@
+{
+  "byte_count": 5963,
+  "doc": "recovery step 4",
+  "hex_head": "82a17585a370657201a470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaaaa",
+  "name": "step_recovery",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.bundle"
+}

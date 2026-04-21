@@ -1,0 +1,8 @@
+{
+  "byte_count": 180,
+  "doc": "distinct seed+round+period+proposer",
+  "hex_head": "85a46f7065720da56f70726f70c4203333333333333333333333333333333333",
+  "name": "distinct_all",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedProposal"
+}

@@ -1,0 +1,8 @@
+{
+  "byte_count": 712,
+  "doc": "block header only, no seed proof + PriorVote/step_propose",
+  "hex_head": "84a56f70726f70c4204242424242424242424242424242424242424242424242",
+  "name": "header_only_no_seedproof",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.transmittedPayload"
+}

@@ -382,3 +382,82 @@ list hard-fails the test.
 - sortition@v1.0.0 `sortition.go:44` — Go `Select` signature
 - sortition@v1.0.0 `sortition.cpp:10` — Boost-backed CDF walk
 - Rust `crates/core/algo-consensus-crypto/src/sortition.rs:92` — `select` under test
+
+## Agreement Wire Vector Regeneration
+
+Rust's hand-coded `algo-agreement` codec must round-trip every msgpack
+wire representation go-algorand's `agreement/msgp_gen.go` produces —
+Vote / UnauthenticatedVote / Bundle / Certificate / Proposal /
+UnauthenticatedProposal, plus the inner `rawVote`, `proposalValue`,
+`voteAuthenticator`, `equivocationVoteAuthenticator`, and
+`transmittedPayload` types. Divergence in canonical field ordering,
+`omitempty` handling, or integer-width encoding would silently change
+vote / cert / proposal hashes and break consensus.
+
+### Fixture location
+
+- `crates/core/algo-agreement/tests/fixtures/wire/` — one subdirectory
+  per wire type (`rawvote/`, `uvote/`, `vote/`, `ubundle/`, `cert/`,
+  `bundle/`, `uproposal/`, `proposal/`, `tpayload/`, `proposalvalue/`).
+  Each fixture is a `<name>.msgpack` blob plus a `<name>.json` metadata
+  sidecar. See that directory's `README.md` for the schema, variation
+  rationale, and per-subdir counts.
+
+### Why this tool is structurally different from v13 / VRF / sortition captures
+
+Every interesting type in the `agreement` package (`rawVote`,
+`unauthenticatedVote`, `vote`, `unauthenticatedBundle`, `bundle`,
+`voteAuthenticator`, `equivocationVoteAuthenticator`,
+`unauthenticatedProposal`, `transmittedPayload`) is **package-private**,
+so an external Go program cannot construct or encode them. The capture
+therefore runs as a real Go test *inside* go-algorand's `agreement`
+package. Because we never modify the pinned go-algorand checkout, the
+tool stages the test file into `../go-algorand/agreement/` at runtime
+and removes it afterwards.
+
+The staged file's name — `algod_rust_wire_fixtures_test.go` — is
+distinctive enough that a stray copy left by an aborted run is
+obviously ours. The wrapper's pin-check skips it in the
+dirty-tree scan so a mid-flight cleanup failure doesn't permanently
+block future regenerations.
+
+### Regenerating
+
+```bash
+cd tools/agreement-wire-capture
+go run .
+```
+
+Runtime: ~40 s end-to-end on a modern laptop. The regeneration
+enforces the same `v4.5.1-stable` pin + clean `agreement/` tree the
+VRF tool does. Pass `--allow-unpinned` for intentional
+regeneration against a different go-algorand tag (the output will
+then be out-of-sync with the rest of the workspace until the pin
+update lands). `--keep-staged` leaves the staged test file in
+place for debugging.
+
+The test asserts each of the 9 guarded subdirectories has ≥20
+fixtures (40 files: .msgpack + .json each); a corpus narrower than
+that fails regeneration.
+
+### When to regenerate
+
+- Bumping the go-algorand pin to a release that touches
+  `agreement/` (new codec fields, renamed codec tags, etc.).
+- Extending the fixture matrix in
+  `tools/agreement-wire-capture/fixtures_test.go.tmpl`. Append only —
+  stable `name` identifiers keep downstream consumers (TASK-55
+  roundtrip harness, TASK-56 fuzz seed corpus) from breaking.
+
+### References
+
+- `agreement/vote.go:30`, `vote.go:42` — `rawVote`, `unauthenticatedVote`
+- `agreement/vote.go:50` — `vote` (authenticated)
+- `agreement/bundle.go:31`, `bundle.go:46` — `unauthenticatedBundle`, `bundle`
+- `agreement/bundle.go:57`, `bundle.go:65` — vote / equivocation authenticators
+- `agreement/certificate.go:32` — `type Certificate unauthenticatedBundle`
+- `agreement/proposal.go:55`, `proposal.go:89` — `unauthenticatedProposal`, `proposal`
+- `agreement/proposal.go:49` — `transmittedPayload`
+- `agreement/msgp_gen.go` — canonical msgpack encoders (13K LOC, generated)
+- `agreement/golden_vectors_test.go` — starter Go-side anchor (pre-existing,
+  untracked in go-algorand)

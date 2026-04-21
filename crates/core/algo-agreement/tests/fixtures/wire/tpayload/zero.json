@@ -1,0 +1,8 @@
+{
+  "byte_count": 451,
+  "doc": "zero-valued + PriorVote/zero",
+  "hex_head": "81a2707682a46372656481a27066c450707172737475767778797a7b7c7d7e7f",
+  "name": "zero",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.transmittedPayload"
+}

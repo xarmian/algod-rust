@@ -1,0 +1,8 @@
+{
+  "byte_count": 4999,
+  "doc": "proposal B, 10 votes",
+  "hex_head": "84a470726f7084a3646967c420cccccccccccccccccccccccccccccccccccccc",
+  "name": "distinct_proposal",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedBundle"
+}

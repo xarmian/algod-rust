@@ -1,0 +1,8 @@
+{
+  "byte_count": 44,
+  "doc": "bottom proposal on a non-next step (unusual but well-formed)",
+  "hex_head": "82a3726e6407a3736e64c4200e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e",
+  "name": "bottom_proposal_prop_step",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.rawVote"
+}

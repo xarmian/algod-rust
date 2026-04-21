@@ -1,0 +1,8 @@
+{
+  "byte_count": 176,
+  "doc": "round 4294967295",
+  "hex_head": "84a56f70726f70c4204242424242424242424242424242424242424242424242",
+  "name": "round_u32_max_like",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedProposal"
+}

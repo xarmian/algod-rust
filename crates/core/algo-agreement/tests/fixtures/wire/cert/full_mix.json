@@ -1,0 +1,8 @@
+{
+  "byte_count": 15336,
+  "doc": "20 votes + 5 equivocations (as Certificate)",
+  "hex_head": "85a36571769584a46372656481a27066c4508a8b8c8d8e8f9091929394959697",
+  "name": "full_mix",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.Certificate"
+}

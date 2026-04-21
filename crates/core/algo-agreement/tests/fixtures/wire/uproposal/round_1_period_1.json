@@ -1,0 +1,8 @@
+{
+  "byte_count": 178,
+  "doc": "round=1, period=1",
+  "hex_head": "85a46f70657201a56f70726f70c4204242424242424242424242424242424242",
+  "name": "round_1_period_1",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedProposal"
+}

@@ -1,0 +1,8 @@
+{
+  "byte_count": 190,
+  "doc": "all fields distinct",
+  "hex_head": "85a370657207a470726f7084a3646967c4204444444444444444444444444444",
+  "name": "distinct_all",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.rawVote"
+}

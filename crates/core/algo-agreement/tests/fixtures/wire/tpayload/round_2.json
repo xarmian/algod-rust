@@ -1,0 +1,8 @@
+{
+  "byte_count": 805,
+  "doc": "round 2 + PriorVote/proposal_value_B",
+  "hex_head": "85a56f70726f70c4204242424242424242424242424242424242424242424242",
+  "name": "round_2",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.transmittedPayload"
+}

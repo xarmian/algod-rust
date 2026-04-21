@@ -1,0 +1,8 @@
+{
+  "byte_count": 143,
+  "doc": "sender=all-0x00",
+  "hex_head": "83a470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "name": "sender_00",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.rawVote"
+}

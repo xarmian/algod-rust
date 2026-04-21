@@ -1,0 +1,8 @@
+{
+  "byte_count": 190,
+  "doc": "period near u32 max",
+  "hex_head": "85a3706572ce00ffffffa470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaa",
+  "name": "max_period",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.rawVote"
+}

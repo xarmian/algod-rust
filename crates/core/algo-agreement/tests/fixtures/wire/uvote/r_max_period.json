@@ -1,0 +1,8 @@
+{
+  "byte_count": 639,
+  "doc": "uvote wrapping rawVote/max_period",
+  "hex_head": "83a46372656481a27066c450434445464748494a4b4c4d4e4f50515253545556",
+  "name": "r_max_period",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedVote"
+}

@@ -1,0 +1,8 @@
+{
+  "byte_count": 799,
+  "doc": "seed proof filled with 0xff + PriorVote/period_0_step_0",
+  "hex_head": "85a56f70726f70c4204242424242424242424242424242424242424242424242",
+  "name": "seed_proof_all_ff",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.transmittedPayload"
+}

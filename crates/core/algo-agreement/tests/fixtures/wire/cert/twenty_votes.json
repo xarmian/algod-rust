@@ -1,0 +1,8 @@
+{
+  "byte_count": 9851,
+  "doc": "20 votes (full soft committee) (as Certificate)",
+  "hex_head": "84a470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "name": "twenty_votes",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.Certificate"
+}

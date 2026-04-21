@@ -1,0 +1,8 @@
+{
+  "byte_count": 41,
+  "doc": "round 0, no seed proof (as proposal; unexported fields unserialized)",
+  "hex_head": "81a56f70726f70c4201111111111111111111111111111111111111111111111",
+  "name": "no_seedproof_zero_round",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.proposal"
+}

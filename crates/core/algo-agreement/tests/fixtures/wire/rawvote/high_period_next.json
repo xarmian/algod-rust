@@ -1,0 +1,8 @@
+{
+  "byte_count": 57,
+  "doc": "high period, next-vote, bottom",
+  "hex_head": "84a3706572cd01f4a3726e6405a3736e64c4200f0f0f0f0f0f0f0f0f0f0f0f0f",
+  "name": "high_period_next",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.rawVote"
+}

@@ -1,0 +1,8 @@
+{
+  "byte_count": 5975,
+  "doc": "period 500",
+  "hex_head": "82a17585a3706572cd01f4a470726f7084a3646967c420aaaaaaaaaaaaaaaaaa",
+  "name": "high_period",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.bundle"
+}

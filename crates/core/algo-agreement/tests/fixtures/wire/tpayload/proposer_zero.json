@@ -1,0 +1,8 @@
+{
+  "byte_count": 770,
+  "doc": "OriginalProposer=all-zero + PriorVote/step_recovery_4",
+  "hex_head": "84a2707683a46372656481a27066c45075767778797a7b7c7d7e7f8081828384",
+  "name": "proposer_zero",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.transmittedPayload"
+}
