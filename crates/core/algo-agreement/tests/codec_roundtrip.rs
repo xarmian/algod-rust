@@ -16,26 +16,33 @@
 //! (Debug-printed), and a hex window around the divergence so the
 //! encoder bug is localized without needing to regenerate the corpus.
 //!
-//! ## Scope of THIS PR
+//! ## Coverage
 //!
-//! The Rust codec currently exposes a `pub` roundtrip API for:
-//!
+//! TASK-55 shipped roundtrip parity for the three outer envelope types
+//! exposed by the initial public codec API:
 //!   * `UnauthenticatedVote`       (`uvote/`)
 //!   * `UnauthenticatedBundle`     (`ubundle/`)
 //!   * `Certificate` (= UBundle)   (`cert/`)
 //!
-//! Each is covered here with ≥20 fixtures.
-//!
-//! The remaining corpus subdirectories — `rawvote/`, `vote/`,
-//! `bundle/`, `uproposal/`, `proposal/`, `tpayload/`,
-//! `proposalvalue/` — require new encoders/decoders on the Rust
-//! side that are out of scope for TASK-55. They're tracked as a
-//! follow-up (see `SKIPPED_SUBDIRS_DOC`).
+//! TASK-60 extends parity to every inner wire type captured in the
+//! corpus:
+//!   * `proposalValue`             (`proposalvalue/`)
+//!   * `rawVote`                   (`rawvote/`)
+//!   * authenticated `vote`        (`vote/`, uses `committee.Credential`)
+//!   * authenticated `bundle`      (`bundle/`, wraps full `[]vote` / `[]equivocationVote`)
+//!   * `unauthenticatedProposal`   (`uproposal/`)
+//!   * `proposal`                  (`proposal/`, byte-identical to `uproposal`)
+//!   * `transmittedPayload`        (`tpayload/`, = `uproposal` + `"pv"`)
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use algo_agreement::codec::{decode_bundle, decode_vote, encode_bundle, encode_vote};
+use algo_agreement::codec::{
+    decode_authenticated_bundle, decode_authenticated_vote, decode_bundle, decode_compound_message,
+    decode_proposalvalue, decode_rawvote, decode_unauthenticated_proposal, decode_vote,
+    encode_authenticated_bundle, encode_authenticated_vote, encode_bundle, encode_compound_message,
+    encode_proposalvalue, encode_rawvote, encode_unauthenticated_proposal, encode_vote,
+};
 
 /// Path to the committed fixture tree from TASK-54.
 fn fixture_root() -> PathBuf {
@@ -43,23 +50,6 @@ fn fixture_root() -> PathBuf {
     p.push("tests/fixtures/wire");
     p
 }
-
-/// Documentation (rendered in the final test output) listing every
-/// subdirectory whose roundtrip is NOT exercised yet and why.
-/// Tracked as **TASK-60** — each subdir lights up here as its
-/// encoder/decoder lands.
-const SKIPPED_SUBDIRS_DOC: &str = "\
-Roundtrip parity deferred to TASK-60 (extends agreement codec):
-  rawvote/      — internal rawVote; no pub encoder/decoder in algo-agreement::codec.
-  vote/         — authenticated Vote (committee::Credential); no Rust codec path.
-  bundle/       — authenticated bundle; wraps authenticated votes + equivocationVotes.
-  uproposal/    — UnauthenticatedProposal decode side not exposed (encode exists).
-  proposal/     — same wire bytes as uproposal; same limitation.
-  tpayload/     — transmittedPayload wraps uproposal + PriorVote; blocked on uproposal decode.
-  proposalvalue/— private encode_proposal_value/decode_proposal_value helpers.
-The fixture corpus is already committed from TASK-54 and each
-subdir lights up here as TASK-60 adds the corresponding codec
-path.";
 
 /// First diverging byte offset, or `None` when `a` and `b` are
 /// identical. When lengths differ AND the shared prefix is
@@ -241,35 +231,102 @@ fn cert_roundtrip_vs_go() {
     eprintln!("cert_roundtrip_vs_go: {n} fixtures matched byte-for-byte");
 }
 
-/// Documentation-as-test: a test that simply fails if somebody
-/// silently deletes the follow-up-subdirs list. Keeping this as a
-/// `#[test]` (instead of a doc comment) guarantees the note is
-/// visible in `cargo test` output and in CI logs when the TASK-55
-/// follow-up is scheduled.
+// ── Inner wire types (TASK-60) ────────────────────────────────────────────
+
 #[test]
-fn out_of_scope_subdirs_documented() {
-    // Confirm every subdir documented as skipped actually exists
-    // on disk — i.e. the corpus is there and ready for a future
-    // codec expansion to light up. Missing a subdir listed here
-    // fails loudly so we don't silently lose coverage by accident.
-    let skipped = [
-        "rawvote",
-        "vote",
-        "bundle",
-        "uproposal",
-        "proposal",
-        "tpayload",
+fn proposalvalue_roundtrip_vs_go() {
+    // Inner schema anchor — the TASK-54 capture intentionally ships a
+    // small corpus here (3 fixtures). The broader ≥20-per-subdir
+    // convention applies to envelope types only; proposalValue is
+    // exercised transitively by rawvote/vote/bundle fixtures.
+    let n = run_subdir_roundtrip(
         "proposalvalue",
-    ];
-    for s in skipped {
-        let p = fixture_root().join(s);
-        assert!(
-            p.is_dir(),
-            "documented out-of-scope subdir {s:?} is missing from the fixture tree ({p:?}). \
-             Regenerate with `cd tools/agreement-wire-capture && go run .`."
-        );
-    }
-    eprintln!("codec_roundtrip scope:\n{SKIPPED_SUBDIRS_DOC}");
+        |b| as_string_err(decode_proposalvalue(b)),
+        encode_proposalvalue,
+        3,
+    );
+    eprintln!("proposalvalue_roundtrip_vs_go: {n} fixtures matched byte-for-byte");
+}
+
+#[test]
+fn rawvote_roundtrip_vs_go() {
+    let n = run_subdir_roundtrip(
+        "rawvote",
+        |b| as_string_err(decode_rawvote(b)),
+        encode_rawvote,
+        20,
+    );
+    eprintln!("rawvote_roundtrip_vs_go: {n} fixtures matched byte-for-byte");
+}
+
+#[test]
+fn vote_roundtrip_vs_go() {
+    // Authenticated vote: same top-level shape as unauthenticatedVote
+    // ("cred", "r", "sig") but `cred` is a full committee.Credential
+    // sub-map (ds/h/hc/pf/wt).
+    let n = run_subdir_roundtrip(
+        "vote",
+        |b| as_string_err(decode_authenticated_vote(b)),
+        encode_authenticated_vote,
+        20,
+    );
+    eprintln!("vote_roundtrip_vs_go: {n} fixtures matched byte-for-byte");
+}
+
+#[test]
+fn bundle_roundtrip_vs_go() {
+    // Authenticated bundle: wraps an UnauthenticatedBundle under "u"
+    // plus full []vote / []equivocationVote arrays (each carrying its
+    // own Credential and OTS signatures).
+    let n = run_subdir_roundtrip(
+        "bundle",
+        |b| as_string_err(decode_authenticated_bundle(b)),
+        encode_authenticated_bundle,
+        20,
+    );
+    eprintln!("bundle_roundtrip_vs_go: {n} fixtures matched byte-for-byte");
+}
+
+#[test]
+fn uproposal_roundtrip_vs_go() {
+    let n = run_subdir_roundtrip(
+        "uproposal",
+        |b| as_string_err(decode_unauthenticated_proposal(b)),
+        encode_unauthenticated_proposal,
+        20,
+    );
+    eprintln!("uproposal_roundtrip_vs_go: {n} fixtures matched byte-for-byte");
+}
+
+#[test]
+fn proposal_roundtrip_vs_go() {
+    // Go: `type proposal struct { unauthenticatedProposal; ve; validatedAt }`
+    // `ve` and `validatedAt` are unserialized, so the wire bytes are
+    // byte-identical to `unauthenticatedProposal`. The Rust codec has
+    // no distinct Proposal type — round-tripping via the uproposal
+    // codec is correct.
+    let n = run_subdir_roundtrip(
+        "proposal",
+        |b| as_string_err(decode_unauthenticated_proposal(b)),
+        encode_unauthenticated_proposal,
+        20,
+    );
+    eprintln!("proposal_roundtrip_vs_go: {n} fixtures matched byte-for-byte");
+}
+
+#[test]
+fn tpayload_roundtrip_vs_go() {
+    // transmittedPayload embeds unauthenticatedProposal and adds a
+    // `"pv"` key carrying an unauthenticatedVote (omitempty). The
+    // existing encode/decode_compound_message pair already handles
+    // both shapes (with and without a prior vote).
+    let n = run_subdir_roundtrip(
+        "tpayload",
+        |b| as_string_err(decode_compound_message(b)),
+        encode_compound_message,
+        20,
+    );
+    eprintln!("tpayload_roundtrip_vs_go: {n} fixtures matched byte-for-byte");
 }
 
 /// Minimal sanity — every .msgpack file in a guarded subdir has

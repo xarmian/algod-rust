@@ -58,12 +58,16 @@ use algo_consensus_crypto::OneTimeSignature;
 use algo_types::{Address, Block, Digest, Round};
 
 use crate::bundle::{EquivocationVoteAuthenticator, UnauthenticatedBundle, VoteAuthenticator};
-use crate::credential::UnauthenticatedCredential;
+use crate::credential::{Credential, HashableCredential, UnauthenticatedCredential};
 use crate::events::CompoundMessage;
 use crate::proposal::UnauthenticatedProposal;
 use crate::step::{Period, Step};
-use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, BOTTOM};
+use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, Vote, BOTTOM};
+use crate::vote_tracker::EquivocationVote;
 use crate::VRF_PROOF_SIZE;
+
+/// Size of the VRF output (vrf_out `raw_out` inside hashableCredential) in bytes.
+const VRF_OUTPUT_SIZE: usize = 64;
 
 /// Errors that can occur during agreement message decoding.
 #[derive(Debug)]
@@ -559,9 +563,10 @@ pub fn encode_compound_message(cm: &CompoundMessage) -> Vec<u8> {
 /// 2. Scan the map a second time to extract the proposal-specific fields
 ///    (`oper`, `oprop`, `sdpf`) and the optional prior vote (`pv`).
 pub fn decode_compound_message(bytes: &[u8]) -> Result<CompoundMessage, CodecError> {
-    // Step 1: Decode block fields (skips unknown keys).
-    let block = Block::decode_from_bytes(bytes)
-        .map_err(|e| CodecError::Decode(format!("block decode in compound message: {e}")))?;
+    // Step 1: Decode block fields (skips unknown keys). Use the
+    // rnd-tolerant wrapper so transmittedPayload fixtures with
+    // round=0 (which omit the `rnd` key via omitempty) still parse.
+    let block = decode_block_allowing_missing_rnd(bytes)?;
 
     // Step 2: Scan the map to extract proposal-specific fields and prior vote.
     let mut cursor = Cursor::new(bytes);
@@ -644,6 +649,16 @@ fn read_bin_fixed<const N: usize>(cursor: &mut Cursor<&[u8]>) -> Result<[u8; N],
             Ok(arr)
         }
         _ => Err(CodecError::Format(format!("expected binary, got {val:?}"))),
+    }
+}
+
+/// Read a msgpack bool value.
+fn read_bool(cursor: &mut Cursor<&[u8]>) -> Result<bool, CodecError> {
+    let val =
+        rmpv::decode::read_value(cursor).map_err(|e| CodecError::Decode(format!("bool: {e}")))?;
+    match val {
+        rmpv::Value::Boolean(b) => Ok(b),
+        _ => Err(CodecError::Format(format!("expected bool, got {val:?}"))),
     }
 }
 
@@ -946,6 +961,789 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<UnauthenticatedBundle, CodecError> 
     }
 
     Ok(bundle)
+}
+
+// ── Pub wrappers for inner types (TASK-60) ───────────────────────────────
+//
+// TASK-55 shipped only the outer-envelope encoders/decoders
+// (UnauthenticatedVote, UnauthenticatedBundle, Certificate,
+// CompoundMessage). TASK-60 extends public coverage to every inner
+// wire type captured under tests/fixtures/wire/ so that the roundtrip
+// parity harness can assert byte-identical equality against
+// go-algorand/agreement/msgp_gen.go for the full corpus.
+
+/// Encode a `ProposalValue` to canonical wire-format msgpack bytes.
+///
+/// Mirrors `agreement.proposalValue.MarshalMsg` in
+/// `../go-algorand/agreement/msgp_gen.go`. Fields sorted by codec tag,
+/// all `omitempty`: `"dig"`, `"encdig"`, `"oper"`, `"oprop"`.
+pub fn encode_proposalvalue(pv: &ProposalValue) -> Vec<u8> {
+    encode_proposal_value(pv)
+}
+
+/// Decode a `ProposalValue` from canonical wire-format msgpack bytes.
+pub fn decode_proposalvalue(bytes: &[u8]) -> Result<ProposalValue, CodecError> {
+    let mut cursor = Cursor::new(bytes);
+    decode_proposal_value(&mut cursor)
+}
+
+/// Encode a `RawVote` to canonical wire-format msgpack bytes.
+///
+/// Mirrors `agreement.rawVote.MarshalMsg`. Fields sorted by codec tag,
+/// all `omitempty`: `"per"`, `"prop"`, `"rnd"`, `"snd"`, `"step"`.
+pub fn encode_rawvote(rv: &RawVote) -> Vec<u8> {
+    encode_raw_vote(rv)
+}
+
+/// Decode a `RawVote` from canonical wire-format msgpack bytes.
+pub fn decode_rawvote(bytes: &[u8]) -> Result<RawVote, CodecError> {
+    let mut cursor = Cursor::new(bytes);
+    decode_raw_vote(&mut cursor)
+}
+
+// ── committee.Credential / hashableCredential wire codec ────────────────
+//
+// `committee.Credential` wraps `UnauthenticatedCredential` (providing `pf`)
+// with verified fields `wt`, `h`, `ds`, and `hc`. The embedded
+// `UnauthenticatedCredential` is flattened into the outer map by Go's
+// msgpack generator, so the wire shape is a single map with fields
+// sorted alphabetically by codec tag:
+//
+//   "ds" -> DomainSeparationEnabled (bool)
+//   "h"  -> VrfOut (crypto.Digest, bin32)
+//   "hc" -> Hashable (hashableCredential sub-map)
+//   "pf" -> Proof (crypto.VrfProof, bin80)  — from embedded UnauthenticatedCredential
+//   "wt" -> Weight (uint64)
+//
+// All fields are `omitempty` (`codec:",omitempty,omitemptyarray"` at the
+// struct level). Reference: `../go-algorand/data/committee/credential.go`.
+
+/// Encode a `hashableCredential` sub-map.
+///
+/// Fields (sorted, `omitempty`):
+///   "i" -> Iter (uint64)
+///   "m" -> Member (Address, bin32)
+///   "v" -> RawOut (VrfOutput, bin64)
+fn encode_hashable_credential_wire(hc: &HashableCredential) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(128);
+
+    let iter_empty = hc.iter == 0;
+    let m_empty = hc.member.0 == [0u8; 32];
+    let v_empty = hc.raw_out == [0u8; VRF_OUTPUT_SIZE];
+
+    let mut count: u8 = 0;
+    if !iter_empty {
+        count += 1;
+    }
+    if !m_empty {
+        count += 1;
+    }
+    if !v_empty {
+        count += 1;
+    }
+
+    rmp::encode::write_map_len(&mut buf, count as u32).unwrap();
+
+    if !iter_empty {
+        write_str_key(&mut buf, "i");
+        rmp::encode::write_uint(&mut buf, hc.iter).unwrap();
+    }
+    if !m_empty {
+        write_str_key(&mut buf, "m");
+        rmp::encode::write_bin(&mut buf, &hc.member.0).unwrap();
+    }
+    if !v_empty {
+        write_str_key(&mut buf, "v");
+        rmp::encode::write_bin(&mut buf, &hc.raw_out).unwrap();
+    }
+
+    buf
+}
+
+/// Decode a `hashableCredential` sub-map from cursor.
+fn decode_hashable_credential_from_cursor(
+    cursor: &mut Cursor<&[u8]>,
+) -> Result<HashableCredential, CodecError> {
+    let map_len = rmp::decode::read_map_len(cursor)
+        .map_err(|e| CodecError::Decode(format!("hashable cred map: {e}")))?;
+
+    let mut hc = HashableCredential::default();
+
+    for _ in 0..map_len {
+        let key = read_str_key(cursor)?;
+        match key.as_str() {
+            "i" => hc.iter = read_uint64(cursor)?,
+            "m" => hc.member = Address(read_bin_fixed::<32>(cursor)?),
+            "v" => hc.raw_out = read_bin_fixed::<VRF_OUTPUT_SIZE>(cursor)?,
+            _ => {
+                rmpv::decode::read_value(cursor)
+                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+            }
+        }
+    }
+
+    Ok(hc)
+}
+
+/// Encode a `committee.Credential` to canonical wire-format msgpack bytes.
+pub fn encode_credential(cred: &Credential) -> Vec<u8> {
+    let hc_encoded = encode_hashable_credential_wire(&cred.hashable);
+
+    let ds_empty = !cred.domain_separation_enabled;
+    let h_empty = cred.vrf_out.0 == [0u8; 32];
+    let hc_empty = hc_encoded == [0x80];
+    let pf_empty = cred.proof == [0u8; VRF_PROOF_SIZE];
+    let wt_empty = cred.weight == 0;
+
+    let mut count: u8 = 0;
+    if !ds_empty {
+        count += 1;
+    }
+    if !h_empty {
+        count += 1;
+    }
+    if !hc_empty {
+        count += 1;
+    }
+    if !pf_empty {
+        count += 1;
+    }
+    if !wt_empty {
+        count += 1;
+    }
+
+    let mut buf = Vec::with_capacity(192);
+    rmp::encode::write_map_len(&mut buf, count as u32).unwrap();
+
+    // Fields sorted: "ds", "h", "hc", "pf", "wt"
+    if !ds_empty {
+        write_str_key(&mut buf, "ds");
+        rmp::encode::write_bool(&mut buf, cred.domain_separation_enabled).unwrap();
+    }
+    if !h_empty {
+        write_str_key(&mut buf, "h");
+        rmp::encode::write_bin(&mut buf, &cred.vrf_out.0).unwrap();
+    }
+    if !hc_empty {
+        write_str_key(&mut buf, "hc");
+        buf.extend_from_slice(&hc_encoded);
+    }
+    if !pf_empty {
+        write_str_key(&mut buf, "pf");
+        rmp::encode::write_bin(&mut buf, &cred.proof).unwrap();
+    }
+    if !wt_empty {
+        write_str_key(&mut buf, "wt");
+        rmp::encode::write_uint(&mut buf, cred.weight).unwrap();
+    }
+
+    buf
+}
+
+/// Decode a `committee.Credential` from canonical wire-format msgpack bytes.
+pub fn decode_credential(bytes: &[u8]) -> Result<Credential, CodecError> {
+    let mut cursor = Cursor::new(bytes);
+    decode_credential_from_cursor(&mut cursor)
+}
+
+fn decode_credential_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<Credential, CodecError> {
+    let map_len = rmp::decode::read_map_len(cursor)
+        .map_err(|e| CodecError::Decode(format!("credential map: {e}")))?;
+
+    let mut cred = Credential {
+        weight: 0,
+        vrf_out: Digest([0u8; 32]),
+        domain_separation_enabled: false,
+        hashable: HashableCredential::default(),
+        proof: [0u8; VRF_PROOF_SIZE],
+    };
+
+    for _ in 0..map_len {
+        let key = read_str_key(cursor)?;
+        match key.as_str() {
+            "ds" => cred.domain_separation_enabled = read_bool(cursor)?,
+            "h" => cred.vrf_out = Digest(read_bin_fixed::<32>(cursor)?),
+            "hc" => cred.hashable = decode_hashable_credential_from_cursor(cursor)?,
+            "pf" => cred.proof = read_bin_fixed::<VRF_PROOF_SIZE>(cursor)?,
+            "wt" => cred.weight = read_uint64(cursor)?,
+            _ => {
+                rmpv::decode::read_value(cursor)
+                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+            }
+        }
+    }
+
+    Ok(cred)
+}
+
+// ── authenticated Vote wire codec ────────────────────────────────────────
+//
+// Go's `agreement.vote` has the same top-level shape as
+// `unauthenticatedVote` — fields sorted `"cred"`, `"r"`, `"sig"` —
+// except `cred` is a full `committee.Credential` (not
+// `UnauthenticatedCredential`). The struct carries an unserialized
+// `validatedAt` field which is skipped by msgp.
+
+/// Encode an authenticated `Vote` (with verified `committee.Credential`)
+/// to canonical wire-format msgpack bytes. Matches Go's
+/// `vote.MarshalMsg`.
+pub fn encode_authenticated_vote(v: &Vote) -> Vec<u8> {
+    let cred_encoded = encode_credential(&v.cred);
+    let r_encoded = encode_raw_vote(&v.raw_vote);
+    let sig_zero = ots_is_zero(&v.sig);
+
+    let cred_empty = cred_encoded == [0x80];
+    let r_empty = r_encoded == [0x80];
+
+    let mut count: u8 = 0;
+    if !cred_empty {
+        count += 1;
+    }
+    if !r_empty {
+        count += 1;
+    }
+    if !sig_zero {
+        count += 1;
+    }
+
+    let mut buf = Vec::with_capacity(768);
+    rmp::encode::write_map_len(&mut buf, count as u32).unwrap();
+
+    if !cred_empty {
+        write_str_key(&mut buf, "cred");
+        buf.extend_from_slice(&cred_encoded);
+    }
+    if !r_empty {
+        write_str_key(&mut buf, "r");
+        buf.extend_from_slice(&r_encoded);
+    }
+    if !sig_zero {
+        write_str_key(&mut buf, "sig");
+        buf.extend_from_slice(&encode_one_time_signature(&v.sig));
+    }
+
+    buf
+}
+
+/// Decode an authenticated `Vote` from canonical wire-format msgpack bytes.
+pub fn decode_authenticated_vote(bytes: &[u8]) -> Result<Vote, CodecError> {
+    let mut cursor = Cursor::new(bytes);
+    decode_authenticated_vote_from_cursor(&mut cursor)
+}
+
+fn decode_authenticated_vote_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<Vote, CodecError> {
+    let map_len = rmp::decode::read_map_len(cursor)
+        .map_err(|e| CodecError::Decode(format!("auth vote map: {e}")))?;
+
+    let mut vote = Vote::default();
+
+    for _ in 0..map_len {
+        let key = read_str_key(cursor)?;
+        match key.as_str() {
+            "cred" => vote.cred = decode_credential_from_cursor(cursor)?,
+            "r" => vote.raw_vote = decode_raw_vote(cursor)?,
+            "sig" => vote.sig = decode_one_time_signature(cursor)?,
+            _ => {
+                rmpv::decode::read_value(cursor)
+                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+            }
+        }
+    }
+
+    Ok(vote)
+}
+
+// ── authenticated equivocationVote wire codec ────────────────────────────
+//
+// Go's `agreement.equivocationVote` (full struct, not the bundle-level
+// `equivocationVoteAuthenticator`) has fields sorted alphabetically:
+//
+//   "cred"  -> committee.Credential       (omitempty)
+//   "per"   -> period                     (omitempty)
+//   "props" -> [2]proposalValue           (always fixarray(2); entries are proposalValue sub-maps)
+//   "rnd"   -> basics.Round               (omitempty)
+//   "sigs"  -> [2]crypto.OneTimeSignature (always fixarray(2); entries are OTS sub-maps)
+//   "snd"   -> basics.Address             (omitempty)
+//   "step"  -> step                       (omitempty)
+//
+// Struct-level `codec:",omitempty,omitemptyarray"` only affects
+// variable-length fields; `[2]T` arrays always emit a fixarray(2).
+
+fn encode_equivocation_vote(ev: &EquivocationVote) -> Vec<u8> {
+    let cred_encoded = encode_credential(&ev.cred);
+    let cred_empty = cred_encoded == [0x80];
+    let per_empty = ev.period.0 == 0;
+    let rnd_empty = ev.round.0 == 0;
+    let snd_empty = ev.sender.0 == [0u8; 32];
+    let step_empty = ev.step.0 == 0;
+
+    // props + sigs are always present (fixed-size arrays)
+    let mut count: u8 = 2;
+    if !cred_empty {
+        count += 1;
+    }
+    if !per_empty {
+        count += 1;
+    }
+    if !rnd_empty {
+        count += 1;
+    }
+    if !snd_empty {
+        count += 1;
+    }
+    if !step_empty {
+        count += 1;
+    }
+
+    let mut buf = Vec::with_capacity(1024);
+    rmp::encode::write_map_len(&mut buf, count as u32).unwrap();
+
+    // Sorted: "cred", "per", "props", "rnd", "sigs", "snd", "step"
+    if !cred_empty {
+        write_str_key(&mut buf, "cred");
+        buf.extend_from_slice(&cred_encoded);
+    }
+    if !per_empty {
+        write_str_key(&mut buf, "per");
+        rmp::encode::write_uint(&mut buf, ev.period.0).unwrap();
+    }
+
+    write_str_key(&mut buf, "props");
+    rmp::encode::write_array_len(&mut buf, 2).unwrap();
+    buf.extend_from_slice(&encode_proposal_value(&ev.proposals[0]));
+    buf.extend_from_slice(&encode_proposal_value(&ev.proposals[1]));
+
+    if !rnd_empty {
+        write_str_key(&mut buf, "rnd");
+        rmp::encode::write_uint(&mut buf, ev.round.0).unwrap();
+    }
+
+    write_str_key(&mut buf, "sigs");
+    rmp::encode::write_array_len(&mut buf, 2).unwrap();
+    buf.extend_from_slice(&encode_one_time_signature(&ev.sigs[0]));
+    buf.extend_from_slice(&encode_one_time_signature(&ev.sigs[1]));
+
+    if !snd_empty {
+        write_str_key(&mut buf, "snd");
+        rmp::encode::write_bin(&mut buf, &ev.sender.0).unwrap();
+    }
+    if !step_empty {
+        write_str_key(&mut buf, "step");
+        rmp::encode::write_uint(&mut buf, ev.step.0).unwrap();
+    }
+
+    buf
+}
+
+fn decode_equivocation_vote_from_cursor(
+    cursor: &mut Cursor<&[u8]>,
+) -> Result<EquivocationVote, CodecError> {
+    let map_len = rmp::decode::read_map_len(cursor)
+        .map_err(|e| CodecError::Decode(format!("equivocation vote map: {e}")))?;
+
+    let zero_sig = OneTimeSignature {
+        sig: [0u8; 64],
+        pk: [0u8; 32],
+        pk_sig_old: [0u8; 64],
+        pk2: [0u8; 32],
+        pk1_sig: [0u8; 64],
+        pk2_sig: [0u8; 64],
+    };
+
+    let mut ev = EquivocationVote {
+        sender: Address([0u8; 32]),
+        round: Round(0),
+        period: Period(0),
+        step: Step(0),
+        cred: Credential {
+            weight: 0,
+            vrf_out: Digest([0u8; 32]),
+            domain_separation_enabled: false,
+            hashable: HashableCredential::default(),
+            proof: [0u8; VRF_PROOF_SIZE],
+        },
+        proposals: [BOTTOM, BOTTOM],
+        sigs: [zero_sig.clone(), zero_sig],
+    };
+
+    for _ in 0..map_len {
+        let key = read_str_key(cursor)?;
+        match key.as_str() {
+            "cred" => ev.cred = decode_credential_from_cursor(cursor)?,
+            "per" => ev.period = Period(read_uint64(cursor)?),
+            "props" => {
+                let arr_len = rmp::decode::read_array_len(cursor)
+                    .map_err(|e| CodecError::Decode(format!("props array: {e}")))?;
+                if arr_len != 2 {
+                    return Err(CodecError::Format(format!(
+                        "expected 2 proposals, got {arr_len}"
+                    )));
+                }
+                ev.proposals[0] = decode_proposal_value(cursor)?;
+                ev.proposals[1] = decode_proposal_value(cursor)?;
+            }
+            "rnd" => ev.round = Round(read_uint64(cursor)?),
+            "sigs" => {
+                let arr_len = rmp::decode::read_array_len(cursor)
+                    .map_err(|e| CodecError::Decode(format!("sigs array: {e}")))?;
+                if arr_len != 2 {
+                    return Err(CodecError::Format(format!(
+                        "expected 2 signatures, got {arr_len}"
+                    )));
+                }
+                ev.sigs[0] = decode_one_time_signature(cursor)?;
+                ev.sigs[1] = decode_one_time_signature(cursor)?;
+            }
+            "snd" => ev.sender = Address(read_bin_fixed::<32>(cursor)?),
+            "step" => ev.step = Step(read_uint64(cursor)?),
+            _ => {
+                rmpv::decode::read_value(cursor)
+                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+            }
+        }
+    }
+
+    Ok(ev)
+}
+
+// ── authenticated Bundle wire codec ──────────────────────────────────────
+//
+// Go's `agreement.bundle` (vs `unauthenticatedBundle`) wraps the
+// unauthenticated form and attaches full `[]vote` / `[]equivocationVote`
+// arrays (each carrying its own verified credential/signature) rather
+// than the compressed `[]voteAuthenticator` /
+// `[]equivocationVoteAuthenticator` that the unauthenticated form uses.
+//
+// Wire shape (all `omitempty`, sorted):
+//   "eqv"  -> []equivocationVote
+//   "u"    -> unauthenticatedBundle sub-map
+//   "vote" -> []vote
+
+/// Wire-level authenticated bundle mirroring Go's `agreement.bundle`.
+///
+/// This is a pure msgpack container for roundtrip parity — it does NOT
+/// perform signature/credential verification. For verified-bundle
+/// semantics (threshold checks, duplicate voter detection, etc.), see
+/// [`crate::Bundle`] and [`UnauthenticatedBundle::verify`].
+#[derive(Debug, Clone, Default)]
+pub struct AuthenticatedBundle {
+    /// The underlying unauthenticated bundle (round, period, step, proposal,
+    /// plus the compressed authenticator arrays).
+    pub u: UnauthenticatedBundle,
+    /// Full authenticated votes (each carrying its own `RawVote`,
+    /// `Credential`, and signature).
+    pub votes: Vec<Vote>,
+    /// Full authenticated equivocation votes (each with round/period/step,
+    /// credential, pair of proposals, pair of signatures).
+    pub equivocation_votes: Vec<EquivocationVote>,
+}
+
+/// Encode an authenticated bundle to canonical wire-format msgpack bytes.
+pub fn encode_authenticated_bundle(b: &AuthenticatedBundle) -> Vec<u8> {
+    let u_encoded = encode_bundle(&b.u);
+    let u_empty = u_encoded == [0x80];
+    let eqv_empty = b.equivocation_votes.is_empty();
+    let vote_empty = b.votes.is_empty();
+
+    let mut count: u8 = 0;
+    if !eqv_empty {
+        count += 1;
+    }
+    if !u_empty {
+        count += 1;
+    }
+    if !vote_empty {
+        count += 1;
+    }
+
+    let mut buf = Vec::with_capacity(2048);
+    rmp::encode::write_map_len(&mut buf, count as u32).unwrap();
+
+    // Sorted: "eqv", "u", "vote"
+    if !eqv_empty {
+        write_str_key(&mut buf, "eqv");
+        rmp::encode::write_array_len(&mut buf, b.equivocation_votes.len() as u32).unwrap();
+        for ev in &b.equivocation_votes {
+            buf.extend_from_slice(&encode_equivocation_vote(ev));
+        }
+    }
+    if !u_empty {
+        write_str_key(&mut buf, "u");
+        buf.extend_from_slice(&u_encoded);
+    }
+    if !vote_empty {
+        write_str_key(&mut buf, "vote");
+        rmp::encode::write_array_len(&mut buf, b.votes.len() as u32).unwrap();
+        for v in &b.votes {
+            buf.extend_from_slice(&encode_authenticated_vote(v));
+        }
+    }
+
+    buf
+}
+
+/// Decode an authenticated bundle from canonical wire-format msgpack bytes.
+pub fn decode_authenticated_bundle(bytes: &[u8]) -> Result<AuthenticatedBundle, CodecError> {
+    // Same alloc bound as `decode_bundle`.
+    const MAX_BUNDLE_ARRAY_LEN: u32 = 10_000;
+
+    let mut cursor = Cursor::new(bytes);
+    let map_len = rmp::decode::read_map_len(&mut cursor)
+        .map_err(|e| CodecError::Decode(format!("auth bundle map: {e}")))?;
+
+    let mut ab = AuthenticatedBundle::default();
+
+    for _ in 0..map_len {
+        let key = read_str_key(&mut cursor)?;
+        match key.as_str() {
+            "eqv" => {
+                let arr_len = rmp::decode::read_array_len(&mut cursor)
+                    .map_err(|e| CodecError::Decode(format!("eqv array: {e}")))?;
+                if arr_len > MAX_BUNDLE_ARRAY_LEN {
+                    return Err(CodecError::Format(format!(
+                        "eqv array length {} exceeds maximum {}",
+                        arr_len, MAX_BUNDLE_ARRAY_LEN
+                    )));
+                }
+                let mut evs = Vec::with_capacity(arr_len as usize);
+                for _ in 0..arr_len {
+                    evs.push(decode_equivocation_vote_from_cursor(&mut cursor)?);
+                }
+                ab.equivocation_votes = evs;
+            }
+            "u" => {
+                // The unauthenticated bundle is an inline sub-map; decode
+                // it by delegating to the existing cursor-aware logic.
+                ab.u = decode_unauthenticated_bundle_from_cursor(&mut cursor)?;
+            }
+            "vote" => {
+                let arr_len = rmp::decode::read_array_len(&mut cursor)
+                    .map_err(|e| CodecError::Decode(format!("vote array: {e}")))?;
+                if arr_len > MAX_BUNDLE_ARRAY_LEN {
+                    return Err(CodecError::Format(format!(
+                        "vote array length {} exceeds maximum {}",
+                        arr_len, MAX_BUNDLE_ARRAY_LEN
+                    )));
+                }
+                let mut vs = Vec::with_capacity(arr_len as usize);
+                for _ in 0..arr_len {
+                    vs.push(decode_authenticated_vote_from_cursor(&mut cursor)?);
+                }
+                ab.votes = vs;
+            }
+            _ => {
+                rmpv::decode::read_value(&mut cursor)
+                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+            }
+        }
+    }
+
+    Ok(ab)
+}
+
+/// Decode an `UnauthenticatedBundle` from the current cursor position
+/// (as opposed to a standalone byte slice). Used when a bundle appears
+/// as a nested sub-map (e.g., the `"u"` field of `AuthenticatedBundle`).
+fn decode_unauthenticated_bundle_from_cursor(
+    cursor: &mut Cursor<&[u8]>,
+) -> Result<UnauthenticatedBundle, CodecError> {
+    const MAX_BUNDLE_ARRAY_LEN: u32 = 10_000;
+
+    let map_len = rmp::decode::read_map_len(cursor)
+        .map_err(|e| CodecError::Decode(format!("unauth bundle map: {e}")))?;
+
+    let mut bundle = UnauthenticatedBundle::default();
+
+    for _ in 0..map_len {
+        let key = read_str_key(cursor)?;
+        match key.as_str() {
+            "eqv" => {
+                let arr_len = rmp::decode::read_array_len(cursor)
+                    .map_err(|e| CodecError::Decode(format!("eqv array: {e}")))?;
+                if arr_len > MAX_BUNDLE_ARRAY_LEN {
+                    return Err(CodecError::Format(format!(
+                        "eqv array length {} exceeds maximum {}",
+                        arr_len, MAX_BUNDLE_ARRAY_LEN
+                    )));
+                }
+                let mut evs = Vec::with_capacity(arr_len as usize);
+                for _ in 0..arr_len {
+                    evs.push(decode_equivocation_vote_authenticator(cursor)?);
+                }
+                bundle.equivocation_votes = evs;
+            }
+            "per" => bundle.period = Period(read_uint64(cursor)?),
+            "prop" => bundle.proposal = decode_proposal_value(cursor)?,
+            "rnd" => bundle.round = Round(read_uint64(cursor)?),
+            "step" => bundle.step = Step(read_uint64(cursor)?),
+            "vote" => {
+                let arr_len = rmp::decode::read_array_len(cursor)
+                    .map_err(|e| CodecError::Decode(format!("vote array: {e}")))?;
+                if arr_len > MAX_BUNDLE_ARRAY_LEN {
+                    return Err(CodecError::Format(format!(
+                        "vote array length {} exceeds maximum {}",
+                        arr_len, MAX_BUNDLE_ARRAY_LEN
+                    )));
+                }
+                let mut vs = Vec::with_capacity(arr_len as usize);
+                for _ in 0..arr_len {
+                    vs.push(decode_vote_authenticator(cursor)?);
+                }
+                bundle.votes = vs;
+            }
+            _ => {
+                rmpv::decode::read_value(cursor)
+                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+            }
+        }
+    }
+
+    Ok(bundle)
+}
+
+// ── UnauthenticatedProposal wire codec ───────────────────────────────────
+//
+// `unauthenticatedProposal` embeds `bookkeeping.Block` (flattened into
+// the outer map) and adds `"sdpf"` (VRF seed proof), `"oper"`
+// (OriginalPeriod), `"oprop"` (OriginalProposer). `proposal` embeds
+// `unauthenticatedProposal` without adding any new serialized fields,
+// so its wire bytes are byte-identical.
+//
+// The encode side reuses `algo_codec::canonical_encode_unauthenticated_proposal`,
+// which already produces the canonical sorted-map representation.
+//
+// The decode side delegates block-field handling to
+// `Block::decode_from_bytes` (which skips unknown keys) and then scans
+// the same map for the three uproposal-specific fields.
+
+/// Encode an `UnauthenticatedProposal` to canonical wire-format msgpack bytes.
+///
+/// Produces the same bytes as Go's
+/// `unauthenticatedProposal.MarshalMsg` and (by construction) Go's
+/// `proposal.MarshalMsg`.
+pub fn encode_unauthenticated_proposal(p: &UnauthenticatedProposal) -> Vec<u8> {
+    canonical_encode_unauthenticated_proposal(
+        &p.block,
+        &p.seed_proof,
+        p.original_period.0,
+        &p.original_proposer,
+    )
+}
+
+/// Decode an `UnauthenticatedProposal` from canonical wire-format
+/// msgpack bytes. Accepts both `unauthenticatedProposal` and
+/// `proposal` fixtures (they share the same wire representation).
+pub fn decode_unauthenticated_proposal(
+    bytes: &[u8],
+) -> Result<UnauthenticatedProposal, CodecError> {
+    // Step 1: decode block fields (skips unknown keys).
+    //
+    // `Block::decode_from_bytes` requires `rnd` to be present, but
+    // uproposal fixtures where round=0 omit that key via Go's
+    // `omitempty`. Synthesize `rnd: 0` when the key is absent so the
+    // block decoder can complete — round stays Round(0) either way.
+    let block = decode_block_allowing_missing_rnd(bytes)?;
+
+    // Step 2: scan the map to extract proposal-specific fields.
+    let mut cursor = Cursor::new(bytes);
+    let map_len = rmp::decode::read_map_len(&mut cursor)
+        .map_err(|e| CodecError::Decode(format!("uproposal map: {e}")))?;
+
+    let mut original_period = Period(0);
+    let mut original_proposer = Address([0u8; 32]);
+    let mut seed_proof = [0u8; VRF_PROOF_SIZE];
+
+    for _ in 0..map_len {
+        let key = read_str_key(&mut cursor)?;
+        match key.as_str() {
+            "oper" => original_period = Period(read_uint64(&mut cursor)?),
+            "oprop" => original_proposer = Address(read_bin_fixed::<32>(&mut cursor)?),
+            "sdpf" => seed_proof = read_bin_fixed::<VRF_PROOF_SIZE>(&mut cursor)?,
+            _ => {
+                // Skip all block fields (already consumed via the
+                // block decoder above) and any unknown fields.
+                rmpv::decode::read_value(&mut cursor)
+                    .map_err(|e| CodecError::Decode(format!("skip field: {e}")))?;
+            }
+        }
+    }
+
+    Ok(UnauthenticatedProposal {
+        block,
+        seed_proof,
+        original_period,
+        original_proposer,
+    })
+}
+
+/// Run `Block::decode_from_bytes`, synthesizing a `rnd: 0` entry in the
+/// top-level map first if the key is absent. Needed because that
+/// decoder hard-requires `rnd`, whereas Go msgp omits zero rounds via
+/// `omitempty` — a legitimate shape for the uproposal / transmitted
+/// payload fixtures where round=0.
+fn decode_block_allowing_missing_rnd(bytes: &[u8]) -> Result<Block, CodecError> {
+    if map_has_key(bytes, "rnd")? {
+        return Block::decode_from_bytes(bytes)
+            .map_err(|e| CodecError::Decode(format!("block decode: {e}")));
+    }
+    let patched = inject_rnd_zero(bytes)?;
+    Block::decode_from_bytes(&patched)
+        .map_err(|e| CodecError::Decode(format!("block decode (rnd synthesized): {e}")))
+}
+
+/// Returns `true` if the top-level msgpack map in `bytes` contains the
+/// string key `needle`.
+fn map_has_key(bytes: &[u8], needle: &str) -> Result<bool, CodecError> {
+    let mut cursor = Cursor::new(bytes);
+    let map_len = rmp::decode::read_map_len(&mut cursor)
+        .map_err(|e| CodecError::Decode(format!("map header: {e}")))?;
+    for _ in 0..map_len {
+        let key = read_str_key(&mut cursor)?;
+        if key == needle {
+            return Ok(true);
+        }
+        rmpv::decode::read_value(&mut cursor)
+            .map_err(|e| CodecError::Decode(format!("skip value: {e}")))?;
+    }
+    Ok(false)
+}
+
+/// Insert a `"rnd" -> 0` entry at the sorted position in a top-level
+/// msgpack map and return the patched bytes.
+fn inject_rnd_zero(bytes: &[u8]) -> Result<Vec<u8>, CodecError> {
+    let mut cursor = Cursor::new(bytes);
+    let map_len = rmp::decode::read_map_len(&mut cursor)
+        .map_err(|e| CodecError::Decode(format!("map header: {e}")))?;
+    let header_end = cursor.position() as usize;
+    let kv_bytes = &bytes[header_end..];
+
+    let mut scan = Cursor::new(kv_bytes);
+    let mut insert_offset = kv_bytes.len();
+    for _ in 0..map_len {
+        let key_start = scan.position() as usize;
+        let key_val = rmpv::decode::read_value(&mut scan)
+            .map_err(|e| CodecError::Decode(format!("key: {e}")))?;
+        if let rmpv::Value::String(ref s) = key_val {
+            if let Some(k) = s.as_str() {
+                if k > "rnd" {
+                    insert_offset = key_start;
+                    break;
+                }
+            }
+        }
+        rmpv::decode::read_value(&mut scan)
+            .map_err(|e| CodecError::Decode(format!("value: {e}")))?;
+    }
+
+    let new_map_len = map_len + 1;
+    let mut buf = Vec::with_capacity(bytes.len() + 8);
+    rmp::encode::write_map_len(&mut buf, new_map_len).unwrap();
+    buf.extend_from_slice(&kv_bytes[..insert_offset]);
+    write_str_key(&mut buf, "rnd");
+    rmp::encode::write_uint(&mut buf, 0).unwrap();
+    buf.extend_from_slice(&kv_bytes[insert_offset..]);
+
+    Ok(buf)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
