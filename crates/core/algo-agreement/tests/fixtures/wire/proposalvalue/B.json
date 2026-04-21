@@ -1,0 +1,8 @@
+{
+  "byte_count": 126,
+  "doc": "distinct B",
+  "hex_head": "84a3646967c420cccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "name": "B",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.proposalValue"
+}

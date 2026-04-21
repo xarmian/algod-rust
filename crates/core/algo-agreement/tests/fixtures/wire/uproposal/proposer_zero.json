@@ -1,0 +1,8 @@
+{
+  "byte_count": 132,
+  "doc": "OriginalProposer=all-zero",
+  "hex_head": "83a3726e6401a473647066c45005060708090a0b0c0d0e0f1011121314151617",
+  "name": "proposer_zero",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedProposal"
+}

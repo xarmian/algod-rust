@@ -1,0 +1,8 @@
+{
+  "byte_count": 624,
+  "doc": "uvote wrapping rawVote/period_0_step_0",
+  "hex_head": "83a46372656481a27066c4504142434445464748494a4b4c4d4e4f5051525354",
+  "name": "r_period_0_step_0",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedVote"
+}

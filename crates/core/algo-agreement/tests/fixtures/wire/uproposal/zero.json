@@ -1,0 +1,8 @@
+{
+  "byte_count": 1,
+  "doc": "zero-valued",
+  "hex_head": "80",
+  "name": "zero",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedProposal"
+}

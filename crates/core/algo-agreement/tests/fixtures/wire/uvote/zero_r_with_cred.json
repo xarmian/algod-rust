@@ -1,0 +1,8 @@
+{
+  "byte_count": 447,
+  "doc": "R zero, cred + sig present",
+  "hex_head": "82a46372656481a27066c4501112131415161718191a1b1c1d1e1f2021222324",
+  "name": "zero_r_with_cred",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedVote"
+}

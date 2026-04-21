@@ -1,0 +1,8 @@
+{
+  "byte_count": 85,
+  "doc": "block header only, no seed proof (as proposal; unexported fields unserialized)",
+  "hex_head": "83a56f70726f70c4204242424242424242424242424242424242424242424242",
+  "name": "header_only_no_seedproof",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.proposal"
+}

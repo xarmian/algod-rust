@@ -1,0 +1,8 @@
+{
+  "byte_count": 55,
+  "doc": "next-vote step (3) with bottom proposal",
+  "hex_head": "84a370657201a3726e6401a3736e64c420040404040404040404040404040404",
+  "name": "step_next_bottom",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.rawVote"
+}

@@ -1,0 +1,8 @@
+{
+  "byte_count": 635,
+  "doc": "uvote wrapping rawVote/step_recovery_4",
+  "hex_head": "83a46372656481a27066c45035363738393a3b3c3d3e3f404142434445464748",
+  "name": "r_step_recovery_4",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedVote"
+}

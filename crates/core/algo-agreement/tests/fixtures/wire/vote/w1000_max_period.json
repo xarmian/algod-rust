@@ -1,0 +1,8 @@
+{
+  "byte_count": 681,
+  "doc": "weight=1000, rawVote/max_period",
+  "hex_head": "83a46372656483a168c420393939393939393939393939393939393939393939",
+  "name": "w1000_max_period",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.vote"
+}

@@ -1,0 +1,8 @@
+{
+  "byte_count": 1598,
+  "doc": "bundle at earliest round/period/step",
+  "hex_head": "83a470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "name": "round_1_period_0_step_0",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedBundle"
+}

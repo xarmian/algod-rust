@@ -1,0 +1,8 @@
+{
+  "byte_count": 185,
+  "doc": "round 10_000_000",
+  "hex_head": "84a470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "name": "round_large",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.rawVote"
+}

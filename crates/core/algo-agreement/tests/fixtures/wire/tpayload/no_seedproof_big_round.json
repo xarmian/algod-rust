@@ -1,0 +1,8 @@
+{
+  "byte_count": 591,
+  "doc": "round 10M, no seed proof + PriorVote/bottom_proposal_prop_step",
+  "hex_head": "85a46f70657205a56f70726f70c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "name": "no_seedproof_big_round",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.transmittedPayload"
+}

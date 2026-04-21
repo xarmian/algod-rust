@@ -1,0 +1,8 @@
+{
+  "byte_count": 664,
+  "doc": "weight=5, rawVote/step_propose",
+  "hex_head": "83a46372656483a168c4200b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+  "name": "w5_step_propose",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.vote"
+}

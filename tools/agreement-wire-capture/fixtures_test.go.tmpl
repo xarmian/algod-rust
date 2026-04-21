@@ -1,0 +1,629 @@
+// Code generated & maintained by `tools/agreement-wire-capture` in
+// the algod-rust repository. This file is STAGED into
+// `../go-algorand/agreement/algod_rust_wire_fixtures_test.go` at
+// regeneration time and removed afterwards — see `main.go` in the
+// same tool directory.
+//
+// The file lives in the `agreement` package for the sole reason that
+// every interesting wire type (rawVote, unauthenticatedVote, vote,
+// unauthenticatedBundle, bundle, voteAuthenticator,
+// equivocationVoteAuthenticator, unauthenticatedProposal,
+// transmittedPayload) is package-private. The fixtures themselves are
+// deterministic, synthetic values whose crypto fields (VrfProof,
+// OneTimeSignature, Credential) are filled with predictable byte
+// patterns; we're probing canonical msgpack encoding, not signature
+// validity.
+//
+// Output layout per wire type `T`:
+//
+//	<dir>/<subdir>/<name>.msgpack  -- raw protocol.Encode(&v) bytes
+//	<dir>/<subdir>/<name>.json     -- metadata sidecar (JSON)
+//
+// `dir` is taken from the `ALGOD_RUST_WIRE_FIXTURE_DIR` env var. If
+// unset, the test skips — so running `go test ./agreement/...`
+// normally doesn't produce files.
+
+package agreement
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/algorand/go-algorand/crypto"
+	"github.com/algorand/go-algorand/data/basics"
+	"github.com/algorand/go-algorand/data/bookkeeping"
+	"github.com/algorand/go-algorand/data/committee"
+	"github.com/algorand/go-algorand/protocol"
+)
+
+// arfAddr builds a deterministic 32-byte basics.Address from a single seed byte.
+func arfAddr(seed byte) basics.Address {
+	var a basics.Address
+	for i := range a {
+		a[i] = seed
+	}
+	return a
+}
+
+// arfDigest fills a 32-byte digest with `seed` in every byte.
+func arfDigest(seed byte) crypto.Digest {
+	var d crypto.Digest
+	for i := range d {
+		d[i] = seed
+	}
+	return d
+}
+
+// arfVrfProof fills an 80-byte VRF proof with a repeating pattern seeded
+// by `seed`. Values are not cryptographically valid — we only need a
+// deterministic byte pattern for canonical msgpack.
+func arfVrfProof(seed byte) crypto.VrfProof {
+	var p crypto.VrfProof
+	for i := range p {
+		p[i] = byte((int(seed) + i) & 0xff)
+	}
+	return p
+}
+
+// arfVrfOutput fills a 64-byte VRF output similarly.
+func arfVrfOutput(seed byte) crypto.VrfOutput {
+	var o crypto.VrfOutput
+	for i := range o {
+		o[i] = byte((int(seed) + i) & 0xff)
+	}
+	return o
+}
+
+// arfOneTimeSig produces a deterministic OneTimeSignature with all
+// inner fields populated. It's not a valid signature, but the msgpack
+// shape is identical to a real one — that's what the fixture is
+// probing.
+func arfOneTimeSig(seed byte) crypto.OneTimeSignature {
+	var sig crypto.OneTimeSignature
+	for i := range sig.Sig {
+		sig.Sig[i] = byte((int(seed) + i) & 0xff)
+	}
+	for i := range sig.PK {
+		sig.PK[i] = byte((int(seed) + 0x40 + i) & 0xff)
+	}
+	for i := range sig.PKSigOld {
+		sig.PKSigOld[i] = byte((int(seed) + 0x80 + i) & 0xff)
+	}
+	for i := range sig.PK2 {
+		sig.PK2[i] = byte((int(seed) + 0xc0 + i) & 0xff)
+	}
+	for i := range sig.PK1Sig {
+		sig.PK1Sig[i] = byte((int(seed) + 0x20 + i) & 0xff)
+	}
+	for i := range sig.PK2Sig {
+		sig.PK2Sig[i] = byte((int(seed) + 0x60 + i) & 0xff)
+	}
+	return sig
+}
+
+// arfUnauthCred produces a deterministic UnauthenticatedCredential.
+func arfUnauthCred(seed byte) committee.UnauthenticatedCredential {
+	return committee.UnauthenticatedCredential{Proof: arfVrfProof(seed)}
+}
+
+// arfCred produces a deterministic authenticated Credential.
+// `Weight` is the only field we set; VrfOut / Hashable / Selected
+// mirror a fixed nonzero stake so the msgpack shape matches a real vote.
+func arfCred(seed byte, weight uint64) committee.Credential {
+	return committee.Credential{
+		UnauthenticatedCredential: arfUnauthCred(seed),
+		VrfOut:                    arfDigest(seed ^ 0x5a),
+		Weight:                    weight,
+		// Selected / DomainSeparationEnabled are zero-value; they're
+		// either `codec:"-"` or omitempty in msgp_gen.go — verify by
+		// inspection if the shape ever drifts.
+	}
+}
+
+// arfProposalValue builds a deterministic non-bottom proposalValue.
+// `seed` varies the inner digests; passing 0 to all fields produces
+// the canonical bottom proposal (zero-value).
+func arfProposalValue(originalPeriod period, origProposer byte, block byte, enc byte) proposalValue {
+	return proposalValue{
+		OriginalPeriod:   originalPeriod,
+		OriginalProposer: arfAddr(origProposer),
+		BlockDigest:      arfDigest(block),
+		EncodingDigest:   arfDigest(enc),
+	}
+}
+
+// writeFixture encodes `v` and writes both the raw msgpack bytes and a
+// JSON metadata sidecar.
+func writeFixture(t *testing.T, dir, subdir, name, doc string, v interface{}) {
+	t.Helper()
+	full := filepath.Join(dir, subdir)
+	if err := os.MkdirAll(full, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", full, err)
+	}
+
+	// protocol.Encode takes an interface; the underlying types all
+	// implement it via msgp_gen.go. We pass a pointer where required.
+	var encoded []byte
+	switch x := v.(type) {
+	case *rawVote:
+		encoded = protocol.Encode(x)
+	case *unauthenticatedVote:
+		encoded = protocol.Encode(x)
+	case *vote:
+		encoded = protocol.Encode(x)
+	case *unauthenticatedBundle:
+		encoded = protocol.Encode(x)
+	case *bundle:
+		encoded = protocol.Encode(x)
+	case *unauthenticatedProposal:
+		encoded = protocol.Encode(x)
+	case *proposal:
+		encoded = protocol.Encode(x)
+	case *transmittedPayload:
+		encoded = protocol.Encode(x)
+	case *proposalValue:
+		encoded = protocol.Encode(x)
+	default:
+		t.Fatalf("writeFixture %q: unsupported type %T", name, v)
+	}
+
+	msgpackPath := filepath.Join(full, name+".msgpack")
+	if err := os.WriteFile(msgpackPath, encoded, 0o644); err != nil {
+		t.Fatalf("write %s: %v", msgpackPath, err)
+	}
+
+	meta := map[string]interface{}{
+		"name":       name,
+		"type":       fmt.Sprintf("%T", v),
+		"doc":        doc,
+		"byte_count": len(encoded),
+		"hex_head":   hex.EncodeToString(encoded[:min(32, len(encoded))]),
+		"source":     "algod-rust/tools/agreement-wire-capture (TASK-54)",
+	}
+	metaJSON, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal meta %s: %v", name, err)
+	}
+	metaJSON = append(metaJSON, '\n')
+	metaPath := filepath.Join(full, name+".json")
+	if err := os.WriteFile(metaPath, metaJSON, 0o644); err != nil {
+		t.Fatalf("write %s: %v", metaPath, err)
+	}
+}
+
+// TestAlgodRustGenerateWireFixtures is the entry point invoked by
+// `tools/agreement-wire-capture`'s wrapper. It's a no-op when
+// ALGOD_RUST_WIRE_FIXTURE_DIR is unset, so a normal `go test ./...`
+// in go-algorand doesn't litter the workspace.
+func TestAlgodRustGenerateWireFixtures(t *testing.T) {
+	dir := os.Getenv("ALGOD_RUST_WIRE_FIXTURE_DIR")
+	if dir == "" {
+		t.Skip("ALGOD_RUST_WIRE_FIXTURE_DIR not set; invoke via tools/agreement-wire-capture.")
+	}
+
+	// Reference proposalValues used across the corpus.
+	pvBottom := proposalValue{} // canonical "bottom" / nil proposal
+	pvA := arfProposalValue(1, 0x42, 0xaa, 0xbb)
+	pvB := arfProposalValue(2, 0x43, 0xcc, 0xdd)
+
+	// ---- rawVote fixtures (20) ---------------------------------
+	rawVoteCases := []struct {
+		name  string
+		doc   string
+		value rawVote
+	}{
+		{"zero", "zero-valued rawVote", rawVote{}},
+		{"step_propose", "propose step (0), period 0, round 1, pv A", rawVote{
+			Sender: arfAddr(0x01), Round: basics.Round(1), Period: period(0), Step: step(0), Proposal: pvA,
+		}},
+		{"step_soft", "soft step (1)", rawVote{
+			Sender: arfAddr(0x02), Round: basics.Round(1), Period: period(0), Step: step(1), Proposal: pvA,
+		}},
+		{"step_cert", "cert step (2)", rawVote{
+			Sender: arfAddr(0x03), Round: basics.Round(1), Period: period(0), Step: step(2), Proposal: pvA,
+		}},
+		{"step_next_bottom", "next-vote step (3) with bottom proposal", rawVote{
+			Sender: arfAddr(0x04), Round: basics.Round(1), Period: period(1), Step: step(3), Proposal: pvBottom,
+		}},
+		{"step_recovery_4", "recovery step 4", rawVote{
+			Sender: arfAddr(0x05), Round: basics.Round(1), Period: period(2), Step: step(4), Proposal: pvA,
+		}},
+		{"step_recovery_5", "recovery step 5", rawVote{
+			Sender: arfAddr(0x06), Round: basics.Round(1), Period: period(3), Step: step(5), Proposal: pvB,
+		}},
+		{"round_small", "round 100", rawVote{
+			Sender: arfAddr(0x07), Round: basics.Round(100), Period: period(0), Step: step(1), Proposal: pvA,
+		}},
+		{"round_large", "round 10_000_000", rawVote{
+			Sender: arfAddr(0x08), Round: basics.Round(10_000_000), Period: period(0), Step: step(1), Proposal: pvA,
+		}},
+		{"period_large", "period 1000", rawVote{
+			Sender: arfAddr(0x09), Round: basics.Round(42), Period: period(1000), Step: step(1), Proposal: pvA,
+		}},
+		{"proposal_value_A", "distinct proposal A", rawVote{
+			Sender: arfAddr(0x0a), Round: basics.Round(42), Period: period(0), Step: step(1), Proposal: pvA,
+		}},
+		{"proposal_value_B", "distinct proposal B", rawVote{
+			Sender: arfAddr(0x0b), Round: basics.Round(42), Period: period(0), Step: step(1), Proposal: pvB,
+		}},
+		{"sender_00", "sender=all-0x00", rawVote{
+			Sender: arfAddr(0x00), Round: basics.Round(42), Period: period(0), Step: step(1), Proposal: pvA,
+		}},
+		{"sender_ff", "sender=all-0xff", rawVote{
+			Sender: arfAddr(0xff), Round: basics.Round(42), Period: period(0), Step: step(1), Proposal: pvA,
+		}},
+		{"bottom_proposal_prop_step", "bottom proposal on a non-next step (unusual but well-formed)", rawVote{
+			Sender: arfAddr(0x0e), Round: basics.Round(7), Period: period(0), Step: step(0), Proposal: pvBottom,
+		}},
+		{"high_period_next", "high period, next-vote, bottom", rawVote{
+			Sender: arfAddr(0x0f), Round: basics.Round(5), Period: period(500), Step: step(3), Proposal: pvBottom,
+		}},
+		{"round_1", "smallest nonzero round", rawVote{
+			Sender: arfAddr(0x10), Round: basics.Round(1), Period: period(0), Step: step(1), Proposal: pvA,
+		}},
+		{"period_0_step_0", "propose step at period 0 (origin)", rawVote{
+			Sender: arfAddr(0x11), Round: basics.Round(1), Period: period(0), Step: step(0), Proposal: pvA,
+		}},
+		{"distinct_all", "all fields distinct", rawVote{
+			Sender: arfAddr(0x22), Round: basics.Round(99999), Period: period(7), Step: step(2),
+			Proposal: arfProposalValue(7, 0x33, 0x44, 0x55),
+		}},
+		{"max_period", "period near u32 max", rawVote{
+			Sender: arfAddr(0x33), Round: basics.Round(10), Period: period(0xffffff), Step: step(1), Proposal: pvA,
+		}},
+	}
+	for i := range rawVoteCases {
+		c := &rawVoteCases[i]
+		writeFixture(t, dir, "rawvote", c.name, c.doc, &c.value)
+	}
+
+	// ---- unauthenticatedVote fixtures (20) ---------------------
+	uvBase := func(seed byte, r rawVote) unauthenticatedVote {
+		return unauthenticatedVote{
+			R:    r,
+			Cred: arfUnauthCred(seed),
+			Sig:  arfOneTimeSig(seed),
+		}
+	}
+	uvoteCases := []struct {
+		name  string
+		doc   string
+		value unauthenticatedVote
+	}{
+		{"zero", "zero-valued", unauthenticatedVote{}},
+		{"zero_r_with_cred", "R zero, cred + sig present", uvBase(0x11, rawVote{})},
+	}
+	for i, rc := range rawVoteCases {
+		if i == 0 {
+			continue // already covered as "zero_r_with_cred" (ish)
+		}
+		uvoteCases = append(uvoteCases, struct {
+			name  string
+			doc   string
+			value unauthenticatedVote
+		}{
+			name:  "r_" + rc.name,
+			doc:   "uvote wrapping rawVote/" + rc.name,
+			value: uvBase(byte(0x30+i), rc.value),
+		})
+	}
+	// Trim/ensure ≥20.
+	for i := range uvoteCases {
+		c := &uvoteCases[i]
+		writeFixture(t, dir, "uvote", c.name, c.doc, &c.value)
+	}
+
+	// ---- authenticated vote fixtures (20) -----------------------
+	vBase := func(seed byte, r rawVote, weight uint64) vote {
+		return vote{
+			R:    r,
+			Cred: arfCred(seed, weight),
+			Sig:  arfOneTimeSig(seed ^ 0x3c),
+		}
+	}
+	voteCases := []struct {
+		name  string
+		doc   string
+		value vote
+	}{
+		{"zero", "zero-valued authenticated vote", vote{}},
+		{"weight_1", "weight=1", vBase(0x21, rawVoteCases[1].value, 1)},
+	}
+	weights := []uint64{1, 5, 20, 100, 1000}
+	for i, rc := range rawVoteCases {
+		if i == 0 {
+			continue
+		}
+		w := weights[i%len(weights)]
+		voteCases = append(voteCases, struct {
+			name  string
+			doc   string
+			value vote
+		}{
+			name:  "w" + fmt.Sprint(w) + "_" + rc.name,
+			doc:   fmt.Sprintf("weight=%d, rawVote/%s", w, rc.name),
+			value: vBase(byte(0x50+i), rc.value, w),
+		})
+	}
+	for i := range voteCases {
+		c := &voteCases[i]
+		writeFixture(t, dir, "vote", c.name, c.doc, &c.value)
+	}
+
+	// ---- unauthenticatedBundle / certificate fixtures (20) ------
+	//
+	// Go-algorand's `Certificate` is `type Certificate unauthenticatedBundle`,
+	// so certificate fixtures are exactly the same encoding shape. We
+	// write the same corpus under `ubundle/` and symlink-equivalent
+	// `cert/` (actually a second write to cover the named type — the
+	// wire is identical but having a canonical `cert/` directory makes
+	// the Rust-side harness path-symmetric with the task's spec).
+	mkAuth := func(seed byte) voteAuthenticator {
+		return voteAuthenticator{
+			Sender: arfAddr(seed),
+			Cred:   arfUnauthCred(seed ^ 0x0a),
+			Sig:    arfOneTimeSig(seed ^ 0x5a),
+		}
+	}
+	mkEqAuth := func(seed byte) equivocationVoteAuthenticator {
+		return equivocationVoteAuthenticator{
+			Sender: arfAddr(seed),
+			Cred:   arfUnauthCred(seed ^ 0x0a),
+			Sigs: [2]crypto.OneTimeSignature{
+				arfOneTimeSig(seed ^ 0x11),
+				arfOneTimeSig(seed ^ 0x22),
+			},
+			Proposals: [2]proposalValue{pvA, pvB},
+		}
+	}
+
+	mkBundle := func(nVotes, nEq int, round basics.Round, per period, stp step, prop proposalValue) unauthenticatedBundle {
+		u := unauthenticatedBundle{Round: round, Period: per, Step: stp, Proposal: prop}
+		for i := 0; i < nVotes; i++ {
+			u.Votes = append(u.Votes, mkAuth(byte(0x60+i)))
+		}
+		for i := 0; i < nEq; i++ {
+			u.EquivocationVotes = append(u.EquivocationVotes, mkEqAuth(byte(0x80+i)))
+		}
+		return u
+	}
+
+	ubundleCases := []struct {
+		name  string
+		doc   string
+		value unauthenticatedBundle
+	}{
+		{"zero", "zero-valued", unauthenticatedBundle{}},
+		{"min_one_vote", "1 vote, min threshold", mkBundle(1, 0, 1, 0, 2, pvA)},
+		{"five_votes", "5 votes", mkBundle(5, 0, 1, 0, 2, pvA)},
+		{"ten_votes", "10 votes", mkBundle(10, 0, 1, 0, 2, pvA)},
+		{"twenty_votes", "20 votes (full soft committee)", mkBundle(20, 0, 1, 0, 2, pvA)},
+		{"with_1_equivocation", "5 votes + 1 equivocation", mkBundle(5, 1, 1, 0, 2, pvA)},
+		{"with_3_equivocations", "5 votes + 3 equivocations", mkBundle(5, 3, 1, 0, 2, pvA)},
+		{"only_equivocations", "0 votes + 2 equivocations", mkBundle(0, 2, 1, 0, 2, pvA)},
+		{"bottom_proposal", "bundle for bottom (nil) proposal", mkBundle(5, 0, 1, 0, 3, pvBottom)},
+		{"step_recovery", "bundle for recovery step 4", mkBundle(5, 0, 1, 1, 4, pvA)},
+		{"high_round", "bundle at round 10M", mkBundle(5, 0, 10_000_000, 0, 2, pvA)},
+		{"high_period", "bundle at period 500", mkBundle(5, 0, 10, 500, 2, pvA)},
+		{"distinct_proposal", "proposal B, 10 votes", mkBundle(10, 0, 1, 0, 2, pvB)},
+		{"full_mix", "20 votes + 5 equivocations", mkBundle(20, 5, 1, 0, 2, pvA)},
+		{"min_zero_round", "1 vote at round 0 (degenerate but legal)", mkBundle(1, 0, 0, 0, 1, pvA)},
+		{"round_1_period_0_step_0", "bundle at earliest round/period/step", mkBundle(3, 0, 1, 0, 0, pvA)},
+		{"round_1_period_1_step_3_bottom", "period-1 next-vote bundle on bottom", mkBundle(3, 0, 1, 1, 3, pvBottom)},
+		{"equivocation_heavy", "1 vote + 10 equivocations", mkBundle(1, 10, 1, 0, 2, pvA)},
+		{"fifteen_votes_distinct_prop", "15 votes for proposal B", mkBundle(15, 0, 1, 0, 2, pvB)},
+		{"two_votes", "2 votes", mkBundle(2, 0, 1, 0, 2, pvA)},
+	}
+	for i := range ubundleCases {
+		c := &ubundleCases[i]
+		writeFixture(t, dir, "ubundle", c.name, c.doc, &c.value)
+	}
+	// Certificate corpus mirrors ubundle — Certificate is a type alias.
+	// We cast via `unauthenticatedBundle(cert) = cert` conceptually;
+	// here we just write the same struct under cert/ with identical names.
+	for i := range ubundleCases {
+		c := &ubundleCases[i]
+		cert := Certificate(c.value) // named-type conversion; same wire bytes
+		writeFixture(t, dir, "cert", c.name, c.doc+" (as Certificate)", (*unauthenticatedBundle)(&cert))
+	}
+
+	// ---- authenticated bundle (agreement.bundle) fixtures (20) --
+	// bundle wraps an unauthenticatedBundle + internal Vote/Equivocation
+	// slices. For encoding the task only cares about ≥20 fixtures, so
+	// we produce variants parallel to ubundle.
+	mkVoteStruct := func(seed byte, r rawVote, weight uint64) vote { return vBase(seed, r, weight) }
+	mkBundleAuth := func(nVotes, nEq int, round basics.Round, per period, stp step, prop proposalValue) bundle {
+		b := bundle{U: mkBundle(nVotes, nEq, round, per, stp, prop)}
+		// Mirror Votes/EquivocationVotes with internal vote / equivocationVote
+		// for symmetry. Sender/Cred fields drive the msgpack shape.
+		baseR := rawVote{Round: round, Period: per, Step: stp, Proposal: prop}
+		for i := 0; i < nVotes; i++ {
+			rv := baseR
+			rv.Sender = arfAddr(byte(0xa0 + i))
+			b.Votes = append(b.Votes, mkVoteStruct(byte(0xa0+i), rv, 1))
+		}
+		for i := 0; i < nEq; i++ {
+			b.EquivocationVotes = append(b.EquivocationVotes, equivocationVote{
+				Sender:    arfAddr(byte(0xc0 + i)),
+				Round:     round,
+				Period:    per,
+				Step:      stp,
+				Cred:      arfCred(byte(0xc0+i), 1),
+				Proposals: [2]proposalValue{pvA, pvB},
+				Sigs: [2]crypto.OneTimeSignature{
+					arfOneTimeSig(byte(0xc0 + i)),
+					arfOneTimeSig(byte(0xd0 + i)),
+				},
+			})
+		}
+		return b
+	}
+	bundleCases := []struct {
+		name  string
+		doc   string
+		value bundle
+	}{
+		{"zero", "zero-valued", bundle{}},
+		{"min_one_vote", "1 vote", mkBundleAuth(1, 0, 1, 0, 2, pvA)},
+		{"five_votes", "5 votes", mkBundleAuth(5, 0, 1, 0, 2, pvA)},
+		{"ten_votes", "10 votes", mkBundleAuth(10, 0, 1, 0, 2, pvA)},
+		{"twenty_votes", "20 votes", mkBundleAuth(20, 0, 1, 0, 2, pvA)},
+		{"with_1_equivocation", "5 votes + 1 equivocation", mkBundleAuth(5, 1, 1, 0, 2, pvA)},
+		{"with_3_equivocations", "5 votes + 3 equivocations", mkBundleAuth(5, 3, 1, 0, 2, pvA)},
+		{"only_equivocations", "0 votes + 2 equivocations", mkBundleAuth(0, 2, 1, 0, 2, pvA)},
+		{"bottom_proposal", "bundle for bottom", mkBundleAuth(5, 0, 1, 0, 3, pvBottom)},
+		{"step_recovery", "recovery step 4", mkBundleAuth(5, 0, 1, 1, 4, pvA)},
+		{"high_round", "round 10M", mkBundleAuth(5, 0, 10_000_000, 0, 2, pvA)},
+		{"high_period", "period 500", mkBundleAuth(5, 0, 10, 500, 2, pvA)},
+		{"distinct_proposal", "10 votes for proposal B", mkBundleAuth(10, 0, 1, 0, 2, pvB)},
+		{"full_mix", "20 votes + 5 equivocations", mkBundleAuth(20, 5, 1, 0, 2, pvA)},
+		{"min_zero_round", "1 vote at round 0", mkBundleAuth(1, 0, 0, 0, 1, pvA)},
+		{"earliest", "round/period/step all 0/0/0", mkBundleAuth(3, 0, 1, 0, 0, pvA)},
+		{"next_vote_bottom", "period-1 next-vote bundle on bottom", mkBundleAuth(3, 0, 1, 1, 3, pvBottom)},
+		{"equivocation_heavy", "1 vote + 10 equivocations", mkBundleAuth(1, 10, 1, 0, 2, pvA)},
+		{"fifteen_votes_B", "15 votes, proposal B", mkBundleAuth(15, 0, 1, 0, 2, pvB)},
+		{"two_votes", "2 votes", mkBundleAuth(2, 0, 1, 0, 2, pvA)},
+	}
+	for i := range bundleCases {
+		c := &bundleCases[i]
+		writeFixture(t, dir, "bundle", c.name, c.doc, &c.value)
+	}
+
+	// ---- unauthenticatedProposal / proposal / transmittedPayload (20 each) ----
+	//
+	// Proposals wrap bookkeeping.Block plus a SeedProof / OriginalPeriod /
+	// OriginalProposer. We vary the block header fields minimally — the
+	// msgpack shape exercises the outer Proposal wrapper, not Block's
+	// internals (which have their own msgp_gen coverage in go-algorand).
+	mkBlockHeader := func(round basics.Round) bookkeeping.BlockHeader {
+		var h bookkeeping.BlockHeader
+		h.Round = round
+		h.Seed = committee.Seed(arfDigest(byte(round % 256)))
+		return h
+	}
+	mkUProp := func(seed byte, round basics.Round, origPeriod period, origProposer byte, withSeedProof bool) unauthenticatedProposal {
+		var p unauthenticatedProposal
+		p.Block = bookkeeping.Block{BlockHeader: mkBlockHeader(round)}
+		if withSeedProof {
+			p.SeedProof = arfVrfProof(seed)
+		}
+		p.OriginalPeriod = origPeriod
+		p.OriginalProposer = arfAddr(origProposer)
+		return p
+	}
+	uproposalCases := []struct {
+		name  string
+		doc   string
+		value unauthenticatedProposal
+	}{
+		{"zero", "zero-valued", unauthenticatedProposal{}},
+		{"header_only_no_seedproof", "block header only, no seed proof", mkUProp(0x01, 1, 0, 0x42, false)},
+		{"header_with_seedproof", "block header + seed proof", mkUProp(0x02, 1, 0, 0x42, true)},
+		{"high_round", "round 10M", mkUProp(0x03, 10_000_000, 0, 0x42, true)},
+		{"period_large", "original period 1000", mkUProp(0x04, 42, 1000, 0x55, true)},
+		{"proposer_zero", "OriginalProposer=all-zero", mkUProp(0x05, 1, 0, 0x00, true)},
+		{"proposer_ff", "OriginalProposer=all-0xff", mkUProp(0x06, 1, 0, 0xff, true)},
+		{"distinct_seed", "distinct seed byte pattern", mkUProp(0xa1, 5, 0, 0x42, true)},
+		{"round_1_period_0", "round=1, period=0", mkUProp(0x07, 1, 0, 0x42, true)},
+		{"round_1_period_1", "round=1, period=1", mkUProp(0x08, 1, 1, 0x42, true)},
+		{"round_1_period_2", "round=1, period=2", mkUProp(0x09, 1, 2, 0x42, true)},
+		{"round_2", "round 2", mkUProp(0x0a, 2, 0, 0x42, true)},
+		{"round_100", "round 100", mkUProp(0x0b, 100, 0, 0x42, true)},
+		{"round_1000", "round 1000", mkUProp(0x0c, 1000, 0, 0x42, true)},
+		{"no_seedproof_big_round", "round 10M, no seed proof", mkUProp(0x0d, 10_000_000, 5, 0xaa, false)},
+		{"no_seedproof_zero_round", "round 0, no seed proof", mkUProp(0x0e, 0, 0, 0x11, false)},
+		{"seed_proof_all_00", "seed proof filled with 0x00 (not arf)", func() unauthenticatedProposal {
+			p := mkUProp(0x10, 1, 0, 0x42, false)
+			p.SeedProof = crypto.VrfProof{} // explicit zero (empty or omitempty depending on codec tag)
+			return p
+		}()},
+		{"seed_proof_all_ff", "seed proof filled with 0xff", func() unauthenticatedProposal {
+			p := mkUProp(0x11, 1, 0, 0x42, false)
+			for i := range p.SeedProof {
+				p.SeedProof[i] = 0xff
+			}
+			return p
+		}()},
+		{"distinct_all", "distinct seed+round+period+proposer", mkUProp(0x12, 777, 13, 0x33, true)},
+		{"round_u32_max_like", "round 4294967295", mkUProp(0x13, basics.Round(4_294_967_295), 0, 0x42, true)},
+	}
+	for i := range uproposalCases {
+		c := &uproposalCases[i]
+		writeFixture(t, dir, "uproposal", c.name, c.doc, &c.value)
+	}
+
+	// `proposal` adds two unexported, non-serialized fields (`ve`,
+	// `validatedAt`) on top of `unauthenticatedProposal`. Wire bytes
+	// are identical; we still write under proposal/ for path-symmetry
+	// with the task's deliverable list.
+	for i := range uproposalCases {
+		c := &uproposalCases[i]
+		var p proposal
+		p.unauthenticatedProposal = c.value
+		writeFixture(t, dir, "proposal", c.name, c.doc+" (as proposal; unexported fields unserialized)", &p)
+	}
+
+	// ---- transmittedPayload fixtures (20) -----------------------
+	// A transmittedPayload = unauthenticatedProposal + PriorVote.
+	tpCases := make([]struct {
+		name  string
+		doc   string
+		value transmittedPayload
+	}, 0, len(uproposalCases))
+	for i := range uproposalCases {
+		uc := &uproposalCases[i]
+		rv := rawVoteCases[i%len(rawVoteCases)].value
+		pv := uvBase(byte(0x70+i), rv)
+		tp := transmittedPayload{
+			unauthenticatedProposal: uc.value,
+			PriorVote:               pv,
+		}
+		tpCases = append(tpCases, struct {
+			name  string
+			doc   string
+			value transmittedPayload
+		}{
+			name:  uc.name,
+			doc:   uc.doc + " + PriorVote/" + rawVoteCases[i%len(rawVoteCases)].name,
+			value: tp,
+		})
+	}
+	for i := range tpCases {
+		c := &tpCases[i]
+		writeFixture(t, dir, "tpayload", c.name, c.doc, &c.value)
+	}
+
+	// ---- proposalValue fixtures (small; optional per task but
+	//      cheap and useful as inner schema anchors) -------------
+	pvCases := []struct {
+		name  string
+		doc   string
+		value proposalValue
+	}{
+		{"zero_bottom", "canonical bottom / nil proposal", proposalValue{}},
+		{"A", "distinct A", pvA},
+		{"B", "distinct B", pvB},
+	}
+	for i := range pvCases {
+		c := &pvCases[i]
+		writeFixture(t, dir, "proposalvalue", c.name, c.doc, &c.value)
+	}
+
+	// Final accounting. Ensure each required subdir has ≥20 fixtures
+	// so downstream tasks can trust the coverage floor.
+	for _, sub := range []string{"rawvote", "uvote", "vote", "ubundle", "cert", "bundle", "uproposal", "proposal", "tpayload"} {
+		entries, err := os.ReadDir(filepath.Join(dir, sub))
+		if err != nil {
+			t.Fatalf("read dir %s: %v", sub, err)
+		}
+		// Each fixture is 2 files (.msgpack + .json).
+		if len(entries) < 40 {
+			t.Fatalf("fixture subdir %q has %d files; expected ≥40 (20 fixtures × 2 files)", sub, len(entries))
+		}
+	}
+	t.Logf("wrote agreement wire fixtures to %s", dir)
+}

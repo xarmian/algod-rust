@@ -1,0 +1,8 @@
+{
+  "byte_count": 5147,
+  "doc": "bundle for bottom",
+  "hex_head": "82a17583a3726e6401a47374657003a4766f74659583a46372656481a27066c4",
+  "name": "bottom_proposal",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.bundle"
+}

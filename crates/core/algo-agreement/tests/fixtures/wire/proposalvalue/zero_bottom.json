@@ -1,0 +1,8 @@
+{
+  "byte_count": 1,
+  "doc": "canonical bottom / nil proposal",
+  "hex_head": "80",
+  "name": "zero_bottom",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.proposalValue"
+}

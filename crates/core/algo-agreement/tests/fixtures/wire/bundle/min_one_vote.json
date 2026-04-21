@@ -1,0 +1,8 @@
+{
+  "byte_count": 1313,
+  "doc": "1 vote",
+  "hex_head": "82a17584a470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "name": "min_one_vote",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.bundle"
+}

@@ -1,0 +1,8 @@
+{
+  "byte_count": 172,
+  "doc": "OriginalProposer=all-0xff (as proposal; unexported fields unserialized)",
+  "hex_head": "84a56f70726f70c420ffffffffffffffffffffffffffffffffffffffffffffff",
+  "name": "proposer_ff",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.proposal"
+}

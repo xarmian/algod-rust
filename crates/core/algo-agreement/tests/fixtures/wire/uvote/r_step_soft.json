@@ -1,0 +1,8 @@
+{
+  "byte_count": 630,
+  "doc": "uvote wrapping rawVote/step_soft",
+  "hex_head": "83a46372656481a27066c45032333435363738393a3b3c3d3e3f404142434445",
+  "name": "r_step_soft",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedVote"
+}

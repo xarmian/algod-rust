@@ -1,0 +1,8 @@
+{
+  "byte_count": 670,
+  "doc": "weight=20, rawVote/step_soft",
+  "hex_head": "83a46372656483a168c420080808080808080808080808080808080808080808",
+  "name": "w20_step_soft",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.vote"
+}

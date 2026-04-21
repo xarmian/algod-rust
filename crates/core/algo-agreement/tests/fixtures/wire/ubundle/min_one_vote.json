@@ -1,0 +1,8 @@
+{
+  "byte_count": 634,
+  "doc": "1 vote, min threshold",
+  "hex_head": "84a470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "name": "min_one_vote",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedBundle"
+}

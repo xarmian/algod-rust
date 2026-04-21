@@ -1,0 +1,8 @@
+{
+  "byte_count": 592,
+  "doc": "uvote wrapping rawVote/sender_00",
+  "hex_head": "83a46372656481a27066c4503c3d3e3f404142434445464748494a4b4c4d4e4f",
+  "name": "r_sender_00",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedVote"
+}

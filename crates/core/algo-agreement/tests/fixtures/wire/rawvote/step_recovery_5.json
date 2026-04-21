@@ -1,0 +1,8 @@
+{
+  "byte_count": 186,
+  "doc": "recovery step 5",
+  "hex_head": "85a370657203a470726f7084a3646967c420cccccccccccccccccccccccccccc",
+  "name": "step_recovery_5",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.rawVote"
+}

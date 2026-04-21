@@ -1,0 +1,8 @@
+{
+  "byte_count": 629,
+  "doc": "1 vote at round 0 (degenerate but legal) (as Certificate)",
+  "hex_head": "83a470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "name": "min_zero_round",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.unauthenticatedBundle"
+}

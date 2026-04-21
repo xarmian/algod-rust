@@ -1,0 +1,8 @@
+{
+  "byte_count": 175,
+  "doc": "propose step at period 0 (origin)",
+  "hex_head": "83a470726f7084a3646967c420aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "name": "period_0_step_0",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.rawVote"
+}

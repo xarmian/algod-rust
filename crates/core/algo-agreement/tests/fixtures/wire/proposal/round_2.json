@@ -1,0 +1,8 @@
+{
+  "byte_count": 172,
+  "doc": "round 2 (as proposal; unexported fields unserialized)",
+  "hex_head": "84a56f70726f70c4204242424242424242424242424242424242424242424242",
+  "name": "round_2",
+  "source": "algod-rust/tools/agreement-wire-capture (TASK-54)",
+  "type": "*agreement.proposal"
+}
