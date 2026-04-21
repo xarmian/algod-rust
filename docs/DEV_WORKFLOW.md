@@ -210,3 +210,36 @@ Output files per block:
 - `block_N_txn_I.txid.hex` — Transaction ID (SHA512/256)
 - `block_N_stxn_I.canonical.hex` — Canonical encoded signed transaction
 - `block_N.digest.hex` — Block digest (from block N+1's `prev` field)
+
+## V13 Opcode Vector Regeneration
+
+TEAL v13 opcodes (`sumhash512` 0x86, `sha512` 0x87) are tested against fixture
+files produced directly by go-algorand's underlying primitives. The fixtures
+live at:
+
+- `crates/core/algo-avm/tests/fixtures/v13/sha512/vectors.json`
+- `crates/core/algo-avm/tests/fixtures/v13/sumhash512/vectors.json`
+
+Each file is a JSON array of `{name, input_hex, output_hex}` entries.
+
+### Regenerating
+
+The capture tool is a standalone Go module at `tools/v13-vector-capture/`.
+It depends on the same `github.com/algorand/go-sumhash v0.1.0` package used by
+go-algorand's `data/transactions/logic/crypto.go`.
+
+```bash
+cd tools/v13-vector-capture
+go run . -out=../../crates/core/algo-avm/tests/fixtures/v13
+```
+
+Output is deterministic (seeded `math/rand`), so regeneration against the same
+module versions produces byte-identical fixture files. Regenerate only when
+advancing `go-algorand` to a consensus version that changes `sumhash512`
+semantics — otherwise treat the committed fixtures as golden.
+
+### References
+
+- go-algorand `data/transactions/logic/crypto.go:120` — `opSumhash512`
+- go-algorand `data/transactions/logic/crypto.go:128` — `opSHA512`
+- go-algorand `data/transactions/logic/opcodes.go:657-658` — opcode specs
