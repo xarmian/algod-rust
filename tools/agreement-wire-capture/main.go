@@ -223,6 +223,20 @@ func main() {
 		"debug: don't remove the staged test file from go-algorand after running")
 	flag.Parse()
 
+	// Normalize --out to an absolute path BEFORE anything else uses
+	// it. The wrapper runs in the user's CWD, but we launch `go test`
+	// with `cmd.Dir = ../go-algorand`; a relative `--out` would
+	// resolve to different directories in the two contexts, causing
+	// the cleanup step to clear one path and the fixture writes to
+	// land elsewhere — stale vectors on disk, deterministic regen
+	// broken (Codex P2 on PR #228, r3).
+	absOut, err := filepath.Abs(*out)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "resolving --out=%q: %v\n", *out, err)
+		os.Exit(1)
+	}
+	*out = absOut
+
 	if err := verifyGoAlgorandPin(*allowUnpinned); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
