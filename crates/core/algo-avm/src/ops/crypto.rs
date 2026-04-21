@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use algo_error::AlgoError;
-use sha2::{Digest as Sha2Digest, Sha256, Sha512_256};
+use sha2::{Digest as Sha2Digest, Sha256, Sha512, Sha512_256};
 use sha3::{Keccak256, Sha3_256};
 
 use crate::bytecode::Instruction;
@@ -52,6 +52,21 @@ pub fn op_sha512_256(
 pub fn op_sha3_256(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
     let data = machine.pop_bytes()?;
     let hash = Sha3_256::digest(&data);
+    machine.push(AvmValue::Bytes(hash.to_vec()))
+}
+
+/// `sha512` (0x87): pop bytes, push SHA-512 hash (64 bytes). AVM v13+.
+///
+/// Dynamic cost: `15 + 32 * DivCeil(len, 2)`, matching go-algorand
+/// `data/transactions/logic/opcodes.go:658` — `costByLength(15, 32, 2, 0)`.
+///
+/// Reference: go-algorand `data/transactions/logic/crypto.go:128` (`opSHA512`).
+pub fn op_sha512(machine: &mut AvmMachine, _instruction: &Instruction) -> Result<(), AlgoError> {
+    let data = machine.pop_bytes()?;
+    // Dynamic cost: baseCost=15, chunkCost=32, chunkSize=2, depth=0.
+    let cost = 15u64 + 32u64 * (data.len() as u64).div_ceil(2);
+    machine.charge_cost(cost)?;
+    let hash = Sha512::digest(&data);
     machine.push(AvmValue::Bytes(hash.to_vec()))
 }
 
