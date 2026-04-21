@@ -243,3 +243,68 @@ semantics — otherwise treat the committed fixtures as golden.
 - go-algorand `data/transactions/logic/crypto.go:120` — `opSumhash512`
 - go-algorand `data/transactions/logic/crypto.go:128` — `opSHA512`
 - go-algorand `data/transactions/logic/opcodes.go:657-658` — opcode specs
+
+## VRF Vector Regeneration
+
+Byte-exact VRF parity is the foundation of Phase 6 — Rust's pure-Rust ECVRF
+implementation must agree with go-algorand's `crypto/vrf.go` (which delegates
+to the Algorand libsodium-fork) on every proof and output. Ground-truth
+vectors are produced by a standalone Go tool and consumed by the Rust parity
+harness (TASK-52, a follow-up task).
+
+### Fixture location
+
+- `crates/core/algo-consensus-crypto/tests/fixtures/vrf/vectors.jsonl`
+  — JSONL corpus (≥10,000 entries; see the directory's README for the schema).
+
+### One-time prerequisites
+
+The capture tool imports `github.com/algorand/go-algorand/crypto`, which is a
+CGo wrapper over the `libsodium-fork` vendored under `../go-algorand/crypto/
+libsodium-fork/`. Before the tool can link on Linux, build the fork's static
+library:
+
+```bash
+# Debian/Ubuntu prerequisites
+sudo apt install -y autoconf automake libtool
+cd ../go-algorand && make libsodium
+```
+
+This produces `../go-algorand/crypto/libs/linux/amd64/lib/libsodium.a` plus
+the fork's headers under `crypto/libs/linux/amd64/include/sodium/`. The CGo
+directives in `go-algorand/crypto/vrf.go` (`#cgo linux,amd64 CFLAGS:
+-I${SRCDIR}/libs/linux/amd64/include`) then resolve automatically when the
+capture tool is built with a `replace` directive pointing at the local
+checkout.
+
+### Regenerating
+
+```bash
+cd tools/vrf-vector-capture
+go run .
+```
+
+Runtime: ~5 seconds for the default 10,000-vector corpus on a modern x86_64
+laptop. Output is deterministic (fixed RNG seed + stable iteration order);
+two runs against the same go-algorand pin produce byte-identical fixtures.
+
+### When to regenerate
+
+- Bumping the go-algorand pin to a release that touches `crypto/vrf.go` or
+  `crypto/libsodium-fork` (extremely rare inside a v4.x minor series).
+- Extending the fixed edge-case matrix in `tools/vrf-vector-capture/main.go`.
+  Append only — do not rename or reorder existing fixed entries, because
+  downstream tests reference them by the `name` field.
+
+If the regenerated file disagrees with the committed one on any TV1/TV2 line,
+stop: the IETF draft-03 constants are external anchors and divergence means
+the capture environment is broken, not the corpus.
+
+### References
+
+- go-algorand `crypto/vrf.go:82` — `VrfKeygenFromSeed`
+- go-algorand `crypto/vrf.go:99` — `proveBytes` / `C.crypto_vrf_prove`
+- go-algorand `crypto/vrf.go:117` — `VrfProof.Hash` / `C.crypto_vrf_proof_to_hash`
+- go-algorand `crypto/util.go:38` — `HashRep[H Hashable]` (empty HashID ⇒ identity,
+  used to feed raw alpha through `sk.Prove` in the capture tool)
+- IETF draft-irtf-cfrg-vrf-03 §A.4 — TV1 / TV2 anchor vectors
