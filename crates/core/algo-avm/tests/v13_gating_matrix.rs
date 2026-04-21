@@ -190,6 +190,75 @@ fn v13_sha512_program_executes() {
     assert_eq!(top.len(), 64, "sha512 output must be 64 bytes");
 }
 
+// ---------------------------------------------------------------------------
+// Eval-entry-point ceiling enforcement
+// ---------------------------------------------------------------------------
+//
+// The parser accepts v13 bytecode unconditionally (MAX_AVM_VERSION = 13), but
+// the eval entry points must reject a v13 program when the active consensus
+// ceiling is < 13. This is enforced via `AvmContext::consensus_logic_sig_version`.
+
+/// Tiny test context that carries a consensus ceiling and nothing else.
+struct CeilingOnlyContext {
+    ceiling: u64,
+}
+
+impl algo_avm::AvmContext for CeilingOnlyContext {
+    fn consensus_logic_sig_version(&self) -> Option<u64> {
+        Some(self.ceiling)
+    }
+}
+
+#[test]
+fn run_approval_program_rejects_v13_under_v41_ceiling() {
+    use algo_avm::eval::run_approval_program;
+    use algo_avm::group::GroupBudget;
+
+    // Minimal v13 program: pushbytes "", sha512 (just to ensure body is
+    // non-trivial, though we expect rejection before any opcode runs).
+    let raw = build_program(13, &[0x80, 0x00, 0x87]);
+    let mut ctx = CeilingOnlyContext { ceiling: 12 };
+    let mut budget = GroupBudget::for_logicsig(1);
+    let err = run_approval_program(&raw, &mut ctx, &mut budget)
+        .expect_err("v13 program under V41-ceiling consensus must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("exceeds consensus LogicSigVersion ceiling"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn run_logicsig_program_rejects_v13_under_v41_ceiling() {
+    use algo_avm::eval::run_logicsig_program;
+    use algo_avm::group::GroupBudget;
+
+    let raw = build_program(13, &[0x80, 0x00, 0x87]);
+    let mut ctx = CeilingOnlyContext { ceiling: 12 };
+    let mut budget = GroupBudget::for_logicsig(1);
+    let err = run_logicsig_program(&raw, &mut ctx, &mut budget)
+        .expect_err("v13 logicsig under V41-ceiling consensus must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("exceeds consensus LogicSigVersion ceiling"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn run_approval_program_accepts_v12_under_v41_ceiling() {
+    use algo_avm::eval::run_approval_program;
+    use algo_avm::group::GroupBudget;
+
+    // `pushint 1, return` — smallest accept program, v3+ is enough for
+    // `pushint`/`return`. Declare v12 so we stay at the ceiling.
+    let raw = build_program(12, &[0x81, 0x01, 0x43]);
+    let mut ctx = CeilingOnlyContext { ceiling: 12 };
+    let mut budget = GroupBudget::for_logicsig(1);
+    let result = run_approval_program(&raw, &mut ctx, &mut budget).expect("v12 under V41 must run");
+    assert!(result.approved);
+}
+
 #[test]
 fn v13_sumhash512_program_executes() {
     let mut code = vec![0x80, 0x05]; // pushbytes 5 bytes

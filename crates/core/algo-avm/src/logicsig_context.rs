@@ -83,6 +83,10 @@ impl<'a> LogicSigAvmContext<'a> {
 }
 
 impl<'a> AvmContext for LogicSigAvmContext<'a> {
+    fn consensus_logic_sig_version(&self) -> Option<u64> {
+        Some(self.consensus.logic_sig_version)
+    }
+
     // ---- Global fields ----
 
     fn global_field(&self, field: u8) -> Result<TealValue, AlgoError> {

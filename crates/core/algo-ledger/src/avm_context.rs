@@ -1453,6 +1453,10 @@ fn read_txn_field(
 // ---------------------------------------------------------------------------
 
 impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
+    fn consensus_logic_sig_version(&self) -> Option<u64> {
+        Some(self.consensus.logic_sig_version)
+    }
+
     // ---- Transaction access ----
 
     fn txn_field(

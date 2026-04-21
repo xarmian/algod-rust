@@ -381,6 +381,21 @@ pub trait AvmContext {
         0
     }
 
+    /// Active consensus protocol's `LogicSigVersion` ceiling, if known.
+    ///
+    /// When `Some(v)`, the eval entry points (`run_approval_program`,
+    /// `run_logicsig_program` and their tracer variants) reject programs whose
+    /// declared version byte exceeds `v`. Matches go-algorand's pre-eval
+    /// `proto.LogicSigVersion` check in `data/transactions/logic/eval.go`.
+    ///
+    /// Returns `None` for contexts that do not carry consensus params — e.g.
+    /// [`NullContext`] used in unit tests. In that case the check is skipped
+    /// and only the hard `MAX_AVM_VERSION` ceiling applies (enforced by the
+    /// bytecode parser).
+    fn consensus_logic_sig_version(&self) -> Option<u64> {
+        None
+    }
+
     // ---- Box storage ----
 
     /// Get a box's contents. Returns `(value, exists)`.
