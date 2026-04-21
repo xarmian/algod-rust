@@ -47,12 +47,23 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/algorand/go-algorand/crypto"
 	"github.com/algorand/go-algorand/protocol"
 )
+
+// expectedGoAlgorandPin is the go-algorand tag this capture tool is pinned to.
+// It matches the workspace-wide pin documented in the repo's CLAUDE.md. The
+// tool refuses to run unless `../go-algorand` resolves to exactly this tag
+// (or the --allow-unpinned flag is set), so two developers regenerating the
+// same corpus are guaranteed byte-identical output regardless of whatever
+// branch or dirty state happens to be checked out in their local go-algorand
+// clone.
+const expectedGoAlgorandPin = "v4.5.1-stable"
 
 // rawAlpha is a crypto.Hashable whose HashRep is identity: ToBeHashed returns
 // an empty HashID and the raw bytes, so HashRep(rawAlpha{b}) = b. This lets
@@ -298,11 +309,98 @@ func defaultOutPath() string {
 	return filepath.Join(repoRoot, "crates", "core", "algo-consensus-crypto", "tests", "fixtures", "vrf", "vectors.jsonl")
 }
 
+// goAlgorandPath resolves `../go-algorand` relative to this source file — the
+// same location the go.mod `replace` directive points at — so the pin check
+// runs against the actual checkout CGo is about to link.
+func goAlgorandPath() string {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		return filepath.Join("..", "..", "..", "go-algorand")
+	}
+	toolDir := filepath.Dir(thisFile)
+	// tools/vrf-vector-capture/main.go → repo root is two levels up; sibling
+	// of the repo is go-algorand.
+	repoRoot := filepath.Clean(filepath.Join(toolDir, "..", ".."))
+	return filepath.Clean(filepath.Join(repoRoot, "..", "go-algorand"))
+}
+
+// verifyGoAlgorandPin exits non-zero unless the go-algorand checkout we'd link
+// against is exactly at `expectedGoAlgorandPin` with a clean working tree.
+// Returning nil means the pin is verified; the capture output is reproducible
+// against that tag.
+func verifyGoAlgorandPin(path string) error {
+	// 1. Exact-tag match (detached HEAD on v4.5.1-stable). Anything else —
+	//    a branch tip, an ahead-of-tag commit, a different tag — is a
+	//    regeneration hazard.
+	cmd := exec.Command("git", "-C", path, "describe", "--tags", "--exact-match", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		// Fall back to a rev-parse so the error message is informative.
+		rev, _ := exec.Command("git", "-C", path, "rev-parse", "HEAD").Output()
+		return fmt.Errorf(
+			"go-algorand at %q is not pinned to %s (HEAD=%s). "+
+				"Fix with:\n  cd %s && git fetch --tags && git checkout %s\n"+
+				"Or pass --allow-unpinned if you are intentionally regenerating against a different pin.",
+			path, expectedGoAlgorandPin, strings.TrimSpace(string(rev)), path, expectedGoAlgorandPin,
+		)
+	}
+	if got := strings.TrimSpace(string(out)); got != expectedGoAlgorandPin {
+		return fmt.Errorf(
+			"go-algorand at %q is on tag %q, expected %q. "+
+				"Fix: cd %s && git checkout %s  (or pass --allow-unpinned)",
+			path, got, expectedGoAlgorandPin, path, expectedGoAlgorandPin,
+		)
+	}
+
+	// 2. Clean working tree — a dirty crypto/ directory could rebuild
+	//    libsodium-fork differently and make output diverge silently.
+	cmd = exec.Command("git", "-C", path, "status", "--porcelain")
+	out, err = cmd.Output()
+	if err != nil {
+		return fmt.Errorf("checking %s working tree: %w", path, err)
+	}
+	// Filter status to paths that could affect the VRF capture output:
+	// crypto/ (libsodium-fork + vrf.go wrapper) and protocol/ (Hashable /
+	// HashID). Other dirty files (e.g. test-local scratch) are fine.
+	var dirty []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		// Porcelain format: `XY path`.
+		if len(line) < 4 {
+			continue
+		}
+		p := strings.TrimSpace(line[3:])
+		if strings.HasPrefix(p, "crypto/") || strings.HasPrefix(p, "protocol/") {
+			dirty = append(dirty, line)
+		}
+	}
+	if len(dirty) > 0 {
+		return fmt.Errorf(
+			"go-algorand at %q has uncommitted changes under crypto/ or protocol/ "+
+				"that could change VRF output:\n%s\nClean the tree or pass --allow-unpinned.",
+			path, strings.Join(dirty, "\n"),
+		)
+	}
+	return nil
+}
+
 func main() {
 	out := flag.String("out", defaultOutPath(), "output JSONL path")
 	randN := flag.Int("random", 10_000, "number of random (seed, alpha) vectors")
 	rngSeed := flag.Int64("rng-seed", 0x5152_5354_5556_5758, "RNG seed for random-vector generation")
+	allowUnpinned := flag.Bool("allow-unpinned", false,
+		"skip the go-algorand pin check (only for intentional upgrades; "+
+			"the checked-in fixture MUST be regenerated from the pin)")
 	flag.Parse()
+
+	if !*allowUnpinned {
+		if err := verifyGoAlgorandPin(goAlgorandPath()); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
 
 	var vecs []Vector
 

@@ -288,6 +288,15 @@ Runtime: ~5 seconds for the default 10,000-vector corpus on a modern x86_64
 laptop. Output is deterministic (fixed RNG seed + stable iteration order);
 two runs against the same go-algorand pin produce byte-identical fixtures.
 
+The tool refuses to run unless `../go-algorand` is checked out at exactly
+the tag tracked in `CLAUDE.md` (currently `v4.5.1-stable`) with a clean
+`crypto/` and `protocol/` tree. This prevents a developer's local branch
+state from silently changing the golden corpus. If you are intentionally
+regenerating against a different pin (e.g. preparing a go-algorand bump),
+pass `--allow-unpinned` — but then the resulting fixture is out-of-sync
+with the rest of the workspace and must not be committed until the pin
+update lands.
+
 ### When to regenerate
 
 - Bumping the go-algorand pin to a release that touches `crypto/vrf.go` or

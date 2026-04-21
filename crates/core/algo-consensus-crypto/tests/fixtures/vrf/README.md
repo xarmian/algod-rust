@@ -61,6 +61,9 @@ go run .
 
 Output is deterministic (fixed RNG seed + stable iteration order), so two
 runs against the same go-algorand pin produce byte-identical `vectors.jsonl`.
+The capture tool enforces the pin at runtime: it refuses to generate vectors
+unless `../go-algorand` is on the tag tracked in `CLAUDE.md` with a clean
+`crypto/` and `protocol/` tree (override only with `--allow-unpinned`).
 
 ## When to regenerate
 
