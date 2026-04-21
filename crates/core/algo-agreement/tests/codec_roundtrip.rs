@@ -61,12 +61,67 @@ The fixture corpus is already committed from TASK-54 and each
 subdir lights up here as TASK-60 adds the corresponding codec
 path.";
 
-/// First diverging byte offset, or `None` when equal.
+/// First diverging byte offset, or `None` when `a` and `b` are
+/// identical. When lengths differ AND the shared prefix is
+/// identical, returns the shared-prefix length (the offset where
+/// one side simply ran out). When the shared prefix already
+/// disagrees, returns the earliest offset at which they differ —
+/// so the panic report's hex window always frames the actual
+/// divergence, not the tail truncation (Codex P2 on PR #229).
 fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
-    if a.len() != b.len() {
-        return Some(a.len().min(b.len()));
+    let common = a.len().min(b.len());
+    for i in 0..common {
+        if a[i] != b[i] {
+            return Some(i);
+        }
     }
-    a.iter().zip(b.iter()).position(|(x, y)| x != y)
+    if a.len() != b.len() {
+        Some(common)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod first_diff_tests {
+    use super::first_diff;
+
+    #[test]
+    fn identical_buffers_return_none() {
+        assert_eq!(first_diff(&[1, 2, 3], &[1, 2, 3]), None);
+        assert_eq!(first_diff(&[], &[]), None);
+    }
+
+    #[test]
+    fn prefix_differs_first_returns_prefix_offset_even_if_lengths_differ() {
+        // Codex P2 regression guard: lengths differ AND buffers
+        // disagree at offset 1 — must report 1, not min(3,4)=3.
+        assert_eq!(first_diff(&[0, 9, 2], &[0, 2, 2, 2]), Some(1));
+    }
+
+    #[test]
+    fn equal_prefix_different_lengths_returns_shared_length() {
+        assert_eq!(first_diff(&[1, 2, 3], &[1, 2, 3, 4]), Some(3));
+        assert_eq!(first_diff(&[1, 2, 3, 4], &[1, 2, 3]), Some(3));
+    }
+
+    #[test]
+    fn same_length_different_middle_returns_middle() {
+        assert_eq!(first_diff(&[1, 2, 3, 4], &[1, 2, 9, 4]), Some(2));
+    }
+
+    #[test]
+    fn differ_at_zero() {
+        assert_eq!(first_diff(&[9], &[0]), Some(0));
+        assert_eq!(first_diff(&[9, 0, 0], &[0, 0, 0, 0]), Some(0));
+    }
+
+    #[test]
+    fn empty_vs_nonempty_returns_zero() {
+        // Shared prefix length is 0, lengths differ → report 0.
+        assert_eq!(first_diff(&[], &[1, 2]), Some(0));
+        assert_eq!(first_diff(&[1, 2], &[]), Some(0));
+    }
 }
 
 /// Format a hex window of `size` bytes centered on `offset` for
