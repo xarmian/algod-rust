@@ -166,6 +166,7 @@ pub fn dispatch(
         0x44 => flow::op_assert(machine, instruction),
         0x84 => crypto::op_ed25519verify_bare(machine, instruction),
         0x85 => crypto::op_falcon_verify(machine, instruction),
+        0x86 => crypto::op_sumhash512(machine, instruction),
         0x87 => crypto::op_sha512(machine, instruction),
         0x88 => flow::op_callsub(machine, instruction),
         0x89 => flow::op_retsub(machine, instruction),
