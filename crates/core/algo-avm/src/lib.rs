@@ -37,7 +37,7 @@ pub use opcode::{
 };
 pub use tracer::{EvalTracer, NullTracer, ProgramType};
 pub use txn_fields::{read_txn_field, type_enum};
-pub use validator::check_program;
+pub use validator::{check_program, check_program_version_allowed};
 
 // Assembler / disassembler / source map re-exports.
 pub use assembler::{assemble_string, OpStream as AssemblerOpStream};

@@ -151,6 +151,15 @@ pub fn run_clear_state_program(
     ctx: &mut dyn AvmContext,
     consensus: &ConsensusParams,
 ) -> AvmResult {
+    // Reject programs declaring a version above the active consensus
+    // LogicSigVersion ceiling (go-algorand eval.go pre-eval check).
+    if !program.is_empty()
+        && crate::validator::check_program_version_allowed(program[0], consensus.logic_sig_version)
+            .is_err()
+    {
+        return AvmResult::empty();
+    }
+
     let parsed = match bytecode::parse(program) {
         Ok(p) => p,
         Err(_) => {
@@ -312,6 +321,18 @@ pub fn run_clear_state_program_with_tracer(
     consensus: &ConsensusParams,
     tracer: &mut dyn EvalTracer,
 ) -> AvmResult {
+    // Reject programs declaring a version above the active consensus
+    // LogicSigVersion ceiling (go-algorand eval.go pre-eval check).
+    if !program.is_empty() {
+        if let Err(e) =
+            crate::validator::check_program_version_allowed(program[0], consensus.logic_sig_version)
+        {
+            tracer.before_program(ProgramType::ClearState);
+            tracer.after_program(ProgramType::ClearState, false, Some(&e.to_string()));
+            return AvmResult::empty();
+        }
+    }
+
     let parsed = match bytecode::parse(program) {
         Ok(p) => p,
         Err(e) => {
