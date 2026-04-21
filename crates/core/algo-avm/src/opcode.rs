@@ -343,7 +343,7 @@ static OPCODE_TABLE: [Option<OpSpec>; 256] = {
     op!(0x84, "ed25519verify_bare", 7, Static(1900), 3, 1, Any, None);
     op!(0x85, "falcon_verify", 12, Static(1700), 3, 1, Any, None);
     // 0x86 sumhash512 is v13
-    // 0x87 sha512 is v13
+    op!(0x87, "sha512", 13, Dynamic, 1, 1, Any, None);
 
     // ---- Subroutines / Frames ----
     op!(0x88, "callsub", 4, Static(1), 0, 0, Any, Int16);
