@@ -273,6 +273,21 @@ func copyFile(src, dst string) error {
 }
 
 func main() {
+	// All fallible logic lives in `run`. `os.Exit` does not execute
+	// deferred functions, so running the whole flow inside a
+	// returning helper is the only way to guarantee that the
+	// staged-file cleanup (a deferred closure set up once the copy
+	// succeeds) actually fires on every error path — including the
+	// `go test` failure path that previously leaked the file into
+	// `../go-algorand/agreement/` and left the checkout dirty
+	// (Codex P1 on PR #228, r4).
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	out := flag.String("out", defaultFixtureDir(), "output directory for fixtures")
 	allowUnpinned := flag.Bool("allow-unpinned", false, "skip the go-algorand pin check")
 	keepStaged := flag.Bool("keep-staged", false,
@@ -288,25 +303,24 @@ func main() {
 	// broken (Codex P2 on PR #228, r3).
 	absOut, err := filepath.Abs(*out)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolving --out=%q: %v\n", *out, err)
-		os.Exit(1)
+		return fmt.Errorf("resolving --out=%q: %w", *out, err)
 	}
 	*out = absOut
 
 	if err := verifyGoAlgorandPin(*allowUnpinned); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 
 	tmpl := templatePath()
 	staged := stagedPath()
 	if err := copyFile(tmpl, staged); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 
 	// Defer cleanup unless the user asked to keep it (for debugging).
-	cleanup := func() {
+	// Safe now that `run` returns — `os.Exit` is only called from
+	// `main` after `run` has already returned and its defers fired.
+	defer func() {
 		if *keepStaged {
 			fmt.Fprintf(os.Stderr, "staged file left in place for debugging: %s\n", staged)
 			return
@@ -314,13 +328,11 @@ func main() {
 		if err := os.Remove(staged); err != nil && !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "cleanup: failed to remove %s: %v\n", staged, err)
 		}
-	}
-	defer cleanup()
+	}()
 
 	// Ensure the fixture output dir exists before go test runs.
 	if err := os.MkdirAll(*out, 0o755); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 
 	// Clear stale fixtures before regenerating. Without this, a
@@ -339,8 +351,7 @@ func main() {
 	// preserved. Hardcoded names prevent `--out /tmp` (or worse) from
 	// nuking unrelated data (Codex P1 on PR #228, r2).
 	if err := clearFixtureSubdirs(*out); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 
 	cmd := exec.Command("go", "test",
@@ -356,9 +367,9 @@ func main() {
 		"ALGOD_RUST_WIRE_FIXTURE_DIR="+*out,
 	)
 	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "go test failed: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("go test failed: %w", err)
 	}
 
 	fmt.Printf("agreement wire fixtures written to %s\n", *out)
+	return nil
 }
