@@ -55,6 +55,29 @@ pub fn op_sha3_256(machine: &mut AvmMachine, _instruction: &Instruction) -> Resu
     machine.push(AvmValue::Bytes(hash.to_vec()))
 }
 
+/// `sumhash512` (0x86): pop bytes, push sumhash-512 hash (64 bytes). AVM v13+.
+///
+/// Uses the `algo_consensus_crypto::sumhash::sumhash512` primitive — the same
+/// hash used in State Proofs. Matches go-algorand's `opSumhash512` which calls
+/// `sumhash.New512(nil)` with no salt.
+///
+/// Dynamic cost: `150 + 7 * DivCeil(len, 4)`, matching go-algorand
+/// `data/transactions/logic/opcodes.go:657` — `costByLength(150, 7, 4, 0)`.
+///
+/// Reference: go-algorand `data/transactions/logic/crypto.go:120`
+/// (`opSumhash512`).
+pub fn op_sumhash512(
+    machine: &mut AvmMachine,
+    _instruction: &Instruction,
+) -> Result<(), AlgoError> {
+    let data = machine.pop_bytes()?;
+    // Dynamic cost: baseCost=150, chunkCost=7, chunkSize=4, depth=0.
+    let cost = 150u64 + 7u64 * (data.len() as u64).div_ceil(4);
+    machine.charge_cost(cost)?;
+    let hash = algo_consensus_crypto::sumhash::sumhash512(&data);
+    machine.push(AvmValue::Bytes(hash.to_vec()))
+}
+
 /// `sha512` (0x87): pop bytes, push SHA-512 hash (64 bytes). AVM v13+.
 ///
 /// Dynamic cost: `15 + 32 * DivCeil(len, 2)`, matching go-algorand
