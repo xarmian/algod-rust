@@ -30,6 +30,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	sumhash "github.com/algorand/go-sumhash"
 )
@@ -130,8 +131,24 @@ func writeVectors(path string, vectors []Vector) error {
 	return nil
 }
 
+// defaultOutDir resolves the fixture directory relative to this source file,
+// so `go run .` from `tools/v13-vector-capture` always writes to the
+// checked-in fixture path regardless of the shell's current directory.
+func defaultOutDir() string {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		// Fall back to a CWD-relative path that only works when invoked from
+		// `tools/v13-vector-capture/` — the tool's module directory.
+		return filepath.Join("..", "..", "crates", "core", "algo-avm", "tests", "fixtures", "v13")
+	}
+	toolDir := filepath.Dir(thisFile)
+	// tools/v13-vector-capture/main.go → repo root is two levels up.
+	repoRoot := filepath.Clean(filepath.Join(toolDir, "..", ".."))
+	return filepath.Join(repoRoot, "crates", "core", "algo-avm", "tests", "fixtures", "v13")
+}
+
 func main() {
-	outDir := flag.String("out", "crates/core/algo-avm/tests/fixtures/v13", "output base directory")
+	outDir := flag.String("out", defaultOutDir(), "output base directory")
 	flag.Parse()
 
 	sha512Path := filepath.Join(*outDir, "sha512", "vectors.json")
