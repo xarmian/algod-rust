@@ -138,6 +138,7 @@ dependencies = [
  "rmp",
  "serde",
  "serde_bytes",
+ "serde_json",
  "sha2",
  "sha3",
  "statrs",
