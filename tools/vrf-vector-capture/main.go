@@ -362,28 +362,62 @@ func verifyGoAlgorandPin(path string) error {
 	// Filter status to paths that could affect the VRF capture output:
 	// crypto/ (libsodium-fork + vrf.go wrapper) and protocol/ (Hashable /
 	// HashID). Other dirty files (e.g. test-local scratch) are fine.
-	var dirty []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line == "" {
-			continue
-		}
-		// Porcelain format: `XY path`.
-		if len(line) < 4 {
-			continue
-		}
-		p := strings.TrimSpace(line[3:])
-		if strings.HasPrefix(p, "crypto/") || strings.HasPrefix(p, "protocol/") {
-			dirty = append(dirty, line)
-		}
-	}
+	dirty := filterDirtyPaths(string(out), []string{"crypto/", "protocol/"})
 	if len(dirty) > 0 {
 		return fmt.Errorf(
-			"go-algorand at %q has uncommitted changes under crypto/ or protocol/ "+
-				"that could change VRF output:\n%s\nClean the tree or pass --allow-unpinned.",
+			"go-algorand at %q has uncommitted changes touching crypto/ or protocol/ "+
+				"(including renames into those directories) that could change VRF output:\n%s\n"+
+				"Clean the tree or pass --allow-unpinned.",
 			path, strings.Join(dirty, "\n"),
 		)
 	}
 	return nil
+}
+
+// filterDirtyPaths returns `git status --porcelain` entries whose source or
+// destination path starts with any of the prefixes. Renames/copies in
+// porcelain v1 are emitted as `XY <old> -> <new>` — both sides must be
+// inspected, because a file moved *into* a guarded directory changes the
+// tree under that prefix just as surely as an in-place modification does.
+//
+// Split out for unit testing: the logic is simple enough that a real `git`
+// repository is not needed to verify it.
+//
+// NOTE: porcelain v1's `XY` status code can begin with a literal space (e.g.
+// ` M path` = "worktree modified") so the input MUST NOT be whitespace-
+// trimmed before line splitting — that would eat the leading space on the
+// first entry and shift every subsequent offset.
+func filterDirtyPaths(porcelain string, prefixes []string) []string {
+	var dirty []string
+	for _, line := range strings.Split(strings.TrimRight(porcelain, "\n"), "\n") {
+		if len(line) < 4 {
+			continue
+		}
+		body := strings.TrimSpace(line[3:])
+		paths := []string{body}
+		if idx := strings.Index(body, " -> "); idx >= 0 {
+			paths = []string{strings.TrimSpace(body[:idx]), strings.TrimSpace(body[idx+4:])}
+		}
+		for _, p := range paths {
+			// A path may be quoted if it contains spaces or non-ASCII (see
+			// core.quotePath); strip a leading/trailing double-quote before
+			// matching.
+			p = strings.TrimPrefix(p, `"`)
+			p = strings.TrimSuffix(p, `"`)
+			matched := false
+			for _, pref := range prefixes {
+				if strings.HasPrefix(p, pref) {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				dirty = append(dirty, line)
+				break
+			}
+		}
+	}
+	return dirty
 }
 
 func main() {
