@@ -355,26 +355,33 @@ byte-identical `vectors.jsonl`. Module pinning is enforced through
 module resolution at build time, so there's no runtime pin check needed
 (unlike the VRF tool, which links a locally-replaced go-algorand).
 
-### Known parity gap — ratio == 1.0 edge cases
+### Ratio == 1.0 saturation boundary (TASK-59)
 
-The parity harness at `crates/core/algo-consensus-crypto/tests/sortition_parity.rs`
-allowlists **13 `digest_max` fixture divergences**. These are ratio=1.0
-exactly (VRF output = 0xff…ff), where Rust's numerically-stable log-PMF
-recurrence saturates the CDF one f64 ulp below 1.0 while Boost's
-regularized-incomplete-beta evaluation rounds up to exactly 1.0 at a
-specific j. Production impact is nil: a 256-bit uniform VRF output
-producing exactly 0xff…ff is cryptographically unreachable (~2^-256 per
-query). Follow-up work is tracked separately — see `is_known_boost_saturation_divergence`
-in the parity test for the exhaustive list; any divergence outside that
-list hard-fails the test.
+`digest_max` fixtures (VRF output = 0xff…ff ⇒ ratio = 1.0 exactly)
+exercise the CDF's f64 saturation-to-1.0 rounding boundary — the
+point where Boost's `ibetac(j+1, n-j, p) = 1 - ibeta(..)` rounds up
+to exactly `1.0`. Rust's walker matches this byte-for-byte via a
+dedicated tail-bound check in `binomial_cdf_walk`, keyed on the
+`y ≤ 2^-54` threshold under which `1.0 - y == 1.0` holds in f64
+round-to-nearest-even. Every `digest_max` corpus fixture now matches
+Go — no allowlist. The parity test also asserts a minimum of 13
+`digest_max` fixtures so this coverage can't silently erode (see
+`sortition_parity_vs_go_algorand`).
+
+Production impact of the fix: still nil — a 256-bit uniform VRF
+output producing exactly 0xff…ff remains cryptographically
+unreachable (~2^-256 per query). The fix exists so the conformance
+corpus can run byte-exact end-to-end without a maintenance-prone
+allowlist.
 
 ### When to regenerate
 
 - Bumping `github.com/algorand/sortition` in `tools/sortition-vector-capture/go.sum`
   (effectively never — v1.0.0 is stable).
 - Extending the fixed parameter or digest matrix in `main.go`. Append
-  only, never renumber — downstream harness allowlists reference fixtures
-  by the `name` field.
+  only, never renumber — downstream harness state (e.g. the corpus
+  size floors in `sortition_parity.rs`) references fixtures by the
+  `name` field and by fixture count.
 
 ### References
 
