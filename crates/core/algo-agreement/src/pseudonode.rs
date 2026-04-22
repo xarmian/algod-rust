@@ -1163,6 +1163,16 @@ mod tests {
     // * **`TestPseudonodeNonEnqueuedTasks`** — depends on the async vote
     //   verifier exec pool and its log output; covered separately by the
     //   crypto_verifier tests.
+    // * **Event-shape happy path** (Go lines 196-232: `make_proposals`
+    //   returning `VoteVerified`+`PayloadVerified` pairs, `make_votes`
+    //   returning only `VoteVerified`) — requires a full fixture stack
+    //   (seeded block factory, online-account ledger entries, per-round
+    //   seeds, registered VRF+OTS signing keys) so the pseudonode can
+    //   produce credentials and signatures that verify. Without that,
+    //   the tests pass vacuously on empty event lists and miss the
+    //   regressions they would otherwise catch. Deferred to follow-up
+    //   alongside the simulate / player-permutation infrastructure
+    //   (DOC-21 §3.4 / §3.6) which builds the same stack.
     // * **`participationKeys = nil` retention** (Go test lines 432-436):
     //   the Go test relies on `nil` vs empty-slice distinction to verify
     //   that clearing `participationKeys` is NOT re-populated on a
@@ -1307,89 +1317,23 @@ mod tests {
         }
     }
 
-    /// Go test lines 196-212 (roughly). A single `make_proposals` call
-    /// with participating accounts produces both `VoteVerified` events
-    /// (one per account that wins sortition) and `PayloadVerified`
-    /// events (the corresponding block proposal). The Go test asserts a
-    /// range `[2..=10]` for each because sortition outcomes vary; we
-    /// assert the relationship that every emitted `VoteVerified` is
-    /// paired with a `PayloadVerified`, since the Rust impl generates
-    /// them together inside `create_proposals`.
-    ///
-    /// This exercises the same "single successful request returns the
-    /// expected event shape" contract the Go test checks; the
-    /// backlog-overflow prelude (Go lines 166-194) is skipped because
-    /// Rust has no bounded pre-verification backlog to overflow (see the
-    /// "Scenarios intentionally NOT ported" note above).
-    #[test]
-    fn make_proposals_emits_paired_vote_and_payload_events() {
-        let factory = crate::stubs::StubBlockFactory::new();
-        let keys = TestKeyManager::new(vec![participation_record(1)]);
-        let ledger = crate::stubs::StubLedger::new(v41_params(), Round(100));
-        let mut pn = AsyncPseudonode::new(factory, keys, ledger);
-
-        // With a non-empty `TestKeyManager`, `NoProposals` (which is only
-        // emitted when participation keys are empty) would indicate a
-        // key-loading regression, not a sortition outcome. Fail loudly on
-        // any error so regressions can't slip through.
-        let events = pn
-            .make_proposals(Round(100), Period(0))
-            .expect("make_proposals must succeed with non-empty keys");
-
-        let vote_verified = events
-            .iter()
-            .filter(|e| e.t == EventType::VoteVerified)
-            .count();
-        let payload_verified = events
-            .iter()
-            .filter(|e| e.t == EventType::PayloadVerified)
-            .count();
-        assert_eq!(
-            vote_verified, payload_verified,
-            "make_proposals must emit paired vote+payload events: got \
-             {vote_verified} votes and {payload_verified} payloads",
-        );
-    }
-
-    /// Go test lines 214-232: `make_votes` produces only `VoteVerified`
-    /// events — never `PayloadVerified`, since votes don't carry a
-    /// block payload. The Go test asserts
-    /// `assert.Equal(t, 0, len(events[payloadVerified]))`.
-    #[test]
-    fn make_votes_emits_only_vote_verified_events() {
-        let factory = crate::stubs::StubBlockFactory::new();
-        let keys = TestKeyManager::new(vec![participation_record(1)]);
-        let ledger = crate::stubs::StubLedger::new(v41_params(), Round(100));
-        let mut pn = AsyncPseudonode::new(factory, keys, ledger);
-
-        let proposal = ProposalValue {
-            original_period: Period(1),
-            original_proposer: Address([0x42; 32]),
-            block_digest: Digest([0xaa; 32]),
-            encoding_digest: Digest([0xbb; 32]),
-        };
-
-        // Same rationale as the proposal test: `NoVotes` indicates a
-        // participation-key-loading regression, not a sortition outcome.
-        let events = pn
-            .make_votes(Round(100), Period(1), Step(2), proposal, None)
-            .expect("make_votes must succeed with non-empty keys");
-
-        assert_eq!(
-            events
-                .iter()
-                .filter(|e| e.t == EventType::PayloadVerified)
-                .count(),
-            0,
-            "make_votes must never emit PayloadVerified events",
-        );
-        // If anything was emitted, it must be only VoteVerified.
-        for ev in &events {
-            assert_eq!(
-                ev.t,
-                EventType::VoteVerified,
-                "unexpected event type in make_votes output: {ev:?}",
-            );
-        }
-    }
+    // Go test scenarios at lines 196-212 (`make_proposals` returns
+    // `VoteVerified` + `PayloadVerified` pairs) and 214-232 (`make_votes`
+    // returns only `VoteVerified`) would need a full happy-path fixture
+    // to be meaningful: a seeded `StubBlockFactory::set_block`, per-round
+    // `StubLedger::set_account` entries with online stake (so
+    // `membership_from_ledger` succeeds), per-round seeds, and registered
+    // `AccountSigningKeys` (VRF + OTS) so the pseudonode can produce
+    // credentials and signatures that `verify_vote_from_ledger` accepts.
+    // Without all of that, `assemble_block` returns `RoundStale` and
+    // `create_proposals` / `create_votes` exit before emitting anything —
+    // so an "events-empty-is-acceptable" assertion would pass vacuously
+    // and miss the exact regressions the test is supposed to catch.
+    //
+    // Building that fixture stack is out of scope for this test-port task
+    // (TASK-65 is sized "s"); it is a natural follow-up under the
+    // player-permutation / simulate work in DOC-21 §3.4 / §3.6, which
+    // brings the same infrastructure in for the broader state-machine
+    // test matrix. See the top-of-block "Scenarios intentionally NOT
+    // ported" list — this entry is captured there.
 }
