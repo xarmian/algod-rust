@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{debug, info, warn};
 
@@ -400,10 +400,17 @@ fn main_loop<L, K, BF, R>(
     });
 
     // Determine initial state: restored from crash DB or fresh bootstrap.
-    let (mut router, mut player, mut actions) = if let Some((
+    //
+    // When restoring, also recover the wall-clock "zero" that was persisted
+    // alongside the state (mirrors Go's `s.Clock = clock` assignment in
+    // `agreement/service.go:252`). The zero is then used to clamp the
+    // restored player's deadlines by the elapsed wall-clock interval, so
+    // that timeouts continue to fire on their original schedule rather than
+    // being reset by the restart — addressing DOC-21 §3.8.
+    let (mut router, mut player, mut actions, service_zero) = if let Some((
         r_router,
-        r_player,
-        _r_clock,
+        mut r_player,
+        r_clock,
         r_actions,
     )) = restored_state
     {
@@ -413,16 +420,19 @@ fn main_loop<L, K, BF, R>(
                 "using restored agreement state at round {} (ledger next round {})",
                 r_player.round, next_round
             );
-            (r_router, r_player, r_actions)
+            let zero = resume_from_clock_zero(&mut r_player, &r_clock, SystemTime::now());
+            (r_router, r_player, r_actions, zero)
         } else {
             info!(
                     "restored agreement state at round {} is stale (ledger next round {}); bootstrapping fresh",
                     r_player.round, next_round
                 );
-            bootstrap_fresh(next_round, &cparams)
+            let (router, player, actions) = bootstrap_fresh(next_round, &cparams);
+            (router, player, actions, SystemTime::now())
         }
     } else {
-        bootstrap_fresh(next_round, &cparams)
+        let (router, player, actions) = bootstrap_fresh(next_round, &cparams);
+        (router, player, actions, SystemTime::now())
     };
 
     // Create the pseudonode for local proposal/vote generation.
@@ -531,6 +541,7 @@ fn main_loop<L, K, BF, R>(
                     &persist_router,
                     &persist_player,
                     &persist_actions,
+                    service_zero,
                 );
             }
         }
@@ -577,6 +588,7 @@ fn execute_pseudonode_action(
     persist_router: &Option<RootRouter>,
     persist_player: &Option<Player>,
     persist_actions: &Option<Vec<Action>>,
+    service_zero: SystemTime,
 ) {
     match pa.t {
         ActionType::Assemble => {
@@ -645,7 +657,11 @@ fn execute_pseudonode_action(
                 persist_player,
                 persist_actions,
             ) {
-                let clock_state = ClockState::default(); // TODO: populate from service clock
+                // Snapshot the service clock alongside the state — mirrors
+                // go-algorand `agreement/service.go:282` which encodes
+                // `s.Clock` with every persist. On a later restore the zero
+                // is used to clamp outstanding deadlines; see main_loop.
+                let clock_state = ClockState::with_zero(service_zero);
                 match persistence::encode(p_router, p_player, &clock_state, p_actions) {
                     Ok(raw) if !raw.is_empty() => {
                         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
@@ -725,6 +741,54 @@ fn execute_pseudonode_action(
         }
         _ => {
             warn!("unexpected pseudonode action type: {}", pa.t);
+        }
+    }
+}
+
+/// Resume the service clock from a restored `ClockState` and clamp the
+/// restored player's outstanding deadlines by the elapsed wall-clock
+/// interval. Returns the `SystemTime` to adopt as the service epoch.
+///
+/// Semantics (mirrors go-algorand v4.5.1-stable `agreement/service.go:226-253`):
+///
+/// * `ClockState` carries a persisted zero. If present, we measure the
+///   wall-clock elapsed time from that zero to `now`; each of the player's
+///   outstanding deadlines is reduced by that elapsed amount (saturating
+///   at zero so a timeout that already expired fires immediately). The
+///   persisted zero is adopted as the new service epoch so subsequent
+///   persists continue anchoring against the same reference point.
+/// * If the persisted zero is in the future (wall-clock moved backwards or
+///   the crash.sqlite state is bogus), we refuse to adjust deadlines and
+///   rebase the epoch to `now` — safer to run one round as if fresh than
+///   to time-travel the state machine.
+/// * If no zero was persisted (legacy pre-TASK-62 state), we start a fresh
+///   epoch at `now` and leave the restored deadlines as-is.
+fn resume_from_clock_zero(player: &mut Player, clock: &ClockState, now: SystemTime) -> SystemTime {
+    match clock.zero() {
+        Some(zero) => match now.duration_since(zero) {
+            Ok(elapsed) => {
+                let deadline_before = player.deadline.duration;
+                let fast_before = player.fast_recovery_deadline;
+                player.deadline.duration = deadline_before.saturating_sub(elapsed);
+                player.fast_recovery_deadline = fast_before.saturating_sub(elapsed);
+                info!(
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    deadline_before_ms = deadline_before.as_millis() as u64,
+                    deadline_after_ms = player.deadline.duration.as_millis() as u64,
+                    fast_before_ms = fast_before.as_millis() as u64,
+                    fast_after_ms = player.fast_recovery_deadline.as_millis() as u64,
+                    "resumed agreement clock; clamped restored deadlines by elapsed wall-clock",
+                );
+                zero
+            }
+            Err(_) => {
+                warn!("restored clock zero is in the future; starting a fresh clock epoch");
+                now
+            }
+        },
+        None => {
+            info!("restored agreement state has no clock zero; starting fresh clock epoch");
+            now
         }
     }
 }
@@ -1338,6 +1402,147 @@ mod tests {
         assert!(!clocks.contains_key(&Round(5)));
         // Round 20 should be kept
         assert!(clocks.contains_key(&Round(20)));
+    }
+
+    // ---------------- TASK-62: clock-state restore on agreement start ------
+
+    /// Build a minimal player with known outstanding deadlines for clock
+    /// resume tests. Only the fields the helper touches are set.
+    fn player_with_deadlines(deadline: Duration, fast_recovery: Duration) -> Player {
+        Player {
+            deadline: Deadline {
+                duration: deadline,
+                timeout_type: TimeoutType::Filter,
+            },
+            fast_recovery_deadline: fast_recovery,
+            ..Player::default()
+        }
+    }
+
+    /// Persisting state at t=T and restoring at t=T+elapsed must clamp the
+    /// player's outstanding deadlines by `elapsed`, mirroring the wall-clock
+    /// anchoring that go-algorand does via `s.Clock = clock` at
+    /// `agreement/service.go:252`. Covers TASK-62 / DOC-21 §3.8.
+    #[test]
+    fn resume_from_clock_zero_clamps_deadlines_by_elapsed_wall_clock() {
+        let persist_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_710_000_000);
+        let clock = ClockState::with_zero(persist_time);
+
+        // At persist time the player had 5s left on the main deadline and
+        // 10s left on the fast-recovery deadline.
+        let mut player = player_with_deadlines(Duration::from_secs(5), Duration::from_secs(10));
+
+        // Simulate a restart 3 seconds later.
+        let restart_time = persist_time + Duration::from_secs(3);
+        let adopted_zero = resume_from_clock_zero(&mut player, &clock, restart_time);
+
+        // The adopted epoch must be the persisted zero — subsequent
+        // persists have to anchor against the same reference point.
+        assert_eq!(adopted_zero, persist_time);
+        // Deadlines are clamped by the wall-clock elapsed (3s).
+        assert_eq!(player.deadline.duration, Duration::from_secs(2));
+        assert_eq!(player.fast_recovery_deadline, Duration::from_secs(7));
+    }
+
+    /// A deadline that has already fully elapsed pre-restart must come back
+    /// as zero so the agreement service fires it immediately rather than
+    /// waiting the full original duration all over again.
+    #[test]
+    fn resume_from_clock_zero_saturates_past_deadlines_to_zero() {
+        let persist_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_710_000_000);
+        let clock = ClockState::with_zero(persist_time);
+
+        // 2s of outstanding deadline, but we restart 10s later.
+        let mut player = player_with_deadlines(Duration::from_secs(2), Duration::from_secs(4));
+        let restart_time = persist_time + Duration::from_secs(10);
+        let zero = resume_from_clock_zero(&mut player, &clock, restart_time);
+
+        assert_eq!(zero, persist_time);
+        assert_eq!(player.deadline.duration, Duration::ZERO);
+        assert_eq!(player.fast_recovery_deadline, Duration::ZERO);
+    }
+
+    /// Pre-TASK-62 persisted state has no zero. The helper must not touch
+    /// the deadlines and must adopt `now` as the new epoch.
+    #[test]
+    fn resume_from_clock_zero_with_no_persisted_zero_keeps_deadlines() {
+        let clock = ClockState::default();
+        let mut player = player_with_deadlines(Duration::from_secs(5), Duration::from_secs(10));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+
+        let zero = resume_from_clock_zero(&mut player, &clock, now);
+
+        assert_eq!(zero, now);
+        assert_eq!(player.deadline.duration, Duration::from_secs(5));
+        assert_eq!(player.fast_recovery_deadline, Duration::from_secs(10));
+    }
+
+    /// If the persisted zero is in the future (clock drift, bogus state)
+    /// the helper must refuse to adjust deadlines and rebase the epoch to
+    /// `now`. Better to run one round as if fresh than to time-travel.
+    #[test]
+    fn resume_from_clock_zero_rejects_future_zero() {
+        let persist_time = SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000_000);
+        let clock = ClockState::with_zero(persist_time);
+
+        let mut player = player_with_deadlines(Duration::from_secs(5), Duration::from_secs(10));
+        // "now" is before the persisted zero.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let zero = resume_from_clock_zero(&mut player, &clock, now);
+
+        assert_eq!(zero, now);
+        assert_eq!(player.deadline.duration, Duration::from_secs(5));
+        assert_eq!(player.fast_recovery_deadline, Duration::from_secs(10));
+    }
+
+    /// End-to-end: encode a `ClockState` with a specific zero, persist it
+    /// through the SQLite `persist`/`restore`/`decode` pipeline, and confirm
+    /// `resume_from_clock_zero` still clamps by the right amount after
+    /// everything round-trips. This is the acceptance-criterion test from
+    /// TASK-62: "persist state at t=T, simulate restart, verify clock offset
+    /// restored."
+    #[test]
+    fn persist_then_restore_preserves_clock_offset_end_to_end() {
+        use crate::persistence::{decode, encode, persist, restore};
+
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+
+        let persist_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_710_000_000);
+        let clock = ClockState::with_zero(persist_time);
+        let router = RootRouter::default();
+        // The player's round has to be >= ledger next round for the
+        // service-level restore branch to apply; the helper itself does not
+        // care about round, so we use a non-zero one for realism.
+        let persisted_player = Player {
+            round: Round(42),
+            deadline: Deadline {
+                duration: Duration::from_secs(5),
+                timeout_type: TimeoutType::Filter,
+            },
+            fast_recovery_deadline: Duration::from_secs(10),
+            ..Player::default()
+        };
+        let raw = encode(&router, &persisted_player, &clock, &[]).expect("encode");
+        persist(&conn, &raw).expect("persist");
+
+        // Simulate a crash + restart 3 seconds later.
+        let raw_back = restore(&conn).expect("restore").expect("state present");
+        let (_dec_router, mut dec_player, dec_clock, _dec_actions) =
+            decode(&raw_back).expect("decode");
+
+        // Sanity: the encoded player matches what we persisted.
+        assert_eq!(dec_player.round, Round(42));
+        assert_eq!(dec_player.deadline.duration, Duration::from_secs(5));
+        assert_eq!(dec_player.fast_recovery_deadline, Duration::from_secs(10));
+        assert_eq!(dec_clock.zero(), Some(persist_time));
+
+        // Apply the service-level restore logic.
+        let restart_time = persist_time + Duration::from_secs(3);
+        let adopted_zero = resume_from_clock_zero(&mut dec_player, &dec_clock, restart_time);
+
+        assert_eq!(adopted_zero, persist_time);
+        assert_eq!(dec_player.deadline.duration, Duration::from_secs(2));
+        assert_eq!(dec_player.fast_recovery_deadline, Duration::from_secs(7));
     }
 
     #[test]
