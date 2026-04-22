@@ -461,3 +461,57 @@ that fails regeneration.
 - `agreement/msgp_gen.go` — canonical msgpack encoders (13K LOC, generated)
 - `agreement/golden_vectors_test.go` — starter Go-side anchor (pre-existing,
   untracked in go-algorand)
+
+## Agreement Codec Tests
+
+Two complementary test harnesses guard the `algo-agreement::codec` wire
+roundtrip invariant (`encode(decode(b)) == b` against Go-produced
+bytes):
+
+### Fixed-corpus replay — `codec_roundtrip.rs`
+
+Decodes every committed `tests/fixtures/wire/<type>/*.msgpack` fixture
+from TASK-54 through Rust's codec, re-encodes it, and asserts
+byte-identical equality against the Go-produced input. Covers all 10
+fixture subdirectories (`uvote`, `vote`, `ubundle`, `bundle`, `cert`,
+`rawvote`, `proposalvalue`, `uproposal`, `proposal`, `tpayload`) —
+~205 fixtures total, 17 tests in ≈0.01 s.
+
+```bash
+cargo test -p algo-agreement --test codec_roundtrip
+```
+
+This is the authoritative conformance check vs `go-algorand/agreement/msgp_gen.go`.
+Any roundtrip failure indicates field-ordering, `omitempty`, or
+integer-width drift and must be investigated before landing the change.
+
+### Property-based canonical-encoding fuzz — `codec_proptest.rs`
+
+Complements the fixed corpus by feeding the codec structured random
+values via `proptest` and asserting the canonical-encoding invariant
+
+```text
+encode(decode(encode(v))) == encode(v)
+```
+
+Covers the wire types whose codec doesn't require a full
+`bookkeeping.Block`: `ProposalValue`, `RawVote`, `UnauthenticatedVote`,
+`Vote` (authenticated), `UnauthenticatedBundle`, `AuthenticatedBundle`.
+`UnauthenticatedProposal` and `TransmittedPayload` are intentionally
+anchored by the fixed corpus only (generating arbitrary valid `Block`
+values is out of scope).
+
+```bash
+# Default: 256 cases per test, 6 tests — ≈0.6 s
+cargo test -p algo-agreement --test codec_proptest
+
+# Extended local run: override the case count via env var
+PROPTEST_CASES=100000 cargo test -p algo-agreement --test codec_proptest --release
+```
+
+Because the test uses byte-identity (not struct equality), a divergence
+manifests as a `prop_assert_eq!` byte-vector mismatch and shrinks down
+to the minimal input that exhibits the bug. The `proptest-regressions/`
+file committed next to the test is how proptest persists minimized
+failure seeds between runs — keep it in git so CI and developers
+replay the exact same regression inputs.

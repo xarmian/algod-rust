@@ -75,6 +75,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
+# Testing
+proptest = "1"
+
 # Workspace crates
 algo-error = { path = "crates/core/algo-error" }
 algo-types = { path = "crates/core/algo-types" }
