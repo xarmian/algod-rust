@@ -345,12 +345,28 @@ impl Cadaver {
         tag: CadaverEntryType,
         payload: &T,
     ) -> Result<(), CadaverError> {
+        match self.write_tagged_inner(tag, payload) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Any failure here can leave a partial frame on disk
+                // (e.g. tag written but payload failed mid-way). Trip
+                // the sticky failure flag so subsequent `trace_*` calls
+                // short-circuit via `try_setup` instead of appending
+                // additional records into a corrupted stream.
+                self.failed = true;
+                Err(e)
+            }
+        }
+    }
+
+    fn write_tagged_inner<T: Serialize>(
+        &mut self,
+        tag: CadaverEntryType,
+        payload: &T,
+    ) -> Result<(), CadaverError> {
         let handle = match self.out.as_mut() {
             Some(h) => h,
-            None => {
-                self.failed = true;
-                return Err(CadaverError::Failed);
-            }
+            None => return Err(CadaverError::Failed),
         };
         // Write the tag (1 byte positive-fixint in msgpack) followed by
         // the payload. A single `write_all` per value keeps the on-disk
@@ -818,6 +834,52 @@ mod tests {
         match records.get(eos_idx + 1) {
             Some(CadaverRecord::Meta(_)) => {}
             other => panic!("expected Meta after EOS, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A payload whose `Serialize` impl always errors — used to simulate a
+    /// mid-record write failure without needing to fake the filesystem.
+    struct FailingSerialize;
+
+    impl Serialize for FailingSerialize {
+        fn serialize<S: serde::Serializer>(&self, _s: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("intentional serialize failure"))
+        }
+    }
+
+    /// Regression for the Codex P1 on PR #237: an error in `write_tagged`
+    /// must flip the sticky `failed` flag so subsequent writes don't
+    /// silently append into a partial frame.
+    #[test]
+    fn write_tagged_sets_failed_on_serialize_error() {
+        let dir = unique_dir("fail-flag");
+        let cfg = test_config(&dir, "node", CADAVER_SIZE_MINIMUM);
+        let mut cad = Cadaver::open(cfg.clone()).expect("open");
+
+        let scope = PlayerSnapshot {
+            round: Round(1),
+            period: Period(0),
+            step: 0,
+        };
+
+        // First call: the Player entry serializes fine, but the Event
+        // payload fails mid-record. `write_tagged` must mark `failed`.
+        let err = cad
+            .trace_event(scope, &FailingSerialize)
+            .expect_err("serialize failure must propagate");
+        assert!(
+            matches!(err, CadaverError::Encode(_)),
+            "expected Encode error, got {err:?}",
+        );
+
+        // Second call: must short-circuit with `Failed` instead of writing
+        // new records into a potentially corrupted stream.
+        match cad.write_player(scope) {
+            Err(CadaverError::Failed) => {}
+            Err(e) => panic!("expected Failed, got {e:?}"),
+            Ok(()) => panic!("expected Failed, got Ok — failed flag not sticky"),
         }
 
         let _ = fs::remove_dir_all(&dir);
