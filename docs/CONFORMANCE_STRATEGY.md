@@ -330,22 +330,56 @@ Includes:
 
 # 14. Continuous Integration
 
-CI should automatically run:
+CI automatically runs every parity dimension on every PR. Failures
+block merges.
 
-- codec tests
-- hash tests
-- ledger replay tests
-- AVM test vectors
+## 14.1 PR workflow — `.github/workflows/conformance-parity.yml`
 
-Suggested CI steps:
+Byte-level differential suite vs go-algorand `v4.5.1-stable`. Target
+wall time: ≤ 8 min on a warm cache. Exercises the PLAN-30 gap
+dimensions (Greek letters match the gap memo):
 
-```
-cargo test
-cargo fuzz run codec
-algod-rust-conform validate --rounds 1..500
-```
+| Step | Test | Corpus |
+|------|------|--------|
+| **β** VRF parity | `cargo test --release -p algo-consensus-crypto --test vrf_parity` | `crates/core/algo-consensus-crypto/tests/fixtures/vrf/vectors.jsonl` |
+| **γ** Sortition parity | `cargo test --release -p algo-consensus-crypto --test sortition_parity` | `crates/core/algo-consensus-crypto/tests/fixtures/sortition/vectors.jsonl` |
+| **ε** Codec roundtrip | `cargo test --release -p algo-agreement --test codec_roundtrip` | `crates/core/algo-agreement/tests/fixtures/wire/**` |
+| **ζ** Canonical-encoding proptest | `PROPTEST_CASES=1000000 cargo test --release -p algo-agreement --test codec_proptest` | generated (no fixture) |
+| **η** Lookback boundary | `cargo test --release -p algo-agreement --test lookback_boundary` | `crates/core/algo-agreement/tests/fixtures/lookback/lookback_boundaries.json` |
 
-Failures should block merges.
+The workflow runs a single job that reuses one `target/` across all
+five steps (via `Swatinem/rust-cache@v2`), keeping compile cost
+amortized.
+
+## 14.2 Nightly workflow — `.github/workflows/nightly-fuzz.yml`
+
+Extends **ζ** with `PROPTEST_CASES=10_000_000` (~30 min wall time, ≈5×
+the PR budget). Schedule: 03:17 UTC daily, plus `workflow_dispatch`
+with an overridable `proptest_cases` input. If proptest finds a new
+counter-example:
+
+1. The failing seed is written to
+   `crates/core/algo-agreement/tests/proptest-regressions/` by
+   proptest itself.
+2. The workflow uploads that directory as a 30-day retained artifact
+   (`proptest-regressions-<run-id>`).
+3. The workflow opens a PR against `main` with the new seed committed,
+   labeled `fuzz-finding` + `conformance`, so the next CI run replays
+   the regression automatically once merged.
+
+## 14.3 Baseline test job
+
+`cargo test --workspace` continues to run in the project's default
+test job and covers the non-parity corpus (codec unit tests, AVM
+opcode tests, ledger apply tests, REST API handler tests). The
+parity workflow is additive, not a replacement.
+
+## 14.4 Refreshing fixtures
+
+`docs/DEV_WORKFLOW.md` §"Conformance Fixture Refresh" is the runbook
+for bumping go-algorand and regenerating the corpora in this section.
+Read it before the first refresh on a new machine — each capture tool
+has prerequisites (libsodium for VRF, C++ toolchain for sortition).
 
 ---
 

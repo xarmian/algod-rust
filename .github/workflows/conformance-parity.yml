@@ -1,0 +1,80 @@
+name: Conformance Parity
+
+# Byte-level parity suite vs go-algorand v4.5.1-stable. Runs on every PR
+# and push to main. Exercises each PLAN-30 gap dimension:
+#
+#   β  VRF byte-level proof/output parity
+#   γ  Sortition precision-boundary parity (Boost binomial CDF)
+#   ε  Agreement wire codec roundtrip vs Go-produced msgpack
+#   ζ  Canonical-encoding proptest (budgeted ~3 min)
+#   η  Lookback round-math boundary parity across consensus versions
+#
+# Budget target: ≤ 8 min wall time with a warm cache.
+# Compile-once-test-many pattern: a single job reuses one `target/` across
+# all five parity tests, dominating on test-binary compile cost.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: conformance-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  conformance:
+    name: Crypto + Codec Parity Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: conformance-parity
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # β — VRF byte-level parity vs Go-produced vectors.
+      # Corpus: crates/core/algo-consensus-crypto/tests/fixtures/vrf/vectors.jsonl
+      - name: β — VRF parity vs go-algorand
+        run: cargo test --release -p algo-consensus-crypto --test vrf_parity
+
+      # γ — Sortition precision-boundary parity vs Go's Boost-backed walker.
+      # Corpus: crates/core/algo-consensus-crypto/tests/fixtures/sortition/vectors.jsonl
+      - name: γ — Sortition parity vs go-algorand
+        run: cargo test --release -p algo-consensus-crypto --test sortition_parity
+
+      # ε — Agreement wire codec roundtrip vs Go-produced msgpack fixtures.
+      # Corpus: crates/core/algo-agreement/tests/fixtures/wire/**
+      - name: ε — Agreement codec roundtrip vs go-algorand
+        run: cargo test --release -p algo-agreement --test codec_roundtrip
+
+      # ζ — Canonical-encoding proptest, budgeted for ~3 min on GitHub-hosted
+      # runners. Local default is 256 cases per test; 1,000,000 per test
+      # (6,000,000 total roundtrips) scales that up to a PR-budget-friendly
+      # sweep. Nightly extends this further — see nightly-fuzz.yml.
+      - name: ζ — Canonical-encoding proptest (budgeted ~3 min)
+        env:
+          PROPTEST_CASES: "1000000"
+        run: cargo test --release -p algo-agreement --test codec_proptest
+
+      # η — Lookback version-boundary parity vs Go's agreement.ParamsRound /
+      # BalanceRound / seedRound across every consensus version V7..V41.
+      # Corpus: crates/core/algo-agreement/tests/fixtures/lookback/lookback_boundaries.json
+      - name: η — Lookback boundary parity vs go-algorand
+        run: cargo test --release -p algo-agreement --test lookback_boundary
