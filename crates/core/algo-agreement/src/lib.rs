@@ -31,6 +31,7 @@ mod selector;
 pub mod service;
 mod step;
 pub mod stubs;
+pub mod trace;
 pub mod traits;
 pub mod types;
 mod vote;
