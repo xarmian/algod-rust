@@ -1,0 +1,2526 @@
+{
+  "source": "algod-rust/tools/lookback-vector-capture (TASK-57)",
+  "go_algorand_pin": "v4.5.1-stable",
+  "vectors": [
+    {
+      "version": "v7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 100,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 100,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 100,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 100,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "v7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 100,
+      "round": 399,
+      "params_round": 397,
+      "balance_round": 0,
+      "seed_round": 397
+    },
+    {
+      "version": "v7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 100,
+      "round": 400,
+      "params_round": 398,
+      "balance_round": 0,
+      "seed_round": 398
+    },
+    {
+      "version": "v7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 100,
+      "round": 401,
+      "params_round": 399,
+      "balance_round": 1,
+      "seed_round": 399
+    },
+    {
+      "version": "v7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 100,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999600,
+      "seed_round": 9999998
+    },
+    {
+      "version": "v8",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v8",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v8",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v8",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "v8",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "v8",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "v8",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "v8",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "v9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "v9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "v9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "v9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "v9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "v10",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v10",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v10",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v10",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "v10",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "v10",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "v10",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "v10",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "v11",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v11",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v11",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v11",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "v11",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "v11",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "v11",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "v11",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "v12",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v12",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v12",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "v12",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "v12",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "v12",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "v12",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "v12",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/0c8a9dc44d7368cc266d5407b79fb3311f4fc795",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/0c8a9dc44d7368cc266d5407b79fb3311f4fc795",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/0c8a9dc44d7368cc266d5407b79fb3311f4fc795",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/0c8a9dc44d7368cc266d5407b79fb3311f4fc795",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/0c8a9dc44d7368cc266d5407b79fb3311f4fc795",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/0c8a9dc44d7368cc266d5407b79fb3311f4fc795",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/0c8a9dc44d7368cc266d5407b79fb3311f4fc795",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/0c8a9dc44d7368cc266d5407b79fb3311f4fc795",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/2526b6ae062b4fe5e163e06e41e1d9b9219135a9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/2526b6ae062b4fe5e163e06e41e1d9b9219135a9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/2526b6ae062b4fe5e163e06e41e1d9b9219135a9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/2526b6ae062b4fe5e163e06e41e1d9b9219135a9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/2526b6ae062b4fe5e163e06e41e1d9b9219135a9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/2526b6ae062b4fe5e163e06e41e1d9b9219135a9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/2526b6ae062b4fe5e163e06e41e1d9b9219135a9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/2526b6ae062b4fe5e163e06e41e1d9b9219135a9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/a26ed78ed8f834e2b9ccb6eb7d3ee9f629a6e622",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/a26ed78ed8f834e2b9ccb6eb7d3ee9f629a6e622",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/a26ed78ed8f834e2b9ccb6eb7d3ee9f629a6e622",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/a26ed78ed8f834e2b9ccb6eb7d3ee9f629a6e622",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/a26ed78ed8f834e2b9ccb6eb7d3ee9f629a6e622",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/a26ed78ed8f834e2b9ccb6eb7d3ee9f629a6e622",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/a26ed78ed8f834e2b9ccb6eb7d3ee9f629a6e622",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/a26ed78ed8f834e2b9ccb6eb7d3ee9f629a6e622",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/22726c9dcd12d9cddce4a8bd7e8ccaa707f74101",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/22726c9dcd12d9cddce4a8bd7e8ccaa707f74101",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/22726c9dcd12d9cddce4a8bd7e8ccaa707f74101",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/22726c9dcd12d9cddce4a8bd7e8ccaa707f74101",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/22726c9dcd12d9cddce4a8bd7e8ccaa707f74101",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/22726c9dcd12d9cddce4a8bd7e8ccaa707f74101",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/22726c9dcd12d9cddce4a8bd7e8ccaa707f74101",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorand/spec/tree/22726c9dcd12d9cddce4a8bd7e8ccaa707f74101",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/5615adc36bad610c7f165fa2967f4ecfa75125f0",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/5615adc36bad610c7f165fa2967f4ecfa75125f0",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/5615adc36bad610c7f165fa2967f4ecfa75125f0",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/5615adc36bad610c7f165fa2967f4ecfa75125f0",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/5615adc36bad610c7f165fa2967f4ecfa75125f0",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/5615adc36bad610c7f165fa2967f4ecfa75125f0",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/5615adc36bad610c7f165fa2967f4ecfa75125f0",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/5615adc36bad610c7f165fa2967f4ecfa75125f0",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/6c6bd668be0ab14098e51b37e806c509f7b7e31f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/6c6bd668be0ab14098e51b37e806c509f7b7e31f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/6c6bd668be0ab14098e51b37e806c509f7b7e31f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/6c6bd668be0ab14098e51b37e806c509f7b7e31f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/6c6bd668be0ab14098e51b37e806c509f7b7e31f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/6c6bd668be0ab14098e51b37e806c509f7b7e31f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/6c6bd668be0ab14098e51b37e806c509f7b7e31f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/6c6bd668be0ab14098e51b37e806c509f7b7e31f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/0e196e82bfd6e327994bec373c4cc81bc878ef5c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/0e196e82bfd6e327994bec373c4cc81bc878ef5c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/0e196e82bfd6e327994bec373c4cc81bc878ef5c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/0e196e82bfd6e327994bec373c4cc81bc878ef5c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/0e196e82bfd6e327994bec373c4cc81bc878ef5c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/0e196e82bfd6e327994bec373c4cc81bc878ef5c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/0e196e82bfd6e327994bec373c4cc81bc878ef5c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/0e196e82bfd6e327994bec373c4cc81bc878ef5c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/4a9db6a25595c6fd097cf9cc137cc83027787eaa",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/4a9db6a25595c6fd097cf9cc137cc83027787eaa",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/4a9db6a25595c6fd097cf9cc137cc83027787eaa",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/4a9db6a25595c6fd097cf9cc137cc83027787eaa",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/4a9db6a25595c6fd097cf9cc137cc83027787eaa",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/4a9db6a25595c6fd097cf9cc137cc83027787eaa",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/4a9db6a25595c6fd097cf9cc137cc83027787eaa",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/4a9db6a25595c6fd097cf9cc137cc83027787eaa",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/8096e2df2da75c3339986317f9abe69d4fa86b4b",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/8096e2df2da75c3339986317f9abe69d4fa86b4b",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/8096e2df2da75c3339986317f9abe69d4fa86b4b",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/8096e2df2da75c3339986317f9abe69d4fa86b4b",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/8096e2df2da75c3339986317f9abe69d4fa86b4b",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/8096e2df2da75c3339986317f9abe69d4fa86b4b",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/8096e2df2da75c3339986317f9abe69d4fa86b4b",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/8096e2df2da75c3339986317f9abe69d4fa86b4b",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/57016b942f6d97e6d4c0688b373bb0a2fc85a1a2",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/57016b942f6d97e6d4c0688b373bb0a2fc85a1a2",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/57016b942f6d97e6d4c0688b373bb0a2fc85a1a2",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/57016b942f6d97e6d4c0688b373bb0a2fc85a1a2",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/57016b942f6d97e6d4c0688b373bb0a2fc85a1a2",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/57016b942f6d97e6d4c0688b373bb0a2fc85a1a2",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/57016b942f6d97e6d4c0688b373bb0a2fc85a1a2",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/57016b942f6d97e6d4c0688b373bb0a2fc85a1a2",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/e5f565421d720c6f75cdd186f7098495caf9101f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/e5f565421d720c6f75cdd186f7098495caf9101f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/e5f565421d720c6f75cdd186f7098495caf9101f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/e5f565421d720c6f75cdd186f7098495caf9101f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/e5f565421d720c6f75cdd186f7098495caf9101f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/e5f565421d720c6f75cdd186f7098495caf9101f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/e5f565421d720c6f75cdd186f7098495caf9101f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/e5f565421d720c6f75cdd186f7098495caf9101f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/3a83c4c743f8b17adfd73944b4319c25722a6782",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/3a83c4c743f8b17adfd73944b4319c25722a6782",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/3a83c4c743f8b17adfd73944b4319c25722a6782",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/3a83c4c743f8b17adfd73944b4319c25722a6782",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/3a83c4c743f8b17adfd73944b4319c25722a6782",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/3a83c4c743f8b17adfd73944b4319c25722a6782",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/3a83c4c743f8b17adfd73944b4319c25722a6782",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/3a83c4c743f8b17adfd73944b4319c25722a6782",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bea19289bf41217d2c0af30522fa222ef1366466",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bea19289bf41217d2c0af30522fa222ef1366466",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bea19289bf41217d2c0af30522fa222ef1366466",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bea19289bf41217d2c0af30522fa222ef1366466",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bea19289bf41217d2c0af30522fa222ef1366466",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bea19289bf41217d2c0af30522fa222ef1366466",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bea19289bf41217d2c0af30522fa222ef1366466",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bea19289bf41217d2c0af30522fa222ef1366466",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/ac2255d586c4474d4ebcf3809acccb59b7ef34ff",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/ac2255d586c4474d4ebcf3809acccb59b7ef34ff",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/ac2255d586c4474d4ebcf3809acccb59b7ef34ff",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/ac2255d586c4474d4ebcf3809acccb59b7ef34ff",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/ac2255d586c4474d4ebcf3809acccb59b7ef34ff",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/ac2255d586c4474d4ebcf3809acccb59b7ef34ff",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/ac2255d586c4474d4ebcf3809acccb59b7ef34ff",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/ac2255d586c4474d4ebcf3809acccb59b7ef34ff",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d050b3cade6d5c664df8bd729bf219f179812595",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d050b3cade6d5c664df8bd729bf219f179812595",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d050b3cade6d5c664df8bd729bf219f179812595",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d050b3cade6d5c664df8bd729bf219f179812595",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d050b3cade6d5c664df8bd729bf219f179812595",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d050b3cade6d5c664df8bd729bf219f179812595",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d050b3cade6d5c664df8bd729bf219f179812595",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d050b3cade6d5c664df8bd729bf219f179812595",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/65b4ab3266c52c56a0fa7d591754887d68faad0a",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/65b4ab3266c52c56a0fa7d591754887d68faad0a",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/65b4ab3266c52c56a0fa7d591754887d68faad0a",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/65b4ab3266c52c56a0fa7d591754887d68faad0a",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/65b4ab3266c52c56a0fa7d591754887d68faad0a",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/65b4ab3266c52c56a0fa7d591754887d68faad0a",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/65b4ab3266c52c56a0fa7d591754887d68faad0a",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/65b4ab3266c52c56a0fa7d591754887d68faad0a",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abc54f79f9ad679d2d22f0fb9909fb005c16f8a1",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abc54f79f9ad679d2d22f0fb9909fb005c16f8a1",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abc54f79f9ad679d2d22f0fb9909fb005c16f8a1",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abc54f79f9ad679d2d22f0fb9909fb005c16f8a1",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abc54f79f9ad679d2d22f0fb9909fb005c16f8a1",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abc54f79f9ad679d2d22f0fb9909fb005c16f8a1",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abc54f79f9ad679d2d22f0fb9909fb005c16f8a1",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abc54f79f9ad679d2d22f0fb9909fb005c16f8a1",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bc36005dbd776e6d1eaf0c560619bb183215645c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bc36005dbd776e6d1eaf0c560619bb183215645c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bc36005dbd776e6d1eaf0c560619bb183215645c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bc36005dbd776e6d1eaf0c560619bb183215645c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bc36005dbd776e6d1eaf0c560619bb183215645c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bc36005dbd776e6d1eaf0c560619bb183215645c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bc36005dbd776e6d1eaf0c560619bb183215645c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/bc36005dbd776e6d1eaf0c560619bb183215645c",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/85e6db1fdbdef00aa232c75199e10dc5fe9498f6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/85e6db1fdbdef00aa232c75199e10dc5fe9498f6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/85e6db1fdbdef00aa232c75199e10dc5fe9498f6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/85e6db1fdbdef00aa232c75199e10dc5fe9498f6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/85e6db1fdbdef00aa232c75199e10dc5fe9498f6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/85e6db1fdbdef00aa232c75199e10dc5fe9498f6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/85e6db1fdbdef00aa232c75199e10dc5fe9498f6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/85e6db1fdbdef00aa232c75199e10dc5fe9498f6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d5ac876d7ede07367dbaa26e149aa42589aac1f7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d5ac876d7ede07367dbaa26e149aa42589aac1f7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d5ac876d7ede07367dbaa26e149aa42589aac1f7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d5ac876d7ede07367dbaa26e149aa42589aac1f7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d5ac876d7ede07367dbaa26e149aa42589aac1f7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d5ac876d7ede07367dbaa26e149aa42589aac1f7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d5ac876d7ede07367dbaa26e149aa42589aac1f7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/d5ac876d7ede07367dbaa26e149aa42589aac1f7",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/830a4e673148498cc7230a0d1ba1ed0a5471acc6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/830a4e673148498cc7230a0d1ba1ed0a5471acc6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/830a4e673148498cc7230a0d1ba1ed0a5471acc6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/830a4e673148498cc7230a0d1ba1ed0a5471acc6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/830a4e673148498cc7230a0d1ba1ed0a5471acc6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/830a4e673148498cc7230a0d1ba1ed0a5471acc6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/830a4e673148498cc7230a0d1ba1ed0a5471acc6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/830a4e673148498cc7230a0d1ba1ed0a5471acc6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/2dd5435993f6f6d65691140f592ebca5ef19ffbd",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/2dd5435993f6f6d65691140f592ebca5ef19ffbd",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/2dd5435993f6f6d65691140f592ebca5ef19ffbd",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/2dd5435993f6f6d65691140f592ebca5ef19ffbd",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/2dd5435993f6f6d65691140f592ebca5ef19ffbd",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/2dd5435993f6f6d65691140f592ebca5ef19ffbd",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/2dd5435993f6f6d65691140f592ebca5ef19ffbd",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/2dd5435993f6f6d65691140f592ebca5ef19ffbd",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/433d8e9a7274b6fca703d91213e05c7e6a589e69",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/433d8e9a7274b6fca703d91213e05c7e6a589e69",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/433d8e9a7274b6fca703d91213e05c7e6a589e69",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/433d8e9a7274b6fca703d91213e05c7e6a589e69",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/433d8e9a7274b6fca703d91213e05c7e6a589e69",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/433d8e9a7274b6fca703d91213e05c7e6a589e69",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/433d8e9a7274b6fca703d91213e05c7e6a589e69",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/433d8e9a7274b6fca703d91213e05c7e6a589e69",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/44fa607d6051730f5264526bf3c108d51f0eadb6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/44fa607d6051730f5264526bf3c108d51f0eadb6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/44fa607d6051730f5264526bf3c108d51f0eadb6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/44fa607d6051730f5264526bf3c108d51f0eadb6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/44fa607d6051730f5264526bf3c108d51f0eadb6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/44fa607d6051730f5264526bf3c108d51f0eadb6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/44fa607d6051730f5264526bf3c108d51f0eadb6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/44fa607d6051730f5264526bf3c108d51f0eadb6",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/1ac4dd1f85470e1fb36c8a65520e1313d7dfed5e",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/1ac4dd1f85470e1fb36c8a65520e1313d7dfed5e",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/1ac4dd1f85470e1fb36c8a65520e1313d7dfed5e",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/1ac4dd1f85470e1fb36c8a65520e1313d7dfed5e",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/1ac4dd1f85470e1fb36c8a65520e1313d7dfed5e",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/1ac4dd1f85470e1fb36c8a65520e1313d7dfed5e",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/1ac4dd1f85470e1fb36c8a65520e1313d7dfed5e",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/1ac4dd1f85470e1fb36c8a65520e1313d7dfed5e",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abd3d4823c6f77349fc04c3af7b1e99fe4df699f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abd3d4823c6f77349fc04c3af7b1e99fe4df699f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abd3d4823c6f77349fc04c3af7b1e99fe4df699f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abd3d4823c6f77349fc04c3af7b1e99fe4df699f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abd3d4823c6f77349fc04c3af7b1e99fe4df699f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abd3d4823c6f77349fc04c3af7b1e99fe4df699f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abd3d4823c6f77349fc04c3af7b1e99fe4df699f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/abd3d4823c6f77349fc04c3af7b1e99fe4df699f",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/925a46433742afb0b51bb939354bd907fa88bf95",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/925a46433742afb0b51bb939354bd907fa88bf95",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/925a46433742afb0b51bb939354bd907fa88bf95",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/925a46433742afb0b51bb939354bd907fa88bf95",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/925a46433742afb0b51bb939354bd907fa88bf95",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/925a46433742afb0b51bb939354bd907fa88bf95",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/925a46433742afb0b51bb939354bd907fa88bf95",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/925a46433742afb0b51bb939354bd907fa88bf95",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/236dcc18c9c507d794813ab768e467ea42d1b4d9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/236dcc18c9c507d794813ab768e467ea42d1b4d9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/236dcc18c9c507d794813ab768e467ea42d1b4d9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/236dcc18c9c507d794813ab768e467ea42d1b4d9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/236dcc18c9c507d794813ab768e467ea42d1b4d9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/236dcc18c9c507d794813ab768e467ea42d1b4d9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/236dcc18c9c507d794813ab768e467ea42d1b4d9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/236dcc18c9c507d794813ab768e467ea42d1b4d9",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 0,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 1,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 2,
+      "params_round": 0,
+      "balance_round": 0,
+      "seed_round": 0
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 3,
+      "params_round": 1,
+      "balance_round": 0,
+      "seed_round": 1
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 319,
+      "params_round": 317,
+      "balance_round": 0,
+      "seed_round": 317
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 320,
+      "params_round": 318,
+      "balance_round": 0,
+      "seed_round": 318
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 321,
+      "params_round": 319,
+      "balance_round": 1,
+      "seed_round": 319
+    },
+    {
+      "version": "https://github.com/algorandfoundation/specs/tree/953304de35264fc3ef91bcd05c123242015eeaed",
+      "seed_lookback": 2,
+      "seed_refresh_interval": 80,
+      "round": 10000000,
+      "params_round": 9999998,
+      "balance_round": 9999680,
+      "seed_round": 9999998
+    }
+  ]
+}

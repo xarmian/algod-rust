@@ -462,6 +462,63 @@ that fails regeneration.
 - `agreement/golden_vectors_test.go` — starter Go-side anchor (pre-existing,
   untracked in go-algorand)
 
+## Lookback Vector Regeneration
+
+Rust's `algo_agreement::lookback` primitives (`params_round`,
+`balance_round`, `seed_round`) are called on every vote verification
+and their output depends on the per-version `SeedLookback` /
+`SeedRefreshInterval` values in `ConsensusParams`. A silent drift
+between Rust's and Go's math — or between Rust's per-version params
+table and Go's — causes committee-selection divergence during a
+protocol upgrade. The fixture anchors every supported version + a
+round matrix at the saturation, seed-lookback, balance-lookback, and
+large-round boundaries against Go's actual output.
+
+### Fixture location
+
+- `crates/core/algo-agreement/tests/fixtures/lookback/lookback_boundaries.json`
+  — a single pretty-printed JSON envelope with 280 vectors across 35
+  consensus versions (V7..V41). Consumed by
+  `tests/lookback_boundary.rs`.
+
+### Regenerating
+
+```bash
+cd tools/lookback-vector-capture
+go run .
+```
+
+Runtime: a few seconds (pure call-graph through go-algorand's
+`agreement.ParamsRound` / `agreement.BalanceRound` + the replicated
+`seedRound` formula; no I/O or crypto). The tool enforces the same
+`v4.5.1-stable` pin + clean tree the other captures do, filtering
+`_test.go` files out of the dirty-tree scan so pre-existing
+untracked anchors (`agreement/golden_vectors_test.go`) don't block
+regeneration. Pass `--allow-unpinned` for an intentional capture
+against a different go-algorand tag.
+
+### When to regenerate
+
+- Bumping the go-algorand pin to a release that touches
+  `agreement/selector.go`, `agreement/params.go`, or per-version
+  `SeedLookback` / `SeedRefreshInterval` values in
+  `config/consensus.go`.
+- Adding a new consensus version to
+  `tools/lookback-vector-capture/main.go :: allVersions()` (e.g. V42
+  when it lands).
+
+### References
+
+- `agreement/params.go:25`   — `ParamsRound(r)` (exported)
+- `agreement/selector.go:53` — `BalanceRound(r, cparams)` (exported)
+- `agreement/selector.go:59` — `BalanceLookback(cparams)` = 2·SeedRefreshInterval·SeedLookback
+- `agreement/selector.go:63` — `seedRound(r, cparams)` (package-private; replicated in the capture tool)
+- `data/basics/units.go:150` — `Round.SubSaturate`
+- `config/consensus.go:870`  — v8 overrides `SeedRefreshInterval = 80`
+  (v7 default was 100) — the only historical lookback-shifting
+  protocol change, explicitly anchored by
+  `tests/lookback_boundary.rs :: v7_to_v8_transition_shifts_balance_round_by_160`
+
 ## Agreement Codec Tests
 
 Two complementary test harnesses guard the `algo-agreement::codec` wire
