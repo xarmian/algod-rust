@@ -219,10 +219,20 @@ func verifyGoAlgorandPin(path string) error {
 	if err != nil {
 		return fmt.Errorf("checking %s working tree: %w", path, err)
 	}
-	dirty := filterDirtyPaths(string(out), []string{"agreement/", "config/", "data/basics/"})
+	// protocol/ is guarded because the tool builds its version list
+	// from `protocol.ConsensusV*` constants; a local edit there
+	// could add, rename, or drop a version without the capture
+	// reflecting that, breaking reproducibility against the pinned
+	// release.
+	dirty := filterDirtyPaths(string(out), []string{
+		"agreement/",
+		"config/",
+		"data/basics/",
+		"protocol/",
+	})
 	if len(dirty) > 0 {
 		return fmt.Errorf(
-			"go-algorand at %q has uncommitted changes in agreement/, config/, or data/basics/ "+
+			"go-algorand at %q has uncommitted changes in agreement/, config/, data/basics/, or protocol/ "+
 				"that could change the captured vectors:\n%s\nClean the tree or pass --allow-unpinned.",
 			path, strings.Join(dirty, "\n"),
 		)
