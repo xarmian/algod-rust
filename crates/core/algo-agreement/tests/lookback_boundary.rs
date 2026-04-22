@@ -75,35 +75,96 @@ fn load_corpus() -> Corpus {
         .unwrap_or_else(|e| panic!("malformed lookback fixture {p:?}: {e}"))
 }
 
-/// The corpus must cover at least 280 (version, round) pairs — 35
-/// versions × ~8 rounds each. A narrower fixture implies the capture
-/// tool dropped a version or the Go side stopped emitting a subset,
-/// both of which must be investigated rather than silently tolerated.
+/// Canonical set of consensus versions the parity harness must cover —
+/// every non-deprecated, non-alpha, non-future real protocol version
+/// recognised by go-algorand v4.5.1-stable. Cross-checked against
+/// both directions so
+///
+///   - a capture that DROPS a required version (e.g. the tool skips
+///     one by accident) fails here, and
+///   - a capture that ADDS a new version (e.g. V42 lands but this
+///     test isn't updated) also fails here — otherwise Rust would
+///     silently inherit the new version's math without anchoring it
+///     against Go.
+const REQUIRED_VERSIONS: &[&str] = &[
+    algo_types::consensus::CONSENSUS_V7,
+    algo_types::consensus::CONSENSUS_V8,
+    algo_types::consensus::CONSENSUS_V9,
+    algo_types::consensus::CONSENSUS_V10,
+    algo_types::consensus::CONSENSUS_V11,
+    algo_types::consensus::CONSENSUS_V12,
+    algo_types::consensus::CONSENSUS_V13,
+    algo_types::consensus::CONSENSUS_V14,
+    algo_types::consensus::CONSENSUS_V15,
+    algo_types::consensus::CONSENSUS_V16,
+    algo_types::consensus::CONSENSUS_V17,
+    algo_types::consensus::CONSENSUS_V18,
+    algo_types::consensus::CONSENSUS_V19,
+    algo_types::consensus::CONSENSUS_V20,
+    algo_types::consensus::CONSENSUS_V21,
+    algo_types::consensus::CONSENSUS_V22,
+    algo_types::consensus::CONSENSUS_V23,
+    algo_types::consensus::CONSENSUS_V24,
+    algo_types::consensus::CONSENSUS_V25,
+    algo_types::consensus::CONSENSUS_V26,
+    algo_types::consensus::CONSENSUS_V27,
+    algo_types::consensus::CONSENSUS_V28,
+    algo_types::consensus::CONSENSUS_V29,
+    algo_types::consensus::CONSENSUS_V30,
+    algo_types::consensus::CONSENSUS_V31,
+    algo_types::consensus::CONSENSUS_V32,
+    algo_types::consensus::CONSENSUS_V33,
+    algo_types::consensus::CONSENSUS_V34,
+    algo_types::consensus::CONSENSUS_V35,
+    algo_types::consensus::CONSENSUS_V36,
+    algo_types::consensus::CONSENSUS_V37,
+    algo_types::consensus::CONSENSUS_V38,
+    algo_types::consensus::CONSENSUS_V39,
+    algo_types::consensus::CONSENSUS_V40,
+    algo_types::consensus::CONSENSUS_V41,
+];
+
+/// The captured version set must equal `REQUIRED_VERSIONS` exactly —
+/// no missing versions (silent coverage gap) and no unknown versions
+/// (new protocol landed without the anchor being extended). Checked
+/// by set-difference rather than count so a drop-and-add of equal
+/// cardinality can't slip through.
 #[test]
 fn corpus_covers_every_known_version() {
     let corpus = load_corpus();
-    assert!(
-        corpus.vectors.len() >= 280,
-        "corpus shrank to {} vectors; regenerate via tools/lookback-vector-capture",
-        corpus.vectors.len()
-    );
+    let mut captured: Vec<&str> = corpus.vectors.iter().map(|v| v.version.as_str()).collect();
+    captured.sort_unstable();
+    captured.dedup();
 
-    let mut versions: Vec<&str> = corpus.vectors.iter().map(|v| v.version.as_str()).collect();
-    versions.sort_unstable();
-    versions.dedup();
-    assert!(
-        versions.len() >= 35,
-        "corpus spans only {} versions; expected \u{2265}35 (V7..V41)",
-        versions.len()
-    );
+    // (1) Every required version must appear.
+    for required in REQUIRED_VERSIONS {
+        assert!(
+            captured.contains(required),
+            "version {required:?} missing from corpus; \
+             regenerate via `cd tools/lookback-vector-capture && go run .`"
+        );
+    }
 
-    // V7 must be present — it's the only historical version with a
-    // distinct SeedRefreshInterval (100 vs v8+'s 80), so losing it
-    // would silently remove the only real boundary-shift coverage in
-    // the suite.
+    // (2) Every captured version must be one we expect. Catches a
+    // future tool run that emits a newly-added version before this
+    // test is extended to cover it — otherwise we'd ship parity
+    // "coverage" for a version whose math nobody verified.
+    for captured_v in &captured {
+        assert!(
+            REQUIRED_VERSIONS.contains(captured_v),
+            "corpus contains unknown version {captured_v:?}; \
+             either add it to REQUIRED_VERSIONS (and write any version-specific \
+             anchor tests) or drop it from tools/lookback-vector-capture"
+        );
+    }
+
+    // V7 is REQUIRED specifically because it has a distinct
+    // SeedRefreshInterval (100 vs v8+'s 80) — without the v7 anchor
+    // the `v7_to_v8_transition_shifts_balance_round_by_160` test
+    // below has no captured fixture backing the v7 side.
     assert!(
-        versions.contains(&"v7"),
-        "v7 missing from corpus; the V7\u{2192}V8 SeedRefreshInterval shift is this suite's headline check"
+        REQUIRED_VERSIONS.contains(&algo_types::consensus::CONSENSUS_V7),
+        "REQUIRED_VERSIONS must include v7"
     );
 }
 
