@@ -401,13 +401,14 @@ fn main_loop<L, K, BF, R>(
 
     // Determine initial state: restored from crash DB or fresh bootstrap.
     //
-    // When restoring, also recover the wall-clock "zero" that was persisted
-    // alongside the state (mirrors Go's `s.Clock = clock` assignment in
-    // `agreement/service.go:252`). The zero is then used to clamp the
-    // restored player's deadlines by the elapsed wall-clock interval, so
-    // that timeouts continue to fire on their original schedule rather than
-    // being reset by the restart — addressing DOC-21 §3.8.
-    let (mut router, mut player, mut actions, service_zero) = if let Some((
+    // When restoring, recover the wall-clock stamp that was written into
+    // the persisted `ClockState` at checkpoint time and clamp the restored
+    // player's outstanding deadlines by the interval elapsed since that
+    // stamp — i.e. the crash downtime. Mirrors Go's `s.Clock = clock`
+    // assignment in `agreement/service.go:252` so timeouts continue to
+    // fire on their original schedule rather than being reset by the
+    // restart (DOC-21 §3.8).
+    let (mut router, mut player, mut actions) = if let Some((
         r_router,
         mut r_player,
         r_clock,
@@ -420,19 +421,17 @@ fn main_loop<L, K, BF, R>(
                 "using restored agreement state at round {} (ledger next round {})",
                 r_player.round, next_round
             );
-            let zero = resume_from_clock_zero(&mut r_player, &r_clock, SystemTime::now());
-            (r_router, r_player, r_actions, zero)
+            resume_from_clock_zero(&mut r_player, &r_clock, SystemTime::now());
+            (r_router, r_player, r_actions)
         } else {
             info!(
                     "restored agreement state at round {} is stale (ledger next round {}); bootstrapping fresh",
                     r_player.round, next_round
                 );
-            let (router, player, actions) = bootstrap_fresh(next_round, &cparams);
-            (router, player, actions, SystemTime::now())
+            bootstrap_fresh(next_round, &cparams)
         }
     } else {
-        let (router, player, actions) = bootstrap_fresh(next_round, &cparams);
-        (router, player, actions, SystemTime::now())
+        bootstrap_fresh(next_round, &cparams)
     };
 
     // Create the pseudonode for local proposal/vote generation.
@@ -541,7 +540,6 @@ fn main_loop<L, K, BF, R>(
                     &persist_router,
                     &persist_player,
                     &persist_actions,
-                    service_zero,
                 );
             }
         }
@@ -588,7 +586,6 @@ fn execute_pseudonode_action(
     persist_router: &Option<RootRouter>,
     persist_player: &Option<Player>,
     persist_actions: &Option<Vec<Action>>,
-    service_zero: SystemTime,
 ) {
     match pa.t {
         ActionType::Assemble => {
@@ -657,11 +654,18 @@ fn execute_pseudonode_action(
                 persist_player,
                 persist_actions,
             ) {
-                // Snapshot the service clock alongside the state — mirrors
-                // go-algorand `agreement/service.go:282` which encodes
-                // `s.Clock` with every persist. On a later restore the zero
-                // is used to clamp outstanding deadlines; see main_loop.
-                let clock_state = ClockState::with_zero(service_zero);
+                // Snapshot the wall-clock at checkpoint time. On a later
+                // restore, `resume_from_clock_zero` measures elapsed since
+                // this stamp — i.e. the crash downtime — and clamps the
+                // restored player's outstanding deadlines by that interval.
+                //
+                // Using `SystemTime::now()` per-checkpoint (rather than a
+                // fixed service-startup zero) ensures the elapsed math
+                // reflects only downtime, not uptime, so a node that has
+                // been up for hours still recovers correctly from a crash.
+                // Mirrors go-algorand's encode-fresh-each-checkpoint
+                // pattern in `agreement/service.go:282`.
+                let clock_state = ClockState::with_zero(SystemTime::now());
                 match persistence::encode(p_router, p_player, &clock_state, p_actions) {
                     Ok(raw) if !raw.is_empty() => {
                         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
@@ -745,24 +749,28 @@ fn execute_pseudonode_action(
     }
 }
 
-/// Resume the service clock from a restored `ClockState` and clamp the
-/// restored player's outstanding deadlines by the elapsed wall-clock
-/// interval. Returns the `SystemTime` to adopt as the service epoch.
+/// Resume from a restored `ClockState` by clamping the restored player's
+/// outstanding deadlines by the elapsed wall-clock crash downtime.
+/// Returns the `SystemTime` adopted as the reference point (informational;
+/// current persists always stamp `SystemTime::now()` fresh at checkpoint).
 ///
 /// Semantics (mirrors go-algorand v4.5.1-stable `agreement/service.go:226-253`):
 ///
-/// * `ClockState` carries a persisted zero. If present, we measure the
-///   wall-clock elapsed time from that zero to `now`; each of the player's
-///   outstanding deadlines is reduced by that elapsed amount (saturating
-///   at zero so a timeout that already expired fires immediately). The
-///   persisted zero is adopted as the new service epoch so subsequent
-///   persists continue anchoring against the same reference point.
-/// * If the persisted zero is in the future (wall-clock moved backwards or
-///   the crash.sqlite state is bogus), we refuse to adjust deadlines and
-///   rebase the epoch to `now` — safer to run one round as if fresh than
-///   to time-travel the state machine.
-/// * If no zero was persisted (legacy pre-TASK-62 state), we start a fresh
-///   epoch at `now` and leave the restored deadlines as-is.
+/// * `ClockState` carries the wall-clock stamp taken at the most recent
+///   checkpoint (the last `Attest` before the crash). On restore we
+///   measure `now - stamp` — this is exactly the crash downtime, not
+///   service uptime — and reduce each outstanding player deadline by
+///   that interval (saturating at zero so an already-expired timeout
+///   fires immediately). Using checkpoint-time (not service-startup) as
+///   the reference ensures nodes that have been up for hours still
+///   recover correctly; otherwise the elapsed value would include total
+///   uptime and over-subtract the deadlines.
+/// * If the persisted stamp is in the future (wall-clock moved backwards
+///   or the crash.sqlite state is bogus), we refuse to adjust deadlines
+///   and return `now` — safer to run one round as if fresh than to
+///   time-travel the state machine.
+/// * If no stamp was persisted (legacy pre-TASK-62 state), we leave the
+///   restored deadlines as-is and return `now`.
 fn resume_from_clock_zero(player: &mut Player, clock: &ClockState, now: SystemTime) -> SystemTime {
     match clock.zero() {
         Some(zero) => match now.duration_since(zero) {
