@@ -128,26 +128,35 @@ pub fn select(money: u64, total_money: u64, expected_size: f64, vrf_output: [u8;
 /// still fires at the right `j`.
 fn boost_binomial_ccdf_ibeta(n: u64, j: u64, p: f64) -> f64 {
     let one_minus_p = 1.0 - p;
-    // `result = p^n` via `powi` rather than `exp(n * ln p)` — `powi`
-    // is repeated squaring + multiplication, which stays exact for any
-    // p that's a power of two (e.g. `p = 1/8 = 2^-3` → `p^18 = 2^-54`
-    // exactly) and otherwise has well-bounded ulp error (at most a
-    // few ulps), matching Boost's `pow` on x86-64.
-    let mut result = p.powi(n as i32);
+    // `result = p^n`. Use `powf(n as f64)` rather than `powi(n as i32)`
+    // so we survive `n > i32::MAX` without the signed truncation wrap
+    // (`n as i32` turns negative → `powi` returns `∞` for `p < 1`).
+    // For the small-`n` cases that actually exercise this function
+    // (Codex's n=12, n=18, n=40 — all `< i32::MAX`), `powf` is
+    // byte-identical to `powi` on x86-64 f64: I verified
+    // `0.125_f64.powf(18.0) == 0.125_f64.powi(18) == 2^-54` exactly.
+    // `powf` preserves the power-of-two-exact result for any `p` that
+    // is a dyadic rational in f64, which is what makes the n=18
+    // boundary case work.
+    let mut result = p.powf(n as f64);
     if !result.is_finite() || result <= 0.0 {
-        // `powi` under-flowed or produced a non-finite result. Boost's
+        // `powf` underflowed or was otherwise non-positive. Boost's
         // corresponding branch re-seeds the sum at the mode and walks
         // outward; we don't need it for the committed corpus or the
-        // known Codex-reported edge cases, and returning `0.0` is
-        // equivalent from the caller's `1.0 - ibeta` perspective (both
-        // cause saturation).
+        // Codex-reported edge cases, and returning `0.0` is
+        // equivalent from the caller's `1.0 - ibeta` perspective
+        // (both cause saturation). Formally, returning `0.0` here is
+        // only correct when the true `P(X > j)` is also within ulp
+        // of zero — which it is whenever `p^n` underflows, because
+        // the tail is dominated by `PMF(n) = p^n` when `b < 40` is
+        // tiny.
         return 0.0;
     }
     let mut term = result;
-    // `i` steps from `n - 1` down to `j + 1`. Use a signed cast so the
-    // stopping condition works even for `j = 0` (though the caller
-    // never asks for that — j=0 is handled by the outer walker
-    // before we get here).
+    // `i` steps from `n - 1` down to `j + 1`. Use `i128` so the
+    // stopping condition works for `n` up to `u64::MAX` (`i64` would
+    // fail for `n >= 2^63`, which is reachable in sortition when
+    // `money` comes close to `total_money ≈ 2^62`).
     let mut i = n as i128 - 1;
     let stop = j as i128;
     while i > stop {
