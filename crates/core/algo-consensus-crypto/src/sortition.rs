@@ -290,6 +290,27 @@ fn binomial_cdf_walk(n: u64, p: f64, ratio: f64) -> u64 {
     let ratio_is_one = ratio >= 1.0;
     const BOOST_SATURATION_THRESHOLD: f64 = f64::EPSILON * 0.25;
 
+    // For `ratio == 1.0` fixtures we PRIMARILY want the tail-bound
+    // saturation detector below to fire at `j_boost` — it matches
+    // Boost's `1 - ibeta(j+1, n-j, p)` rounding byte-for-byte when the
+    // reconstructed `PMF(j+1)` is precise. At the exact saturation
+    // boundary (`true tail(j) == 2^-54` for some `j`), the log/exp
+    // reconstruction of `PMF(j+1)` can overshoot the true value by a
+    // handful of ulps, causing the threshold test to miss.
+    //
+    // To keep those edge cases working, we retain the Kahan-sum
+    // `ratio <= cdf` trigger ONLY as a loop-end fallback for
+    // `ratio == 1.0`: record the first `j` where Kahan sees
+    // `cdf >= 1.0`, but don't return from it. If the tail-bound
+    // detector fires at any later `j ≥ j_boost`, it wins (matching
+    // Boost). If the loop exits without the detector firing, we
+    // return the recorded Kahan index — handling the Codex-reported
+    // `n=18, p=1/8` edge case where the tail is ~27 ulps above
+    // `2^-54` from log/exp drift but Kahan's accumulated sum still
+    // reaches `1.0` at the correct `j`. If neither fires we fall
+    // through to `return n`, matching Boost's exhaustion branch.
+    let mut ratio_one_kahan_first: Option<u64> = None;
+
     for j in 1..iter_cap {
         let nf = n as f64;
         let jf = j as f64;
@@ -307,13 +328,23 @@ fn binomial_cdf_walk(n: u64, p: f64, ratio: f64) -> u64 {
         c = (t - cdf) - y;
         cdf = t;
 
-        if !ratio_is_one && ratio <= cdf {
-            // Non-saturation trigger (97 % of the corpus). The Kahan
-            // CDF is accurate to ulp relative error vs Boost, so the
-            // byte-for-byte agreement is guaranteed for any ratio that
-            // is strictly less than the eventual saturation-to-1.0
-            // rounding point.
-            return j;
+        if ratio <= cdf {
+            if !ratio_is_one {
+                // Non-saturation trigger (~97 % of the corpus). Kahan
+                // CDF is accurate to ulp relative error vs Boost, so
+                // byte-for-byte agreement is guaranteed for any ratio
+                // strictly less than the saturation-to-1.0 boundary.
+                return j;
+            }
+            // `ratio == 1.0`: accumulated PMF rounding can bias Kahan's
+            // `cdf` over `1.0` at a `j` either BEFORE Boost's actual
+            // saturation (as in `test_select_max`) or AT it (as in the
+            // Codex-reported `n=18, p=1/8`). Remember the first match
+            // but let the tail-bound detector below drive the return
+            // so the former case still matches Boost.
+            if ratio_one_kahan_first.is_none() {
+                ratio_one_kahan_first = Some(j);
+            }
         }
 
         if ratio_is_one && jf > mean {
@@ -342,6 +373,15 @@ fn binomial_cdf_walk(n: u64, p: f64, ratio: f64) -> u64 {
                 }
             }
         }
+    }
+
+    // Saturation detector never fired. For `ratio == 1.0`, fall back to
+    // the first Kahan-trigger `j` if we saw one — this covers the
+    // edge case where `true tail = 2^-54` exactly but log/exp drifted
+    // the reconstructed PMF a few ulps above the threshold. Otherwise
+    // return `n`, matching Boost's walker's loop-exhaustion branch.
+    if let Some(j) = ratio_one_kahan_first {
+        return j;
     }
     n
 }
@@ -409,6 +449,20 @@ mod tests {
         // companion parity harness for the broader 13-fixture corpus this
         // trigger closes.
         assert_eq!(select(1000, 10000, 20.0, [0xFF; 32]), 22);
+    }
+
+    #[test]
+    fn test_select_exact_boundary_pmf() {
+        // Edge case identified in Codex review of PR #234: at
+        // `(n=18, p=1/8)` the true `P(X > 17)` equals exactly `2^-54`
+        // because `C(18,18) * (1/8)^18 * (7/8)^0 = 2^-54` in f64. Boost's
+        // `1 - ibeta(18, 0, 1/8)` therefore rounds up to exactly 1.0 at
+        // j=17 and the walker returns 17. Our log/exp-reconstructed
+        // `next_pmf` is ~27 ulps above `2^-54` (accumulated floating
+        // drift), so the tail-bound detector alone would miss this `j`.
+        // The Kahan-sum fallback in `binomial_cdf_walk` catches it via
+        // `ratio_one_kahan_first`. This test guards that fallback path.
+        assert_eq!(select(18, 8, 1.0, [0xFF; 32]), 17);
     }
 
     #[test]
