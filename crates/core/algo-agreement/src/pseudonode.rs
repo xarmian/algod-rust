@@ -1125,4 +1125,231 @@ mod tests {
     fn max_output_wait_duration_is_2s() {
         assert_eq!(MAX_PSEUDONODE_OUTPUT_WAIT_DURATION, Duration::from_secs(2));
     }
+
+    // ----------------------------------------------------------------------
+    // Ports from go-algorand v4.5.1-stable agreement/pseudonode_test.go.
+    //
+    // TASK-65 (PLAN-31 §3.15). The Go test file has three top-level tests:
+    //
+    //   * `TestPseudonode` — exercises backlog overflow (bounded async
+    //     verification queue), single-request event counts, and async-vs-
+    //     serialized-pseudonode output equivalence.
+    //   * `TestPseudonodeLoadingOfParticipationKeys` — caching + reload
+    //     semantics of `asyncPseudonode.loadRoundParticipationKeys`, and
+    //     proxy-based assertion that `KeyManager.VotingKeys` is called with
+    //     the correct `(votingRound, balanceRound)` pair.
+    //   * `TestPseudonodeNonEnqueuedTasks` — verifies graceful warn-and-
+    //     continue when the async vote verifier's exec pool is full.
+    //
+    // ## Scenarios ported here
+    // * Initial state of `participation_keys` and `participation_keys_round`.
+    // * Cache hit on repeated `load_round_participation_keys(r)` (same r).
+    // * Cache invalidation when the round changes.
+    // * Proxy-based verification that `voting_keys` is called with the
+    //   correct `(voting_round, balance_round)` pair across several
+    //   rounds, matching Go's `KeyManagerProxy` scenario at lines 445-455.
+    //
+    // ## Scenarios intentionally NOT ported
+    // * **Backlog overflow** (`pseudonodeVerificationBacklog*2` loop
+    //   returning `errPseudonodeBacklogFull`) — Rust's `AsyncPseudonode`
+    //   produces events synchronously inside `make_proposals` /
+    //   `make_votes`, so there is no bounded pre-verification queue to
+    //   overflow. The error variant `PseudonodeError::BacklogFull` is
+    //   already constructed + displayed in the existing error tests
+    //   above; the backlog integration path belongs to the crypto
+    //   verifier tests, not the pseudonode.
+    // * **`serializedPseudonode` equivalence** — Rust does not have a
+    //   synchronous serialization wrapper type.
+    // * **`TestPseudonodeNonEnqueuedTasks`** — depends on the async vote
+    //   verifier exec pool and its log output; covered separately by the
+    //   crypto_verifier tests.
+    // * **Event-shape happy path** (Go lines 196-232: `make_proposals`
+    //   returning `VoteVerified`+`PayloadVerified` pairs, `make_votes`
+    //   returning only `VoteVerified`) — requires a full fixture stack
+    //   (seeded block factory, online-account ledger entries, per-round
+    //   seeds, registered VRF+OTS signing keys) so the pseudonode can
+    //   produce credentials and signatures that verify. Without that,
+    //   the tests pass vacuously on empty event lists and miss the
+    //   regressions they would otherwise catch. Deferred to follow-up
+    //   alongside the simulate / player-permutation infrastructure
+    //   (DOC-21 §3.4 / §3.6) which builds the same stack.
+    // * **`participationKeys = nil` retention** (Go test lines 432-436):
+    //   the Go test relies on `nil` vs empty-slice distinction to verify
+    //   that clearing `participationKeys` is NOT re-populated on a
+    //   subsequent call with the same round. Rust's cache check
+    //   `participation_keys_round == vote_round && !participation_keys
+    //   .is_empty()` intentionally reloads when the cache is empty —
+    //   making this a Rust-specific behavior divergence that is safer
+    //   than the Go semantics (no risk of running with a mysteriously
+    //   empty cache).
+    //
+    // The four ported scenarios together cover the portion of the Go
+    // test file that maps onto the Rust API surface.
+
+    /// Proxy KeyManager that captures every call to `voting_keys` so
+    /// tests can assert the arguments the pseudonode passes in. Mirrors
+    /// Go's `KeyManagerProxy` (pseudonode_test.go:385-398).
+    struct RecordingKeyManager {
+        inner_keys: Vec<ParticipationRecord>,
+        calls: RefCell<Vec<(Round, Round)>>,
+    }
+
+    impl RecordingKeyManager {
+        fn new(keys: Vec<ParticipationRecord>) -> Self {
+            Self {
+                inner_keys: keys,
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(Round, Round)> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl AgreementKeyManager for RecordingKeyManager {
+        fn voting_keys(&self, voting_round: Round, keys_round: Round) -> Vec<ParticipationRecord> {
+            self.calls.borrow_mut().push((voting_round, keys_round));
+            self.inner_keys.clone()
+        }
+
+        fn record(&self, _account: &Address, _round: Round, _action: ParticipationAction) {}
+    }
+
+    fn participation_record(addr_byte: u8) -> ParticipationRecord {
+        ParticipationRecord {
+            address: Address([addr_byte; 32]),
+            vote_id: [0u8; 32],
+            selection_id: [0u8; 32],
+            vote_first_valid: Round(0),
+            vote_last_valid: Round(1_000_000),
+            vote_key_dilution: 100,
+        }
+    }
+
+    /// Go test: `TestPseudonodeLoadingOfParticipationKeys`
+    /// lines 423-425 ("verify start condition").
+    #[test]
+    fn load_round_participation_keys_initial_state_is_empty() {
+        let factory = crate::stubs::StubBlockFactory::new();
+        let keys = RecordingKeyManager::new(vec![participation_record(1)]);
+        let ledger = crate::stubs::StubLedger::new(v41_params(), Round(100));
+        let pn = AsyncPseudonode::new(factory, keys, ledger);
+
+        assert_eq!(pn.participation_keys_round, Round(0));
+        assert!(pn.participation_keys.is_empty());
+    }
+
+    /// Go test lines 427-430 ("check after round 1"). First
+    /// `load_round_participation_keys(Round(1))` populates the cache
+    /// and updates `participation_keys_round`.
+    #[test]
+    fn load_round_participation_keys_populates_cache_on_first_call() {
+        let factory = crate::stubs::StubBlockFactory::new();
+        let key_manager =
+            RecordingKeyManager::new(vec![participation_record(1), participation_record(2)]);
+        let ledger = crate::stubs::StubLedger::new(v41_params(), Round(100));
+        let mut pn = AsyncPseudonode::new(factory, key_manager, ledger);
+
+        let loaded = pn.load_round_participation_keys(Round(1)).to_vec();
+        assert_eq!(pn.participation_keys_round, Round(1));
+        assert_eq!(loaded.len(), 2);
+        // `ParticipationRecord` doesn't implement `PartialEq` (and we
+        // don't want to add it in a test-only port), so compare the
+        // stable-identity field (`address`) pointwise.
+        let loaded_addrs: Vec<_> = loaded.iter().map(|r| r.address).collect();
+        let cached_addrs: Vec<_> = pn.participation_keys.iter().map(|r| r.address).collect();
+        assert_eq!(loaded_addrs, cached_addrs);
+        assert_eq!(pn.keys.calls().len(), 1);
+
+        // Cache hit: a second call with the SAME round must not re-invoke
+        // `voting_keys` on the underlying KeyManager. This is the core of
+        // Go's "check that participationKeysRound is preserved" assertion
+        // at pseudonode_test.go:429-430 — without it, a regression that
+        // re-fetches keys on every call would still pass the populate
+        // check above. Mirrors Go test lines 432-435 (cache-keep
+        // semantics) modulo the documented divergence on the
+        // `participationKeys = nil` retention edge case.
+        let _reloaded = pn.load_round_participation_keys(Round(1));
+        assert_eq!(
+            pn.keys.calls().len(),
+            1,
+            "second load with same round must hit cache, not re-invoke voting_keys",
+        );
+        assert_eq!(pn.participation_keys_round, Round(1));
+    }
+
+    /// Go test lines 438-442 ("check that it's being updated when asked
+    /// with a different round number"). Changing the round triggers a
+    /// reload.
+    #[test]
+    fn load_round_participation_keys_reloads_on_different_round() {
+        let factory = crate::stubs::StubBlockFactory::new();
+        let key_manager = RecordingKeyManager::new(vec![participation_record(7)]);
+        let ledger = crate::stubs::StubLedger::new(v41_params(), Round(100));
+        let mut pn = AsyncPseudonode::new(factory, key_manager, ledger);
+
+        let _ = pn.load_round_participation_keys(Round(1));
+        assert_eq!(pn.keys.calls().len(), 1);
+
+        let loaded2 = pn.load_round_participation_keys(Round(2)).to_vec();
+        assert_eq!(pn.participation_keys_round, Round(2));
+        let loaded_addrs: Vec<_> = loaded2.iter().map(|r| r.address).collect();
+        let cached_addrs: Vec<_> = pn.participation_keys.iter().map(|r| r.address).collect();
+        assert_eq!(loaded_addrs, cached_addrs);
+        // voting_keys must have been called a second time for the new round.
+        assert_eq!(pn.keys.calls().len(), 2);
+    }
+
+    /// Go test lines 444-455: use a proxy to verify `voting_keys` is
+    /// invoked with the correct `(voting_round, balance_round)` pair.
+    /// `balance_round` is derived from consensus params; for our v41
+    /// stub it's `voting_round - params.SeedLookback * params.SeedRefreshInterval`.
+    #[test]
+    fn load_round_participation_keys_calls_voting_keys_with_correct_balance_round() {
+        let factory = crate::stubs::StubBlockFactory::new();
+        let keys = vec![participation_record(5)];
+        let key_manager = RecordingKeyManager::new(keys);
+        let ledger = crate::stubs::StubLedger::new(v41_params(), Round(100));
+        let mut pn = AsyncPseudonode::new(factory, key_manager, ledger);
+
+        let cparams = v41_params();
+
+        // Go walks rnd = 3..1000 step 43. Mirror the same cadence so any
+        // lookback edge case (round boundaries, saturation to zero) is
+        // exercised identically.
+        let mut rnd = Round(3);
+        while rnd.0 < 1000 {
+            let _ = pn.load_round_participation_keys(rnd);
+            let calls = pn.keys.calls();
+            let (captured_voting, captured_balance) = *calls.last().expect("at least one call");
+            assert_eq!(captured_voting, rnd, "voting_round mismatch at {rnd:?}");
+            assert_eq!(
+                captured_balance,
+                crate::lookback::balance_round(rnd, &cparams),
+                "balance_round mismatch at voting_round {rnd:?}",
+            );
+            rnd = Round(rnd.0 + 43);
+        }
+    }
+
+    // Go test scenarios at lines 196-212 (`make_proposals` returns
+    // `VoteVerified` + `PayloadVerified` pairs) and 214-232 (`make_votes`
+    // returns only `VoteVerified`) would need a full happy-path fixture
+    // to be meaningful: a seeded `StubBlockFactory::set_block`, per-round
+    // `StubLedger::set_account` entries with online stake (so
+    // `membership_from_ledger` succeeds), per-round seeds, and registered
+    // `AccountSigningKeys` (VRF + OTS) so the pseudonode can produce
+    // credentials and signatures that `verify_vote_from_ledger` accepts.
+    // Without all of that, `assemble_block` returns `RoundStale` and
+    // `create_proposals` / `create_votes` exit before emitting anything —
+    // so an "events-empty-is-acceptable" assertion would pass vacuously
+    // and miss the exact regressions the test is supposed to catch.
+    //
+    // Building that fixture stack is out of scope for this test-port task
+    // (TASK-65 is sized "s"); it is a natural follow-up under the
+    // player-permutation / simulate work in DOC-21 §3.4 / §3.6, which
+    // brings the same infrastructure in for the broader state-machine
+    // test matrix. See the top-of-block "Scenarios intentionally NOT
+    // ported" list — this entry is captured there.
 }
