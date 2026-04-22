@@ -1676,36 +1676,60 @@ pub fn decode_unauthenticated_proposal(
     })
 }
 
-/// Run `Block::decode_from_bytes`, synthesizing a `rnd: 0` entry in the
-/// top-level map first if the key is absent. Needed because that
-/// decoder hard-requires `rnd`, whereas Go msgp omits zero rounds via
-/// `omitempty` — a legitimate shape for the uproposal / transmitted
+/// Run `Block::decode_from_bytes`, with a fallback that synthesizes
+/// `rnd: 0` into the top-level map if the block decoder rejects the
+/// input for the specific reason that `rnd` is missing. Needed because
+/// that decoder hard-requires `rnd`, whereas Go msgp omits zero rounds
+/// via `omitempty` — a legitimate shape for uproposal / transmitted
 /// payload fixtures where round=0.
+///
+/// The fast path (round ≠ 0) is a single call to
+/// `Block::decode_from_bytes` with no extra map traversal — this
+/// matters because `decode_compound_message` is on the network ingest
+/// path (`demux::handle_raw_proposal`) and pre-scanning every proposal
+/// map would add per-packet CPU and amplify proposal-spam.
 fn decode_block_allowing_missing_rnd(bytes: &[u8]) -> Result<Block, CodecError> {
-    if map_has_key(bytes, "rnd")? {
-        return Block::decode_from_bytes(bytes)
-            .map_err(|e| CodecError::Decode(format!("block decode: {e}")));
+    match Block::decode_from_bytes(bytes) {
+        Ok(block) => Ok(block),
+        Err(first_err) => {
+            // Only attempt the synthesized-`rnd` fallback if the
+            // decoder rejected the input specifically for a missing
+            // `rnd` key. Other failures (malformed bytes, other
+            // missing required fields) propagate unchanged.
+            if !is_missing_rnd_error(&first_err) {
+                return Err(CodecError::Decode(format!("block decode: {first_err}")));
+            }
+            let patched = inject_rnd_zero(bytes)
+                .map_err(|_| CodecError::Decode(format!("block decode: {first_err}")))?;
+            Block::decode_from_bytes(&patched).map_err(|retry_err| {
+                CodecError::Decode(format!("block decode (rnd synthesized): {retry_err}"))
+            })
+        }
     }
-    let patched = inject_rnd_zero(bytes)?;
-    Block::decode_from_bytes(&patched)
-        .map_err(|e| CodecError::Decode(format!("block decode (rnd synthesized): {e}")))
 }
 
-/// Returns `true` if the top-level msgpack map in `bytes` contains the
-/// string key `needle`.
-fn map_has_key(bytes: &[u8], needle: &str) -> Result<bool, CodecError> {
-    let mut cursor = Cursor::new(bytes);
-    let map_len = rmp::decode::read_map_len(&mut cursor)
-        .map_err(|e| CodecError::Decode(format!("map header: {e}")))?;
-    for _ in 0..map_len {
-        let key = read_str_key(&mut cursor)?;
-        if key == needle {
-            return Ok(true);
+/// Returns `true` if `err` is the specific error emitted by
+/// `Block::decode_from_bytes` when the top-level msgpack map omits
+/// the required `rnd` key (i.e., Go's `omitempty` dropped it because
+/// round=0). `algo-agreement` doesn't depend on `algo-error` directly
+/// — inspect via the `std::error::Error` trait so we don't need to
+/// add a dep just for pattern-matching.
+fn is_missing_rnd_error<E: std::error::Error + 'static>(err: &E) -> bool {
+    // `Block::decode_from_reader` wraps the diagnostic as
+    // `AlgoError::Codec { source: "Block: missing required 'rnd' field", .. }`.
+    // The Display impl for `AlgoError::Codec` shows only the context
+    // ("rmp_decode"), so walk the chained `source` to detect the
+    // specific case.
+    let mut cur: &(dyn std::error::Error + 'static) = err;
+    loop {
+        if cur.to_string().contains("missing required 'rnd'") {
+            return true;
         }
-        rmpv::decode::read_value(&mut cursor)
-            .map_err(|e| CodecError::Decode(format!("skip value: {e}")))?;
+        match cur.source() {
+            Some(next) => cur = next,
+            None => return false,
+        }
     }
-    Ok(false)
 }
 
 /// Insert a `"rnd" -> 0` entry at the sorted position in a top-level
