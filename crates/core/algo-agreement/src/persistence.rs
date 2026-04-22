@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
@@ -70,13 +70,61 @@ mod duration_map_serde {
 
 /// Represents the clock state that is persisted alongside player/router state.
 ///
-/// Go persists a `Clock[TimeoutType]` which tracks deadline offsets per timeout
-/// type. We model this as a map from `TimeoutType` to `Duration`.
+/// Mirrors go-algorand v4.5.1-stable `timers.Monotonic.zero` — a single
+/// wall-clock "zero" reference point used to anchor deadline math across
+/// restarts. See `util/timers/monotonic.go:33-48` (the `zero time.Time`
+/// field and `Zero()` method) and `agreement/persistence.go:56` where Go
+/// encodes just that zero value.
+///
+/// The `deadlines` map is a Rust-specific placeholder that predates the
+/// zero-anchor design; callers should prefer `zero` for new code, and
+/// `deadlines` is retained only so existing round-trip tests keep passing.
+///
+/// ## Format compatibility
+/// `zero_since_epoch` was added in TASK-62 (PLAN-31 §3.8). Adding a new
+/// rmp-serde field changes the array length of the encoded `ClockState`,
+/// so pre-TASK-62 crash.sqlite payloads fail to decode. This is safe:
+/// `Service::start` already degrades gracefully on decode errors by
+/// logging and bootstrapping a fresh agreement state — a one-time loss
+/// of in-flight pre-upgrade crash state, which is the right tradeoff
+/// for a double-vote-safety fix.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ClockState {
     /// Duration offsets for each active timeout, keyed by timeout type.
+    ///
+    /// Kept for backwards-compatible test coverage; not populated by the
+    /// live service (the service uses `zero` below to anchor deadline math).
     #[serde(with = "duration_map_serde")]
     pub deadlines: HashMap<TimeoutType, Duration>,
+
+    /// Nanoseconds since `UNIX_EPOCH` — the wall-clock "zero" reference
+    /// point for the service clock at the moment this snapshot was taken.
+    /// Mirrors Go's `timers.Monotonic.zero`. `None` means the clock has
+    /// never been anchored (fresh bootstrap with no prior persist).
+    pub zero_since_epoch: Option<u64>,
+}
+
+impl ClockState {
+    /// Build a `ClockState` anchored at a given wall-clock instant.
+    ///
+    /// Times before `UNIX_EPOCH` (should not happen on real systems) are
+    /// stored as `None` and treated as "unset" on restore.
+    pub fn with_zero(zero: SystemTime) -> Self {
+        let zero_ns = zero
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_nanos() as u64);
+        Self {
+            deadlines: HashMap::new(),
+            zero_since_epoch: zero_ns,
+        }
+    }
+
+    /// Recover the wall-clock zero as a `SystemTime`, if one was persisted.
+    pub fn zero(&self) -> Option<SystemTime> {
+        self.zero_since_epoch
+            .map(|ns| UNIX_EPOCH + Duration::from_nanos(ns))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -552,6 +600,42 @@ mod tests {
             dec_clock.deadlines.get(&TimeoutType::FastRecovery),
             Some(&Duration::from_millis(1500))
         );
+    }
+
+    #[test]
+    fn test_clock_state_zero_round_trip() {
+        // Capture a known wall-clock point, encode + decode, and confirm the
+        // zero survives unchanged. Mirrors go-algorand's monotonic clock
+        // persistence — see `util/timers/monotonic.go:80-94`.
+        let zero = UNIX_EPOCH + Duration::from_secs(1_710_000_000) + Duration::from_nanos(123);
+        let clock = ClockState::with_zero(zero);
+        assert_eq!(clock.zero(), Some(zero));
+
+        let player = Player::default();
+        let router = RootRouter::default();
+        let raw = encode(&router, &player, &clock, &[]).expect("encode");
+        let (_, _, dec_clock, _) = decode(&raw).expect("decode");
+
+        assert_eq!(
+            dec_clock.zero(),
+            Some(zero),
+            "persisted zero must round-trip byte-identical",
+        );
+    }
+
+    #[test]
+    fn test_clock_state_with_no_zero_encodes_as_none() {
+        // A default `ClockState` has no wall-clock zero. After a round-trip
+        // the decoded state should report `None` without failure.
+        let clock = ClockState::default();
+        assert_eq!(clock.zero(), None);
+
+        let player = Player::default();
+        let router = RootRouter::default();
+        let raw = encode(&router, &player, &clock, &[]).expect("encode");
+        let (_, _, dec_clock, _) = decode(&raw).expect("decode");
+
+        assert_eq!(dec_clock.zero(), None);
     }
 
     #[test]
@@ -1240,6 +1324,7 @@ mod tests {
                 m.insert(TimeoutType::Filter, Duration::from_millis(500));
                 m
             },
+            zero_since_epoch: None,
         };
         let raw = encode(&router, &player, &clock, &[]).expect("encode");
 
