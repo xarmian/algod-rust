@@ -1328,15 +1328,13 @@ mod tests {
         let ledger = crate::stubs::StubLedger::new(v41_params(), Round(100));
         let mut pn = AsyncPseudonode::new(factory, keys, ledger);
 
-        let events = match pn.make_proposals(Round(100), Period(0)) {
-            Ok(evs) => evs,
-            // Sortition can reject every account in a tiny 1-account
-            // setup; the invariant we actually want is "if a vote fires,
-            // a payload fires too" — assert that if no events, that's
-            // fine, but if events exist they come in pairs.
-            Err(PseudonodeError::NoProposals) => return,
-            Err(e) => panic!("unexpected error: {e:?}"),
-        };
+        // With a non-empty `TestKeyManager`, `NoProposals` (which is only
+        // emitted when participation keys are empty) would indicate a
+        // key-loading regression, not a sortition outcome. Fail loudly on
+        // any error so regressions can't slip through.
+        let events = pn
+            .make_proposals(Round(100), Period(0))
+            .expect("make_proposals must succeed with non-empty keys");
 
         let vote_verified = events
             .iter()
@@ -1371,11 +1369,11 @@ mod tests {
             encoding_digest: Digest([0xbb; 32]),
         };
 
-        let events = match pn.make_votes(Round(100), Period(1), Step(2), proposal, None) {
-            Ok(evs) => evs,
-            Err(PseudonodeError::NoVotes) => return,
-            Err(e) => panic!("unexpected error: {e:?}"),
-        };
+        // Same rationale as the proposal test: `NoVotes` indicates a
+        // participation-key-loading regression, not a sortition outcome.
+        let events = pn
+            .make_votes(Round(100), Period(1), Step(2), proposal, None)
+            .expect("make_votes must succeed with non-empty keys");
 
         assert_eq!(
             events
