@@ -1804,6 +1804,34 @@ fn parse_genesis_hash(hex_str: &str) -> anyhow::Result<[u8; 32]> {
     Ok(arr)
 }
 
+/// Open (or create) the agreement crash recovery database.
+///
+/// Mirrors go-algorand v4.5.1-stable `node/node.go:305-323`, which opens
+/// `crash.sqlite` (`config.CrashFilename`) inside the genesis directory next
+/// to the ledger and threads the resulting accessor into `agreement.Parameters`.
+///
+/// Without this connection, `Parameters.crash_db` is `None`, the agreement
+/// service skips persistence entirely, and a node crash mid-round can lead to
+/// equivocation (double-vote) on restart. See [[DOC-21]] §3.7.
+fn open_crash_db(ledger_path: &Path) -> anyhow::Result<rusqlite::Connection> {
+    let crash_db_path = ledger_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("crash.sqlite");
+    let conn = rusqlite::Connection::open(&crash_db_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to open agreement crash db at {}: {}",
+            crash_db_path.display(),
+            e
+        )
+    })?;
+    info!(
+        path = %crash_db_path.display(),
+        "opened agreement crash recovery database"
+    );
+    Ok(conn)
+}
+
 /// Run the participate command: start the agreement protocol and participate
 /// in consensus using the provided participation keys.
 #[allow(clippy::too_many_arguments)]
@@ -1855,6 +1883,12 @@ pub async fn run(
     info!(path = %ledger_path.display(), latest_round = latest, "opened ledger database");
 
     let ledger = Arc::new(Mutex::new(sqlite_ledger));
+
+    // Open the agreement crash recovery database alongside the ledger.
+    // Without this, agreement state is never persisted before votes are
+    // broadcast, so a crash-restart could cause equivocation. Mirrors Go's
+    // `node/node.go:305-323`. See [[DOC-21]] §3.7.
+    let crash_db = open_crash_db(ledger_path)?;
 
     // -----------------------------------------------------------------------
     // 2. Open the participation key store.
@@ -2070,7 +2104,7 @@ pub async fn run(
         random_source,
         monitor,
         crypto,
-        crash_db: None, // TODO: wire up crash recovery database
+        crash_db: Some(crash_db),
     };
 
     let service = Service::new(params);
@@ -5151,5 +5185,60 @@ mod tests {
             starting_txn_counter + 3,
             "txn_counter should equal starting value + number of transactions"
         );
+    }
+
+    /// `open_crash_db` must create `crash.sqlite` next to the ledger and the
+    /// resulting connection must round-trip persisted state through close +
+    /// reopen — exercising the same restore path the agreement service uses
+    /// on restart. Covers TASK-61 / [[DOC-21]] §3.7.
+    #[test]
+    fn test_open_crash_db_roundtrip() {
+        use algo_agreement::persistence::{persist, restore};
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Use a unique tmp dir so parallel test runs don't collide.
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-crashdb-test-{}-{}",
+            std::process::id(),
+            nonce,
+        ));
+        fs::create_dir_all(&tmp_dir).expect("create tmp dir");
+        let ledger_path = tmp_dir.join("ledger.sqlite");
+        let crash_db_path = tmp_dir.join("crash.sqlite");
+
+        let payload: Vec<u8> = b"persisted-agreement-state".to_vec();
+
+        // Open the crash db, write a payload, then drop the connection to
+        // simulate a node shutdown / crash.
+        {
+            let conn = super::open_crash_db(&ledger_path).expect("open crash db");
+            persist(&conn, &payload).expect("persist payload");
+        }
+
+        // The file must exist next to the ledger using the Go-compatible name.
+        assert!(
+            crash_db_path.exists(),
+            "crash.sqlite was not created at {}",
+            crash_db_path.display(),
+        );
+
+        // Reopen and restore — must return the exact bytes we wrote.
+        let conn = super::open_crash_db(&ledger_path).expect("reopen crash db");
+        let restored = restore(&conn)
+            .expect("restore must succeed")
+            .expect("restored payload must be present");
+        assert_eq!(
+            restored, payload,
+            "restored bytes do not match persisted bytes",
+        );
+
+        // Cleanup. Drop conn first so SQLite releases its file handles.
+        drop(conn);
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
