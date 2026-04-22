@@ -572,3 +572,119 @@ to the minimal input that exhibits the bug. The `proptest-regressions/`
 file committed next to the test is how proptest persists minimized
 failure seeds between runs — keep it in git so CI and developers
 replay the exact same regression inputs.
+
+## Conformance Fixture Refresh
+
+All PLAN-30 conformance parity dimensions (VRF, sortition, agreement
+wire, lookback round math, v13 opcodes) are anchored by **committed
+golden fixtures produced by go-algorand**. CI (`.github/workflows/
+conformance-parity.yml`) replays those fixtures on every PR and blocks
+merge on any byte-level divergence. This section is the playbook for
+refreshing the fixtures when go-algorand changes underneath us.
+
+### When to refresh
+
+Refresh the full corpus only when one of the following is true. Do
+**not** refresh casually — a stale-but-consistent fixture beats a
+fresh-but-drifted one.
+
+1. **go-algorand pin bump** — `CLAUDE.md` is updated to a new
+   `v4.x.y-stable` tag. Refresh all fixtures whose upstream source
+   touched the new release (typically: all of them, unless the release
+   notes prove otherwise).
+2. **Schema extension in a capture tool** — e.g. a new fixed edge case
+   appended to `tools/vrf-vector-capture/main.go`, or a new
+   consensus version added to
+   `tools/lookback-vector-capture/main.go :: allVersions()`. Append
+   only; never rename or reorder existing fixtures, because downstream
+   tests reference them by `name`.
+3. **Consensus version added** — e.g. V42 ships. Refresh
+   `lookback/lookback_boundaries.json` and the VRF / sortition corpora
+   (if their stake sampling depends on the per-version params).
+4. **Codec tag rename or field addition in `agreement/`** — regenerate
+   the wire fixture corpus.
+
+If a capture tool's output disagrees with the committed file on any
+pre-existing line, **stop**. That means the capture environment is
+broken (wrong go-algorand tag, dirty working tree, toolchain mismatch)
+— don't commit the regenerated file.
+
+### Per-fixture regeneration commands
+
+Each fixture has a dedicated capture tool under `tools/`. Run them
+individually; they are idempotent and deterministic given the same
+go-algorand pin + toolchain.
+
+| Dimension | Fixture | Regen command |
+|-----------|---------|---------------|
+| **VRF (β)** | `crates/core/algo-consensus-crypto/tests/fixtures/vrf/vectors.jsonl` | `cd tools/vrf-vector-capture && go run .` |
+| **Sortition (γ)** | `crates/core/algo-consensus-crypto/tests/fixtures/sortition/vectors.jsonl` | `cd tools/sortition-vector-capture && go run .` |
+| **Agreement wire (ε)** | `crates/core/algo-agreement/tests/fixtures/wire/**` | `cd tools/agreement-wire-capture && go run .` |
+| **Lookback (η)** | `crates/core/algo-agreement/tests/fixtures/lookback/lookback_boundaries.json` | `cd tools/lookback-vector-capture && go run .` |
+| **v13 opcodes** | `crates/core/algo-avm/tests/fixtures/v13/**` | `cd tools/v13-vector-capture && go run . -out=../../crates/core/algo-avm/tests/fixtures/v13` |
+
+All Go tools enforce the `CLAUDE.md`-tracked go-algorand pin and refuse
+to run against a dirty `../go-algorand` tree. Pass `--allow-unpinned`
+only when you are deliberately preparing a pin bump — the resulting
+fixture is out of sync with the rest of the workspace until the bump
+lands.
+
+The per-dimension deep dives above (VRF Vector Regeneration, Sortition
+Vector Regeneration, Agreement Wire Vector Regeneration, Lookback
+Vector Regeneration, V13 Opcode Vector Regeneration) describe
+prerequisites (libsodium build for VRF, Boost pinning for sortition,
+etc.). Read them before your first refresh on a new machine.
+
+### Validating a refresh locally
+
+After regenerating one or more fixtures, re-run the parity harnesses
+in the same order CI does — this is the fastest way to confirm the
+fresh corpus still agrees with the Rust implementation:
+
+```bash
+# β  VRF parity
+cargo test --release -p algo-consensus-crypto --test vrf_parity
+
+# γ  Sortition parity
+cargo test --release -p algo-consensus-crypto --test sortition_parity
+
+# ε  Agreement codec roundtrip (replays the wire fixture corpus)
+cargo test --release -p algo-agreement --test codec_roundtrip
+
+# ζ  Canonical-encoding proptest — does not consume fixtures, but
+#    catches codec regressions a refresh might silently introduce.
+cargo test --release -p algo-agreement --test codec_proptest
+
+# η  Lookback boundary parity
+cargo test --release -p algo-agreement --test lookback_boundary
+
+# Or all five at once:
+cargo test --release --workspace
+```
+
+If any of β / γ / ε / η fail after a refresh, do **not** adjust the
+Rust implementation to match the new fixtures — that direction
+silently rubber-stamps upstream drift. Instead:
+
+1. Diff the new fixture file against the committed one.
+2. Map the diff to the go-algorand commit range that produced it.
+3. Port the behavior change to the Rust side, then re-run the harness.
+
+Commit the regenerated fixture **and** the matching Rust change in the
+same PR; splitting them leaves `main` red for a window.
+
+### Refreshing during a go-algorand pin bump
+
+The ordered playbook for a pin bump (e.g. `v4.5.1-stable` →
+`v4.6.0-stable`):
+
+1. Bump the tag in `CLAUDE.md`.
+2. In `../go-algorand`, `git fetch && git checkout <new-tag>` and
+   rebuild libsodium (`make libsodium`) if the fork changed.
+3. Regenerate every fixture table row above (`--allow-unpinned` is
+   not required — the tools will auto-detect the new `CLAUDE.md` tag).
+4. Run the five parity tests locally. Fix any divergences on the Rust
+   side. Re-run until green.
+5. Open a single PR containing `CLAUDE.md` + every refreshed fixture
+   + every Rust-side port. CI's `conformance-parity` job replays the
+   fresh corpus end-to-end.

@@ -1,0 +1,113 @@
+name: Nightly Fuzz
+
+# Extended canonical-encoding proptest run. Cranks PROPTEST_CASES up by an
+# order of magnitude relative to the PR budget (see conformance-parity.yml's
+# ζ step) so rare field-combination bugs the short PR run misses have a
+# fighting chance of being caught overnight.
+#
+# If proptest finds a new regression, it writes the failing seed to
+# crates/core/algo-agreement/tests/proptest-regressions/. We upload those
+# files as a workflow artifact and open a PR committing them — future CI
+# runs then replay the seed automatically.
+
+on:
+  schedule:
+    # 03:17 UTC daily — off-peak for GitHub-hosted runners, and far enough
+    # from the top of the hour to dodge scheduled-job stampedes.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      proptest_cases:
+        description: "PROPTEST_CASES override for the extended run"
+        default: "10000000"
+        required: false
+
+concurrency:
+  group: nightly-fuzz
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  extended-proptest:
+    name: ζ — Extended canonical-encoding proptest (≥30 min)
+    runs-on: ubuntu-latest
+    # 30 min budget for the test itself + generous margin for compile/cache.
+    # Hard-stop at 60 min so a runaway shrink doesn't starve the scheduler.
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-fuzz
+
+      # PROPTEST_CASES=10_000_000 per test (6 tests → 60M roundtrips) calibrates
+      # to ~30 min on GitHub-hosted runners (≈5× the PR budget of 1M). The
+      # workflow_dispatch input lets us re-run with a different budget
+      # on demand without editing the file.
+      - name: ζ — Extended canonical-encoding proptest
+        env:
+          PROPTEST_CASES: ${{ github.event.inputs.proptest_cases || '10000000' }}
+        run: cargo test --release -p algo-agreement --test codec_proptest -- --nocapture
+
+      # Always upload the regressions directory so a human can inspect seeds
+      # even if the PR-creation step below fails (e.g. token scope issues).
+      - name: Upload proptest-regressions artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions-${{ github.run_id }}
+          path: crates/core/algo-agreement/tests/proptest-regressions/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # Open a PR committing any regression seeds proptest wrote. This only
+      # runs if the test step above failed — i.e. proptest actually found a
+      # new counter-example. The PR gives a human the chance to triage before
+      # the seed lands on main.
+      - name: Open PR with new proptest regression seeds
+        if: failure()
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: nightly-fuzz/proptest-regressions
+          base: main
+          title: "chore(fuzz): commit new proptest regression seeds from nightly run"
+          commit-message: |
+            chore(fuzz): commit new proptest regression seeds from nightly run
+
+            Auto-generated from nightly-fuzz workflow run
+            ${{ github.run_id }} (${{ github.run_number }}).
+          body: |
+            The nightly extended-proptest run caught at least one new
+            canonical-encoding counter-example.
+
+            Proptest has written the failing seed(s) to
+            `crates/core/algo-agreement/tests/proptest-regressions/`. Once
+            this PR merges, every subsequent CI run replays the seed, so
+            the regression cannot silently re-open.
+
+            **Next steps**
+            1. Review the run log:
+               ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            2. Reproduce locally with
+               `cargo test --release -p algo-agreement --test codec_proptest`
+               (proptest auto-loads committed seed files).
+            3. Fix the codec bug, land the fix, and keep the seed committed.
+          add-paths: |
+            crates/core/algo-agreement/tests/proptest-regressions/
+          labels: |
+            fuzz-finding
+            conformance
