@@ -408,7 +408,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     block: &Block,
     mode: ApplyMode,
     validate: bool,
-    tracer: Option<&mut dyn EvalTracer>,
+    mut tracer: Option<&mut dyn EvalTracer>,
 ) -> Result<(), AlgoError> {
     // Validate round monotonicity.
     let expected = Round(store.current_round().0 + 1);
@@ -463,18 +463,23 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
         consensus: consensus.clone(),
     };
 
-    // Convert tracer to a raw pointer so it can be used inside the
-    // immediately-invoked closure without lifetime conflicts. SAFETY: the
-    // closure is invoked synchronously and does not outlive this scope, so
-    // the pointer remains valid for its entire use.
-    let tracer_ptr: Option<*mut dyn EvalTracer> = tracer.map(|t| t as *mut dyn EvalTracer);
-
-    let result = (|| {
+    // Re-borrow the tracer per iteration with `Option::as_deref_mut` so
+    // each `apply_transaction_with_budget` call gets its own short-lived
+    // `Option<&mut dyn EvalTracer>` without aliasing. A labeled block
+    // (rather than the previous IIFE) lets us early-exit on error without
+    // pulling `tracer` into a closure capture — the closure form would
+    // reborrow `tracer` for the lifetime of the captured `&mut`, which
+    // conflicts with the per-iteration `as_deref_mut` borrows. Resolves
+    // GH #209 — replaces the previous `*mut dyn EvalTracer` round-trip
+    // with a fully-checked borrow chain.
+    let result: Result<(), AlgoError> = 'block: {
         match ctx.mode {
             ApplyMode::Replay => {
                 // Replay mode: process transactions individually (no AVM execution).
                 for stx in &block.payset {
-                    let _ = apply_transaction(store, stx, &ctx, 0)?;
+                    if let Err(e) = apply_transaction(store, stx, &ctx, 0) {
+                        break 'block Err(e);
+                    }
                 }
             }
             ApplyMode::Execute => {
@@ -501,11 +506,18 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                             index: gi_idx,
                         };
                         if stx.txn.txn_type == "appl" {
-                            // SAFETY: tracer_ptr is valid for the duration of
-                            // this synchronous closure; only one mutable ref
-                            // is created at a time.
-                            let tracer_ref = tracer_ptr.map(|p| unsafe { &mut *p });
-                            let _ = apply_transaction_with_budget(
+                            // Fresh per-call re-borrow via explicit
+                            // `match`-bound reborrow. The inner
+                            // `&mut dyn EvalTracer` lives only for the
+                            // duration of this synchronous call;
+                            // matching binds a fresh borrow with a
+                            // local lifetime that the borrow checker
+                            // can prove doesn't outlive the call.
+                            let tracer_ref: Option<&mut dyn EvalTracer> = match tracer {
+                                Some(ref mut t) => Some(&mut **t),
+                                None => None,
+                            };
+                            if let Err(e) = apply_transaction_with_budget(
                                 store,
                                 stx,
                                 &ctx,
@@ -513,9 +525,11 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                                 Some(&mut group_budget),
                                 Some(&gi),
                                 tracer_ref,
-                            )?;
-                        } else {
-                            let _ = apply_transaction(store, stx, &ctx, 0)?;
+                            ) {
+                                break 'block Err(e);
+                            }
+                        } else if let Err(e) = apply_transaction(store, stx, &ctx, 0) {
+                            break 'block Err(e);
                         }
                         global_txn_idx += 1;
                     }
@@ -523,7 +537,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
             }
         }
         Ok(())
-    })();
+    };
 
     if result.is_err() {
         // Restore rewards state and addresses on failure.
@@ -1198,20 +1212,67 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
         store.snapshot_with_ids(&snapshot_addrs, &asset_ids_to_snap, &app_ids_to_snap)
     };
 
-    // Convert tracer to a raw pointer so it can be used inside the
-    // immediately-invoked closure without lifetime conflicts. SAFETY: the
-    // closure is invoked synchronously and does not outlive this scope.
-    let tracer_ptr: Option<*mut dyn EvalTracer> = tracer.map(|t| t as *mut dyn EvalTracer);
+    // The `appl` branch below re-borrows `tracer` per call via
+    // `Option::as_deref_mut`, giving each `apply_appl` invocation its
+    // own short-lived `Option<&mut dyn EvalTracer>` without aliasing.
+    // The IIFE pattern remains so an early-return via `?` still triggers
+    // the post-closure snapshot rollback. Resolves GH #209 — replaces
+    // the previous `*mut dyn EvalTracer` round-trip with a fully-checked
+    // borrow chain.
 
-    // Execute all transaction logic inside a closure so that ANY error
-    // (fee, type-specific, EvalDelta, rewards-pool debit, rekey) triggers
-    // a full rollback via restore_snapshot.
-    let result = (|| -> Result<ApplyData, AlgoError> {
+    // Execute all transaction logic in a helper so that ANY error
+    // (fee, type-specific, EvalDelta, rewards-pool debit, rekey) returns
+    // through `?` and we trigger a full rollback via `restore_snapshot`.
+    // Pulling the body out of an IIFE (which it used to be) lets the
+    // borrow checker see `tracer` as a normal function parameter, so the
+    // appl branch can do a fresh `tracer.as_deref_mut()` per call without
+    // the lifetime tangles a closure capture would create. Resolves
+    // GH #209 — replaces the previous `*mut dyn EvalTracer` round-trip.
+    let result = apply_transaction_inner_body(
+        store,
+        stx,
+        ctx,
+        depth,
+        group_budget,
+        group_info,
+        tracer,
+        &reward_addrs,
+        &snapshot_addrs,
+        &lease_arr,
+    );
+
+    if result.is_err() {
+        store.restore_snapshot(snapshot);
+    }
+
+    result
+}
+
+/// Body of `apply_transaction_inner` extracted into a helper so the
+/// `?`-based control flow doesn't have to live inside an IIFE that
+/// captured `tracer` and `store` simultaneously. The outer
+/// `apply_transaction_inner` still owns the snapshot rollback path; this
+/// helper is purely the work that needs rollback on error.
+#[allow(clippy::too_many_arguments)]
+fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    stx: &SignedTransaction,
+    ctx: &ApplyContext,
+    depth: u32,
+    group_budget: Option<&mut GroupBudget>,
+    group_info: Option<&GroupInfo<'_>>,
+    mut tracer: Option<&mut dyn EvalTracer>,
+    reward_addrs: &[Address],
+    snapshot_addrs: &[Address],
+    lease_arr: &[u8; 32],
+) -> Result<ApplyData, AlgoError> {
+    let txn = &stx.txn;
+    {
         let mut apply_data = ApplyData::default();
 
         // Apply rewards to transaction participants only (not snapshot-only addresses).
         let mut total_rewards: u64 = 0;
-        for addr in &reward_addrs {
+        for addr in reward_addrs {
             let mut account = store.get_or_default_account(addr);
             let reward = apply_rewards(&mut account, ctx.rewards_level);
             total_rewards += reward;
@@ -1261,9 +1322,14 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
                 apply_afrz(store, &stx.txn)?;
             }
             "appl" => {
-                // SAFETY: tracer_ptr is valid for the duration of this
-                // synchronous closure; only one mutable ref is live at a time.
-                let tracer_ref = tracer_ptr.map(|p| unsafe { &mut *p });
+                // Fresh re-borrow via explicit `match`-bound reborrow so
+                // the inner `&mut dyn EvalTracer` has a local lifetime
+                // the borrow checker accepts across `apply_appl`'s
+                // elided lifetime.
+                let tracer_ref: Option<&mut dyn EvalTracer> = match tracer {
+                    Some(ref mut t) => Some(&mut **t),
+                    None => None,
+                };
                 // Capture the app ID that will be created (txn_counter + 1)
                 // before apply_appl runs, in case we need it for ApplyData.
                 let pre_apply_counter = ctx.txn_counter.get();
@@ -1333,7 +1399,7 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
         // RewardsPool, StateProofSender, and zeroed-out accounts).
         {
             let rewards_pool_addr = store.rewards_pool();
-            for addr in &snapshot_addrs {
+            for addr in snapshot_addrs {
                 // Skip special accounts that are exempt from min balance checks.
                 if *addr == ctx.fee_sink || *addr == rewards_pool_addr {
                     continue;
@@ -1357,7 +1423,7 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
         }
 
         // Record lease on success (no-op for empty/zero leases).
-        store.record_lease(&txn.sender, &lease_arr, txn.last_valid.0);
+        store.record_lease(&txn.sender, lease_arr, txn.last_valid.0);
 
         // Increment the running transaction counter for this top-level txn.
         // Mirrors go-algorand's `addTx` -> `incTxnCount()`. This ensures
@@ -1367,7 +1433,7 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
         // Set update_round on all touched accounts (including fee_sink).
         // This tracks which round last modified each account, used by the
         // Merkle trie V6 hash builder as affinity bytes.
-        for addr in &snapshot_addrs {
+        for addr in snapshot_addrs {
             let mut account = store.get_or_default_account(addr);
             if account.update_round < ctx.round {
                 account.update_round = ctx.round;
@@ -1376,13 +1442,7 @@ fn apply_transaction_inner<L: crate::store_trait::LedgerStore>(
         }
 
         Ok(apply_data)
-    })();
-
-    if result.is_err() {
-        store.restore_snapshot(snapshot);
     }
-
-    result
 }
 
 /// Debit fee from sender and credit to fee_sink.
