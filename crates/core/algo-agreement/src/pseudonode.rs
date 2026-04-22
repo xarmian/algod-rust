@@ -1261,6 +1261,22 @@ mod tests {
         let cached_addrs: Vec<_> = pn.participation_keys.iter().map(|r| r.address).collect();
         assert_eq!(loaded_addrs, cached_addrs);
         assert_eq!(pn.keys.calls().len(), 1);
+
+        // Cache hit: a second call with the SAME round must not re-invoke
+        // `voting_keys` on the underlying KeyManager. This is the core of
+        // Go's "check that participationKeysRound is preserved" assertion
+        // at pseudonode_test.go:429-430 — without it, a regression that
+        // re-fetches keys on every call would still pass the populate
+        // check above. Mirrors Go test lines 432-435 (cache-keep
+        // semantics) modulo the documented divergence on the
+        // `participationKeys = nil` retention edge case.
+        let _reloaded = pn.load_round_participation_keys(Round(1));
+        assert_eq!(
+            pn.keys.calls().len(),
+            1,
+            "second load with same round must hit cache, not re-invoke voting_keys",
+        );
+        assert_eq!(pn.participation_keys_round, Round(1));
     }
 
     /// Go test lines 438-442 ("check that it's being updated when asked
