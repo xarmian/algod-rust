@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
+proptest.workspace = true
 
 [dependencies]
 algo-codec.workspace = true
