@@ -230,14 +230,24 @@ func verifyGoAlgorandPin(path string) error {
 	return nil
 }
 
-// filterDirtyPaths — trimmed-down version of the helper in vrf-vector-capture.
-// Rename handling is out of scope here (no expected renames inside the
-// relevant subtrees for this pin). Files ending in `_test.go` are
-// excluded because `go build` / `go run` of this external consumer
-// never imports them, so their state cannot change the captured
-// vectors; in practice the workspace ships at least one
-// pre-existing untracked test file under agreement/ (see
-// agreement-wire-capture for context).
+// filterDirtyPaths returns porcelain v1 entries whose source or
+// destination path starts with any of `prefixes` and is not a pure
+// test-file move. Rename entries (`R  <old> -> <new>`) are
+// expanded and both sides are inspected, so a rename *into* a
+// guarded directory is flagged just like an in-place modification —
+// a non-rename-aware filter could silently accept a dirty checkout
+// whose build-affecting files had been renamed under agreement/
+// and emit non-reproducible vectors.
+//
+// Files ending in `_test.go` are excluded because `go build` /
+// `go run` of this external consumer never imports them, so their
+// state cannot change the captured vectors; in practice the
+// workspace ships at least one pre-existing untracked test file
+// under agreement/ (see agreement-wire-capture for context). The
+// skip applies only when EVERY path in the entry is a test file —
+// a rename that converts a non-test file into a test file (or vice
+// versa) still gets prefix-checked because the build-tree change
+// is real.
 func filterDirtyPaths(porcelain string, prefixes []string) []string {
 	var dirty []string
 	for _, line := range strings.Split(strings.TrimRight(porcelain, "\n"), "\n") {
@@ -245,17 +255,61 @@ func filterDirtyPaths(porcelain string, prefixes []string) []string {
 			continue
 		}
 		body := strings.TrimSpace(line[3:])
-		if strings.HasSuffix(body, "_test.go") {
+		paths := []string{body}
+		if idx := strings.Index(body, " -> "); idx >= 0 {
+			paths = []string{
+				strings.TrimSpace(body[:idx]),
+				strings.TrimSpace(body[idx+len(" -> "):]),
+			}
+		}
+		allTest := true
+		for _, p := range paths {
+			if !strings.HasSuffix(p, "_test.go") {
+				allTest = false
+				break
+			}
+		}
+		if allTest {
 			continue
 		}
-		for _, p := range prefixes {
-			if strings.HasPrefix(body, p) {
+		for _, p := range paths {
+			matched := false
+			for _, prefix := range prefixes {
+				if strings.HasPrefix(p, prefix) {
+					matched = true
+					break
+				}
+			}
+			if matched {
 				dirty = append(dirty, line)
 				break
 			}
 		}
 	}
 	return dirty
+}
+
+// resolveGoAlgorandPin returns the string written to the fixture's
+// `go_algorand_pin` metadata. When the pin was verified it's the
+// expected tag (honestly describing a reproducible capture). Under
+// `--allow-unpinned` we instead emit whatever `git describe` reports
+// for the actual HEAD, plus a `(unpinned)` suffix — so a fixture
+// captured against a different commit carries metadata that tells
+// reviewers "this did not come from the workspace-wide pin".
+func resolveGoAlgorandPin(path string, pinVerified bool) string {
+	if pinVerified {
+		return expectedGoAlgorandPin
+	}
+	out, err := exec.Command("git", "-C", path, "describe", "--tags", "--always", "--dirty=+dirty").Output()
+	if err != nil {
+		// Fall back to raw HEAD so we always emit *something*
+		// identifiable instead of silently misreporting the tag.
+		if rev, rerr := exec.Command("git", "-C", path, "rev-parse", "HEAD").Output(); rerr == nil {
+			return strings.TrimSpace(string(rev)) + " (unpinned)"
+		}
+		return "unknown (unpinned)"
+	}
+	return strings.TrimSpace(string(out)) + " (unpinned)"
 }
 
 func main() {
@@ -265,7 +319,8 @@ func main() {
 	)
 	flag.Parse()
 
-	if !*allowUnpinned {
+	pinVerified := !*allowUnpinned
+	if pinVerified {
 		if err := verifyGoAlgorandPin(goAlgorandDir()); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
@@ -275,7 +330,7 @@ func main() {
 	versions := allVersions()
 	corpus := Corpus{
 		Source:        "algod-rust/tools/lookback-vector-capture (TASK-57)",
-		GoAlgorandPin: expectedGoAlgorandPin,
+		GoAlgorandPin: resolveGoAlgorandPin(goAlgorandDir(), pinVerified),
 	}
 
 	for _, v := range versions {
