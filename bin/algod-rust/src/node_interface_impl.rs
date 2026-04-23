@@ -206,6 +206,26 @@ impl AlgodNodeInterface {
             .ok_or(NodeError::NotImplemented(method))
     }
 
+    /// Acquire the ledger `Mutex`, surfacing poison as
+    /// [`NodeError::Internal`] so an earlier panic inside the simulator
+    /// (or any other code path that held the lock) does not cascade into
+    /// panics for every subsequent REST request. Must be used by every
+    /// `Result`-returning lock site; non-`Result` methods
+    /// ([`Self::min_txn_fee`], [`Self::suggested_fee`]) handle poison
+    /// inline by recovering the guard from the poisoned lock.
+    fn lock_ledger(
+        &self,
+        method: &'static str,
+    ) -> Result<std::sync::MutexGuard<'_, SqliteLedger>, NodeError> {
+        self.ledger.lock().map_err(|_| {
+            NodeError::Internal(format!(
+                "{method}: ledger lock poisoned — an earlier operation panicked \
+                 while holding the lock; subsequent requests may return stale state \
+                 until the node is restarted"
+            ))
+        })
+    }
+
     /// Return the attached broadcaster (or [`NodeError::NotImplemented`]
     /// when absent) plus an `Arc` clone suitable for spawning onto
     /// `tokio::spawn` for the fire-and-forget variant.
@@ -278,7 +298,7 @@ impl AlgodNodeInterface {
     /// would otherwise leave `last_round` and `latest_header` on different
     /// rounds (a real risk when agreement/catchup commits are concurrent).
     fn read_status_snapshot(&self) -> Result<StatusSnapshot, NodeError> {
-        let ledger = self.ledger.lock().expect("ledger lock poisoned");
+        let ledger = self.lock_ledger("status")?;
         let last_round = ledger
             .last_committed_round()
             .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?
@@ -298,7 +318,7 @@ impl AlgodNodeInterface {
     /// `last_round` and `account_data` on the same round even if agreement
     /// commits while the handler is running.
     fn read_account_snapshot(&self, addr: &Address) -> Result<(u64, AccountData), NodeError> {
-        let ledger = self.ledger.lock().expect("ledger lock poisoned");
+        let ledger = self.lock_ledger("lookup_account")?;
         let last_round = ledger
             .last_committed_round()
             .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?
@@ -419,9 +439,14 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     async fn min_txn_fee(&self) -> u64 {
-        let proto = {
-            let ledger = self.ledger.lock().expect("ledger lock poisoned");
-            self.resolve_protocol(&ledger)
+        // The trait signature returns `u64` (no `Result`), so a poisoned
+        // lock falls back to the protocol default (1000 microAlgos)
+        // rather than panicking. Recovering the guard from poison here
+        // is safe because this is a read-only lookup of the cached
+        // protocol string — no write path depends on it.
+        let proto = match self.ledger.lock() {
+            Ok(g) => self.resolve_protocol(&g),
+            Err(poisoned) => self.resolve_protocol(&poisoned.into_inner()),
         };
         consensus_params_for_version(&proto)
             .map(|p| p.min_txn_fee)
@@ -444,7 +469,7 @@ impl NodeInterface for AlgodNodeInterface {
         // channel in TASK-79).
         loop {
             let last = {
-                let ledger = self.ledger.lock().expect("ledger lock poisoned");
+                let ledger = self.lock_ledger("wait_for_round")?;
                 ledger
                     .last_committed_round()
                     .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?
@@ -482,7 +507,7 @@ impl NodeInterface for AlgodNodeInterface {
 
     async fn get_block(&self, round: u64) -> Result<Block, NodeError> {
         let bytes = {
-            let ledger = self.ledger.lock().expect("ledger lock poisoned");
+            let ledger = self.lock_ledger("get_block")?;
             ledger
                 .get_block_data(round)
                 .map_err(|e| NodeError::Internal(format!("get_block_data({round}): {e}")))?
@@ -494,7 +519,7 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     async fn get_block_header(&self, round: u64) -> Result<BlockHeader, NodeError> {
-        let ledger = self.ledger.lock().expect("ledger lock poisoned");
+        let ledger = self.lock_ledger("get_block_header")?;
         ledger
             .get_block_header(round)
             .map_err(|e| NodeError::Internal(format!("get_block_header({round}): {e}")))?
@@ -511,7 +536,7 @@ impl NodeInterface for AlgodNodeInterface {
         // `compute_block_digest(&block)`, which kept relay-populated rows
         // hashable; this fallback preserves that behavior.
         let (hdr_bytes_opt, blk_bytes_opt) = {
-            let ledger = self.ledger.lock().expect("ledger lock poisoned");
+            let ledger = self.lock_ledger("get_block_hash")?;
             let h = ledger
                 .get_block_header_data(round)
                 .map_err(|e| NodeError::Internal(format!("get_block_header_data({round}): {e}")))?;
@@ -576,7 +601,7 @@ impl NodeInterface for AlgodNodeInterface {
         // uses the same hand-rolled pattern for P2P block responses —
         // consolidating the two into a shared helper is a follow-up.
         let (block_bytes, cert_bytes_opt) = {
-            let ledger = self.ledger.lock().expect("ledger lock poisoned");
+            let ledger = self.lock_ledger("get_block_raw_msgpack")?;
             let blk = ledger
                 .get_block_data(round)
                 .map_err(|e| NodeError::Internal(format!("get_block_data({round}): {e}")))?
@@ -612,7 +637,7 @@ impl NodeInterface for AlgodNodeInterface {
 
     async fn get_state_delta_for_round(&self, round: u64) -> Result<StateDelta, NodeError> {
         let bytes = {
-            let ledger = self.ledger.lock().expect("ledger lock poisoned");
+            let ledger = self.lock_ledger("get_state_delta_for_round")?;
             ledger
                 .get_state_delta(round)
                 .map_err(|e| NodeError::Internal(format!("get_state_delta({round}): {e}")))?
@@ -658,7 +683,7 @@ impl NodeInterface for AlgodNodeInterface {
 
     async fn consensus_params(&self) -> Result<ConsensusParams, NodeError> {
         let proto = {
-            let ledger = self.ledger.lock().expect("ledger lock poisoned");
+            let ledger = self.lock_ledger("consensus_params")?;
             self.resolve_protocol(&ledger)
         };
         Self::resolve_consensus_params(&proto)
@@ -784,11 +809,7 @@ impl NodeInterface for AlgodNodeInterface {
         // tracked as a refinement under PLAN-34 alongside the rest of
         // the simulation-response fidelity work.
         let result = {
-            let mut ledger = self.ledger.lock().map_err(|_| {
-                NodeError::Internal(
-                    "simulate: ledger lock poisoned — a prior request panicked".into(),
-                )
-            })?;
+            let mut ledger = self.lock_ledger("simulate")?;
             let mut simulator = Simulator::new(&mut *ledger);
             simulator
                 .simulate(sim_req)
@@ -1776,6 +1797,92 @@ mod tests {
         match internal {
             NodeError::Internal(m) => assert!(m.starts_with("simulate: internal: ")),
             other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_ledger_surfaces_poisoned_mutex_as_internal_error() {
+        // Poison the ledger mutex by panicking while a guard is held,
+        // then confirm every `Result`-returning adapter method surfaces
+        // `NodeError::Internal` with the poison message instead of
+        // propagating the panic into subsequent callers (which is what
+        // `expect("ledger lock poisoned")` used to do).
+        let ledger_arc = Arc::new(Mutex::new(
+            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+        ));
+        // Poison by panicking inside a lock scope. `catch_unwind` keeps
+        // the panic from escaping into the test harness.
+        let poison_target = Arc::clone(&ledger_arc);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = poison_target.lock().expect("initial lock");
+            panic!("simulated panic while holding ledger lock");
+        }));
+        assert!(
+            ledger_arc.is_poisoned(),
+            "test harness failed to poison the ledger mutex"
+        );
+
+        let adapter = AlgodNodeInterface::new(
+            ledger_arc,
+            NodeInterfaceConfig {
+                genesis_id: "testnet-v1.0".into(),
+                genesis_hash: Digest([0xAB; 32]),
+                genesis_json: "{}".into(),
+                build_version: build_version_fixture(),
+                default_protocol: CONSENSUS_V41.into(),
+            },
+        );
+
+        // Direct helper: poison surfaces as Internal, carrying the
+        // method name so operators can trace which caller tripped the
+        // cascade. `MutexGuard<SqliteLedger>` is not `Debug`, so we
+        // destructure the error directly rather than printing the whole
+        // `Result` in the panic message.
+        let err = adapter
+            .lock_ledger("probe")
+            .err()
+            .expect("poisoned lock should error");
+        match err {
+            NodeError::Internal(msg) => {
+                assert!(
+                    msg.starts_with("probe: ledger lock poisoned"),
+                    "expected poison message, got {msg:?}"
+                );
+                assert!(
+                    msg.contains("earlier operation panicked"),
+                    "expected panic explanation, got {msg:?}"
+                );
+            }
+            other => panic!("expected Internal(poisoned), got {other:?}"),
+        }
+
+        // Status preflight (the very path Codex flagged as cascading
+        // into simulate) now returns Internal instead of panicking.
+        match adapter.status().await {
+            Err(NodeError::Internal(msg)) => {
+                assert!(msg.starts_with("status: ledger lock poisoned"));
+            }
+            other => panic!("expected Internal from status(), got {other:?}"),
+        }
+
+        // simulate() itself surfaces the poison message without calling
+        // into the simulator.
+        let request = SimulateRequest {
+            allow_empty_signatures: None,
+            allow_more_logging: None,
+            allow_unnamed_resources: None,
+            exec_trace_config: None,
+            extra_opcode_budget: None,
+            fix_signers: None,
+            round: None,
+            txn_groups: Vec::new(),
+            decoded_txn_groups: vec![vec![SignedTransaction::default()]],
+        };
+        match adapter.simulate(request).await {
+            Err(NodeError::Internal(msg)) => {
+                assert!(msg.starts_with("simulate: ledger lock poisoned"));
+            }
+            other => panic!("expected Internal from simulate(), got {other:?}"),
         }
     }
 
