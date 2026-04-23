@@ -31,6 +31,7 @@ pub mod phonebook;
 pub mod request_response;
 pub mod request_tracker;
 pub mod srv_resolver;
+pub mod tx_syncer;
 pub mod ws_network;
 
 // ---------------------------------------------------------------------------
@@ -226,6 +227,16 @@ pub use agreement_network::{
     agreement_tag_to_network_tag, network_tag_to_agreement_tag, AgreementNetworkBridge,
     AgreementNetworkConfig, DEFAULT_BUNDLE_QUEUE_LEN, DEFAULT_PROPOSAL_QUEUE_LEN,
     DEFAULT_VOTE_QUEUE_LEN,
+};
+
+// ---------------------------------------------------------------------------
+// Re-exports: Transaction synchronizer (Plan 33, gap G1 — skeleton)
+// ---------------------------------------------------------------------------
+
+// TxSyncer state machine, peer / pool / handler abstractions, seen-hash LRU
+pub use tx_syncer::{
+    sync_round, NoOpSolicitedTxHandler, PeerSource, PendingTxAggregate, SeenTxCache,
+    SolicitedTxHandler, TxSyncError, TxSyncPeerClient, TxSyncer, TxSyncerConfig,
 };
 
 // ---------------------------------------------------------------------------
