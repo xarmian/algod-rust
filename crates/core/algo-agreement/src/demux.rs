@@ -388,15 +388,27 @@ impl Demux {
             // Block until any channel is ready. crossbeam_channel::Select
             // chooses fairly (random) when multiple are ready simultaneously,
             // matching Go's `select {}` behavior.
+            //
+            // Semantic note (vs. pre-clock Rust): previously the demux used
+            // `select_timeout(min(deadline, fast_deadline))` and deterministically
+            // returned `FastTimeout` only when `fast_deadline_dur < deadline_dur`.
+            // The new clock-based path leaves tie-breaking to crossbeam's fair
+            // random selection — which is what Go does at its own `select { case
+            // <-fastCh: ... case <-slowCh: ... }` sites in `agreement/demux.go`,
+            // so this is an intentional alignment rather than a regression. The
+            // "both already elapsed" tie is also far rarer now that `do_rezero_action`
+            // re-zeros the active clock on `Action::Rezero`.
             let oper = sel.select();
             let index = oper.index();
 
             // -- Deadline timeouts (clock-provided) --
             //
-            // A deadline receiver becoming "ready" means its sender was dropped
-            // by the clock (analogous to Go closing the timeout channel). We
-            // consume via `oper.recv(...)` to satisfy the Select contract; the
-            // returned Err(Disconnected) is expected and discarded.
+            // A deadline receiver becoming "ready" means the clock's underlying
+            // `crossbeam_channel::after(...)` fired (or the pre-closed sender
+            // was dropped for an already-elapsed delta). We consume via
+            // `oper.recv(...)` to satisfy the Select contract; the payload
+            // (`Instant`) or `Err(Disconnected)` is discarded — we only care
+            // about readiness.
             if index == deadline_idx {
                 let _ = oper.recv(&deadline_rx);
                 return Some(make_timeout_event(

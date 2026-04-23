@@ -2,177 +2,97 @@
 //
 // Mirrors go-algorand/util/timers/monotonic.go — `Monotonic[TimeoutType]`.
 //
-// `SystemClock` wraps `std::time::Instant` and uses `thread::sleep` in a
-// spawned thread to signal timeout receivers. Repeat calls for the same
-// `TimeoutType` with matching `delta` return the cached receiver so the demux
-// doesn't spawn a new sleeper thread on every iteration. This preserves the
-// timing semantics the agreement service had before the `Clock` abstraction
-// was introduced.
+// `SystemClock` wraps `std::time::Instant` and delegates timer firing to
+// `crossbeam_channel::after`, which uses a shared background scheduler — no
+// per-call OS thread spawn. This preserves the timing semantics the agreement
+// service had before the `Clock` abstraction was introduced.
+//
+// Mutability: `zero()` resets the monotonic reference in place (interior
+// mutability via a `Mutex`). Both `main_loop` (which handles `Action::Rezero`)
+// and `demux_loop` (which calls `timeout_at`) share the same `Arc<dyn Clock>`,
+// so a `zero()` from the main loop is immediately visible to the demux.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{bounded, Receiver};
-use thiserror::Error;
 
 use crate::clock::Clock;
 use crate::types::TimeoutType;
 
-/// Cached timeout entry so repeated `timeout_at(delta, ty)` calls with the
-/// same `ty` and matching `delta` return the same receiver.
-struct CachedTimeout {
-    delta: Duration,
-    rx: Receiver<()>,
-}
-
-/// Default production clock — wraps `Instant::now()` with a per-`TimeoutType`
-/// cache, matching go-algorand's `timers.Monotonic`.
-pub struct SystemClock {
+/// Mutable state behind a `Mutex`. Kept small so `zero()` is cheap.
+struct State {
     /// Monotonic zero point. Timeouts fire at `zero + delta`.
     zero: Instant,
-    /// Wall-clock timestamp that corresponds to `zero`; used by `encode` so
-    /// that persistence can be cross-checked against `SystemTime::now()` at
-    /// restore time.
+    /// Wall-clock stamp corresponding to `zero`. Useful for logging /
+    /// future persistence.
+    #[allow(dead_code)]
     zero_wall: SystemTime,
-    /// Per-`TimeoutType` cache — mirrors `m.timeouts` in monotonic.go.
-    timeouts: Mutex<HashMap<TimeoutType, CachedTimeout>>,
+}
+
+/// Default production clock — wraps `Instant::now()` with in-place `zero()`
+/// support, matching go-algorand's `timers.Monotonic` for timing semantics.
+pub struct SystemClock {
+    state: Mutex<State>,
 }
 
 impl SystemClock {
     /// Create a new `SystemClock` zeroed at the current wall-clock instant,
     /// returning it as an `Arc<dyn Clock>` ready to hand to `Parameters`.
     ///
-    /// Mirrors `timers.MakeMonotonicClock[TimeoutType](time.Now())` — the
-    /// Go equivalent constructs and returns the concrete type; the Rust
-    /// service threads clocks as trait objects so every call site wants the
+    /// Mirrors `timers.MakeMonotonicClock[TimeoutType](time.Now())` — the Go
+    /// equivalent constructs and returns the concrete type; the Rust service
+    /// threads clocks as trait objects so every call site wants the
     /// `Arc<dyn Clock>` shape.
     #[allow(clippy::new_ret_no_self)] // returns trait object by design — see doc.
     pub fn new() -> Arc<dyn Clock> {
-        Arc::new(Self::with_zero(Instant::now(), SystemTime::now()))
-    }
-
-    /// Create a new `SystemClock` zeroed at the given instant and wall-clock
-    /// stamp. Useful for tests that want a known reference point.
-    pub fn with_zero(zero: Instant, zero_wall: SystemTime) -> Self {
-        Self {
-            zero,
-            zero_wall,
-            timeouts: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Reconstruct a `SystemClock` from the bytes produced by `encode`.
-    ///
-    /// The encoded payload is the clock's wall-clock zero timestamp expressed
-    /// as nanoseconds since `UNIX_EPOCH`. The monotonic zero is reconstructed
-    /// by projecting the wall-clock delta onto `Instant::now()`; if the stored
-    /// zero is in the future (e.g. bogus payload, clock skew), we refuse to
-    /// return a usable clock and surface `ClockDecodeError::ZeroInFuture`.
-    pub fn decode(bytes: &[u8]) -> Result<Arc<dyn Clock>, ClockDecodeError> {
-        if bytes.len() != 16 {
-            return Err(ClockDecodeError::WrongLength {
-                expected: 16,
-                got: bytes.len(),
-            });
-        }
-        let mut buf = [0u8; 16];
-        buf.copy_from_slice(bytes);
-        let nanos = u128::from_le_bytes(buf);
-        let zero_wall = UNIX_EPOCH
-            .checked_add(Duration::from_nanos(
-                u64::try_from(nanos).map_err(|_| ClockDecodeError::Malformed)?,
-            ))
-            .ok_or(ClockDecodeError::Malformed)?;
-
-        let now_wall = SystemTime::now();
-        let elapsed_wall = now_wall
-            .duration_since(zero_wall)
-            .map_err(|_| ClockDecodeError::ZeroInFuture)?;
-        let now_instant = Instant::now();
-        let zero_instant = now_instant
-            .checked_sub(elapsed_wall)
-            .ok_or(ClockDecodeError::ZeroInFuture)?;
-
-        Ok(Arc::new(Self::with_zero(zero_instant, zero_wall)))
+        Arc::new(Self {
+            state: Mutex::new(State {
+                zero: Instant::now(),
+                zero_wall: SystemTime::now(),
+            }),
+        })
     }
 }
 
 impl Clock for SystemClock {
-    fn timeout_at(&self, delta: Duration, timeout_type: TimeoutType) -> Receiver<()> {
-        let mut timeouts = self
-            .timeouts
-            .lock()
-            .expect("SystemClock timeouts mutex poisoned");
+    fn timeout_at(&self, delta: Duration, _timeout_type: TimeoutType) -> Receiver<Instant> {
+        // Snapshot `zero` under the mutex, then drop the guard before touching
+        // crossbeam's timer scheduler.
+        let zero = {
+            let state = self.state.lock().expect("SystemClock state mutex poisoned");
+            state.zero
+        };
 
-        if let Some(cached) = timeouts.get(&timeout_type) {
-            if cached.delta == delta {
-                return cached.rx.clone();
-            }
-        }
-
-        let target = self.zero + delta;
+        let target = zero + delta;
         let left = target.saturating_duration_since(Instant::now());
-        let (tx, rx) = bounded::<()>(0);
 
         if left.is_zero() {
-            // Already elapsed — drop tx so recv sees Disconnected immediately.
+            // Already elapsed — return a pre-dropped channel so
+            // `Select::recv(&rx)` surfaces it as ready immediately. Mirrors
+            // Go's "closed channel always receives" idiom.
+            let (tx, rx) = bounded::<Instant>(0);
             drop(tx);
+            rx
         } else {
-            thread::Builder::new()
-                .name(format!("clock-timeout-{timeout_type}"))
-                .spawn(move || {
-                    thread::sleep(left);
-                    // Dropping tx here closes the channel, which the demux's
-                    // crossbeam `Select::recv(&rx)` treats as a fired timeout.
-                    drop(tx);
-                })
-                .expect("failed to spawn clock-timeout thread");
+            // crossbeam's `after` uses a shared internal timer thread — it
+            // does NOT spawn one OS thread per call, avoiding the thread-
+            // accumulation risk that the first iteration of this refactor
+            // had with `thread::sleep`.
+            crossbeam_channel::after(left)
         }
-
-        timeouts.insert(
-            timeout_type,
-            CachedTimeout {
-                delta,
-                rx: rx.clone(),
-            },
-        );
-        rx
     }
 
     fn since(&self) -> Duration {
-        Instant::now().saturating_duration_since(self.zero)
+        let state = self.state.lock().expect("SystemClock state mutex poisoned");
+        Instant::now().saturating_duration_since(state.zero)
     }
 
-    fn zero(&self) -> Arc<dyn Clock> {
-        Arc::new(Self::with_zero(Instant::now(), SystemTime::now()))
+    fn zero(&self) {
+        let mut state = self.state.lock().expect("SystemClock state mutex poisoned");
+        state.zero = Instant::now();
+        state.zero_wall = SystemTime::now();
     }
-
-    fn encode(&self) -> Vec<u8> {
-        // Serialize the wall-clock zero as u128 nanoseconds (little-endian).
-        let nanos = self
-            .zero_wall
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        nanos.to_le_bytes().to_vec()
-    }
-}
-
-/// Errors returned by `SystemClock::decode`.
-#[derive(Debug, Error)]
-pub enum ClockDecodeError {
-    /// Encoded payload had an unexpected length.
-    #[error("clock decode: wrong length (expected {expected}, got {got})")]
-    WrongLength { expected: usize, got: usize },
-    /// Encoded payload did not represent a valid wall-clock timestamp.
-    #[error("clock decode: malformed payload")]
-    Malformed,
-    /// The decoded zero timestamp is in the future relative to the current
-    /// wall clock — cannot project onto a monotonic instant.
-    #[error("clock decode: stored zero is in the future (clock skew or corrupt state)")]
-    ZeroInFuture,
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +103,7 @@ pub enum ClockDecodeError {
 mod tests {
     use super::*;
     use crossbeam_channel::select;
+    use std::thread;
 
     #[test]
     fn since_is_small_at_construction() {
@@ -200,13 +121,20 @@ mod tests {
     fn zero_resets_the_monotonic_reference() {
         let clock = SystemClock::new();
         thread::sleep(Duration::from_millis(20));
-        let reset = clock.zero();
-        // `reset.since()` should be much smaller than `clock.since()`.
+        let before = clock.since();
+        clock.zero();
+        let after = clock.since();
+        // `after` should be much smaller than `before`.
         assert!(
-            reset.since() < clock.since(),
-            "zero() did not reset the monotonic reference (reset={:?}, clock={:?})",
-            reset.since(),
-            clock.since()
+            after < before,
+            "zero() did not reset the monotonic reference (before={:?}, after={:?})",
+            before,
+            after
+        );
+        assert!(
+            after < Duration::from_millis(10),
+            "since() immediately after zero() was {:?}; expected <10ms",
+            after
         );
     }
 
@@ -232,11 +160,11 @@ mod tests {
             rx.recv_timeout(Duration::from_millis(10)).is_err(),
             "timeout_at fired before delta elapsed"
         );
-        // After sufficient wait the timeout should fire (sender dropped).
-        // We use select with a generous timeout to avoid flakiness under load.
+        // After sufficient wait the timeout should fire.
         select! {
-            recv(rx) -> res => {
-                assert!(res.is_err(), "expected Disconnected once timer elapsed");
+            recv(rx) -> _ => {
+                // Either an Ok(Instant) from crossbeam::after or
+                // Err(Disconnected) — both mean the timer fired / was ready.
             },
             default(Duration::from_millis(500)) => {
                 panic!("timeout_at did not fire within 500ms");
@@ -245,58 +173,38 @@ mod tests {
     }
 
     #[test]
-    fn timeout_at_caches_per_timeout_type() {
+    fn timeout_at_after_zero_measures_from_new_zero() {
         let clock = SystemClock::new();
-        let rx_a = clock.timeout_at(Duration::from_secs(10), TimeoutType::Deadline);
-        let rx_b = clock.timeout_at(Duration::from_secs(10), TimeoutType::Deadline);
-        // Same delta + same type → same underlying receiver.
-        assert!(rx_a.same_channel(&rx_b), "expected cached receiver reuse");
-    }
-
-    #[test]
-    fn timeout_at_new_channel_when_delta_changes() {
-        let clock = SystemClock::new();
-        let rx_a = clock.timeout_at(Duration::from_secs(5), TimeoutType::Deadline);
-        let rx_b = clock.timeout_at(Duration::from_secs(10), TimeoutType::Deadline);
-        // Different delta → fresh receiver.
+        // Sleep to accumulate monotonic time past any short delta.
+        thread::sleep(Duration::from_millis(30));
+        clock.zero();
+        // A 50ms delta, measured from the new zero, should NOT fire immediately.
+        let rx = clock.timeout_at(Duration::from_millis(50), TimeoutType::Deadline);
         assert!(
-            !rx_a.same_channel(&rx_b),
-            "expected new receiver when delta changed"
+            rx.recv_timeout(Duration::from_millis(10)).is_err(),
+            "timeout_at fired immediately after zero() — clock was not reset"
         );
     }
 
     #[test]
-    fn encode_then_decode_roundtrip() {
+    fn since_progresses_between_zero_calls() {
         let clock = SystemClock::new();
-        let encoded = clock.encode();
-        assert_eq!(encoded.len(), 16, "encoded clock should be 16 bytes");
-        let decoded = match SystemClock::decode(&encoded) {
-            Ok(c) => c,
-            Err(e) => panic!("decode should succeed: {e}"),
-        };
-        // since() on the decoded clock should be close to the original's since(),
-        // with some tolerance for the decode-time gap.
-        let orig_since = clock.since();
-        let dec_since = decoded.since();
-        let diff = if dec_since > orig_since {
-            dec_since - orig_since
-        } else {
-            orig_since - dec_since
-        };
+        thread::sleep(Duration::from_millis(15));
+        let first_since = clock.since();
+        clock.zero();
+        thread::sleep(Duration::from_millis(15));
+        let second_since = clock.since();
+        // Both should be ~15ms; neither should be dramatically bigger than the other.
         assert!(
-            diff < Duration::from_millis(50),
-            "decoded since drifted too far (orig={:?}, dec={:?}, diff={:?})",
-            orig_since,
-            dec_since,
-            diff
+            first_since >= Duration::from_millis(10),
+            "first_since was {:?}",
+            first_since
         );
-    }
-
-    #[test]
-    fn decode_rejects_wrong_length() {
-        match SystemClock::decode(&[0u8; 8]) {
-            Ok(_) => panic!("decode should reject short payloads"),
-            Err(e) => assert!(matches!(e, ClockDecodeError::WrongLength { .. })),
-        }
+        assert!(
+            second_since >= Duration::from_millis(10) && second_since < first_since * 2,
+            "second_since={:?} didn't reset properly against first_since={:?}",
+            second_since,
+            first_since
+        );
     }
 }

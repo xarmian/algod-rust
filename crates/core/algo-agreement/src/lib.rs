@@ -132,7 +132,7 @@ pub use service::{Parameters, Service, ServiceHandle};
 
 // Re-exports from clock module
 pub use clock::Clock;
-pub use system_clock::{ClockDecodeError, SystemClock};
+pub use system_clock::SystemClock;
 
 // Re-exports from persistence module
 pub use persistence::{
