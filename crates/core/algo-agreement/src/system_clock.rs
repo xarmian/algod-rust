@@ -64,7 +64,15 @@ impl Clock for SystemClock {
             state.zero
         };
 
-        let target = zero + delta;
+        // `Instant::checked_add` guards against overflow for pathological
+        // deltas (the bare `zero + delta` would panic); an overflowed target
+        // is indistinguishable from "never fires" since no monotonic clock
+        // reading could ever reach it, so return a never-channel — the demux
+        // happily selects on it and simply never takes that branch.
+        let target = match zero.checked_add(delta) {
+            Some(t) => t,
+            None => return crossbeam_channel::never(),
+        };
         let left = target.saturating_duration_since(Instant::now());
 
         if left.is_zero() {
@@ -183,6 +191,20 @@ mod tests {
         assert!(
             rx.recv_timeout(Duration::from_millis(10)).is_err(),
             "timeout_at fired immediately after zero() — clock was not reset"
+        );
+    }
+
+    #[test]
+    fn timeout_at_pathological_delta_does_not_panic() {
+        // Regression: an extreme delta must not panic via Instant overflow
+        // inside `zero + delta`. The clock should gracefully surface a
+        // never-firing receiver.
+        let clock = SystemClock::new();
+        let rx = clock.timeout_at(Duration::MAX, TimeoutType::Deadline);
+        // Not ready under any reasonable wait.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "pathological timeout_at should surface a never-firing receiver"
         );
     }
 
