@@ -30,6 +30,15 @@ pub enum NodeError {
     #[error("{0}")]
     NotFound(String),
 
+    /// Client-supplied request was invalid (bad input, conflicting
+    /// options, out-of-domain values) — handlers map to 400. Use this
+    /// variant when the failure is attributable to the caller's input,
+    /// not a node-side problem. Introduced so adapter-level errors like
+    /// `simulate: invalid request: ...` and `broadcast: empty group`
+    /// surface as 4xx responses instead of being collapsed into 500.
+    #[error("{0}")]
+    BadRequest(String),
+
     /// Operation timed out — handlers map to 408.
     #[error("{0}")]
     Timeout(String),

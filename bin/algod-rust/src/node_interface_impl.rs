@@ -9,7 +9,7 @@
 //! - Pool methods (`TASK-76`) — `pending_transactions`, `get_pending_transaction`
 //! - Broadcast methods (`TASK-77`) — `broadcast_signed_tx_group`,
 //!   `async_broadcast_signed_tx_group`
-//! - Simulation (`TASK-78`) — `simulate`
+//! - Simulation (`TASK-78`) — `simulate`, via `algo_ledger::simulation::Simulator`
 //! - CLI wiring (`TASK-79`) — constructs [`AlgodNodeInterface`] in the
 //!   `participate` / `serve` subcommands and passes it to the axum router
 //!
@@ -27,17 +27,25 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use algo_codec::{canonical_encode_block_header, compute_block_digest};
+use algo_ledger::simulation::{
+    ExecTraceConfig, SimulationRequest, SimulationResult, Simulator, SimulatorError,
+    TxnGroupResult, TxnResult,
+};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{SqliteLedger, StateDelta};
 use algo_network::local_tx_broadcast::{LocalTxBroadcaster, LocalTxError};
 use algo_pool::TransactionPool;
+use algo_rest_api::models::{
+    PreEncodedTxInfo, SimulateRequest, SimulateResponse, SimulateTraceConfig,
+    SimulateTransactionGroupResult, SimulateTransactionResult,
+};
 use algo_rest_api::node::{
     AccountLookup, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
     TxnWithStatus,
 };
 use algo_types::consensus::consensus_params_for_version;
 use algo_types::{
-    AccountData, Address, Block, BlockHeader, ConsensusParams, Digest, SignedTransaction,
+    AccountData, Address, Block, BlockHeader, ConsensusParams, Digest, Round, SignedTransaction,
 };
 use async_trait::async_trait;
 use sha2::{Digest as _, Sha512_256};
@@ -198,6 +206,26 @@ impl AlgodNodeInterface {
             .ok_or(NodeError::NotImplemented(method))
     }
 
+    /// Acquire the ledger `Mutex`, surfacing poison as
+    /// [`NodeError::Internal`] so an earlier panic inside the simulator
+    /// (or any other code path that held the lock) does not cascade into
+    /// panics for every subsequent REST request. Must be used by every
+    /// `Result`-returning lock site; non-`Result` methods
+    /// ([`Self::min_txn_fee`], [`Self::suggested_fee`]) handle poison
+    /// inline by recovering the guard from the poisoned lock.
+    fn lock_ledger(
+        &self,
+        method: &'static str,
+    ) -> Result<std::sync::MutexGuard<'_, SqliteLedger>, NodeError> {
+        self.ledger.lock().map_err(|_| {
+            NodeError::Internal(format!(
+                "{method}: ledger lock poisoned — an earlier operation panicked \
+                 while holding the lock; subsequent requests may return stale state \
+                 until the node is restarted"
+            ))
+        })
+    }
+
     /// Return the attached broadcaster (or [`NodeError::NotImplemented`]
     /// when absent) plus an `Arc` clone suitable for spawning onto
     /// `tokio::spawn` for the fire-and-forget variant.
@@ -270,7 +298,7 @@ impl AlgodNodeInterface {
     /// would otherwise leave `last_round` and `latest_header` on different
     /// rounds (a real risk when agreement/catchup commits are concurrent).
     fn read_status_snapshot(&self) -> Result<StatusSnapshot, NodeError> {
-        let ledger = self.ledger.lock().expect("ledger lock poisoned");
+        let ledger = self.lock_ledger("status")?;
         let last_round = ledger
             .last_committed_round()
             .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?
@@ -290,7 +318,7 @@ impl AlgodNodeInterface {
     /// `last_round` and `account_data` on the same round even if agreement
     /// commits while the handler is running.
     fn read_account_snapshot(&self, addr: &Address) -> Result<(u64, AccountData), NodeError> {
-        let ledger = self.ledger.lock().expect("ledger lock poisoned");
+        let ledger = self.lock_ledger("lookup_account")?;
         let last_round = ledger
             .last_committed_round()
             .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?
@@ -411,9 +439,14 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     async fn min_txn_fee(&self) -> u64 {
-        let proto = {
-            let ledger = self.ledger.lock().expect("ledger lock poisoned");
-            self.resolve_protocol(&ledger)
+        // The trait signature returns `u64` (no `Result`), so a poisoned
+        // lock falls back to the protocol default (1000 microAlgos)
+        // rather than panicking. Recovering the guard from poison here
+        // is safe because this is a read-only lookup of the cached
+        // protocol string — no write path depends on it.
+        let proto = match self.ledger.lock() {
+            Ok(g) => self.resolve_protocol(&g),
+            Err(poisoned) => self.resolve_protocol(&poisoned.into_inner()),
         };
         consensus_params_for_version(&proto)
             .map(|p| p.min_txn_fee)
@@ -436,7 +469,7 @@ impl NodeInterface for AlgodNodeInterface {
         // channel in TASK-79).
         loop {
             let last = {
-                let ledger = self.ledger.lock().expect("ledger lock poisoned");
+                let ledger = self.lock_ledger("wait_for_round")?;
                 ledger
                     .last_committed_round()
                     .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?
@@ -474,7 +507,7 @@ impl NodeInterface for AlgodNodeInterface {
 
     async fn get_block(&self, round: u64) -> Result<Block, NodeError> {
         let bytes = {
-            let ledger = self.ledger.lock().expect("ledger lock poisoned");
+            let ledger = self.lock_ledger("get_block")?;
             ledger
                 .get_block_data(round)
                 .map_err(|e| NodeError::Internal(format!("get_block_data({round}): {e}")))?
@@ -486,7 +519,7 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     async fn get_block_header(&self, round: u64) -> Result<BlockHeader, NodeError> {
-        let ledger = self.ledger.lock().expect("ledger lock poisoned");
+        let ledger = self.lock_ledger("get_block_header")?;
         ledger
             .get_block_header(round)
             .map_err(|e| NodeError::Internal(format!("get_block_header({round}): {e}")))?
@@ -503,7 +536,7 @@ impl NodeInterface for AlgodNodeInterface {
         // `compute_block_digest(&block)`, which kept relay-populated rows
         // hashable; this fallback preserves that behavior.
         let (hdr_bytes_opt, blk_bytes_opt) = {
-            let ledger = self.ledger.lock().expect("ledger lock poisoned");
+            let ledger = self.lock_ledger("get_block_hash")?;
             let h = ledger
                 .get_block_header_data(round)
                 .map_err(|e| NodeError::Internal(format!("get_block_header_data({round}): {e}")))?;
@@ -568,7 +601,7 @@ impl NodeInterface for AlgodNodeInterface {
         // uses the same hand-rolled pattern for P2P block responses —
         // consolidating the two into a shared helper is a follow-up.
         let (block_bytes, cert_bytes_opt) = {
-            let ledger = self.ledger.lock().expect("ledger lock poisoned");
+            let ledger = self.lock_ledger("get_block_raw_msgpack")?;
             let blk = ledger
                 .get_block_data(round)
                 .map_err(|e| NodeError::Internal(format!("get_block_data({round}): {e}")))?
@@ -604,7 +637,7 @@ impl NodeInterface for AlgodNodeInterface {
 
     async fn get_state_delta_for_round(&self, round: u64) -> Result<StateDelta, NodeError> {
         let bytes = {
-            let ledger = self.ledger.lock().expect("ledger lock poisoned");
+            let ledger = self.lock_ledger("get_state_delta_for_round")?;
             ledger
                 .get_state_delta(round)
                 .map_err(|e| NodeError::Internal(format!("get_state_delta({round}): {e}")))?
@@ -650,7 +683,7 @@ impl NodeInterface for AlgodNodeInterface {
 
     async fn consensus_params(&self) -> Result<ConsensusParams, NodeError> {
         let proto = {
-            let ledger = self.ledger.lock().expect("ledger lock poisoned");
+            let ledger = self.lock_ledger("consensus_params")?;
             self.resolve_protocol(&ledger)
         };
         Self::resolve_consensus_params(&proto)
@@ -754,9 +787,211 @@ impl NodeInterface for AlgodNodeInterface {
         });
         Ok(())
     }
+
+    // ---- Simulation (TASK-78) ----
+
+    async fn simulate(&self, request: SimulateRequest) -> Result<SimulateResponse, NodeError> {
+        // The REST handler populates `decoded_txn_groups` from the raw
+        // JSON/msgpack `txn_groups` before calling us. Direct trait callers
+        // that bypass the handler must populate it themselves.
+        let sim_req = Self::build_simulation_request(request);
+
+        // Run the simulator under the ledger lock. `Simulator` takes
+        // `&mut L: LedgerStore` and uses snapshot/restore to leave the
+        // store unchanged on both the `Ok` and `Err` paths. A panic
+        // *inside* the simulator bypasses the explicit restore (the
+        // snapshot is dropped mid-way) and poisons the `std::sync::Mutex`,
+        // so we handle poison here rather than `expect`-ing — an earlier
+        // panic does not cascade into the entire REST surface dying on
+        // subsequent requests. Long AVM simulations still stall other
+        // ledger access and block the current Tokio worker;
+        // `spawn_blocking` (or migrating to `tokio::sync::Mutex`) is
+        // tracked as a refinement under PLAN-34 alongside the rest of
+        // the simulation-response fidelity work.
+        let result = {
+            let mut ledger = self.lock_ledger("simulate")?;
+            let mut simulator = Simulator::new(&mut *ledger);
+            simulator
+                .simulate(sim_req)
+                .map_err(Self::map_simulator_error)?
+        };
+        Ok(Self::build_simulate_response(result))
+    }
 }
 
 impl AlgodNodeInterface {
+    // ---- Simulation conversion helpers (TASK-78) ----
+    //
+    // These pure functions translate between the REST-level model types
+    // (`algo_rest_api::models::Simulate*`) and the ledger's internal
+    // simulation types (`algo_ledger::simulation::Simulation*`). Keeping
+    // them as associated functions lets each conversion branch be
+    // exercised without standing up a live simulator.
+    //
+    // Response-shape fidelity gaps (`eval_overrides`, `initial_states`,
+    // `exec-trace` contents, unnamed-resources-accessed, etc.) are
+    // tracked in PLAN-34; this task only plumbs the call.
+
+    /// Translate the REST `SimulateTraceConfig` into the ledger's
+    /// [`ExecTraceConfig`], collapsing `Option<bool>` flags to `bool`.
+    fn exec_trace_config_from_model(cfg: Option<SimulateTraceConfig>) -> ExecTraceConfig {
+        let cfg = cfg.unwrap_or_default();
+        ExecTraceConfig {
+            enable: cfg.enable.unwrap_or(false),
+            stack: cfg.stack_change.unwrap_or(false),
+            scratch: cfg.scratch_change.unwrap_or(false),
+            state: cfg.state_change.unwrap_or(false),
+        }
+    }
+
+    /// Build the ledger's [`SimulationRequest`] from the REST
+    /// [`SimulateRequest`]. Uses the handler-populated
+    /// `decoded_txn_groups` field — callers that bypass the handler must
+    /// populate it before calling this method.
+    ///
+    /// Note: `allow_more_logging` is plumbed through for forward
+    /// compatibility but is currently a no-op inside
+    /// [`algo_ledger::simulation::Simulator::simulate`], which does not
+    /// yet raise the AVM `max_log_calls` / `max_log_size` limits. The
+    /// simulator-side wiring lands with the rest of the
+    /// simulation-response fidelity work in PLAN-34. Callers that rely
+    /// on relaxed log limits should not expect this flag to take effect
+    /// until then.
+    fn build_simulation_request(request: SimulateRequest) -> SimulationRequest {
+        SimulationRequest {
+            round: request.round.map(Round),
+            txn_groups: request.decoded_txn_groups,
+            allow_empty_signatures: request.allow_empty_signatures.unwrap_or(false),
+            allow_more_logging: request.allow_more_logging.unwrap_or(false),
+            allow_unnamed_resources: request.allow_unnamed_resources.unwrap_or(false),
+            extra_opcode_budget: request.extra_opcode_budget.unwrap_or(0),
+            trace_config: Self::exec_trace_config_from_model(request.exec_trace_config),
+            fix_signers: request.fix_signers.unwrap_or(false),
+        }
+    }
+
+    /// Collapse a zero counter to `None` so `skip_serializing_if` keeps
+    /// the wire response tidy. Mirrors go-algorand's
+    /// `omitempty`-on-uint behavior.
+    fn opt_nonzero_u64(value: u64) -> Option<u64> {
+        if value == 0 {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    /// Build a minimal [`PreEncodedTxInfo`] from a simulation [`TxnResult`].
+    ///
+    /// Fields sourced from `ApplyData` (rewards, closing amounts, asset /
+    /// application indexes, state deltas, logs, inner transactions) are
+    /// deliberately left `None` — populating them fully is PLAN-34's
+    /// response-fidelity work. The `txn` field is populated from the
+    /// result so clients can confirm which transaction the result refers
+    /// to even without apply-data parity.
+    fn pre_encoded_txinfo_from_txn_result(result: &TxnResult) -> PreEncodedTxInfo {
+        PreEncodedTxInfo {
+            txn: result.txn.clone().unwrap_or_default(),
+            pool_error: String::new(),
+            confirmed_round: None,
+            closing_amount: None,
+            asset_closing_amount: None,
+            sender_rewards: None,
+            receiver_rewards: None,
+            close_rewards: None,
+            asset_index: None,
+            application_index: None,
+            global_state_delta: None,
+            local_state_delta: None,
+            logs: None,
+            inner_txns: None,
+        }
+    }
+
+    /// Convert a single simulation [`TxnResult`] into the REST shape.
+    fn txn_result_to_model(result: TxnResult) -> SimulateTransactionResult {
+        let txn_result = Self::pre_encoded_txinfo_from_txn_result(&result);
+        SimulateTransactionResult {
+            app_budget_consumed: Self::opt_nonzero_u64(result.app_budget_consumed),
+            // `exec-trace` population is PLAN-34 (Dryrun / Simulate trace
+            // capture — the simulator already records the trace on
+            // `result.trace`, but translating the nested trace types to
+            // the REST `SimulationTransactionExecTrace` schema is its
+            // own sub-project).
+            exec_trace: None,
+            fixed_signer: result.fixed_signer.map(|a| a.to_string()),
+            logic_sig_budget_consumed: Self::opt_nonzero_u64(result.logicsig_budget_consumed),
+            txn_result,
+            unnamed_resources_accessed: None,
+        }
+    }
+
+    /// Convert a simulation [`TxnGroupResult`] into the REST shape.
+    fn txn_group_result_to_model(group: TxnGroupResult) -> SimulateTransactionGroupResult {
+        SimulateTransactionGroupResult {
+            app_budget_added: Self::opt_nonzero_u64(group.app_budget_added),
+            app_budget_consumed: Self::opt_nonzero_u64(group.app_budget_consumed),
+            failed_at: group
+                .failed_at
+                .map(|path| path.into_iter().map(|i| i as u64).collect()),
+            failure_message: group.failure_message,
+            txn_results: group
+                .txn_results
+                .into_iter()
+                .map(Self::txn_result_to_model)
+                .collect(),
+            unnamed_resources_accessed: None,
+        }
+    }
+
+    /// Build the top-level [`SimulateResponse`] from the simulator's
+    /// [`SimulationResult`].
+    ///
+    /// `eval_overrides`, `initial_states`, and `exec_trace_config` are
+    /// intentionally left `None` — populating them is PLAN-34 scope.
+    fn build_simulate_response(result: SimulationResult) -> SimulateResponse {
+        SimulateResponse {
+            eval_overrides: None,
+            exec_trace_config: None,
+            initial_states: None,
+            last_round: result.last_round.0,
+            txn_groups: result
+                .txn_groups
+                .into_iter()
+                .map(Self::txn_group_result_to_model)
+                .collect(),
+            version: result.version,
+        }
+    }
+
+    /// Map a [`SimulatorError`] to the trait-level [`NodeError`].
+    ///
+    /// - `InvalidRequest` → [`NodeError::BadRequest`] so REST clients
+    ///   get 400s for bad input (conflicting `fix-signers` /
+    ///   `allow-empty-signatures` flags, multi-group requests, empty
+    ///   groups, etc.) instead of a collapsed 500.
+    /// - `EvalFailure` → [`NodeError::Internal`]. In practice
+    ///   `simulate()` carries eval failures inside the result
+    ///   (`TxnGroupResult::failure_message` + `failed_at`) rather than
+    ///   raising this variant, so this branch only fires for
+    ///   pre-execution signature / well-formedness checks.
+    /// - `Internal` → [`NodeError::Internal`].
+    ///
+    /// Each variant's message keeps a `simulate: <category>: …` prefix
+    /// so logs and client-visible bodies remain traceable to the
+    /// underlying cause.
+    fn map_simulator_error(err: SimulatorError) -> NodeError {
+        match err {
+            SimulatorError::InvalidRequest(e) => {
+                NodeError::BadRequest(format!("simulate: invalid request: {e}"))
+            }
+            SimulatorError::EvalFailure(e) => {
+                NodeError::Internal(format!("simulate: eval failure: {e}"))
+            }
+            SimulatorError::Internal(e) => NodeError::Internal(format!("simulate: internal: {e}")),
+        }
+    }
+
     /// Translate a raw `(txn, pool_error, found)` tuple from
     /// [`TransactionPool::lookup`] into the trait-level response.
     ///
@@ -1346,6 +1581,344 @@ mod tests {
             "no peers".into(),
         ));
         assert_eq!(msg(broadcast), "broadcast: gossip failed: no peers");
+    }
+
+    // ---- Simulation (TASK-78) ----
+
+    #[test]
+    fn exec_trace_config_from_model_collapses_optional_bools() {
+        // Missing outer: all defaults false.
+        let default = AlgodNodeInterface::exec_trace_config_from_model(None);
+        assert!(!default.enable);
+        assert!(!default.stack);
+        assert!(!default.scratch);
+        assert!(!default.state);
+
+        // Fully-populated outer: individual flags propagate.
+        let full = AlgodNodeInterface::exec_trace_config_from_model(Some(SimulateTraceConfig {
+            enable: Some(true),
+            stack_change: Some(true),
+            scratch_change: Some(false),
+            state_change: Some(true),
+        }));
+        assert!(full.enable);
+        assert!(full.stack);
+        assert!(!full.scratch);
+        assert!(full.state);
+    }
+
+    #[test]
+    fn build_simulation_request_maps_fields_and_uses_decoded_txn_groups() {
+        let decoded = vec![vec![SignedTransaction::default()]];
+        let request = SimulateRequest {
+            allow_empty_signatures: Some(true),
+            allow_more_logging: Some(true),
+            allow_unnamed_resources: Some(false),
+            exec_trace_config: Some(SimulateTraceConfig {
+                enable: Some(true),
+                stack_change: None,
+                scratch_change: None,
+                state_change: None,
+            }),
+            extra_opcode_budget: Some(2_000),
+            fix_signers: Some(true),
+            round: Some(42),
+            txn_groups: Vec::new(), // handler uses decoded_txn_groups instead
+            decoded_txn_groups: decoded.clone(),
+        };
+
+        let sim = AlgodNodeInterface::build_simulation_request(request);
+        assert_eq!(sim.round, Some(Round(42)));
+        assert_eq!(sim.txn_groups, decoded);
+        assert!(sim.allow_empty_signatures);
+        assert!(sim.allow_more_logging);
+        assert!(!sim.allow_unnamed_resources);
+        assert_eq!(sim.extra_opcode_budget, 2_000);
+        assert!(sim.trace_config.enable);
+        assert!(sim.fix_signers);
+    }
+
+    #[test]
+    fn build_simulation_request_defaults_unset_options_to_false_and_zero() {
+        let request = SimulateRequest {
+            allow_empty_signatures: None,
+            allow_more_logging: None,
+            allow_unnamed_resources: None,
+            exec_trace_config: None,
+            extra_opcode_budget: None,
+            fix_signers: None,
+            round: None,
+            txn_groups: Vec::new(),
+            decoded_txn_groups: Vec::new(),
+        };
+
+        let sim = AlgodNodeInterface::build_simulation_request(request);
+        assert!(sim.round.is_none());
+        assert!(sim.txn_groups.is_empty());
+        assert!(!sim.allow_empty_signatures);
+        assert!(!sim.allow_more_logging);
+        assert!(!sim.allow_unnamed_resources);
+        assert_eq!(sim.extra_opcode_budget, 0);
+        assert!(!sim.fix_signers);
+        assert!(!sim.trace_config.enable);
+    }
+
+    #[test]
+    fn opt_nonzero_u64_skips_zero_keeps_nonzero() {
+        assert!(AlgodNodeInterface::opt_nonzero_u64(0).is_none());
+        assert_eq!(AlgodNodeInterface::opt_nonzero_u64(1), Some(1));
+        assert_eq!(
+            AlgodNodeInterface::opt_nonzero_u64(u64::MAX),
+            Some(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn build_simulate_response_leaves_fidelity_fields_none() {
+        // Build a minimal SimulationResult with one group + one txn and
+        // confirm the REST response has the shape downstream tests
+        // already check (version / last_round / txn_groups populated,
+        // eval_overrides / initial_states / exec_trace_config None per
+        // PLAN-34).
+        let txn = SignedTransaction::default();
+        let group = TxnGroupResult {
+            txn_results: vec![TxnResult {
+                txn: Some(txn.clone()),
+                app_budget_consumed: 100,
+                logicsig_budget_consumed: 0,
+                ..Default::default()
+            }],
+            failure_message: None,
+            failed_at: None,
+            app_budget_added: 700,
+            app_budget_consumed: 100,
+        };
+        let result = SimulationResult {
+            version: 2,
+            last_round: Round(1000),
+            txn_groups: vec![group],
+            eval_overrides: Default::default(),
+            trace_config: Default::default(),
+            initial_states: None,
+        };
+
+        let response = AlgodNodeInterface::build_simulate_response(result);
+        assert_eq!(response.version, 2);
+        assert_eq!(response.last_round, 1000);
+        assert!(response.eval_overrides.is_none());
+        assert!(response.initial_states.is_none());
+        assert!(response.exec_trace_config.is_none());
+        assert_eq!(response.txn_groups.len(), 1);
+
+        let group = &response.txn_groups[0];
+        assert_eq!(group.app_budget_added, Some(700));
+        assert_eq!(group.app_budget_consumed, Some(100));
+        assert!(group.failure_message.is_none());
+        assert!(group.failed_at.is_none());
+        assert_eq!(group.txn_results.len(), 1);
+
+        let txn_result = &group.txn_results[0];
+        assert_eq!(txn_result.app_budget_consumed, Some(100));
+        assert!(txn_result.logic_sig_budget_consumed.is_none()); // 0 → None
+        assert!(txn_result.exec_trace.is_none());
+        assert_eq!(txn_result.txn_result.txn, txn);
+        assert!(txn_result.txn_result.pool_error.is_empty());
+    }
+
+    #[test]
+    fn build_simulate_response_propagates_failure_message_and_path() {
+        let result = SimulationResult {
+            version: 2,
+            last_round: Round(10),
+            txn_groups: vec![TxnGroupResult {
+                txn_results: vec![TxnResult {
+                    txn: Some(SignedTransaction::default()),
+                    ..Default::default()
+                }],
+                failure_message: Some("rejected: bad fee".into()),
+                failed_at: Some(vec![0, 1]),
+                app_budget_added: 0,
+                app_budget_consumed: 0,
+            }],
+            eval_overrides: Default::default(),
+            trace_config: Default::default(),
+            initial_states: None,
+        };
+
+        let response = AlgodNodeInterface::build_simulate_response(result);
+        let group = &response.txn_groups[0];
+        assert_eq!(group.failure_message.as_deref(), Some("rejected: bad fee"));
+        assert_eq!(group.failed_at.as_deref(), Some(&[0u64, 1u64][..]));
+        // Zero-valued budget counters collapse to None.
+        assert!(group.app_budget_added.is_none());
+        assert!(group.app_budget_consumed.is_none());
+    }
+
+    #[test]
+    fn map_simulator_error_routes_invalid_request_to_bad_request_and_others_to_internal() {
+        use algo_ledger::simulation::{EvalFailureError, InvalidRequestError};
+
+        // Invalid-request routes to BadRequest (→ 400) so the REST
+        // handler surfaces client-side mistakes correctly.
+        let invalid = AlgodNodeInterface::map_simulator_error(SimulatorError::InvalidRequest(
+            InvalidRequestError {
+                message: "no groups".into(),
+            },
+        ));
+        match invalid {
+            NodeError::BadRequest(m) => {
+                assert_eq!(m, "simulate: invalid request: no groups")
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // Eval failures stay on Internal (→ 500); the simulator normally
+        // carries eval failures inside the result rather than raising
+        // this variant, so this branch is for pre-execution checks.
+        let eval = AlgodNodeInterface::map_simulator_error(SimulatorError::EvalFailure(
+            EvalFailureError {
+                message: "budget exceeded".into(),
+                failed_at: vec![0],
+            },
+        ));
+        match eval {
+            NodeError::Internal(m) => {
+                assert!(m.starts_with("simulate: eval failure: "))
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+
+        // Internal errors (ledger read failures, etc.) stay on Internal.
+        let internal = AlgodNodeInterface::map_simulator_error(SimulatorError::Internal(
+            algo_error::AlgoError::Ledger {
+                message: "disk oops".into(),
+            },
+        ));
+        match internal {
+            NodeError::Internal(m) => assert!(m.starts_with("simulate: internal: ")),
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_ledger_surfaces_poisoned_mutex_as_internal_error() {
+        // Poison the ledger mutex by panicking while a guard is held,
+        // then confirm every `Result`-returning adapter method surfaces
+        // `NodeError::Internal` with the poison message instead of
+        // propagating the panic into subsequent callers (which is what
+        // `expect("ledger lock poisoned")` used to do).
+        let ledger_arc = Arc::new(Mutex::new(
+            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+        ));
+        // Poison by panicking inside a lock scope. `catch_unwind` keeps
+        // the panic from escaping into the test harness.
+        let poison_target = Arc::clone(&ledger_arc);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = poison_target.lock().expect("initial lock");
+            panic!("simulated panic while holding ledger lock");
+        }));
+        assert!(
+            ledger_arc.is_poisoned(),
+            "test harness failed to poison the ledger mutex"
+        );
+
+        let adapter = AlgodNodeInterface::new(
+            ledger_arc,
+            NodeInterfaceConfig {
+                genesis_id: "testnet-v1.0".into(),
+                genesis_hash: Digest([0xAB; 32]),
+                genesis_json: "{}".into(),
+                build_version: build_version_fixture(),
+                default_protocol: CONSENSUS_V41.into(),
+            },
+        );
+
+        // Direct helper: poison surfaces as Internal, carrying the
+        // method name so operators can trace which caller tripped the
+        // cascade. `MutexGuard<SqliteLedger>` is not `Debug`, so we
+        // destructure the error directly rather than printing the whole
+        // `Result` in the panic message.
+        let err = adapter
+            .lock_ledger("probe")
+            .err()
+            .expect("poisoned lock should error");
+        match err {
+            NodeError::Internal(msg) => {
+                assert!(
+                    msg.starts_with("probe: ledger lock poisoned"),
+                    "expected poison message, got {msg:?}"
+                );
+                assert!(
+                    msg.contains("earlier operation panicked"),
+                    "expected panic explanation, got {msg:?}"
+                );
+            }
+            other => panic!("expected Internal(poisoned), got {other:?}"),
+        }
+
+        // Status preflight (the very path Codex flagged as cascading
+        // into simulate) now returns Internal instead of panicking.
+        match adapter.status().await {
+            Err(NodeError::Internal(msg)) => {
+                assert!(msg.starts_with("status: ledger lock poisoned"));
+            }
+            other => panic!("expected Internal from status(), got {other:?}"),
+        }
+
+        // simulate() itself surfaces the poison message without calling
+        // into the simulator.
+        let request = SimulateRequest {
+            allow_empty_signatures: None,
+            allow_more_logging: None,
+            allow_unnamed_resources: None,
+            exec_trace_config: None,
+            extra_opcode_budget: None,
+            fix_signers: None,
+            round: None,
+            txn_groups: Vec::new(),
+            decoded_txn_groups: vec![vec![SignedTransaction::default()]],
+        };
+        match adapter.simulate(request).await {
+            Err(NodeError::Internal(msg)) => {
+                assert!(msg.starts_with("simulate: ledger lock poisoned"));
+            }
+            other => panic!("expected Internal from simulate(), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn simulate_rejects_empty_txn_groups_as_bad_request() {
+        // The simulator validates that the request contains at least one
+        // transaction group. An empty request surfaces as
+        // `SimulatorError::InvalidRequest`, which the adapter maps to
+        // `NodeError::BadRequest` so the REST handler returns 400. This
+        // exercises the full trait method without needing a populated
+        // ledger.
+        let adapter = make_adapter();
+        let request = SimulateRequest {
+            allow_empty_signatures: None,
+            allow_more_logging: None,
+            allow_unnamed_resources: None,
+            exec_trace_config: None,
+            extra_opcode_budget: None,
+            fix_signers: None,
+            round: None,
+            txn_groups: Vec::new(),
+            decoded_txn_groups: Vec::new(),
+        };
+        match adapter.simulate(request).await {
+            Err(NodeError::BadRequest(msg)) => {
+                assert!(
+                    msg.starts_with("simulate: invalid request:"),
+                    "expected invalid-request prefix, got {msg:?}"
+                );
+                assert!(
+                    msg.contains("at least one transaction group"),
+                    "expected message to mention required txn group, got {msg:?}"
+                );
+            }
+            other => panic!("expected BadRequest(invalid request), got {other:?}"),
+        }
     }
 
     #[tokio::test]
