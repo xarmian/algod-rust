@@ -41,7 +41,6 @@ use algo_types::{
 };
 use async_trait::async_trait;
 use sha2::{Digest as _, Sha512_256};
-use tracing::warn;
 
 /// Default upgrade-vote window length (in rounds) for the current Algorand
 /// mainnet protocol.
@@ -655,20 +654,36 @@ impl NodeInterface for AlgodNodeInterface {
         &self,
         tx_group: Vec<SignedTransaction>,
     ) -> Result<(), NodeError> {
-        // Mirror go-algorand's `Node.AsyncBroadcastSignedTxGroup`: return
-        // immediately, run pool validation + gossip on a background task.
-        // Failures are logged via `tracing::warn` so operators can see
-        // rejected async submissions without surfacing them to the caller.
+        // Fire-and-forget: the caller gets Ok as soon as the group is
+        // accepted for background processing. This matches go-algorand's
+        // `Node.AsyncBroadcastSignedTxGroup`, which routes through
+        // `txHandler.LocalTransaction` — a non-blocking backlog enqueue
+        // that returns success once the group is queued and performs
+        // validation + gossip later. See
+        // `../go-algorand/node/node.go:596-600` and
+        // `../go-algorand/data/txHandler.go:873-888` @ v4.5.1-stable.
+        //
+        // Consequence: pool-rejection / encode / gossip failures after
+        // the spawn are NOT surfaced through the return value. They are
+        // logged inside `LocalTxBroadcaster::submit_group`
+        // (`local_tx_broadcast.rs:200-222`) so operators still have
+        // visibility. Callers that need synchronous rejection signals
+        // should use `broadcast_signed_tx_group` instead.
         let broadcaster = self.broadcaster("async_broadcast_signed_tx_group")?;
-        let group_len = tx_group.len();
+
+        // Preflight the obviously-bad cases synchronously so clients see
+        // immediate feedback rather than a silent drop. Keep this list
+        // minimal — anything that needs pool state (duplicate detection,
+        // fee check, signature verification) belongs in the async path.
+        if tx_group.is_empty() {
+            return Err(Self::local_tx_error_to_node_error(LocalTxError::Empty));
+        }
+
+        // Spawn the full ingest + gossip path. `LocalTxBroadcaster`
+        // already emits structured warnings on every failure branch, so
+        // no additional logging is needed here.
         tokio::spawn(async move {
-            if let Err(err) = broadcaster.submit_group(tx_group).await {
-                warn!(
-                    error = %err,
-                    group_len,
-                    "async_broadcast_signed_tx_group: background submit failed",
-                );
-            }
+            let _ = broadcaster.submit_group(tx_group).await;
         });
         Ok(())
     }
