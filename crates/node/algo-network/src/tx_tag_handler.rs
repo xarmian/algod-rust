@@ -234,17 +234,26 @@ impl MessageHandler for TxTagHandler {
             };
         }
 
-        // Submit the whole group to the pool. On success, record the
-        // txids so subsequent duplicates short-circuit. On failure,
-        // the txids are **not** recorded — a bad-signed or otherwise
-        // rejected variant must not suppress a valid retransmission
-        // of the same Transaction body (txids are body-derived, not
-        // signature-derived).
+        // Submit the whole group to the pool on the blocking executor.
+        // `TransactionPool::remember` is a synchronous mutex/condvar
+        // flow that can wait up to ~`timeout_on_new_block` (default
+        // 1 s) when the evaluator lags, so running it inline on a
+        // Tokio worker would stall peer dispatch under TX bursts. We
+        // offload to `spawn_blocking` so the async receive task can
+        // proceed to the next message immediately.
         //
-        // Errors are logged and dropped — unsolicited inbound txns
+        // On `Ok(())` we record the txids in the seen cache so
+        // subsequent duplicates short-circuit. On failure, the txids
+        // are NOT recorded — a bad-signed or otherwise rejected
+        // variant must not suppress a valid retransmission of the
+        // same Transaction body (txids are body-derived).
+        //
+        // Errors are logged and dropped; unsolicited inbound txns
         // must never panic or propagate back to the dispatcher.
-        match self.pool.remember(group) {
-            Ok(()) => {
+        let pool = self.pool.clone();
+        let result = tokio::task::spawn_blocking(move || pool.remember(group)).await;
+        match result {
+            Ok(Ok(())) => {
                 for id in &txids {
                     self.seen.insert(*id);
                 }
@@ -254,11 +263,18 @@ impl MessageHandler for TxTagHandler {
                     "TxTagHandler: group accepted",
                 );
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(
                     sender = %msg.sender,
                     error = %e,
                     "TxTagHandler: pool rejected inbound TX group",
+                );
+            }
+            Err(join_err) => {
+                warn!(
+                    sender = %msg.sender,
+                    error = %join_err,
+                    "TxTagHandler: pool ingest task join failed",
                 );
             }
         }
