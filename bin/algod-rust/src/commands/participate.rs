@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,21 +16,28 @@ use algo_ledger::{
     AgreementKeyManagerBridge, AgreementLedgerBridge, BlockFetcher, CatchupService, FetchError,
     FetchedBlockCert, SqliteLedger,
 };
+use algo_network::local_tx_broadcast::{LocalTxBroadcaster, PoolIngestAdapter};
 use algo_network::{
     AgreementNetworkBridge, GossipNode, Phonebook, WebsocketNetwork, WebsocketNetworkConfig,
     RELAY_ROLE,
 };
 use algo_pool::{PoolConfig, TransactionPool};
+use algo_rest_api::node::BuildVersion;
+use algo_rest_api::server::{ApiServer, ApiServerConfig};
 use algo_rest_client::GossipBlockSource;
-use algo_types::{AccountData, Address, BlockHeader, Round, TxnType};
+use algo_types::consensus::CONSENSUS_V41;
+use algo_types::{AccountData, Address, BlockHeader, Digest, Round, TxnType};
 use algo_validate::merkle::{compute_payset_merkle_root, compute_vector_commitment, HashAlgo};
 use algo_validate::rules::{has_txn256, has_txn512};
 use algo_validate::signature::verify_transaction_signature;
 use rand::Rng;
 use sha2::{Digest as _, Sha512_256};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::commands::network_common::genesis_id_for;
+use crate::config::RestConfig;
+use crate::node_interface_impl::{AlgodNodeInterface, NodeInterfaceConfig};
 
 /// A no-op `EventsProcessingMonitor` for production use.
 ///
@@ -1832,6 +1840,139 @@ fn open_crash_db(ledger_path: &Path) -> anyhow::Result<rusqlite::Connection> {
     Ok(conn)
 }
 
+/// CLI + TOML inputs for the REST API server. CLI fields already
+/// shadow the TOML fields at parse time; this struct keeps them
+/// together so the resolver sees a single consistent bundle.
+#[derive(Debug, Default, Clone)]
+pub struct RestOptions {
+    /// `--rest-listen` flag value. When `None`, the `[rest].listen`
+    /// field from the loaded config file is consulted.
+    pub listen: Option<String>,
+    /// `--data-dir` flag value. Applied as the API server's data
+    /// directory (where `algod.token`, `algod.admin.token`, and
+    /// `algod.net` are read/written). Defaults to the `[rest].data_dir`
+    /// field when unset.
+    pub data_dir: Option<PathBuf>,
+    /// `--genesis-path` flag value. Used to read `genesis.json`
+    /// verbatim for the REST API's `/genesis` endpoint. Defaults to
+    /// `[rest].genesis_path`, then `<data_dir>/genesis.json`.
+    pub genesis_path: Option<PathBuf>,
+    /// The parsed `[rest]` table, if any. Provides defaults for every
+    /// CLI flag above; CLI flags always win when both are set.
+    pub file_rest: Option<RestConfig>,
+}
+
+/// Fully-resolved REST configuration, ready to hand to [`ApiServer`].
+#[derive(Debug, Clone)]
+struct ResolvedRest {
+    listen: SocketAddr,
+    data_dir: Option<PathBuf>,
+    api_token: Option<String>,
+    admin_token: Option<String>,
+    genesis_path: Option<PathBuf>,
+    async_backlog_size: Option<usize>,
+}
+
+impl RestOptions {
+    /// Merge CLI flags, `[rest]` TOML fields, and a sensible
+    /// `data_dir` default so the caller gets a concrete socket
+    /// address + auxiliary paths. Returns `Ok(None)` when REST is
+    /// disabled (no `--rest-listen`, no `[rest].listen`).
+    fn resolve(&self, default_data_dir: Option<&Path>) -> anyhow::Result<Option<ResolvedRest>> {
+        let listen_str = self
+            .listen
+            .clone()
+            .or_else(|| self.file_rest.as_ref().and_then(|r| r.listen.clone()));
+        let Some(listen_str) = listen_str else {
+            return Ok(None);
+        };
+        let listen: SocketAddr = listen_str
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid --rest-listen address {:?}: {e}", listen_str))?;
+
+        let data_dir = self
+            .data_dir
+            .clone()
+            .or_else(|| self.file_rest.as_ref().and_then(|r| r.data_dir.clone()))
+            .or_else(|| default_data_dir.map(Path::to_path_buf));
+
+        // Token overrides come only from the config file — we avoid a
+        // CLI flag so operators aren't tempted to paste secrets on the
+        // command line (process-listing leak). The API server defaults
+        // to reading `algod.token` / `algod.admin.token` from
+        // `data_dir`, so CLI-only setups work without any overrides.
+        let (api_token, admin_token) = match self.file_rest.as_ref() {
+            Some(rest) => (rest.api_token.clone(), rest.admin_token.clone()),
+            None => (None, None),
+        };
+
+        let genesis_path = self
+            .genesis_path
+            .clone()
+            .or_else(|| self.file_rest.as_ref().and_then(|r| r.genesis_path.clone()));
+
+        let async_backlog_size = self.file_rest.as_ref().and_then(|r| r.async_backlog_size);
+
+        Ok(Some(ResolvedRest {
+            listen,
+            data_dir,
+            api_token,
+            admin_token,
+            genesis_path,
+            async_backlog_size,
+        }))
+    }
+}
+
+/// Best-effort load of `genesis.json`. Tries the explicit
+/// `genesis_path` first, then `<data_dir>/genesis.json`. Returns
+/// `Ok(None)` when neither file exists; returns `Err` only on real I/O
+/// errors (permission denied, partial read, etc.) so a missing file
+/// never blocks startup.
+fn load_genesis_json(
+    explicit: Option<&Path>,
+    data_dir: Option<&Path>,
+) -> anyhow::Result<Option<String>> {
+    let candidate = explicit
+        .map(Path::to_path_buf)
+        .or_else(|| data_dir.map(|d| d.join("genesis.json")));
+    let Some(path) = candidate else {
+        return Ok(None);
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            info!(path = %path.display(), bytes = contents.len(), "loaded genesis.json");
+            Ok(Some(contents))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::anyhow!(
+            "failed to read genesis.json at {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+/// Build a stub genesis.json body for the REST `/genesis` endpoint
+/// when no real file is available. Matches go-algorand's minimal
+/// `bookkeeping.Genesis` JSON shape (network + id + proto + empty
+/// alloc) so downstream clients that only read `network` / `id` work.
+fn synthesize_genesis_json(genesis_id: &str, network: &str, proto: &str) -> String {
+    // Strip the `network-` prefix from genesis_id to get the suffix
+    // go-algorand stores in `id` (e.g. "mainnet-v1.0" → "v1.0").
+    let id_suffix = genesis_id
+        .strip_prefix(&format!("{network}-"))
+        .unwrap_or(genesis_id);
+    let value = serde_json::json!({
+        "network": network,
+        "id": id_suffix,
+        "proto": proto,
+        "alloc": [],
+        "fees": "",
+        "rwd": "",
+    });
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// Run the participate command: start the agreement protocol and participate
 /// in consensus using the provided participation keys.
 #[allow(clippy::too_many_arguments)]
@@ -1843,6 +1984,7 @@ pub async fn run(
     partkey_path: &Path,
     listen_address: Option<&str>,
     genesis_hash_hex: Option<&str>,
+    rest_opts: RestOptions,
 ) -> anyhow::Result<()> {
     // Resolve genesis ID: use the provided value, or look it up by network name.
     let resolved_genesis_id = match genesis_id {
@@ -1997,6 +2139,87 @@ pub async fn run(
     }
 
     // -----------------------------------------------------------------------
+    // 3b. Construct the local tx broadcaster.
+    //
+    // Shares `tx_seen_cache` with the inbound TX handler so peer echoes
+    // of our local submissions are deduplicated before reaching the
+    // pool. Needed by the `AlgodNodeInterface::broadcast_signed_tx_group`
+    // path (PLAN-74 TASK-77) — cheap to construct even when the REST
+    // server is disabled so the adapter's shape stays stable.
+    // -----------------------------------------------------------------------
+    let broadcaster = Arc::new(LocalTxBroadcaster::new(
+        Arc::new(PoolIngestAdapter::new(pool.clone())),
+        gossip_node.clone() as Arc<dyn GossipNode>,
+        tx_seen_cache.clone(),
+    ));
+
+    // -----------------------------------------------------------------------
+    // 3c. Optional: start the REST API server.
+    //
+    // When the operator passes `--rest-listen` (or sets `[rest].listen`
+    // in `algod-rust.toml`), we build an `AlgodNodeInterface` adapter
+    // around the ledger + pool + broadcaster and hand it to
+    // `ApiServer::serve`. Shutdown is coordinated through a shared
+    // `CancellationToken` that the Ctrl-C handler cancels (see step 7
+    // below).
+    // -----------------------------------------------------------------------
+    let shutdown_token = CancellationToken::new();
+    let default_data_dir = ledger_path.parent().map(Path::to_path_buf);
+    let rest_cfg = rest_opts.resolve(default_data_dir.as_deref())?;
+    let rest_server_handle = if let Some(cfg) = rest_cfg {
+        let genesis_json = load_genesis_json(cfg.genesis_path.as_deref(), cfg.data_dir.as_deref())?
+            .unwrap_or_else(|| {
+                warn!(
+                    "no genesis.json found; synthesizing a minimal stub for the /genesis endpoint"
+                );
+                synthesize_genesis_json(&resolved_genesis_id, network, CONSENSUS_V41)
+            });
+
+        let node_config = NodeInterfaceConfig {
+            genesis_id: resolved_genesis_id.clone(),
+            genesis_hash: Digest(genesis_hash),
+            genesis_json,
+            build_version: BuildVersion::from_build_env(),
+            default_protocol: CONSENSUS_V41.into(),
+        };
+
+        let mut adapter = AlgodNodeInterface::new(ledger.clone(), node_config)
+            .with_pool(pool.clone())
+            .with_broadcaster(broadcaster.clone());
+        if let Some(capacity) = cfg.async_backlog_size {
+            adapter = adapter.with_async_backlog_capacity(capacity);
+        }
+        let node = Arc::new(adapter);
+
+        let api_config = ApiServerConfig {
+            listen_addr: cfg.listen,
+            data_dir: cfg.data_dir.clone(),
+            api_token: cfg.api_token.clone(),
+            admin_token: cfg.admin_token.clone(),
+        };
+
+        info!(
+            listen = %cfg.listen,
+            data_dir = ?cfg.data_dir,
+            "starting REST API server"
+        );
+
+        let shutdown_future = {
+            let token = shutdown_token.clone();
+            async move { token.cancelled().await }
+        };
+        let api_server = ApiServer::new(api_config);
+        let (bound_addr, join_handle) = api_server
+            .serve(node, shutdown_future)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to bind REST API listener: {e}"))?;
+        info!(address = %bound_addr, "REST API server bound");
+        Some(join_handle)
+    } else {
+        None
+    };
+
+    // -----------------------------------------------------------------------
     // 4. Build agreement bridges.
     // -----------------------------------------------------------------------
 
@@ -2149,6 +2372,13 @@ pub async fn run(
 
     info!("shutting down consensus participation...");
 
+    // Cancel the shared token first so the REST server's graceful
+    // shutdown begins unblocking in-flight requests while we tear
+    // down agreement + gossip. The server's own draining uses axum's
+    // `with_graceful_shutdown`, so connections finish their current
+    // request before the listener closes.
+    shutdown_token.cancel();
+
     // Stop the agreement service first, then the catchup service (mirrors
     // Go's shutdown order where the agreement service is stopped before the
     // catchup service, ensuring no new certificates are sent after the
@@ -2156,6 +2386,17 @@ pub async fn run(
     handle.shutdown();
     catchup_service.stop();
     gossip_node.stop().await;
+
+    // Await the REST server last — its graceful shutdown depends on
+    // axum finishing any in-flight requests, and by now gossip has
+    // stopped serving fresh data so the responses are stable.
+    if let Some(join_handle) = rest_server_handle {
+        if let Err(e) = join_handle.await {
+            warn!(err = %e, "REST API server task terminated unexpectedly");
+        } else {
+            info!("REST API server stopped");
+        }
+    }
     info!("consensus participation stopped");
 
     Ok(())
@@ -2167,7 +2408,7 @@ mod tests {
     use algo_pool::traits::BlockEvaluator;
     use algo_types::{
         consensus::consensus_params_for_version, Address, ConsensusParams, Round,
-        SignedTransaction, Transaction, TxnType, CONSENSUS_V41,
+        SignedTransaction, Transaction, TxnType,
     };
     use ed25519_dalek::{Signer, SigningKey};
     use serde_bytes::ByteBuf;
@@ -2178,6 +2419,174 @@ mod tests {
         Arc::new(Mutex::new(
             SqliteLedger::open_in_memory().expect("in-memory ledger"),
         ))
+    }
+
+    // ── Helpers: RestOptions / load_genesis_json ────────────────────
+    //
+    // These tests cover the CLI/TOML merge and genesis-file fallback
+    // added in PLAN-74 TASK-79; they don't touch the agreement
+    // protocol so no mock ledger / evaluator is needed.
+
+    #[test]
+    fn rest_options_disabled_when_no_listen_anywhere() {
+        let opts = RestOptions::default();
+        let resolved = opts.resolve(None).expect("resolve ok");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn rest_options_cli_listen_overrides_toml_listen() {
+        let opts = RestOptions {
+            listen: Some("127.0.0.1:9999".to_string()),
+            data_dir: None,
+            genesis_path: None,
+            file_rest: Some(RestConfig {
+                listen: Some("127.0.0.1:1111".to_string()),
+                ..RestConfig::default()
+            }),
+        };
+        let resolved = opts
+            .resolve(None)
+            .expect("resolve ok")
+            .expect("rest enabled");
+        assert_eq!(resolved.listen.to_string(), "127.0.0.1:9999");
+    }
+
+    #[test]
+    fn rest_options_falls_back_to_toml_listen() {
+        let opts = RestOptions {
+            file_rest: Some(RestConfig {
+                listen: Some("0.0.0.0:8080".into()),
+                ..RestConfig::default()
+            }),
+            ..RestOptions::default()
+        };
+        let resolved = opts.resolve(None).unwrap().expect("rest enabled");
+        assert_eq!(resolved.listen.to_string(), "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn rest_options_invalid_listen_reports_error() {
+        let opts = RestOptions {
+            listen: Some("not-a-socket-addr".into()),
+            ..RestOptions::default()
+        };
+        let err = opts.resolve(None).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --rest-listen"),
+            "expected parse-error message, got {err}"
+        );
+    }
+
+    #[test]
+    fn rest_options_data_dir_defaults_to_ledger_parent() {
+        let opts = RestOptions {
+            listen: Some("127.0.0.1:4001".into()),
+            data_dir: None,
+            genesis_path: None,
+            file_rest: None,
+        };
+        let ledger_parent = std::path::Path::new("/srv/algod");
+        let resolved = opts.resolve(Some(ledger_parent)).unwrap().unwrap();
+        assert_eq!(
+            resolved.data_dir.as_deref(),
+            Some(ledger_parent),
+            "missing data_dir should default to the ledger's parent directory"
+        );
+    }
+
+    #[test]
+    fn rest_options_cli_data_dir_overrides_default() {
+        let opts = RestOptions {
+            listen: Some("127.0.0.1:4001".into()),
+            data_dir: Some(PathBuf::from("/var/lib/algod")),
+            genesis_path: None,
+            file_rest: None,
+        };
+        let resolved = opts
+            .resolve(Some(std::path::Path::new("/srv/algod")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resolved.data_dir.as_deref(),
+            Some(std::path::Path::new("/var/lib/algod"))
+        );
+    }
+
+    #[test]
+    fn rest_options_token_overrides_come_only_from_toml() {
+        let opts = RestOptions {
+            listen: Some("127.0.0.1:4001".into()),
+            file_rest: Some(RestConfig {
+                api_token: Some("from-toml-api".into()),
+                admin_token: Some("from-toml-admin".into()),
+                ..RestConfig::default()
+            }),
+            ..RestOptions::default()
+        };
+        let resolved = opts.resolve(None).unwrap().unwrap();
+        assert_eq!(resolved.api_token.as_deref(), Some("from-toml-api"));
+        assert_eq!(resolved.admin_token.as_deref(), Some("from-toml-admin"));
+    }
+
+    #[test]
+    fn rest_options_async_backlog_plumbed_from_toml() {
+        let opts = RestOptions {
+            listen: Some("127.0.0.1:4001".into()),
+            file_rest: Some(RestConfig {
+                async_backlog_size: Some(42),
+                ..RestConfig::default()
+            }),
+            ..RestOptions::default()
+        };
+        let resolved = opts.resolve(None).unwrap().unwrap();
+        assert_eq!(resolved.async_backlog_size, Some(42));
+    }
+
+    #[test]
+    fn load_genesis_json_returns_none_when_paths_absent() {
+        let got = load_genesis_json(None, None).expect("ok with no paths");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn load_genesis_json_prefers_explicit_path_then_data_dir() {
+        let tmp = std::env::temp_dir().join(format!(
+            "algod-rust-test-genesis-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, r#"{"network":"unit-test"}"#).unwrap();
+        let got = load_genesis_json(Some(&tmp), None)
+            .expect("ok")
+            .expect("file present");
+        assert_eq!(got, r#"{"network":"unit-test"}"#);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn load_genesis_json_missing_explicit_file_returns_none() {
+        // Missing file must not be a hard error — startup should fall
+        // back to the synthesized stub instead of aborting.
+        let got = load_genesis_json(Some(std::path::Path::new("/no/such/genesis.json")), None)
+            .expect("ok even when file absent");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn synthesize_genesis_json_produces_minimal_valid_body() {
+        let json = synthesize_genesis_json("mainnet-v1.0", "mainnet", "https://example.com/v41");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["network"], "mainnet");
+        assert_eq!(parsed["id"], "v1.0");
+        assert_eq!(parsed["proto"], "https://example.com/v41");
+        assert!(parsed["alloc"].is_array());
+    }
+
+    #[test]
+    fn synthesize_genesis_json_passes_through_when_prefix_missing() {
+        let json = synthesize_genesis_json("foo-bar-baz", "mainnet", "proto");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["id"], "foo-bar-baz");
     }
 
     // ── Helper: V41 consensus params ────────────────────────────────

@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod config;
 mod node_interface_impl;
 
 use clap::Parser;
@@ -313,7 +314,18 @@ async fn main() -> anyhow::Result<()> {
             partkey_path,
             listen_address,
             genesis_hash,
+            rest_listen,
+            data_dir,
+            genesis_path,
+            config,
         } => {
+            let file_config = crate::config::AlgodRustConfig::load(config.as_deref())?;
+            let rest_opts = commands::participate::RestOptions {
+                listen: rest_listen,
+                data_dir,
+                genesis_path,
+                file_rest: file_config.rest().cloned(),
+            };
             commands::participate::run(
                 &ledger_path,
                 genesis_id.as_deref(),
@@ -322,6 +334,7 @@ async fn main() -> anyhow::Result<()> {
                 &partkey_path,
                 listen_address.as_deref(),
                 genesis_hash.as_deref(),
+                rest_opts,
             )
             .await?;
         }

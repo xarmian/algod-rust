@@ -10,18 +10,12 @@
 //! - Broadcast methods (`TASK-77`) — `broadcast_signed_tx_group`,
 //!   `async_broadcast_signed_tx_group`
 //! - Simulation (`TASK-78`) — `simulate`, via `algo_ledger::simulation::Simulator`
-//! - CLI wiring (`TASK-79`) — constructs [`AlgodNodeInterface`] in the
-//!   `participate` / `serve` subcommands and passes it to the axum router
-//!
-//! Until TASK-79 lands, nothing in the binary constructs this type, which
-//! would trigger `dead_code` / `clippy::dead_code` warnings. The tests at
-//! the bottom of this module exercise every method, so the `#[allow]` below
-//! is a scaffold — remove it once the binary wires the adapter up.
+//! - CLI wiring (`TASK-79`) — `commands/participate.rs` constructs
+//!   [`AlgodNodeInterface`] when `--rest-listen` is provided and hands
+//!   it to [`algo_rest_api::server::ApiServer`].
 //!
 //! Reference: `../go-algorand/daemon/algod/api/server/v2/handlers.go` @
 //! `v4.5.1-stable` (the trait is modeled after `v2.NodeInterface`).
-
-#![allow(dead_code)]
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

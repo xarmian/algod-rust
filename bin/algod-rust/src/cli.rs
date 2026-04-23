@@ -390,6 +390,33 @@ pub enum Commands {
         /// 32-byte hex genesis hash for block validation.
         #[arg(long)]
         genesis_hash: Option<String>,
+
+        /// Address to bind the REST API (e.g. "127.0.0.1:8080"). When
+        /// set via this flag or the `rest.listen` field in the config
+        /// file, the node starts the algod v2 REST API server
+        /// alongside consensus. Unset means "no REST API", preserving
+        /// the pre-TASK-79 behavior.
+        #[arg(long)]
+        rest_listen: Option<String>,
+
+        /// Data directory used by the REST API server for reading /
+        /// writing `algod.net`, `algod.token`, and `algod.admin.token`.
+        /// Defaults to the ledger database's parent directory when
+        /// `--rest-listen` is set but `--data-dir` is not provided.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// Path to `genesis.json` so the REST API can return its exact
+        /// contents from `/genesis`. Defaults to `<data-dir>/genesis.json`
+        /// when unset; falls back to a synthesized stub that matches the
+        /// configured `genesis_id` + `genesis_hash` when neither exists.
+        #[arg(long)]
+        genesis_path: Option<PathBuf>,
+
+        /// Optional path to an `algod-rust.toml` file. Populated fields
+        /// provide defaults; individual CLI flags override them.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 
     /// Follow mode: continuously validate new blocks as they arrive.
