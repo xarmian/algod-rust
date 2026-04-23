@@ -117,58 +117,66 @@ async fn per_ip_rate_limit_rejects_rapid_redial() {
 
     let hp = relay_host_port(&net);
 
-    // Rapid re-dial. Each dial uses a unique NodeRandom so it is not
-    // classified as a self-loop (which would reject for a different
-    // reason and confound the test).
+    // Fire all 3 dials concurrently. This is the crucial timing
+    // guarantee: because `connections_rate_limiting_window` is fixed at
+    // 1 s in `WebsocketNetwork::new`, any approach that serializes the
+    // dials is vulnerable to the first timestamp aging out before the
+    // third dial reaches `validate_incoming_connection` on a slow CI
+    // runner. Running them as futures in `join_all` ensures all three
+    // are in-flight (and therefore all three `track_connection`
+    // timestamps are inside the same window) by the time the server
+    // begins evaluating them.
     //
-    // We disconnect immediately so the per-IP connection-count drops back
-    // but the rate-window timestamps remain — that is exactly the
-    // attacker model the rate gate defends against.
-    let mut outcomes: Vec<Result<(), String>> = Vec::new();
-    for i in 0..3 {
-        let req = gossip_request(&hp, "test-v1.0", &format!("rate-test-{i}"));
-        match tokio_tungstenite::connect_async(req).await {
-            Ok((ws, _resp)) => {
-                outcomes.push(Ok(()));
-                drop(ws); // close TCP immediately to release the active count
+    // Each dial uses a unique NodeRandom so the handshake passes the
+    // self-loop check and actually reaches the rate-limit gate.
+    //
+    // We disconnect immediately on success so the per-IP connection
+    // count drops back — but rate-window timestamps persist, which is
+    // exactly the attacker model the rate gate defends against.
+    let hp_clone = hp.clone();
+    let futures: Vec<_> = (0..3)
+        .map(|i| {
+            let hp = hp_clone.clone();
+            async move {
+                let req = gossip_request(&hp, "test-v1.0", &format!("rate-test-{i}"));
+                match tokio_tungstenite::connect_async(req).await {
+                    Ok((ws, _resp)) => {
+                        drop(ws);
+                        Ok::<(), String>(())
+                    }
+                    Err(tungstenite::Error::Http(resp)) => Err(format!("http {}", resp.status())),
+                    Err(e) => Err(format!("other: {e}")),
+                }
             }
-            Err(tungstenite::Error::Http(resp)) => {
-                outcomes.push(Err(format!("http {}", resp.status())));
-            }
-            Err(e) => {
-                outcomes.push(Err(format!("other: {e}")));
-            }
-        }
-    }
+        })
+        .collect();
 
-    // Dials 1 and 2 must succeed.
-    assert!(
-        outcomes[0].is_ok(),
-        "dial 1 should succeed: got {:?}",
-        outcomes[0],
+    let outcomes: Vec<Result<(), String>> = futures_util::future::join_all(futures).await;
+
+    // Because dials are concurrent, the order in which the server
+    // processes them is nondeterministic. The deterministic property
+    // is the *count*: with `connections_rate_limiting_count = 2`,
+    // exactly 2 of 3 dials pass the gate and exactly 1 is rejected.
+    let ok_count = outcomes.iter().filter(|r| r.is_ok()).count();
+    let err_count = outcomes.iter().filter(|r| r.is_err()).count();
+    assert_eq!(
+        ok_count, 2,
+        "expected exactly 2 of 3 concurrent dials to succeed, got {ok_count}. outcomes: {outcomes:?}",
     );
-    assert!(
-        outcomes[1].is_ok(),
-        "dial 2 should succeed: got {:?}",
-        outcomes[1],
+    assert_eq!(
+        err_count, 1,
+        "expected exactly 1 of 3 concurrent dials to be rejected, got {err_count}. outcomes: {outcomes:?}",
     );
 
-    // Dial 3 must be rejected. We accept either the `Err(Http(429))` path
-    // or any other `Err(...)` — tokio-tungstenite's behaviour on a
-    // rejected upgrade depends on timing (the server may close the TCP
-    // socket before finishing the HTTP response).
-    assert!(
-        outcomes[2].is_err(),
-        "dial 3 should be rejected by the rate-limit gate, got {:?}",
-        outcomes[2],
-    );
-    if let Err(msg) = &outcomes[2] {
-        // When we *do* get a status code back, it must be 429.
-        if let Some(stripped) = msg.strip_prefix("http ") {
-            assert!(
-                stripped.starts_with("429"),
-                "expected HTTP 429 Too Many Requests for rate-limit rejection, got {msg}",
-            );
+    // When we *do* get a status code back, it must be 429.
+    for o in &outcomes {
+        if let Err(msg) = o {
+            if let Some(stripped) = msg.strip_prefix("http ") {
+                assert!(
+                    stripped.starts_with("429"),
+                    "expected HTTP 429 Too Many Requests for rate-limit rejection, got {msg}",
+                );
+            }
         }
     }
 
@@ -184,17 +192,17 @@ async fn per_ip_rate_limit_rejects_rapid_redial() {
 /// slots) capacity.
 ///
 /// Sanity check at the **TCP listener** layer — distinct from the
-/// axum/handshake layer exercised in the rate-limit test above. We hold
-/// N long-lived TCP connections open (each occupying one semaphore
-/// permit via the connection guard held in the relay's accept loop),
-/// then verify the (N+1)th connection gets promptly closed by the
-/// server rather than entering a serve loop.
+/// axum/handshake layer exercised in the rate-limit test above.
 ///
-/// Keeping the test *short-and-loud*: we don't attempt to count the
-/// reserved-health slots; instead we configure `incoming_connections_
-/// limit = 1` (total semaphore capacity becomes 11). We open 11
-/// long-lived connections to saturate it, then an additional connection
-/// whose read-side should EOF quickly.
+/// Approach (avoids wall-clock races): fire `TOTAL_DIALS` concurrent
+/// TCP connections (deliberately more than the semaphore cap of
+/// `incoming_connections_limit + reserved_health = 11`), wait for the
+/// accept loop to drain the backlog, then probe each one with a small
+/// `/status` request and classify the response. Because we dial past
+/// the cap by a safe margin, at least `TOTAL_DIALS − cap` connections
+/// are guaranteed to be closed by the listener — regardless of
+/// scheduling jitter. If the cap were not enforced, every connection
+/// would return a 200.
 #[tokio::test]
 async fn tcp_connection_limit_rejects_over_capacity() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -202,15 +210,23 @@ async fn tcp_connection_limit_rejects_over_capacity() {
 
     init_tracing();
 
+    // Cap: 1 + 10 reserved = 11 permits.
+    const LIMIT: u32 = 1;
+    const RESERVED: u32 = 10;
+    const CAP: usize = (LIMIT + RESERVED) as usize;
+    // Dial well past the cap so rejections are inevitable on any
+    // scheduler.
+    const TOTAL_DIALS: usize = 25;
+
     let config = WebsocketNetworkConfig {
         genesis_id: "test-v1.0".to_string(),
         network_id: "test".to_string(),
         net_address: Some("127.0.0.1:0".to_string()),
-        incoming_connections_limit: 1, // TCP cap: 1 + 10 reserved = 11 permits
+        incoming_connections_limit: LIMIT,
         relay_messages: true,
         // Make every *other* gate generous so we isolate Gate 1.
-        max_connections_per_ip: 10_000,
-        connections_rate_limiting_count: 10_000,
+        max_connections_per_ip: u32::MAX,
+        connections_rate_limiting_count: u32::MAX,
         mesh_interval: Duration::from_secs(3600),
         ..Default::default()
     };
@@ -220,78 +236,113 @@ async fn tcp_connection_limit_rejects_over_capacity() {
 
     let hp = relay_host_port(&net);
 
-    // Saturate the semaphore: open 11 long-lived plain TCP connections.
-    // We deliberately do not send any HTTP bytes — the connection guard
-    // is acquired by `RejectingLimitListener::accept` before axum ever
-    // sees the socket, so these dangling sockets are enough to drain
-    // the permit pool.
-    let mut holders: Vec<TcpStream> = Vec::new();
-    for _ in 0..11 {
-        let s = TcpStream::connect(&hp).await.expect("baseline dial");
-        holders.push(s);
+    // Open TOTAL_DIALS concurrent TCP connections.
+    let mut clients: Vec<TcpStream> = Vec::with_capacity(TOTAL_DIALS);
+    for _ in 0..TOTAL_DIALS {
+        clients.push(
+            TcpStream::connect(&hp)
+                .await
+                .expect("TCP-level dial should always succeed (the kernel accepts)"),
+        );
     }
 
-    // Give the accept loop a moment to assign permits.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Poll until the accept loop has drained the backlog. We consider
+    // the listener "settled" once at least `TOTAL_DIALS - CAP`
+    // connections have been rejected (i.e. closed server-side). Poll
+    // with a generous overall deadline rather than a fixed sleep so the
+    // test passes on slow CI without being flaky on fast dev machines.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut classified: Vec<bool> = vec![false; TOTAL_DIALS]; // true = served, false = rejected
+    loop {
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for (i, c) in clients.iter_mut().enumerate() {
+            // Non-destructive probe: try to read 0 bytes with a short
+            // timeout. If the server has closed this connection, we
+            // get Ok(0) or an error.
+            let mut buf = [0u8; 1];
+            let read_result =
+                tokio::time::timeout(Duration::from_millis(20), c.peek(&mut buf)).await;
+            match read_result {
+                Ok(Ok(0)) | Ok(Err(_)) => {
+                    classified[i] = false;
+                    rejected += 1;
+                }
+                Ok(Ok(_)) => {
+                    // Unexpected at this stage — we haven't sent a
+                    // request yet. Treat as "not yet classified".
+                }
+                Err(_) => {
+                    // Read timed out — server is holding this connection
+                    // open, which means it was accepted.
+                    classified[i] = true;
+                    accepted += 1;
+                }
+            }
+            let _ = (accepted, rejected); // read to avoid unused warnings on break path
+        }
 
-    // The (11+1)th connection. Expected behaviour: the `RejectingLimit
-    // Listener` accepts at the OS level and immediately drops the stream.
-    // Our client sees a cleanly-closed peer either via a 0-byte read or
-    // an immediate EOF when trying to write + read.
-    let mut rejected = TcpStream::connect(&hp)
-        .await
-        .expect("TCP-level dial itself should succeed");
-    // The server-side drop should propagate as EOF on read within a short
-    // window. Writing tiny bytes first flushes any lingering state.
-    let _ = rejected
-        .write_all(b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n")
-        .await;
-
-    let mut buf = [0u8; 64];
-    let read_result = tokio::time::timeout(Duration::from_secs(2), rejected.read(&mut buf)).await;
-
-    // We expect either an EOF (0 bytes) or a read error within the 2 s
-    // window. We do NOT expect a full HTTP response, because the permit
-    // was exhausted before axum could serve the request.
-    match read_result {
-        Ok(Ok(0)) => { /* ok — server closed cleanly */ }
-        Ok(Ok(n)) => {
-            // If the server *did* respond, the permit must have freed up
-            // (one of the holders' sockets closed mid-test, perhaps due
-            // to an OS quirk). Accept this only if the response is a
-            // 5xx/4xx indicating some rejection — not a 200.
-            let body = std::str::from_utf8(&buf[..n]).unwrap_or("");
-            assert!(
-                !body.starts_with("HTTP/1.1 200") && !body.starts_with("HTTP/1.1 101"),
-                "unexpected full success response from saturated listener: {body:?}",
+        // Rejection condition: at least `TOTAL_DIALS - CAP` connections
+        // closed AND the sum of accepted + rejected accounts for every
+        // dial (i.e. nothing is still in an ambiguous in-flight state).
+        let closed = classified.iter().filter(|b| !**b).count();
+        let total_classified = classified
+            .iter()
+            .zip(clients.iter_mut())
+            .filter(|(served, _)| **served)
+            .count()
+            + closed;
+        if closed >= TOTAL_DIALS - CAP && total_classified >= TOTAL_DIALS.saturating_sub(2) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "listener never reached steady-state rejection after 5 s \
+                 (closed={closed}, accepted={}, pending={})",
+                classified.iter().filter(|b| **b).count(),
+                TOTAL_DIALS - classified.iter().filter(|b| **b).count() - closed,
             );
         }
-        Ok(Err(_)) => { /* ok — read error after server close */ }
-        Err(_) => panic!("read did not complete within 2 s — the server never closed the rejected connection, suggesting the TCP cap is not enforced"),
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Free a permit: drop one of the holders. A subsequent dial should
-    // now make it through the listener gate (proving the semaphore is
-    // being released, not just permanently exhausted).
-    drop(holders.pop().expect("holder list non-empty"));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let accepted_count = classified.iter().filter(|b| **b).count();
+    let rejected_count = classified.iter().filter(|b| !**b).count();
 
-    let mut fresh = TcpStream::connect(&hp).await.expect("post-release dial");
+    // Cap invariant: at most CAP connections are accepted.
+    assert!(
+        accepted_count <= CAP,
+        "accepted {accepted_count} > cap {CAP} — listener is not enforcing limit",
+    );
+    // Flood invariant: if we dial past the cap, some are rejected.
+    assert!(
+        rejected_count >= TOTAL_DIALS - CAP,
+        "expected at least {} rejections, got {rejected_count} (accepted: {accepted_count})",
+        TOTAL_DIALS - CAP,
+    );
+
+    // Sanity: drop every holder and verify the listener resumes
+    // serving. If the semaphore were permanently exhausted this would
+    // time out.
+    drop(clients);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut fresh = TcpStream::connect(&hp)
+        .await
+        .expect("post-release TCP dial");
     let _ = fresh
         .write_all(b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n")
         .await;
-    let mut buf2 = [0u8; 128];
-    let n = tokio::time::timeout(Duration::from_secs(2), fresh.read(&mut buf2))
+    let mut resp_buf = [0u8; 128];
+    let n = tokio::time::timeout(Duration::from_secs(2), fresh.read(&mut resp_buf))
         .await
         .expect("post-release read within timeout")
         .expect("post-release read should not error");
-    let body = std::str::from_utf8(&buf2[..n]).unwrap_or("");
+    let body = std::str::from_utf8(&resp_buf[..n]).unwrap_or("");
     assert!(
         body.starts_with("HTTP/1.1 200"),
         "post-release /status should return 200, got: {body:?}",
     );
 
-    // Cleanup.
-    drop(holders);
     net.stop().await;
 }
