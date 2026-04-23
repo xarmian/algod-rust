@@ -296,6 +296,14 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
+        Commands::Autopsy { cadaver, json } => {
+            let format = if json {
+                commands::autopsy::AutopsyFormat::Json
+            } else {
+                commands::autopsy::AutopsyFormat::Text
+            };
+            commands::autopsy::run(&cadaver, format)?;
+        }
         Commands::Participate {
             ledger_path,
             genesis_id,
