@@ -246,68 +246,60 @@ async fn tcp_connection_limit_rejects_over_capacity() {
         );
     }
 
-    // Poll until the accept loop has drained the backlog. We consider
-    // the listener "settled" once at least `TOTAL_DIALS - CAP`
-    // connections have been rejected (i.e. closed server-side). Poll
-    // with a generous overall deadline rather than a fixed sleep so the
-    // test passes on slow CI without being flaky on fast dev machines.
+    // Poll until every dial is either Accepted or Rejected — no
+    // Pending entries left. A tri-state is required here: if we used
+    // a boolean initialized to `false`, every as-yet-unclassified
+    // entry would look like a rejection on the first pass, and the
+    // settle condition could fire before the listener has actually
+    // drained the backlog.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DialState {
+        Pending,
+        Accepted,
+        Rejected,
+    }
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut classified: Vec<bool> = vec![false; TOTAL_DIALS]; // true = served, false = rejected
+    let mut states: Vec<DialState> = vec![DialState::Pending; TOTAL_DIALS];
     loop {
-        let mut accepted = 0usize;
-        let mut rejected = 0usize;
         for (i, c) in clients.iter_mut().enumerate() {
-            // Non-destructive probe: try to read 0 bytes with a short
-            // timeout. If the server has closed this connection, we
-            // get Ok(0) or an error.
-            let mut buf = [0u8; 1];
-            let read_result =
-                tokio::time::timeout(Duration::from_millis(20), c.peek(&mut buf)).await;
-            match read_result {
-                Ok(Ok(0)) | Ok(Err(_)) => {
-                    classified[i] = false;
-                    rejected += 1;
-                }
-                Ok(Ok(_)) => {
-                    // Unexpected at this stage — we haven't sent a
-                    // request yet. Treat as "not yet classified".
-                }
-                Err(_) => {
-                    // Read timed out — server is holding this connection
-                    // open, which means it was accepted.
-                    classified[i] = true;
-                    accepted += 1;
-                }
+            if states[i] != DialState::Pending {
+                continue;
             }
-            let _ = (accepted, rejected); // read to avoid unused warnings on break path
+            // Non-destructive probe via `peek`. If the server closed the
+            // socket we get `Ok(0)` or a read error; otherwise `peek`
+            // blocks (the server is holding an accepted connection
+            // open, waiting for us to speak HTTP).
+            let mut buf = [0u8; 1];
+            match tokio::time::timeout(Duration::from_millis(20), c.peek(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => states[i] = DialState::Rejected,
+                Err(_) => states[i] = DialState::Accepted, // read timed out → held open
+                Ok(Ok(_)) => { /* unexpected data; leave as Pending and retry */ }
+            }
         }
 
-        // Rejection condition: at least `TOTAL_DIALS - CAP` connections
-        // closed AND the sum of accepted + rejected accounts for every
-        // dial (i.e. nothing is still in an ambiguous in-flight state).
-        let closed = classified.iter().filter(|b| !**b).count();
-        let total_classified = classified
-            .iter()
-            .zip(clients.iter_mut())
-            .filter(|(served, _)| **served)
-            .count()
-            + closed;
-        if closed >= TOTAL_DIALS - CAP && total_classified >= TOTAL_DIALS.saturating_sub(2) {
+        let pending = states.iter().filter(|s| **s == DialState::Pending).count();
+        let accepted = states.iter().filter(|s| **s == DialState::Accepted).count();
+        let rejected = states.iter().filter(|s| **s == DialState::Rejected).count();
+
+        // Settle condition: no Pending entries AND the rejection count
+        // meets the lower bound implied by the cap. Both clauses are
+        // needed — `rejected >= TOTAL_DIALS - CAP` alone is
+        // vulnerable to a scheduling delay that leaves many entries
+        // still Pending on the first pass.
+        if pending == 0 && rejected >= TOTAL_DIALS - CAP {
             break;
         }
         if std::time::Instant::now() >= deadline {
             panic!(
-                "listener never reached steady-state rejection after 5 s \
-                 (closed={closed}, accepted={}, pending={})",
-                classified.iter().filter(|b| **b).count(),
-                TOTAL_DIALS - classified.iter().filter(|b| **b).count() - closed,
+                "listener never reached steady state after 5 s \
+                 (pending={pending}, accepted={accepted}, rejected={rejected})",
             );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let accepted_count = classified.iter().filter(|b| **b).count();
-    let rejected_count = classified.iter().filter(|b| !**b).count();
+    let accepted_count = states.iter().filter(|s| **s == DialState::Accepted).count();
+    let rejected_count = states.iter().filter(|s| **s == DialState::Rejected).count();
 
     // Cap invariant: at most CAP connections are accepted.
     assert!(
