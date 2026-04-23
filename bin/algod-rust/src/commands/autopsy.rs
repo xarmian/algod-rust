@@ -114,21 +114,41 @@ fn open_chained_reader(inputs: &[PathBuf]) -> anyhow::Result<Box<dyn Read>> {
 
 fn write_text(records: &[CadaverRecord], out: &mut dyn Write) -> io::Result<()> {
     let mut current_scope: Option<PlayerSnapshot> = None;
+    // Run boundaries are demarcated by `EndOfSequence`, NOT by `Meta`.
+    // Cadaver rotation writes a fresh `Meta` without an `EndOfSequence`
+    // and the writer keeps its `prev_round` / `prev_period` across the
+    // rotation (see `algo_agreement::trace::Cadaver::try_setup` /
+    // `init_file`), so the next event/action may not be preceded by a
+    // new `Player`. Treating `Meta` as a hard run boundary therefore
+    // (a) inflates the displayed run count and (b) drops scope from
+    // post-rotation records. Use `EndOfSequence` for the boundary and
+    // present mid-run `Meta` as informational file-rotation markers.
     let mut run_index: u32 = 0;
+    let mut waiting_for_run_header = true;
 
     for rec in records {
         match rec {
             CadaverRecord::Meta(meta) => {
-                if run_index > 0 {
-                    writeln!(out)?;
+                if waiting_for_run_header {
+                    if run_index > 0 {
+                        writeln!(out)?;
+                    }
+                    writeln!(
+                        out,
+                        "== run #{} (num_opened={}, version={}) ==",
+                        run_index, meta.num_opened, meta.version_commit_hash,
+                    )?;
+                    waiting_for_run_header = false;
+                } else {
+                    writeln!(
+                        out,
+                        "-- file rotated (num_opened={}, version={}) --",
+                        meta.num_opened, meta.version_commit_hash,
+                    )?;
                 }
-                writeln!(
-                    out,
-                    "== run #{} (num_opened={}, version={}) ==",
-                    run_index, meta.num_opened, meta.version_commit_hash,
-                )?;
-                run_index += 1;
-                current_scope = None;
+                // Intentionally do NOT clear `current_scope`: rotation
+                // continues the same logical scope from the writer's
+                // perspective.
             }
             CadaverRecord::Player(scope) => {
                 writeln!(
@@ -156,7 +176,9 @@ fn write_text(records: &[CadaverRecord], out: &mut dyn Write) -> io::Result<()> 
             }
             CadaverRecord::EndOfSequence => {
                 writeln!(out, "-- end of sequence --")?;
+                run_index += 1;
                 current_scope = None;
+                waiting_for_run_header = true;
             }
         }
     }
@@ -205,17 +227,18 @@ enum JsonRecord<'a> {
 }
 
 fn write_json(records: &[CadaverRecord], out: &mut dyn Write) -> io::Result<()> {
+    // Same scope-preservation rules as the text renderer: only
+    // `EndOfSequence` resets the active scope; `Meta` is informational
+    // (file rotation can land mid-run without resetting the writer's
+    // `prev_round` / `prev_period`).
     let mut current_scope: Option<PlayerSnapshot> = None;
     let mapped: Vec<JsonRecord> = records
         .iter()
         .map(|rec| match rec {
-            CadaverRecord::Meta(meta) => {
-                current_scope = None;
-                JsonRecord::Meta {
-                    num_opened: meta.num_opened,
-                    version_commit_hash: &meta.version_commit_hash,
-                }
-            }
+            CadaverRecord::Meta(meta) => JsonRecord::Meta {
+                num_opened: meta.num_opened,
+                version_commit_hash: &meta.version_commit_hash,
+            },
             CadaverRecord::Player(scope) => {
                 current_scope = Some(*scope);
                 JsonRecord::Player {
@@ -481,6 +504,188 @@ mod tests {
 
         let inputs = resolve_inputs(&archive).expect("resolve");
         assert_eq!(inputs, vec![archive]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the Codex P1 on PR #241: cadaver rotation writes a
+    /// fresh `Meta` mid-run without an `EndOfSequence`, and the writer
+    /// keeps its `prev_round` / `prev_period` across the rotation.
+    /// The renderer must therefore (a) treat the rotation `Meta` as a
+    /// file boundary within the same run (not a new run) and (b)
+    /// preserve `current_scope` across that boundary so post-rotation
+    /// events/actions are still scoped correctly.
+    #[test]
+    fn render_text_keeps_scope_across_mid_run_rotation() {
+        let dir = unique_dir("rotation-text");
+        let cfg = CadaverConfig {
+            base_directory: dir.clone(),
+            base_filename: "node".into(),
+            file_size_target: CADAVER_SIZE_MINIMUM,
+            version_commit_hash: "fixture-commit".into(),
+        };
+        let active = cfg.active_path();
+
+        // Drive the writer past the rotation threshold within a single
+        // open `Cadaver` instance. The fixture event payload is fat
+        // (200-byte string) so a few thousand iterations comfortably
+        // crosses 100KB.
+        let scope = PlayerSnapshot {
+            round: Round(42),
+            period: Period(0),
+            step: 0,
+        };
+        {
+            let mut cad = Cadaver::open(cfg.clone()).expect("open");
+            let big = "x".repeat(200);
+            for i in 0..2000u32 {
+                cad.trace_event(
+                    scope,
+                    &FixtureEvent {
+                        kind: big.clone(),
+                        value: i as i64,
+                    },
+                )
+                .expect("write event");
+                if cad.num_opened() > 1 {
+                    // Push at least a few more events past the rotation
+                    // so the post-rotation file has events without a
+                    // preceding Player (writer's prev_round/prev_period
+                    // weren't reset on rotation).
+                    for j in 0..3u32 {
+                        cad.trace_event(
+                            scope,
+                            &FixtureEvent {
+                                kind: "post".into(),
+                                value: j as i64,
+                            },
+                        )
+                        .expect("write post event");
+                    }
+                    break;
+                }
+            }
+        }
+
+        let mut sink: Vec<u8> = Vec::new();
+        render_to(&active, AutopsyFormat::Text, &mut sink).expect("render text");
+        let output = String::from_utf8(sink).expect("utf-8 output");
+
+        // Single logical run — only one `== run #` header.
+        assert_eq!(
+            output.matches("== run #").count(),
+            1,
+            "rotation must not introduce a second run header in:\n{output}",
+        );
+        // Rotation surfaces as a `-- file rotated --` marker.
+        assert!(
+            output.contains("-- file rotated"),
+            "rotation marker missing in:\n{output}",
+        );
+        // No `-- end of sequence --` marker — that would only fire if
+        // the file was reopened in a fresh process.
+        assert!(
+            !output.contains("-- end of sequence --"),
+            "EOS must not appear for a single-process rotation in:\n{output}",
+        );
+        // Every event line is scoped (no `[      ]` empty scope).
+        let unscoped = output
+            .lines()
+            .filter(|l| l.contains(" event:") || l.contains(" action:"))
+            .filter(|l| l.starts_with("[      ]"))
+            .count();
+        assert_eq!(
+            unscoped, 0,
+            "post-rotation events lost their scope in:\n{output}",
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Same regression for `--json`: JSON event/action records must
+    /// carry their scope across a mid-run rotation.
+    #[test]
+    fn render_json_keeps_scope_across_mid_run_rotation() {
+        let dir = unique_dir("rotation-json");
+        let cfg = CadaverConfig {
+            base_directory: dir.clone(),
+            base_filename: "node".into(),
+            file_size_target: CADAVER_SIZE_MINIMUM,
+            version_commit_hash: "fixture-commit".into(),
+        };
+        let active = cfg.active_path();
+
+        let scope = PlayerSnapshot {
+            round: Round(99),
+            period: Period(2),
+            step: 1,
+        };
+        {
+            let mut cad = Cadaver::open(cfg.clone()).expect("open");
+            let big = "x".repeat(200);
+            for i in 0..2000u32 {
+                cad.trace_event(
+                    scope,
+                    &FixtureEvent {
+                        kind: big.clone(),
+                        value: i as i64,
+                    },
+                )
+                .expect("write event");
+                if cad.num_opened() > 1 {
+                    for j in 0..3u32 {
+                        cad.trace_event(
+                            scope,
+                            &FixtureEvent {
+                                kind: "post".into(),
+                                value: j as i64,
+                            },
+                        )
+                        .expect("write post event");
+                    }
+                    break;
+                }
+            }
+        }
+
+        let mut sink: Vec<u8> = Vec::new();
+        render_to(&active, AutopsyFormat::Json, &mut sink).expect("render json");
+        let value: serde_json::Value = serde_json::from_slice(&sink).expect("output is valid JSON");
+        let arr = value.as_array().expect("top-level array");
+
+        // Find the index of the second `meta` record (the rotation).
+        let meta_indices: Vec<usize> = arr
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| if v["kind"] == "meta" { Some(i) } else { None })
+            .collect();
+        assert!(
+            meta_indices.len() >= 2,
+            "expected at least one rotation meta in JSON output: {value:#?}",
+        );
+
+        // Every event/action record after the rotation meta must still
+        // carry the scope (round/period/step != null).
+        for record in &arr[meta_indices[1]..] {
+            let kind = record["kind"].as_str().unwrap_or("");
+            if kind == "event" || kind == "action" {
+                assert!(
+                    !record["round"].is_null(),
+                    "post-rotation {kind} lost round: {record:?}",
+                );
+                assert!(
+                    !record["period"].is_null(),
+                    "post-rotation {kind} lost period: {record:?}",
+                );
+                assert!(
+                    !record["step"].is_null(),
+                    "post-rotation {kind} lost step: {record:?}",
+                );
+                assert_eq!(record["round"], 99);
+                assert_eq!(record["period"], 2);
+                assert_eq!(record["step"], 1);
+            }
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }
