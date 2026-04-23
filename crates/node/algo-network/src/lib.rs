@@ -32,6 +32,7 @@ pub mod request_response;
 pub mod request_tracker;
 pub mod srv_resolver;
 pub mod tx_syncer;
+pub mod tx_tag_handler;
 pub mod ws_network;
 
 // ---------------------------------------------------------------------------
@@ -238,6 +239,13 @@ pub use tx_syncer::{
     sync_round, NoOpSolicitedTxHandler, PeerSource, PendingTxAggregate, SeenTxCache,
     SolicitedTxHandler, TxSyncError, TxSyncPeerClient, TxSyncer, TxSyncerConfig,
 };
+
+// ---------------------------------------------------------------------------
+// Re-exports: TX-tag inbound handler (Plan 33, gap G1 — inbound half)
+// ---------------------------------------------------------------------------
+
+// Decoder + MessageHandler for inbound TX-tagged gossip messages
+pub use tx_tag_handler::{decode_tx_message, TxTagError, TxTagHandler, MAX_TX_GROUP_SIZE};
 
 // ---------------------------------------------------------------------------
 // Message filtering helpers

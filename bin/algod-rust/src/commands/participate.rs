@@ -1950,7 +1950,40 @@ pub async fn run(
 
     let gossip_node = Arc::new(WebsocketNetwork::new(net_config, phonebook));
 
-    // Start the network (listener + mesh).
+    // -------------------------------------------------------------------
+    // Construct the transaction pool early and register the inbound TX
+    // handler on the multiplexer **before** starting the listener. If
+    // we start the gossip node first and register after, inbound TX
+    // frames that arrive during the startup window fall through to
+    // `Multiplexer::handle`'s Ignore fallback and are silently dropped
+    // (PLAN-33 / TASK-69, gap G1 in DOC-23).
+    //
+    // The `SeenTxCache` is created here so it can be shared with the
+    // TxSyncer when TASK-70 lands.
+    // -------------------------------------------------------------------
+    let pool_ledger_adapter = Arc::new(PoolLedgerAdapter {
+        ledger: ledger.clone(),
+    });
+    let pool = Arc::new(TransactionPool::new(
+        PoolConfig::default(),
+        pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
+    ));
+    let tx_seen_cache = Arc::new(algo_network::SeenTxCache::new(
+        algo_network::TxSyncerConfig::default().seen_cache_size,
+    ));
+    gossip_node.multiplexer().register_handlers(vec![
+        algo_network::handler::TaggedMessageHandler {
+            tag: algo_network::Tag::Transaction,
+            handler: Arc::new(algo_network::TxTagHandler::new(
+                pool.clone(),
+                tx_seen_cache.clone(),
+            )),
+        },
+    ]);
+
+    // Start the network (listener + mesh). TX-tag handler is already
+    // wired, so inbound transactions cannot slip past during the
+    // startup window.
     gossip_node
         .start_arc()
         .await
@@ -1990,14 +2023,7 @@ pub async fn run(
     let key_manager = AgreementKeyManagerBridge::new(part_store);
 
     // Block factory bridge: wraps TransactionPool for block assembly.
-    let pool_ledger_adapter = Arc::new(PoolLedgerAdapter {
-        ledger: ledger.clone(),
-    });
-    let pool = Arc::new(TransactionPool::new(
-        PoolConfig::default(),
-        pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
-    ));
-    let block_factory = BlockFactoryBridge::new(pool);
+    let block_factory = BlockFactoryBridge::new(pool.clone());
 
     // Block validator bridge: wraps algo-validate for incoming block checks.
     // Extract the timestamp from the latest committed block header so the

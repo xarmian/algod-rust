@@ -9,6 +9,7 @@ algo-agreement.workspace = true
 algo-types.workspace = true
 algo-codec.workspace = true
 algo-error.workspace = true
+algo-pool.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 bytes = "1"
