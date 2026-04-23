@@ -772,15 +772,23 @@ impl NodeInterface for AlgodNodeInterface {
         let sim_req = Self::build_simulation_request(request);
 
         // Run the simulator under the ledger lock. `Simulator` takes
-        // `&mut L: LedgerStore`; it uses snapshot/restore to leave the
-        // store unchanged, so no mutations leak even though we hand it a
-        // mutable borrow. Long AVM simulations will stall other ledger
-        // access and block the current Tokio worker; `spawn_blocking` (or
-        // migrating to `tokio::sync::Mutex`) is tracked as a refinement
-        // under PLAN-34 alongside the rest of the simulation-response
-        // fidelity work.
+        // `&mut L: LedgerStore` and uses snapshot/restore to leave the
+        // store unchanged on both the `Ok` and `Err` paths. A panic
+        // *inside* the simulator bypasses the explicit restore (the
+        // snapshot is dropped mid-way) and poisons the `std::sync::Mutex`,
+        // so we handle poison here rather than `expect`-ing — an earlier
+        // panic does not cascade into the entire REST surface dying on
+        // subsequent requests. Long AVM simulations still stall other
+        // ledger access and block the current Tokio worker;
+        // `spawn_blocking` (or migrating to `tokio::sync::Mutex`) is
+        // tracked as a refinement under PLAN-34 alongside the rest of
+        // the simulation-response fidelity work.
         let result = {
-            let mut ledger = self.ledger.lock().expect("ledger lock poisoned");
+            let mut ledger = self.ledger.lock().map_err(|_| {
+                NodeError::Internal(
+                    "simulate: ledger lock poisoned — a prior request panicked".into(),
+                )
+            })?;
             let mut simulator = Simulator::new(&mut *ledger);
             simulator
                 .simulate(sim_req)
@@ -819,6 +827,15 @@ impl AlgodNodeInterface {
     /// [`SimulateRequest`]. Uses the handler-populated
     /// `decoded_txn_groups` field — callers that bypass the handler must
     /// populate it before calling this method.
+    ///
+    /// Note: `allow_more_logging` is plumbed through for forward
+    /// compatibility but is currently a no-op inside
+    /// [`algo_ledger::simulation::Simulator::simulate`], which does not
+    /// yet raise the AVM `max_log_calls` / `max_log_size` limits. The
+    /// simulator-side wiring lands with the rest of the
+    /// simulation-response fidelity work in PLAN-34. Callers that rely
+    /// on relaxed log limits should not expect this flag to take effect
+    /// until then.
     fn build_simulation_request(request: SimulateRequest) -> SimulationRequest {
         SimulationRequest {
             round: request.round.map(Round),
@@ -928,14 +945,24 @@ impl AlgodNodeInterface {
 
     /// Map a [`SimulatorError`] to the trait-level [`NodeError`].
     ///
-    /// All variants collapse to `NodeError::Internal` because the trait
-    /// has no `BadRequest` bucket; the category is preserved in the
-    /// message prefix so the REST handler (and its logs) keep enough
-    /// detail to debug failed simulations.
+    /// - `InvalidRequest` → [`NodeError::BadRequest`] so REST clients
+    ///   get 400s for bad input (conflicting `fix-signers` /
+    ///   `allow-empty-signatures` flags, multi-group requests, empty
+    ///   groups, etc.) instead of a collapsed 500.
+    /// - `EvalFailure` → [`NodeError::Internal`]. In practice
+    ///   `simulate()` carries eval failures inside the result
+    ///   (`TxnGroupResult::failure_message` + `failed_at`) rather than
+    ///   raising this variant, so this branch only fires for
+    ///   pre-execution signature / well-formedness checks.
+    /// - `Internal` → [`NodeError::Internal`].
+    ///
+    /// Each variant's message keeps a `simulate: <category>: …` prefix
+    /// so logs and client-visible bodies remain traceable to the
+    /// underlying cause.
     fn map_simulator_error(err: SimulatorError) -> NodeError {
         match err {
             SimulatorError::InvalidRequest(e) => {
-                NodeError::Internal(format!("simulate: invalid request: {e}"))
+                NodeError::BadRequest(format!("simulate: invalid request: {e}"))
             }
             SimulatorError::EvalFailure(e) => {
                 NodeError::Internal(format!("simulate: eval failure: {e}"))
@@ -1707,47 +1734,59 @@ mod tests {
     }
 
     #[test]
-    fn map_simulator_error_preserves_category_prefix() {
+    fn map_simulator_error_routes_invalid_request_to_bad_request_and_others_to_internal() {
         use algo_ledger::simulation::{EvalFailureError, InvalidRequestError};
 
-        fn msg(err: NodeError) -> String {
-            match err {
-                NodeError::Internal(m) => m,
-                other => panic!("expected Internal, got {other:?}"),
-            }
-        }
-
+        // Invalid-request routes to BadRequest (→ 400) so the REST
+        // handler surfaces client-side mistakes correctly.
         let invalid = AlgodNodeInterface::map_simulator_error(SimulatorError::InvalidRequest(
             InvalidRequestError {
                 message: "no groups".into(),
             },
         ));
-        assert_eq!(msg(invalid), "simulate: invalid request: no groups");
+        match invalid {
+            NodeError::BadRequest(m) => {
+                assert_eq!(m, "simulate: invalid request: no groups")
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
 
+        // Eval failures stay on Internal (→ 500); the simulator normally
+        // carries eval failures inside the result rather than raising
+        // this variant, so this branch is for pre-execution checks.
         let eval = AlgodNodeInterface::map_simulator_error(SimulatorError::EvalFailure(
             EvalFailureError {
                 message: "budget exceeded".into(),
                 failed_at: vec![0],
             },
         ));
-        assert!(msg(eval).starts_with("simulate: eval failure: "));
+        match eval {
+            NodeError::Internal(m) => {
+                assert!(m.starts_with("simulate: eval failure: "))
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
 
+        // Internal errors (ledger read failures, etc.) stay on Internal.
         let internal = AlgodNodeInterface::map_simulator_error(SimulatorError::Internal(
             algo_error::AlgoError::Ledger {
                 message: "disk oops".into(),
             },
         ));
-        assert!(msg(internal).starts_with("simulate: internal: "));
+        match internal {
+            NodeError::Internal(m) => assert!(m.starts_with("simulate: internal: ")),
+            other => panic!("expected Internal, got {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn simulate_rejects_empty_txn_groups_as_invalid_request() {
-        // The simulator itself validates that the request contains at
-        // least one transaction group. An empty request surfaces as
-        // `SimulatorError::InvalidRequest`, which we map to
-        // `NodeError::Internal("simulate: invalid request: ...")`.
-        // This exercises the full trait method without needing a
-        // populated ledger.
+    async fn simulate_rejects_empty_txn_groups_as_bad_request() {
+        // The simulator validates that the request contains at least one
+        // transaction group. An empty request surfaces as
+        // `SimulatorError::InvalidRequest`, which the adapter maps to
+        // `NodeError::BadRequest` so the REST handler returns 400. This
+        // exercises the full trait method without needing a populated
+        // ledger.
         let adapter = make_adapter();
         let request = SimulateRequest {
             allow_empty_signatures: None,
@@ -1761,7 +1800,7 @@ mod tests {
             decoded_txn_groups: Vec::new(),
         };
         match adapter.simulate(request).await {
-            Err(NodeError::Internal(msg)) => {
+            Err(NodeError::BadRequest(msg)) => {
                 assert!(
                     msg.starts_with("simulate: invalid request:"),
                     "expected invalid-request prefix, got {msg:?}"
@@ -1771,7 +1810,7 @@ mod tests {
                     "expected message to mention required txn group, got {msg:?}"
                 );
             }
-            other => panic!("expected Internal(invalid request), got {other:?}"),
+            other => panic!("expected BadRequest(invalid request), got {other:?}"),
         }
     }
 

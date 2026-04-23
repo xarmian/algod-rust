@@ -2854,6 +2854,7 @@ pub async fn simulate_transaction<N: NodeInterface>(
     match node.simulate(request).await {
         Ok(response) => format::encode_response(&response, resp_format),
         Err(NodeError::NotFound(msg)) => error::not_found(msg),
+        Err(NodeError::BadRequest(msg)) => error::bad_request(msg),
         Err(NodeError::NotImplemented(method)) => {
             error::internal_error(format!("{method} not implemented"))
         }
