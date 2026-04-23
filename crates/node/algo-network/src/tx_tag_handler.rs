@@ -121,10 +121,16 @@ pub fn decode_tx_message(data: &[u8]) -> Result<Vec<SignedTransaction>, TxTagErr
         match rmp_serde::from_read::<_, SignedTransaction>(&mut cursor) {
             Ok(tx) => group.push(tx),
             Err(e) => {
-                // EOF-like errors end the loop cleanly only when we've
-                // consumed at least one value. Any decoder error with
-                // zero values decoded is treated as invalid.
-                if is_eof_like(&e) && (cursor.position() as usize) >= data.len() {
+                // Clean end-of-stream means we *started* the read at
+                // EOF — i.e. the previous decode exactly exhausted the
+                // buffer. Checking where the cursor *landed* after an
+                // `UnexpectedEof` is wrong: a truncated trailing
+                // object (e.g. a valid txn followed by a partial
+                // msgpack prefix that consumes the remaining bytes)
+                // can also end with the cursor at `data.len()`, and
+                // that case must be rejected as malformed — not
+                // silently accepted with the partial tail dropped.
+                if is_eof_like(&e) && (offset as usize) == data.len() {
                     break;
                 }
                 return Err(TxTagError::Decode { offset, source: e });
@@ -328,6 +334,27 @@ mod tests {
         assert!(
             matches!(err, TxTagError::Decode { .. }),
             "expected Decode, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn decode_truncated_tail_is_error() {
+        // A valid txn followed by a truncated msgpack object must be
+        // rejected, not silently accepted with the partial tail
+        // dropped. Regression for a prior bug where the EOF-check
+        // keyed off the cursor *after* an UnexpectedEof, which could
+        // land at `data.len()` when the partial object consumed the
+        // remaining bytes.
+        let good = encode_group(&[make_signed_txn(42)]);
+        let mut truncated = good.clone();
+        // Append a msgpack "map of 3 entries" header (0x83) with no
+        // entries — an unexpected-EOF candidate.
+        truncated.push(0x83);
+
+        let err = decode_tx_message(&truncated).unwrap_err();
+        assert!(
+            matches!(err, TxTagError::Decode { .. }),
+            "expected Decode error for truncated tail, got {err:?}",
         );
     }
 
