@@ -313,7 +313,13 @@ pub struct TxSyncer {
     peer_source: Arc<dyn PeerSource>,
     handler: Arc<dyn SolicitedTxHandler>,
     seen: Arc<SeenTxCache>,
-    cancel: CancellationToken,
+    /// Cancellation token for the currently-running task.
+    ///
+    /// Wrapped in a `Mutex` because `CancellationToken::cancel()` is
+    /// permanent — every clone observes "cancelled" forever. To support
+    /// `stop()` + `start()` restart we install a fresh token on each
+    /// `start()`.
+    cancel: Mutex<CancellationToken>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -345,7 +351,7 @@ impl TxSyncer {
             peer_source,
             handler,
             seen,
-            cancel: CancellationToken::new(),
+            cancel: Mutex::new(CancellationToken::new()),
             task: Mutex::new(None),
         }
     }
@@ -370,17 +376,28 @@ impl TxSyncer {
     ///
     /// Idempotent: calling `start()` while already running is a no-op and
     /// does not double-spawn the task.
+    ///
+    /// If the previous token has been cancelled (typical after a
+    /// `stop()`), install a fresh one so the new task is not born
+    /// already-cancelled.
     pub fn start(&self) {
         let mut guard = self.task.lock().expect("TxSyncer.task mutex poisoned");
         if guard.is_some() {
             return;
         }
 
+        let cancel = {
+            let mut token = self.cancel.lock().expect("TxSyncer.cancel mutex poisoned");
+            if token.is_cancelled() {
+                *token = CancellationToken::new();
+            }
+            token.clone()
+        };
+
         let config = self.config.clone();
         let pool = self.pool.clone();
         let peer_source = self.peer_source.clone();
         let handler = self.handler.clone();
-        let cancel = self.cancel.clone();
 
         let task = tokio::spawn(async move {
             debug!(
@@ -426,8 +443,14 @@ impl TxSyncer {
     /// Idempotent. Safe to call from a task that holds no strong reference
     /// to the running task — the `CancellationToken` is cloned into the
     /// spawned task, so cancelling it here tears the loop down.
+    ///
+    /// The cancelled token is left in place; the next call to [`start`](Self::start)
+    /// will replace it with a fresh one, so syncing can be resumed.
     pub async fn stop(&self) {
-        self.cancel.cancel();
+        self.cancel
+            .lock()
+            .expect("TxSyncer.cancel mutex poisoned")
+            .cancel();
         let handle = {
             self.task
                 .lock()
@@ -721,5 +744,77 @@ mod tests {
         let b = syncer.seen_cache();
         a.insert(d(7));
         assert!(b.contains(&d(7)));
+    }
+
+    /// Regression: a stopped syncer must be restartable.
+    ///
+    /// `CancellationToken::cancel()` is permanent — every clone observes
+    /// "cancelled" forever. If `start()` were to reuse the same token
+    /// after a prior `stop()`, the newly-spawned task's cancel branch
+    /// would fire immediately and the loop would exit without ever
+    /// running a sync round.
+    #[tokio::test]
+    async fn txsyncer_can_be_restarted_after_stop() {
+        struct CountingPeer {
+            calls: Arc<StdMutex<u32>>,
+        }
+        #[async_trait]
+        impl TxSyncPeerClient for CountingPeer {
+            fn address(&self) -> String {
+                "counter".into()
+            }
+            async fn sync(
+                &self,
+                _pending: &[Digest],
+                _timeout: Duration,
+            ) -> Result<Vec<Vec<SignedTransaction>>, TxSyncError> {
+                *self.calls.lock().expect("counter mutex poisoned") += 1;
+                Ok(vec![])
+            }
+        }
+        struct Src(Arc<CountingPeer>);
+        impl PeerSource for Src {
+            fn sample_peer(&self) -> Option<Arc<dyn TxSyncPeerClient>> {
+                Some(self.0.clone())
+            }
+        }
+
+        let calls = Arc::new(StdMutex::new(0));
+        let peer = Arc::new(CountingPeer {
+            calls: calls.clone(),
+        });
+        // Short interval so we see at least one real tick in each phase.
+        let cfg = TxSyncerConfig {
+            sync_interval: Duration::from_millis(30),
+            ..TxSyncerConfig::default()
+        };
+        let syncer = TxSyncer::new(
+            cfg,
+            Arc::new(FakePool(Vec::new())),
+            Arc::new(Src(peer)),
+            Arc::new(NoOpSolicitedTxHandler),
+        );
+
+        // Phase 1: run, wait for a tick, stop.
+        syncer.start();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        syncer.stop().await;
+        let after_first = *calls.lock().unwrap();
+        assert!(
+            after_first > 0,
+            "first run should tick at least once (got {after_first})",
+        );
+
+        // Phase 2: restart. With a stale cancellation token this would
+        // exit immediately; with the fix a fresh token is installed and
+        // the loop ticks again.
+        syncer.start();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        syncer.stop().await;
+        let after_second = *calls.lock().unwrap();
+        assert!(
+            after_second > after_first,
+            "restart should tick again (first={after_first}, second={after_second})",
+        );
     }
 }
