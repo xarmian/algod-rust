@@ -41,6 +41,8 @@ use algo_types::{
 };
 use async_trait::async_trait;
 use sha2::{Digest as _, Sha512_256};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracing::warn;
 
 /// Default upgrade-vote window length (in rounds) for the current Algorand
 /// mainnet protocol.
@@ -72,6 +74,14 @@ const DEFAULT_UPGRADE_THRESHOLD: u64 = 9_000;
 /// this should be replaced with a `tokio::sync::watch<u64>` receiver driven
 /// by the commit loop.
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Default backlog size for the `async_broadcast_signed_tx_group` admission
+/// semaphore, matching go-algorand's `TxBacklogSize = 26000` default in
+/// `config/localTemplate.go` @ `v4.5.1-stable`. Under saturation the async
+/// trait method returns an error rather than spawning unbounded tasks.
+/// TASK-79 will wire this through `algod-rust.toml` so operators can tune
+/// it from the node config.
+const DEFAULT_ASYNC_BACKLOG_SIZE: usize = 26_000;
 
 /// Construction-time configuration for [`AlgodNodeInterface`].
 ///
@@ -113,6 +123,13 @@ pub struct AlgodNodeInterface {
     ledger: Arc<Mutex<SqliteLedger>>,
     pool: Option<Arc<TransactionPool>>,
     broadcaster: Option<Arc<LocalTxBroadcaster>>,
+    /// Bounded admission semaphore for
+    /// [`NodeInterface::async_broadcast_signed_tx_group`] — shed load
+    /// instead of spawning unbounded `tokio::spawn` tasks. Mirrors
+    /// go-algorand's `backlogQueue` in `data/txHandler.go`. Default
+    /// capacity is [`DEFAULT_ASYNC_BACKLOG_SIZE`]; override via
+    /// [`Self::with_async_backlog_capacity`].
+    async_backlog_permits: Arc<Semaphore>,
     genesis_id: String,
     genesis_hash: Digest,
     genesis_json: String,
@@ -131,12 +148,26 @@ impl AlgodNodeInterface {
             ledger,
             pool: None,
             broadcaster: None,
+            async_backlog_permits: Arc::new(Semaphore::new(DEFAULT_ASYNC_BACKLOG_SIZE)),
             genesis_id: config.genesis_id,
             genesis_hash: config.genesis_hash,
             genesis_json: config.genesis_json,
             build_version: config.build_version,
             default_protocol: config.default_protocol,
         }
+    }
+
+    /// Override the async-broadcast backlog capacity. TASK-79 will call
+    /// this from the node-config loader so operators can tune the
+    /// `/v2/transactions/async` admission window.
+    #[must_use]
+    pub fn with_async_backlog_capacity(mut self, capacity: usize) -> Self {
+        // `Semaphore::new(0)` is legal (immediately refuses everything)
+        // but a zero capacity is almost certainly a misconfiguration, so
+        // floor at 1 to keep at least one slot open. Matches the
+        // `SeenTxCache::new` behavior.
+        self.async_backlog_permits = Arc::new(Semaphore::new(capacity.max(1)));
+        self
     }
 
     /// Attach a transaction pool to the adapter. Builder-style so a single
@@ -175,6 +206,21 @@ impl AlgodNodeInterface {
             .as_ref()
             .map(Arc::clone)
             .ok_or(NodeError::NotImplemented(method))
+    }
+
+    /// Try to reserve a slot on the async-broadcast backlog semaphore.
+    /// Returns an owned permit (moved into the background task so it's
+    /// released when `submit_group` completes) or
+    /// [`NodeError::Internal`] with a fixed `"broadcast: async backlog
+    /// full"` prefix when all slots are in use. Extracted as a helper so
+    /// the admission logic is unit-testable without standing up a live
+    /// broadcaster.
+    fn reserve_async_backlog_permit(
+        permits: &Arc<Semaphore>,
+    ) -> Result<OwnedSemaphorePermit, NodeError> {
+        Arc::clone(permits)
+            .try_acquire_owned()
+            .map_err(|_| NodeError::Internal("broadcast: async backlog full".into()))
     }
 
     /// Convert a [`LocalTxError`] to the trait-level [`NodeError`].
@@ -663,27 +709,48 @@ impl NodeInterface for AlgodNodeInterface {
         // `../go-algorand/node/node.go:596-600` and
         // `../go-algorand/data/txHandler.go:873-888` @ v4.5.1-stable.
         //
-        // Consequence: pool-rejection / encode / gossip failures after
-        // the spawn are NOT surfaced through the return value. They are
-        // logged inside `LocalTxBroadcaster::submit_group`
-        // (`local_tx_broadcast.rs:200-222`) so operators still have
-        // visibility. Callers that need synchronous rejection signals
-        // should use `broadcast_signed_tx_group` instead.
+        // The three *synchronous* error surfaces this method preserves:
+        //   1. No broadcaster attached       → NotImplemented
+        //   2. Empty group                   → Internal("empty group")
+        //   3. Async backlog is full         → Internal("async backlog full")
+        //
+        // Pool-rejection / gossip failures after the spawn are not
+        // surfaced through the return value. `LocalTxBroadcaster::submit_group`
+        // logs Pool / Broadcast errors (see
+        // `local_tx_broadcast.rs:200-222`); we add a dedicated `warn!`
+        // for Encode because the broadcaster propagates that variant
+        // without its own log (`local_tx_broadcast.rs:193`).
+        // Callers that need synchronous rejection signals should use
+        // `broadcast_signed_tx_group` instead.
         let broadcaster = self.broadcaster("async_broadcast_signed_tx_group")?;
 
         // Preflight the obviously-bad cases synchronously so clients see
-        // immediate feedback rather than a silent drop. Keep this list
-        // minimal — anything that needs pool state (duplicate detection,
-        // fee check, signature verification) belongs in the async path.
+        // immediate feedback rather than a silent drop.
         if tx_group.is_empty() {
             return Err(Self::local_tx_error_to_node_error(LocalTxError::Empty));
         }
 
+        // Admission control: mirror go-algorand's bounded backlog. Under
+        // saturation we surface `backlog full` instead of spawning an
+        // unbounded task per request. The permit is moved into the
+        // spawned task so it's dropped when `submit_group` completes,
+        // freeing the slot.
+        let permit = Self::reserve_async_backlog_permit(&self.async_backlog_permits)?;
+
         // Spawn the full ingest + gossip path. `LocalTxBroadcaster`
-        // already emits structured warnings on every failure branch, so
-        // no additional logging is needed here.
+        // already emits structured warnings for Pool and Broadcast
+        // errors, so only Encode (which returns directly without
+        // logging) gets an adapter-side log.
         tokio::spawn(async move {
-            let _ = broadcaster.submit_group(tx_group).await;
+            let _permit = permit; // release slot on completion
+            if let Err(err) = broadcaster.submit_group(tx_group).await {
+                if matches!(&err, LocalTxError::Encode(_)) {
+                    warn!(
+                        error = %err,
+                        "async_broadcast_signed_tx_group: encode failed",
+                    );
+                }
+            }
         });
         Ok(())
     }
@@ -1198,6 +1265,54 @@ mod tests {
             }
             other => panic!("expected NotImplemented, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reserve_async_backlog_permit_acquires_and_releases() {
+        // Capacity = 1: the first acquire succeeds, the second fails
+        // until the first permit is dropped.
+        let permits = Arc::new(Semaphore::new(1));
+        let first =
+            AlgodNodeInterface::reserve_async_backlog_permit(&permits).expect("first permit");
+
+        match AlgodNodeInterface::reserve_async_backlog_permit(&permits) {
+            Err(NodeError::Internal(msg)) => {
+                assert_eq!(msg, "broadcast: async backlog full");
+            }
+            other => panic!("expected backlog full, got {other:?}"),
+        }
+
+        drop(first);
+        let _second_after_drop = AlgodNodeInterface::reserve_async_backlog_permit(&permits)
+            .expect("permit available after drop");
+    }
+
+    #[test]
+    fn with_async_backlog_capacity_replaces_the_semaphore() {
+        // The builder must install a fresh semaphore — sanity-check by
+        // constructing with a tiny capacity and asserting the first
+        // acquire works, the second fails.
+        let adapter = make_adapter().with_async_backlog_capacity(1);
+        let first =
+            AlgodNodeInterface::reserve_async_backlog_permit(&adapter.async_backlog_permits)
+                .expect("first permit");
+        assert!(matches!(
+            AlgodNodeInterface::reserve_async_backlog_permit(&adapter.async_backlog_permits),
+            Err(NodeError::Internal(_))
+        ));
+        drop(first);
+    }
+
+    #[test]
+    fn with_async_backlog_capacity_floors_at_one() {
+        // Capacity = 0 is a footgun (immediately refuses everything); the
+        // builder silently raises it to 1 so the adapter still makes
+        // forward progress.
+        let adapter = make_adapter().with_async_backlog_capacity(0);
+        assert!(
+            AlgodNodeInterface::reserve_async_backlog_permit(&adapter.async_backlog_permits)
+                .is_ok()
+        );
     }
 
     #[test]
