@@ -307,25 +307,44 @@ impl fmt::Debug for SeenTxCache {
 ///
 /// The struct holds [`Arc`] references to its collaborators so the spawned
 /// Tokio task can own its own copies independently of the caller.
+/// Lifecycle state held under a single mutex.
+///
+/// `cancel` and `task` must be kept in sync — the token inside `cancel` is
+/// always the one wired into the task in `task`. Updating them atomically
+/// prevents `start`/`stop` interleavings from handing one call a cancelled
+/// token while another call holds the fresh task handle.
+struct TxSyncerLifecycle {
+    /// Cancellation token for the currently-running task (or a stale token
+    /// left over from the last `stop()` — `start()` replaces it before
+    /// spawning).
+    cancel: CancellationToken,
+    /// Join handle for the currently-running task, if any.
+    task: Option<JoinHandle<()>>,
+}
+
 pub struct TxSyncer {
     config: TxSyncerConfig,
     pool: Arc<dyn PendingTxAggregate>,
     peer_source: Arc<dyn PeerSource>,
     handler: Arc<dyn SolicitedTxHandler>,
     seen: Arc<SeenTxCache>,
-    /// Cancellation token for the currently-running task.
+    /// Combined lifecycle state: cancellation token + running task handle.
     ///
-    /// Wrapped in a `Mutex` because `CancellationToken::cancel()` is
-    /// permanent — every clone observes "cancelled" forever. To support
-    /// `stop()` + `start()` restart we install a fresh token on each
-    /// `start()`.
-    cancel: Mutex<CancellationToken>,
-    task: Mutex<Option<JoinHandle<()>>>,
+    /// A single mutex is used (rather than separate locks for `cancel` and
+    /// `task`) so that any `start`/`stop` pair observes them atomically —
+    /// otherwise two concurrent `stop()` calls bracketing a `start()` can
+    /// take the handle of a freshly-spawned task while leaving its token
+    /// un-cancelled, which hangs the caller that awaits it.
+    lifecycle: Mutex<TxSyncerLifecycle>,
 }
 
 impl fmt::Debug for TxSyncer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let running = self.task.lock().map(|g| g.is_some()).unwrap_or(false);
+        let running = self
+            .lifecycle
+            .lock()
+            .map(|g| g.task.is_some())
+            .unwrap_or(false);
         f.debug_struct("TxSyncer")
             .field("config", &self.config)
             .field("seen_cache", &*self.seen)
@@ -351,8 +370,10 @@ impl TxSyncer {
             peer_source,
             handler,
             seen,
-            cancel: Mutex::new(CancellationToken::new()),
-            task: Mutex::new(None),
+            lifecycle: Mutex::new(TxSyncerLifecycle {
+                cancel: CancellationToken::new(),
+                task: None,
+            }),
         }
     }
 
@@ -381,31 +402,38 @@ impl TxSyncer {
     /// `stop()`), install a fresh one so the new task is not born
     /// already-cancelled.
     pub fn start(&self) {
-        let mut guard = self.task.lock().expect("TxSyncer.task mutex poisoned");
-        if guard.is_some() {
+        let mut state = self
+            .lifecycle
+            .lock()
+            .expect("TxSyncer.lifecycle mutex poisoned");
+        if state.task.is_some() {
             return;
         }
 
-        let cancel = {
-            let mut token = self.cancel.lock().expect("TxSyncer.cancel mutex poisoned");
-            if token.is_cancelled() {
-                *token = CancellationToken::new();
-            }
-            token.clone()
-        };
+        // Replace a stale (cancelled) token so the new task is not born
+        // already-cancelled.
+        if state.cancel.is_cancelled() {
+            state.cancel = CancellationToken::new();
+        }
+        let cancel = state.cancel.clone();
 
         let config = self.config.clone();
         let pool = self.pool.clone();
         let peer_source = self.peer_source.clone();
         let handler = self.handler.clone();
 
+        // Defensive clamp: `tokio::time::interval` panics on a zero
+        // duration. A bad config should degrade to "effectively busy"
+        // rather than crash the sync loop on startup.
+        let tick_interval = config.sync_interval.max(MIN_TICK_INTERVAL);
+
         let task = tokio::spawn(async move {
             debug!(
-                interval = ?config.sync_interval,
+                interval = ?tick_interval,
                 timeout = ?config.sync_timeout,
                 "TxSyncer loop started",
             );
-            let mut ticker = time::interval(config.sync_interval);
+            let mut ticker = time::interval(tick_interval);
             // Match Go's `time.After` semantics: wait a full interval before
             // the first sync round.
             ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
@@ -435,27 +463,27 @@ impl TxSyncer {
                 }
             }
         });
-        *guard = Some(task);
+        state.task = Some(task);
     }
 
     /// Stop the background sync loop and await its termination.
     ///
-    /// Idempotent. Safe to call from a task that holds no strong reference
-    /// to the running task — the `CancellationToken` is cloned into the
-    /// spawned task, so cancelling it here tears the loop down.
+    /// Idempotent. The cancel-signal and handle-extraction happen under a
+    /// single lock so a concurrent `start()` cannot swap the handle out
+    /// from under us after we cancel — which would otherwise leave us
+    /// awaiting a *new* task whose token we never signalled.
     ///
-    /// The cancelled token is left in place; the next call to [`start`](Self::start)
-    /// will replace it with a fresh one, so syncing can be resumed.
+    /// The cancelled token is left in place; the next call to
+    /// [`start`](Self::start) will replace it with a fresh one, so syncing
+    /// can be resumed.
     pub async fn stop(&self) {
-        self.cancel
-            .lock()
-            .expect("TxSyncer.cancel mutex poisoned")
-            .cancel();
         let handle = {
-            self.task
+            let mut state = self
+                .lifecycle
                 .lock()
-                .expect("TxSyncer.task mutex poisoned")
-                .take()
+                .expect("TxSyncer.lifecycle mutex poisoned");
+            state.cancel.cancel();
+            state.task.take()
         };
         if let Some(h) = handle {
             let _ = h.await;
@@ -465,9 +493,20 @@ impl TxSyncer {
     /// Is the background task currently running?
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.task.lock().map(|g| g.is_some()).unwrap_or(false)
+        self.lifecycle
+            .lock()
+            .map(|g| g.task.is_some())
+            .unwrap_or(false)
     }
 }
+
+/// Floor for the sync-loop tick interval.
+///
+/// `tokio::time::interval` panics on a zero duration; clamping to 1 ms
+/// turns a misconfigured `TxSyncerConfig::sync_interval == 0` into a
+/// "tight-ish loop" instead of a startup crash. Matches the defensive
+/// posture of [`SeenTxCache::new`] for `seen_cache_size == 0`.
+const MIN_TICK_INTERVAL: Duration = Duration::from_millis(1);
 
 /// One cycle of the sync loop.
 ///
@@ -744,6 +783,31 @@ mod tests {
         let b = syncer.seen_cache();
         a.insert(d(7));
         assert!(b.contains(&d(7)));
+    }
+
+    /// Regression: `start()` with `sync_interval == Duration::ZERO` must
+    /// not panic. `tokio::time::interval(0)` panics, so `start()` clamps to
+    /// `MIN_TICK_INTERVAL`.
+    #[tokio::test]
+    async fn txsyncer_zero_sync_interval_is_clamped() {
+        let cfg = TxSyncerConfig {
+            sync_interval: Duration::ZERO,
+            ..TxSyncerConfig::default()
+        };
+        let syncer = TxSyncer::new(
+            cfg,
+            Arc::new(FakePool(Vec::new())),
+            Arc::new(EmptyPeerSource),
+            Arc::new(NoOpSolicitedTxHandler),
+        );
+        // No panic on start.
+        syncer.start();
+        // Give the spawned task a moment to reach its tick loop, to prove
+        // the clamp took effect rather than the task panicking immediately.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(syncer.is_running());
+        syncer.stop().await;
+        assert!(!syncer.is_running());
     }
 
     /// Regression: a stopped syncer must be restartable.
