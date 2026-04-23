@@ -24,6 +24,7 @@ pub mod ws_peer;
 pub mod discovery;
 pub mod dns_bootstrap;
 pub mod gossip_node;
+pub mod local_tx_broadcast;
 pub mod mesh;
 pub mod message_filter;
 pub mod peer_role;
@@ -246,6 +247,15 @@ pub use tx_syncer::{
 
 // Decoder + MessageHandler for inbound TX-tagged gossip messages
 pub use tx_tag_handler::{decode_tx_message, TxTagError, TxTagHandler, MAX_TX_GROUP_SIZE};
+
+// ---------------------------------------------------------------------------
+// Re-exports: Local txn broadcast (Plan 33, gap G1 — outbound half)
+// ---------------------------------------------------------------------------
+
+// Pool ingest trait, adapter, and local-txn broadcast orchestrator
+pub use local_tx_broadcast::{
+    encode_tx_group, LocalTxBroadcaster, LocalTxError, PoolIngest, PoolIngestAdapter,
+};
 
 // ---------------------------------------------------------------------------
 // Message filtering helpers
