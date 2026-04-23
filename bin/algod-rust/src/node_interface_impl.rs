@@ -25,7 +25,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use algo_codec::canonical_encode_block_header;
+use algo_codec::{canonical_encode_block_header, compute_block_digest};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{SqliteLedger, StateDelta};
 use algo_rest_api::node::{
@@ -368,19 +368,64 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     async fn get_block_hash(&self, round: u64) -> Result<Option<Digest>, NodeError> {
-        // Derive the digest from the header directly — go-algorand's block
-        // hash is SHA512/256("BH" || canonical(header)), and the header alone
-        // is sufficient. Using the header path avoids decoding the full
-        // payset (which keeps `/v2/blocks/{round}/hash` robust against any
-        // future full-block decoding drift that would leave the header
-        // unaffected).
-        let header_opt = {
+        // Prefer the header-only path (SHA512/256("BH" || canonical(header)))
+        // — it's cheaper and doesn't depend on full-block decoding. Fall
+        // back to the full block when header bytes are missing or empty:
+        // `bin/algod-rust/src/commands/relay.rs` stores blocks with
+        // `put_block(round, "", &[], block_data)` — a valid persisted row
+        // with empty `hdrdata`. The pre-refactor impl hashed via
+        // `compute_block_digest(&block)`, which kept relay-populated rows
+        // hashable; this fallback preserves that behavior.
+        let (hdr_bytes_opt, blk_bytes_opt) = {
             let ledger = self.ledger.lock().expect("ledger lock poisoned");
-            ledger
-                .get_block_header(round)
-                .map_err(|e| NodeError::Internal(format!("get_block_header({round}): {e}")))?
+            let h = ledger
+                .get_block_header_data(round)
+                .map_err(|e| NodeError::Internal(format!("get_block_header_data({round}): {e}")))?;
+            let b = ledger
+                .get_block_data(round)
+                .map_err(|e| NodeError::Internal(format!("get_block_data({round}): {e}")))?;
+            (h, b)
         };
-        Ok(header_opt.map(|h| Self::block_digest_from_header(&h)))
+
+        // Row completely absent → Ok(None) (matches the trait's documented
+        // semantic: not-yet-available rounds return None, not an error).
+        let hdr_nonempty = hdr_bytes_opt
+            .as_deref()
+            .map(|b| !b.is_empty())
+            .unwrap_or(false);
+        let blk_nonempty = blk_bytes_opt
+            .as_deref()
+            .map(|b| !b.is_empty())
+            .unwrap_or(false);
+        if !hdr_nonempty && !blk_nonempty {
+            return Ok(None);
+        }
+
+        // Header path — only used when `hdrdata` is present and non-empty.
+        // A decode failure falls through to the blkdata path rather than
+        // surfacing an Internal error; this mirrors the pre-refactor
+        // behavior for rows with malformed headers but intact blocks.
+        if hdr_nonempty {
+            let hdr_bytes = hdr_bytes_opt
+                .as_deref()
+                .expect("hdr_nonempty checked above");
+            if let Ok(header) = BlockHeader::decode_from_reader(&mut &*hdr_bytes) {
+                return Ok(Some(Self::block_digest_from_header(&header)));
+            }
+        }
+
+        // Fallback: decode the full block and hash via compute_block_digest.
+        let blk_bytes = blk_bytes_opt
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| {
+                NodeError::Internal(format!(
+                    "block {round} has unusable hdrdata and no blkdata fallback"
+                ))
+            })?;
+        let block = Block::decode_from_bytes(blk_bytes)
+            .map_err(|e| NodeError::Internal(format!("decode block {round}: {e}")))?;
+        Ok(Some(compute_block_digest(&block)))
     }
 
     async fn get_block_raw_msgpack(&self, round: u64) -> Result<Vec<u8>, NodeError> {
@@ -706,6 +751,52 @@ mod tests {
         expected.extend_from_slice(b"block");
         expected.extend_from_slice(&stored_block);
         assert_eq!(raw, expected);
+    }
+
+    #[tokio::test]
+    async fn get_block_hash_falls_back_to_blkdata_when_hdrdata_is_empty() {
+        // Mirrors the relay writer in commands/relay.rs which calls
+        // `put_block(round, "", &[], block_data)` — i.e. valid `blkdata`
+        // but empty `hdrdata`. The adapter must still produce the correct
+        // hash via the full-block path.
+        use algo_codec::compute_block_digest;
+        use algo_types::{Block, Round};
+
+        let block = Block {
+            round: Round(9),
+            current_protocol: CONSENSUS_V41.into(),
+            ..Block::default()
+        };
+        let blkdata = rmp_serde::to_vec_named(&block).expect("encode block");
+
+        let ledger_arc = Arc::new(Mutex::new(
+            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+        ));
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            // Empty proto + empty hdrdata, non-empty blkdata — matches relay.
+            ledger
+                .put_block(9, "", &[], &blkdata)
+                .expect("put_block ok");
+        }
+
+        let adapter = adapter_with_ledger(ledger_arc);
+        let hash = adapter
+            .get_block_hash(9)
+            .await
+            .expect("get_block_hash ok")
+            .expect("hash present");
+        assert_eq!(hash, compute_block_digest(&block));
+    }
+
+    #[tokio::test]
+    async fn get_block_hash_returns_none_when_row_is_absent() {
+        // The adapter must distinguish "round not yet committed" (Ok(None))
+        // from "round is present but corrupted" (Err). An absent row is the
+        // former — `get_block_header_data` + `get_block_data` both return
+        // None, so the method returns Ok(None).
+        let adapter = make_adapter();
+        assert!(matches!(adapter.get_block_hash(123).await, Ok(None)));
     }
 
     #[tokio::test]
