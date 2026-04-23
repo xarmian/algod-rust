@@ -387,6 +387,16 @@ pub enum Commands {
         #[arg(long, short = 'b')]
         listen_address: Option<String>,
 
+        /// Act as a relay for gossip messages (forward received
+        /// transactions + blocks to other peers instead of only
+        /// handling them locally). Ignored unless `--listen-address`
+        /// is also set, mirroring go-algorand's `NetAddress != "" &&
+        /// Relay == true` gate. Required when another participate
+        /// node connects to this one over gossip, e.g. in the
+        /// two-binary REST-driven propagation integration test.
+        #[arg(long)]
+        relay_messages: bool,
+
         /// 32-byte hex genesis hash for block validation.
         #[arg(long)]
         genesis_hash: Option<String>,
