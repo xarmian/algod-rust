@@ -28,11 +28,15 @@ use std::time::Duration;
 use algo_codec::{canonical_encode_block_header, compute_block_digest};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{SqliteLedger, StateDelta};
+use algo_pool::TransactionPool;
 use algo_rest_api::node::{
     AccountLookup, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
+    TxnWithStatus,
 };
 use algo_types::consensus::consensus_params_for_version;
-use algo_types::{AccountData, Address, Block, BlockHeader, ConsensusParams, Digest};
+use algo_types::{
+    AccountData, Address, Block, BlockHeader, ConsensusParams, Digest, SignedTransaction,
+};
 use async_trait::async_trait;
 use sha2::{Digest as _, Sha512_256};
 
@@ -92,13 +96,19 @@ pub struct NodeInterfaceConfig {
     pub default_protocol: String,
 }
 
-/// Production `NodeInterface` adapter backed by a live [`SqliteLedger`].
+/// Production `NodeInterface` adapter backed by a live [`SqliteLedger`] and
+/// (optionally) an in-memory [`TransactionPool`].
 ///
 /// Cheap to clone-by-`Arc` and share across REST handlers. The adapter
-/// exposes only read-heavy methods for now; write paths (broadcast, simulate,
-/// participation-key installation) are added by downstream PLAN-74 tasks.
+/// exposes read-heavy methods plus pool lookups; write paths (broadcast,
+/// simulate, participation-key installation) are added by downstream
+/// PLAN-74 tasks. The pool is optional so tests and subcommands that don't
+/// need pending-transaction state (e.g. read-only catchpoint replay) can
+/// construct the adapter without one — the pool-dependent trait methods
+/// fall back to [`NodeError::NotImplemented`] when the pool is absent.
 pub struct AlgodNodeInterface {
     ledger: Arc<Mutex<SqliteLedger>>,
+    pool: Option<Arc<TransactionPool>>,
     genesis_id: String,
     genesis_hash: Digest,
     genesis_json: String,
@@ -107,17 +117,39 @@ pub struct AlgodNodeInterface {
 }
 
 impl AlgodNodeInterface {
-    /// Construct a new adapter. See [`NodeInterfaceConfig`] for the field
-    /// semantics.
+    /// Construct a new adapter without a transaction pool — suitable for
+    /// read-only ledger inspection. Pool-dependent trait methods will report
+    /// `NodeError::NotImplemented` until a pool is attached via
+    /// [`Self::with_pool`].
     pub fn new(ledger: Arc<Mutex<SqliteLedger>>, config: NodeInterfaceConfig) -> Self {
         Self {
             ledger,
+            pool: None,
             genesis_id: config.genesis_id,
             genesis_hash: config.genesis_hash,
             genesis_json: config.genesis_json,
             build_version: config.build_version,
             default_protocol: config.default_protocol,
         }
+    }
+
+    /// Attach a transaction pool to the adapter. Builder-style so a single
+    /// `AlgodNodeInterface::new(...).with_pool(pool)` call covers the common
+    /// "full-node" path in the binary wiring (TASK-79) while tests can
+    /// continue constructing an adapter without a pool.
+    #[must_use]
+    pub fn with_pool(mut self, pool: Arc<TransactionPool>) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// Return the attached pool or a [`NodeError::NotImplemented`] if none
+    /// was set. Used by pool-backed trait methods as a single-site check so
+    /// the error string is consistent.
+    fn pool(&self, method: &'static str) -> Result<&TransactionPool, NodeError> {
+        self.pool
+            .as_deref()
+            .ok_or(NodeError::NotImplemented(method))
     }
 
     /// Resolve the effective protocol string for a locked ledger guard,
@@ -529,6 +561,57 @@ impl NodeInterface for AlgodNodeInterface {
         };
         Self::resolve_consensus_params(&proto)
     }
+
+    // ---- Pool-backed methods (TASK-76) ----
+
+    async fn get_pending_txns_from_pool(&self) -> Result<Vec<SignedTransaction>, NodeError> {
+        let pool = self.pool("get_pending_txns_from_pool")?;
+        // `pending_tx_groups` snapshots the pool's proposal-ordered groups.
+        // Flatten into a single list — go-algorand's
+        // `GetPendingTxnsFromPool` returns exactly this shape.
+        let groups = pool.pending_tx_groups();
+        let flat: Vec<SignedTransaction> = groups.into_iter().flatten().collect();
+        Ok(flat)
+    }
+
+    async fn get_pending_transaction(
+        &self,
+        txid: &Digest,
+    ) -> Result<Option<TxnWithStatus>, NodeError> {
+        let pool = self.pool("get_pending_transaction")?;
+
+        // `pool.lookup(txid)` returns one of:
+        //   - still pending:       (txn,     "",   true)  → pool hit, no error
+        //   - recently evicted:    (default, err,  true)  → tombstoned with a reason
+        //   - never seen (miss):   (default, "",   false) → not in pool / status cache
+        //
+        // go-algorand's `Node.GetPendingTransaction` then searches the last
+        // `MaxTxnLife` blocks for a confirmed copy; that block-side lookup
+        // is tracked as a follow-up (TASK-75 already lands ledger-read
+        // methods; wiring them into this method is out of PLAN-74 TASK-76's
+        // scope — see the `pool-only for now` note below).
+        let (txn, pool_error, found) = pool.lookup(txid);
+        if !found {
+            return Ok(None);
+        }
+        Ok(Some(TxnWithStatus {
+            txn,
+            // confirmed_round stays 0 while the txn is in-pool or tombstoned;
+            // block-side confirmation lookup lands in a follow-up task.
+            confirmed_round: 0,
+            pool_error,
+            closing_amount: 0,
+            asset_closing_amount: 0,
+            sender_rewards: 0,
+            receiver_rewards: 0,
+            close_rewards: 0,
+            asset_index: None,
+            application_index: None,
+            eval_delta: None,
+            logs: None,
+            inner_txns: None,
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -797,6 +880,98 @@ mod tests {
         // None, so the method returns Ok(None).
         let adapter = make_adapter();
         assert!(matches!(adapter.get_block_hash(123).await, Ok(None)));
+    }
+
+    /// Minimal `PoolLedger` impl so tests can construct a real
+    /// `TransactionPool` without pulling in the participate-subcommand
+    /// plumbing. The pool methods under test (`pending_tx_groups`,
+    /// `lookup`) do not exercise any `PoolLedger` method, so the stubs can
+    /// return trivially.
+    struct PoolLedgerStub;
+
+    impl algo_pool::traits::PoolLedger for PoolLedgerStub {
+        fn latest(&self) -> algo_types::Round {
+            algo_types::Round(0)
+        }
+
+        fn block_hdr(
+            &self,
+            _round: algo_types::Round,
+        ) -> Result<algo_types::BlockHeader, algo_error::AlgoError> {
+            Ok(algo_types::BlockHeader::default())
+        }
+
+        fn consensus_params(
+            &self,
+            _round: algo_types::Round,
+        ) -> Result<algo_types::ConsensusParams, algo_error::AlgoError> {
+            Ok(algo_types::ConsensusParams::default())
+        }
+
+        fn start_evaluator(
+            &self,
+            _hdr: algo_types::BlockHeader,
+            _payset_hint: usize,
+            _max_txn_bytes_per_block: usize,
+        ) -> Result<Box<dyn algo_pool::traits::BlockEvaluator>, algo_error::AlgoError> {
+            // Not needed by the pool methods under test.
+            Err(algo_error::AlgoError::Ledger {
+                message: "PoolLedgerStub::start_evaluator intentionally unimplemented".into(),
+            })
+        }
+    }
+
+    fn adapter_with_pool() -> AlgodNodeInterface {
+        let pool = Arc::new(algo_pool::TransactionPool::new(
+            algo_pool::PoolConfig::default(),
+            Arc::new(PoolLedgerStub),
+        ));
+        make_adapter().with_pool(pool)
+    }
+
+    #[tokio::test]
+    async fn pool_methods_return_not_implemented_without_pool() {
+        let adapter = make_adapter();
+        let err = adapter
+            .get_pending_txns_from_pool()
+            .await
+            .expect_err("should require pool");
+        match err {
+            NodeError::NotImplemented(name) => {
+                assert_eq!(name, "get_pending_txns_from_pool");
+            }
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+        let err = adapter
+            .get_pending_transaction(&Digest([0u8; 32]))
+            .await
+            .expect_err("should require pool");
+        match err {
+            NodeError::NotImplemented(name) => {
+                assert_eq!(name, "get_pending_transaction");
+            }
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_pending_txns_from_pool_returns_empty_vec_when_pool_is_idle() {
+        let adapter = adapter_with_pool();
+        let txns = adapter
+            .get_pending_txns_from_pool()
+            .await
+            .expect("empty pool ok");
+        assert!(txns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_pending_transaction_returns_none_for_unknown_txid() {
+        let adapter = adapter_with_pool();
+        let got = adapter
+            .get_pending_transaction(&Digest([0xFFu8; 32]))
+            .await
+            .expect("lookup ok");
+        assert!(got.is_none());
     }
 
     #[tokio::test]
