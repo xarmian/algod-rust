@@ -387,6 +387,33 @@ pub enum Commands {
         #[arg(long, short = 'b')]
         listen_address: Option<String>,
 
+        /// Act as a gossip relay: accept inbound peer dials on
+        /// `--listen-address` and allow locally-originated /
+        /// consensus-generated messages to be rebroadcast to peers.
+        ///
+        /// The inbound-listener side is gated on `--listen-address`
+        /// being set, mirroring go-algorand's
+        /// `is_relay = NetAddress != "" && Relay`. The outbound side
+        /// (the broadcast thread + the `broadcast()` path on
+        /// `WebsocketNetwork`) is enabled whenever this flag is set,
+        /// which is what lets `LocalTxBroadcaster` fan a local txn
+        /// out to connected peers — passing `--relay-messages`
+        /// without `--listen-address` therefore still has an effect
+        /// (though such a node has no way to accept inbound peers
+        /// to forward to).
+        ///
+        /// Note: peer-originated transactions received on the
+        /// `Transaction` tag are NOT re-relayed today — the handler
+        /// drops them after ingesting into the local pool. Relay
+        /// forwarding of third-party TX gossip is a separate
+        /// follow-up.
+        ///
+        /// Required when another participate node needs to connect
+        /// to this one over gossip (e.g. in the two-binary
+        /// REST-driven propagation integration test).
+        #[arg(long)]
+        relay_messages: bool,
+
         /// 32-byte hex genesis hash for block validation.
         #[arg(long)]
         genesis_hash: Option<String>,

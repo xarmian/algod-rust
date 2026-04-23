@@ -2026,6 +2026,7 @@ pub async fn run(
     peers: &[String],
     partkey_path: &Path,
     listen_address: Option<&str>,
+    relay_messages: bool,
     genesis_hash_hex: Option<&str>,
     rest_opts: RestOptions,
 ) -> anyhow::Result<()> {
@@ -2128,7 +2129,16 @@ pub async fn run(
         genesis_id: resolved_genesis_id.clone(),
         network_id: network.to_string(),
         net_address: listen_address.map(|s| s.to_string()),
-        relay_messages: false, // participation node, not a relay
+        // Default participation nodes to "peer" (non-relay) mode;
+        // `--relay-messages` lets callers opt this node into a relay
+        // role when another peer needs to dial it for gossip (e.g.
+        // the two-binary tx-propagation E2E in PLAN-74 / TASK-80).
+        // `WebsocketNetwork` gates the inbound listener on both
+        // `net_address.is_some()` and `relay_messages`, so setting
+        // this flag without `--listen-address` only enables outbound
+        // broadcast forwarding — typically useful only when both are
+        // set together.
+        relay_messages,
         gossip_fanout: peers.len().max(algo_network::DEFAULT_GOSSIP_FANOUT),
         ..Default::default()
     };
@@ -2166,9 +2176,36 @@ pub async fn run(
         },
     ]);
 
+    // -------------------------------------------------------------------
+    // Bootstrap the pool's block evaluator from the current ledger tip
+    // BEFORE starting the gossip network.
+    //
+    // Without this, submissions routed through `LocalTxBroadcaster`
+    // (either in-process or via the REST `POST /v2/transactions` path)
+    // fail with `PoolError::NoPendingBlockEvaluator` until agreement
+    // commits its first block. The pool's `recompute_block_evaluator`
+    // reads `ledger.latest()` + `block_hdr(latest)` to build the
+    // evaluator, so the `Block` passed here is purely a trigger — its
+    // fields are ignored. Mirrors go-algorand's `node.go:startNode`,
+    // which calls `pool.OnNewBlock` during node initialization to
+    // prime the pool.
+    //
+    // Bootstrapping before `start_arc()` closes the second startup
+    // race noted in PLAN-33 / TASK-69 (gap G1 in DOC-23): inbound TX
+    // frames that arrive immediately after the listener binds would
+    // otherwise call `pool.remember()` on a pool with no evaluator
+    // and surface as `NoPendingBlockEvaluator` errors.
+    //
+    // On a freshly-initialized ledger that lacks a tip block,
+    // `recompute_block_evaluator` returns early and leaves the pool
+    // without an evaluator, which is the pre-bootstrap behavior —
+    // this call is strictly additive.
+    // -------------------------------------------------------------------
+    pool.on_new_block(&algo_types::Block::default(), &HashSet::new());
+
     // Start the network (listener + mesh). TX-tag handler is already
-    // wired, so inbound transactions cannot slip past during the
-    // startup window.
+    // wired AND the pool has its evaluator, so inbound transactions
+    // cannot slip past during the startup window.
     gossip_node
         .start_arc()
         .await

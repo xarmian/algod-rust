@@ -313,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
             peers,
             partkey_path,
             listen_address,
+            relay_messages,
             genesis_hash,
             rest_listen,
             data_dir,
@@ -333,6 +334,7 @@ async fn main() -> anyhow::Result<()> {
                 &peers,
                 &partkey_path,
                 listen_address.as_deref(),
+                relay_messages,
                 genesis_hash.as_deref(),
                 rest_opts,
             )
