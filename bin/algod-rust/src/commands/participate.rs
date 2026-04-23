@@ -39,6 +39,14 @@ use crate::commands::network_common::genesis_id_for;
 use crate::config::RestConfig;
 use crate::node_interface_impl::{AlgodNodeInterface, NodeInterfaceConfig};
 
+/// Upper bound on how long Ctrl-C is willing to wait for the REST
+/// server's graceful shutdown to drain. The `wait_for_round` handler
+/// already honours the shutdown token and should return promptly; this
+/// cap is defence-in-depth for a hypothetical future handler that
+/// forgets to. Short enough that operators aren't tempted to SIGKILL
+/// the process, long enough that normal in-flight requests finish.
+const REST_SHUTDOWN_HARD_CAP: Duration = Duration::from_secs(5);
+
 /// A no-op `EventsProcessingMonitor` for production use.
 ///
 /// Unlike `StubEventsProcessingMonitor` which stores all events in a Vec
@@ -1925,31 +1933,66 @@ impl RestOptions {
 }
 
 /// Best-effort load of `genesis.json`. Tries the explicit
-/// `genesis_path` first, then `<data_dir>/genesis.json`. Returns
-/// `Ok(None)` when neither file exists; returns `Err` only on real I/O
-/// errors (permission denied, partial read, etc.) so a missing file
-/// never blocks startup.
+/// `genesis_path` first and, on `NotFound`, falls back to
+/// `<data_dir>/genesis.json`. Returns `Ok(None)` only when *both*
+/// candidates are absent (or neither candidate was provided); returns
+/// `Err` on real I/O errors (permission denied, partial read, etc.)
+/// so a missing file never blocks startup while a misconfigured one
+/// does.
+///
+/// The fallback chain matters when an operator passes
+/// `--genesis-path` pointing at a stale location: the documented
+/// behaviour is "use the explicit path if present, otherwise try the
+/// data-dir default". The prior short-circuit on explicit-NotFound
+/// silently synthesized a stub, which could make `/genesis` serve
+/// incorrect bytes when a real file was available under `data_dir`.
 fn load_genesis_json(
     explicit: Option<&Path>,
     data_dir: Option<&Path>,
 ) -> anyhow::Result<Option<String>> {
-    let candidate = explicit
-        .map(Path::to_path_buf)
-        .or_else(|| data_dir.map(|d| d.join("genesis.json")));
-    let Some(path) = candidate else {
-        return Ok(None);
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => {
-            info!(path = %path.display(), bytes = contents.len(), "loaded genesis.json");
-            Ok(Some(contents))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(anyhow::anyhow!(
-            "failed to read genesis.json at {}: {e}",
-            path.display()
-        )),
+    // Walk the candidate list in priority order. Each entry is
+    // (path, origin-label); the label appears in log lines so
+    // operators can see which candidate served the response.
+    let mut candidates: Vec<(std::path::PathBuf, &'static str)> = Vec::new();
+    if let Some(p) = explicit {
+        candidates.push((p.to_path_buf(), "--genesis-path"));
     }
+    if let Some(dir) = data_dir {
+        let derived = dir.join("genesis.json");
+        // Deduplicate — if `--genesis-path` already pointed at the
+        // same file, we don't want a noisy second read attempt.
+        if !candidates.iter().any(|(p, _)| p == &derived) {
+            candidates.push((derived, "<data_dir>/genesis.json"));
+        }
+    }
+
+    for (path, origin) in &candidates {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                info!(
+                    path = %path.display(),
+                    origin = origin,
+                    bytes = contents.len(),
+                    "loaded genesis.json"
+                );
+                return Ok(Some(contents));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Try the next candidate. Missing files are soft
+                // failures so the synthesized stub remains available
+                // as a last resort.
+                continue;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to read genesis.json at {} ({}): {e}",
+                    path.display(),
+                    origin
+                ));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Build a stub genesis.json body for the REST `/genesis` endpoint
@@ -2185,7 +2228,8 @@ pub async fn run(
 
         let mut adapter = AlgodNodeInterface::new(ledger.clone(), node_config)
             .with_pool(pool.clone())
-            .with_broadcaster(broadcaster.clone());
+            .with_broadcaster(broadcaster.clone())
+            .with_shutdown_token(shutdown_token.clone());
         if let Some(capacity) = cfg.async_backlog_size {
             adapter = adapter.with_async_backlog_capacity(capacity);
         }
@@ -2389,12 +2433,20 @@ pub async fn run(
 
     // Await the REST server last — its graceful shutdown depends on
     // axum finishing any in-flight requests, and by now gossip has
-    // stopped serving fresh data so the responses are stable.
+    // stopped serving fresh data so the responses are stable. The
+    // adapter's `wait_for_round` honours `shutdown_token` so
+    // long-poll `wait-for-block-after` handlers return 408 promptly
+    // instead of hanging out their full 60s deadline; a hard-cap
+    // timeout is still applied as a defence-in-depth safety net in
+    // case a future handler forgets to honour the token.
     if let Some(join_handle) = rest_server_handle {
-        if let Err(e) = join_handle.await {
-            warn!(err = %e, "REST API server task terminated unexpectedly");
-        } else {
-            info!("REST API server stopped");
+        match tokio::time::timeout(REST_SHUTDOWN_HARD_CAP, join_handle).await {
+            Ok(Ok(())) => info!("REST API server stopped"),
+            Ok(Err(e)) => warn!(err = %e, "REST API server task terminated unexpectedly"),
+            Err(_) => warn!(
+                cap = ?REST_SHUTDOWN_HARD_CAP,
+                "REST API server did not drain within the shutdown cap; abandoning the join handle"
+            ),
         }
     }
     info!("consensus participation stopped");
@@ -2564,12 +2616,79 @@ mod tests {
     }
 
     #[test]
-    fn load_genesis_json_missing_explicit_file_returns_none() {
-        // Missing file must not be a hard error — startup should fall
-        // back to the synthesized stub instead of aborting.
-        let got = load_genesis_json(Some(std::path::Path::new("/no/such/genesis.json")), None)
-            .expect("ok even when file absent");
+    fn load_genesis_json_missing_explicit_falls_back_to_data_dir() {
+        // When `--genesis-path` points at a missing file but
+        // `<data_dir>/genesis.json` exists, the real file wins — we
+        // must not silently synthesize a stub when a real file is
+        // available under the data directory.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-test-dd-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let data_dir_genesis = tmp_dir.join("genesis.json");
+        std::fs::write(&data_dir_genesis, r#"{"network":"fallback"}"#).unwrap();
+
+        let got = load_genesis_json(
+            Some(std::path::Path::new("/no/such/genesis.json")),
+            Some(&tmp_dir),
+        )
+        .expect("ok — fallback succeeds")
+        .expect("data_dir/genesis.json should serve the response");
+        assert_eq!(got, r#"{"network":"fallback"}"#);
+
+        let _ = std::fs::remove_file(&data_dir_genesis);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[test]
+    fn load_genesis_json_all_candidates_absent_returns_none() {
+        // When both the explicit path and the data_dir default are
+        // missing, the function returns `Ok(None)` so startup can
+        // synthesize a stub. This is the "no real genesis file
+        // anywhere on disk" path, distinct from the fallback test
+        // above.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-test-absent-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        // Intentionally do NOT create `genesis.json` in `tmp_dir`.
+
+        let got = load_genesis_json(
+            Some(std::path::Path::new("/no/such/genesis.json")),
+            Some(&tmp_dir),
+        )
+        .expect("ok when both absent");
         assert!(got.is_none());
+
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[test]
+    fn load_genesis_json_deduplicates_when_explicit_equals_data_dir_derived() {
+        // If `--genesis-path` resolves to the same file as
+        // `<data_dir>/genesis.json`, the function must not attempt
+        // two reads. The test exercises the dedup branch by pointing
+        // both candidates at the same path.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "algod-rust-test-dedup-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let shared = tmp_dir.join("genesis.json");
+        std::fs::write(&shared, r#"{"network":"shared"}"#).unwrap();
+
+        let got = load_genesis_json(Some(&shared), Some(&tmp_dir))
+            .expect("ok")
+            .expect("shared file serves");
+        assert_eq!(got, r#"{"network":"shared"}"#);
+
+        let _ = std::fs::remove_file(&shared);
+        let _ = std::fs::remove_dir(&tmp_dir);
     }
 
     #[test]
