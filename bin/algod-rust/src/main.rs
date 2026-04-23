@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod node_interface_impl;
 
 use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
