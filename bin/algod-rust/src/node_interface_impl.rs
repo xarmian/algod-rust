@@ -579,25 +579,57 @@ impl NodeInterface for AlgodNodeInterface {
         txid: &Digest,
     ) -> Result<Option<TxnWithStatus>, NodeError> {
         let pool = self.pool("get_pending_transaction")?;
-
-        // `pool.lookup(txid)` returns one of:
-        //   - still pending:       (txn,     "",   true)  → pool hit, no error
-        //   - recently evicted:    (default, err,  true)  → tombstoned with a reason
-        //   - never seen (miss):   (default, "",   false) → not in pool / status cache
-        //
-        // go-algorand's `Node.GetPendingTransaction` then searches the last
-        // `MaxTxnLife` blocks for a confirmed copy; that block-side lookup
-        // is tracked as a follow-up (TASK-75 already lands ledger-read
-        // methods; wiring them into this method is out of PLAN-74 TASK-76's
-        // scope — see the `pool-only for now` note below).
         let (txn, pool_error, found) = pool.lookup(txid);
+        Ok(Self::map_pool_lookup(txn, pool_error, found))
+    }
+}
+
+impl AlgodNodeInterface {
+    /// Translate a raw `(txn, pool_error, found)` tuple from
+    /// [`TransactionPool::lookup`] into the trait-level response.
+    ///
+    /// The pool's `lookup` distinguishes four states, which collapse to
+    /// three observable tuples:
+    ///
+    /// | pool state                | tuple shape               | API response                        |
+    /// |---------------------------|---------------------------|-------------------------------------|
+    /// | pending (live in pool)    | `(txn,     "",   true)`   | `Some(TxnWithStatus { txn, ... })`  |
+    /// | recently evicted          | `(default, err,  true)`   | `Some(TxnWithStatus { pool_error })`|
+    /// | recently committed        | `(default, "",   true)`   | `None` — see note                   |
+    /// | never seen / miss         | `(default, "",   false)`  | `None`                              |
+    ///
+    /// The pool records committed-txid entries in its status cache with an
+    /// *empty* error string (see `pool.rs:on_new_block`), so the "recently
+    /// committed" tuple is indistinguishable from a pending-txn-with-empty
+    /// error except that the returned txn is `SignedTransaction::default()`.
+    /// Returning `Some(TxnWithStatus { txn: default, pool_error: "" })`
+    /// would be a bogus pending response (empty txn, no error). Go-algorand
+    /// handles this by then searching the last `MaxTxnLife` blocks for the
+    /// confirmation round; that block-side lookup is a follow-up outside
+    /// PLAN-74 TASK-76's scope, so we conservatively return `None` and let
+    /// the caller retry (or query the block directly) once the confirmation
+    /// path is wired.
+    ///
+    /// Extracted as an associated function so the branch logic can be
+    /// unit-tested without staging real block commits through a live pool.
+    fn map_pool_lookup(
+        txn: SignedTransaction,
+        pool_error: String,
+        found: bool,
+    ) -> Option<TxnWithStatus> {
         if !found {
-            return Ok(None);
+            return None;
         }
-        Ok(Some(TxnWithStatus {
+        let txn_is_default = txn == SignedTransaction::default();
+        if txn_is_default && pool_error.is_empty() {
+            // Recently-committed case — see the method-level comment above.
+            return None;
+        }
+        Some(TxnWithStatus {
             txn,
-            // confirmed_round stays 0 while the txn is in-pool or tombstoned;
-            // block-side confirmation lookup lands in a follow-up task.
+            // `confirmed_round` stays 0 until the block-side confirmation
+            // lookup lands in a follow-up task — pool-only results are
+            // either in-pool (0 is correct) or evicted (0 is a stub).
             confirmed_round: 0,
             pool_error,
             closing_amount: 0,
@@ -610,7 +642,7 @@ impl NodeInterface for AlgodNodeInterface {
             eval_delta: None,
             logs: None,
             inner_txns: None,
-        }))
+        })
     }
 }
 
@@ -972,6 +1004,65 @@ mod tests {
             .await
             .expect("lookup ok");
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn map_pool_lookup_miss_returns_none() {
+        let got =
+            AlgodNodeInterface::map_pool_lookup(SignedTransaction::default(), String::new(), false);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn map_pool_lookup_pending_hit_surfaces_txn_with_empty_error() {
+        // A real pending txn: non-default (distinguishable by note), no
+        // pool_error, found=true → Some with the txn echoed through.
+        use algo_types::{Transaction, TxnType};
+        use serde_bytes::ByteBuf;
+        let base = Transaction {
+            note: ByteBuf::from(b"pending-hit".to_vec()),
+            txn_type: TxnType::Pay,
+            ..Transaction::default()
+        };
+        let pending = SignedTransaction {
+            txn: base,
+            ..SignedTransaction::default()
+        };
+        let got = AlgodNodeInterface::map_pool_lookup(pending.clone(), String::new(), true)
+            .expect("pending hit should produce Some");
+        assert_eq!(got.txn, pending);
+        assert_eq!(got.confirmed_round, 0);
+        assert!(got.pool_error.is_empty());
+    }
+
+    #[test]
+    fn map_pool_lookup_evicted_surfaces_pool_error() {
+        // Evicted case: pool returns `(default, err, true)` when the txn
+        // was removed from pending via the status cache with an error.
+        let got = AlgodNodeInterface::map_pool_lookup(
+            SignedTransaction::default(),
+            "expired".to_string(),
+            true,
+        )
+        .expect("eviction should produce Some");
+        assert_eq!(got.txn, SignedTransaction::default());
+        assert_eq!(got.pool_error, "expired");
+        assert_eq!(got.confirmed_round, 0);
+    }
+
+    #[test]
+    fn map_pool_lookup_recently_committed_returns_none_until_block_lookup_wired() {
+        // Committed txns land in the status cache with an empty error
+        // string — pool returns `(default, "", true)` which by itself is
+        // meaningless. Until the block-side confirmation lookup is wired,
+        // the adapter conservatively returns None rather than a bogus
+        // pending response.
+        let got =
+            AlgodNodeInterface::map_pool_lookup(SignedTransaction::default(), String::new(), true);
+        assert!(
+            got.is_none(),
+            "committed case without block-side lookup must not synthesize a pending response"
+        );
     }
 
     #[tokio::test]
