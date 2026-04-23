@@ -28,6 +28,7 @@ use crate::actions::{
     Action, ActionType, CryptoAction, EnsureAction, NetworkAction, PseudonodeAction, RezeroAction,
     StageDigestAction,
 };
+use crate::clock::Clock;
 use crate::codec;
 use crate::demux::{Demux, ExternalDemuxSignals, ExternalEvent};
 use crate::events::ConsensusVersionView;
@@ -82,6 +83,16 @@ where
     pub monitor: M,
     /// Asynchronous crypto verifier for votes, proposals, and bundles.
     pub crypto: C,
+    /// Clock driving deadline-based timeouts in the demux.
+    ///
+    /// Production code passes `SystemClock::new()`, which preserves the
+    /// wall-clock timing behavior the service had before this field existed.
+    /// The `agreementtest::simulate` harness (TASK-81) injects a mock clock
+    /// so tests can advance deterministically without real time.
+    ///
+    /// Mirrors Go's `agreement.Parameters.Clock`
+    /// (`../go-algorand/agreement/service.go`).
+    pub clock: Arc<dyn Clock>,
     /// Optional SQLite connection for crash recovery persistence.
     ///
     /// When `Some`, agreement state is persisted to this database before
@@ -186,6 +197,7 @@ where
             random_source,
             monitor,
             crypto,
+            clock,
             crash_db,
         } = self.params;
 
@@ -254,7 +266,7 @@ where
         // Quit channel for the Demux.
         let (quit_demux_tx, quit_demux_rx) = crossbeam_channel::bounded(1);
 
-        // Construct the Demux with all channel receivers.
+        // Construct the Demux with all channel receivers and the clock.
         let mut demux = Demux::new(
             av_rx,
             pp_rx,
@@ -264,6 +276,7 @@ where
             verified_bundles_rx,
             ledger_round_rx,
             quit_demux_rx,
+            clock,
         );
         // Wire up network and ledger references for peer disconnect on decode
         // errors (G8) and round re-sampling on interruption (G9).
@@ -1340,6 +1353,7 @@ mod tests {
             random_source: StubRandomSource::constant(42),
             monitor: StubEventsProcessingMonitor::new(),
             crypto: StubCryptoVerifier::new(),
+            clock: crate::SystemClock::new(),
             crash_db: None,
         };
 
@@ -1357,6 +1371,7 @@ mod tests {
             random_source: StubRandomSource::constant(42),
             monitor: StubEventsProcessingMonitor::new(),
             crypto: StubCryptoVerifier::new(),
+            clock: crate::SystemClock::new(),
             crash_db: None,
         };
 

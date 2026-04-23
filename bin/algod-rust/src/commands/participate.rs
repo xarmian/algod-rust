@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use algo_agreement::{
     AsyncCryptoVerifier, BlockFactoryBridge, BlockValidatorBridge, EventsProcessingMonitor,
-    NetworkAdvancer, Parameters, RandomSource, Service,
+    NetworkAdvancer, Parameters, RandomSource, Service, SystemClock,
 };
 use algo_avm::group::GroupBudget;
 use algo_codec::{canonical_encode_signed_txn_in_block, canonical_encode_transaction};
@@ -2434,6 +2434,7 @@ pub async fn run(
         random_source,
         monitor,
         crypto,
+        clock: SystemClock::new(),
         crash_db: Some(crash_db),
     };
 
