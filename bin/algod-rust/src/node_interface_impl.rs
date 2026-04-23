@@ -25,15 +25,16 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use algo_codec::compute_block_digest;
+use algo_codec::canonical_encode_block_header;
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{SqliteLedger, StateDelta};
 use algo_rest_api::node::{
     AccountLookup, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
 };
 use algo_types::consensus::consensus_params_for_version;
-use algo_types::{Address, Block, BlockHeader, BlockResponse, ConsensusParams, Digest};
+use algo_types::{AccountData, Address, Block, BlockHeader, ConsensusParams, Digest};
 use async_trait::async_trait;
+use sha2::{Digest as _, Sha512_256};
 
 /// Default upgrade-vote window length (in rounds) for the current Algorand
 /// mainnet protocol.
@@ -119,26 +120,16 @@ impl AlgodNodeInterface {
         }
     }
 
-    /// Returns the current consensus protocol string reported by the ledger,
+    /// Resolve the effective protocol string for a locked ledger guard,
     /// falling back to the configured `default_protocol` when the ledger has
     /// no committed blocks yet (empty `protocol()`).
-    fn current_protocol(&self) -> String {
-        let ledger = self.ledger.lock().expect("ledger lock poisoned");
+    fn resolve_protocol(&self, ledger: &SqliteLedger) -> String {
         let live = ledger.protocol().to_string();
         if live.is_empty() {
             self.default_protocol.clone()
         } else {
             live
         }
-    }
-
-    /// Read the last-committed round, mapping the "no blocks yet" case to 0.
-    fn last_committed_round(&self) -> Result<u64, NodeError> {
-        let ledger = self.ledger.lock().expect("ledger lock poisoned");
-        let opt = ledger
-            .last_committed_round()
-            .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?;
-        Ok(opt.unwrap_or(0))
     }
 
     /// Look up the consensus params for a given protocol string.
@@ -148,14 +139,59 @@ impl AlgodNodeInterface {
         })
     }
 
-    /// Fetch the latest committed block header, if any.
-    fn latest_header(&self) -> Result<Option<BlockHeader>, NodeError> {
-        let last_round = self.last_committed_round()?;
+    /// Snapshot of the ledger-visible status fields captured under a single
+    /// `Mutex` acquisition — prevents tearing across an agreement commit that
+    /// would otherwise leave `last_round` and `latest_header` on different
+    /// rounds (a real risk when agreement/catchup commits are concurrent).
+    fn read_status_snapshot(&self) -> Result<StatusSnapshot, NodeError> {
         let ledger = self.ledger.lock().expect("ledger lock poisoned");
-        ledger
+        let last_round = ledger
+            .last_committed_round()
+            .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?
+            .unwrap_or(0);
+        let protocol = self.resolve_protocol(&ledger);
+        let latest_header = ledger
             .get_block_header(last_round)
-            .map_err(|e| NodeError::Internal(format!("get_block_header({last_round}): {e}")))
+            .map_err(|e| NodeError::Internal(format!("get_block_header({last_round}): {e}")))?;
+        Ok(StatusSnapshot {
+            last_round,
+            protocol,
+            latest_header,
+        })
     }
+
+    /// Snapshot of an account lookup captured under a single lock — keeps
+    /// `last_round` and `account_data` on the same round even if agreement
+    /// commits while the handler is running.
+    fn read_account_snapshot(&self, addr: &Address) -> Result<(u64, AccountData), NodeError> {
+        let ledger = self.ledger.lock().expect("ledger lock poisoned");
+        let last_round = ledger
+            .last_committed_round()
+            .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?
+            .unwrap_or(0);
+        let account_data = ledger.get_account(addr).unwrap_or_default();
+        Ok((last_round, account_data))
+    }
+
+    /// Compute the block digest (SHA512/256 of `"BH" || canonical(header)`)
+    /// directly from a header. Mirrors `algo_codec::compute_block_digest` but
+    /// accepts a `BlockHeader` so callers can serve `/v2/blocks/{round}/hash`
+    /// via the cheaper header-only path instead of decoding the full block.
+    fn block_digest_from_header(header: &BlockHeader) -> Digest {
+        let canonical = canonical_encode_block_header(header);
+        let mut hasher = Sha512_256::new();
+        hasher.update(b"BH");
+        hasher.update(&canonical);
+        Digest(hasher.finalize().into())
+    }
+}
+
+/// Values captured by [`AlgodNodeInterface::read_status_snapshot`] under a
+/// single lock — see that helper's docs for why.
+struct StatusSnapshot {
+    last_round: u64,
+    protocol: String,
+    latest_header: Option<BlockHeader>,
 }
 
 #[async_trait]
@@ -181,30 +217,33 @@ impl NodeInterface for AlgodNodeInterface {
     // ---- Status / upgrade vote ----
 
     async fn status(&self) -> Result<NodeStatus, NodeError> {
-        let last_round = self.last_committed_round()?;
-        let current = self.current_protocol();
-        let header = self.latest_header()?;
+        let snap = self.read_status_snapshot()?;
 
         // Protocol-switch fields come from the latest block header when
         // present; fall back to "next == current, next round = last + 1" when
         // the ledger is empty.
-        let (next_version, next_version_round, next_version_supported) = match header.as_ref() {
-            Some(h) if !h.next_protocol.is_empty() => (
-                h.next_protocol.clone(),
-                h.next_protocol_switch_on.0,
-                consensus_params_for_version(&h.next_protocol).is_some(),
-            ),
-            _ => (current.clone(), last_round.saturating_add(1), true),
-        };
+        let (next_version, next_version_round, next_version_supported) =
+            match snap.latest_header.as_ref() {
+                Some(h) if !h.next_protocol.is_empty() => (
+                    h.next_protocol.clone(),
+                    h.next_protocol_switch_on.0,
+                    consensus_params_for_version(&h.next_protocol).is_some(),
+                ),
+                _ => (
+                    snap.protocol.clone(),
+                    snap.last_round.saturating_add(1),
+                    true,
+                ),
+            };
 
         Ok(NodeStatus {
-            last_round,
+            last_round: snap.last_round,
             // Without a commit-time notification channel we cannot track the
             // wall-clock delta accurately; reported as zero until TASK-79
             // wires the adapter to the block-commit path.
             time_since_last_round: 0,
             catchup_time: 0,
-            last_version: current,
+            last_version: snap.protocol,
             next_version,
             next_version_round,
             next_version_supported,
@@ -221,11 +260,13 @@ impl NodeInterface for AlgodNodeInterface {
             catchpoint_verified_kvs: 0,
             catchpoint_total_blocks: 0,
             catchpoint_acquired_blocks: 0,
-            next_protocol_vote_before: header
+            next_protocol_vote_before: snap
+                .latest_header
                 .as_ref()
                 .map(|h| h.next_protocol_vote_before.0)
                 .unwrap_or(0),
-            next_protocol_approvals: header
+            next_protocol_approvals: snap
+                .latest_header
                 .as_ref()
                 .map(|h| h.next_protocol_approvals)
                 .unwrap_or(0),
@@ -244,7 +285,10 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     async fn min_txn_fee(&self) -> u64 {
-        let proto = self.current_protocol();
+        let proto = {
+            let ledger = self.ledger.lock().expect("ledger lock poisoned");
+            self.resolve_protocol(&ledger)
+        };
         consensus_params_for_version(&proto)
             .map(|p| p.min_txn_fee)
             .unwrap_or(1_000)
@@ -265,7 +309,14 @@ impl NodeInterface for AlgodNodeInterface {
         // on `WAIT_POLL_INTERVAL` for the planned follow-up (notification
         // channel in TASK-79).
         loop {
-            if self.last_committed_round()? >= round {
+            let last = {
+                let ledger = self.ledger.lock().expect("ledger lock poisoned");
+                ledger
+                    .last_committed_round()
+                    .map_err(|e| NodeError::Internal(format!("last_committed_round: {e}")))?
+                    .unwrap_or(0)
+            };
+            if last >= round {
                 return Ok(());
             }
             tokio::time::sleep(WAIT_POLL_INTERVAL).await;
@@ -273,7 +324,8 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     async fn latest_block_header_protocol_info(&self) -> Result<ProtocolSwitchInfo, NodeError> {
-        let info = match self.latest_header()? {
+        let snap = self.read_status_snapshot()?;
+        let info = match snap.latest_header {
             Some(h) => ProtocolSwitchInfo {
                 // An upgrade is pending iff `next_protocol` is non-empty.
                 // When there's no pending upgrade we treat the current
@@ -316,28 +368,34 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     async fn get_block_hash(&self, round: u64) -> Result<Option<Digest>, NodeError> {
-        // Reconstruct the block digest canonically (SHA512/256 of "BH" ||
-        // canonical(header)). Matches `compute_block_digest` in `algo-codec`,
-        // which is the same helper used when building block headers.
-        let block_bytes_opt = {
+        // Derive the digest from the header directly — go-algorand's block
+        // hash is SHA512/256("BH" || canonical(header)), and the header alone
+        // is sufficient. Using the header path avoids decoding the full
+        // payset (which keeps `/v2/blocks/{round}/hash` robust against any
+        // future full-block decoding drift that would leave the header
+        // unaffected).
+        let header_opt = {
             let ledger = self.ledger.lock().expect("ledger lock poisoned");
             ledger
-                .get_block_data(round)
-                .map_err(|e| NodeError::Internal(format!("get_block_data({round}): {e}")))?
+                .get_block_header(round)
+                .map_err(|e| NodeError::Internal(format!("get_block_header({round}): {e}")))?
         };
-        let Some(bytes) = block_bytes_opt else {
-            return Ok(None);
-        };
-        let block = Block::decode_from_bytes(&bytes)
-            .map_err(|e| NodeError::Internal(format!("decode block {round}: {e}")))?;
-        Ok(Some(compute_block_digest(&block)))
+        Ok(header_opt.map(|h| Self::block_digest_from_header(&h)))
     }
 
     async fn get_block_raw_msgpack(&self, round: u64) -> Result<Vec<u8>, NodeError> {
         // Mirrors go-algorand's `rpcs.RawBlockBytes(ledger, round)`: returns
         // the `{"block": block, "cert": cert}` envelope that the REST
-        // endpoint serves with `X-Algorand-Struct: block-v1`. We rebuild the
-        // envelope from the two stored halves so that clients see both parts.
+        // endpoint serves with `X-Algorand-Struct: block-v1`.
+        //
+        // Pass the stored halves through *verbatim* by hand-building the
+        // msgpack map. Decoding + re-encoding through a typed `BlockResponse`
+        // would drop unknown fields (breaking forward compatibility) and
+        // would omit the `cert` key entirely when absent due to
+        // `#[serde(skip_serializing_if)]`. See also
+        // `algo_network::block_service::encode_pre_encoded_block_cert` which
+        // uses the same hand-rolled pattern for P2P block responses —
+        // consolidating the two into a shared helper is a follow-up.
         let (block_bytes, cert_bytes_opt) = {
             let ledger = self.ledger.lock().expect("ledger lock poisoned");
             let blk = ledger
@@ -350,22 +408,25 @@ impl NodeInterface for AlgodNodeInterface {
             (blk, cert)
         };
 
-        let block = Block::decode_from_bytes(&block_bytes)
-            .map_err(|e| NodeError::Internal(format!("decode block {round}: {e}")))?;
+        let entry_count: u8 = if cert_bytes_opt.is_some() { 2 } else { 1 };
+        let mut buf = Vec::with_capacity(block_bytes.len() + 32);
 
-        let cert = match cert_bytes_opt {
-            Some(bytes) => {
-                let mut rd = bytes.as_slice();
-                let v = rmpv::decode::read_value(&mut rd)
-                    .map_err(|e| NodeError::Internal(format!("decode cert {round}: {e}")))?;
-                Some(v)
-            }
-            None => None,
-        };
+        // fixmap(N) — N <= 15 here (we only ever emit 1 or 2 entries).
+        buf.push(0x80 | entry_count);
 
-        let response = BlockResponse { block, cert };
-        rmp_serde::to_vec_named(&response)
-            .map_err(|e| NodeError::Internal(format!("encode block response: {e}")))
+        // "block" key (fixstr, length 5) + raw block bytes (already msgpack).
+        buf.push(0xa5);
+        buf.extend_from_slice(b"block");
+        buf.extend_from_slice(&block_bytes);
+
+        if let Some(cert_bytes) = cert_bytes_opt {
+            // "cert" key (fixstr, length 4) + raw cert bytes.
+            buf.push(0xa4);
+            buf.extend_from_slice(b"cert");
+            buf.extend_from_slice(&cert_bytes);
+        }
+
+        Ok(buf)
     }
 
     // ---- Ledger state delta ----
@@ -386,11 +447,7 @@ impl NodeInterface for AlgodNodeInterface {
     // ---- Account state ----
 
     async fn lookup_account(&self, addr: &Address) -> Result<AccountLookup, NodeError> {
-        let last_round = self.last_committed_round()?;
-        let account_data = {
-            let ledger = self.ledger.lock().expect("ledger lock poisoned");
-            ledger.get_account(addr).unwrap_or_default()
-        };
+        let (last_round, account_data) = self.read_account_snapshot(addr)?;
         // `AccountData` already carries the four resource maps alongside the
         // core fields — clone them into the lookup result rather than
         // re-querying per-resource accessors.
@@ -408,11 +465,7 @@ impl NodeInterface for AlgodNodeInterface {
     async fn lookup_account_basic(&self, addr: &Address) -> Result<AccountLookup, NodeError> {
         // "Basic" mode (`exclude=all` on the REST endpoint) skips the
         // potentially-large resource maps — return empty BTreeMaps.
-        let last_round = self.last_committed_round()?;
-        let account_data = {
-            let ledger = self.ledger.lock().expect("ledger lock poisoned");
-            ledger.get_account(addr).unwrap_or_default()
-        };
+        let (last_round, account_data) = self.read_account_snapshot(addr)?;
         Ok(AccountLookup {
             amount_without_pending_rewards: account_data.micro_algos,
             assets: Default::default(),
@@ -425,7 +478,10 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     async fn consensus_params(&self) -> Result<ConsensusParams, NodeError> {
-        let proto = self.current_protocol();
+        let proto = {
+            let ledger = self.ledger.lock().expect("ledger lock poisoned");
+            self.resolve_protocol(&ledger)
+        };
         Self::resolve_consensus_params(&proto)
     }
 }
@@ -557,5 +613,142 @@ mod tests {
         assert!(info.next_protocol.is_empty());
         assert!(info.next_protocol_supported);
         assert_eq!(info.next_protocol_switch_on, 0);
+    }
+
+    /// Build an adapter that wraps a supplied ledger Arc (rather than the
+    /// default in-memory one from `make_adapter`) so tests can seed blocks
+    /// before constructing the adapter.
+    fn adapter_with_ledger(ledger: Arc<Mutex<SqliteLedger>>) -> AlgodNodeInterface {
+        AlgodNodeInterface::new(
+            ledger,
+            NodeInterfaceConfig {
+                genesis_id: "testnet-v1.0".into(),
+                genesis_hash: Digest([0xAB; 32]),
+                genesis_json: r#"{"network":"testnet"}"#.into(),
+                build_version: build_version_fixture(),
+                default_protocol: CONSENSUS_V41.into(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn get_block_raw_msgpack_embeds_stored_bytes_verbatim() {
+        // `put_block` is a plain DB insert — we can seed arbitrary
+        // msgpack-valid bytes to prove the envelope is a true pass-through.
+        // Fields inside "block" that our typed Rust `Block` does not model
+        // (e.g. `zzextra`) must survive the round trip.
+        let ledger_arc = Arc::new(Mutex::new(
+            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+        ));
+
+        // fixmap(2) + "rnd":1 + "zzextra":"keep"
+        let stored_block: Vec<u8> = vec![
+            0x82, // fixmap(2)
+            0xa3, b'r', b'n', b'd', // "rnd"
+            0x01, // 1 (positive fixint)
+            0xa7, b'z', b'z', b'e', b'x', b't', b'r', b'a', // "zzextra"
+            0xa4, b'k', b'e', b'e', b'p', // "keep"
+        ];
+        let stored_hdr = stored_block.clone();
+        // fixmap(1) + "sig":0
+        let stored_cert: Vec<u8> = vec![0x81, 0xa3, b's', b'i', b'g', 0x00];
+
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            ledger
+                .put_block(7, CONSENSUS_V41, &stored_hdr, &stored_block)
+                .expect("put_block ok");
+            ledger
+                .put_block_cert(7, &stored_cert)
+                .expect("put_block_cert ok");
+        }
+
+        let adapter = adapter_with_ledger(Arc::clone(&ledger_arc));
+        let raw = adapter
+            .get_block_raw_msgpack(7)
+            .await
+            .expect("raw msgpack ok");
+
+        let mut expected = Vec::new();
+        expected.push(0x82); // fixmap(2)
+        expected.push(0xa5); // fixstr(5)
+        expected.extend_from_slice(b"block");
+        expected.extend_from_slice(&stored_block);
+        expected.push(0xa4); // fixstr(4)
+        expected.extend_from_slice(b"cert");
+        expected.extend_from_slice(&stored_cert);
+
+        assert_eq!(raw, expected, "envelope must pass stored bytes verbatim");
+    }
+
+    #[tokio::test]
+    async fn get_block_raw_msgpack_omits_cert_when_missing() {
+        let ledger_arc = Arc::new(Mutex::new(
+            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+        ));
+        let stored_block: Vec<u8> = vec![0x81, 0xa3, b'r', b'n', b'd', 0x02]; // {rnd:2}
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            ledger
+                .put_block(2, CONSENSUS_V41, &stored_block, &stored_block)
+                .expect("put_block ok");
+            // Intentionally no put_block_cert — mirrors catchpoint-backfilled
+            // blocks that arrive without their original certificate.
+        }
+        let adapter = adapter_with_ledger(ledger_arc);
+        let raw = adapter
+            .get_block_raw_msgpack(2)
+            .await
+            .expect("raw msgpack ok");
+
+        // Expected: fixmap(1) + "block" + raw bytes — no "cert" key.
+        let mut expected = vec![0x81, 0xa5];
+        expected.extend_from_slice(b"block");
+        expected.extend_from_slice(&stored_block);
+        assert_eq!(raw, expected);
+    }
+
+    #[tokio::test]
+    async fn get_block_hash_uses_header_path_and_matches_compute_block_digest() {
+        // Round-trip: encode a Block's header both ways and confirm the
+        // adapter's header-derived digest matches `algo_codec`'s
+        // `compute_block_digest` (which hashes the canonical header encoded
+        // from the full block). This guarantees the refactor from
+        // "decode full block → compute_block_digest" to
+        // "fetch header → block_digest_from_header" is hash-preserving.
+        use algo_codec::{canonical_encode_block_header_from_block, compute_block_digest};
+        use algo_types::{Block, Round};
+
+        let block = Block {
+            round: Round(5),
+            current_protocol: CONSENSUS_V41.into(),
+            ..Block::default()
+        };
+
+        // Populate the ledger with serde-encoded header/block bytes. We use
+        // the codec's canonical header encoding for `hdrdata` because that's
+        // what `SqliteLedger::get_block_header` decodes back. For `blkdata`
+        // we use rmp_serde::to_vec_named, which Block::decode_from_reader
+        // parses.
+        let hdrdata = canonical_encode_block_header_from_block(&block);
+        let blkdata = rmp_serde::to_vec_named(&block).expect("encode block");
+
+        let ledger_arc = Arc::new(Mutex::new(
+            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+        ));
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            ledger
+                .put_block(5, CONSENSUS_V41, &hdrdata, &blkdata)
+                .expect("put_block ok");
+        }
+
+        let adapter = adapter_with_ledger(ledger_arc);
+        let hash = adapter
+            .get_block_hash(5)
+            .await
+            .expect("get_block_hash ok")
+            .expect("hash present for round 5");
+        assert_eq!(hash, compute_block_digest(&block));
     }
 }
