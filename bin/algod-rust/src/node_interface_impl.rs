@@ -7,7 +7,8 @@
 //! Downstream tasks layer additional methods onto the same struct:
 //!
 //! - Pool methods (`TASK-76`) — `pending_transactions`, `get_pending_transaction`
-//! - Broadcast methods (`TASK-77`) — `broadcast_signed_tx_group`
+//! - Broadcast methods (`TASK-77`) — `broadcast_signed_tx_group`,
+//!   `async_broadcast_signed_tx_group`
 //! - Simulation (`TASK-78`) — `simulate`
 //! - CLI wiring (`TASK-79`) — constructs [`AlgodNodeInterface`] in the
 //!   `participate` / `serve` subcommands and passes it to the axum router
@@ -28,6 +29,7 @@ use std::time::Duration;
 use algo_codec::{canonical_encode_block_header, compute_block_digest};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{SqliteLedger, StateDelta};
+use algo_network::local_tx_broadcast::{LocalTxBroadcaster, LocalTxError};
 use algo_pool::TransactionPool;
 use algo_rest_api::node::{
     AccountLookup, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
@@ -39,6 +41,8 @@ use algo_types::{
 };
 use async_trait::async_trait;
 use sha2::{Digest as _, Sha512_256};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracing::warn;
 
 /// Default upgrade-vote window length (in rounds) for the current Algorand
 /// mainnet protocol.
@@ -71,6 +75,14 @@ const DEFAULT_UPGRADE_THRESHOLD: u64 = 9_000;
 /// by the commit loop.
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Default backlog size for the `async_broadcast_signed_tx_group` admission
+/// semaphore, matching go-algorand's `TxBacklogSize = 26000` default in
+/// `config/localTemplate.go` @ `v4.5.1-stable`. Under saturation the async
+/// trait method returns an error rather than spawning unbounded tasks.
+/// TASK-79 will wire this through `algod-rust.toml` so operators can tune
+/// it from the node config.
+const DEFAULT_ASYNC_BACKLOG_SIZE: usize = 26_000;
+
 /// Construction-time configuration for [`AlgodNodeInterface`].
 ///
 /// All fields are cached on the adapter so per-call trait methods stay
@@ -97,18 +109,27 @@ pub struct NodeInterfaceConfig {
 }
 
 /// Production `NodeInterface` adapter backed by a live [`SqliteLedger`] and
-/// (optionally) an in-memory [`TransactionPool`].
+/// (optionally) an in-memory [`TransactionPool`] + [`LocalTxBroadcaster`].
 ///
 /// Cheap to clone-by-`Arc` and share across REST handlers. The adapter
-/// exposes read-heavy methods plus pool lookups; write paths (broadcast,
-/// simulate, participation-key installation) are added by downstream
-/// PLAN-74 tasks. The pool is optional so tests and subcommands that don't
-/// need pending-transaction state (e.g. read-only catchpoint replay) can
-/// construct the adapter without one — the pool-dependent trait methods
-/// fall back to [`NodeError::NotImplemented`] when the pool is absent.
+/// exposes read-heavy methods plus pool lookups and tx broadcast; simulate
+/// and participation-key installation are still added by downstream
+/// PLAN-74 tasks. The pool and broadcaster are optional so tests and
+/// subcommands that don't need write paths (e.g. read-only catchpoint
+/// replay) can construct the adapter without them — the dependent trait
+/// methods fall back to [`NodeError::NotImplemented`] when the collaborator
+/// is absent.
 pub struct AlgodNodeInterface {
     ledger: Arc<Mutex<SqliteLedger>>,
     pool: Option<Arc<TransactionPool>>,
+    broadcaster: Option<Arc<LocalTxBroadcaster>>,
+    /// Bounded admission semaphore for
+    /// [`NodeInterface::async_broadcast_signed_tx_group`] — shed load
+    /// instead of spawning unbounded `tokio::spawn` tasks. Mirrors
+    /// go-algorand's `backlogQueue` in `data/txHandler.go`. Default
+    /// capacity is [`DEFAULT_ASYNC_BACKLOG_SIZE`]; override via
+    /// [`Self::with_async_backlog_capacity`].
+    async_backlog_permits: Arc<Semaphore>,
     genesis_id: String,
     genesis_hash: Digest,
     genesis_json: String,
@@ -117,20 +138,36 @@ pub struct AlgodNodeInterface {
 }
 
 impl AlgodNodeInterface {
-    /// Construct a new adapter without a transaction pool — suitable for
-    /// read-only ledger inspection. Pool-dependent trait methods will report
-    /// `NodeError::NotImplemented` until a pool is attached via
-    /// [`Self::with_pool`].
+    /// Construct a new adapter without a transaction pool or broadcaster
+    /// — suitable for read-only ledger inspection. Pool- and
+    /// broadcaster-dependent trait methods will report
+    /// `NodeError::NotImplemented` until the collaborators are attached via
+    /// [`Self::with_pool`] / [`Self::with_broadcaster`].
     pub fn new(ledger: Arc<Mutex<SqliteLedger>>, config: NodeInterfaceConfig) -> Self {
         Self {
             ledger,
             pool: None,
+            broadcaster: None,
+            async_backlog_permits: Arc::new(Semaphore::new(DEFAULT_ASYNC_BACKLOG_SIZE)),
             genesis_id: config.genesis_id,
             genesis_hash: config.genesis_hash,
             genesis_json: config.genesis_json,
             build_version: config.build_version,
             default_protocol: config.default_protocol,
         }
+    }
+
+    /// Override the async-broadcast backlog capacity. TASK-79 will call
+    /// this from the node-config loader so operators can tune the
+    /// `/v2/transactions/async` admission window.
+    #[must_use]
+    pub fn with_async_backlog_capacity(mut self, capacity: usize) -> Self {
+        // `Semaphore::new(0)` is legal (immediately refuses everything)
+        // but a zero capacity is almost certainly a misconfiguration, so
+        // floor at 1 to keep at least one slot open. Matches the
+        // `SeenTxCache::new` behavior.
+        self.async_backlog_permits = Arc::new(Semaphore::new(capacity.max(1)));
+        self
     }
 
     /// Attach a transaction pool to the adapter. Builder-style so a single
@@ -143,6 +180,15 @@ impl AlgodNodeInterface {
         self
     }
 
+    /// Attach a [`LocalTxBroadcaster`] so `broadcast_signed_tx_group` and
+    /// `async_broadcast_signed_tx_group` route submitted groups through the
+    /// ingest → gossip path. Builder-style to match [`Self::with_pool`].
+    #[must_use]
+    pub fn with_broadcaster(mut self, broadcaster: Arc<LocalTxBroadcaster>) -> Self {
+        self.broadcaster = Some(broadcaster);
+        self
+    }
+
     /// Return the attached pool or a [`NodeError::NotImplemented`] if none
     /// was set. Used by pool-backed trait methods as a single-site check so
     /// the error string is consistent.
@@ -150,6 +196,54 @@ impl AlgodNodeInterface {
         self.pool
             .as_deref()
             .ok_or(NodeError::NotImplemented(method))
+    }
+
+    /// Return the attached broadcaster (or [`NodeError::NotImplemented`]
+    /// when absent) plus an `Arc` clone suitable for spawning onto
+    /// `tokio::spawn` for the fire-and-forget variant.
+    fn broadcaster(&self, method: &'static str) -> Result<Arc<LocalTxBroadcaster>, NodeError> {
+        self.broadcaster
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or(NodeError::NotImplemented(method))
+    }
+
+    /// Try to reserve a slot on the async-broadcast backlog semaphore.
+    /// Returns an owned permit (moved into the background task so it's
+    /// released when `submit_group` completes) or
+    /// [`NodeError::Internal`] with a fixed `"broadcast: async backlog
+    /// full"` prefix when all slots are in use. Extracted as a helper so
+    /// the admission logic is unit-testable without standing up a live
+    /// broadcaster.
+    fn reserve_async_backlog_permit(
+        permits: &Arc<Semaphore>,
+    ) -> Result<OwnedSemaphorePermit, NodeError> {
+        Arc::clone(permits)
+            .try_acquire_owned()
+            .map_err(|_| NodeError::Internal("broadcast: async backlog full".into()))
+    }
+
+    /// Convert a [`LocalTxError`] to the trait-level [`NodeError`].
+    ///
+    /// The `NodeInterface` trait only exposes the four variants
+    /// (`NotFound`, `Timeout`, `NotImplemented`, `Internal`) — none of
+    /// which map cleanly to a client-data rejection (invalid signature,
+    /// bad fee, duplicate). For now every `LocalTxError` collapses to
+    /// `Internal` with the category preserved in the message; handlers can
+    /// key off the prefix if/when a richer trait error is added.
+    fn local_tx_error_to_node_error(err: LocalTxError) -> NodeError {
+        match err {
+            LocalTxError::Empty => NodeError::Internal("broadcast: empty group".into()),
+            LocalTxError::Pool(msg) => {
+                NodeError::Internal(format!("broadcast: pool rejected group: {msg}"))
+            }
+            LocalTxError::Encode(msg) => {
+                NodeError::Internal(format!("broadcast: encode failed: {msg}"))
+            }
+            LocalTxError::Broadcast(msg) => {
+                NodeError::Internal(format!("broadcast: gossip failed: {msg}"))
+            }
+        }
     }
 
     /// Resolve the effective protocol string for a locked ledger guard,
@@ -581,6 +675,84 @@ impl NodeInterface for AlgodNodeInterface {
         let pool = self.pool("get_pending_transaction")?;
         let (txn, pool_error, found) = pool.lookup(txid);
         Ok(Self::map_pool_lookup(txn, pool_error, found))
+    }
+
+    // ---- Broadcast methods (TASK-77) ----
+
+    async fn broadcast_signed_tx_group(
+        &self,
+        tx_group: Vec<SignedTransaction>,
+    ) -> Result<(), NodeError> {
+        let broadcaster = self.broadcaster("broadcast_signed_tx_group")?;
+        // `submit_group` runs ingest → seen-cache → gossip broadcast and
+        // returns the first txid on success. The NodeInterface contract
+        // for this method returns `()`, so we discard the txid; handlers
+        // that need it (e.g. `POST /v2/transactions`) re-derive it from
+        // the submitted group.
+        broadcaster
+            .submit_group(tx_group)
+            .await
+            .map(|_first_txid| ())
+            .map_err(Self::local_tx_error_to_node_error)
+    }
+
+    async fn async_broadcast_signed_tx_group(
+        &self,
+        tx_group: Vec<SignedTransaction>,
+    ) -> Result<(), NodeError> {
+        // Fire-and-forget: the caller gets Ok as soon as the group is
+        // accepted for background processing. This matches go-algorand's
+        // `Node.AsyncBroadcastSignedTxGroup`, which routes through
+        // `txHandler.LocalTransaction` — a non-blocking backlog enqueue
+        // that returns success once the group is queued and performs
+        // validation + gossip later. See
+        // `../go-algorand/node/node.go:596-600` and
+        // `../go-algorand/data/txHandler.go:873-888` @ v4.5.1-stable.
+        //
+        // The three *synchronous* error surfaces this method preserves:
+        //   1. No broadcaster attached       → NotImplemented
+        //   2. Empty group                   → Internal("empty group")
+        //   3. Async backlog is full         → Internal("async backlog full")
+        //
+        // Pool-rejection / gossip failures after the spawn are not
+        // surfaced through the return value. `LocalTxBroadcaster::submit_group`
+        // logs Pool / Broadcast errors (see
+        // `local_tx_broadcast.rs:200-222`); we add a dedicated `warn!`
+        // for Encode because the broadcaster propagates that variant
+        // without its own log (`local_tx_broadcast.rs:193`).
+        // Callers that need synchronous rejection signals should use
+        // `broadcast_signed_tx_group` instead.
+        let broadcaster = self.broadcaster("async_broadcast_signed_tx_group")?;
+
+        // Preflight the obviously-bad cases synchronously so clients see
+        // immediate feedback rather than a silent drop.
+        if tx_group.is_empty() {
+            return Err(Self::local_tx_error_to_node_error(LocalTxError::Empty));
+        }
+
+        // Admission control: mirror go-algorand's bounded backlog. Under
+        // saturation we surface `backlog full` instead of spawning an
+        // unbounded task per request. The permit is moved into the
+        // spawned task so it's dropped when `submit_group` completes,
+        // freeing the slot.
+        let permit = Self::reserve_async_backlog_permit(&self.async_backlog_permits)?;
+
+        // Spawn the full ingest + gossip path. `LocalTxBroadcaster`
+        // already emits structured warnings for Pool and Broadcast
+        // errors, so only Encode (which returns directly without
+        // logging) gets an adapter-side log.
+        tokio::spawn(async move {
+            let _permit = permit; // release slot on completion
+            if let Err(err) = broadcaster.submit_group(tx_group).await {
+                if matches!(&err, LocalTxError::Encode(_)) {
+                    warn!(
+                        error = %err,
+                        "async_broadcast_signed_tx_group: encode failed",
+                    );
+                }
+            }
+        });
+        Ok(())
     }
 }
 
@@ -1063,6 +1235,117 @@ mod tests {
             got.is_none(),
             "committed case without block-side lookup must not synthesize a pending response"
         );
+    }
+
+    // ---- Broadcast methods (TASK-77) ----
+
+    #[tokio::test]
+    async fn broadcast_methods_return_not_implemented_without_broadcaster() {
+        let adapter = make_adapter();
+        let tx_group = vec![SignedTransaction::default()];
+
+        match adapter
+            .broadcast_signed_tx_group(tx_group.clone())
+            .await
+            .expect_err("should require broadcaster")
+        {
+            NodeError::NotImplemented(name) => {
+                assert_eq!(name, "broadcast_signed_tx_group");
+            }
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+
+        match adapter
+            .async_broadcast_signed_tx_group(tx_group)
+            .await
+            .expect_err("should require broadcaster")
+        {
+            NodeError::NotImplemented(name) => {
+                assert_eq!(name, "async_broadcast_signed_tx_group");
+            }
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reserve_async_backlog_permit_acquires_and_releases() {
+        // Capacity = 1: the first acquire succeeds, the second fails
+        // until the first permit is dropped.
+        let permits = Arc::new(Semaphore::new(1));
+        let first =
+            AlgodNodeInterface::reserve_async_backlog_permit(&permits).expect("first permit");
+
+        match AlgodNodeInterface::reserve_async_backlog_permit(&permits) {
+            Err(NodeError::Internal(msg)) => {
+                assert_eq!(msg, "broadcast: async backlog full");
+            }
+            other => panic!("expected backlog full, got {other:?}"),
+        }
+
+        drop(first);
+        let _second_after_drop = AlgodNodeInterface::reserve_async_backlog_permit(&permits)
+            .expect("permit available after drop");
+    }
+
+    #[test]
+    fn with_async_backlog_capacity_replaces_the_semaphore() {
+        // The builder must install a fresh semaphore — sanity-check by
+        // constructing with a tiny capacity and asserting the first
+        // acquire works, the second fails.
+        let adapter = make_adapter().with_async_backlog_capacity(1);
+        let first =
+            AlgodNodeInterface::reserve_async_backlog_permit(&adapter.async_backlog_permits)
+                .expect("first permit");
+        assert!(matches!(
+            AlgodNodeInterface::reserve_async_backlog_permit(&adapter.async_backlog_permits),
+            Err(NodeError::Internal(_))
+        ));
+        drop(first);
+    }
+
+    #[test]
+    fn with_async_backlog_capacity_floors_at_one() {
+        // Capacity = 0 is a footgun (immediately refuses everything); the
+        // builder silently raises it to 1 so the adapter still makes
+        // forward progress.
+        let adapter = make_adapter().with_async_backlog_capacity(0);
+        assert!(
+            AlgodNodeInterface::reserve_async_backlog_permit(&adapter.async_backlog_permits)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn local_tx_error_maps_to_node_error_internal_with_category_prefix() {
+        // The NodeInterface trait only exposes Internal / NotFound /
+        // Timeout / NotImplemented — none of which cleanly express a
+        // client-data rejection. We collapse all four LocalTxError
+        // variants to Internal but preserve the category in the message
+        // so handlers can (later) key off the prefix to refine status
+        // codes.
+        fn msg(err: NodeError) -> String {
+            match err {
+                NodeError::Internal(m) => m,
+                other => panic!("expected Internal, got {other:?}"),
+            }
+        }
+
+        let empty = AlgodNodeInterface::local_tx_error_to_node_error(LocalTxError::Empty);
+        assert_eq!(msg(empty), "broadcast: empty group");
+
+        let pool =
+            AlgodNodeInterface::local_tx_error_to_node_error(LocalTxError::Pool("bad fee".into()));
+        assert_eq!(msg(pool), "broadcast: pool rejected group: bad fee");
+
+        let encode = AlgodNodeInterface::local_tx_error_to_node_error(LocalTxError::Encode(
+            "bad msgpack".into(),
+        ));
+        assert_eq!(msg(encode), "broadcast: encode failed: bad msgpack");
+
+        let broadcast = AlgodNodeInterface::local_tx_error_to_node_error(LocalTxError::Broadcast(
+            "no peers".into(),
+        ));
+        assert_eq!(msg(broadcast), "broadcast: gossip failed: no peers");
     }
 
     #[tokio::test]
