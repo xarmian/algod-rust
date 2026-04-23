@@ -387,16 +387,26 @@ pub enum Commands {
         #[arg(long, short = 'b')]
         listen_address: Option<String>,
 
-        /// Act as a relay for gossip messages: forward received
-        /// transactions + blocks to other peers instead of only
-        /// handling them locally, and accept inbound peer dials on
-        /// `--listen-address`. The inbound-listener side of this
-        /// flag is gated on `--listen-address` being set (mirrors
-        /// go-algorand's `is_relay = NetAddress != "" && Relay`), but
-        /// the forwarding side is applied regardless — setting this
-        /// without `--listen-address` starts the broadcast thread
-        /// and rebroadcasts to outbound-only peers, which usually
-        /// only makes sense when both flags are set.
+        /// Act as a gossip relay: accept inbound peer dials on
+        /// `--listen-address` and allow locally-originated /
+        /// consensus-generated messages to be rebroadcast to peers.
+        ///
+        /// The inbound-listener side is gated on `--listen-address`
+        /// being set, mirroring go-algorand's
+        /// `is_relay = NetAddress != "" && Relay`. The outbound side
+        /// (the broadcast thread + the `broadcast()` path on
+        /// `WebsocketNetwork`) is enabled whenever this flag is set,
+        /// which is what lets `LocalTxBroadcaster` fan a local txn
+        /// out to connected peers — passing `--relay-messages`
+        /// without `--listen-address` therefore still has an effect
+        /// (though such a node has no way to accept inbound peers
+        /// to forward to).
+        ///
+        /// Note: peer-originated transactions received on the
+        /// `Transaction` tag are NOT re-relayed today — the handler
+        /// drops them after ingesting into the local pool. Relay
+        /// forwarding of third-party TX gossip is a separate
+        /// follow-up.
         ///
         /// Required when another participate node needs to connect
         /// to this one over gossip (e.g. in the two-binary
