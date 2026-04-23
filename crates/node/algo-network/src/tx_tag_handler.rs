@@ -208,12 +208,18 @@ impl MessageHandler for TxTagHandler {
             }
         };
 
-        // Dedup via the seen-tx cache. If every txid in the group is
-        // already seen, short-circuit — the pool would reject as
-        // duplicates anyway.
-        let any_new = group
-            .iter()
-            .any(|tx| !self.seen.contains(&compute_txn_id(&tx.txn)));
+        // Compute txids once up front — `compute_txn_id` hashes the
+        // Transaction body (not the signature), so we can dedup
+        // consistently across different signed variants of the same
+        // txn.
+        let txids: Vec<algo_types::Digest> =
+            group.iter().map(|tx| compute_txn_id(&tx.txn)).collect();
+
+        // Dedup fast-path: if every txid in the group has already been
+        // *successfully ingested* (see below — we only insert on
+        // Ok(())), the pool would just return duplicates. Skip the
+        // round-trip.
+        let any_new = txids.iter().any(|id| !self.seen.contains(id));
         if !any_new {
             debug!(
                 sender = %msg.sender,
@@ -228,19 +234,25 @@ impl MessageHandler for TxTagHandler {
             };
         }
 
-        // Record every txid in the cache *before* calling the pool.
-        // Even if the pool rejects the group (fee/sig/whatever), we
-        // don't want to retry every gossip duplicate against the pool.
-        for tx in &group {
-            self.seen.insert(compute_txn_id(&tx.txn));
-        }
-
-        // Submit the whole group to the pool. Errors are logged and
-        // dropped; unsolicited inbound txns must never panic or
-        // propagate back to the dispatcher.
+        // Submit the whole group to the pool. On success, record the
+        // txids so subsequent duplicates short-circuit. On failure,
+        // the txids are **not** recorded — a bad-signed or otherwise
+        // rejected variant must not suppress a valid retransmission
+        // of the same Transaction body (txids are body-derived, not
+        // signature-derived).
+        //
+        // Errors are logged and dropped — unsolicited inbound txns
+        // must never panic or propagate back to the dispatcher.
         match self.pool.remember(group) {
             Ok(()) => {
-                debug!(sender = %msg.sender, "TxTagHandler: group accepted");
+                for id in &txids {
+                    self.seen.insert(*id);
+                }
+                debug!(
+                    sender = %msg.sender,
+                    ingested = txids.len(),
+                    "TxTagHandler: group accepted",
+                );
             }
             Err(e) => {
                 warn!(
