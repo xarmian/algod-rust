@@ -8,6 +8,7 @@ pub mod block_factory_bridge;
 pub mod block_validator_bridge;
 mod bundle;
 mod certificate;
+pub mod clock;
 pub mod codec;
 mod credential;
 pub mod crypto_verifier;
@@ -31,6 +32,7 @@ mod selector;
 pub mod service;
 mod step;
 pub mod stubs;
+pub mod system_clock;
 pub mod trace;
 pub mod traits;
 pub mod types;
@@ -127,6 +129,10 @@ pub use crypto_verifier::{AsyncCryptoVerifier, NoOpValidator};
 
 // Re-exports from service module
 pub use service::{Parameters, Service, ServiceHandle};
+
+// Re-exports from clock module
+pub use clock::Clock;
+pub use system_clock::SystemClock;
 
 // Re-exports from persistence module
 pub use persistence::{

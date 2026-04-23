@@ -28,6 +28,7 @@ use crate::actions::{
     Action, ActionType, CryptoAction, EnsureAction, NetworkAction, PseudonodeAction, RezeroAction,
     StageDigestAction,
 };
+use crate::clock::Clock;
 use crate::codec;
 use crate::demux::{Demux, ExternalDemuxSignals, ExternalEvent};
 use crate::events::ConsensusVersionView;
@@ -82,6 +83,16 @@ where
     pub monitor: M,
     /// Asynchronous crypto verifier for votes, proposals, and bundles.
     pub crypto: C,
+    /// Clock driving deadline-based timeouts in the demux.
+    ///
+    /// Production code passes `SystemClock::new()`, which preserves the
+    /// wall-clock timing behavior the service had before this field existed.
+    /// The `agreementtest::simulate` harness (TASK-81) injects a mock clock
+    /// so tests can advance deterministically without real time.
+    ///
+    /// Mirrors Go's `agreement.Parameters.Clock`
+    /// (`../go-algorand/agreement/service.go`).
+    pub clock: Arc<dyn Clock>,
     /// Optional SQLite connection for crash recovery persistence.
     ///
     /// When `Some`, agreement state is persisted to this database before
@@ -186,6 +197,7 @@ where
             random_source,
             monitor,
             crypto,
+            clock,
             crash_db,
         } = self.params;
 
@@ -254,7 +266,11 @@ where
         // Quit channel for the Demux.
         let (quit_demux_tx, quit_demux_rx) = crossbeam_channel::bounded(1);
 
-        // Construct the Demux with all channel receivers.
+        // The demux_loop needs its own handle to the clock so it can rezero
+        // on `Action::Rezero` — clone before the Demux takes ownership.
+        let clock_for_actions = clock.clone();
+
+        // Construct the Demux with all channel receivers and the clock.
         let mut demux = Demux::new(
             av_rx,
             pp_rx,
@@ -264,6 +280,7 @@ where
             verified_bundles_rx,
             ledger_round_rx,
             quit_demux_rx,
+            clock,
         );
         // Wire up network and ledger references for peer disconnect on decode
         // errors (G8) and round re-sampling on interruption (G9).
@@ -334,6 +351,7 @@ where
                     crypto,
                     monitor_demux,
                     vote_verifier,
+                    clock_for_actions,
                 );
             })
             .expect("failed to spawn agreement demux loop thread");
@@ -866,6 +884,7 @@ fn demux_loop<N, L, BV, C, M>(
     crypto: C,
     monitor: Arc<Mutex<M>>,
     vote_verifier: Arc<AsyncVoteVerifier>,
+    clock: Arc<dyn Clock>,
 ) where
     N: AgreementNetwork + Send + Sync + 'static,
     L: LedgerReader + LedgerWriter + Send + Sync + 'static,
@@ -909,6 +928,7 @@ fn demux_loop<N, L, BV, C, M>(
             &mut historical_clocks,
             &crypto,
             &vote_verifier,
+            &clock,
         );
 
         // Actions consumed — report queue drained.
@@ -980,6 +1000,7 @@ fn do_actions<N, L, BV, C>(
     historical_clocks: &mut HashMap<Round, Instant>,
     crypto: &C,
     vote_verifier: &AsyncVoteVerifier,
+    clock: &Arc<dyn Clock>,
 ) where
     N: AgreementNetwork,
     L: LedgerReader + LedgerWriter,
@@ -995,6 +1016,7 @@ fn do_actions<N, L, BV, C>(
             historical_clocks,
             crypto,
             vote_verifier,
+            clock,
         );
     }
 }
@@ -1011,6 +1033,7 @@ fn do_action<N, L, BV, C>(
     historical_clocks: &mut HashMap<Round, Instant>,
     crypto: &C,
     vote_verifier: &AsyncVoteVerifier,
+    clock: &Arc<dyn Clock>,
 ) where
     N: AgreementNetwork,
     L: LedgerReader + LedgerWriter,
@@ -1037,7 +1060,7 @@ fn do_action<N, L, BV, C>(
         }
 
         Action::Rezero(ref ra) => {
-            do_rezero_action(ra, historical_clocks);
+            do_rezero_action(ra, historical_clocks, clock);
         }
 
         Action::Pseudonode(ref pa) => {
@@ -1214,9 +1237,26 @@ fn do_stage_digest_action<L: LedgerWriter>(
 
 /// Execute a rezero action (reset the clock).
 ///
-/// Mirrors Go's `rezeroAction.do`.
-fn do_rezero_action(ra: &RezeroAction, historical_clocks: &mut HashMap<Round, Instant>) {
-    // Record the start time for this round (period 0).
+/// Mirrors Go's `rezeroAction.do`, which does `s.Clock = s.Clock.Zero()`.
+/// Resetting the active clock is **consensus-critical**: without it, after
+/// the process has been up for longer than the step timeout the demux's
+/// `clock.timeout_at(delta)` receivers would surface as "already elapsed"
+/// immediately, firing spurious `Timeout`/`FastTimeout` events on every new
+/// round / period boundary.
+///
+/// The `clock` `Arc<dyn Clock>` here is the same instance the `Demux` holds,
+/// so the in-place `zero()` is visible to the next `timeout_at(...)` call.
+fn do_rezero_action(
+    ra: &RezeroAction,
+    historical_clocks: &mut HashMap<Round, Instant>,
+    clock: &Arc<dyn Clock>,
+) {
+    // Reset the active clock's zero reference to "now" — this is the
+    // Rust equivalent of Go's `s.Clock = s.Clock.Zero()`.
+    clock.zero();
+
+    // Record the start time for this round (period 0) for late-credential
+    // tracking / cadaver replay (orthogonal to the active clock).
     historical_clocks
         .entry(ra.round)
         .or_insert_with(Instant::now);
@@ -1340,6 +1380,7 @@ mod tests {
             random_source: StubRandomSource::constant(42),
             monitor: StubEventsProcessingMonitor::new(),
             crypto: StubCryptoVerifier::new(),
+            clock: crate::SystemClock::new(),
             crash_db: None,
         };
 
@@ -1357,6 +1398,7 @@ mod tests {
             random_source: StubRandomSource::constant(42),
             monitor: StubEventsProcessingMonitor::new(),
             crypto: StubCryptoVerifier::new(),
+            clock: crate::SystemClock::new(),
             crash_db: None,
         };
 
@@ -1388,8 +1430,9 @@ mod tests {
     fn do_rezero_action_records_clock() {
         let mut clocks = HashMap::new();
         let ra = RezeroAction { round: Round(10) };
+        let clock = crate::SystemClock::new();
 
-        do_rezero_action(&ra, &mut clocks);
+        do_rezero_action(&ra, &mut clocks, &clock);
 
         assert!(clocks.contains_key(&Round(10)));
     }
@@ -1402,7 +1445,8 @@ mod tests {
         clocks.insert(Round(20), Instant::now());
 
         let ra = RezeroAction { round: Round(20) };
-        do_rezero_action(&ra, &mut clocks);
+        let clock = crate::SystemClock::new();
+        do_rezero_action(&ra, &mut clocks, &clock);
 
         // Round 1 should be GC'd (credential_round_lag = 8, 20 > 1 + 8 = 9)
         assert!(!clocks.contains_key(&Round(1)));
@@ -1410,6 +1454,38 @@ mod tests {
         assert!(!clocks.contains_key(&Round(5)));
         // Round 20 should be kept
         assert!(clocks.contains_key(&Round(20)));
+    }
+
+    #[test]
+    fn do_rezero_action_zeroes_active_clock() {
+        // Regression: do_rezero_action must reset the active clock's zero
+        // reference, not just record the historical_clocks entry. Without this,
+        // the demux's clock.timeout_at(delta) returns already-elapsed receivers
+        // once the service has been up longer than one step timeout, firing
+        // spurious Timeout/FastTimeout events on every round boundary.
+        let mut clocks = HashMap::new();
+        let ra = RezeroAction { round: Round(10) };
+        let clock = crate::SystemClock::new();
+
+        // Accumulate wall-clock time on the clock.
+        thread::sleep(Duration::from_millis(30));
+        let before = clock.since();
+        assert!(
+            before >= Duration::from_millis(20),
+            "test precondition: expected ~30ms elapsed, got {before:?}"
+        );
+
+        do_rezero_action(&ra, &mut clocks, &clock);
+
+        let after = clock.since();
+        assert!(
+            after < before,
+            "do_rezero_action did not reset the active clock (before={before:?}, after={after:?})"
+        );
+        assert!(
+            after < Duration::from_millis(10),
+            "clock.since() immediately after rezero was {after:?}; expected < 10ms"
+        );
     }
 
     // ---------------- TASK-62: clock-state restore on agreement start ------

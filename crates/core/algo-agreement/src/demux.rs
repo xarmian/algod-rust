@@ -19,6 +19,7 @@ use algo_types::Round;
 use crossbeam_channel::{self, Receiver};
 use tracing::warn;
 
+use crate::clock::Clock;
 use crate::codec;
 use crate::events::{
     CompoundMessage, ConsensusVersionView, Event, EventType, InternalMessage, MessageEvent,
@@ -29,7 +30,7 @@ use crate::traits::{
     AgreementNetwork, CryptoResult, CryptoVerifier, CryptoVoteVerifyResult, Message,
     AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG, VOTE_BUNDLE_TAG,
 };
-use crate::types::Deadline;
+use crate::types::{Deadline, TimeoutType};
 use crate::vote::BOTTOM;
 use algo_types::Address;
 
@@ -182,6 +183,15 @@ pub struct Demux {
     /// Ledger handle used to re-sample the current round when the ledger
     /// round channel fires, matching Go's `nextRound = s.Ledger.NextRound()`.
     ledger: Option<Arc<dyn LedgerReader + Send + Sync>>,
+
+    // -- Clock for deadline-based timeouts --
+    /// Clock used to derive the `Receiver<()>` endpoints fed into the select
+    /// for the current player's deadline + fast-recovery deadline.
+    ///
+    /// Production uses `SystemClock`; the simulate harness injects a mock
+    /// `Clock` so tests can advance deterministically. Mirrors Go's
+    /// `demux.s.Clock` access pattern.
+    clock: Arc<dyn Clock>,
 }
 
 impl std::fmt::Debug for Demux {
@@ -193,9 +203,11 @@ impl std::fmt::Debug for Demux {
 }
 
 impl Demux {
-    /// Create a new demux from the given channel receivers.
+    /// Create a new demux from the given channel receivers and clock.
     ///
-    /// Mirrors Go's `makeDemux`.
+    /// Mirrors Go's `makeDemux`. The `clock` drives deadline-based timeouts
+    /// via `Clock::timeout_at`; production code passes a `SystemClock`, while
+    /// tests and the simulation harness can inject their own impls.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         av_rx: Receiver<Message>,
@@ -206,6 +218,7 @@ impl Demux {
         verified_bundles_rx: Receiver<CryptoResult>,
         ledger_round_rx: Receiver<Round>,
         quit_rx: Receiver<()>,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             av_rx,
@@ -219,6 +232,7 @@ impl Demux {
             pseudo_queue: VecDeque::new(),
             network: None,
             ledger: None,
+            clock,
         }
     }
 
@@ -286,8 +300,9 @@ impl Demux {
         }
 
         // Compute the timeout duration from the deadline signal.
-        // We use the minimum of the two deadlines (regular and fast) as the
-        // select timeout, but we need to track which one fired.
+        // A `Duration::ZERO` signals "no deadline set"; we substitute the
+        // default fallback so the clock still produces a (far-future) receiver
+        // the select can pend on.
         let deadline_dur = if signals.deadline.duration > Duration::ZERO {
             signals.deadline.duration
         } else {
@@ -298,9 +313,6 @@ impl Demux {
         } else {
             DEFAULT_SELECT_TIMEOUT
         };
-
-        // Use the smaller of the two deadlines as the select timeout.
-        let timeout = deadline_dur.min(fast_deadline_dur);
 
         // Loop until we get a valid event or a quit signal. Decode errors
         // and non-quit channel closures are logged and retried, matching
@@ -325,6 +337,15 @@ impl Demux {
             let skip_av = av_full;
             let skip_pp = pp_full || av_full;
             let skip_vb = vb_full;
+
+            // Resolve the two deadline receivers via the clock. Mirrors Go's
+            // `s.Clock.TimeoutAt(d.deadline.Duration, TimeoutDeadline)` pair of
+            // select cases in `demux.next()`. The sender-dropped semantics on
+            // these receivers is the crossbeam analogue of Go's channel close.
+            let deadline_rx = self.clock.timeout_at(deadline_dur, TimeoutType::Deadline);
+            let fast_deadline_rx = self
+                .clock
+                .timeout_at(fast_deadline_dur, TimeoutType::FastRecovery);
 
             // Use the runtime Select builder so we can conditionally include
             // channels based on crypto backpressure state.
@@ -357,28 +378,51 @@ impl Demux {
             let vp_idx = sel.recv(&self.verified_proposals_rx);
             let vbr_idx = sel.recv(&self.verified_bundles_rx);
 
-            // Select with timeout. crossbeam_channel::Select channels are
-            // selected fairly (random when multiple are ready).
-            let oper = match sel.select_timeout(timeout) {
-                Ok(oper) => oper,
-                Err(crossbeam_channel::SelectTimeoutError) => {
-                    // Timeout fired. Determine which deadline it corresponds
-                    // to based on which is strictly shorter.
-                    if fast_deadline_dur < deadline_dur {
-                        return Some(make_fast_timeout_event(
-                            signals.random_source_entropy,
-                            signals.current_round,
-                        ));
-                    } else {
-                        return Some(make_timeout_event(
-                            signals.random_source_entropy,
-                            signals.current_round,
-                        ));
-                    }
-                }
-            };
+            // Clock-provided deadline receivers — always included. Under the
+            // mock `instant` clock (see TASK-81) these surface as
+            // already-closed receivers, letting simulation run with zero real
+            // wall time.
+            let deadline_idx = sel.recv(&deadline_rx);
+            let fast_deadline_idx = sel.recv(&fast_deadline_rx);
 
+            // Block until any channel is ready. crossbeam_channel::Select
+            // chooses fairly (random) when multiple are ready simultaneously,
+            // matching Go's `select {}` behavior.
+            //
+            // Semantic note (vs. pre-clock Rust): previously the demux used
+            // `select_timeout(min(deadline, fast_deadline))` and deterministically
+            // returned `FastTimeout` only when `fast_deadline_dur < deadline_dur`.
+            // The new clock-based path leaves tie-breaking to crossbeam's fair
+            // random selection — which is what Go does at its own `select { case
+            // <-fastCh: ... case <-slowCh: ... }` sites in `agreement/demux.go`,
+            // so this is an intentional alignment rather than a regression. The
+            // "both already elapsed" tie is also far rarer now that `do_rezero_action`
+            // re-zeros the active clock on `Action::Rezero`.
+            let oper = sel.select();
             let index = oper.index();
+
+            // -- Deadline timeouts (clock-provided) --
+            //
+            // A deadline receiver becoming "ready" means the clock's underlying
+            // `crossbeam_channel::after(...)` fired (or the pre-closed sender
+            // was dropped for an already-elapsed delta). We consume via
+            // `oper.recv(...)` to satisfy the Select contract; the payload
+            // (`Instant`) or `Err(Disconnected)` is discarded — we only care
+            // about readiness.
+            if index == deadline_idx {
+                let _ = oper.recv(&deadline_rx);
+                return Some(make_timeout_event(
+                    signals.random_source_entropy,
+                    signals.current_round,
+                ));
+            }
+            if index == fast_deadline_idx {
+                let _ = oper.recv(&fast_deadline_rx);
+                return Some(make_fast_timeout_event(
+                    signals.random_source_entropy,
+                    signals.current_round,
+                ));
+            }
 
             // -- Quit signal --
             if index == quit_idx {
@@ -797,6 +841,7 @@ mod tests {
     use super::*;
     use crate::codec;
     use crate::events::EmptyEvent;
+    use crate::system_clock::SystemClock;
     use crate::vote::UnauthenticatedVote;
 
     /// Helper to create a Demux with dummy channels for testing.
@@ -821,7 +866,17 @@ mod tests {
         let (lr_tx, lr_rx) = crossbeam_channel::unbounded();
         let (quit_tx, quit_rx) = crossbeam_channel::unbounded();
 
-        let demux = Demux::new(av_rx, pp_rx, vb_rx, vv_rx, vp_rx, vb_res_rx, lr_rx, quit_rx);
+        let demux = Demux::new(
+            av_rx,
+            pp_rx,
+            vb_rx,
+            vv_rx,
+            vp_rx,
+            vb_res_rx,
+            lr_rx,
+            quit_rx,
+            SystemClock::new(),
+        );
         (
             demux, av_tx, pp_tx, vb_tx, vv_tx, vp_tx, vb_res_tx, lr_tx, quit_tx,
         )
