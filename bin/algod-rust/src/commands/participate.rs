@@ -1997,7 +1997,28 @@ pub async fn run(
         PoolConfig::default(),
         pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
     ));
-    let block_factory = BlockFactoryBridge::new(pool);
+    let block_factory = BlockFactoryBridge::new(pool.clone());
+
+    // -------------------------------------------------------------------
+    // Register inbound TX-tag handler so gossip transactions enter the
+    // pool (PLAN-33 / TASK-69, gap G1 in DOC-23).
+    //
+    // The `SeenTxCache` is created here and shared with the TxSyncer
+    // when TASK-70 lands, so inbound and outbound paths see the same
+    // "recently processed" view.
+    // -------------------------------------------------------------------
+    let tx_seen_cache = Arc::new(algo_network::SeenTxCache::new(
+        algo_network::TxSyncerConfig::default().seen_cache_size,
+    ));
+    gossip_node.multiplexer().register_handlers(vec![
+        algo_network::handler::TaggedMessageHandler {
+            tag: algo_network::Tag::Transaction,
+            handler: Arc::new(algo_network::TxTagHandler::new(
+                pool.clone(),
+                tx_seen_cache.clone(),
+            )),
+        },
+    ]);
 
     // Block validator bridge: wraps algo-validate for incoming block checks.
     // Extract the timestamp from the latest committed block header so the

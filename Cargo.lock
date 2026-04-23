@@ -218,6 +218,7 @@ dependencies = [
  "algo-agreement",
  "algo-codec",
  "algo-error",
+ "algo-pool",
  "algo-types",
  "async-trait",
  "axum",
