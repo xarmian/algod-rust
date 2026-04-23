@@ -7,7 +7,8 @@
 //! Downstream tasks layer additional methods onto the same struct:
 //!
 //! - Pool methods (`TASK-76`) — `pending_transactions`, `get_pending_transaction`
-//! - Broadcast methods (`TASK-77`) — `broadcast_signed_tx_group`
+//! - Broadcast methods (`TASK-77`) — `broadcast_signed_tx_group`,
+//!   `async_broadcast_signed_tx_group`
 //! - Simulation (`TASK-78`) — `simulate`
 //! - CLI wiring (`TASK-79`) — constructs [`AlgodNodeInterface`] in the
 //!   `participate` / `serve` subcommands and passes it to the axum router
@@ -28,6 +29,7 @@ use std::time::Duration;
 use algo_codec::{canonical_encode_block_header, compute_block_digest};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{SqliteLedger, StateDelta};
+use algo_network::local_tx_broadcast::{LocalTxBroadcaster, LocalTxError};
 use algo_pool::TransactionPool;
 use algo_rest_api::node::{
     AccountLookup, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
@@ -39,6 +41,7 @@ use algo_types::{
 };
 use async_trait::async_trait;
 use sha2::{Digest as _, Sha512_256};
+use tracing::warn;
 
 /// Default upgrade-vote window length (in rounds) for the current Algorand
 /// mainnet protocol.
@@ -97,18 +100,20 @@ pub struct NodeInterfaceConfig {
 }
 
 /// Production `NodeInterface` adapter backed by a live [`SqliteLedger`] and
-/// (optionally) an in-memory [`TransactionPool`].
+/// (optionally) an in-memory [`TransactionPool`] + [`LocalTxBroadcaster`].
 ///
 /// Cheap to clone-by-`Arc` and share across REST handlers. The adapter
-/// exposes read-heavy methods plus pool lookups; write paths (broadcast,
-/// simulate, participation-key installation) are added by downstream
-/// PLAN-74 tasks. The pool is optional so tests and subcommands that don't
-/// need pending-transaction state (e.g. read-only catchpoint replay) can
-/// construct the adapter without one — the pool-dependent trait methods
-/// fall back to [`NodeError::NotImplemented`] when the pool is absent.
+/// exposes read-heavy methods plus pool lookups and tx broadcast; simulate
+/// and participation-key installation are still added by downstream
+/// PLAN-74 tasks. The pool and broadcaster are optional so tests and
+/// subcommands that don't need write paths (e.g. read-only catchpoint
+/// replay) can construct the adapter without them — the dependent trait
+/// methods fall back to [`NodeError::NotImplemented`] when the collaborator
+/// is absent.
 pub struct AlgodNodeInterface {
     ledger: Arc<Mutex<SqliteLedger>>,
     pool: Option<Arc<TransactionPool>>,
+    broadcaster: Option<Arc<LocalTxBroadcaster>>,
     genesis_id: String,
     genesis_hash: Digest,
     genesis_json: String,
@@ -117,14 +122,16 @@ pub struct AlgodNodeInterface {
 }
 
 impl AlgodNodeInterface {
-    /// Construct a new adapter without a transaction pool — suitable for
-    /// read-only ledger inspection. Pool-dependent trait methods will report
-    /// `NodeError::NotImplemented` until a pool is attached via
-    /// [`Self::with_pool`].
+    /// Construct a new adapter without a transaction pool or broadcaster
+    /// — suitable for read-only ledger inspection. Pool- and
+    /// broadcaster-dependent trait methods will report
+    /// `NodeError::NotImplemented` until the collaborators are attached via
+    /// [`Self::with_pool`] / [`Self::with_broadcaster`].
     pub fn new(ledger: Arc<Mutex<SqliteLedger>>, config: NodeInterfaceConfig) -> Self {
         Self {
             ledger,
             pool: None,
+            broadcaster: None,
             genesis_id: config.genesis_id,
             genesis_hash: config.genesis_hash,
             genesis_json: config.genesis_json,
@@ -143,6 +150,15 @@ impl AlgodNodeInterface {
         self
     }
 
+    /// Attach a [`LocalTxBroadcaster`] so `broadcast_signed_tx_group` and
+    /// `async_broadcast_signed_tx_group` route submitted groups through the
+    /// ingest → gossip path. Builder-style to match [`Self::with_pool`].
+    #[must_use]
+    pub fn with_broadcaster(mut self, broadcaster: Arc<LocalTxBroadcaster>) -> Self {
+        self.broadcaster = Some(broadcaster);
+        self
+    }
+
     /// Return the attached pool or a [`NodeError::NotImplemented`] if none
     /// was set. Used by pool-backed trait methods as a single-site check so
     /// the error string is consistent.
@@ -150,6 +166,39 @@ impl AlgodNodeInterface {
         self.pool
             .as_deref()
             .ok_or(NodeError::NotImplemented(method))
+    }
+
+    /// Return the attached broadcaster (or [`NodeError::NotImplemented`]
+    /// when absent) plus an `Arc` clone suitable for spawning onto
+    /// `tokio::spawn` for the fire-and-forget variant.
+    fn broadcaster(&self, method: &'static str) -> Result<Arc<LocalTxBroadcaster>, NodeError> {
+        self.broadcaster
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or(NodeError::NotImplemented(method))
+    }
+
+    /// Convert a [`LocalTxError`] to the trait-level [`NodeError`].
+    ///
+    /// The `NodeInterface` trait only exposes the four variants
+    /// (`NotFound`, `Timeout`, `NotImplemented`, `Internal`) — none of
+    /// which map cleanly to a client-data rejection (invalid signature,
+    /// bad fee, duplicate). For now every `LocalTxError` collapses to
+    /// `Internal` with the category preserved in the message; handlers can
+    /// key off the prefix if/when a richer trait error is added.
+    fn local_tx_error_to_node_error(err: LocalTxError) -> NodeError {
+        match err {
+            LocalTxError::Empty => NodeError::Internal("broadcast: empty group".into()),
+            LocalTxError::Pool(msg) => {
+                NodeError::Internal(format!("broadcast: pool rejected group: {msg}"))
+            }
+            LocalTxError::Encode(msg) => {
+                NodeError::Internal(format!("broadcast: encode failed: {msg}"))
+            }
+            LocalTxError::Broadcast(msg) => {
+                NodeError::Internal(format!("broadcast: gossip failed: {msg}"))
+            }
+        }
     }
 
     /// Resolve the effective protocol string for a locked ledger guard,
@@ -581,6 +630,47 @@ impl NodeInterface for AlgodNodeInterface {
         let pool = self.pool("get_pending_transaction")?;
         let (txn, pool_error, found) = pool.lookup(txid);
         Ok(Self::map_pool_lookup(txn, pool_error, found))
+    }
+
+    // ---- Broadcast methods (TASK-77) ----
+
+    async fn broadcast_signed_tx_group(
+        &self,
+        tx_group: Vec<SignedTransaction>,
+    ) -> Result<(), NodeError> {
+        let broadcaster = self.broadcaster("broadcast_signed_tx_group")?;
+        // `submit_group` runs ingest → seen-cache → gossip broadcast and
+        // returns the first txid on success. The NodeInterface contract
+        // for this method returns `()`, so we discard the txid; handlers
+        // that need it (e.g. `POST /v2/transactions`) re-derive it from
+        // the submitted group.
+        broadcaster
+            .submit_group(tx_group)
+            .await
+            .map(|_first_txid| ())
+            .map_err(Self::local_tx_error_to_node_error)
+    }
+
+    async fn async_broadcast_signed_tx_group(
+        &self,
+        tx_group: Vec<SignedTransaction>,
+    ) -> Result<(), NodeError> {
+        // Mirror go-algorand's `Node.AsyncBroadcastSignedTxGroup`: return
+        // immediately, run pool validation + gossip on a background task.
+        // Failures are logged via `tracing::warn` so operators can see
+        // rejected async submissions without surfacing them to the caller.
+        let broadcaster = self.broadcaster("async_broadcast_signed_tx_group")?;
+        let group_len = tx_group.len();
+        tokio::spawn(async move {
+            if let Err(err) = broadcaster.submit_group(tx_group).await {
+                warn!(
+                    error = %err,
+                    group_len,
+                    "async_broadcast_signed_tx_group: background submit failed",
+                );
+            }
+        });
+        Ok(())
     }
 }
 
@@ -1063,6 +1153,69 @@ mod tests {
             got.is_none(),
             "committed case without block-side lookup must not synthesize a pending response"
         );
+    }
+
+    // ---- Broadcast methods (TASK-77) ----
+
+    #[tokio::test]
+    async fn broadcast_methods_return_not_implemented_without_broadcaster() {
+        let adapter = make_adapter();
+        let tx_group = vec![SignedTransaction::default()];
+
+        match adapter
+            .broadcast_signed_tx_group(tx_group.clone())
+            .await
+            .expect_err("should require broadcaster")
+        {
+            NodeError::NotImplemented(name) => {
+                assert_eq!(name, "broadcast_signed_tx_group");
+            }
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+
+        match adapter
+            .async_broadcast_signed_tx_group(tx_group)
+            .await
+            .expect_err("should require broadcaster")
+        {
+            NodeError::NotImplemented(name) => {
+                assert_eq!(name, "async_broadcast_signed_tx_group");
+            }
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_tx_error_maps_to_node_error_internal_with_category_prefix() {
+        // The NodeInterface trait only exposes Internal / NotFound /
+        // Timeout / NotImplemented — none of which cleanly express a
+        // client-data rejection. We collapse all four LocalTxError
+        // variants to Internal but preserve the category in the message
+        // so handlers can (later) key off the prefix to refine status
+        // codes.
+        fn msg(err: NodeError) -> String {
+            match err {
+                NodeError::Internal(m) => m,
+                other => panic!("expected Internal, got {other:?}"),
+            }
+        }
+
+        let empty = AlgodNodeInterface::local_tx_error_to_node_error(LocalTxError::Empty);
+        assert_eq!(msg(empty), "broadcast: empty group");
+
+        let pool =
+            AlgodNodeInterface::local_tx_error_to_node_error(LocalTxError::Pool("bad fee".into()));
+        assert_eq!(msg(pool), "broadcast: pool rejected group: bad fee");
+
+        let encode = AlgodNodeInterface::local_tx_error_to_node_error(LocalTxError::Encode(
+            "bad msgpack".into(),
+        ));
+        assert_eq!(msg(encode), "broadcast: encode failed: bad msgpack");
+
+        let broadcast = AlgodNodeInterface::local_tx_error_to_node_error(LocalTxError::Broadcast(
+            "no peers".into(),
+        ));
+        assert_eq!(msg(broadcast), "broadcast: gossip failed: no peers");
     }
 
     #[tokio::test]
