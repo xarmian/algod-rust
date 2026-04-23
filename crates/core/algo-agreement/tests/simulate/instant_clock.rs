@@ -38,19 +38,14 @@ use algo_agreement::types::TimeoutType;
 use algo_agreement::{Clock, EventsProcessingMonitor};
 use algo_types::Round;
 
-/// Internal queue-name used by the agreement service when reporting
-/// pseudonode backlog. Must match `crate::demux::EVENT_QUEUE_PSEUDONODE`
-/// (`"pseudonode"`) — `timeout_at` inspects it to decide whether to fire
-/// a Filter timeout immediately.
-const PSEUDONODE_QUEUE: &str = "pseudonode";
-
 /// Mutable state for `InstantClock`. Kept small so the mutex is rarely
 /// contested in practice.
 struct InstantState {
     /// Per-queue backlog reported by the service's `EventsProcessingMonitor`.
-    /// `timeout_at` checks `pseudonode` to decide whether a Filter timeout
-    /// should fire immediately (Go semantics: only when the pseudonode queue
-    /// is empty, i.e. nothing locally pending).
+    /// Currently read only by `EventsProcessingMonitor` consumers for
+    /// introspection (via `make_monitor()`); reserved for future test
+    /// logic that wants to assert queue-length invariants across rounds.
+    #[allow(dead_code)] // retained for monitor-side introspection
     events_queues: HashMap<String, usize>,
 }
 
@@ -95,6 +90,14 @@ pub struct InstantClock {
     /// the demux would block forever (unlike SystemClock where the
     /// underlying `crossbeam::after` eventually fires on its own).
     active_senders: Mutex<HashMap<TimeoutType, Sender<Instant>>>,
+
+    /// `true` once `shutdown()` has been called. `timeout_at` consults this
+    /// flag to avoid a race where the demux requests a fresh timeout
+    /// receiver AFTER shutdown has already cleared `active_senders` — the
+    /// new sender would not be dropped, leaving the demux parked forever.
+    /// When set, `timeout_at` returns a pre-disconnected receiver so every
+    /// post-shutdown request surfaces as immediately ready.
+    shutting_down: AtomicBool,
 }
 
 impl InstantClock {
@@ -117,6 +120,7 @@ impl InstantClock {
             timeout_at_rx: toa_rx,
             first_timeout_seen: AtomicBool::new(false),
             active_senders: Mutex::new(HashMap::new()),
+            shutting_down: AtomicBool::new(false),
         })
     }
 
@@ -146,6 +150,12 @@ impl InstantClock {
     /// sender-drop dance needed because Rust's demux doesn't fall back to
     /// a real wall-clock `select_timeout` once `Clock` is injectable.
     pub fn shutdown(&self) {
+        // Set the shutdown flag BEFORE clearing active senders so any
+        // racing `timeout_at` call observes shutdown and returns a
+        // pre-disconnected receiver rather than inserting a new sender
+        // that would outlive the clear.
+        self.shutting_down.store(true, Ordering::SeqCst);
+
         // Drop all active timeout senders. Any receiver the demux is
         // currently selecting on disconnects → `Select::select()` fires
         // that arm → `demux.next()` returns a Timeout event → the main
@@ -167,19 +177,6 @@ impl InstantClock {
             inner: Arc::clone(self),
         }
     }
-
-    fn has_pending_pseudonode(&self) -> bool {
-        let state = self
-            .state
-            .lock()
-            .expect("InstantClock state mutex poisoned");
-        state
-            .events_queues
-            .get(PSEUDONODE_QUEUE)
-            .copied()
-            .unwrap_or(0)
-            > 0
-    }
 }
 
 impl Clock for InstantClock {
@@ -196,21 +193,25 @@ impl Clock for InstantClock {
             *sender = None;
         }
 
-        // Filter-step timeouts fire immediately when no pseudonode backlog
-        // is present (Go semantics in simulate.go:71-73), letting the
-        // service advance through vote steps without wall-clock waits.
-        if timeout_type == TimeoutType::Filter && !self.has_pending_pseudonode() {
+        // If shutdown has been requested, any timeout request must surface
+        // immediately so the demux's `Select` fires and the service can
+        // observe `quit`. Returning a pre-disconnected receiver (sender
+        // dropped) has the same effect as a closed Go channel.
+        if self.shutting_down.load(Ordering::SeqCst) {
             let (tx, rx) = bounded::<Instant>(0);
             drop(tx);
             return rx;
         }
 
-        // All other timeouts return a "never-fire" receiver — but we keep
-        // the matched sender alive on this clock so `shutdown()` can drop
-        // it later and surface the receiver as Disconnected (waking the
-        // demux's `Select`). Without this the demux would block forever
-        // once `run_round` returns — real wall-clock timeout can't save
-        // us now that Clock is injectable.
+        // All timeouts the Rust demux actually requests (Deadline +
+        // FastRecovery — see `demux.rs`) return a never-firing receiver
+        // under this mock. We keep the matched sender alive on this clock
+        // so `shutdown()` can drop it later and surface the receiver as
+        // Disconnected (waking the demux's `Select`). Filter timeouts
+        // (Go simulate.go:71-73) are NOT requested by the Rust demux
+        // today — if that ever changes we'll extend this path, but there
+        // is no benefit to special-casing them here while they remain
+        // unused.
         let (tx, rx) = bounded::<Instant>(0);
         self.active_senders
             .lock()
@@ -226,10 +227,17 @@ impl Clock for InstantClock {
     }
 
     fn zero(&self) {
-        // Signal Z0 (non-blocking write into cap-1 buffer), then rendezvous
-        // on Z1 which blocks until `run_round` reads. Mirrors Go's
-        // `instant.Zero()` in simulate.go:77-82.
-        let _ = self.z0_tx.try_send(());
+        // Signal Z0 — bounded(1) buffer, so on the normal happy path this
+        // slots in without blocking. If a previous round's signal is
+        // still buffered (run_round hasn't drained it yet), `send` blocks
+        // until it does — that preserves Go's semantics where `Z0 <-
+        // struct{}{}` on a buffered-1 channel blocks on a full buffer.
+        // Using `try_send` here silently dropped the marker and caused
+        // run_round's `z0_rx.recv()` to deadlock on subsequent rounds
+        // (Codex round-1 finding).
+        let _ = self.z0_tx.send(());
+        // Rendezvous on Z1 (cap 0) — blocks until `run_round` reads.
+        // Mirrors Go's `instant.Zero()` in simulate.go:77-82.
         let _ = self.z1_tx.send(());
     }
 }

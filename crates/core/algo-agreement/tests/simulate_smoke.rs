@@ -70,11 +70,7 @@ fn simulate_zero_rounds_returns_immediately() {
         crash_db: None,
     };
 
-    let result = simulate(params, clock, Round(0), None);
-    assert!(
-        result.is_ok(),
-        "simulate(n=0) should return Ok; got {result:?}"
-    );
+    simulate(params, clock, Round(0));
 }
 
 #[test]
@@ -103,16 +99,13 @@ fn simulate_one_round_completes_clock_handshake() {
 
     let handle = thread::Builder::new()
         .name("simulate-smoke-driver".into())
-        .spawn(move || simulate(params, clock, Round(1), None))
+        .spawn(move || simulate(params, clock, Round(1)))
         .expect("spawn simulate thread");
 
     // 10s is plenty for a single-round rendezvous on any machine; a
     // deadlock would otherwise hang forever.
-    let joined = join_with_timeout(handle, Duration::from_secs(10));
-
-    match joined {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("simulate returned error: {e:?}"),
+    match join_with_timeout(handle, Duration::from_secs(10)) {
+        Ok(()) => {}
         Err(()) => {
             panic!("simulate did not complete within 10s — likely a clock handshake deadlock")
         }
@@ -188,59 +181,41 @@ fn instant_clock_first_timeout_at_returns_never_channel() {
 }
 
 #[test]
-fn instant_clock_filter_fires_when_no_pseudonode_pending() {
+fn instant_clock_deadline_timeout_never_fires_until_shutdown() {
     use algo_agreement::{types::TimeoutType, Clock};
     let clock = InstantClock::new();
-
-    // Consume the first-call to flip `first_timeout_seen`.
-    let _ = clock.timeout_at(Duration::from_secs(60), TimeoutType::Deadline);
-
-    // With no pseudonode backlog reported, a Filter timeout should fire
-    // immediately (via a pre-dropped sender).
-    let rx = clock.timeout_at(Duration::from_millis(1), TimeoutType::Filter);
-    assert!(
-        rx.recv_timeout(Duration::from_millis(20)).is_err(),
-        "Filter timeout with no pseudonode backlog must surface immediately \
-         (the channel is pre-dropped → recv returns Disconnected)"
-    );
-}
-
-#[test]
-fn instant_clock_filter_does_not_fire_with_pseudonode_pending() {
-    use algo_agreement::{types::TimeoutType, Clock, EventsProcessingMonitor};
-    let clock = InstantClock::new();
-    let monitor = clock.make_monitor();
-
-    // Consume the first-call.
-    let _ = clock.timeout_at(Duration::from_secs(60), TimeoutType::Deadline);
-
-    // Report pseudonode backlog.
-    monitor.update_events_queue("pseudonode", 3);
-
-    // Filter timeout should now NOT fire (never-channel).
-    let rx = clock.timeout_at(Duration::from_millis(1), TimeoutType::Filter);
-    // Small polling window: recv_timeout returning an error is expected
-    // whether the channel is Disconnected or Empty, so we additionally
-    // check that the receiver can hold a concurrent send (it's the
-    // crossbeam::never() path if so).
-    assert!(
-        rx.recv_timeout(Duration::from_millis(20)).is_err(),
-        "Filter timeout with pseudonode pending must NOT fire"
-    );
-}
-
-#[test]
-fn instant_clock_deadline_timeout_never_fires() {
-    use algo_agreement::{types::TimeoutType, Clock};
-    let clock = InstantClock::new();
-    // Consume the first-call.
-    let _ = clock.timeout_at(Duration::from_secs(60), TimeoutType::Deadline);
-    // A subsequent Deadline timeout should never fire (the driver advances
-    // rounds via run_round, not by firing deadline timers).
+    // Consume the first-call side effect (drops the timeout_at_sender).
+    let _first = clock.timeout_at(Duration::from_secs(60), TimeoutType::Deadline);
+    // A subsequent Deadline timeout should NOT fire — the driver advances
+    // rounds via `run_round`, not by firing deadline timers.
     let rx = clock.timeout_at(Duration::from_millis(1), TimeoutType::Deadline);
     assert!(
         rx.recv_timeout(Duration::from_millis(20)).is_err(),
-        "non-Filter subsequent timeout must never fire"
+        "Deadline timeout should not fire before shutdown"
+    );
+    // After shutdown, the sender held inside `active_senders` is dropped,
+    // so the receiver we captured above must surface Disconnected
+    // immediately — this is the wake-up the real service depends on.
+    clock.shutdown();
+    assert!(
+        rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "timeout receivers must disconnect after shutdown() so the demux wakes"
+    );
+}
+
+#[test]
+fn instant_clock_timeout_after_shutdown_surfaces_immediately() {
+    use algo_agreement::{types::TimeoutType, Clock};
+    // Regression: a `timeout_at` request that races `shutdown()` and lands
+    // AFTER the flag flips must return a pre-disconnected receiver —
+    // otherwise its sender would live outside `active_senders` and the
+    // demux would park forever.
+    let clock = InstantClock::new();
+    clock.shutdown();
+    let rx = clock.timeout_at(Duration::from_secs(60), TimeoutType::Deadline);
+    assert!(
+        rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "post-shutdown timeout_at must return a pre-disconnected receiver"
     );
 }
 
@@ -269,6 +244,6 @@ fn instant_clock_zero_rendezvous_with_run_round() {
 
     // If everything is wired correctly, run_round returns and the thread
     // joins cleanly. A deadlock here would hang the test.
-    let joined = join_with_timeout(driver, Duration::from_secs(5));
-    assert!(joined.is_ok(), "zero()/run_round rendezvous deadlocked");
+    join_with_timeout(driver, Duration::from_secs(5))
+        .expect("zero()/run_round rendezvous deadlocked");
 }
