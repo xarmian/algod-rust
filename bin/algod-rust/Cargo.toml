@@ -36,6 +36,7 @@ rmpv.workspace = true
 rmp-serde.workspace = true
 rusqlite.workspace = true
 tokio-util.workspace = true
+toml = "0.8"
 reqwest.workspace = true
 rand.workspace = true
 sha2.workspace = true

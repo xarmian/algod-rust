@@ -10,18 +10,12 @@
 //! - Broadcast methods (`TASK-77`) — `broadcast_signed_tx_group`,
 //!   `async_broadcast_signed_tx_group`
 //! - Simulation (`TASK-78`) — `simulate`, via `algo_ledger::simulation::Simulator`
-//! - CLI wiring (`TASK-79`) — constructs [`AlgodNodeInterface`] in the
-//!   `participate` / `serve` subcommands and passes it to the axum router
-//!
-//! Until TASK-79 lands, nothing in the binary constructs this type, which
-//! would trigger `dead_code` / `clippy::dead_code` warnings. The tests at
-//! the bottom of this module exercise every method, so the `#[allow]` below
-//! is a scaffold — remove it once the binary wires the adapter up.
+//! - CLI wiring (`TASK-79`) — `commands/participate.rs` constructs
+//!   [`AlgodNodeInterface`] when `--rest-listen` is provided and hands
+//!   it to [`algo_rest_api::server::ApiServer`].
 //!
 //! Reference: `../go-algorand/daemon/algod/api/server/v2/handlers.go` @
 //! `v4.5.1-stable` (the trait is modeled after `v2.NodeInterface`).
-
-#![allow(dead_code)]
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -50,6 +44,7 @@ use algo_types::{
 use async_trait::async_trait;
 use sha2::{Digest as _, Sha512_256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 /// Default upgrade-vote window length (in rounds) for the current Algorand
@@ -138,6 +133,15 @@ pub struct AlgodNodeInterface {
     /// capacity is [`DEFAULT_ASYNC_BACKLOG_SIZE`]; override via
     /// [`Self::with_async_backlog_capacity`].
     async_backlog_permits: Arc<Semaphore>,
+    /// Optional shutdown signal. When the enclosing subcommand's
+    /// cancellation token fires,
+    /// [`NodeInterface::wait_for_round`] terminates its polling loop
+    /// early with [`NodeError::Timeout`] so in-flight
+    /// `wait-for-block-after` handlers don't hold the REST server's
+    /// graceful-shutdown future open until their own 60s deadline
+    /// expires. Unset for read-only / test contexts — the adapter
+    /// still polls until the caller-supplied timeout arrives.
+    shutdown_token: Option<CancellationToken>,
     genesis_id: String,
     genesis_hash: Digest,
     genesis_json: String,
@@ -157,12 +161,24 @@ impl AlgodNodeInterface {
             pool: None,
             broadcaster: None,
             async_backlog_permits: Arc::new(Semaphore::new(DEFAULT_ASYNC_BACKLOG_SIZE)),
+            shutdown_token: None,
             genesis_id: config.genesis_id,
             genesis_hash: config.genesis_hash,
             genesis_json: config.genesis_json,
             build_version: config.build_version,
             default_protocol: config.default_protocol,
         }
+    }
+
+    /// Attach a shared [`CancellationToken`] so
+    /// [`NodeInterface::wait_for_round`] can break out of its polling
+    /// loop when the node starts shutting down. See the
+    /// [`AlgodNodeInterface::shutdown_token`] docstring for the
+    /// rationale.
+    #[must_use]
+    pub fn with_shutdown_token(mut self, token: CancellationToken) -> Self {
+        self.shutdown_token = Some(token);
+        self
     }
 
     /// Override the async-broadcast backlog capacity. TASK-79 will call
@@ -462,11 +478,22 @@ impl NodeInterface for AlgodNodeInterface {
     }
 
     async fn wait_for_round(&self, round: u64) -> Result<(), NodeError> {
-        // Poll the ledger's last-committed round. The REST handler always
-        // wraps this future in a `tokio::select!` with the caller's timeout,
-        // so this loop cannot leak if `round` never arrives. See the comment
-        // on `WAIT_POLL_INTERVAL` for the planned follow-up (notification
-        // channel in TASK-79).
+        // Poll the ledger's last-committed round. The REST handler
+        // wraps this future in a `tokio::select!` with the caller's
+        // timeout, so this loop cannot leak if `round` never arrives.
+        //
+        // Two shutdown surfaces cause us to break out early:
+        //   1. Lock poison — already handled by `lock_ledger`.
+        //   2. Cancellation token — when the enclosing subcommand
+        //      starts shutting down the agreement service, no new
+        //      rounds will ever land. We surface
+        //      [`NodeError::Timeout`] so the REST handler returns 408
+        //      and the axum graceful-shutdown future isn't held open
+        //      for the client's 60s deadline.
+        //
+        // Replacing the poll with a notification channel driven by the
+        // block-commit path is a PLAN-34 refinement — see the comment
+        // on [`WAIT_POLL_INTERVAL`].
         loop {
             let last = {
                 let ledger = self.lock_ledger("wait_for_round")?;
@@ -478,7 +505,19 @@ impl NodeInterface for AlgodNodeInterface {
             if last >= round {
                 return Ok(());
             }
-            tokio::time::sleep(WAIT_POLL_INTERVAL).await;
+            match &self.shutdown_token {
+                Some(token) => {
+                    tokio::select! {
+                        () = tokio::time::sleep(WAIT_POLL_INTERVAL) => {}
+                        () = token.cancelled() => {
+                            return Err(NodeError::Timeout(
+                                "wait_for_round: node is shutting down".into(),
+                            ));
+                        }
+                    }
+                }
+                None => tokio::time::sleep(WAIT_POLL_INTERVAL).await,
+            }
         }
     }
 
@@ -1547,6 +1586,55 @@ mod tests {
         assert!(
             AlgodNodeInterface::reserve_async_backlog_permit(&adapter.async_backlog_permits)
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_round_returns_timeout_when_shutdown_token_fires() {
+        // The ledger never advances past round 0, so without the
+        // shutdown token `wait_for_round(1)` would poll forever. The
+        // token gives us a bounded exit so REST's graceful shutdown
+        // isn't held open by long-poll handlers when the node is
+        // stopping.
+        let token = CancellationToken::new();
+        let adapter = make_adapter().with_shutdown_token(token.clone());
+
+        let waiter = tokio::spawn(async move { adapter.wait_for_round(1).await });
+        // Cancel the token. The waiter's inner `tokio::select!` sees
+        // the cancellation on either the current poll's sleep or the
+        // next one — no virtual-clock machinery needed.
+        token.cancel();
+
+        // Bound the test with a generous real-clock timeout; the
+        // waiter should return well under this cap once the token
+        // cancellation propagates (a handful of `WAIT_POLL_INTERVAL`s
+        // at most).
+        let result = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter did not return within 5s")
+            .expect("task joined");
+        match result {
+            Err(NodeError::Timeout(msg)) => {
+                assert!(
+                    msg.contains("shutting down"),
+                    "expected shutdown message, got {msg:?}"
+                );
+            }
+            other => panic!("expected Timeout(shutdown), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_round_without_shutdown_token_keeps_polling() {
+        // When no token is attached, cancellation has no effect — the
+        // poll loop continues until the round arrives. This test
+        // proves the optional plumbing doesn't change pre-TASK-79
+        // behaviour for adapters constructed without a token.
+        let adapter = make_adapter();
+        let result = tokio::time::timeout(WAIT_POLL_INTERVAL * 3, adapter.wait_for_round(1)).await;
+        assert!(
+            result.is_err(),
+            "expected outer timeout (waiter kept polling), got {result:?}"
         );
     }
 
