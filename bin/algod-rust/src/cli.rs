@@ -311,6 +311,26 @@ pub enum Commands {
         dns_bootstrap: Option<String>,
     },
 
+    /// Render an agreement cadaver trace as a round-by-round timeline.
+    ///
+    /// Reads the binary log produced by `algo_agreement::trace::Cadaver`
+    /// (the writer plumbed by the agreement service for post-mortem
+    /// debugging) and prints a human-readable transcript of player
+    /// transitions, input events, and output actions. If a sibling
+    /// `<path>.archive` file is present it is read first, matching
+    /// go-algorand's `agreement.PrepareAutopsy` ordering.
+    Autopsy {
+        /// Path to the active `.cdv` cadaver file (or directly to a
+        /// `.cdv.archive` file). When the active file is given and a
+        /// sibling `.archive` exists, both are streamed in order.
+        #[arg(long)]
+        cadaver: PathBuf,
+
+        /// Emit JSON instead of plain text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Capture raw wire-protocol messages from a Go relay for offline regression tests.
     CaptureWire {
         /// WebSocket address of the relay to connect to (e.g. "r-mn.algorand.network:4160").

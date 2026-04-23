@@ -1,3 +1,4 @@
+pub mod autopsy;
 pub mod bench;
 pub mod capture;
 pub mod capture_wire;
