@@ -449,15 +449,31 @@ impl TxSyncer {
                         return;
                     }
                     _ = ticker.tick() => {
-                        if let Err(e) = sync_round(
-                            &config,
-                            pool.as_ref(),
-                            peer_source.as_ref(),
-                            handler.as_ref(),
-                        )
-                        .await
-                        {
-                            warn!(error = %e, "TxSyncer sync round failed");
+                        // Race the sync round against cancellation too.
+                        // Otherwise `stop()` can stall up to the peer's
+                        // full `sync_timeout` (30 s by default) waiting
+                        // for an in-flight `peer.sync(...)` to return,
+                        // or even longer for a misbehaving peer.
+                        //
+                        // Dropping the round's future cancels any
+                        // in-flight peer I/O via standard Tokio future
+                        // cancellation semantics.
+                        select! {
+                            biased;
+                            () = cancel.cancelled() => {
+                                debug!("TxSyncer loop cancelled mid-round");
+                                return;
+                            }
+                            res = sync_round(
+                                &config,
+                                pool.as_ref(),
+                                peer_source.as_ref(),
+                                handler.as_ref(),
+                            ) => {
+                                if let Err(e) = res {
+                                    warn!(error = %e, "TxSyncer sync round failed");
+                                }
+                            }
                         }
                     }
                 }
@@ -783,6 +799,62 @@ mod tests {
         let b = syncer.seen_cache();
         a.insert(d(7));
         assert!(b.contains(&d(7)));
+    }
+
+    /// Regression: `stop()` must not wait for an in-flight peer.sync to
+    /// return. The sync loop races peer I/O against cancellation so
+    /// shutdown cannot stall on a slow or hung peer.
+    #[tokio::test]
+    async fn txsyncer_stop_cancels_in_flight_peer_sync() {
+        /// A peer whose `sync` holds for 5 seconds. If the loop were to
+        /// `.await` this unconditionally, `stop()` would stall.
+        struct SlowPeer;
+        #[async_trait]
+        impl TxSyncPeerClient for SlowPeer {
+            fn address(&self) -> String {
+                "slow".into()
+            }
+            async fn sync(
+                &self,
+                _pending: &[Digest],
+                _timeout: Duration,
+            ) -> Result<Vec<Vec<SignedTransaction>>, TxSyncError> {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(Vec::new())
+            }
+        }
+        struct Src(Arc<SlowPeer>);
+        impl PeerSource for Src {
+            fn sample_peer(&self) -> Option<Arc<dyn TxSyncPeerClient>> {
+                Some(self.0.clone())
+            }
+        }
+
+        let cfg = TxSyncerConfig {
+            // Tick immediately so we enter sync_round right away.
+            sync_interval: Duration::from_millis(10),
+            ..TxSyncerConfig::default()
+        };
+        let syncer = TxSyncer::new(
+            cfg,
+            Arc::new(FakePool(Vec::new())),
+            Arc::new(Src(Arc::new(SlowPeer))),
+            Arc::new(NoOpSolicitedTxHandler),
+        );
+
+        syncer.start();
+        // Give the loop time to wake, tick, and enter peer.sync's 5 s sleep.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Stop. Must return well before the 5 s peer sleep completes.
+        let started = std::time::Instant::now();
+        syncer.stop().await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "stop() stalled on in-flight peer.sync (took {elapsed:?})",
+        );
+        assert!(!syncer.is_running());
     }
 
     /// Regression: `start()` with `sync_interval == Duration::ZERO` must
