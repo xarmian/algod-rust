@@ -387,13 +387,20 @@ pub enum Commands {
         #[arg(long, short = 'b')]
         listen_address: Option<String>,
 
-        /// Act as a relay for gossip messages (forward received
+        /// Act as a relay for gossip messages: forward received
         /// transactions + blocks to other peers instead of only
-        /// handling them locally). Ignored unless `--listen-address`
-        /// is also set, mirroring go-algorand's `NetAddress != "" &&
-        /// Relay == true` gate. Required when another participate
-        /// node connects to this one over gossip, e.g. in the
-        /// two-binary REST-driven propagation integration test.
+        /// handling them locally, and accept inbound peer dials on
+        /// `--listen-address`. The inbound-listener side of this
+        /// flag is gated on `--listen-address` being set (mirrors
+        /// go-algorand's `is_relay = NetAddress != "" && Relay`), but
+        /// the forwarding side is applied regardless — setting this
+        /// without `--listen-address` starts the broadcast thread
+        /// and rebroadcasts to outbound-only peers, which usually
+        /// only makes sense when both flags are set.
+        ///
+        /// Required when another participate node needs to connect
+        /// to this one over gossip (e.g. in the two-binary
+        /// REST-driven propagation integration test).
         #[arg(long)]
         relay_messages: bool,
 
