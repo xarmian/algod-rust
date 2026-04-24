@@ -7,3 +7,6 @@ netroot/
 soak-*.jsonl
 soak-*.jsonl.summary.json
 
+# Python bytecode from `python3 -c py_compile` or direct script runs.
+scripts/__pycache__/
+

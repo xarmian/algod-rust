@@ -53,18 +53,29 @@ with stop.sh.
 EOF
 }
 
+# need_arg FLAG — error out if $2 is missing. Without this, `set -u`
+# makes `shift 2` after a bare trailing flag abort with an opaque
+# "unbound variable" message; a controlled usage error is nicer.
+need_arg() {
+    if [ $# -lt 2 ] || [ -z "$2" ] || [ "${2:0:2}" = "--" ]; then
+        echo "error: flag '$1' requires a value" >&2
+        usage >&2
+        exit 2
+    fi
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --rounds)
-            ROUNDS="$2"; shift 2 ;;
+            need_arg "$@"; ROUNDS="$2"; shift 2 ;;
         --out)
-            OUT="$2"; shift 2 ;;
+            need_arg "$@"; OUT="$2"; shift 2 ;;
         --interval)
-            INTERVAL="$2"; shift 2 ;;
+            need_arg "$@"; INTERVAL="$2"; shift 2 ;;
         --stall-timeout)
-            STALL_TIMEOUT="$2"; shift 2 ;;
+            need_arg "$@"; STALL_TIMEOUT="$2"; shift 2 ;;
         --overall-timeout)
-            OVERALL_TIMEOUT="$2"; shift 2 ;;
+            need_arg "$@"; OVERALL_TIMEOUT="$2"; shift 2 ;;
         --skip-preflight)
             SKIP_PREFLIGHT=1; shift ;;
         -h|--help)

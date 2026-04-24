@@ -291,6 +291,12 @@ def main() -> int:
                         "msg": f"status fetch {n['name']} failed: {e!s}",
                     })
                     continue
+                # Capture the wall time RIGHT AFTER this node's /v2/status
+                # returned — used below to derive commit_ts_utc. Using the
+                # outer `tick` would backdate every node's commit_ts by
+                # however long the earlier polls took (including retries /
+                # timeouts), which contaminates commit_spread_ms.
+                poll_ts_wall = time.time()
 
                 try:
                     lr = int(st.get("last-round", 0))
@@ -325,7 +331,7 @@ def main() -> int:
                         commit_ts = None
                         tslr_ms = None
                         if r == lr:
-                            commit_wall = tick - tslr_ns / 1e9
+                            commit_wall = poll_ts_wall - tslr_ns / 1e9
                             commit_ts = datetime.fromtimestamp(
                                 commit_wall, tz=timezone.utc
                             ).isoformat()

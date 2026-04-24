@@ -71,9 +71,16 @@ emitted the record.
 `back_fill=true` means this `node_round` record covers a round the node
 jumped over in a single observation (multi-step advance). The collector
 only has an accurate `commit_ts_utc` for the latest round in such a
-jump; the back-filled rounds have `commit_ts_utc=null` on purpose. The
-analyzer treats back-fills conservatively and notes any partial-round
-observations in its output.
+jump; the back-filled rounds have `commit_ts_utc=null` on purpose.
+
+The analyzer reports back-filled rounds as their own count
+(`rounds.back_filled_only_count` — rounds we witnessed via back-fill
+but never sampled with an authoritative `commit_ts`). They are excluded
+from the `commit_spread_ms` distribution because there is no commit
+time to diff against. `partial_round_observations` is a separate
+tally: rounds where we have a `commit_ts` from exactly one node (so a
+single-node run would see every round as "partial", while a back-fill
+gives us zero nodes).
 
 ## Derived metrics (in analyze.py)
 
@@ -142,7 +149,7 @@ ops/mixed-cluster/scripts/status.sh
 # 3. Run the soak.
 ops/mixed-cluster/scripts/soak.sh --rounds 200
 
-# 4. Analyze.
+# 4. Analyze (one file at a time — see §Comparing runs for multi-run diffs).
 ops/mixed-cluster/scripts/analyze.py ops/mixed-cluster/soak-<ts>.jsonl
 
 # 5. Tear down.

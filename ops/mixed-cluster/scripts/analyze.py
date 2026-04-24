@@ -98,10 +98,20 @@ def summarize(records, lag_tolerance: int):
     warnings = []
     # round -> node -> first commit_ts (datetime)
     commit_ts_by_round: dict = defaultdict(dict)
+    # rounds seen ONLY through back_fill records (no authoritative
+    # commit_ts available). Tracked separately so they don't silently
+    # disappear from the report even though they can't contribute to
+    # the commit-spread distribution.
+    back_filled_rounds: set = set()
     # round -> block record
     block_by_round: dict = {}
-    # node -> max round
+    # node -> max round. Seeded from run_meta.baseline + run_meta.end so a
+    # REST node that NEVER advances past baseline still shows up in the
+    # lag check (otherwise it'd be invisible — no node_round emitted).
     node_max_round: dict = defaultdict(int)
+    # Set of REST node names the collector was configured to poll. A node
+    # missing from this set was never contacted at all (don't lag-check it).
+    configured_rest_nodes: set = set()
     # rust node log samples
     rust_state_samples: list = []
 
@@ -109,6 +119,23 @@ def summarize(records, lag_tolerance: int):
         k = rec.get("kind")
         if k == "run_meta":
             run_metas.append(rec)
+            # Seed node_max_round / configured_rest_nodes from authoritative
+            # collector state so a stuck node is visible in the lag check.
+            for key in ("start_round_by_node", "final_last_seen"):
+                m = rec.get(key)
+                if isinstance(m, dict):
+                    for node, r in m.items():
+                        try:
+                            r_int = int(r)
+                        except (TypeError, ValueError):
+                            continue
+                        node_max_round[node] = max(node_max_round[node], r_int)
+                        configured_rest_nodes.add(node)
+            nodes_rest = rec.get("nodes_rest")
+            if isinstance(nodes_rest, list):
+                for n in nodes_rest:
+                    if isinstance(n, str):
+                        configured_rest_nodes.add(n)
         elif k == "warning":
             warnings.append(rec)
         elif k == "node_round":
@@ -120,6 +147,11 @@ def summarize(records, lag_tolerance: int):
                 if commit_ts is not None and node not in commit_ts_by_round[r]:
                     # Prefer the FIRST commit_ts we saw for this (round,node).
                     commit_ts_by_round[r][node] = commit_ts
+                elif rec.get("back_fill"):
+                    # Only register as back-filled if we don't already have
+                    # a better (commit_ts-bearing) observation for that round.
+                    if r not in commit_ts_by_round or not commit_ts_by_round[r]:
+                        back_filled_rounds.add(int(r))
         elif k == "block":
             r = rec.get("round")
             if r is not None and r not in block_by_round:
@@ -127,16 +159,21 @@ def summarize(records, lag_tolerance: int):
         elif k == "container":
             rust_state_samples.append(rec)
 
-    # Round coverage
-    observed_rounds = sorted(commit_ts_by_round.keys())
+    # Rounds that at least one commit_ts landed for — authoritative
+    # sampled rounds. Back-filled rounds are tracked separately.
+    timestamped_rounds = set(commit_ts_by_round.keys())
+    # De-dupe back-fills against timestamped rounds.
+    back_filled_rounds = back_filled_rounds - timestamped_rounds
+    all_observed = timestamped_rounds | back_filled_rounds
+    observed_rounds = sorted(timestamped_rounds)
     baseline_record = next(
         (m for m in run_metas if m.get("phase") == "baseline"), None
     )
     start_max = baseline_record.get("start_max_round") if baseline_record else None
     target_max = baseline_record.get("target_max_round") if baseline_record else None
 
-    first_observed = observed_rounds[0] if observed_rounds else None
-    last_observed = observed_rounds[-1] if observed_rounds else None
+    first_observed = min(all_observed) if all_observed else None
+    last_observed = max(all_observed) if all_observed else None
 
     # Block-time distribution
     sorted_block_rounds = sorted(block_by_round.keys())
@@ -223,6 +260,7 @@ def summarize(records, lag_tolerance: int):
         },
         "rounds": {
             "observed_count": len(observed_rounds),
+            "back_filled_only_count": len(back_filled_rounds),
             "first_observed": first_observed,
             "last_observed": last_observed,
             "start_max": start_max,
@@ -286,8 +324,10 @@ def print_report(summary, source_paths):
     print()
 
     r = summary["rounds"]
-    print(f"Rounds: observed={r['observed_count']} first={r['first_observed']} "
-          f"last={r['last_observed']} blocks_captured={r['blocks_captured']} "
+    print(f"Rounds: observed={r['observed_count']} "
+          f"back_filled_only={r['back_filled_only_count']} "
+          f"first={r['first_observed']} last={r['last_observed']} "
+          f"blocks_captured={r['blocks_captured']} "
           f"partial_observations={r['partial_round_observations']}")
     if r["blocks_missing_ts"]:
         print(f"  rounds with missing block_ts: {len(r['blocks_missing_ts'])}")
@@ -379,31 +419,35 @@ def print_report(summary, source_paths):
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Analyze a PLAN-32 / TASK-87 soak JSONL file.",
+        description=(
+            "Analyze ONE PLAN-32 / TASK-87 soak JSONL file. "
+            "Pass separate files through separate invocations — merging "
+            "records across runs silently confuses the lag check and "
+            "block-time distribution."
+        ),
     )
-    parser.add_argument("inputs", nargs="+", help="One or more JSONL files from metrics.py.")
+    parser.add_argument("input", help="A JSONL file from metrics.py.")
     parser.add_argument("--lag-tolerance", type=int, default=5,
                         help="Max allowed per-node round delta at end of run (default 5).")
     parser.add_argument("--json-out", default=None,
                         help="Path to write the full summary JSON (default: <input>.summary.json).")
     args = parser.parse_args()
 
-    for p in args.inputs:
-        if not os.path.exists(p):
-            print(f"error: {p} not found", file=sys.stderr)
-            return 2
+    if not os.path.exists(args.input):
+        print(f"error: {args.input} not found", file=sys.stderr)
+        return 2
 
-    records = list(load_jsonl(args.inputs))
+    records = list(load_jsonl([args.input]))
     if not records:
-        print("error: no records loaded from input(s)", file=sys.stderr)
+        print(f"error: no records loaded from {args.input}", file=sys.stderr)
         return 2
 
     summary = summarize(records, args.lag_tolerance)
-    clean = print_report(summary, args.inputs)
+    clean = print_report(summary, [args.input])
 
     # Strip _samples from the sidecar to keep it compact (and also emit a
     # separate _samples file if the caller wants raw arrays).
-    out_path = args.json_out or (args.inputs[0] + ".summary.json")
+    out_path = args.json_out or (args.input + ".summary.json")
     serializable = {k: v for k, v in summary.items() if k != "_samples"}
     with open(out_path, "w") as f:
         json.dump(serializable, f, indent=2, default=str)

@@ -79,8 +79,9 @@ has already brought everything up and tears nothing down.
 # Long acceptance soak (~10-15 minutes at ~3s block time).
 ops/mixed-cluster/scripts/soak.sh --rounds 200
 
-# Analyze the most recent soak output.
-ops/mixed-cluster/scripts/analyze.py ops/mixed-cluster/soak-*.jsonl
+# Analyze a specific soak output. Pass exactly one file; merging
+# records across runs silently confuses the lag + block-time checks.
+ops/mixed-cluster/scripts/analyze.py ops/mixed-cluster/soak-<unix>.jsonl
 ```
 
 Output goes to `ops/mixed-cluster/soak-<unix>.jsonl` by default (gitignored).
