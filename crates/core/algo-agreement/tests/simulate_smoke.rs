@@ -183,39 +183,53 @@ fn instant_clock_first_timeout_at_returns_never_channel() {
 #[test]
 fn instant_clock_deadline_timeout_never_fires_until_shutdown() {
     use algo_agreement::{types::TimeoutType, Clock};
+    use crossbeam_channel::TryRecvError;
     let clock = InstantClock::new();
     // Consume the first-call side effect (drops the timeout_at_sender).
     let _first = clock.timeout_at(Duration::from_secs(60), TimeoutType::Deadline);
-    // A subsequent Deadline timeout should NOT fire — the driver advances
-    // rounds via `run_round`, not by firing deadline timers.
+    // A subsequent Deadline timeout should be "open but empty" pre-shutdown
+    // — the driver advances rounds via `run_round`, not by firing deadline
+    // timers. `try_recv` distinguishes `Empty` (sender alive, no message)
+    // from `Disconnected` — we want `Empty`, asserting the sender is still
+    // held inside `active_senders`.
     let rx = clock.timeout_at(Duration::from_millis(1), TimeoutType::Deadline);
-    assert!(
-        rx.recv_timeout(Duration::from_millis(20)).is_err(),
-        "Deadline timeout should not fire before shutdown"
+    assert_eq!(
+        rx.try_recv().unwrap_err(),
+        TryRecvError::Empty,
+        "Deadline receiver should be Empty pre-shutdown (sender held in active_senders)"
     );
     // After shutdown, the sender held inside `active_senders` is dropped,
-    // so the receiver we captured above must surface Disconnected
-    // immediately — this is the wake-up the real service depends on.
+    // so `try_recv` on the receiver we captured above must surface
+    // `Disconnected` — not `Empty`. This is exactly the wake-up the real
+    // service's `Select::select` depends on.
     clock.shutdown();
-    assert!(
-        rx.recv_timeout(Duration::from_millis(50)).is_err(),
-        "timeout receivers must disconnect after shutdown() so the demux wakes"
+    // Allow the sender drop to propagate; crossbeam guarantees eventual
+    // visibility but the mutex release ordering can lag a hair.
+    std::thread::sleep(Duration::from_millis(5));
+    assert_eq!(
+        rx.try_recv().unwrap_err(),
+        TryRecvError::Disconnected,
+        "shutdown() must disconnect live timeout receivers so the demux wakes"
     );
 }
 
 #[test]
 fn instant_clock_timeout_after_shutdown_surfaces_immediately() {
     use algo_agreement::{types::TimeoutType, Clock};
+    use crossbeam_channel::TryRecvError;
     // Regression: a `timeout_at` request that races `shutdown()` and lands
     // AFTER the flag flips must return a pre-disconnected receiver —
     // otherwise its sender would live outside `active_senders` and the
-    // demux would park forever.
+    // demux would park forever. Assert `Disconnected` specifically (not
+    // merely `is_err`) so a future regression returning a never-channel
+    // here would fail loudly.
     let clock = InstantClock::new();
     clock.shutdown();
     let rx = clock.timeout_at(Duration::from_secs(60), TimeoutType::Deadline);
-    assert!(
-        rx.recv_timeout(Duration::from_millis(50)).is_err(),
-        "post-shutdown timeout_at must return a pre-disconnected receiver"
+    assert_eq!(
+        rx.try_recv().unwrap_err(),
+        TryRecvError::Disconnected,
+        "post-shutdown timeout_at must return a Disconnected receiver, not a never-channel"
     );
 }
 
