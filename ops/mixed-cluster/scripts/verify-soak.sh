@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
-# PLAN-32 / TASK-88 — mixed-cluster soak verifier.
+# PLAN-32 / TASK-88 + TASK-95 — mixed-cluster soak verifier.
 #
-# Wraps the two TASK-88 tools:
+# Wraps the two verifier tools:
 #
 #   1. algo-fork-detector — pulls /v2/blocks/{r} from every Go REST node
 #      in the mixed cluster and asserts identical block digests per round.
 #   2. algo-cert-crossverify — cross-verifies certs the Go nodes produced
-#      by authenticating them against an algod-rust ledger (the Rust
-#      relay's ledger.sqlite, copied out of the container into a temp
-#      directory for the duration of the run).
+#      by authenticating them against an algod-rust ledger. As of
+#      TASK-95 the mixed-cluster Rust relay seeds accountbase +
+#      accounttotals from genesis and applies each imported block, so
+#      its `/app/ledger.sqlite` is a valid verifier input. This script
+#      `docker cp`s it out into a temp dir for the run and cleans up
+#      on exit.
 #
 # Usage:
 #   verify-soak.sh [--from-round N] [--to-round M] [--stride S]
-#                  [--tools-dir PATH] [--skip-preflight]
+#                  [--tools-dir PATH] [--no-cert-crossverify]
+#                  [--cert-ledger PATH] [--skip-preflight]
 #
 # Exit codes:
 #   0 — every tool that ran reported clean
@@ -21,11 +25,10 @@
 #   2 — the fork detector detected a real fork (bubbled up verbatim)
 #       OR the cert cross-verify tool failed authentication
 #   3 — preflight failed (cluster not healthy, no token file, etc.)
-#   4 — extracting the Rust ledger failed (unused by the default path,
-#       reserved for future --with-cert-crossverify auto-extraction)
+#   4 — extracting the Rust ledger failed
 #
 # When both tools run and both fail, the larger exit code (most severe)
-# wins. A fork-only run never sees cert's exit code at all.
+# wins.
 #
 # Notes:
 # - Rust → Go cert verification (the inverse direction) is out of scope
@@ -47,19 +50,19 @@ STRIDE=20
 TOOLS_DIR="${TOOLS_DIR:-$REPO_ROOT/target/debug}"
 SKIP_PREFLIGHT=0
 OUT_DIR="${OUT_DIR:-$ROOT}"
-# Cert cross-verify is OPT-IN today because the mixed-cluster Rust node
-# runs in `relay` mode and doesn't populate a full ledger (empty proto,
-# empty hdrdata, no participation tracker). The cert-crossverify binary
-# detects this and bails fast, but there's no point running it by
-# default until TASK-95 lands a full-sync Rust node in the harness.
-# Pass `--with-cert-crossverify <full-sync-ledger.sqlite>` to opt in.
-CERT_LEDGER=""
+# Cert cross-verify runs by default as of TASK-95 (the Rust relay now
+# maintains a full-sync ledger). Pass --no-cert-crossverify to skip it
+# (e.g. for a quick fork-only check), or --cert-ledger PATH to point at
+# an externally-prepared SQLite instead of the relay container's.
+RUN_CERT=1
+CERT_LEDGER_OVERRIDE=""
 
 usage() {
     cat <<EOF
 usage: $(basename "$0") [--from-round N] [--to-round M] [--stride S]
                         [--tools-dir PATH] [--out-dir PATH]
-                        [--with-cert-crossverify PATH] [--skip-preflight]
+                        [--no-cert-crossverify] [--cert-ledger PATH]
+                        [--skip-preflight]
 
 Options:
   --from-round N         First round to verify (default: 1).
@@ -74,19 +77,20 @@ Options:
                          'cargo build -p algo-fork-detector -p algo-cert-crossverify'.
   --out-dir PATH         Where to write verifier JSONL output (default:
                          the mixed-cluster root).
-  --with-cert-crossverify PATH
-                         Run cert cross-verify against the SQLite ledger
-                         at PATH. Must be a full-sync algod-rust ledger
-                         (not the mixed-cluster relay's, which lacks
-                         proto/hdrdata/participation state — see TASK-95).
-                         If omitted, cert cross-verify is skipped with a
-                         note.
+  --no-cert-crossverify  Skip the cert cross-verify step entirely.
+                         Fork detection still runs. Useful for a fast
+                         sanity check when you don't care about cert
+                         authentication.
+  --cert-ledger PATH     Use an externally-prepared SQLite ledger at
+                         PATH instead of docker cp'ing from
+                         phase6-rust-node-4:/app/ledger.sqlite. The
+                         ledger must be caught up past --to-round.
   --skip-preflight       Skip the status.sh health check.
   -h, --help             Show this help.
 
 Artifacts written:
   \$OUT_DIR/verify-fork-<ts>.jsonl
-  \$OUT_DIR/verify-cert-<ts>.jsonl (only with --with-cert-crossverify)
+  \$OUT_DIR/verify-cert-<ts>.jsonl (unless --no-cert-crossverify)
 EOF
 }
 
@@ -107,7 +111,8 @@ while [ $# -gt 0 ]; do
         --stride)                 need_arg "$@"; STRIDE="$2"; shift 2 ;;
         --tools-dir)              need_arg "$@"; TOOLS_DIR="$2"; shift 2 ;;
         --out-dir)                need_arg "$@"; OUT_DIR="$2"; shift 2 ;;
-        --with-cert-crossverify)  need_arg "$@"; CERT_LEDGER="$2"; shift 2 ;;
+        --cert-ledger)            need_arg "$@"; CERT_LEDGER_OVERRIDE="$2"; shift 2 ;;
+        --no-cert-crossverify)    RUN_CERT=0; shift ;;
         --skip-preflight)         SKIP_PREFLIGHT=1; shift ;;
         -h|--help)                usage; exit 0 ;;
         *)
@@ -129,10 +134,11 @@ if [ ! -x "$FORK_BIN" ]; then
     echo "         cargo build -p algo-fork-detector" >&2
     exit 2
 fi
-if [ -n "$CERT_LEDGER" ] && [ ! -x "$CERT_BIN" ]; then
+if [ "$RUN_CERT" = "1" ] && [ ! -x "$CERT_BIN" ]; then
     echo "error: $CERT_BIN not found or not executable" >&2
-    echo "       --with-cert-crossverify needs it; rebuild with:" >&2
+    echo "       cert cross-verify needs it; rebuild with:" >&2
     echo "         cargo build -p algo-cert-crossverify" >&2
+    echo "       (or pass --no-cert-crossverify to skip this step)" >&2
     exit 2
 fi
 
@@ -186,21 +192,52 @@ fork_rc=$?
 set -e
 echo "    fork-detector exit: $fork_rc (output: $FORK_OUT)"
 
-# -- 2. Cert cross-verify (Go → Rust) — OPT-IN -----------------------------
+# -- 2. Cert cross-verify (Go → Rust) — DEFAULT ON (TASK-95) ---------------
 cert_rc=0
-if [ -n "$CERT_LEDGER" ]; then
-    if [ ! -f "$CERT_LEDGER" ]; then
-        echo "error: --with-cert-crossverify path $CERT_LEDGER does not exist" >&2
-        exit 4
+WORKDIR=""
+cleanup_workdir() {
+    if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
+        rm -rf "$WORKDIR"
     fi
+}
+trap cleanup_workdir EXIT
+
+if [ "$RUN_CERT" = "1" ]; then
     CERT_OUT="$OUT_DIR/verify-cert-$(date +%s).jsonl"
-    echo "==> cert cross-verify (Go-produced → Rust verifier), stride $STRIDE"
-    echo "    ledger: $CERT_LEDGER"
+    if [ -n "$CERT_LEDGER_OVERRIDE" ]; then
+        if [ ! -f "$CERT_LEDGER_OVERRIDE" ]; then
+            echo "error: --cert-ledger path $CERT_LEDGER_OVERRIDE does not exist" >&2
+            exit 4
+        fi
+        CERT_LEDGER_PATH="$CERT_LEDGER_OVERRIDE"
+        echo "==> cert cross-verify (Go-produced → Rust verifier), stride $STRIDE"
+        echo "    ledger: $CERT_LEDGER_PATH (--cert-ledger override)"
+    else
+        WORKDIR="$(mktemp -d -t verify-soak.XXXXXX)"
+        CERT_LEDGER_PATH="$WORKDIR/ledger.sqlite"
+        echo "==> cert cross-verify (Go-produced → Rust verifier), stride $STRIDE"
+        echo "    copying Rust ledger from phase6-rust-node-4:/app/ledger.sqlite"
+        if ! docker cp phase6-rust-node-4:/app/ledger.sqlite "$CERT_LEDGER_PATH" 2>/dev/null; then
+            echo "error: failed to docker cp the Rust ledger." >&2
+            echo "       is phase6-rust-node-4 running?" >&2
+            exit 4
+        fi
+        if [ ! -s "$CERT_LEDGER_PATH" ]; then
+            echo "error: extracted ledger $CERT_LEDGER_PATH is empty" >&2
+            exit 4
+        fi
+        # Capture the WAL + SHM so the SQLite snapshot is self-consistent.
+        # These may not exist on a quiescent node; ignore failures.
+        for sidecar in ledger.sqlite-wal ledger.sqlite-shm; do
+            docker cp "phase6-rust-node-4:/app/$sidecar" "$WORKDIR/$sidecar" 2>/dev/null || true
+        done
+        echo "    ledger size: $(du -h "$CERT_LEDGER_PATH" | awk '{print $1}')"
+    fi
     set +e
     "$CERT_BIN" \
         --node http://127.0.0.1:4001 \
         --token-file "$TOKEN_FILE" \
-        --ledger-sqlite "$CERT_LEDGER" \
+        --ledger-sqlite "$CERT_LEDGER_PATH" \
         --from-round "$FROM_ROUND" \
         --to-round "$TO_ROUND" \
         --stride "$STRIDE" \
@@ -209,21 +246,16 @@ if [ -n "$CERT_LEDGER" ]; then
     set -e
     echo "    cert-crossverify exit: $cert_rc (output: $CERT_OUT)"
 else
-    echo "==> cert cross-verify: SKIPPED (pass --with-cert-crossverify <path> to enable)"
-    echo "    The mixed-cluster Rust relay today does NOT maintain a full"
-    echo "    ledger — imported blocks land with empty proto/hdrdata and"
-    echo "    the participation tracker is never populated, so cert"
-    echo "    verification would fail at the first round. Tracked as TASK-95"
-    echo "    (follow-up: enable full-sync mode for cert cross-verify)."
+    echo "==> cert cross-verify: SKIPPED (--no-cert-crossverify)"
 fi
 
 # -- Summary ----------------------------------------------------------------
 echo ""
 if [ "$fork_rc" -eq 0 ] && [ "$cert_rc" -eq 0 ]; then
-    if [ -n "$CERT_LEDGER" ]; then
+    if [ "$RUN_CERT" = "1" ]; then
         echo "verify-soak: CLEAN — fork detector + Go→Rust cert cross-verify both passed."
     else
-        echo "verify-soak: fork-clean (cert cross-verify skipped — see --help)."
+        echo "verify-soak: fork-clean (cert cross-verify skipped via --no-cert-crossverify)."
     fi
     exit 0
 fi

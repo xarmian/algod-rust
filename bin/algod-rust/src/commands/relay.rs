@@ -2,7 +2,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use algo_ledger::{LedgerStore, SqliteLedger};
+use algo_ledger::{
+    apply::apply_block, parse_genesis_json, populate_store, seed_account_totals_from_genesis,
+    LedgerStore, SqliteLedger,
+};
 use algo_network::{
     BlockService, BlockServiceError, ForwardingPolicy, GossipNode, IncomingMessage,
     LedgerForBlockService, MessageHandler, OutgoingMessage, Phonebook, Tag, TaggedMessageHandler,
@@ -28,11 +31,30 @@ struct LedgerBlockService {
 }
 
 impl LedgerBlockService {
-    /// Store a raw block and certificate fetched from a peer.
+    /// Store a raw block + certificate fetched from a peer, and (when
+    /// possible) apply the block's state transitions so the local
+    /// ledger's accountbase stays current.
     ///
-    /// This uses the SQLite ledger's block storage: `put_block` inserts the
-    /// raw block data, `put_block_cert` stores the certificate, and
-    /// `set_current_round` + `commit_block` advance the ledger tip.
+    /// History: before PLAN-32 / TASK-95 this function passed an empty
+    /// `proto` + empty `hdrdata` to `put_block` and skipped `apply_block`
+    /// entirely — fine for a pure block archive but left the
+    /// `accountbase` / `accounttotals` / per-round header fields empty,
+    /// which in turn broke `algo_agreement::Certificate::authenticate`
+    /// for downstream consumers (the TASK-88 cert cross-verify tool).
+    ///
+    /// Current behavior:
+    /// 1. Decode the block msgpack bytes to a typed `Block`. If decode
+    ///    fails we fall back to the legacy behavior (raw blob store
+    ///    without apply) so a malformed block doesn't break gossip —
+    ///    downstream consumers surface the resulting gaps on their own.
+    /// 2. Call `put_block` with the real `proto` (from
+    ///    `Block::current_protocol`) and canonical `hdrdata` so
+    ///    `LedgerReader::{consensus_version, seed, lookup_digest}` work.
+    /// 3. For every round > 0, call `apply_block` to mutate `accountbase`.
+    ///    Round 0 (genesis) is stored without apply since the opening
+    ///    state should come from `populate_store`. If apply fails we
+    ///    log + continue — still better than silently dropping the
+    ///    block. Downstream verification fails visibly in that case.
     fn store_block_and_cert(
         &self,
         round: u64,
@@ -41,15 +63,63 @@ impl LedgerBlockService {
     ) -> Result<(), String> {
         let mut ledger = self.ledger.lock().map_err(|e| format!("lock: {e}"))?;
         ledger.begin_block().map_err(|e| format!("begin: {e}"))?;
-        ledger
-            .put_block(round, "", &[], block_data)
-            .map_err(|e| format!("put_block: {e}"))?;
-        ledger
-            .put_block_cert(round, cert_data)
-            .map_err(|e| format!("put_block_cert: {e}"))?;
-        ledger.set_current_round(Round(round));
-        ledger.commit_block().map_err(|e| format!("commit: {e}"))?;
-        Ok(())
+
+        // Attempt a typed decode. Fall back to empty proto/hdrdata if it
+        // fails — keeps the archive path robust to formats we don't yet
+        // decode end-to-end while still taking the full-apply path on
+        // the common case.
+        let decoded = algo_codec::decode_block_fast(block_data)
+            .or_else(|_| algo_codec::decode_block(block_data));
+        match decoded {
+            Ok(block) => {
+                let proto = block.current_protocol.clone();
+                let hdrdata = algo_codec::canonical_encode_block_header_from_block(&block);
+                if let Err(e) = ledger.put_block(round, &proto, &hdrdata, block_data) {
+                    return Err(format!("put_block: {e}"));
+                }
+                if let Err(e) = ledger.put_block_cert(round, cert_data) {
+                    return Err(format!("put_block_cert: {e}"));
+                }
+                // Apply state transitions for non-genesis rounds. apply_block
+                // on round 0 would re-run the genesis transactions (which
+                // is both redundant and sometimes incorrect — the genesis
+                // state has already been loaded via populate_store).
+                if round > 0 {
+                    if let Err(e) = apply_block(&mut *ledger, &block) {
+                        // Apply failures are logged but not fatal — the
+                        // block is still stored so gossip service works.
+                        warn!(round = round, error = %e, "apply_block failed; ledger state may drift");
+                    }
+                }
+                ledger.set_current_round(Round(round));
+                ledger.commit_block().map_err(|e| format!("commit: {e}"))?;
+                Ok(())
+            }
+            Err(decode_err) => {
+                // Preserve the legacy archive path on decode failure so a
+                // single bad block never stalls gossip. We still stash the
+                // raw block msgpack as `hdrdata` so the seed extractor (it
+                // just searches for the "seed" codec key at the top of a
+                // msgpack map) can function — the genesis block / any
+                // shape we don't yet decode end-to-end otherwise leaves
+                // `lookup_digest` / `seed` broken for that round. No apply
+                // runs without a typed Block.
+                warn!(
+                    round = round,
+                    error = %decode_err,
+                    "block decode failed; falling back to archive store with raw-as-hdrdata"
+                );
+                ledger
+                    .put_block(round, "", block_data, block_data)
+                    .map_err(|e| format!("put_block: {e}"))?;
+                ledger
+                    .put_block_cert(round, cert_data)
+                    .map_err(|e| format!("put_block_cert: {e}"))?;
+                ledger.set_current_round(Round(round));
+                ledger.commit_block().map_err(|e| format!("commit: {e}"))?;
+                Ok(())
+            }
+        }
     }
 
     fn latest_round_inner(&self) -> u64 {
@@ -375,6 +445,7 @@ pub async fn run(
     tls_key: Option<&str>,
     mem_cap_mb: u64,
     ledger_path: &Path,
+    genesis_json_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     // Resolve genesis ID: use the provided value, or look it up by network name.
     let resolved_genesis_id = if genesis_id.is_empty() {
@@ -437,12 +508,58 @@ pub async fn run(
     let net = Arc::new(WebsocketNetwork::new(config, phonebook));
 
     // Open the SQLite ledger and register the block service HTTP handler.
-    let sqlite_ledger = SqliteLedger::open(ledger_path).map_err(|e| {
+    let mut sqlite_ledger = SqliteLedger::open(ledger_path).map_err(|e| {
         anyhow::anyhow!("failed to open ledger at {}: {}", ledger_path.display(), e)
     })?;
 
     let latest = sqlite_ledger.current_round().0;
     info!(path = %ledger_path.display(), latest_round = latest, "opened ledger database");
+
+    // Optional: bootstrap genesis state when the ledger is fresh. Without
+    // this the relay's accountbase + accounttotals stay empty forever
+    // (apply_block alone doesn't populate totals — see PLAN-32 /
+    // TASK-95), which breaks downstream consumers that need full
+    // ledger state. Skipping when already seeded — detected by
+    // `online_stake() > 0` OR `latest_round > 0` — keeps restarts idempotent.
+    if let Some(genesis_path) = genesis_json_path {
+        let already_seeded =
+            sqlite_ledger.online_stake().map(|s| s > 0).unwrap_or(false) || latest > 0;
+        if !already_seeded {
+            let genesis_str = std::fs::read_to_string(genesis_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to read genesis.json at {}: {}",
+                    genesis_path.display(),
+                    e
+                )
+            })?;
+            let genesis = parse_genesis_json(&genesis_str)
+                .map_err(|e| anyhow::anyhow!("failed to parse genesis.json: {}", e))?;
+            sqlite_ledger
+                .begin_block()
+                .map_err(|e| anyhow::anyhow!("begin_block during genesis seed: {}", e))?;
+            populate_store(&mut sqlite_ledger, &genesis)
+                .map_err(|e| anyhow::anyhow!("populate_store from genesis: {}", e))?;
+            seed_account_totals_from_genesis(&mut sqlite_ledger, &genesis)
+                .map_err(|e| anyhow::anyhow!("seed_account_totals_from_genesis: {}", e))?;
+            sqlite_ledger
+                .commit_block()
+                .map_err(|e| anyhow::anyhow!("commit_block during genesis seed: {}", e))?;
+            let online = sqlite_ledger.online_stake().unwrap_or(0);
+            info!(
+                genesis_path = %genesis_path.display(),
+                allocations = genesis.alloc.len(),
+                online_stake = online,
+                "seeded ledger from genesis (accountbase + accounttotals)"
+            );
+        } else {
+            info!(
+                latest_round = latest,
+                "ledger already seeded; skipping genesis bootstrap"
+            );
+        }
+    } else {
+        debug!("no --genesis-json provided; accountbase will remain empty (archive-only mode)");
+    }
 
     let ledger = Arc::new(LedgerBlockService {
         ledger: Mutex::new(sqlite_ledger),

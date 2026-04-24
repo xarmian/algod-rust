@@ -109,6 +109,44 @@ pub fn parse_genesis_json(json_str: &str) -> Result<GenesisJson, AlgoError> {
     })
 }
 
+/// Seed the SQLite ledger's `accounttotals` table from a parsed genesis.
+///
+/// PLAN-32 / TASK-95 — `apply_block` doesn't maintain `accounttotals`
+/// today (catchpoint-only), so mixed-cluster-style harnesses need to
+/// seed it at startup or `Certificate::authenticate`'s `circulation()`
+/// lookup returns 0 and verification fails. This sums allocation
+/// `algo` amounts by online/offline/not-participating status and
+/// writes a single row to `accounttotals`.
+///
+/// Correct as long as no subsequent transaction flips an account's
+/// online status — true for the PLAN-32 harness (Wallet1/2/3 online
+/// and Wallet4 offline, statically for the whole soak). NOT suitable
+/// for general-purpose production nodes; see `catchpoint::importer`
+/// for the authoritative writer.
+pub fn seed_account_totals_from_genesis(
+    ledger: &mut crate::sqlite::SqliteLedger,
+    genesis: &GenesisJson,
+) -> Result<(), AlgoError> {
+    let mut online: u64 = 0;
+    let mut offline: u64 = 0;
+    let mut not_participating: u64 = 0;
+    for alloc in &genesis.alloc {
+        let status = match alloc.state.onl {
+            Some(v) => AccountStatus::from(v),
+            None => AccountStatus::Offline,
+        };
+        let algo = alloc.state.algo;
+        match status {
+            AccountStatus::Online => online = online.saturating_add(algo),
+            AccountStatus::Offline => offline = offline.saturating_add(algo),
+            AccountStatus::NotParticipating => {
+                not_participating = not_participating.saturating_add(algo);
+            }
+        }
+    }
+    ledger.put_account_totals_seed(online, offline, not_participating)
+}
+
 impl LedgerState {
     /// Load ledger state from a genesis.json file on disk.
     pub fn from_genesis(path: &Path) -> Result<LedgerState, AlgoError> {
@@ -239,5 +277,55 @@ mod tests {
     fn test_invalid_genesis_json() {
         let result = LedgerState::from_genesis_json("not valid json");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn seed_account_totals_from_genesis_sums_by_status() {
+        // PLAN-32 / TASK-95: regression test for the harness-style genesis
+        // seeder — 2 online + 1 offline + 1 not-participating allocation
+        // should land as three distinct totals in accounttotals.
+        let json = r#"{
+            "network": "phase6net",
+            "id": "v1",
+            "proto": "future",
+            "alloc": [
+                {"addr": "A2UDRUOIEWEYDTE5DJLC4EH2HWFKQMZOPUKGNOWDOJOLJFPOPZ4EVXAAJY",
+                 "comment": "online-1",
+                 "state": {"algo": 33, "onl": 1}},
+                {"addr": "GBMUQUM7E3QW75GCVLQFMCS2Y7V5XTOJUBRVBXWOLS3EENBZP4AIGPHM6A",
+                 "comment": "online-2",
+                 "state": {"algo": 33, "onl": 1}},
+                {"addr": "ALGORANDSCOLLECTSFEES7777777777777777777777777777777746MSJUVU",
+                 "comment": "offline",
+                 "state": {"algo": 33, "onl": 0}},
+                {"addr": "B2UDRUOIEWEYDTE5DJLC4EH2HWFKQMZOPUKGNOWDOJOLJFPOPZ4EVXAAJY",
+                 "comment": "notpart",
+                 "state": {"algo": 1, "onl": 2}}
+            ],
+            "fees": "7777777777777777777777777777777777777777777777777774MSJUVU",
+            "rwd":  "7777777777777777777777777777777777777777777777777774MSJUVU"
+        }"#;
+        let genesis = parse_genesis_json(json).unwrap();
+        let mut ledger = crate::sqlite::SqliteLedger::open_in_memory().unwrap();
+        seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
+        // Total online = 33 + 33 = 66; online_stake reads that column.
+        assert_eq!(ledger.online_stake().unwrap(), 66);
+    }
+
+    #[test]
+    fn seed_account_totals_is_idempotent() {
+        // Calling twice should not double-count — INSERT OR REPLACE.
+        let genesis = parse_genesis_json(
+            r#"{"network":"n","id":"v","proto":"p","alloc":[
+                {"addr":"7777777777777777777777777777777777777777777777777774MSJUVU",
+                 "state":{"algo":10,"onl":1}}
+            ],"fees":"7777777777777777777777777777777777777777777777777774MSJUVU",
+              "rwd":"7777777777777777777777777777777777777777777777777774MSJUVU"}"#,
+        )
+        .unwrap();
+        let mut ledger = crate::sqlite::SqliteLedger::open_in_memory().unwrap();
+        seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
+        seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
+        assert_eq!(ledger.online_stake().unwrap(), 10);
     }
 }

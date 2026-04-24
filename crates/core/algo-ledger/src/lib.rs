@@ -35,7 +35,10 @@ pub use eval_compare::{
     MismatchCategory,
 };
 pub use eval_delta::{parse_eval_delta, DeltaAction, EvalDelta, ValueDelta};
-pub use genesis::{parse_genesis_json, populate_store, GenesisAllocation, GenesisJson};
+pub use genesis::{
+    parse_genesis_json, populate_store, seed_account_totals_from_genesis, GenesisAllocation,
+    GenesisJson,
+};
 pub use heartbeat::{
     bits_match, find_challenge, last_seen, Challenge, ChallengePeriod, HeaderProvider,
     StoreHeaderProvider,

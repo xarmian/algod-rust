@@ -289,6 +289,16 @@ pub enum Commands {
         /// Block service memory cap in MB.
         #[arg(long, default_value = "500")]
         mem_cap_mb: u64,
+
+        /// Optional path to a genesis.json file. When set, and the local
+        /// ledger is empty, the relay seeds genesis accounts + account
+        /// totals from this file. Without it the ledger's accountbase
+        /// and accounttotals stay empty, which is fine for a pure block
+        /// archive but breaks downstream consumers that need full
+        /// ledger state (e.g. the TASK-88 cert cross-verify tool).
+        /// See PLAN-32 / TASK-95.
+        #[arg(long)]
+        genesis_json: Option<PathBuf>,
     },
 
     /// Observe gossip traffic: connect to relay peers and log all messages as JSON lines.

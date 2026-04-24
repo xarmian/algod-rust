@@ -251,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
             tls_cert,
             tls_key,
             mem_cap_mb,
+            genesis_json,
         } => {
             commands::relay::run(
                 &bind_address,
@@ -265,6 +266,7 @@ async fn main() -> anyhow::Result<()> {
                 tls_key.as_deref(),
                 mem_cap_mb,
                 &ledger_path,
+                genesis_json.as_deref(),
             )
             .await?;
         }
