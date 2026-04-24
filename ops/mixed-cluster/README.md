@@ -1,4 +1,4 @@
-# Mixed-Cluster Consensus Harness (TASK-86 / TASK-87)
+# Mixed-Cluster Consensus Harness (TASK-86 / TASK-87 / TASK-88)
 
 A 4-node docker-compose harness that runs 3 go-algorand v4.5.1-stable
 nodes + 1 algod-rust node on a private network. Foundation for:
@@ -92,6 +92,34 @@ See `docs/SOAK_METHODOLOGY.md` for the full set of tuning knobs,
 measured metrics, acceptance criteria, and known limitations (notably
 the Rust node is **not** yet a proposer — gated on PLAN-35 participation
 key interop).
+
+## Verifying a soak (TASK-88)
+
+After a soak, run the verifier to assert no forks occurred across the
+Go REST nodes and (optionally) cross-verify the certs Go produced
+under algod-rust's `Certificate::authenticate`:
+
+```bash
+# Build the tools once.
+cargo build -p algo-fork-detector -p algo-cert-crossverify
+
+# Fork detection — exits non-zero on any round where Go nodes disagree.
+ops/mixed-cluster/scripts/verify-soak.sh --from-round 1 --to-round 200
+
+# Cert cross-verify — opt-in. The mixed-cluster Rust node runs in
+# relay mode today (imported blocks stored as raw blobs without
+# populating proto / hdrdata / the participation tracker), so
+# Certificate::authenticate needs a ledger from a full-sync
+# algod-rust instance, not the relay's. Tracked as TASK-95.
+ops/mixed-cluster/scripts/verify-soak.sh \
+    --from-round 1 --to-round 200 \
+    --with-cert-crossverify /path/to/full-sync/ledger.sqlite
+```
+
+The verifier writes `verify-fork-<ts>.jsonl` (and `verify-cert-<ts>.jsonl`
+when cert verify runs) next to the soak output. The underlying binaries
+`algo-fork-detector` and `algo-cert-crossverify` are standalone and
+scriptable outside the shell wrapper.
 
 ## Host ports
 

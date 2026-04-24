@@ -94,6 +94,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "algo-cert-crossverify"
+version = "0.1.0"
+dependencies = [
+ "algo-agreement",
+ "algo-codec",
+ "algo-ledger",
+ "algo-rest-client",
+ "algo-types",
+ "anyhow",
+ "clap",
+ "hex",
+ "rmp-serde",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "algo-codec"
 version = "0.1.0"
 dependencies = [
@@ -176,6 +197,23 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "algo-fork-detector"
+version = "0.1.0"
+dependencies = [
+ "algo-codec",
+ "algo-rest-client",
+ "algo-types",
+ "anyhow",
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
