@@ -37,7 +37,10 @@ services:
       # See the algorand/algod entrypoint's `start_public_network` path.
       - PEER_ADDRESS=go-node-2:4161;go-node-3:4161
     ports:
-      - "4001:8080"
+      # Bound to 127.0.0.1 so the harness REST stays local-only even
+      # though the committed token is the trivial "aaaa..." value. Use
+      # `docker compose exec` or edit the binding for off-host access.
+      - "127.0.0.1:4001:8080"
     volumes:
       # Each Go node mounts ONLY its own netroot subdirectory as
       # /algod/data. The parent /algod directory is left unmounted so the
@@ -69,7 +72,7 @@ services:
       - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - PEER_ADDRESS=go-node-1:4161;go-node-3:4161
     ports:
-      - "4002:8080"
+      - "127.0.0.1:4002:8080"
     volumes:
       - ./netroot/Node2:/algod/data
     healthcheck:
@@ -97,7 +100,7 @@ services:
       - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - PEER_ADDRESS=go-node-1:4161;go-node-2:4161
     ports:
-      - "4003:8080"
+      - "127.0.0.1:4003:8080"
     volumes:
       - ./netroot/Node3:/algod/data
     healthcheck:
@@ -134,15 +137,20 @@ services:
         condition: service_healthy
     environment:
       - RUST_LOG=info,algod_rust=debug,algo_network=debug,algo_agreement=info
+    # The genesis-id is sourced from PHASE6_GENESIS_ID which start.sh
+    # captures from the goal-generated genesis.json at bootstrap time.
+    # Fallback default matches the template's NetworkName+id on a clean
+    # run; override if you customize the template or rerun on a stale
+    # netroot/ tree.
     entrypoint:
       - algod-rust
       - relay
       - --bind-address=0.0.0.0:4160
-      - --genesis-id=phase6net-v1
+      - --genesis-id=${PHASE6_GENESIS_ID:-phase6net-v1}
       - --ledger-path=/app/ledger.sqlite
       - --peers=go-node-1:4161,go-node-2:4161,go-node-3:4161
     ports:
-      - "4160:4160"
+      - "127.0.0.1:4160:4160"
     volumes:
       - rust-node-4-data:/app
     restart: unless-stopped

@@ -117,6 +117,31 @@ node's `config.json` with:
 The `netroot/` tree is `.gitignore`d — it contains private participation
 keys and should never be committed.
 
+## Platform notes
+
+Validated on Linux with native Docker. macOS and Windows should work in
+principle but some gotchas you may hit:
+
+- **macOS (Docker Desktop, VirtioFS / gRPC-FUSE):** bind mounts like
+  `./netroot/Node1:/algod/data` go through a filesystem shim. The
+  uid-1001 ownership that `goal network create` writes survives the
+  round trip, so `stop.sh --purge`'s in-container `rm` is still the
+  correct path. The host-side fallback in `stop.sh` silently handles
+  the less-common case where `rm -rf` from the host user succeeds.
+- **Windows / WSL2:** native Linux rules apply inside the WSL2 distro.
+  Running `scripts/start.sh` from a PowerShell shell through a Docker
+  Desktop backed by WSL2 should work the same as Linux; scripts assume
+  POSIX tools (`bash`, `python3`, `curl`, `mktemp`).
+- **Colima / non-Docker-Desktop:** untested but should work as long as
+  the runtime supports `docker compose` and bind mounts. Report back if
+  you hit issues.
+
+If you're on a platform where the in-container cleanup path can't reach
+the algorand/algod image (offline, rate-limited, etc.), `stop.sh
+--purge` falls back to a host-side `rm -rf` best-effort — you may see
+a "root-owned files still present" warning and need to `sudo rm -rf
+netroot/` manually.
+
 ## Troubleshooting
 
 - **`docker compose up` fails with "missing netroot/Node1"**: run

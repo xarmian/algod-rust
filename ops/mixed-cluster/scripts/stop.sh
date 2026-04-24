@@ -43,12 +43,27 @@ if [ "$PURGE" = "1" ]; then
     # root-in-namespace can unlink them, then clean up the now-empty
     # directory from the host side.
     if [ -d "$ROOT/netroot" ]; then
-        docker run --rm \
-            -v "$ROOT/netroot:/netroot" \
-            --entrypoint sh \
-            algorand/algod:4.5.1-stable \
-            -c 'rm -rf /netroot/* /netroot/.[!.]* 2>/dev/null || true'
-        rmdir "$ROOT/netroot" 2>/dev/null || rm -rf "$ROOT/netroot"
+        # Prefer the in-container rm so root-owned files can be unlinked.
+        # If the algod image isn't cached and the host is offline, the
+        # pull will fail — fall back to a best-effort host-side rm so we
+        # don't leave a half-cleaned netroot/ behind. A partial purge is
+        # still preferable to `set -e` aborting mid-cleanup.
+        if ! docker run --rm \
+                -v "$ROOT/netroot:/netroot" \
+                --entrypoint sh \
+                algorand/algod:4.5.1-stable \
+                -c 'rm -rf /netroot/* /netroot/.[!.]* 2>/dev/null || true'; then
+            echo "warning: container-based purge failed (image unavailable?); \
+falling back to host-side rm (may leave root-owned files behind)" >&2
+        fi
+        # Host-side fallback — works for host-owned leftovers and no-ops
+        # on already-clean trees. `|| true` guards against leftover
+        # root-owned files we couldn't unlink above.
+        rm -rf "$ROOT/netroot" 2>/dev/null || true
+        if [ -d "$ROOT/netroot" ]; then
+            echo "warning: $ROOT/netroot still exists after purge — \
+likely contains uid-1001 files. Re-run with docker available." >&2
+        fi
     fi
 fi
 

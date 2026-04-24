@@ -27,7 +27,26 @@ echo "    netroot:  $NETROOT"
 echo "    template: $TEMPLATE"
 
 # -- 1. Bootstrap the netgoal tree if missing ------------------------------
+#
+# A complete bootstrap leaves BOTH `network.json` AND every expected
+# Node<N>/ subdirectory. If `network.json` exists but one of the node
+# dirs is missing, that means a previous bootstrap was interrupted;
+# treat it as "needs regeneration" so we don't proceed with a
+# half-built tree.
+NEEDS_BOOTSTRAP=0
 if [ ! -f "$NETROOT/network.json" ]; then
+    NEEDS_BOOTSTRAP=1
+else
+    for node in Node1 Node2 Node3 Node4Rust; do
+        if [ ! -d "$NETROOT/$node" ]; then
+            echo "==> detected half-built netroot/ (missing $node) — rebuilding"
+            NEEDS_BOOTSTRAP=1
+            break
+        fi
+    done
+fi
+
+if [ "$NEEDS_BOOTSTRAP" = "1" ]; then
     echo "==> generating netroot/ via goal network create"
     # Clean any stale partial state. goal network create writes files
     # owned by uid 1001 (the `algorand` user inside the container); if
@@ -67,9 +86,9 @@ fi
 # bind to 0.0.0.0 on predictable ports, and blank out DNSBootstrapID so
 # the nodes don't try to reach mainnet/testnet relays from the private net.
 for node in Node1 Node2 Node3 Node4Rust; do
-    cfg="$NETROOT/$node/config.json"
     if [ ! -d "$NETROOT/$node" ]; then
-        continue
+        echo "error: $NETROOT/$node missing after bootstrap — rerun with stop.sh --purge and try again" >&2
+        exit 1
     fi
     # Use algocfg from the image to avoid hand-rolling JSON diffs.
     docker run --rm \

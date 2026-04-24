@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Per-node round + peer-count snapshot for the PLAN-32 / TASK-86 mixed
-# cluster. Exits non-zero if any node is unreachable or >N rounds behind.
+# Per-node round + liveness snapshot for the PLAN-32 / TASK-86 mixed
+# cluster. Exits non-zero if any node is unreachable / not running /
+# more than LAG_TOLERANCE rounds behind the max.
 
 set -euo pipefail
 
@@ -9,26 +10,22 @@ ALGOD_TOKEN="${ALGOD_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 # Exit non-zero if any node's round lags > LAG_TOLERANCE behind the max.
 LAG_TOLERANCE="${LAG_TOLERANCE:-5}"
 
-declare -A NODES=(
-    [go-node-1]=4001
-    [go-node-2]=4002
-    [go-node-3]=4003
-    [rust-node-4]=4160
+# Name → (container, host_port). The Rust node has no container-facing
+# REST today, so we fall back to a container-state check for it.
+declare -a ROWS=(
+    "go-node-1|phase6-go-node-1|4001"
+    "go-node-2|phase6-go-node-2|4002"
+    "go-node-3|phase6-go-node-3|4003"
+    "rust-node-4|phase6-rust-node-4|4160"
 )
 
 # ------------------------------------------------------------------ helpers
 
 fetch_round() {
     local port="$1"
-    # Go nodes use X-Algo-API-Token; the Rust `relay` subcommand today
-    # does not expose /v2/status, so we fall back to "N/A" for ports >= 4160.
-    if [ "$port" -ge 4160 ]; then
-        echo "n/a (rust relay lacks REST)"
-        return
-    fi
     local body
     body="$(curl -sf -H "X-Algo-API-Token: $ALGOD_TOKEN" \
-        "http://localhost:$port/v2/status" 2>/dev/null || true)"
+        "http://127.0.0.1:$port/v2/status" 2>/dev/null || true)"
     if [ -z "$body" ]; then
         echo "unreachable"
         return
@@ -43,18 +40,56 @@ except Exception as e:
 "
 }
 
+# Returns the container's Docker state string ('running' / 'exited' /
+# 'notfound') so we can surface a failure for nodes that don't expose
+# REST. Safe to use on any node.
+container_state() {
+    local name="$1"
+    local state
+    state="$(docker inspect --format='{{.State.Status}}' "$name" 2>/dev/null || true)"
+    if [ -z "$state" ]; then
+        echo "notfound"
+    else
+        echo "$state"
+    fi
+}
+
 # ------------------------------------------------------------------ main
 
 max_round=-1
 any_fail=0
-printf "%-14s %-6s %s\n" "node" "port" "round"
-printf "%-14s %-6s %s\n" "----" "----" "-----"
+printf "%-14s %-10s %-6s %s\n" "node" "state" "port" "round"
+printf "%-14s %-10s %-6s %s\n" "----" "-----" "----" "-----"
 
-for name in "${!NODES[@]}"; do
-    port="${NODES[$name]}"
+declare -A NODE_ROUND
+for row in "${ROWS[@]}"; do
+    name="${row%%|*}"
+    rest="${row#*|}"
+    container="${rest%%|*}"
+    port="${rest##*|}"
+
+    state="$(container_state "$container")"
+
+    # Container liveness is the first gate — if it's not running, the
+    # node is unhealthy regardless of whether REST answers.
+    if [ "$state" != "running" ]; then
+        printf "%-14s %-10s %-6s %s\n" "$name" "$state" "$port" "-"
+        any_fail=1
+        continue
+    fi
+
+    # Running containers that don't serve REST (today: only the Rust
+    # relay) report state only; we still consider them healthy as long
+    # as the container is up. TASK-87 will scrape gossip logs for a
+    # stronger signal.
+    if [ "$port" -ge 4160 ]; then
+        printf "%-14s %-10s %-6s %s\n" "$name" "$state" "$port" "n/a (no REST)"
+        continue
+    fi
+
     round="$(fetch_round "$port")"
-    printf "%-14s %-6s %s\n" "$name" "$port" "$round"
-    # Numeric rounds participate in the lag check.
+    printf "%-14s %-10s %-6s %s\n" "$name" "$state" "$port" "$round"
+    NODE_ROUND[$name]="$round"
     if [[ "$round" =~ ^[0-9]+$ ]]; then
         if [ "$round" -gt "$max_round" ]; then max_round="$round"; fi
     elif [ "$round" = "unreachable" ]; then
@@ -64,7 +99,7 @@ done
 
 if [ "$any_fail" = "1" ]; then
     echo ""
-    echo "at least one Go node is unreachable — cluster is not healthy." >&2
+    echo "at least one node is unreachable or not running — cluster is not healthy." >&2
     exit 1
 fi
 
@@ -75,9 +110,8 @@ if [ "$max_round" -lt 0 ]; then
 fi
 
 # Lag check among numeric rounds only.
-for name in "${!NODES[@]}"; do
-    port="${NODES[$name]}"
-    round="$(fetch_round "$port")"
+for name in "${!NODE_ROUND[@]}"; do
+    round="${NODE_ROUND[$name]}"
     if [[ "$round" =~ ^[0-9]+$ ]]; then
         lag=$((max_round - round))
         if [ "$lag" -gt "$LAG_TOLERANCE" ]; then
