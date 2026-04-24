@@ -64,10 +64,14 @@ impl LedgerBlockService {
         let mut ledger = self.ledger.lock().map_err(|e| format!("lock: {e}"))?;
         ledger.begin_block().map_err(|e| format!("begin: {e}"))?;
 
-        // Attempt a typed decode. Fall back to empty proto/hdrdata if it
-        // fails — keeps the archive path robust to formats we don't yet
-        // decode end-to-end while still taking the full-apply path on
-        // the common case.
+        // Attempt a typed decode. decode_block_fast is the rmp-direct
+        // path; fall back to decode_block (serde) for shapes the fast
+        // path can't yet round-trip. If BOTH fail and this is round 0,
+        // fall back to a raw-bytes archive (genesis blocks have a
+        // minimal shape that isn't always round-trip-decodable today);
+        // for any other round, treat decode as fatal — we refuse to
+        // commit a block we can't apply, to keep accountbase
+        // consistent.
         let decoded = algo_codec::decode_block_fast(block_data)
             .or_else(|_| algo_codec::decode_block(block_data));
         match decoded {
@@ -75,9 +79,11 @@ impl LedgerBlockService {
                 let proto = block.current_protocol.clone();
                 let hdrdata = algo_codec::canonical_encode_block_header_from_block(&block);
                 if let Err(e) = ledger.put_block(round, &proto, &hdrdata, block_data) {
+                    let _ = ledger.rollback_block();
                     return Err(format!("put_block: {e}"));
                 }
                 if let Err(e) = ledger.put_block_cert(round, cert_data) {
+                    let _ = ledger.rollback_block();
                     return Err(format!("put_block_cert: {e}"));
                 }
                 // Apply state transitions for non-genesis rounds. apply_block
@@ -86,38 +92,63 @@ impl LedgerBlockService {
                 // state has already been loaded via populate_store).
                 if round > 0 {
                     if let Err(e) = apply_block(&mut *ledger, &block) {
-                        // Apply failures are logged but not fatal — the
-                        // block is still stored so gossip service works.
-                        warn!(round = round, error = %e, "apply_block failed; ledger state may drift");
+                        // Apply failure is fatal: apply_block only rolls
+                        // back rewards on error, not earlier per-txn
+                        // accountbase mutations within the same block.
+                        // Committing would leave corrupted state that
+                        // future rounds build on. Roll the whole
+                        // transaction back instead; gossip will retry
+                        // fetching the block.
+                        warn!(
+                            round = round,
+                            error = %e,
+                            "apply_block failed; rolling back this round"
+                        );
+                        let _ = ledger.rollback_block();
+                        return Err(format!("apply_block: {e}"));
                     }
                 }
                 ledger.set_current_round(Round(round));
                 ledger.commit_block().map_err(|e| format!("commit: {e}"))?;
                 Ok(())
             }
-            Err(decode_err) => {
-                // Preserve the legacy archive path on decode failure so a
-                // single bad block never stalls gossip. We still stash the
-                // raw block msgpack as `hdrdata` so the seed extractor (it
-                // just searches for the "seed" codec key at the top of a
-                // msgpack map) can function — the genesis block / any
-                // shape we don't yet decode end-to-end otherwise leaves
-                // `lookup_digest` / `seed` broken for that round. No apply
-                // runs without a typed Block.
+            Err(decode_err) if round == 0 => {
+                // Round 0 — genesis block shape isn't always round-trip
+                // decodable today. Accept the raw msgpack as `hdrdata`
+                // so `seed()` extracting the "seed" codec key at the
+                // top of the map still works (consumers that need
+                // round 0's seed go through this path). Skip apply —
+                // populate_store already supplied genesis state.
                 warn!(
-                    round = round,
                     error = %decode_err,
-                    "block decode failed; falling back to archive store with raw-as-hdrdata"
+                    "round 0 decode failed; storing raw bytes as hdrdata fallback"
                 );
                 ledger
-                    .put_block(round, "", block_data, block_data)
-                    .map_err(|e| format!("put_block: {e}"))?;
-                ledger
-                    .put_block_cert(round, cert_data)
-                    .map_err(|e| format!("put_block_cert: {e}"))?;
-                ledger.set_current_round(Round(round));
+                    .put_block(0, "", block_data, block_data)
+                    .map_err(|e| {
+                        let _ = ledger.rollback_block();
+                        format!("put_block: {e}")
+                    })?;
+                ledger.put_block_cert(0, cert_data).map_err(|e| {
+                    let _ = ledger.rollback_block();
+                    format!("put_block_cert: {e}")
+                })?;
+                ledger.set_current_round(Round(0));
                 ledger.commit_block().map_err(|e| format!("commit: {e}"))?;
                 Ok(())
+            }
+            Err(decode_err) => {
+                // Non-genesis decode failure: refuse to store. Storing
+                // without apply would leave the accountbase out of
+                // sync with the block history, which poisons all
+                // subsequent verification. Rolling back + returning
+                // err keeps the gossip fetch loop retrying — if the
+                // peer really returned malformed bytes, that's visible
+                // in logs.
+                let _ = ledger.rollback_block();
+                Err(format!(
+                    "block decode failed at round {round}: {decode_err}"
+                ))
             }
         }
     }
@@ -515,16 +546,33 @@ pub async fn run(
     let latest = sqlite_ledger.current_round().0;
     info!(path = %ledger_path.display(), latest_round = latest, "opened ledger database");
 
-    // Optional: bootstrap genesis state when the ledger is fresh. Without
-    // this the relay's accountbase + accounttotals stay empty forever
-    // (apply_block alone doesn't populate totals — see PLAN-32 /
-    // TASK-95), which breaks downstream consumers that need full
-    // ledger state. Skipping when already seeded — detected by
-    // `online_stake() > 0` OR `latest_round > 0` — keeps restarts idempotent.
+    // Optional: bootstrap genesis state when the ledger is fresh.
+    // Without this the relay's accountbase + accounttotals stay empty
+    // forever (apply_block alone doesn't populate totals — see
+    // PLAN-32 / TASK-95), which breaks downstream consumers that need
+    // full ledger state.
+    //
+    // "Already seeded" is detected SOLELY by `online_stake() > 0`
+    // (non-zero accounttotals row). We intentionally don't also check
+    // `latest_round > 0`: a pre-TASK-95 archive volume has blocks but
+    // empty accounttotals, and conflating the two would silently skip
+    // the bootstrap that volume still needs. The detection logs a
+    // warning in that case and proceeds anyway — reseeding accountbase
+    // may overwrite some apply_block mutations on earlier rounds, but
+    // the alternative is a permanently-broken verify path. Best
+    // practice for an upgrade is `scripts/stop.sh --purge` then start
+    // fresh.
     if let Some(genesis_path) = genesis_json_path {
-        let already_seeded =
-            sqlite_ledger.online_stake().map(|s| s > 0).unwrap_or(false) || latest > 0;
-        if !already_seeded {
+        let seeded_online = sqlite_ledger.online_stake().map(|s| s > 0).unwrap_or(false);
+        if !seeded_online && latest > 0 {
+            warn!(
+                latest_round = latest,
+                "ledger has imported blocks but empty accounttotals (likely a \
+                 pre-TASK-95 archive volume). Re-seeding from genesis; for a \
+                 clean upgrade path run `scripts/stop.sh --purge` first."
+            );
+        }
+        if !seeded_online {
             let genesis_str = std::fs::read_to_string(genesis_path).map_err(|e| {
                 anyhow::anyhow!(
                     "failed to read genesis.json at {}: {}",
@@ -554,7 +602,7 @@ pub async fn run(
         } else {
             info!(
                 latest_round = latest,
-                "ledger already seeded; skipping genesis bootstrap"
+                "ledger already seeded (accounttotals non-zero); skipping genesis bootstrap"
             );
         }
     } else {

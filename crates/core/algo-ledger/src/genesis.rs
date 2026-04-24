@@ -127,15 +127,25 @@ pub fn seed_account_totals_from_genesis(
     ledger: &mut crate::sqlite::SqliteLedger,
     genesis: &GenesisJson,
 ) -> Result<(), AlgoError> {
-    let mut online: u64 = 0;
-    let mut offline: u64 = 0;
-    let mut not_participating: u64 = 0;
+    use std::collections::HashMap;
+
+    // Deduplicate by address — populate_store is last-write-wins per
+    // address, so a duplicate allocation would otherwise double-count
+    // here and diverge accounttotals from what actually lives in
+    // accountbase. Sample genesis files (e.g. fee sink + rewards pool
+    // sharing the reserve address) hit this in practice.
+    let mut per_addr: HashMap<String, (AccountStatus, u64)> = HashMap::new();
     for alloc in &genesis.alloc {
         let status = match alloc.state.onl {
             Some(v) => AccountStatus::from(v),
             None => AccountStatus::Offline,
         };
-        let algo = alloc.state.algo;
+        per_addr.insert(alloc.addr.clone(), (status, alloc.state.algo));
+    }
+    let mut online: u64 = 0;
+    let mut offline: u64 = 0;
+    let mut not_participating: u64 = 0;
+    for (_, (status, algo)) in per_addr {
         match status {
             AccountStatus::Online => online = online.saturating_add(algo),
             AccountStatus::Offline => offline = offline.saturating_add(algo),
@@ -310,6 +320,33 @@ mod tests {
         seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
         // Total online = 33 + 33 = 66; online_stake reads that column.
         assert_eq!(ledger.online_stake().unwrap(), 66);
+    }
+
+    #[test]
+    fn seed_account_totals_dedupes_duplicate_addrs() {
+        // A genesis with the same address listed twice (e.g. fee sink
+        // and rewards pool sharing the reserve) should match
+        // populate_store's last-write-wins behavior — totals count
+        // that address ONCE using the final status + amount, not the
+        // sum of every row.
+        let json = r#"{
+            "network": "n", "id": "v", "proto": "p",
+            "alloc": [
+                {"addr": "7777777777777777777777777777777777777777777777777774MSJUVU",
+                 "comment": "first",
+                 "state": {"algo": 100, "onl": 1}},
+                {"addr": "7777777777777777777777777777777777777777777777777774MSJUVU",
+                 "comment": "second (wins)",
+                 "state": {"algo": 50, "onl": 0}}
+            ],
+            "fees": "7777777777777777777777777777777777777777777777777774MSJUVU",
+            "rwd":  "7777777777777777777777777777777777777777777777777774MSJUVU"
+        }"#;
+        let genesis = parse_genesis_json(json).unwrap();
+        let mut ledger = crate::sqlite::SqliteLedger::open_in_memory().unwrap();
+        seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
+        // Second entry (offline, 50) wins — online total is 0, not 100.
+        assert_eq!(ledger.online_stake().unwrap(), 0);
     }
 
     #[test]

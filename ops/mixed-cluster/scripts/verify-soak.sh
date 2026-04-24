@@ -216,21 +216,49 @@ if [ "$RUN_CERT" = "1" ]; then
         WORKDIR="$(mktemp -d -t verify-soak.XXXXXX)"
         CERT_LEDGER_PATH="$WORKDIR/ledger.sqlite"
         echo "==> cert cross-verify (Go-produced → Rust verifier), stride $STRIDE"
-        echo "    copying Rust ledger from phase6-rust-node-4:/app/ledger.sqlite"
-        if ! docker cp phase6-rust-node-4:/app/ledger.sqlite "$CERT_LEDGER_PATH" 2>/dev/null; then
-            echo "error: failed to docker cp the Rust ledger." >&2
-            echo "       is phase6-rust-node-4 running?" >&2
-            exit 4
+        # Use SQLite's online backup API from INSIDE the container to
+        # snapshot atomically. Plain `docker cp` of the WAL-mode main
+        # file + sidecar WAL/SHM from a running writer can race with
+        # appends or checkpoints and produce an inconsistent snapshot
+        # that either fails to open or reports impossible state. The
+        # `.backup` command runs the SQLite backup API which holds a
+        # read lock for the duration and writes a fully consistent
+        # file, which we then docker cp out in a single transfer.
+        #
+        # Requires sqlite3 inside the algod-rust container image; our
+        # Dockerfile includes it. Fall back to plain docker cp with a
+        # warning if `.backup` isn't available (e.g. slim images built
+        # in CI without sqlite3).
+        echo "    snapshotting Rust ledger via SQLite backup API"
+        if docker exec phase6-rust-node-4 sqlite3 /app/ledger.sqlite \
+                ".backup '/app/verify-soak-snapshot.sqlite'" >/dev/null 2>&1; then
+            if ! docker cp phase6-rust-node-4:/app/verify-soak-snapshot.sqlite \
+                    "$CERT_LEDGER_PATH" 2>/dev/null; then
+                echo "error: failed to docker cp the snapshot." >&2
+                exit 4
+            fi
+            # Clean up the in-container snapshot; don't leak volume space
+            # across runs. `rm -f` is safe even if the file vanished.
+            docker exec phase6-rust-node-4 rm -f /app/verify-soak-snapshot.sqlite \
+                >/dev/null 2>&1 || true
+        else
+            echo "    warning: sqlite3 .backup unavailable in container;" >&2
+            echo "    falling back to raw docker cp (may be racy under heavy writes)" >&2
+            if ! docker cp phase6-rust-node-4:/app/ledger.sqlite \
+                    "$CERT_LEDGER_PATH" 2>/dev/null; then
+                echo "error: failed to docker cp the Rust ledger." >&2
+                echo "       is phase6-rust-node-4 running?" >&2
+                exit 4
+            fi
+            for sidecar in ledger.sqlite-wal ledger.sqlite-shm; do
+                docker cp "phase6-rust-node-4:/app/$sidecar" "$WORKDIR/$sidecar" \
+                    2>/dev/null || true
+            done
         fi
         if [ ! -s "$CERT_LEDGER_PATH" ]; then
             echo "error: extracted ledger $CERT_LEDGER_PATH is empty" >&2
             exit 4
         fi
-        # Capture the WAL + SHM so the SQLite snapshot is self-consistent.
-        # These may not exist on a quiescent node; ignore failures.
-        for sidecar in ledger.sqlite-wal ledger.sqlite-shm; do
-            docker cp "phase6-rust-node-4:/app/$sidecar" "$WORKDIR/$sidecar" 2>/dev/null || true
-        done
         echo "    ledger size: $(du -h "$CERT_LEDGER_PATH" | awk '{print $1}')"
     fi
     set +e
