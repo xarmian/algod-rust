@@ -40,7 +40,13 @@ Per tick (default 500 ms):
   - Proposer (block header `prp` on v40+, falling back to
     `cert.prop.oprop` for older protocols)
   - Genesis hash, previous-block hash
-  - `txn_count` (length of `txns` array, or `tc` as a hint)
+  - `txn_count` — **per-block** transaction count (length of the
+    `txns` array, or 0 when the key is omitted from an empty block)
+  - `tx_counter` — **cumulative** chain-wide transaction counter
+    (the block header's `tc` field). Monotonically non-decreasing
+    across rounds. Captured separately because `tc` is chain-wide,
+    not per-block — earlier drafts used `tc` as a fallback for
+    `txn_count` and that was misleading.
 
 Every 5 s:
 
