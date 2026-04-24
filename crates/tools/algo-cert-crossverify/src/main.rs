@@ -150,27 +150,64 @@ fn open_bridge(path: &std::path::Path) -> Result<AgreementLedgerBridge> {
 /// can't run under that ledger — it fails on the first
 /// `consensus_params(round)` call with an empty protocol version.
 ///
-/// Fail fast with a clear pointer to the follow-up task rather than
-/// letting the user watch every round fail with a cryptic "unknown
-/// consensus version: """ error.
+/// Probe **three** fields the verifier actually depends on so a ledger
+/// that has partial state (e.g. proto populated but hdrdata empty, or
+/// hdrdata populated but `onlineaccounts` never tracked) still trips
+/// preflight rather than silently failing round-by-round later:
+///
+///   - `consensus_version(r)` — non-empty; fails on relay-mode proto.
+///   - `seed(r)` — needs `hdrdata` to decode.
+///   - `lookup_digest(r)` — also needs `hdrdata`, different codepath.
+///
+/// We deliberately do NOT probe `circulation` / `lookup_agreement` here
+/// because those have fall-back paths that return plausible-looking
+/// values off the genesis totals even when the onlineaccounts /
+/// onlineroundparamstail tables are empty. A ledger that passes all
+/// three of the above but has no participation tracker would still
+/// fail verification at the bundle step — and that's the exact error
+/// TASK-95 is tracking.
 fn assert_full_sync_ledger(bridge: &AgreementLedgerBridge, probe_round: Round) -> Result<()> {
+    let task95_hint = "This looks like a relay-mode sqlite — imported blocks don't \
+         populate proto/hdrdata or the participation tracker. A \
+         full-sync algod-rust ledger is required. Tracked under \
+         TASK-95 (PLAN-32 follow-up).";
+
     match bridge.consensus_version(probe_round) {
-        Ok(version) if !version.is_empty() => Ok(()),
-        Ok(empty) => Err(anyhow!(
-            "ledger reports an empty consensus version at round {} (got {:?}).\n\
-             This looks like a relay-mode sqlite — imported blocks don't populate \
-             proto/hdrdata or the participation tracker. A full-sync algod-rust \
-             ledger is required. Tracked under TASK-95 (PLAN-32 follow-up).",
-            probe_round.0,
-            empty
-        )),
-        Err(e) => Err(anyhow!(
-            "ledger probe for round {} failed: {}. Is the ledger caught up past \
-             the verify range? See TASK-95.",
-            probe_round.0,
-            e
-        )),
+        Ok(version) if !version.is_empty() => {}
+        Ok(empty) => {
+            return Err(anyhow!(
+                "ledger reports an empty consensus version at round {} (got {:?}).\n{}",
+                probe_round.0,
+                empty,
+                task95_hint,
+            ));
+        }
+        Err(e) => {
+            return Err(anyhow!(
+                "ledger probe for round {} consensus_version failed: {}. Is the \
+                 ledger caught up past the verify range? See TASK-95.",
+                probe_round.0,
+                e
+            ));
+        }
     }
+    if let Err(e) = bridge.seed(probe_round) {
+        return Err(anyhow!(
+            "ledger probe for round {} seed() failed: {}. {}",
+            probe_round.0,
+            e,
+            task95_hint
+        ));
+    }
+    if let Err(e) = bridge.lookup_digest(probe_round) {
+        return Err(anyhow!(
+            "ledger probe for round {} lookup_digest() failed: {}. {}",
+            probe_round.0,
+            e,
+            task95_hint
+        ));
+    }
+    Ok(())
 }
 
 async fn run(cli: Cli) -> Result<i32> {

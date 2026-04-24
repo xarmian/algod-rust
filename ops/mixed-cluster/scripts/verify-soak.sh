@@ -15,11 +15,17 @@
 #                  [--tools-dir PATH] [--skip-preflight]
 #
 # Exit codes:
-#   0 — both tools reported clean
-#   2 — at least one tool reported a failure (fork or cert
-#       authentication error); the tool's own non-zero exit propagates
-#   3 — preflight failed (cluster not healthy)
-#   4 — extracting the Rust ledger failed
+#   0 — every tool that ran reported clean
+#   1 — the fork detector exited with its degraded-coverage code
+#       (insufficient or fetch errors without `--allow-degraded`)
+#   2 — the fork detector detected a real fork (bubbled up verbatim)
+#       OR the cert cross-verify tool failed authentication
+#   3 — preflight failed (cluster not healthy, no token file, etc.)
+#   4 — extracting the Rust ledger failed (unused by the default path,
+#       reserved for future --with-cert-crossverify auto-extraction)
+#
+# When both tools run and both fail, the larger exit code (most severe)
+# wins. A fork-only run never sees cert's exit code at all.
 #
 # Notes:
 # - Rust → Go cert verification (the inverse direction) is out of scope
@@ -113,14 +119,22 @@ done
 
 FORK_BIN="$TOOLS_DIR/algo-fork-detector"
 CERT_BIN="$TOOLS_DIR/algo-cert-crossverify"
-for bin in "$FORK_BIN" "$CERT_BIN"; do
-    if [ ! -x "$bin" ]; then
-        echo "error: $bin not found or not executable" >&2
-        echo "       rebuild with:" >&2
-        echo "         cargo build -p algo-fork-detector -p algo-cert-crossverify" >&2
-        exit 2
-    fi
-done
+
+# Fork detector is always required; cert tool is only required when
+# the caller opted into --with-cert-crossverify. That way a user
+# running fork-only doesn't have to build the cert crate too.
+if [ ! -x "$FORK_BIN" ]; then
+    echo "error: $FORK_BIN not found or not executable" >&2
+    echo "       rebuild with:" >&2
+    echo "         cargo build -p algo-fork-detector" >&2
+    exit 2
+fi
+if [ -n "$CERT_LEDGER" ] && [ ! -x "$CERT_BIN" ]; then
+    echo "error: $CERT_BIN not found or not executable" >&2
+    echo "       --with-cert-crossverify needs it; rebuild with:" >&2
+    echo "         cargo build -p algo-cert-crossverify" >&2
+    exit 2
+fi
 
 mkdir -p "$OUT_DIR"
 
@@ -213,5 +227,16 @@ if [ "$fork_rc" -eq 0 ] && [ "$cert_rc" -eq 0 ]; then
     fi
     exit 0
 fi
-echo "verify-soak: FAILED — fork_rc=$fork_rc cert_rc=$cert_rc" >&2
-exit 2
+
+# Propagate the most severe child exit code so callers can distinguish
+# (fork=2 catastrophic vs degraded=1 coverage vs cert=2 authn fail vs
+# successful 0). If both tools failed, the larger code wins.
+worst=0
+if [ "$fork_rc" -gt "$worst" ]; then
+    worst=$fork_rc
+fi
+if [ "$cert_rc" -gt "$worst" ]; then
+    worst=$cert_rc
+fi
+echo "verify-soak: FAILED — fork_rc=$fork_rc cert_rc=$cert_rc (exit=$worst)" >&2
+exit "$worst"

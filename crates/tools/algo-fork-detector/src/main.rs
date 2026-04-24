@@ -63,10 +63,15 @@ struct Cli {
     #[arg(long)]
     token: Option<String>,
 
-    /// Treat InsufficientCoverage / FetchError findings as failures too.
-    /// By default the detector only exits non-zero on real Fork findings.
+    /// Allow the run to exit 0 even when some nodes failed to return a
+    /// block for a round (FetchError) or too few nodes reported
+    /// (InsufficientCoverage). The detector defaults to failing on
+    /// these because a node that 404s every round should not produce
+    /// a green verification just because the other nodes happen to
+    /// agree among themselves. Use with care (e.g. when one node is
+    /// known offline for maintenance).
     #[arg(long)]
-    strict: bool,
+    allow_degraded: bool,
 
     /// Emit the full verdicts list (one record per round) as JSONL to this
     /// path. Useful for feeding the output into downstream analysis. If
@@ -236,7 +241,12 @@ async fn run(cli: Cli) -> Result<i32> {
         None => None,
     };
 
-    let mut fetch_error_findings = 0usize;
+    // Fetch failures accumulate here with the specific (round, node)
+    // pair so aggregate_findings can turn them into proper FetchError
+    // findings. Silently collapsing fetches into None (as a previous
+    // version did) lets a node that 404s every round produce a green
+    // verification when the two surviving nodes happen to agree.
+    let mut fetch_failures: Vec<(u64, String)> = Vec::new();
     let mut round_verdicts: Vec<(u64, RoundVerdict)> = Vec::new();
 
     for r in cli.from_round..=cli.to_round {
@@ -260,24 +270,17 @@ async fn run(cli: Cli) -> Result<i32> {
                     by_node.insert(name, digest);
                 }
                 Ok((name, Ok(None))) => {
-                    fetch_error_findings += 1;
-                    if let Some(w) = jsonl_writer.as_mut() {
-                        write_jsonl(
-                            w,
-                            &JsonlRecord::Finding {
-                                round: r,
-                                finding_kind: "fetch_error",
-                                detail: format!("{name} did not return block"),
-                            },
-                        )?;
-                    }
+                    fetch_failures.push((r, name));
                 }
                 Ok((name, Err(e))) => {
-                    fetch_error_findings += 1;
                     warn!(node = %name, round = %round, error = %e, "fetch task returned error");
+                    fetch_failures.push((r, name));
                 }
                 Err(join_err) => {
+                    // Panic / cancellation — surface under a synthetic
+                    // "<task>" node name so the caller sees *something*.
                     error!(error = %join_err, "fetch task panicked or was cancelled");
+                    fetch_failures.push((r, format!("<task-error:{join_err}>")));
                 }
             }
         }
@@ -307,7 +310,7 @@ async fn run(cli: Cli) -> Result<i32> {
         round_verdicts.push((r, verdict));
     }
 
-    let findings = aggregate_findings(round_verdicts);
+    let findings = aggregate_findings(round_verdicts, fetch_failures.iter().cloned());
     let fork_count = findings
         .iter()
         .filter(|f| f.kind == FindingKind::Fork)
@@ -315,6 +318,10 @@ async fn run(cli: Cli) -> Result<i32> {
     let insufficient_count = findings
         .iter()
         .filter(|f| f.kind == FindingKind::InsufficientCoverage)
+        .count();
+    let fetch_error_count = findings
+        .iter()
+        .filter(|f| f.kind == FindingKind::FetchError)
         .count();
 
     // Summary to stdout — human-readable.
@@ -326,7 +333,7 @@ async fn run(cli: Cli) -> Result<i32> {
         nodes.len(),
         fork_count,
         insufficient_count,
-        fetch_error_findings
+        fetch_error_count
     );
     for f in &findings {
         let tag = match f.kind {
@@ -362,17 +369,20 @@ async fn run(cli: Cli) -> Result<i32> {
                 total_rounds: cli.to_round - cli.from_round + 1,
                 fork_findings: fork_count,
                 insufficient_findings: insufficient_count,
-                fetch_error_findings,
+                fetch_error_findings: fetch_error_count,
                 nodes_polled: nodes.iter().map(|(e, _)| e.name.clone()).collect(),
             },
         )?;
     }
 
-    // Exit code selection.
+    // Exit code selection. Forks are always fatal (exit 2). Coverage
+    // problems (fetch errors / insufficient) default to fatal (exit 1)
+    // so a node that silently 404s every round can't be masked by the
+    // surviving nodes agreeing; `--allow-degraded` opts out.
     if fork_count > 0 {
         return Ok(2);
     }
-    if cli.strict && (insufficient_count > 0 || fetch_error_findings > 0) {
+    if !cli.allow_degraded && (insufficient_count > 0 || fetch_error_count > 0) {
         return Ok(1);
     }
     Ok(0)

@@ -98,10 +98,19 @@ pub struct Finding {
     pub detail: String,
 }
 
-/// Given a stream of per-round verdicts, materialize findings.
-pub fn aggregate_findings<I>(per_round: I) -> Vec<Finding>
+/// Given a stream of per-round verdicts and a list of per-round fetch
+/// failures, materialize a prioritized findings list.
+///
+/// `fetch_failures` is a `(round, node_name)` stream of nodes that
+/// couldn't produce a block for a round. We emit those as
+/// `FindingKind::FetchError` so they surface in the summary / JSONL
+/// alongside fork and insufficient-coverage findings — silently
+/// dropping them would let a node that 404s every round produce a
+/// green verification when two surviving nodes agree.
+pub fn aggregate_findings<I, J>(per_round: I, fetch_failures: J) -> Vec<Finding>
 where
     I: IntoIterator<Item = (u64, RoundVerdict)>,
+    J: IntoIterator<Item = (u64, String)>,
 {
     let mut out = Vec::new();
     for (round, verdict) in per_round {
@@ -131,6 +140,13 @@ where
                 });
             }
         }
+    }
+    for (round, node) in fetch_failures {
+        out.push(Finding {
+            kind: FindingKind::FetchError,
+            round,
+            detail: format!("{node} did not return block"),
+        });
     }
     out
 }
@@ -200,6 +216,21 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_includes_fetch_failures() {
+        let verdicts = vec![(
+            10,
+            RoundVerdict::Agreed {
+                digest: d(1),
+                nodes: vec!["a".into(), "b".into()],
+            },
+        )];
+        let fetches = vec![(10, "c".to_string()), (11, "c".to_string())];
+        let findings = aggregate_findings(verdicts, fetches);
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().all(|f| f.kind == FindingKind::FetchError));
+    }
+
+    #[test]
     fn aggregate_emits_findings_for_forks_only() {
         let verdicts = vec![
             (
@@ -222,7 +253,7 @@ mod tests {
                 },
             ),
         ];
-        let findings = aggregate_findings(verdicts);
+        let findings = aggregate_findings(verdicts, std::iter::empty::<(u64, String)>());
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].kind, FindingKind::Fork);
         assert_eq!(findings[0].round, 11);
