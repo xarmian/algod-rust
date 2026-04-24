@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 # PLAN-32 / TASK-87 — soak-output analyzer.
 #
-# Reads one or more JSONL files produced by scripts/metrics.py and
-# emits a human-readable summary plus a machine-readable sidecar
-# ('<input>.summary.json') containing the same metrics.
+# Reads exactly ONE JSONL file produced by scripts/metrics.py and emits
+# a human-readable summary plus a machine-readable sidecar
+# ('<input>.summary.json') containing the same metrics. Multi-file
+# input is intentionally unsupported — merging records from separate
+# runs confuses the round-keyed lag and block-time aggregates; run
+# analyze.py once per file and diff the sidecars to compare.
 #
 # Metrics computed:
-#   - Rounds observed (total, first, last)
+#   - Rounds observed (total, first, last) + back-filled-only count
 #   - Block-time distribution: mean / p50 / p95 / p99 of
 #     (block_ts[r] - block_ts[r-1]) over consecutive rounds
 #   - Commit-latency distribution: for each round, the spread between
 #     the earliest and latest node-observed commit_ts (convergence time)
 #   - Per-node max round at end-of-run + whether any node fell behind
-#     by more than --lag-tolerance
+#     by more than --lag-tolerance (seeded from run_meta so a stuck
+#     node is visible even without node_round events)
 #   - Proposer histogram (count per proposer address)
 #   - Rust container state timeline: any non-"running" observation, any
 #     log-round observation (best-effort)
@@ -27,8 +31,7 @@
 # from TASK-87 live in docs/SOAK_METHODOLOGY.md.
 #
 # Usage:
-#   scripts/analyze.py <soak.jsonl> [<soak2.jsonl> ...]
-#                      [--lag-tolerance N] [--json-out PATH]
+#   scripts/analyze.py <soak.jsonl> [--lag-tolerance N] [--json-out PATH]
 
 import argparse
 import json
