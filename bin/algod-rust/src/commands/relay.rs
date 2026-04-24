@@ -553,25 +553,33 @@ pub async fn run(
     // full ledger state.
     //
     // "Already seeded" is detected by whether the `accounttotals` ROW
-    // EXISTS, not whether online stake is non-zero. A network with
+    // EXISTS, not whether online stake is non-zero — a network with
     // every allocation offline legitimately has online=0 after
     // seeding, and `online_stake > 0` would then re-seed every
-    // restart, trampling accumulated state. We also don't gate on
-    // `latest_round > 0` alone: a pre-TASK-95 archive volume has
-    // blocks but no accounttotals row, and conflating the two would
-    // silently skip the bootstrap that volume still needs. The
-    // pre-existing-blocks case logs a warning and reseeds anyway —
-    // overwriting some apply_block mutations is preferable to a
-    // permanently-broken verify path. Best upgrade practice is
-    // `scripts/stop.sh --purge`.
+    // restart, trampling accumulated state.
+    //
+    // Pre-TASK-95 archive volumes (blocks present, no accounttotals
+    // row) are a genuinely ambiguous state: re-running populate_store
+    // would reset `accountbase` to genesis while the blocks table
+    // stays at the current tip, leaving the ledger internally
+    // inconsistent (genesis state + history of later-round apply
+    // writes, with nothing tying them together). Rather than paper
+    // over that, fail fast and force the operator to `--purge` and
+    // rebuild from scratch. This path only fires on the first
+    // TASK-95 upgrade of an existing volume; `--purge` is already
+    // the documented upgrade procedure.
     if let Some(genesis_path) = genesis_json_path {
         let already_seeded = sqlite_ledger.has_account_totals().unwrap_or(false);
         if !already_seeded && latest > 0 {
-            warn!(
-                latest_round = latest,
-                "ledger has imported blocks but no accounttotals row (likely a \
-                 pre-TASK-95 archive volume). Re-seeding from genesis; for a \
-                 clean upgrade path run `scripts/stop.sh --purge` first."
+            anyhow::bail!(
+                "ledger at {} has {} imported block(s) but no accounttotals row — \
+                 likely a pre-TASK-95 archive volume. Refusing to re-seed genesis \
+                 over accumulated block history (would leave accountbase at genesis \
+                 while blocks table is at round {}). Run `scripts/stop.sh --purge` \
+                 and restart to rebuild the ledger cleanly.",
+                ledger_path.display(),
+                latest,
+                latest,
             );
         }
         if !already_seeded {
