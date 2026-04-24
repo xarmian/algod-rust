@@ -2094,6 +2094,27 @@ impl SqliteLedger {
         }
     }
 
+    /// Check whether the `accounttotals` row has been populated —
+    /// either by the catchpoint importer or by
+    /// [`put_account_totals_seed`]. Used by the mixed-cluster relay
+    /// bootstrap as the "already seeded" sentinel; presence of the
+    /// row is the safe check even for networks whose online stake is
+    /// legitimately zero (where `online_stake()` returns Ok(0) from
+    /// both a populated and an empty table).
+    pub fn has_account_totals(&self) -> Result<bool, AlgoError> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM accounttotals WHERE id = ''",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query accounttotals count error: {e}"),
+            })?;
+        Ok(count > 0)
+    }
+
     /// Seed the `accounttotals` row from genesis-time totals (PLAN-32
     /// / TASK-95). `apply_block` does not maintain this table today —
     /// the catchpoint importer is the only other writer — so the

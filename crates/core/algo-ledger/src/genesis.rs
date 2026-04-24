@@ -350,6 +350,33 @@ mod tests {
     }
 
     #[test]
+    fn has_account_totals_distinguishes_zero_online_from_unseeded() {
+        // A network with zero online stake (everyone offline) is still
+        // "seeded" once the accounttotals row has been written. The
+        // relay bootstrap must not re-seed every restart for such
+        // networks. Regression from Codex round-2 MEDIUM finding.
+        let genesis = parse_genesis_json(
+            r#"{"network":"n","id":"v","proto":"p","alloc":[
+                {"addr":"7777777777777777777777777777777777777777777777777774MSJUVU",
+                 "state":{"algo":100,"onl":0}}
+            ],"fees":"7777777777777777777777777777777777777777777777777774MSJUVU",
+              "rwd":"7777777777777777777777777777777777777777777777777774MSJUVU"}"#,
+        )
+        .unwrap();
+        let mut ledger = crate::sqlite::SqliteLedger::open_in_memory().unwrap();
+        assert!(
+            !ledger.has_account_totals().unwrap(),
+            "fresh ledger has no row"
+        );
+        seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
+        assert!(
+            ledger.has_account_totals().unwrap(),
+            "post-seed: accounttotals row present even with online==0"
+        );
+        assert_eq!(ledger.online_stake().unwrap(), 0);
+    }
+
+    #[test]
     fn seed_account_totals_is_idempotent() {
         // Calling twice should not double-count — INSERT OR REPLACE.
         let genesis = parse_genesis_json(

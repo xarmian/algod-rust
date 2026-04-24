@@ -552,27 +552,29 @@ pub async fn run(
     // PLAN-32 / TASK-95), which breaks downstream consumers that need
     // full ledger state.
     //
-    // "Already seeded" is detected SOLELY by `online_stake() > 0`
-    // (non-zero accounttotals row). We intentionally don't also check
-    // `latest_round > 0`: a pre-TASK-95 archive volume has blocks but
-    // empty accounttotals, and conflating the two would silently skip
-    // the bootstrap that volume still needs. The detection logs a
-    // warning in that case and proceeds anyway — reseeding accountbase
-    // may overwrite some apply_block mutations on earlier rounds, but
-    // the alternative is a permanently-broken verify path. Best
-    // practice for an upgrade is `scripts/stop.sh --purge` then start
-    // fresh.
+    // "Already seeded" is detected by whether the `accounttotals` ROW
+    // EXISTS, not whether online stake is non-zero. A network with
+    // every allocation offline legitimately has online=0 after
+    // seeding, and `online_stake > 0` would then re-seed every
+    // restart, trampling accumulated state. We also don't gate on
+    // `latest_round > 0` alone: a pre-TASK-95 archive volume has
+    // blocks but no accounttotals row, and conflating the two would
+    // silently skip the bootstrap that volume still needs. The
+    // pre-existing-blocks case logs a warning and reseeds anyway —
+    // overwriting some apply_block mutations is preferable to a
+    // permanently-broken verify path. Best upgrade practice is
+    // `scripts/stop.sh --purge`.
     if let Some(genesis_path) = genesis_json_path {
-        let seeded_online = sqlite_ledger.online_stake().map(|s| s > 0).unwrap_or(false);
-        if !seeded_online && latest > 0 {
+        let already_seeded = sqlite_ledger.has_account_totals().unwrap_or(false);
+        if !already_seeded && latest > 0 {
             warn!(
                 latest_round = latest,
-                "ledger has imported blocks but empty accounttotals (likely a \
+                "ledger has imported blocks but no accounttotals row (likely a \
                  pre-TASK-95 archive volume). Re-seeding from genesis; for a \
                  clean upgrade path run `scripts/stop.sh --purge` first."
             );
         }
-        if !seeded_online {
+        if !already_seeded {
             let genesis_str = std::fs::read_to_string(genesis_path).map_err(|e| {
                 anyhow::anyhow!(
                     "failed to read genesis.json at {}: {}",
@@ -602,7 +604,7 @@ pub async fn run(
         } else {
             info!(
                 latest_round = latest,
-                "ledger already seeded (accounttotals non-zero); skipping genesis bootstrap"
+                "ledger already seeded (accounttotals row present); skipping genesis bootstrap"
             );
         }
     } else {
