@@ -1,9 +1,10 @@
-# Mixed-Cluster Consensus Harness (TASK-86)
+# Mixed-Cluster Consensus Harness (TASK-86 / TASK-87)
 
 A 4-node docker-compose harness that runs 3 go-algorand v4.5.1-stable
 nodes + 1 algod-rust node on a private network. Foundation for:
 
-- TASK-87 — 200-round soak test (needs this harness + a metrics collector)
+- TASK-87 — 200-round soak test with metrics collection (shipped — see
+  "Running a soak" below and `docs/SOAK_METHODOLOGY.md`)
 - TASK-88 — fork detector / cert cross-verify (needs the same harness)
 
 ## Topology
@@ -68,6 +69,28 @@ ops/mixed-cluster/scripts/stop.sh --purge
 After ~30s the 3 Go nodes should be at round ≥ 3. After 2 minutes
 all 3 should be at round ≥ 10 (assuming the default 4.5s block time
 under the `future` consensus protocol baked into the template).
+
+## Running a soak (TASK-87)
+
+The soak harness layers on top of the cluster. It assumes `start.sh`
+has already brought everything up and tears nothing down.
+
+```bash
+# Long acceptance soak (~10-15 minutes at ~3s block time).
+ops/mixed-cluster/scripts/soak.sh --rounds 200
+
+# Analyze the most recent soak output.
+ops/mixed-cluster/scripts/analyze.py ops/mixed-cluster/soak-*.jsonl
+```
+
+Output goes to `ops/mixed-cluster/soak-<unix>.jsonl` by default (gitignored).
+`analyze.py` prints a human report and writes a `<file>.summary.json`
+sidecar.
+
+See `docs/SOAK_METHODOLOGY.md` for the full set of tuning knobs,
+measured metrics, acceptance criteria, and known limitations (notably
+the Rust node is **not** yet a proposer — gated on PLAN-35 participation
+key interop).
 
 ## Host ports
 
