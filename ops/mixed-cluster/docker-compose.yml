@@ -142,6 +142,13 @@ services:
     # Fallback default matches the template's NetworkName+id on a clean
     # run; override if you customize the template or rerun on a stale
     # netroot/ tree.
+    # --genesis-json tells the relay to bootstrap accountbase +
+    # accounttotals from genesis on first startup (PLAN-32 / TASK-95).
+    # Without this the ledger is an archive-only block store and the
+    # TASK-88 cert cross-verify tool can't authenticate certs against
+    # it. The netroot/ tree is bind-mounted read-only at /netroot
+    # (start.sh owns the host-side copy), so the file is available to
+    # the container without shipping it inside the image.
     entrypoint:
       - algod-rust
       - relay
@@ -149,10 +156,12 @@ services:
       - --genesis-id=${PHASE6_GENESIS_ID:-phase6net-v1}
       - --ledger-path=/app/ledger.sqlite
       - --peers=go-node-1:4161,go-node-2:4161,go-node-3:4161
+      - --genesis-json=/netroot/genesis.json
     ports:
       - "127.0.0.1:4160:4160"
     volumes:
       - rust-node-4-data:/app
+      - ./netroot:/netroot:ro
     restart: unless-stopped
     networks:
       - phase6net

@@ -238,16 +238,22 @@ Post-soak, two tools assert the cluster held together:
   against a SQLite-backed `AgreementLedgerBridge`. Shipped under
   `crates/tools/algo-cert-crossverify`.
 
-`ops/mixed-cluster/scripts/verify-soak.sh` wraps both tools:
+`ops/mixed-cluster/scripts/verify-soak.sh` wraps both tools. As of
+TASK-95 cert cross-verify runs by default — the relay maintains the
+ledger state it needs — and the script extracts the SQLite via
+`docker exec sqlite3 .backup` + `docker cp`.
 
 ```bash
-# Fork detection only (current default — see §Verifier scope).
+# Default: fork detection + Go→Rust cert cross-verify.
 scripts/verify-soak.sh --from-round 1 --to-round 200
 
-# Opt in to cert cross-verify against a pre-built full-sync ledger.
+# Skip cert cross-verify entirely (faster sanity check).
+scripts/verify-soak.sh --from-round 1 --to-round 200 --no-cert-crossverify
+
+# Use an externally-prepared SQLite instead of the relay container's.
 scripts/verify-soak.sh \
     --from-round 1 --to-round 200 \
-    --with-cert-crossverify /path/to/full-sync-ledger.sqlite
+    --cert-ledger /path/to/external-full-sync-ledger.sqlite
 ```
 
 ### Verifier scope
@@ -256,18 +262,16 @@ The fork detector runs end-to-end against the current TASK-86 harness
 — verified on a 30-round live soak with 41 rounds checked, 0 forks,
 0 insufficient-coverage warnings, 0 fetch errors.
 
-Cert cross-verify ships the binary + library + orchestrator plumbing,
-but the current harness runs the Rust node in `relay` mode, which
-writes imported blocks with empty `proto` / `hdrdata` and never
-updates the participation tracker. The cross-verify binary detects
-this and fails fast with a clear pointer to **TASK-95** (follow-up:
-enable a full-sync algod-rust ledger in the mixed cluster). Until
-then, running cert cross-verify requires a full-sync ledger supplied
-externally via `--with-cert-crossverify <path>`.
+Cert cross-verify runs by default as of **TASK-95**. The Rust relay
+seeds `accountbase` + `accounttotals` from the bind-mounted genesis
+on fresh startup and applies each imported block, so its SQLite
+ledger (copied out of the container by `verify-soak.sh` at verify
+time) is a valid input for `Certificate::authenticate`. Verified
+live on a 90-round soak: 11/11 sampled rounds authenticated cleanly.
 
-Rust-produced cert verification (the inverse Rust → Go direction) is
-not in this PR's scope at all — it needs the Rust node to be running
-online participation keys, which is gated on PLAN-35.
+Rust-produced cert verification (the inverse Rust → Go direction)
+is **not** in this PR's scope — it needs the Rust node to actively
+propose with online participation keys, which is gated on PLAN-35.
 
 ## Follow-ups (out of TASK-87 scope)
 

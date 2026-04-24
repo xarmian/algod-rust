@@ -109,6 +109,54 @@ pub fn parse_genesis_json(json_str: &str) -> Result<GenesisJson, AlgoError> {
     })
 }
 
+/// Seed the SQLite ledger's `accounttotals` table from a parsed genesis.
+///
+/// PLAN-32 / TASK-95 — `apply_block` doesn't maintain `accounttotals`
+/// today (catchpoint-only), so mixed-cluster-style harnesses need to
+/// seed it at startup or `Certificate::authenticate`'s `circulation()`
+/// lookup returns 0 and verification fails. This sums allocation
+/// `algo` amounts by online/offline/not-participating status and
+/// writes a single row to `accounttotals`.
+///
+/// Correct as long as no subsequent transaction flips an account's
+/// online status — true for the PLAN-32 harness (Wallet1/2/3 online
+/// and Wallet4 offline, statically for the whole soak). NOT suitable
+/// for general-purpose production nodes; see `catchpoint::importer`
+/// for the authoritative writer.
+pub fn seed_account_totals_from_genesis(
+    ledger: &mut crate::sqlite::SqliteLedger,
+    genesis: &GenesisJson,
+) -> Result<(), AlgoError> {
+    use std::collections::HashMap;
+
+    // Deduplicate by address — populate_store is last-write-wins per
+    // address, so a duplicate allocation would otherwise double-count
+    // here and diverge accounttotals from what actually lives in
+    // accountbase. Sample genesis files (e.g. fee sink + rewards pool
+    // sharing the reserve address) hit this in practice.
+    let mut per_addr: HashMap<String, (AccountStatus, u64)> = HashMap::new();
+    for alloc in &genesis.alloc {
+        let status = match alloc.state.onl {
+            Some(v) => AccountStatus::from(v),
+            None => AccountStatus::Offline,
+        };
+        per_addr.insert(alloc.addr.clone(), (status, alloc.state.algo));
+    }
+    let mut online: u64 = 0;
+    let mut offline: u64 = 0;
+    let mut not_participating: u64 = 0;
+    for (_, (status, algo)) in per_addr {
+        match status {
+            AccountStatus::Online => online = online.saturating_add(algo),
+            AccountStatus::Offline => offline = offline.saturating_add(algo),
+            AccountStatus::NotParticipating => {
+                not_participating = not_participating.saturating_add(algo);
+            }
+        }
+    }
+    ledger.put_account_totals_seed(online, offline, not_participating)
+}
+
 impl LedgerState {
     /// Load ledger state from a genesis.json file on disk.
     pub fn from_genesis(path: &Path) -> Result<LedgerState, AlgoError> {
@@ -239,5 +287,109 @@ mod tests {
     fn test_invalid_genesis_json() {
         let result = LedgerState::from_genesis_json("not valid json");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn seed_account_totals_from_genesis_sums_by_status() {
+        // PLAN-32 / TASK-95: regression test for the harness-style genesis
+        // seeder — 2 online + 1 offline + 1 not-participating allocation
+        // should land as three distinct totals in accounttotals.
+        let json = r#"{
+            "network": "phase6net",
+            "id": "v1",
+            "proto": "future",
+            "alloc": [
+                {"addr": "A2UDRUOIEWEYDTE5DJLC4EH2HWFKQMZOPUKGNOWDOJOLJFPOPZ4EVXAAJY",
+                 "comment": "online-1",
+                 "state": {"algo": 33, "onl": 1}},
+                {"addr": "GBMUQUM7E3QW75GCVLQFMCS2Y7V5XTOJUBRVBXWOLS3EENBZP4AIGPHM6A",
+                 "comment": "online-2",
+                 "state": {"algo": 33, "onl": 1}},
+                {"addr": "ALGORANDSCOLLECTSFEES7777777777777777777777777777777746MSJUVU",
+                 "comment": "offline",
+                 "state": {"algo": 33, "onl": 0}},
+                {"addr": "B2UDRUOIEWEYDTE5DJLC4EH2HWFKQMZOPUKGNOWDOJOLJFPOPZ4EVXAAJY",
+                 "comment": "notpart",
+                 "state": {"algo": 1, "onl": 2}}
+            ],
+            "fees": "7777777777777777777777777777777777777777777777777774MSJUVU",
+            "rwd":  "7777777777777777777777777777777777777777777777777774MSJUVU"
+        }"#;
+        let genesis = parse_genesis_json(json).unwrap();
+        let mut ledger = crate::sqlite::SqliteLedger::open_in_memory().unwrap();
+        seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
+        // Total online = 33 + 33 = 66; online_stake reads that column.
+        assert_eq!(ledger.online_stake().unwrap(), 66);
+    }
+
+    #[test]
+    fn seed_account_totals_dedupes_duplicate_addrs() {
+        // A genesis with the same address listed twice (e.g. fee sink
+        // and rewards pool sharing the reserve) should match
+        // populate_store's last-write-wins behavior — totals count
+        // that address ONCE using the final status + amount, not the
+        // sum of every row.
+        let json = r#"{
+            "network": "n", "id": "v", "proto": "p",
+            "alloc": [
+                {"addr": "7777777777777777777777777777777777777777777777777774MSJUVU",
+                 "comment": "first",
+                 "state": {"algo": 100, "onl": 1}},
+                {"addr": "7777777777777777777777777777777777777777777777777774MSJUVU",
+                 "comment": "second (wins)",
+                 "state": {"algo": 50, "onl": 0}}
+            ],
+            "fees": "7777777777777777777777777777777777777777777777777774MSJUVU",
+            "rwd":  "7777777777777777777777777777777777777777777777777774MSJUVU"
+        }"#;
+        let genesis = parse_genesis_json(json).unwrap();
+        let mut ledger = crate::sqlite::SqliteLedger::open_in_memory().unwrap();
+        seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
+        // Second entry (offline, 50) wins — online total is 0, not 100.
+        assert_eq!(ledger.online_stake().unwrap(), 0);
+    }
+
+    #[test]
+    fn has_account_totals_distinguishes_zero_online_from_unseeded() {
+        // A network with zero online stake (everyone offline) is still
+        // "seeded" once the accounttotals row has been written. The
+        // relay bootstrap must not re-seed every restart for such
+        // networks. Regression from Codex round-2 MEDIUM finding.
+        let genesis = parse_genesis_json(
+            r#"{"network":"n","id":"v","proto":"p","alloc":[
+                {"addr":"7777777777777777777777777777777777777777777777777774MSJUVU",
+                 "state":{"algo":100,"onl":0}}
+            ],"fees":"7777777777777777777777777777777777777777777777777774MSJUVU",
+              "rwd":"7777777777777777777777777777777777777777777777777774MSJUVU"}"#,
+        )
+        .unwrap();
+        let mut ledger = crate::sqlite::SqliteLedger::open_in_memory().unwrap();
+        assert!(
+            !ledger.has_account_totals().unwrap(),
+            "fresh ledger has no row"
+        );
+        seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
+        assert!(
+            ledger.has_account_totals().unwrap(),
+            "post-seed: accounttotals row present even with online==0"
+        );
+        assert_eq!(ledger.online_stake().unwrap(), 0);
+    }
+
+    #[test]
+    fn seed_account_totals_is_idempotent() {
+        // Calling twice should not double-count — INSERT OR REPLACE.
+        let genesis = parse_genesis_json(
+            r#"{"network":"n","id":"v","proto":"p","alloc":[
+                {"addr":"7777777777777777777777777777777777777777777777777774MSJUVU",
+                 "state":{"algo":10,"onl":1}}
+            ],"fees":"7777777777777777777777777777777777777777777777777774MSJUVU",
+              "rwd":"7777777777777777777777777777777777777777777777777774MSJUVU"}"#,
+        )
+        .unwrap();
+        let mut ledger = crate::sqlite::SqliteLedger::open_in_memory().unwrap();
+        seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
+        seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
+        assert_eq!(ledger.online_stake().unwrap(), 10);
     }
 }

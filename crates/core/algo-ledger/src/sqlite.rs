@@ -2094,6 +2094,67 @@ impl SqliteLedger {
         }
     }
 
+    /// Check whether the `accounttotals` row has been populated —
+    /// either by the catchpoint importer or by
+    /// [`put_account_totals_seed`]. Used by the mixed-cluster relay
+    /// bootstrap as the "already seeded" sentinel; presence of the
+    /// row is the safe check even for networks whose online stake is
+    /// legitimately zero (where `online_stake()` returns Ok(0) from
+    /// both a populated and an empty table).
+    pub fn has_account_totals(&self) -> Result<bool, AlgoError> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM accounttotals WHERE id = ''",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query accounttotals count error: {e}"),
+            })?;
+        Ok(count > 0)
+    }
+
+    /// Seed the `accounttotals` row from genesis-time totals (PLAN-32
+    /// / TASK-95). `apply_block` does not maintain this table today —
+    /// the catchpoint importer is the only other writer — so the
+    /// mixed-cluster relay would otherwise see `online_stake() == 0`
+    /// on every call, which breaks `Certificate::authenticate`'s
+    /// `circulation()` lookup.
+    ///
+    /// The mixed cluster's online-stake composition is static for the
+    /// lifetime of a soak (Wallet1/2/3 online, Wallet4 offline, no txns
+    /// change this), so a one-time seed from genesis allocations is
+    /// correct for the harness. Reward-unit and rewards-level columns
+    /// are set to zero — they aren't consumed by the verifier path we
+    /// care about. This is intentionally a coarser-grained write than
+    /// the catchpoint importer's version.
+    ///
+    /// Safe to call multiple times; it `INSERT OR REPLACE`s the row.
+    pub fn put_account_totals_seed(
+        &mut self,
+        online_money: u64,
+        offline_money: u64,
+        not_participating_money: u64,
+    ) -> Result<(), AlgoError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO accounttotals(id, online, onlinerewardunits, \
+                 offline, offlinerewardunits, notparticipating, \
+                 notparticipatingrewardunits, rewardslevel) \
+                 VALUES('', ?1, 0, ?2, 0, ?3, 0, 0)",
+                params![
+                    online_money as i64,
+                    offline_money as i64,
+                    not_participating_money as i64,
+                ],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("put_account_totals_seed error: {e}"),
+            })?;
+        Ok(())
+    }
+
     /// Query the total online stake from the `accounttotals` table.
     ///
     /// Returns the `online` column (total microAlgos of all online accounts)
