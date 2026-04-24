@@ -1,2 +1,12 @@
 # Generated network data (contains participation keys — never commit).
 netroot/
+
+# Soak run output (TASK-87): per-run JSONL captures + their summary sidecars.
+# Kept out of git because file sizes grow with run length and the data is
+# local-machine / run-specific. Attach summaries to PRs / Pad items by hand.
+soak-*.jsonl
+soak-*.jsonl.summary.json
+
+# Python bytecode from `python3 -c py_compile` or direct script runs.
+scripts/__pycache__/
+
