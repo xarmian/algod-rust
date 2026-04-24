@@ -155,9 +155,12 @@ netroot/` manually.
   logs with `docker logs phase6-rust-node-4`. Common cause: the
   `--genesis-id` passed in the compose file doesn't match what
   `goal network create` actually produced. `start.sh` captures the ID
-  in `netroot/.phase6-genesis-id`; the Rust peer's `--genesis-id` in
-  `docker-compose.yml` is hard-coded to `phase6net-v1` which matches
-  the default produced by the template's `NetworkName: phase6net`.
+  into `netroot/.phase6-genesis-id` AND exports it as the
+  `PHASE6_GENESIS_ID` environment variable; `docker-compose.yml`
+  interpolates that via `${PHASE6_GENESIS_ID:-phase6net-v1}` so custom
+  templates / renamed networks pick up the right value automatically.
+  If you invoke `docker compose up` directly (bypassing `start.sh`),
+  export the id first: `PHASE6_GENESIS_ID="$(cat ops/mixed-cluster/netroot/.phase6-genesis-id)" docker compose -f ops/mixed-cluster/docker-compose.yml up`.
 - **"address already in use" on host port**: another service is bound
   to 4001/4002/4003/4160. Edit the compose file's `ports:` section to
   remap.
