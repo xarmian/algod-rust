@@ -7,6 +7,11 @@ netroot/
 soak-*.jsonl
 soak-*.jsonl.summary.json
 
+# Verifier run output (TASK-88): per-run fork / cert cross-verify traces.
+# Same rationale as soak output.
+verify-fork-*.jsonl
+verify-cert-*.jsonl
+
 # Python bytecode from `python3 -c py_compile` or direct script runs.
 scripts/__pycache__/
 

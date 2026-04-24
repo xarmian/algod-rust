@@ -1,0 +1,40 @@
+[package]
+name = "algo-cert-crossverify"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+# PLAN-32 / TASK-88 — Certificate cross-verification tool.
+#
+# Fetches a (block, cert) pair from an algod REST endpoint and verifies
+# the cert under algod-rust's `Certificate::authenticate` using an
+# AgreementLedgerBridge over a read-only SQLite ledger snapshot. The
+# sqlite snapshot must already be caught up to the target round (in the
+# TASK-86 mixed cluster, this comes from the Rust relay's own ledger).
+#
+# Rust-produced cert verification (the inverse direction) is deferred
+# to PLAN-35 — it requires the Rust node to be running with online
+# participation keys, which is gated on participation-key format
+# interop with go-algorand's netgoal output. See
+# `docs/MIXED_CLUSTER_HARNESS.md` §Open questions.
+
+[[bin]]
+name = "algo-cert-crossverify"
+path = "src/main.rs"
+
+[dependencies]
+algo-agreement.workspace = true
+algo-codec.workspace = true
+algo-ledger.workspace = true
+algo-rest-client.workspace = true
+algo-types.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+hex.workspace = true
+rmp-serde.workspace = true
+rmpv.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

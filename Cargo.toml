@@ -17,6 +17,8 @@ members = [
     "crates/node/algo-network",
     "crates/node/algo-rest-api",
     "crates/tools/algo-bench",
+    "crates/tools/algo-fork-detector",
+    "crates/tools/algo-cert-crossverify",
     "bin/algod-rust",
 ]
 exclude = ["fuzz"]

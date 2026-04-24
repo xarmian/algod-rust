@@ -224,6 +224,51 @@ change in proposer distribution beyond noise is worth investigating.
   store it elsewhere are not handled — if we ever run this harness on
   `future = vN < v40`, revisit `extract_proposer` in `metrics.py`.
 
+## Verifying a soak (TASK-88)
+
+Post-soak, two tools assert the cluster held together:
+
+- `algo-fork-detector` — polls `/v2/blocks/{r}` across every Go REST
+  node, computes each block's digest locally, and fails non-zero on
+  any round where the nodes disagree. Shipped as a workspace binary
+  under `crates/tools/algo-fork-detector`. Fork detection covers the
+  three Go nodes; the Rust node is deferred (see §Verifier scope).
+- `algo-cert-crossverify` — loads the `(block, cert)` pair Go produced
+  and runs it through `algo_agreement::Certificate::authenticate`
+  against a SQLite-backed `AgreementLedgerBridge`. Shipped under
+  `crates/tools/algo-cert-crossverify`.
+
+`ops/mixed-cluster/scripts/verify-soak.sh` wraps both tools:
+
+```bash
+# Fork detection only (current default — see §Verifier scope).
+scripts/verify-soak.sh --from-round 1 --to-round 200
+
+# Opt in to cert cross-verify against a pre-built full-sync ledger.
+scripts/verify-soak.sh \
+    --from-round 1 --to-round 200 \
+    --with-cert-crossverify /path/to/full-sync-ledger.sqlite
+```
+
+### Verifier scope
+
+The fork detector runs end-to-end against the current TASK-86 harness
+— verified on a 30-round live soak with 41 rounds checked, 0 forks,
+0 insufficient-coverage warnings, 0 fetch errors.
+
+Cert cross-verify ships the binary + library + orchestrator plumbing,
+but the current harness runs the Rust node in `relay` mode, which
+writes imported blocks with empty `proto` / `hdrdata` and never
+updates the participation tracker. The cross-verify binary detects
+this and fails fast with a clear pointer to **TASK-95** (follow-up:
+enable a full-sync algod-rust ledger in the mixed cluster). Until
+then, running cert cross-verify requires a full-sync ledger supplied
+externally via `--with-cert-crossverify <path>`.
+
+Rust-produced cert verification (the inverse Rust → Go direction) is
+not in this PR's scope at all — it needs the Rust node to be running
+online participation keys, which is gated on PLAN-35.
+
 ## Follow-ups (out of TASK-87 scope)
 
 - CI gate: short soak (30-50 rounds) on merge-to-main. Needs a
