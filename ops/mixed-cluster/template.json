@@ -1,0 +1,44 @@
+{
+    "Genesis": {
+        "NetworkName": "phase6net",
+        "FirstPartKeyRound": 0,
+        "LastPartKeyRound": NUM_ROUNDS,
+        "ConsensusProtocol": "future",
+        "Wallets": [
+            { "Name": "Wallet1", "Stake": 33, "Online": true },
+            { "Name": "Wallet2", "Stake": 33, "Online": true },
+            { "Name": "Wallet3", "Stake": 33, "Online": true },
+            { "Name": "Wallet4", "Stake": 1,  "Online": false }
+        ]
+    },
+    "Nodes": [
+        {
+            "Name": "Node1",
+            "IsRelay": true,
+            "Wallets": [
+                { "Name": "Wallet1", "ParticipationOnly": false }
+            ]
+        },
+        {
+            "Name": "Node2",
+            "IsRelay": true,
+            "Wallets": [
+                { "Name": "Wallet2", "ParticipationOnly": false }
+            ]
+        },
+        {
+            "Name": "Node3",
+            "IsRelay": true,
+            "Wallets": [
+                { "Name": "Wallet3", "ParticipationOnly": false }
+            ]
+        },
+        {
+            "Name": "Node4Rust",
+            "IsRelay": true,
+            "Wallets": [
+                { "Name": "Wallet4", "ParticipationOnly": false }
+            ]
+        }
+    ]
+}

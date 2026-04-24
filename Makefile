@@ -3,6 +3,7 @@ ALGOD_URL := http://localhost:4001
 COMPOSE := docker compose -f docker/docker-compose.yml
 COMPOSE_RELAY := docker compose -f docker/docker-compose.test-relay.yml
 COMPOSE_MIXED := docker compose -f docker/docker-compose.mixed-cluster.yml
+PHASE6_CLUSTER := ops/mixed-cluster
 
 .PHONY: build test fmt fmt-check clippy lint deny ci clean
 .PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful replay-mainnet-1k
@@ -14,6 +15,7 @@ COMPOSE_MIXED := docker compose -f docker/docker-compose.mixed-cluster.yml
 .PHONY: generate-diverse-txns fixtures-diverse
 .PHONY: relay-up relay-down relay-test
 .PHONY: mixed-cluster-up mixed-cluster-down mixed-cluster-smoke mixed-cluster-test mixed-cluster-conformance
+.PHONY: phase6-cluster-up phase6-cluster-down phase6-cluster-status
 
 ## ── Build & Test ──────────────────────────────────────────────
 
@@ -333,6 +335,20 @@ mixed-cluster-conformance: mixed-cluster-up ## Run long-running conformance test
 	@echo "==> Mixed cluster conformance test complete."
 	$(MAKE) mixed-cluster-down
 
+## ── Phase 6 mixed-cluster consensus harness (TASK-86) ──────────
+phase6-cluster-up: ## Bring up the PLAN-32 4-node (3 Go + 1 Rust) consensus harness
+	$(PHASE6_CLUSTER)/scripts/start.sh
+
+phase6-cluster-status: ## Per-node round + peer-count snapshot for the phase6 cluster
+	$(PHASE6_CLUSTER)/scripts/status.sh
+
+phase6-cluster-down: ## Tear down the phase6 cluster (pass PURGE=1 to wipe netroot/)
+	@if [ "$(PURGE)" = "1" ]; then \
+		$(PHASE6_CLUSTER)/scripts/stop.sh --purge; \
+	else \
+		$(PHASE6_CLUSTER)/scripts/stop.sh; \
+	fi
+
 ## ── Benchmarks ─────────────────────────────────────────────
 BENCH_START  ?= 40000000
 BENCH_COUNT  ?= 100
@@ -431,6 +447,11 @@ help:
 	@echo "  make mixed-cluster-down   Stop mixed cluster and remove volumes"
 	@echo "  make mixed-cluster-smoke  Quick connectivity check"
 	@echo "  make mixed-cluster-test   Full conformance test (up + smoke + logs + down)"
+	@echo ""
+	@echo "Phase 6 Mixed-Cluster Consensus (TASK-86):"
+	@echo "  make phase6-cluster-up      Bring up 4-node cluster (3 Go + 1 Rust)"
+	@echo "  make phase6-cluster-status  Per-node round + liveness snapshot"
+	@echo "  make phase6-cluster-down    Tear down (append PURGE=1 to wipe netroot/)"
 	@echo ""
 	@echo "Benchmarks (fair comparison):"
 	@echo "  make bench-micro      Run Rust criterion microbenchmarks (fixture-based)"
