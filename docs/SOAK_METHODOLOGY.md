@@ -238,16 +238,22 @@ Post-soak, two tools assert the cluster held together:
   against a SQLite-backed `AgreementLedgerBridge`. Shipped under
   `crates/tools/algo-cert-crossverify`.
 
-`ops/mixed-cluster/scripts/verify-soak.sh` wraps both tools:
+`ops/mixed-cluster/scripts/verify-soak.sh` wraps both tools. As of
+TASK-95 cert cross-verify runs by default — the relay maintains the
+ledger state it needs — and the script extracts the SQLite via
+`docker exec sqlite3 .backup` + `docker cp`.
 
 ```bash
-# Fork detection only (current default — see §Verifier scope).
+# Default: fork detection + Go→Rust cert cross-verify.
 scripts/verify-soak.sh --from-round 1 --to-round 200
 
-# Opt in to cert cross-verify against a pre-built full-sync ledger.
+# Skip cert cross-verify entirely (faster sanity check).
+scripts/verify-soak.sh --from-round 1 --to-round 200 --no-cert-crossverify
+
+# Use an externally-prepared SQLite instead of the relay container's.
 scripts/verify-soak.sh \
     --from-round 1 --to-round 200 \
-    --with-cert-crossverify /path/to/full-sync-ledger.sqlite
+    --cert-ledger /path/to/external-full-sync-ledger.sqlite
 ```
 
 ### Verifier scope
