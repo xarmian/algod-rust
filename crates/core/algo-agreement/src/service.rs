@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{debug, info, warn};
 
-use algo_types::Round;
+use algo_types::{Address, Round};
 
 use crate::actions::{
     Action, ActionType, CryptoAction, EnsureAction, NetworkAction, PseudonodeAction, RezeroAction,
@@ -35,7 +35,7 @@ use crate::events::ConsensusVersionView;
 use crate::ledger_reader::LedgerReader;
 use crate::persistence::{self, AsyncPersistenceLoop, ClockState, PersistentRequest};
 use crate::player::Player;
-use crate::pseudonode::{AsyncPseudonode, Pseudonode};
+use crate::pseudonode::{AccountSigningKeys, AsyncPseudonode, Pseudonode};
 use crate::router::RootRouter;
 use crate::step::{Period, Step, PROPOSE, SOFT};
 use crate::traits::{
@@ -99,6 +99,21 @@ where
     /// broadcasting votes, enabling crash recovery without double-voting.
     /// When `None`, no persistence is performed (existing behavior).
     pub crash_db: Option<rusqlite::Connection>,
+    /// Per-account signing secrets (VRF keypair + OTS secrets) the
+    /// pseudonode should use to produce real, cryptographically valid
+    /// proposals and votes for each address.
+    ///
+    /// Production code typically passes an empty map: signing happens
+    /// elsewhere via the participation-key DB. The
+    /// `agreementtest::simulate` harness (TASK-90) injects fabricated
+    /// secrets here so the pseudonode can drive multi-round consensus
+    /// against a sortition-aware test ledger.
+    ///
+    /// `Service::start()` forwards each entry into the constructed
+    /// `AsyncPseudonode` via the existing
+    /// [`AsyncPseudonode::register_signing_keys`] API, then proceeds.
+    /// An empty map is a no-op — matches prior behavior.
+    pub signing_keys: HashMap<Address, AccountSigningKeys>,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +214,7 @@ where
             crypto,
             clock,
             crash_db,
+            signing_keys,
         } = self.params;
 
         // Try to restore persisted state BEFORE creating the persistence loop
@@ -324,6 +340,7 @@ where
                     pseudo_tx,
                     persistence_loop,
                     restored_state,
+                    signing_keys,
                 );
             })
             .expect("failed to spawn agreement main loop thread");
@@ -390,6 +407,7 @@ fn main_loop<L, K, BF, R>(
     pseudo_events: mpsc::Sender<Vec<ExternalEvent>>,
     mut persistence_loop: Option<AsyncPersistenceLoop>,
     restored_state: Option<(RootRouter, Player, ClockState, Vec<Action>)>,
+    signing_keys: HashMap<Address, AccountSigningKeys>,
 ) where
     L: LedgerReader + LedgerWriter + Send + Sync + 'static,
     K: AgreementKeyManager + Send + 'static,
@@ -455,9 +473,16 @@ fn main_loop<L, K, BF, R>(
     // Create the pseudonode for local proposal/vote generation.
     // We share ledger via a clone of the Arc, but AsyncPseudonode wants
     // owned references. We use a LedgerReaderRef wrapper below.
-    let pseudonode =
+    let mut async_pseudo =
         AsyncPseudonode::new(block_factory, key_manager, LedgerReaderRef(ledger.clone()));
-    let mut pseudonode: Box<dyn Pseudonode + Send> = Box::new(pseudonode);
+    // Register caller-supplied signing secrets so the pseudonode can
+    // produce real VRF proofs and OTS signatures (used by the
+    // agreementtest::simulate harness — TASK-90). Empty map is a no-op
+    // and matches prior production behavior.
+    for (addr, keys) in signing_keys {
+        async_pseudo.register_signing_keys(addr, keys);
+    }
+    let mut pseudonode: Box<dyn Pseudonode + Send> = Box::new(async_pseudo);
 
     // Persistence state — saved when actions contain a persistent action (attest).
     // These snapshots are used to encode the state for the persistence loop.
@@ -1382,6 +1407,7 @@ mod tests {
             crypto: StubCryptoVerifier::new(),
             clock: crate::SystemClock::new(),
             crash_db: None,
+            signing_keys: std::collections::HashMap::new(),
         };
 
         let _service = Service::new(params);
@@ -1400,6 +1426,7 @@ mod tests {
             crypto: StubCryptoVerifier::new(),
             clock: crate::SystemClock::new(),
             crash_db: None,
+            signing_keys: std::collections::HashMap::new(),
         };
 
         let service = Service::new(params);

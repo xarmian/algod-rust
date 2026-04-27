@@ -128,6 +128,7 @@ fn service_starts_and_shuts_down_cleanly() {
         crypto: StubCryptoVerifier::new(),
         clock: SystemClock::new(),
         crash_db: None,
+        signing_keys: std::collections::HashMap::new(),
     };
 
     let service = Service::new(params);
@@ -159,6 +160,7 @@ fn service_start_calls_network_start() {
         crypto: StubCryptoVerifier::new(),
         clock: SystemClock::new(),
         crash_db: None,
+        signing_keys: std::collections::HashMap::new(),
     };
 
     let service = Service::new(params);
@@ -189,6 +191,7 @@ fn service_bootstrap_at_ledger_round() {
         crypto: StubCryptoVerifier::new(),
         clock: SystemClock::new(),
         crash_db: None,
+        signing_keys: std::collections::HashMap::new(),
     };
 
     let service = Service::new(params);
@@ -211,6 +214,7 @@ fn service_handles_round_zero() {
         crypto: StubCryptoVerifier::new(),
         clock: SystemClock::new(),
         crash_db: None,
+        signing_keys: std::collections::HashMap::new(),
     };
 
     let service = Service::new(params);
@@ -235,6 +239,7 @@ fn service_multiple_start_shutdown_cycles() {
             crypto: StubCryptoVerifier::new(),
             clock: SystemClock::new(),
             crash_db: None,
+            signing_keys: std::collections::HashMap::new(),
         };
 
         let service = Service::new(params);
@@ -258,6 +263,7 @@ fn service_immediate_shutdown() {
         crypto: StubCryptoVerifier::new(),
         clock: SystemClock::new(),
         crash_db: None,
+        signing_keys: std::collections::HashMap::new(),
     };
 
     let service = Service::new(params);
@@ -962,6 +968,7 @@ fn service_handle_shutdown_completes() {
         crypto: StubCryptoVerifier::new(),
         clock: SystemClock::new(),
         crash_db: None,
+        signing_keys: std::collections::HashMap::new(),
     };
 
     let handle = Service::new(params).start();
@@ -1076,6 +1083,7 @@ fn make_service_with_injectables(
         crypto: StubCryptoVerifier::new(),
         clock: SystemClock::new(),
         crash_db: None,
+        signing_keys: std::collections::HashMap::new(),
     };
 
     let handle = Service::new(params).start();
@@ -1236,6 +1244,7 @@ fn service_random_source_provides_entropy() {
         crypto: StubCryptoVerifier::new(),
         clock: SystemClock::new(),
         crash_db: None,
+        signing_keys: std::collections::HashMap::new(),
     };
 
     let handle = Service::new(params).start();
@@ -1269,6 +1278,7 @@ fn service_with_crypto_verifier_channels() {
         crypto,
         clock: SystemClock::new(),
         crash_db: None,
+        signing_keys: std::collections::HashMap::new(),
     };
 
     let handle = Service::new(params).start();

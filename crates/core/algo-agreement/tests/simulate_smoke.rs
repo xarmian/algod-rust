@@ -68,6 +68,7 @@ fn simulate_zero_rounds_returns_immediately() {
         crypto: StubCryptoVerifier::new(),
         clock: Arc::clone(&clock) as Arc<dyn algo_agreement::Clock>,
         crash_db: None,
+        signing_keys: std::collections::HashMap::new(),
     };
 
     simulate(params, clock, Round(0));
@@ -95,6 +96,7 @@ fn simulate_one_round_completes_clock_handshake() {
         crypto: StubCryptoVerifier::new(),
         clock: Arc::clone(&clock) as Arc<dyn algo_agreement::Clock>,
         crash_db: None,
+        signing_keys: std::collections::HashMap::new(),
     };
 
     let handle = thread::Builder::new()
