@@ -828,6 +828,14 @@ mod tests {
         }
         let last = accept(&mut tracker, &params, n - 1, CERT, pv);
         assert_eq!(last.event_type(), EventType::CertThreshold);
+        if let Event::Threshold(te) = last {
+            assert_eq!(te.proposal, pv);
+            assert_eq!(te.round, Round(1));
+            assert_eq!(te.period, Period(0));
+            assert_eq!(te.step, CERT);
+        } else {
+            panic!("expected Threshold event with payload");
+        }
 
         let mut tracker = VoteTracker::default();
         for i in 0..(n - 1) {
@@ -854,6 +862,14 @@ mod tests {
         }
         let last = accept(&mut tracker, &params, n - 1, crate::step::NEXT, pv);
         assert_eq!(last.event_type(), EventType::NextThreshold);
+        if let Event::Threshold(te) = last {
+            assert_eq!(te.proposal, pv);
+            assert_eq!(te.round, Round(1));
+            assert_eq!(te.period, Period(0));
+            assert_eq!(te.step, crate::step::NEXT);
+        } else {
+            panic!("expected Threshold event with payload");
+        }
 
         let mut tracker = VoteTracker::default();
         for i in 0..(n - 1) {
@@ -1185,9 +1201,15 @@ mod tests {
         // Drive 2N votes, paired by sender (i / 2). Every odd index
         // triggers an equivocation, incrementing `equivocators_count`.
         // After the count reaches quorum, `handle_vote_accepted` panics
-        // — which the `#[should_panic]` annotation catches. We use a
-        // unique block-digest per index so distinct proposals can't
-        // collide and accidentally satisfy a duplicate-vote drop.
+        // — which the `#[should_panic]` annotation catches.
+        //
+        // Note on uniqueness: `pv_with_digest` indexes into a u8, so
+        // values wrap at 256. That's fine for this test because what
+        // matters is *intra-pair* distinctness (the two votes a single
+        // sender casts must have different proposal digests so the
+        // second is treated as an equivocation, not a duplicate).
+        // Consecutive-increment digests inside a pair always differ,
+        // including across the 0xff→0x00 wrap.
         let mut digest = 0u8;
         for i in 0..(2 * n) {
             digest = digest.wrapping_add(1);
@@ -1217,25 +1239,45 @@ mod tests {
     /// `propose.reaches_quorum()` is always false). Behaviorally
     /// equivalent for consensus, but operator-observable: Go panics,
     /// Rust does not. Tracked in TASK-97.
+    ///
+    /// The body below intentionally drives the propose-step vote and
+    /// asserts a panic. Today the bare `VoteTracker` does NOT panic, so
+    /// without `#[ignore]` the test would fail. When TASK-97 ports the
+    /// contract layer, removing `#[ignore]` flips the test into a
+    /// passing `#[should_panic]` check.
     #[test]
     #[ignore = "see TASK-97 — port voteTrackerContract precondition panics"]
+    #[should_panic(expected = "propose")]
     fn vote_tracker_propose_no_op_panics() {
-        // When TASK-97 lands, replace this with the panic test.
-        // The shape of the test would be:
-        //   #[should_panic(expected = "propose")]
-        //   fn ... { accept(&mut tracker, &params, 0, PROPOSE, test_proposal()); }
+        let params = test_params();
+        let mut tracker = VoteTracker::default();
+        accept(
+            &mut tracker,
+            &params,
+            0,
+            crate::step::PROPOSE,
+            test_proposal(),
+        );
     }
 
     /// Port of `TestVoteTrackerPanicsOnSoftBotQuorum`. Same gap as
     /// above — Go's contract postcondition panics if a SoftThreshold
     /// event fires for proposal=bottom. The Rust port does not enforce
     /// this. Tracked in TASK-97.
+    ///
+    /// Body drives `threshold` votes for `BOTTOM` at SOFT to push the
+    /// (currently silent) post-condition violation. With TASK-97 the
+    /// `#[should_panic]` annotation will match the new contract panic.
     #[test]
     #[ignore = "see TASK-97 — port voteTrackerContract postcondition panic"]
+    #[should_panic(expected = "soft")]
     fn vote_tracker_panics_on_soft_bot_quorum() {
-        // When TASK-97 lands, replace with the panic test that drives
-        // `threshold` votes for `BOTTOM` at the soft step and asserts
-        // a panic on the threshold-emission boundary.
+        let params = test_params();
+        let n = SOFT.committee_threshold(&params);
+        let mut tracker = VoteTracker::default();
+        for i in 0..n {
+            accept(&mut tracker, &params, i, SOFT, ProposalValue::default());
+        }
     }
 
     #[test]
