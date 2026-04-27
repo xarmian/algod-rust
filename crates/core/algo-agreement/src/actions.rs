@@ -476,32 +476,42 @@ impl fmt::Display for Action {
 // Convenience constructors (matching Go free functions)
 // ---------------------------------------------------------------------------
 
-/// Creates an ignore action for the given message event and error reason.
+/// Clone the originating peer's [`MessageHandle`] off a [`MessageEvent`].
 ///
-/// Mirrors Go's `ignoreAction(e, err)` — but currently does NOT carry the
-/// originating peer's `MessageHandle`. See [`disconnect_action`] for the
-/// follow-up tracking issue (TASK-96).
-pub fn ignore_action(err: SerializableError) -> Action {
+/// The handle is `Option<Arc<dyn Any + Send + Sync>>` (TASK-82); the
+/// `Arc::clone` is reference-count-only, so propagating the handle through
+/// every relay/disconnect/ignore action is essentially free.
+///
+/// Mirrors the implicit `e.Input.messageHandle` capture in go-algorand
+/// `agreement/actions.go::relayAction`/`disconnectAction`/`ignoreAction`.
+#[inline]
+pub fn handle_of(e: &MessageEvent) -> MessageHandle {
+    e.input.message_handle.as_ref().map(std::sync::Arc::clone)
+}
+
+/// Creates an ignore action carrying the originating peer's
+/// [`MessageHandle`] for telemetry / attribution.
+///
+/// Mirrors Go's `ignoreAction(e, err)` in `agreement/actions.go:459`.
+pub fn ignore_action(e: &MessageEvent, err: SerializableError) -> Action {
     Action::Network(Box::new(NetworkAction {
         t: ActionType::Ignore,
         err: Some(err),
+        message_handle: handle_of(e),
         ..NetworkAction::default()
     }))
 }
 
-/// Creates a disconnect action for the given message event and error reason.
+/// Creates a disconnect action targeting the originating peer (via the
+/// captured [`MessageHandle`]). The [`AgreementNetwork::disconnect`] bridge
+/// call consults the handle to drop the right connection.
 ///
-/// Mirrors Go's `disconnectAction(e, err)` — but currently does NOT carry
-/// the originating peer's `MessageHandle`. The bridge therefore cannot
-/// disconnect the offending peer; this is tracked end-to-end in TASK-96
-/// (propagate `MessageHandle` through relay/disconnect/ignore actions).
-/// Same caveat applies to [`ignore_action`] and to every `Relay`/`Broadcast`
-/// constructed inline in `player.rs`. The Box-to-Arc switch in TASK-82
-/// makes the broader fix mechanical; it just lives in a separate PR.
-pub fn disconnect_action(err: SerializableError) -> Action {
+/// Mirrors Go's `disconnectAction(e, err)` in `agreement/actions.go:463`.
+pub fn disconnect_action(e: &MessageEvent, err: SerializableError) -> Action {
     Action::Network(Box::new(NetworkAction {
         t: ActionType::Disconnect,
         err: Some(err),
+        message_handle: handle_of(e),
         ..NetworkAction::default()
     }))
 }
@@ -653,14 +663,58 @@ mod tests {
 
     #[test]
     fn ignore_action_constructor() {
-        let a = ignore_action(SerializableError::new("test"));
+        let e = MessageEvent::default();
+        let a = ignore_action(&e, SerializableError::new("test"));
         assert_eq!(a.action_type(), ActionType::Ignore);
     }
 
     #[test]
     fn disconnect_action_constructor() {
-        let a = disconnect_action(SerializableError::new("bad peer"));
+        let e = MessageEvent::default();
+        let a = disconnect_action(&e, SerializableError::new("bad peer"));
         assert_eq!(a.action_type(), ActionType::Disconnect);
+    }
+
+    #[test]
+    fn ignore_action_propagates_handle() {
+        use crate::events::InternalMessage;
+        use std::sync::Arc;
+        struct Marker(u32);
+        let h: MessageHandle = Some(Arc::new(Marker(7)));
+        let e = MessageEvent {
+            input: InternalMessage {
+                message_handle: h.as_ref().map(Arc::clone),
+                ..InternalMessage::default()
+            },
+            ..MessageEvent::default()
+        };
+        let a = ignore_action(&e, SerializableError::new("x"));
+        let Action::Network(na) = a else {
+            panic!("expected network action")
+        };
+        let got = na.message_handle.as_ref().expect("handle propagated");
+        assert_eq!(got.downcast_ref::<Marker>().expect("downcast Marker").0, 7);
+    }
+
+    #[test]
+    fn disconnect_action_propagates_handle() {
+        use crate::events::InternalMessage;
+        use std::sync::Arc;
+        struct Marker(u32);
+        let h: MessageHandle = Some(Arc::new(Marker(11)));
+        let e = MessageEvent {
+            input: InternalMessage {
+                message_handle: h.as_ref().map(Arc::clone),
+                ..InternalMessage::default()
+            },
+            ..MessageEvent::default()
+        };
+        let a = disconnect_action(&e, SerializableError::new("x"));
+        let Action::Network(na) = a else {
+            panic!("expected network action")
+        };
+        let got = na.message_handle.as_ref().expect("handle propagated");
+        assert_eq!(got.downcast_ref::<Marker>().expect("downcast Marker").0, 11);
     }
 
     #[test]

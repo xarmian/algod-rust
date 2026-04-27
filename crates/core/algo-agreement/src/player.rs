@@ -1086,13 +1086,13 @@ impl Player {
                                 "rejected message since it was invalid: {:?}",
                                 fe.err
                             ));
-                            return vec![crate::actions::ignore_action(err)];
+                            return vec![crate::actions::ignore_action(&e, err)];
                         }
                     }
                     EventType::PayloadRejected => {
                         if let Event::PayloadProcessed(ep) = ef {
                             if let Some(err) = ep.err {
-                                return vec![crate::actions::ignore_action(err)];
+                                return vec![crate::actions::ignore_action(&e, err)];
                             }
                         }
                         return Vec::new();
@@ -1111,6 +1111,7 @@ impl Player {
                                     proposal: up,
                                     vote: uv,
                                 },
+                                message_handle: crate::actions::handle_of(&e),
                                 ..NetworkAction::default()
                             }));
 
@@ -1230,7 +1231,7 @@ impl Player {
                                 "rejected message since it was invalid: {:?}",
                                 fe.err
                             ));
-                            return vec![crate::actions::disconnect_action(err)];
+                            return vec![crate::actions::disconnect_action(&e, err)];
                         }
                     }
                     EventType::VoteFiltered => {
@@ -1238,7 +1239,7 @@ impl Player {
                             let err = fe.err.unwrap_or_else(|| {
                                 crate::events::SerializableError::new("filtered")
                             });
-                            return vec![crate::actions::ignore_action(err)];
+                            return vec![crate::actions::ignore_action(&e, err)];
                         }
                     }
                     _ => {}
@@ -1260,6 +1261,7 @@ impl Player {
                         t: ActionType::Relay,
                         tag: crate::traits::AGREEMENT_VOTE_TAG.to_string(),
                         unauthenticated_vote: v.to_unauthenticated(),
+                        message_handle: crate::actions::handle_of(&e),
                         ..NetworkAction::default()
                     })));
                 }
@@ -1286,7 +1288,7 @@ impl Player {
                                 "rejected message since it was invalid: {:?}",
                                 fe.err
                             ));
-                            return vec![crate::actions::disconnect_action(err)];
+                            return vec![crate::actions::disconnect_action(&e, err)];
                         }
                     }
                     EventType::BundleFiltered => {
@@ -1294,7 +1296,7 @@ impl Player {
                             let err = fe.err.unwrap_or_else(|| {
                                 crate::events::SerializableError::new("filtered")
                             });
-                            return vec![crate::actions::ignore_action(err)];
+                            return vec![crate::actions::ignore_action(&e, err)];
                         }
                     }
                     _ => {}
@@ -1313,6 +1315,7 @@ impl Player {
                         t: ActionType::Relay,
                         tag: crate::traits::VOTE_BUNDLE_TAG.to_string(),
                         unauthenticated_bundle: te.bundle.clone(),
+                        message_handle: crate::actions::handle_of(&e),
                         ..NetworkAction::default()
                     })));
                 }
@@ -1354,7 +1357,7 @@ impl Player {
                     let err = fe
                         .err
                         .unwrap_or_else(|| crate::events::SerializableError::new("malformed"));
-                    return vec![crate::actions::disconnect_action(err)];
+                    return vec![crate::actions::disconnect_action(&e, err)];
                 }
             }
             EventType::VoteFiltered => {
@@ -1364,7 +1367,7 @@ impl Player {
                             .err
                             .clone()
                             .unwrap_or_else(|| crate::events::SerializableError::new("filtered"));
-                        return vec![crate::actions::ignore_action(err)];
+                        return vec![crate::actions::ignore_action(&e, err)];
                     }
                     match fe.late_credential_tracking_note {
                         LateCredentialTrackingEffect::VerifiedBetterLateCredentialForTracking => {
@@ -1373,6 +1376,7 @@ impl Player {
                                     t: ActionType::Relay,
                                     tag: crate::traits::AGREEMENT_VOTE_TAG.to_string(),
                                     unauthenticated_vote: v.to_unauthenticated(),
+                                    message_handle: crate::actions::handle_of(&e),
                                     ..NetworkAction::default()
                                 }))];
                             }
@@ -1381,7 +1385,7 @@ impl Player {
                             let err = fe.err.clone().unwrap_or_else(|| {
                                 crate::events::SerializableError::new("filtered")
                             });
-                            return vec![crate::actions::ignore_action(err)];
+                            return vec![crate::actions::ignore_action(&e, err)];
                         }
                         LateCredentialTrackingEffect::UnverifiedLateCredentialForTracking => {
                             // Continue processing
@@ -1417,6 +1421,11 @@ impl Player {
                                 proposal: payload.unauthenticated_proposal.clone(),
                                 vote: v.to_unauthenticated(),
                             };
+                            // Broadcast (not Relay): the player synthesizes a
+                            // compound message it has already authenticated, so
+                            // the originating peer no longer matters and the
+                            // handle is intentionally not propagated. Mirrors
+                            // Go's `broadcastAction` (no `h`).
                             actions.push(Action::Network(Box::new(NetworkAction {
                                 t: ActionType::Broadcast,
                                 tag: crate::traits::PROPOSAL_PAYLOAD_TAG.to_string(),
@@ -1428,6 +1437,7 @@ impl Player {
                                 t: ActionType::Relay,
                                 tag: crate::traits::AGREEMENT_VOTE_TAG.to_string(),
                                 unauthenticated_vote: v.to_unauthenticated(),
+                                message_handle: crate::actions::handle_of(&e),
                                 ..NetworkAction::default()
                             })));
                         }
@@ -1436,6 +1446,7 @@ impl Player {
                             t: ActionType::Relay,
                             tag: crate::traits::AGREEMENT_VOTE_TAG.to_string(),
                             unauthenticated_vote: v.to_unauthenticated(),
+                            message_handle: crate::actions::handle_of(&e),
                             ..NetworkAction::default()
                         })));
                     }
@@ -1444,6 +1455,7 @@ impl Player {
                         t: ActionType::Relay,
                         tag: crate::traits::AGREEMENT_VOTE_TAG.to_string(),
                         unauthenticated_vote: v.to_unauthenticated(),
+                        message_handle: crate::actions::handle_of(&e),
                         ..NetworkAction::default()
                     })));
                 }
