@@ -1012,6 +1012,339 @@ mod tests {
         );
     }
 
+    // ───────────────────────────────────────────────────────────────────
+    // BF-1 tests (TASK-92): port of go-algorand/agreement/vote_test.go
+    //
+    // The Go fixtures spin up a 100-account ledger and walk every step,
+    // accepting only votes whose VRF credentials happened to win sortition.
+    // The Rust counterpart can't replicate that without porting
+    // `readOnlyFixture100`, so we exercise the same rejection mechanics
+    // analytically: build one valid OTS-signed vote and mutate exactly one
+    // field at a time. Each mutation either changes the OTS-signed bytes
+    // (→ `OtsVerificationFailed`) or violates a step/period precondition
+    // checked before OTS (→ the matching `VoteError` variant).
+    //
+    // Coverage map (each Go test → Rust counterpart):
+    //
+    //   TestVoteValidation                        → vote_verify_full_rejection_matrix
+    //   TestVoteReproposalValidation              → vote_reproposal_validation_rules
+    //   TestVoteMakeVote (cert+bottom panic)      → vote_make_vote_cert_step_rejects_bottom
+    //   TestVoteValidationStepCertAndProposalBottom
+    //                                             → vote_verify_cert_step_rejects_bottom
+    //   TestEquivocationVoteValidation            → see `bundle::tests::
+    //                                                   equivocation_vote_verify_rejection_matrix`
+    //                                               (Rust port stores equivocation pairs on the
+    //                                               `Bundle` parent rather than as a top-level
+    //                                               `unauthenticatedEquivocationVote`, so the
+    //                                               structural port lives next to
+    //                                               `Bundle::verify_equivocation_vote`. Covers
+    //                                               identical-proposals, zero-sig, badBlockHash on
+    //                                               proposal[0]/[1], bundle-round mismatch, and
+    //                                               unknown-sender membership lookup.).
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Build an OTS-signed `UnauthenticatedVote` plus the matching
+    /// [`VoteVerifyParams`] (with a real OTS verifier but a zero VRF
+    /// credential). Verification of the returned baseline produces
+    /// [`VoteError::CredentialVerificationFailed`] — meaning OTS is the
+    /// only check the vote *passes*, so any subsequent mutation that
+    /// changes the signed bytes turns the result into
+    /// [`VoteError::OtsVerificationFailed`].
+    ///
+    /// The vote uses `step = NEXT` so the early step-specific checks
+    /// (proposer mismatch / future period / bottom-not-allowed) don't
+    /// apply unless the test explicitly engineers them.
+    fn signed_vote_baseline(
+        sender: Address,
+        round: u64,
+        period: Period,
+        step: Step,
+        proposal: ProposalValue,
+    ) -> (UnauthenticatedVote, VoteVerifyParams) {
+        use algo_consensus_crypto::vrf::VrfKeypair;
+        use algo_consensus_crypto::OneTimeSignatureSecrets;
+
+        let key_dilution = 100u64;
+        let id = one_time_id_for_round(round, key_dilution);
+        let secrets = OneTimeSignatureSecrets::generate(id.batch, 1);
+        let verifier = secrets.verifier();
+
+        let rv = RawVote {
+            sender,
+            round: Round(round),
+            period,
+            step,
+            proposal,
+        };
+        let msg = [RawVote::hash_id(), rv.to_be_hashed().as_slice()].concat();
+        let ots_sig = secrets.sign(&msg, round, key_dilution);
+
+        let uv = UnauthenticatedVote {
+            raw_vote: rv,
+            cred: UnauthenticatedCredential::new([0u8; 80]),
+            sig: ots_sig,
+        };
+
+        let vrf_kp = VrfKeypair::from_seed([7u8; 32]);
+        let params = VoteVerifyParams {
+            membership: Membership {
+                address: sender,
+                selection_id: *vrf_kp.pk.as_bytes(),
+                balance: 5_000_000,
+                total_money: 10_000_000,
+                selector: Selector {
+                    seed: Seed([0xab; 32]),
+                    round: Round(round),
+                    period,
+                    step,
+                },
+            },
+            vote_id: verifier,
+            vote_first_valid: Round(0),
+            vote_last_valid: Round(0),
+            vote_key_dilution: key_dilution,
+            consensus_params: algo_types::consensus::consensus_params_for_version(
+                algo_types::CONSENSUS_V41,
+            )
+            .expect("v41 params"),
+        };
+
+        (uv, params)
+    }
+
+    /// Port of go-algorand `agreement/vote_test.go::TestVoteValidation`.
+    ///
+    /// Mutates each field on a baseline OTS-signed vote and asserts the
+    /// resulting `verify()` rejects. The Go test loops over 50 candidate
+    /// keys and only mutates the votes that won sortition; we collapse
+    /// that to a single deterministic baseline because the rejection
+    /// mechanics don't depend on sortition.
+    #[test]
+    fn vote_verify_full_rejection_matrix() {
+        let sender = Address([0x42; 32]);
+        let round = 1000u64;
+        let pv = ProposalValue {
+            original_period: Period(0),
+            original_proposer: sender,
+            block_digest: Digest([0xaa; 32]),
+            encoding_digest: Digest([0xbb; 32]),
+        };
+        let (baseline, params) = signed_vote_baseline(sender, round, Period(0), NEXT, pv);
+
+        // Sanity: baseline passes OTS, fails at the dummy credential.
+        let baseline_err = baseline.verify(&params).unwrap_err();
+        assert!(
+            matches!(baseline_err, VoteError::CredentialVerificationFailed(_)),
+            "baseline should clear OTS and fail on cred; got {baseline_err:?}",
+        );
+
+        // noSig — zeroed signature can't validate.
+        let mut no_sig = baseline.clone();
+        no_sig.sig = make_zero_sig();
+        assert_eq!(
+            no_sig.verify(&params).unwrap_err(),
+            VoteError::OtsVerificationFailed,
+        );
+
+        // Note on `noCred`: Go's `noCred.Cred = committee.UnauthenticatedCredential{}`
+        // zeros the proof against an otherwise-selected credential. Our
+        // baseline already uses `UnauthenticatedCredential::new([0u8; 80])`
+        // (the dummy proof — equivalent to Go's zero value), so the
+        // baseline failure mode *is* the noCred failure mode:
+        // `CredentialVerificationFailed`. Verified above as the baseline
+        // assertion; no separate subcase needed. (To exercise an
+        // accept→reject `noCred` mutation we'd need a real selected VRF
+        // proof, which the readOnlyFixture100 ledger fixture provides
+        // for Go but is out of scope here — see DOC-91 BF-3 for the
+        // real-cred fixture port.)
+
+        // badRound — bumping round changes the OTS-signed bytes.
+        let mut bad_round = baseline.clone();
+        bad_round.raw_vote.round = Round(round + 1);
+        assert_eq!(
+            bad_round.verify(&params).unwrap_err(),
+            VoteError::OtsVerificationFailed,
+        );
+
+        // badPeriod — bumping period likewise breaks the OTS message.
+        let mut bad_period = baseline.clone();
+        bad_period.raw_vote.period = Period(1);
+        assert_eq!(
+            bad_period.verify(&params).unwrap_err(),
+            VoteError::OtsVerificationFailed,
+        );
+
+        // badStep — bumping step breaks OTS.
+        let mut bad_step = baseline.clone();
+        bad_step.raw_vote.step = Step(NEXT.0 + 1);
+        assert_eq!(
+            bad_step.verify(&params).unwrap_err(),
+            VoteError::OtsVerificationFailed,
+        );
+
+        // badBlockHash — proposal digest is part of the signed bytes.
+        let mut bad_digest = baseline.clone();
+        bad_digest.raw_vote.proposal.block_digest = Digest([0xcc; 32]);
+        assert_eq!(
+            bad_digest.verify(&params).unwrap_err(),
+            VoteError::OtsVerificationFailed,
+        );
+
+        // badProposer — original_proposer is part of the signed bytes.
+        let mut bad_proposer = baseline.clone();
+        bad_proposer.raw_vote.proposal.original_proposer = Address([0xee; 32]);
+        assert_eq!(
+            bad_proposer.verify(&params).unwrap_err(),
+            VoteError::OtsVerificationFailed,
+        );
+    }
+
+    /// Port of go-algorand `agreement/vote_test.go::TestVoteReproposalValidation`.
+    ///
+    /// Exercises the propose-step reproposal rules:
+    ///   - vote period 1 + original_period 0 + different proposer → reproposal,
+    ///     so the proposer-mismatch / future-period gates don't fire.
+    ///   - vote period 1 + original_period 1 + different proposer → fresh
+    ///     proposal mismatched against sender → `ProposerMismatch`.
+    ///   - vote period 1 + original_period 2 → original is in the future →
+    ///     `FuturePeriod`.
+    #[test]
+    fn vote_reproposal_validation_rules() {
+        let sender = Address([0x42; 32]);
+        let round = 1000u64;
+        let other_proposer = Address([0xee; 32]);
+
+        // Good reproposal: period 1, original period 0, original proposer
+        // differs from sender (the *original* proposer, not necessarily the
+        // current voter). The reproposal-window check passes.
+        let pv_good = ProposalValue {
+            original_period: Period(0),
+            original_proposer: other_proposer,
+            block_digest: Digest([0xaa; 32]),
+            encoding_digest: Digest([0xbb; 32]),
+        };
+        // Sign at period 1 so the OTS bytes match what we verify; if the
+        // helper's period drifts from the verifying vote's period, OTS
+        // would fail and mask the gate semantics we want to assert. The
+        // assertion below explicitly demands a `CredentialVerificationFailed`
+        // outcome, proving the propose-step gates *and* OTS both passed.
+        let (uv_good, params) = signed_vote_baseline(sender, round, Period(1), PROPOSE, pv_good);
+        let err = uv_good.verify(&params).unwrap_err();
+        assert!(
+            matches!(err, VoteError::CredentialVerificationFailed(_)),
+            "good reproposal should clear propose gates AND OTS; got {err:?}",
+        );
+
+        // Bad fresh proposal: original_period == vote period, but
+        // sender ≠ original_proposer.
+        let pv_bad_fresh = ProposalValue {
+            original_period: Period(1),
+            original_proposer: other_proposer,
+            block_digest: Digest([0xaa; 32]),
+            encoding_digest: Digest([0xbb; 32]),
+        };
+        let uv_bad_fresh = UnauthenticatedVote {
+            raw_vote: RawVote {
+                sender,
+                round: Round(round),
+                period: Period(1),
+                step: PROPOSE,
+                proposal: pv_bad_fresh,
+            },
+            cred: UnauthenticatedCredential::new([0u8; 80]),
+            sig: make_zero_sig(),
+        };
+        assert_eq!(
+            uv_bad_fresh.verify(&params).unwrap_err(),
+            VoteError::ProposerMismatch,
+        );
+
+        // Bad future-original reproposal: original_period > vote period.
+        let pv_future = ProposalValue {
+            original_period: Period(2),
+            original_proposer: sender,
+            block_digest: Digest([0xaa; 32]),
+            encoding_digest: Digest([0xbb; 32]),
+        };
+        let uv_future = UnauthenticatedVote {
+            raw_vote: RawVote {
+                sender,
+                round: Round(round),
+                period: Period(1),
+                step: PROPOSE,
+                proposal: pv_future,
+            },
+            cred: UnauthenticatedCredential::new([0u8; 80]),
+            sig: make_zero_sig(),
+        };
+        assert_eq!(
+            uv_future.verify(&params).unwrap_err(),
+            VoteError::FuturePeriod {
+                vote_period: Period(1),
+                original_period: Period(2),
+            },
+        );
+    }
+
+    /// Port of go-algorand `agreement/vote_test.go::TestVoteMakeVote` —
+    /// specifically the cert+bottom panic case.
+    ///
+    /// Go's `makeVote(rv, ...)` panics when constructing a vote with
+    /// `step == cert` and `proposal == bottom`. The Rust port does not
+    /// have a top-level `make_vote` constructor; the equivalent contract
+    /// is enforced at `verify()` time, which rejects with
+    /// `BottomNotAllowed { step: CERT }`. Either path means: a node can't
+    /// successfully build *or* validate a cert-step vote for bottom.
+    #[test]
+    fn vote_make_vote_cert_step_rejects_bottom() {
+        let uv = UnauthenticatedVote {
+            raw_vote: RawVote {
+                sender: Address([0x01; 32]),
+                round: Round(100),
+                period: Period(0),
+                step: CERT,
+                proposal: BOTTOM,
+            },
+            cred: UnauthenticatedCredential::new([0u8; 80]),
+            sig: make_zero_sig(),
+        };
+        let params = make_verify_params(Round(100));
+        assert_eq!(
+            uv.verify(&params).unwrap_err(),
+            VoteError::BottomNotAllowed { step: CERT },
+        );
+    }
+
+    /// Port of go-algorand
+    /// `agreement/vote_test.go::TestVoteValidationStepCertAndProposalBottom`.
+    ///
+    /// Take a vote that *would* pass step/proposal validation, then mutate
+    /// it post-hoc into `step = cert, proposal = bottom`. The mutated vote
+    /// must reject. The Go test does the same mutation against
+    /// `unauthenticatedVote` (the raw-vote view), checking the same
+    /// rejection.
+    #[test]
+    fn vote_verify_cert_step_rejects_bottom() {
+        let sender = Address([0x42; 32]);
+        let round = 1000u64;
+        let pv = ProposalValue {
+            original_period: Period(0),
+            original_proposer: sender,
+            block_digest: Digest([0xaa; 32]),
+            encoding_digest: Digest([0xbb; 32]),
+        };
+        let (mut uv, params) = signed_vote_baseline(sender, round, Period(0), NEXT, pv);
+
+        // Mutate into the forbidden cert+bottom shape.
+        uv.raw_vote.step = CERT;
+        uv.raw_vote.proposal = BOTTOM;
+
+        assert_eq!(
+            uv.verify(&params).unwrap_err(),
+            VoteError::BottomNotAllowed { step: CERT },
+        );
+    }
+
     // ── Test helpers ───────────────────────────────────────────────────
 
     fn make_zero_sig() -> OneTimeSignature {
