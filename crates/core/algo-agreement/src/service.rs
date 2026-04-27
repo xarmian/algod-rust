@@ -500,12 +500,56 @@ fn main_loop<L, K, BF, R>(
             break;
         }
 
-        // Step 1: Send actions to demux loop.
+        // Step 1: Execute pseudonode actions inline and forward resulting
+        // events to the demux's prioritize queue.
+        //
+        // Mirrors go-algorand's demux dispatch path (`agreement/service.go:195`
+        // → `pseudonodeAction.do` in `agreement/actions.go:387`). In Go the
+        // demux loop calls `s.do(ctx, a)` on every action batch, which routes
+        // pseudonode actions to `s.loopback.MakeProposals/MakeVotes` and
+        // prioritizes the resulting events back into the demux. The Rust
+        // port owns the pseudonode in the main loop (because it captures
+        // BlockFactory/KeyManager by value), so we run that step here —
+        // critically, *before* sending the remainder of the batch to the
+        // demux. Doing it at the top of the iteration ensures the bootstrap
+        // batch's `Pseudonode(Assemble)` actually invokes `make_proposals`
+        // (so round 1's first proposal reaches the player) instead of being
+        // silently dropped by the demux's no-op `Action::Pseudonode` arm.
+        let mut pseudonode_events = Vec::new();
+        for action in &actions {
+            if let Action::Pseudonode(ref pa) = action {
+                execute_pseudonode_action(
+                    pa,
+                    &mut *pseudonode,
+                    &mut pseudonode_events,
+                    &persistence_loop,
+                    &persist_router,
+                    &persist_player,
+                    &persist_actions,
+                );
+            }
+        }
+        // Persistence snapshots are consumed by the attest above; reset so
+        // the next attest batch captures a fresh snapshot from its own
+        // `submit_top` result.
+        persist_router = None;
+        persist_player = None;
+        persist_actions = None;
+        if !pseudonode_events.is_empty() && pseudo_events.send(pseudonode_events).is_err() {
+            break;
+        }
+        // The demux's `do_action` arm for `Action::Pseudonode` is a no-op
+        // (we executed them above); strip them so the demux's monitor
+        // queue counts and any future per-action work see only the actions
+        // it actually handles.
+        actions.retain(|a| !matches!(a, Action::Pseudonode(_)));
+
+        // Step 2: Send (filtered) actions to demux loop.
         if output.send(actions).is_err() {
             break;
         }
 
-        // Step 2: Send signals so demux loop knows what events to look for.
+        // Step 3: Send signals so demux loop knows what events to look for.
         let fast_recovery_deadline = Deadline {
             duration: player.fast_recovery_deadline,
             timeout_type: TimeoutType::FastRecovery,
@@ -531,13 +575,13 @@ fn main_loop<L, K, BF, R>(
             break;
         }
 
-        // Step 3: Receive the next external event from the demux loop.
+        // Step 4: Receive the next external event from the demux loop.
         let event = match input.recv() {
             Ok(Some(e)) => e,
             Ok(None) | Err(_) => break,
         };
 
-        // Step 4: Look up consensus params for this event's round.
+        // Step 5: Look up consensus params for this event's round.
         let event_round = event.consensus_round();
         let params = ledger
             .consensus_params(event_round)
@@ -556,52 +600,21 @@ fn main_loop<L, K, BF, R>(
         };
         let event = event.attach_consensus_version(version_view);
 
-        // Step 5: Drive the state machine.
+        // Step 6: Drive the state machine.
         let (new_player, new_actions) = router.submit_top(player, event.event, &params);
         player = new_player;
         actions = new_actions;
 
-        // Track state for persistence when actions contain a persistent
-        // action (attest). The snapshot is taken BEFORE executing the
-        // pseudonode actions, matching Go's pattern where state is persisted
-        // before votes are broadcast.
+        // Step 7: Snapshot state for the next iteration's persistent attest
+        // dispatch. Mirrors go-algorand's `s.persistRouter = router` block
+        // after `router.submitTop` (`agreement/service.go:266-270`): the
+        // snapshot is consumed at the top of the *next* iteration, so the
+        // attest's persist-then-broadcast ordering is preserved.
         if persistence::persistent(&actions) {
             persist_router = Some(router.clone());
             persist_player = Some(player.clone());
             persist_actions = Some(actions.clone());
         }
-
-        // Execute pseudonode actions inline and send resulting events to the
-        // demux loop for prioritization. In Go these are executed in the demux
-        // goroutine's `do()` method; since our pseudonode is owned by the main
-        // loop, we execute them here and forward the results.
-        let mut pseudonode_events = Vec::new();
-        for action in &actions {
-            if let Action::Pseudonode(ref pa) = action {
-                execute_pseudonode_action(
-                    pa,
-                    &mut *pseudonode,
-                    &mut pseudonode_events,
-                    &persistence_loop,
-                    &persist_router,
-                    &persist_player,
-                    &persist_actions,
-                );
-            }
-        }
-
-        // Clear persistence snapshots after pseudonode actions are executed.
-        persist_router = None;
-        persist_player = None;
-        persist_actions = None;
-
-        if !pseudonode_events.is_empty() && pseudo_events.send(pseudonode_events).is_err() {
-            break;
-        }
-
-        // Filter out pseudonode actions before sending to the demux loop
-        // since they have already been executed above.
-        actions.retain(|a| !matches!(a, Action::Pseudonode(_)));
     }
 
     // Clean up.

@@ -191,6 +191,24 @@ impl RootRouter {
             StateMachineTag::ProposalMachineRound => {
                 self.proposal_manager.store_for_round(r).handle(p, e)
             }
+            // ProposalMachinePeriod queries (`ProposalFrozen`, `ReadLowest`,
+            // `ReadStaging`, etc.) must consult the SAME per-period
+            // `ProposalTracker` that VoteVerified events mutate. Those are
+            // stored inside `ProposalStore.trackers[period]` (canonical),
+            // populated by `proposal_manager.handle` → `store.handle(period, ...)`
+            // → `dispatch_to_tracker(period, ...)`. The legacy mirror under
+            // `PeriodRouter.proposal_tracker` is never written by production
+            // dispatch, so reading from it returns BOTTOM and `issue_soft_vote`
+            // sees no proposal. Route through the canonical
+            // `ProposalManager.stores[r].trackers[p]` so freezer / staging
+            // queries see the real state. Mirrors the ProposalMachineRound
+            // fix above, and matches go-algorand where the periodRouter
+            // delegates back into the same proposalManager state via
+            // `roundRouter.proposalStore.dispatch_to_tracker` (`agreement/router.go`).
+            StateMachineTag::ProposalMachinePeriod => self
+                .proposal_manager
+                .store_for_round(r)
+                .dispatch_to_tracker(p, e),
             StateMachineTag::VoteMachine => {
                 // Wrap in a FilterableMessageEvent for the vote aggregator
                 if let Event::FilterableMessage(ref fme) = e {

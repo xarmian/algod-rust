@@ -4,28 +4,27 @@
 // driver used by go-algorand tests to step the agreement state machine
 // through N rounds without real wall-clock timing or real network I/O.
 //
-// Public API: [`simulate`] — takes a preconstructed `Parameters` plus an
-// `Arc<InstantClock>` handle, starts the service, rendezvouses with each
-// round's `clock.zero()` via `clock.run_round(r)`, then shuts down cleanly.
+// Public API:
+//   * [`simulate`] — takes a preconstructed `Parameters` plus an
+//     `Arc<InstantClock>` handle, starts the service, rendezvouses with
+//     each of `n` rounds' `clock.zero()` via `clock.run_round(r)`, then
+//     shuts down cleanly. Use this when the test only needs to exercise
+//     the clock handshake (no commits expected — e.g.
+//     `EmptyKeyManager` smokes).
+//   * [`simulate_until_committed`] — the commit-driven variant that
+//     mirrors Go's `for ledger.NextRound() < stopRound` loop
+//     (`agreement/agreementtest/simulate.go:179-193`). Takes a
+//     `next_round_fn` closure so the driver can poll a cloned handle
+//     without re-borrowing the ledger that's been moved into
+//     `Parameters`. Use this whenever the test asserts that N rounds
+//     actually commit — TASK-90's `TestLedger` (clonable, with real
+//     stake / sortition) is the canonical pairing.
 //
 // Composition: see the `instant_clock` and `blackhole_network` sibling
 // modules. Callers construct an `InstantClock`, an `InstantMonitor` (via
 // `clock.make_monitor()`), a `BlackholeNetwork`, a ledger, and
 // participation key/factory/validator stubs — then hand them to
-// `Parameters` and call `simulate(parameters, clock, n)`.
-//
-// Deliberately omitted in this iteration:
-//   - `round_deadline` / ledger-wait watchdog. Implementing this requires
-//     a shared handle to the ledger that the driver can poll
-//     `round_notify` on; `Parameters` takes the ledger by value today, so
-//     the driver doesn't see it. Will land with the follow-up test
-//     infrastructure (TASK-90) that introduces a cloneable test ledger
-//     with stake/sortition support — at which point it becomes possible
-//     to assert "N blocks committed within deadline".
-//   - Multi-round driving. Without participation keys the service never
-//     produces a block, so the ledger never advances and a second
-//     `clock.zero()` never fires. The 1-round smoke here exercises the
-//     entire clock handshake; multi-round is unblocked by TASK-90.
+// `Parameters` and call the appropriate driver above.
 
 pub mod blackhole_network;
 pub mod instant_clock;
@@ -54,8 +53,9 @@ pub use instant_clock::InstantMonitor;
 /// stepped through `n` rounds, then shut down cleanly.
 ///
 /// Mirrors Go's `agreementtest.Simulate` (simulate.go:143-196), minus the
-/// ledger-deadline watchdog — see the module-level doc comment for the
-/// rationale and the TASK-90 follow-up pointer.
+/// ledger-deadline watchdog — see [`simulate_until_committed`] for the
+/// commit-driven variant that mirrors Go's `for ledger.NextRound() <
+/// stopRound` loop.
 pub fn simulate<N, L, K, BF, BV, R, M, C>(
     parameters: Parameters<N, L, K, BF, BV, R, M, C>,
     clock: Arc<InstantClock>,
@@ -86,6 +86,58 @@ pub fn simulate<N, L, K, BF, BV, R, M, C>(
     // surfaces as Disconnected, waking the demux's `Select`. Without this,
     // `handle.shutdown()` would hang because the demux has no way to
     // observe the `quit` atomic while parked on never-firing receivers.
+    clock.shutdown();
+    handle.shutdown();
+}
+
+/// Run agreement until the ledger has committed all rounds up to and
+/// including `target`, then shut down cleanly.
+///
+/// Mirrors Go's `agreementtest.Simulate`'s commit-driven loop
+/// (`agreement/agreementtest/simulate.go:179-193`):
+///
+/// ```text
+/// for ledger.NextRound() < stopRound {
+///     stopwatch.runRound(r)
+///     <-ledger.Wait(r)
+/// }
+/// ```
+///
+/// The Rust version here uses the `next_round_fn` closure to read
+/// `Ledger::next_round()` from outside `Parameters` (which has consumed
+/// the ledger by value). Each `run_round` call drains one
+/// `clock.zero()` → `clock.timeout_at()` → `Z0` handshake — the bootstrap
+/// fires the first one; every subsequent committed round fires the next
+/// from the player's `enter_round(R+1)` → `Action::Rezero(R+1)` path.
+///
+/// The loop stops as soon as `next_round_fn() > target`; at that point the
+/// service may already be parked on the post-commit `Rezero` of `target+1`,
+/// so `clock.shutdown()` drops active senders to wake the demux's
+/// `Select` and let `handle.shutdown()` complete.
+pub fn simulate_until_committed<N, L, K, BF, BV, R, M, C>(
+    parameters: Parameters<N, L, K, BF, BV, R, M, C>,
+    clock: Arc<InstantClock>,
+    target: Round,
+    next_round_fn: impl Fn() -> Round,
+) where
+    N: AgreementNetwork + Send + Sync + 'static,
+    L: LedgerReader + LedgerWriter + Send + Sync + 'static,
+    K: AgreementKeyManager + Send + 'static,
+    BF: BlockFactory + Send + 'static,
+    BV: BlockValidator + Send + 'static,
+    R: RandomSource + Send + 'static,
+    M: EventsProcessingMonitor + Send + 'static,
+    C: CryptoVerifier + Send + 'static,
+{
+    let service = Service::new(parameters);
+    let handle = service.start();
+
+    let mut iteration: u64 = 0;
+    while next_round_fn().0 <= target.0 {
+        clock.run_round(Round(iteration));
+        iteration = iteration.saturating_add(1);
+    }
+
     clock.shutdown();
     handle.shutdown();
 }
