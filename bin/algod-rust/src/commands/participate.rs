@@ -2436,6 +2436,7 @@ pub async fn run(
         crypto,
         clock: SystemClock::new(),
         crash_db: Some(crash_db),
+        signing_keys: std::collections::HashMap::new(),
     };
 
     let service = Service::new(params);
