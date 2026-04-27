@@ -100,19 +100,22 @@ where
     /// When `None`, no persistence is performed (existing behavior).
     pub crash_db: Option<rusqlite::Connection>,
     /// Per-account signing secrets (VRF keypair + OTS secrets) the
-    /// pseudonode should use to produce real, cryptographically valid
+    /// pseudonode uses to produce real, cryptographically valid
     /// proposals and votes for each address.
     ///
-    /// Production code typically passes an empty map: signing happens
-    /// elsewhere via the participation-key DB. The
-    /// `agreementtest::simulate` harness (TASK-90) injects fabricated
-    /// secrets here so the pseudonode can drive multi-round consensus
-    /// against a sortition-aware test ledger.
+    /// An empty map preserves the prior no-local-signing behavior:
+    /// the pseudonode falls back to zero placeholder signatures and
+    /// credentials, which the verifier rejects before they ever reach
+    /// the state machine — so peers / the rest of the protocol never
+    /// see invalid traffic from a local source. All current production
+    /// call sites pass an empty map; the `agreementtest::simulate`
+    /// harness (TASK-90) is the first caller to inject real secrets
+    /// here so the pseudonode can drive multi-round consensus against
+    /// a sortition-aware test ledger.
     ///
     /// `Service::start()` forwards each entry into the constructed
     /// `AsyncPseudonode` via the existing
     /// [`AsyncPseudonode::register_signing_keys`] API, then proceeds.
-    /// An empty map is a no-op — matches prior behavior.
     pub signing_keys: HashMap<Address, AccountSigningKeys>,
 }
 
