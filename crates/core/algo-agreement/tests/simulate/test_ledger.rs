@@ -175,6 +175,12 @@ impl TestLedger {
         // Mirrors what a real ledger does: `lookup_digest(r)` returns the
         // digest the consensus voted on at round r.
         state.digests.insert(r, cert.proposal.block_digest);
+        // Record the block's seed so subsequent rounds' sortition reads
+        // the committed seed (via `seed_round(R)` lookback) rather than
+        // falling back to the genesis seed for every round. Mirrors
+        // `LedgerWriter`'s contract that `Seed(r)` reflects written
+        // blocks at round r.
+        state.seeds.insert(r, Seed(block.seed));
         state.blocks.insert(r, block);
         state.certs.insert(r, cert);
         if state.next_rnd.0 < r.0 + 1 {

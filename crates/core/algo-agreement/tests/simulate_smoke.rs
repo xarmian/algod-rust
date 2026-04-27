@@ -275,13 +275,25 @@ fn instant_clock_since_is_zero() {
 
 #[test]
 fn instant_clock_first_timeout_at_returns_never_channel() {
-    use algo_agreement::{types::TimeoutType, Clock};
+    use algo_agreement::{types::TimeoutType, Clock, EventsProcessingMonitor};
+    use crossbeam_channel::TryRecvError;
+    // Seed the pseudonode queue as having pending work so the
+    // post-TASK-90 filter-timer gate keeps the receiver alive
+    // (sender held in `active_senders`). With an empty pseudonode
+    // queue the receiver would surface as `Disconnected` immediately
+    // — that's the firing-path covered by the simulate harness; here
+    // we want to assert the *never-firing* baseline.
     let clock = InstantClock::new();
+    clock.make_monitor().update_events_queue("pseudonode", 1);
     let rx = clock.timeout_at(Duration::from_secs(60), TimeoutType::Deadline);
-    // A "never" channel never delivers; a short poll should time out.
-    assert!(
-        rx.recv_timeout(Duration::from_millis(20)).is_err(),
-        "first timeout_at must return a never-firing receiver"
+    // The receiver must be open-but-empty (sender alive in
+    // `active_senders`) — distinguish from `Disconnected` which would
+    // indicate the sender was already dropped (only happens after
+    // `shutdown()` or via the empty-queue fast-fire path).
+    assert_eq!(
+        rx.try_recv().unwrap_err(),
+        TryRecvError::Empty,
+        "first timeout_at with pending pseudonode work must return a live, never-firing receiver",
     );
 }
 
