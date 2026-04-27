@@ -22,6 +22,7 @@ algo-agreement = { path = ".", features = ["test-support"] }
 hex.workspace = true
 proptest.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [dependencies]
 algo-codec.workspace = true

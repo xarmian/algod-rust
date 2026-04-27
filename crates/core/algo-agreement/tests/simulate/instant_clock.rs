@@ -42,10 +42,11 @@ use algo_types::Round;
 /// contested in practice.
 struct InstantState {
     /// Per-queue backlog reported by the service's `EventsProcessingMonitor`.
-    /// Currently read only by `EventsProcessingMonitor` consumers for
-    /// introspection (via `make_monitor()`); reserved for future test
-    /// logic that wants to assert queue-length invariants across rounds.
-    #[allow(dead_code)] // retained for monitor-side introspection
+    /// Read by `timeout_at` for `Deadline` requests: when the pseudonode
+    /// queue is empty, the timeout fires immediately so the demux can
+    /// advance the round through the filter step. Mirrors Go's
+    /// `instant.HasPending("pseudonode")` check in
+    /// `simulate.go::TimeoutAt` (simulate.go:71).
     events_queues: HashMap<String, usize>,
 }
 
@@ -203,15 +204,39 @@ impl Clock for InstantClock {
             return rx;
         }
 
-        // All timeouts the Rust demux actually requests (Deadline +
-        // FastRecovery — see `demux.rs`) return a never-firing receiver
-        // under this mock. We keep the matched sender alive on this clock
-        // so `shutdown()` can drop it later and surface the receiver as
-        // Disconnected (waking the demux's `Select`). Filter timeouts
-        // (Go simulate.go:71-73) are NOT requested by the Rust demux
-        // today — if that ever changes we'll extend this path, but there
-        // is no benefit to special-casing them here while they remain
-        // unused.
+        // For `Deadline` requests (Rust demux's name for the round's
+        // filter timer — set from `player.deadline.duration` which is
+        // computed via `filter_timeout(period, params)`), fire
+        // immediately when the pseudonode queue is drained. Mirrors
+        // Go's `simulate.go:71-73` special-case for `TimeoutFilter`.
+        // Without this, the filter-step transition (PROPOSE → SOFT)
+        // never happens under the mock clock, and consensus stalls in
+        // the propose step waiting for a never-firing timer.
+        if timeout_type == TimeoutType::Deadline {
+            let pseudo_pending = {
+                let state = self
+                    .state
+                    .lock()
+                    .expect("InstantClock state mutex poisoned");
+                state.events_queues.get("pseudonode").copied().unwrap_or(0) > 0
+            };
+            if !pseudo_pending {
+                // Empty pseudonode queue → fire the timer immediately
+                // by returning a pre-disconnected receiver. The demux's
+                // `Select` arm for this receiver fires with
+                // `RecvError`, which the demux treats as a timeout
+                // event — exactly what we want.
+                let (tx, rx) = bounded::<Instant>(0);
+                drop(tx);
+                return rx;
+            }
+        }
+
+        // FastRecovery (and Deadline-with-pending-pseudonode) timeouts
+        // return a never-firing receiver. We keep the matched sender
+        // alive on this clock so `shutdown()` can drop it later and
+        // surface the receiver as Disconnected (waking the demux's
+        // `Select`).
         let (tx, rx) = bounded::<Instant>(0);
         self.active_senders
             .lock()

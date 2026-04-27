@@ -29,6 +29,9 @@
 
 pub mod blackhole_network;
 pub mod instant_clock;
+pub mod test_account;
+pub mod test_factory;
+pub mod test_ledger;
 
 use std::sync::Arc;
 
