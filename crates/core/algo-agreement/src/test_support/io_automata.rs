@@ -49,6 +49,15 @@ pub struct IoAutomataConcretePlayer {
     /// specific `ConsensusParams` (stock V41, V41+dynamic-filter) via
     /// [`super::override_consensus_with_dynamic_filter`].
     params: ConsensusParams,
+    /// Set to `true` after a `transition` call panics. Subsequent
+    /// `transition` calls return `Err("automata poisoned")` so callers
+    /// can't accidentally drive a partially-mutated `RootRouter` (the
+    /// player itself is replaced with `Default::default()` on panic, but
+    /// the router's per-round/period maps may have been left
+    /// half-updated). Permutation tests panic-then-abort so this never
+    /// trips today; the flag exists so future reusers (TASK-92/93/94)
+    /// don't silently produce nonsense traces after a panic.
+    poisoned: bool,
 }
 
 impl IoAutomataConcretePlayer {
@@ -59,7 +68,14 @@ impl IoAutomataConcretePlayer {
             router,
             trace: IoTrace::new(),
             params,
+            poisoned: false,
         }
+    }
+
+    /// Whether a previous `transition` call panicked. Once poisoned the
+    /// machine refuses to drive further transitions.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// Borrow the underlying player.
@@ -110,28 +126,32 @@ impl IoAutomataConcretePlayer {
 
     /// Drive one transition, recording input + outputs in the trace.
     ///
-    /// Returns `Ok(())` on success or `Err(panic_msg)` if the player
-    /// (or any sub-machine) panicked. Mirrors Go's `ioAutomataConcretePlayer.transition`
+    /// Returns `Ok(())` on success, `Err("automata poisoned: ...")` if a
+    /// previous transition panicked, or `Err(panic_msg)` if THIS
+    /// transition panicked. Mirrors Go's `ioAutomataConcretePlayer.transition`
     /// which returns `(err, panicErr)`. We collapse both into a single
-    /// `Result` since panics are the only failure mode worth distinguishing.
+    /// `Result` since panics are the only failure mode worth
+    /// distinguishing in a synchronous test driver.
     ///
-    /// Important: we move `self.player` into `submit_top` rather than
-    /// cloning it. `Player.pending: ProposalTableImpl` holds boxed
-    /// `MessageEvent`s whose `InternalMessage.message_handle` field is
-    /// `Option<Box<dyn Any>>` — non-cloneable, and `InternalMessage::clone`
-    /// drops the handle to `None`. Cloning the player before each
-    /// transition would silently strip handles that test preconditions
-    /// installed via `player_mut().pending.push(...)`, breaking the
-    /// "relay as proposer" branch coverage in `PrevRoundPendingPayloadPresent`.
+    /// On panic the player is replaced with `Default::default()` and the
+    /// machine is marked poisoned; subsequent calls short-circuit. The
+    /// router may have been left partially mutated (HashMap::entry
+    /// inserts, etc., happen before panics farther down the call stack),
+    /// so reusing a poisoned machine would produce nonsense traces.
     pub fn transition(&mut self, e: Event) -> Result<(), String> {
+        if self.poisoned {
+            return Err("automata poisoned: previous transition panicked".to_string());
+        }
+
         self.trace.extend_input(e.clone());
 
-        // Move the player out, leaving a default placeholder. On panic we
-        // report and leave the placeholder in place — the test driver
-        // shouldn't reuse a panicked machine. AssertUnwindSafe lets us
-        // borrow the router across the boundary; std::panic::catch_unwind
-        // requires unwind-safe args, but the alternative is an unrecoverable
-        // process abort, which is worse for test ergonomics.
+        // Move the player out, leaving a default placeholder. On success
+        // we put it back; on panic we leave the placeholder in place
+        // (`std::mem::take` already wrote it) and set `poisoned = true`.
+        // `AssertUnwindSafe` lets us borrow the router across the unwind
+        // boundary — `std::panic::catch_unwind` requires unwind-safe
+        // args, but the alternative is an unrecoverable process abort,
+        // which is worse for test ergonomics.
         let player = std::mem::take(&mut self.player);
         let router = &mut self.router;
         let params = &self.params;
@@ -147,6 +167,7 @@ impl IoAutomataConcretePlayer {
                 Ok(())
             }
             Err(panic) => {
+                self.poisoned = true;
                 // Best-effort extraction of the panic message.
                 let msg = panic
                     .downcast_ref::<String>()
@@ -273,6 +294,22 @@ impl IoAutomataConcretePlayer {
     /// in `RoundRouter.children[r].vote_tracker_round` (consulted by
     /// `freshest_bundle` requests). Same duplication shape as
     /// [`set_proposal_assembler`].
+    ///
+    /// **Verbatim port note.** Go's `player_permutation_test.go` also
+    /// constructs an internally inconsistent state here: `threshold.Proposal`
+    /// is `pV` while `threshold.Bundle` is `unauthenticatedBundle{Round: r}`
+    /// (proposal defaults to bottom). Go's player builds the cert from
+    /// `freshestRes.Event.Bundle`, so the resulting `ensure` action carries
+    /// a bottom-proposal certificate even though the threshold itself is for
+    /// `pV`. This is intentional in the Go test (see
+    /// `agreement/player_permutation_test.go:104-118` and the
+    /// `playerSameRoundReachedCertThreshold × payloadVerified` expected
+    /// assertion that hard-codes `Certificate(unauthenticatedBundle{Round:
+    /// r})`). We reproduce it byte-for-byte; the corresponding test
+    /// expectation matches against `ProposalValue::default()` (bottom). If
+    /// future backfill tasks (TASK-92/93/94) want to exercise the
+    /// realistic `bundle.proposal == value` path, they should add a
+    /// separate setup variant rather than altering this one.
     ///
     /// Calls a `pub(crate)` setter on `VoteTrackerRound`; field-level
     /// surface stays private to keep the production API tight.

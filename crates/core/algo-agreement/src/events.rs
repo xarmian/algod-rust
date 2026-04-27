@@ -276,9 +276,15 @@ pub struct InternalMessage {
 impl Clone for InternalMessage {
     fn clone(&self) -> Self {
         Self {
-            // MessageHandle is an opaque, non-cloneable handle.
-            // Cloned messages lose the handle reference.
-            message_handle: None,
+            // `MessageHandle` is `Option<Arc<dyn Any + Send + Sync>>`, so
+            // cloning preserves the handle by reference-count. This is
+            // load-bearing: the crypto verifier round-trip
+            // (`PayloadPresent → verify_payload_action → PayloadVerified`)
+            // clones the input message into the action and back into the
+            // response event. If cloning dropped the handle, the
+            // resulting `PayloadVerified` would look "sourceless" and
+            // wrongly trigger the player's `relay-as-proposer` branch.
+            message_handle: self.message_handle.as_ref().map(std::sync::Arc::clone),
             tag: self.tag.clone(),
             vote: self.vote.clone(),
             proposal: self.proposal.clone(),

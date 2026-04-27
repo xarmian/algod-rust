@@ -157,9 +157,11 @@ impl Clone for NetworkAction {
             compound_message: self.compound_message.clone(),
             unauthenticated_votes: self.unauthenticated_votes.clone(),
             err: self.err.clone(),
-            // MessageHandle is not cloneable — cloned actions lose the handle,
-            // matching the InternalMessage clone behavior.
-            message_handle: None,
+            // `MessageHandle` is `Option<Arc<dyn Any>>`, cloned by
+            // reference-count so the originating peer reference survives
+            // through the action pipeline. See `InternalMessage::clone`
+            // for the rationale.
+            message_handle: self.message_handle.as_ref().map(std::sync::Arc::clone),
         }
     }
 }

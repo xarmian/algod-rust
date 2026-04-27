@@ -233,8 +233,8 @@ fn unique_handle() -> algo_agreement::MessageHandle {
     // signals "this came from a real peer", which the player checks when
     // deciding whether to relay-back the payload along with the vote
     // (PrevRoundPendingPayloadPresent test). The concrete value doesn't
-    // matter as long as it round-trips through `Option<Box<dyn Any>>`.
-    Some(Box::new(()))
+    // matter as long as it round-trips through `Option<Arc<dyn Any>>`.
+    Some(std::sync::Arc::new(()))
 }
 
 fn err_test_verify_failed() -> SerializableError {
