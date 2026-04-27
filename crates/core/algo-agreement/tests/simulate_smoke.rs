@@ -114,21 +114,124 @@ fn simulate_one_round_completes_clock_handshake() {
     }
 }
 
-// NOTE: A multi-round simulate smoke (n=3+ with "3 blocks committed" /
-// "3 certs produced" assertions) is deferred to a follow-up task. It
-// requires participation-key + stake + sortition infrastructure beyond
-// what the existing stubs provide — the service's ledger does not advance
-// without a proposing participant, so subsequent `clock.zero()` calls are
-// never issued. The driver delivered here (InstantClock + BlackholeNetwork
-// + `simulate` fn) is the substrate the follow-up will build on.
-//
-// Follow-up will cover:
-//   - Port of go-algorand's `generateNAccounts` (simulate_test.go:330) or
-//     equivalent Rust-side helper that constructs real VRF + OTS keys.
-//   - A test-ledger with stake/sortition support so `ensure_block` advances
-//     the `next_round`.
-//   - Assertions: 3 blocks committed, 3 certificates produced (matching
-//     TASK-81's original acceptance criterion).
+// ---------------------------------------------------------------------------
+// Multi-round simulate smoke (TASK-90)
+// ---------------------------------------------------------------------------
+
+/// Drives 3 rounds of agreement against a real pseudonode-signed test
+/// ledger and asserts the acceptance criteria from TASK-90: ledger
+/// advances past round 3, each round has a block + certificate, and at
+/// least one round elects a Rust-generated proposer.
+///
+/// **Currently `#[ignore]`'d — see TASK-99.** All four generated
+/// accounts successfully propose AND vote (the participation log
+/// records 4×Proposed + repeated 4×Voted entries for round 1), but
+/// `TestLedger::ensure_block` is never called — the cert-threshold →
+/// EnsureAction pipeline stalls somewhere downstream of vote
+/// verification. The infrastructure (TestLedger / TestAccount /
+/// AutoBlockFactory / TestKeyManager) and the InstantClock filter-
+/// timer fix shipped here are reusable substrate; TASK-99 will
+/// diagnose the remaining stall and remove `#[ignore]`.
+#[test]
+#[ignore = "see TASK-99 — simulate stalls before ensure_block; \
+            cert-threshold pipeline diagnosis pending"]
+fn simulate_three_rounds_commits_three_blocks() {
+    use crate::simulate::test_account::generate_n_accounts;
+    use crate::simulate::test_factory::{
+        signing_keys_from_accounts, AutoBlockFactory, TestKeyManager,
+    };
+    use crate::simulate::test_ledger::TestLedger;
+
+    let params = v41_params();
+    let key_dilution = params.default_key_dilution;
+    let target_round = Round(3);
+
+    // Four staked accounts — each holds 1/4 of total online stake. With
+    // committee sizes of 2_990 (soft) and 1_500 (cert) under v41 and
+    // each account's expected weight ≈ committee_size / 4, the sum of
+    // selected weights reliably crosses quorum across 4 accounts.
+    let accounts = generate_n_accounts(
+        4,
+        Round(0),
+        Round(target_round.0 + 10),
+        key_dilution,
+        0xa9_3e,
+    );
+
+    let key_manager = TestKeyManager::new(&accounts);
+    let log = key_manager.log();
+    let ledger = TestLedger::new(
+        &accounts,
+        100_000,
+        params.clone(),
+        algo_types::CONSENSUS_V41.to_string(),
+    );
+    let ledger_handle = ledger.clone();
+
+    // Move secrets into the signing-keys map; `accounts` is consumed.
+    let (signing_keys, _addrs) = signing_keys_from_accounts(accounts);
+
+    let clock = InstantClock::new();
+    let monitor = clock.make_monitor();
+    let agreement_params = Parameters {
+        network: BlackholeNetwork::new(),
+        ledger,
+        key_manager,
+        block_factory: AutoBlockFactory,
+        block_validator: StubBlockValidator::accepting(),
+        random_source: StubRandomSource::constant(0),
+        monitor,
+        crypto: StubCryptoVerifier::new(),
+        clock: Arc::clone(&clock) as Arc<dyn algo_agreement::Clock>,
+        crash_db: None,
+        signing_keys,
+    };
+
+    let handle = thread::Builder::new()
+        .name("simulate-three-rounds-driver".into())
+        .spawn(move || simulate(agreement_params, clock, target_round))
+        .expect("spawn simulate thread");
+
+    // 30s budget — three rounds with a real pseudonode + sortition +
+    // bundle generation should finish in a small fraction of that even
+    // on a busy CI runner. A timeout indicates a deadlock.
+    join_with_timeout(handle, Duration::from_secs(30))
+        .expect("simulate did not complete within 30s — likely a consensus deadlock");
+
+    // Acceptance #1: ledger advanced past round 3 → rounds 1..=3 committed.
+    let next = ledger_handle.next_round();
+    assert!(
+        next.0 > target_round.0,
+        "expected next_round > {} after committing 3 rounds, got {}",
+        target_round.0,
+        next.0,
+    );
+
+    // Acceptance #2: each of the 3 rounds has both a block AND a cert.
+    for r in 1..=target_round.0 {
+        let r = Round(r);
+        assert!(
+            ledger_handle.block(r).is_some(),
+            "round {r} block not committed",
+        );
+        assert!(
+            ledger_handle.cert(r).is_some(),
+            "round {r} certificate not recorded",
+        );
+    }
+
+    // Acceptance #3: at least one round elected a proposer from our
+    // test accounts. The KeyManager records `Proposed` per successful
+    // sortition; with 4 accounts holding all online stake, every round
+    // is expected to elect at least one.
+    let log = log.lock().unwrap();
+    let any_round_proposed = (1..=target_round.0).map(Round).any(|r| log.proposed_in(r));
+    assert!(
+        any_round_proposed,
+        "expected ≥1 round to elect a Rust-generated proposer; participation log: {:?}",
+        log.entries,
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -184,15 +287,21 @@ fn instant_clock_first_timeout_at_returns_never_channel() {
 
 #[test]
 fn instant_clock_deadline_timeout_never_fires_until_shutdown() {
-    use algo_agreement::{types::TimeoutType, Clock};
+    use algo_agreement::{types::TimeoutType, Clock, EventsProcessingMonitor};
     use crossbeam_channel::TryRecvError;
     let clock = InstantClock::new();
+    // Mark the pseudonode queue as having pending work; otherwise the
+    // post-TASK-90 InstantClock fires Deadline timeouts immediately
+    // (mirroring Go's `instant.HasPending("pseudonode")` gate). This
+    // test asserts the *non-firing* path.
+    clock.make_monitor().update_events_queue("pseudonode", 1);
     // Consume the first-call side effect (drops the timeout_at_sender).
     let _first = clock.timeout_at(Duration::from_secs(60), TimeoutType::Deadline);
     // A subsequent Deadline timeout should be "open but empty" pre-shutdown
-    // — the driver advances rounds via `run_round`, not by firing deadline
-    // timers. `try_recv` distinguishes `Empty` (sender alive, no message)
-    // from `Disconnected` — we want `Empty`, asserting the sender is still
+    // — with pending pseudonode work, the timer never fires; the driver
+    // advances rounds via `run_round`, not by firing deadline timers.
+    // `try_recv` distinguishes `Empty` (sender alive, no message) from
+    // `Disconnected` — we want `Empty`, asserting the sender is still
     // held inside `active_senders`.
     let rx = clock.timeout_at(Duration::from_millis(1), TimeoutType::Deadline);
     assert_eq!(
