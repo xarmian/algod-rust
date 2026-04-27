@@ -52,10 +52,16 @@ impl TestAccount {
 /// `OneTimeSignatureSecrets::generate` already produces an in-memory
 /// secrets object covering the requested batch range.
 ///
-/// Determinism: each account's VRF keypair is seeded from
-/// `(salt, index)` so two calls with the same `salt` produce the same
-/// accounts. The salt lets multiple tests (or repeated runs) get
-/// independent sets without collision.
+/// Determinism: each account's **VRF keypair and address** are seeded
+/// from `(salt, index)` so two calls with the same `salt` produce the
+/// same VRF keys and the same addresses. The OTS secrets, by contrast,
+/// are produced via `OneTimeSignatureSecrets::generate(...)` which uses
+/// fresh ed25519 randomness internally — so OTS verifiers / signatures
+/// differ across calls. That's acceptable for the simulate harness:
+/// vote signatures verify against whatever `vote_id` was published in
+/// the same run, and tests don't rely on cross-run signature stability.
+/// The salt still lets multiple tests (or repeated runs) get independent
+/// account *identities* without collision.
 pub fn generate_n_accounts(
     n: usize,
     first_round: Round,

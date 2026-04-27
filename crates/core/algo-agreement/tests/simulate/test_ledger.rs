@@ -47,6 +47,11 @@ pub struct TestLedgerState {
     /// seed (the test factory doesn't propagate VRF-derived seeds, so a
     /// stable seed is sufficient for sortition to elect proposers).
     pub seeds: HashMap<Round, Seed>,
+    /// Per-round block digests. Round 0 is pre-populated with a
+    /// synthetic genesis digest so `lookup_digest(0)` resolves for
+    /// verifier paths that mix in the previous block's digest at round 1.
+    /// `ensure_block` records the actual block's digest under its round.
+    pub digests: HashMap<Round, Digest>,
     /// Per-address online account data. The test never changes account
     /// state, so a single map (addr → data) suffices regardless of the
     /// queried round.
@@ -113,8 +118,17 @@ impl TestLedger {
         // for the earliest rounds.
         seeds.insert(Round(0), Seed([0x42u8; 32]));
 
+        // Pre-populate a synthetic genesis digest at round 0 so
+        // `lookup_digest(0)` doesn't return `RoundNotAvailable` for
+        // verifier paths that mix in the previous block's digest at
+        // round 1. The actual bytes don't matter — the agreement
+        // service hashes them in but never inspects the value.
+        let mut digests = HashMap::new();
+        digests.insert(Round(0), Digest([0u8; 32]));
+
         let state = TestLedgerState {
             blocks: HashMap::new(),
+            digests,
             certs: HashMap::new(),
             seeds,
             accounts: acct_map,
@@ -157,6 +171,10 @@ impl TestLedger {
     /// now satisfied.
     fn record_block_locked(state: &mut TestLedgerState, block: Block, cert: Certificate) {
         let r = block.round;
+        // Record the block's digest from the certificate (== block_digest).
+        // Mirrors what a real ledger does: `lookup_digest(r)` returns the
+        // digest the consensus voted on at round r.
+        state.digests.insert(r, cert.proposal.block_digest);
         state.blocks.insert(r, block);
         state.certs.insert(r, cert);
         if state.next_rnd.0 < r.0 + 1 {
@@ -211,9 +229,14 @@ impl LedgerReader for TestLedger {
 
     fn lookup_digest(&self, round: Round) -> Result<Digest, LedgerError> {
         let s = self.state.lock().unwrap();
-        s.blocks
+        // Try the explicit digests map first (round 0 = synthetic
+        // genesis, round N = recorded by `ensure_block`); fall back to
+        // a zero placeholder if the round was committed but no digest
+        // was recorded (defensive — `record_block_locked` always
+        // populates digests).
+        s.digests
             .get(&round)
-            .map(|_| Digest([0u8; 32]))
+            .copied()
             .ok_or(LedgerError::RoundNotAvailable(round))
     }
 
