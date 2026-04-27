@@ -715,6 +715,529 @@ mod tests {
         }
     }
 
+    // ───────────────────────────────────────────────────────────────────
+    // BF-2 tests (TASK-93): port of go-algorand
+    // agreement/voteTracker_test.go.
+    //
+    // Helpers:
+    //   - `index_address(i)`: stable per-test sender for vote-maker index `i`,
+    //     mirroring Go's `voteMakerHelper` per-index Address fabrication.
+    //   - `pv_with_digest(b)`: minimal proposal value distinguishable by
+    //     `block_digest`, mirroring Go's `proposalValue{BlockDigest: hash}`
+    //     pattern in vote_tracker tests.
+    //
+    // Two of the 13 Go tests assert panics that Go's `voteTrackerContract`
+    // enforces as wrapper preconditions/postconditions around the bare
+    // `voteTracker`. The Rust port has only the bare `VoteTracker` and no
+    // contract layer, so those two are #[ignore]'d here with a pointer to
+    // TASK-97 (port the contract-layer panics). All other 11 tests
+    // exercise behavior that's already implemented and behaves the same
+    // as Go.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Stable per-index sender address. Mirrors Go's
+    /// `voteMakerHelper.addressIndex(i)` — the i'th address is
+    /// deterministic but distinct from address j ≠ i.
+    fn index_address(i: u64) -> Address {
+        let mut bytes = [0u8; 32];
+        bytes[0..8].copy_from_slice(&i.to_le_bytes());
+        // Salt with a non-zero byte so index 0 doesn't collide with the
+        // all-zero `BOTTOM`/default address used elsewhere in the tests.
+        bytes[31] = 0x5a;
+        Address(bytes)
+    }
+
+    /// Minimal proposal value distinguishable by `block_digest`. Mirrors
+    /// the `proposalValue{BlockDigest: hash}` shape used by Go's
+    /// vote_tracker tests, which only ever inspect the digest.
+    fn pv_with_digest(b: u8) -> ProposalValue {
+        ProposalValue {
+            original_period: Period(0),
+            original_proposer: Address([0u8; 32]),
+            block_digest: Digest([b; 32]),
+            encoding_digest: Digest([0u8; 32]),
+        }
+    }
+
+    /// Drive a single VoteAccepted into the tracker.
+    fn accept(
+        tracker: &mut VoteTracker,
+        params: &ConsensusParams,
+        i: u64,
+        step: Step,
+        proposal: ProposalValue,
+    ) -> Event {
+        let vote = make_vote(index_address(i), Round(1), Period(0), step, proposal, 1);
+        tracker.handle(
+            &Event::VoteAccepted(VoteAcceptedEvent {
+                vote,
+                proto: String::new(),
+            }),
+            params,
+        )
+    }
+
+    // -- Threshold boundary tests ---------------------------------------
+
+    /// Port of `TestVoteTrackerSoftQuorum`. Exactly N=threshold votes →
+    /// SoftThreshold on the last vote; N-1 votes → no threshold.
+    #[test]
+    fn vote_tracker_soft_quorum_boundary() {
+        let params = test_params();
+        let pv = test_proposal();
+        let n = SOFT.committee_threshold(&params);
+
+        // Exactly threshold votes → SoftThreshold on the last one.
+        let mut tracker = VoteTracker::default();
+        for i in 0..(n - 1) {
+            assert_eq!(
+                accept(&mut tracker, &params, i, SOFT, pv).event_type(),
+                EventType::None,
+                "vote {i} below threshold should not fire",
+            );
+        }
+        let last = accept(&mut tracker, &params, n - 1, SOFT, pv);
+        assert_eq!(last.event_type(), EventType::SoftThreshold);
+        if let Event::Threshold(te) = last {
+            assert_eq!(te.proposal, pv);
+        }
+
+        // Threshold − 1 votes → no SoftThreshold.
+        let mut tracker = VoteTracker::default();
+        for i in 0..(n - 1) {
+            assert_eq!(
+                accept(&mut tracker, &params, i, SOFT, pv).event_type(),
+                EventType::None,
+            );
+        }
+    }
+
+    /// Port of `TestVoteTrackerCertQuorum`. Same shape as the soft case.
+    #[test]
+    fn vote_tracker_cert_quorum_boundary() {
+        let params = test_params();
+        let pv = test_proposal();
+        let n = CERT.committee_threshold(&params);
+
+        let mut tracker = VoteTracker::default();
+        for i in 0..(n - 1) {
+            assert_eq!(
+                accept(&mut tracker, &params, i, CERT, pv).event_type(),
+                EventType::None,
+            );
+        }
+        let last = accept(&mut tracker, &params, n - 1, CERT, pv);
+        assert_eq!(last.event_type(), EventType::CertThreshold);
+
+        let mut tracker = VoteTracker::default();
+        for i in 0..(n - 1) {
+            assert_eq!(
+                accept(&mut tracker, &params, i, CERT, pv).event_type(),
+                EventType::None,
+            );
+        }
+    }
+
+    /// Port of `TestVoteTrackerNextQuorum`.
+    #[test]
+    fn vote_tracker_next_quorum_boundary() {
+        let params = test_params();
+        let pv = test_proposal();
+        let n = crate::step::NEXT.committee_threshold(&params);
+
+        let mut tracker = VoteTracker::default();
+        for i in 0..(n - 1) {
+            assert_eq!(
+                accept(&mut tracker, &params, i, crate::step::NEXT, pv).event_type(),
+                EventType::None,
+            );
+        }
+        let last = accept(&mut tracker, &params, n - 1, crate::step::NEXT, pv);
+        assert_eq!(last.event_type(), EventType::NextThreshold);
+
+        let mut tracker = VoteTracker::default();
+        for i in 0..(n - 1) {
+            assert_eq!(
+                accept(&mut tracker, &params, i, crate::step::NEXT, pv).event_type(),
+                EventType::None,
+            );
+        }
+    }
+
+    // -- Equivocator weight + multi-value tests --------------------------
+
+    /// Port of `TestVoteTrackerEquivocatorWeightCountedOnce`. Cast
+    /// `threshold − 1` valid votes, then equivocate sender 0 → no
+    /// SoftThreshold, because the equivocator's weight gets MOVED to
+    /// `equivocators_count` (which contributes to count() once) but the
+    /// original direct vote was REMOVED. The total count for the original
+    /// proposal is therefore `threshold − 1`, still below quorum.
+    #[test]
+    fn vote_tracker_equivocator_weight_counted_once() {
+        let params = test_params();
+        let pv = test_proposal();
+        let n = SOFT.committee_threshold(&params);
+
+        let mut tracker = VoteTracker::default();
+        for i in 0..(n - 1) {
+            assert_eq!(
+                accept(&mut tracker, &params, i, SOFT, pv).event_type(),
+                EventType::None,
+            );
+        }
+        // Sender 0 already voted for `pv`; voting again for a different
+        // proposal triggers equivocation logic.
+        let result = accept(&mut tracker, &params, 0, SOFT, test_proposal_2());
+        assert_eq!(
+            result.event_type(),
+            EventType::None,
+            "equivocator weight must not double-count to push past threshold",
+        );
+        assert_eq!(tracker.equivocators_count, 1);
+    }
+
+    /// Port of `TestVoteTrackerEquivDoesntReemitThreshold`. Once the
+    /// SoftThreshold fires for a proposal, an equivocation by an existing
+    /// voter (followed by a brand-new vote) must NOT emit a second
+    /// threshold.
+    #[test]
+    fn vote_tracker_equiv_doesnt_reemit_threshold() {
+        let params = test_params();
+        let pv = test_proposal();
+        let n = SOFT.committee_threshold(&params);
+
+        let mut tracker = VoteTracker::default();
+        for i in 0..(n - 1) {
+            accept(&mut tracker, &params, i, SOFT, pv);
+        }
+        let crossed = accept(&mut tracker, &params, n - 1, SOFT, pv);
+        assert_eq!(crossed.event_type(), EventType::SoftThreshold);
+
+        // Equivocate sender 0 onto a different proposal.
+        let dup = accept(&mut tracker, &params, 0, SOFT, test_proposal_2());
+        assert_eq!(
+            dup.event_type(),
+            EventType::None,
+            "post-threshold equivocation must not re-emit threshold",
+        );
+
+        // Add a fresh voter — still no re-emission.
+        let extra = accept(&mut tracker, &params, n + 1, SOFT, pv);
+        assert_eq!(extra.event_type(), EventType::None);
+    }
+
+    /// Port of `TestVoteTrackerEquivocationsCount`. Half-threshold votes
+    /// for v1, half-threshold votes for v2 (different senders), then the
+    /// v2 voters equivocate onto v1 → the v1 proposal reaches quorum on
+    /// the last equivocation event because the equivocators' weight
+    /// contributes to the v1 count via `equivocators_count`.
+    #[test]
+    fn vote_tracker_equivocations_count() {
+        let params = test_params();
+        let v1 = pv_with_digest(0xa1);
+        let v2 = pv_with_digest(0xa2);
+        let n = CERT.committee_threshold(&params);
+        let half = n / 2;
+
+        let mut tracker = VoteTracker::default();
+        // First `half` voters vote for v1.
+        for i in 0..half {
+            assert_eq!(
+                accept(&mut tracker, &params, i, CERT, v1).event_type(),
+                EventType::None,
+            );
+        }
+        // Next `n - half` voters vote for v2.
+        for i in half..n {
+            assert_eq!(
+                accept(&mut tracker, &params, i, CERT, v2).event_type(),
+                EventType::None,
+            );
+        }
+        // The v2 voters equivocate onto v1. The last one crosses the
+        // CertThreshold for v1 (direct + equivocator weight).
+        let mut last = Event::Empty(EmptyEvent);
+        for i in half..n {
+            last = accept(&mut tracker, &params, i, CERT, v1);
+        }
+        assert_eq!(last.event_type(), EventType::CertThreshold);
+        if let Event::Threshold(te) = last {
+            assert_eq!(te.proposal, v1);
+        }
+    }
+
+    /// Port of `TestVoteTrackerSuperEquivocationsCount`. Same as the
+    /// previous test but the equivocations are onto v3 (a third value
+    /// distinct from v1 and v2). v1 still reaches quorum because
+    /// `equivocators_count` contributes to *every* proposal's `count()`.
+    #[test]
+    fn vote_tracker_super_equivocations_count() {
+        let params = test_params();
+        let v1 = pv_with_digest(0xb1);
+        let v2 = pv_with_digest(0xb2);
+        let v3 = pv_with_digest(0xb3);
+        let n = CERT.committee_threshold(&params);
+        let half = n / 2;
+
+        let mut tracker = VoteTracker::default();
+        for i in 0..half {
+            accept(&mut tracker, &params, i, CERT, v1);
+        }
+        for i in half..n {
+            accept(&mut tracker, &params, i, CERT, v2);
+        }
+        let mut last = Event::Empty(EmptyEvent);
+        for i in half..n {
+            last = accept(&mut tracker, &params, i, CERT, v3);
+        }
+        assert_eq!(last.event_type(), EventType::CertThreshold);
+        if let Event::Threshold(te) = last {
+            // Quorum landed on v1, the proposal whose `count()` benefited
+            // from the equivocators (v2 voters had their direct weight
+            // removed; v3 has only equivocators).
+            assert_eq!(te.proposal, v1);
+        }
+    }
+
+    // -- Equivocation forwarding behavior -------------------------------
+
+    /// Port of `TestVoteTrackerForwardsFirstEquivocation`. The first
+    /// equivocation from sender X is FORWARDED (filter request returns
+    /// Empty), but subsequent equivocations from the same sender are
+    /// FILTERED. Mirrors the asymmetry between `voters` (cleared on
+    /// equivocation) and `equivocators` (set on equivocation).
+    #[test]
+    fn vote_tracker_forwards_first_equivocation() {
+        let params = test_params();
+        let v1 = pv_with_digest(0xc1);
+        let v2 = pv_with_digest(0xc2);
+        let v3 = pv_with_digest(0xc3);
+
+        let mut tracker = VoteTracker::default();
+        // Sender 0 votes for v1.
+        accept(&mut tracker, &params, 0, crate::step::NEXT, v1);
+
+        // Filter for sender 0 + v1: same proposal → filtered (duplicate).
+        let dup = tracker.handle(
+            &Event::VoteFilterRequest(VoteFilterRequestEvent {
+                raw_vote: RawVote {
+                    sender: index_address(0),
+                    round: Round(1),
+                    period: Period(0),
+                    step: crate::step::NEXT,
+                    proposal: v1,
+                },
+            }),
+            &params,
+        );
+        assert_eq!(dup.event_type(), EventType::VoteFilteredStep);
+
+        // Filter for sender 0 + v2 (different proposal): the first
+        // equivocation is forwarded — filter returns empty so the
+        // network actually relays the second vote.
+        let first_equi = tracker.handle(
+            &Event::VoteFilterRequest(VoteFilterRequestEvent {
+                raw_vote: RawVote {
+                    sender: index_address(0),
+                    round: Round(1),
+                    period: Period(0),
+                    step: crate::step::NEXT,
+                    proposal: v2,
+                },
+            }),
+            &params,
+        );
+        assert_eq!(
+            first_equi.event_type(),
+            EventType::None,
+            "first equivocation must be forwarded (not filtered)",
+        );
+
+        // Drive the equivocation through.
+        accept(&mut tracker, &params, 0, crate::step::NEXT, v2);
+
+        // Now sender 0 is in `equivocators`. A filter request for v3 (a
+        // third value) is filtered as a future equivocation.
+        let future_equi = tracker.handle(
+            &Event::VoteFilterRequest(VoteFilterRequestEvent {
+                raw_vote: RawVote {
+                    sender: index_address(0),
+                    round: Round(1),
+                    period: Period(0),
+                    step: crate::step::NEXT,
+                    proposal: v3,
+                },
+            }),
+            &params,
+        );
+        assert_eq!(future_equi.event_type(), EventType::VoteFilteredStep);
+    }
+
+    /// Port of `TestVoteTrackerFiltersFutureEquivocations`. Once a sender
+    /// is a known equivocator, every subsequent filter request from them
+    /// returns FilteredStep, regardless of the proposal value.
+    #[test]
+    fn vote_tracker_filters_future_equivocations() {
+        let params = test_params();
+        let v1 = pv_with_digest(0xd1);
+        let v2 = pv_with_digest(0xd2);
+
+        let mut tracker = VoteTracker::default();
+        // Build the equivocation: sender 0 votes for v1, then v2.
+        accept(&mut tracker, &params, 0, SOFT, v1);
+        // First filter for v2 (the equivocation about to land) — forwarded.
+        let first = tracker.handle(
+            &Event::VoteFilterRequest(VoteFilterRequestEvent {
+                raw_vote: RawVote {
+                    sender: index_address(0),
+                    round: Round(1),
+                    period: Period(0),
+                    step: SOFT,
+                    proposal: v2,
+                },
+            }),
+            &params,
+        );
+        assert_eq!(first.event_type(), EventType::None);
+        accept(&mut tracker, &params, 0, SOFT, v2);
+
+        // Now any future filter request from sender 0 is rejected.
+        for digest in 0xd3u8..0xd3 + 16 {
+            let val = pv_with_digest(digest);
+            let result = tracker.handle(
+                &Event::VoteFilterRequest(VoteFilterRequestEvent {
+                    raw_vote: RawVote {
+                        sender: index_address(0),
+                        round: Round(1),
+                        period: Period(0),
+                        step: SOFT,
+                        proposal: val,
+                    },
+                }),
+                &params,
+            );
+            assert_eq!(
+                result.event_type(),
+                EventType::VoteFilteredStep,
+                "future equivocation for digest {digest} should be filtered",
+            );
+        }
+    }
+
+    // -- Invariant-panic tests ------------------------------------------
+
+    /// Port of `TestVoteTrackerPanicsOnTwoSoftQuorums`. Cross the
+    /// SoftThreshold for v1, then drive votes for v2 from disjoint
+    /// senders to push v2 over its quorum. The second crossing trips
+    /// `over_threshold`'s panic guard ("more than one value reached a
+    /// threshold").
+    #[test]
+    #[should_panic(expected = "more than one value reached a threshold")]
+    fn vote_tracker_panics_on_two_soft_quorums() {
+        let params = test_params();
+        let v1 = pv_with_digest(0xe1);
+        let v2 = pv_with_digest(0xe2);
+        let n = SOFT.committee_threshold(&params);
+
+        let mut tracker = VoteTracker::default();
+        for i in 0..n {
+            accept(&mut tracker, &params, i, SOFT, v1);
+        }
+        // Disjoint sender range pushes v2 over quorum from a clean state
+        // for v2's `count()` — total count includes equivocators from
+        // earlier (none here, since each sender voted exactly once).
+        for i in n..(2 * n) {
+            accept(&mut tracker, &params, i, SOFT, v2);
+        }
+    }
+
+    /// Port of `TestVoteTrackerPanicsOnTwoNextQuorums`. Same shape as the
+    /// soft case but at next-step, with v1 = bottom and v2 = a real
+    /// proposal — both can reach quorum at next-step in Go.
+    #[test]
+    #[should_panic(expected = "more than one value reached a threshold")]
+    fn vote_tracker_panics_on_two_next_quorums() {
+        let params = test_params();
+        let v_bot = ProposalValue::default(); // BOTTOM
+        let v2 = pv_with_digest(0xf2);
+        let n = crate::step::NEXT.committee_threshold(&params);
+
+        let mut tracker = VoteTracker::default();
+        for i in 0..n {
+            accept(&mut tracker, &params, i, crate::step::NEXT, v_bot);
+        }
+        for i in n..(2 * n) {
+            accept(&mut tracker, &params, i, crate::step::NEXT, v2);
+        }
+    }
+
+    /// Port of `TestVoteTrackerRejectsTooManyEquivocators`. Pair every
+    /// sender with a fresh equivocation. After enough pairs the
+    /// `equivocators_count` itself reaches quorum, tripping the
+    /// "too many equivocators" panic.
+    #[test]
+    #[should_panic(expected = "too many equivocators")]
+    fn vote_tracker_rejects_too_many_equivocators() {
+        let params = test_params();
+        let n = SOFT.committee_threshold(&params);
+
+        let mut tracker = VoteTracker::default();
+        // Drive 2N votes, paired by sender (i / 2). Every odd index
+        // triggers an equivocation, incrementing `equivocators_count`.
+        // After the count reaches quorum, `handle_vote_accepted` panics
+        // — which the `#[should_panic]` annotation catches. We use a
+        // unique block-digest per index so distinct proposals can't
+        // collide and accidentally satisfy a duplicate-vote drop.
+        let mut digest = 0u8;
+        for i in 0..(2 * n) {
+            digest = digest.wrapping_add(1);
+            accept(&mut tracker, &params, i / 2, SOFT, pv_with_digest(digest));
+        }
+    }
+
+    /// Port of `TestVoteTrackerRejectsUnknownEvent`. The bare
+    /// `voteTracker.handle()` panics on event types it doesn't recognize.
+    #[test]
+    #[should_panic(expected = "voteTracker: bad event type")]
+    fn vote_tracker_rejects_unknown_event() {
+        let params = test_params();
+        let mut tracker = VoteTracker::default();
+        // Empty event is not a VoteAccepted / VoteFilterRequest /
+        // DumpVotesRequest.
+        let _ = tracker.handle(&Event::Empty(EmptyEvent), &params);
+    }
+
+    // -- Conformance gaps deferred to TASK-97 ---------------------------
+
+    /// Port of `TestVoteTrackerProposeNoOp`. Go's
+    /// `voteTrackerContract.preconditions` panics on propose-step
+    /// votes wrapped around the bare `voteTracker`. The Rust port has
+    /// no contract layer — `VoteTracker::handle_vote_accepted` accepts
+    /// propose-step votes and silently produces no threshold (because
+    /// `propose.reaches_quorum()` is always false). Behaviorally
+    /// equivalent for consensus, but operator-observable: Go panics,
+    /// Rust does not. Tracked in TASK-97.
+    #[test]
+    #[ignore = "see TASK-97 — port voteTrackerContract precondition panics"]
+    fn vote_tracker_propose_no_op_panics() {
+        // When TASK-97 lands, replace this with the panic test.
+        // The shape of the test would be:
+        //   #[should_panic(expected = "propose")]
+        //   fn ... { accept(&mut tracker, &params, 0, PROPOSE, test_proposal()); }
+    }
+
+    /// Port of `TestVoteTrackerPanicsOnSoftBotQuorum`. Same gap as
+    /// above — Go's contract postcondition panics if a SoftThreshold
+    /// event fires for proposal=bottom. The Rust port does not enforce
+    /// this. Tracked in TASK-97.
+    #[test]
+    #[ignore = "see TASK-97 — port voteTrackerContract postcondition panic"]
+    fn vote_tracker_panics_on_soft_bot_quorum() {
+        // When TASK-97 lands, replace with the panic test that drives
+        // `threshold` votes for `BOTTOM` at the soft step and asserts
+        // a panic on the threshold-emission boundary.
+    }
+
     #[test]
     fn equivocation_vote_v0_v1() {
         let ev = EquivocationVote {
