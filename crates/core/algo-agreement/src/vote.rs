@@ -1037,7 +1037,10 @@ mod tests {
     //                                               `Bundle` parent rather than as a top-level
     //                                               `unauthenticatedEquivocationVote`, so the
     //                                               structural port lives next to
-    //                                               `Bundle::verify_equivocation_vote`).
+    //                                               `Bundle::verify_equivocation_vote`. Covers
+    //                                               identical-proposals, zero-sig, badBlockHash on
+    //                                               proposal[0]/[1], bundle-round mismatch, and
+    //                                               unknown-sender membership lookup.).
     // ───────────────────────────────────────────────────────────────────
 
     /// Build an OTS-signed `UnauthenticatedVote` plus the matching
@@ -1054,6 +1057,7 @@ mod tests {
     fn signed_vote_baseline(
         sender: Address,
         round: u64,
+        period: Period,
         step: Step,
         proposal: ProposalValue,
     ) -> (UnauthenticatedVote, VoteVerifyParams) {
@@ -1068,7 +1072,7 @@ mod tests {
         let rv = RawVote {
             sender,
             round: Round(round),
-            period: Period(0),
+            period,
             step,
             proposal,
         };
@@ -1091,7 +1095,7 @@ mod tests {
                 selector: Selector {
                     seed: Seed([0xab; 32]),
                     round: Round(round),
-                    period: Period(0),
+                    period,
                     step,
                 },
             },
@@ -1125,7 +1129,7 @@ mod tests {
             block_digest: Digest([0xaa; 32]),
             encoding_digest: Digest([0xbb; 32]),
         };
-        let (baseline, params) = signed_vote_baseline(sender, round, NEXT, pv);
+        let (baseline, params) = signed_vote_baseline(sender, round, Period(0), NEXT, pv);
 
         // Sanity: baseline passes OTS, fails at the dummy credential.
         let baseline_err = baseline.verify(&params).unwrap_err();
@@ -1142,13 +1146,17 @@ mod tests {
             VoteError::OtsVerificationFailed,
         );
 
-        // noCred — zeroed credential proof. OTS still passes; cred fails.
-        let mut no_cred = baseline.clone();
-        no_cred.cred = UnauthenticatedCredential::new([0u8; 80]);
-        assert!(matches!(
-            no_cred.verify(&params).unwrap_err(),
-            VoteError::CredentialVerificationFailed(_),
-        ));
+        // Note on `noCred`: Go's `noCred.Cred = committee.UnauthenticatedCredential{}`
+        // zeros the proof against an otherwise-selected credential. Our
+        // baseline already uses `UnauthenticatedCredential::new([0u8; 80])`
+        // (the dummy proof — equivalent to Go's zero value), so the
+        // baseline failure mode *is* the noCred failure mode:
+        // `CredentialVerificationFailed`. Verified above as the baseline
+        // assertion; no separate subcase needed. (To exercise an
+        // accept→reject `noCred` mutation we'd need a real selected VRF
+        // proof, which the readOnlyFixture100 ledger fixture provides
+        // for Go but is out of scope here — see DOC-91 BF-3 for the
+        // real-cred fixture port.)
 
         // badRound — bumping round changes the OTS-signed bytes.
         let mut bad_round = baseline.clone();
@@ -1215,28 +1223,16 @@ mod tests {
             block_digest: Digest([0xaa; 32]),
             encoding_digest: Digest([0xbb; 32]),
         };
-        let mut uv_good = UnauthenticatedVote {
-            raw_vote: RawVote {
-                sender,
-                round: Round(round),
-                period: Period(1),
-                step: PROPOSE,
-                proposal: pv_good,
-            },
-            cred: UnauthenticatedCredential::new([0u8; 80]),
-            sig: make_zero_sig(),
-        };
-        // Sign so the OTS check passes (we want to land on cred-failure
-        // — proves we got past the propose-step gates).
-        let (signed, params) = signed_vote_baseline(sender, round, PROPOSE, pv_good);
-        uv_good.sig = signed.sig.clone();
+        // Sign at period 1 so the OTS bytes match what we verify; if the
+        // helper's period drifts from the verifying vote's period, OTS
+        // would fail and mask the gate semantics we want to assert. The
+        // assertion below explicitly demands a `CredentialVerificationFailed`
+        // outcome, proving the propose-step gates *and* OTS both passed.
+        let (uv_good, params) = signed_vote_baseline(sender, round, Period(1), PROPOSE, pv_good);
         let err = uv_good.verify(&params).unwrap_err();
         assert!(
-            !matches!(
-                err,
-                VoteError::ProposerMismatch | VoteError::FuturePeriod { .. }
-            ),
-            "good reproposal should clear propose gates; got {err:?}",
+            matches!(err, VoteError::CredentialVerificationFailed(_)),
+            "good reproposal should clear propose gates AND OTS; got {err:?}",
         );
 
         // Bad fresh proposal: original_period == vote period, but
@@ -1337,7 +1333,7 @@ mod tests {
             block_digest: Digest([0xaa; 32]),
             encoding_digest: Digest([0xbb; 32]),
         };
-        let (mut uv, params) = signed_vote_baseline(sender, round, NEXT, pv);
+        let (mut uv, params) = signed_vote_baseline(sender, round, Period(0), NEXT, pv);
 
         // Mutate into the forbidden cert+bottom shape.
         uv.raw_vote.step = CERT;

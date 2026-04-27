@@ -717,46 +717,48 @@ mod tests {
     /// type, so the structural port lives here next to
     /// [`Bundle::verify_equivocation_vote`].
     ///
-    /// Asserts the rejection mechanics that map cleanly across the two
-    /// architectures:
-    ///   - identical proposals → `IdenticalEquivocationProposals`
-    ///     (covered by `bundle_verify_rejects_identical_equivocation_proposals`).
-    ///   - zero signatures across distinct proposals → vote-verify failure
-    ///     (the OTS path on the all-zero sig fails before the credential
-    ///     check, surfacing as `VoteVerificationFailed`).
-    ///   - sender unknown to the ledger → membership lookup fails →
-    ///     `VoteVerificationFailed`.
+    /// Builds a real OTS-signed equivocation pair (distinct proposals,
+    /// same round/period/step) and exercises the rejection matrix:
     ///
-    /// The Go test's "same-vote" case (two copies of the same OTS-signed
-    /// message for the same proposal) is the same property as identical
-    /// proposals; we keep both sub-cases for parity with Go's intent.
+    ///   - **identical proposals** → `IdenticalEquivocationProposals`
+    ///     (covers Go's "same vote" sub-case where both proposals match).
+    ///   - **zero signatures** across distinct proposals → first proposal's
+    ///     OTS verification fails → `VoteVerificationFailed { index: 0,
+    ///     detail: "first proposal failed: ..." }`.
+    ///   - **bad blockhash on proposal[0]** → first proposal's OTS-signed
+    ///     bytes mismatch → first-proposal failure.
+    ///   - **bad bundle round** → both reconstructed votes' OTS-signed
+    ///     bytes use the new round → first-proposal failure with OTS detail.
+    ///   - **sender unknown to the ledger** → `membership_from_ledger`
+    ///     fails → `VoteVerificationFailed` with membership-shaped detail.
+    ///
+    /// **Deferred to BF-3** (real-VRF ledger fixture port from go-algorand
+    /// `readOnlyFixture100`):
+    ///   - the `noCred` mutation case (Go zeros a previously-selected
+    ///     credential); without a real selected credential we can't
+    ///     distinguish "valid cred → noCred fails" from baseline.
+    ///   - second-proposal-failure cases (e.g. `badBlockHash` on
+    ///     `proposal[1]`); `verify_equivocation_vote` runs the full
+    ///     credential check on the first proposal before reaching the
+    ///     second OTS, so with a dummy credential the first-proposal
+    ///     failure masks any second-proposal mutation. The first-proposal
+    ///     subcases above already exercise `verify_equivocation_vote`'s
+    ///     OTS plumbing for the bytes that survive into both reconstructions.
     #[test]
     fn equivocation_vote_verify_rejection_matrix() {
-        // -- Sub-case 1: distinct proposals, zero signatures → reject. --
-        //
-        // The all-zero `OneTimeSignature` can't validate against any
-        // OTS-signed message, so verify_equivocation_vote fails on the
-        // first proposal's vote verification. We seed an account so the
-        // ledger lookup succeeds and the rejection comes from the OTS
-        // check rather than membership.
-        let params = v41_params();
-        let mut ledger = MockLedgerReader::new(params);
+        use crate::hashable::Hashable;
+        use algo_consensus_crypto::{one_time_id_for_round, OneTimeSignatureSecrets};
+
+        // ---- Setup: real OTS-signed equivocation pair. -----------------
         let sender = Address([0x42; 32]);
-        ledger.add_account(
-            sender,
-            crate::ledger_reader::OnlineAccountData {
-                micro_algos: 5_000_000,
-                vote_id: [0u8; 32],
-                selection_id: [0u8; 32],
-                vote_first_valid: Round(0),
-                vote_last_valid: Round(0),
-                vote_key_dilution: 0,
-                incentive_eligible: false,
-                last_proposed: Round(0),
-                last_heartbeat: Round(0),
-                state_proof_id: [0u8; 64],
-            },
-        );
+        let round = 100u64;
+        let period = Period(0);
+        let step = SOFT;
+        let key_dilution = 100u64;
+
+        let id = one_time_id_for_round(round, key_dilution);
+        let secrets = OneTimeSignatureSecrets::generate(id.batch, 1);
+        let verifier = secrets.verifier();
 
         let proposal_a = ProposalValue {
             original_period: Period(0),
@@ -771,73 +773,176 @@ mod tests {
             encoding_digest: Digest([0xdd; 32]),
         };
 
-        let bundle_zero_sig = UnauthenticatedBundle {
-            round: Round(100),
-            period: Period(0),
-            step: SOFT,
-            proposal: proposal_a,
-            votes: vec![],
-            equivocation_votes: vec![EquivocationVoteAuthenticator {
+        // Sign the OTS-only portion of each proposal (the credential
+        // remains the dummy zero-proof; the test asserts OTS-shaped
+        // failures, so the credential path is irrelevant here).
+        let sign = |proposal: ProposalValue| -> OneTimeSignature {
+            let rv = RawVote {
                 sender,
-                cred: UnauthenticatedCredential::new([0u8; 80]),
-                sigs: [make_zero_sig(), make_zero_sig()],
-                proposals: [proposal_a, proposal_b],
-            }],
+                round: Round(round),
+                period,
+                step,
+                proposal,
+            };
+            let msg = [RawVote::hash_id(), rv.to_be_hashed().as_slice()].concat();
+            secrets.sign(&msg, round, key_dilution)
         };
-        let result = bundle_zero_sig.verify(&ledger);
-        assert!(
-            matches!(result, Err(BundleError::VoteVerificationFailed { .. })),
-            "expected VoteVerificationFailed for zero-sig equivocation, got {result:?}",
+        let sig_a = sign(proposal_a);
+        let sig_b = sign(proposal_b);
+
+        // Seed the ledger account with the real OTS verifier so the
+        // OTS check has a chance of passing (cred still fails on the
+        // dummy proof, but rejections we assert below come from OTS,
+        // not from membership lookups failing).
+        let mut ledger = MockLedgerReader::new(v41_params());
+        ledger.add_account(
+            sender,
+            crate::ledger_reader::OnlineAccountData {
+                micro_algos: 5_000_000,
+                vote_id: verifier,
+                selection_id: [0u8; 32],
+                vote_first_valid: Round(0),
+                vote_last_valid: Round(0),
+                vote_key_dilution: key_dilution,
+                incentive_eligible: false,
+                last_proposed: Round(0),
+                last_heartbeat: Round(0),
+                state_proof_id: [0u8; 64],
+            },
         );
 
-        // -- Sub-case 2: distinct proposals, sender unknown to the ledger.
-        //
-        // membership_from_ledger fails when the address isn't seeded. The
-        // resulting `BundleError::VoteVerificationFailed` carries the
-        // ledger lookup error in `detail`.
-        let unknown = Address([0xff; 32]);
-        let bundle_unknown = UnauthenticatedBundle {
-            round: Round(100),
-            period: Period(0),
-            step: SOFT,
-            proposal: proposal_a,
-            votes: vec![],
-            equivocation_votes: vec![EquivocationVoteAuthenticator {
-                sender: unknown,
-                cred: UnauthenticatedCredential::new([0u8; 80]),
-                sigs: [make_zero_sig(), make_zero_sig()],
-                proposals: [proposal_a, proposal_b],
-            }],
+        // Helper: assemble a bundle with a single equivocation pair plus
+        // optional overrides for testing field mutations.
+        let make_bundle = |round: Round,
+                           period: Period,
+                           step: Step,
+                           sender: Address,
+                           proposals: [ProposalValue; 2],
+                           sigs: [OneTimeSignature; 2]|
+         -> UnauthenticatedBundle {
+            UnauthenticatedBundle {
+                round,
+                period,
+                step,
+                proposal: proposals[0],
+                votes: vec![],
+                equivocation_votes: vec![EquivocationVoteAuthenticator {
+                    sender,
+                    cred: UnauthenticatedCredential::new([0u8; 80]),
+                    sigs,
+                    proposals,
+                }],
+            }
         };
-        let result = bundle_unknown.verify(&MockLedgerReader::new(v41_params()));
+
+        // -- Sub-case 1: identical proposals. ----------------------------
+        let bundle = make_bundle(
+            Round(round),
+            period,
+            step,
+            sender,
+            [proposal_a, proposal_a],
+            [sig_a.clone(), sig_a.clone()],
+        );
         assert!(
-            matches!(result, Err(BundleError::VoteVerificationFailed { .. })),
-            "expected VoteVerificationFailed for unknown sender, got {result:?}",
+            matches!(
+                bundle.verify(&ledger),
+                Err(BundleError::IdenticalEquivocationProposals),
+            ),
+            "expected IdenticalEquivocationProposals",
         );
 
-        // -- Sub-case 3: identical proposals (same as Go's "same vote"
-        // case) — already covered by
-        // `bundle_verify_rejects_identical_equivocation_proposals` above.
-        // Repeat the assertion here so the rejection-matrix test fails
-        // first if that property regresses.
-        let bundle_same = UnauthenticatedBundle {
-            round: Round(100),
-            period: Period(0),
-            step: SOFT,
-            proposal: proposal_a,
-            votes: vec![],
-            equivocation_votes: vec![EquivocationVoteAuthenticator {
-                sender,
-                cred: UnauthenticatedCredential::new([0u8; 80]),
-                sigs: [make_zero_sig(), make_zero_sig()],
-                proposals: [proposal_a, proposal_a],
-            }],
-        };
-        let result = bundle_same.verify(&MockLedgerReader::new(v41_params()));
-        assert!(
-            matches!(result, Err(BundleError::IdenticalEquivocationProposals)),
-            "expected IdenticalEquivocationProposals, got {result:?}",
+        // -- Sub-case 2: zero signatures across distinct proposals. ------
+        let bundle = make_bundle(
+            Round(round),
+            period,
+            step,
+            sender,
+            [proposal_a, proposal_b],
+            [make_zero_sig(), make_zero_sig()],
         );
+        match bundle.verify(&ledger) {
+            Err(BundleError::VoteVerificationFailed { index, detail }) => {
+                assert_eq!(index, 0, "equivocation pair is at index 0");
+                assert!(
+                    detail.contains("first proposal failed"),
+                    "detail should pin the first-proposal path; got {detail:?}",
+                );
+            }
+            other => panic!("expected first-proposal OTS rejection, got {other:?}"),
+        }
+
+        // -- Sub-case 3: badBlockHash on proposal[0]. --------------------
+        // Mutate proposal[0] AFTER signing → OTS-signed bytes don't match.
+        let bad_a = ProposalValue {
+            block_digest: Digest([0xee; 32]),
+            ..proposal_a
+        };
+        let bundle = make_bundle(
+            Round(round),
+            period,
+            step,
+            sender,
+            [bad_a, proposal_b],
+            [sig_a.clone(), sig_b.clone()],
+        );
+        match bundle.verify(&ledger) {
+            Err(BundleError::VoteVerificationFailed { index, detail }) => {
+                assert_eq!(index, 0);
+                assert!(
+                    detail.contains("first proposal failed"),
+                    "expected first-proposal detail; got {detail:?}",
+                );
+            }
+            other => panic!("expected first-proposal mismatch, got {other:?}"),
+        }
+
+        // -- Sub-case 4: bad bundle round. -------------------------------
+        // Sigs were generated for `round`, but the bundle declares
+        // `round + 1` → both reconstructed votes' OTS-signed bytes don't
+        // match → first-proposal OTS rejects.
+        let bundle = make_bundle(
+            Round(round + 1),
+            period,
+            step,
+            sender,
+            [proposal_a, proposal_b],
+            [sig_a.clone(), sig_b.clone()],
+        );
+        match bundle.verify(&ledger) {
+            Err(BundleError::VoteVerificationFailed { index, detail }) => {
+                assert_eq!(index, 0);
+                assert!(
+                    detail.contains("first proposal failed"),
+                    "expected first-proposal detail; got {detail:?}",
+                );
+            }
+            other => panic!("expected bundle-round mismatch rejection, got {other:?}"),
+        }
+
+        // -- Sub-case 5: sender unknown to the ledger. -------------------
+        // Different sender → membership_from_ledger fails. Detail is
+        // shaped by `verify_equivocation_vote`'s "could not get
+        // membership for equivocation vote" wrapper.
+        let unknown = Address([0x99; 32]);
+        let bundle = make_bundle(
+            Round(round),
+            period,
+            step,
+            unknown,
+            [proposal_a, proposal_b],
+            [sig_a.clone(), sig_b.clone()],
+        );
+        match bundle.verify(&ledger) {
+            Err(BundleError::VoteVerificationFailed { index, detail }) => {
+                assert_eq!(index, 0);
+                assert!(
+                    detail.contains("could not get membership"),
+                    "expected membership-lookup detail; got {detail:?}",
+                );
+            }
+            other => panic!("expected membership-lookup rejection, got {other:?}"),
+        }
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────
