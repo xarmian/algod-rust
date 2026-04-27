@@ -478,7 +478,9 @@ impl fmt::Display for Action {
 
 /// Creates an ignore action for the given message event and error reason.
 ///
-/// Mirrors Go's `ignoreAction`.
+/// Mirrors Go's `ignoreAction(e, err)` — but currently does NOT carry the
+/// originating peer's `MessageHandle`. See [`disconnect_action`] for the
+/// follow-up tracking issue (TASK-96).
 pub fn ignore_action(err: SerializableError) -> Action {
     Action::Network(Box::new(NetworkAction {
         t: ActionType::Ignore,
@@ -489,7 +491,13 @@ pub fn ignore_action(err: SerializableError) -> Action {
 
 /// Creates a disconnect action for the given message event and error reason.
 ///
-/// Mirrors Go's `disconnectAction`.
+/// Mirrors Go's `disconnectAction(e, err)` — but currently does NOT carry
+/// the originating peer's `MessageHandle`. The bridge therefore cannot
+/// disconnect the offending peer; this is tracked end-to-end in TASK-96
+/// (propagate `MessageHandle` through relay/disconnect/ignore actions).
+/// Same caveat applies to [`ignore_action`] and to every `Relay`/`Broadcast`
+/// constructed inline in `player.rs`. The Box-to-Arc switch in TASK-82
+/// makes the broader fix mechanical; it just lives in a separate PR.
 pub fn disconnect_action(err: SerializableError) -> Action {
     Action::Network(Box::new(NetworkAction {
         t: ActionType::Disconnect,
