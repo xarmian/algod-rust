@@ -24,7 +24,8 @@ use algo_agreement::test_support::{
 };
 use algo_agreement::{
     Action, ActionType, BlockAssembler, ConsensusVersionView, Event, EventType, InternalMessage,
-    MessageEvent, MessageHandle, AGREEMENT_VOTE_TAG, PROPOSE, SOFT,
+    MessageEvent, MessageHandle, SerializableError, AGREEMENT_VOTE_TAG, PROPOSAL_PAYLOAD_TAG,
+    PROPOSE, SOFT,
 };
 use algo_types::{Address, Round, CONSENSUS_V41};
 
@@ -218,4 +219,98 @@ fn handle_round_trips_through_verify_vote_action() {
         .downcast_ref::<PeerMarker>()
         .expect("downcast to PeerMarker");
     assert_eq!(marker, &PeerMarker(303));
+}
+
+// ---------------------------------------------------------------------------
+// Disconnect path: a verified soft vote whose `MessageEvent.err` is set
+// signals "verification failed" → dispatch returns VoteMalformed → player
+// emits disconnect_action carrying the originating peer's handle. Mirrors
+// the `SoftVoteVerifiedErrorSamePeriod` arm of the permutation matrix.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn handle_propagates_through_disconnect_on_malformed_vote() {
+    let oc = override_consensus_with_dynamic_filter(false);
+    let (_, mut machine, mut helper) = setup_p(TEST_ROUND, TEST_PERIOD, SOFT, &oc.params);
+
+    let payload = make_random_proposal_payload(TEST_ROUND);
+    let pv = payload.unauthenticated_proposal.value();
+    let vote = helper.make_verified_vote(0, TEST_ROUND, TEST_PERIOD, SOFT, pv);
+
+    let me = MessageEvent {
+        t: EventType::VoteVerified,
+        input: InternalMessage {
+            message_handle: marker_handle(404),
+            vote: Some(vote.clone()),
+            unauthenticated_vote: vote.to_unauthenticated(),
+            ..InternalMessage::default()
+        },
+        // Non-None `err` flags this verified vote as malformed; the
+        // VoteMachine dispatch turns it into a Filtered/VoteMalformed which
+        // the player turns into `disconnect_action(&e, err)`.
+        err: Some(SerializableError::new("verify failed")),
+        proto: proto_view(),
+        ..MessageEvent::default()
+    };
+
+    machine
+        .transition(Event::Message(me))
+        .expect("transition produced no panic");
+
+    let marker = extract_peer_marker(machine.trace(), ActionType::Disconnect);
+    assert_eq!(marker, &PeerMarker(404));
+}
+
+// ---------------------------------------------------------------------------
+// Payload-relay path: PayloadPresent for the same round → dispatch returns
+// PayloadPipelined → player.rs ~1107 emits a compound-message Relay tagged
+// `PROPOSAL_PAYLOAD_TAG`. Asserts the inline `..NetworkAction::default()`
+// site now propagates the originating peer's handle. Mirrors the
+// `playerSameRound × payloadPresent` arm of the permutation matrix.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn handle_propagates_through_payload_relay() {
+    let oc = override_consensus_with_dynamic_filter(false);
+    let (_, mut machine, _helper) = setup_p(TEST_ROUND, TEST_PERIOD, SOFT, &oc.params);
+
+    let payload = make_random_proposal_payload(TEST_ROUND);
+    let pv = payload.unauthenticated_proposal.value();
+
+    // Seed the per-round/period state with a pipelining-ready assembler so
+    // the dispatch returns PayloadPipelined rather than rejecting the
+    // payload outright. Mirrors the `SameRoundProcessedProposalVote` setup
+    // in the permutation matrix.
+    machine.ensure_round_period(TEST_ROUND, TEST_PERIOD);
+    machine.set_proposal_assembler(TEST_ROUND, pv, BlockAssembler::default());
+
+    let me = MessageEvent {
+        t: EventType::PayloadPresent,
+        input: InternalMessage {
+            message_handle: marker_handle(505),
+            unauthenticated_proposal: payload.unauthenticated_proposal.clone(),
+            ..InternalMessage::default()
+        },
+        proto: proto_view(),
+        ..MessageEvent::default()
+    };
+
+    machine
+        .transition(Event::Message(me))
+        .expect("transition produced no panic");
+
+    let marker = extract_peer_marker(machine.trace(), ActionType::Relay);
+    assert_eq!(marker, &PeerMarker(505));
+
+    // Confirm the relayed payload is the proposal-payload (not the vote
+    // path): the relay we matched must carry the proposal-payload tag.
+    let na = machine
+        .trace()
+        .actions()
+        .find_map(|a| match a {
+            Action::Network(na) if na.t == ActionType::Relay => Some(na),
+            _ => None,
+        })
+        .expect("relay present");
+    assert_eq!(na.tag, PROPOSAL_PAYLOAD_TAG);
 }
