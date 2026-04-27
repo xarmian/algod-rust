@@ -784,16 +784,28 @@ mod tests {
     /// asserts.
     #[test]
     fn proposal_store_get_pinned_value_with_payload() {
-        let pv = make_proposal_value(0xa1);
+        // Build a payload whose `value()` is non-bottom so we have a
+        // distinct PV to pin. `Proposal::default()` would value() to
+        // BOTTOM (all-zero originals), so set `original_proposer` to
+        // a non-zero address.
+        let mut payload = Proposal::default();
+        payload.unauthenticated_proposal.original_proposer = Address([0xa1; 32]);
+        let pv = payload.unauthenticated_proposal.value();
+        assert_ne!(pv, BOTTOM, "test fixture must produce non-bottom pv");
+
+        // Pre-seed the pinned slot AND a default assembler under the
+        // matching pv. Mirrors Go's white-box setup: pin the value,
+        // then drive PayloadVerified through `handle()` to bind the
+        // payload to the pinned assembler.
         let mut store = ProposalStore {
             pinned: pv,
             ..ProposalStore::default()
         };
+        store.assemblers.insert(pv, BlockAssembler::default());
 
-        // 1. Without an assembled payload: ReadPinned returns the
-        //    proposal but `payload_ok = false`.
-        let pinned_event = Event::PinnedValue(PinnedValueEvent::default());
-        let result = store.handle(Period(0), pinned_event);
+        // 1. Without an assembled payload yet: ReadPinned returns the
+        //    pinned proposal but `payload_ok = false`.
+        let result = store.handle(Period(0), Event::PinnedValue(PinnedValueEvent::default()));
         if let Event::PinnedValue(pve) = result {
             assert_eq!(pve.proposal, pv);
             assert!(!pve.payload_ok, "no payload yet → payload_ok must be false");
@@ -801,38 +813,29 @@ mod tests {
             panic!("expected PinnedValue event");
         }
 
-        // 2. Drive a PayloadVerified through the store, binding the
-        //    payload to the pinned value's assembler.
-        let mut payload = Proposal::default();
-        payload.unauthenticated_proposal.original_period = pv.original_period;
-        payload.unauthenticated_proposal.original_proposer = pv.original_proposer;
-        // Force the proposal's value() to match `pv` exactly, so the
-        // store's PayloadVerified path hits the pinned assembler. We
-        // pre-seed the assembler under `pv` so the lookup succeeds even
-        // though `payload.value()` may differ in encoding_digest.
-        store.assemblers.insert(pv, BlockAssembler::default());
+        // 2. Drive PayloadVerified through `handle()` — this exercises
+        //    the assembler-lookup + bind() round trip rather than
+        //    white-boxing it. Should return PayloadAccepted (no
+        //    matching staging proposal at current_period=0, so we
+        //    don't get Committable).
+        let res = store.handle(
+            Period(0),
+            payload_event(EventType::PayloadVerified, payload.clone()),
+        );
+        assert_eq!(
+            res.event_type(),
+            EventType::PayloadAccepted,
+            "PayloadVerified path must accept the payload",
+        );
 
-        // The PayloadVerified path uses payload.value() to look up the
-        // assembler. Mirror Go's "white-box" pattern: stuff the payload
-        // we want into the pinned assembler directly via PayloadVerified
-        // by routing through a payload whose value() matches `pv`.
-        // Since constructing such a proposal requires reproducing the
-        // canonical-encoding hash, we shortcut by directly binding:
-        let bound = store
-            .assemblers
-            .remove(&pv)
-            .unwrap()
-            .bind(payload.clone())
-            .expect("bind succeeds on fresh assembler");
-        store.assemblers.insert(pv, bound);
-
-        // 3. ReadPinned now returns the proposal AND payload.
-        let pinned_event = Event::PinnedValue(PinnedValueEvent::default());
-        let result = store.handle(Period(0), pinned_event);
+        // 3. ReadPinned now returns the proposal AND the payload.
+        let result = store.handle(Period(0), Event::PinnedValue(PinnedValueEvent::default()));
         if let Event::PinnedValue(pve) = result {
             assert_eq!(pve.proposal, pv);
             assert!(pve.payload_ok, "pinned with assembled payload → payload_ok");
-            assert!(pve.payload.is_some(), "payload must be returned");
+            let returned = pve.payload.expect("payload must be returned");
+            // Mirrors Go's `returnEvent.Payload.value() == proposalV`.
+            assert_eq!(returned.unauthenticated_proposal.value(), pv);
         } else {
             panic!("expected PinnedValue event");
         }
@@ -985,14 +988,16 @@ mod tests {
     /// Regression for go-algorand bug `39387501` (port of
     /// `TestProposalStoreRegressionWrongPipelinePeriodBug_39387501`).
     ///
-    /// **What the bug was:** When a payload pipelined for a period-1
-    /// proposal arrived AFTER the store had already processed period-2
-    /// votes/payloads, the pipelined event's `period` field was
-    /// incorrectly set to the current period (2) rather than the
-    /// proposal's owning period (1). Downstream consumers used `period`
-    /// to attribute the payload to the wrong relevant slot. The fix
-    /// uses `last_relevant(pv)` to pick the period of the proposal that
-    /// owns the payload.
+    /// **What the bug was:** Go's old `lastRelevant(pv)` returned the
+    /// highest period for which ANY proposal-value was relevant — it
+    /// ignored the requested `pv` argument. So when a period-1 payload
+    /// arrived after the store had already recorded `relevant[2] = pv2`,
+    /// the lookup attributed the period-1 payload to period 2.
+    /// Downstream consumers used the returned `period` to attribute the
+    /// payload to the wrong relevant slot. The fix made `lastRelevant`
+    /// search only entries whose value equals the requested `pv`, so a
+    /// period-1 payload bound to `pv1` correctly reports period 1
+    /// regardless of what later periods have recorded.
     ///
     /// **What this test guards:** after period transitions and out-of-
     /// order payload arrivals, the `PayloadPipelined` event for a
