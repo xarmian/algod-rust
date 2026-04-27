@@ -179,6 +179,18 @@ impl RootRouter {
             StateMachineTag::ProposalMachine => {
                 self.proposal_manager.handle(state.round, state.period, e)
             }
+            // ProposalMachineRound queries (`staged_value`, `pinned_value`,
+            // `read_lowest`, etc.) must consult the SAME per-round
+            // ProposalStore that the message-handling dispatch mutates —
+            // otherwise the Player will read empty state and conclude
+            // proposals are not committable. Route through the canonical
+            // ProposalManager.stores rather than the legacy mirror under
+            // RoundRouter.proposal_store. The mirror remains in the tree
+            // for now (persistence shape, future refactor in follow-up
+            // task), but no production dispatch hits it.
+            StateMachineTag::ProposalMachineRound => {
+                self.proposal_manager.store_for_round(r).handle(p, e)
+            }
             StateMachineTag::VoteMachine => {
                 // Wrap in a FilterableMessageEvent for the vote aggregator
                 if let Event::FilterableMessage(ref fme) = e {

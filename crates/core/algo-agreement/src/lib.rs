@@ -33,6 +33,8 @@ pub mod service;
 mod step;
 pub mod stubs;
 pub mod system_clock;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod trace;
 pub mod traits;
 pub mod types;
