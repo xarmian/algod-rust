@@ -675,6 +675,394 @@ mod tests {
         }
     }
 
+    // ───────────────────────────────────────────────────────────────────
+    // BF-5 tests (TASK-94): port of go-algorand
+    // agreement/proposalStore_test.go.
+    //
+    // Two are regression tests for shipped Go bugs (b29ea57 and 39387501)
+    // that previously corrupted proposal-store state for proposals across
+    // period transitions. Without Rust counterparts those bugs could
+    // silently re-emerge.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Build a `Vote` for the given period — only the `period` field is
+    /// inspected by `BlockAssembler::authenticator`, so the rest is
+    /// zero-filled to keep the helper minimal. Mirrors Go's
+    /// `makeVoteTesting` shape (which fabricates an OTS-signed vote)
+    /// reduced to what `authenticator()` actually reads.
+    fn vote_in_period(period: Period) -> Vote {
+        use crate::credential::{Credential, HashableCredential};
+        use crate::VRF_PROOF_SIZE;
+        Vote {
+            raw_vote: RawVote {
+                sender: Address([0u8; 32]),
+                round: Round(1),
+                period,
+                step: crate::step::Step(0),
+                proposal: BOTTOM,
+            },
+            cred: Credential {
+                weight: 1,
+                vrf_out: Digest([0u8; 32]),
+                domain_separation_enabled: true,
+                hashable: HashableCredential::default(),
+                proof: [0u8; VRF_PROOF_SIZE],
+            },
+            sig: algo_consensus_crypto::OneTimeSignature {
+                sig: [0u8; 64],
+                pk: [0u8; 32],
+                pk_sig_old: [0u8; 64],
+                pk2: [0u8; 32],
+                pk1_sig: [0u8; 64],
+                pk2_sig: [0u8; 64],
+            },
+        }
+    }
+
+    // -- TestBlockAssemblerBind -----------------------------------------
+
+    /// First bind on a fresh assembler must succeed. Mirrors the
+    /// `assembled: false` row of go-algorand's `TestBlockAssemblerBind`.
+    #[test]
+    fn block_assembler_bind_accepts_first() {
+        let ba = BlockAssembler::default();
+        let result = ba.bind(Proposal::default());
+        let bound = result.expect("first bind should succeed");
+        assert!(bound.assembled, "bind sets assembled = true");
+        assert!(bound.payload.is_some(), "bind stores payload");
+    }
+
+    /// Second bind on an already-assembled assembler must fail. Mirrors
+    /// the `assembled: true` row of `TestBlockAssemblerBind`.
+    #[test]
+    fn block_assembler_bind_rejects_double() {
+        let ba = BlockAssembler {
+            assembled: true,
+            ..BlockAssembler::default()
+        };
+        let result = ba.bind(Proposal::default());
+        assert!(
+            result.is_err(),
+            "bind on already-assembled must reject (Go: 'already assembled')",
+        );
+    }
+
+    // -- TestBlockAssemblerAuthenticator --------------------------------
+
+    /// `authenticator(p)` returns the first vote whose period matches.
+    /// Mirrors the "test with vote authenticators" row of Go's
+    /// `TestBlockAssemblerAuthenticator`.
+    #[test]
+    fn block_assembler_authenticator_returns_first_vote() {
+        let v = vote_in_period(Period(0));
+        let ba = BlockAssembler {
+            authenticators: vec![v.clone()],
+            ..BlockAssembler::default()
+        };
+        let got = ba.authenticator(Period(0)).expect("expected matching vote");
+        // Identity check via raw_vote — the helper zeroes the cred/sig,
+        // so RawVote equality is the meaningful comparison.
+        assert_eq!(got.raw_vote, v.raw_vote);
+    }
+
+    /// `authenticator(p)` returns `None` when no votes are stored. Go
+    /// returns the zero `vote{}`; Rust returns `Option::None` — same
+    /// semantics. Mirrors the "no vote authenticators" row.
+    #[test]
+    fn block_assembler_authenticator_returns_empty_when_none() {
+        let ba = BlockAssembler::default();
+        assert!(ba.authenticator(Period(0)).is_none());
+    }
+
+    // -- TestProposalStoreGetPinnedValue (with-payload) -----------------
+
+    /// Once a `PayloadVerified` event lands an assembled `Proposal` for
+    /// the pinned value, a subsequent `ReadPinned` must return both the
+    /// proposal AND the payload (with `payload_ok = true`). Pre-PR Rust
+    /// only covered the empty/no-payload case; this fills the with-
+    /// payload gap that go-algorand's `TestProposalStoreGetPinnedValue`
+    /// asserts.
+    #[test]
+    fn proposal_store_get_pinned_value_with_payload() {
+        let pv = make_proposal_value(0xa1);
+        let mut store = ProposalStore {
+            pinned: pv,
+            ..ProposalStore::default()
+        };
+
+        // 1. Without an assembled payload: ReadPinned returns the
+        //    proposal but `payload_ok = false`.
+        let pinned_event = Event::PinnedValue(PinnedValueEvent::default());
+        let result = store.handle(Period(0), pinned_event);
+        if let Event::PinnedValue(pve) = result {
+            assert_eq!(pve.proposal, pv);
+            assert!(!pve.payload_ok, "no payload yet → payload_ok must be false");
+        } else {
+            panic!("expected PinnedValue event");
+        }
+
+        // 2. Drive a PayloadVerified through the store, binding the
+        //    payload to the pinned value's assembler.
+        let mut payload = Proposal::default();
+        payload.unauthenticated_proposal.original_period = pv.original_period;
+        payload.unauthenticated_proposal.original_proposer = pv.original_proposer;
+        // Force the proposal's value() to match `pv` exactly, so the
+        // store's PayloadVerified path hits the pinned assembler. We
+        // pre-seed the assembler under `pv` so the lookup succeeds even
+        // though `payload.value()` may differ in encoding_digest.
+        store.assemblers.insert(pv, BlockAssembler::default());
+
+        // The PayloadVerified path uses payload.value() to look up the
+        // assembler. Mirror Go's "white-box" pattern: stuff the payload
+        // we want into the pinned assembler directly via PayloadVerified
+        // by routing through a payload whose value() matches `pv`.
+        // Since constructing such a proposal requires reproducing the
+        // canonical-encoding hash, we shortcut by directly binding:
+        let bound = store
+            .assemblers
+            .remove(&pv)
+            .unwrap()
+            .bind(payload.clone())
+            .expect("bind succeeds on fresh assembler");
+        store.assemblers.insert(pv, bound);
+
+        // 3. ReadPinned now returns the proposal AND payload.
+        let pinned_event = Event::PinnedValue(PinnedValueEvent::default());
+        let result = store.handle(Period(0), pinned_event);
+        if let Event::PinnedValue(pve) = result {
+            assert_eq!(pve.proposal, pv);
+            assert!(pve.payload_ok, "pinned with assembled payload → payload_ok");
+            assert!(pve.payload.is_some(), "payload must be returned");
+        } else {
+            panic!("expected PinnedValue event");
+        }
+    }
+
+    // -- Regression tests for shipped Go bugs ---------------------------
+
+    /// Build a minimal authenticated `Proposal` whose
+    /// `unauthenticated_proposal` carries the given `original_period`
+    /// and `original_proposer`. Mirrors the
+    /// `proposal{ unauthenticatedProposal: unauthenticatedProposal{ ... }}`
+    /// pattern in Go's regression tests.
+    fn proposal_for_regression(original_period: Period, proposer: Address) -> Proposal {
+        Proposal {
+            unauthenticated_proposal: UnauthenticatedProposal {
+                original_period,
+                original_proposer: proposer,
+                ..UnauthenticatedProposal::default()
+            },
+            ..Proposal::default()
+        }
+    }
+
+    /// Build a vote-verified `MessageEvent` carrying the proposal's value
+    /// in `raw_vote.proposal`. Mirrors Go's
+    /// `messageEvent{T: voteVerified, Input: msg}` shape.
+    fn vote_verified_event(
+        round: Round,
+        period: Period,
+        sender: Address,
+        pv: ProposalValue,
+    ) -> Event {
+        let v = Vote {
+            raw_vote: RawVote {
+                sender,
+                round,
+                period,
+                step: crate::step::Step(0),
+                proposal: pv,
+            },
+            ..vote_in_period(period)
+        };
+        Event::Message(crate::events::MessageEvent {
+            t: EventType::VoteVerified,
+            input: crate::events::InternalMessage {
+                vote: Some(v.clone()),
+                unauthenticated_vote: v.to_unauthenticated(),
+                ..crate::events::InternalMessage::default()
+            },
+            ..crate::events::MessageEvent::default()
+        })
+    }
+
+    /// Build a payload-verified or payload-present `MessageEvent`
+    /// carrying the given proposal. Choose the event type via `t`.
+    fn payload_event(t: EventType, payload: Proposal) -> Event {
+        Event::Message(crate::events::MessageEvent {
+            t,
+            input: crate::events::InternalMessage {
+                proposal: Some(payload.clone()),
+                unauthenticated_proposal: payload.unauthenticated_proposal,
+                ..crate::events::InternalMessage::default()
+            },
+            ..crate::events::MessageEvent::default()
+        })
+    }
+
+    /// Regression for go-algorand bug `b29ea57` (port of
+    /// `TestProposalStoreRegressionBlockRedeliveryBug_b29ea57`).
+    ///
+    /// **What the bug was:** When the proposal-store handled two
+    /// proposals with different `OriginalPeriod` fields (e.g., one from
+    /// period 1 reproposed and one freshly proposed in period 2), the
+    /// store could mistake the second proposal's payload for a duplicate
+    /// of the first and reject it. The fix in commit `b29ea57` ensured
+    /// the proposal-value's `original_period` is part of the key, so the
+    /// two payloads are tracked under distinct assemblers.
+    ///
+    /// **What this test guards:** drive period 1 + period 2 through the
+    /// store; both payloads must be ACCEPTED (not REJECTED). Repeats 10
+    /// times because Go's `HashMap` iteration order made the bug
+    /// intermittent.
+    #[test]
+    fn proposal_store_regression_block_redelivery_b29ea57() {
+        let cur_round = Round(10);
+        let proposer = Address([0xab; 32]);
+
+        for _ in 0..10 {
+            let mut store = ProposalStore::default();
+
+            // Period 1.
+            let pay1 = proposal_for_regression(Period(1), proposer);
+            let pv1 = pay1.unauthenticated_proposal.value();
+            assert_eq!(
+                store
+                    .handle(
+                        Period(0),
+                        Event::NewPeriod(NewPeriodEvent {
+                            period: Period(1),
+                            proposal: BOTTOM,
+                        })
+                    )
+                    .event_type(),
+                EventType::None,
+            );
+            let res = store.handle(
+                Period(0),
+                vote_verified_event(cur_round, Period(1), proposer, pv1),
+            );
+            assert_eq!(res.event_type(), EventType::ProposalAccepted);
+            let res = store.handle(Period(0), payload_event(EventType::PayloadVerified, pay1));
+            assert_eq!(res.event_type(), EventType::PayloadAccepted);
+
+            // Period 2 — a *different* proposal value (different
+            // original_period AND different encoding_digest because the
+            // unauthenticated_proposal's `original_period` is part of
+            // the canonical encoding).
+            let pay2 = proposal_for_regression(Period(2), proposer);
+            let pv2 = pay2.unauthenticated_proposal.value();
+            assert_ne!(pv1, pv2, "test malformed: PVs must differ across periods");
+
+            assert_eq!(
+                store
+                    .handle(
+                        Period(0),
+                        Event::NewPeriod(NewPeriodEvent {
+                            period: Period(2),
+                            proposal: BOTTOM,
+                        })
+                    )
+                    .event_type(),
+                EventType::None,
+            );
+            let res = store.handle(
+                Period(0),
+                vote_verified_event(cur_round, Period(2), proposer, pv2),
+            );
+            assert_eq!(res.event_type(), EventType::ProposalAccepted);
+
+            let res = store.handle(Period(0), payload_event(EventType::PayloadVerified, pay2));
+            assert_ne!(
+                res.event_type(),
+                EventType::PayloadRejected,
+                "bug b29ea57: payload from new original period was rejected as duplicate",
+            );
+            assert_eq!(res.event_type(), EventType::PayloadAccepted);
+        }
+    }
+
+    /// Regression for go-algorand bug `39387501` (port of
+    /// `TestProposalStoreRegressionWrongPipelinePeriodBug_39387501`).
+    ///
+    /// **What the bug was:** When a payload pipelined for a period-1
+    /// proposal arrived AFTER the store had already processed period-2
+    /// votes/payloads, the pipelined event's `period` field was
+    /// incorrectly set to the current period (2) rather than the
+    /// proposal's owning period (1). Downstream consumers used `period`
+    /// to attribute the payload to the wrong relevant slot. The fix
+    /// uses `last_relevant(pv)` to pick the period of the proposal that
+    /// owns the payload.
+    ///
+    /// **What this test guards:** after period transitions and out-of-
+    /// order payload arrivals, the `PayloadPipelined` event for a
+    /// payload bound to a period-1 PV must report `period = 1`, not
+    /// the current period.
+    #[test]
+    fn proposal_store_regression_wrong_pipeline_period_39387501() {
+        let cur_round = Round(10);
+        let proposer = Address([0xcd; 32]);
+        let mut store = ProposalStore::default();
+
+        let pay1 = proposal_for_regression(Period(1), proposer);
+        let pv1 = pay1.unauthenticated_proposal.value();
+        let pay2 = proposal_for_regression(Period(2), proposer);
+        let pv2 = pay2.unauthenticated_proposal.value();
+        assert_ne!(pv1, pv2);
+
+        // Period 1: NewPeriod + voteVerified (binds assembler entry under pv1).
+        store.handle(
+            Period(0),
+            Event::NewPeriod(NewPeriodEvent {
+                period: Period(1),
+                proposal: BOTTOM,
+            }),
+        );
+        let res = store.handle(
+            Period(0),
+            vote_verified_event(cur_round, Period(1), proposer, pv1),
+        );
+        assert_eq!(res.event_type(), EventType::ProposalAccepted);
+
+        // Period 2: NewPeriod + voteVerified (binds assembler under pv2).
+        store.handle(
+            Period(0),
+            Event::NewPeriod(NewPeriodEvent {
+                period: Period(2),
+                proposal: BOTTOM,
+            }),
+        );
+        let res = store.handle(
+            Period(0),
+            vote_verified_event(cur_round, Period(2), proposer, pv2),
+        );
+        assert_eq!(res.event_type(), EventType::ProposalAccepted);
+
+        // PayloadPresent for pay2 — pipelined with period == 2.
+        let res = store.handle(Period(0), payload_event(EventType::PayloadPresent, pay2));
+        assert_eq!(res.event_type(), EventType::PayloadPipelined);
+        if let Event::PayloadProcessed(pe) = res {
+            assert_eq!(pe.period, Period(2));
+        } else {
+            panic!("expected PayloadProcessed event");
+        }
+
+        // PayloadPresent for pay1, arriving AFTER pay2 — must report
+        // period = 1 (its own period), NOT period = 2 (current).
+        let res = store.handle(Period(0), payload_event(EventType::PayloadPresent, pay1));
+        assert_eq!(res.event_type(), EventType::PayloadPipelined);
+        if let Event::PayloadProcessed(pe) = res {
+            assert_ne!(
+                pe.period,
+                Period(2),
+                "bug 39387501: out-of-order period-1 payload reported as period 2",
+            );
+            assert_eq!(pe.period, Period(1));
+        } else {
+            panic!("expected PayloadProcessed event");
+        }
+    }
+
     #[test]
     fn proposal_store_read_staging() {
         let mut store = ProposalStore::default();
