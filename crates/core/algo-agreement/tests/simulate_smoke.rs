@@ -31,7 +31,7 @@ use algo_agreement::{
 };
 use algo_types::{Address, ConsensusParams, Round};
 
-use crate::simulate::{simulate, BlackholeNetwork, InstantClock};
+use crate::simulate::{simulate, simulate_until_committed, BlackholeNetwork, InstantClock};
 
 fn v41_params() -> ConsensusParams {
     algo_types::consensus::consensus_params_for_version(algo_types::CONSENSUS_V41)
@@ -123,24 +123,46 @@ fn simulate_one_round_completes_clock_handshake() {
 /// advances past round 3, each round has a block + certificate, and at
 /// least one round elects a Rust-generated proposer.
 ///
-/// **Currently `#[ignore]`'d — see TASK-99.** All four generated
-/// accounts successfully propose AND vote (the participation log
-/// records 4×Proposed + repeated 4×Voted entries for round 1), but
-/// `TestLedger::ensure_block` is never called — the cert-threshold →
-/// EnsureAction pipeline stalls somewhere downstream of vote
-/// verification. The infrastructure (TestLedger / TestAccount /
-/// AutoBlockFactory / TestKeyManager) and the InstantClock filter-
-/// timer fix shipped here are reusable substrate; TASK-99 will
-/// diagnose the remaining stall and remove `#[ignore]`.
+/// Verifies that the full pseudonode → bind → soft-vote → cert-vote →
+/// `Action::Ensure` pipeline runs end-to-end against the deterministic
+/// `TestLedger`. Three production fixes shipped under TASK-99 unblocked
+/// this:
+///
+/// 1. **Bootstrap pseudonode dispatch.** The main loop now executes
+///    `Action::Pseudonode` actions inline before sending the batch to the
+///    demux; previously the bootstrap `Pseudonode(Assemble)` was sent
+///    straight to the demux's no-op arm and dropped, so `make_proposals`
+///    never ran and the player never saw a proposal.
+/// 2. **Canonical `ProposalMachinePeriod` routing.** `RootRouter::dispatch`
+///    now routes `ProposalMachinePeriod` queries (`ProposalFrozen`,
+///    `ReadStaging`, `ReadLowestVote`) through `ProposalManager.stores[r]
+///    .trackers[p]` — the same `ProposalTracker` that absorbed the
+///    `VoteVerified` events. Previously they read from the legacy
+///    `PeriodRouter.proposal_tracker` mirror, which is never written by
+///    production dispatch, so `issue_soft_vote` saw `BOTTOM` and skipped.
+/// 3. **Commit-driven simulate loop.** [`simulate_until_committed`]
+///    polls the ledger and runs `clock.run_round` while
+///    `ledger.next_round() <= target`, mirroring Go's
+///    `for ledger.NextRound() < stopRound` shape; the previous
+///    fixed-count loop shut down the service mid-round on the third
+///    iteration.
 #[test]
-#[ignore = "see TASK-99 — simulate stalls before ensure_block; \
-            cert-threshold pipeline diagnosis pending"]
 fn simulate_three_rounds_commits_three_blocks() {
     use crate::simulate::test_account::generate_n_accounts;
     use crate::simulate::test_factory::{
         signing_keys_from_accounts, AutoBlockFactory, TestKeyManager,
     };
     use crate::simulate::test_ledger::TestLedger;
+
+    // Diagnostic tracing subscriber — read RUST_LOG to scope verbosity.
+    // `try_init` so concurrent tests in the binary don't double-init.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
 
     let params = v41_params();
     let key_dilution = params.default_key_dilution;
@@ -187,9 +209,17 @@ fn simulate_three_rounds_commits_three_blocks() {
         signing_keys,
     };
 
+    // The driver reads `next_round` through this clone of the ledger
+    // handle so it can poll commit progress without re-borrowing the
+    // ledger that's already moved into `agreement_params`.
+    let ledger_for_driver = ledger_handle.clone();
     let handle = thread::Builder::new()
         .name("simulate-three-rounds-driver".into())
-        .spawn(move || simulate(agreement_params, clock, target_round))
+        .spawn(move || {
+            simulate_until_committed(agreement_params, clock, target_round, move || {
+                ledger_for_driver.next_round()
+            })
+        })
         .expect("spawn simulate thread");
 
     // 30s budget — three rounds with a real pseudonode + sortition +
