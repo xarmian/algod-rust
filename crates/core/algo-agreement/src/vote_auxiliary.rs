@@ -149,6 +149,22 @@ impl VoteTrackerRound {
         self.periods.entry(period).or_default()
     }
 
+    /// Test-only setter that injects a synthetic threshold event as the
+    /// `freshest` and flips `ok = true`. Used by white-box permutation tests
+    /// (see `crate::test_support::io_automata::IoAutomataConcretePlayer::set_cert_threshold`)
+    /// to put the round into "cert-threshold reached" state without driving
+    /// a full bundle through the dispatch path.
+    ///
+    /// Gated on the same `cfg(any(test, feature = "test-support"))` as the
+    /// `test_support` module so release builds don't carry this method.
+    /// Mirrors the direct field assignment Go's `player_permutation_test.go`
+    /// performs on `VoteTrackerRound.Freshest` / `.Ok`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn force_freshest_for_test(&mut self, te: ThresholdEvent) {
+        self.freshest = te;
+        self.ok = true;
+    }
+
     /// Handles an incoming event for this round.
     ///
     /// Handles event types: VoteAccepted, SoftThreshold, CertThreshold,

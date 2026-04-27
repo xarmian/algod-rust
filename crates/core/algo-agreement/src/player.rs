@@ -56,10 +56,14 @@ pub struct ProposalTableImpl {
 impl ProposalTableImpl {
     /// Push a tail event and return a sequence number for later retrieval.
     ///
-    /// Mirrors Go's `proposalTable.push`.
+    /// Mirrors Go's `proposalTable.push` (in `agreement/proposalTable.go`)
+    /// byte-for-byte: the counter is incremented BEFORE the value is read,
+    /// so the first sequence number returned is `1` (not `0`). This makes
+    /// task indices match Go's exactly, which keeps cadaver replay output
+    /// and any future cross-implementation persistence interop aligned.
     pub fn push(&mut self, tail: Option<Box<MessageEvent>>) -> u64 {
-        let seq = self.next_seq;
         self.next_seq += 1;
+        let seq = self.next_seq;
         if let Some(t) = tail {
             self.pending.insert(seq, t);
         }
@@ -1122,9 +1126,43 @@ impl Player {
                     _ => {}
                 }
 
-                // Relay as the proposer (if message_handle is None)
-                // Skip this in the Rust implementation for now - the message
-                // handle check requires more infrastructure.
+                // Relay as the proposer (if message_handle is None).
+                //
+                // Mirrors go-algorand `agreement/player.go:691-702`. The
+                // unauthenticated-vote attached to the relayed compound
+                // message comes from the matching proposal-vote the
+                // proposalMachine pulled out of the assembler when the
+                // payload was pipelined / accepted, or from the
+                // committableEvent if the payload is committable.
+                if e.input.message_handle.is_none() {
+                    let uv = match &ef {
+                        Event::PayloadProcessed(ep)
+                            if ep.t == EventType::PayloadPipelined
+                                || ep.t == EventType::PayloadAccepted =>
+                        {
+                            ep.vote
+                                .as_ref()
+                                .map(|v| v.to_unauthenticated())
+                                .unwrap_or_default()
+                        }
+                        Event::Committable(ce) => ce
+                            .vote
+                            .as_ref()
+                            .map(|v| v.to_unauthenticated())
+                            .unwrap_or_default(),
+                        _ => UnauthenticatedVote::default(),
+                    };
+                    let up = e.input.unauthenticated_proposal.clone();
+                    actions.push(Action::Network(Box::new(NetworkAction {
+                        t: ActionType::Relay,
+                        tag: crate::traits::PROPOSAL_PAYLOAD_TAG.to_string(),
+                        compound_message: CompoundMessage {
+                            proposal: up,
+                            vote: uv,
+                        },
+                        ..NetworkAction::default()
+                    })));
+                }
 
                 // If the payload is valid, check it against any received cert threshold
                 if ef.event_type() == EventType::ProposalCommittable
@@ -1530,7 +1568,8 @@ mod tests {
         let mut pt = ProposalTableImpl::default();
         let me = MessageEvent::default();
         let seq = pt.push(Some(Box::new(me)));
-        assert_eq!(seq, 0);
+        // Mirrors Go's pre-increment: first push returns 1, not 0.
+        assert_eq!(seq, 1);
         let result = pt.pop(seq);
         assert!(result.is_some());
         let result2 = pt.pop(seq);
@@ -1541,7 +1580,8 @@ mod tests {
     fn proposal_table_push_none() {
         let mut pt = ProposalTableImpl::default();
         let seq = pt.push(None);
-        assert_eq!(seq, 0);
+        // Mirrors Go's pre-increment: first push returns 1, not 0.
+        assert_eq!(seq, 1);
         let result = pt.pop(seq);
         assert!(result.is_none());
     }
@@ -2212,8 +2252,9 @@ mod tests {
         let me2 = MessageEvent::default();
         let seq1 = pt.push(Some(Box::new(me1)));
         let seq2 = pt.push(Some(Box::new(me2)));
-        assert_eq!(seq1, 0);
-        assert_eq!(seq2, 1);
+        // Mirrors Go's pre-increment: 1, 2, ... rather than 0, 1, ...
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2);
 
         // Pop in reverse order
         let r2 = pt.pop(seq2);

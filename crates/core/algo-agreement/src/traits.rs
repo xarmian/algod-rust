@@ -299,9 +299,22 @@ pub trait RandomSource {
 
 /// An opaque handle referring to a specific network message.
 ///
-/// Mirrors Go's `agreement.MessageHandle`. A value of `None` denotes
-/// that the message is "sourceless".
-pub type MessageHandle = Option<Box<dyn std::any::Any + Send + Sync>>;
+/// Mirrors Go's `agreement.MessageHandle` (an `interface{}` that travels
+/// alongside the message through the demux + crypto pipeline so the
+/// player can later relay or disconnect the originating peer). A value
+/// of `None` denotes that the message is "sourceless" — i.e. the player
+/// itself produced the payload, in which case the player's
+/// `relay-as-proposer` branch fires.
+///
+/// Backed by `Arc` (not `Box`) so cloning preserves the handle: the
+/// crypto verifier path clones the message into its action and back into
+/// the response event; if cloning dropped the handle, network-origin
+/// payloads would be misclassified as locally-produced and the player
+/// would emit the proposer-relay action redundantly. Several internal
+/// types (`InternalMessage`, `NetworkAction`) hold this field via a
+/// custom `Clone` impl that previously zeroed it; those impls now
+/// `Arc::clone` instead.
+pub type MessageHandle = Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>;
 
 /// A message encapsulating a handle and its payload.
 ///

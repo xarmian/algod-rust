@@ -4,7 +4,21 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# White-box helpers (`IoTrace`, `IoAutomataConcretePlayer`, `VoteMakerHelper`,
+# `setup_p`, ...) used by integration tests that need to drive `Player`
+# transitions directly without spinning up the full agreement service. The
+# self-dev-dependency below activates this feature unconditionally during
+# `cargo test`, so integration tests can `use algo_agreement::test_support::*`
+# without an explicit `--features` flag. Always disabled in release builds.
+test-support = []
+
 [dev-dependencies]
+# Self-reference to enable `test-support` automatically when running
+# `cargo test`. Cargo unifies this with the normal lib build, so integration
+# tests in `tests/` see the test_support module via the public API. This
+# mirrors the pattern used by tokio, tracing, and serde.
+algo-agreement = { path = ".", features = ["test-support"] }
 hex.workspace = true
 proptest.workspace = true
 serde_json.workspace = true

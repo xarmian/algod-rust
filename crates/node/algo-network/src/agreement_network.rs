@@ -90,7 +90,7 @@ impl Peer for PeerRef {
 // ---------------------------------------------------------------------------
 
 /// Metadata attached to each inbound agreement message, stored as the
-/// `MessageHandle` (an opaque `Box<dyn Any + Send + Sync>`).
+/// `MessageHandle` (an opaque `Arc<dyn Any + Send + Sync>`).
 ///
 /// This mirrors Go's `messageMetadata` struct in `agreement/gossip/network.go`,
 /// which stores the original `network.IncomingMessage` so that `Relay` and
@@ -104,7 +104,7 @@ struct MessageMetadata {
 fn metadata_from_handle(handle: &MessageHandle) -> Option<&MessageMetadata> {
     handle
         .as_ref()
-        .and_then(|boxed| boxed.downcast_ref::<MessageMetadata>())
+        .and_then(|arced| arced.downcast_ref::<MessageMetadata>())
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +169,7 @@ impl MessageHandler for ChannelForwarder {
         };
 
         let agreement_msg = Message {
-            handle: Some(Box::new(MessageMetadata { sender_peer })),
+            handle: Some(Arc::new(MessageMetadata { sender_peer })),
             data: msg.data.clone(),
         };
 
@@ -526,7 +526,7 @@ mod tests {
         let peer: Arc<dyn Peer> = Arc::new(PeerRef {
             addr: "1.2.3.4:4160".to_string(),
         });
-        let handle: MessageHandle = Some(Box::new(MessageMetadata {
+        let handle: MessageHandle = Some(Arc::new(MessageMetadata {
             sender_peer: Some(peer),
         }));
         let meta = metadata_from_handle(&handle);
@@ -543,7 +543,7 @@ mod tests {
 
     #[test]
     fn metadata_from_handle_with_wrong_type() {
-        let handle: MessageHandle = Some(Box::new(42u32));
+        let handle: MessageHandle = Some(Arc::new(42u32));
         assert!(metadata_from_handle(&handle).is_none());
     }
 

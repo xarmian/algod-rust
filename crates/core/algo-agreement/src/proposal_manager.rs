@@ -50,6 +50,22 @@ impl ProposalManager {
         self.stores.entry(round).or_default()
     }
 
+    /// Crate-internal accessor for the per-round `ProposalStore`.
+    ///
+    /// Used by:
+    /// * `RootRouter::dispatch` for `ProposalMachineRound` lookups, so
+    ///   `staged_value` / `pinned_value` queries observe the same per-round
+    ///   state that the message-handling dispatch mutates.
+    /// * `crate::test_support` to inject preconditions
+    ///   (assemblers, duplicates, staging values) for white-box tests.
+    ///
+    /// `pub(crate)` keeps the surface internal — external callers should go
+    /// through dispatch. The per-round store is created on demand if it
+    /// doesn't already exist, matching the message-dispatch behavior.
+    pub(crate) fn store_for_round(&mut self, round: Round) -> &mut ProposalStore {
+        self.store_for(round)
+    }
+
     /// Handle an event dispatched to this proposalMachine.
     ///
     /// `player_round`, `player_period` describe the player's current state.

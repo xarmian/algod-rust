@@ -763,11 +763,18 @@ fn setup_compound_message_from_network(
         }
     } else {
         // Vote + payload: vote is primary, payload is the tail.
-        // The tail message carries the proposal payload.
+        // The tail message carries the proposal payload AND a clone of
+        // the same network handle. Mirrors Go's `setupCompoundMessage`
+        // which assigns `synthetic.MessageHandle = e.MessageHandle` on
+        // both the vote event and the payload tail. With `MessageHandle =
+        // Option<Arc<dyn Any + Send + Sync>>` this is a refcount bump,
+        // not a deep copy. Critically, the Player relies on the tail
+        // having a non-None handle: otherwise the post-verify
+        // PayloadVerified event triggers the `relay as proposer` branch
+        // and emits a redundant compound relay for a peer-originated
+        // message.
         let tail_internal = InternalMessage {
-            // The tail shares the same message handle (cloned as None since
-            // MessageHandle is not cloneable — Go re-uses the same handle).
-            message_handle: None,
+            message_handle: handle.as_ref().map(std::sync::Arc::clone),
             tag: PROPOSAL_PAYLOAD_TAG.to_string(),
             unauthenticated_proposal: compound.proposal,
             ..InternalMessage::default()
