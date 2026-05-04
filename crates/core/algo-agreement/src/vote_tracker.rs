@@ -20,8 +20,8 @@ use crate::events::{
     DumpVotesEvent, EmptyEvent, Event, EventType, FilteredStepEvent, ThresholdEvent,
     VoteAcceptedEvent, VoteFilterRequestEvent,
 };
-use crate::step::{Period, Step, CERT, SOFT};
-use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, Vote};
+use crate::step::{Period, Step, CERT, PROPOSE, SOFT};
+use crate::vote::{ProposalValue, RawVote, UnauthenticatedVote, Vote, BOTTOM};
 
 // ---------------------------------------------------------------------------
 // EquivocationVote — internal verified equivocation vote pair
@@ -223,6 +223,24 @@ impl VoteTracker {
 
     /// Process a vote-accepted event.
     fn handle_vote_accepted(&mut self, e: &VoteAcceptedEvent, params: &ConsensusParams) -> Event {
+        // Precondition (mirrors `agreement/voteTrackerContract.go::pre`
+        // line 58): VoteAccepted must NOT have step == propose.
+        // proposal-step votes belong to the `proposalTracker`, not
+        // the per-step `voteTracker`. Routing one here is a wiring
+        // bug at a higher layer (rootRouter / proposalManager); panic
+        // immediately so it surfaces in test rather than silently
+        // corrupting `counts` / `voters` for a step that has no
+        // soft/cert/next semantics.
+        assert!(
+            e.vote.raw_vote.step != PROPOSE,
+            "voteTracker: incoming VoteAccepted has step propose; \
+             proposal-step votes must be routed to the proposalTracker, \
+             not the per-step voteTracker (sender={:?}, round={:?}, period={:?})",
+            e.vote.raw_vote.sender,
+            e.vote.raw_vote.round,
+            e.vote.raw_vote.period,
+        );
+
         let sender = e.vote.raw_vote.sender;
 
         // Check if sender is already a known equivocator — drop
@@ -315,6 +333,29 @@ impl VoteTracker {
             CERT => EventType::CertThreshold,
             _ => EventType::NextThreshold,
         };
+
+        // Postcondition (mirrors `agreement/voteTrackerContract.go::post`
+        // line 113-117): a `softThreshold` or `certThreshold` event MUST
+        // NOT carry `proposal == bottom`. Crossing soft/cert threshold
+        // for the bottom proposal would mean the cluster is committing
+        // to "no proposal", which Algorand never permits — bottom is
+        // reserved for next-vote (the recovery escalation path) where
+        // it's the explicit signal "no value committable this period".
+        // Quorum on bottom at soft/cert is therefore an upstream
+        // invariant violation (e.g. a faulty proposalTracker emitting
+        // bottom-bound votes upstream); panic so the bug fails its
+        // test rather than silently emitting a malformed threshold.
+        assert!(
+            !((t == EventType::SoftThreshold || t == EventType::CertThreshold) && prop == BOTTOM),
+            "voteTracker: emitting {:?} with proposal == bottom; \
+             soft/cert threshold for the bottom proposal violates the \
+             agreement invariant — bottom is reserved for next-vote \
+             (round={:?}, period={:?}, step={:?})",
+            t,
+            round,
+            period,
+            step,
+        );
 
         let bundle = self.gen_bundle(params, prop, proposal_votes);
 
@@ -1238,15 +1279,9 @@ mod tests {
     /// propose-step votes and silently produces no threshold (because
     /// `propose.reaches_quorum()` is always false). Behaviorally
     /// equivalent for consensus, but operator-observable: Go panics,
-    /// Rust does not. Tracked in TASK-97.
-    ///
-    /// The body below intentionally drives the propose-step vote and
-    /// asserts a panic. Today the bare `VoteTracker` does NOT panic, so
-    /// without `#[ignore]` the test would fail. When TASK-97 ports the
-    /// contract layer, removing `#[ignore]` flips the test into a
-    /// passing `#[should_panic]` check.
+    /// Rust does too as of TASK-97 (precondition assertion in
+    /// `VoteTracker::handle_vote_accepted`).
     #[test]
-    #[ignore = "see TASK-97 — port voteTrackerContract precondition panics"]
     #[should_panic(expected = "propose")]
     fn vote_tracker_propose_no_op_panics() {
         let params = test_params();
@@ -1260,16 +1295,12 @@ mod tests {
         );
     }
 
-    /// Port of `TestVoteTrackerPanicsOnSoftBotQuorum`. Same gap as
-    /// above — Go's contract postcondition panics if a SoftThreshold
-    /// event fires for proposal=bottom. The Rust port does not enforce
-    /// this. Tracked in TASK-97.
-    ///
-    /// Body drives `threshold` votes for `BOTTOM` at SOFT to push the
-    /// (currently silent) post-condition violation. With TASK-97 the
-    /// `#[should_panic]` annotation will match the new contract panic.
+    /// Port of `TestVoteTrackerPanicsOnSoftBotQuorum`. Same provenance
+    /// as above — Go's contract postcondition panics if a SoftThreshold
+    /// event fires for proposal=bottom. As of TASK-97 the Rust port
+    /// enforces it via the postcondition assertion in
+    /// `VoteTracker::handle_vote_accepted`.
     #[test]
-    #[ignore = "see TASK-97 — port voteTrackerContract postcondition panic"]
     #[should_panic(expected = "soft")]
     fn vote_tracker_panics_on_soft_bot_quorum() {
         let params = test_params();
