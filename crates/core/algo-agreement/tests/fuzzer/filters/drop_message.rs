@@ -3,12 +3,18 @@
 // Mirrors `agreement/fuzzer/dropMessageFilter_test.go` (Go) — the
 // behavior is *deterministic*, not RNG-driven: the filter keeps two
 // counters (one per direction) and drops the message whenever
-// `counter % rate == 0` after incrementing. `rate == 0` is treated as
-// "drop everything" (matches Go's `rate == 0` short-circuit).
+// `counter % rate == 0` after incrementing.
+//
+// Rate semantics (matching Go's `rate == 0 || count%rate != 0`
+// short-circuit at `dropMessageFilter_test.go:48-52`):
+//   * `None`     → no-op; forward every message in this direction.
+//   * `Some(0)`  → no-op; the `||` short-circuits to TRUE so Go's
+//                  forward branch always runs. To "drop everything"
+//                  use `Some(1)` (every counter % 1 == 0).
+//   * `Some(N)`  → drop the Nth, 2Nth, 3Nth, … message.
 //
 // Per-direction rates can be configured independently via
-// [`DropMessageFilterBuilder`]; either can be `None` (default — pass
-// everything through in that direction).
+// [`DropMessageFilterBuilder`].
 
 use crate::fuzzer::filter::{Filter, FilterDecision};
 use crate::fuzzer::AlgoMessage;
@@ -26,15 +32,17 @@ impl DropMessageFilterBuilder {
         Self::default()
     }
 
-    /// Drop every Nth outgoing message. `Some(0)` ⇒ drop every message;
-    /// `Some(N)` for `N > 0` ⇒ drop the Nth, 2Nth, 3Nth, … message.
-    /// `None` ⇒ pass all outgoing messages through.
+    /// Configure the outgoing-direction drop rate. See the module-level
+    /// doc for the full semantics table; in short:
+    ///   * `None` or `Some(0)` ⇒ no-op (forward every message).
+    ///   * `Some(1)` ⇒ drop every message.
+    ///   * `Some(N)` for `N > 1` ⇒ drop the Nth, 2Nth, 3Nth, … message.
     pub fn outgoing_rate(mut self, rate: Option<u64>) -> Self {
         self.outgoing_rate = rate;
         self
     }
 
-    /// Drop every Nth incoming message — same semantics as
+    /// Configure the incoming-direction drop rate — same semantics as
     /// [`Self::outgoing_rate`] but for traffic arriving at this node.
     pub fn incoming_rate(mut self, rate: Option<u64>) -> Self {
         self.incoming_rate = rate;
