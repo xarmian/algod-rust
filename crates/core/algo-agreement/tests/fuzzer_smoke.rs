@@ -1,16 +1,19 @@
-// Integration smoke for the agreement fuzzer harness (TASK-84).
+// Integration smoke for the agreement fuzzer harness (TASK-84 + TASK-85).
 //
 // Exercises the full message-pump pipeline: per-node outgoing chain →
-// router → per-node incoming chain → received log. The two filters
-// shipping under TASK-84 (`drop_message`, `duplicate_message`) are
-// counter-driven, so every assertion below is a deterministic
-// expected-count match — no probabilistic tolerances, no RNG.
+// router → per-node incoming chain → received log. Four filters now
+// ship as part of PLAN-32's "base 4" set — `drop_message`,
+// `duplicate_message` (TASK-84, counter-driven, no RNG); plus
+// `message_reordering` (TASK-85, seeded `ChaCha8Rng` per direction —
+// chosen over `StdRng` for cross-version replay stability) and
+// `node_crash` (TASK-85, tick-range based suppression). All assertions
+// are deterministic — RNG-using filters are seeded explicitly so the
+// emission sequence is fixed across runs.
 //
-// Live multi-Service consensus through the harness is deliberately
-// out of scope here (CONVE-14: keep task scope to one PR); that
-// integration arrives in TASK-85 alongside reorder + nodeCrash.
-// What this smoke proves is that the harness itself routes / filters
-// / ticks correctly and is ready for that follow-up.
+// Live multi-Service consensus through the harness is still out of
+// scope (CONVE-14); the message-pump shape stays the same, the
+// follow-up just bridges the `Scheduler` to N real `Service`s over a
+// custom `AgreementNetwork` impl.
 
 #![deny(unsafe_code)]
 
@@ -19,6 +22,8 @@ mod fuzzer;
 use fuzzer::filter::{Filter, FilterDecision};
 use fuzzer::filters::drop_message::DropMessageFilterBuilder;
 use fuzzer::filters::duplicate_message::DuplicateMessageFilterBuilder;
+use fuzzer::filters::message_reordering::MessageReorderingFilterBuilder;
+use fuzzer::filters::node_crash::NodeCrashFilterBuilder;
 use fuzzer::network_facade::NetworkFacade;
 use fuzzer::router::Router;
 use fuzzer::scheduler::Scheduler;
@@ -510,4 +515,422 @@ fn scheduler_tick_releases_delayed_outgoing_messages() {
     let recv = sched.drain_received(1);
     assert_eq!(recv.len(), 1);
     assert_eq!(recv[0].data, vec![99]);
+}
+
+// ---------------------------------------------------------------------------
+// Reorder filter (TASK-85) — seeded-RNG shuffle pool
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reorder_filter_size_zero_is_noop() {
+    let mut f = MessageReorderingFilterBuilder::new()
+        .outgoing(0, 0xa5_5a)
+        .build();
+    for i in 0..5 {
+        assert_eq!(
+            f.filter_outgoing(&AlgoMessage::broadcast(0, TAG, vec![i as u8])),
+            FilterDecision::Keep,
+        );
+    }
+}
+
+#[test]
+fn reorder_filter_holds_first_n_then_emits_displaced() {
+    // shuffle_size=2 → first 2 messages are buffered (Drop); the 3rd
+    // pushes the pool to 3 > 2 and triggers a random-index emission.
+    let mut f = MessageReorderingFilterBuilder::new()
+        .outgoing(2, 0x1234)
+        .build();
+    let m1 = AlgoMessage::broadcast(0, TAG, vec![1]);
+    let m2 = AlgoMessage::broadcast(0, TAG, vec![2]);
+    let m3 = AlgoMessage::broadcast(0, TAG, vec![3]);
+
+    assert_eq!(f.filter_outgoing(&m1), FilterDecision::Drop);
+    assert_eq!(f.outgoing_pool_size(), 1);
+    assert_eq!(f.filter_outgoing(&m2), FilterDecision::Drop);
+    assert_eq!(f.outgoing_pool_size(), 2);
+
+    let dec3 = f.filter_outgoing(&m3);
+    match dec3 {
+        FilterDecision::Substitute { with } => {
+            assert_eq!(with.len(), 1);
+            // The displaced message must be one of the three we pushed.
+            let payload = with[0].data[0];
+            assert!(
+                payload == 1 || payload == 2 || payload == 3,
+                "displaced message payload {} is not one of [1,2,3]",
+                payload,
+            );
+        }
+        other => panic!("expected Substitute on overflow, got {:?}", other),
+    }
+    assert_eq!(f.outgoing_pool_size(), 2);
+}
+
+#[test]
+fn reorder_filter_seed_is_deterministic() {
+    // Two filters with the same seed should produce identical
+    // displacement choices for the same input sequence.
+    fn collect_displacements(seed: u64) -> Vec<u8> {
+        let mut f = MessageReorderingFilterBuilder::new()
+            .outgoing(2, seed)
+            .build();
+        let mut out = Vec::new();
+        for i in 1u8..=10 {
+            let dec = f.filter_outgoing(&AlgoMessage::broadcast(0, TAG, vec![i]));
+            if let FilterDecision::Substitute { with } = dec {
+                out.push(with[0].data[0]);
+            }
+        }
+        out
+    }
+    let a = collect_displacements(0xc0fe);
+    let b = collect_displacements(0xc0fe);
+    assert_eq!(
+        a, b,
+        "same seed must produce identical displacement sequence"
+    );
+    // Sanity: different seed gives a (probably) different sequence.
+    let c = collect_displacements(0xdead_beef);
+    assert_ne!(
+        a, c,
+        "different seeds should differ on a 10-message sequence (probability of collision ~0)",
+    );
+}
+
+#[test]
+fn reorder_filter_tick_retention_flushes_expired_outgoing() {
+    // Configure max_retention=4: messages flushed when they have
+    // been in the pool for STRICTLY MORE than 4 ticks (Codex round 2
+    // caught a `saturating_sub` bug in an earlier revision that
+    // flushed at tick 1; the fix bails when `current_tick <=
+    // max_retention_ticks` and uses strict-less for the cutoff).
+    // Mirrors Go's MaxRetension at messageReorderingFilter_test.go:32-34.
+    let mut f = MessageReorderingFilterBuilder::new()
+        .outgoing(8, 0xfeed) // shuffle_size large enough that
+        // the 3 messages below stay parked
+        // by displacement alone.
+        .max_retention_ticks(4)
+        .build();
+
+    // Park three messages at tick 0 (the filter's initial current_tick).
+    for i in 1u8..=3 {
+        let _ = f.filter_outgoing(&AlgoMessage::broadcast(0, TAG, vec![i]));
+    }
+    assert_eq!(f.outgoing_pool_size(), 3);
+
+    // Walk the clock incrementally — messages must NOT flush until
+    // strictly more than `max_retention_ticks` (4) have elapsed.
+    for t in 1..=4u64 {
+        let early = f.tick(t);
+        assert!(
+            early.is_empty(),
+            "at tick {t} (within max_retention=4) nothing should flush; got {}",
+            early.len(),
+        );
+        assert_eq!(f.outgoing_pool_size(), 3);
+    }
+
+    // Tick 5 ⇒ elapsed = 5 > 4 ⇒ flush.
+    let flushed_at_5 = f.tick(5);
+    assert_eq!(
+        flushed_at_5.len(),
+        3,
+        "all 3 messages (arrival_tick=0) should flush at tick 5 (> max_retention=4)",
+    );
+    assert_eq!(f.outgoing_pool_size(), 0);
+
+    // A subsequent tick with no new arrivals returns nothing.
+    let flushed_at_6 = f.tick(6);
+    assert!(flushed_at_6.is_empty());
+}
+
+#[test]
+fn reorder_filter_retention_walks_through_scheduler_incremental_ticks() {
+    // Drive the retention behavior through the actual `Scheduler`'s
+    // `tick_to`, which calls `tick(t)` for every integer in
+    // `(current, target]`. Asserts that the filter sees the
+    // incremental tick stream and that retention is enforced at the
+    // scheduler boundary too — locks down the saturating_sub
+    // regression Codex caught in round 2.
+    let n = 2;
+    let router = Router::new(n);
+    let mut facades = Vec::with_capacity(n);
+    facades.push(NetworkFacade::new(
+        0,
+        vec![Box::new(
+            MessageReorderingFilterBuilder::new()
+                .outgoing(4, 0xb01d)
+                .max_retention_ticks(3)
+                .build(),
+        )],
+        Vec::new(),
+    ));
+    facades.push(NetworkFacade::new(1, Vec::new(), Vec::new()));
+    let mut sched = Scheduler::new(router, facades);
+
+    // Park 2 messages at tick 0; pool=2 < shuffle_size=4 so they
+    // stay buffered (Drop).
+    sched.enqueue_send(AlgoMessage::broadcast(0, TAG, vec![1]));
+    sched.enqueue_send(AlgoMessage::broadcast(0, TAG, vec![2]));
+    assert!(sched.drain_received(1).is_empty(), "pool not yet full");
+
+    // Walk to tick 3 — strictly NOT past max_retention (3). Nothing
+    // should surface (the saturating_sub bug would have surfaced
+    // them at tick 1 here).
+    sched.tick_to(3);
+    assert!(
+        sched.drain_received(1).is_empty(),
+        "retention not yet expired at tick 3; saturating_sub regression?",
+    );
+
+    // Tick 4 — elapsed=4 > 3 ⇒ flush.
+    sched.tick_to(4);
+    let recv = sched.drain_received(1);
+    assert_eq!(recv.len(), 2, "both messages should flush at tick 4");
+}
+
+#[test]
+fn reorder_filter_drain_returns_remaining_pool() {
+    let mut f = MessageReorderingFilterBuilder::new()
+        .outgoing(3, 0x33)
+        .build();
+    for i in 1u8..=2 {
+        let _ = f.filter_outgoing(&AlgoMessage::broadcast(0, TAG, vec![i]));
+    }
+    assert_eq!(f.outgoing_pool_size(), 2);
+    let (out_drained, in_drained) = f.drain_pending();
+    assert_eq!(out_drained.len(), 2);
+    assert!(in_drained.is_empty());
+    assert_eq!(f.outgoing_pool_size(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// NodeCrash filter (TASK-85) — tick-range based suppression
+// ---------------------------------------------------------------------------
+
+#[test]
+fn node_crash_filter_default_is_passthrough() {
+    // Default builder = crash window [0, 0) which means never crashed.
+    let mut f = NodeCrashFilterBuilder::new().build();
+    for i in 0..3 {
+        assert_eq!(
+            f.filter_outgoing(&AlgoMessage::broadcast(0, TAG, vec![i])),
+            FilterDecision::Keep,
+        );
+        assert_eq!(
+            f.filter_incoming(&AlgoMessage::unicast(1, 0, TAG, vec![i])),
+            FilterDecision::Keep,
+        );
+    }
+    assert_eq!(f.crashed_messages_seen(), 0);
+}
+
+#[test]
+fn node_crash_filter_drops_inside_window_in_both_directions() {
+    let mut f = NodeCrashFilterBuilder::new()
+        .crash_window(2, 5) // crashed at ticks 2, 3, 4
+        .build();
+
+    // Tick 0: not crashed → Keep.
+    assert_eq!(
+        f.filter_outgoing(&AlgoMessage::broadcast(0, TAG, vec![0])),
+        FilterDecision::Keep,
+    );
+
+    // Advance to tick 2: now crashed.
+    let _ = f.tick(2);
+    assert_eq!(
+        f.filter_outgoing(&AlgoMessage::broadcast(0, TAG, vec![1])),
+        FilterDecision::Drop,
+    );
+    assert_eq!(
+        f.filter_incoming(&AlgoMessage::unicast(1, 0, TAG, vec![1])),
+        FilterDecision::Drop,
+    );
+
+    // Still crashed at tick 4 (last tick of the [2, 5) window).
+    let _ = f.tick(4);
+    assert_eq!(
+        f.filter_outgoing(&AlgoMessage::broadcast(0, TAG, vec![2])),
+        FilterDecision::Drop,
+    );
+
+    // Tick 5: window over, node is back online.
+    let _ = f.tick(5);
+    assert_eq!(
+        f.filter_outgoing(&AlgoMessage::broadcast(0, TAG, vec![3])),
+        FilterDecision::Keep,
+    );
+    assert_eq!(f.crashed_messages_seen(), 3);
+}
+
+#[test]
+#[should_panic(expected = "crash window start")]
+fn node_crash_filter_rejects_inverted_window() {
+    let _ = NodeCrashFilterBuilder::new().crash_window(10, 5).build();
+}
+
+#[test]
+fn node_crash_filter_documents_delay_release_bypass_known_limitation() {
+    // Locks down the documented limitation (see node_crash.rs module
+    // header): messages parked in the NetworkFacade's delay heap
+    // BEFORE the crash window starts are still released during the
+    // window — the scheduler's tick_to releases them straight to the
+    // router without re-entering the source's outgoing chain. If a
+    // future PR plumbs an `is_crashed()` veto through the scheduler,
+    // this test should be inverted; until then it captures current
+    // behavior so the gap doesn't silently regress.
+    use crate::fuzzer::filter::Filter;
+
+    struct DelayOnceFilter {
+        triggered: bool,
+    }
+    impl Filter for DelayOnceFilter {
+        fn filter_outgoing(&mut self, _msg: &AlgoMessage) -> FilterDecision {
+            if self.triggered {
+                FilterDecision::Keep
+            } else {
+                self.triggered = true;
+                FilterDecision::Delay { delay_ticks: 5 }
+            }
+        }
+    }
+
+    // Chain: [NodeCrash(window 3..10), DelayOnce(5 ticks)]. The
+    // outgoing message hits NodeCrash first (current_tick=0, not
+    // crashed → Keep), then DelayOnce parks it for release at tick 5.
+    // We then advance past the crash start (tick 3) and into the
+    // window. At tick 5 the delayed message is released — the
+    // documented limitation predicts it surfaces despite the node
+    // being "crashed".
+    let n = 2;
+    let router = Router::new(n);
+    let mut facades = Vec::with_capacity(n);
+    facades.push(NetworkFacade::new(
+        0,
+        vec![
+            Box::new(NodeCrashFilterBuilder::new().crash_window(3, 10).build()),
+            Box::new(DelayOnceFilter { triggered: false }),
+        ],
+        Vec::new(),
+    ));
+    facades.push(NetworkFacade::new(1, Vec::new(), Vec::new()));
+    let mut sched = Scheduler::new(router, facades);
+
+    sched.enqueue_send(AlgoMessage::broadcast(0, TAG, vec![42]));
+    sched.tick_to(5); // crosses crash_start (3) and reaches release (5)
+
+    let recv = sched.drain_received(1);
+    assert_eq!(
+        recv.len(),
+        1,
+        "documented limitation: delayed messages bypass NodeCrash on release; \
+         see node_crash.rs module header for the follow-up plan",
+    );
+    assert_eq!(recv[0].data, vec![42]);
+}
+
+// ---------------------------------------------------------------------------
+// 4-filter scheduler integration (TASK-85 acceptance criterion)
+// ---------------------------------------------------------------------------
+
+/// Build a 4-node cluster with all four filters configured at node 0:
+/// drop (rate=4), duplicate (rate=3, extra=1), reorder (size=2,
+/// seeded), and node_crash (window 3..6 — i.e. ticks 3, 4, 5 are
+/// crashed). Nodes 1, 2, 3 have empty chains. Returns the scheduler.
+fn make_four_node_cluster_with_all_filters() -> Scheduler {
+    let n = 4;
+    let router = Router::new(n);
+    let mut facades = Vec::with_capacity(n);
+    facades.push(NetworkFacade::new(
+        0,
+        vec![
+            Box::new(NodeCrashFilterBuilder::new().crash_window(3, 6).build()),
+            Box::new(
+                DropMessageFilterBuilder::new()
+                    .outgoing_rate(Some(4))
+                    .build(),
+            ),
+            Box::new(
+                DuplicateMessageFilterBuilder::new()
+                    .outgoing(Some(3), 1)
+                    .build(),
+            ),
+            Box::new(
+                MessageReorderingFilterBuilder::new()
+                    .outgoing(2, 0xc0de_cafe)
+                    .build(),
+            ),
+        ],
+        Vec::new(),
+    ));
+    facades.push(NetworkFacade::new(1, Vec::new(), Vec::new()));
+    facades.push(NetworkFacade::new(2, Vec::new(), Vec::new()));
+    facades.push(NetworkFacade::new(3, Vec::new(), Vec::new()));
+    Scheduler::new(router, facades)
+}
+
+#[test]
+fn scheduler_four_node_with_all_four_filters_is_deterministic() {
+    // Drive 12 messages, advance the clock through the crash window,
+    // then drive 12 more after the window. Two fresh runs must
+    // produce byte-identical received logs at every receiver. This is
+    // the deterministic-replay guarantee from the TASK-85 acceptance
+    // criteria — proves all four filters compose without introducing
+    // hidden non-determinism (e.g. random ordering, time-based
+    // tiebreaks).
+    fn run() -> [Vec<Vec<u8>>; 3] {
+        let mut sched = make_four_node_cluster_with_all_filters();
+        for i in 1u8..=12 {
+            sched.enqueue_send(AlgoMessage::broadcast(0, TAG, vec![i]));
+        }
+        // Walk the clock through the crash window (3..6).
+        sched.tick_to(7);
+        for i in 13u8..=24 {
+            sched.enqueue_send(AlgoMessage::broadcast(0, TAG, vec![i]));
+        }
+        sched.tick_to(20);
+        [
+            sched
+                .drain_received(1)
+                .iter()
+                .map(|m| m.data.clone())
+                .collect(),
+            sched
+                .drain_received(2)
+                .iter()
+                .map(|m| m.data.clone())
+                .collect(),
+            sched
+                .drain_received(3)
+                .iter()
+                .map(|m| m.data.clone())
+                .collect(),
+        ]
+    }
+
+    let a = run();
+    let b = run();
+    for (i, (recv_a, recv_b)) in a.iter().zip(b.iter()).enumerate() {
+        assert_eq!(
+            recv_a,
+            recv_b,
+            "node {} receive log diverged across reruns — not deterministic",
+            i + 1,
+        );
+    }
+
+    // Each receiver should have gotten the SAME number of messages
+    // (the cluster is a uniform broadcast topology with all filters
+    // at the source node only).
+    assert_eq!(a[0].len(), a[1].len());
+    assert_eq!(a[1].len(), a[2].len());
+
+    // And the count must be > 0 (filters drop / hold a lot but don't
+    // suppress everything outside the crash window).
+    assert!(
+        !a[0].is_empty(),
+        "expected at least some messages to survive the 4-filter chain",
+    );
 }

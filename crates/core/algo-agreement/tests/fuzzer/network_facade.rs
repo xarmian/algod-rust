@@ -309,5 +309,27 @@ fn run_chain_from(
             });
             Vec::new()
         }
+        FilterDecision::Substitute { with } => {
+            // Drop the original; feed each replacement through the
+            // *remaining* filters. Empty `with` collapses to `Drop`;
+            // single-element `with` is a pure substitution; multi-
+            // element fans out (each replacement flows independently).
+            // Used by the reorder filter to emit a buffered displaced
+            // message in place of the fresh arrival.
+            let mut all: ChainResult = Vec::new();
+            for replacement in with {
+                let sub = run_chain_from(
+                    chain,
+                    delay_heap,
+                    delay_seq,
+                    current_tick,
+                    replacement,
+                    start_idx + 1,
+                    direction,
+                );
+                all.extend(sub);
+            }
+            all
+        }
     }
 }
