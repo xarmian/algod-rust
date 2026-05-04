@@ -90,14 +90,14 @@ impl Filter for DropMessageFilter {
 fn decide(counter: u64, rate: Option<u64>) -> FilterDecision {
     match rate {
         None => FilterDecision::Keep,
-        // Match Go's semantics: `rate == 0` means "drop every message".
-        // `dropMessageFilter_test.go:48-52`: `if rate == 0 || n.sendMessageCount%rate != 0 { ... downstream.SendMessage(...) }`
-        // — the body forwards the message when the modulus is non-zero
-        // OR when rate==0 (the latter SHORT-CIRCUITING TO DROP because
-        // the surrounding `if rate, has := ...; has { ... return }` then
-        // suppresses the fallback). Net effect: rate==0 drops all.
-        // Easier to read in Rust as an explicit branch.
-        Some(0) => FilterDecision::Drop,
+        // Match Go's semantics in `agreement/fuzzer/dropMessageFilter_test.go:48-52`:
+        // `if rate == 0 || n.sendMessageCount%rate != 0 { downstream.SendMessage(...) }`.
+        // The `||` short-circuits to TRUE when `rate == 0`, so the
+        // forward branch is taken every time — i.e. `rate == 0` is a
+        // no-op (forwards every message), NOT "drop every message".
+        // `rate == 1` is the drop-everything configuration since
+        // `counter % 1 == 0` is always true.
+        Some(0) => FilterDecision::Keep,
         Some(rate) => {
             if counter % rate == 0 {
                 FilterDecision::Drop

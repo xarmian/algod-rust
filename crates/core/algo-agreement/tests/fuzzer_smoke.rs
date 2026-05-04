@@ -60,15 +60,31 @@ fn drop_filter_drops_every_nth_outgoing() {
 }
 
 #[test]
-fn drop_filter_rate_zero_drops_everything_outgoing() {
+fn drop_filter_rate_zero_is_noop() {
+    // Matches Go's `dropMessageFilter_test.go:48-52` short-circuit:
+    // `rate == 0` makes the `||` always-true so the forward branch
+    // runs every time. Effective behavior: rate-zero is a no-op
+    // (forwards everything). To drop EVERY message, configure
+    // `rate == 1` (every counter % 1 == 0).
     let mut f = DropMessageFilterBuilder::new()
         .outgoing_rate(Some(0))
         .build();
     for i in 0..5 {
         let msg = AlgoMessage::broadcast(0, TAG, vec![i as u8]);
-        assert_eq!(f.filter_outgoing(&msg), FilterDecision::Drop);
+        assert_eq!(f.filter_outgoing(&msg), FilterDecision::Keep);
     }
     assert_eq!(f.outgoing_seen(), 5);
+}
+
+#[test]
+fn drop_filter_rate_one_drops_every_message() {
+    let mut f = DropMessageFilterBuilder::new()
+        .outgoing_rate(Some(1))
+        .build();
+    for i in 0..4 {
+        let msg = AlgoMessage::broadcast(0, TAG, vec![i as u8]);
+        assert_eq!(f.filter_outgoing(&msg), FilterDecision::Drop);
+    }
 }
 
 #[test]
@@ -128,6 +144,45 @@ fn duplicate_filter_zero_extra_copies_is_noop() {
 // ---------------------------------------------------------------------------
 // NetworkFacade chain integration
 // ---------------------------------------------------------------------------
+
+#[test]
+fn facade_outgoing_chain_duplicate_then_drop_propagates_copies() {
+    // Coverage for the "Duplicate's extra copies flow through
+    // remaining filters too" guarantee in run_chain_from. With
+    // [Duplicate(rate=1, extra=2), Drop(rate=2)]:
+    //   * Duplicate fires on EVERY message (rate=1) and emits 1+2 = 3
+    //     copies per call.
+    //   * Each of those 3 copies feeds into Drop, whose internal
+    //     counter advances 1, 2, 3 across them — Drop's modulo=2
+    //     fires on copies 2 and 6 (etc.).
+    //
+    // For 2 input messages:
+    //   In 1 → 3 copies → Drop counter 1, 2, 3 → drops at #2 → 2 survive.
+    //   In 2 → 3 copies → Drop counter 4, 5, 6 → drops at #4, #6 → 1 survives.
+    //   Total survivors: 3.
+    //
+    // If `Duplicate` somehow short-circuited the rest of the chain,
+    // we'd see all 6 copies survive — the assertion below catches
+    // that regression.
+    let dup = DuplicateMessageFilterBuilder::new()
+        .outgoing(Some(1), 2)
+        .build();
+    let drop = DropMessageFilterBuilder::new()
+        .outgoing_rate(Some(2))
+        .build();
+    let mut facade = NetworkFacade::new(0, vec![Box::new(dup), Box::new(drop)], Vec::new());
+
+    let mut emitted = 0usize;
+    for i in 1u8..=2 {
+        let survivors = facade.process_outgoing(AlgoMessage::unicast(0, 1, TAG, vec![i]));
+        emitted += survivors.len();
+    }
+    assert_eq!(
+        emitted, 3,
+        "expected 3 survivors after [Duplicate(1, extra=2), Drop(2)] on 2 msgs; \
+         each duplicate copy must flow through Drop",
+    );
+}
 
 #[test]
 fn facade_outgoing_chain_drop_then_duplicate_runs_in_order() {
@@ -325,6 +380,88 @@ fn scheduler_loopback_unicast_is_dropped() {
     sched.enqueue_send(AlgoMessage::unicast(0, 0, TAG, vec![1]));
     assert!(sched.drain_received(0).is_empty());
     assert!(sched.drain_received(1).is_empty());
+}
+
+#[test]
+fn scheduler_tick_releases_delayed_messages_in_release_tick_order() {
+    // Coverage for DelayedMessage::Ord — items inserted out-of-order
+    // by release tick must surface in ascending release_tick order.
+    //
+    // Filter that delays the 1st message by 10 ticks, the 2nd by 3,
+    // the 3rd by 7. Expected drain order at tick 10: [#2 (tick 3),
+    // #3 (tick 7), #1 (tick 10)].
+    use crate::fuzzer::filter::Filter;
+
+    struct ScheduleByDataFilter;
+    impl Filter for ScheduleByDataFilter {
+        fn filter_outgoing(&mut self, msg: &AlgoMessage) -> FilterDecision {
+            // Encode the delay in the message payload byte for clarity.
+            FilterDecision::Delay {
+                delay_ticks: msg.data[0] as u64,
+            }
+        }
+    }
+
+    let n = 2;
+    let router = Router::new(n);
+    let mut facades = Vec::with_capacity(n);
+    facades.push(NetworkFacade::new(
+        0,
+        vec![Box::new(ScheduleByDataFilter)],
+        Vec::new(),
+    ));
+    facades.push(NetworkFacade::new(1, Vec::new(), Vec::new()));
+    let mut sched = Scheduler::new(router, facades);
+
+    // Insertion order: [10, 3, 7].
+    sched.enqueue_send(AlgoMessage::broadcast(0, TAG, vec![10]));
+    sched.enqueue_send(AlgoMessage::broadcast(0, TAG, vec![3]));
+    sched.enqueue_send(AlgoMessage::broadcast(0, TAG, vec![7]));
+
+    sched.tick_to(10);
+    let recv: Vec<u8> = sched.drain_received(1).iter().map(|m| m.data[0]).collect();
+    assert_eq!(
+        recv,
+        vec![3, 7, 10],
+        "delayed messages must surface in ascending release_tick order",
+    );
+}
+
+#[test]
+fn scheduler_tick_release_same_tick_preserves_insertion_order() {
+    // Coverage for the `sequence` tie-breaker in DelayedMessage::Ord.
+    // Three messages all delayed to the same tick must surface in the
+    // order they were enqueued.
+    use crate::fuzzer::filter::Filter;
+
+    struct DelayAllFiveFilter;
+    impl Filter for DelayAllFiveFilter {
+        fn filter_outgoing(&mut self, _msg: &AlgoMessage) -> FilterDecision {
+            FilterDecision::Delay { delay_ticks: 5 }
+        }
+    }
+
+    let n = 2;
+    let router = Router::new(n);
+    let mut facades = Vec::with_capacity(n);
+    facades.push(NetworkFacade::new(
+        0,
+        vec![Box::new(DelayAllFiveFilter)],
+        Vec::new(),
+    ));
+    facades.push(NetworkFacade::new(1, Vec::new(), Vec::new()));
+    let mut sched = Scheduler::new(router, facades);
+
+    for i in 1u8..=5 {
+        sched.enqueue_send(AlgoMessage::broadcast(0, TAG, vec![i]));
+    }
+    sched.tick_to(5);
+    let recv: Vec<u8> = sched.drain_received(1).iter().map(|m| m.data[0]).collect();
+    assert_eq!(
+        recv,
+        vec![1, 2, 3, 4, 5],
+        "same-tick delayed messages must drain in insertion order",
+    );
 }
 
 #[test]

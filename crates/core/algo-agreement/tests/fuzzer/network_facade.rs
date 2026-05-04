@@ -287,9 +287,23 @@ fn run_chain_from(
             // chain. When the heap releases it, it re-enters the
             // outgoing/incoming stream as a fully-filtered delivery
             // (matching Go's `processDownstreamBuffer` semantics).
+            //
+            // Panic on `current_tick + delay_ticks` overflow rather
+            // than silently saturating: a fuzzer scaffold should fail
+            // loudly on configuration that's outside the harness's
+            // representable range — silent saturation could mask a
+            // bug where a filter accidentally requested an enormous
+            // delay (e.g. `u64::MAX` from an unchecked subtraction).
+            // `delay_seq.wrapping_add` is fine because the sequence
+            // is purely a tie-breaker — wrap is harmless.
             *delay_seq = delay_seq.wrapping_add(1);
+            let release_tick = current_tick.checked_add(delay_ticks).unwrap_or_else(|| {
+                panic!(
+                    "Filter::Delay: current_tick {current_tick} + delay_ticks {delay_ticks} overflows u64",
+                )
+            });
             delay_heap.push(DelayedMessage {
-                release_tick: current_tick.saturating_add(delay_ticks),
+                release_tick,
                 sequence: *delay_seq,
                 message: msg,
             });
