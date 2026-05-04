@@ -142,20 +142,38 @@ impl ShufflePool {
         }
     }
 
-    /// Sweep the pool for messages older than `current_tick - max_retention_ticks`
-    /// and return them. `max_retention_ticks == 0` disables (returns
-    /// empty without inspecting the pool).
+    /// Sweep the pool for messages whose arrival_tick + max_retention_ticks
+    /// is `< current_tick` (i.e. they have been pending for STRICTLY MORE
+    /// than `max_retention_ticks` ticks) and return them.
+    /// `max_retention_ticks == 0` disables retention entirely.
+    ///
+    /// Care: avoid `saturating_sub` for the cutoff. A naive
+    /// `current_tick.saturating_sub(max_retention_ticks)` floors at
+    /// zero when `current_tick < max_retention_ticks`, so a message
+    /// with `arrival_tick == 0` would expire at `tick(1)` even with
+    /// `max_retention_ticks == 4` — a 1-tick effective retention,
+    /// not the configured 4. We instead bail early when the elapsed
+    /// time can't possibly exceed the retention budget.
     fn flush_expired(&mut self, current_tick: u64, max_retention_ticks: u64) -> Vec<AlgoMessage> {
         if max_retention_ticks == 0 {
             return Vec::new();
         }
-        let cutoff = current_tick.saturating_sub(max_retention_ticks);
+        // No message can have aged past `max_retention_ticks` if
+        // we haven't reached at least `max_retention_ticks + 1`
+        // ticks since clock zero — the earliest possible
+        // `arrival_tick` is 0. Bail before computing the cutoff to
+        // avoid `saturating_sub` clamping us into a premature flush.
+        if current_tick <= max_retention_ticks {
+            return Vec::new();
+        }
+        let cutoff = current_tick - max_retention_ticks; // > 0, no underflow.
         let mut out = Vec::new();
-        // Walk from the back so swap_remove preserves earlier indices.
+        // Walk from the back so swap_remove preserves earlier indices
+        // for the not-yet-inspected entries.
         let mut i = self.pool.len();
         while i > 0 {
             i -= 1;
-            if self.pool[i].arrival_tick <= cutoff {
+            if self.pool[i].arrival_tick < cutoff {
                 let entry = self.pool.swap_remove(i);
                 out.push(entry.message);
             }

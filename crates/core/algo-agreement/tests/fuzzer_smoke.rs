@@ -600,9 +600,12 @@ fn reorder_filter_seed_is_deterministic() {
 
 #[test]
 fn reorder_filter_tick_retention_flushes_expired_outgoing() {
-    // Configure max_retention=4: messages older than 4 ticks are
-    // auto-flushed via `tick`. Mirrors Go's MaxRetension at
-    // messageReorderingFilter_test.go:32-34.
+    // Configure max_retention=4: messages flushed when they have
+    // been in the pool for STRICTLY MORE than 4 ticks (Codex round 2
+    // caught a `saturating_sub` bug in an earlier revision that
+    // flushed at tick 1; the fix bails when `current_tick <=
+    // max_retention_ticks` and uses strict-less for the cutoff).
+    // Mirrors Go's MaxRetension at messageReorderingFilter_test.go:32-34.
     let mut f = MessageReorderingFilterBuilder::new()
         .outgoing(8, 0xfeed) // shuffle_size large enough that
         // the 3 messages below stay parked
@@ -616,20 +619,75 @@ fn reorder_filter_tick_retention_flushes_expired_outgoing() {
     }
     assert_eq!(f.outgoing_pool_size(), 3);
 
-    // Tick to 4 — arrival_tick=0 is NOT yet older than tick(4) - 4 = 0
-    // (the cutoff is INCLUSIVE: `arrival_tick <= cutoff`), so they
-    // expire exactly at tick 4.
-    let flushed_at_4 = f.tick(4);
+    // Walk the clock incrementally — messages must NOT flush until
+    // strictly more than `max_retention_ticks` (4) have elapsed.
+    for t in 1..=4u64 {
+        let early = f.tick(t);
+        assert!(
+            early.is_empty(),
+            "at tick {t} (within max_retention=4) nothing should flush; got {}",
+            early.len(),
+        );
+        assert_eq!(f.outgoing_pool_size(), 3);
+    }
+
+    // Tick 5 ⇒ elapsed = 5 > 4 ⇒ flush.
+    let flushed_at_5 = f.tick(5);
     assert_eq!(
-        flushed_at_4.len(),
+        flushed_at_5.len(),
         3,
-        "all 3 messages should flush at tick 4"
+        "all 3 messages (arrival_tick=0) should flush at tick 5 (> max_retention=4)",
     );
     assert_eq!(f.outgoing_pool_size(), 0);
 
     // A subsequent tick with no new arrivals returns nothing.
-    let flushed_at_5 = f.tick(5);
-    assert!(flushed_at_5.is_empty());
+    let flushed_at_6 = f.tick(6);
+    assert!(flushed_at_6.is_empty());
+}
+
+#[test]
+fn reorder_filter_retention_walks_through_scheduler_incremental_ticks() {
+    // Drive the retention behavior through the actual `Scheduler`'s
+    // `tick_to`, which calls `tick(t)` for every integer in
+    // `(current, target]`. Asserts that the filter sees the
+    // incremental tick stream and that retention is enforced at the
+    // scheduler boundary too — locks down the saturating_sub
+    // regression Codex caught in round 2.
+    let n = 2;
+    let router = Router::new(n);
+    let mut facades = Vec::with_capacity(n);
+    facades.push(NetworkFacade::new(
+        0,
+        vec![Box::new(
+            MessageReorderingFilterBuilder::new()
+                .outgoing(4, 0xb01d)
+                .max_retention_ticks(3)
+                .build(),
+        )],
+        Vec::new(),
+    ));
+    facades.push(NetworkFacade::new(1, Vec::new(), Vec::new()));
+    let mut sched = Scheduler::new(router, facades);
+
+    // Park 2 messages at tick 0; pool=2 < shuffle_size=4 so they
+    // stay buffered (Drop).
+    sched.enqueue_send(AlgoMessage::broadcast(0, TAG, vec![1]));
+    sched.enqueue_send(AlgoMessage::broadcast(0, TAG, vec![2]));
+    assert!(sched.drain_received(1).is_empty(), "pool not yet full");
+
+    // Walk to tick 3 — strictly NOT past max_retention (3). Nothing
+    // should surface (the saturating_sub bug would have surfaced
+    // them at tick 1 here).
+    sched.tick_to(3);
+    assert!(
+        sched.drain_received(1).is_empty(),
+        "retention not yet expired at tick 3; saturating_sub regression?",
+    );
+
+    // Tick 4 — elapsed=4 > 3 ⇒ flush.
+    sched.tick_to(4);
+    let recv = sched.drain_received(1);
+    assert_eq!(recv.len(), 2, "both messages should flush at tick 4");
 }
 
 #[test]
