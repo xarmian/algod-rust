@@ -17,6 +17,24 @@
 // range" is straightforward because the harness clock is the only
 // time reference available to filters.
 //
+// # Known limitation: delayed-message bypass
+//
+// Messages that another filter in the chain (e.g. a future
+// `MessageDelayFilter`) parked in the [`NetworkFacade`]'s delay heap
+// BEFORE the crash window started will still be released during the
+// crash window — the scheduler's `tick_to` releases them directly
+// to the router without re-entering the source's outgoing chain
+// (matching Go's `processDownstreamBuffer` semantics, see
+// `agreement/fuzzer/messageDuplicationFilter_test.go:154`). For a
+// strictly-correct "crashed node emits nothing" model, place
+// `NodeCrashFilter` **first** in the outgoing chain and avoid
+// combining it with `Delay`-emitting filters until the multi-Service
+// follow-up plumbs an `is_crashed()` veto through the scheduler. The
+// test
+// `node_crash_filter_documents_delay_release_bypass_known_limitation`
+// in `fuzzer_smoke.rs` locks down the current behavior so a future
+// fix can flip the assertion intentionally.
+//
 // Determinism: the filter is purely deterministic — the crash window
 // is configured up front; no RNG involved. Same configuration ⇒
 // same suppression sequence.

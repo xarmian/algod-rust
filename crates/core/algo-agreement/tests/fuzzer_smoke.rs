@@ -4,7 +4,8 @@
 // router → per-node incoming chain → received log. Four filters now
 // ship as part of PLAN-32's "base 4" set — `drop_message`,
 // `duplicate_message` (TASK-84, counter-driven, no RNG); plus
-// `message_reordering` (TASK-85, seeded `StdRng` per direction) and
+// `message_reordering` (TASK-85, seeded `ChaCha8Rng` per direction —
+// chosen over `StdRng` for cross-version replay stability) and
 // `node_crash` (TASK-85, tick-range based suppression). All assertions
 // are deterministic — RNG-using filters are seeded explicitly so the
 // emission sequence is fixed across runs.
@@ -598,6 +599,40 @@ fn reorder_filter_seed_is_deterministic() {
 }
 
 #[test]
+fn reorder_filter_tick_retention_flushes_expired_outgoing() {
+    // Configure max_retention=4: messages older than 4 ticks are
+    // auto-flushed via `tick`. Mirrors Go's MaxRetension at
+    // messageReorderingFilter_test.go:32-34.
+    let mut f = MessageReorderingFilterBuilder::new()
+        .outgoing(8, 0xfeed) // shuffle_size large enough that
+        // the 3 messages below stay parked
+        // by displacement alone.
+        .max_retention_ticks(4)
+        .build();
+
+    // Park three messages at tick 0 (the filter's initial current_tick).
+    for i in 1u8..=3 {
+        let _ = f.filter_outgoing(&AlgoMessage::broadcast(0, TAG, vec![i]));
+    }
+    assert_eq!(f.outgoing_pool_size(), 3);
+
+    // Tick to 4 — arrival_tick=0 is NOT yet older than tick(4) - 4 = 0
+    // (the cutoff is INCLUSIVE: `arrival_tick <= cutoff`), so they
+    // expire exactly at tick 4.
+    let flushed_at_4 = f.tick(4);
+    assert_eq!(
+        flushed_at_4.len(),
+        3,
+        "all 3 messages should flush at tick 4"
+    );
+    assert_eq!(f.outgoing_pool_size(), 0);
+
+    // A subsequent tick with no new arrivals returns nothing.
+    let flushed_at_5 = f.tick(5);
+    assert!(flushed_at_5.is_empty());
+}
+
+#[test]
 fn reorder_filter_drain_returns_remaining_pool() {
     let mut f = MessageReorderingFilterBuilder::new()
         .outgoing(3, 0x33)
@@ -676,6 +711,66 @@ fn node_crash_filter_drops_inside_window_in_both_directions() {
 #[should_panic(expected = "crash window start")]
 fn node_crash_filter_rejects_inverted_window() {
     let _ = NodeCrashFilterBuilder::new().crash_window(10, 5).build();
+}
+
+#[test]
+fn node_crash_filter_documents_delay_release_bypass_known_limitation() {
+    // Locks down the documented limitation (see node_crash.rs module
+    // header): messages parked in the NetworkFacade's delay heap
+    // BEFORE the crash window starts are still released during the
+    // window — the scheduler's tick_to releases them straight to the
+    // router without re-entering the source's outgoing chain. If a
+    // future PR plumbs an `is_crashed()` veto through the scheduler,
+    // this test should be inverted; until then it captures current
+    // behavior so the gap doesn't silently regress.
+    use crate::fuzzer::filter::Filter;
+
+    struct DelayOnceFilter {
+        triggered: bool,
+    }
+    impl Filter for DelayOnceFilter {
+        fn filter_outgoing(&mut self, _msg: &AlgoMessage) -> FilterDecision {
+            if self.triggered {
+                FilterDecision::Keep
+            } else {
+                self.triggered = true;
+                FilterDecision::Delay { delay_ticks: 5 }
+            }
+        }
+    }
+
+    // Chain: [NodeCrash(window 3..10), DelayOnce(5 ticks)]. The
+    // outgoing message hits NodeCrash first (current_tick=0, not
+    // crashed → Keep), then DelayOnce parks it for release at tick 5.
+    // We then advance past the crash start (tick 3) and into the
+    // window. At tick 5 the delayed message is released — the
+    // documented limitation predicts it surfaces despite the node
+    // being "crashed".
+    let n = 2;
+    let router = Router::new(n);
+    let mut facades = Vec::with_capacity(n);
+    facades.push(NetworkFacade::new(
+        0,
+        vec![
+            Box::new(NodeCrashFilterBuilder::new().crash_window(3, 10).build()),
+            Box::new(DelayOnceFilter { triggered: false }),
+        ],
+        Vec::new(),
+    ));
+    facades.push(NetworkFacade::new(1, Vec::new(), Vec::new()));
+    let mut sched = Scheduler::new(router, facades);
+
+    sched.enqueue_send(AlgoMessage::broadcast(0, TAG, vec![42]));
+    sched.tick_to(5); // crosses crash_start (3) and reaches release (5)
+
+    let recv = sched.drain_received(1);
+    assert_eq!(
+        recv.len(),
+        1,
+        "documented limitation: delayed messages bypass NodeCrash on release; \
+         see node_crash.rs module header for the follow-up plan",
+    );
+    assert_eq!(recv[0].data, vec![42]);
 }
 
 // ---------------------------------------------------------------------------
