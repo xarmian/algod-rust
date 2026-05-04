@@ -6,3 +6,5 @@
 
 pub mod drop_message;
 pub mod duplicate_message;
+pub mod message_reordering;
+pub mod node_crash;

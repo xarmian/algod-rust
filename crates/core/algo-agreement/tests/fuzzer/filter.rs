@@ -17,13 +17,13 @@ use super::AlgoMessage;
 
 /// Disposition for a single filter inspecting a single message.
 ///
-/// The semantics deliberately match the four cases the task acceptance
-/// criteria call out (drop / keep / duplicate / delay). The
+/// The semantics cover the cases the task acceptance criteria call
+/// out (drop / keep / duplicate / delay) plus a `Substitute` variant
+/// for filters that need to swap the current message for one or more
+/// arbitrary replacements (used by the reorder filter — see
+/// `filters::message_reordering`). The
 /// [`network_facade::NetworkFacade`] interprets each decision before
-/// passing the message to the next filter in the chain — so a chain
-/// of `[Drop, Duplicate]` means: Drop sees the original first; if it
-/// returns `Keep` then Duplicate runs, and any extra copies it asks for
-/// also flow through any *subsequent* filters (here: none).
+/// passing the message(s) to the next filter in the chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FilterDecision {
     /// Pass the original message through to the next filter / final
@@ -39,9 +39,17 @@ pub enum FilterDecision {
     Duplicate { extra_copies: u32 },
     /// Hold the message and re-fire `delay_ticks` ticks from the
     /// current scheduler clock. Recognized for completeness but not
-    /// emitted by the drop / duplicate filters that ship in TASK-84;
-    /// reserved for future delay / reorder filters (TASK-85).
+    /// emitted by the drop / duplicate filters that ship in TASK-84.
     Delay { delay_ticks: u64 },
+    /// Drop the original and emit each of the supplied messages
+    /// through the remaining filters in the chain instead. An empty
+    /// `with` vec is equivalent to `Drop`; a single-element vec is a
+    /// pure substitution; a multi-element vec is a "substitute then
+    /// fan out" — each replacement flows through `chain[start_idx +
+    /// 1..]` independently. Used by the reorder filter (TASK-85) to
+    /// emit a previously-buffered displaced message in place of the
+    /// fresh arrival.
+    Substitute { with: Vec<AlgoMessage> },
 }
 
 /// A single filter in the per-node chain. Each filter sees both

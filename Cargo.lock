@@ -43,6 +43,7 @@ dependencies = [
  "hex",
  "num-bigint",
  "proptest",
+ "rand 0.8.5",
  "rmp",
  "rmp-serde",
  "rmpv",
