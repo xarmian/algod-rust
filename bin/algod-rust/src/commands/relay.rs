@@ -543,6 +543,26 @@ pub async fn run(
         anyhow::anyhow!("failed to open ledger at {}: {}", ledger_path.display(), e)
     })?;
 
+    // Reject the split-commit gap before serving blocks — see
+    // `SqliteLedger::open_split` for the cross-file consistency model.
+    // A relay that resumes with tracker > blockdb would happily serve
+    // its peers from a hole in the block archive; refuse to start.
+    match sqlite_ledger
+        .reconcile_cross_file()
+        .map_err(|e| anyhow::anyhow!("reconcile cross-file consistency for relay ledger: {e}"))?
+    {
+        algo_ledger::CrossFileState::Empty | algo_ledger::CrossFileState::Consistent { .. } => {}
+        algo_ledger::CrossFileState::BlockBehind {
+            tracker_round,
+            block_max_round,
+        } => {
+            anyhow::bail!(
+                "ledger inconsistency: tracker at round {tracker_round} but blockdb.blocks \
+                 stops at {block_max_round:?}. Recover from a catchpoint or delete the DB."
+            );
+        }
+    }
+
     let latest = sqlite_ledger.current_round().0;
     info!(path = %ledger_path.display(), latest_round = latest, "opened ledger database");
 

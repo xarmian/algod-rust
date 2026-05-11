@@ -970,11 +970,32 @@ impl SyncOrchestrator {
         // been committed. Query the database for the last committed round and
         // skip ahead to avoid re-applying blocks (which would fail with a
         // round mismatch in apply_block's strict monotonicity check).
+        //
+        // Before trusting the tracker round, run the cross-file
+        // reconciliation check (see `SqliteLedger::open_split`): a crash
+        // mid-commit can leave the tracker ahead of `blockdb.blocks`, in
+        // which case resuming from `tracker + 1` would silently skip the
+        // missing tail. We bail out and ask the operator to recover.
         let start_round = {
             let resume_store =
                 crate::SqliteLedger::open(&self.config.db_path).map_err(|e| AlgoError::Ledger {
                     message: format!("open ledger for resume check: {e}"),
                 })?;
+            match resume_store.reconcile_cross_file()? {
+                crate::CrossFileState::Empty | crate::CrossFileState::Consistent { .. } => {}
+                crate::CrossFileState::BlockBehind {
+                    tracker_round,
+                    block_max_round,
+                } => {
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "ledger inconsistency: tracker at round {tracker_round} but \
+                             blockdb.blocks stops at {block_max_round:?}. Recover from a \
+                             catchpoint or delete the DB."
+                        ),
+                    });
+                }
+            }
             match resume_store.last_committed_round() {
                 Ok(Some(last)) if last > catchpoint_round => {
                     tracing::info!(
@@ -1288,6 +1309,24 @@ impl SyncOrchestrator {
             crate::SqliteLedger::open(&self.config.db_path).map_err(|e| AlgoError::Ledger {
                 message: format!("open ledger for follow mode: {e}"),
             })?;
+
+        // Reject the split-commit gap before entering the polling loop —
+        // see `SqliteLedger::open_split` for the consistency model.
+        match store.reconcile_cross_file()? {
+            crate::CrossFileState::Empty | crate::CrossFileState::Consistent { .. } => {}
+            crate::CrossFileState::BlockBehind {
+                tracker_round,
+                block_max_round,
+            } => {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "ledger inconsistency entering follow mode: tracker at round \
+                         {tracker_round} but blockdb.blocks stops at {block_max_round:?}. \
+                         Recover from a catchpoint or delete the DB."
+                    ),
+                });
+            }
+        }
 
         // Enable Merkle trie tracking if a trie path is configured.
         if self.config.trie_path.is_some() {

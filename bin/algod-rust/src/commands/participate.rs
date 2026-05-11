@@ -2065,6 +2065,26 @@ pub async fn run(
     let sqlite_ledger = SqliteLedger::open(ledger_path).map_err(|e| {
         anyhow::anyhow!("failed to open ledger at {}: {}", ledger_path.display(), e)
     })?;
+
+    // Reject the split-commit gap before booting agreement — see
+    // `SqliteLedger::open_split` for the consistency model. Participating
+    // with a missing tail block would risk producing votes against state
+    // that the block archive can't reproduce on the next restart.
+    match sqlite_ledger.reconcile_cross_file().map_err(|e| {
+        anyhow::anyhow!("reconcile cross-file consistency for participate ledger: {e}")
+    })? {
+        algo_ledger::CrossFileState::Empty | algo_ledger::CrossFileState::Consistent { .. } => {}
+        algo_ledger::CrossFileState::BlockBehind {
+            tracker_round,
+            block_max_round,
+        } => {
+            anyhow::bail!(
+                "ledger inconsistency: tracker at round {tracker_round} but blockdb.blocks \
+                 stops at {block_max_round:?}. Recover from a catchpoint or delete the DB."
+            );
+        }
+    }
+
     let latest = sqlite_ledger.current_round().0;
     info!(path = %ledger_path.display(), latest_round = latest, "opened ledger database");
 
