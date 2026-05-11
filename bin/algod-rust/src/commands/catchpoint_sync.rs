@@ -625,6 +625,29 @@ pub async fn handoff_to_gossip_sync(
         algo_ledger::SqliteLedger::open(&config.db_path).map_err(|e| AlgoError::Ledger {
             message: format!("open ledger for gossip handoff: {e}"),
         })?;
+    // Reconcile the cross-file state before trusting the tracker round.
+    // CatchpointOnly is the expected shape entering gossip handoff
+    // (tracker just imported from a catchpoint, blockdb may still be
+    // sparse before lookback completed) — accept it. BlockBehind is the
+    // split-commit hazard and aborts.
+    match ledger
+        .reconcile_cross_file()
+        .map_err(|e| anyhow::anyhow!("reconcile cross-file consistency for gossip handoff: {e}"))?
+    {
+        algo_ledger::CrossFileState::Empty
+        | algo_ledger::CrossFileState::Consistent { .. }
+        | algo_ledger::CrossFileState::CatchpointOnly { .. } => {}
+        algo_ledger::CrossFileState::BlockBehind {
+            tracker_round,
+            block_max_round,
+        } => {
+            anyhow::bail!(
+                "ledger inconsistency at gossip handoff: tracker at round {tracker_round} but \
+                 blockdb.blocks max is {block_max_round}. Recover from a catchpoint or delete \
+                 the DB."
+            );
+        }
+    }
     let mut current_round = ledger
         .last_committed_round()
         .map_err(|e| AlgoError::Ledger {

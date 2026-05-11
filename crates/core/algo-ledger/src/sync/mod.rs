@@ -983,6 +983,18 @@ impl SyncOrchestrator {
                 })?;
             match resume_store.reconcile_cross_file()? {
                 crate::CrossFileState::Empty | crate::CrossFileState::Consistent { .. } => {}
+                // CatchpointOnly is the expected shape during catchpoint
+                // replay: tracker is at `catchpoint_round` and the
+                // block-download phase ran (lookback inclusive of
+                // catchpoint round). If we got here with blockdb still
+                // empty that means lookback was skipped — but the
+                // resume path's job is to refetch forward, so accept it.
+                crate::CrossFileState::CatchpointOnly { tracker_round } => {
+                    tracing::info!(
+                        tracker_round,
+                        "catchpoint-only state during replay resume; will refetch blocks"
+                    );
+                }
                 crate::CrossFileState::BlockBehind {
                     tracker_round,
                     block_max_round,
@@ -990,7 +1002,7 @@ impl SyncOrchestrator {
                     return Err(AlgoError::Ledger {
                         message: format!(
                             "ledger inconsistency: tracker at round {tracker_round} but \
-                             blockdb.blocks stops at {block_max_round:?}. Recover from a \
+                             blockdb.blocks max is {block_max_round}. Recover from a \
                              catchpoint or delete the DB."
                         ),
                     });
@@ -1310,10 +1322,22 @@ impl SyncOrchestrator {
                 message: format!("open ledger for follow mode: {e}"),
             })?;
 
-        // Reject the split-commit gap before entering the polling loop —
-        // see `SqliteLedger::open_split` for the consistency model.
+        // Reject anything but a fully populated block archive before
+        // entering the polling loop. Follow mode applies new blocks
+        // forward from the on-disk state; both the split-commit gap and
+        // the catchpoint-only shape (blockdb empty) leave it unable to
+        // serve catchup peers that ask for a missing tail round.
         match store.reconcile_cross_file()? {
             crate::CrossFileState::Empty | crate::CrossFileState::Consistent { .. } => {}
+            crate::CrossFileState::CatchpointOnly { tracker_round } => {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "follow mode requires blocks on disk; the ledger is catchpoint-only at \
+                         round {tracker_round}. Run a regular sync first to populate the block \
+                         archive."
+                    ),
+                });
+            }
             crate::CrossFileState::BlockBehind {
                 tracker_round,
                 block_max_round,
@@ -1321,7 +1345,7 @@ impl SyncOrchestrator {
                 return Err(AlgoError::Ledger {
                     message: format!(
                         "ledger inconsistency entering follow mode: tracker at round \
-                         {tracker_round} but blockdb.blocks stops at {block_max_round:?}. \
+                         {tracker_round} but blockdb.blocks max is {block_max_round}. \
                          Recover from a catchpoint or delete the DB."
                     ),
                 });

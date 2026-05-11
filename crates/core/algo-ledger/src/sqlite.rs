@@ -254,23 +254,46 @@ pub fn ledger_exists(path: &Path) -> bool {
 }
 
 /// Outcome of [`SqliteLedger::reconcile_cross_file`]. Distinguishes the
-/// fresh-DB / consistent / tracker-ahead cases so callers can route to
-/// the right startup recovery path.
+/// fresh-DB / consistent / catchpoint-imported / split-commit-gap cases
+/// so callers can route to the right startup recovery path.
+///
+/// `BlockBehind` is the only state that signals a corrupt-on-disk
+/// hazard. `CatchpointOnly` is a legitimate shape (right after a
+/// standalone catchpoint import, before any blocks have been fetched);
+/// callers that REQUIRE the block archive (relay, participate, follow,
+/// replay) treat it like `BlockBehind`, while callers that drive a
+/// recovery (sync, the catchpoint orchestrator's gossip handoff)
+/// accept it and proceed to download blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrossFileState {
     /// Neither the tracker nor `blockdb.blocks` has committed any rounds.
     Empty,
-    /// Tracker and `blockdb.blocks` agree on the latest round.
+    /// Tracker and `blockdb.blocks` agree on the latest round, or
+    /// `blockdb.blocks` is ahead of the tracker (a transient state
+    /// during sync where the block is stored before the apply commits).
+    /// The tracker's own `current_round` is reported for callers that
+    /// want to log it.
     Consistent { round: u64 },
-    /// Tracker recorded round `tracker_round` as committed but
-    /// `blockdb.blocks` only contains rows up to `block_max_round` (or
-    /// none at all). The gap was created by a crash mid-commit; the
-    /// caller is responsible for backfilling the missing block(s) or
-    /// rejecting startup. Mirrors go-algorand's split tracker/block DB
-    /// recovery (`../go-algorand/ledger/ledger.go:327,336`).
+    /// Tracker recorded a round but `blockdb.blocks` is completely
+    /// empty. Mirrors the shape produced by the standalone `algod-rust
+    /// catchpoint import` command: tracker state has been bulk-loaded
+    /// from a catchpoint file but no blocks have been downloaded yet.
+    /// `sync` accepts this and refetches; `relay` / `participate` /
+    /// `follow` / `replay` treat it as fatal because they cannot
+    /// reproduce the block tail.
+    CatchpointOnly { tracker_round: u64 },
+    /// Tracker recorded round `tracker_round` as committed and
+    /// `blockdb.blocks` contains some rows up to `block_max_round`, but
+    /// the row for `tracker_round` itself is missing. This is the
+    /// split-commit hazard documented on [`SqliteLedger::open_split`]:
+    /// a crash between the tracker WAL fsync and the blockdb WAL fsync
+    /// left the tracker ahead of the durable block archive. The caller
+    /// is responsible for backfilling the missing block(s) or rejecting
+    /// startup. Mirrors go-algorand's split tracker/block DB recovery
+    /// (`../go-algorand/ledger/ledger.go:327,336`).
     BlockBehind {
         tracker_round: u64,
-        block_max_round: Option<u64>,
+        block_max_round: u64,
     },
 }
 
@@ -2367,42 +2390,62 @@ impl SqliteLedger {
     /// at startup. See [`Self::reconcile_cross_file`].
     fn _consistency_state_doc(&self) {}
 
-    /// Inspect the tracker / block-DB round pair and report any
-    /// inconsistency caused by the non-atomic ATTACH commit documented on
-    /// [`Self::open_split`].
+    /// Inspect the tracker / block-DB round pair and report the disk-
+    /// layout state.
     ///
     /// Returns:
     /// - [`CrossFileState::Empty`] when no rounds have been committed yet
     ///   (fresh DB or post-`remove_ledger_files`).
-    /// - [`CrossFileState::Consistent`] when tracker and block DB are
-    ///   at the same round (the common case).
-    /// - [`CrossFileState::BlockBehind`] when the tracker is ahead. This
-    ///   indicates the tail block (or several tail blocks) is missing
-    ///   from `blockdb.blocks`; the resume path needs to either backfill
-    ///   those blocks from the network or reject startup until the user
-    ///   recovers the DB.
+    /// - [`CrossFileState::Consistent`] when the tracker round has a
+    ///   matching row in `blockdb.blocks`, or `blockdb.blocks` is ahead
+    ///   of the tracker.
+    /// - [`CrossFileState::CatchpointOnly`] when the tracker has rounds
+    ///   but `blockdb.blocks` is fully empty — the legitimate shape
+    ///   after a standalone `catchpoint import`.
+    /// - [`CrossFileState::BlockBehind`] when the tracker round is
+    ///   missing from `blockdb.blocks` even though `blockdb.blocks` has
+    ///   other rows — the cross-file split-commit hazard documented on
+    ///   [`Self::open_split`]. The caller must backfill the missing
+    ///   block(s) or refuse to start.
     pub fn reconcile_cross_file(&self) -> Result<CrossFileState, AlgoError> {
         let tracker = self.last_committed_round()?;
         let block_max = self.max_block_round_in_blockdb()?;
         let state = match (tracker, block_max) {
             (None, _) => CrossFileState::Empty,
-            // Tracker reports round 0 (genesis bootstrap) and blockdb is
-            // empty — fresh DB, not a gap.
+            // Tracker reports round 0 with no blocks committed — fresh
+            // DB just after schema creation, not a gap.
             (Some(0), None) => CrossFileState::Empty,
-            (Some(t), None) => CrossFileState::BlockBehind {
-                tracker_round: t,
-                block_max_round: None,
-            },
-            (Some(t), Some(b)) if t > b => CrossFileState::BlockBehind {
-                tracker_round: t,
-                block_max_round: Some(b),
-            },
-            // Tracker == blockdb (the consistent case) OR tracker behind
-            // blockdb (a sync where the block arrived first but tracker
-            // apply lags). Neither is the split-commit hazard documented
-            // on `open_split`; treat both as Consistent at the tracker
-            // round.
-            (Some(t), Some(_)) => CrossFileState::Consistent { round: t },
+            // Tracker has rounds but blockdb is completely empty.
+            // Catchpoint import shape; not a crash hazard, but callers
+            // that need blocks should reject it.
+            (Some(t), None) => CrossFileState::CatchpointOnly { tracker_round: t },
+            // Tracker behind blockdb (block stored before tracker apply
+            // committed — happens during sync). Not the hazard.
+            (Some(t), Some(b)) if t <= b => CrossFileState::Consistent { round: t },
+            // Tracker ahead of blockdb max with at least one stored
+            // block. The row for the tracker round itself is missing —
+            // double-check, since a previous run may have committed the
+            // exact round but pruned older ones.
+            (Some(t), Some(b)) => {
+                let row_present: bool = self
+                    .conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM blockdb.blocks WHERE rnd = ?1)",
+                        params![t as i64],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| AlgoError::Ledger {
+                        message: format!("reconcile_cross_file row probe error: {e}"),
+                    })?;
+                if row_present {
+                    CrossFileState::Consistent { round: t }
+                } else {
+                    CrossFileState::BlockBehind {
+                        tracker_round: t,
+                        block_max_round: b,
+                    }
+                }
+            }
         };
         Ok(state)
     }
@@ -5194,7 +5237,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_cross_file_reports_empty_consistent_and_block_behind() {
+    fn reconcile_cross_file_distinguishes_empty_consistent_catchpoint_and_block_behind() {
         // Empty DB: both tracker and blockdb are bare. Should report Empty.
         let dir = tempfile::tempdir().unwrap();
         let prefix = dir.path().join("ledger");
@@ -5204,8 +5247,8 @@ mod tests {
             CrossFileState::Empty
         );
 
-        // Simulate the consistent case: tracker advanced to round 5 and
-        // blockdb has a row for round 5.
+        // Consistent: tracker advanced to round 5 and blockdb has a row
+        // for round 5.
         ledger.put_block(5, "v41", b"hdr", b"blk").unwrap();
         set_meta_u64(&ledger.conn, "current_round", 5).unwrap();
         assert_eq!(
@@ -5213,33 +5256,47 @@ mod tests {
             CrossFileState::Consistent { round: 5 }
         );
 
-        // Simulate the split-commit gap: bump tracker to round 7 without
-        // adding the matching blockdb rows. This is the post-crash shape
-        // the reconciliation is meant to catch.
+        // Split-commit gap: bump tracker to round 7 without adding the
+        // matching blockdb row, but leave the round-5 row in place. This
+        // is the post-crash shape we must catch.
         set_meta_u64(&ledger.conn, "current_round", 7).unwrap();
-        let state = ledger.reconcile_cross_file().unwrap();
         assert_eq!(
-            state,
+            ledger.reconcile_cross_file().unwrap(),
             CrossFileState::BlockBehind {
                 tracker_round: 7,
-                block_max_round: Some(5)
+                block_max_round: 5,
             }
         );
 
-        // Tracker ahead but blockdb totally empty (rare: catchpoint
-        // import bumped tracker but no blocks fetched yet) — still
-        // reports the gap so the caller decides what to do.
+        // Catchpoint-only: blockdb fully empty but tracker has a round.
+        // Legitimate shape right after `catchpoint import`; reported
+        // distinctly so callers can opt in (sync proceeds, relay
+        // refuses).
         ledger
             .conn
             .execute("DELETE FROM blockdb.blocks", [])
             .unwrap();
-        let state = ledger.reconcile_cross_file().unwrap();
         assert_eq!(
-            state,
-            CrossFileState::BlockBehind {
-                tracker_round: 7,
-                block_max_round: None
-            }
+            ledger.reconcile_cross_file().unwrap(),
+            CrossFileState::CatchpointOnly { tracker_round: 7 }
+        );
+
+        // Tracker behind blockdb (block stored before tracker apply
+        // commits — transient sync state): still Consistent.
+        ledger.put_block(10, "v41", b"hdr", b"blk").unwrap();
+        set_meta_u64(&ledger.conn, "current_round", 8).unwrap();
+        assert_eq!(
+            ledger.reconcile_cross_file().unwrap(),
+            CrossFileState::Consistent { round: 8 }
+        );
+
+        // Tracker-round row present even though it isn't the max
+        // (pruning case): Consistent — the hazard is about the exact
+        // tracker-round row, not the max.
+        ledger.put_block(8, "v41", b"hdr", b"blk").unwrap();
+        assert_eq!(
+            ledger.reconcile_cross_file().unwrap(),
+            CrossFileState::Consistent { round: 8 }
         );
     }
 

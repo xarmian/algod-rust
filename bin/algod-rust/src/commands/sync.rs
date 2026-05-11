@@ -239,14 +239,18 @@ pub async fn run(
 
     let effective_start = if db_exists {
         // Detect the cross-file split-commit gap before deciding where to
-        // resume from. A crash between the tracker WAL fsync and the
-        // blockdb WAL fsync can leave the tracker ahead of `blockdb.blocks`
-        // by one or more tail rounds; resuming from `tracker + 1` would
-        // skip those rounds permanently. When detected, walk back to the
-        // last round actually durable in the block DB so the next pass
-        // refetches and re-applies the missing tail.
+        // resume from. `CatchpointOnly` is the legitimate shape after
+        // `catchpoint import` (blockdb fully empty); sync's whole job at
+        // that point is to download blocks forward, so we accept it.
         match store.reconcile_cross_file()? {
             algo_ledger::CrossFileState::Empty | algo_ledger::CrossFileState::Consistent { .. } => {
+            }
+            algo_ledger::CrossFileState::CatchpointOnly { tracker_round } => {
+                info!(
+                    tracker_round,
+                    "catchpoint-only state detected (blockdb empty); sync will download blocks \
+                     forward from the catchpoint round"
+                );
             }
             algo_ledger::CrossFileState::BlockBehind {
                 tracker_round,
@@ -254,7 +258,7 @@ pub async fn run(
             } => {
                 error!(
                     tracker_round,
-                    block_max_round = ?block_max_round,
+                    block_max_round,
                     "cross-file split-commit gap detected: tracker advanced past blockdb.blocks. \
                      Refusing to resume because tracker/account state cannot be safely rewound \
                      in-place. Recover by re-syncing from a catchpoint, or delete the ledger \
@@ -262,7 +266,7 @@ pub async fn run(
                 );
                 anyhow::bail!(
                     "ledger inconsistency: tracker at round {tracker_round} but blockdb.blocks \
-                     stops at {block_max_round:?}. Recover from a catchpoint or delete the DB."
+                     max is {block_max_round}. Recover from a catchpoint or delete the DB."
                 );
             }
         }

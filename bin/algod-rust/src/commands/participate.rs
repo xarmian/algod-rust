@@ -2066,21 +2066,28 @@ pub async fn run(
         anyhow::anyhow!("failed to open ledger at {}: {}", ledger_path.display(), e)
     })?;
 
-    // Reject the split-commit gap before booting agreement — see
-    // `SqliteLedger::open_split` for the consistency model. Participating
-    // with a missing tail block would risk producing votes against state
-    // that the block archive can't reproduce on the next restart.
+    // Reject anything but a fully populated block archive before
+    // booting agreement. Participating with a missing tail block — or
+    // with the catchpoint-only "blockdb empty" shape — would risk
+    // producing votes against state that the block archive can't
+    // reproduce on the next restart.
     match sqlite_ledger.reconcile_cross_file().map_err(|e| {
         anyhow::anyhow!("reconcile cross-file consistency for participate ledger: {e}")
     })? {
         algo_ledger::CrossFileState::Empty | algo_ledger::CrossFileState::Consistent { .. } => {}
+        algo_ledger::CrossFileState::CatchpointOnly { tracker_round } => {
+            anyhow::bail!(
+                "participate requires blocks on disk; the ledger is catchpoint-only at round \
+                 {tracker_round}. Run `algod-rust sync` first to populate the block archive."
+            );
+        }
         algo_ledger::CrossFileState::BlockBehind {
             tracker_round,
             block_max_round,
         } => {
             anyhow::bail!(
-                "ledger inconsistency: tracker at round {tracker_round} but blockdb.blocks \
-                 stops at {block_max_round:?}. Recover from a catchpoint or delete the DB."
+                "ledger inconsistency: tracker at round {tracker_round} but blockdb.blocks max \
+                 is {block_max_round}. Recover from a catchpoint or delete the DB."
             );
         }
     }
