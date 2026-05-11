@@ -239,6 +239,18 @@ fn serialize_node(out: &mut Vec<u8>, node: &PageNode) {
     write_uvarint(out, node.hash.len() as u64);
     out.extend_from_slice(&node.hash);
     if node.is_leaf {
+        // Leaf nodes never carry children — Go's deserializer reads no
+        // child list when `leafFlag == 0` (`node.go:343-347`), so any
+        // children attached to a leaf-tagged node would be silently
+        // discarded on round-trip. Constructors (`PageNode::leaf` and
+        // the deserializer) maintain this invariant; the public-field
+        // path is checked here so misuse panics rather than corrupting
+        // the trie.
+        assert!(
+            node.children.is_empty(),
+            "leaf node must have no children; construct via PageNode::leaf or clear \
+             the children list before flipping is_leaf",
+        );
         out.push(0);
         return;
     }
@@ -718,6 +730,26 @@ mod tests {
                     child_id: 2,
                 },
             ],
+        };
+        let mut page = Page::new();
+        page.nodes.insert(1, bad);
+        let _ = page.serialize();
+    }
+
+    #[test]
+    #[should_panic(expected = "leaf node must have no children")]
+    fn serialize_panics_when_leaf_carries_children_via_public_fields() {
+        // Symmetric guard for the leaf branch: a caller that flips
+        // `is_leaf = true` while leaving children attached must panic
+        // at serialize time — without the assert, the children would
+        // be silently discarded and round-trip back as a bare leaf.
+        let bad = PageNode {
+            hash: vec![0u8; 4],
+            is_leaf: true,
+            children: vec![ChildEntry {
+                hash_index: 0x10,
+                child_id: 1,
+            }],
         };
         let mut page = Page::new();
         page.nodes.insert(1, bad);
