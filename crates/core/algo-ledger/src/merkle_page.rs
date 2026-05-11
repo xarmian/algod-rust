@@ -256,12 +256,18 @@ fn serialize_node(out: &mut Vec<u8>, node: &PageNode) {
         "non-leaf node must have at least one child to emit a sentinel terminator; \
          construct via PageNode::try_internal to surface this earlier",
     );
-    debug_assert!(
+    // The fields of `PageNode` are public for inspection (TASK-102 will
+    // need to walk node.hash / node.children from SQL-loaded pages), so
+    // a caller can in principle bypass `try_internal` and hand us a
+    // node with out-of-order or duplicate children. Validate at
+    // serialize time — a `debug_assert!` would silently emit a
+    // truncated/misaligned page in release builds.
+    assert!(
         node.children
             .windows(2)
             .all(|w| w[0].hash_index < w[1].hash_index),
-        "non-leaf children must be strictly ascending by hash_index; \
-         construct via PageNode::try_internal to enforce",
+        "non-leaf children must be strictly ascending by hash_index with no duplicates; \
+         construct via PageNode::try_internal to enforce, or sort+dedup before serialize",
     );
     for child in &node.children {
         out.push(child.hash_index);
@@ -689,6 +695,55 @@ mod tests {
             },
         ];
         assert!(PageNode::try_internal(vec![0u8; 32], dup).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "must be strictly ascending by hash_index")]
+    fn serialize_panics_on_unsorted_children_constructed_via_public_fields() {
+        // A caller that bypasses `try_internal` and assembles a node
+        // via the public fields can violate the format invariant. The
+        // serializer panics rather than emit a silently corrupt page
+        // (the runtime assert is intentional — debug-only would let it
+        // through in release builds).
+        let bad = PageNode {
+            hash: vec![0u8; 4],
+            is_leaf: false,
+            children: vec![
+                ChildEntry {
+                    hash_index: 0x55,
+                    child_id: 1,
+                },
+                ChildEntry {
+                    hash_index: 0x10, // out of order — assert fires here
+                    child_id: 2,
+                },
+            ],
+        };
+        let mut page = Page::new();
+        page.nodes.insert(1, bad);
+        let _ = page.serialize();
+    }
+
+    #[test]
+    #[should_panic(expected = "must be strictly ascending by hash_index")]
+    fn serialize_panics_on_duplicate_children_constructed_via_public_fields() {
+        let bad = PageNode {
+            hash: vec![0u8; 4],
+            is_leaf: false,
+            children: vec![
+                ChildEntry {
+                    hash_index: 0x10,
+                    child_id: 1,
+                },
+                ChildEntry {
+                    hash_index: 0x10, // duplicate — assert fires here
+                    child_id: 2,
+                },
+            ],
+        };
+        let mut page = Page::new();
+        page.nodes.insert(1, bad);
+        let _ = page.serialize();
     }
 
     #[test]
