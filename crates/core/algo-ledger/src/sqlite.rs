@@ -99,6 +99,31 @@ CREATE TABLE IF NOT EXISTS merkle_trie (
     data BLOB NOT NULL
 );
 
+-- Go-compatible paged trie storage. Matches
+-- `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:66-68`
+-- byte-for-byte modulo the IF NOT EXISTS clause. Each row is one page
+-- of the merkle trie serialized with the format documented on
+-- `algo_ledger::merkle_page::Page`. The legacy single-blob `merkle_trie`
+-- row (`id = 0`) is preserved alongside this table during the
+-- migration window and is the source of truth for now; TASK-102's
+-- legacy-data check refuses to open a DB that has the old blob without
+-- the new pages so a future task can flip the source-of-truth without
+-- silently dropping state.
+CREATE TABLE IF NOT EXISTS accounthashes (
+    id   INTEGER PRIMARY KEY,
+    data BLOB
+);
+
+-- Staging table for catchpoint imports. Mirrors
+-- `../go-algorand/ledger/store/trackerdb/sqlitedriver/catchpoint.go:534`;
+-- the orchestrator writes new pages here and renames the table to
+-- `accounthashes` once the catchpoint is fully imported. Created
+-- up-front by `IF NOT EXISTS` so the import path doesn't have to.
+CREATE TABLE IF NOT EXISTS catchpointaccounthashes (
+    id   INTEGER PRIMARY KEY,
+    data BLOB
+);
+
 CREATE TABLE IF NOT EXISTS kvstore (
     key   BLOB PRIMARY KEY,
     value BLOB
@@ -1973,6 +1998,22 @@ impl SqliteLedger {
             .map_err(|e| AlgoError::Ledger {
                 message: format!("schema creation error (block): {e}"),
             })?;
+
+        // Legacy-trie-format note (TASK-102 / PLAN-35 / DOC-24 §G2):
+        //
+        // Older Rust ledgers stored the trie as a single blob in the
+        // `merkle_trie` table; TASK-102 added the `accounthashes` /
+        // `catchpointaccounthashes` Go-compatible paged tables alongside
+        // it. The two formats are NOT interchangeable byte-for-byte:
+        // Rust's `MerkleTrie` is path-compressed while Go's is a
+        // 256-ary radix trie. Until the Rust trie is converted to
+        // Go's shape (a follow-up PLAN-35 task), the runtime still
+        // writes to `merkle_trie` and leaves the paged tables empty
+        // (Go reads will return no pages — same as an empty trie).
+        // We intentionally do NOT refuse to open a legacy-blob DB
+        // here yet; that gate lands together with the trie rewrite
+        // so the recovery path ("re-sync from a catchpoint") has a
+        // real new-format target to migrate to.
 
         // Load cached chain-level state from DB.
         let current_round = Round(get_meta_u64(&conn, "current_round")?);
