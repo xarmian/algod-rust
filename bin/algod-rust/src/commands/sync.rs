@@ -240,16 +240,32 @@ pub async fn run(
     let effective_start = if db_exists {
         // Detect the cross-file split-commit gap before deciding where to
         // resume from. `CatchpointOnly` is the legitimate shape after
-        // `catchpoint import` (blockdb fully empty); sync's whole job at
-        // that point is to download blocks forward, so we accept it.
+        // `catchpoint import` (blockdb fully empty); sync accepts it and
+        // continues downloading forward.
+        //
+        // KNOWN GAP: the standalone `algod-rust catchpoint import` does
+        // not download lookback blocks (see the warning emitted by
+        // `bin/algod-rust/src/commands/catchpoint.rs` step 8). Resuming
+        // forward from `tracker + 1` therefore leaves
+        // `[catchpoint - MaxTxnLife, catchpoint]` empty in `blockdb`,
+        // which breaks lease validation and cert cross-verify for those
+        // rounds. The full catchpoint orchestrator (`algod-rust
+        // catchpoint sync`) downloads the lookback range and ends up in
+        // `Consistent`. Re-emit the same warning here so operators see
+        // it on every sync resume, not only at import time. Backfilling
+        // the lookback range from this path is tracked separately under
+        // PLAN-35.
         match store.reconcile_cross_file()? {
             algo_ledger::CrossFileState::Empty | algo_ledger::CrossFileState::Consistent { .. } => {
             }
             algo_ledger::CrossFileState::CatchpointOnly { tracker_round } => {
-                info!(
+                warn!(
                     tracker_round,
                     "catchpoint-only state detected (blockdb empty); sync will download blocks \
-                     forward from the catchpoint round"
+                     forward, but [catchpoint - MaxTxnLife, catchpoint] remains EMPTY — lease \
+                     validation and cert cross-verify for those rounds will be unavailable. \
+                     Use `algod-rust catchpoint sync` (full orchestrator) instead of \
+                     `catchpoint import` + `sync` to fill the lookback range."
                 );
             }
             algo_ledger::CrossFileState::BlockBehind {
