@@ -94,16 +94,44 @@ impl PageNode {
     }
 
     /// Construct a non-leaf node with the given subtree hash and child
-    /// list. `children` is taken as-is — the caller is responsible for
-    /// keeping it sorted ascending by `hash_index`, matching the
-    /// invariant the deserializer relies on
-    /// (`node.go:355` breaks on the first non-monotone byte).
+    /// list. Children are normalized to the invariant the on-disk
+    /// format requires: sorted ascending by `hash_index` and unique
+    /// (`node.go:355` breaks the decode loop on the first non-monotone
+    /// byte, so duplicates / out-of-order entries would round-trip into
+    /// a shorter child list and silently corrupt the trie).
+    ///
+    /// Panics if `children` is empty — go-algorand never produces a
+    /// non-leaf node with zero children (the serializer would have no
+    /// sentinel byte to emit). Callers that may have an empty list
+    /// should construct a leaf instead, or use
+    /// [`PageNode::try_internal`].
     pub fn internal(hash: Vec<u8>, children: Vec<ChildEntry>) -> Self {
-        Self {
+        Self::try_internal(hash, children).expect("non-leaf must have at least one child")
+    }
+
+    /// Fallible variant of [`PageNode::internal`]. Returns the same
+    /// normalized node on success, or `None` if `children` is empty.
+    /// Duplicate `hash_index` entries are also rejected because they
+    /// would collapse on deserialization (the sentinel terminator
+    /// fires when the next index is `<=` the previous one).
+    pub fn try_internal(hash: Vec<u8>, mut children: Vec<ChildEntry>) -> Option<Self> {
+        if children.is_empty() {
+            return None;
+        }
+        children.sort_by_key(|c| c.hash_index);
+        // Reject duplicates: two children sharing the same `hash_index`
+        // can never round-trip through the format (the deserializer
+        // treats the second occurrence as a sentinel terminator).
+        for win in children.windows(2) {
+            if win[0].hash_index == win[1].hash_index {
+                return None;
+            }
+        }
+        Some(Self {
             hash,
             children,
             is_leaf: false,
-        }
+        })
     }
 }
 
@@ -215,13 +243,25 @@ fn serialize_node(out: &mut Vec<u8>, node: &PageNode) {
         return;
     }
     out.push(1);
-    // Children: emit each (hashIndex, childID) pair, then a sentinel
+    // Children must already be sorted ascending by hash_index with no
+    // duplicates — `PageNode::try_internal` enforces this on
+    // construction, and `Page::deserialize` produces nodes that match
+    // that invariant directly. The format relies on it: the loop below
+    // emits each (hashIndex, childID) pair, then a single sentinel
     // byte equal to the LAST child's hashIndex so the deserializer
-    // loop terminates on the first non-monotone byte
-    // (`node.go:355` `childIndex <= prevChildIndex && !first` break).
-    debug_assert!(
+    // breaks on the first non-monotone byte (`node.go:355`
+    // `childIndex <= prevChildIndex && !first`).
+    assert!(
         !node.children.is_empty(),
-        "non-leaf node must have at least one child to round-trip via the sentinel terminator",
+        "non-leaf node must have at least one child to emit a sentinel terminator; \
+         construct via PageNode::try_internal to surface this earlier",
+    );
+    debug_assert!(
+        node.children
+            .windows(2)
+            .all(|w| w[0].hash_index < w[1].hash_index),
+        "non-leaf children must be strictly ascending by hash_index; \
+         construct via PageNode::try_internal to enforce",
     );
     for child in &node.children {
         out.push(child.hash_index);
@@ -243,15 +283,21 @@ fn deserialize_node(buf: &[u8], offset: usize) -> Result<(PageNode, usize), Stri
     let hash_len_usize: usize = hash_len
         .try_into()
         .map_err(|_| format!("hash length {hash_len} overflows usize"))?;
-    if cursor + hash_len_usize >= buf.len() {
-        // Need at least one more byte for the leaf flag.
+    // `cursor + hash_len_usize` would overflow on absurd (corrupt)
+    // inputs, so use `checked_add` and treat overflow as truncation.
+    // The trailing leaf-flag byte must also fit in the remaining slice;
+    // requiring `< buf.len()` (rather than `<=`) reserves room for it.
+    let hash_end = cursor.checked_add(hash_len_usize).ok_or_else(|| {
+        format!("node body length overflow (hash_len={hash_len_usize}, cursor={cursor})",)
+    })?;
+    if hash_end >= buf.len() {
         return Err(format!(
             "truncated node body (need hash {hash_len_usize} + flag byte; have {} bytes left)",
             buf.len().saturating_sub(cursor),
         ));
     }
-    let hash = buf[cursor..cursor + hash_len_usize].to_vec();
-    cursor += hash_len_usize;
+    let hash = buf[cursor..hash_end].to_vec();
+    cursor = hash_end;
     let leaf_flag = buf[cursor];
     cursor += 1;
     if leaf_flag == 0 {
@@ -590,5 +636,93 @@ mod tests {
         let bytes = page.serialize();
         let decoded = Page::deserialize(&bytes).expect("decode full page");
         assert_eq!(decoded, page);
+    }
+
+    #[test]
+    fn try_internal_rejects_empty_children() {
+        assert!(PageNode::try_internal(vec![0u8; 32], vec![]).is_none());
+    }
+
+    #[test]
+    fn try_internal_sorts_unsorted_children() {
+        // Construct with deliberately reversed children; try_internal
+        // must normalize them to ascending hash_index order so the
+        // serialize/deserialize round trip preserves the full list.
+        let unsorted = vec![
+            ChildEntry {
+                hash_index: 0xff,
+                child_id: 3,
+            },
+            ChildEntry {
+                hash_index: 0x10,
+                child_id: 1,
+            },
+            ChildEntry {
+                hash_index: 0x55,
+                child_id: 2,
+            },
+        ];
+        let node = PageNode::try_internal(vec![0u8; 32], unsorted).expect("non-empty children");
+        let expected_indices: Vec<u8> = node.children.iter().map(|c| c.hash_index).collect();
+        assert_eq!(expected_indices, vec![0x10, 0x55, 0xff]);
+
+        let mut page = Page::new();
+        page.nodes.insert(1, node.clone());
+        let bytes = page.serialize();
+        let decoded = Page::deserialize(&bytes).expect("decode normalized");
+        assert_eq!(decoded.nodes.get(&1).unwrap(), &node);
+    }
+
+    #[test]
+    fn try_internal_rejects_duplicate_hash_indices() {
+        // Two children with the same hash_index would round-trip as one
+        // because the deserializer's sentinel fires on the second
+        // occurrence (`<= prevChildIndex`). Reject up front.
+        let dup = vec![
+            ChildEntry {
+                hash_index: 0x10,
+                child_id: 1,
+            },
+            ChildEntry {
+                hash_index: 0x10,
+                child_id: 2,
+            },
+        ];
+        assert!(PageNode::try_internal(vec![0u8; 32], dup).is_none());
+    }
+
+    #[test]
+    fn deserialize_rejects_overflowing_hash_length() {
+        // Craft a node whose declared hash length exceeds the buffer:
+        // the addition `cursor + hash_len_usize` would have overflowed
+        // on 32-bit targets, so we expect an `AlgoError`, not a panic.
+        let mut bytes = Vec::new();
+        write_uvarint(&mut bytes, NODE_PAGE_VERSION);
+        write_varint(&mut bytes, 1); // 1 node
+        write_uvarint(&mut bytes, 7); // nodeID
+                                      // Declare a 1 GiB hash length, then provide nothing.
+        write_uvarint(&mut bytes, 1u64 << 30);
+        let err = Page::deserialize(&bytes).expect_err("must reject huge hash length");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("truncated node body") || msg.contains("length overflow"),
+            "expected truncation / overflow error, got: {msg}",
+        );
+
+        // Now craft a length that overflows `usize` on every platform:
+        // varint of u64::MAX. On 64-bit hosts this overflows on
+        // `try_into`; on 32-bit hosts it overflows on `checked_add`.
+        // Both paths must produce an error rather than panic.
+        let mut bytes = Vec::new();
+        write_uvarint(&mut bytes, NODE_PAGE_VERSION);
+        write_varint(&mut bytes, 1);
+        write_uvarint(&mut bytes, 9);
+        write_uvarint(&mut bytes, u64::MAX);
+        let err = Page::deserialize(&bytes).expect_err("must reject u64::MAX hash length");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("overflow") || msg.contains("truncated"),
+            "expected overflow / truncation error, got: {msg}",
+        );
     }
 }
