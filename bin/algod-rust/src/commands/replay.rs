@@ -400,7 +400,11 @@ pub async fn run_stateful(
     // NOTE: On resume, in-memory leases from the previous session are lost.
     // This is acceptable because committed blocks are already validated —
     // lease violations cannot occur during replay of valid chain history.
-    let db_exists = db_path.exists();
+    //
+    // `db_path` is a ledger prefix (or legacy `.sqlite`-suffixed path);
+    // existence is determined by the derived tracker file because the prefix
+    // path itself does not exist as a file under the split layout.
+    let db_exists = algo_ledger::ledger_exists(db_path);
     let mut store = algo_ledger::SqliteLedger::open(db_path)?;
 
     let effective_start = if db_exists {
@@ -417,7 +421,7 @@ pub async fn run_stateful(
             // previous aborted run. Delete and recreate to avoid stale state.
             warn!("existing DB has no committed round — recreating");
             drop(store);
-            std::fs::remove_file(db_path)?;
+            algo_ledger::remove_ledger_files(db_path)?;
             store = algo_ledger::SqliteLedger::open(db_path)?;
             load_genesis_into_store(&mut store, genesis_path)?;
             start

@@ -230,8 +230,11 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let client = Arc::new(AlgodClient::new(algod_url, algod_token));
 
-    // Open or create the SQLite ledger.
-    let db_exists = db_path.exists();
+    // Open or create the SQLite ledger. `db_path` is a ledger prefix (or a
+    // legacy `.sqlite`-suffixed path); existence is determined by the
+    // derived tracker file, not the prefix path itself
+    // (which doesn't exist as a file in the split layout).
+    let db_exists = algo_ledger::ledger_exists(db_path);
     let mut store = SqliteLedger::open(db_path)?;
 
     let effective_start = if db_exists {
@@ -247,7 +250,7 @@ pub async fn run(
             // DB exists but no committed round — stale/partial DB.
             warn!("existing DB has no committed round — recreating");
             drop(store);
-            std::fs::remove_file(db_path)?;
+            algo_ledger::remove_ledger_files(db_path)?;
             store = SqliteLedger::open(db_path)?;
             if start == 0 {
                 load_genesis_into_store(&mut store, genesis_path)?;

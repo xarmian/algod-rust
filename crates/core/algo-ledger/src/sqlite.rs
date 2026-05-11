@@ -204,6 +204,85 @@ pub fn block_path_for_prefix(prefix: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(s)
 }
 
+/// Open a raw `rusqlite::Connection` against the ledger pair derived from
+/// `path` (a prefix or legacy `.sqlite`-suffixed path). The tracker file is
+/// opened as the `main` schema and the block file is attached as `blockdb`.
+///
+/// This is the lower-level companion to [`SqliteLedger::open`]: it returns a
+/// bare connection (without running any schema DDL or loading cached chain
+/// state) so callers that perform raw SQL — catchpoint import, ad-hoc
+/// maintenance tooling, etc. — can address both schemas through the same
+/// connection. Both schemas are switched to WAL mode and `synchronous=NORMAL`.
+pub fn open_ledger_connection(path: &Path) -> Result<Connection, AlgoError> {
+    let prefix = derive_ledger_prefix(path);
+    let tracker = tracker_path_for_prefix(&prefix);
+    let block = block_path_for_prefix(&prefix);
+    let conn = Connection::open(&tracker).map_err(|e| AlgoError::Ledger {
+        message: format!(
+            "sqlite open error opening tracker db {}: {e}",
+            tracker.display()
+        ),
+    })?;
+    conn.execute(
+        "ATTACH DATABASE ?1 AS blockdb",
+        params![block.to_string_lossy().as_ref()],
+    )
+    .map_err(|e| AlgoError::Ledger {
+        message: format!(
+            "sqlite attach error opening block db {}: {e}",
+            block.display()
+        ),
+    })?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA blockdb.journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA blockdb.synchronous=NORMAL;",
+    )
+    .map_err(|e| AlgoError::Ledger {
+        message: format!("set pragmas on ledger connection: {e}"),
+    })?;
+    Ok(conn)
+}
+
+/// Return `true` if a ledger database pair (tracker file) already exists at
+/// the given prefix-or-path. Mirrors the "does the on-disk DB exist?" check
+/// callers used to perform against a single-file `ledger.sqlite`.
+pub fn ledger_exists(path: &Path) -> bool {
+    let prefix = derive_ledger_prefix(path);
+    tracker_path_for_prefix(&prefix).exists()
+}
+
+/// Remove every file backing a ledger pair (`<prefix>.tracker.sqlite`,
+/// `<prefix>.block.sqlite`, and their SQLite WAL/SHM sidecars).
+///
+/// Matches the cleanup paths in go-algorand's tests
+/// (`../go-algorand/ledger/ledger_test.go:1485-2520`) which remove the same
+/// six files when a stale DB needs to be recreated. Missing files are
+/// silently ignored; the first I/O error stops the cleanup and is returned.
+pub fn remove_ledger_files(path: &Path) -> std::io::Result<()> {
+    let prefix = derive_ledger_prefix(path);
+    for suffix in [
+        TRACKER_SUFFIX,
+        BLOCK_SUFFIX,
+        // SQLite WAL-mode sidecars created next to each DB file.
+        ".tracker.sqlite-wal",
+        ".tracker.sqlite-shm",
+        ".block.sqlite-wal",
+        ".block.sqlite-shm",
+    ] {
+        let mut full = prefix.as_os_str().to_owned();
+        full.push(suffix);
+        let target = std::path::PathBuf::from(full);
+        match std::fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 // Resource ctype constants (matches Go's `basics.AssetCreatable = 0`, `basics.AppCreatable = 1`)
 const CTYPE_ASSET: i64 = 0;
 const CTYPE_APP: i64 = 1;
@@ -1782,9 +1861,20 @@ impl SqliteLedger {
         })?;
         // ATTACH the block file as the `blockdb` schema. Mirrors go-algorand's
         // two-file layout while keeping all SQL routed through a single
-        // connection (so transactions span both files via SQLite's 2-phase
-        // commit). The block file is parameter-bound to avoid quoting issues
-        // with paths that contain a quote character.
+        // connection. The block file is parameter-bound to avoid quoting
+        // issues with paths that contain a quote character.
+        //
+        // Cross-file commit semantics: SQLite uses a multi-database commit
+        // sequence for transactions that touch both schemas. In WAL mode the
+        // ordering is well-defined (each WAL is fsync'd in turn) but is NOT
+        // a true atomic commit across files — a crash mid-commit can leave
+        // the tracker and block schemas at adjacent rounds, with the tracker
+        // ahead by at most one. This mirrors go-algorand's behavior (the
+        // tracker and block DBs are also independent there) and is handled
+        // by the sync/replay startup paths, which resume from
+        // `last_committed_round()` and re-fetch any missing tail block. The
+        // caller MUST NOT assume that "tracker says round N" implies
+        // "blockdb contains round N's row".
         conn.execute(
             "ATTACH DATABASE ?1 AS blockdb",
             params![block_path.to_string_lossy().as_ref()],

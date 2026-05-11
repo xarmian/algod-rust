@@ -49,8 +49,9 @@ pub use rewards::{
     apply_rewards, compute_pending_rewards, normalized_online_balance, REWARD_UNITS,
 };
 pub use sqlite::{
-    block_path_for_prefix, derive_ledger_prefix, tracker_path_for_prefix, ReadSnapshot,
-    SqliteLedger, BLOCK_SUFFIX, TRACKER_SUFFIX,
+    block_path_for_prefix, derive_ledger_prefix, ledger_exists, open_ledger_connection,
+    remove_ledger_files, tracker_path_for_prefix, ReadSnapshot, SqliteLedger, BLOCK_SUFFIX,
+    TRACKER_SUFFIX,
 };
 pub use state::{schema_min_balance, LedgerState, StateSnapshot};
 pub use store_trait::LedgerStore;

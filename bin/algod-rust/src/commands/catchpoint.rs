@@ -5,8 +5,8 @@ use std::time::Instant;
 use algo_ledger::catchpoint::{
     import_catchpoint_file, parse_catchpoint_label, validate_post_import, verify_catchpoint,
 };
+use algo_ledger::open_ledger_connection;
 use algo_rest_client::{CatchpointDownloader, DownloadProgress};
-use rusqlite::Connection;
 use tracing::{error, info, warn};
 
 /// Run the catchpoint import subcommand.
@@ -22,10 +22,11 @@ pub async fn run_import(
 ) -> anyhow::Result<()> {
     let timer = Instant::now();
 
-    // Step 1: Open database connection.
-    let conn = Connection::open(db_path).map_err(|e| anyhow::anyhow!("open db: {e}"))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-        .map_err(|e| anyhow::anyhow!("set pragmas: {e}"))?;
+    // Step 1: Open database connection. `db_path` is a ledger prefix (or
+    // legacy `.sqlite`-suffixed path); the helper opens the tracker file
+    // and attaches the block file as `blockdb`, matching the layout used by
+    // sync/relay/participate so downstream tooling sees the same data.
+    let conn = open_ledger_connection(db_path).map_err(|e| anyhow::anyhow!("open db: {e}"))?;
 
     println!("=== Catchpoint Import ===");
     println!("File:     {}", file_path.display());
@@ -281,7 +282,9 @@ pub async fn run_import(
 
 /// Run the catchpoint verify subcommand (verify an already-imported database).
 pub async fn run_verify(db_path: &Path, file_path: Option<&Path>) -> anyhow::Result<()> {
-    let conn = Connection::open(db_path).map_err(|e| anyhow::anyhow!("open db: {e}"))?;
+    // Open via the split-ledger helper so the verify pass sees the same data
+    // (tracker + attached `blockdb`) that import/sync wrote.
+    let conn = open_ledger_connection(db_path).map_err(|e| anyhow::anyhow!("open db: {e}"))?;
 
     println!("=== Catchpoint Verify ===");
     println!("Database: {}", db_path.display());
