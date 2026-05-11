@@ -253,6 +253,27 @@ pub fn ledger_exists(path: &Path) -> bool {
     tracker_path_for_prefix(&prefix).exists()
 }
 
+/// Outcome of [`SqliteLedger::reconcile_cross_file`]. Distinguishes the
+/// fresh-DB / consistent / tracker-ahead cases so callers can route to
+/// the right startup recovery path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossFileState {
+    /// Neither the tracker nor `blockdb.blocks` has committed any rounds.
+    Empty,
+    /// Tracker and `blockdb.blocks` agree on the latest round.
+    Consistent { round: u64 },
+    /// Tracker recorded round `tracker_round` as committed but
+    /// `blockdb.blocks` only contains rows up to `block_max_round` (or
+    /// none at all). The gap was created by a crash mid-commit; the
+    /// caller is responsible for backfilling the missing block(s) or
+    /// rejecting startup. Mirrors go-algorand's split tracker/block DB
+    /// recovery (`../go-algorand/ledger/ledger.go:327,336`).
+    BlockBehind {
+        tracker_round: u64,
+        block_max_round: Option<u64>,
+    },
+}
+
 /// Remove every file backing a ledger pair (`<prefix>.tracker.sqlite`,
 /// `<prefix>.block.sqlite`, and their SQLite WAL/SHM sidecars).
 ///
@@ -2319,6 +2340,71 @@ impl SqliteLedger {
         } else {
             Ok(Some(val))
         }
+    }
+
+    /// Highest round currently stored in the attached block database, or
+    /// `None` if the table is empty.
+    ///
+    /// Used together with [`Self::last_committed_round`] to detect the
+    /// cross-file split-commit gap documented on [`Self::open_split`]: if
+    /// the tracker reports round `N` but `blockdb.blocks` only goes up to
+    /// `M < N`, the tail block was not durably written. Callers can use
+    /// the gap to decide between bailing out, refetching, or rolling
+    /// forward.
+    pub fn max_block_round_in_blockdb(&self) -> Result<Option<u64>, AlgoError> {
+        // SQLite `MAX()` over an empty table returns NULL, so collect into
+        // an Option<i64> rather than a bare i64.
+        let raw: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(rnd) FROM blockdb.blocks", [], |row| row.get(0))
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("max_block_round_in_blockdb query error: {e}"),
+            })?;
+        Ok(raw.map(|v| v as u64))
+    }
+
+    /// Result of cross-file (tracker vs `blockdb`) consistency checks
+    /// at startup. See [`Self::reconcile_cross_file`].
+    fn _consistency_state_doc(&self) {}
+
+    /// Inspect the tracker / block-DB round pair and report any
+    /// inconsistency caused by the non-atomic ATTACH commit documented on
+    /// [`Self::open_split`].
+    ///
+    /// Returns:
+    /// - [`CrossFileState::Empty`] when no rounds have been committed yet
+    ///   (fresh DB or post-`remove_ledger_files`).
+    /// - [`CrossFileState::Consistent`] when tracker and block DB are
+    ///   at the same round (the common case).
+    /// - [`CrossFileState::BlockBehind`] when the tracker is ahead. This
+    ///   indicates the tail block (or several tail blocks) is missing
+    ///   from `blockdb.blocks`; the resume path needs to either backfill
+    ///   those blocks from the network or reject startup until the user
+    ///   recovers the DB.
+    pub fn reconcile_cross_file(&self) -> Result<CrossFileState, AlgoError> {
+        let tracker = self.last_committed_round()?;
+        let block_max = self.max_block_round_in_blockdb()?;
+        let state = match (tracker, block_max) {
+            (None, _) => CrossFileState::Empty,
+            // Tracker reports round 0 (genesis bootstrap) and blockdb is
+            // empty — fresh DB, not a gap.
+            (Some(0), None) => CrossFileState::Empty,
+            (Some(t), None) => CrossFileState::BlockBehind {
+                tracker_round: t,
+                block_max_round: None,
+            },
+            (Some(t), Some(b)) if t > b => CrossFileState::BlockBehind {
+                tracker_round: t,
+                block_max_round: Some(b),
+            },
+            // Tracker == blockdb (the consistent case) OR tracker behind
+            // blockdb (a sync where the block arrived first but tracker
+            // apply lags). Neither is the split-commit hazard documented
+            // on `open_split`; treat both as Consistent at the tracker
+            // round.
+            (Some(t), Some(_)) => CrossFileState::Consistent { round: t },
+        };
+        Ok(state)
     }
 
     /// Check whether the `accounttotals` row has been populated —
@@ -5104,6 +5190,56 @@ mod tests {
         assert_eq!(
             ledger.get_block_cert(42).unwrap().as_deref(),
             Some(b"cert".as_ref())
+        );
+    }
+
+    #[test]
+    fn reconcile_cross_file_reports_empty_consistent_and_block_behind() {
+        // Empty DB: both tracker and blockdb are bare. Should report Empty.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        let mut ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+        assert_eq!(
+            ledger.reconcile_cross_file().unwrap(),
+            CrossFileState::Empty
+        );
+
+        // Simulate the consistent case: tracker advanced to round 5 and
+        // blockdb has a row for round 5.
+        ledger.put_block(5, "v41", b"hdr", b"blk").unwrap();
+        set_meta_u64(&ledger.conn, "current_round", 5).unwrap();
+        assert_eq!(
+            ledger.reconcile_cross_file().unwrap(),
+            CrossFileState::Consistent { round: 5 }
+        );
+
+        // Simulate the split-commit gap: bump tracker to round 7 without
+        // adding the matching blockdb rows. This is the post-crash shape
+        // the reconciliation is meant to catch.
+        set_meta_u64(&ledger.conn, "current_round", 7).unwrap();
+        let state = ledger.reconcile_cross_file().unwrap();
+        assert_eq!(
+            state,
+            CrossFileState::BlockBehind {
+                tracker_round: 7,
+                block_max_round: Some(5)
+            }
+        );
+
+        // Tracker ahead but blockdb totally empty (rare: catchpoint
+        // import bumped tracker but no blocks fetched yet) — still
+        // reports the gap so the caller decides what to do.
+        ledger
+            .conn
+            .execute("DELETE FROM blockdb.blocks", [])
+            .unwrap();
+        let state = ledger.reconcile_cross_file().unwrap();
+        assert_eq!(
+            state,
+            CrossFileState::BlockBehind {
+                tracker_round: 7,
+                block_max_round: None
+            }
         );
     }
 

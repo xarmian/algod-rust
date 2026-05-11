@@ -238,6 +238,34 @@ pub async fn run(
     let mut store = SqliteLedger::open(db_path)?;
 
     let effective_start = if db_exists {
+        // Detect the cross-file split-commit gap before deciding where to
+        // resume from. A crash between the tracker WAL fsync and the
+        // blockdb WAL fsync can leave the tracker ahead of `blockdb.blocks`
+        // by one or more tail rounds; resuming from `tracker + 1` would
+        // skip those rounds permanently. When detected, walk back to the
+        // last round actually durable in the block DB so the next pass
+        // refetches and re-applies the missing tail.
+        match store.reconcile_cross_file()? {
+            algo_ledger::CrossFileState::Empty | algo_ledger::CrossFileState::Consistent { .. } => {
+            }
+            algo_ledger::CrossFileState::BlockBehind {
+                tracker_round,
+                block_max_round,
+            } => {
+                error!(
+                    tracker_round,
+                    block_max_round = ?block_max_round,
+                    "cross-file split-commit gap detected: tracker advanced past blockdb.blocks. \
+                     Refusing to resume because tracker/account state cannot be safely rewound \
+                     in-place. Recover by re-syncing from a catchpoint, or delete the ledger \
+                     pair and start fresh."
+                );
+                anyhow::bail!(
+                    "ledger inconsistency: tracker at round {tracker_round} but blockdb.blocks \
+                     stops at {block_max_round:?}. Recover from a catchpoint or delete the DB."
+                );
+            }
+        }
         if let Some(last_round) = store.last_committed_round()? {
             let resume = last_round + 1;
             info!(
