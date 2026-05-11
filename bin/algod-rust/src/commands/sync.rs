@@ -230,11 +230,62 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let client = Arc::new(AlgodClient::new(algod_url, algod_token));
 
-    // Open or create the SQLite ledger.
-    let db_exists = db_path.exists();
+    // Open or create the SQLite ledger. `db_path` is a ledger prefix (or a
+    // legacy `.sqlite`-suffixed path); existence is determined by the
+    // derived tracker file, not the prefix path itself
+    // (which doesn't exist as a file in the split layout).
+    let db_exists = algo_ledger::ledger_exists(db_path);
     let mut store = SqliteLedger::open(db_path)?;
 
     let effective_start = if db_exists {
+        // Detect the cross-file split-commit gap before deciding where to
+        // resume from. `CatchpointOnly` is the legitimate shape after
+        // `catchpoint import` (blockdb fully empty); sync accepts it and
+        // continues downloading forward.
+        //
+        // KNOWN GAP: the standalone `algod-rust catchpoint import` does
+        // not download lookback blocks (see the warning emitted by
+        // `bin/algod-rust/src/commands/catchpoint.rs` step 8). Resuming
+        // forward from `tracker + 1` therefore leaves
+        // `[catchpoint - MaxTxnLife, catchpoint]` empty in `blockdb`,
+        // which breaks lease validation and cert cross-verify for those
+        // rounds. The full catchpoint orchestrator (`algod-rust
+        // catchpoint sync`) downloads the lookback range and ends up in
+        // `Consistent`. Re-emit the same warning here so operators see
+        // it on every sync resume, not only at import time. Backfilling
+        // the lookback range from this path is tracked separately under
+        // PLAN-35.
+        match store.reconcile_cross_file()? {
+            algo_ledger::CrossFileState::Empty | algo_ledger::CrossFileState::Consistent { .. } => {
+            }
+            algo_ledger::CrossFileState::CatchpointOnly { tracker_round } => {
+                warn!(
+                    tracker_round,
+                    "catchpoint-only state detected (blockdb empty); sync will download blocks \
+                     forward, but [catchpoint - MaxTxnLife, catchpoint] remains EMPTY — lease \
+                     validation and cert cross-verify for those rounds will be unavailable. \
+                     Use `algod-rust catchpoint sync` (full orchestrator) instead of \
+                     `catchpoint import` + `sync` to fill the lookback range."
+                );
+            }
+            algo_ledger::CrossFileState::BlockBehind {
+                tracker_round,
+                block_max_round,
+            } => {
+                error!(
+                    tracker_round,
+                    block_max_round,
+                    "cross-file split-commit gap detected: tracker advanced past blockdb.blocks. \
+                     Refusing to resume because tracker/account state cannot be safely rewound \
+                     in-place. Recover by re-syncing from a catchpoint, or delete the ledger \
+                     pair and start fresh."
+                );
+                anyhow::bail!(
+                    "ledger inconsistency: tracker at round {tracker_round} but blockdb.blocks \
+                     max is {block_max_round}. Recover from a catchpoint or delete the DB."
+                );
+            }
+        }
         if let Some(last_round) = store.last_committed_round()? {
             let resume = last_round + 1;
             info!(
@@ -247,7 +298,7 @@ pub async fn run(
             // DB exists but no committed round — stale/partial DB.
             warn!("existing DB has no committed round — recreating");
             drop(store);
-            std::fs::remove_file(db_path)?;
+            algo_ledger::remove_ledger_files(db_path)?;
             store = SqliteLedger::open(db_path)?;
             if start == 0 {
                 load_genesis_into_store(&mut store, genesis_path)?;

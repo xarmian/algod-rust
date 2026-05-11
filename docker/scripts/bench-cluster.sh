@@ -157,8 +157,10 @@ while true; do
     # Get rounds
     GO_RELAY_ROUND=$(get_round "http://localhost:4001")
     GO_NONRELAY_ROUND=$(get_round "http://localhost:4002")
-    # Query rust-relay's ledger round directly via sqlite
-    RUST_RELAY_ROUND=$(docker exec mc-rust-relay sqlite3 /app/ledger.sqlite "SELECT value FROM algod_rust_meta WHERE key='current_round'" 2>/dev/null || echo "?")
+    # Query rust-relay's ledger round directly via sqlite. Since TASK-100
+    # the round metadata lives in the tracker DB
+    # (`<prefix>.tracker.sqlite`), not the legacy single `ledger.sqlite`.
+    RUST_RELAY_ROUND=$(docker exec mc-rust-relay sqlite3 /app/ledger.tracker.sqlite "SELECT value FROM algod_rust_meta WHERE key='current_round'" 2>/dev/null || echo "?")
 
     # Sample container stats
     RUST_STATS=$(sample_stats "mc-rust-relay" 2>/dev/null || echo "")

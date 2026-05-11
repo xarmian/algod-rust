@@ -121,8 +121,13 @@ pub enum Commands {
         #[arg(long, default_value = "1")]
         sample_rate: u64,
 
-        /// SQLite database path for stateful replay.
-        #[arg(long, default_value = "./ledger.sqlite")]
+        /// Ledger prefix for the on-disk database pair (tracker + block
+        /// SQLite files). The CLI opens `<prefix>.tracker.sqlite` and
+        /// `<prefix>.block.sqlite`, matching go-algorand's layout
+        /// (`../go-algorand/ledger/ledger.go:327,336`). Legacy values that
+        /// end in `.sqlite` or `.tracker.sqlite` / `.block.sqlite` are
+        /// accepted — the suffix is stripped to recover the prefix.
+        #[arg(long, alias = "ledger-prefix", default_value = "./ledger")]
         db: PathBuf,
 
         /// Enable Merkle trie state root computation.
@@ -159,8 +164,13 @@ pub enum Commands {
         #[arg(long)]
         genesis: Option<PathBuf>,
 
-        /// SQLite database path for ledger state.
-        #[arg(long, default_value = "./ledger.sqlite")]
+        /// Ledger prefix for the on-disk database pair (tracker + block
+        /// SQLite files). The CLI opens `<prefix>.tracker.sqlite` and
+        /// `<prefix>.block.sqlite`, matching go-algorand's layout
+        /// (`../go-algorand/ledger/ledger.go:327,336`). Legacy values that
+        /// end in `.sqlite` or `.tracker.sqlite` / `.block.sqlite` are
+        /// accepted — the suffix is stripped to recover the prefix.
+        #[arg(long, alias = "ledger-prefix", default_value = "./ledger")]
         db: PathBuf,
 
         /// First round to sync (default: 0, or resume from DB).
@@ -245,8 +255,13 @@ pub enum Commands {
         #[arg(long, short = 'b')]
         bind_address: String,
 
-        /// Path to the SQLite ledger database.
-        #[arg(long, short = 'l')]
+        /// Ledger prefix for the on-disk database pair (tracker + block
+        /// SQLite files). The CLI opens `<prefix>.tracker.sqlite` and
+        /// `<prefix>.block.sqlite`, matching go-algorand's layout
+        /// (`../go-algorand/ledger/ledger.go:327,336`). Legacy `.sqlite` /
+        /// `.tracker.sqlite` / `.block.sqlite` suffixes are stripped to
+        /// recover the prefix.
+        #[arg(long, short = 'l', alias = "ledger-prefix")]
         ledger_path: PathBuf,
 
         /// Genesis ID string (e.g. "mainnet-v1.0").
@@ -372,8 +387,13 @@ pub enum Commands {
 
     /// Participate in consensus: run the agreement protocol with participation keys.
     Participate {
-        /// Path to the SQLite ledger database.
-        #[arg(long, short = 'l')]
+        /// Ledger prefix for the on-disk database pair (tracker + block
+        /// SQLite files). The CLI opens `<prefix>.tracker.sqlite` and
+        /// `<prefix>.block.sqlite`, matching go-algorand's layout
+        /// (`../go-algorand/ledger/ledger.go:327,336`). Legacy `.sqlite` /
+        /// `.tracker.sqlite` / `.block.sqlite` suffixes are stripped to
+        /// recover the prefix.
+        #[arg(long, short = 'l', alias = "ledger-prefix")]
         ledger_path: PathBuf,
 
         /// Genesis ID string (e.g. "mainnet-v1.0").

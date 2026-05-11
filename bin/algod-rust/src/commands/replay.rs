@@ -400,10 +400,51 @@ pub async fn run_stateful(
     // NOTE: On resume, in-memory leases from the previous session are lost.
     // This is acceptable because committed blocks are already validated —
     // lease violations cannot occur during replay of valid chain history.
-    let db_exists = db_path.exists();
+    //
+    // `db_path` is a ledger prefix (or legacy `.sqlite`-suffixed path);
+    // existence is determined by the derived tracker file because the prefix
+    // path itself does not exist as a file under the split layout.
+    let db_exists = algo_ledger::ledger_exists(db_path);
     let mut store = algo_ledger::SqliteLedger::open(db_path)?;
 
     let effective_start = if db_exists {
+        // Detect the cross-file split-commit gap before resuming. See
+        // sqlite.rs `open_split` for the consistency model; replay is
+        // strictly read-from-disk-and-apply, so it cannot recover from
+        // missing blocks. Both BlockBehind (post-crash gap) and
+        // CatchpointOnly (catchpoint-imported but no blocks downloaded)
+        // are fatal here.
+        match store.reconcile_cross_file()? {
+            algo_ledger::CrossFileState::Empty | algo_ledger::CrossFileState::Consistent { .. } => {
+            }
+            algo_ledger::CrossFileState::CatchpointOnly { tracker_round } => {
+                error!(
+                    tracker_round,
+                    "catchpoint-only ledger detected: tracker has rounds but blockdb is empty. \
+                     Replay needs blocks on disk — run `algod-rust sync` first to populate the \
+                     block archive."
+                );
+                anyhow::bail!(
+                    "replay requires blocks on disk; the ledger is catchpoint-only at round \
+                     {tracker_round}. Run `algod-rust sync` first."
+                );
+            }
+            algo_ledger::CrossFileState::BlockBehind {
+                tracker_round,
+                block_max_round,
+            } => {
+                error!(
+                    tracker_round,
+                    block_max_round,
+                    "cross-file split-commit gap detected: tracker advanced past blockdb.blocks. \
+                     Refusing to resume — recover from a catchpoint or delete the ledger pair."
+                );
+                anyhow::bail!(
+                    "ledger inconsistency: tracker at round {tracker_round} but blockdb.blocks \
+                     max is {block_max_round}. Recover from a catchpoint or delete the DB."
+                );
+            }
+        }
         if let Some(last_round) = store.last_committed_round()? {
             let resume = last_round + 1;
             info!(
@@ -417,7 +458,7 @@ pub async fn run_stateful(
             // previous aborted run. Delete and recreate to avoid stale state.
             warn!("existing DB has no committed round — recreating");
             drop(store);
-            std::fs::remove_file(db_path)?;
+            algo_ledger::remove_ledger_files(db_path)?;
             store = algo_ledger::SqliteLedger::open(db_path)?;
             load_genesis_into_store(&mut store, genesis_path)?;
             start

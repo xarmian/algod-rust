@@ -118,7 +118,12 @@ pub struct SyncConfig {
     pub genesis_id: String,
     /// Genesis hash (32-byte SHA-256 digest).
     pub genesis_hash: [u8; 32],
-    /// Path to the SQLite database file.
+    /// Ledger prefix for the on-disk database pair (e.g. `/var/lib/algod/ledger`).
+    /// The tracker and block databases are derived as
+    /// `<prefix>.tracker.sqlite` and `<prefix>.block.sqlite`, matching
+    /// go-algorand's layout (`../go-algorand/ledger/ledger.go:327,336`).
+    /// Legacy `*.sqlite` paths are accepted — the suffix is stripped to
+    /// recover the prefix.
     pub db_path: PathBuf,
     /// Number of concurrent download tasks.
     pub concurrency: usize,
@@ -490,16 +495,37 @@ impl SyncOrchestrator {
         Ok(())
     }
 
-    /// Open a SQLite connection to the configured database path with
+    /// Open a SQLite connection to the configured database pair with
     /// appropriate pragmas for bulk import.
+    ///
+    /// `config.db_path` is treated as a ledger prefix (matching go-algorand's
+    /// `<prefix>.tracker.sqlite` + `<prefix>.block.sqlite` layout). The
+    /// tracker file is opened as the `main` schema and the block file is
+    /// attached as `blockdb`, so SQL referring to `blockdb.blocks` works
+    /// over both schemas through the same connection.
     fn open_db(&self) -> Result<Connection, AlgoError> {
-        let conn = Connection::open(&self.config.db_path).map_err(|e| AlgoError::Ledger {
-            message: format!("open sync database: {e}"),
+        let prefix = crate::derive_ledger_prefix(&self.config.db_path);
+        let tracker_path = crate::tracker_path_for_prefix(&prefix);
+        let block_path = crate::block_path_for_prefix(&prefix);
+        let conn = Connection::open(&tracker_path).map_err(|e| AlgoError::Ledger {
+            message: format!("open sync tracker database {}: {e}", tracker_path.display()),
         })?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("set sync database pragmas: {e}"),
-            })?;
+        conn.execute(
+            "ATTACH DATABASE ?1 AS blockdb",
+            rusqlite::params![block_path.to_string_lossy().as_ref()],
+        )
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("attach sync block database {}: {e}", block_path.display()),
+        })?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA blockdb.journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA blockdb.synchronous=NORMAL;",
+        )
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("set sync database pragmas: {e}"),
+        })?;
         Ok(conn)
     }
 
@@ -832,10 +858,12 @@ impl SyncOrchestrator {
 
         // Ensure the blocks and txtail tables exist. On a fresh database created
         // by the catchpoint importer, only the catchpoint staging/account tables
-        // exist — the normal SCHEMA_SQL (run by SqliteLedger::open()) has not
-        // been executed yet. Using IF NOT EXISTS makes this idempotent.
+        // exist — the normal SCHEMA_TRACKER_SQL / SCHEMA_BLOCK_SQL (run by
+        // SqliteLedger::open()) have not been executed yet. Using IF NOT EXISTS
+        // makes this idempotent. The `blocks` table lives on the attached
+        // `blockdb` schema; `txtail` is on the tracker.
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS blocks (
+            "CREATE TABLE IF NOT EXISTS blockdb.blocks (
                 rnd INTEGER PRIMARY KEY,
                 proto TEXT,
                 hdrdata BLOB,
@@ -865,7 +893,7 @@ impl SyncOrchestrator {
             |rnd, proto, hdrdata, blkdata| {
                 // Store block in the blocks table.
                 conn.execute(
-                    "INSERT OR REPLACE INTO blocks (rnd, proto, hdrdata, blkdata) \
+                    "INSERT OR REPLACE INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) \
                      VALUES (?1, ?2, ?3, ?4)",
                     rusqlite::params![rnd as i64, proto, hdrdata, blkdata],
                 )
@@ -942,11 +970,51 @@ impl SyncOrchestrator {
         // been committed. Query the database for the last committed round and
         // skip ahead to avoid re-applying blocks (which would fail with a
         // round mismatch in apply_block's strict monotonicity check).
+        //
+        // Before trusting the tracker round, run the cross-file
+        // reconciliation check (see `SqliteLedger::open_split`): a crash
+        // mid-commit can leave the tracker ahead of `blockdb.blocks`, in
+        // which case resuming from `tracker + 1` would silently skip the
+        // missing tail. We bail out and ask the operator to recover.
         let start_round = {
             let resume_store =
                 crate::SqliteLedger::open(&self.config.db_path).map_err(|e| AlgoError::Ledger {
                     message: format!("open ledger for resume check: {e}"),
                 })?;
+            match resume_store.reconcile_cross_file()? {
+                crate::CrossFileState::Empty | crate::CrossFileState::Consistent { .. } => {}
+                // By the time replay runs, the orchestrator has already
+                // executed phase 3 (`download_lookback_blocks`), so
+                // blockdb should contain `[catchpoint - MaxTxnLife,
+                // catchpoint]`. Seeing CatchpointOnly here means the
+                // lookback phase was skipped or rolled back — replaying
+                // forward without it would leave a permanent hole that
+                // breaks lease validation and certificate verification.
+                // Treat it as a programmer/operator error rather than
+                // silently continuing.
+                crate::CrossFileState::CatchpointOnly { tracker_round } => {
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "internal: catchpoint replay reached the resume step with \
+                             tracker_round={tracker_round} and an empty blockdb (lookback \
+                             never ran). Recover from a catchpoint or delete the DB and \
+                             restart sync from genesis."
+                        ),
+                    });
+                }
+                crate::CrossFileState::BlockBehind {
+                    tracker_round,
+                    block_max_round,
+                } => {
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "ledger inconsistency: tracker at round {tracker_round} but \
+                             blockdb.blocks max is {block_max_round}. Recover from a \
+                             catchpoint or delete the DB."
+                        ),
+                    });
+                }
+            }
             match resume_store.last_committed_round() {
                 Ok(Some(last)) if last > catchpoint_round => {
                     tracing::info!(
@@ -1260,6 +1328,36 @@ impl SyncOrchestrator {
             crate::SqliteLedger::open(&self.config.db_path).map_err(|e| AlgoError::Ledger {
                 message: format!("open ledger for follow mode: {e}"),
             })?;
+
+        // Reject anything but a fully populated block archive before
+        // entering the polling loop. Follow mode applies new blocks
+        // forward from the on-disk state; both the split-commit gap and
+        // the catchpoint-only shape (blockdb empty) leave it unable to
+        // serve catchup peers that ask for a missing tail round.
+        match store.reconcile_cross_file()? {
+            crate::CrossFileState::Empty | crate::CrossFileState::Consistent { .. } => {}
+            crate::CrossFileState::CatchpointOnly { tracker_round } => {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "follow mode requires blocks on disk; the ledger is catchpoint-only at \
+                         round {tracker_round}. Run a regular sync first to populate the block \
+                         archive."
+                    ),
+                });
+            }
+            crate::CrossFileState::BlockBehind {
+                tracker_round,
+                block_max_round,
+            } => {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "ledger inconsistency entering follow mode: tracker at round \
+                         {tracker_round} but blockdb.blocks max is {block_max_round}. \
+                         Recover from a catchpoint or delete the DB."
+                    ),
+                });
+            }
+        }
 
         // Enable Merkle trie tracking if a trie path is configured.
         if self.config.trie_path.is_some() {

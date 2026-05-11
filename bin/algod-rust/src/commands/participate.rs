@@ -2065,6 +2065,33 @@ pub async fn run(
     let sqlite_ledger = SqliteLedger::open(ledger_path).map_err(|e| {
         anyhow::anyhow!("failed to open ledger at {}: {}", ledger_path.display(), e)
     })?;
+
+    // Reject anything but a fully populated block archive before
+    // booting agreement. Participating with a missing tail block — or
+    // with the catchpoint-only "blockdb empty" shape — would risk
+    // producing votes against state that the block archive can't
+    // reproduce on the next restart.
+    match sqlite_ledger.reconcile_cross_file().map_err(|e| {
+        anyhow::anyhow!("reconcile cross-file consistency for participate ledger: {e}")
+    })? {
+        algo_ledger::CrossFileState::Empty | algo_ledger::CrossFileState::Consistent { .. } => {}
+        algo_ledger::CrossFileState::CatchpointOnly { tracker_round } => {
+            anyhow::bail!(
+                "participate requires blocks on disk; the ledger is catchpoint-only at round \
+                 {tracker_round}. Run `algod-rust sync` first to populate the block archive."
+            );
+        }
+        algo_ledger::CrossFileState::BlockBehind {
+            tracker_round,
+            block_max_round,
+        } => {
+            anyhow::bail!(
+                "ledger inconsistency: tracker at round {tracker_round} but blockdb.blocks max \
+                 is {block_max_round}. Recover from a catchpoint or delete the DB."
+            );
+        }
+    }
+
     let latest = sqlite_ledger.current_round().0;
     info!(path = %ledger_path.display(), latest_round = latest, "opened ledger database");
 

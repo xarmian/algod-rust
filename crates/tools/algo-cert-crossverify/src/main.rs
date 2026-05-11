@@ -136,7 +136,11 @@ fn load_token(cli: &Cli) -> Result<String> {
 }
 
 fn open_bridge(path: &std::path::Path) -> Result<AgreementLedgerBridge> {
-    if !path.exists() {
+    // `path` is a ledger prefix (or a legacy `.sqlite`-suffixed value);
+    // since TASK-100 the on-disk DB is a pair (`<prefix>.tracker.sqlite`
+    // + `<prefix>.block.sqlite`), so checking `path.exists()` would
+    // reject every valid ledger. Use the split-aware helper.
+    if !algo_ledger::ledger_exists(path) {
         bail!("ledger sqlite not found at {}", path.display());
     }
     let ledger = SqliteLedger::open(path)

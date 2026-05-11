@@ -182,9 +182,16 @@ fn cleanup_temp_dir(dir: &Path) {
 }
 
 /// Query the last committed round from a SQLite ledger DB.
-/// The SqliteLedger stores values as little-endian u64 bytes in `algod_rust_meta`.
+///
+/// Since TASK-100 the ledger is a pair of files
+/// (`<prefix>.tracker.sqlite` + `<prefix>.block.sqlite`);
+/// `algod_rust_meta` lives on the tracker file, so resolve the legacy
+/// `.sqlite` test path to its tracker file before opening. The
+/// SqliteLedger stores values as little-endian u64 bytes in
+/// `algod_rust_meta`.
 fn query_last_committed_round(db_path: &Path) -> Option<u64> {
-    let conn = rusqlite::Connection::open(db_path).ok()?;
+    let tracker = ledger_tracker_path(db_path);
+    let conn = rusqlite::Connection::open(tracker).ok()?;
     conn.query_row(
         "SELECT value FROM algod_rust_meta WHERE key = 'current_round'",
         [],
@@ -199,6 +206,26 @@ fn query_last_committed_round(db_path: &Path) -> Option<u64> {
     )
     .ok()
     .flatten()
+}
+
+/// Return whether the on-disk ledger pair exists at `db_path` (treated
+/// as a prefix, with legacy `.sqlite` suffix stripped). Mirrors what
+/// `algo_ledger::ledger_exists` does in the binary.
+fn ledger_pair_exists(db_path: &Path) -> bool {
+    ledger_tracker_path(db_path).exists()
+}
+
+/// Compute the tracker file path that the binary will actually create
+/// for the given `--db <db_path>` argument. Matches the prefix
+/// derivation in `algo_ledger::derive_ledger_prefix`.
+fn ledger_tracker_path(db_path: &Path) -> std::path::PathBuf {
+    let s = db_path.to_string_lossy();
+    let prefix = s
+        .strip_suffix(".tracker.sqlite")
+        .or_else(|| s.strip_suffix(".block.sqlite"))
+        .or_else(|| s.strip_suffix(".sqlite"))
+        .unwrap_or(&s);
+    std::path::PathBuf::from(format!("{prefix}.tracker.sqlite"))
 }
 
 /// Run sync with the given arguments and return (stdout, stderr, success).
@@ -293,8 +320,10 @@ fn test_sync_from_genesis() {
     // diverse txn types). Check that the DB was created and has committed rounds.
     let _ = success; // don't assert on exit code due to possible apply failures
 
-    // Verify the DB exists.
-    assert!(db_path.exists(), "ledger DB was not created");
+    // Verify the DB exists. Since TASK-100 the binary writes
+    // `<prefix>.tracker.sqlite` + `<prefix>.block.sqlite`, not the legacy
+    // single `ledger.sqlite` file, so check the tracker file.
+    assert!(ledger_pair_exists(&db_path), "ledger DB was not created");
 
     // Verify there is a last committed round in the DB.
     let committed =
