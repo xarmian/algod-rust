@@ -983,17 +983,24 @@ impl SyncOrchestrator {
                 })?;
             match resume_store.reconcile_cross_file()? {
                 crate::CrossFileState::Empty | crate::CrossFileState::Consistent { .. } => {}
-                // CatchpointOnly is the expected shape during catchpoint
-                // replay: tracker is at `catchpoint_round` and the
-                // block-download phase ran (lookback inclusive of
-                // catchpoint round). If we got here with blockdb still
-                // empty that means lookback was skipped — but the
-                // resume path's job is to refetch forward, so accept it.
+                // By the time replay runs, the orchestrator has already
+                // executed phase 3 (`download_lookback_blocks`), so
+                // blockdb should contain `[catchpoint - MaxTxnLife,
+                // catchpoint]`. Seeing CatchpointOnly here means the
+                // lookback phase was skipped or rolled back — replaying
+                // forward without it would leave a permanent hole that
+                // breaks lease validation and certificate verification.
+                // Treat it as a programmer/operator error rather than
+                // silently continuing.
                 crate::CrossFileState::CatchpointOnly { tracker_round } => {
-                    tracing::info!(
-                        tracker_round,
-                        "catchpoint-only state during replay resume; will refetch blocks"
-                    );
+                    return Err(AlgoError::Ledger {
+                        message: format!(
+                            "internal: catchpoint replay reached the resume step with \
+                             tracker_round={tracker_round} and an empty blockdb (lookback \
+                             never ran). Recover from a catchpoint or delete the DB and \
+                             restart sync from genesis."
+                        ),
+                    });
                 }
                 crate::CrossFileState::BlockBehind {
                     tracker_round,

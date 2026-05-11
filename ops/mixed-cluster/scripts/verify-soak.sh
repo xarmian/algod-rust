@@ -214,7 +214,18 @@ if [ "$RUN_CERT" = "1" ]; then
         echo "    ledger: $CERT_LEDGER_PATH (--cert-ledger override)"
     else
         WORKDIR="$(mktemp -d -t verify-soak.XXXXXX)"
-        CERT_LEDGER_PATH="$WORKDIR/ledger.sqlite"
+        # Since TASK-100 the Rust node writes a pair of files
+        # (`<prefix>.tracker.sqlite` + `<prefix>.block.sqlite`) instead of
+        # a single `ledger.sqlite`. cert-crossverify only needs the
+        # tracker file (it reads accountbase / onlineaccounts /
+        # onlineroundparamstail / blocks via SqliteLedger::open, which
+        # also opens the block file from the derived prefix). We snapshot
+        # both files into $WORKDIR and pass the bare prefix to the
+        # verifier.
+        CERT_LEDGER_PREFIX="$WORKDIR/ledger"
+        CERT_LEDGER_PATH="$CERT_LEDGER_PREFIX"
+        TRACKER_PATH="${CERT_LEDGER_PREFIX}.tracker.sqlite"
+        BLOCK_PATH="${CERT_LEDGER_PREFIX}.block.sqlite"
         echo "==> cert cross-verify (Go-produced → Rust verifier), stride $STRIDE"
         # Use SQLite's online backup API from INSIDE the container to
         # snapshot atomically. Plain `docker cp` of the WAL-mode main
@@ -229,37 +240,54 @@ if [ "$RUN_CERT" = "1" ]; then
         # Dockerfile includes it. Fall back to plain docker cp with a
         # warning if `.backup` isn't available (e.g. slim images built
         # in CI without sqlite3).
-        echo "    snapshotting Rust ledger via SQLite backup API"
-        if docker exec phase6-rust-node-4 sqlite3 /app/ledger.sqlite \
-                ".backup '/app/verify-soak-snapshot.sqlite'" >/dev/null 2>&1; then
-            if ! docker cp phase6-rust-node-4:/app/verify-soak-snapshot.sqlite \
-                    "$CERT_LEDGER_PATH" 2>/dev/null; then
-                echo "error: failed to docker cp the snapshot." >&2
+        echo "    snapshotting Rust tracker + block databases via SQLite backup API"
+        if docker exec phase6-rust-node-4 sqlite3 /app/ledger.tracker.sqlite \
+                    ".backup '/app/verify-soak-tracker.sqlite'" >/dev/null 2>&1 \
+                && docker exec phase6-rust-node-4 sqlite3 /app/ledger.block.sqlite \
+                    ".backup '/app/verify-soak-block.sqlite'" >/dev/null 2>&1; then
+            if ! docker cp phase6-rust-node-4:/app/verify-soak-tracker.sqlite \
+                    "$TRACKER_PATH" 2>/dev/null; then
+                echo "error: failed to docker cp the tracker snapshot." >&2
                 exit 4
             fi
-            # Clean up the in-container snapshot; don't leak volume space
-            # across runs. `rm -f` is safe even if the file vanished.
-            docker exec phase6-rust-node-4 rm -f /app/verify-soak-snapshot.sqlite \
+            if ! docker cp phase6-rust-node-4:/app/verify-soak-block.sqlite \
+                    "$BLOCK_PATH" 2>/dev/null; then
+                echo "error: failed to docker cp the block snapshot." >&2
+                exit 4
+            fi
+            # Clean up the in-container snapshots; don't leak volume
+            # space across runs. `rm -f` is safe even if a file vanished.
+            docker exec phase6-rust-node-4 rm -f \
+                    /app/verify-soak-tracker.sqlite \
+                    /app/verify-soak-block.sqlite \
                 >/dev/null 2>&1 || true
         else
             echo "    warning: sqlite3 .backup unavailable in container;" >&2
             echo "    falling back to raw docker cp (may be racy under heavy writes)" >&2
-            if ! docker cp phase6-rust-node-4:/app/ledger.sqlite \
-                    "$CERT_LEDGER_PATH" 2>/dev/null; then
-                echo "error: failed to docker cp the Rust ledger." >&2
+            if ! docker cp phase6-rust-node-4:/app/ledger.tracker.sqlite \
+                    "$TRACKER_PATH" 2>/dev/null; then
+                echo "error: failed to docker cp the tracker DB." >&2
                 echo "       is phase6-rust-node-4 running?" >&2
                 exit 4
             fi
-            for sidecar in ledger.sqlite-wal ledger.sqlite-shm; do
+            if ! docker cp phase6-rust-node-4:/app/ledger.block.sqlite \
+                    "$BLOCK_PATH" 2>/dev/null; then
+                echo "error: failed to docker cp the block DB." >&2
+                echo "       is phase6-rust-node-4 running?" >&2
+                exit 4
+            fi
+            for sidecar in \
+                    ledger.tracker.sqlite-wal ledger.tracker.sqlite-shm \
+                    ledger.block.sqlite-wal ledger.block.sqlite-shm; do
                 docker cp "phase6-rust-node-4:/app/$sidecar" "$WORKDIR/$sidecar" \
                     2>/dev/null || true
             done
         fi
-        if [ ! -s "$CERT_LEDGER_PATH" ]; then
-            echo "error: extracted ledger $CERT_LEDGER_PATH is empty" >&2
+        if [ ! -s "$TRACKER_PATH" ] || [ ! -s "$BLOCK_PATH" ]; then
+            echo "error: extracted ledger pair under $WORKDIR is empty" >&2
             exit 4
         fi
-        echo "    ledger size: $(du -h "$CERT_LEDGER_PATH" | awk '{print $1}')"
+        echo "    ledger size: tracker=$(du -h "$TRACKER_PATH" | awk '{print $1}') block=$(du -h "$BLOCK_PATH" | awk '{print $1}')"
     fi
     set +e
     "$CERT_BIN" \

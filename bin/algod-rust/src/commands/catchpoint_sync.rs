@@ -626,17 +626,25 @@ pub async fn handoff_to_gossip_sync(
             message: format!("open ledger for gossip handoff: {e}"),
         })?;
     // Reconcile the cross-file state before trusting the tracker round.
-    // CatchpointOnly is the expected shape entering gossip handoff
-    // (tracker just imported from a catchpoint, blockdb may still be
-    // sparse before lookback completed) — accept it. BlockBehind is the
-    // split-commit hazard and aborts.
+    // By this point the catchpoint orchestrator has already downloaded
+    // the catchpoint round + lookback, so blockdb should contain
+    // `[catchpoint - MaxTxnLife, catchpoint]`. CatchpointOnly here
+    // therefore signals an upstream failure (lookback skipped); refuse
+    // to start the gossip-forward pass against a sparse archive,
+    // because the missing tail would silently break lease validation
+    // and cert-cross-verify on those rounds.
     match ledger
         .reconcile_cross_file()
         .map_err(|e| anyhow::anyhow!("reconcile cross-file consistency for gossip handoff: {e}"))?
     {
-        algo_ledger::CrossFileState::Empty
-        | algo_ledger::CrossFileState::Consistent { .. }
-        | algo_ledger::CrossFileState::CatchpointOnly { .. } => {}
+        algo_ledger::CrossFileState::Empty | algo_ledger::CrossFileState::Consistent { .. } => {}
+        algo_ledger::CrossFileState::CatchpointOnly { tracker_round } => {
+            anyhow::bail!(
+                "internal: gossip handoff reached with tracker_round={tracker_round} and an \
+                 empty blockdb — the catchpoint lookback download did not run. Recover from a \
+                 catchpoint or delete the DB and restart sync from genesis."
+            );
+        }
         algo_ledger::CrossFileState::BlockBehind {
             tracker_round,
             block_max_round,
