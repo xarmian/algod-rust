@@ -22,25 +22,32 @@
 //
 // Reproducible setup:
 //
-//  1. Check out go-algorand alongside this repo:
+// The `replace` directive in `go.mod` resolves to `../../../go-algorand`
+// relative to this tool's directory, which is the parent of the
+// `algod-rust` repo root. From a fresh `git clone` of `algod-rust`:
 //
-//         cd ../..
+//  1. Check out go-algorand as a sibling of `algod-rust`:
+//
+//         # from $REPO_PARENT (the directory that contains algod-rust/)
 //         git clone --depth 1 --branch v4.5.1-stable \
 //             https://github.com/algorand/go-algorand.git
+//         # resulting layout:
+//         #   $REPO_PARENT/algod-rust/
+//         #   $REPO_PARENT/go-algorand/
 //
 //  2. Build and run from this tool's directory:
 //
 //         cd algod-rust/tools/merkle-page-capture
-//         go run . > ../../crates/core/algo-ledger/tests/fixtures/merkle_pages/pages.json
+//         go run . > \
+//             ../../crates/core/algo-ledger/tests/fixtures/merkle_pages/pages.json
 //
-// `go.mod` pins `github.com/algorand/go-algorand` to the v4.5.1-stable
-// commit (`a8c16ecc2324cc10acb75de367c0b5dad4b0a5a3`, dated
-// 2026-02-09) AND carries a `replace` directive pointing at the sibling
+// `go.mod` carries a `replace` directive pointing at that sibling
 // checkout, mirroring `tools/lookback-vector-capture` and the other
 // vector-capture tools in this repo. Without the sibling checkout the
 // build fails fast at `go run` time — that's intentional, because the
 // alternative (publishing a forked module) would unpin the version we
-// claim to cross-reference.
+// claim to cross-reference: v4.5.1-stable, commit
+// a8c16ecc2324cc10acb75de367c0b5dad4b0a5a3, dated 2026-02-09.
 //
 // Determinism: the fixture is generated from a fixed sequence of
 // hashes (the same i-byte triples Go's own committer_test.go uses) so
