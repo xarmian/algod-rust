@@ -11,6 +11,7 @@ pub mod eval_delta;
 pub mod genesis;
 pub mod heartbeat;
 pub mod lease;
+pub mod merkle_page;
 pub mod merkle_trie;
 pub mod params;
 pub mod participation;
