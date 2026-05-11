@@ -217,15 +217,24 @@ if [ "$RUN_CERT" = "1" ]; then
         CERT_PREFIX_CANDIDATE="${CERT_LEDGER_OVERRIDE%.tracker.sqlite}"
         CERT_PREFIX_CANDIDATE="${CERT_PREFIX_CANDIDATE%.block.sqlite}"
         CERT_PREFIX_CANDIDATE="${CERT_PREFIX_CANDIDATE%.sqlite}"
-        if [ -f "${CERT_PREFIX_CANDIDATE}.tracker.sqlite" ]; then
-            CERT_LEDGER_PATH="$CERT_PREFIX_CANDIDATE"
-        else
+        if [ ! -s "${CERT_PREFIX_CANDIDATE}.tracker.sqlite" ]; then
             echo "error: --cert-ledger path $CERT_LEDGER_OVERRIDE is not a split-layout" >&2
-            echo "       ledger (no ${CERT_PREFIX_CANDIDATE}.tracker.sqlite found)." >&2
+            echo "       ledger (no non-empty ${CERT_PREFIX_CANDIDATE}.tracker.sqlite)." >&2
             echo "       Pre-TASK-100 single-file ledgers are no longer supported by" >&2
             echo "       algo-cert-crossverify; re-sync to produce a tracker+block pair." >&2
             exit 4
         fi
+        if [ ! -s "${CERT_PREFIX_CANDIDATE}.block.sqlite" ]; then
+            # cert-crossverify reads `blockdb.blocks`, so a missing or
+            # empty block file would let `SqliteLedger::open` ATTACH an
+            # empty stub and then fail later with a less actionable
+            # error. Refuse up front.
+            echo "error: --cert-ledger split prefix $CERT_PREFIX_CANDIDATE is missing the" >&2
+            echo "       block database (no non-empty ${CERT_PREFIX_CANDIDATE}.block.sqlite)." >&2
+            echo "       Provide both .tracker.sqlite + .block.sqlite, or re-sync." >&2
+            exit 4
+        fi
+        CERT_LEDGER_PATH="$CERT_PREFIX_CANDIDATE"
         echo "==> cert cross-verify (Go-produced → Rust verifier), stride $STRIDE"
         echo "    ledger: $CERT_LEDGER_PATH (--cert-ledger override)"
     else
