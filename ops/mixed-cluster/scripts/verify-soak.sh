@@ -205,24 +205,25 @@ trap cleanup_workdir EXIT
 if [ "$RUN_CERT" = "1" ]; then
     CERT_OUT="$OUT_DIR/verify-cert-$(date +%s).jsonl"
     if [ -n "$CERT_LEDGER_OVERRIDE" ]; then
-        # `--cert-ledger` may be either a single legacy `.sqlite` file
-        # (Go-produced) or a TASK-100 split prefix
-        # (`<prefix>.tracker.sqlite` + `<prefix>.block.sqlite`). Accept
-        # both: derive the prefix the same way algo_ledger does and
-        # check the tracker file's existence.
+        # `--cert-ledger` accepts the split-ledger layout introduced by
+        # TASK-100: either a bare prefix (`/path/to/ledger`) or any
+        # member of the pair (`/path/to/ledger.sqlite`,
+        # `/path/to/ledger.tracker.sqlite`, `/path/to/ledger.block.sqlite`).
+        # Derive the prefix the same way `algo_ledger::derive_ledger_prefix`
+        # does and require the tracker file to exist — `algo-cert-crossverify`
+        # opens the pair via `SqliteLedger::open(prefix)`, which gates on
+        # `<prefix>.tracker.sqlite`. Pre-TASK-100 single-file ledgers are
+        # not supported.
         CERT_PREFIX_CANDIDATE="${CERT_LEDGER_OVERRIDE%.tracker.sqlite}"
         CERT_PREFIX_CANDIDATE="${CERT_PREFIX_CANDIDATE%.block.sqlite}"
         CERT_PREFIX_CANDIDATE="${CERT_PREFIX_CANDIDATE%.sqlite}"
-        if [ -f "$CERT_LEDGER_OVERRIDE" ]; then
-            # Single-file (legacy) shape: accept as-is.
-            CERT_LEDGER_PATH="$CERT_LEDGER_OVERRIDE"
-        elif [ -f "${CERT_PREFIX_CANDIDATE}.tracker.sqlite" ]; then
-            # Split-layout shape: pass the bare prefix.
+        if [ -f "${CERT_PREFIX_CANDIDATE}.tracker.sqlite" ]; then
             CERT_LEDGER_PATH="$CERT_PREFIX_CANDIDATE"
         else
-            echo "error: --cert-ledger path $CERT_LEDGER_OVERRIDE not found as" >&2
-            echo "       either a legacy single file or a split-layout prefix" >&2
-            echo "       (no ${CERT_PREFIX_CANDIDATE}.tracker.sqlite either)" >&2
+            echo "error: --cert-ledger path $CERT_LEDGER_OVERRIDE is not a split-layout" >&2
+            echo "       ledger (no ${CERT_PREFIX_CANDIDATE}.tracker.sqlite found)." >&2
+            echo "       Pre-TASK-100 single-file ledgers are no longer supported by" >&2
+            echo "       algo-cert-crossverify; re-sync to produce a tracker+block pair." >&2
             exit 4
         fi
         echo "==> cert cross-verify (Go-produced → Rust verifier), stride $STRIDE"
