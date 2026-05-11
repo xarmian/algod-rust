@@ -48,7 +48,10 @@ pub use params::min_balance;
 pub use rewards::{
     apply_rewards, compute_pending_rewards, normalized_online_balance, REWARD_UNITS,
 };
-pub use sqlite::{ReadSnapshot, SqliteLedger};
+pub use sqlite::{
+    block_path_for_prefix, derive_ledger_prefix, tracker_path_for_prefix, ReadSnapshot,
+    SqliteLedger, BLOCK_SUFFIX, TRACKER_SUFFIX,
+};
 pub use state::{schema_min_balance, LedgerState, StateSnapshot};
 pub use store_trait::LedgerStore;
 

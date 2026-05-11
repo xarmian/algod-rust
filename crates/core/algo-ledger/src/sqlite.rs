@@ -34,8 +34,19 @@ fn account_nob_i64(account: &AccountData) -> i64 {
 // ---------------------------------------------------------------------------
 // Schema DDL
 // ---------------------------------------------------------------------------
+//
+// go-algorand splits the ledger database into two SQLite files
+// (`<prefix>.tracker.sqlite` for tracker tables and `<prefix>.block.sqlite`
+// for the block archive — see `../go-algorand/ledger/ledger.go:327,336`).
+// We mirror that layout by opening the tracker file as the `main` schema and
+// `ATTACH`-ing the block file as the `blockdb` schema on the same connection.
+// All block-table SQL therefore qualifies the table as `blockdb.blocks`.
 
-const SCHEMA_SQL: &str = "
+/// DDL run on the tracker connection (the `main` schema). Mirrors
+/// go-algorand's `accountsSchema` plus the auxiliary tables used by the Rust
+/// reimplementation. Excludes the `blocks` table — that lives in the
+/// attached `blockdb` schema (`SCHEMA_BLOCK_SQL`).
+const SCHEMA_TRACKER_SQL: &str = "
 CREATE TABLE IF NOT EXISTS acctrounds (
     id    TEXT PRIMARY KEY,
     rnd   INTEGER
@@ -93,14 +104,6 @@ CREATE TABLE IF NOT EXISTS kvstore (
     value BLOB
 );
 
-CREATE TABLE IF NOT EXISTS blocks (
-    rnd INTEGER PRIMARY KEY,
-    proto TEXT,
-    hdrdata BLOB,
-    blkdata BLOB,
-    certdata BLOB
-);
-
 CREATE TABLE IF NOT EXISTS txtail (
     rnd INTEGER PRIMARY KEY NOT NULL,
     data BLOB NOT NULL
@@ -142,6 +145,64 @@ CREATE TABLE IF NOT EXISTS state_deltas (
     delta BLOB NOT NULL
 );
 ";
+
+/// DDL run on the attached `blockdb` schema. Mirrors
+/// `../go-algorand/ledger/store/blockdb/blockdb.go:35-40` byte-for-byte
+/// (modulo the `IF NOT EXISTS` clause we always use).
+pub(crate) const SCHEMA_BLOCK_SQL: &str = "
+CREATE TABLE IF NOT EXISTS blockdb.blocks (
+    rnd INTEGER PRIMARY KEY,
+    proto TEXT,
+    hdrdata BLOB,
+    blkdata BLOB,
+    certdata BLOB
+);
+";
+
+/// Suffix appended to the ledger prefix to form the tracker file path,
+/// matching go-algorand's `<prefix>.tracker.sqlite` convention
+/// (`../go-algorand/ledger/ledger.go:327`).
+pub const TRACKER_SUFFIX: &str = ".tracker.sqlite";
+
+/// Suffix appended to the ledger prefix to form the block file path,
+/// matching go-algorand's `<prefix>.block.sqlite` convention
+/// (`../go-algorand/ledger/ledger.go:336`).
+pub const BLOCK_SUFFIX: &str = ".block.sqlite";
+
+/// Derive the ledger prefix from a path that may already include a
+/// `.sqlite` or `.tracker.sqlite` suffix.
+///
+/// Examples:
+/// - `/foo/ledger` → `/foo/ledger`
+/// - `/foo/ledger.sqlite` → `/foo/ledger`
+/// - `/foo/ledger.tracker.sqlite` → `/foo/ledger`
+/// - `/foo/ledger.block.sqlite` → `/foo/ledger`
+///
+/// Kept as a free function so CLI callers can normalize a `--ledger-path`
+/// argument to a prefix before handing it to other tooling.
+pub fn derive_ledger_prefix(path: &Path) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    let trimmed = s
+        .strip_suffix(TRACKER_SUFFIX)
+        .or_else(|| s.strip_suffix(BLOCK_SUFFIX))
+        .or_else(|| s.strip_suffix(".sqlite"))
+        .unwrap_or(&s);
+    std::path::PathBuf::from(trimmed.to_string())
+}
+
+/// Compute the tracker file path for a given ledger prefix.
+pub fn tracker_path_for_prefix(prefix: &Path) -> std::path::PathBuf {
+    let mut s = prefix.as_os_str().to_owned();
+    s.push(TRACKER_SUFFIX);
+    std::path::PathBuf::from(s)
+}
+
+/// Compute the block file path for a given ledger prefix.
+pub fn block_path_for_prefix(prefix: &Path) -> std::path::PathBuf {
+    let mut s = prefix.as_os_str().to_owned();
+    s.push(BLOCK_SUFFIX);
+    std::path::PathBuf::from(s)
+}
 
 // Resource ctype constants (matches Go's `basics.AssetCreatable = 0`, `basics.AppCreatable = 1`)
 const CTYPE_ASSET: i64 = 0;
@@ -1648,10 +1709,13 @@ impl Drop for ReadSnapshot {
 
 pub struct SqliteLedger {
     conn: Connection,
-    /// Path to the SQLite database file, or `None` for in-memory databases.
-    /// Used to open read-only snapshot connections for point-in-time account
-    /// lookups without holding the main ledger mutex.
-    db_path: Option<std::path::PathBuf>,
+    /// Ledger prefix for the on-disk database pair, or `None` for in-memory
+    /// databases. The tracker file lives at `<prefix>.tracker.sqlite` and the
+    /// block file at `<prefix>.block.sqlite`, matching
+    /// `../go-algorand/ledger/ledger.go:327,336`. Used to open read-only
+    /// snapshot connections for point-in-time account lookups without holding
+    /// the main ledger mutex.
+    db_prefix: Option<std::path::PathBuf>,
     /// In-memory lease table (leases are short-lived, no persistence needed).
     lease_table: LeaseTable,
     /// Cached chain-level state (loaded from DB, flushed on commit).
@@ -1678,33 +1742,102 @@ pub struct SqliteLedger {
 }
 
 impl SqliteLedger {
-    /// Open or create a SQLite ledger database at the given path.
+    /// Open or create a SQLite ledger database pair.
+    ///
+    /// `path` may be either a bare prefix (e.g. `/foo/ledger`) or a legacy
+    /// single-file path with a `.sqlite` / `.tracker.sqlite` / `.block.sqlite`
+    /// suffix; the suffix is stripped to recover the prefix. The tracker
+    /// database opens at `<prefix>.tracker.sqlite` and the block database is
+    /// attached as the `blockdb` schema from `<prefix>.block.sqlite`,
+    /// matching go-algorand's layout (`../go-algorand/ledger/ledger.go:327,336`).
     pub fn open(path: &Path) -> Result<Self, AlgoError> {
-        let conn = Connection::open(path).map_err(|e| AlgoError::Ledger {
-            message: format!("sqlite open error: {e}"),
-        })?;
-        Self::init(conn, Some(path.to_path_buf()))
+        let prefix = derive_ledger_prefix(path);
+        Self::open_with_prefix(&prefix)
     }
 
-    /// Open an in-memory database (for testing).
+    /// Open a ledger database pair using an explicit prefix (no suffix
+    /// stripping). The tracker and block files are derived as
+    /// `<prefix>.tracker.sqlite` and `<prefix>.block.sqlite`.
+    pub fn open_with_prefix(prefix: &Path) -> Result<Self, AlgoError> {
+        let tracker = tracker_path_for_prefix(prefix);
+        let block = block_path_for_prefix(prefix);
+        Self::open_split(&tracker, &block, Some(prefix.to_path_buf()))
+    }
+
+    /// Open a tracker + block database pair from fully explicit paths.
+    ///
+    /// `prefix` is the canonical prefix recorded on the resulting ledger
+    /// instance; pass `None` only for ephemeral databases that should not be
+    /// re-openable via `open_read_snapshot`.
+    pub fn open_split(
+        tracker_path: &Path,
+        block_path: &Path,
+        prefix: Option<std::path::PathBuf>,
+    ) -> Result<Self, AlgoError> {
+        let conn = Connection::open(tracker_path).map_err(|e| AlgoError::Ledger {
+            message: format!(
+                "sqlite open error opening tracker db {}: {e}",
+                tracker_path.display()
+            ),
+        })?;
+        // ATTACH the block file as the `blockdb` schema. Mirrors go-algorand's
+        // two-file layout while keeping all SQL routed through a single
+        // connection (so transactions span both files via SQLite's 2-phase
+        // commit). The block file is parameter-bound to avoid quoting issues
+        // with paths that contain a quote character.
+        conn.execute(
+            "ATTACH DATABASE ?1 AS blockdb",
+            params![block_path.to_string_lossy().as_ref()],
+        )
+        .map_err(|e| AlgoError::Ledger {
+            message: format!(
+                "sqlite attach error opening block db {}: {e}",
+                block_path.display()
+            ),
+        })?;
+        Self::init(conn, prefix)
+    }
+
+    /// Open an in-memory database pair (for testing). Both the tracker and
+    /// the attached `blockdb` schema are in-memory; no physical files are
+    /// created and `open_read_snapshot` is unavailable.
+    ///
+    /// This deliberately keeps a single connection (with `ATTACH DATABASE
+    /// ':memory:' AS blockdb`) — there is no separate on-disk file pair to
+    /// reopen, so the production two-file behavior does not apply to
+    /// in-memory tests.
     pub fn open_in_memory() -> Result<Self, AlgoError> {
         let conn = Connection::open_in_memory().map_err(|e| AlgoError::Ledger {
             message: format!("sqlite open error: {e}"),
         })?;
+        // A fresh anonymous in-memory database is created per ATTACH call,
+        // so the attached blockdb is fully isolated from the main schema.
+        conn.execute_batch("ATTACH DATABASE ':memory:' AS blockdb;")
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("sqlite attach in-memory blockdb error: {e}"),
+            })?;
         Self::init(conn, None)
     }
 
-    fn init(conn: Connection, db_path: Option<std::path::PathBuf>) -> Result<Self, AlgoError> {
-        // Enable WAL mode for better concurrent read performance.
-        conn.execute_batch("PRAGMA journal_mode=WAL;")
+    fn init(conn: Connection, db_prefix: Option<std::path::PathBuf>) -> Result<Self, AlgoError> {
+        // Enable WAL mode for better concurrent read performance. ATTACH-ed
+        // databases inherit their own journal mode, so we explicitly switch
+        // both schemas to WAL. (`PRAGMA blockdb.journal_mode=WAL` is a no-op
+        // for the in-memory case.)
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA blockdb.journal_mode=WAL;")
             .map_err(|e| AlgoError::Ledger {
                 message: format!("pragma error: {e}"),
             })?;
 
-        // Create tables if they don't exist.
-        conn.execute_batch(SCHEMA_SQL)
+        // Create tables if they don't exist. The block schema is run against
+        // the `blockdb` schema; the tracker schema is the default `main`.
+        conn.execute_batch(SCHEMA_TRACKER_SQL)
             .map_err(|e| AlgoError::Ledger {
-                message: format!("schema creation error: {e}"),
+                message: format!("schema creation error (tracker): {e}"),
+            })?;
+        conn.execute_batch(SCHEMA_BLOCK_SQL)
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("schema creation error (block): {e}"),
             })?;
 
         // Load cached chain-level state from DB.
@@ -1748,7 +1881,7 @@ impl SqliteLedger {
 
         Ok(Self {
             conn,
-            db_path,
+            db_prefix,
             lease_table: LeaseTable::new(),
             current_round,
             rewards_level,
@@ -1776,21 +1909,25 @@ impl SqliteLedger {
         &self.lease_table
     }
 
-    /// Open a read-only snapshot connection to the same database file.
+    /// Open a read-only snapshot connection to the same database files.
     ///
     /// The returned [`ReadSnapshot`] holds a separate SQLite connection with
     /// a deferred read transaction, which in WAL mode provides a
-    /// point-in-time consistent view of the database. This allows the block
-    /// evaluator to read account data without re-acquiring the main ledger
-    /// mutex, eliminating the risk of seeing data from a different round if
-    /// the ledger advances concurrently (e.g., from catchup).
+    /// point-in-time consistent view of the tracker database. This allows the
+    /// block evaluator to read account data without re-acquiring the main
+    /// ledger mutex, eliminating the risk of seeing data from a different
+    /// round if the ledger advances concurrently (e.g., from catchup).
+    ///
+    /// Only the tracker file is opened here — `ReadSnapshot` exists solely
+    /// for account lookups, which never touch the block archive.
     ///
     /// Returns `None` for in-memory databases (which cannot share state
     /// across connections).
     pub fn open_read_snapshot(&self) -> Option<ReadSnapshot> {
-        let path = self.db_path.as_ref()?;
+        let prefix = self.db_prefix.as_ref()?;
+        let tracker_path = tracker_path_for_prefix(prefix);
         let conn = match Connection::open_with_flags(
-            path,
+            &tracker_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ) {
             Ok(c) => c,
@@ -3802,7 +3939,7 @@ impl LedgerStore for SqliteLedger {
     ) -> Result<(), AlgoError> {
         self.conn
             .execute(
-                "INSERT INTO blocks (rnd, proto, hdrdata, blkdata) VALUES (?1, ?2, ?3, ?4) \
+                "INSERT INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(rnd) DO UPDATE SET proto=excluded.proto, hdrdata=excluded.hdrdata, blkdata=excluded.blkdata",
                 params![round as i64, proto, hdrdata, blkdata],
             )
@@ -3815,7 +3952,7 @@ impl LedgerStore for SqliteLedger {
     fn get_block_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
         self.conn
             .query_row(
-                "SELECT blkdata FROM blocks WHERE rnd = ?1",
+                "SELECT blkdata FROM blockdb.blocks WHERE rnd = ?1",
                 params![round as i64],
                 |row| row.get(0),
             )
@@ -3828,7 +3965,7 @@ impl LedgerStore for SqliteLedger {
     fn get_block_header_data(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
         self.conn
             .query_row(
-                "SELECT hdrdata FROM blocks WHERE rnd = ?1",
+                "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1",
                 params![round as i64],
                 |row| row.get(0),
             )
@@ -3841,7 +3978,7 @@ impl LedgerStore for SqliteLedger {
     fn get_block_cert(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
         self.conn
             .query_row(
-                "SELECT certdata FROM blocks WHERE rnd = ?1",
+                "SELECT certdata FROM blockdb.blocks WHERE rnd = ?1",
                 params![round as i64],
                 |row| row.get::<_, Option<Vec<u8>>>(0),
             )
@@ -3855,7 +3992,7 @@ impl LedgerStore for SqliteLedger {
     fn get_block_proto(&self, round: u64) -> Result<Option<String>, AlgoError> {
         self.conn
             .query_row(
-                "SELECT proto FROM blocks WHERE rnd = ?1",
+                "SELECT proto FROM blockdb.blocks WHERE rnd = ?1",
                 params![round as i64],
                 |row| row.get(0),
             )
@@ -3869,7 +4006,7 @@ impl LedgerStore for SqliteLedger {
         let rows_affected = self
             .conn
             .execute(
-                "UPDATE blocks SET certdata = ?2 WHERE rnd = ?1",
+                "UPDATE blockdb.blocks SET certdata = ?2 WHERE rnd = ?1",
                 params![round as i64, certdata],
             )
             .map_err(|e| AlgoError::Ledger {
@@ -3914,7 +4051,10 @@ impl LedgerStore for SqliteLedger {
 
     fn forget_before(&mut self, round: u64) -> Result<(), AlgoError> {
         self.conn
-            .execute("DELETE FROM blocks WHERE rnd < ?1", params![round as i64])
+            .execute(
+                "DELETE FROM blockdb.blocks WHERE rnd < ?1",
+                params![round as i64],
+            )
             .map_err(|e| AlgoError::Ledger {
                 message: format!("forget_before blocks error: {e}"),
             })?;
@@ -4720,7 +4860,7 @@ mod tests {
         let certdata: Option<Vec<u8>> = ledger
             .conn
             .query_row(
-                "SELECT certdata FROM blocks WHERE rnd = ?1",
+                "SELECT certdata FROM blockdb.blocks WHERE rnd = ?1",
                 params![7i64],
                 |row| row.get(0),
             )
@@ -4747,5 +4887,165 @@ mod tests {
         // Verify cert was NOT erased by the re-insert.
         let got_cert = ledger.get_block_cert(3).unwrap();
         assert_eq!(got_cert, Some(b"cert-data".to_vec()));
+    }
+
+    // ------------------------------------------------------------------
+    // Two-file (tracker + block) layout tests — mirrors go-algorand's
+    // `<prefix>.tracker.sqlite` + `<prefix>.block.sqlite` pair
+    // (`../go-algorand/ledger/ledger.go:327,336`).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn derive_ledger_prefix_strips_known_suffixes() {
+        use std::path::PathBuf;
+        assert_eq!(
+            derive_ledger_prefix(&PathBuf::from("/var/lib/algod/ledger")),
+            PathBuf::from("/var/lib/algod/ledger")
+        );
+        assert_eq!(
+            derive_ledger_prefix(&PathBuf::from("/var/lib/algod/ledger.sqlite")),
+            PathBuf::from("/var/lib/algod/ledger")
+        );
+        assert_eq!(
+            derive_ledger_prefix(&PathBuf::from("/var/lib/algod/ledger.tracker.sqlite")),
+            PathBuf::from("/var/lib/algod/ledger")
+        );
+        assert_eq!(
+            derive_ledger_prefix(&PathBuf::from("/var/lib/algod/ledger.block.sqlite")),
+            PathBuf::from("/var/lib/algod/ledger")
+        );
+    }
+
+    #[test]
+    fn open_with_prefix_creates_two_files_with_split_schemas() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+
+        // Open once to create the pair.
+        let ledger = SqliteLedger::open_with_prefix(&prefix).expect("open prefix");
+        drop(ledger);
+
+        // Both files exist on disk after open.
+        let tracker_path = tracker_path_for_prefix(&prefix);
+        let block_path = block_path_for_prefix(&prefix);
+        assert!(
+            tracker_path.exists(),
+            "tracker file should be created at {}",
+            tracker_path.display()
+        );
+        assert!(
+            block_path.exists(),
+            "block file should be created at {}",
+            block_path.display()
+        );
+
+        // The blocks table lives in the block DB only — verify the two
+        // files have the schemas we expect by opening each independently.
+        let tracker_conn = Connection::open(&tracker_path).unwrap();
+        let tracker_has_blocks: bool = tracker_conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='blocks')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !tracker_has_blocks,
+            "tracker DB must not contain the `blocks` table (it lives in the block DB)"
+        );
+        let tracker_has_accountbase: bool = tracker_conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accountbase')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            tracker_has_accountbase,
+            "tracker DB must contain accountbase"
+        );
+
+        let block_conn = Connection::open(&block_path).unwrap();
+        let block_has_blocks: bool = block_conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='blocks')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(block_has_blocks, "block DB must contain the `blocks` table");
+        let block_has_accountbase: bool = block_conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accountbase')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !block_has_accountbase,
+            "block DB must not contain accountbase (it lives in the tracker DB)"
+        );
+    }
+
+    #[test]
+    fn open_path_accepts_legacy_sqlite_suffix_and_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pass a legacy `.sqlite` path; `open` derives the prefix.
+        let legacy = dir.path().join("ledger.sqlite");
+
+        {
+            let mut ledger = SqliteLedger::open(&legacy).expect("open legacy");
+            ledger.put_block(42, "v41", b"hdr", b"blk").unwrap();
+            ledger.put_block_cert(42, b"cert").unwrap();
+        }
+
+        // Reopen via the bare prefix — block data round-trips.
+        let prefix = dir.path().join("ledger");
+        let ledger = SqliteLedger::open_with_prefix(&prefix).expect("reopen prefix");
+
+        assert_eq!(
+            ledger.get_block_data(42).unwrap().as_deref(),
+            Some(b"blk".as_ref())
+        );
+        assert_eq!(
+            ledger.get_block_header_data(42).unwrap().as_deref(),
+            Some(b"hdr".as_ref())
+        );
+        assert_eq!(
+            ledger.get_block_cert(42).unwrap().as_deref(),
+            Some(b"cert".as_ref())
+        );
+    }
+
+    #[test]
+    fn open_split_with_go_style_paths_reads_back_blocks_and_accounts() {
+        // Simulates the manual smoke test in the TASK-100 acceptance criteria:
+        // a Go-style tracker.sqlite + block.sqlite pair is present in a tmp
+        // dir; we point algod-rust at it and verify both schemas are
+        // accessible. (A real Go-generated DB carries production data; here
+        // we just verify the layout/wiring.)
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = dir.path().join("ledger.tracker.sqlite");
+        let block = dir.path().join("ledger.block.sqlite");
+
+        let mut ledger =
+            SqliteLedger::open_split(&tracker, &block, Some(dir.path().join("ledger")))
+                .expect("open split");
+        ledger.put_block(1, "v41", b"hdr1", b"blk1").unwrap();
+        ledger.put_block(2, "v41", b"hdr2", b"blk2").unwrap();
+
+        // latest_round / get_block_data / get_block_header_data all work.
+        assert_eq!(
+            ledger.get_block_data(1).unwrap().as_deref(),
+            Some(b"blk1".as_ref())
+        );
+        assert_eq!(
+            ledger.get_block_header_data(2).unwrap().as_deref(),
+            Some(b"hdr2".as_ref())
+        );
+
+        // Confirm the two files actually exist where we expect.
+        assert!(tracker.exists());
+        assert!(block.exists());
     }
 }
