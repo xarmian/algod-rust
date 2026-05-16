@@ -415,7 +415,23 @@ fn normalize_kvstore_nulls(conn: &Connection) -> rusqlite::Result<()> {
         return Ok(());
     }
 
-    conn.execute("UPDATE kvstore SET value = x'' WHERE value IS NULL", [])?;
+    // Rewrite two shapes that break Rust's `Vec<u8>` reads:
+    //   - NULL (pre-G13 Rust and pre-G13 Go)
+    //   - empty TEXT (`''`, the literal Go's own
+    //     `performKVStoreNullBlobConversion` writes — SQLite stores it
+    //     with TEXT affinity, which rusqlite refuses to scan into
+    //     `Vec<u8>`). A DB previously migrated by Go would otherwise
+    //     have the marker stamped without those values ever being
+    //     coerced to BLOB.
+    // The `typeof(value) = 'text' AND length(value) = 0` predicate is
+    // strict enough not to touch any non-empty TEXT.
+    conn.execute(
+        "UPDATE kvstore
+             SET value = x''
+             WHERE value IS NULL
+                OR (typeof(value) = 'text' AND length(value) = 0)",
+        [],
+    )?;
     conn.execute(
         "INSERT OR REPLACE INTO catchpointstate (id, intval) VALUES (?1, 1)",
         [KVSTORE_NULL_NORM_MARKER],
@@ -5763,6 +5779,69 @@ mod tests {
             v3, None,
             "marker must prevent re-scan; post-migration NULLs stay NULL"
         );
+    }
+
+    #[test]
+    fn kvstore_normalization_coerces_go_text_empty_to_blob() {
+        // G13 regression — a DB previously migrated by Go has
+        // `kvstore.value = ''` for old NULLs, which SQLite stores as
+        // TEXT (not BLOB). Rust's `row.get::<_, Vec<u8>>` rejects TEXT,
+        // so the Rust open must coerce those values to BLOB empty
+        // before stamping the migration marker (otherwise the marker
+        // would permanently skip the repair).
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        let tracker_path = tracker_path_for_prefix(&prefix);
+        let block_path = block_path_for_prefix(&prefix);
+
+        {
+            let conn = Connection::open(&tracker_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE kvstore (key BLOB PRIMARY KEY, value BLOB);
+                 INSERT INTO kvstore (key, value) VALUES (x'01', NULL);
+                 INSERT INTO kvstore (key, value) VALUES (x'02', x'aabb');
+                 -- Replay Go's `performKVStoreNullBlobConversion`
+                 -- exactly, leaving an empty-TEXT value behind.
+                 UPDATE kvstore SET value = '' WHERE value IS NULL;",
+            )
+            .unwrap();
+            // Sanity check: the seeded value really is TEXT.
+            let stored_type: String = conn
+                .query_row(
+                    "SELECT typeof(value) FROM kvstore WHERE key = x'01'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored_type, "text");
+        }
+        Connection::open(&block_path).unwrap();
+
+        let _ = SqliteLedger::open_with_prefix(&prefix).expect("open runs migration");
+
+        let conn = Connection::open(&tracker_path).unwrap();
+        // Empty TEXT was coerced to empty BLOB.
+        let stored_type: String = conn
+            .query_row(
+                "SELECT typeof(value) FROM kvstore WHERE key = x'01'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_type, "blob");
+        let v1: Vec<u8> = conn
+            .query_row("SELECT value FROM kvstore WHERE key = x'01'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(v1, Vec::<u8>::new());
+        // Non-empty values are still untouched.
+        let v2: Vec<u8> = conn
+            .query_row("SELECT value FROM kvstore WHERE key = x'02'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(v2, vec![0xaa, 0xbb]);
     }
 
     #[test]
