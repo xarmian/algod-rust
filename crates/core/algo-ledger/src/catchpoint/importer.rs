@@ -18,7 +18,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use algo_types::AccountStatus;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use super::checkpoint::{
     clear_checkpoint, create_checkpoint_table, read_checkpoint, update_checkpoint, ImportCheckpoint,
@@ -137,21 +137,37 @@ impl<'a> CatchpointImporter<'a> {
 
         if let Some(cp) = read_checkpoint(self.conn)? {
             if cp.catchpoint_label == self.catchpoint_label {
-                tracing::info!(
-                    "resuming catchpoint import from chunk {}",
-                    cp.last_chunk_ordinal
+                // G5: resuming reuses the existing staging tables. If those
+                // were created by a pre-G5 binary, `catchpointresources.ctype`
+                // is nullable; the cutover rename would then install a
+                // nullable `resources` over the live one, bypassing the
+                // NOT NULL DEFAULT -1 invariant. Detect that case and restart
+                // the import from scratch rather than honour the stale resume.
+                if !catchpointresources_ctype_is_not_null(self.conn)? {
+                    tracing::warn!(
+                        "stale pre-G5 catchpoint staging detected (catchpointresources.ctype \
+                         is nullable); discarding checkpoint and restarting import"
+                    );
+                    clear_checkpoint(self.conn)?;
+                    self.chunk_ordinal = 0;
+                } else {
+                    tracing::info!(
+                        "resuming catchpoint import from chunk {}",
+                        cp.last_chunk_ordinal
+                    );
+                    return Ok(Some(cp));
+                }
+            } else {
+                // Different label — start fresh. Clear the stale checkpoint so
+                // import_chunks does not skip chunks belonging to the old label.
+                tracing::warn!(
+                    "checkpoint label mismatch (have '{}', want '{}'), restarting import",
+                    cp.catchpoint_label,
+                    self.catchpoint_label
                 );
-                return Ok(Some(cp));
+                clear_checkpoint(self.conn)?;
+                self.chunk_ordinal = 0;
             }
-            // Different label — start fresh. Clear the stale checkpoint so
-            // import_chunks does not skip chunks belonging to the old label.
-            tracing::warn!(
-                "checkpoint label mismatch (have '{}', want '{}'), restarting import",
-                cp.catchpoint_label,
-                self.catchpoint_label
-            );
-            clear_checkpoint(self.conn)?;
-            self.chunk_ordinal = 0;
         }
 
         // Create staging tables via raw DDL (single source of truth in sqlite.rs).
@@ -501,14 +517,18 @@ impl<'a> CatchpointImporter<'a> {
                 .map_err(|e| CatchpointError::ImportError(format!("decode resource data: {e}")))?;
 
             // Determine ctype: asset=0, app=1 (matches Go's basics.CreatableType).
+            // Unknown/non-owning resources use -1 — the same "unknown"
+            // sentinel Go uses (see G5 / DOC-24, and
+            // `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:970`
+            // where the post-migration column is `NOT NULL DEFAULT -1`).
             let resource_is_asset = is_asset(rd.resource_flags, &rd);
             let resource_is_app = is_app(rd.resource_flags, &rd);
-            let ctype: Option<i64> = if resource_is_app {
-                Some(CTYPE_APP)
+            let ctype: i64 = if resource_is_app {
+                CTYPE_APP
             } else if resource_is_asset {
-                Some(CTYPE_ASSET)
+                CTYPE_ASSET
             } else {
-                None
+                -1
             };
 
             self.conn.execute(
@@ -774,6 +794,21 @@ pub fn import_catchpoint_file(
 // ---------------------------------------------------------------------------
 // Resource flag helpers (mirrors Go's resourcesData methods)
 // ---------------------------------------------------------------------------
+
+/// Returns `true` iff `catchpointresources` exists and its `ctype` column is
+/// declared `NOT NULL`. Used at resume time to detect stale pre-G5 staging
+/// tables (see DOC-24 §G5 and the live-resources migration in `sqlite.rs`).
+/// Treats a missing table as "not-not-null" so the caller restarts cleanly.
+fn catchpointresources_ctype_is_not_null(conn: &Connection) -> rusqlite::Result<bool> {
+    let notnull: Option<i64> = conn
+        .query_row(
+            "SELECT \"notnull\" FROM pragma_table_info('catchpointresources') WHERE name='ctype'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(notnull == Some(1))
+}
 
 /// Returns `true` if the ownership bit is set.
 fn is_owning(flags: u8) -> bool {
@@ -1047,6 +1082,50 @@ mod tests {
             })
             .unwrap();
         assert_eq!(creator_count, 0);
+    }
+
+    #[test]
+    fn prepare_staging_restarts_when_resuming_pre_g5_staging() {
+        // G5 — if a checkpoint+staging pair was left behind by a pre-G5
+        // binary (catchpointresources.ctype nullable), resuming with the
+        // same label must NOT honour the stale staging: a later cutover
+        // rename would otherwise install a nullable `resources` table
+        // over the live one, bypassing the new NOT NULL DEFAULT -1
+        // invariant. Expected behaviour: discard the checkpoint, drop +
+        // recreate staging, return Ok(None) (fresh import).
+        let conn = mem_conn();
+
+        // Seed a pre-G5 staging shape (nullable ctype) and a valid
+        // checkpoint pointing at the same label the importer will use.
+        conn.execute_batch(
+            "CREATE TABLE catchpointresources (
+                addrid INTEGER NOT NULL,
+                aidx INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                ctype INTEGER,
+                PRIMARY KEY (addrid, aidx)
+            ) WITHOUT ROWID;",
+        )
+        .unwrap();
+        super::super::checkpoint::create_checkpoint_table(&conn).unwrap();
+        super::super::checkpoint::update_checkpoint(&conn, 3, 10, "test#label").unwrap();
+
+        let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        let cp = importer.prepare_staging().expect("prepare_staging");
+        assert!(
+            cp.is_none(),
+            "stale pre-G5 staging must not be resumed; expected fresh start, got resume {cp:?}"
+        );
+
+        // The new staging table must be NOT NULL.
+        let notnull: i64 = conn
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('catchpointresources') WHERE name='ctype'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(notnull, 1);
     }
 
     #[test]
