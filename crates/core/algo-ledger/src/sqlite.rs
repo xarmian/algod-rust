@@ -2139,6 +2139,26 @@ impl SqliteLedger {
         // and `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:970`.
         migrate_resources_ctype_not_null(&conn)?;
 
+        // G13: normalize NULL kvstore values to empty blobs. Mirrors Go's
+        // `performKVStoreNullBlobConversion`
+        // (`../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:358-362`).
+        // Without it, a Rust reader on a Go-written DB would see NULL where
+        // Go intends an empty box value, and a `Vec<u8>` column read would
+        // error instead of returning the empty value.
+        //
+        // We write `x''` (empty BLOB literal) rather than Go's `''` (empty
+        // TEXT literal) because rusqlite's column-type checks treat them
+        // differently: a TEXT-typed empty value reads back as
+        // `InvalidColumnType` under `row.get::<_, Vec<u8>>`, while a BLOB
+        // empty reads cleanly as `Vec::new()`. Semantically identical to
+        // Go (both are "not NULL, length zero") and matches what the rest
+        // of the Rust kvstore code already produces for empty values.
+        // Idempotent (no-op when there are no NULLs).
+        conn.execute("UPDATE kvstore SET value = x'' WHERE value IS NULL", [])
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("kvstore NULL normalization error: {e}"),
+            })?;
+
         // Legacy-trie-format note (TASK-102 / PLAN-35 / DOC-24 §G2):
         //
         // Older Rust ledgers stored the trie as a single blob in the
@@ -5641,6 +5661,61 @@ mod tests {
             msg.contains("TASK-109") || msg.contains("G12"),
             "error should point to the G12 follow-up; got: {msg}"
         );
+    }
+
+    #[test]
+    fn kvstore_null_values_are_normalized_to_empty_blob_on_open() {
+        // G13 — Go runs `UPDATE kvstore SET value = '' WHERE value IS NULL`
+        // on init (`../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:358-362`).
+        // A Go-written DB can therefore contain box rows whose `value` is
+        // an intentional empty BLOB, but pre-G13 it stored those as NULL.
+        // Verify the migration runs at `open` time and is idempotent.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        let tracker_path = tracker_path_for_prefix(&prefix);
+        let block_path = block_path_for_prefix(&prefix);
+
+        // Seed a Go-style kvstore with a NULL row and a non-NULL row.
+        {
+            let conn = Connection::open(&tracker_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE kvstore (key BLOB PRIMARY KEY, value BLOB);
+                 INSERT INTO kvstore (key, value) VALUES (x'01', NULL);
+                 INSERT INTO kvstore (key, value) VALUES (x'02', x'aabb');",
+            )
+            .unwrap();
+        }
+        Connection::open(&block_path).unwrap();
+
+        let _ = SqliteLedger::open_with_prefix(&prefix).expect("open runs migration");
+
+        let conn = Connection::open(&tracker_path).unwrap();
+        // NULL row is now empty.
+        let v1: Vec<u8> = conn
+            .query_row("SELECT value FROM kvstore WHERE key = x'01'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(v1, Vec::<u8>::new(), "NULL kvstore value must become empty");
+        // Non-NULL row is untouched.
+        let v2: Vec<u8> = conn
+            .query_row("SELECT value FROM kvstore WHERE key = x'02'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(v2, vec![0xaa, 0xbb], "non-NULL value must be preserved");
+        // Idempotent: re-open is fine and doesn't mutate non-NULL rows.
+        drop(conn);
+        let _ = SqliteLedger::open_with_prefix(&prefix).expect("reopen is idempotent");
+        let conn = Connection::open(&tracker_path).unwrap();
+        let null_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kvstore WHERE value IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_count, 0);
     }
 
     #[test]
