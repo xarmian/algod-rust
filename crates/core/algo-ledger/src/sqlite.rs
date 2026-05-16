@@ -406,7 +406,7 @@ const CTYPE_APP: i64 = 1;
 /// declared the column from the start).
 ///
 /// Idempotent: a DB already in the new shape is a no-op.
-fn migrate_resources_ctype_not_null(conn: &Connection) -> rusqlite::Result<()> {
+fn migrate_resources_ctype_not_null(conn: &Connection) -> Result<(), AlgoError> {
     // Three on-disk shapes are possible:
     //   (a) `resources` doesn't exist at all → schema creation will have
     //       just produced the new shape; nothing to do.
@@ -417,11 +417,15 @@ fn migrate_resources_ctype_not_null(conn: &Connection) -> rusqlite::Result<()> {
     //       Replay that exact ALTER so subsequent code can read `r.ctype`.
     //   (c) `resources.ctype` exists but is nullable → pre-G5 Rust shape;
     //       rebuild the table to enforce NOT NULL DEFAULT -1.
-    let table_exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources')",
-        [],
-        |row| row.get(0),
-    )?;
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("query resources table existence: {e}"),
+        })?;
     if !table_exists {
         // Case (a).
         return Ok(());
@@ -434,17 +438,29 @@ fn migrate_resources_ctype_not_null(conn: &Connection) -> rusqlite::Result<()> {
             [],
             |row| row.get(0),
         )
-        .optional()?;
+        .optional()
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("query resources.ctype pragma: {e}"),
+        })?;
 
     let Some(notnull) = notnull else {
-        // Case (b): column missing — add it with Go's exact DDL. SQLite
-        // permits ADD COLUMN with NOT NULL when a non-NULL DEFAULT is
-        // supplied, so existing rows are backfilled to -1 atomically.
-        conn.execute(
-            "ALTER TABLE resources ADD COLUMN ctype INTEGER NOT NULL DEFAULT -1",
-            [],
-        )?;
-        return Ok(());
+        // Case (b): column missing. Go's `accountsAddCreatableTypeColumn`
+        // adds the column AND backfills `ctype` per row (from
+        // `assetcreators` and then by decoding resource blobs;
+        // `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:946-1039`).
+        // Skipping the backfill would leave existing asset/app rows with
+        // ctype=-1, which is treated as "unknown" by lookups filtering on
+        // ctype = 0/1 (e.g. `r.ctype = ?`) and would make those resources
+        // silently invisible. Porting the full backfill is the job of
+        // TASK-109 / G12 (pre-v3 migration, explicitly out of scope here);
+        // until then, refuse to open such a DB with a clear pointer.
+        return Err(AlgoError::Ledger {
+            message: "resources table is missing the `ctype` column \
+                      (pre-ctype Go shape). Backfill migration is not \
+                      yet ported (see PLAN-35 TASK-109 / DOC-24 §G12). \
+                      Recover by re-syncing this ledger from a catchpoint."
+                .to_string(),
+        });
     };
 
     // Already in the new shape — done.
@@ -468,7 +484,10 @@ fn migrate_resources_ctype_not_null(conn: &Connection) -> rusqlite::Result<()> {
          DROP TABLE resources;
          ALTER TABLE resources_g5_migration RENAME TO resources;
          COMMIT;",
-    )?;
+    )
+    .map_err(|e| AlgoError::Ledger {
+        message: format!("rebuild resources for NOT NULL ctype: {e}"),
+    })?;
     Ok(())
 }
 
@@ -2118,9 +2137,7 @@ impl SqliteLedger {
         // Upgrade pre-G5 Rust DBs whose `resources.ctype` is nullable to
         // Go's post-migration shape (NOT NULL DEFAULT -1). See DOC-24 §G5
         // and `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:970`.
-        migrate_resources_ctype_not_null(&conn).map_err(|e| AlgoError::Ledger {
-            message: format!("resources.ctype migration error: {e}"),
-        })?;
+        migrate_resources_ctype_not_null(&conn)?;
 
         // Legacy-trie-format note (TASK-102 / PLAN-35 / DOC-24 §G2):
         //
@@ -5577,11 +5594,16 @@ mod tests {
     }
 
     #[test]
-    fn resources_ctype_migration_adds_missing_column_on_pre_ctype_go_db() {
+    fn resources_ctype_migration_refuses_pre_ctype_go_db() {
         // G5 — a tracker DB whose `resources` table predates Go's own
         // ctype migration has no `ctype` column at all. Opening such a
-        // DB should add the column with `NOT NULL DEFAULT -1`,
-        // replaying `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:970`.
+        // DB must refuse with a clear error rather than silently adding
+        // the column without backfill: Go's `accountsAddCreatableTypeColumn`
+        // populates ctype per row from `assetcreators` + decoded resource
+        // blobs, and skipping that step would make existing asset/app
+        // rows (which downstream queries filter on `ctype IN (0,1)`)
+        // invisible at runtime. The deeper port lives in TASK-109 / G12,
+        // which is explicitly out of scope for TASK-104.
         let dir = tempfile::tempdir().unwrap();
         let prefix = dir.path().join("ledger");
         let tracker_path = tracker_path_for_prefix(&prefix);
@@ -5606,25 +5628,19 @@ mod tests {
         }
         Connection::open(&block_path).unwrap();
 
-        let _ = SqliteLedger::open_with_prefix(&prefix).expect("open adds missing column");
-
-        let conn = Connection::open(&tracker_path).unwrap();
-        let notnull: i64 = conn
-            .query_row(
-                "SELECT \"notnull\" FROM pragma_table_info('resources') WHERE name='ctype'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(notnull, 1);
-        let ctype: i64 = conn
-            .query_row(
-                "SELECT ctype FROM resources WHERE addrid=1 AND aidx=2",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(ctype, -1, "existing rows must be backfilled to -1");
+        let err = match SqliteLedger::open_with_prefix(&prefix) {
+            Ok(_) => panic!("opening a pre-ctype DB must fail"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("missing the `ctype` column"),
+            "error should mention missing ctype column; got: {msg}"
+        );
+        assert!(
+            msg.contains("TASK-109") || msg.contains("G12"),
+            "error should point to the G12 follow-up; got: {msg}"
+        );
     }
 
     #[test]
