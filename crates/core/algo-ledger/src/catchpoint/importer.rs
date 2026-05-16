@@ -501,14 +501,18 @@ impl<'a> CatchpointImporter<'a> {
                 .map_err(|e| CatchpointError::ImportError(format!("decode resource data: {e}")))?;
 
             // Determine ctype: asset=0, app=1 (matches Go's basics.CreatableType).
+            // Unknown/non-owning resources use -1 — the same "unknown"
+            // sentinel Go uses (see G5 / DOC-24, and
+            // `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:970`
+            // where the post-migration column is `NOT NULL DEFAULT -1`).
             let resource_is_asset = is_asset(rd.resource_flags, &rd);
             let resource_is_app = is_app(rd.resource_flags, &rd);
-            let ctype: Option<i64> = if resource_is_app {
-                Some(CTYPE_APP)
+            let ctype: i64 = if resource_is_app {
+                CTYPE_APP
             } else if resource_is_asset {
-                Some(CTYPE_ASSET)
+                CTYPE_ASSET
             } else {
-                None
+                -1
             };
 
             self.conn.execute(

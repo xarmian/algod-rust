@@ -407,8 +407,27 @@ const CTYPE_APP: i64 = 1;
 ///
 /// Idempotent: a DB already in the new shape is a no-op.
 fn migrate_resources_ctype_not_null(conn: &Connection) -> rusqlite::Result<()> {
-    // Inspect the live shape of `ctype`. `pragma_table_info` returns rows
-    // {cid, name, type, notnull, dflt_value, pk}.
+    // Three on-disk shapes are possible:
+    //   (a) `resources` doesn't exist at all → schema creation will have
+    //       just produced the new shape; nothing to do.
+    //   (b) `resources` exists but has no `ctype` column → this is a
+    //       pre-ctype Go DB (the column was added by Go's
+    //       `accountsAddCreatableTypeColumn` at
+    //       `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:970`).
+    //       Replay that exact ALTER so subsequent code can read `r.ctype`.
+    //   (c) `resources.ctype` exists but is nullable → pre-G5 Rust shape;
+    //       rebuild the table to enforce NOT NULL DEFAULT -1.
+    let table_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        // Case (a).
+        return Ok(());
+    }
+
+    // `pragma_table_info` returns rows {cid, name, type, notnull, dflt_value, pk}.
     let notnull: Option<i64> = conn
         .query_row(
             "SELECT \"notnull\" FROM pragma_table_info('resources') WHERE name='ctype'",
@@ -417,10 +436,14 @@ fn migrate_resources_ctype_not_null(conn: &Connection) -> rusqlite::Result<()> {
         )
         .optional()?;
 
-    // No `resources` table or no `ctype` column → nothing to migrate;
-    // schema creation just ran with the new shape so this is the
-    // freshly-initialized case.
     let Some(notnull) = notnull else {
+        // Case (b): column missing — add it with Go's exact DDL. SQLite
+        // permits ADD COLUMN with NOT NULL when a non-NULL DEFAULT is
+        // supplied, so existing rows are backfilled to -1 atomically.
+        conn.execute(
+            "ALTER TABLE resources ADD COLUMN ctype INTEGER NOT NULL DEFAULT -1",
+            [],
+        )?;
         return Ok(());
     };
 
@@ -3058,11 +3081,15 @@ CREATE TABLE IF NOT EXISTS catchpointaccounthashes (
     data BLOB
 );
 
+-- G5: `ctype` matches the live `resources` shape — the catchpoint
+-- importer renames this staging table over `resources` at cutover, so
+-- it must declare the same `NOT NULL DEFAULT -1` shape or cutover would
+-- bypass the invariant.
 CREATE TABLE IF NOT EXISTS catchpointresources (
     addrid INTEGER NOT NULL,
     aidx INTEGER NOT NULL,
     data BLOB NOT NULL,
-    ctype INTEGER,
+    ctype INTEGER NOT NULL DEFAULT -1,
     PRIMARY KEY (addrid, aidx)
 ) WITHOUT ROWID;
 
@@ -5547,6 +5574,79 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn resources_ctype_migration_adds_missing_column_on_pre_ctype_go_db() {
+        // G5 — a tracker DB whose `resources` table predates Go's own
+        // ctype migration has no `ctype` column at all. Opening such a
+        // DB should add the column with `NOT NULL DEFAULT -1`,
+        // replaying `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:970`.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        let tracker_path = tracker_path_for_prefix(&prefix);
+        let block_path = block_path_for_prefix(&prefix);
+
+        {
+            let conn = Connection::open(&tracker_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE resources (
+                    addrid  INTEGER NOT NULL,
+                    aidx    INTEGER NOT NULL,
+                    data    BLOB    NOT NULL,
+                    PRIMARY KEY (addrid, aidx)
+                ) WITHOUT ROWID;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO resources (addrid, aidx, data) VALUES (1, 2, x'cc')",
+                [],
+            )
+            .unwrap();
+        }
+        Connection::open(&block_path).unwrap();
+
+        let _ = SqliteLedger::open_with_prefix(&prefix).expect("open adds missing column");
+
+        let conn = Connection::open(&tracker_path).unwrap();
+        let notnull: i64 = conn
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('resources') WHERE name='ctype'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(notnull, 1);
+        let ctype: i64 = conn
+            .query_row(
+                "SELECT ctype FROM resources WHERE addrid=1 AND aidx=2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ctype, -1, "existing rows must be backfilled to -1");
+    }
+
+    #[test]
+    fn catchpointresources_ctype_matches_live_resources_shape() {
+        // G5 — `catchpointresources` is renamed over `resources` by the
+        // catchpoint cutover, so its `ctype` declaration must match the
+        // live shape. Verified by initializing a connection with the
+        // catchpoint-staging DDL (which lives in a separate constant)
+        // and checking pragma reports NOT NULL.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CATCHPOINT_STAGING_TABLES_SQL).unwrap();
+        let notnull: i64 = conn
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('catchpointresources') WHERE name='ctype'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            notnull, 1,
+            "catchpointresources.ctype must be NOT NULL (matches live resources)"
+        );
     }
 
     #[test]
