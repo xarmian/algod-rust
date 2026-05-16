@@ -89,6 +89,38 @@ CREATE TABLE IF NOT EXISTS assetcreators (
     ctype   INTEGER
 );
 
+-- Catchpoint catalog. Matches
+-- `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:60-65`
+-- byte-for-byte modulo the IF NOT EXISTS clause. Phase A is reader-only;
+-- the row is populated by the catchpoint tracker (out of scope for
+-- PLAN-35, see PLAN-37). The table must exist with this exact shape so a
+-- Go-written DB containing rows here re-opens cleanly under Rust, and a
+-- Rust-initialized DB re-opens cleanly under Go.
+CREATE TABLE IF NOT EXISTS storedcatchpoints (
+    round     INTEGER PRIMARY KEY,
+    filename  TEXT NOT NULL,
+    catchpoint TEXT NOT NULL,
+    filesize  size NOT NULL,
+    pinned    INTEGER NOT NULL
+);
+
+-- First-stage catchpoint metadata. Matches
+-- `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:143-146`.
+-- `info` is a msgp-encoded `catchpointFirstStageInfo`. Empty for the
+-- reader path; the writer is downstream of PLAN-35.
+CREATE TABLE IF NOT EXISTS catchpointfirststageinfo (
+    round INTEGER PRIMARY KEY NOT NULL,
+    info  BLOB NOT NULL
+);
+
+-- Unfinished catchpoints staging. Matches
+-- `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:148-151`.
+-- Empty for the reader path; the writer is downstream of PLAN-35.
+CREATE TABLE IF NOT EXISTS unfinishedcatchpoints (
+    round     INTEGER PRIMARY KEY NOT NULL,
+    blockhash BLOB NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS algod_rust_meta (
     key   TEXT PRIMARY KEY,
     value BLOB
@@ -5245,6 +5277,66 @@ mod tests {
             !block_has_accountbase,
             "block DB must not contain accountbase (it lives in the tracker DB)"
         );
+    }
+
+    #[test]
+    fn tracker_schema_declares_go_catchpoint_tables() {
+        // G3 — verify the three tracker tables that go-algorand's
+        // `accountsSchema` / first-stage / unfinished-catchpoints DDL
+        // declares are all present after a fresh open. They are empty in
+        // the reader path, but their existence is a prerequisite for Go
+        // re-opening a Rust-initialized DB and for Rust reading a
+        // Go-initialized DB without hitting a "no such table" on
+        // catchpoint-related queries.
+        //
+        // Go reference:
+        //   ../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:60-65
+        //     (storedcatchpoints)
+        //   ../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:143-146
+        //     (catchpointfirststageinfo)
+        //   ../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:148-151
+        //     (unfinishedcatchpoints)
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        let _ = SqliteLedger::open_with_prefix(&prefix).expect("open ledger");
+
+        let tracker_conn = Connection::open(tracker_path_for_prefix(&prefix)).unwrap();
+        for table in [
+            "storedcatchpoints",
+            "catchpointfirststageinfo",
+            "unfinishedcatchpoints",
+        ] {
+            let exists: bool = tracker_conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "tracker DB must contain table `{table}` (G3)");
+        }
+
+        // Smoke check: writing a row to each table with Go's column
+        // shapes succeeds. This guards against type/NOT-NULL drift.
+        tracker_conn
+            .execute(
+                "INSERT INTO storedcatchpoints (round, filename, catchpoint, filesize, pinned) \
+                 VALUES (1, 'cp.tar', 'abc', 100, 0)",
+                [],
+            )
+            .expect("insert storedcatchpoints");
+        tracker_conn
+            .execute(
+                "INSERT INTO catchpointfirststageinfo (round, info) VALUES (1, x'00')",
+                [],
+            )
+            .expect("insert catchpointfirststageinfo");
+        tracker_conn
+            .execute(
+                "INSERT INTO unfinishedcatchpoints (round, blockhash) VALUES (1, x'00')",
+                [],
+            )
+            .expect("insert unfinishedcatchpoints");
     }
 
     #[test]
