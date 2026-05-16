@@ -393,6 +393,36 @@ pub fn remove_ledger_files(path: &Path) -> std::io::Result<()> {
 const CTYPE_ASSET: i64 = 0;
 const CTYPE_APP: i64 = 1;
 
+/// Marker key written to `catchpointstate` after the G13 kvstore NULL
+/// normalization has run. Namespaced with `algod_rust_` so it cannot
+/// collide with Go's well-known keys (Go reads specific keys by name and
+/// ignores everything else, so leaving the row in place is safe).
+const KVSTORE_NULL_NORM_MARKER: &str = "algod_rust_kvstore_null_norm_v1";
+
+/// G13: one-shot conversion of NULL `kvstore.value` rows to empty BLOBs.
+/// Mirrors Go's `performKVStoreNullBlobConversion`. Persists a marker in
+/// `catchpointstate` so subsequent opens skip the table scan; idempotent
+/// either way.
+fn normalize_kvstore_nulls(conn: &Connection) -> rusqlite::Result<()> {
+    let already_done: Option<i64> = conn
+        .query_row(
+            "SELECT intval FROM catchpointstate WHERE id = ?1",
+            [KVSTORE_NULL_NORM_MARKER],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if already_done == Some(1) {
+        return Ok(());
+    }
+
+    conn.execute("UPDATE kvstore SET value = x'' WHERE value IS NULL", [])?;
+    conn.execute(
+        "INSERT OR REPLACE INTO catchpointstate (id, intval) VALUES (?1, 1)",
+        [KVSTORE_NULL_NORM_MARKER],
+    )?;
+    Ok(())
+}
+
 /// Upgrade pre-G5 Rust DBs whose `resources.ctype` was declared `INTEGER`
 /// (nullable) to Go's post-migration shape `INTEGER NOT NULL DEFAULT -1`.
 /// SQLite can't change a column's `NOT NULL` in place, so we rebuild the
@@ -2139,8 +2169,8 @@ impl SqliteLedger {
         // and `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:970`.
         migrate_resources_ctype_not_null(&conn)?;
 
-        // G13: normalize NULL kvstore values to empty blobs. Mirrors Go's
-        // `performKVStoreNullBlobConversion`
+        // G13: normalize NULL kvstore values to empty blobs (one-shot).
+        // Mirrors Go's `performKVStoreNullBlobConversion`
         // (`../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:358-362`).
         // Without it, a Rust reader on a Go-written DB would see NULL where
         // Go intends an empty box value, and a `Vec<u8>` column read would
@@ -2151,13 +2181,15 @@ impl SqliteLedger {
         // differently: a TEXT-typed empty value reads back as
         // `InvalidColumnType` under `row.get::<_, Vec<u8>>`, while a BLOB
         // empty reads cleanly as `Vec::new()`. Semantically identical to
-        // Go (both are "not NULL, length zero") and matches what the rest
-        // of the Rust kvstore code already produces for empty values.
-        // Idempotent (no-op when there are no NULLs).
-        conn.execute("UPDATE kvstore SET value = x'' WHERE value IS NULL", [])
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("kvstore NULL normalization error: {e}"),
-            })?;
+        // Go (both are "not NULL, length zero").
+        //
+        // Performance: `kvstore.value` is not indexed, so a NULL-check
+        // would scan the entire box store on every open. Persist a marker
+        // in `catchpointstate` (Go's own k-v table — Go ignores unknown
+        // keys) and skip the UPDATE once the migration has run.
+        normalize_kvstore_nulls(&conn).map_err(|e| AlgoError::Ledger {
+            message: format!("kvstore NULL normalization error: {e}"),
+        })?;
 
         // Legacy-trie-format note (TASK-102 / PLAN-35 / DOC-24 §G2):
         //
@@ -5704,18 +5736,33 @@ mod tests {
             })
             .unwrap();
         assert_eq!(v2, vec![0xaa, 0xbb], "non-NULL value must be preserved");
-        // Idempotent: re-open is fine and doesn't mutate non-NULL rows.
-        drop(conn);
-        let _ = SqliteLedger::open_with_prefix(&prefix).expect("reopen is idempotent");
-        let conn = Connection::open(&tracker_path).unwrap();
-        let null_count: i64 = conn
+        // Marker is persisted so subsequent opens skip the table scan.
+        let marker: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM kvstore WHERE value IS NULL",
+                "SELECT intval FROM catchpointstate WHERE id = 'algod_rust_kvstore_null_norm_v1'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(null_count, 0);
+        assert_eq!(marker, 1);
+
+        // After the marker is set, a NULL written post-migration is NOT
+        // auto-rewritten on reopen — confirming the marker actually
+        // gates the UPDATE rather than the UPDATE running unconditionally.
+        conn.execute("INSERT INTO kvstore (key, value) VALUES (x'03', NULL)", [])
+            .unwrap();
+        drop(conn);
+        let _ = SqliteLedger::open_with_prefix(&prefix).expect("reopen is idempotent");
+        let conn = Connection::open(&tracker_path).unwrap();
+        let v3: Option<Vec<u8>> = conn
+            .query_row("SELECT value FROM kvstore WHERE key = x'03'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            v3, None,
+            "marker must prevent re-scan; post-migration NULLs stay NULL"
+        );
     }
 
     #[test]
