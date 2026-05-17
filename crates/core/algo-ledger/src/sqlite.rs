@@ -1999,7 +1999,19 @@ pub(crate) fn derive_chain_meta_from_latest_block(
 ) -> Result<Option<ChainMetaFromHeader>, AlgoError> {
     // Tracker round = committed accountbase round (matches Go's
     // `accountsRound`). NULL/missing row → fall back to legacy meta.
-    let tracker_rnd: Option<i64> = conn
+    // Committed round = the highest of:
+    //   - `acctrounds.acctbase`: what Go writes when applying blocks
+    //     (and what the Rust catchpoint importer seeds), and
+    //   - `algod_rust_meta.current_round`: what Rust's `commit_block`
+    //     advances on every block apply. Rust does NOT mirror that
+    //     value back into `acctrounds` (the writer-side change is out
+    //     of scope for G6 part 1), so a Rust-applied DB with a stale
+    //     catchpoint-seeded `acctrounds` row would regress on reopen
+    //     if we trusted `acctrounds` alone.
+    //
+    // Take the max of the two so derivation never moves backwards
+    // regardless of which path wrote the DB.
+    let acctrounds_rnd: Option<i64> = conn
         .query_row(
             "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
             [],
@@ -2009,17 +2021,23 @@ pub(crate) fn derive_chain_meta_from_latest_block(
         .map_err(|e| AlgoError::Ledger {
             message: format!("derive chain meta: acctrounds query: {e}"),
         })?;
-    let Some(rnd) = tracker_rnd else {
-        return Ok(None);
-    };
-    if rnd < 0 {
-        // A negative round is a corruption signal — let the caller's
+    if matches!(acctrounds_rnd, Some(r) if r < 0) {
+        // Negative round is a corruption signal; let the caller's
         // fallback handle it rather than panic on the cast.
         tracing::warn!(
-            "derive chain meta: acctrounds 'acctbase' is negative ({rnd}); falling back"
+            "derive chain meta: acctrounds 'acctbase' is negative ({:?}); falling back",
+            acctrounds_rnd
         );
         return Ok(None);
     }
+    let meta_rnd = get_meta_u64(conn, "current_round").unwrap_or(0);
+    let acctrounds_u: u64 = acctrounds_rnd.map(|v| v as u64).unwrap_or(0);
+    let rnd_u = acctrounds_u.max(meta_rnd);
+    if rnd_u == 0 && acctrounds_rnd.is_none() && meta_rnd == 0 {
+        // Truly fresh DB: nothing to derive from.
+        return Ok(None);
+    }
+    let rnd = rnd_u as i64;
 
     let hdrdata: Option<Vec<u8>> = conn
         .query_row(
@@ -6086,6 +6104,68 @@ mod tests {
         assert_eq!(ledger.current_round, Round(3), "must use tracker round");
         assert_eq!(ledger.protocol, "vCommitted");
         assert_eq!(ledger.txn_counter, 33);
+    }
+
+    #[test]
+    fn chain_metadata_does_not_regress_when_rust_apply_advances_past_acctrounds() {
+        // G6 part 1 regression — Rust's `commit_block` writes
+        // `current_round` to `algod_rust_meta` but does NOT update
+        // `acctrounds.acctbase` (that's a writer-side change deferred
+        // to a later G6 task). After a catchpoint import (which seeds
+        // `acctrounds` at the catchpoint round) followed by applying
+        // additional blocks, reopen would regress `current_round`
+        // back to the catchpoint round if derivation trusted
+        // `acctrounds` alone. We instead take the max of acctrounds
+        // and the meta cache.
+        use algo_types::BlockHeader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+
+        // Catchpoint round 100; Rust then applies blocks up to 103.
+        let mut hdr100 = BlockHeader {
+            round: Round(100),
+            ..Default::default()
+        };
+        hdr100.current_protocol = "vCatchpoint".to_string();
+        hdr100.txn_counter = 100;
+        let hdr100_bytes = rmp_serde::to_vec_named(&hdr100).unwrap();
+        let mut hdr103 = BlockHeader {
+            round: Round(103),
+            ..Default::default()
+        };
+        hdr103.current_protocol = "vApplied".to_string();
+        hdr103.txn_counter = 103;
+        let hdr103_bytes = rmp_serde::to_vec_named(&hdr103).unwrap();
+
+        {
+            let mut ledger = SqliteLedger::open_with_prefix(&prefix).expect("open");
+            ledger
+                .put_block(100, "vCatchpoint", &hdr100_bytes, b"b100")
+                .unwrap();
+            ledger
+                .put_block(103, "vApplied", &hdr103_bytes, b"b103")
+                .unwrap();
+            // Catchpoint seeded acctrounds at 100; apply has since
+            // advanced algod_rust_meta to 103 without touching it.
+            ledger
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 100)",
+                    [],
+                )
+                .unwrap();
+            set_meta_u64(&ledger.conn, "current_round", 103).unwrap();
+        }
+
+        let ledger = SqliteLedger::open_with_prefix(&prefix).expect("reopen");
+        assert_eq!(
+            ledger.current_round,
+            Round(103),
+            "must not regress past meta's current_round"
+        );
+        assert_eq!(ledger.protocol, "vApplied");
+        assert_eq!(ledger.txn_counter, 103);
     }
 
     #[test]
