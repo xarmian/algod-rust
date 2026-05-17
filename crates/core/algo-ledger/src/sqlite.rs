@@ -2777,27 +2777,50 @@ impl SqliteLedger {
     }
 
     /// Get the last committed round (for resume capability).
+    ///
+    /// G6 part 1: matches the round source used by `init`'s derivation
+    /// — the max of `acctrounds.acctbase` (Go's `accountsRound`) and
+    /// `algod_rust_meta.current_round` (Rust's commit cache). Reading
+    /// only the meta cache would make a Go-generated DB report `None`
+    /// here, which `reconcile_cross_file()` would then classify as
+    /// `Empty` — letting sync/replay callers reject or recreate a
+    /// perfectly valid ledger. Returns `None` only when neither row
+    /// exists (truly fresh / never-initialized DB).
     pub fn last_committed_round(&self) -> Result<Option<u64>, AlgoError> {
-        let val = get_meta_u64(&self.conn, "current_round")?;
-        if val == 0 {
-            // Check if it actually exists vs just being zero.
-            let exists: bool = self
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM algod_rust_meta WHERE key = 'current_round'",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|e| AlgoError::Ledger {
-                    message: format!("query error: {e}"),
-                })?;
-            if exists {
-                Ok(Some(0))
-            } else {
-                Ok(None)
-            }
+        let acctrounds_rnd: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("acctrounds query error: {e}"),
+            })?;
+        let meta_present: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM algod_rust_meta WHERE key = 'current_round'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("meta presence query error: {e}"),
+            })?;
+
+        let acctrounds_u = acctrounds_rnd.map(|v| v.max(0) as u64);
+        let meta_val = if meta_present {
+            Some(get_meta_u64(&self.conn, "current_round")?)
         } else {
-            Ok(Some(val))
+            None
+        };
+
+        match (acctrounds_u, meta_val) {
+            (None, None) => Ok(None),
+            (Some(a), None) => Ok(Some(a)),
+            (None, Some(m)) => Ok(Some(m)),
+            (Some(a), Some(m)) => Ok(Some(a.max(m))),
         }
     }
 
@@ -6104,6 +6127,35 @@ mod tests {
         assert_eq!(ledger.current_round, Round(3), "must use tracker round");
         assert_eq!(ledger.protocol, "vCommitted");
         assert_eq!(ledger.txn_counter, 33);
+    }
+
+    #[test]
+    fn last_committed_round_reads_acctrounds_when_meta_is_empty() {
+        // G6 part 1 regression — `last_committed_round` previously
+        // read only `algod_rust_meta.current_round`. On a Go-generated
+        // DB (empty meta, populated `acctrounds`) it returned None and
+        // `reconcile_cross_file` would mis-classify the DB as Empty.
+        // Verify the new max(acctrounds, meta) path returns the
+        // tracker round.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        {
+            let mut ledger = SqliteLedger::open_with_prefix(&prefix).expect("open");
+            ledger.put_block(42, "v41", b"hdr", b"blk").unwrap();
+            ledger
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 42)",
+                    [],
+                )
+                .unwrap();
+            ledger
+                .conn
+                .execute("DELETE FROM algod_rust_meta", [])
+                .unwrap();
+        }
+        let ledger = SqliteLedger::open_with_prefix(&prefix).expect("reopen");
+        assert_eq!(ledger.last_committed_round().unwrap(), Some(42));
     }
 
     #[test]
