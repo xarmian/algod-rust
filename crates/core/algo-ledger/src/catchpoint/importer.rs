@@ -375,34 +375,42 @@ impl<'a> CatchpointImporter<'a> {
             );",
         )?;
 
+        // Key names match Go's `trackerdb.CatchpointState*` constants
+        // (centralized in `crate::catchpoint::state_keys`). Routing
+        // through the constants avoids drift if Go ever renames one.
+        use crate::catchpoint::state_keys;
+
         // catchpointCatchupLabel — the label string
         tx.execute(
-            "INSERT OR REPLACE INTO catchpointstate(id, strval) VALUES('catchpointCatchupLabel', ?1)",
-            rusqlite::params![&self.catchpoint_label],
+            "INSERT OR REPLACE INTO catchpointstate(id, strval) VALUES(?1, ?2)",
+            rusqlite::params![state_keys::CATCHUP_LABEL, &self.catchpoint_label],
         )?;
 
         // catchpointCatchupVersion — file version from the header
         tx.execute(
-            "INSERT OR REPLACE INTO catchpointstate(id, intval) VALUES('catchpointCatchupVersion', ?1)",
-            rusqlite::params![header.version as i64],
+            "INSERT OR REPLACE INTO catchpointstate(id, intval) VALUES(?1, ?2)",
+            rusqlite::params![state_keys::CATCHUP_VERSION, header.version as i64],
         )?;
 
         // catchpointCatchupBlockRound — block round from the header
         tx.execute(
-            "INSERT OR REPLACE INTO catchpointstate(id, intval) VALUES('catchpointCatchupBlockRound', ?1)",
-            rusqlite::params![header.blocks_round as i64],
+            "INSERT OR REPLACE INTO catchpointstate(id, intval) VALUES(?1, ?2)",
+            rusqlite::params![state_keys::CATCHUP_BLOCK_ROUND, header.blocks_round as i64],
         )?;
 
         // catchpointCatchupBalancesRound — balances round from the header
         tx.execute(
-            "INSERT OR REPLACE INTO catchpointstate(id, intval) VALUES('catchpointCatchupBalancesRound', ?1)",
-            rusqlite::params![header.balances_round as i64],
+            "INSERT OR REPLACE INTO catchpointstate(id, intval) VALUES(?1, ?2)",
+            rusqlite::params![
+                state_keys::CATCHUP_BALANCES_ROUND,
+                header.balances_round as i64
+            ],
         )?;
 
         // catchpointCatchupHashRound — same as block round for V6+ (matches Go)
         tx.execute(
-            "INSERT OR REPLACE INTO catchpointstate(id, intval) VALUES('catchpointCatchupHashRound', ?1)",
-            rusqlite::params![header.blocks_round as i64],
+            "INSERT OR REPLACE INTO catchpointstate(id, intval) VALUES(?1, ?2)",
+            rusqlite::params![state_keys::CATCHUP_HASH_ROUND, header.blocks_round as i64],
         )?;
 
         // Step 6: Clean up remaining staging tables and checkpoint.
@@ -1409,6 +1417,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hash_rnd, 47_000_000);
+    }
+
+    #[test]
+    fn atomic_cutover_writes_go_canonical_catchpointstate_keys() {
+        // G6 part 2 (TASK-106) — verify the five catchpointstate keys
+        // the importer writes during cutover match Go's
+        // `trackerdb.CatchpointState*` constants byte-for-byte. If a
+        // future refactor regresses any of these to a Rust-only name,
+        // Go would fail to find them on reopen.
+        use crate::catchpoint::state_keys;
+
+        let conn = mem_conn();
+        let mut importer = CatchpointImporter::new(&conn, "47000000#abc".to_string(), REWARD_UNITS);
+        importer.prepare_staging().unwrap();
+
+        let header = make_test_header(47_000_000);
+        importer.atomic_cutover(&header).unwrap();
+
+        // Each Go-canonical key the importer is supposed to write
+        // must be present in the live catchpointstate table.
+        for key in [
+            state_keys::CATCHUP_LABEL,
+            state_keys::CATCHUP_VERSION,
+            state_keys::CATCHUP_BLOCK_ROUND,
+            state_keys::CATCHUP_BALANCES_ROUND,
+            state_keys::CATCHUP_HASH_ROUND,
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM catchpointstate WHERE id = ?1)",
+                    [key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing Go-canonical catchpointstate key `{key}`");
+        }
+
+        // Every non-namespaced key actually written to the table must
+        // appear in the canonical list — catches drift if a new
+        // non-namespaced key is added without updating state_keys.
+        let mut written: Vec<String> = Vec::new();
+        let mut stmt = conn.prepare("SELECT id FROM catchpointstate").unwrap();
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+        for r in rows {
+            written.push(r.unwrap());
+        }
+        for k in &written {
+            if k.starts_with("algod_rust_") {
+                continue;
+            }
+            assert!(
+                state_keys::ALL_GO_CANONICAL.contains(&k.as_str()),
+                "catchpointstate key `{k}` is not Go-canonical and is \
+                 not namespaced; add to state_keys::ALL_GO_CANONICAL \
+                 or prefix with `algod_rust_`"
+            );
+        }
     }
 
     #[test]
