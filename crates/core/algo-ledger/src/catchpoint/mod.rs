@@ -2,6 +2,7 @@ pub mod checkpoint;
 pub mod importer;
 pub mod msgp_compat;
 pub mod parser;
+pub mod state_keys;
 pub mod types;
 pub mod verify;
 

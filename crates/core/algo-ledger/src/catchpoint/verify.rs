@@ -1094,10 +1094,15 @@ pub fn verify_catchpoint(
     conn: &Connection,
     block_header_digest: &[u8; 32],
 ) -> Result<CatchpointVerifyResult, CatchpointError> {
-    // Step 1: Read catchpointstate keys.
-    let stored_label = read_catchpointstate_str(conn, "catchpointCatchupLabel")?;
-    let version = read_catchpointstate_int(conn, "catchpointCatchupVersion")? as u64;
-    let _balances_round = read_catchpointstate_int(conn, "catchpointCatchupBalancesRound")? as u64;
+    // Step 1: Read catchpointstate keys. Key names match Go's
+    // `trackerdb.CatchpointState*` constants — see
+    // `crate::catchpoint::state_keys` for the canonical list and the
+    // mapping back to Go's `catchpoint.go`.
+    use crate::catchpoint::state_keys;
+    let stored_label = read_catchpointstate_str(conn, state_keys::CATCHUP_LABEL)?;
+    let version = read_catchpointstate_int(conn, state_keys::CATCHUP_VERSION)? as u64;
+    let _balances_round =
+        read_catchpointstate_int(conn, state_keys::CATCHUP_BALANCES_ROUND)? as u64;
 
     // Step 2: Parse the stored label to extract round.
     let parsed_label = parse_catchpoint_label(&stored_label)?;

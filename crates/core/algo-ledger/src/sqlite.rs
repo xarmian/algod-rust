@@ -2343,6 +2343,18 @@ impl SqliteLedger {
             message: format!("kvstore NULL normalization error: {e}"),
         })?;
 
+        // G6 part 2 (TASK-106): rename any legacy Rust-only
+        // `catchpointstate` keys to their Go-canonical equivalents.
+        // Currently a no-op — Rust has only ever written Go-canonical
+        // keys — but the call point is wired in so a future rename
+        // lands here without churn at the init site. See
+        // `crate::catchpoint::state_keys` for the canonical list.
+        crate::catchpoint::state_keys::migrate_legacy_keys(&conn).map_err(|e| {
+            AlgoError::Ledger {
+                message: format!("catchpointstate key migration error: {e}"),
+            }
+        })?;
+
         // Legacy-trie-format note (TASK-102 / PLAN-35 / DOC-24 §G2):
         //
         // Older Rust ledgers stored the trie as a single blob in the
