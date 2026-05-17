@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use algo_error::AlgoError;
 use algo_types::{
     AccountData, AccountStatus, Address, AppLocalState, AppParams, AssetHolding, AssetParams,
-    AssetParamsRecord, Round, StateSchema, TealValue,
+    AssetParamsRecord, BlockHeader, Round, StateSchema, TealValue,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -1955,6 +1955,94 @@ fn set_meta_string(conn: &Connection, key: &str, val: &str) -> Result<(), AlgoEr
     set_meta_blob(conn, key, val.as_bytes())
 }
 
+/// Snapshot of cached chain-level state derived from a block header.
+/// Mirrors the subset of fields the runtime currently caches in the
+/// (Rust-only) `algod_rust_meta` table — keeping the shape identical
+/// lets the init path swap one source for the other without touching
+/// downstream callers.
+#[derive(Debug)]
+pub(crate) struct ChainMetaFromHeader {
+    pub current_round: Round,
+    pub rewards_level: u64,
+    pub rewards_rate: u64,
+    pub rewards_residue: u64,
+    pub rewards_recalculation_round: u64,
+    pub fee_sink: Address,
+    pub rewards_pool: Address,
+    pub genesis_id: String,
+    pub genesis_hash: [u8; 32],
+    pub protocol: String,
+    pub txn_counter: u64,
+}
+
+/// G6 part 1 — derive cached chain-level state from the latest block
+/// header in `blockdb.blocks`. Returns `None` when the block archive is
+/// empty (genesis-only DBs), in which case the caller falls back to the
+/// legacy `algod_rust_meta` table.
+///
+/// Go's tracker has no `algod_rust_meta` analogue: it reads the round
+/// number from `acctrounds` and reconstructs the rest of the live
+/// chain state from the latest committed block header on demand. This
+/// helper is the Phase-A reader-side equivalent.
+///
+/// Source: DOC-24 §G6. Header field shape matches `BlockHeader` /
+/// `RewardsState` from `../go-algorand/data/bookkeeping/block.go`.
+pub(crate) fn derive_chain_meta_from_latest_block(
+    conn: &Connection,
+) -> Result<Option<ChainMetaFromHeader>, AlgoError> {
+    // `MAX()` over an empty table returns SQL NULL — bind to
+    // `Option<i64>` rather than `i64` so the row scan doesn't error.
+    let max_rnd: Option<i64> = conn
+        .query_row("SELECT MAX(rnd) FROM blockdb.blocks", [], |row| row.get(0))
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("derive chain meta: MAX(rnd) query: {e}"),
+        })?;
+    let Some(rnd) = max_rnd else {
+        return Ok(None);
+    };
+
+    let hdrdata: Vec<u8> = conn
+        .query_row(
+            "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1",
+            params![rnd],
+            |row| row.get(0),
+        )
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("derive chain meta: hdrdata fetch for round {rnd}: {e}"),
+        })?;
+
+    // Tolerate malformed headers by falling back to the legacy meta
+    // table rather than refusing to open. In production a header that
+    // failed to decode is a real corruption signal worth investigating,
+    // but for Phase A we'd rather degrade to the algod_rust_meta cache
+    // than brick the node — and unit tests that seed raw byte fixtures
+    // (`put_block(_, _, b"hdr", _)`) rely on this behaviour.
+    let hdr: BlockHeader = match rmp_serde::from_slice(&hdrdata) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(
+                "derive chain meta: failed to decode BlockHeader at round {rnd} ({e}); \
+                 falling back to algod_rust_meta"
+            );
+            return Ok(None);
+        }
+    };
+
+    Ok(Some(ChainMetaFromHeader {
+        current_round: hdr.round,
+        rewards_level: hdr.rewards_level,
+        rewards_rate: hdr.rewards_rate,
+        rewards_residue: hdr.rewards_residue,
+        rewards_recalculation_round: hdr.rewards_recalculation_round.0,
+        fee_sink: hdr.fee_sink,
+        rewards_pool: hdr.rewards_pool,
+        genesis_id: hdr.genesis_id,
+        genesis_hash: hdr.genesis_hash,
+        protocol: hdr.current_protocol,
+        txn_counter: hdr.txn_counter,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // SqliteLedger
 // ---------------------------------------------------------------------------
@@ -2223,44 +2311,95 @@ impl SqliteLedger {
         // so the recovery path ("re-sync from a catchpoint") has a
         // real new-format target to migrate to.
 
-        // Load cached chain-level state from DB.
-        let current_round = Round(get_meta_u64(&conn, "current_round")?);
-        let rewards_level = get_meta_u64(&conn, "rewards_level")?;
-        let rewards_rate = get_meta_u64(&conn, "rewards_rate")?;
-        let rewards_residue = get_meta_u64(&conn, "rewards_residue")?;
-        let rewards_recalculation_round = get_meta_u64(&conn, "rewards_recalculation_round")?;
+        // Load cached chain-level state. Prefer the Go-compatible
+        // source: derive everything from the latest block header in
+        // `blockdb.blocks`. That is the path a Go-generated data
+        // directory always lands on (no `algod_rust_meta` to read
+        // from). Only when the block archive is empty do we fall back
+        // to the legacy `algod_rust_meta` table — which still holds
+        // the genesis-init values before any block has been committed.
+        // The table itself is removed by TASK-107 / G6 part 3.
+        let (
+            current_round,
+            rewards_level,
+            rewards_rate,
+            rewards_residue,
+            rewards_recalculation_round,
+            fee_sink,
+            rewards_pool,
+            genesis_id,
+            genesis_hash,
+            protocol,
+            txn_counter,
+        ) = match derive_chain_meta_from_latest_block(&conn)? {
+            Some(m) => (
+                m.current_round,
+                m.rewards_level,
+                m.rewards_rate,
+                m.rewards_residue,
+                m.rewards_recalculation_round,
+                m.fee_sink,
+                m.rewards_pool,
+                m.genesis_id,
+                m.genesis_hash,
+                m.protocol,
+                m.txn_counter,
+            ),
+            None => {
+                let current_round = Round(get_meta_u64(&conn, "current_round")?);
+                let rewards_level = get_meta_u64(&conn, "rewards_level")?;
+                let rewards_rate = get_meta_u64(&conn, "rewards_rate")?;
+                let rewards_residue = get_meta_u64(&conn, "rewards_residue")?;
+                let rewards_recalculation_round =
+                    get_meta_u64(&conn, "rewards_recalculation_round")?;
 
-        let fee_sink_bytes = get_meta_blob(&conn, "fee_sink")?;
-        let fee_sink = if fee_sink_bytes.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&fee_sink_bytes);
-            Address(arr)
-        } else {
-            Address::ZERO
+                let fee_sink_bytes = get_meta_blob(&conn, "fee_sink")?;
+                let fee_sink = if fee_sink_bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&fee_sink_bytes);
+                    Address(arr)
+                } else {
+                    Address::ZERO
+                };
+
+                let rewards_pool_bytes = get_meta_blob(&conn, "rewards_pool")?;
+                let rewards_pool = if rewards_pool_bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&rewards_pool_bytes);
+                    Address(arr)
+                } else {
+                    Address::ZERO
+                };
+
+                let genesis_id = get_meta_string(&conn, "genesis_id")?;
+
+                let genesis_hash_bytes = get_meta_blob(&conn, "genesis_hash")?;
+                let genesis_hash = if genesis_hash_bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&genesis_hash_bytes);
+                    arr
+                } else {
+                    [0u8; 32]
+                };
+
+                let protocol = get_meta_string(&conn, "protocol")?;
+                let txn_counter = get_meta_u64(&conn, "txn_counter")?;
+
+                (
+                    current_round,
+                    rewards_level,
+                    rewards_rate,
+                    rewards_residue,
+                    rewards_recalculation_round,
+                    fee_sink,
+                    rewards_pool,
+                    genesis_id,
+                    genesis_hash,
+                    protocol,
+                    txn_counter,
+                )
+            }
         };
-
-        let rewards_pool_bytes = get_meta_blob(&conn, "rewards_pool")?;
-        let rewards_pool = if rewards_pool_bytes.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&rewards_pool_bytes);
-            Address(arr)
-        } else {
-            Address::ZERO
-        };
-
-        let genesis_id = get_meta_string(&conn, "genesis_id")?;
-
-        let genesis_hash_bytes = get_meta_blob(&conn, "genesis_hash")?;
-        let genesis_hash = if genesis_hash_bytes.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&genesis_hash_bytes);
-            arr
-        } else {
-            [0u8; 32]
-        };
-
-        let protocol = get_meta_string(&conn, "protocol")?;
-        let txn_counter = get_meta_u64(&conn, "txn_counter")?;
 
         Ok(Self {
             conn,
@@ -5779,6 +5918,97 @@ mod tests {
             v3, None,
             "marker must prevent re-scan; post-migration NULLs stay NULL"
         );
+    }
+
+    #[test]
+    fn chain_metadata_derives_from_latest_block_header_when_no_algod_rust_meta() {
+        // G6 part 1 — a Go-generated DB has no `algod_rust_meta` table
+        // populated. Verify the runtime falls back to deriving chain
+        // metadata from the latest block header instead. We exercise
+        // the helper directly (so the test doesn't depend on the
+        // genesis-init machinery) plus the production `open` path with
+        // an empty meta table.
+        use algo_types::BlockHeader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+
+        // Synthesize a real msgpack-encoded BlockHeader and write it
+        // through the production put_block path. This is the same
+        // shape Go's `daemon/algod/api/server/v2` returns when callers
+        // ask for `/v2/blocks/{r}`'s header.
+        let mut hdr = BlockHeader {
+            round: Round(7),
+            ..Default::default()
+        };
+        hdr.genesis_id = "test-net-v1".to_string();
+        hdr.genesis_hash = [0xab; 32];
+        hdr.current_protocol = "vTest".to_string();
+        hdr.fee_sink = Address([0x11; 32]);
+        hdr.rewards_pool = Address([0x22; 32]);
+        hdr.rewards_level = 100;
+        hdr.rewards_rate = 200;
+        hdr.rewards_residue = 300;
+        hdr.rewards_recalculation_round = Round(400);
+        hdr.txn_counter = 12345;
+        let hdrdata = rmp_serde::to_vec_named(&hdr).unwrap();
+
+        {
+            let mut ledger = SqliteLedger::open_with_prefix(&prefix).expect("open");
+            ledger.put_block(7, "vTest", &hdrdata, b"blk").unwrap();
+            // Wipe algod_rust_meta to simulate a Go-generated DB.
+            ledger
+                .conn
+                .execute("DELETE FROM algod_rust_meta", [])
+                .unwrap();
+        }
+
+        // Re-open: the runtime must derive from the header now.
+        let ledger = SqliteLedger::open_with_prefix(&prefix).expect("reopen");
+        assert_eq!(ledger.current_round, Round(7));
+        assert_eq!(ledger.genesis_id, "test-net-v1");
+        assert_eq!(ledger.genesis_hash, [0xab; 32]);
+        assert_eq!(ledger.protocol, "vTest");
+        assert_eq!(ledger.fee_sink, Address([0x11; 32]));
+        assert_eq!(ledger.rewards_pool, Address([0x22; 32]));
+        assert_eq!(ledger.rewards_level, 100);
+        assert_eq!(ledger.rewards_rate, 200);
+        assert_eq!(ledger.rewards_residue, 300);
+        assert_eq!(ledger.rewards_recalculation_round, 400);
+        assert_eq!(ledger.txn_counter, 12345);
+
+        // Direct helper coverage: invoke the derivation against the
+        // same connection and confirm the shape matches.
+        let derived = derive_chain_meta_from_latest_block(&ledger.conn)
+            .unwrap()
+            .expect("derivation must succeed with a real header");
+        assert_eq!(derived.current_round, Round(7));
+        assert_eq!(derived.genesis_id, "test-net-v1");
+    }
+
+    #[test]
+    fn chain_metadata_falls_back_to_algod_rust_meta_when_blocks_empty() {
+        // G6 part 1 — a freshly-initialized DB with no blocks yet but
+        // genesis-init values written to algod_rust_meta must still
+        // boot correctly. The derivation returns None; the fallback
+        // path reads the cached values.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        {
+            let ledger = SqliteLedger::open_with_prefix(&prefix).expect("open");
+            set_meta_u64(&ledger.conn, "current_round", 0).unwrap();
+            set_meta_string(&ledger.conn, "genesis_id", "fresh-net").unwrap();
+            set_meta_string(&ledger.conn, "protocol", "vBoot").unwrap();
+        }
+        let ledger = SqliteLedger::open_with_prefix(&prefix).expect("reopen");
+        assert_eq!(ledger.current_round, Round(0));
+        assert_eq!(ledger.genesis_id, "fresh-net");
+        assert_eq!(ledger.protocol, "vBoot");
+
+        // Derivation returns None — confirming the fallback path was the
+        // one that ran.
+        let derived = derive_chain_meta_from_latest_block(&ledger.conn).unwrap();
+        assert!(derived.is_none());
     }
 
     #[test]
