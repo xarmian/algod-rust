@@ -1975,41 +1975,71 @@ pub(crate) struct ChainMetaFromHeader {
     pub txn_counter: u64,
 }
 
-/// G6 part 1 — derive cached chain-level state from the latest block
-/// header in `blockdb.blocks`. Returns `None` when the block archive is
-/// empty (genesis-only DBs), in which case the caller falls back to the
-/// legacy `algod_rust_meta` table.
+/// G6 part 1 — derive cached chain-level state from the **committed
+/// tracker round**'s block header. The tracker round comes from
+/// `acctrounds` (Go's `accountsRound`, id=`'acctbase'`), not from
+/// `MAX(rnd) FROM blockdb.blocks`: the block archive is allowed to be
+/// ahead of the tracker (sync writes blocks before applying them), and
+/// trusting the archive MAX would advance `current_round`, rewards
+/// state, and `txn_counter` past the committed accountbase round —
+/// `next_round()` would then skip the next real block.
 ///
-/// Go's tracker has no `algod_rust_meta` analogue: it reads the round
-/// number from `acctrounds` and reconstructs the rest of the live
-/// chain state from the latest committed block header on demand. This
-/// helper is the Phase-A reader-side equivalent.
+/// Returns `None` when `acctrounds` has no row yet (Rust-only DBs
+/// before genesis apply, or freshly-opened empty DBs); the caller falls
+/// back to the legacy `algod_rust_meta` table. Also returns `None` if
+/// the corresponding header is missing or fails to decode.
 ///
-/// Source: DOC-24 §G6. Header field shape matches `BlockHeader` /
-/// `RewardsState` from `../go-algorand/data/bookkeeping/block.go`.
+/// Go's tracker has no `algod_rust_meta` analogue: it reads
+/// `acctrounds.acctbase` and reconstructs live chain state from that
+/// header on demand. This helper is the Phase-A reader-side
+/// equivalent. Source: DOC-24 §G6; `BlockHeader` / `RewardsState` in
+/// `../go-algorand/data/bookkeeping/block.go`.
 pub(crate) fn derive_chain_meta_from_latest_block(
     conn: &Connection,
 ) -> Result<Option<ChainMetaFromHeader>, AlgoError> {
-    // `MAX()` over an empty table returns SQL NULL — bind to
-    // `Option<i64>` rather than `i64` so the row scan doesn't error.
-    let max_rnd: Option<i64> = conn
-        .query_row("SELECT MAX(rnd) FROM blockdb.blocks", [], |row| row.get(0))
+    // Tracker round = committed accountbase round (matches Go's
+    // `accountsRound`). NULL/missing row → fall back to legacy meta.
+    let tracker_rnd: Option<i64> = conn
+        .query_row(
+            "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
         .map_err(|e| AlgoError::Ledger {
-            message: format!("derive chain meta: MAX(rnd) query: {e}"),
+            message: format!("derive chain meta: acctrounds query: {e}"),
         })?;
-    let Some(rnd) = max_rnd else {
+    let Some(rnd) = tracker_rnd else {
         return Ok(None);
     };
+    if rnd < 0 {
+        // A negative round is a corruption signal — let the caller's
+        // fallback handle it rather than panic on the cast.
+        tracing::warn!(
+            "derive chain meta: acctrounds 'acctbase' is negative ({rnd}); falling back"
+        );
+        return Ok(None);
+    }
 
-    let hdrdata: Vec<u8> = conn
+    let hdrdata: Option<Vec<u8>> = conn
         .query_row(
             "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1",
             params![rnd],
             |row| row.get(0),
         )
+        .optional()
         .map_err(|e| AlgoError::Ledger {
             message: format!("derive chain meta: hdrdata fetch for round {rnd}: {e}"),
         })?;
+    let Some(hdrdata) = hdrdata else {
+        // Tracker has been told it's at round N but blockdb has no
+        // matching header. This is the split-commit gap documented on
+        // `reconcile_cross_file`; fall back rather than guessing.
+        tracing::warn!(
+            "derive chain meta: no header at tracker round {rnd}; falling back to legacy meta"
+        );
+        return Ok(None);
+    };
 
     // Tolerate malformed headers by falling back to the legacy meta
     // table rather than refusing to open. In production a header that
@@ -5956,6 +5986,18 @@ mod tests {
         {
             let mut ledger = SqliteLedger::open_with_prefix(&prefix).expect("open");
             ledger.put_block(7, "vTest", &hdrdata, b"blk").unwrap();
+            // Tell the tracker its committed round is 7 (matches Go's
+            // `accountsRound`). Derivation deliberately reads from
+            // here rather than `MAX(rnd) FROM blockdb.blocks` so
+            // archive-ahead-of-tracker DBs don't advance state past
+            // the committed round.
+            ledger
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 7)",
+                    [],
+                )
+                .unwrap();
             // Wipe algod_rust_meta to simulate a Go-generated DB.
             ledger
                 .conn
@@ -5984,6 +6026,66 @@ mod tests {
             .expect("derivation must succeed with a real header");
         assert_eq!(derived.current_round, Round(7));
         assert_eq!(derived.genesis_id, "test-net-v1");
+    }
+
+    #[test]
+    fn chain_metadata_derivation_uses_tracker_round_not_blockdb_max() {
+        // G6 part 1 regression — the block archive is allowed to be
+        // ahead of the tracker (sync writes blocks before applying).
+        // Derivation must NOT pick up the future header from
+        // `MAX(rnd) FROM blockdb.blocks`; that would silently advance
+        // `current_round`, rewards state, and `txn_counter` past the
+        // committed accountbase round and cause `next_round()` to skip
+        // the next real block.
+        use algo_types::BlockHeader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+
+        // Round 3: the committed tracker round.
+        let mut committed = BlockHeader {
+            round: Round(3),
+            ..Default::default()
+        };
+        committed.current_protocol = "vCommitted".to_string();
+        committed.txn_counter = 33;
+        let committed_bytes = rmp_serde::to_vec_named(&committed).unwrap();
+
+        // Round 5: a future block already in the archive but not yet
+        // applied by the tracker.
+        let mut future = BlockHeader {
+            round: Round(5),
+            ..Default::default()
+        };
+        future.current_protocol = "vFuture".to_string();
+        future.txn_counter = 999;
+        let future_bytes = rmp_serde::to_vec_named(&future).unwrap();
+
+        {
+            let mut ledger = SqliteLedger::open_with_prefix(&prefix).expect("open");
+            ledger
+                .put_block(3, "vCommitted", &committed_bytes, b"b3")
+                .unwrap();
+            ledger
+                .put_block(5, "vFuture", &future_bytes, b"b5")
+                .unwrap();
+            ledger
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 3)",
+                    [],
+                )
+                .unwrap();
+            ledger
+                .conn
+                .execute("DELETE FROM algod_rust_meta", [])
+                .unwrap();
+        }
+
+        let ledger = SqliteLedger::open_with_prefix(&prefix).expect("reopen");
+        assert_eq!(ledger.current_round, Round(3), "must use tracker round");
+        assert_eq!(ledger.protocol, "vCommitted");
+        assert_eq!(ledger.txn_counter, 33);
     }
 
     #[test]
