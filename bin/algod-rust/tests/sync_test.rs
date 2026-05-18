@@ -184,28 +184,22 @@ fn cleanup_temp_dir(dir: &Path) {
 /// Query the last committed round from a SQLite ledger DB.
 ///
 /// Since TASK-100 the ledger is a pair of files
-/// (`<prefix>.tracker.sqlite` + `<prefix>.block.sqlite`);
-/// `algod_rust_meta` lives on the tracker file, so resolve the legacy
-/// `.sqlite` test path to its tracker file before opening. The
-/// SqliteLedger stores values as little-endian u64 bytes in
-/// `algod_rust_meta`.
+/// (`<prefix>.tracker.sqlite` + `<prefix>.block.sqlite`).
+/// G6 part 3 (TASK-107) retired the Rust-only `algod_rust_meta` cache;
+/// the committed round is now sourced from `acctrounds.acctbase`
+/// (Go's `accountsRound`), which `flush_chain_state` mirrors on every
+/// `commit_block`.
 fn query_last_committed_round(db_path: &Path) -> Option<u64> {
     let tracker = ledger_tracker_path(db_path);
     let conn = rusqlite::Connection::open(tracker).ok()?;
-    conn.query_row(
-        "SELECT value FROM algod_rust_meta WHERE key = 'current_round'",
-        [],
-        |row| {
-            let bytes: Vec<u8> = row.get(0)?;
-            if bytes.len() == 8 {
-                Ok(Some(u64::from_le_bytes(bytes.try_into().unwrap())))
-            } else {
-                Ok(None)
-            }
-        },
-    )
-    .ok()
-    .flatten()
+    let rnd: Option<i64> = conn
+        .query_row(
+            "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    rnd.map(|v| v.max(0) as u64)
 }
 
 /// Return whether the on-disk ledger pair exists at `db_path` (treated

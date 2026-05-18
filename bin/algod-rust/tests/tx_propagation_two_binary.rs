@@ -178,13 +178,14 @@ fn bootstrap_node_layout() -> NodeLayout {
         ..Default::default()
     };
     let hdr_bytes = canonical_encode_block_header(&hdr);
-    // `put_block` writes the `blocks` row directly; the chain-level
-    // meta fields (set via setters below) are only flushed to the
-    // `algod_rust_meta` table when `commit_block` runs. Without the
-    // begin/commit pair the child process would open the ledger and
-    // read `current_round = None`, which makes
-    // `AlgodNodeInterface::status` return "failed retrieving node
-    // status" to the REST handler.
+    // `put_block` writes the `blocks` row directly; the committed
+    // tracker round is only flushed to `acctrounds.acctbase` (Go's
+    // `accountsRound`, the post-G6-part-3 home for what
+    // `algod_rust_meta.current_round` used to hold) when
+    // `commit_block` runs. Without the begin/commit pair the child
+    // process would open the ledger with `current_round = None`,
+    // which makes `AlgodNodeInterface::status` return "failed
+    // retrieving node status" to the REST handler.
     ledger
         .put_block(bootstrap_round.0, CONSENSUS_V41, &hdr_bytes, &hdr_bytes)
         .expect("put_block");

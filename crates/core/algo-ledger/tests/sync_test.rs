@@ -608,14 +608,17 @@ async fn test_follow_after_sync_skipped_for_noop() {
 // ===========================================================================
 
 fn create_test_db() -> Connection {
+    // G6 part 3: sync-state persistence moved off `algod_rust_meta`
+    // onto namespaced rows in `catchpointstate`.
     let conn = Connection::open_in_memory().expect("failed to open in-memory db");
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS algod_rust_meta (
-            key   TEXT PRIMARY KEY,
-            value BLOB
-        );",
+        "CREATE TABLE IF NOT EXISTS catchpointstate (
+             id     TEXT PRIMARY KEY,
+             intval INTEGER,
+             strval TEXT
+         );",
     )
-    .expect("failed to create meta table");
+    .expect("failed to create catchpointstate table");
     conn
 }
 
