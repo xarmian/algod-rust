@@ -3,7 +3,9 @@
 //! Backs the REST API crate's [`NodeInterface`] trait with a live
 //! [`SqliteLedger`] and cached genesis / build metadata. This file is the
 //! *skeleton* established by PLAN-74 / TASK-75 — it covers the read-only
-//! surface (status, genesis, block lookups, state deltas, account state).
+//! surface (status, genesis, block lookups, account state). The state-delta
+//! endpoint is wired but stubbed pending DeltaCache integration; see the
+//! `get_state_delta_for_round` impl below.
 //! Downstream tasks layer additional methods onto the same struct:
 //!
 //! - Pool methods (`TASK-76`) — `pending_transactions`, `get_pending_transaction`
@@ -674,17 +676,20 @@ impl NodeInterface for AlgodNodeInterface {
 
     // ---- Ledger state delta ----
 
+    /// Look up the ledger state delta for `round`.
+    ///
+    /// PLAN-36 / TASK-116 removed the Rust-only `state_deltas` SQLite table
+    /// that previously backed this lookup (the table was never written to,
+    /// so the endpoint already behaved this way in practice). The in-memory
+    /// [`algo_ledger::DeltaCache`] is the intended replacement — once it's
+    /// wired into this handler the endpoint will start returning real data
+    /// for rounds inside the rolling window (default 320). Until then, every
+    /// round is `NotFound`, matching the prior on-the-wire behavior. See
+    /// the PLAN-36 follow-up task for the wiring work.
     async fn get_state_delta_for_round(&self, round: u64) -> Result<StateDelta, NodeError> {
-        let bytes = {
-            let ledger = self.lock_ledger("get_state_delta_for_round")?;
-            ledger
-                .get_state_delta(round)
-                .map_err(|e| NodeError::Internal(format!("get_state_delta({round}): {e}")))?
-        }
-        .ok_or_else(|| NodeError::NotFound(format!("no state delta for round {round}")))?;
-
-        rmp_serde::from_slice::<StateDelta>(&bytes)
-            .map_err(|e| NodeError::Internal(format!("decode state delta {round}: {e}")))
+        Err(NodeError::NotFound(format!(
+            "no state delta for round {round}"
+        )))
     }
 
     // ---- Account state ----

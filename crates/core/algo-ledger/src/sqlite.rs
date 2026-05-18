@@ -206,11 +206,6 @@ CREATE TABLE IF NOT EXISTS stateproofverification (
     lastattestedround INTEGER PRIMARY KEY NOT NULL,
     verificationcontext BLOB NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS state_deltas (
-    round INTEGER PRIMARY KEY,
-    delta BLOB NOT NULL
-);
 ";
 
 /// DDL run on the attached `blockdb` schema. Mirrors
@@ -3438,52 +3433,6 @@ impl SqliteLedger {
             .map_err(|e| AlgoError::Ledger {
                 message: format!("drop catchpoint staging tables error: {e}"),
             })
-    }
-
-    // ---- State delta persistence ----
-
-    /// Insert a serialized state delta for the given round.
-    pub fn insert_state_delta(&self, round: u64, delta: &[u8]) -> Result<(), AlgoError> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO state_deltas (round, delta) VALUES (?1, ?2)",
-                params![round as i64, delta],
-            )
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("insert state_delta error: {e}"),
-            })?;
-        Ok(())
-    }
-
-    /// Retrieve the serialized state delta for the given round.
-    ///
-    /// Returns `None` if no delta is stored for that round.
-    pub fn get_state_delta(&self, round: u64) -> Result<Option<Vec<u8>>, AlgoError> {
-        self.conn
-            .query_row(
-                "SELECT delta FROM state_deltas WHERE round = ?1",
-                params![round as i64],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("get state_delta error: {e}"),
-            })
-    }
-
-    /// Delete state deltas for rounds older than `min_round`.
-    ///
-    /// Used by the delta cache to prune old entries.
-    pub fn delete_state_deltas_before(&self, min_round: u64) -> Result<(), AlgoError> {
-        self.conn
-            .execute(
-                "DELETE FROM state_deltas WHERE round < ?1",
-                params![min_round as i64],
-            )
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("delete state_deltas error: {e}"),
-            })?;
-        Ok(())
     }
 }
 
