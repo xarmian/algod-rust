@@ -5,8 +5,10 @@
 //! `catchpointassetcreators`, `catchpointkvstore`, `catchpointonlineaccounts`,
 //! `catchpointonlineroundparamstail`).
 //!
-//! Supports resumable imports via checkpoint persistence (see
-//! [`checkpoint`](super::checkpoint)).
+//! Import is single-pass within a process: progress is tracked in memory on
+//! the [`CatchpointImporter`] via [`ImportCheckpoint`]. If the process dies
+//! mid-import, the next run starts over from chunk 0 — matching go-algorand,
+//! which has no cross-process resume table for catchpoint streaming.
 //!
 //! After all chunks are imported, [`CatchpointImporter::atomic_cutover`]
 //! atomically replaces the live tables with the staging tables.
@@ -18,11 +20,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use algo_types::AccountStatus;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
-use super::checkpoint::{
-    clear_checkpoint, create_checkpoint_table, read_checkpoint, update_checkpoint, ImportCheckpoint,
-};
+use super::checkpoint::ImportCheckpoint;
 use super::msgp_compat::{decode_base_account_data, decode_resources_data};
 use super::parser::{self, CatchpointEntry};
 use super::types::{
@@ -96,15 +96,24 @@ pub struct CatchpointImporter<'a> {
     total_online_accounts: u64,
     total_online_round_params: u64,
     reward_unit: u64,
+    /// In-memory progress checkpoint. Updated after every batch commit;
+    /// reset to default on every new importer instance. Not persisted.
+    checkpoint: ImportCheckpoint,
 }
 
 impl<'a> CatchpointImporter<'a> {
     /// Create a new importer targeting the given connection.
     ///
-    /// `catchpoint_label` is stored in the checkpoint for resume validation.
+    /// `catchpoint_label` is the file's label string; it is stored on
+    /// [`Self::checkpoint`] for diagnostic / test inspection.
     /// `reward_unit` is the protocol consensus reward unit used for computing
     /// normalized online balances (typically 1_000_000).
     pub fn new(conn: &'a Connection, catchpoint_label: String, reward_unit: u64) -> Self {
+        let checkpoint = ImportCheckpoint {
+            last_chunk_ordinal: 0,
+            total_chunks: 0,
+            catchpoint_label: catchpoint_label.clone(),
+        };
         Self {
             conn,
             batch_size: DEFAULT_BATCH_SIZE,
@@ -115,6 +124,7 @@ impl<'a> CatchpointImporter<'a> {
             total_online_accounts: 0,
             total_online_round_params: 0,
             reward_unit,
+            checkpoint,
         }
     }
 
@@ -124,53 +134,34 @@ impl<'a> CatchpointImporter<'a> {
         self
     }
 
+    /// In-memory import progress for this importer instance.
+    ///
+    /// Reset on every new instance; not persisted across process restarts.
+    pub fn checkpoint(&self) -> &ImportCheckpoint {
+        &self.checkpoint
+    }
+
     // -----------------------------------------------------------------------
     // Staging preparation
     // -----------------------------------------------------------------------
 
-    /// Create staging tables and the checkpoint table.
+    /// Drop any leftover staging tables and recreate them empty.
     ///
-    /// If a checkpoint already exists for the same catchpoint label, this is a
-    /// resume — the staging tables are assumed to already exist.
-    pub fn prepare_staging(&mut self) -> Result<Option<ImportCheckpoint>, CatchpointError> {
-        create_checkpoint_table(self.conn)?;
-
-        if let Some(cp) = read_checkpoint(self.conn)? {
-            if cp.catchpoint_label == self.catchpoint_label {
-                // G5: resuming reuses the existing staging tables. If those
-                // were created by a pre-G5 binary, `catchpointresources.ctype`
-                // is nullable; the cutover rename would then install a
-                // nullable `resources` over the live one, bypassing the
-                // NOT NULL DEFAULT -1 invariant. Detect that case and restart
-                // the import from scratch rather than honour the stale resume.
-                if !catchpointresources_ctype_is_not_null(self.conn)? {
-                    tracing::warn!(
-                        "stale pre-G5 catchpoint staging detected (catchpointresources.ctype \
-                         is nullable); discarding checkpoint and restarting import"
-                    );
-                    clear_checkpoint(self.conn)?;
-                    self.chunk_ordinal = 0;
-                } else {
-                    tracing::info!(
-                        "resuming catchpoint import from chunk {}",
-                        cp.last_chunk_ordinal
-                    );
-                    return Ok(Some(cp));
-                }
-            } else {
-                // Different label — start fresh. Clear the stale checkpoint so
-                // import_chunks does not skip chunks belonging to the old label.
-                tracing::warn!(
-                    "checkpoint label mismatch (have '{}', want '{}'), restarting import",
-                    cp.catchpoint_label,
-                    self.catchpoint_label
-                );
-                clear_checkpoint(self.conn)?;
-                self.chunk_ordinal = 0;
-            }
-        }
-
+    /// Always starts fresh: progress is in-memory only (see
+    /// [`ImportCheckpoint`]), so there is nothing to resume from. Any
+    /// staging tables present in the DB are from a prior failed run and
+    /// are unconditionally dropped before being recreated. This also
+    /// renders the pre-G5 stale-`catchpointresources.ctype` concern moot —
+    /// the table is dropped + recreated with the correct shape every time.
+    pub fn prepare_staging(&mut self) -> Result<(), CatchpointError> {
         // Create staging tables via raw DDL (single source of truth in sqlite.rs).
+        //
+        // The trailing `DROP TABLE IF EXISTS catchpoint_import_state` is a
+        // transitional cleanup for tracker DBs produced by older Rust
+        // versions that left the now-removed table behind (PLAN-36 G4 /
+        // TASK-117). Phase B's goal is that Rust-produced DBs are openable
+        // by go-algorand without unknown tables — this drop guarantees that
+        // any later import on such a DB scrubs the legacy artifact.
         self.conn.execute_batch(
             "
             DROP TABLE IF EXISTS catchpointassetcreators;
@@ -182,32 +173,40 @@ impl<'a> CatchpointImporter<'a> {
             DROP TABLE IF EXISTS catchpointonlineaccounts;
             DROP TABLE IF EXISTS catchpointonlineroundparamstail;
             DROP TABLE IF EXISTS catchpointstateproofverification;
+            DROP TABLE IF EXISTS catchpoint_import_state;
             ",
         )?;
 
         self.conn
             .execute_batch(crate::sqlite::CATCHPOINT_STAGING_TABLES_SQL)?;
 
-        Ok(None)
+        // Reset in-memory progress in case this importer is being reused.
+        self.chunk_ordinal = 0;
+        self.checkpoint = ImportCheckpoint {
+            last_chunk_ordinal: 0,
+            total_chunks: 0,
+            catchpoint_label: self.catchpoint_label.clone(),
+        };
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
     // Chunk import — main loop
     // -----------------------------------------------------------------------
 
-    /// Import all chunks from an iterator, batching commits and checkpointing.
+    /// Import all chunks from an iterator, batching commits.
     ///
-    /// Chunks are expected to arrive in ordinal order (0, 1, 2, ...).
-    /// If resuming from a checkpoint, chunks with ordinals <= the checkpoint
-    /// are skipped automatically.
+    /// Chunks are expected to arrive in ordinal order (0, 1, 2, ...). Import
+    /// is single-pass: there is no resume across importer instances. The
+    /// in-memory [`Self::checkpoint`] is updated after every batch commit
+    /// (and again after the trailing partial batch) so callers can inspect
+    /// per-batch progress within the same process.
     pub fn import_chunks(
         &mut self,
         chunks: impl Iterator<Item = Result<(u64, CatchpointSnapshotChunkV6), CatchpointError>>,
         total_chunks: u64,
     ) -> Result<ImportStats, CatchpointError> {
-        let resume_ordinal: Option<u64> =
-            read_checkpoint(self.conn)?.map(|cp| cp.last_chunk_ordinal);
-
         let mut stats = ImportStats::default();
         let mut batch_count: usize = 0;
         let mut in_txn = false;
@@ -215,16 +214,6 @@ impl<'a> CatchpointImporter<'a> {
         let result: Result<ImportStats, CatchpointError> = (|| {
             for chunk_result in chunks {
                 let (ordinal, chunk) = chunk_result?;
-
-                // Resume support: skip already-committed chunks.
-                // Using Option<u64> avoids ambiguity when ordinal 0 was the last
-                // committed chunk (previously, resume_ordinal == 0 was
-                // indistinguishable from "no checkpoint exists").
-                if let Some(last) = resume_ordinal {
-                    if ordinal <= last {
-                        continue;
-                    }
-                }
 
                 if !in_txn {
                     self.conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -235,8 +224,9 @@ impl<'a> CatchpointImporter<'a> {
                 batch_count += 1;
 
                 if batch_count >= self.batch_size {
-                    update_checkpoint(self.conn, ordinal, total_chunks, &self.catchpoint_label)?;
                     self.conn.execute_batch("COMMIT")?;
+                    self.checkpoint.last_chunk_ordinal = ordinal;
+                    self.checkpoint.total_chunks = total_chunks;
                     in_txn = false;
                     batch_count = 0;
                 }
@@ -244,13 +234,9 @@ impl<'a> CatchpointImporter<'a> {
 
             // Commit any remaining partial batch.
             if in_txn {
-                update_checkpoint(
-                    self.conn,
-                    self.chunk_ordinal,
-                    total_chunks,
-                    &self.catchpoint_label,
-                )?;
                 self.conn.execute_batch("COMMIT")?;
+                self.checkpoint.last_chunk_ordinal = self.chunk_ordinal;
+                self.checkpoint.total_chunks = total_chunks;
                 in_txn = false;
             }
 
@@ -258,7 +244,7 @@ impl<'a> CatchpointImporter<'a> {
         })();
 
         // Roll back any open transaction on error so the connection is left
-        // in a clean state for retry/resume.
+        // in a clean state.
         if in_txn {
             let _ = self.conn.execute_batch("ROLLBACK");
         }
@@ -276,7 +262,7 @@ impl<'a> CatchpointImporter<'a> {
     /// 1. DROP live tables that are being replaced.
     /// 2. RENAME staging tables to live table names.
     /// 3. Reconstruct `acctrounds` and `accounttotals` from the header.
-    /// 4. DROP remaining staging tables and checkpoint table.
+    /// 4. DROP remaining staging tables.
     ///
     /// If the transaction fails, nothing changes (atomic rollback).
     ///
@@ -413,7 +399,14 @@ impl<'a> CatchpointImporter<'a> {
             rusqlite::params![state_keys::CATCHUP_HASH_ROUND, header.blocks_round as i64],
         )?;
 
-        // Step 6: Clean up remaining staging tables and checkpoint.
+        // Step 6: Clean up remaining staging tables.
+        //
+        // `catchpoint_import_state` is dropped here as a transitional
+        // cleanup — Phase B (TASK-117) no longer creates the table, but
+        // tracker DBs produced by older Rust versions may still carry one
+        // from a prior interrupted import. Dropping at cutover ensures
+        // such legacy artifacts can never persist into a fully imported
+        // (and thus Go-openable) tracker DB.
         tx.execute_batch(
             "DROP TABLE IF EXISTS catchpointpendinghashes;
             DROP TABLE IF EXISTS catchpoint_import_state;",
@@ -650,9 +643,12 @@ impl<'a> CatchpointImporter<'a> {
 /// This is the main entry point for offline catchpoint import. It:
 /// 1. Opens and parses the catchpoint tar file (auto-detecting compression).
 /// 2. Reads the file header to obtain the round, totals, and catchpoint label.
-/// 3. Creates staging tables and streams all chunks into them (with batching
-///    and checkpointing for resume support).
+/// 3. Creates staging tables and streams all chunks into them (batched).
 /// 4. Performs an atomic cutover: replaces live tables with staging tables.
+///
+/// Import is single-pass: if the process dies mid-import, the next run
+/// starts over from chunk 0 (matching go-algorand). Progress within the
+/// running process is tracked in memory on the importer.
 ///
 /// On success, the database contains the full account state at the catchpoint
 /// round, ready for block replay from that point forward.
@@ -700,25 +696,15 @@ pub fn import_catchpoint_file(
         let mut chunk_ordinal: u64 = 0;
         let mut stats = ImportStats::default();
 
-        let resume_ordinal: Option<u64> = read_checkpoint(conn)?.map(|cp| cp.last_chunk_ordinal);
         let batch_size = importer.batch_size;
         let mut batch_count: usize = 0;
         let mut in_txn = false;
-        let catchpoint_label_ref = importer.catchpoint_label.clone();
 
         let stream_result: Result<(), CatchpointError> = reader.for_each(|entry| {
             match entry {
                 CatchpointEntry::Header(_) => { /* already extracted */ }
                 CatchpointEntry::Chunk(chunk) => {
                     chunk_ordinal += 1;
-
-                    // Resume support: skip already-committed chunks.
-                    if let Some(last) = resume_ordinal {
-                        if chunk_ordinal <= last {
-                            stats.chunks_processed += 1;
-                            return Ok(());
-                        }
-                    }
 
                     if !in_txn {
                         conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -729,13 +715,9 @@ pub fn import_catchpoint_file(
                     batch_count += 1;
 
                     if batch_count >= batch_size {
-                        update_checkpoint(
-                            conn,
-                            chunk_ordinal,
-                            total_chunks,
-                            &catchpoint_label_ref,
-                        )?;
                         conn.execute_batch("COMMIT")?;
+                        importer.checkpoint.last_chunk_ordinal = chunk_ordinal;
+                        importer.checkpoint.total_chunks = total_chunks;
                         in_txn = false;
                         batch_count = 0;
                     }
@@ -754,7 +736,7 @@ pub fn import_catchpoint_file(
         });
 
         // Roll back any open transaction on error so the connection is left
-        // in a clean state for retry/resume.
+        // in a clean state.
         if let Err(e) = stream_result {
             if in_txn {
                 let _ = conn.execute_batch("ROLLBACK");
@@ -764,8 +746,9 @@ pub fn import_catchpoint_file(
 
         // Commit any remaining partial batch.
         if in_txn {
-            update_checkpoint(conn, chunk_ordinal, total_chunks, &catchpoint_label_ref)?;
             conn.execute_batch("COMMIT")?;
+            importer.checkpoint.last_chunk_ordinal = chunk_ordinal;
+            importer.checkpoint.total_chunks = total_chunks;
         }
 
         stats
@@ -802,21 +785,6 @@ pub fn import_catchpoint_file(
 // ---------------------------------------------------------------------------
 // Resource flag helpers (mirrors Go's resourcesData methods)
 // ---------------------------------------------------------------------------
-
-/// Returns `true` iff `catchpointresources` exists and its `ctype` column is
-/// declared `NOT NULL`. Used at resume time to detect stale pre-G5 staging
-/// tables (see DOC-24 §G5 and the live-resources migration in `sqlite.rs`).
-/// Treats a missing table as "not-not-null" so the caller restarts cleanly.
-fn catchpointresources_ctype_is_not_null(conn: &Connection) -> rusqlite::Result<bool> {
-    let notnull: Option<i64> = conn
-        .query_row(
-            "SELECT \"notnull\" FROM pragma_table_info('catchpointresources') WHERE name='ctype'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(notnull == Some(1))
-}
 
 /// Returns `true` if the ownership bit is set.
 fn is_owning(flags: u8) -> bool {
@@ -1093,18 +1061,17 @@ mod tests {
     }
 
     #[test]
-    fn prepare_staging_restarts_when_resuming_pre_g5_staging() {
-        // G5 — if a checkpoint+staging pair was left behind by a pre-G5
-        // binary (catchpointresources.ctype nullable), resuming with the
-        // same label must NOT honour the stale staging: a later cutover
-        // rename would otherwise install a nullable `resources` table
-        // over the live one, bypassing the new NOT NULL DEFAULT -1
-        // invariant. Expected behaviour: discard the checkpoint, drop +
-        // recreate staging, return Ok(None) (fresh import).
+    fn prepare_staging_always_yields_not_null_ctype() {
+        // Phase B: prepare_staging unconditionally drops and recreates the
+        // staging tables (no cross-instance resume), so any leftover from
+        // an older binary — including pre-G5 staging with a nullable
+        // `catchpointresources.ctype` — is replaced with the canonical
+        // shape declared in `CATCHPOINT_STAGING_TABLES_SQL`. Regression
+        // guard against the NOT NULL DEFAULT -1 invariant silently going
+        // away.
         let conn = mem_conn();
 
-        // Seed a pre-G5 staging shape (nullable ctype) and a valid
-        // checkpoint pointing at the same label the importer will use.
+        // Seed a pre-G5 staging shape (nullable ctype) to be replaced.
         conn.execute_batch(
             "CREATE TABLE catchpointresources (
                 addrid INTEGER NOT NULL,
@@ -1115,17 +1082,10 @@ mod tests {
             ) WITHOUT ROWID;",
         )
         .unwrap();
-        super::super::checkpoint::create_checkpoint_table(&conn).unwrap();
-        super::super::checkpoint::update_checkpoint(&conn, 3, 10, "test#label").unwrap();
 
         let mut importer = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
-        let cp = importer.prepare_staging().expect("prepare_staging");
-        assert!(
-            cp.is_none(),
-            "stale pre-G5 staging must not be resumed; expected fresh start, got resume {cp:?}"
-        );
+        importer.prepare_staging().expect("prepare_staging");
 
-        // The new staging table must be NOT NULL.
         let notnull: i64 = conn
             .query_row(
                 "SELECT \"notnull\" FROM pragma_table_info('catchpointresources') WHERE name='ctype'",
@@ -1246,16 +1206,22 @@ mod tests {
             .unwrap();
         assert_eq!(count, 5);
 
-        // Checkpoint should exist.
-        let cp = read_checkpoint(&conn).unwrap().expect("checkpoint");
+        // After import the in-memory checkpoint reflects the last committed
+        // chunk + the expected total.
+        let cp = importer.checkpoint();
         assert_eq!(cp.catchpoint_label, "test#label");
+        assert_eq!(cp.last_chunk_ordinal, 5);
+        assert_eq!(cp.total_chunks, 5);
     }
 
     #[test]
-    fn resume_skips_committed_chunks() {
+    fn checkpoint_resets_on_fresh_prepare_staging() {
+        // Phase B / TASK-117: there is no cross-instance resume. Creating
+        // a new importer after a previous one finished must start from
+        // chunk 0 with an empty in-memory checkpoint.
         let conn = mem_conn();
 
-        // First pass: import chunks 1-3.
+        // First importer imports 3 chunks then drops.
         {
             let mut importer =
                 CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS)
@@ -1272,56 +1238,14 @@ mod tests {
                     Ok((i, chunk))
                 })
                 .collect();
-
             importer.import_chunks(chunks.into_iter(), 5).unwrap();
+            assert_eq!(importer.checkpoint().last_chunk_ordinal, 3);
         }
 
-        // Second pass: resume from chunk 1, but chunks 1-3 should be skipped.
-        {
-            let mut importer =
-                CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS)
-                    .with_batch_size(10);
-            let checkpoint = importer.prepare_staging().unwrap();
-            assert!(checkpoint.is_some());
-
-            // Provide all 5 chunks — first 3 should be skipped.
-            let chunks: Vec<Result<(u64, CatchpointSnapshotChunkV6), CatchpointError>> = (1..=5)
-                .map(|i| {
-                    let mut chunk = CatchpointSnapshotChunkV6::default();
-                    chunk.kvs.push(KVRecordV6 {
-                        key: ByteBuf::from(format!("key{i}").into_bytes()),
-                        value: ByteBuf::from(format!("val{i}").into_bytes()),
-                    });
-                    Ok((i, chunk))
-                })
-                .collect();
-
-            let stats = importer.import_chunks(chunks.into_iter(), 5).unwrap();
-            // Only chunks 4 and 5 should have been processed.
-            assert_eq!(stats.chunks_processed, 2);
-        }
-    }
-
-    #[test]
-    fn prepare_staging_restarts_on_label_mismatch() {
-        let conn = mem_conn();
-
-        // First import with label "old".
-        {
-            let mut importer = CatchpointImporter::new(&conn, "old".to_string(), REWARD_UNITS);
-            importer.prepare_staging().unwrap();
-
-            let chunks: Vec<Result<(u64, CatchpointSnapshotChunkV6), CatchpointError>> =
-                vec![Ok((1, CatchpointSnapshotChunkV6::default()))];
-            importer.import_chunks(chunks.into_iter(), 1).unwrap();
-        }
-
-        // New import with different label should restart.
-        {
-            let mut importer = CatchpointImporter::new(&conn, "new".to_string(), REWARD_UNITS);
-            let checkpoint = importer.prepare_staging().unwrap();
-            assert!(checkpoint.is_none());
-        }
+        // A brand-new importer must NOT pick up any cross-process state.
+        let importer2 = CatchpointImporter::new(&conn, "test#label".to_string(), REWARD_UNITS);
+        assert_eq!(importer2.checkpoint().last_chunk_ordinal, 0);
+        assert_eq!(importer2.checkpoint().total_chunks, 0);
     }
 
     // -------------------------------------------------------------------
@@ -1549,7 +1473,9 @@ mod tests {
             .unwrap();
         assert!(!exists_after);
 
-        // catchpoint_import_state should also be gone.
+        // After TASK-117 the Rust-only `catchpoint_import_state` table no
+        // longer exists at all — assert that it was never created during
+        // import or by cutover.
         let cp_exists: bool = conn
             .query_row(
                 "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='catchpoint_import_state'",

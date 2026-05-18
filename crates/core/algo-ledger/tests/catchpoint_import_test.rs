@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use rusqlite::{params, Connection};
 use serde_bytes::ByteBuf;
 
-use algo_ledger::catchpoint::checkpoint::read_checkpoint;
 use algo_ledger::catchpoint::importer::CatchpointImporter;
 use algo_ledger::catchpoint::types::{AccountTotals, AlgoCount, RESOURCE_FLAGS_OWNERSHIP};
 use algo_ledger::catchpoint::{
@@ -367,12 +366,18 @@ fn test_full_import_populates_all_tables() {
 }
 
 #[test]
-fn test_resume_after_interruption() {
+fn test_fresh_restart_after_interruption() {
+    // Phase B / TASK-117 changed the resume model: there is no
+    // cross-importer/cross-process resume table. If the importer dies
+    // mid-import, the next run starts over from chunk 0 — and crucially
+    // `prepare_staging` drops any staging tables left over by the
+    // interrupted run so the rerun is not contaminated by partial state.
+    // This test validates that contract.
     let conn = setup_test_db();
-    let label = "47000000#RESUME_TEST".to_string();
+    let label = "47000000#RESTART_TEST".to_string();
 
     // Phase 1: Import chunks 1-2 (out of 4 total), then "interrupt" by
-    // dropping the importer.
+    // dropping the importer. The intermediate state lives in staging.
     {
         let mut importer =
             CatchpointImporter::new(&conn, label.clone(), REWARD_UNITS).with_batch_size(10);
@@ -397,28 +402,39 @@ fn test_resume_after_interruption() {
         let stats = importer.import_chunks(chunks.into_iter(), 4).unwrap();
         assert_eq!(stats.chunks_processed, 2);
         assert_eq!(stats.kvs, 2);
+
+        // Confirm the staging table actually has the 2 partial rows
+        // before we drop the importer (so the next assertion that they
+        // get cleared by prepare_staging is meaningful).
+        let kv_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM catchpointkvstore", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(kv_count, 2);
     }
 
-    // Verify checkpoint exists and has correct state.
-    let cp = read_checkpoint(&conn)
-        .unwrap()
-        .expect("checkpoint should exist");
-    assert_eq!(cp.last_chunk_ordinal, 2);
-    assert_eq!(cp.total_chunks, 4);
-    assert_eq!(cp.catchpoint_label, label);
-
-    // Phase 2: Create a NEW importer (simulating process restart), resume.
+    // Phase 2: Create a NEW importer (simulating process restart). It
+    // must NOT pick up where the previous importer left off — its
+    // in-memory checkpoint starts at zero and `prepare_staging` wipes
+    // any leftover partial staging.
     {
         let mut importer =
             CatchpointImporter::new(&conn, label.clone(), REWARD_UNITS).with_batch_size(10);
-        let checkpoint = importer.prepare_staging().unwrap();
+        assert_eq!(importer.checkpoint().last_chunk_ordinal, 0);
 
-        // Should detect existing checkpoint for same label.
-        assert!(checkpoint.is_some());
-        let cp = checkpoint.unwrap();
-        assert_eq!(cp.last_chunk_ordinal, 2);
+        importer.prepare_staging().unwrap();
 
-        // Provide all 4 chunks — chunks 1-2 should be skipped.
+        // Staging table must be empty after prepare_staging — the 2 rows
+        // from the interrupted run have been dropped.
+        let kv_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM catchpointkvstore", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(kv_count, 0);
+
+        // Re-import all 4 chunks from the beginning.
         let chunk1 = CatchpointSnapshotChunkV6 {
             balances: vec![],
             kvs: vec![make_kv_record(b"key1", b"val1")],
@@ -453,17 +469,21 @@ fn test_resume_after_interruption() {
 
         let stats = importer.import_chunks(chunks.into_iter(), 4).unwrap();
 
-        // Only chunks 3 and 4 should have been processed (1 and 2 were skipped).
-        assert_eq!(stats.chunks_processed, 2);
-        assert_eq!(stats.kvs, 2);
+        // All 4 chunks reprocessed from scratch.
+        assert_eq!(stats.chunks_processed, 4);
+        assert_eq!(stats.kvs, 4);
 
-        // Verify all 4 KV records are in the staging table (2 from before + 2 new).
+        // Staging table holds all 4 rows post-import.
         let kv_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM catchpointkvstore", [], |row| {
                 row.get(0)
             })
             .unwrap();
         assert_eq!(kv_count, 4);
+
+        // In-memory checkpoint reflects completion.
+        assert_eq!(importer.checkpoint().last_chunk_ordinal, 4);
+        assert_eq!(importer.checkpoint().total_chunks, 4);
 
         // Perform cutover.
         let header = make_test_header(47_000_000, make_test_totals());
@@ -474,7 +494,6 @@ fn test_resume_after_interruption() {
     let kv_count = count_rows(&conn, "kvstore");
     assert_eq!(kv_count, 4);
 
-    // Verify each key exists and has correct value.
     for i in 1..=4 {
         let value: Vec<u8> = conn
             .query_row(
