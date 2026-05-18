@@ -695,3 +695,56 @@ The ordered playbook for a pin bump (e.g. `v4.5.1-stable` →
 5. Open a single PR containing `CLAUDE.md` + every refreshed fixture
    + every Rust-side port. CI's `conformance-parity` job replays the
    fresh corpus end-to-end.
+
+## Phase A acceptance fixture capture
+
+PLAN-35 (DB Interchange — Phase A: Reader Side) ships an acceptance
+test at `crates/core/algo-ledger/tests/phase_a_acceptance.rs` that
+covers the synthesizable half of the gate: a DB built via the
+production `--ledger-prefix` path is opened, every cross-task
+invariant (G1, G3, G5, G6 parts 1-3, G7, G12, G13) is asserted, and
+the chain-meta derivation pipeline round-trips.
+
+The remaining half — **bit-identical `/v2/blocks/{r}` comparison
+against a real Go-generated DB** — is fixture-based and lives
+outside CI. To capture and check in fixtures for that:
+
+1. **Generate a Go data directory** at a known round:
+   ```bash
+   cd ../go-algorand
+   # Spin up devnet with goal at a small round (e.g. 5-10).
+   ./scripts/local_install.sh
+   goal network create -n acceptance -r tests/testdata/nettemplates/TwoNodes50EachFuture.json -d /tmp/acceptance
+   goal network start  -d /tmp/acceptance
+   # Wait a few rounds, then stop:
+   sleep 30
+   goal network stop -d /tmp/acceptance
+   ```
+   The data directory at `/tmp/acceptance/Node1/<genesisID>/` holds
+   `ledger.tracker.sqlite` + `ledger.block.sqlite`.
+
+2. **Capture the Go `/v2/blocks/{r}` reference response** while the
+   network is running:
+   ```bash
+   curl -s -H "X-Algo-API-Token: $(cat /tmp/acceptance/Node1/algod.token)" \
+        "http://localhost:$(cat /tmp/acceptance/Node1/algod.net | cut -d: -f2)/v2/blocks/3?format=msgpack" \
+        -o tests/fixtures/phase_a/block_3.msgp
+   ```
+
+3. **Check in** the captured `ledger.tracker.sqlite` +
+   `ledger.block.sqlite` pair plus every captured response under
+   `crates/core/algo-ledger/tests/fixtures/phase_a/`. Keep the
+   genesis round small so the artifacts stay under a few hundred
+   KiB.
+
+4. **Add the bit-identical assertion** to a NEW test (don't extend
+   `phase_a_acceptance.rs` — that file is meant to run with no
+   external dependencies). The new test opens the captured pair,
+   stands up the REST API via the `algod-rest-api` crate, requests
+   `/v2/blocks/{r}`, and `assert_eq`'s against `block_3.msgp` byte
+   for byte.
+
+5. **Re-capture on pin bump.** Every go-algorand pin bump rebuilds
+   the fixture pair using the new binary. The bit-identical check
+   then proves the Rust REST layer's encoder agrees with the new
+   Go release on the same on-disk DB.
