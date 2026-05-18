@@ -709,33 +709,50 @@ The remaining half — **bit-identical `/v2/blocks/{r}` comparison
 against a real Go-generated DB** — is fixture-based and lives
 outside CI. To capture and check in fixtures for that:
 
+Pin the algod-rust repo root in a shell variable up front — every
+step below writes fixtures back into this tree, so don't lose the
+path when you `cd ../go-algorand`:
+
+```bash
+RUST_REPO="$(pwd)"            # run this from the algod-rust root
+FIXDIR="$RUST_REPO/crates/core/algo-ledger/tests/fixtures/phase_a"
+mkdir -p "$FIXDIR"
+```
+
 1. **Generate a Go data directory** at a known round:
    ```bash
    cd ../go-algorand
-   # Spin up devnet with goal at a small round (e.g. 5-10).
    ./scripts/local_install.sh
-   goal network create -n acceptance -r tests/testdata/nettemplates/TwoNodes50EachFuture.json -d /tmp/acceptance
-   goal network start  -d /tmp/acceptance
-   # Wait a few rounds, then stop:
+   goal network create -n acceptance \
+       -r tests/testdata/nettemplates/TwoNodes50EachFuture.json \
+       -d /tmp/acceptance
+   goal network start -d /tmp/acceptance
+   # Wait a few rounds (the curl in step 2 needs the network up).
    sleep 30
-   goal network stop -d /tmp/acceptance
    ```
-   The data directory at `/tmp/acceptance/Node1/<genesisID>/` holds
-   `ledger.tracker.sqlite` + `ledger.block.sqlite`.
+   The data directory at `/tmp/acceptance/Node1/<genesisID>/` will
+   hold `ledger.tracker.sqlite` + `ledger.block.sqlite` once you
+   stop the network in step 3.
 
 2. **Capture the Go `/v2/blocks/{r}` reference response** while the
-   network is running:
+   network is still running (do NOT stop it before this step):
    ```bash
-   curl -s -H "X-Algo-API-Token: $(cat /tmp/acceptance/Node1/algod.token)" \
-        "http://localhost:$(cat /tmp/acceptance/Node1/algod.net | cut -d: -f2)/v2/blocks/3?format=msgpack" \
-        -o tests/fixtures/phase_a/block_3.msgp
+   ALGOD_PORT=$(cat /tmp/acceptance/Node1/algod.net | cut -d: -f2)
+   ALGOD_TOK=$(cat /tmp/acceptance/Node1/algod.token)
+   curl -s -H "X-Algo-API-Token: $ALGOD_TOK" \
+        "http://localhost:$ALGOD_PORT/v2/blocks/3?format=msgpack" \
+        -o "$FIXDIR/block_3.msgp"
    ```
 
-3. **Check in** the captured `ledger.tracker.sqlite` +
-   `ledger.block.sqlite` pair plus every captured response under
-   `crates/core/algo-ledger/tests/fixtures/phase_a/`. Keep the
-   genesis round small so the artifacts stay under a few hundred
-   KiB.
+3. **Stop the network and check in** the captured artifacts:
+   ```bash
+   goal network stop -d /tmp/acceptance
+   # Copy the on-disk DB pair alongside the response.
+   cp /tmp/acceptance/Node1/*/ledger.tracker.sqlite "$FIXDIR/"
+   cp /tmp/acceptance/Node1/*/ledger.block.sqlite   "$FIXDIR/"
+   ```
+   Keep the genesis round small so the artifacts stay under a few
+   hundred KiB.
 
 4. **Add the bit-identical assertion** to a NEW test (don't extend
    `phase_a_acceptance.rs` — that file is meant to run with no
