@@ -126,10 +126,15 @@ CREATE TABLE IF NOT EXISTS unfinishedcatchpoints (
     blockhash BLOB NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS algod_rust_meta (
-    key   TEXT PRIMARY KEY,
-    value BLOB
-);
+-- G6 part 3 (TASK-107) removed the Rust-only `algod_rust_meta` table.
+-- Chain-level state is derived from `acctrounds.acctbase` + the
+-- committed block's header (see `derive_chain_meta_from_latest_block`).
+-- Sync-state persistence (Rust-only operational state) moved to
+-- namespaced `algod_rust_sync_*` keys in `catchpointstate` — Go's own
+-- k-v table, which ignores unknown keys (precedent: TASK-110's
+-- `algod_rust_kvstore_null_norm_v1` marker). `DROP TABLE IF EXISTS
+-- algod_rust_meta` runs at open below to clean up DBs initialized by
+-- a pre-G6-part-3 binary.
 
 CREATE TABLE IF NOT EXISTS merkle_trie (
     id   INTEGER PRIMARY KEY CHECK (id = 0),
@@ -1886,73 +1891,115 @@ pub(crate) fn set_blob_update_round(blob: &[u8], update_round: u64) -> Vec<u8> {
 // Chain-level meta helpers
 // ---------------------------------------------------------------------------
 
-fn get_meta_u64(conn: &Connection, key: &str) -> Result<u64, AlgoError> {
-    let result: Option<Vec<u8>> = conn
+/// G6 part 3 — one-shot migration that retires `algod_rust_meta`.
+///
+/// 1. If the table exists and `current_round` is set, mirror that value
+///    into `acctrounds.acctbase` so `derive_chain_meta_from_latest_block`
+///    has a tracker round to read after the table is dropped. The Rust
+///    apply path never wrote to `acctrounds` pre-G6-part-3.
+/// 2. Migrate the four `sync_*` rows to `catchpointstate` with namespaced
+///    `algod_rust_sync_*` ids — see `sync_state_keys` for the canonical
+///    list. This preserves resume-after-restart behaviour.
+/// 3. `DROP TABLE IF EXISTS algod_rust_meta`. Idempotent (the migration
+///    is a no-op on DBs that were never initialized by a pre-G6-part-3
+///    binary).
+fn migrate_off_algod_rust_meta(conn: &Connection) -> rusqlite::Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='algod_rust_meta')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(());
+    }
+
+    // Step 1: mirror current_round → acctrounds.acctbase if missing.
+    let legacy_round: Option<Vec<u8>> = conn
         .query_row(
-            "SELECT value FROM algod_rust_meta WHERE key = ?1",
-            params![key],
+            "SELECT value FROM algod_rust_meta WHERE key = 'current_round'",
+            [],
             |row| row.get(0),
         )
-        .optional()
-        .map_err(|e| AlgoError::Ledger {
-            message: format!("meta read error: {e}"),
-        })?;
-
-    match result {
-        Some(bytes) => {
-            if bytes.len() == 8 {
-                Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
-            } else {
-                Ok(0)
+        .optional()?;
+    if let Some(bytes) = legacy_round {
+        if bytes.len() == 8 {
+            let rnd = u64::from_le_bytes(bytes.try_into().unwrap()) as i64;
+            let acctrounds_present: Option<i64> = conn
+                .query_row(
+                    "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            // Mirror only when acctrounds is missing or behind — never
+            // regress an authoritative tracker round.
+            let should_mirror = match acctrounds_present {
+                None => true,
+                Some(existing) => rnd > existing,
+            };
+            if should_mirror {
+                conn.execute(
+                    "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', ?1)",
+                    [rnd],
+                )?;
             }
         }
-        None => Ok(0),
     }
-}
 
-fn set_meta_u64(conn: &Connection, key: &str, val: u64) -> Result<(), AlgoError> {
-    conn.execute(
-        "INSERT OR REPLACE INTO algod_rust_meta (key, value) VALUES (?1, ?2)",
-        params![key, val.to_le_bytes().to_vec()],
-    )
-    .map_err(|e| AlgoError::Ledger {
-        message: format!("meta write error: {e}"),
-    })?;
-    Ok(())
-}
-
-fn get_meta_blob(conn: &Connection, key: &str) -> Result<Vec<u8>, AlgoError> {
-    let result: Option<Vec<u8>> = conn
+    // Step 2: migrate sync_* rows to namespaced catchpointstate ids.
+    // Ensure the destination exists (it always should — schema creates
+    // it — but be defensive in case migration runs before the rest of
+    // the schema is in place during exotic flows).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS catchpointstate (
+             id     TEXT PRIMARY KEY,
+             intval INTEGER,
+             strval TEXT
+         );",
+    )?;
+    for (legacy_key, new_key) in [
+        ("sync_state", "algod_rust_sync_state"),
+        ("sync_catchpoint_label", "algod_rust_sync_catchpoint_label"),
+        ("sync_catchpoint_file", "algod_rust_sync_catchpoint_file"),
+    ] {
+        let val: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT value FROM algod_rust_meta WHERE key = ?1",
+                [legacy_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(bytes) = val {
+            let s = String::from_utf8(bytes).unwrap_or_default();
+            conn.execute(
+                "INSERT OR REPLACE INTO catchpointstate (id, strval) VALUES (?1, ?2)",
+                rusqlite::params![new_key, s],
+            )?;
+        }
+    }
+    // sync_catchpoint_round was stored as string LE bytes of a decimal
+    // (set_sync_meta uses `value.as_bytes()` on `round.to_string()`); we
+    // round-trip through string here.
+    let round_str: Option<Vec<u8>> = conn
         .query_row(
-            "SELECT value FROM algod_rust_meta WHERE key = ?1",
-            params![key],
+            "SELECT value FROM algod_rust_meta WHERE key = 'sync_catchpoint_round'",
+            [],
             |row| row.get(0),
         )
-        .optional()
-        .map_err(|e| AlgoError::Ledger {
-            message: format!("meta read error: {e}"),
-        })?;
-    Ok(result.unwrap_or_default())
-}
+        .optional()?;
+    if let Some(bytes) = round_str {
+        let s = String::from_utf8(bytes).unwrap_or_default();
+        if let Ok(n) = s.parse::<i64>() {
+            conn.execute(
+                "INSERT OR REPLACE INTO catchpointstate (id, intval) VALUES (?1, ?2)",
+                rusqlite::params!["algod_rust_sync_catchpoint_round", n],
+            )?;
+        }
+    }
 
-fn set_meta_blob(conn: &Connection, key: &str, val: &[u8]) -> Result<(), AlgoError> {
-    conn.execute(
-        "INSERT OR REPLACE INTO algod_rust_meta (key, value) VALUES (?1, ?2)",
-        params![key, val],
-    )
-    .map_err(|e| AlgoError::Ledger {
-        message: format!("meta write error: {e}"),
-    })?;
+    // Step 3: drop the legacy table.
+    conn.execute_batch("DROP TABLE IF EXISTS algod_rust_meta;")?;
     Ok(())
-}
-
-fn get_meta_string(conn: &Connection, key: &str) -> Result<String, AlgoError> {
-    let bytes = get_meta_blob(conn, key)?;
-    Ok(String::from_utf8(bytes).unwrap_or_default())
-}
-
-fn set_meta_string(conn: &Connection, key: &str, val: &str) -> Result<(), AlgoError> {
-    set_meta_blob(conn, key, val.as_bytes())
 }
 
 /// Snapshot of cached chain-level state derived from a block header.
@@ -1999,18 +2046,13 @@ pub(crate) fn derive_chain_meta_from_latest_block(
 ) -> Result<Option<ChainMetaFromHeader>, AlgoError> {
     // Tracker round = committed accountbase round (matches Go's
     // `accountsRound`). NULL/missing row → fall back to legacy meta.
-    // Committed round = the highest of:
-    //   - `acctrounds.acctbase`: what Go writes when applying blocks
-    //     (and what the Rust catchpoint importer seeds), and
-    //   - `algod_rust_meta.current_round`: what Rust's `commit_block`
-    //     advances on every block apply. Rust does NOT mirror that
-    //     value back into `acctrounds` (the writer-side change is out
-    //     of scope for G6 part 1), so a Rust-applied DB with a stale
-    //     catchpoint-seeded `acctrounds` row would regress on reopen
-    //     if we trusted `acctrounds` alone.
-    //
-    // Take the max of the two so derivation never moves backwards
-    // regardless of which path wrote the DB.
+    // Committed round = `acctrounds.acctbase` (Go's `accountsRound`).
+    // The Rust apply path mirrors `current_round` into this row on every
+    // `commit_block`; the catchpoint importer seeds it at cutover.
+    // Pre-G6-part-3 DBs that only had the round cached in the legacy
+    // `algod_rust_meta.current_round` have been migrated into
+    // `acctrounds` by `migrate_off_algod_rust_meta` before this helper
+    // ever runs.
     let acctrounds_rnd: Option<i64> = conn
         .query_row(
             "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
@@ -2021,23 +2063,36 @@ pub(crate) fn derive_chain_meta_from_latest_block(
         .map_err(|e| AlgoError::Ledger {
             message: format!("derive chain meta: acctrounds query: {e}"),
         })?;
-    if matches!(acctrounds_rnd, Some(r) if r < 0) {
-        // Negative round is a corruption signal; let the caller's
-        // fallback handle it rather than panic on the cast.
+    let Some(rnd) = acctrounds_rnd else {
+        return Ok(None);
+    };
+    if rnd < 0 {
         tracing::warn!(
-            "derive chain meta: acctrounds 'acctbase' is negative ({:?}); falling back",
-            acctrounds_rnd
+            "derive chain meta: acctrounds 'acctbase' is negative ({rnd}); skipping derivation"
         );
         return Ok(None);
     }
-    let meta_rnd = get_meta_u64(conn, "current_round").unwrap_or(0);
-    let acctrounds_u: u64 = acctrounds_rnd.map(|v| v as u64).unwrap_or(0);
-    let rnd_u = acctrounds_u.max(meta_rnd);
-    if rnd_u == 0 && acctrounds_rnd.is_none() && meta_rnd == 0 {
-        // Truly fresh DB: nothing to derive from.
-        return Ok(None);
+    if rnd == 0 {
+        // Fresh / never-initialized DBs commonly have acctrounds at 0
+        // with no matching block at round 0. Treat as "nothing to
+        // derive yet" so genesis init can populate from scratch.
+        // Genuine round-0 ledgers with a real header at 0 are
+        // exercised exclusively in tests; production catchpoints
+        // never produce a round-0 acctbase.
+        let header_at_zero: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT hdrdata FROM blockdb.blocks WHERE rnd = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("derive chain meta: round-0 probe: {e}"),
+            })?;
+        if header_at_zero.is_none() {
+            return Ok(None);
+        }
     }
-    let rnd = rnd_u as i64;
 
     let hdrdata: Option<Vec<u8>> = conn
         .query_row(
@@ -2355,6 +2410,24 @@ impl SqliteLedger {
             }
         })?;
 
+        // G6 part 3 (TASK-107): retire the legacy Rust-only
+        // `algod_rust_meta` table.
+        //
+        // 1. Migration: an upgrade from a pre-G6-part-3 binary leaves
+        //    the round cached in `algod_rust_meta.current_round` but
+        //    NOT in `acctrounds.acctbase` (Rust's apply path didn't
+        //    mirror it back). Copy the value across before dropping
+        //    so derivation has a tracker round to read on next open.
+        // 2. Sync-state migration: the four `sync_*` keys move to
+        //    `catchpointstate` with `algod_rust_sync_*` namespaced ids
+        //    (precedent: TASK-110's kvstore-null marker; Go ignores
+        //    unknown keys, so the rows are safe to leave behind when
+        //    a Go binary reopens the DB).
+        // 3. Drop the table.
+        migrate_off_algod_rust_meta(&conn).map_err(|e| AlgoError::Ledger {
+            message: format!("algod_rust_meta retirement error: {e}"),
+        })?;
+
         // Legacy-trie-format note (TASK-102 / PLAN-35 / DOC-24 §G2):
         //
         // Older Rust ledgers stored the trie as a single blob in the
@@ -2371,14 +2444,13 @@ impl SqliteLedger {
         // so the recovery path ("re-sync from a catchpoint") has a
         // real new-format target to migrate to.
 
-        // Load cached chain-level state. Prefer the Go-compatible
-        // source: derive everything from the latest block header in
-        // `blockdb.blocks`. That is the path a Go-generated data
-        // directory always lands on (no `algod_rust_meta` to read
-        // from). Only when the block archive is empty do we fall back
-        // to the legacy `algod_rust_meta` table — which still holds
-        // the genesis-init values before any block has been committed.
-        // The table itself is removed by TASK-107 / G6 part 3.
+        // Load cached chain-level state. Sole source: derive from
+        // `acctrounds.acctbase` (Go's tracker round) + that round's
+        // `BlockHeader` in `blockdb.blocks`. G6 part 3 removed the
+        // legacy `algod_rust_meta` fallback; a fresh DB with neither
+        // source populated lands on zero-defaults, which the genesis
+        // / catchpoint init paths overwrite before the runtime is
+        // exposed to consumers.
         let (
             current_round,
             rewards_level,
@@ -2405,60 +2477,19 @@ impl SqliteLedger {
                 m.protocol,
                 m.txn_counter,
             ),
-            None => {
-                let current_round = Round(get_meta_u64(&conn, "current_round")?);
-                let rewards_level = get_meta_u64(&conn, "rewards_level")?;
-                let rewards_rate = get_meta_u64(&conn, "rewards_rate")?;
-                let rewards_residue = get_meta_u64(&conn, "rewards_residue")?;
-                let rewards_recalculation_round =
-                    get_meta_u64(&conn, "rewards_recalculation_round")?;
-
-                let fee_sink_bytes = get_meta_blob(&conn, "fee_sink")?;
-                let fee_sink = if fee_sink_bytes.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&fee_sink_bytes);
-                    Address(arr)
-                } else {
-                    Address::ZERO
-                };
-
-                let rewards_pool_bytes = get_meta_blob(&conn, "rewards_pool")?;
-                let rewards_pool = if rewards_pool_bytes.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&rewards_pool_bytes);
-                    Address(arr)
-                } else {
-                    Address::ZERO
-                };
-
-                let genesis_id = get_meta_string(&conn, "genesis_id")?;
-
-                let genesis_hash_bytes = get_meta_blob(&conn, "genesis_hash")?;
-                let genesis_hash = if genesis_hash_bytes.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&genesis_hash_bytes);
-                    arr
-                } else {
-                    [0u8; 32]
-                };
-
-                let protocol = get_meta_string(&conn, "protocol")?;
-                let txn_counter = get_meta_u64(&conn, "txn_counter")?;
-
-                (
-                    current_round,
-                    rewards_level,
-                    rewards_rate,
-                    rewards_residue,
-                    rewards_recalculation_round,
-                    fee_sink,
-                    rewards_pool,
-                    genesis_id,
-                    genesis_hash,
-                    protocol,
-                    txn_counter,
-                )
-            }
+            None => (
+                Round(0),
+                0,
+                0,
+                0,
+                0,
+                Address::ZERO,
+                Address::ZERO,
+                String::new(),
+                [0u8; 32],
+                String::new(),
+                0,
+            ),
         };
 
         Ok(Self {
@@ -2790,16 +2821,15 @@ impl SqliteLedger {
 
     /// Get the last committed round (for resume capability).
     ///
-    /// G6 part 1: matches the round source used by `init`'s derivation
-    /// — the max of `acctrounds.acctbase` (Go's `accountsRound`) and
-    /// `algod_rust_meta.current_round` (Rust's commit cache). Reading
-    /// only the meta cache would make a Go-generated DB report `None`
-    /// here, which `reconcile_cross_file()` would then classify as
-    /// `Empty` — letting sync/replay callers reject or recreate a
-    /// perfectly valid ledger. Returns `None` only when neither row
-    /// exists (truly fresh / never-initialized DB).
+    /// Sole source: `acctrounds.acctbase` (Go's `accountsRound`).
+    /// Apply mirrors `current_round` here via `flush_chain_state`;
+    /// catchpoint cutover seeds it; the legacy `algod_rust_meta`
+    /// cache was retired in G6 part 3 (TASK-107) — pre-existing rows
+    /// are migrated into `acctrounds` by `migrate_off_algod_rust_meta`
+    /// during open. Returns `None` only when the row doesn't exist
+    /// (truly fresh / never-initialized DB).
     pub fn last_committed_round(&self) -> Result<Option<u64>, AlgoError> {
-        let acctrounds_rnd: Option<i64> = self
+        let rnd: Option<i64> = self
             .conn
             .query_row(
                 "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
@@ -2810,30 +2840,7 @@ impl SqliteLedger {
             .map_err(|e| AlgoError::Ledger {
                 message: format!("acctrounds query error: {e}"),
             })?;
-        let meta_present: bool = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM algod_rust_meta WHERE key = 'current_round'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("meta presence query error: {e}"),
-            })?;
-
-        let acctrounds_u = acctrounds_rnd.map(|v| v.max(0) as u64);
-        let meta_val = if meta_present {
-            Some(get_meta_u64(&self.conn, "current_round")?)
-        } else {
-            None
-        };
-
-        match (acctrounds_u, meta_val) {
-            (None, None) => Ok(None),
-            (Some(a), None) => Ok(Some(a)),
-            (None, Some(m)) => Ok(Some(m)),
-            (Some(a), Some(m)) => Ok(Some(a.max(m))),
-        }
+        Ok(rnd.map(|v| v.max(0) as u64))
     }
 
     /// Highest round currently stored in the attached block database, or
@@ -3082,23 +3089,22 @@ impl SqliteLedger {
         }
     }
 
-    /// Flush cached chain-level state to the meta table.
+    /// Persist the committed tracker round to `acctrounds.acctbase`
+    /// (Go's `accountsRound`). G6 part 3 retired the
+    /// `algod_rust_meta` chain-meta cache; the rest of the cached
+    /// fields (rewards state, genesis, protocol, txn_counter) are
+    /// recovered on next open by `derive_chain_meta_from_latest_block`
+    /// from this round's header in `blockdb.blocks`, so writing them
+    /// to a secondary table would be redundant.
     fn flush_chain_state(&self) -> Result<(), AlgoError> {
-        set_meta_u64(&self.conn, "current_round", self.current_round.0)?;
-        set_meta_u64(&self.conn, "rewards_level", self.rewards_level)?;
-        set_meta_u64(&self.conn, "rewards_rate", self.rewards_rate)?;
-        set_meta_u64(&self.conn, "rewards_residue", self.rewards_residue)?;
-        set_meta_u64(
-            &self.conn,
-            "rewards_recalculation_round",
-            self.rewards_recalculation_round,
-        )?;
-        set_meta_blob(&self.conn, "fee_sink", &self.fee_sink.0)?;
-        set_meta_blob(&self.conn, "rewards_pool", &self.rewards_pool.0)?;
-        set_meta_string(&self.conn, "genesis_id", &self.genesis_id)?;
-        set_meta_blob(&self.conn, "genesis_hash", &self.genesis_hash)?;
-        set_meta_string(&self.conn, "protocol", &self.protocol)?;
-        set_meta_u64(&self.conn, "txn_counter", self.txn_counter)?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', ?1)",
+                params![self.current_round.0 as i64],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("acctrounds flush error: {e}"),
+            })?;
         Ok(())
     }
 
@@ -3313,33 +3319,60 @@ pub fn initialize_meta_from_catchpoint(
     txn_counter: u64,
     rewards_level: u64,
 ) -> Result<(), AlgoError> {
-    // Ensure the meta table exists.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS algod_rust_meta (
-            key   TEXT PRIMARY KEY,
-            value BLOB
-        );",
+    // G6 part 3: the legacy `algod_rust_meta` table is gone. Instead,
+    // seed the canonical sources that `SqliteLedger::init` reads on
+    // next open:
+    //   - `acctrounds.acctbase = round` (already written by the
+    //     catchpoint importer's `atomic_cutover`, but we set it again
+    //     defensively for callers that invoke this function outside
+    //     of the importer).
+    //   - A synthesized minimal `BlockHeader` at `round` in
+    //     `blockdb.blocks`. The header carries the genesis fields,
+    //     protocol, `txn_counter`, and `rewards_level` from the
+    //     catchpoint header so derivation produces the same values
+    //     the old meta cache used to expose. The rewards-state fields
+    //     not present in the catchpoint header (rate, residue,
+    //     recalculation round, fee sink, rewards pool) default to
+    //     zero — they are corrected by the first applied post-import
+    //     block, the same behaviour the legacy meta path had.
+    //
+    // If lookback download later writes the real round-N header into
+    // `blockdb.blocks`, this synthesized row is overwritten via
+    // `put_block`'s `ON CONFLICT DO UPDATE`.
+    let hdr = algo_types::BlockHeader {
+        round: Round(round),
+        genesis_id: genesis_id.to_string(),
+        genesis_hash: *genesis_hash,
+        current_protocol: protocol.to_string(),
+        txn_counter,
+        rewards_level,
+        ..algo_types::BlockHeader::default()
+    };
+
+    let hdrdata = rmp_serde::to_vec_named(&hdr).map_err(|e| AlgoError::Ledger {
+        message: format!("encode synthesized catchpoint header: {e}"),
+    })?;
+    // Use a zero-length blkdata placeholder; the real block payload
+    // arrives via lookback download. Downstream readers that hit the
+    // payload before lookback completes already need to tolerate
+    // missing transactions for the catchpoint round.
+    conn.execute(
+        "INSERT INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(rnd) DO UPDATE SET proto=excluded.proto, hdrdata=excluded.hdrdata",
+        params![round as i64, protocol, hdrdata, &[] as &[u8]],
     )
     .map_err(|e| AlgoError::Ledger {
-        message: format!("create meta table error: {e}"),
+        message: format!("seed catchpoint block header: {e}"),
     })?;
 
-    set_meta_u64(conn, "current_round", round)?;
-    set_meta_string(conn, "genesis_id", genesis_id)?;
-    set_meta_blob(conn, "genesis_hash", genesis_hash)?;
-    set_meta_string(conn, "protocol", protocol)?;
-    set_meta_u64(conn, "txn_counter", txn_counter)?;
-    set_meta_u64(conn, "rewards_level", rewards_level)?;
-
-    // P1-2 fix: Reset ALL meta keys that SqliteLedger::init reads.
-    // Without these, stale values from a previously-used DB survive cutover.
-    // These will be corrected by the first block application or by
-    // downloading lookback blocks.
-    set_meta_u64(conn, "rewards_rate", 0)?;
-    set_meta_u64(conn, "rewards_residue", 0)?;
-    set_meta_u64(conn, "rewards_recalculation_round", 0)?;
-    set_meta_blob(conn, "fee_sink", &[0u8; 32])?;
-    set_meta_blob(conn, "rewards_pool", &[0u8; 32])?;
+    conn.execute(
+        "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', ?1)",
+        params![round as i64],
+    )
+    .map_err(|e| AlgoError::Ledger {
+        message: format!("seed acctrounds: {e}"),
+    })?;
 
     tracing::info!(
         "initialized chain meta from catchpoint: round={}, genesis_id={}, protocol={}, \
@@ -4958,13 +4991,18 @@ mod tests {
         assert_eq!(ledger.genesis_id(), "testnet-v1.0");
         assert_eq!(ledger.protocol(), "v42");
 
-        // Test flush + reload
+        // G6 part 3: flush_chain_state now writes acctrounds.acctbase
+        // (the legacy algod_rust_meta cache is gone).
         ledger.flush_chain_state().unwrap();
-        assert_eq!(get_meta_u64(&ledger.conn, "current_round").unwrap(), 42);
-        assert_eq!(
-            get_meta_string(&ledger.conn, "genesis_id").unwrap(),
-            "testnet-v1.0"
-        );
+        let acctbase: i64 = ledger
+            .conn
+            .query_row(
+                "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(acctbase, 42);
     }
 
     #[test]
@@ -6051,11 +6089,7 @@ mod tests {
                     [],
                 )
                 .unwrap();
-            // Wipe algod_rust_meta to simulate a Go-generated DB.
-            ledger
-                .conn
-                .execute("DELETE FROM algod_rust_meta", [])
-                .unwrap();
+            // No algod_rust_meta to wipe — G6 part 3 dropped it.
         }
 
         // Re-open: the runtime must derive from the header now.
@@ -6129,10 +6163,7 @@ mod tests {
                     [],
                 )
                 .unwrap();
-            ledger
-                .conn
-                .execute("DELETE FROM algod_rust_meta", [])
-                .unwrap();
+            // algod_rust_meta no longer exists (G6 part 3).
         }
 
         let ledger = SqliteLedger::open_with_prefix(&prefix).expect("reopen");
@@ -6161,10 +6192,7 @@ mod tests {
                     [],
                 )
                 .unwrap();
-            ledger
-                .conn
-                .execute("DELETE FROM algod_rust_meta", [])
-                .unwrap();
+            // algod_rust_meta no longer exists (G6 part 3).
         }
         let ledger = SqliteLedger::open_with_prefix(&prefix).expect("reopen");
         assert_eq!(ledger.last_committed_round().unwrap(), Some(42));
@@ -6210,51 +6238,105 @@ mod tests {
             ledger
                 .put_block(103, "vApplied", &hdr103_bytes, b"b103")
                 .unwrap();
-            // Catchpoint seeded acctrounds at 100; apply has since
-            // advanced algod_rust_meta to 103 without touching it.
+            // Post-G6-part-3 invariant: apply mirrors current_round
+            // into acctrounds.acctbase on every commit_block, so by
+            // the time we reopen the row already points at 103.
             ledger
                 .conn
                 .execute(
-                    "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 100)",
+                    "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 103)",
                     [],
                 )
                 .unwrap();
-            set_meta_u64(&ledger.conn, "current_round", 103).unwrap();
         }
 
         let ledger = SqliteLedger::open_with_prefix(&prefix).expect("reopen");
-        assert_eq!(
-            ledger.current_round,
-            Round(103),
-            "must not regress past meta's current_round"
-        );
+        assert_eq!(ledger.current_round, Round(103));
         assert_eq!(ledger.protocol, "vApplied");
         assert_eq!(ledger.txn_counter, 103);
     }
 
     #[test]
-    fn chain_metadata_falls_back_to_algod_rust_meta_when_blocks_empty() {
-        // G6 part 1 — a freshly-initialized DB with no blocks yet but
-        // genesis-init values written to algod_rust_meta must still
-        // boot correctly. The derivation returns None; the fallback
-        // path reads the cached values.
+    fn algod_rust_meta_retire_migrates_round_into_acctrounds_and_drops_table() {
+        // G6 part 3 — a DB initialized by a pre-G6-part-3 binary has
+        // `algod_rust_meta.current_round` populated but no
+        // `acctrounds.acctbase` (Rust's apply path never mirrored the
+        // round across). Reopen must:
+        //   1. Copy `current_round` from the legacy table into
+        //      `acctrounds.acctbase` so derivation has a tracker round.
+        //   2. Drop the legacy table so subsequent reopens never see it.
+        // Idempotent: re-opening after the migration is a no-op.
         let dir = tempfile::tempdir().unwrap();
         let prefix = dir.path().join("ledger");
-        {
-            let ledger = SqliteLedger::open_with_prefix(&prefix).expect("open");
-            set_meta_u64(&ledger.conn, "current_round", 0).unwrap();
-            set_meta_string(&ledger.conn, "genesis_id", "fresh-net").unwrap();
-            set_meta_string(&ledger.conn, "protocol", "vBoot").unwrap();
-        }
-        let ledger = SqliteLedger::open_with_prefix(&prefix).expect("reopen");
-        assert_eq!(ledger.current_round, Round(0));
-        assert_eq!(ledger.genesis_id, "fresh-net");
-        assert_eq!(ledger.protocol, "vBoot");
+        let tracker_path = tracker_path_for_prefix(&prefix);
+        let block_path = block_path_for_prefix(&prefix);
 
-        // Derivation returns None — confirming the fallback path was the
-        // one that ran.
-        let derived = derive_chain_meta_from_latest_block(&ledger.conn).unwrap();
-        assert!(derived.is_none());
+        // Synthesize a real header at round 57 so derivation succeeds
+        // once the migration has populated acctrounds.
+        let mut hdr = algo_types::BlockHeader {
+            round: Round(57),
+            ..Default::default()
+        };
+        hdr.current_protocol = "vLegacy".to_string();
+        hdr.txn_counter = 57_000;
+        let hdrdata = rmp_serde::to_vec_named(&hdr).unwrap();
+
+        {
+            let mut ledger = SqliteLedger::open_with_prefix(&prefix).expect("open");
+            ledger.put_block(57, "vLegacy", &hdrdata, b"blk").unwrap();
+            // Seed the legacy table as a pre-G6-part-3 binary would.
+            ledger
+                .conn
+                .execute_batch(
+                    "CREATE TABLE algod_rust_meta (
+                         key   TEXT PRIMARY KEY,
+                         value BLOB
+                     );",
+                )
+                .unwrap();
+            ledger
+                .conn
+                .execute(
+                    "INSERT INTO algod_rust_meta (key, value) VALUES ('current_round', ?1)",
+                    params![57u64.to_le_bytes().to_vec()],
+                )
+                .unwrap();
+            // Explicitly clear acctrounds — the migration must repopulate it.
+            ledger
+                .conn
+                .execute("DELETE FROM acctrounds WHERE id = 'acctbase'", [])
+                .unwrap();
+        }
+
+        let ledger = SqliteLedger::open_with_prefix(&prefix).expect("reopen runs migration");
+        assert_eq!(ledger.current_round, Round(57));
+        assert_eq!(ledger.protocol, "vLegacy");
+        assert_eq!(ledger.txn_counter, 57_000);
+
+        let conn = Connection::open(&tracker_path).unwrap();
+        // Legacy table is gone.
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='algod_rust_meta')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!table_exists, "algod_rust_meta must be dropped");
+        // Tracker round was migrated.
+        let acctbase: i64 = conn
+            .query_row(
+                "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(acctbase, 57);
+
+        // Idempotent: reopen again still works.
+        drop(conn);
+        let _ = SqliteLedger::open_with_prefix(&prefix).expect("idempotent reopen");
+        let _ = block_path;
     }
 
     #[test]
@@ -6386,7 +6468,13 @@ mod tests {
         // Consistent: tracker advanced to round 5 and blockdb has a row
         // for round 5.
         ledger.put_block(5, "v41", b"hdr", b"blk").unwrap();
-        set_meta_u64(&ledger.conn, "current_round", 5).unwrap();
+        ledger
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 5)",
+                [],
+            )
+            .unwrap();
         assert_eq!(
             ledger.reconcile_cross_file().unwrap(),
             CrossFileState::Consistent { round: 5 }
@@ -6395,7 +6483,13 @@ mod tests {
         // Split-commit gap: bump tracker to round 7 without adding the
         // matching blockdb row, but leave the round-5 row in place. This
         // is the post-crash shape we must catch.
-        set_meta_u64(&ledger.conn, "current_round", 7).unwrap();
+        ledger
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 7)",
+                [],
+            )
+            .unwrap();
         assert_eq!(
             ledger.reconcile_cross_file().unwrap(),
             CrossFileState::BlockBehind {
@@ -6420,7 +6514,13 @@ mod tests {
         // Tracker behind blockdb (block stored before tracker apply
         // commits — transient sync state): still Consistent.
         ledger.put_block(10, "v41", b"hdr", b"blk").unwrap();
-        set_meta_u64(&ledger.conn, "current_round", 8).unwrap();
+        ledger
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 8)",
+                [],
+            )
+            .unwrap();
         assert_eq!(
             ledger.reconcile_cross_file().unwrap(),
             CrossFileState::Consistent { round: 8 }

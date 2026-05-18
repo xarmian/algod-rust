@@ -159,8 +159,10 @@ while true; do
     GO_NONRELAY_ROUND=$(get_round "http://localhost:4002")
     # Query rust-relay's ledger round directly via sqlite. Since TASK-100
     # the round metadata lives in the tracker DB
-    # (`<prefix>.tracker.sqlite`), not the legacy single `ledger.sqlite`.
-    RUST_RELAY_ROUND=$(docker exec mc-rust-relay sqlite3 /app/ledger.tracker.sqlite "SELECT value FROM algod_rust_meta WHERE key='current_round'" 2>/dev/null || echo "?")
+    # (`<prefix>.tracker.sqlite`); G6 part 3 (TASK-107) retired the
+    # Rust-only `algod_rust_meta` cache, so we read `acctrounds.acctbase`
+    # (Go's `accountsRound` — the same row both Go and Rust agree on).
+    RUST_RELAY_ROUND=$(docker exec mc-rust-relay sqlite3 /app/ledger.tracker.sqlite "SELECT rnd FROM acctrounds WHERE id='acctbase'" 2>/dev/null || echo "?")
 
     # Sample container stats
     RUST_STATS=$(sample_stats "mc-rust-relay" 2>/dev/null || echo "")

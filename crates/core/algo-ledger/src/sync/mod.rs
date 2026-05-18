@@ -162,7 +162,20 @@ pub struct SyncResult {
 // State persistence helpers
 // ---------------------------------------------------------------------------
 
-/// Persist the current sync state to the `algod_rust_meta` table.
+// G6 part 3 (TASK-107): sync-state persistence migrated off the
+// retired `algod_rust_meta` table onto namespaced rows in
+// `catchpointstate` — Go's own k-v table, which ignores unknown ids
+// (precedent: TASK-110's `algod_rust_kvstore_null_norm_v1` marker).
+// The id prefix `algod_rust_sync_` keeps these rows visibly
+// Rust-private; `migrate_off_algod_rust_meta` (sqlite.rs) copies
+// pre-existing rows across on first open.
+const SYNC_STATE_KEY: &str = "algod_rust_sync_state";
+const SYNC_CATCHPOINT_LABEL_KEY: &str = "algod_rust_sync_catchpoint_label";
+const SYNC_CATCHPOINT_ROUND_KEY: &str = "algod_rust_sync_catchpoint_round";
+const SYNC_CATCHPOINT_FILE_KEY: &str = "algod_rust_sync_catchpoint_file";
+
+/// Persist the current sync state to `catchpointstate` with namespaced
+/// `algod_rust_sync_*` ids.
 ///
 /// Stores the state string, catchpoint label, catchpoint round, and
 /// catchpoint file path so that a crashed sync can be resumed.
@@ -173,57 +186,59 @@ pub fn persist_sync_state(
     catchpoint_round: Option<u64>,
     catchpoint_file: Option<&str>,
 ) -> Result<(), AlgoError> {
+    // `catchpointstate` is created by `SCHEMA_TRACKER_SQL`; ensure it
+    // exists defensively in case a caller invokes this against a
+    // partially-initialized connection.
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS algod_rust_meta (
-            key   TEXT PRIMARY KEY,
-            value BLOB
-        );",
+        "CREATE TABLE IF NOT EXISTS catchpointstate (
+             id     TEXT PRIMARY KEY,
+             intval INTEGER,
+             strval TEXT
+         );",
     )
     .map_err(|e| AlgoError::Ledger {
-        message: format!("create meta table error: {e}"),
+        message: format!("create catchpointstate error: {e}"),
     })?;
 
-    set_sync_meta(conn, "sync_state", &state.to_db_string())?;
+    set_sync_str(conn, SYNC_STATE_KEY, &state.to_db_string())?;
 
     if let Some(label) = catchpoint_label {
-        set_sync_meta(conn, "sync_catchpoint_label", label)?;
+        set_sync_str(conn, SYNC_CATCHPOINT_LABEL_KEY, label)?;
     } else {
-        delete_sync_meta(conn, "sync_catchpoint_label")?;
+        delete_sync_row(conn, SYNC_CATCHPOINT_LABEL_KEY)?;
     }
     if let Some(round) = catchpoint_round {
-        set_sync_meta(conn, "sync_catchpoint_round", &round.to_string())?;
+        set_sync_int(conn, SYNC_CATCHPOINT_ROUND_KEY, round as i64)?;
     } else {
-        delete_sync_meta(conn, "sync_catchpoint_round")?;
+        delete_sync_row(conn, SYNC_CATCHPOINT_ROUND_KEY)?;
     }
     if let Some(file) = catchpoint_file {
-        set_sync_meta(conn, "sync_catchpoint_file", file)?;
+        set_sync_str(conn, SYNC_CATCHPOINT_FILE_KEY, file)?;
     } else {
-        delete_sync_meta(conn, "sync_catchpoint_file")?;
+        delete_sync_row(conn, SYNC_CATCHPOINT_FILE_KEY)?;
     }
 
     Ok(())
 }
 
-/// Restore the sync state from the `algod_rust_meta` table.
+/// Restore the sync state from `catchpointstate`.
 ///
-/// Returns `None` if no persisted state exists or the table is missing.
+/// Returns `None` if no persisted state exists.
 pub fn restore_sync_state(conn: &Connection) -> Result<Option<PersistedSyncState>, AlgoError> {
-    // Check if table exists.
     let table_exists: bool = conn
         .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='algod_rust_meta'",
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='catchpointstate'",
             [],
             |row| row.get(0),
         )
         .map_err(|e| AlgoError::Ledger {
-            message: format!("check meta table existence: {e}"),
+            message: format!("check catchpointstate existence: {e}"),
         })?;
-
     if !table_exists {
         return Ok(None);
     }
 
-    let state_str = get_sync_meta(conn, "sync_state")?;
+    let state_str = get_sync_str(conn, SYNC_STATE_KEY)?;
     let state_str = match state_str {
         Some(s) => s,
         None => return Ok(None),
@@ -234,10 +249,9 @@ pub fn restore_sync_state(conn: &Connection) -> Result<Option<PersistedSyncState
         None => return Ok(None),
     };
 
-    let catchpoint_label = get_sync_meta(conn, "sync_catchpoint_label")?;
-    let catchpoint_round =
-        get_sync_meta(conn, "sync_catchpoint_round")?.and_then(|s| s.parse::<u64>().ok());
-    let catchpoint_file = get_sync_meta(conn, "sync_catchpoint_file")?;
+    let catchpoint_label = get_sync_str(conn, SYNC_CATCHPOINT_LABEL_KEY)?;
+    let catchpoint_round = get_sync_int(conn, SYNC_CATCHPOINT_ROUND_KEY)?.map(|v| v as u64);
+    let catchpoint_file = get_sync_str(conn, SYNC_CATCHPOINT_FILE_KEY)?;
 
     Ok(Some(PersistedSyncState {
         state,
@@ -251,31 +265,24 @@ pub fn restore_sync_state(conn: &Connection) -> Result<Option<PersistedSyncState
 pub fn clear_sync_state(conn: &Connection) -> Result<(), AlgoError> {
     let table_exists: bool = conn
         .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='algod_rust_meta'",
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='catchpointstate'",
             [],
             |row| row.get(0),
         )
         .map_err(|e| AlgoError::Ledger {
-            message: format!("check meta table existence: {e}"),
+            message: format!("check catchpointstate existence: {e}"),
         })?;
-
     if !table_exists {
         return Ok(());
     }
 
     for key in &[
-        "sync_state",
-        "sync_catchpoint_label",
-        "sync_catchpoint_round",
-        "sync_catchpoint_file",
+        SYNC_STATE_KEY,
+        SYNC_CATCHPOINT_LABEL_KEY,
+        SYNC_CATCHPOINT_ROUND_KEY,
+        SYNC_CATCHPOINT_FILE_KEY,
     ] {
-        conn.execute(
-            "DELETE FROM algod_rust_meta WHERE key = ?1",
-            rusqlite::params![key],
-        )
-        .map_err(|e| AlgoError::Ledger {
-            message: format!("clear sync meta key '{key}': {e}"),
-        })?;
+        delete_sync_row(conn, key)?;
     }
 
     Ok(())
@@ -294,43 +301,69 @@ pub struct PersistedSyncState {
     pub catchpoint_file: Option<String>,
 }
 
-fn delete_sync_meta(conn: &Connection, key: &str) -> Result<(), AlgoError> {
+fn delete_sync_row(conn: &Connection, key: &str) -> Result<(), AlgoError> {
     conn.execute(
-        "DELETE FROM algod_rust_meta WHERE key = ?1",
+        "DELETE FROM catchpointstate WHERE id = ?1",
         rusqlite::params![key],
     )
     .map_err(|e| AlgoError::Ledger {
-        message: format!("delete sync meta '{key}': {e}"),
+        message: format!("delete sync '{key}': {e}"),
     })?;
     Ok(())
 }
 
-fn set_sync_meta(conn: &Connection, key: &str, value: &str) -> Result<(), AlgoError> {
+fn set_sync_str(conn: &Connection, key: &str, value: &str) -> Result<(), AlgoError> {
     conn.execute(
-        "INSERT OR REPLACE INTO algod_rust_meta (key, value) VALUES (?1, ?2)",
-        rusqlite::params![key, value.as_bytes()],
+        "INSERT INTO catchpointstate (id, strval) VALUES (?1, ?2) \
+         ON CONFLICT(id) DO UPDATE SET strval = excluded.strval, intval = NULL",
+        rusqlite::params![key, value],
     )
     .map_err(|e| AlgoError::Ledger {
-        message: format!("set sync meta '{key}': {e}"),
+        message: format!("set sync '{key}': {e}"),
     })?;
     Ok(())
 }
 
-fn get_sync_meta(conn: &Connection, key: &str) -> Result<Option<String>, AlgoError> {
-    use rusqlite::OptionalExtension;
+fn set_sync_int(conn: &Connection, key: &str, value: i64) -> Result<(), AlgoError> {
+    conn.execute(
+        "INSERT INTO catchpointstate (id, intval) VALUES (?1, ?2) \
+         ON CONFLICT(id) DO UPDATE SET intval = excluded.intval, strval = NULL",
+        rusqlite::params![key, value],
+    )
+    .map_err(|e| AlgoError::Ledger {
+        message: format!("set sync '{key}': {e}"),
+    })?;
+    Ok(())
+}
 
-    let result: Option<Vec<u8>> = conn
+fn get_sync_str(conn: &Connection, key: &str) -> Result<Option<String>, AlgoError> {
+    use rusqlite::OptionalExtension;
+    let val: Option<String> = conn
         .query_row(
-            "SELECT value FROM algod_rust_meta WHERE key = ?1",
+            "SELECT strval FROM catchpointstate WHERE id = ?1",
             rusqlite::params![key],
             |row| row.get(0),
         )
         .optional()
         .map_err(|e| AlgoError::Ledger {
-            message: format!("get sync meta '{key}': {e}"),
+            message: format!("get sync '{key}': {e}"),
         })?;
+    Ok(val)
+}
 
-    Ok(result.map(|v| String::from_utf8(v).unwrap_or_default()))
+fn get_sync_int(conn: &Connection, key: &str) -> Result<Option<i64>, AlgoError> {
+    use rusqlite::OptionalExtension;
+    let val: Option<i64> = conn
+        .query_row(
+            "SELECT intval FROM catchpointstate WHERE id = ?1",
+            rusqlite::params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("get sync '{key}': {e}"),
+        })?;
+    Ok(val)
 }
 
 // ---------------------------------------------------------------------------
