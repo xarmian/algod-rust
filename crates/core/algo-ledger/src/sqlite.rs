@@ -2005,18 +2005,27 @@ fn migrate_off_algod_rust_meta(conn: &Connection) -> rusqlite::Result<()> {
     // open. (Reachable because the apply path treats put_block
     // failures as warnings, not commit blockers.)
     //
-    // We only enforce this when `algod_rust_meta` had a committed
-    // round to lose — for legacy DBs without that key (e.g. ones
-    // initialized before any block was committed) there's nothing
-    // to verify.
-    let had_committed_round = conn
-        .query_row::<i64, _, _>(
-            "SELECT 1 FROM algod_rust_meta WHERE key = 'current_round'",
+    // We only enforce this when `algod_rust_meta` had a NON-ZERO
+    // committed round to lose. A genesis-initialized DB writes
+    // `current_round = 0` before any block exists (and so before
+    // any `blockdb.blocks` row exists); treating that as a recovery
+    // target would refuse the drop on legitimate first-open scenarios
+    // — there is no committed state there to protect.
+    let legacy_round_value: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT value FROM algod_rust_meta WHERE key = 'current_round'",
             [],
             |row| row.get(0),
         )
-        .optional()?
-        .is_some();
+        .optional()?;
+    let had_committed_round = matches!(
+        legacy_round_value,
+        Some(ref bytes) if bytes.len() == 8 && {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(bytes);
+            u64::from_le_bytes(arr) > 0
+        }
+    );
     if had_committed_round {
         // `derive_chain_meta_from_latest_block` returns Ok(None) for
         // any condition that would land startup on zero defaults
@@ -6418,6 +6427,53 @@ mod tests {
         drop(conn);
         let _ = SqliteLedger::open_with_prefix(&prefix).expect("idempotent reopen");
         let _ = block_path;
+    }
+
+    #[test]
+    fn algod_rust_meta_retire_allows_drop_when_legacy_round_is_zero_genesis() {
+        // G6 part 3 regression — a genesis-initialized pre-G6-part-3
+        // DB writes `current_round = 0` to the legacy cache before
+        // any block lands in `blockdb.blocks`. The retirement check
+        // must NOT treat that as a "committed round to protect"
+        // (there is no committed state) and must allow the drop.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+
+        {
+            let ledger = SqliteLedger::open_with_prefix(&prefix).expect("open");
+            ledger
+                .conn
+                .execute_batch(
+                    "CREATE TABLE algod_rust_meta (
+                         key   TEXT PRIMARY KEY,
+                         value BLOB
+                     );",
+                )
+                .unwrap();
+            // Genesis init wrote current_round = 0 (LE bytes); other
+            // genesis fields would normally also be present but the
+            // round check is what gates the refusal.
+            ledger
+                .conn
+                .execute(
+                    "INSERT INTO algod_rust_meta (key, value) VALUES ('current_round', ?1)",
+                    params![0u64.to_le_bytes().to_vec()],
+                )
+                .unwrap();
+        }
+
+        // Reopen must succeed (not refuse) and the legacy table must
+        // be dropped — there's nothing committed to recover.
+        let _ = SqliteLedger::open_with_prefix(&prefix).expect("reopen succeeds on genesis-only");
+        let conn = Connection::open(tracker_path_for_prefix(&prefix)).unwrap();
+        let still_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='algod_rust_meta')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!still_exists, "genesis-only legacy meta must be dropped");
     }
 
     #[test]
