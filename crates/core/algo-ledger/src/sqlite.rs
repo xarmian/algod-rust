@@ -1893,33 +1893,37 @@ pub(crate) fn set_blob_update_round(blob: &[u8], update_round: u64) -> Vec<u8> {
 
 /// G12 (TASK-109): refuse to open a pre-v3 tracker DB.
 ///
-/// Pre-v3 shape: the tracker stores account data as a single blob in
-/// the `accountdata` table; assets/apps held by an account live inside
-/// that blob. Go upgrades this to the modern `accountbase` +
-/// `resources` shape via `performResourceTableMigration`
-/// (`../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:399-534`).
+/// Pre-v3 shape: the tracker stores each account as a single
+/// msgpack blob in `accountbase` (columns: `address PRIMARY KEY,
+/// data BLOB`). Assets and apps held by an account are embedded
+/// inside that blob — there is no separate `resources` table. Go's
+/// `performResourceTableMigration`
+/// (`../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:399-534`)
+/// rebuilds `accountbase` with the modern `addrid, address, data,
+/// normalizedonlinebalance` shape and migrates the embedded
+/// resources into a new `resources` table.
 ///
-/// Detection: `accountdata` table exists AND `resources` does not.
-/// (After init runs `SCHEMA_TRACKER_SQL`, `resources` always exists,
-/// so this check MUST run before the schema is created — that's why
-/// the call site lives at the top of `init`.) For a fresh / v3+ DB
-/// there is no `accountdata` table, so the check is a no-op.
+/// Detection: `accountbase` table exists AND `resources` does not.
+/// `SCHEMA_TRACKER_SQL` always creates both, so this check MUST run
+/// before the schema is created (the call site at the top of `init`
+/// is what makes that work). On a fresh DB, neither table exists →
+/// no-op. On a post-migration v3+ DB, both exist → no-op.
 ///
-/// Rust will port the migration when there is fixture coverage; until
-/// then we refuse to open with a structured error pointing operators
-/// at catchpoint recovery. The error message names the follow-up so
-/// the next port has a single landing spot.
+/// Rust will port the migration when fixture coverage is available;
+/// until then we refuse to open with a structured error so the
+/// silent-corruption path (empty `resources` coexisting with a
+/// legacy `accountbase`) stays closed.
 fn refuse_pre_v3_tracker_db(conn: &Connection) -> Result<(), AlgoError> {
-    let has_accountdata: bool = conn
+    let has_accountbase: bool = conn
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accountdata')",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accountbase')",
             [],
             |row| row.get(0),
         )
         .map_err(|e| AlgoError::Ledger {
-            message: format!("pre-v3 detect: accountdata probe: {e}"),
+            message: format!("pre-v3 detect: accountbase probe: {e}"),
         })?;
-    if !has_accountdata {
+    if !has_accountbase {
         return Ok(());
     }
 
@@ -1933,14 +1937,13 @@ fn refuse_pre_v3_tracker_db(conn: &Connection) -> Result<(), AlgoError> {
             message: format!("pre-v3 detect: resources probe: {e}"),
         })?;
     if has_resources {
-        // Co-existence is normal during/after a Go-side migration —
-        // not a refusal trigger.
+        // Post-migration / fresh-DB shape; nothing to refuse.
         return Ok(());
     }
 
     Err(AlgoError::Ledger {
-        message: "pre-v3 tracker DB detected: the `accountdata` table is present \
-                  but `resources` is not. Go's `performResourceTableMigration` \
+        message: "pre-v3 tracker DB detected: `accountbase` exists but `resources` \
+                  does not. Go's `performResourceTableMigration` \
                   (schema.go:399-534) has not run, and the Rust port is not yet \
                   available. Recover by re-syncing this ledger from a catchpoint, \
                   or run a pre-port Go binary once to perform the migration in \
@@ -6554,24 +6557,27 @@ mod tests {
     #[test]
     fn pre_v3_tracker_db_is_refused_with_structured_error() {
         // G12 (TASK-109) — a tracker DB with the pre-v3 shape
-        // (`accountdata` table present, no `resources`) must be
-        // refused at open time. The Rust port of
+        // (`accountbase` table present in its legacy
+        // `address PRIMARY KEY, data BLOB` shape, no `resources`)
+        // must be refused at open time. The Rust port of
         // `performResourceTableMigration` is a future task; until
         // then, silently coexisting an empty `resources` table with
-        // the legacy `accountdata` blob would strand asset / app data
-        // and corrupt downstream lookups.
+        // the legacy single-blob `accountbase` would strand the
+        // embedded asset/app data and corrupt downstream lookups.
         let dir = tempfile::tempdir().unwrap();
         let prefix = dir.path().join("ledger");
         let tracker_path = tracker_path_for_prefix(&prefix);
         let block_path = block_path_for_prefix(&prefix);
 
-        // Seed the pre-v3 tracker shape directly so we don't depend
-        // on Go's bytes layout — only on the table-name signal the
-        // refusal check uses.
+        // Seed the pre-v3 tracker shape directly — only the
+        // table-name signals the refusal check uses, not the row
+        // bytes. Note the legacy two-column shape (no `addrid`, no
+        // `normalizedonlinebalance`) — what Go's
+        // `performResourceTableMigration` migrates AWAY from.
         {
             let conn = Connection::open(&tracker_path).unwrap();
             conn.execute_batch(
-                "CREATE TABLE accountdata (
+                "CREATE TABLE accountbase (
                      address BLOB PRIMARY KEY,
                      data    BLOB
                  );",
@@ -6601,59 +6607,62 @@ mod tests {
         let conn = Connection::open(&tracker_path).unwrap();
         let still_exists: bool = conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accountdata')",
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accountbase')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert!(
             still_exists,
-            "accountdata must be preserved when open is refused"
+            "legacy accountbase must be preserved when open is refused"
+        );
+        // And `resources` must NOT have been silently created by
+        // `SCHEMA_TRACKER_SQL` after the refusal — refusal MUST
+        // happen before schema creation.
+        let resources_created: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !resources_created,
+            "schema creation must not run after refusal; an empty `resources` \
+             coexisting with the legacy accountbase is the corruption we're \
+             preventing"
         );
     }
 
     #[test]
     fn pre_v3_check_does_not_block_fresh_or_v3_dbs() {
-        // G12 sanity — a fresh DB has no `accountdata` table; the
-        // check must be a no-op. A v3-or-later DB where both
-        // `accountdata` and `resources` happen to coexist (e.g. mid-
-        // migration on the Go side, or a probe-during-write window)
-        // is also accepted.
+        // G12 sanity — a fresh DB has neither `accountbase` nor
+        // `resources` yet; the check must be a no-op so schema
+        // creation runs and both tables come into existence. A
+        // post-migration v3+ DB has both tables; the check must also
+        // accept that.
         let dir = tempfile::tempdir().unwrap();
         let prefix = dir.path().join("ledger");
 
-        // Fresh open: should succeed and create the standard schema.
+        // Fresh open creates both tables.
         {
             let ledger = SqliteLedger::open_with_prefix(&prefix).expect("fresh open");
-            // Sanity: `resources` exists post-init.
-            let resources_present: bool = ledger
-                .conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources')",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(resources_present);
+            for t in ["accountbase", "resources"] {
+                let present: bool = ledger
+                    .conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                        [t],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(present, "{t} must exist after fresh open");
+            }
         }
 
-        // Now add a legacy `accountdata` table alongside the modern
-        // `resources` — this is the v3+ coexistence shape the check
-        // must NOT reject.
-        let tracker_path = tracker_path_for_prefix(&prefix);
-        {
-            let conn = Connection::open(&tracker_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE accountdata (
-                     address BLOB PRIMARY KEY,
-                     data    BLOB
-                 );",
-            )
-            .unwrap();
-        }
-
-        // Reopen succeeds because `resources` is also present.
-        let _ = SqliteLedger::open_with_prefix(&prefix).expect("v3 coexistence reopen");
+        // Reopen the same DB — both tables exist now, refusal must
+        // not trigger.
+        let _ = SqliteLedger::open_with_prefix(&prefix).expect("v3+ reopen");
     }
 
     #[test]
