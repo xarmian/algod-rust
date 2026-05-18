@@ -1997,7 +1997,51 @@ fn migrate_off_algod_rust_meta(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
 
-    // Step 3: drop the legacy table.
+    // Step 3: verify the migrated round is recoverable from the
+    // block header before dropping the legacy table. Otherwise an
+    // upgraded DB whose `algod_rust_meta` had a committed round but
+    // whose `blockdb.blocks` row for that round is missing or
+    // undecodable would silently regress to zero-defaults on next
+    // open. (Reachable because the apply path treats put_block
+    // failures as warnings, not commit blockers.)
+    //
+    // We only enforce this when `algod_rust_meta` had a committed
+    // round to lose — for legacy DBs without that key (e.g. ones
+    // initialized before any block was committed) there's nothing
+    // to verify.
+    let had_committed_round = conn
+        .query_row::<i64, _, _>(
+            "SELECT 1 FROM algod_rust_meta WHERE key = 'current_round'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .is_some();
+    if had_committed_round {
+        // `derive_chain_meta_from_latest_block` returns Ok(None) for
+        // any condition that would land startup on zero defaults
+        // (missing acctrounds, missing header, undecodable header).
+        // Treat any of those as a refusal signal — the operator must
+        // either keep running the pre-G6-part-3 binary or recover
+        // via catchpoint re-sync.
+        let derivable = derive_chain_meta_from_latest_block(conn).map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(
+                format!("verify derivation before dropping algod_rust_meta: {e}").into(),
+            )
+        })?;
+        if derivable.is_none() {
+            return Err(rusqlite::Error::ToSqlConversionFailure(
+                "algod_rust_meta retirement aborted: legacy cache had a committed round \
+                 but the corresponding block header is missing or undecodable in \
+                 blockdb.blocks. Dropping the cache would lose the committed round on \
+                 next open. Recover by re-syncing this ledger from a catchpoint, or \
+                 keep running the pre-G6-part-3 binary until that's possible."
+                    .into(),
+            ));
+        }
+    }
+
+    // Step 4: drop the legacy table.
     conn.execute_batch("DROP TABLE IF EXISTS algod_rust_meta;")?;
     Ok(())
 }
@@ -3351,6 +3395,25 @@ pub fn initialize_meta_from_catchpoint(
 
     let hdrdata = rmp_serde::to_vec_named(&hdr).map_err(|e| AlgoError::Ledger {
         message: format!("encode synthesized catchpoint header: {e}"),
+    })?;
+    // The catchpoint flow opens a bare connection via
+    // `open_ledger_connection`, which deliberately does NOT run
+    // `SCHEMA_BLOCK_SQL` — lookback download is what conventionally
+    // creates `blockdb.blocks`. Create it defensively here so the
+    // seed write doesn't fail with "no such table" when
+    // `initialize_meta_from_catchpoint` runs before any block has
+    // been written.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS blockdb.blocks (
+             rnd INTEGER PRIMARY KEY,
+             proto TEXT,
+             hdrdata BLOB,
+             blkdata BLOB,
+             certdata BLOB
+         );",
+    )
+    .map_err(|e| AlgoError::Ledger {
+        message: format!("ensure blockdb.blocks exists: {e}"),
     })?;
     // Use a zero-length blkdata placeholder; the real block payload
     // arrives via lookback download. Downstream readers that hit the
@@ -6337,6 +6400,64 @@ mod tests {
         drop(conn);
         let _ = SqliteLedger::open_with_prefix(&prefix).expect("idempotent reopen");
         let _ = block_path;
+    }
+
+    #[test]
+    fn algod_rust_meta_retire_refuses_when_block_header_is_missing() {
+        // G6 part 3 regression — if the legacy `algod_rust_meta` had a
+        // committed round but `blockdb.blocks` doesn't have the
+        // corresponding header (e.g. a previous put_block was lost as
+        // a warning rather than committed), dropping the legacy
+        // cache would regress startup to zero-defaults. The migration
+        // must refuse instead.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+
+        {
+            let ledger = SqliteLedger::open_with_prefix(&prefix).expect("open");
+            ledger
+                .conn
+                .execute_batch(
+                    "CREATE TABLE algod_rust_meta (
+                         key   TEXT PRIMARY KEY,
+                         value BLOB
+                     );",
+                )
+                .unwrap();
+            // current_round=99 in the legacy cache, but no block at 99.
+            ledger
+                .conn
+                .execute(
+                    "INSERT INTO algod_rust_meta (key, value) VALUES ('current_round', ?1)",
+                    params![99u64.to_le_bytes().to_vec()],
+                )
+                .unwrap();
+        }
+
+        let err = match SqliteLedger::open_with_prefix(&prefix) {
+            Ok(_) => panic!("reopen must refuse to drop the cache without a header"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("algod_rust_meta retirement aborted"),
+            "expected refusal message; got: {msg}"
+        );
+
+        // Legacy table is still present so the operator can
+        // downgrade or fix the gap.
+        let conn = Connection::open(tracker_path_for_prefix(&prefix)).unwrap();
+        let still_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='algod_rust_meta')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            still_exists,
+            "algod_rust_meta must be preserved when migration refuses"
+        );
     }
 
     #[test]
