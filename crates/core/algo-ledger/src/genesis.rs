@@ -4,10 +4,16 @@ use algo_error::AlgoError;
 use algo_types::{AccountData, AccountStatus, Address};
 use data_encoding::BASE64;
 use serde::Deserialize;
+use sha2::{Digest as _, Sha512_256};
 
 use crate::state::LedgerState;
 
 /// Parsed genesis.json representation.
+///
+/// Field set + JSON keys match
+/// `../go-algorand/data/bookkeeping/genesis.go:44-84` byte-for-byte —
+/// keeping them in sync is what makes the G7 genesis-hash computation
+/// agree with Go.
 #[derive(Debug, Deserialize)]
 pub struct GenesisJson {
     pub network: String,
@@ -16,12 +22,39 @@ pub struct GenesisJson {
     pub alloc: Vec<GenesisAllocation>,
     pub fees: String,
     pub rwd: String,
+    /// Genesis block timestamp (seconds since epoch). Required for
+    /// hash parity with Go — every shipped network's `genesis.json`
+    /// carries this field (mainnet = 1560211200, etc.). Defaults to
+    /// 0 so older test fixtures without the field still parse.
+    #[serde(default)]
+    pub timestamp: i64,
+    /// Arbitrary genesis comment string. Go's `genesis.go` marks this
+    /// as `omitempty` so we treat empty / missing identically.
+    #[serde(default)]
+    pub comment: Option<String>,
+    /// Developer-mode network indicator. Go's `genesis.go`:
+    /// "Developer mode networks are a single node network, that
+    /// operates without the agreement service being active." Default
+    /// false matches Go's omitempty behaviour.
+    #[serde(default)]
+    pub devmode: bool,
 }
 
 /// A single account allocation from genesis.json.
+///
+/// NOTE: in Go's `genesis.go:155-164`, `GenesisAllocation` is the
+/// outlier — the comment explicitly says "we forgot to specify
+/// omitempty, and now this struct must be encoded without omitempty
+/// for the Address, Comment, and State fields." Our canonical
+/// encoder must therefore emit `addr`, `comment`, and `state` for
+/// every allocation, even when empty.
 #[derive(Debug, Deserialize)]
 pub struct GenesisAllocation {
     pub addr: String,
+    /// `comment` is always serialized (no omitempty in Go), so we
+    /// normalize JSON `null` / absent to the empty string at canonical-
+    /// encoding time.
+    #[serde(default)]
     pub comment: Option<String>,
     pub state: GenesisAccountState,
 }
@@ -45,13 +78,15 @@ pub struct GenesisAccountState {
 
 /// Populate any `LedgerStore` backend from parsed genesis data.
 ///
-/// Sets fee_sink, rewards_pool, genesis_id, protocol, and all account
-/// allocations. Can be used with both in-memory `LedgerState` and future
-/// SQLite backends.
+/// Sets fee_sink, rewards_pool, genesis_id, protocol, genesis_hash,
+/// and all account allocations. Can be used with both in-memory
+/// `LedgerState` and SQLite backends.
 ///
-/// TODO: go-algorand computes genesis hash as SHA512/256("GE" || canonical_msgpack(genesis)).
-/// For now, genesis_hash is left as [0u8; 32] — the real hash is available from block
-/// headers during replay and can be set/verified then.
+/// The genesis hash is computed via [`genesis_hash`] —
+/// `SHA512/256("GE" || canonical_encode_genesis(genesis))` — and
+/// matches Go's `Genesis.Hash()` byte-for-byte for every shipped
+/// network (mainnet / testnet / devnet / betanet — see the
+/// `genesis_hash_matches_go_for_*` tests below).
 pub fn populate_store<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     genesis: &GenesisJson,
@@ -67,6 +102,7 @@ pub fn populate_store<L: crate::store_trait::LedgerStore>(
     store.set_fee_sink(fee_sink);
     store.set_rewards_pool(rewards_pool);
     store.set_genesis_id(format!("{}-{}", genesis.network, genesis.id));
+    store.set_genesis_hash(genesis_hash(genesis));
     store.set_protocol(genesis.proto.clone());
 
     // Process allocations
@@ -107,6 +143,233 @@ pub fn parse_genesis_json(json_str: &str) -> Result<GenesisJson, AlgoError> {
     serde_json::from_str(json_str).map_err(|e| AlgoError::Ledger {
         message: format!("failed to parse genesis JSON: {e}"),
     })
+}
+
+// ===========================================================================
+// G7: Canonical msgpack encoding + genesis hash
+// ===========================================================================
+//
+// Mirrors Go's `Genesis.ToBeHashed`:
+//   ../go-algorand/data/bookkeeping/genesis.go:167-169
+//     return protocol.Genesis ("GE"), protocol.Encode(&genesis)
+//   crypto.HashObj  → sha512.Sum512_256(HashID || msgpack(obj))
+//
+// Genesis is encoded by Go's `go-codec` library with
+// `omitempty,omitemptyarray` on the struct, except for
+// `GenesisAllocation` which is encoded WITHOUT omitempty
+// ("we forgot to specify omitempty" comment in genesis.go:156).
+// The reference implementation uses canonical msgpack (sorted keys).
+
+/// HashID domain separator for genesis.
+/// Go: `protocol/hash.go:46` → `Genesis HashID = "GE"`.
+const HASH_DOMAIN_GENESIS: &[u8] = b"GE";
+
+/// Canonically encode a `GenesisJson` into msgpack matching Go's
+/// `protocol.Encode(&Genesis)` output. Keys are sorted
+/// lexicographically; omitempty/omitemptyarray rules track Go's
+/// codec tags exactly. The result is what gets hashed for
+/// [`genesis_hash`].
+pub fn canonical_encode_genesis(genesis: &GenesisJson) -> Vec<u8> {
+    let mut fields: Vec<(&'static str, Vec<u8>)> = Vec::new();
+
+    // "alloc" — never omitted in practice (Go's `omitemptyarray` skips
+    // empty but every real genesis ships allocations).
+    if !genesis.alloc.is_empty() {
+        let mut buf = Vec::new();
+        rmp::encode::write_array_len(&mut buf, genesis.alloc.len() as u32).unwrap();
+        for a in &genesis.alloc {
+            buf.extend_from_slice(&encode_allocation(a));
+        }
+        fields.push(("alloc", buf));
+    }
+
+    // "comment" — omitempty string.
+    let comment = genesis.comment.as_deref().unwrap_or("");
+    if !comment.is_empty() {
+        fields.push(("comment", encode_str(comment)));
+    }
+
+    // "devmode" — omitempty bool (skip when false).
+    if genesis.devmode {
+        let mut buf = Vec::new();
+        rmp::encode::write_bool(&mut buf, true).unwrap();
+        fields.push(("devmode", buf));
+    }
+
+    // "fees", "id", "network", "proto", "rwd" — omitempty strings.
+    if !genesis.fees.is_empty() {
+        fields.push(("fees", encode_str(&genesis.fees)));
+    }
+    if !genesis.id.is_empty() {
+        fields.push(("id", encode_str(&genesis.id)));
+    }
+    if !genesis.network.is_empty() {
+        fields.push(("network", encode_str(&genesis.network)));
+    }
+    if !genesis.proto.is_empty() {
+        fields.push(("proto", encode_str(&genesis.proto)));
+    }
+    if !genesis.rwd.is_empty() {
+        fields.push(("rwd", encode_str(&genesis.rwd)));
+    }
+
+    // "timestamp" — omitempty i64 (skip when 0).
+    if genesis.timestamp != 0 {
+        let mut buf = Vec::new();
+        encode_i64(&mut buf, genesis.timestamp);
+        fields.push(("timestamp", buf));
+    }
+
+    // Sort by key — go-codec emits canonical maps with byte-sorted keys.
+    fields.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+
+    let mut out = Vec::new();
+    rmp::encode::write_map_len(&mut out, fields.len() as u32).unwrap();
+    for (k, v) in fields {
+        rmp::encode::write_str(&mut out, k).unwrap();
+        out.extend_from_slice(&v);
+    }
+    out
+}
+
+/// SHA512/256("GE" || canonical_encode_genesis(genesis)). Matches
+/// Go's `Genesis.Hash()` byte-for-byte for every shipped network
+/// (mainnet / testnet / devnet / betanet — verified by the tests
+/// below).
+pub fn genesis_hash(genesis: &GenesisJson) -> [u8; 32] {
+    let mut hasher = Sha512_256::new();
+    hasher.update(HASH_DOMAIN_GENESIS);
+    hasher.update(canonical_encode_genesis(genesis));
+    hasher.finalize().into()
+}
+
+/// Encode a single `GenesisAllocation` as a msgpack map.
+///
+/// IMPORTANT: addr, comment, and state are ALWAYS emitted — Go's
+/// `genesis.go:155-164` notes "we forgot to specify omitempty"
+/// for this type. So even an empty `comment` lands as a 0-length
+/// string in the msgpack output (which matters because mainnet has
+/// allocations with `"comment": ""`).
+fn encode_allocation(a: &GenesisAllocation) -> Vec<u8> {
+    let mut out = Vec::new();
+    rmp::encode::write_map_len(&mut out, 3).unwrap();
+
+    rmp::encode::write_str(&mut out, "addr").unwrap();
+    out.extend_from_slice(&encode_str(&a.addr));
+
+    rmp::encode::write_str(&mut out, "comment").unwrap();
+    let comment = a.comment.as_deref().unwrap_or("");
+    out.extend_from_slice(&encode_str(comment));
+
+    rmp::encode::write_str(&mut out, "state").unwrap();
+    out.extend_from_slice(&encode_account_state(&a.state));
+
+    out
+}
+
+/// Encode a `GenesisAccountState` as a canonical msgpack map.
+/// `GenesisAccountData` in Go has the standard
+/// `omitempty,omitemptyarray` semantics — every field skips when
+/// zero-valued.
+///
+/// Go field order (canonical, sorted): algo, onl, sel, stprf, vote,
+/// voteFst, voteKD, voteLst.
+fn encode_account_state(s: &GenesisAccountState) -> Vec<u8> {
+    let mut fields: Vec<(&'static str, Vec<u8>)> = Vec::new();
+
+    if s.algo != 0 {
+        let mut buf = Vec::new();
+        rmp::encode::write_uint(&mut buf, s.algo).unwrap();
+        fields.push(("algo", buf));
+    }
+    if let Some(v) = s.onl {
+        if v != 0 {
+            let mut buf = Vec::new();
+            rmp::encode::write_uint(&mut buf, v as u64).unwrap();
+            fields.push(("onl", buf));
+        }
+    }
+    if let Some(b) = decode_b64_nonempty(&s.sel) {
+        fields.push(("sel", encode_bin(&b)));
+    }
+    if let Some(b) = decode_b64_nonempty(&s.stprf) {
+        fields.push(("stprf", encode_bin(&b)));
+    }
+    if let Some(b) = decode_b64_nonempty(&s.vote) {
+        fields.push(("vote", encode_bin(&b)));
+    }
+    if let Some(v) = s.vote_fst {
+        if v != 0 {
+            let mut buf = Vec::new();
+            rmp::encode::write_uint(&mut buf, v).unwrap();
+            fields.push(("voteFst", buf));
+        }
+    }
+    if let Some(v) = s.vote_kd {
+        if v != 0 {
+            let mut buf = Vec::new();
+            rmp::encode::write_uint(&mut buf, v).unwrap();
+            fields.push(("voteKD", buf));
+        }
+    }
+    if let Some(v) = s.vote_lst {
+        if v != 0 {
+            let mut buf = Vec::new();
+            rmp::encode::write_uint(&mut buf, v).unwrap();
+            fields.push(("voteLst", buf));
+        }
+    }
+
+    fields.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+
+    let mut out = Vec::new();
+    rmp::encode::write_map_len(&mut out, fields.len() as u32).unwrap();
+    for (k, v) in fields {
+        rmp::encode::write_str(&mut out, k).unwrap();
+        out.extend_from_slice(&v);
+    }
+    out
+}
+
+fn encode_str(s: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    rmp::encode::write_str(&mut buf, s).unwrap();
+    buf
+}
+
+fn encode_bin(b: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    rmp::encode::write_bin(&mut buf, b).unwrap();
+    buf
+}
+
+/// Encode a signed i64 using msgpack's positive-fixint / uint / int
+/// rules, matching go-codec's "shortest signed" output. Positive
+/// values go through the unsigned path because that's how Go's
+/// reflective encoder writes non-negative ints with omitempty (a
+/// positive Timestamp lands as a uint, not an int).
+fn encode_i64(buf: &mut Vec<u8>, v: i64) {
+    if v >= 0 {
+        rmp::encode::write_uint(buf, v as u64).unwrap();
+    } else {
+        rmp::encode::write_sint(buf, v).unwrap();
+    }
+}
+
+/// Decode an optional base64 string into bytes, returning `None`
+/// for absent / empty / all-zero values (matches Go's omitempty for
+/// fixed-size byte arrays).
+fn decode_b64_nonempty(value: &Option<String>) -> Option<Vec<u8>> {
+    let s = value.as_ref()?;
+    if s.is_empty() {
+        return None;
+    }
+    let bytes = BASE64.decode(s.as_bytes()).ok()?;
+    if bytes.iter().all(|&b| b == 0) {
+        None
+    } else {
+        Some(bytes)
+    }
 }
 
 /// Seed the SQLite ledger's `accounttotals` table from a parsed genesis.
@@ -215,6 +478,26 @@ fn decode_key_64(value: &Option<String>, field_name: &str) -> Result<Option<[u8;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use data_encoding::BASE32_NOPAD;
+    use std::path::PathBuf;
+
+    /// Locate a go-algorand genesis fixture relative to this workspace.
+    /// Returns `None` when the sibling `../go-algorand` checkout isn't
+    /// present (CI may run without it; the test then skips rather
+    /// than fails). CLAUDE.md documents the layout: go-algorand is
+    /// pinned at `../go-algorand`.
+    fn go_algorand_genesis_path(network: &str) -> Option<PathBuf> {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").ok()?;
+        let p = PathBuf::from(manifest)
+            .join("../../../../go-algorand/installer/genesis")
+            .join(network)
+            .join("genesis.json");
+        p.exists().then_some(p)
+    }
+
+    fn b32_digest(d: &[u8; 32]) -> String {
+        BASE32_NOPAD.encode(d)
+    }
 
     const SAMPLE_GENESIS: &str = r#"{
         "network": "testnet",
@@ -244,7 +527,12 @@ mod tests {
         assert!(!state.rewards_pool.is_zero());
         // Last allocation wins (same address written twice)
         assert_eq!(state.accounts.len(), 1);
-        assert_eq!(state.genesis_hash, [0u8; 32]);
+        // G7: populate_store now computes the genesis hash; it must
+        // be non-zero and stable across two invocations with the
+        // same input.
+        assert_ne!(state.genesis_hash, [0u8; 32]);
+        let second = LedgerState::from_genesis_json(SAMPLE_GENESIS).unwrap();
+        assert_eq!(state.genesis_hash, second.genesis_hash);
     }
 
     #[test]
@@ -391,5 +679,150 @@ mod tests {
         seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
         seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
         assert_eq!(ledger.online_stake().unwrap(), 10);
+    }
+
+    // -----------------------------------------------------------------
+    // G7: genesis hash parity with Go
+    // -----------------------------------------------------------------
+
+    /// Pin the four shipped networks' expected hashes from
+    /// `../go-algorand/installer/genesis/<net>/genesis.json.hash`.
+    /// If these strings ever change, either Go shipped a new genesis
+    /// (compare against the pinned `v4.5.1-stable` tree) or Rust is
+    /// silently breaking hash parity.
+    #[test]
+    fn genesis_hash_matches_go_for_mainnet() {
+        check_network_hash(
+            "mainnet",
+            // ../go-algorand/installer/genesis/mainnet/genesis.json.hash
+            "YBQ4JWH4DW655UWXMBF6IVUOH5WQIGMHVQ333ZFWEC22WOJERLPQ",
+        );
+    }
+
+    #[test]
+    fn genesis_hash_matches_go_for_testnet() {
+        check_network_hash(
+            "testnet",
+            // ../go-algorand/installer/genesis/testnet/genesis.json.hash
+            read_pinned_hash("testnet").as_str(),
+        );
+    }
+
+    #[test]
+    fn genesis_hash_matches_go_for_devnet() {
+        check_network_hash("devnet", read_pinned_hash("devnet").as_str());
+    }
+
+    #[test]
+    fn genesis_hash_matches_go_for_betanet() {
+        check_network_hash("betanet", read_pinned_hash("betanet").as_str());
+    }
+
+    /// Read the base32 hash string from
+    /// `../go-algorand/installer/genesis/<net>/genesis.json.hash`,
+    /// returning an empty string if the file is unavailable (the
+    /// caller's `check_network_hash` then skips with a warning).
+    fn read_pinned_hash(network: &str) -> String {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+        let p = PathBuf::from(manifest)
+            .join("../../../../go-algorand/installer/genesis")
+            .join(network)
+            .join("genesis.json.hash");
+        std::fs::read_to_string(p)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+
+    fn check_network_hash(network: &str, expected_b32: &str) {
+        let Some(path) = go_algorand_genesis_path(network) else {
+            eprintln!(
+                "skipping genesis hash test for {network}: \
+                 ../go-algorand/installer/genesis/{network}/genesis.json not found"
+            );
+            return;
+        };
+        if expected_b32.is_empty() {
+            eprintln!(
+                "skipping genesis hash test for {network}: \
+                 genesis.json.hash sibling file is missing"
+            );
+            return;
+        }
+
+        let json = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let genesis =
+            parse_genesis_json(&json).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        let h = genesis_hash(&genesis);
+        let got_b32 = b32_digest(&h);
+
+        assert_eq!(
+            got_b32, expected_b32,
+            "{network}: Rust genesis_hash differs from Go's pinned hash.\n  \
+             expected: {expected_b32}\n  \
+             got:      {got_b32}"
+        );
+    }
+
+    #[test]
+    fn canonical_encode_genesis_emits_sorted_keys_and_omits_empty() {
+        // Sanity-check the canonical-encoding contract independent of
+        // any pinned hash: a genesis with timestamp=0, comment="",
+        // devmode=false must omit those fields, and the remaining keys
+        // must appear in lexicographic order in the msgpack output.
+        let genesis = GenesisJson {
+            network: "n".to_string(),
+            id: "v".to_string(),
+            proto: "p".to_string(),
+            alloc: vec![],
+            fees: "7777777777777777777777777777777777777777777777777774MSJUVU".to_string(),
+            rwd: "7777777777777777777777777777777777777777777777777774MSJUVU".to_string(),
+            timestamp: 0,
+            comment: None,
+            devmode: false,
+        };
+        let bytes = canonical_encode_genesis(&genesis);
+
+        // The keys present should be exactly: fees, id, network, proto, rwd.
+        // (alloc is empty → omitted; timestamp=0 → omitted; comment empty
+        // and devmode false → omitted.)
+        let s = String::from_utf8_lossy(&bytes);
+        for key in ["fees", "id", "network", "proto", "rwd"] {
+            assert!(s.contains(key), "missing expected key `{key}`");
+        }
+        for key in ["alloc", "comment", "devmode", "timestamp"] {
+            assert!(!s.contains(key), "key `{key}` should be omitted");
+        }
+
+        // Map header byte for a 5-entry map is fixmap(5) = 0x85.
+        assert_eq!(bytes[0], 0x85);
+    }
+
+    #[test]
+    fn canonical_encode_genesis_devmode_and_comment_round_trip() {
+        // A genesis with devmode=true + comment="dev" + timestamp=42
+        // must include all three in the canonical output. The
+        // resulting hash is internally consistent — encoding the same
+        // genesis twice yields the same bytes.
+        let genesis = GenesisJson {
+            network: "devnet".to_string(),
+            id: "v1".to_string(),
+            proto: "p".to_string(),
+            alloc: vec![],
+            fees: "7777777777777777777777777777777777777777777777777774MSJUVU".to_string(),
+            rwd: "7777777777777777777777777777777777777777777777777774MSJUVU".to_string(),
+            timestamp: 42,
+            comment: Some("dev".to_string()),
+            devmode: true,
+        };
+        let a = canonical_encode_genesis(&genesis);
+        let b = canonical_encode_genesis(&genesis);
+        assert_eq!(a, b, "canonical encoding must be deterministic");
+
+        let s = String::from_utf8_lossy(&a);
+        assert!(s.contains("comment"));
+        assert!(s.contains("devmode"));
+        assert!(s.contains("timestamp"));
     }
 }
