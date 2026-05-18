@@ -3161,12 +3161,29 @@ impl SqliteLedger {
     }
 
     /// Persist the committed tracker round to `acctrounds.acctbase`
-    /// (Go's `accountsRound`). G6 part 3 retired the
-    /// `algod_rust_meta` chain-meta cache; the rest of the cached
-    /// fields (rewards state, genesis, protocol, txn_counter) are
-    /// recovered on next open by `derive_chain_meta_from_latest_block`
-    /// from this round's header in `blockdb.blocks`, so writing them
-    /// to a secondary table would be redundant.
+    /// (Go's `accountsRound`) and ensure a recoverable header exists
+    /// at that round in `blockdb.blocks`.
+    ///
+    /// G6 part 3 retired the `algod_rust_meta` chain-meta cache;
+    /// rewards state, genesis fields, protocol, fee_sink,
+    /// rewards_pool, and txn_counter are recovered on next open by
+    /// `derive_chain_meta_from_latest_block` from this round's
+    /// header. Normal apply flows have already written that header
+    /// via `put_block` before `commit_block` runs, so the synthesized
+    /// fallback below is a no-op (INSERT OR IGNORE skips the existing
+    /// row).
+    ///
+    /// The synthesized fallback matters for two paths that commit
+    /// without calling `put_block`:
+    ///   - Genesis seeding (relay / participate first-boot): writes
+    ///     accountbase + accounttotals at round 0 via begin_block
+    ///     → populate_store → commit_block, never puts a real block.
+    ///     Without this synthesized row, the chain meta would be
+    ///     lost on next restart.
+    ///   - Defensive recovery: if a previous run's `put_block` was
+    ///     lost as a warning but `commit_block` succeeded, this
+    ///     restores the gap with the in-memory state we are about
+    ///     to lose.
     fn flush_chain_state(&self) -> Result<(), AlgoError> {
         self.conn
             .execute(
@@ -3175,6 +3192,41 @@ impl SqliteLedger {
             )
             .map_err(|e| AlgoError::Ledger {
                 message: format!("acctrounds flush error: {e}"),
+            })?;
+
+        // Synthesize a minimal header carrying the cached chain meta
+        // and INSERT OR IGNORE — real blocks written via `put_block`
+        // already occupy the row, so this is a no-op for them.
+        let hdr = algo_types::BlockHeader {
+            round: self.current_round,
+            genesis_id: self.genesis_id.clone(),
+            genesis_hash: self.genesis_hash,
+            current_protocol: self.protocol.clone(),
+            fee_sink: self.fee_sink,
+            rewards_pool: self.rewards_pool,
+            rewards_level: self.rewards_level,
+            rewards_rate: self.rewards_rate,
+            rewards_residue: self.rewards_residue,
+            rewards_recalculation_round: Round(self.rewards_recalculation_round),
+            txn_counter: self.txn_counter,
+            ..algo_types::BlockHeader::default()
+        };
+        let hdrdata = rmp_serde::to_vec_named(&hdr).map_err(|e| AlgoError::Ledger {
+            message: format!("encode synthesized flush header: {e}"),
+        })?;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    self.current_round.0 as i64,
+                    self.protocol,
+                    hdrdata,
+                    &[] as &[u8]
+                ],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("synthesized header flush error: {e}"),
             })?;
         Ok(())
     }
@@ -6427,6 +6479,39 @@ mod tests {
         drop(conn);
         let _ = SqliteLedger::open_with_prefix(&prefix).expect("idempotent reopen");
         let _ = block_path;
+    }
+
+    #[test]
+    fn flush_chain_state_synthesizes_header_for_genesis_round_zero() {
+        // G6 part 3 regression — genesis seeding (relay first-boot)
+        // calls `begin_block` → populate_store → `commit_block` at
+        // round 0 without ever calling `put_block`. Without a
+        // recoverable header, the chain meta (genesis_id, protocol,
+        // fee_sink, rewards_pool) would be lost on next restart.
+        // `flush_chain_state` must synthesize a round-0 header from
+        // the in-memory state.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        {
+            let mut ledger = SqliteLedger::open_with_prefix(&prefix).expect("open");
+            ledger.set_genesis_id("test-genesis".to_string());
+            ledger.set_genesis_hash([0x77; 32]);
+            ledger.set_protocol("vGenesis".to_string());
+            ledger.set_fee_sink(Address([0x11; 32]));
+            ledger.set_rewards_pool(Address([0x22; 32]));
+            ledger.set_current_round(Round(0));
+            // Mirror the genesis-seed flow: begin/commit without put_block.
+            ledger.begin_block().unwrap();
+            ledger.commit_block().unwrap();
+        }
+
+        let ledger = SqliteLedger::open_with_prefix(&prefix).expect("reopen");
+        assert_eq!(ledger.current_round, Round(0));
+        assert_eq!(ledger.genesis_id, "test-genesis");
+        assert_eq!(ledger.genesis_hash, [0x77; 32]);
+        assert_eq!(ledger.protocol, "vGenesis");
+        assert_eq!(ledger.fee_sink, Address([0x11; 32]));
+        assert_eq!(ledger.rewards_pool, Address([0x22; 32]));
     }
 
     #[test]
