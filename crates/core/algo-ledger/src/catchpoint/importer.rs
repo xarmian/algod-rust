@@ -155,6 +155,13 @@ impl<'a> CatchpointImporter<'a> {
     /// the table is dropped + recreated with the correct shape every time.
     pub fn prepare_staging(&mut self) -> Result<(), CatchpointError> {
         // Create staging tables via raw DDL (single source of truth in sqlite.rs).
+        //
+        // The trailing `DROP TABLE IF EXISTS catchpoint_import_state` is a
+        // transitional cleanup for tracker DBs produced by older Rust
+        // versions that left the now-removed table behind (PLAN-36 G4 /
+        // TASK-117). Phase B's goal is that Rust-produced DBs are openable
+        // by go-algorand without unknown tables — this drop guarantees that
+        // any later import on such a DB scrubs the legacy artifact.
         self.conn.execute_batch(
             "
             DROP TABLE IF EXISTS catchpointassetcreators;
@@ -166,6 +173,7 @@ impl<'a> CatchpointImporter<'a> {
             DROP TABLE IF EXISTS catchpointonlineaccounts;
             DROP TABLE IF EXISTS catchpointonlineroundparamstail;
             DROP TABLE IF EXISTS catchpointstateproofverification;
+            DROP TABLE IF EXISTS catchpoint_import_state;
             ",
         )?;
 
@@ -392,7 +400,17 @@ impl<'a> CatchpointImporter<'a> {
         )?;
 
         // Step 6: Clean up remaining staging tables.
-        tx.execute_batch("DROP TABLE IF EXISTS catchpointpendinghashes;")?;
+        //
+        // `catchpoint_import_state` is dropped here as a transitional
+        // cleanup — Phase B (TASK-117) no longer creates the table, but
+        // tracker DBs produced by older Rust versions may still carry one
+        // from a prior interrupted import. Dropping at cutover ensures
+        // such legacy artifacts can never persist into a fully imported
+        // (and thus Go-openable) tracker DB.
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS catchpointpendinghashes;
+            DROP TABLE IF EXISTS catchpoint_import_state;",
+        )?;
 
         tx.commit().map_err(CatchpointError::SqliteError)?;
 
