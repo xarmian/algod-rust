@@ -2897,11 +2897,24 @@ impl SqliteLedger {
     /// the gap to decide between bailing out, refetching, or rolling
     /// forward.
     pub fn max_block_round_in_blockdb(&self) -> Result<Option<u64>, AlgoError> {
-        // SQLite `MAX()` over an empty table returns NULL, so collect into
-        // an Option<i64> rather than a bare i64.
+        // G6 part 3: filter out the synthesized header rows that
+        // `initialize_meta_from_catchpoint` writes (empty `blkdata`).
+        // Those rows exist only so `derive_chain_meta_from_latest_block`
+        // has a header to read post-cutover-but-pre-lookback. They are
+        // NOT real archived blocks, so they must not count here —
+        // otherwise `reconcile_cross_file` would classify a freshly
+        // catchpoint-imported ledger as `Consistent` and let relay /
+        // follow / participate paths skip the lookback safety gate.
+        //
+        // SQLite `MAX()` over an empty filtered result returns NULL,
+        // so collect into Option<i64>.
         let raw: Option<i64> = self
             .conn
-            .query_row("SELECT MAX(rnd) FROM blockdb.blocks", [], |row| row.get(0))
+            .query_row(
+                "SELECT MAX(rnd) FROM blockdb.blocks WHERE blkdata IS NOT NULL AND length(blkdata) > 0",
+                [],
+                |row| row.get(0),
+            )
             .map_err(|e| AlgoError::Ledger {
                 message: format!("max_block_round_in_blockdb query error: {e}"),
             })?;
@@ -2949,10 +2962,15 @@ impl SqliteLedger {
             // double-check, since a previous run may have committed the
             // exact round but pruned older ones.
             (Some(t), Some(b)) => {
+                // Mirror `max_block_round_in_blockdb`'s payload filter:
+                // a synthesized catchpoint-seed row (empty `blkdata`)
+                // is not a real archived block and must not satisfy
+                // the row-present check.
                 let row_present: bool = self
                     .conn
                     .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM blockdb.blocks WHERE rnd = ?1)",
+                        "SELECT EXISTS(SELECT 1 FROM blockdb.blocks \
+                         WHERE rnd = ?1 AND blkdata IS NOT NULL AND length(blkdata) > 0)",
                         params![t as i64],
                         |row| row.get(0),
                     )
@@ -6400,6 +6418,72 @@ mod tests {
         drop(conn);
         let _ = SqliteLedger::open_with_prefix(&prefix).expect("idempotent reopen");
         let _ = block_path;
+    }
+
+    #[test]
+    fn reconcile_cross_file_treats_synthesized_catchpoint_row_as_catchpoint_only() {
+        // G6 part 3 regression — `initialize_meta_from_catchpoint`
+        // seeds `blockdb.blocks` with a header-only row (empty
+        // `blkdata`) so `derive_chain_meta_from_latest_block` can
+        // recover chain meta before lookback download completes. The
+        // safety gate `reconcile_cross_file` must NOT count that
+        // synthesized row as a real block — otherwise relay / follow
+        // / participate paths would skip lookback coverage checks on
+        // a ledger that has no archived history.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("ledger");
+        let ledger = SqliteLedger::open_with_prefix(&prefix).unwrap();
+
+        // Simulate the post-cutover state: acctrounds + synthesized
+        // header at round 1000, no payload.
+        let mut hdr = algo_types::BlockHeader {
+            round: Round(1000),
+            ..Default::default()
+        };
+        hdr.current_protocol = "vSynth".to_string();
+        let hdrdata = rmp_serde::to_vec_named(&hdr).unwrap();
+        ledger
+            .conn
+            .execute(
+                "INSERT INTO blockdb.blocks (rnd, proto, hdrdata, blkdata) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![1000i64, "vSynth", hdrdata, &[] as &[u8]],
+            )
+            .unwrap();
+        ledger
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO acctrounds (id, rnd) VALUES ('acctbase', 1000)",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            ledger.reconcile_cross_file().unwrap(),
+            CrossFileState::CatchpointOnly {
+                tracker_round: 1000
+            },
+            "synthesized header (empty blkdata) must not count as a real block"
+        );
+        assert_eq!(
+            ledger.max_block_round_in_blockdb().unwrap(),
+            None,
+            "max_block_round must ignore synthesized rows"
+        );
+
+        // Once lookback writes a real payload, the state flips.
+        ledger
+            .conn
+            .execute(
+                "UPDATE blockdb.blocks SET blkdata = ?1 WHERE rnd = 1000",
+                params![b"realblock".as_ref()],
+            )
+            .unwrap();
+        assert_eq!(
+            ledger.reconcile_cross_file().unwrap(),
+            CrossFileState::Consistent { round: 1000 }
+        );
+        assert_eq!(ledger.max_block_round_in_blockdb().unwrap(), Some(1000));
     }
 
     #[test]
