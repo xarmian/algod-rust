@@ -38,6 +38,17 @@
 //!   fresh IDs; old node slots are not reused. Mirrors Go's
 //!   correctness contract; can be added once write amplification
 //!   matters in practice.
+//! - **Eviction is gated `pub(crate)` until lazy-load lands.** The
+//!   LRU bookkeeping, root-pinning, and dirty-page tracking are all
+//!   wired and tested in `#[cfg(test)]`, but no production path calls
+//!   `evict` because evicted pages have no on-demand reload. This
+//!   means **the runtime cache is currently unbounded** — it grows
+//!   monotonically across block applies until the trie is dropped or
+//!   reloaded via [`crate::merkle_trie::MerkleTrie::load`]. This is
+//!   a deliberate trade-off: TASK-136 needs paged persistence to
+//!   land first; lazy-load + active eviction is a follow-up under
+//!   the perf-tuning portion of TASK-137 scope. For the trie sizes
+//!   algod-rust handles today (test/local nets) this is acceptable.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -422,23 +433,32 @@ impl MerkleTrieCache {
     #[allow(dead_code)] // exercised in #[cfg(test)] only until lazy-load lands
     pub(crate) fn evict(&mut self, root_id: Option<u64>) -> usize {
         // Pin the root page at the front.
-        if let Some(rid) = root_id {
-            let root_page = self.page_of(rid);
-            if self.pages_priority_set.contains(&root_page) {
-                if let Some(pos) = self.pages_priority.iter().position(|&p| p == root_page) {
+        let root_page = root_id.map(|rid| self.page_of(rid));
+        if let Some(rp) = root_page {
+            if self.pages_priority_set.contains(&rp) {
+                if let Some(pos) = self.pages_priority.iter().position(|&p| p == rp) {
                     self.pages_priority.remove(pos);
                 }
-                self.pages_priority.push_front(root_page);
+                self.pages_priority.push_front(rp);
             }
         }
 
         let mut evicted = 0;
         while self.cached_node_count > self.cached_node_count_target {
-            let Some(page) = self.pages_priority.pop_back() else {
+            // Peek the back; if it's the pinned root page, stop — the
+            // "pin" must hold even when the root is the only page left
+            // (otherwise root_hash + algorithm traversal would panic).
+            // Mirrors Go's invariant at `cache.go:710-716` that the root
+            // page never appears in the eviction back-pop.
+            let Some(&back_page) = self.pages_priority.back() else {
                 break;
             };
-            self.pages_priority_set.remove(&page);
-            if let Some(page_map) = self.pages.remove(&page) {
+            if Some(back_page) == root_page {
+                break;
+            }
+            self.pages_priority.pop_back();
+            self.pages_priority_set.remove(&back_page);
+            if let Some(page_map) = self.pages.remove(&back_page) {
                 self.cached_node_count -= page_map.len();
                 evicted += 1;
             }
@@ -873,6 +893,26 @@ mod tests {
         assert!(cache.cached_node_count() <= 1);
         // Root page (the page containing c) is pinned and must still be present.
         assert!(cache.contains(c));
+    }
+
+    #[test]
+    fn evict_does_not_drop_root_when_it_is_the_only_page() {
+        // Regression for Codex round-2 finding: the previous loop popped
+        // from the back unconditionally. With only the root page left
+        // (one allocated node, root pointing at it) and a target of 0,
+        // pop_back would remove the root.
+        let mut cache = MerkleTrieCache::with_target(0);
+        let root = cache.allocate(TrieNode::leaf(vec![1; 36]));
+
+        let committer = InMemoryPageCommitter::new();
+        cache.commit(Some(root), 36, &committer).unwrap();
+        cache.evict(Some(root));
+        // Root must survive even when it's the only page and the target
+        // is below the cached node count.
+        assert!(
+            cache.contains(root),
+            "root page must remain when it's the only page left in cache"
+        );
     }
 
     #[test]
