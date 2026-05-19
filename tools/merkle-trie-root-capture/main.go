@@ -56,6 +56,13 @@
 //   - "5-account-trie": the TASK-134 deliverable. Five 36-byte elements with
 //     mixed shared prefixes, exercising both leaf-remainder storage and
 //     ancestor-chain construction.
+//   - "100-account-trie": TASK-138 deliverable. 100 elements (fits on one
+//     production page since NODES_PER_PAGE = 116) but with non-trivial
+//     internal-node depth and fanout.
+//   - "1000-account-trie": TASK-138 deliverable. 1000 elements, exercises
+//     commit splitting across multiple pages and the full hash-accumulator
+//     + recompute path on a deep tree. This is the consensus-critical
+//     close-out gate for PLAN-130.
 //
 // Each scenario emits the input element list (so the Rust test can replay
 // the inserts) and the Go-computed root hash (the ground truth).
@@ -209,6 +216,16 @@ func main() {
 			name:        "5-account-trie",
 			elements:    makeElementSeq(5),
 			description: "TASK-134 deliverable: 5 elements with mixed prefixes, exercises leaf-remainder + ancestor chain",
+		},
+		{
+			name:        "100-account-trie",
+			elements:    makeElementSeq(100),
+			description: "TASK-138 deliverable: 100 elements — exercises tree depth, multiple internal-node fanouts, persistence packing across more than one page (NODES_PER_PAGE = 116, so 100 elements fits on one page but produces tree shape with depth > 2)",
+		},
+		{
+			name:        "1000-account-trie",
+			elements:    makeElementSeq(1000),
+			description: "TASK-138 deliverable: 1000 elements — full large-N scenario. Exercises commit splitting across multiple pages, deep ancestor chains, and the hash-accumulator + recompute path on a non-trivial tree. This is the consensus-critical close-out gate for PLAN-130",
 		},
 	}
 

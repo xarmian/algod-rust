@@ -15,16 +15,27 @@
 //!
 //! Scenarios covered by the fixture file:
 //!
-//! - `single-element`        — exercises the single-leaf-root invariant
-//! - `two-element-split-byte-0`        — no shared prefix (no chain ancestors)
-//! - `two-element-shared-byte-0..4`    — 5-byte shared prefix (5 chain ancestors)
-//! - `5-account-trie`        — TASK-134 deliverable: 5 mixed-prefix elements
+//! - `single-element`               — single-leaf-root invariant
+//! - `two-element-split-byte-0`     — no shared prefix (no chain ancestors)
+//! - `two-element-shared-byte-0..4` — 5-byte shared prefix (5 chain ancestors)
+//! - `5-account-trie`               — TASK-134 deliverable: 5 mixed-prefix elements
+//! - `100-account-trie`             — TASK-138 deliverable: 100 elements
+//! - `1000-account-trie`            — TASK-138 deliverable: 1000 elements
+//!   (the consensus-critical close-out gate for PLAN-130)
 //!
 //! Capture re-run: see the `merkle-trie-root-capture` package comment for
 //! the sibling-checkout setup required to regenerate the fixture.
+//!
+//! Persistence: the `large_n_fixtures_round_trip_through_paged_committer`
+//! test additionally drives the TASK-136 paged-persistence path with the
+//! same fixtures — adding all elements, committing through an in-memory
+//! [`InMemoryPageCommitter`], reloading via [`MerkleTrie::load`], and
+//! asserting both the contents and the root hash match. This validates
+//! that the cache + page format survive scale.
 
 use std::path::PathBuf;
 
+use algo_ledger::merkle_cache::InMemoryPageCommitter;
 use algo_ledger::merkle_trie::MerkleTrie;
 use serde::Deserialize;
 
@@ -167,4 +178,105 @@ fn single_element_fixture_matches_manual_hash() {
     let mut trie = MerkleTrie::new(single.element_size);
     trie.add(&elem).unwrap();
     assert_eq!(trie.root_hash(), expected);
+}
+
+/// TASK-138 close-out: drive every fixture through the
+/// commit-then-load round trip via the paged persistence layer added
+/// by TASK-136. This validates that:
+///
+/// 1. The trie can be built up to ≥ 1000 elements without errors.
+/// 2. The page format survives scale — committing 1000 elements
+///    produces pages that re-load into a structurally-identical trie.
+/// 3. The root hash matches the Go reference both before commit
+///    (in-memory) and after a load (from the persisted bytes).
+/// 4. `contains` returns true for every input element after the
+///    round trip.
+#[test]
+fn large_n_fixtures_round_trip_through_paged_committer() {
+    let fixtures = load_fixtures();
+
+    let mut report: Vec<(String, bool, [u8; 32], [u8; 32])> = Vec::new();
+
+    for fx in &fixtures {
+        let committer = InMemoryPageCommitter::new();
+
+        // Build trie, commit, then reload from the committer.
+        let mut trie = MerkleTrie::new(fx.element_size);
+        let elements: Vec<Vec<u8>> = fx
+            .elements_hex
+            .iter()
+            .map(|h| hex::decode(h).expect("hex"))
+            .collect();
+        for (i, e) in elements.iter().enumerate() {
+            let added = trie
+                .add(e)
+                .unwrap_or_else(|err| panic!("scenario {}: add[{i}]: {err}", fx.name));
+            assert!(
+                added,
+                "scenario {}: element[{i}] unexpectedly duplicate",
+                fx.name
+            );
+        }
+        let in_memory_root = trie.root_hash();
+        trie.commit(&committer)
+            .unwrap_or_else(|e| panic!("scenario {}: commit: {e}", fx.name));
+
+        // Reload from disk.
+        let mut restored = MerkleTrie::load(&committer)
+            .unwrap_or_else(|e| panic!("scenario {}: load: {e}", fx.name))
+            .unwrap_or_else(|| panic!("scenario {}: load returned None after commit", fx.name));
+
+        assert_eq!(
+            restored.len(),
+            elements.len(),
+            "scenario {}: reload len mismatch ({} vs {})",
+            fx.name,
+            restored.len(),
+            elements.len()
+        );
+        for (i, e) in elements.iter().enumerate() {
+            assert!(
+                restored.contains(e),
+                "scenario {}: reloaded trie missing element[{i}]",
+                fx.name
+            );
+        }
+
+        let restored_root = restored.root_hash();
+        assert_eq!(
+            in_memory_root, restored_root,
+            "scenario {}: in-memory root does not match reloaded root",
+            fx.name
+        );
+
+        let expected = decode_root(&fx.name, &fx.root_hex);
+        report.push((
+            fx.name.clone(),
+            restored_root == expected,
+            expected,
+            restored_root,
+        ));
+    }
+
+    let failures: Vec<&(String, bool, [u8; 32], [u8; 32])> =
+        report.iter().filter(|(_, ok, _, _)| !ok).collect();
+
+    if !failures.is_empty() {
+        let mut msg = String::from(
+            "\nreloaded-trie root hash mismatch vs. go-algorand (TASK-138 close-out):\n",
+        );
+        for (name, _, expected, actual) in &failures {
+            msg.push_str(&format!(
+                "  scenario {name}:\n    go-algorand expected: {}\n    rust after reload:   {}\n",
+                hex::encode(expected),
+                hex::encode(actual),
+            ));
+        }
+        msg.push_str(&format!(
+            "\n{} of {} scenarios matched.\n",
+            report.len() - failures.len(),
+            report.len(),
+        ));
+        panic!("{msg}");
+    }
 }
