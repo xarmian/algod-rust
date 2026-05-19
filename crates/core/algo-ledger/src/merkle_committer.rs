@@ -22,6 +22,7 @@
 use algo_error::AlgoError;
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::merkle_cache::PageCommitter;
 use crate::merkle_page::Page;
 
 /// Which `accounthashes`-shaped table this committer reads/writes.
@@ -166,6 +167,7 @@ impl<'c> SqliteMerkleCommitter<'c> {
 
     /// Count rows in this committer's table. Used by the legacy-data
     /// check at open time and by tests; not on a hot path.
+    #[allow(dead_code)] // referenced by tests + future TASK-138 large-N assertions
     pub fn page_count(&self) -> Result<u64, AlgoError> {
         let sql = format!("SELECT COUNT(*) FROM {}", self.table.table_name());
         let n: i64 = self
@@ -175,6 +177,19 @@ impl<'c> SqliteMerkleCommitter<'c> {
                 message: format!("page_count {}: {e}", self.table.unqualified()),
             })?;
         Ok(n as u64)
+    }
+}
+
+// `MerkleTrieCache` writes/reads pages through any [`PageCommitter`]; this
+// bridges the SQLite-backed committer into that trait. Mirrors Go's
+// `Committer` interface implementation in `merkle_committer.go`.
+impl<'c> PageCommitter for SqliteMerkleCommitter<'c> {
+    fn load_page(&self, id: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        self.load_page_bytes(id)
+    }
+
+    fn store_page(&self, id: u64, content: &[u8]) -> Result<(), AlgoError> {
+        self.store_page_bytes(id, content)
     }
 }
 

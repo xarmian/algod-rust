@@ -2680,44 +2680,34 @@ impl SqliteLedger {
         Some(ReadSnapshot { conn })
     }
 
-    /// Load the trie from the `merkle_trie` table or rebuild from DB contents.
+    /// Load the trie from the paged `accounthashes` table, or rebuild from
+    /// DB contents if no paged state exists.
     ///
-    /// If the table contains a serialized trie, it is deserialized.
-    /// Otherwise the trie is rebuilt from all accounts and resources in the DB.
+    /// PLAN-130 TASK-136 swap: the runtime trie is now persisted as pages
+    /// in `accounthashes` (the Go-compatible format), via
+    /// [`crate::merkle_committer::SqliteMerkleCommitter`]. The legacy
+    /// `merkle_trie` single-blob table is no longer consulted by the
+    /// runtime; the DDL is retained for PLAN-36 TASK-118 to drop
+    /// separately.
     pub fn load_trie(&mut self) -> Result<(), AlgoError> {
-        use crate::trie_hash::ELEMENT_SIZE;
+        let committer = crate::merkle_committer::SqliteMerkleCommitter::active(&self.conn);
 
-        let stored: Option<Vec<u8>> = self
-            .conn
-            .query_row("SELECT data FROM merkle_trie WHERE id = 0", [], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(|e| AlgoError::Ledger {
-                message: format!("load trie error: {e}"),
-            })?;
-
-        let trie = match stored {
-            Some(data) => {
-                // Pre-PLAN-130 trie blobs used a path-compressed node shape
-                // that's incompatible with the current 256-ary format
-                // (see merkle_trie.rs::TRIE_BLOB_VERSION). On version
-                // mismatch, fall back to a full rebuild rather than
-                // surfacing a load error — the rebuild path produces a
-                // valid trie from `accountbase` / `resources` / `kvstore`
-                // and the next `commit_block` re-persists the blob in the
-                // current format.
-                match crate::merkle_trie::MerkleTrie::deserialize(&data, ELEMENT_SIZE) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!(
-                            "merkle_trie blob rejected ({e}); rebuilding from DB contents"
-                        );
-                        self.rebuild_trie_from_db()?
-                    }
-                }
+        // Try to load from page 0 metadata. If page 0 is missing
+        // (`load` returns `Ok(None)`), the DB is fresh w.r.t. the paged
+        // format — rebuild from `accountbase` / `resources` / `kvstore`
+        // and the next `commit_block` will persist it.
+        let trie = match crate::merkle_trie::MerkleTrie::load(&committer) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                tracing::debug!(
+                    "merkle_trie: no accounthashes metadata page found; rebuilding from DB"
+                );
+                self.rebuild_trie_from_db()?
             }
-            None => self.rebuild_trie_from_db()?,
+            Err(e) => {
+                tracing::warn!("merkle_trie: accounthashes load failed ({e}); rebuilding from DB");
+                self.rebuild_trie_from_db()?
+            }
         };
 
         self.trie = Some(trie);
@@ -2915,20 +2905,14 @@ impl SqliteLedger {
         // Flush chain-level state to meta table.
         self.flush_chain_state()?;
 
-        // Persist the trie if enabled. `serialize` takes `&mut self` because
-        // it forces a hash recomputation when the trie is dirty (so the
-        // persisted blob always carries final SHA hashes, not transient
-        // path-from-root bytes — see merkle_trie.rs::serialize).
+        // Persist the trie if enabled. Paged commit via the same SQLite
+        // transaction we're about to COMMIT — page writes happen against
+        // `accounthashes` (PLAN-130 TASK-136). The legacy `merkle_trie`
+        // table is intentionally no longer touched by the runtime; its
+        // DDL is retained for PLAN-36 TASK-118 to drop separately.
         if let Some(ref mut trie) = self.trie {
-            let data = trie.serialize();
-            self.conn
-                .execute(
-                    "INSERT OR REPLACE INTO merkle_trie (id, data) VALUES (0, ?1)",
-                    params![data],
-                )
-                .map_err(|e| AlgoError::Ledger {
-                    message: format!("persist trie error: {e}"),
-                })?;
+            let committer = crate::merkle_committer::SqliteMerkleCommitter::active(&self.conn);
+            trie.commit(&committer)?;
         }
 
         self.conn

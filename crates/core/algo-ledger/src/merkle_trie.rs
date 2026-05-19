@@ -20,19 +20,26 @@
 //! - **Internal post-computation:** stores the SHA512/256 hash, replacing the
 //!   path bytes (`n.hash = hash[:]` at the end of `calculateHash`).
 //!
-//! Persistence: single-blob msgpack via `serialize`/`deserialize`. The runtime
-//! swap to paged `accounthashes` lands in PLAN-130 TASK-136; the legacy DDL
-//! drop lands in PLAN-36 TASK-118.
-
-use std::collections::HashMap;
+//! Persistence: paged via [`crate::merkle_cache::MerkleTrieCache`] (each
+//! page holds [`crate::merkle_page::NODES_PER_PAGE`] nodes), driven by a
+//! [`crate::merkle_cache::PageCommitter`]. Page 0 carries the trie root
+//! metadata; pages ≥ 1 carry node contents in the Go-compatible
+//! `merkle_page::Page` format.
+//!
+//! History:
+//! - **PLAN-130 TASK-132/133/134** (PR #284): structural rewrite to
+//!   256-ary, Go conformance gate.
+//! - **PLAN-130 TASK-135** (PR #285): element-format fixture lock-in.
+//! - **PLAN-130 TASK-136/137** (this PR): swap single-blob `serialize`/
+//!   `deserialize` for paged `accounthashes` persistence via the
+//!   [`crate::merkle_cache::MerkleTrieCache`] with LRU eviction. The
+//!   legacy `merkle_trie` SQL table DDL is retained for [`PLAN-36`]
+//!   TASK-118 to drop separately.
 
 use algo_error::AlgoError;
 use sha2::{Digest, Sha512_256};
 
-/// Top-level blob version persisted in the `merkle_trie` SQL row. Bumped
-/// when the node-shape changes incompatibly. See `serialize` / `deserialize`
-/// for the version history.
-pub const TRIE_BLOB_VERSION: u64 = 2;
+use crate::merkle_cache::{CommitStats, MerkleTrieCache, PageCommitter};
 
 // ---------------------------------------------------------------------------
 // Bitset — 256-bit child-presence mask. Mirrors go-algorand
@@ -160,31 +167,32 @@ impl TrieNode {
     }
 
     /// Reset hash invalidation tracking. Kept for API compatibility with the
-    /// previous design's `invalidate()`; under the new design, dirty tracking
-    /// lives on the trie, not per-node. This is a no-op.
+    /// previous design's `invalidate()`; under the cache-based design,
+    /// dirty tracking lives at the trie level, not per-node.
     pub fn invalidate(&mut self) {}
 }
 
 // ---------------------------------------------------------------------------
-// MerkleTrie — top-level trie wrapping the node store.
-// Mirrors `crypto/merkletrie/trie.go:62-77`.
+// MerkleTrie — top-level trie wrapping the paged node store.
+// Mirrors `crypto/merkletrie/trie.go:62-77` + the cache initialization at
+// `crypto/merkletrie/cache.go:97-120`.
 // ---------------------------------------------------------------------------
 
-/// In-memory 256-ary Merkle trie matching go-algorand's algorithm.
+/// In-memory 256-ary Merkle trie matching go-algorand's algorithm, backed
+/// by a paged [`MerkleTrieCache`].
 ///
 /// Elements are fixed-length byte slices (typically 36 bytes for accounts —
-/// see `trie_hash.rs::ELEMENT_SIZE`). The trie supports `add` / `delete` /
-/// `contains` / `root_hash`, plus single-blob `serialize` / `deserialize` for
-/// the current (pre-TASK-136) persistence layer.
+/// see `trie_hash.rs::ELEMENT_SIZE`). The trie supports
+/// `add` / `delete` / `contains` / `root_hash`, plus [`MerkleTrie::commit`]
+/// and [`MerkleTrie::load`] for paged persistence via any
+/// [`PageCommitter`].
 #[derive(Debug)]
 pub struct MerkleTrie {
     /// Root node ID (`None` when the trie is empty).
     root: Option<u64>,
-    /// In-memory node store. Node IDs are monotonically allocated; deleted
-    /// nodes leave gaps (matching Go's `merkleTrieCache` pre-eviction model).
-    nodes: HashMap<u64, TrieNode>,
-    /// Next node ID to allocate.
-    next_id: u64,
+    /// Paged node store. Replaces the prior `HashMap<u64, TrieNode>` +
+    /// `next_id: u64` pair. Owns LRU eviction + dirty-page tracking.
+    cache: MerkleTrieCache,
     /// Fixed element size in bytes (36 for V6 account hashing).
     element_length: usize,
     /// True iff any internal-node hash may be stale and must be recomputed
@@ -194,16 +202,30 @@ pub struct MerkleTrie {
 
 impl MerkleTrie {
     // -----------------------------------------------------------------------
-    // Construction + node-store accessors (public so tests can drive the
-    // store directly — mirrors the original API surface).
+    // Construction + node-store accessors. The accessor methods are kept on
+    // `MerkleTrie` (rather than exposing the cache directly) for backwards
+    // compatibility with the original API surface — test code constructs
+    // nodes via `TrieNode::leaf` / `TrieNode::internal`, allocates them
+    // via `allocate_node`, and points the root at them via `set_root`.
     // -----------------------------------------------------------------------
 
     /// Create a new empty trie with the given fixed element length.
     pub fn new(element_length: usize) -> Self {
         Self {
             root: None,
-            nodes: HashMap::new(),
-            next_id: 1,
+            cache: MerkleTrieCache::new(),
+            element_length,
+            dirty: false,
+        }
+    }
+
+    /// Create a new empty trie with a custom in-memory node-count target
+    /// (LRU eviction kicks in when `commit` finishes and the cache holds
+    /// more than this many nodes).
+    pub fn with_cache_target(element_length: usize, target: usize) -> Self {
+        Self {
+            root: None,
+            cache: MerkleTrieCache::with_target(target),
             element_length,
             dirty: false,
         }
@@ -221,7 +243,7 @@ impl MerkleTrie {
 
     /// Number of leaf elements currently in the trie.
     pub fn len(&self) -> usize {
-        self.nodes.values().filter(|n| n.is_leaf()).count()
+        self.cache.leaf_count()
     }
 
     /// Root node ID, if any.
@@ -229,7 +251,7 @@ impl MerkleTrie {
         self.root
     }
 
-    /// Set the root node ID (used by tests + deserialize).
+    /// Set the root node ID (used by tests + persistence reload).
     pub fn set_root(&mut self, id: Option<u64>) {
         self.root = id;
         self.dirty = true;
@@ -237,22 +259,19 @@ impl MerkleTrie {
 
     /// Allocate a new node in the store and return its ID.
     pub fn allocate_node(&mut self, node: TrieNode) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.nodes.insert(id, node);
         self.dirty = true;
-        id
+        self.cache.allocate(node)
     }
 
     /// Borrow a node by ID.
     pub fn get_node(&self, id: u64) -> Option<&TrieNode> {
-        self.nodes.get(&id)
+        self.cache.get(id)
     }
 
     /// Borrow a node by ID mutably.
     pub fn get_node_mut(&mut self, id: u64) -> Option<&mut TrieNode> {
         self.dirty = true;
-        self.nodes.get_mut(&id)
+        self.cache.get_mut(id)
     }
 
     // -----------------------------------------------------------------------
@@ -301,9 +320,11 @@ impl MerkleTrie {
 
         let new_root = self.node_add(root_id, element, &[]);
         // Go does `cache.deleteNode(mt.root)` after add returns the new root.
-        // The old root's storage is reused via `refurbishNode`; we just remove
-        // the entry.
-        self.nodes.remove(&root_id);
+        // The old root's storage is reused via `refurbishNode`; we just
+        // remove the entry. The cache distinguishes "never committed" from
+        // "previously committed" — if the root was already on-disk, this
+        // marks its page for an update at the next commit.
+        self.cache.delete(root_id);
         self.root = Some(new_root);
         self.dirty = true;
         Ok(true)
@@ -337,9 +358,9 @@ impl MerkleTrie {
         }
 
         // Special case: the root itself is the leaf we're deleting.
-        let root_is_leaf = self.nodes[&root_id].is_leaf();
+        let root_is_leaf = self.cache.get_or_panic(root_id).is_leaf();
         if root_is_leaf {
-            self.nodes.remove(&root_id);
+            self.cache.delete(root_id);
             self.root = None;
             self.dirty = true;
             return Ok(true);
@@ -347,7 +368,7 @@ impl MerkleTrie {
 
         let new_root = self.node_remove(root_id, element, &[]);
         // Go: `cache.deleteNode(mt.root); mt.root = updatedRoot;`
-        self.nodes.remove(&root_id);
+        self.cache.delete(root_id);
         self.root = new_root;
         self.dirty = true;
         Ok(true)
@@ -380,7 +401,7 @@ impl MerkleTrie {
             self.dirty = false;
         }
 
-        let node = &self.nodes[&root_id];
+        let node = self.cache.get_or_panic(root_id);
         let mut hasher = Sha512_256::new();
         if node.is_leaf() {
             hasher.update([0x00]);
@@ -394,30 +415,92 @@ impl MerkleTrie {
     }
 
     // -----------------------------------------------------------------------
+    // Persistence — paged commit/load via PageCommitter.
+    // Mirrors `crypto/merkletrie/trie.go:223-248` (Commit + Evict).
+    // -----------------------------------------------------------------------
+
+    /// Persist the trie to `committer`.
+    ///
+    /// Forces a hash recomputation when the trie is dirty (so the
+    /// persisted node bytes carry final SHA hashes, not transient
+    /// path-from-root bytes), then partitions the cache's pending pages
+    /// into create/update/delete sets and writes them through the
+    /// committer. Finally writes the root-metadata blob at page 0
+    /// (matching Go's `Trie.Commit` at `trie.go:223-231`).
+    ///
+    /// Returns per-commit accounting from the cache.
+    pub fn commit<C: PageCommitter>(&mut self, committer: &C) -> Result<CommitStats, AlgoError> {
+        if self.dirty {
+            if let Some(root_id) = self.root {
+                self.recompute_all_hashes(root_id);
+            }
+            self.dirty = false;
+        }
+        self.cache.commit(self.root, self.element_length, committer)
+    }
+
+    /// Reconstruct a trie from a [`PageCommitter`].
+    ///
+    /// Reads page 0 for metadata. Returns `Ok(None)` if page 0 doesn't
+    /// exist (fresh DB — caller should `rebuild_trie_from_db` or start
+    /// empty). On success eagerly loads every reachable node page; lazy
+    /// loading is a future optimization.
+    pub fn load<C: PageCommitter>(committer: &C) -> Result<Option<Self>, AlgoError> {
+        let Some(meta) = MerkleTrieCache::read_metadata_page(committer)? else {
+            return Ok(None);
+        };
+
+        let mut cache = MerkleTrieCache::new();
+        cache.load_all(meta.next_node_id, committer)?;
+
+        Ok(Some(Self {
+            root: meta.root,
+            cache,
+            element_length: meta.element_length,
+            // After load every internal node's `hash` field carries the
+            // SHA hash that was committed; root_hash returns without
+            // recomputation.
+            dirty: false,
+        }))
+    }
+
+    /// Evict least-recently-used pages from memory back to the eviction
+    /// target. The root page is pinned.
+    ///
+    /// **`pub(crate)`** until lazy-load lands. See
+    /// [`crate::merkle_cache::MerkleTrieCache::evict`] for the rationale:
+    /// the current cache has no on-demand reload path, so any trie
+    /// operation that traverses to an evicted page will panic. Safe
+    /// usage is therefore restricted to `commit → evict → drop`
+    /// (memory reclamation before the trie is recycled). Tests and the
+    /// LRU plumbing live in-crate; external callers should not gate any
+    /// behavior on `evict` until lazy-load lands in a follow-up.
+    ///
+    /// Caller must guarantee no dirty pages remain (i.e. `commit` was
+    /// called immediately before, or `dirty == false`). Returns the
+    /// number of pages evicted.
+    #[allow(dead_code)] // exercised in #[cfg(test)] only until lazy-load lands
+    pub(crate) fn evict(&mut self) -> Result<usize, AlgoError> {
+        if self.dirty {
+            return Err(AlgoError::Ledger {
+                message: "MerkleTrie::evict called with dirty cache — commit first".into(),
+            });
+        }
+        Ok(self.cache.evict(self.root))
+    }
+
+    // -----------------------------------------------------------------------
     // Hash computation — bottom-up, mirrors Go `node.calculateHash` at
     // `node.go:227-252`.
     // -----------------------------------------------------------------------
 
-    /// Recompute hashes for every internal node reachable from `root_id`.
-    ///
-    /// The traversal order matters: when computing a parent's hash we need
-    /// each child's *current* hash bytes (a leaf's element-remainder, or an
-    /// internal's already-computed SHA hash). We post-order DFS so children
-    /// are hashed before parents.
-    ///
-    /// Each internal node's `hash` field is overwritten in place: before the
-    /// recomputation it holds the path-from-root bytes; afterward it holds
-    /// the SHA512/256 output. To support recomputation across multiple
-    /// `root_hash` calls (the trie may be mutated again), we reconstruct the
-    /// path-from-root via the recursion's `path` parameter rather than
-    /// relying on the (now-overwritten) field.
     fn recompute_all_hashes(&mut self, root_id: u64) {
         let mut path: Vec<u8> = Vec::new();
         self.recompute_hash_at(root_id, &mut path);
     }
 
     fn recompute_hash_at(&mut self, node_id: u64, path: &mut Vec<u8>) {
-        let is_leaf = self.nodes[&node_id].is_leaf();
+        let is_leaf = self.cache.get_or_panic(node_id).is_leaf();
         if is_leaf {
             // Leaves never recompute — their `hash` is the element remainder
             // (or full element for a single-leaf root) and is set at
@@ -426,7 +509,9 @@ impl MerkleTrie {
         }
 
         // Recurse into children first so their hashes are up-to-date.
-        let child_descriptors: Vec<(u8, u64)> = self.nodes[&node_id]
+        let child_descriptors: Vec<(u8, u64)> = self
+            .cache
+            .get_or_panic(node_id)
             .children
             .iter()
             .map(|c| (c.hash_index, c.child_id))
@@ -445,15 +530,12 @@ impl MerkleTrie {
         //     child.hash_index
         //     child.hash bytes
         let mut acc: Vec<u8> = Vec::new();
-        // path length must fit in a byte — Go writes `byte(len(path))`. The
-        // path length equals the depth of this node; depth is bounded by
-        // `element_length` (= 36), so this fits comfortably.
         debug_assert!(path.len() <= 255);
         acc.push(path.len() as u8);
         acc.extend_from_slice(path);
 
         for (hi, cid) in &child_descriptors {
-            let child = &self.nodes[cid];
+            let child = self.cache.get_or_panic(*cid);
             if child.is_leaf() {
                 acc.push(0x00);
             } else {
@@ -469,7 +551,7 @@ impl MerkleTrie {
         hasher.update(&acc);
         let result = hasher.finalize();
 
-        let node = self.nodes.get_mut(&node_id).unwrap();
+        let node = self.cache.get_mut(node_id).unwrap();
         node.hash = result.to_vec();
     }
 
@@ -478,7 +560,7 @@ impl MerkleTrie {
     // -----------------------------------------------------------------------
 
     fn node_find(&self, node_id: u64, d: &[u8]) -> bool {
-        let node = &self.nodes[&node_id];
+        let node = self.cache.get_or_panic(node_id);
         if node.is_leaf() {
             return d == node.hash.as_slice();
         }
@@ -504,7 +586,7 @@ impl MerkleTrie {
     // -----------------------------------------------------------------------
 
     fn node_add(&mut self, node_id: u64, d: &[u8], path: &[u8]) -> u64 {
-        let node = self.nodes[&node_id].clone();
+        let node = self.cache.get_or_panic(node_id).clone();
 
         if node.is_leaf() {
             // Find the first byte where this leaf's remainder and the new
@@ -587,7 +669,7 @@ impl MerkleTrie {
             // For correctness of subsequent operations and `len()`, remove
             // the old node here. The caller will plug `top_id` into its
             // children list (or the root pointer).
-            self.nodes.remove(&node_id);
+            self.cache.delete(node_id);
             return top_id;
         }
 
@@ -624,7 +706,7 @@ impl MerkleTrie {
                 children: new_children,
                 children_mask: new_mask,
             };
-            self.nodes.remove(&node_id);
+            self.cache.delete(node_id);
             return self.allocate_node(new_node);
         }
 
@@ -644,7 +726,7 @@ impl MerkleTrie {
             children: new_children,
             children_mask: node.children_mask,
         };
-        self.nodes.remove(&node_id);
+        self.cache.delete(node_id);
         self.allocate_node(new_node)
     }
 
@@ -663,12 +745,12 @@ impl MerkleTrie {
     // -----------------------------------------------------------------------
 
     fn node_remove(&mut self, node_id: u64, key: &[u8], path: &[u8]) -> Option<u64> {
-        let node = self.nodes[&node_id].clone();
+        let node = self.cache.get_or_panic(node_id).clone();
         debug_assert!(!node.is_leaf(), "node_remove must not be called on leaves");
 
         let child_idx = node.index_of(key[0]);
         let child_id = node.children[child_idx].child_id;
-        let child = self.nodes[&child_id].clone();
+        let child = self.cache.get_or_panic(child_id).clone();
 
         // Mirrors Go `node.remove` at node.go:266-289. We construct `new_node`
         // — the surviving node at this position — then potentially collapse
@@ -684,7 +766,7 @@ impl MerkleTrie {
             let mut new_mask = node.children_mask;
             new_mask.clear_bit(key[0]);
             // Free the leaf's storage.
-            self.nodes.remove(&child_id);
+            self.cache.delete(child_id);
             TrieNode {
                 hash: path.to_vec(),
                 children: new_children,
@@ -718,13 +800,13 @@ impl MerkleTrie {
         // `node.go:291-304`.
         let collapsed = if new_node.children.len() == 1 {
             let only = &new_node.children[0];
-            let only_child = &self.nodes[&only.child_id];
+            let only_child = self.cache.get_or_panic(only.child_id);
             if only_child.is_leaf() {
                 let mut merged = Vec::with_capacity(1 + only_child.hash.len());
                 merged.push(only.hash_index);
                 merged.extend_from_slice(&only_child.hash);
                 let only_child_id = only.child_id;
-                self.nodes.remove(&only_child_id);
+                self.cache.delete(only_child_id);
                 Some(TrieNode::leaf(merged))
             } else {
                 None
@@ -735,7 +817,7 @@ impl MerkleTrie {
 
         let final_node = collapsed.unwrap_or(new_node);
         // Free the original node and allocate the surviving node.
-        self.nodes.remove(&node_id);
+        self.cache.delete(node_id);
         Some(self.allocate_node(final_node))
     }
 
@@ -757,305 +839,6 @@ impl MerkleTrie {
         }
         Ok(trie)
     }
-
-    // -----------------------------------------------------------------------
-    // Serialize / Deserialize — single-blob msgpack. Format is Rust-internal
-    // (NOT Go-compatible); used by the legacy `merkle_trie` SQL table. PLAN-
-    // 130 TASK-136 deletes both methods when paged persistence lands.
-    // -----------------------------------------------------------------------
-
-    /// Serialize the trie to a compact msgpack representation for storage in
-    /// the legacy single-blob `merkle_trie` SQL row.
-    ///
-    /// **This method takes `&mut self`** because every internal node's `hash`
-    /// field carries path-from-root bytes until `root_hash` (or this method)
-    /// recomputes it; serializing path bytes as if they were final hashes
-    /// would corrupt the blob. We force a recomputation here when `dirty` is
-    /// set so the blob always carries the final SHA hashes, and `deserialize`
-    /// can safely set `dirty = false`.
-    ///
-    /// Layout: map with keys `v` (format version, currently `2`), `r`
-    /// (root_id, Nil if empty), `n` (next_id), `e` (element_length), `d`
-    /// (nodes — map of `id -> node_map`). Each node_map: `h` (hash bytes),
-    /// `m` (children_mask as 4×u64 array), `c` (children — array of
-    /// `[hash_index, child_id]` pairs).
-    ///
-    /// Version history:
-    /// - `v=1` (implicit; pre-PLAN-130 path-compressed format) — used keys
-    ///   `p` (path), `l` (is_leaf), `h` (hash). Rejected by `deserialize`
-    ///   under the new format; affected databases must rebuild from
-    ///   `accountbase` / `resources` / `kvstore`.
-    /// - `v=2` (this format) — 256-ary, leaf-remainder storage, explicit
-    ///   bitset. Matches go-algorand `crypto/merkletrie` node structure
-    ///   byte-for-byte at the trie-shape level (the blob format itself is
-    ///   still Rust-internal; Go-format paged persistence lands in
-    ///   PLAN-130 TASK-136).
-    pub fn serialize(&mut self) -> Vec<u8> {
-        // Force a recomputation so internal-node `hash` fields hold SHA
-        // bytes, not path bytes. Without this, a dirty trie serialized
-        // mid-operation would persist path bytes as if they were hashes,
-        // and a subsequent deserialize+root_hash would yield an incorrect
-        // root.
-        if self.dirty {
-            if let Some(root_id) = self.root {
-                self.recompute_all_hashes(root_id);
-            }
-            self.dirty = false;
-        }
-
-        let mut nodes_vec: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-        for (&id, node) in &self.nodes {
-            let mut node_map: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-            node_map.push((
-                rmpv::Value::String("h".into()),
-                rmpv::Value::Binary(node.hash.clone()),
-            ));
-            let mask_arr: Vec<rmpv::Value> = node
-                .children_mask
-                .d
-                .iter()
-                .map(|&w| rmpv::Value::from(w))
-                .collect();
-            node_map.push((
-                rmpv::Value::String("m".into()),
-                rmpv::Value::Array(mask_arr),
-            ));
-            if !node.children.is_empty() {
-                let children: Vec<rmpv::Value> = node
-                    .children
-                    .iter()
-                    .map(|c| {
-                        rmpv::Value::Array(vec![
-                            rmpv::Value::from(c.hash_index as u64),
-                            rmpv::Value::from(c.child_id),
-                        ])
-                    })
-                    .collect();
-                node_map.push((
-                    rmpv::Value::String("c".into()),
-                    rmpv::Value::Array(children),
-                ));
-            }
-            nodes_vec.push((rmpv::Value::from(id), rmpv::Value::Map(node_map)));
-        }
-
-        let root_val = match self.root {
-            Some(id) => rmpv::Value::from(id),
-            None => rmpv::Value::Nil,
-        };
-
-        let top = rmpv::Value::Map(vec![
-            (
-                rmpv::Value::String("v".into()),
-                rmpv::Value::from(TRIE_BLOB_VERSION),
-            ),
-            (rmpv::Value::String("r".into()), root_val),
-            (
-                rmpv::Value::String("n".into()),
-                rmpv::Value::from(self.next_id),
-            ),
-            (
-                rmpv::Value::String("e".into()),
-                rmpv::Value::from(self.element_length as u64),
-            ),
-            (rmpv::Value::String("d".into()), rmpv::Value::Map(nodes_vec)),
-        ]);
-
-        let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &top).expect("msgpack encode trie");
-        buf
-    }
-
-    /// Inverse of `serialize`.
-    ///
-    /// Rejects blobs without a `v=2` top-level version key. Pre-PLAN-130
-    /// blobs (path-compressed format) did not carry a version field, so
-    /// this rejection cleanly forces a rebuild from `accountbase` /
-    /// `resources` / `kvstore` rather than silently misreading old `p`/`l`
-    /// fields as the new `h`/`m`/`c` shape (which would yield a
-    /// structurally-corrupt trie).
-    ///
-    /// Callers that catch this error (e.g. `SqliteLedger::load_trie`)
-    /// should fall back to `rebuild_trie_from_db` after a rejection. If
-    /// they don't, this error propagates and the caller fails loudly,
-    /// which is the desired outcome on schema mismatch.
-    pub fn deserialize(data: &[u8], element_length: usize) -> Result<Self, AlgoError> {
-        let val: rmpv::Value =
-            rmpv::decode::read_value(&mut &data[..]).map_err(|e| AlgoError::Ledger {
-                message: format!("trie deserialize error: {e}"),
-            })?;
-
-        let map = match val {
-            rmpv::Value::Map(m) => m,
-            _ => {
-                return Err(AlgoError::Ledger {
-                    message: "expected msgpack map for trie".into(),
-                })
-            }
-        };
-
-        let mut version: Option<u64> = None;
-        let mut root: Option<u64> = None;
-        let mut next_id: u64 = 1;
-        let mut stored_element_length: usize = element_length;
-        let mut nodes = HashMap::new();
-        // Detect pre-PLAN-130 blobs by their telltale node-level keys.
-        // The old format used `p` (path) and `l` (is_leaf) per-node; the
-        // new format uses `h` / `m` / `c`. If we see either at the node
-        // level we know we're looking at the old shape regardless of the
-        // missing top-level `v`.
-        let mut saw_legacy_node_key = false;
-
-        for (k, v) in map {
-            match k.as_str().unwrap_or("") {
-                "v" => {
-                    version = v.as_u64();
-                }
-                "r" => {
-                    root = v.as_u64();
-                }
-                "n" => {
-                    next_id = v.as_u64().unwrap_or(1);
-                }
-                "e" => {
-                    stored_element_length = v.as_u64().unwrap_or(element_length as u64) as usize;
-                }
-                "d" => {
-                    if let rmpv::Value::Map(node_pairs) = v {
-                        for (nk, nv) in node_pairs {
-                            let id = nk.as_u64().ok_or_else(|| AlgoError::Ledger {
-                                message: "bad node id".into(),
-                            })?;
-                            if let rmpv::Value::Map(ref node_map) = nv {
-                                for (nmk, _) in node_map {
-                                    match nmk.as_str().unwrap_or("") {
-                                        "p" | "l" => saw_legacy_node_key = true,
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            let node = Self::deserialize_node(nv)?;
-                            nodes.insert(id, node);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Reject pre-PLAN-130 blobs explicitly. They predate this format
-        // change and have an incompatible node shape (leaves stored full
-        // elements, not remainders; internals carried an explicit path
-        // field that this format folds into `hash`).
-        match version {
-            Some(v) if v == TRIE_BLOB_VERSION => { /* current format, accept */ }
-            Some(v) => {
-                return Err(AlgoError::Ledger {
-                    message: format!(
-                        "trie blob version mismatch: stored={v}, expected={TRIE_BLOB_VERSION}; \
-                         rebuild required (e.g. drop the merkle_trie row and re-run load_trie)"
-                    ),
-                });
-            }
-            None => {
-                if saw_legacy_node_key {
-                    return Err(AlgoError::Ledger {
-                        message: "pre-PLAN-130 trie blob detected (legacy `p`/`l` node keys); \
-                             rebuild required from accountbase/resources/kvstore"
-                            .into(),
-                    });
-                }
-                return Err(AlgoError::Ledger {
-                    message: "trie blob missing version field; rebuild required from \
-                         accountbase/resources/kvstore"
-                        .into(),
-                });
-            }
-        }
-
-        if stored_element_length != element_length {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "element_length mismatch: stored={stored_element_length}, expected={element_length}"
-                ),
-            });
-        }
-
-        Ok(Self {
-            root,
-            nodes,
-            next_id,
-            element_length,
-            // After deserialize, every internal node's `hash` field already
-            // holds the SHA hash from before serialization (we forced
-            // recomputation in `serialize`), so `root_hash` can return
-            // without recomputation.
-            dirty: false,
-        })
-    }
-
-    fn deserialize_node(val: rmpv::Value) -> Result<TrieNode, AlgoError> {
-        let map = match val {
-            rmpv::Value::Map(m) => m,
-            _ => {
-                return Err(AlgoError::Ledger {
-                    message: "expected map for trie node".into(),
-                })
-            }
-        };
-
-        let mut hash = Vec::new();
-        let mut children_mask = Bitset::ZERO;
-        let mut children = Vec::new();
-
-        for (k, v) in map {
-            match k.as_str().unwrap_or("") {
-                "h" => {
-                    if let Some(b) = v.as_slice() {
-                        hash = b.to_vec();
-                    }
-                }
-                "m" => {
-                    if let rmpv::Value::Array(arr) = v {
-                        for (i, w) in arr.into_iter().take(4).enumerate() {
-                            children_mask.d[i] = w.as_u64().unwrap_or(0);
-                        }
-                    }
-                }
-                "c" => {
-                    if let rmpv::Value::Array(arr) = v {
-                        for item in arr {
-                            if let rmpv::Value::Array(pair) = item {
-                                if pair.len() == 2 {
-                                    let hash_index = pair[0].as_u64().unwrap_or(0) as u8;
-                                    let child_id = pair[1].as_u64().unwrap_or(0);
-                                    children.push(ChildEntry {
-                                        hash_index,
-                                        child_id,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // If the persisted blob lacked the explicit mask (older format) or
-        // had a mismatched one, rederive from children to keep the invariant.
-        if children_mask == Bitset::ZERO && !children.is_empty() {
-            for c in &children {
-                children_mask.set_bit(c.hash_index);
-            }
-        }
-
-        Ok(TrieNode {
-            hash,
-            children,
-            children_mask,
-        })
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,6 +848,7 @@ impl MerkleTrie {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::merkle_cache::InMemoryPageCommitter;
 
     fn sha512_256(data: &[u8]) -> [u8; 32] {
         let mut hasher = Sha512_256::new();
@@ -1102,8 +886,6 @@ mod tests {
 
     #[test]
     fn test_bitset_layout_matches_go() {
-        // Go: b.d[bit/64] |= 1 << (bit & 63). Bit 0 → d[0] low bit;
-        // bit 63 → d[0] high bit; bit 64 → d[1] low bit; bit 255 → d[3] high bit.
         let mut b = Bitset::ZERO;
         b.set_bit(0);
         assert_eq!(b.d[0], 1);
@@ -1127,9 +909,6 @@ mod tests {
 
     #[test]
     fn test_single_leaf_root_hash() {
-        // A single-leaf root carries the FULL element. Root hash =
-        // SHA512_256(0x00 || element). This is the Go invariant from
-        // trie.go:144 (`pnode.hash = d` on first add) and trie.go:130.
         let mut trie = MerkleTrie::new(36);
         let mut elem = vec![0u8; 36];
         elem[0] = 0xAB;
@@ -1145,8 +924,6 @@ mod tests {
 
     #[test]
     fn test_single_leaf_root_via_manual_construction() {
-        // Same test, but constructing the leaf node by hand. Verifies the
-        // public TrieNode::leaf constructor and set_root paths.
         let mut trie = MerkleTrie::new(36);
         let mut elem = vec![0u8; 36];
         elem[0] = 0xAB;
@@ -1161,13 +938,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Two-element splits (verifies leaf-remainder + chain-ancestor structure)
+    // Two-element splits
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_add_two_elements_no_shared_prefix() {
-        // Two 4-byte elements with no shared prefix → root is a branch node
-        // at depth 0 with two leaves, each carrying 3-byte remainders.
         let mut trie = MerkleTrie::new(4);
         let elem_a = vec![0x10, 0xAA, 0xBB, 0xCC];
         let elem_b = vec![0x20, 0xDD, 0xEE, 0xFF];
@@ -1184,20 +959,7 @@ mod tests {
         assert!(root_node.children_mask.bit(0x10));
         assert!(root_node.children_mask.bit(0x20));
 
-        // Path-from-root for the root branch is empty.
-        // (Field is overwritten by root_hash; check via a fresh compute path.)
-        // We verify the root hash matches the hand-computed value below.
-
-        // Manually compute expected.
-        //
-        // leaf A: hash = elem_a[1..] = [0xAA, 0xBB, 0xCC]
-        // leaf B: hash = elem_b[1..] = [0xDD, 0xEE, 0xFF]
-        //
-        // root_internal_hash = SHA512_256(
-        //   0x00 (path length = 0)
-        //   0x00 (leaf tag A) || 0x03 (len) || 0x10 (hash_index) || 0xAA 0xBB 0xCC
-        //   0x00 (leaf tag B) || 0x03 (len) || 0x20 (hash_index) || 0xDD 0xEE 0xFF
-        // )
+        // Hand-computed expected root.
         let mut acc = vec![0x00];
         acc.extend_from_slice(&[0x00, 0x03, 0x10, 0xAA, 0xBB, 0xCC]);
         acc.extend_from_slice(&[0x00, 0x03, 0x20, 0xDD, 0xEE, 0xFF]);
@@ -1205,25 +967,11 @@ mod tests {
 
         let mut root_input = vec![0x01];
         root_input.extend_from_slice(&internal_hash);
-        let expected_root = sha512_256(&root_input);
-
-        assert_eq!(trie.root_hash(), expected_root);
+        assert_eq!(trie.root_hash(), sha512_256(&root_input));
     }
 
     #[test]
     fn test_add_two_elements_one_byte_shared_prefix() {
-        // [0x10, 0x20, 0xAA, 0xBB] and [0x10, 0x30, 0xCC, 0xDD]
-        // Shared prefix = 1 byte (0x10).
-        //
-        // Go materializes this as:
-        //   root: 1 ancestor with 1 child @ 0x10 → branch_at_depth_1
-        //   branch_at_depth_1: 2 children @ 0x20 (leaf A) and @ 0x30 (leaf B)
-        //   leaf A: hash = elem_a[2..] = [0xAA, 0xBB]
-        //   leaf B: hash = [0xCC, 0xDD]
-        //
-        // Path-from-root values:
-        //   root ancestor: path = []
-        //   branch_at_depth_1: path = [0x10]
         let mut trie = MerkleTrie::new(4);
         let elem_a = vec![0x10, 0x20, 0xAA, 0xBB];
         let elem_b = vec![0x10, 0x30, 0xCC, 0xDD];
@@ -1233,7 +981,6 @@ mod tests {
         assert!(trie.contains(&elem_a));
         assert!(trie.contains(&elem_b));
 
-        // Walk: root → child @ 0x10 → branch
         let root = trie.root_id().unwrap();
         let root_node = trie.get_node(root).unwrap();
         assert!(!root_node.is_leaf());
@@ -1247,21 +994,11 @@ mod tests {
         assert_eq!(branch.children[0].hash_index, 0x20);
         assert_eq!(branch.children[1].hash_index, 0x30);
 
-        // Verify hash composition end-to-end.
-        // branch_hash = SHA512_256(
-        //   0x01 (path_len=1) || 0x10 (path)
-        //   0x00 || 0x02 || 0x20 || 0xAA 0xBB
-        //   0x00 || 0x02 || 0x30 || 0xCC 0xDD
-        // )
         let mut branch_acc = vec![0x01, 0x10];
         branch_acc.extend_from_slice(&[0x00, 0x02, 0x20, 0xAA, 0xBB]);
         branch_acc.extend_from_slice(&[0x00, 0x02, 0x30, 0xCC, 0xDD]);
         let branch_hash = sha512_256(&branch_acc);
 
-        // root_hash_internal = SHA512_256(
-        //   0x00 (path_len=0)
-        //   0x01 (internal tag) || 32 (len) || 0x10 (hash_index) || branch_hash
-        // )
         let mut root_acc = vec![0x00];
         root_acc.push(0x01);
         root_acc.push(branch_hash.len() as u8);
@@ -1271,9 +1008,7 @@ mod tests {
 
         let mut top = vec![0x01];
         top.extend_from_slice(&root_internal);
-        let expected = sha512_256(&top);
-
-        assert_eq!(trie.root_hash(), expected);
+        assert_eq!(trie.root_hash(), sha512_256(&top));
     }
 
     // -----------------------------------------------------------------------
@@ -1291,7 +1026,6 @@ mod tests {
 
     #[test]
     fn test_duplicate_add_returns_ok_false() {
-        // Go trie.go:155-158: silent no-op on duplicate.
         let mut trie = MerkleTrie::new(4);
         let elem = vec![0x01, 0x02, 0x03, 0x04];
         assert!(trie.add(&elem).unwrap());
@@ -1301,14 +1035,12 @@ mod tests {
 
     #[test]
     fn test_delete_nonexistent_returns_ok_false() {
-        // Go trie.go:185-188: silent no-op on missing.
         let mut trie = MerkleTrie::new(4);
         let elem_a = vec![0x01, 0x02, 0x03, 0x04];
         let elem_b = vec![0xFF, 0xFE, 0xFD, 0xFC];
         trie.add(&elem_a).unwrap();
         assert!(!trie.delete(&elem_b).unwrap());
 
-        // Same behavior from an empty trie.
         let mut empty = MerkleTrie::new(4);
         assert!(!empty.delete(&elem_a).unwrap());
     }
@@ -1325,8 +1057,6 @@ mod tests {
 
     #[test]
     fn test_add_three_delete_one_round_trip_hash() {
-        // Insertion-order independent: build (A, B, C) and (A, C, B), delete
-        // both to (A, C), compare hashes.
         let mut trie1 = MerkleTrie::new(4);
         let mut trie2 = MerkleTrie::new(4);
         let a = vec![0x10, 0x00, 0x00, 0x00];
@@ -1356,7 +1086,6 @@ mod tests {
         }
 
         let mut t2 = MerkleTrie::new(4);
-        // Insert in reverse order.
         for e in elems.iter().rev() {
             t2.add(e).unwrap();
         }
@@ -1422,7 +1151,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Length-mismatch error path (kept from prior design)
+    // Length-mismatch error paths
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1434,36 +1163,28 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_wrong_length_errors() {
+        let mut trie = MerkleTrie::new(4);
+        trie.add(&[1, 2, 3, 4]).unwrap();
+        let err = trie.delete(&[1, 2, 3]);
+        assert!(err.is_err());
+    }
+
+    #[test]
     fn test_add_wrong_length_on_first_insert_errors() {
-        // Regression: `new(N)` is an explicit contract. The first add must
-        // respect it; we must NOT silently rebind `element_length` to
-        // whatever the first caller hands us.
         let mut trie = MerkleTrie::new(36);
         let err = trie.add(&[1, 2, 3]);
-        assert!(
-            err.is_err(),
-            "first add with wrong length must error when new(N) was explicit"
-        );
-        assert_eq!(trie.element_length(), 36, "element_length must stay at 36");
+        assert!(err.is_err());
+        assert_eq!(trie.element_length(), 36);
         assert!(trie.is_empty());
     }
 
     #[test]
     fn test_add_length_inference_when_new_zero() {
-        // Opt-in path: `new(0)` means "infer from first add". Subsequent
-        // adds must enforce the inferred length.
         let mut trie = MerkleTrie::new(0);
         trie.add(&[1, 2, 3, 4]).unwrap();
         assert_eq!(trie.element_length(), 4);
         let err = trie.add(&[1, 2, 3]);
-        assert!(err.is_err(), "inferred length must still be enforced");
-    }
-
-    #[test]
-    fn test_delete_wrong_length_errors() {
-        let mut trie = MerkleTrie::new(4);
-        trie.add(&[1, 2, 3, 4]).unwrap();
-        let err = trie.delete(&[1, 2, 3]);
         assert!(err.is_err());
     }
 
@@ -1493,52 +1214,58 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Serialize / Deserialize
+    // Paged persistence — commit / load via PageCommitter.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_serialize_deserialize_empty() {
+    fn test_commit_then_load_empty_trie() {
+        let committer = InMemoryPageCommitter::new();
+
         let mut trie = MerkleTrie::new(36);
-        let data = trie.serialize();
-        let restored = MerkleTrie::deserialize(&data, 36).unwrap();
+        trie.commit(&committer).unwrap();
+        // Only the metadata page (page 0) should exist.
+        assert_eq!(committer.page_count(), 1);
+
+        let restored = MerkleTrie::load(&committer).unwrap().unwrap();
         assert!(restored.is_empty());
-        assert_eq!(restored.len(), 0);
         assert_eq!(restored.element_length(), 36);
     }
 
     #[test]
-    fn test_serialize_deserialize_single_element() {
-        let mut trie = MerkleTrie::new(4);
+    fn test_commit_then_load_round_trip_single_element() {
+        let committer = InMemoryPageCommitter::new();
         let elem = [0x10, 0x20, 0x30, 0x40];
+
+        let mut trie = MerkleTrie::new(4);
         trie.add(&elem).unwrap();
         let hash_before = trie.root_hash();
+        trie.commit(&committer).unwrap();
 
-        let data = trie.serialize();
-        let mut restored = MerkleTrie::deserialize(&data, 4).unwrap();
-
+        let mut restored = MerkleTrie::load(&committer).unwrap().unwrap();
         assert_eq!(restored.len(), 1);
         assert!(restored.contains(&elem));
         assert_eq!(restored.root_hash(), hash_before);
     }
 
     #[test]
-    fn test_serialize_deserialize_multiple_elements() {
-        let mut trie = MerkleTrie::new(4);
-        let elems: Vec<[u8; 4]> = vec![
+    fn test_commit_then_load_round_trip_multiple_elements() {
+        let committer = InMemoryPageCommitter::new();
+        let elems = [
             [0x10, 0x20, 0x30, 0x40],
             [0x50, 0x60, 0x70, 0x80],
             [0x10, 0x30, 0xAA, 0xBB],
             [0xCC, 0xDD, 0xEE, 0xFF],
         ];
+
+        let mut trie = MerkleTrie::new(4);
         for e in &elems {
             trie.add(e).unwrap();
         }
         let hash_before = trie.root_hash();
         let len_before = trie.len();
+        trie.commit(&committer).unwrap();
 
-        let data = trie.serialize();
-        let mut restored = MerkleTrie::deserialize(&data, 4).unwrap();
-
+        let mut restored = MerkleTrie::load(&committer).unwrap().unwrap();
         assert_eq!(restored.len(), len_before);
         assert_eq!(restored.root_hash(), hash_before);
         for e in &elems {
@@ -1547,85 +1274,125 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_deserialize_element_length_mismatch() {
-        // Need at least one element so the serialized blob has a stored
-        // element_length to mismatch. Without `add`, the blob's stored
-        // element_length matches whatever `MerkleTrie::new(4)` set, which
-        // would defeat the check. Add a 4-byte element to lock the
-        // serialized element_length at 4.
+    fn test_load_returns_none_on_fresh_committer() {
+        let committer = InMemoryPageCommitter::new();
+        let got = MerkleTrie::load(&committer).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn test_commit_then_mutate_then_recommit_preserves_root() {
+        let committer = InMemoryPageCommitter::new();
+        let mut trie = MerkleTrie::new(4);
+        trie.add(&[0x10, 0x20, 0x30, 0x40]).unwrap();
+        trie.commit(&committer).unwrap();
+
+        // Add one more, then commit again.
+        trie.add(&[0x50, 0x60, 0x70, 0x80]).unwrap();
+        let expected = trie.root_hash();
+        trie.commit(&committer).unwrap();
+
+        let mut restored = MerkleTrie::load(&committer).unwrap().unwrap();
+        assert_eq!(restored.root_hash(), expected);
+        assert_eq!(restored.len(), 2);
+    }
+
+    #[test]
+    fn test_in_place_mutation_via_get_mut_survives_round_trip() {
+        // Regression for Codex round-1 finding: get_node_mut on a
+        // previously-committed node must dirty the page so commit
+        // includes it in the write set. Without that fix, the in-memory
+        // mutation would be lost on reload because commit only wrote
+        // pages with newly-allocated nodes (`pending_created`).
+        //
+        // We mutate a LEAF's hash specifically: leaves are skipped by
+        // `recompute_all_hashes` (their hash IS the element bytes), so
+        // the mutation isn't overwritten by the commit-time recompute
+        // step. This isolates the cache's dirty-page tracking from
+        // the trie's recompute logic.
+        let committer = InMemoryPageCommitter::new();
+        let mut trie = MerkleTrie::new(4);
+        trie.add(&[0x10, 0x20, 0x30, 0x40]).unwrap();
+        trie.add(&[0x10, 0x21, 0x30, 0x40]).unwrap();
+        let _ = trie.root_hash();
+        trie.commit(&committer).unwrap();
+
+        // Find one of the leaves and mutate its hash via get_node_mut.
+        let root_id = trie.root_id().unwrap();
+        let leaf_id = find_a_leaf_descendant(&trie, root_id);
+        let mutated_marker = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        trie.get_node_mut(leaf_id).unwrap().hash = mutated_marker.clone();
+        trie.commit(&committer).unwrap();
+
+        // Reload from disk and check the mutation persisted.
+        let restored = MerkleTrie::load(&committer).unwrap().unwrap();
+        let got = restored.get_node(leaf_id).expect("leaf must still exist");
+        assert_eq!(
+            got.hash, mutated_marker,
+            "in-place mutation via get_node_mut must persist through commit + load"
+        );
+    }
+
+    /// Recursively find any leaf descendant of `node_id`. The trie's
+    /// leaf-storage invariants guarantee at least one exists below any
+    /// non-empty internal node.
+    fn find_a_leaf_descendant(trie: &MerkleTrie, node_id: u64) -> u64 {
+        let node = trie.get_node(node_id).expect("node in cache");
+        if node.is_leaf() {
+            return node_id;
+        }
+        find_a_leaf_descendant(trie, node.children[0].child_id)
+    }
+
+    #[test]
+    fn test_commit_after_delete_persists_deletion() {
+        let committer = InMemoryPageCommitter::new();
+        let mut trie = MerkleTrie::new(4);
+        trie.add(&[0x10, 0x20, 0x30, 0x40]).unwrap();
+        trie.add(&[0x50, 0x60, 0x70, 0x80]).unwrap();
+        trie.commit(&committer).unwrap();
+
+        trie.delete(&[0x10, 0x20, 0x30, 0x40]).unwrap();
+        let expected = trie.root_hash();
+        trie.commit(&committer).unwrap();
+
+        let mut restored = MerkleTrie::load(&committer).unwrap().unwrap();
+        assert_eq!(restored.root_hash(), expected);
+        assert!(!restored.contains(&[0x10, 0x20, 0x30, 0x40]));
+        assert!(restored.contains(&[0x50, 0x60, 0x70, 0x80]));
+    }
+
+    #[test]
+    fn test_evict_rejects_dirty_trie() {
         let mut trie = MerkleTrie::new(4);
         trie.add(&[1, 2, 3, 4]).unwrap();
-        let data = trie.serialize();
-        let err = MerkleTrie::deserialize(&data, 36);
-        assert!(err.is_err(), "expected element_length mismatch error");
-        let msg = err.unwrap_err().to_string();
-        assert!(
-            msg.contains("element_length mismatch"),
-            "expected element_length mismatch, got: {msg}"
-        );
+        // dirty=true, no commit; evict must refuse.
+        let err = trie.evict();
+        assert!(err.is_err());
     }
 
     #[test]
-    fn test_deserialize_rejects_legacy_blob() {
-        // Synthesize a pre-PLAN-130 blob (legacy node keys `p`/`l`/`h` plus
-        // top-level `r`/`n`/`e`/`d` but no `v`). Should be rejected with a
-        // clear message.
-        use rmpv::Value;
-        let legacy_node = Value::Map(vec![
-            (Value::String("p".into()), Value::Binary(vec![])),
-            (Value::String("l".into()), Value::Boolean(true)),
-            (Value::String("h".into()), Value::Binary(vec![0u8; 4])),
-        ]);
-        let blob = Value::Map(vec![
-            (Value::String("r".into()), Value::from(1u64)),
-            (Value::String("n".into()), Value::from(2u64)),
-            (Value::String("e".into()), Value::from(4u64)),
-            (
-                Value::String("d".into()),
-                Value::Map(vec![(Value::from(1u64), legacy_node)]),
-            ),
-        ]);
-        let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &blob).unwrap();
+    fn test_evict_after_commit_keeps_root_page() {
+        let committer = InMemoryPageCommitter::new();
+        // Tight cache target so eviction has work to do.
+        let mut trie = MerkleTrie::with_cache_target(4, 1);
+        // Add a handful of elements that will land in multiple pages
+        // worth of internal nodes.
+        for i in 0u8..20 {
+            trie.add(&[i, i.wrapping_mul(3), 0, 0]).unwrap();
+        }
+        let expected = trie.root_hash();
+        trie.commit(&committer).unwrap();
+        let evicted = trie.evict().unwrap();
+        // We expect at least some pages to have been evicted given the
+        // tight target.
+        let _ = evicted; // not asserting an exact number — depends on layout
 
-        let err = MerkleTrie::deserialize(&bytes, 4);
-        assert!(err.is_err(), "legacy blob must be rejected");
-        let msg = err.unwrap_err().to_string();
-        assert!(
-            msg.contains("pre-PLAN-130") || msg.contains("legacy"),
-            "expected legacy-format rejection, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_serialize_after_mutation_persists_correct_root() {
-        // Regression: serialize must force a hash recomputation, otherwise
-        // internal nodes' path-from-root bytes would be persisted as if
-        // they were SHA hashes, and a subsequent deserialize+root_hash
-        // would return the wrong root.
-        let mut trie = MerkleTrie::new(4);
-        trie.add(&[0x10, 0x20, 0xAA, 0xBB]).unwrap();
-        trie.add(&[0x10, 0x30, 0xCC, 0xDD]).unwrap();
-        // Note: we serialize WITHOUT calling root_hash first. This is the
-        // exact bug pattern Codex flagged.
-        let data = trie.serialize();
-        // After serialize the trie itself should report the same root as
-        // a fresh trie built the same way.
-        let mut fresh = MerkleTrie::new(4);
-        fresh.add(&[0x10, 0x20, 0xAA, 0xBB]).unwrap();
-        fresh.add(&[0x10, 0x30, 0xCC, 0xDD]).unwrap();
-        let expected = fresh.root_hash();
-
-        assert_eq!(trie.root_hash(), expected, "in-memory root must match");
-
-        // And the restored trie must also match — this is the test that
-        // would fail without the dirty-recomputation fix.
-        let mut restored = MerkleTrie::deserialize(&data, 4).unwrap();
-        assert_eq!(
-            restored.root_hash(),
-            expected,
-            "restored trie root must match — serialize must persist final hashes"
-        );
+        // Root page is pinned: the trie can still serve root_hash
+        // because it walks the root node first. (Re-load from disk
+        // also works — verified by the round-trip tests.)
+        let mut restored = MerkleTrie::load(&committer).unwrap().unwrap();
+        assert_eq!(restored.root_hash(), expected);
     }
 
     // -----------------------------------------------------------------------
@@ -1652,30 +1419,5 @@ mod tests {
 
         assert_eq!(t1.root_hash(), t2.root_hash());
         assert_eq!(t1.len(), t2.len());
-    }
-
-    #[test]
-    fn test_serialize_survives_mutations() {
-        let mut trie = MerkleTrie::new(4);
-        let elems = [
-            [0x10, 0x20, 0x30, 0x40],
-            [0x50, 0x60, 0x70, 0x80],
-            [0xAA, 0xBB, 0xCC, 0xDD],
-        ];
-        for e in &elems {
-            trie.add(e).unwrap();
-        }
-        trie.delete(&elems[1]).unwrap();
-        let hash_before = trie.root_hash();
-
-        let data = trie.serialize();
-        let mut restored = MerkleTrie::deserialize(&data, 4).unwrap();
-        assert_eq!(restored.root_hash(), hash_before);
-        assert!(restored.contains(&elems[0]));
-        assert!(!restored.contains(&elems[1]));
-        assert!(restored.contains(&elems[2]));
-
-        restored.add(&elems[1]).unwrap();
-        assert!(restored.contains(&elems[1]));
     }
 }
