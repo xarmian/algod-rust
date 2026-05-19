@@ -266,19 +266,15 @@ impl MerkleTrie {
     /// `trie.go:137-170` Add returning `(false, nil)` on duplicate).
     /// Returns `Err` only on element-length mismatch.
     pub fn add(&mut self, element: &[u8]) -> Result<bool, AlgoError> {
-        // First element bootstraps element_length (matches Go's behavior at
-        // trie.go:144-145 where the first Add captures `len(d)`). The
-        // public-API caller typically sets element_length via `new(...)`, so
-        // length-mismatch is the only error path.
-        if self.root.is_none() {
-            let leaf = TrieNode::leaf(element.to_vec());
-            let id = self.allocate_node(leaf);
-            self.root = Some(id);
+        // Length is checked on every add, including the first. Diverges from
+        // go-algorand `trie.Add` at trie.go:144-145 (which infers element
+        // length from the first add because `MakeTrie` has no length arg) —
+        // Rust's `MerkleTrie::new(element_length)` is explicit, so silently
+        // accepting a mismatched first element would defeat that contract.
+        // Allow inference only when the caller opted in via `new(0)`.
+        if self.element_length == 0 {
             self.element_length = element.len();
-            self.dirty = true;
-            return Ok(true);
         }
-
         if element.len() != self.element_length {
             return Err(AlgoError::Ledger {
                 message: format!(
@@ -287,6 +283,14 @@ impl MerkleTrie {
                     self.element_length
                 ),
             });
+        }
+
+        if self.root.is_none() {
+            let leaf = TrieNode::leaf(element.to_vec());
+            let id = self.allocate_node(leaf);
+            self.root = Some(id);
+            self.dirty = true;
+            return Ok(true);
         }
 
         // Existence check: silent-no-op on duplicate (matches Go trie.go:155-158).
@@ -1427,6 +1431,32 @@ mod tests {
         trie.add(&[1, 2, 3, 4]).unwrap();
         let err = trie.add(&[1, 2, 3]);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_add_wrong_length_on_first_insert_errors() {
+        // Regression: `new(N)` is an explicit contract. The first add must
+        // respect it; we must NOT silently rebind `element_length` to
+        // whatever the first caller hands us.
+        let mut trie = MerkleTrie::new(36);
+        let err = trie.add(&[1, 2, 3]);
+        assert!(
+            err.is_err(),
+            "first add with wrong length must error when new(N) was explicit"
+        );
+        assert_eq!(trie.element_length(), 36, "element_length must stay at 36");
+        assert!(trie.is_empty());
+    }
+
+    #[test]
+    fn test_add_length_inference_when_new_zero() {
+        // Opt-in path: `new(0)` means "infer from first add". Subsequent
+        // adds must enforce the inferred length.
+        let mut trie = MerkleTrie::new(0);
+        trie.add(&[1, 2, 3, 4]).unwrap();
+        assert_eq!(trie.element_length(), 4);
+        let err = trie.add(&[1, 2, 3]);
+        assert!(err.is_err(), "inferred length must still be enforced");
     }
 
     #[test]
