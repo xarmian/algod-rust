@@ -1,0 +1,44 @@
+[
+  {
+    "name": "single-element",
+    "element_count": 1,
+    "element_size": 36,
+    "elements_hex": [
+      "0000000000e076ab7609c7f8c763b5c571d07aea80b06b41452231b1437370f4964ed66e"
+    ],
+    "root_hex": "3c0315cb5173b3362d38bbbc7ed2d7ac979f29be35c75b642c88cc68746125ce"
+  },
+  {
+    "name": "two-element-split-byte-0",
+    "element_count": 2,
+    "element_size": 36,
+    "elements_hex": [
+      "00000000008b71c345fac6e44dca4f7a762a560c3bdd7fa3001e84507c946a7d8fd46ee7",
+      "ffffffff007294506d428b2e99da3a6cec5e8500b20bb19e6a3068df834d872dac6f3f5e"
+    ],
+    "root_hex": "a8570ce976d74af052b27c77fade71ccf28577e37eec862c19cc756ea00f47c0"
+  },
+  {
+    "name": "two-element-shared-byte-0..4",
+    "element_count": 2,
+    "element_size": 36,
+    "elements_hex": [
+      "aabbccdd008b71c345fac6e44dca4f7a762a560c3bdd7fa3001e84507c946a7d8fd46ee7",
+      "aabbccdd00ff71c345fac6e44dca4f7a762a560c3bdd7fa3001e84507c946a7d8fd46ee7"
+    ],
+    "root_hex": "005620b906a54173320a397b5e2eb8994d3ca8f44d86dc05eacc87ef36edf84e"
+  },
+  {
+    "name": "5-account-trie",
+    "element_count": 5,
+    "element_size": 36,
+    "elements_hex": [
+      "0000000000e076ab7609c7f8c763b5c571d07aea80b06b41452231b1437370f4964ed66e",
+      "0000000100b2198160e2254cdf0edc7d321fc605c788ab3aca6f30083827030ce761dffe",
+      "00000002001cf81333ed974fe3c4e19e17e9a13bbeffe5fc14f784ed842cb29bed303fed",
+      "0000000300de71547d38407798f39366dc716cb177c2e110c5a9c4d686b324d0e8d7461b",
+      "0000000400ffe9d1db770a47459267ea1a1356c1e95fc526ee12489ea47cc6ee8615249e"
+    ],
+    "root_hex": "7b46997ab2448004596e4063715f38a9e76738ea8c3b9cee9a21a8ed17595ec0"
+  }
+]

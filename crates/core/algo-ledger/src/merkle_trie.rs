@@ -1,8 +1,28 @@
-//! Merkle trie implementation matching go-algorand's `crypto/merkletrie/`.
+//! Merkle trie matching go-algorand's `crypto/merkletrie/` byte-for-byte.
 //!
-//! This is a compressed trie over fixed-length elements (not key-value pairs).
-//! Elements are self-contained and sorted by their byte content. The trie
-//! supports incremental hash computation with caching.
+//! Tree shape: **256-ary radix, exactly one byte per internal node.** Shared
+//! prefixes are materialized as chains of single-child internal nodes
+//! (mirroring Go's `node.add` ancestor-chain construction in
+//! `../go-algorand/crypto/merkletrie/node.go:144-158`). There is no Patricia-
+//! style path compression on internal nodes.
+//!
+//! Leaves carry the element-remainder bytes from the depth at which they were
+//! branched off (mirroring Go's `node.add` leaf-case `pnode.hash = d[idiff+1:]`
+//! at `node.go:112-113`). A single-leaf root carries the full element bytes
+//! (set once by `trie.Add` when the trie is empty — `trie.go:144`).
+//!
+//! The `TrieNode.hash` field is overloaded to mirror Go's `node.hash`:
+//! - **Leaf:** stores element remainder bytes (full element if root, else
+//!   `element[depth+1..]`). Never recomputed; participates directly in the
+//!   parent's hash accumulator.
+//! - **Internal pre-computation:** stores the path-from-root bytes
+//!   (`pnode.hash = path` in Go).
+//! - **Internal post-computation:** stores the SHA512/256 hash, replacing the
+//!   path bytes (`n.hash = hash[:]` at the end of `calculateHash`).
+//!
+//! Persistence: single-blob msgpack via `serialize`/`deserialize`. The runtime
+//! swap to paged `accounthashes` lands in PLAN-130 TASK-136; the legacy DDL
+//! drop lands in PLAN-36 TASK-118.
 
 use std::collections::HashMap;
 
@@ -10,80 +30,169 @@ use algo_error::AlgoError;
 use sha2::{Digest, Sha512_256};
 
 // ---------------------------------------------------------------------------
-// Data structures
+// Bitset — 256-bit child-presence mask. Mirrors go-algorand
+// `crypto/merkletrie/bitset.go:21-44`.
+// ---------------------------------------------------------------------------
+
+/// 256-bit bitmask backed by four `u64`s. Mirrors Go's `bitset` struct exactly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Bitset {
+    d: [u64; 4],
+}
+
+impl Bitset {
+    /// All bits clear.
+    pub const ZERO: Bitset = Bitset { d: [0; 4] };
+
+    /// Set bit `bit` (0..=255).
+    #[inline]
+    pub fn set_bit(&mut self, bit: u8) {
+        self.d[(bit / 64) as usize] |= 1u64 << (bit & 63);
+    }
+
+    /// Clear bit `bit` (0..=255).
+    #[inline]
+    pub fn clear_bit(&mut self, bit: u8) {
+        self.d[(bit / 64) as usize] &= !(1u64 << (bit & 63));
+    }
+
+    /// Test bit `bit` (0..=255).
+    #[inline]
+    pub fn bit(&self, bit: u8) -> bool {
+        (self.d[(bit / 64) as usize] & (1u64 << (bit & 63))) != 0
+    }
+
+    /// True iff every bit is clear.
+    #[inline]
+    pub fn is_zero(&self) -> bool {
+        self.d[0] == 0 && self.d[1] == 0 && self.d[2] == 0 && self.d[3] == 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ChildEntry — child pointer in an internal node.
+// Mirrors `crypto/merkletrie/node.go:29-32`.
 // ---------------------------------------------------------------------------
 
 /// A single child pointer in an internal trie node.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildEntry {
-    /// The byte value at the branch point (the discriminating byte).
+    /// The byte value at which this child branches from its parent.
     pub hash_index: u8,
-    /// ID of the child node in the node store.
+    /// Identifier of the child node in the node store.
     pub child_id: u64,
 }
 
-/// A node in the compressed Merkle trie.
+// ---------------------------------------------------------------------------
+// TrieNode — a single node in the 256-ary trie.
+// Mirrors `crypto/merkletrie/node.go:33-37`.
+// ---------------------------------------------------------------------------
+
+/// A node in the 256-ary radix Merkle trie.
+///
+/// See module documentation for the `hash` field's overloaded semantics.
 #[derive(Debug, Clone)]
 pub struct TrieNode {
-    /// Path compression: shared prefix bytes for this subtree.
-    pub path: Vec<u8>,
-    /// Children: sorted list of (byte_index, child_node_id) pairs.
-    /// For leaf nodes this is empty.
+    /// Multi-purpose field — see module docs.
+    pub hash: Vec<u8>,
+    /// Children sorted ascending by `hash_index`. Empty iff this is a leaf.
     pub children: Vec<ChildEntry>,
-    /// Cached hash. `None` means dirty (needs recomputation).
-    /// For leaf nodes this holds the raw element data (no hashing applied).
-    pub hash: Option<Vec<u8>>,
-    /// Whether this node is a leaf.
-    pub is_leaf: bool,
+    /// 256-bit mask: bit `b` set iff `children` contains an entry with
+    /// `hash_index == b`. Used for O(1) "does this byte branch from here?"
+    /// lookups, mirroring Go's `childrenMask.Bit(d[0])` in `find`.
+    pub children_mask: Bitset,
 }
 
 impl TrieNode {
-    /// Create a new leaf node containing `element`.
-    pub fn leaf(element: Vec<u8>) -> Self {
+    /// Construct a leaf node carrying the given remainder bytes (or the full
+    /// element, in the single-leaf-root case).
+    pub fn leaf(remainder: Vec<u8>) -> Self {
         Self {
-            path: Vec::new(),
+            hash: remainder,
             children: Vec::new(),
-            hash: Some(element),
-            is_leaf: true,
+            children_mask: Bitset::ZERO,
         }
     }
 
-    /// Create a new internal node with the given path prefix and children.
+    /// Construct an internal node from a path-from-root and a children list.
+    /// The `children_mask` is derived from `children`.
+    ///
+    /// Assumes `children` is non-empty and sorted ascending by `hash_index`.
     pub fn internal(path: Vec<u8>, children: Vec<ChildEntry>) -> Self {
+        debug_assert!(!children.is_empty(), "internal node must have children");
+        debug_assert!(
+            children
+                .windows(2)
+                .all(|w| w[0].hash_index < w[1].hash_index),
+            "children must be strictly ascending by hash_index"
+        );
+        let mut children_mask = Bitset::ZERO;
+        for c in &children {
+            children_mask.set_bit(c.hash_index);
+        }
         Self {
-            path,
+            hash: path,
             children,
-            hash: None,
-            is_leaf: false,
+            children_mask,
         }
     }
 
-    /// Mark this node's cached hash as dirty so it will be recomputed.
-    pub fn invalidate(&mut self) {
-        if !self.is_leaf {
-            self.hash = None;
-        }
+    /// True iff this node is a leaf (i.e. has no children). Matches Go's
+    /// `node.leaf()` at `node.go:40-42`.
+    #[inline]
+    pub fn is_leaf(&self) -> bool {
+        self.children.is_empty()
     }
+
+    /// Binary-search for the first child with `hash_index >= b` and return its
+    /// index into `self.children`. Mirrors Go's `node.indexOf(b)` at
+    /// `node.go:77-80`.
+    #[inline]
+    fn index_of(&self, b: u8) -> usize {
+        self.children
+            .binary_search_by_key(&b, |c| c.hash_index)
+            .unwrap_or_else(|i| i)
+    }
+
+    /// Reset hash invalidation tracking. Kept for API compatibility with the
+    /// previous design's `invalidate()`; under the new design, dirty tracking
+    /// lives on the trie, not per-node. This is a no-op.
+    pub fn invalidate(&mut self) {}
 }
 
-/// In-memory compressed Merkle trie matching go-algorand's algorithm.
+// ---------------------------------------------------------------------------
+// MerkleTrie — top-level trie wrapping the node store.
+// Mirrors `crypto/merkletrie/trie.go:62-77`.
+// ---------------------------------------------------------------------------
+
+/// In-memory 256-ary Merkle trie matching go-algorand's algorithm.
 ///
-/// Elements are fixed-length byte slices. The trie structure compresses
-/// shared prefixes and caches intermediate hashes for efficient root-hash
-/// computation.
+/// Elements are fixed-length byte slices (typically 36 bytes for accounts —
+/// see `trie_hash.rs::ELEMENT_SIZE`). The trie supports `add` / `delete` /
+/// `contains` / `root_hash`, plus single-blob `serialize` / `deserialize` for
+/// the current (pre-TASK-136) persistence layer.
 #[derive(Debug)]
 pub struct MerkleTrie {
     /// Root node ID (`None` when the trie is empty).
     root: Option<u64>,
-    /// In-memory node store.
+    /// In-memory node store. Node IDs are monotonically allocated; deleted
+    /// nodes leave gaps (matching Go's `merkleTrieCache` pre-eviction model).
     nodes: HashMap<u64, TrieNode>,
     /// Next node ID to allocate.
     next_id: u64,
     /// Fixed element size in bytes (36 for V6 account hashing).
     element_length: usize,
+    /// True iff any internal-node hash may be stale and must be recomputed
+    /// on the next `root_hash` call. Set on every `add` / `delete`.
+    dirty: bool,
 }
 
 impl MerkleTrie {
+    // -----------------------------------------------------------------------
+    // Construction + node-store accessors (public so tests can drive the
+    // store directly — mirrors the original API surface).
+    // -----------------------------------------------------------------------
+
     /// Create a new empty trie with the given fixed element length.
     pub fn new(element_length: usize) -> Self {
         Self {
@@ -91,7 +200,34 @@ impl MerkleTrie {
             nodes: HashMap::new(),
             next_id: 1,
             element_length,
+            dirty: false,
         }
+    }
+
+    /// Configured element length.
+    pub fn element_length(&self) -> usize {
+        self.element_length
+    }
+
+    /// True iff no elements have been added (or all have been deleted).
+    pub fn is_empty(&self) -> bool {
+        self.root.is_none()
+    }
+
+    /// Number of leaf elements currently in the trie.
+    pub fn len(&self) -> usize {
+        self.nodes.values().filter(|n| n.is_leaf()).count()
+    }
+
+    /// Root node ID, if any.
+    pub fn root_id(&self) -> Option<u64> {
+        self.root
+    }
+
+    /// Set the root node ID (used by tests + deserialize).
+    pub fn set_root(&mut self, id: Option<u64>) {
+        self.root = id;
+        self.dirty = true;
     }
 
     /// Allocate a new node in the store and return its ID.
@@ -99,66 +235,551 @@ impl MerkleTrie {
         let id = self.next_id;
         self.next_id += 1;
         self.nodes.insert(id, node);
+        self.dirty = true;
         id
     }
 
-    /// Return a reference to a node by ID.
+    /// Borrow a node by ID.
     pub fn get_node(&self, id: u64) -> Option<&TrieNode> {
         self.nodes.get(&id)
     }
 
-    /// Return a mutable reference to a node by ID.
+    /// Borrow a node by ID mutably.
     pub fn get_node_mut(&mut self, id: u64) -> Option<&mut TrieNode> {
+        self.dirty = true;
         self.nodes.get_mut(&id)
     }
 
-    /// Return the root node ID, if any.
-    pub fn root_id(&self) -> Option<u64> {
-        self.root
-    }
+    // -----------------------------------------------------------------------
+    // Public API — Add / Delete / Contains / RootHash.
+    // -----------------------------------------------------------------------
 
-    /// Set the root node ID.
-    pub fn set_root(&mut self, id: Option<u64>) {
-        self.root = id;
-    }
-
-    /// Return the configured element length.
-    pub fn element_length(&self) -> usize {
-        self.element_length
-    }
-
-    /// Get the number of leaf elements in the trie.
-    pub fn len(&self) -> usize {
-        self.nodes.values().filter(|n| n.is_leaf).count()
-    }
-
-    /// Check if the trie is empty.
-    pub fn is_empty(&self) -> bool {
-        self.root.is_none()
-    }
-
-    /// Serialize the trie to a compact msgpack representation for storage.
+    /// Add an element to the trie.
     ///
-    /// Format: msgpack map with keys "root", "next_id", "element_length", "nodes".
-    /// The "nodes" value is a map of id -> serialized node.
+    /// Returns `Ok(true)` if the element was newly added, `Ok(false)` if it
+    /// was already present (silent no-op, matching go-algorand
+    /// `trie.go:137-170` Add returning `(false, nil)` on duplicate).
+    /// Returns `Err` only on element-length mismatch.
+    pub fn add(&mut self, element: &[u8]) -> Result<bool, AlgoError> {
+        // First element bootstraps element_length (matches Go's behavior at
+        // trie.go:144-145 where the first Add captures `len(d)`). The
+        // public-API caller typically sets element_length via `new(...)`, so
+        // length-mismatch is the only error path.
+        if self.root.is_none() {
+            let leaf = TrieNode::leaf(element.to_vec());
+            let id = self.allocate_node(leaf);
+            self.root = Some(id);
+            self.element_length = element.len();
+            self.dirty = true;
+            return Ok(true);
+        }
+
+        if element.len() != self.element_length {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "element length {} != expected {}",
+                    element.len(),
+                    self.element_length
+                ),
+            });
+        }
+
+        // Existence check: silent-no-op on duplicate (matches Go trie.go:155-158).
+        let root_id = self.root.unwrap();
+        if self.node_find(root_id, element) {
+            return Ok(false);
+        }
+
+        let new_root = self.node_add(root_id, element, &[]);
+        // Go does `cache.deleteNode(mt.root)` after add returns the new root.
+        // The old root's storage is reused via `refurbishNode`; we just remove
+        // the entry.
+        self.nodes.remove(&root_id);
+        self.root = Some(new_root);
+        self.dirty = true;
+        Ok(true)
+    }
+
+    /// Delete an element from the trie.
+    ///
+    /// Returns `Ok(true)` if the element was removed, `Ok(false)` if it was
+    /// not present (silent no-op, matching go-algorand `trie.go:174-200`
+    /// Delete returning `(false, nil)` on missing).
+    /// Returns `Err` only on element-length mismatch.
+    pub fn delete(&mut self, element: &[u8]) -> Result<bool, AlgoError> {
+        if self.root.is_none() {
+            return Ok(false);
+        }
+        if element.len() != self.element_length {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "element length {} != expected {}",
+                    element.len(),
+                    self.element_length
+                ),
+            });
+        }
+
+        let root_id = self.root.unwrap();
+
+        // Existence check (Go's trie.go:185-188 does `find` first).
+        if !self.node_find(root_id, element) {
+            return Ok(false);
+        }
+
+        // Special case: the root itself is the leaf we're deleting.
+        let root_is_leaf = self.nodes[&root_id].is_leaf();
+        if root_is_leaf {
+            self.nodes.remove(&root_id);
+            self.root = None;
+            self.dirty = true;
+            return Ok(true);
+        }
+
+        let new_root = self.node_remove(root_id, element, &[]);
+        // Go: `cache.deleteNode(mt.root); mt.root = updatedRoot;`
+        self.nodes.remove(&root_id);
+        self.root = new_root;
+        self.dirty = true;
+        Ok(true)
+    }
+
+    /// True iff `element` is present in the trie.
+    pub fn contains(&self, element: &[u8]) -> bool {
+        if element.len() != self.element_length {
+            return false;
+        }
+        match self.root {
+            None => false,
+            Some(id) => self.node_find(id, element),
+        }
+    }
+
+    /// Compute the root hash.
+    ///
+    /// - Empty trie: `[0u8; 32]` (matches Go `RootHash` at `trie.go:115-118`).
+    /// - Single-leaf root: `SHA512/256(0x00 || leaf.hash)`.
+    /// - Internal root: `SHA512/256(0x01 || root.hash)` after recomputation.
+    pub fn root_hash(&mut self) -> [u8; 32] {
+        let root_id = match self.root {
+            None => return [0u8; 32],
+            Some(id) => id,
+        };
+
+        if self.dirty {
+            self.recompute_all_hashes(root_id);
+            self.dirty = false;
+        }
+
+        let node = &self.nodes[&root_id];
+        let mut hasher = Sha512_256::new();
+        if node.is_leaf() {
+            hasher.update([0x00]);
+        } else {
+            hasher.update([0x01]);
+        }
+        hasher.update(&node.hash);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&hasher.finalize());
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // Hash computation — bottom-up, mirrors Go `node.calculateHash` at
+    // `node.go:227-252`.
+    // -----------------------------------------------------------------------
+
+    /// Recompute hashes for every internal node reachable from `root_id`.
+    ///
+    /// The traversal order matters: when computing a parent's hash we need
+    /// each child's *current* hash bytes (a leaf's element-remainder, or an
+    /// internal's already-computed SHA hash). We post-order DFS so children
+    /// are hashed before parents.
+    ///
+    /// Each internal node's `hash` field is overwritten in place: before the
+    /// recomputation it holds the path-from-root bytes; afterward it holds
+    /// the SHA512/256 output. To support recomputation across multiple
+    /// `root_hash` calls (the trie may be mutated again), we reconstruct the
+    /// path-from-root via the recursion's `path` parameter rather than
+    /// relying on the (now-overwritten) field.
+    fn recompute_all_hashes(&mut self, root_id: u64) {
+        let mut path: Vec<u8> = Vec::new();
+        self.recompute_hash_at(root_id, &mut path);
+    }
+
+    fn recompute_hash_at(&mut self, node_id: u64, path: &mut Vec<u8>) {
+        let is_leaf = self.nodes[&node_id].is_leaf();
+        if is_leaf {
+            // Leaves never recompute — their `hash` is the element remainder
+            // (or full element for a single-leaf root) and is set at
+            // construction time.
+            return;
+        }
+
+        // Recurse into children first so their hashes are up-to-date.
+        let child_descriptors: Vec<(u8, u64)> = self.nodes[&node_id]
+            .children
+            .iter()
+            .map(|c| (c.hash_index, c.child_id))
+            .collect();
+        for (hi, cid) in &child_descriptors {
+            path.push(*hi);
+            self.recompute_hash_at(*cid, path);
+            path.pop();
+        }
+
+        // Compose the accumulator. Format mirrors Go `node.calculateHash`:
+        //   byte(len(path)) || path
+        //   for each child in order:
+        //     byte(0) if leaf else byte(1)
+        //     byte(len(child.hash))
+        //     child.hash_index
+        //     child.hash bytes
+        let mut acc: Vec<u8> = Vec::new();
+        // path length must fit in a byte — Go writes `byte(len(path))`. The
+        // path length equals the depth of this node; depth is bounded by
+        // `element_length` (= 36), so this fits comfortably.
+        debug_assert!(path.len() <= 255);
+        acc.push(path.len() as u8);
+        acc.extend_from_slice(path);
+
+        for (hi, cid) in &child_descriptors {
+            let child = &self.nodes[cid];
+            if child.is_leaf() {
+                acc.push(0x00);
+            } else {
+                acc.push(0x01);
+            }
+            debug_assert!(child.hash.len() <= 255);
+            acc.push(child.hash.len() as u8);
+            acc.push(*hi);
+            acc.extend_from_slice(&child.hash);
+        }
+
+        let mut hasher = Sha512_256::new();
+        hasher.update(&acc);
+        let result = hasher.finalize();
+
+        let node = self.nodes.get_mut(&node_id).unwrap();
+        node.hash = result.to_vec();
+    }
+
+    // -----------------------------------------------------------------------
+    // node_find — mirror of Go `node.find` at `node.go:82-96`.
+    // -----------------------------------------------------------------------
+
+    fn node_find(&self, node_id: u64, d: &[u8]) -> bool {
+        let node = &self.nodes[&node_id];
+        if node.is_leaf() {
+            return d == node.hash.as_slice();
+        }
+        if d.is_empty() {
+            // Shouldn't happen with fixed-length elements; guard anyway.
+            return false;
+        }
+        if !node.children_mask.bit(d[0]) {
+            return false;
+        }
+        let idx = node.index_of(d[0]);
+        let child_id = node.children[idx].child_id;
+        self.node_find(child_id, &d[1..])
+    }
+
+    // -----------------------------------------------------------------------
+    // node_add — mirror of Go `node.add` at `node.go:98-220`.
+    //
+    // Assumes the key is absent (the public `add` does a `find` first).
+    // Returns the new node ID to use in the parent. Caller is responsible
+    // for replacing the old node ID in its own children list (or in the trie
+    // root pointer).
+    // -----------------------------------------------------------------------
+
+    fn node_add(&mut self, node_id: u64, d: &[u8], path: &[u8]) -> u64 {
+        let node = self.nodes[&node_id].clone();
+
+        if node.is_leaf() {
+            // Find the first byte where this leaf's remainder and the new
+            // element's bytes-from-here diverge.
+            let mut idiff = 0usize;
+            // Both are guaranteed to differ somewhere (caller did a `find`),
+            // so we won't run off the end.
+            while node.hash[idiff] == d[idiff] {
+                idiff += 1;
+            }
+
+            // Two new leaves, each carrying the remainder after the diff byte.
+            let cur_child = TrieNode::leaf(node.hash[idiff + 1..].to_vec());
+            let new_child = TrieNode::leaf(d[idiff + 1..].to_vec());
+            let cur_child_id = self.allocate_node(cur_child);
+            let new_child_id = self.allocate_node(new_child);
+
+            // Bottom branch node: 2 children at the diverging bytes.
+            let mut branch_children = Vec::with_capacity(2);
+            let mut branch_mask = Bitset::ZERO;
+            branch_mask.set_bit(node.hash[idiff]);
+            branch_mask.set_bit(d[idiff]);
+            if node.hash[idiff] < d[idiff] {
+                branch_children.push(ChildEntry {
+                    hash_index: node.hash[idiff],
+                    child_id: cur_child_id,
+                });
+                branch_children.push(ChildEntry {
+                    hash_index: d[idiff],
+                    child_id: new_child_id,
+                });
+            } else {
+                branch_children.push(ChildEntry {
+                    hash_index: d[idiff],
+                    child_id: new_child_id,
+                });
+                branch_children.push(ChildEntry {
+                    hash_index: node.hash[idiff],
+                    child_id: cur_child_id,
+                });
+            }
+
+            // Path-from-root for the bottom branch = caller's path + d[0..idiff].
+            let mut branch_path = Vec::with_capacity(path.len() + idiff);
+            branch_path.extend_from_slice(path);
+            branch_path.extend_from_slice(&d[..idiff]);
+            let branch = TrieNode {
+                hash: branch_path,
+                children: branch_children,
+                children_mask: branch_mask,
+            };
+            let mut top_id = self.allocate_node(branch);
+
+            // Create `idiff` single-child ancestor internals, walking back up
+            // from depth `caller_depth + idiff - 1` to `caller_depth`. Each
+            // ancestor has its child branching on the next byte of d.
+            for i in (0..idiff).rev() {
+                let mut mask = Bitset::ZERO;
+                mask.set_bit(d[i]);
+                let mut ancestor_path = Vec::with_capacity(path.len() + i);
+                ancestor_path.extend_from_slice(path);
+                ancestor_path.extend_from_slice(&d[..i]);
+                let ancestor = TrieNode {
+                    hash: ancestor_path,
+                    children: vec![ChildEntry {
+                        hash_index: d[i],
+                        child_id: top_id,
+                    }],
+                    children_mask: mask,
+                };
+                top_id = self.allocate_node(ancestor);
+            }
+
+            // Remove the old leaf (Go's add returns the new top; the caller
+            // then calls cache.deleteNode on the old node it's replacing —
+            // the top-level Trie.Add does this for the root; recursive
+            // callers below "free" the old node implicitly by overwriting
+            // their children entry).
+            //
+            // For correctness of subsequent operations and `len()`, remove
+            // the old node here. The caller will plug `top_id` into its
+            // children list (or the root pointer).
+            self.nodes.remove(&node_id);
+            return top_id;
+        }
+
+        // Non-leaf: branch on d[0].
+        if !node.children_mask.bit(d[0]) {
+            // No existing child at d[0]: insert a new leaf and rebuild this
+            // internal node with the additional child entry.
+            let leaf = TrieNode::leaf(d[1..].to_vec());
+            let leaf_id = self.allocate_node(leaf);
+
+            let mut new_children = Vec::with_capacity(node.children.len() + 1);
+            let mut inserted = false;
+            for c in &node.children {
+                if !inserted && d[0] < c.hash_index {
+                    new_children.push(ChildEntry {
+                        hash_index: d[0],
+                        child_id: leaf_id,
+                    });
+                    inserted = true;
+                }
+                new_children.push(c.clone());
+            }
+            if !inserted {
+                new_children.push(ChildEntry {
+                    hash_index: d[0],
+                    child_id: leaf_id,
+                });
+            }
+            let mut new_mask = node.children_mask;
+            new_mask.set_bit(d[0]);
+
+            let new_node = TrieNode {
+                hash: path.to_vec(),
+                children: new_children,
+                children_mask: new_mask,
+            };
+            self.nodes.remove(&node_id);
+            return self.allocate_node(new_node);
+        }
+
+        // Existing child at d[0]: recurse, then rebuild this node with the
+        // updated child id.
+        let child_idx = node.index_of(d[0]);
+        let cur_child_id = node.children[child_idx].child_id;
+        let mut sub_path = Vec::with_capacity(path.len() + 1);
+        sub_path.extend_from_slice(path);
+        sub_path.push(d[0]);
+        let updated_child_id = self.node_add(cur_child_id, &d[1..], &sub_path);
+
+        let mut new_children = node.children.clone();
+        new_children[child_idx].child_id = updated_child_id;
+        let new_node = TrieNode {
+            hash: path.to_vec(),
+            children: new_children,
+            children_mask: node.children_mask,
+        };
+        self.nodes.remove(&node_id);
+        self.allocate_node(new_node)
+    }
+
+    // -----------------------------------------------------------------------
+    // node_remove — mirror of Go `node.remove` at `node.go:254-309`.
+    //
+    // Called only on non-leaf nodes (the public `delete` handles the
+    // root-is-leaf case directly).
+    //
+    // Returns:
+    //   - `Some(new_id)` if this internal node survives (possibly with a
+    //     reduced child set, or collapsed into a leaf carrying merged bytes).
+    //   - `None` if this internal node should be removed entirely (the caller
+    //     either replaces it in their parent's children list, or — at the
+    //     trie root — sets `mt.root = None`).
+    // -----------------------------------------------------------------------
+
+    fn node_remove(&mut self, node_id: u64, key: &[u8], path: &[u8]) -> Option<u64> {
+        let node = self.nodes[&node_id].clone();
+        debug_assert!(!node.is_leaf(), "node_remove must not be called on leaves");
+
+        let child_idx = node.index_of(key[0]);
+        let child_id = node.children[child_idx].child_id;
+        let child = self.nodes[&child_id].clone();
+
+        // Mirrors Go `node.remove` at node.go:266-289. We construct `new_node`
+        // — the surviving node at this position — then potentially collapse
+        // it if it ends up with a single leaf child (Go's "collapse" block at
+        // node.go:291-304).
+        let new_node: TrieNode = if child.is_leaf() {
+            // Remove this leaf entirely from our children. Per Go's comment
+            // at node.go:269, the tree forbids internal nodes with exactly
+            // one leaf child and no other children, so before this step we
+            // had ≥2 children — after removing one leaf, ≥1 remains.
+            let mut new_children = node.children.clone();
+            new_children.remove(child_idx);
+            let mut new_mask = node.children_mask;
+            new_mask.clear_bit(key[0]);
+            // Free the leaf's storage.
+            self.nodes.remove(&child_id);
+            TrieNode {
+                hash: path.to_vec(),
+                children: new_children,
+                children_mask: new_mask,
+            }
+        } else {
+            // Recurse. The child is non-leaf, so `remove` always returns
+            // `Some` (the tree-invariant guarantees the child has ≥2 children
+            // before, possibly collapsing to a leaf after — still `Some`).
+            let mut sub_path = Vec::with_capacity(path.len() + 1);
+            sub_path.extend_from_slice(path);
+            sub_path.push(key[0]);
+            let updated = self
+                .node_remove(child_id, &key[1..], &sub_path)
+                .expect("non-leaf remove always returns Some");
+            // Free the old child slot (Go's `cache.refurbishNode(childNodeID)`
+            // returns a new id; we mirror that by replacing the children
+            // entry's id).
+            let mut new_children = node.children.clone();
+            new_children[child_idx].child_id = updated;
+            TrieNode {
+                hash: path.to_vec(),
+                children: new_children,
+                children_mask: node.children_mask,
+            }
+        };
+
+        // Collapse: if `new_node` has exactly one child and that child is a
+        // leaf, convert `new_node` itself into a leaf carrying
+        // `[only_child.hash_index] || only_child.hash`. Matches Go
+        // `node.go:291-304`.
+        let collapsed = if new_node.children.len() == 1 {
+            let only = &new_node.children[0];
+            let only_child = &self.nodes[&only.child_id];
+            if only_child.is_leaf() {
+                let mut merged = Vec::with_capacity(1 + only_child.hash.len());
+                merged.push(only.hash_index);
+                merged.extend_from_slice(&only_child.hash);
+                let only_child_id = only.child_id;
+                self.nodes.remove(&only_child_id);
+                Some(TrieNode::leaf(merged))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let final_node = collapsed.unwrap_or(new_node);
+        // Free the original node and allocate the surviving node.
+        self.nodes.remove(&node_id);
+        Some(self.allocate_node(final_node))
+    }
+
+    // -----------------------------------------------------------------------
+    // from_elements — build a trie from a full set of fixed-size elements.
+    // -----------------------------------------------------------------------
+
+    /// Build a trie by inserting every element in `iter` in iteration order.
+    ///
+    /// Returns `Err` only on element-length mismatch. Duplicates are silently
+    /// ignored (matching Go's `Add` semantics).
+    pub fn from_elements(
+        iter: impl Iterator<Item = [u8; 36]>,
+        element_length: usize,
+    ) -> Result<Self, AlgoError> {
+        let mut trie = Self::new(element_length);
+        for elem in iter {
+            trie.add(&elem)?;
+        }
+        Ok(trie)
+    }
+
+    // -----------------------------------------------------------------------
+    // Serialize / Deserialize — single-blob msgpack. Format is Rust-internal
+    // (NOT Go-compatible); used by the legacy `merkle_trie` SQL table. PLAN-
+    // 130 TASK-136 deletes both methods when paged persistence lands.
+    // -----------------------------------------------------------------------
+
+    /// Serialize the trie to a compact msgpack representation for storage in
+    /// the legacy single-blob `merkle_trie` SQL row.
+    ///
+    /// Layout: map with keys `r` (root_id, Nil if empty), `n` (next_id),
+    /// `e` (element_length), `d` (nodes — map of `id -> node_map`).
+    /// Each node_map: `h` (hash bytes), `m` (children_mask as 4×u64 array),
+    /// `c` (children — array of `[hash_index, child_id]` pairs).
     pub fn serialize(&self) -> Vec<u8> {
         let mut nodes_vec: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
         for (&id, node) in &self.nodes {
             let mut node_map: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
             node_map.push((
-                rmpv::Value::String("p".into()),
-                rmpv::Value::Binary(node.path.clone()),
+                rmpv::Value::String("h".into()),
+                rmpv::Value::Binary(node.hash.clone()),
             ));
+            let mask_arr: Vec<rmpv::Value> = node
+                .children_mask
+                .d
+                .iter()
+                .map(|&w| rmpv::Value::from(w))
+                .collect();
             node_map.push((
-                rmpv::Value::String("l".into()),
-                rmpv::Value::Boolean(node.is_leaf),
+                rmpv::Value::String("m".into()),
+                rmpv::Value::Array(mask_arr),
             ));
-            if let Some(ref h) = node.hash {
-                node_map.push((
-                    rmpv::Value::String("h".into()),
-                    rmpv::Value::Binary(h.clone()),
-                ));
-            }
             if !node.children.is_empty() {
                 let children: Vec<rmpv::Value> = node
                     .children
@@ -201,7 +822,7 @@ impl MerkleTrie {
         buf
     }
 
-    /// Deserialize a trie from stored msgpack data.
+    /// Inverse of `serialize`.
     pub fn deserialize(data: &[u8], element_length: usize) -> Result<Self, AlgoError> {
         let val: rmpv::Value =
             rmpv::decode::read_value(&mut &data[..]).map_err(|e| AlgoError::Ledger {
@@ -261,10 +882,13 @@ impl MerkleTrie {
             nodes,
             next_id,
             element_length,
+            // After deserialize, every internal node's `hash` field already
+            // holds the SHA hash from before serialization, so `root_hash`
+            // can return without recomputation.
+            dirty: false,
         })
     }
 
-    /// Deserialize a single TrieNode from an rmpv::Value.
     fn deserialize_node(val: rmpv::Value) -> Result<TrieNode, AlgoError> {
         let map = match val {
             rmpv::Value::Map(m) => m,
@@ -275,24 +899,22 @@ impl MerkleTrie {
             }
         };
 
-        let mut path = Vec::new();
-        let mut is_leaf = false;
-        let mut hash: Option<Vec<u8>> = None;
+        let mut hash = Vec::new();
+        let mut children_mask = Bitset::ZERO;
         let mut children = Vec::new();
 
         for (k, v) in map {
             match k.as_str().unwrap_or("") {
-                "p" => {
-                    if let Some(b) = v.as_slice() {
-                        path = b.to_vec();
-                    }
-                }
-                "l" => {
-                    is_leaf = v.as_bool().unwrap_or(false);
-                }
                 "h" => {
                     if let Some(b) = v.as_slice() {
-                        hash = Some(b.to_vec());
+                        hash = b.to_vec();
+                    }
+                }
+                "m" => {
+                    if let rmpv::Value::Array(arr) = v {
+                        for (i, w) in arr.into_iter().take(4).enumerate() {
+                            children_mask.d[i] = w.as_u64().unwrap_or(0);
+                        }
                     }
                 }
                 "c" => {
@@ -315,543 +937,19 @@ impl MerkleTrie {
             }
         }
 
+        // If the persisted blob lacked the explicit mask (older format) or
+        // had a mismatched one, rederive from children to keep the invariant.
+        if children_mask == Bitset::ZERO && !children.is_empty() {
+            for c in &children {
+                children_mask.set_bit(c.hash_index);
+            }
+        }
+
         Ok(TrieNode {
-            path,
-            children,
             hash,
-            is_leaf,
+            children,
+            children_mask,
         })
-    }
-
-    /// Build a trie from a complete set of 36-byte elements.
-    ///
-    /// This is used when loading from a DB that has no persisted trie — all
-    /// account and resource hashes are computed and inserted one by one.
-    pub fn from_elements(
-        elements: impl Iterator<Item = [u8; 36]>,
-        element_length: usize,
-    ) -> Result<Self, AlgoError> {
-        let mut trie = Self::new(element_length);
-        for elem in elements {
-            trie.add(&elem)?;
-        }
-        Ok(trie)
-    }
-
-    // -----------------------------------------------------------------------
-    // Hash computation
-    // -----------------------------------------------------------------------
-
-    /// Compute the root hash of the trie.
-    ///
-    /// - Empty trie: `[0u8; 32]`
-    /// - Single leaf root: `SHA512/256(0x00 || leaf_element)`
-    /// - Internal root: `SHA512/256(0x01 || internal_hash)`
-    pub fn root_hash(&mut self) -> [u8; 32] {
-        let root_id = match self.root {
-            Some(id) => id,
-            None => return [0u8; 32],
-        };
-
-        // Ensure all hashes are computed bottom-up.
-        self.ensure_hashed(root_id);
-
-        let node = &self.nodes[&root_id];
-        let node_hash = node
-            .hash
-            .as_ref()
-            .expect("hash must be computed after ensure_hashed");
-
-        let mut hasher = Sha512_256::new();
-        if node.is_leaf {
-            hasher.update([0x00]);
-        } else {
-            hasher.update([0x01]);
-        }
-        hasher.update(node_hash);
-        let result = hasher.finalize();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&result);
-        out
-    }
-
-    /// Recursively ensure the hash is computed for `node_id` and all
-    /// descendants. After this call, `node.hash` is `Some(...)`.
-    fn ensure_hashed(&mut self, node_id: u64) {
-        let node = &self.nodes[&node_id];
-
-        // Already cached?
-        if node.hash.is_some() {
-            return;
-        }
-
-        // Must be an internal node (leaves always have hash set).
-        assert!(!node.is_leaf, "leaf node must always have hash set");
-
-        // Recursively hash all children first.
-        let child_ids: Vec<u64> = node.children.iter().map(|c| c.child_id).collect();
-        for child_id in child_ids {
-            self.ensure_hashed(child_id);
-        }
-
-        // Now compute this node's hash.
-        let hash = self.calculate_node_hash(node_id);
-        self.nodes.get_mut(&node_id).unwrap().hash = Some(hash);
-    }
-
-    /// Calculate the hash for an internal node per go-algorand's algorithm.
-    ///
-    /// ```text
-    /// SHA512/256(
-    ///   path_length as u8 ||
-    ///   path bytes ||
-    ///   for each child in order:
-    ///     child_type_tag (0x00 leaf, 0x01 internal) ||
-    ///     child_hash_length as u8 ||
-    ///     child.hash_index as u8 ||
-    ///     child.hash bytes
-    /// )
-    /// ```
-    fn calculate_node_hash(&self, node_id: u64) -> Vec<u8> {
-        let node = &self.nodes[&node_id];
-
-        let mut hasher = Sha512_256::new();
-
-        // Path prefix.
-        hasher.update([node.path.len() as u8]);
-        hasher.update(&node.path);
-
-        // Children (already in sorted order by hash_index).
-        for child in &node.children {
-            let child_node = &self.nodes[&child.child_id];
-            let child_hash = child_node
-                .hash
-                .as_ref()
-                .expect("child hash must be computed before parent");
-
-            // Type tag.
-            if child_node.is_leaf {
-                hasher.update([0x00]);
-            } else {
-                hasher.update([0x01]);
-            }
-
-            // Hash length + hash_index + hash bytes.
-            hasher.update([child_hash.len() as u8]);
-            hasher.update([child.hash_index]);
-            hasher.update(child_hash);
-        }
-
-        hasher.finalize().to_vec()
-    }
-
-    // -----------------------------------------------------------------------
-    // Add / Delete / Contains
-    // -----------------------------------------------------------------------
-
-    /// Add a fixed-length element to the trie.
-    ///
-    /// Returns an error if the element already exists or has the wrong length.
-    pub fn add(&mut self, element: &[u8]) -> Result<(), AlgoError> {
-        if element.len() != self.element_length {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "element length {} != expected {}",
-                    element.len(),
-                    self.element_length
-                ),
-            });
-        }
-
-        match self.root {
-            None => {
-                // Empty trie: create a single leaf as root.
-                let leaf = TrieNode::leaf(element.to_vec());
-                let id = self.allocate_node(leaf);
-                self.root = Some(id);
-                Ok(())
-            }
-            Some(root_id) => {
-                let new_root = self.node_add(root_id, element, 0)?;
-                self.root = Some(new_root);
-                Ok(())
-            }
-        }
-    }
-
-    /// Recursive add into the subtree rooted at `node_id`.
-    /// `depth` is the current byte offset into the element.
-    /// Returns the (possibly new) node ID for this position.
-    fn node_add(&mut self, node_id: u64, element: &[u8], depth: usize) -> Result<u64, AlgoError> {
-        let node = self.nodes.get(&node_id).unwrap().clone();
-
-        if node.is_leaf {
-            let existing = node.hash.as_ref().unwrap();
-            if existing.as_slice() == element {
-                return Err(AlgoError::Ledger {
-                    message: "duplicate element".to_string(),
-                });
-            }
-            // Split: find shared prefix between existing element and new element
-            // starting from `depth`.
-            return self.split_leaf(node_id, element, depth);
-        }
-
-        // Internal node: compare path.
-        let path = &node.path;
-        let path_len = path.len();
-
-        // Find how much of the path matches element bytes at [depth..].
-        let mut match_len = 0;
-        while match_len < path_len {
-            if depth + match_len >= element.len() {
-                // Element is shorter than path — shouldn't happen with fixed-length elements.
-                return Err(AlgoError::Ledger {
-                    message: "element too short for trie path".to_string(),
-                });
-            }
-            if element[depth + match_len] != path[match_len] {
-                break;
-            }
-            match_len += 1;
-        }
-
-        if match_len < path_len {
-            // Partial path match: split this internal node.
-            return self.split_internal(node_id, element, depth, match_len);
-        }
-
-        // Full path matched. Branch on the next byte.
-        let branch_depth = depth + path_len;
-        if branch_depth >= element.len() {
-            return Err(AlgoError::Ledger {
-                message: "element too short after path".to_string(),
-            });
-        }
-        let branch_byte = element[branch_depth];
-
-        // Look for existing child with this branch byte.
-        let child_idx = node
-            .children
-            .iter()
-            .position(|c| c.hash_index == branch_byte);
-
-        match child_idx {
-            Some(idx) => {
-                let child_id = node.children[idx].child_id;
-                let new_child_id = self.node_add(child_id, element, branch_depth + 1)?;
-                // Update child pointer if changed.
-                let n = self.nodes.get_mut(&node_id).unwrap();
-                n.children[idx].child_id = new_child_id;
-                n.invalidate();
-                Ok(node_id)
-            }
-            None => {
-                // No child for this byte: create a new leaf.
-                let leaf = TrieNode::leaf(element.to_vec());
-                let leaf_id = self.allocate_node(leaf);
-                let n = self.nodes.get_mut(&node_id).unwrap();
-                let entry = ChildEntry {
-                    hash_index: branch_byte,
-                    child_id: leaf_id,
-                };
-                // Insert in sorted order by hash_index.
-                let pos = n
-                    .children
-                    .iter()
-                    .position(|c| c.hash_index > branch_byte)
-                    .unwrap_or(n.children.len());
-                n.children.insert(pos, entry);
-                n.invalidate();
-                Ok(node_id)
-            }
-        }
-    }
-
-    /// Split a leaf node when a new element collides at `depth`.
-    /// Returns the new internal node ID that replaces the leaf.
-    fn split_leaf(&mut self, leaf_id: u64, element: &[u8], depth: usize) -> Result<u64, AlgoError> {
-        let existing = self.nodes.get(&leaf_id).unwrap().hash.clone().unwrap();
-
-        // Find shared prefix length from `depth` onward.
-        let mut shared = 0;
-        while depth + shared < existing.len()
-            && depth + shared < element.len()
-            && existing[depth + shared] == element[depth + shared]
-        {
-            shared += 1;
-        }
-
-        let branch_depth = depth + shared;
-
-        // Build the shared-prefix path.
-        let shared_path = existing[depth..branch_depth].to_vec();
-
-        // Branch bytes for the two elements.
-        let old_byte = existing[branch_depth];
-        let new_byte = element[branch_depth];
-
-        // Create new leaf for the new element.
-        let new_leaf_id = self.allocate_node(TrieNode::leaf(element.to_vec()));
-
-        // Build children sorted by hash_index.
-        let mut children = vec![
-            ChildEntry {
-                hash_index: old_byte,
-                child_id: leaf_id,
-            },
-            ChildEntry {
-                hash_index: new_byte,
-                child_id: new_leaf_id,
-            },
-        ];
-        children.sort_by_key(|c| c.hash_index);
-
-        let internal = TrieNode::internal(shared_path, children);
-        let internal_id = self.allocate_node(internal);
-        Ok(internal_id)
-    }
-
-    /// Split an internal node when the path partially matches at `match_len`.
-    /// Returns the new parent internal node ID.
-    fn split_internal(
-        &mut self,
-        node_id: u64,
-        element: &[u8],
-        depth: usize,
-        match_len: usize,
-    ) -> Result<u64, AlgoError> {
-        let node = self.nodes.get(&node_id).unwrap().clone();
-        let branch_depth = depth + match_len;
-
-        // The byte at the divergence point for the old node.
-        let old_byte = node.path[match_len];
-        // The byte at the divergence point for the new element.
-        let new_byte = element[branch_depth];
-
-        // Shorten the old node's path to the suffix after divergence.
-        let suffix_path = node.path[match_len + 1..].to_vec();
-        let n = self.nodes.get_mut(&node_id).unwrap();
-        n.path = suffix_path;
-        n.invalidate();
-
-        // Create new leaf for the new element.
-        let new_leaf_id = self.allocate_node(TrieNode::leaf(element.to_vec()));
-
-        // Build children sorted by hash_index.
-        let mut children = vec![
-            ChildEntry {
-                hash_index: old_byte,
-                child_id: node_id,
-            },
-            ChildEntry {
-                hash_index: new_byte,
-                child_id: new_leaf_id,
-            },
-        ];
-        children.sort_by_key(|c| c.hash_index);
-
-        // New parent with shared prefix.
-        let shared_path = element[depth..branch_depth].to_vec();
-        let parent = TrieNode::internal(shared_path, children);
-        let parent_id = self.allocate_node(parent);
-        Ok(parent_id)
-    }
-
-    /// Delete an element from the trie.
-    ///
-    /// Returns an error if the element is not found.
-    pub fn delete(&mut self, element: &[u8]) -> Result<(), AlgoError> {
-        if element.len() != self.element_length {
-            return Err(AlgoError::Ledger {
-                message: format!(
-                    "element length {} != expected {}",
-                    element.len(),
-                    self.element_length
-                ),
-            });
-        }
-
-        let root_id = match self.root {
-            None => {
-                return Err(AlgoError::Ledger {
-                    message: "element not found in empty trie".to_string(),
-                })
-            }
-            Some(id) => id,
-        };
-
-        let result = self.node_delete(root_id, element, 0)?;
-        self.root = result;
-        Ok(())
-    }
-
-    /// Recursive delete from the subtree rooted at `node_id`.
-    /// Returns `Ok(Some(id))` with the (possibly new) node ID, or `Ok(None)`
-    /// if the node was removed entirely (leaf deleted, subtree empty).
-    fn node_delete(
-        &mut self,
-        node_id: u64,
-        element: &[u8],
-        depth: usize,
-    ) -> Result<Option<u64>, AlgoError> {
-        let node = self.nodes.get(&node_id).unwrap().clone();
-
-        if node.is_leaf {
-            let existing = node.hash.as_ref().unwrap();
-            if existing.as_slice() == element {
-                self.nodes.remove(&node_id);
-                return Ok(None);
-            }
-            return Err(AlgoError::Ledger {
-                message: "element not found".to_string(),
-            });
-        }
-
-        // Internal node: verify path matches.
-        let path_len = node.path.len();
-        for i in 0..path_len {
-            if depth + i >= element.len() || element[depth + i] != node.path[i] {
-                return Err(AlgoError::Ledger {
-                    message: "element not found".to_string(),
-                });
-            }
-        }
-
-        let branch_depth = depth + path_len;
-        if branch_depth >= element.len() {
-            return Err(AlgoError::Ledger {
-                message: "element not found".to_string(),
-            });
-        }
-
-        let branch_byte = element[branch_depth];
-
-        let child_idx = node
-            .children
-            .iter()
-            .position(|c| c.hash_index == branch_byte);
-
-        let idx = match child_idx {
-            Some(i) => i,
-            None => {
-                return Err(AlgoError::Ledger {
-                    message: "element not found".to_string(),
-                })
-            }
-        };
-
-        let child_id = node.children[idx].child_id;
-        let new_child = self.node_delete(child_id, element, branch_depth + 1)?;
-
-        match new_child {
-            Some(new_child_id) => {
-                // Child still exists (possibly replaced).
-                let n = self.nodes.get_mut(&node_id).unwrap();
-                n.children[idx].child_id = new_child_id;
-                n.invalidate();
-                Ok(Some(node_id))
-            }
-            None => {
-                // Child was removed. Remove entry from children.
-                let n = self.nodes.get_mut(&node_id).unwrap();
-                n.children.remove(idx);
-                n.invalidate();
-
-                if n.children.is_empty() {
-                    // No children left — remove this node too.
-                    self.nodes.remove(&node_id);
-                    Ok(None)
-                } else if n.children.len() == 1 {
-                    // Single child: merge (collapse) to maintain path compression.
-                    self.collapse_single_child(node_id)
-                } else {
-                    Ok(Some(node_id))
-                }
-            }
-        }
-    }
-
-    /// Collapse an internal node with a single child into its child.
-    /// Merges paths: `parent.path + child.hash_index + child.path`.
-    /// Returns the surviving node ID.
-    fn collapse_single_child(&mut self, node_id: u64) -> Result<Option<u64>, AlgoError> {
-        let node = self.nodes.get(&node_id).unwrap().clone();
-        assert_eq!(node.children.len(), 1);
-
-        let child_entry = &node.children[0];
-        let child_id = child_entry.child_id;
-        let branch_byte = child_entry.hash_index;
-
-        let child = self.nodes.get(&child_id).unwrap().clone();
-
-        if child.is_leaf {
-            // Parent becomes unnecessary; promote the leaf.
-            // The leaf already stores the full element as its hash, no path merging needed.
-            self.nodes.remove(&node_id);
-            Ok(Some(child_id))
-        } else {
-            // Merge paths: parent.path + branch_byte + child.path.
-            let mut merged_path = node.path.clone();
-            merged_path.push(branch_byte);
-            merged_path.extend_from_slice(&child.path);
-
-            let c = self.nodes.get_mut(&child_id).unwrap();
-            c.path = merged_path;
-            c.invalidate();
-
-            self.nodes.remove(&node_id);
-            Ok(Some(child_id))
-        }
-    }
-
-    /// Check whether an element exists in the trie.
-    pub fn contains(&self, element: &[u8]) -> bool {
-        if element.len() != self.element_length {
-            return false;
-        }
-
-        let mut current_id = match self.root {
-            None => return false,
-            Some(id) => id,
-        };
-
-        let mut depth = 0;
-
-        loop {
-            let node = match self.nodes.get(&current_id) {
-                Some(n) => n,
-                None => return false,
-            };
-
-            if node.is_leaf {
-                return node.hash.as_deref() == Some(element);
-            }
-
-            // Internal node: verify path matches.
-            let path_len = node.path.len();
-            for i in 0..path_len {
-                if depth + i >= element.len() || element[depth + i] != node.path[i] {
-                    return false;
-                }
-            }
-
-            let branch_depth = depth + path_len;
-            if branch_depth >= element.len() {
-                return false;
-            }
-
-            let branch_byte = element[branch_depth];
-            let child = node.children.iter().find(|c| c.hash_index == branch_byte);
-
-            match child {
-                Some(c) => {
-                    current_id = c.child_id;
-                    depth = branch_depth + 1;
-                }
-                None => return false,
-            }
-        }
     }
 }
 
@@ -863,15 +961,58 @@ impl MerkleTrie {
 mod tests {
     use super::*;
 
-    /// Helper: compute SHA512/256 of the given data.
     fn sha512_256(data: &[u8]) -> [u8; 32] {
         let mut hasher = Sha512_256::new();
         hasher.update(data);
-        let result = hasher.finalize();
         let mut out = [0u8; 32];
-        out.copy_from_slice(&result);
+        out.copy_from_slice(&hasher.finalize());
         out
     }
+
+    // -----------------------------------------------------------------------
+    // Bitset
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bitset_set_clear_test() {
+        let mut b = Bitset::ZERO;
+        assert!(b.is_zero());
+        b.set_bit(0);
+        b.set_bit(63);
+        b.set_bit(64);
+        b.set_bit(255);
+        assert!(b.bit(0));
+        assert!(b.bit(63));
+        assert!(b.bit(64));
+        assert!(b.bit(255));
+        assert!(!b.bit(1));
+        assert!(!b.bit(128));
+        assert!(!b.is_zero());
+
+        b.clear_bit(64);
+        assert!(!b.bit(64));
+        assert!(b.bit(0));
+        assert!(b.bit(255));
+    }
+
+    #[test]
+    fn test_bitset_layout_matches_go() {
+        // Go: b.d[bit/64] |= 1 << (bit & 63). Bit 0 → d[0] low bit;
+        // bit 63 → d[0] high bit; bit 64 → d[1] low bit; bit 255 → d[3] high bit.
+        let mut b = Bitset::ZERO;
+        b.set_bit(0);
+        assert_eq!(b.d[0], 1);
+        b.set_bit(63);
+        assert_eq!(b.d[0], 1 | (1u64 << 63));
+        b.set_bit(64);
+        assert_eq!(b.d[1], 1);
+        b.set_bit(255);
+        assert_eq!(b.d[3], 1u64 << 63);
+    }
+
+    // -----------------------------------------------------------------------
+    // Root hash basics
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_empty_trie_root_hash() {
@@ -881,207 +1022,103 @@ mod tests {
 
     #[test]
     fn test_single_leaf_root_hash() {
+        // A single-leaf root carries the FULL element. Root hash =
+        // SHA512_256(0x00 || element). This is the Go invariant from
+        // trie.go:144 (`pnode.hash = d` on first add) and trie.go:130.
         let mut trie = MerkleTrie::new(36);
+        let mut elem = vec![0u8; 36];
+        elem[0] = 0xAB;
+        elem[35] = 0xCD;
 
-        // Create a 36-byte element.
-        let mut element = vec![0u8; 36];
-        element[0] = 0xAB;
-        element[35] = 0xCD;
-
-        let leaf = TrieNode::leaf(element.clone());
-        let leaf_id = trie.allocate_node(leaf);
-        trie.set_root(Some(leaf_id));
-
-        let root = trie.root_hash();
-
-        // Expected: SHA512/256(0x00 || element)
-        let mut input = vec![0x00];
-        input.extend_from_slice(&element);
-        let expected = sha512_256(&input);
-        assert_eq!(root, expected);
-    }
-
-    #[test]
-    fn test_two_elements_shared_prefix() {
-        // Two 4-byte elements sharing a 1-byte prefix, branching at byte 1.
-        // Element A: [0x10, 0x20, 0xAA, 0xBB]
-        // Element B: [0x10, 0x30, 0xCC, 0xDD]
-        //
-        // Trie structure:
-        //   internal(path=[0x10], children=[
-        //     ChildEntry { hash_index: 0x20, child_id: leaf_a },
-        //     ChildEntry { hash_index: 0x30, child_id: leaf_b },
-        //   ])
-        let mut trie = MerkleTrie::new(4);
-
-        let elem_a = vec![0x10, 0x20, 0xAA, 0xBB];
-        let elem_b = vec![0x10, 0x30, 0xCC, 0xDD];
-
-        let leaf_a_id = trie.allocate_node(TrieNode::leaf(elem_a.clone()));
-        let leaf_b_id = trie.allocate_node(TrieNode::leaf(elem_b.clone()));
-
-        let internal = TrieNode::internal(
-            vec![0x10],
-            vec![
-                ChildEntry {
-                    hash_index: 0x20,
-                    child_id: leaf_a_id,
-                },
-                ChildEntry {
-                    hash_index: 0x30,
-                    child_id: leaf_b_id,
-                },
-            ],
-        );
-        let internal_id = trie.allocate_node(internal);
-        trie.set_root(Some(internal_id));
-
-        let root = trie.root_hash();
-
-        // Manually compute the expected internal node hash.
-        // internal_hash = SHA512/256(
-        //   0x01          (path_length)
-        //   0x10          (path byte)
-        //   0x00          (leaf tag for child A)
-        //   0x04          (hash_length = 4, the element itself)
-        //   0x20          (hash_index for child A)
-        //   elem_a bytes  (4 bytes)
-        //   0x00          (leaf tag for child B)
-        //   0x04          (hash_length = 4)
-        //   0x30          (hash_index for child B)
-        //   elem_b bytes  (4 bytes)
-        // )
-        let mut internal_input = vec![
-            0x01,               // path length
-            0x10,               // path
-            0x00,               // leaf tag (child A)
-            elem_a.len() as u8, // hash length
-            0x20,               // hash_index
-        ];
-        internal_input.extend_from_slice(&elem_a);
-        // Child B
-        internal_input.extend_from_slice(&[
-            0x00,               // leaf tag
-            elem_b.len() as u8, // hash length
-            0x30,               // hash_index
-        ]);
-        internal_input.extend_from_slice(&elem_b);
-
-        let expected_internal_hash = sha512_256(&internal_input);
-
-        // Root hash = SHA512/256(0x01 || internal_hash)
-        let mut root_input = vec![0x01];
-        root_input.extend_from_slice(&expected_internal_hash);
-        let expected_root = sha512_256(&root_input);
-
-        assert_eq!(root, expected_root);
-    }
-
-    #[test]
-    fn test_internal_node_hash_caching() {
-        // After computing root_hash once, the internal node's hash should be cached.
-        let mut trie = MerkleTrie::new(4);
-
-        let elem_a = vec![0x01, 0x10, 0x00, 0x00];
-        let elem_b = vec![0x01, 0x20, 0x00, 0x00];
-
-        let leaf_a = trie.allocate_node(TrieNode::leaf(elem_a));
-        let leaf_b = trie.allocate_node(TrieNode::leaf(elem_b));
-
-        let internal = TrieNode::internal(
-            vec![0x01],
-            vec![
-                ChildEntry {
-                    hash_index: 0x10,
-                    child_id: leaf_a,
-                },
-                ChildEntry {
-                    hash_index: 0x20,
-                    child_id: leaf_b,
-                },
-            ],
-        );
-        let internal_id = trie.allocate_node(internal);
-        trie.set_root(Some(internal_id));
-
-        let hash1 = trie.root_hash();
-        // Internal node should now have cached hash.
-        assert!(trie.get_node(internal_id).unwrap().hash.is_some());
-
-        let hash2 = trie.root_hash();
-        assert_eq!(hash1, hash2);
-    }
-
-    #[test]
-    fn test_invalidate_clears_cache() {
-        let mut trie = MerkleTrie::new(4);
-
-        let elem = vec![0x01, 0x02, 0x03, 0x04];
-        let leaf_id = trie.allocate_node(TrieNode::leaf(elem));
-
-        let internal = TrieNode::internal(
-            vec![],
-            vec![ChildEntry {
-                hash_index: 0x01,
-                child_id: leaf_id,
-            }],
-        );
-        let internal_id = trie.allocate_node(internal);
-        trie.set_root(Some(internal_id));
-
-        // Compute hash so it gets cached.
-        let _ = trie.root_hash();
-        assert!(trie.get_node(internal_id).unwrap().hash.is_some());
-
-        // Invalidate and verify cache is cleared.
-        trie.get_node_mut(internal_id).unwrap().invalidate();
-        assert!(trie.get_node(internal_id).unwrap().hash.is_none());
-
-        // Leaf invalidate is a no-op (leaf hash is the element itself).
-        trie.get_node_mut(leaf_id).unwrap().invalidate();
-        assert!(trie.get_node(leaf_id).unwrap().hash.is_some());
-    }
-
-    // -----------------------------------------------------------------------
-    // Add / Delete / Contains tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_add_single_element_root_hash() {
-        let mut trie = MerkleTrie::new(4);
-        let elem = vec![0x10, 0x20, 0x30, 0x40];
         trie.add(&elem).unwrap();
-
         let root = trie.root_hash();
 
-        // Single leaf root hash = SHA512/256(0x00 || element)
         let mut input = vec![0x00];
         input.extend_from_slice(&elem);
-        let expected = sha512_256(&input);
-        assert_eq!(root, expected);
+        assert_eq!(root, sha512_256(&input));
     }
+
+    #[test]
+    fn test_single_leaf_root_via_manual_construction() {
+        // Same test, but constructing the leaf node by hand. Verifies the
+        // public TrieNode::leaf constructor and set_root paths.
+        let mut trie = MerkleTrie::new(36);
+        let mut elem = vec![0u8; 36];
+        elem[0] = 0xAB;
+        elem[35] = 0xCD;
+
+        let leaf_id = trie.allocate_node(TrieNode::leaf(elem.clone()));
+        trie.set_root(Some(leaf_id));
+
+        let mut input = vec![0x00];
+        input.extend_from_slice(&elem);
+        assert_eq!(trie.root_hash(), sha512_256(&input));
+    }
+
+    // -----------------------------------------------------------------------
+    // Two-element splits (verifies leaf-remainder + chain-ancestor structure)
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_add_two_elements_no_shared_prefix() {
+        // Two 4-byte elements with no shared prefix → root is a branch node
+        // at depth 0 with two leaves, each carrying 3-byte remainders.
         let mut trie = MerkleTrie::new(4);
-        let elem_a = vec![0x10, 0x00, 0x00, 0x00];
-        let elem_b = vec![0x20, 0x00, 0x00, 0x00];
+        let elem_a = vec![0x10, 0xAA, 0xBB, 0xCC];
+        let elem_b = vec![0x20, 0xDD, 0xEE, 0xFF];
         trie.add(&elem_a).unwrap();
         trie.add(&elem_b).unwrap();
 
-        // Root should be an internal node with empty path, two leaf children.
         assert!(trie.contains(&elem_a));
         assert!(trie.contains(&elem_b));
 
-        let root_id = trie.root_id().unwrap();
-        let root_node = trie.get_node(root_id).unwrap();
-        assert!(!root_node.is_leaf);
-        assert_eq!(root_node.path.len(), 0);
+        let root = trie.root_id().unwrap();
+        let root_node = trie.get_node(root).unwrap();
+        assert!(!root_node.is_leaf());
         assert_eq!(root_node.children.len(), 2);
+        assert!(root_node.children_mask.bit(0x10));
+        assert!(root_node.children_mask.bit(0x20));
+
+        // Path-from-root for the root branch is empty.
+        // (Field is overwritten by root_hash; check via a fresh compute path.)
+        // We verify the root hash matches the hand-computed value below.
+
+        // Manually compute expected.
+        //
+        // leaf A: hash = elem_a[1..] = [0xAA, 0xBB, 0xCC]
+        // leaf B: hash = elem_b[1..] = [0xDD, 0xEE, 0xFF]
+        //
+        // root_internal_hash = SHA512_256(
+        //   0x00 (path length = 0)
+        //   0x00 (leaf tag A) || 0x03 (len) || 0x10 (hash_index) || 0xAA 0xBB 0xCC
+        //   0x00 (leaf tag B) || 0x03 (len) || 0x20 (hash_index) || 0xDD 0xEE 0xFF
+        // )
+        let mut acc = vec![0x00];
+        acc.extend_from_slice(&[0x00, 0x03, 0x10, 0xAA, 0xBB, 0xCC]);
+        acc.extend_from_slice(&[0x00, 0x03, 0x20, 0xDD, 0xEE, 0xFF]);
+        let internal_hash = sha512_256(&acc);
+
+        let mut root_input = vec![0x01];
+        root_input.extend_from_slice(&internal_hash);
+        let expected_root = sha512_256(&root_input);
+
+        assert_eq!(trie.root_hash(), expected_root);
     }
 
     #[test]
-    fn test_add_two_elements_shared_prefix_splitting() {
+    fn test_add_two_elements_one_byte_shared_prefix() {
+        // [0x10, 0x20, 0xAA, 0xBB] and [0x10, 0x30, 0xCC, 0xDD]
+        // Shared prefix = 1 byte (0x10).
+        //
+        // Go materializes this as:
+        //   root: 1 ancestor with 1 child @ 0x10 → branch_at_depth_1
+        //   branch_at_depth_1: 2 children @ 0x20 (leaf A) and @ 0x30 (leaf B)
+        //   leaf A: hash = elem_a[2..] = [0xAA, 0xBB]
+        //   leaf B: hash = [0xCC, 0xDD]
+        //
+        // Path-from-root values:
+        //   root ancestor: path = []
+        //   branch_at_depth_1: path = [0x10]
         let mut trie = MerkleTrie::new(4);
         let elem_a = vec![0x10, 0x20, 0xAA, 0xBB];
         let elem_b = vec![0x10, 0x30, 0xCC, 0xDD];
@@ -1091,76 +1128,136 @@ mod tests {
         assert!(trie.contains(&elem_a));
         assert!(trie.contains(&elem_b));
 
-        // Root should be internal with path [0x10], two children at 0x20 and 0x30.
-        let root_id = trie.root_id().unwrap();
-        let root_node = trie.get_node(root_id).unwrap();
-        assert!(!root_node.is_leaf);
-        assert_eq!(root_node.path, vec![0x10]);
-        assert_eq!(root_node.children.len(), 2);
-        assert_eq!(root_node.children[0].hash_index, 0x20);
-        assert_eq!(root_node.children[1].hash_index, 0x30);
+        // Walk: root → child @ 0x10 → branch
+        let root = trie.root_id().unwrap();
+        let root_node = trie.get_node(root).unwrap();
+        assert!(!root_node.is_leaf());
+        assert_eq!(root_node.children.len(), 1);
+        assert_eq!(root_node.children[0].hash_index, 0x10);
+
+        let branch_id = root_node.children[0].child_id;
+        let branch = trie.get_node(branch_id).unwrap();
+        assert!(!branch.is_leaf());
+        assert_eq!(branch.children.len(), 2);
+        assert_eq!(branch.children[0].hash_index, 0x20);
+        assert_eq!(branch.children[1].hash_index, 0x30);
+
+        // Verify hash composition end-to-end.
+        // branch_hash = SHA512_256(
+        //   0x01 (path_len=1) || 0x10 (path)
+        //   0x00 || 0x02 || 0x20 || 0xAA 0xBB
+        //   0x00 || 0x02 || 0x30 || 0xCC 0xDD
+        // )
+        let mut branch_acc = vec![0x01, 0x10];
+        branch_acc.extend_from_slice(&[0x00, 0x02, 0x20, 0xAA, 0xBB]);
+        branch_acc.extend_from_slice(&[0x00, 0x02, 0x30, 0xCC, 0xDD]);
+        let branch_hash = sha512_256(&branch_acc);
+
+        // root_hash_internal = SHA512_256(
+        //   0x00 (path_len=0)
+        //   0x01 (internal tag) || 32 (len) || 0x10 (hash_index) || branch_hash
+        // )
+        let mut root_acc = vec![0x00];
+        root_acc.push(0x01);
+        root_acc.push(branch_hash.len() as u8);
+        root_acc.push(0x10);
+        root_acc.extend_from_slice(&branch_hash);
+        let root_internal = sha512_256(&root_acc);
+
+        let mut top = vec![0x01];
+        top.extend_from_slice(&root_internal);
+        let expected = sha512_256(&top);
+
+        assert_eq!(trie.root_hash(), expected);
     }
 
-    #[test]
-    fn test_add_three_delete_one_verify_hash() {
-        let mut trie = MerkleTrie::new(4);
-        let elem_a = vec![0x10, 0x00, 0x00, 0x00];
-        let elem_b = vec![0x20, 0x00, 0x00, 0x00];
-        let elem_c = vec![0x30, 0x00, 0x00, 0x00];
-        trie.add(&elem_a).unwrap();
-        trie.add(&elem_b).unwrap();
-        trie.add(&elem_c).unwrap();
-
-        // Build a reference trie with just A and C.
-        let mut ref_trie = MerkleTrie::new(4);
-        ref_trie.add(&elem_a).unwrap();
-        ref_trie.add(&elem_c).unwrap();
-
-        // Delete B from original.
-        trie.delete(&elem_b).unwrap();
-        assert!(!trie.contains(&elem_b));
-        assert!(trie.contains(&elem_a));
-        assert!(trie.contains(&elem_c));
-
-        assert_eq!(trie.root_hash(), ref_trie.root_hash());
-    }
+    // -----------------------------------------------------------------------
+    // Add / Delete / Contains
+    // -----------------------------------------------------------------------
 
     #[test]
-    fn test_delete_to_empty() {
+    fn test_add_then_contains() {
         let mut trie = MerkleTrie::new(4);
-        let elem = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let elem = vec![0x10, 0x20, 0x30, 0x40];
         trie.add(&elem).unwrap();
-        trie.delete(&elem).unwrap();
-
-        assert_eq!(trie.root_hash(), [0u8; 32]);
-        assert!(trie.root_id().is_none());
+        assert!(trie.contains(&elem));
+        assert!(!trie.contains(&[0x10, 0x20, 0x30, 0x41]));
     }
 
     #[test]
-    fn test_duplicate_add_returns_error() {
+    fn test_duplicate_add_returns_ok_false() {
+        // Go trie.go:155-158: silent no-op on duplicate.
         let mut trie = MerkleTrie::new(4);
         let elem = vec![0x01, 0x02, 0x03, 0x04];
-        trie.add(&elem).unwrap();
-        let result = trie.add(&elem);
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("duplicate"),
-            "error should mention duplicate"
-        );
+        assert!(trie.add(&elem).unwrap());
+        assert!(!trie.add(&elem).unwrap());
+        assert_eq!(trie.len(), 1);
     }
 
     #[test]
-    fn test_delete_nonexistent_returns_error() {
+    fn test_delete_nonexistent_returns_ok_false() {
+        // Go trie.go:185-188: silent no-op on missing.
         let mut trie = MerkleTrie::new(4);
         let elem_a = vec![0x01, 0x02, 0x03, 0x04];
         let elem_b = vec![0xFF, 0xFE, 0xFD, 0xFC];
         trie.add(&elem_a).unwrap();
-        let result = trie.delete(&elem_b);
-        assert!(result.is_err());
+        assert!(!trie.delete(&elem_b).unwrap());
 
-        // Also test deleting from empty trie.
-        let mut empty_trie = MerkleTrie::new(4);
-        assert!(empty_trie.delete(&elem_a).is_err());
+        // Same behavior from an empty trie.
+        let mut empty = MerkleTrie::new(4);
+        assert!(!empty.delete(&elem_a).unwrap());
+    }
+
+    #[test]
+    fn test_delete_single_to_empty() {
+        let mut trie = MerkleTrie::new(4);
+        let elem = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        trie.add(&elem).unwrap();
+        assert!(trie.delete(&elem).unwrap());
+        assert!(trie.is_empty());
+        assert_eq!(trie.root_hash(), [0u8; 32]);
+    }
+
+    #[test]
+    fn test_add_three_delete_one_round_trip_hash() {
+        // Insertion-order independent: build (A, B, C) and (A, C, B), delete
+        // both to (A, C), compare hashes.
+        let mut trie1 = MerkleTrie::new(4);
+        let mut trie2 = MerkleTrie::new(4);
+        let a = vec![0x10, 0x00, 0x00, 0x00];
+        let b = vec![0x20, 0x00, 0x00, 0x00];
+        let c = vec![0x30, 0x00, 0x00, 0x00];
+
+        trie1.add(&a).unwrap();
+        trie1.add(&b).unwrap();
+        trie1.add(&c).unwrap();
+        trie1.delete(&b).unwrap();
+
+        trie2.add(&a).unwrap();
+        trie2.add(&c).unwrap();
+
+        assert_eq!(trie1.root_hash(), trie2.root_hash());
+    }
+
+    #[test]
+    fn test_insertion_order_independence() {
+        let elems: Vec<Vec<u8>> = (0u8..16)
+            .map(|i| vec![i, i.wrapping_mul(3), i.wrapping_add(7), i ^ 0xAA])
+            .collect();
+
+        let mut t1 = MerkleTrie::new(4);
+        for e in &elems {
+            t1.add(e).unwrap();
+        }
+
+        let mut t2 = MerkleTrie::new(4);
+        // Insert in reverse order.
+        for e in elems.iter().rev() {
+            t2.add(e).unwrap();
+        }
+
+        assert_eq!(t1.root_hash(), t2.root_hash());
+        assert_eq!(t1.len(), t2.len());
     }
 
     #[test]
@@ -1168,20 +1265,24 @@ mod tests {
         let mut trie = MerkleTrie::new(4);
         let mut elements: Vec<Vec<u8>> = Vec::new();
         for i in 0u8..100 {
-            let elem = vec![i, i.wrapping_add(1), i.wrapping_add(2), i.wrapping_add(3)];
-            elements.push(elem);
+            elements.push(vec![
+                i,
+                i.wrapping_add(1),
+                i.wrapping_add(2),
+                i.wrapping_add(3),
+            ]);
         }
-        for elem in &elements {
-            trie.add(elem).unwrap();
+        for e in &elements {
+            trie.add(e).unwrap();
         }
-        for elem in &elements {
-            assert!(trie.contains(elem));
+        for e in &elements {
+            assert!(trie.contains(e));
         }
-        for elem in &elements {
-            trie.delete(elem).unwrap();
+        for e in &elements {
+            assert!(trie.delete(e).unwrap());
         }
+        assert!(trie.is_empty());
         assert_eq!(trie.root_hash(), [0u8; 32]);
-        assert!(trie.root_id().is_none());
     }
 
     #[test]
@@ -1189,145 +1290,54 @@ mod tests {
         let mut trie = MerkleTrie::new(4);
         let elem = vec![0x42, 0x43, 0x44, 0x45];
         trie.add(&elem).unwrap();
-        let hash1 = trie.root_hash();
-
+        let h1 = trie.root_hash();
         trie.delete(&elem).unwrap();
         assert_eq!(trie.root_hash(), [0u8; 32]);
-
         trie.add(&elem).unwrap();
-        let hash2 = trie.root_hash();
-
-        assert_eq!(hash1, hash2);
+        let h2 = trie.root_hash();
+        assert_eq!(h1, h2);
     }
 
     #[test]
-    fn test_hash_invalidation_on_add_delete() {
+    fn test_hash_changes_on_add_and_delete() {
         let mut trie = MerkleTrie::new(4);
-        let elem_a = vec![0x10, 0x00, 0x00, 0x00];
-        let elem_b = vec![0x20, 0x00, 0x00, 0x00];
+        let a = vec![0x10, 0x00, 0x00, 0x00];
+        let b = vec![0x20, 0x00, 0x00, 0x00];
 
-        trie.add(&elem_a).unwrap();
-        let hash_after_one = trie.root_hash();
+        trie.add(&a).unwrap();
+        let h_a = trie.root_hash();
 
-        trie.add(&elem_b).unwrap();
-        let hash_after_two = trie.root_hash();
-        assert_ne!(
-            hash_after_one, hash_after_two,
-            "hash should change after add"
-        );
+        trie.add(&b).unwrap();
+        let h_ab = trie.root_hash();
+        assert_ne!(h_a, h_ab);
 
-        trie.delete(&elem_b).unwrap();
-        let hash_after_delete = trie.root_hash();
-        assert_ne!(
-            hash_after_two, hash_after_delete,
-            "hash should change after delete"
-        );
-        assert_eq!(
-            hash_after_one, hash_after_delete,
-            "hash should match single-element state"
-        );
+        trie.delete(&b).unwrap();
+        let h_back = trie.root_hash();
+        assert_eq!(h_a, h_back);
     }
 
     // -----------------------------------------------------------------------
-    // Original Wave 1 tests
+    // Length-mismatch error path (kept from prior design)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_nested_internal_nodes() {
-        // Three elements: [0x10, 0x20, ...], [0x10, 0x30, ...], [0x20, ...]
-        // Structure:
-        //   root_internal(path=[], children=[
-        //     0x10 -> mid_internal(path=[], children=[
-        //       0x20 -> leaf_a,
-        //       0x30 -> leaf_b,
-        //     ]),
-        //     0x20 -> leaf_c,
-        //   ])
-        let mut trie = MerkleTrie::new(3);
+    fn test_add_wrong_length_errors() {
+        let mut trie = MerkleTrie::new(4);
+        trie.add(&[1, 2, 3, 4]).unwrap();
+        let err = trie.add(&[1, 2, 3]);
+        assert!(err.is_err());
+    }
 
-        let elem_a = vec![0x10, 0x20, 0xAA];
-        let elem_b = vec![0x10, 0x30, 0xBB];
-        let elem_c = vec![0x20, 0x40, 0xCC];
-
-        let leaf_a = trie.allocate_node(TrieNode::leaf(elem_a.clone()));
-        let leaf_b = trie.allocate_node(TrieNode::leaf(elem_b.clone()));
-        let leaf_c = trie.allocate_node(TrieNode::leaf(elem_c.clone()));
-
-        let mid = TrieNode::internal(
-            vec![],
-            vec![
-                ChildEntry {
-                    hash_index: 0x20,
-                    child_id: leaf_a,
-                },
-                ChildEntry {
-                    hash_index: 0x30,
-                    child_id: leaf_b,
-                },
-            ],
-        );
-        let mid_id = trie.allocate_node(mid);
-
-        let root_node = TrieNode::internal(
-            vec![],
-            vec![
-                ChildEntry {
-                    hash_index: 0x10,
-                    child_id: mid_id,
-                },
-                ChildEntry {
-                    hash_index: 0x20,
-                    child_id: leaf_c,
-                },
-            ],
-        );
-        let root_id = trie.allocate_node(root_node);
-        trie.set_root(Some(root_id));
-
-        let root = trie.root_hash();
-
-        // Manually compute: mid_hash first, then root_internal_hash, then root_hash.
-        // mid_hash = SHA512/256(0x00 || [children of mid])
-        let mut mid_input = vec![
-            0x00, // path length = 0
-            0x00, // leaf tag (child A)
-            elem_a.len() as u8,
-            0x20, // hash_index
-        ];
-        mid_input.extend_from_slice(&elem_a);
-        mid_input.extend_from_slice(&[
-            0x00, // leaf tag (child B)
-            elem_b.len() as u8,
-            0x30, // hash_index
-        ]);
-        mid_input.extend_from_slice(&elem_b);
-        let mid_hash = sha512_256(&mid_input);
-
-        // root_internal_hash
-        let mut root_internal_input = vec![
-            0x00,                 // path length = 0
-            0x01,                 // internal tag (child: mid)
-            mid_hash.len() as u8, // 32
-            0x10,                 // hash_index
-        ];
-        root_internal_input.extend_from_slice(&mid_hash);
-        // child: leaf_c
-        root_internal_input.push(0x00); // leaf tag
-        root_internal_input.push(elem_c.len() as u8);
-        root_internal_input.push(0x20); // hash_index
-        root_internal_input.extend_from_slice(&elem_c);
-        let root_internal_hash = sha512_256(&root_internal_input);
-
-        // root_hash = SHA512/256(0x01 || root_internal_hash)
-        let mut expected_input = vec![0x01];
-        expected_input.extend_from_slice(&root_internal_hash);
-        let expected = sha512_256(&expected_input);
-
-        assert_eq!(root, expected);
+    #[test]
+    fn test_delete_wrong_length_errors() {
+        let mut trie = MerkleTrie::new(4);
+        trie.add(&[1, 2, 3, 4]).unwrap();
+        let err = trie.delete(&[1, 2, 3]);
+        assert!(err.is_err());
     }
 
     // -----------------------------------------------------------------------
-    // Serialization / Deserialization / from_elements / len / is_empty tests
+    // len / is_empty
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1350,6 +1360,10 @@ mod tests {
         assert!(trie.is_empty());
         assert_eq!(trie.len(), 0);
     }
+
+    // -----------------------------------------------------------------------
+    // Serialize / Deserialize
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_serialize_deserialize_empty() {
@@ -1379,7 +1393,7 @@ mod tests {
     #[test]
     fn test_serialize_deserialize_multiple_elements() {
         let mut trie = MerkleTrie::new(4);
-        let elems = vec![
+        let elems: Vec<[u8; 4]> = vec![
             [0x10, 0x20, 0x30, 0x40],
             [0x50, 0x60, 0x70, 0x80],
             [0x10, 0x30, 0xAA, 0xBB],
@@ -1407,14 +1421,14 @@ mod tests {
         let data = trie.serialize();
         let err = MerkleTrie::deserialize(&data, 36);
         assert!(err.is_err());
-        assert!(err
-            .unwrap_err()
-            .to_string()
-            .contains("element_length mismatch"));
     }
 
+    // -----------------------------------------------------------------------
+    // from_elements
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_from_elements() {
+    fn test_from_elements_matches_incremental_add() {
         let elems: Vec<[u8; 36]> = (0..10u8)
             .map(|i| {
                 let mut e = [0u8; 36];
@@ -1424,24 +1438,21 @@ mod tests {
             })
             .collect();
 
-        // Build via from_elements.
-        let mut trie1 = MerkleTrie::from_elements(elems.iter().copied(), 36).unwrap();
+        let mut t1 = MerkleTrie::from_elements(elems.iter().copied(), 36).unwrap();
 
-        // Build via incremental add.
-        let mut trie2 = MerkleTrie::new(36);
+        let mut t2 = MerkleTrie::new(36);
         for e in &elems {
-            trie2.add(e).unwrap();
+            t2.add(e).unwrap();
         }
 
-        assert_eq!(trie1.root_hash(), trie2.root_hash());
-        assert_eq!(trie1.len(), trie2.len());
+        assert_eq!(t1.root_hash(), t2.root_hash());
+        assert_eq!(t1.len(), t2.len());
     }
 
     #[test]
     fn test_serialize_survives_mutations() {
-        // Serialize after some adds and deletes, then restore and verify.
         let mut trie = MerkleTrie::new(4);
-        let elems = vec![
+        let elems = [
             [0x10, 0x20, 0x30, 0x40],
             [0x50, 0x60, 0x70, 0x80],
             [0xAA, 0xBB, 0xCC, 0xDD],
@@ -1449,18 +1460,16 @@ mod tests {
         for e in &elems {
             trie.add(e).unwrap();
         }
-        trie.delete(&elems[1]).unwrap(); // remove middle element
-
+        trie.delete(&elems[1]).unwrap();
         let hash_before = trie.root_hash();
+
         let data = trie.serialize();
         let mut restored = MerkleTrie::deserialize(&data, 4).unwrap();
-
         assert_eq!(restored.root_hash(), hash_before);
         assert!(restored.contains(&elems[0]));
         assert!(!restored.contains(&elems[1]));
         assert!(restored.contains(&elems[2]));
 
-        // Can continue adding to the restored trie.
         restored.add(&elems[1]).unwrap();
         assert!(restored.contains(&elems[1]));
     }
