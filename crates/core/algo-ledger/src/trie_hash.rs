@@ -1,9 +1,33 @@
 //! V6 hash builders for Merkle trie elements.
 //!
 //! Each trie element is 36 bytes:
+//!
+//! ```text
 //!   bytes 0..4:   affinity (big-endian u32)
-//!   byte  4:      HashKind
+//!   byte  4:      HashKind (Account=0, Asset=1, App=2, Kv=3)
 //!   bytes 5..36:  SHA512/256(prehash)[1..32]  (bytes 1 through 31, dropping byte 0)
+//! ```
+//!
+//! This layout mirrors go-algorand v4.5.1-stable's three sibling builders in
+//! `ledger/store/trackerdb/hashing.go` byte-for-byte:
+//!
+//! - `AccountHashBuilderV6` (`hashing.go:64-78`)
+//! - `ResourcesHashBuilderV6` (`hashing.go:81-95`)
+//! - `KvHashBuilderV6` (`hashing.go:107-115`)
+//!
+//! All three delegate to `hashBufV6(affinity, kind)` (`hashing.go:117-128`)
+//! which writes the affinity + kind prefix, and `finishV6(hash, prehash)`
+//! (`hashing.go:130-135`) which composes the SHA512/256 tail. The Rust
+//! `finish_v6` helper below performs the identical composition; the three
+//! `*_hash_v6` builders mirror the prehash construction of their Go
+//! counterparts.
+//!
+//! Verdict: **MATCH** per PLAN-130 TASK-131 (see DOC-129 §5 Findings). The
+//! 36-byte layout is correct; no alignment work is needed. The
+//! `test_finish_v6_matches_go_captured_elements` test below (PLAN-130
+//! TASK-135) locks this in by asserting byte-exact equality against
+//! Go-captured element bytes for one fixture per HashKind. Capture tool:
+//! `tools/trie-element-capture`.
 
 use algo_types::{AccountData, Address};
 use sha2::{Digest, Sha512_256};
@@ -11,7 +35,42 @@ use sha2::{Digest, Sha512_256};
 use crate::sqlite::encode_account_data;
 
 /// Element size for the Merkle trie (36 bytes).
+///
+/// Matches `4 + crypto.DigestSize` in go-algorand
+/// `ledger/store/trackerdb/hashing.go:51, 73, 89, 110` (where
+/// `crypto.DigestSize = 32`).
 pub const ELEMENT_SIZE: usize = 36;
+
+/// Compose the final 36-byte element from `(affinity, kind, prehash)`.
+///
+/// Layout:
+///
+/// ```text
+///   element[0..4] = affinity.to_be_bytes()
+///   element[4]    = kind as u8
+///   element[5..36]= SHA512/256(prehash)[1..32]
+/// ```
+///
+/// This mirrors Go's two-step composition: `hashBufV6(affinity, kind)`
+/// produces the 36-byte buffer with bytes 0..5 populated and bytes 5..36
+/// zeroed, then `finishV6(buf, prehash)` overwrites bytes 5..36 with
+/// `crypto.Hash(prehash)[1:]`. The Rust implementation fuses both steps
+/// into a single function because the intermediate "partial buffer" has
+/// no other callers in this codebase.
+///
+/// Centralizing the assembly here also gives the TASK-135 fixture test a
+/// stable entry point for byte-exact comparison against Go.
+pub(crate) fn finish_v6(affinity: u32, kind: HashKind, prehash: &[u8]) -> [u8; ELEMENT_SIZE] {
+    let mut hasher = Sha512_256::new();
+    hasher.update(prehash);
+    let hash = hasher.finalize();
+
+    let mut element = [0u8; ELEMENT_SIZE];
+    element[0..4].copy_from_slice(&affinity.to_be_bytes());
+    element[4] = kind as u8;
+    element[5..36].copy_from_slice(&hash[1..32]);
+    element
+}
 
 /// Discriminant byte indicating the type of resource in the trie element.
 #[repr(u8)]
@@ -38,22 +97,14 @@ pub fn compute_affinity(account_data: &AccountData) -> u32 {
 
 /// Compute the 36-byte trie element for an account.
 ///
-/// Prehash layout: `address_bytes(32) || canonical_msgpack(account_data)`
+/// Prehash layout: `address_bytes(32) || canonical_msgpack(account_data)`.
+/// Mirrors `AccountHashBuilderV6` (`hashing.go:64-78`); see module docs.
 pub fn account_hash_v6(address: &Address, account_data: &AccountData) -> [u8; ELEMENT_SIZE] {
     let encoded = encode_account_data(account_data);
-
-    let mut hasher = Sha512_256::new();
-    hasher.update(address.0);
-    hasher.update(&encoded);
-    let hash = hasher.finalize();
-
-    let affinity = compute_affinity(account_data);
-    let mut element = [0u8; ELEMENT_SIZE];
-    element[0..4].copy_from_slice(&affinity.to_be_bytes());
-    element[4] = HashKind::Account as u8;
-    // Take bytes [1..32] of the hash (31 bytes), skipping byte 0.
-    element[5..36].copy_from_slice(&hash[1..32]);
-    element
+    let mut prehash = Vec::with_capacity(32 + encoded.len());
+    prehash.extend_from_slice(&address.0);
+    prehash.extend_from_slice(&encoded);
+    finish_v6(compute_affinity(account_data), HashKind::Account, &prehash)
 }
 
 /// Extract the affinity value from a raw msgpack-encoded data blob.
@@ -103,10 +154,12 @@ pub fn extract_raw_affinity(data: &[u8]) -> u32 {
 
 /// Compute the 36-byte trie element for a resource with an explicit HashKind.
 ///
-/// Prehash layout: `address_bytes(32) || creatable_index(8 bytes LE) || resource_blob`
+/// Prehash layout: `address_bytes(32) || creatable_index(8 bytes LE) || resource_blob`.
+/// Mirrors `ResourcesHashBuilderV6` (`hashing.go:81-95`); see module docs.
 ///
-/// The `resource_data` is the already-encoded msgpack blob (possibly merged holding + params).
-/// The `affinity` should come from the resource's own `UpdateRound` (codec key `"z"`).
+/// The `resource_data` is the already-encoded msgpack blob (possibly merged
+/// holding + params). The `affinity` should come from the resource's own
+/// `UpdateRound` (codec key `"z"`).
 pub fn resource_hash_v6_with_kind(
     address: &Address,
     creatable_index: u64,
@@ -114,36 +167,24 @@ pub fn resource_hash_v6_with_kind(
     affinity: u32,
     kind: HashKind,
 ) -> [u8; ELEMENT_SIZE] {
-    let mut hasher = Sha512_256::new();
-    hasher.update(address.0);
-    hasher.update(creatable_index.to_le_bytes());
-    hasher.update(resource_data);
-    let hash = hasher.finalize();
-
-    let mut element = [0u8; ELEMENT_SIZE];
-    element[0..4].copy_from_slice(&affinity.to_be_bytes());
-    element[4] = kind as u8;
-    element[5..36].copy_from_slice(&hash[1..32]);
-    element
+    let mut prehash = Vec::with_capacity(32 + 8 + resource_data.len());
+    prehash.extend_from_slice(&address.0);
+    prehash.extend_from_slice(&creatable_index.to_le_bytes());
+    prehash.extend_from_slice(resource_data);
+    finish_v6(affinity, kind, &prehash)
 }
 
 /// Compute the 36-byte trie element for a KV (box) entry.
 ///
-/// Matches go-algorand's `KvHashBuilderV6`: affinity is always 0,
-/// HashKind is `Kv` (3), prehash is `key_bytes || value_bytes`.
+/// Mirrors `KvHashBuilderV6` (`hashing.go:107-115`): affinity = 0, HashKind
+/// = `Kv` (3), prehash is `key_bytes || value_bytes`. See module docs.
 ///
 /// The `key` is the full kvstore key (e.g. `"bx:" + big-endian app_id + box_name`).
 pub fn kv_hash_v6(key: &[u8], value: &[u8]) -> [u8; ELEMENT_SIZE] {
-    let mut hasher = Sha512_256::new();
-    hasher.update(key);
-    hasher.update(value);
-    let hash = hasher.finalize();
-
-    let mut element = [0u8; ELEMENT_SIZE];
-    // affinity = 0 (bytes 0..4 are already zero)
-    element[4] = HashKind::Kv as u8;
-    element[5..36].copy_from_slice(&hash[1..32]);
-    element
+    let mut prehash = Vec::with_capacity(key.len() + value.len());
+    prehash.extend_from_slice(key);
+    prehash.extend_from_slice(value);
+    finish_v6(0, HashKind::Kv, &prehash)
 }
 
 #[cfg(test)]
@@ -159,6 +200,161 @@ mod tests {
         let mut out = [0u8; 32];
         out.copy_from_slice(&result);
         out
+    }
+
+    /// Regression test: assert basic layout invariants.
+    ///
+    /// `ELEMENT_SIZE` is part of the consensus-critical contract with
+    /// go-algorand's `AccountHashBuilderV6` / `ResourcesHashBuilderV6` /
+    /// `KvHashBuilderV6`. The byte at index 4 is the `HashKindEncodingIndex`
+    /// (see `ledger/store/trackerdb/hashing.go:47`), and that's where
+    /// `catchupaccessor.go:904` reads the kind to disambiguate hashed
+    /// resources. Pin these two invariants here so they can't drift
+    /// silently — alongside the byte-exact fixture test below which locks
+    /// the entire layout.
+    #[test]
+    fn test_element_layout_invariants() {
+        assert_eq!(
+            ELEMENT_SIZE, 36,
+            "ELEMENT_SIZE must remain 36 (4-byte affinity + 1-byte kind + 31-byte hash tail)"
+        );
+        assert_eq!(HashKind::Account as u8, 0);
+        assert_eq!(HashKind::Asset as u8, 1);
+        assert_eq!(HashKind::App as u8, 2);
+        assert_eq!(HashKind::Kv as u8, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Byte-exact fixture test (PLAN-130 TASK-135).
+    //
+    // Locks in the TASK-131 MATCH verdict (DOC-129 §5 Findings): given the
+    // same (affinity, kind, prehash), Rust's `finish_v6` produces exactly
+    // the same 36 bytes that go-algorand v4.5.1-stable's `finishV6` does
+    // (as invoked through the authoritative public builders
+    // `AccountHashBuilderV6` / `ResourcesHashBuilderV6` / `KvHashBuilderV6`).
+    //
+    // Fixtures are produced by `tools/trie-element-capture` — see that
+    // package's comment for the sibling-checkout setup required to
+    // regenerate.
+    // -----------------------------------------------------------------------
+
+    #[derive(serde::Deserialize)]
+    struct ElementFixture {
+        name: String,
+        affinity: u32,
+        kind: u8,
+        prehash_hex: String,
+        element_hex: String,
+    }
+
+    fn load_element_fixtures() -> Vec<ElementFixture> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("merkle_trie_elements")
+            .join("elements.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read fixture file {}: {e}", path.display()));
+        let fixtures: Vec<ElementFixture> = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("parse fixture file {}: {e}", path.display()));
+        assert!(
+            !fixtures.is_empty(),
+            "expected at least one captured Go element in {}",
+            path.display()
+        );
+        fixtures
+    }
+
+    fn hashkind_from_u8(name: &str, k: u8) -> HashKind {
+        match k {
+            0 => HashKind::Account,
+            1 => HashKind::Asset,
+            2 => HashKind::App,
+            3 => HashKind::Kv,
+            other => panic!("fixture {name}: unknown HashKind discriminant {other}"),
+        }
+    }
+
+    #[test]
+    fn test_finish_v6_matches_go_captured_elements() {
+        let fixtures = load_element_fixtures();
+
+        // Track results across all scenarios so the test report shows the
+        // full pass/fail picture rather than bailing at the first mismatch.
+        let mut report: Vec<(String, bool, [u8; ELEMENT_SIZE], [u8; ELEMENT_SIZE])> = Vec::new();
+
+        for fx in &fixtures {
+            let prehash = hex::decode(&fx.prehash_hex)
+                .unwrap_or_else(|e| panic!("fixture {}: decode prehash: {e}", fx.name));
+            let expected_vec = hex::decode(&fx.element_hex)
+                .unwrap_or_else(|e| panic!("fixture {}: decode element: {e}", fx.name));
+            assert_eq!(
+                expected_vec.len(),
+                ELEMENT_SIZE,
+                "fixture {}: expected element must be 36 bytes",
+                fx.name
+            );
+            let mut expected = [0u8; ELEMENT_SIZE];
+            expected.copy_from_slice(&expected_vec);
+
+            let kind = hashkind_from_u8(&fx.name, fx.kind);
+            let actual = finish_v6(fx.affinity, kind, &prehash);
+            report.push((fx.name.clone(), actual == expected, expected, actual));
+        }
+
+        let failures: Vec<&(String, bool, [u8; ELEMENT_SIZE], [u8; ELEMENT_SIZE])> =
+            report.iter().filter(|(_, ok, _, _)| !ok).collect();
+
+        if !failures.is_empty() {
+            let mut msg = String::from("\ntrie element bytes mismatch vs. go-algorand finishV6:\n");
+            for (name, _, expected, actual) in &failures {
+                msg.push_str(&format!(
+                    "  fixture {name}:\n    go-algorand expected: {}\n    rust actual:         {}\n",
+                    hex::encode(expected),
+                    hex::encode(actual),
+                ));
+            }
+            msg.push_str(&format!(
+                "\n{} of {} fixtures matched.\n",
+                report.len() - failures.len(),
+                report.len(),
+            ));
+            panic!("{msg}");
+        }
+    }
+
+    /// Independent layout cross-check: for one of the captured fixtures,
+    /// recompute the expected element via `sha512_256` + manual byte
+    /// assembly, and assert that BOTH `finish_v6` and the fixture agree.
+    /// This guards against the (unlikely but possible) scenario where
+    /// `finish_v6` and the fixture were both regenerated from a broken
+    /// algorithm — a manual recomputation here grounds the test in the
+    /// arithmetic of the spec rather than just the two implementations
+    /// agreeing with each other.
+    #[test]
+    fn test_finish_v6_layout_via_manual_recomputation() {
+        let fixtures = load_element_fixtures();
+        let kv = fixtures
+            .iter()
+            .find(|f| f.name == "kv-simple")
+            .expect("kv-simple fixture must be present");
+
+        let prehash = hex::decode(&kv.prehash_hex).unwrap();
+        let expected_full = hex::decode(&kv.element_hex).unwrap();
+
+        // Manual recomputation: affinity(0u32) || kind(0x03) || hash[1..32].
+        let hash = sha512_256(&prehash);
+        let mut manual = [0u8; ELEMENT_SIZE];
+        manual[0..4].copy_from_slice(&0u32.to_be_bytes());
+        manual[4] = HashKind::Kv as u8;
+        manual[5..36].copy_from_slice(&hash[1..32]);
+
+        assert_eq!(&manual[..], &expected_full[..], "manual layout mismatch");
+        assert_eq!(
+            finish_v6(0, HashKind::Kv, &prehash),
+            manual,
+            "finish_v6 output must equal manual layout recomputation"
+        );
     }
 
     #[test]
