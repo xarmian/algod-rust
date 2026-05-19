@@ -2698,7 +2698,25 @@ impl SqliteLedger {
             })?;
 
         let trie = match stored {
-            Some(data) => crate::merkle_trie::MerkleTrie::deserialize(&data, ELEMENT_SIZE)?,
+            Some(data) => {
+                // Pre-PLAN-130 trie blobs used a path-compressed node shape
+                // that's incompatible with the current 256-ary format
+                // (see merkle_trie.rs::TRIE_BLOB_VERSION). On version
+                // mismatch, fall back to a full rebuild rather than
+                // surfacing a load error — the rebuild path produces a
+                // valid trie from `accountbase` / `resources` / `kvstore`
+                // and the next `commit_block` re-persists the blob in the
+                // current format.
+                match crate::merkle_trie::MerkleTrie::deserialize(&data, ELEMENT_SIZE) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(
+                            "merkle_trie blob rejected ({e}); rebuilding from DB contents"
+                        );
+                        self.rebuild_trie_from_db()?
+                    }
+                }
+            }
             None => self.rebuild_trie_from_db()?,
         };
 
@@ -2897,8 +2915,11 @@ impl SqliteLedger {
         // Flush chain-level state to meta table.
         self.flush_chain_state()?;
 
-        // Persist the trie if enabled.
-        if let Some(ref trie) = self.trie {
+        // Persist the trie if enabled. `serialize` takes `&mut self` because
+        // it forces a hash recomputation when the trie is dirty (so the
+        // persisted blob always carries final SHA hashes, not transient
+        // path-from-root bytes — see merkle_trie.rs::serialize).
+        if let Some(ref mut trie) = self.trie {
             let data = trie.serialize();
             self.conn
                 .execute(

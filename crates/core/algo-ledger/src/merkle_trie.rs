@@ -29,6 +29,11 @@ use std::collections::HashMap;
 use algo_error::AlgoError;
 use sha2::{Digest, Sha512_256};
 
+/// Top-level blob version persisted in the `merkle_trie` SQL row. Bumped
+/// when the node-shape changes incompatibly. See `serialize` / `deserialize`
+/// for the version history.
+pub const TRIE_BLOB_VERSION: u64 = 2;
+
 // ---------------------------------------------------------------------------
 // Bitset — 256-bit child-presence mask. Mirrors go-algorand
 // `crypto/merkletrie/bitset.go:21-44`.
@@ -758,11 +763,42 @@ impl MerkleTrie {
     /// Serialize the trie to a compact msgpack representation for storage in
     /// the legacy single-blob `merkle_trie` SQL row.
     ///
-    /// Layout: map with keys `r` (root_id, Nil if empty), `n` (next_id),
-    /// `e` (element_length), `d` (nodes — map of `id -> node_map`).
-    /// Each node_map: `h` (hash bytes), `m` (children_mask as 4×u64 array),
-    /// `c` (children — array of `[hash_index, child_id]` pairs).
-    pub fn serialize(&self) -> Vec<u8> {
+    /// **This method takes `&mut self`** because every internal node's `hash`
+    /// field carries path-from-root bytes until `root_hash` (or this method)
+    /// recomputes it; serializing path bytes as if they were final hashes
+    /// would corrupt the blob. We force a recomputation here when `dirty` is
+    /// set so the blob always carries the final SHA hashes, and `deserialize`
+    /// can safely set `dirty = false`.
+    ///
+    /// Layout: map with keys `v` (format version, currently `2`), `r`
+    /// (root_id, Nil if empty), `n` (next_id), `e` (element_length), `d`
+    /// (nodes — map of `id -> node_map`). Each node_map: `h` (hash bytes),
+    /// `m` (children_mask as 4×u64 array), `c` (children — array of
+    /// `[hash_index, child_id]` pairs).
+    ///
+    /// Version history:
+    /// - `v=1` (implicit; pre-PLAN-130 path-compressed format) — used keys
+    ///   `p` (path), `l` (is_leaf), `h` (hash). Rejected by `deserialize`
+    ///   under the new format; affected databases must rebuild from
+    ///   `accountbase` / `resources` / `kvstore`.
+    /// - `v=2` (this format) — 256-ary, leaf-remainder storage, explicit
+    ///   bitset. Matches go-algorand `crypto/merkletrie` node structure
+    ///   byte-for-byte at the trie-shape level (the blob format itself is
+    ///   still Rust-internal; Go-format paged persistence lands in
+    ///   PLAN-130 TASK-136).
+    pub fn serialize(&mut self) -> Vec<u8> {
+        // Force a recomputation so internal-node `hash` fields hold SHA
+        // bytes, not path bytes. Without this, a dirty trie serialized
+        // mid-operation would persist path bytes as if they were hashes,
+        // and a subsequent deserialize+root_hash would yield an incorrect
+        // root.
+        if self.dirty {
+            if let Some(root_id) = self.root {
+                self.recompute_all_hashes(root_id);
+            }
+            self.dirty = false;
+        }
+
         let mut nodes_vec: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
         for (&id, node) in &self.nodes {
             let mut node_map: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
@@ -805,6 +841,10 @@ impl MerkleTrie {
         };
 
         let top = rmpv::Value::Map(vec![
+            (
+                rmpv::Value::String("v".into()),
+                rmpv::Value::from(TRIE_BLOB_VERSION),
+            ),
             (rmpv::Value::String("r".into()), root_val),
             (
                 rmpv::Value::String("n".into()),
@@ -823,6 +863,18 @@ impl MerkleTrie {
     }
 
     /// Inverse of `serialize`.
+    ///
+    /// Rejects blobs without a `v=2` top-level version key. Pre-PLAN-130
+    /// blobs (path-compressed format) did not carry a version field, so
+    /// this rejection cleanly forces a rebuild from `accountbase` /
+    /// `resources` / `kvstore` rather than silently misreading old `p`/`l`
+    /// fields as the new `h`/`m`/`c` shape (which would yield a
+    /// structurally-corrupt trie).
+    ///
+    /// Callers that catch this error (e.g. `SqliteLedger::load_trie`)
+    /// should fall back to `rebuild_trie_from_db` after a rejection. If
+    /// they don't, this error propagates and the caller fails loudly,
+    /// which is the desired outcome on schema mismatch.
     pub fn deserialize(data: &[u8], element_length: usize) -> Result<Self, AlgoError> {
         let val: rmpv::Value =
             rmpv::decode::read_value(&mut &data[..]).map_err(|e| AlgoError::Ledger {
@@ -838,13 +890,23 @@ impl MerkleTrie {
             }
         };
 
+        let mut version: Option<u64> = None;
         let mut root: Option<u64> = None;
         let mut next_id: u64 = 1;
         let mut stored_element_length: usize = element_length;
         let mut nodes = HashMap::new();
+        // Detect pre-PLAN-130 blobs by their telltale node-level keys.
+        // The old format used `p` (path) and `l` (is_leaf) per-node; the
+        // new format uses `h` / `m` / `c`. If we see either at the node
+        // level we know we're looking at the old shape regardless of the
+        // missing top-level `v`.
+        let mut saw_legacy_node_key = false;
 
         for (k, v) in map {
             match k.as_str().unwrap_or("") {
+                "v" => {
+                    version = v.as_u64();
+                }
                 "r" => {
                     root = v.as_u64();
                 }
@@ -860,12 +922,50 @@ impl MerkleTrie {
                             let id = nk.as_u64().ok_or_else(|| AlgoError::Ledger {
                                 message: "bad node id".into(),
                             })?;
+                            if let rmpv::Value::Map(ref node_map) = nv {
+                                for (nmk, _) in node_map {
+                                    match nmk.as_str().unwrap_or("") {
+                                        "p" | "l" => saw_legacy_node_key = true,
+                                        _ => {}
+                                    }
+                                }
+                            }
                             let node = Self::deserialize_node(nv)?;
                             nodes.insert(id, node);
                         }
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Reject pre-PLAN-130 blobs explicitly. They predate this format
+        // change and have an incompatible node shape (leaves stored full
+        // elements, not remainders; internals carried an explicit path
+        // field that this format folds into `hash`).
+        match version {
+            Some(v) if v == TRIE_BLOB_VERSION => { /* current format, accept */ }
+            Some(v) => {
+                return Err(AlgoError::Ledger {
+                    message: format!(
+                        "trie blob version mismatch: stored={v}, expected={TRIE_BLOB_VERSION}; \
+                         rebuild required (e.g. drop the merkle_trie row and re-run load_trie)"
+                    ),
+                });
+            }
+            None => {
+                if saw_legacy_node_key {
+                    return Err(AlgoError::Ledger {
+                        message: "pre-PLAN-130 trie blob detected (legacy `p`/`l` node keys); \
+                             rebuild required from accountbase/resources/kvstore"
+                            .into(),
+                    });
+                }
+                return Err(AlgoError::Ledger {
+                    message: "trie blob missing version field; rebuild required from \
+                         accountbase/resources/kvstore"
+                        .into(),
+                });
             }
         }
 
@@ -883,8 +983,9 @@ impl MerkleTrie {
             next_id,
             element_length,
             // After deserialize, every internal node's `hash` field already
-            // holds the SHA hash from before serialization, so `root_hash`
-            // can return without recomputation.
+            // holds the SHA hash from before serialization (we forced
+            // recomputation in `serialize`), so `root_hash` can return
+            // without recomputation.
             dirty: false,
         })
     }
@@ -1367,7 +1468,7 @@ mod tests {
 
     #[test]
     fn test_serialize_deserialize_empty() {
-        let trie = MerkleTrie::new(36);
+        let mut trie = MerkleTrie::new(36);
         let data = trie.serialize();
         let restored = MerkleTrie::deserialize(&data, 36).unwrap();
         assert!(restored.is_empty());
@@ -1417,10 +1518,84 @@ mod tests {
 
     #[test]
     fn test_serialize_deserialize_element_length_mismatch() {
-        let trie = MerkleTrie::new(4);
+        // Need at least one element so the serialized blob has a stored
+        // element_length to mismatch. Without `add`, the blob's stored
+        // element_length matches whatever `MerkleTrie::new(4)` set, which
+        // would defeat the check. Add a 4-byte element to lock the
+        // serialized element_length at 4.
+        let mut trie = MerkleTrie::new(4);
+        trie.add(&[1, 2, 3, 4]).unwrap();
         let data = trie.serialize();
         let err = MerkleTrie::deserialize(&data, 36);
-        assert!(err.is_err());
+        assert!(err.is_err(), "expected element_length mismatch error");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("element_length mismatch"),
+            "expected element_length mismatch, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_rejects_legacy_blob() {
+        // Synthesize a pre-PLAN-130 blob (legacy node keys `p`/`l`/`h` plus
+        // top-level `r`/`n`/`e`/`d` but no `v`). Should be rejected with a
+        // clear message.
+        use rmpv::Value;
+        let legacy_node = Value::Map(vec![
+            (Value::String("p".into()), Value::Binary(vec![])),
+            (Value::String("l".into()), Value::Boolean(true)),
+            (Value::String("h".into()), Value::Binary(vec![0u8; 4])),
+        ]);
+        let blob = Value::Map(vec![
+            (Value::String("r".into()), Value::from(1u64)),
+            (Value::String("n".into()), Value::from(2u64)),
+            (Value::String("e".into()), Value::from(4u64)),
+            (
+                Value::String("d".into()),
+                Value::Map(vec![(Value::from(1u64), legacy_node)]),
+            ),
+        ]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &blob).unwrap();
+
+        let err = MerkleTrie::deserialize(&bytes, 4);
+        assert!(err.is_err(), "legacy blob must be rejected");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("pre-PLAN-130") || msg.contains("legacy"),
+            "expected legacy-format rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_serialize_after_mutation_persists_correct_root() {
+        // Regression: serialize must force a hash recomputation, otherwise
+        // internal nodes' path-from-root bytes would be persisted as if
+        // they were SHA hashes, and a subsequent deserialize+root_hash
+        // would return the wrong root.
+        let mut trie = MerkleTrie::new(4);
+        trie.add(&[0x10, 0x20, 0xAA, 0xBB]).unwrap();
+        trie.add(&[0x10, 0x30, 0xCC, 0xDD]).unwrap();
+        // Note: we serialize WITHOUT calling root_hash first. This is the
+        // exact bug pattern Codex flagged.
+        let data = trie.serialize();
+        // After serialize the trie itself should report the same root as
+        // a fresh trie built the same way.
+        let mut fresh = MerkleTrie::new(4);
+        fresh.add(&[0x10, 0x20, 0xAA, 0xBB]).unwrap();
+        fresh.add(&[0x10, 0x30, 0xCC, 0xDD]).unwrap();
+        let expected = fresh.root_hash();
+
+        assert_eq!(trie.root_hash(), expected, "in-memory root must match");
+
+        // And the restored trie must also match — this is the test that
+        // would fail without the dirty-recomputation fix.
+        let mut restored = MerkleTrie::deserialize(&data, 4).unwrap();
+        assert_eq!(
+            restored.root_hash(),
+            expected,
+            "restored trie root must match — serialize must persist final hashes"
+        );
     }
 
     // -----------------------------------------------------------------------
