@@ -465,12 +465,22 @@ impl MerkleTrie {
     }
 
     /// Evict least-recently-used pages from memory back to the eviction
-    /// target. The root page is pinned. Caller must guarantee no dirty
-    /// pages remain (i.e. `commit` was called immediately before, or
-    /// `dirty == false`).
+    /// target. The root page is pinned.
     ///
-    /// Returns the number of pages evicted.
-    pub fn evict(&mut self) -> Result<usize, AlgoError> {
+    /// **`pub(crate)`** until lazy-load lands. See
+    /// [`crate::merkle_cache::MerkleTrieCache::evict`] for the rationale:
+    /// the current cache has no on-demand reload path, so any trie
+    /// operation that traverses to an evicted page will panic. Safe
+    /// usage is therefore restricted to `commit → evict → drop`
+    /// (memory reclamation before the trie is recycled). Tests and the
+    /// LRU plumbing live in-crate; external callers should not gate any
+    /// behavior on `evict` until lazy-load lands in a follow-up.
+    ///
+    /// Caller must guarantee no dirty pages remain (i.e. `commit` was
+    /// called immediately before, or `dirty == false`). Returns the
+    /// number of pages evicted.
+    #[allow(dead_code)] // exercised in #[cfg(test)] only until lazy-load lands
+    pub(crate) fn evict(&mut self) -> Result<usize, AlgoError> {
         if self.dirty {
             return Err(AlgoError::Ledger {
                 message: "MerkleTrie::evict called with dirty cache — commit first".into(),
@@ -1285,6 +1295,53 @@ mod tests {
         let mut restored = MerkleTrie::load(&committer).unwrap().unwrap();
         assert_eq!(restored.root_hash(), expected);
         assert_eq!(restored.len(), 2);
+    }
+
+    #[test]
+    fn test_in_place_mutation_via_get_mut_survives_round_trip() {
+        // Regression for Codex round-1 finding: get_node_mut on a
+        // previously-committed node must dirty the page so commit
+        // includes it in the write set. Without that fix, the in-memory
+        // mutation would be lost on reload because commit only wrote
+        // pages with newly-allocated nodes (`pending_created`).
+        //
+        // We mutate a LEAF's hash specifically: leaves are skipped by
+        // `recompute_all_hashes` (their hash IS the element bytes), so
+        // the mutation isn't overwritten by the commit-time recompute
+        // step. This isolates the cache's dirty-page tracking from
+        // the trie's recompute logic.
+        let committer = InMemoryPageCommitter::new();
+        let mut trie = MerkleTrie::new(4);
+        trie.add(&[0x10, 0x20, 0x30, 0x40]).unwrap();
+        trie.add(&[0x10, 0x21, 0x30, 0x40]).unwrap();
+        let _ = trie.root_hash();
+        trie.commit(&committer).unwrap();
+
+        // Find one of the leaves and mutate its hash via get_node_mut.
+        let root_id = trie.root_id().unwrap();
+        let leaf_id = find_a_leaf_descendant(&trie, root_id);
+        let mutated_marker = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        trie.get_node_mut(leaf_id).unwrap().hash = mutated_marker.clone();
+        trie.commit(&committer).unwrap();
+
+        // Reload from disk and check the mutation persisted.
+        let restored = MerkleTrie::load(&committer).unwrap().unwrap();
+        let got = restored.get_node(leaf_id).expect("leaf must still exist");
+        assert_eq!(
+            got.hash, mutated_marker,
+            "in-place mutation via get_node_mut must persist through commit + load"
+        );
+    }
+
+    /// Recursively find any leaf descendant of `node_id`. The trie's
+    /// leaf-storage invariants guarantee at least one exists below any
+    /// non-empty internal node.
+    fn find_a_leaf_descendant(trie: &MerkleTrie, node_id: u64) -> u64 {
+        let node = trie.get_node(node_id).expect("node in cache");
+        if node.is_leaf() {
+            return node_id;
+        }
+        find_a_leaf_descendant(trie, node.children[0].child_id)
     }
 
     #[test]

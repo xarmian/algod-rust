@@ -189,8 +189,17 @@ pub struct MerkleTrieCache {
     nodes_per_page: u64,
     /// IDs created since the last commit, regardless of page. Used to
     /// distinguish "the page contains a brand-new node we must store"
-    /// from "the page is in-memory but unchanged".
+    /// from "the page is in-memory but unchanged", AND to drive the
+    /// silent-delete fast-path in [`MerkleTrieCache::delete`] for nodes
+    /// that were never persisted.
     pending_created: HashSet<u64>,
+    /// Pages with at least one created OR mutated-in-place node since the
+    /// last commit. This is the commit write-set: a page is written iff
+    /// it appears here. Populated by `allocate` (newly-created nodes)
+    /// and `get_mut` (any in-place mutation of an already-cached node);
+    /// the latter is critical for `recompute_all_hashes` writing SHA
+    /// values back to pre-existing internal nodes via `get_mut`.
+    pending_dirty_pages: HashSet<u64>,
     /// Pages that had at least one node removed since the last commit.
     /// On commit, these become either DELETE rows (page is now empty)
     /// or UPDATE rows (page still has live nodes).
@@ -204,6 +213,10 @@ pub struct MerkleTrieCache {
     cached_node_count: usize,
     /// Eviction target. After commit, pages are evicted from the LRU
     /// back until `cached_node_count <= cached_node_count_target`.
+    /// Read by [`MerkleTrieCache::evict`], which is `pub(crate)` until
+    /// lazy-load lands; clippy flags this field as unused on lib-only
+    /// builds where evict is referenced only from `#[cfg(test)]`.
+    #[allow(dead_code)]
     cached_node_count_target: usize,
 }
 
@@ -227,6 +240,7 @@ impl MerkleTrieCache {
             last_committed_node_id: FIRST_NODE_ID,
             nodes_per_page: NODES_PER_PAGE,
             pending_created: HashSet::new(),
+            pending_dirty_pages: HashSet::new(),
             pending_deletion_pages: HashSet::new(),
             pages_priority: VecDeque::new(),
             pages_priority_set: HashSet::new(),
@@ -256,6 +270,7 @@ impl MerkleTrieCache {
         self.pages.entry(page).or_default().insert(id, node);
         self.cached_node_count += 1;
         self.pending_created.insert(id);
+        self.pending_dirty_pages.insert(page);
         self.prioritize_front(page);
         id
     }
@@ -297,13 +312,23 @@ impl MerkleTrieCache {
         self.pages.get(&self.page_of(id))?.get(&id)
     }
 
-    /// Borrow node `id` mutably. Marks the containing page as accessed
-    /// (LRU bump) but does not implicitly dirty it — the caller dirties
-    /// by mutating fields that affect the hash, and the trie-level
-    /// `dirty` flag tracks recompute-needed.
+    /// Borrow node `id` mutably. Marks the containing page as dirty —
+    /// any caller that holds a mutable borrow may modify fields that
+    /// participate in the persisted page bytes (notably `hash`, set by
+    /// `MerkleTrie::recompute_all_hashes` for previously-loaded internal
+    /// nodes), so the page must be included in the next commit's write
+    /// set. Conservative-dirty is the only safe default; we can't ask
+    /// the borrow what it intends to do.
+    ///
+    /// Returns `None` if the node is not in memory (lazy-load is not
+    /// implemented — the trie loads all pages eagerly in `load_all`).
     pub fn get_mut(&mut self, id: u64) -> Option<&mut TrieNode> {
         let page = self.page_of(id);
+        if !self.pages.contains_key(&page) || !self.pages[&page].contains_key(&id) {
+            return None;
+        }
         self.prioritize_front(page);
+        self.pending_dirty_pages.insert(page);
         self.pages.get_mut(&page)?.get_mut(&id)
     }
 
@@ -374,11 +399,28 @@ impl MerkleTrieCache {
     ///
     /// Returns the number of pages evicted.
     ///
-    /// Caller must guarantee no dirty pages remain (i.e. `commit` was
-    /// called immediately before, or the cache is read-only) — evicting
-    /// a dirty page would lose data. The wrapper [`MerkleTrie::evict`]
-    /// enforces this.
-    pub fn evict(&mut self, root_id: Option<u64>) -> usize {
+    /// ## Contract — lazy-load is NOT implemented
+    ///
+    /// After eviction, evicted pages live only on disk via the committer.
+    /// However, the current cache has no lazy-load path: subsequent
+    /// `get` / `get_mut` calls for evicted nodes return `None`, and the
+    /// trie's algorithm helpers ([`crate::merkle_trie::MerkleTrie::node_find`]
+    /// etc.) call `get_or_panic` which panics on miss. This means the
+    /// only safe usage is **commit → evict → drop** (or
+    /// **commit → evict → `MerkleTrie::load`** for a fresh trie).
+    /// Calling `add` / `delete` / `contains` between `evict` and
+    /// `load` will panic.
+    ///
+    /// This is therefore exposed as `pub(crate)`. The LRU bookkeeping
+    /// is wired so a future PR that adds lazy-load can flip eviction
+    /// back to a public API without restructuring the cache.
+    ///
+    /// Caller must also guarantee no dirty pages remain (i.e. `commit`
+    /// was called immediately before, or the cache is read-only) —
+    /// evicting a dirty page would lose data. The wrapper
+    /// [`crate::merkle_trie::MerkleTrie::evict`] enforces this.
+    #[allow(dead_code)] // exercised in #[cfg(test)] only until lazy-load lands
+    pub(crate) fn evict(&mut self, root_id: Option<u64>) -> usize {
         // Pin the root page at the front.
         if let Some(rid) = root_id {
             let root_page = self.page_of(rid);
@@ -424,14 +466,18 @@ impl MerkleTrieCache {
         let mut stats = CommitStats::default();
 
         // Partition pending pages into create / update / delete.
-        // - Pages that contain any pending_created node need to be written.
-        // - Pages in pending_deletion_pages either need DELETE (now empty)
-        //   or UPDATE (still has nodes).
-        let mut pages_to_write: HashSet<u64> = HashSet::new();
-        for &nid in &self.pending_created {
-            pages_to_write.insert(self.page_of(nid));
-        }
-        // Pages with deletions: write if they still have nodes, otherwise delete.
+        //
+        // The write set is the union of:
+        //
+        //   1. `pending_dirty_pages` — any page with a created OR mutated
+        //      node since the last commit (populated by `allocate` and
+        //      `get_mut`).
+        //   2. `pending_deletion_pages` for pages that STILL HAVE NODES
+        //      after the deletion (the page is mutated, not gone).
+        //
+        // Anything in `pending_deletion_pages` whose in-memory page map
+        // is empty is a true DELETE (the row goes away).
+        let mut pages_to_write: HashSet<u64> = self.pending_dirty_pages.clone();
         let mut pages_to_delete: HashSet<u64> = HashSet::new();
         for &page in &self.pending_deletion_pages {
             match self.pages.get(&page) {
@@ -483,6 +529,7 @@ impl MerkleTrieCache {
 
         // Reset dirty tracking.
         self.pending_created.clear();
+        self.pending_dirty_pages.clear();
         self.pending_deletion_pages.clear();
         self.last_committed_node_id = self.next_node_id;
 
