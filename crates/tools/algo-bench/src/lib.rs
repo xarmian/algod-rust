@@ -4,6 +4,7 @@
 pub mod metrics;
 pub mod output;
 pub mod table;
+pub mod trie_replay;
 
 // Re-export key types for convenience.
 pub use metrics::{BenchMetrics, MetricsCollector};

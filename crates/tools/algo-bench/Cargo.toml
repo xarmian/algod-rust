@@ -8,6 +8,23 @@ rust-version.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sysinfo.workspace = true
+sha2.workspace = true
+hex.workspace = true
+algo-ledger.workspace = true
+algo-error.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+# The trie_replay bench harness uses `harness = false` so it can drive its
+# own measurement loop (per-iter `Instant` sampling → median/p99/total) and
+# emit the structured JSON consumed by `trie_bench_compare`. The Go
+# counterpart in `tools/go-trie-replay-bench/` mirrors this measurement
+# protocol so the per-phase JSON files are directly comparable.
+[[bench]]
+name = "trie_replay"
+harness = false
+
+[[bin]]
+name = "trie_bench_compare"
+path = "src/bin/trie_bench_compare.rs"

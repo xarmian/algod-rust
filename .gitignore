@@ -1,5 +1,9 @@
 /target/
+**/target/
 .claude/
+# Bench output JSON — produced by `trie_replay` and `go-trie-replay-bench`.
+bench-results/
+**/bench-results/
 /fixtures/
 reports/
 docker/data/
