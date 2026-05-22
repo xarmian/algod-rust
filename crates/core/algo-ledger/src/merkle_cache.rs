@@ -69,6 +69,20 @@ pub const FIRST_NODE_ID: u64 = 0x4160;
 /// `TrieCachedNodesCount = 9000`.
 pub const DEFAULT_CACHED_NODES_TARGET: usize = 9000;
 
+/// Default target fill factor for committed pages. Matches go-algorand's
+/// `MemoryConfig.PageFillFactor` at
+/// `ledger/store/trackerdb/catchpoint.go:35`. PLAN-144 TASK-148: the
+/// `reallocate_pending_pages` heuristic repacks any newly-created page
+/// whose fill factor falls below this threshold onto fresh tail pages.
+pub const DEFAULT_PAGE_FILL_FACTOR: f32 = 0.95;
+
+/// Default upper bound on the number of distinct child pages a single
+/// internal node may reference before its children are relocated onto a
+/// single fresh page. Matches go-algorand's
+/// `MemoryConfig.MaxChildrenPagesThreshold` at
+/// `ledger/store/trackerdb/catchpoint.go:37`.
+pub const DEFAULT_MAX_CHILDREN_PAGES_THRESHOLD: u64 = 64;
+
 /// Version word for the trie-root metadata page (page 0). Matches Go's
 /// `merkleTreeVersion = 0x1000000010000000` at
 /// `crypto/merkletrie/trie.go:29` — note that this is the same value as
@@ -192,6 +206,16 @@ pub struct CommitStats {
     pub deleted_page_count: usize,
     pub new_node_count: usize,
     pub updated_node_count: usize,
+    /// Nodes whose children were relocated to a single page because the
+    /// fanout (unique child page count) exceeded
+    /// `max_children_pages_threshold`. PLAN-144 TASK-148; mirrors Go's
+    /// `CommitStats.FanoutReallocatedNodeCount`.
+    pub fanout_reallocated_node_count: usize,
+    /// Nodes relocated by the per-page fill-factor pass — pages whose
+    /// fill factor fell below `target_page_fill_factor` had every node
+    /// moved onto fresh tail pages. Mirrors Go's
+    /// `CommitStats.PackingReallocatedNodeCount`.
+    pub packing_reallocated_node_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +287,16 @@ pub struct MerkleTrieCache {
     ///
     /// No `Send` bound — see module docs.
     lazy_loader: Option<Box<dyn PageCommitter + Send>>,
+    /// Target fill factor for committed pages. The
+    /// `reallocate_pending_pages` pass (called by `commit`) repacks any
+    /// newly-created page whose fill factor falls below this value.
+    /// PLAN-144 TASK-148; mirrors Go's `MemoryConfig.PageFillFactor`.
+    target_page_fill_factor: f32,
+    /// Maximum number of distinct child pages a single internal node
+    /// may reference before its children are relocated onto a fresh
+    /// page. PLAN-144 TASK-148; mirrors Go's
+    /// `MemoryConfig.MaxChildrenPagesThreshold`.
+    max_children_pages_threshold: u64,
 }
 
 impl std::fmt::Debug for MerkleTrieCache {
@@ -312,6 +346,8 @@ impl MerkleTrieCache {
             cached_node_count: 0,
             cached_node_count_target: target,
             lazy_loader: None,
+            target_page_fill_factor: DEFAULT_PAGE_FILL_FACTOR,
+            max_children_pages_threshold: DEFAULT_MAX_CHILDREN_PAGES_THRESHOLD,
         }
     }
 
@@ -596,73 +632,59 @@ impl MerkleTrieCache {
     /// (`trie.go:224-231`).
     pub fn commit<C: PageCommitter>(
         &mut self,
-        root_id: Option<u64>,
+        root_id: &mut Option<u64>,
         element_length: usize,
         committer: &C,
     ) -> Result<CommitStats, AlgoError> {
+        // PLAN-144 TASK-148: full port of go-algorand's
+        // `reallocatePendingPages` (cache.go:425-530) + helpers. The
+        // trie has already recomputed hashes via `recompute_all_hashes`
+        // before this call, so the reallocation pass below only
+        // restructures page layout — child IDs change, hashes do not.
         let mut stats = CommitStats::default();
+        let (pages_to_create, pages_to_delete, pages_to_update) =
+            self.reallocate_pending_pages(root_id, &mut stats);
 
-        // Partition pending pages into create / update / delete.
-        //
-        // The write set is the union of:
-        //
-        //   1. `pending_dirty_pages` — any page with a created OR mutated
-        //      node since the last commit (populated by `allocate` and
-        //      `get_mut`).
-        //   2. `pending_deletion_pages` for pages that STILL HAVE NODES
-        //      after the deletion (the page is mutated, not gone).
-        //
-        // Anything in `pending_deletion_pages` whose in-memory page map
-        // is empty is a true DELETE (the row goes away).
-        let mut pages_to_write: HashSet<u64> = self.pending_dirty_pages.clone();
-        let mut pages_to_delete: HashSet<u64> = HashSet::new();
-        for &page in &self.pending_deletion_pages {
-            match self.pages.get(&page) {
-                Some(p) if !p.is_empty() => {
-                    pages_to_write.insert(page);
-                }
-                _ => {
-                    pages_to_delete.insert(page);
-                }
-            }
-        }
-
-        // Write pages.
-        for &page in &pages_to_write {
-            let Some(nodes) = self.pages.get(&page) else {
-                continue;
+        // Write created + updated pages.
+        let mut write_page = |page_id: u64, is_create: bool| -> Result<(), AlgoError> {
+            let nodes = match self.pages.get(&page_id) {
+                Some(p) if !p.is_empty() => p,
+                _ => return Ok(()),
             };
             let mut wire = Page::new();
+            let node_count = nodes.len();
             for (&nid, node) in nodes {
                 wire.nodes.insert(nid, trie_node_to_page_node(node));
             }
             let bytes = wire.serialize();
-            committer.store_page(page, &bytes)?;
-
-            // Statistics: a page is "new" iff all of its nodes were
-            // created since the last commit (i.e. their ids exceed
-            // last_committed_node_id-derived threshold).
-            let first_id_on_page = page * self.nodes_per_page;
-            if first_id_on_page >= self.last_committed_node_id {
+            committer.store_page(page_id, &bytes)?;
+            if is_create {
                 stats.new_page_count += 1;
-                stats.new_node_count += nodes.len();
+                stats.new_node_count += node_count;
             } else {
                 stats.updated_page_count += 1;
-                stats.updated_node_count += nodes.len();
+                stats.updated_node_count += node_count;
             }
+            Ok(())
+        };
+        for &page in &pages_to_create {
+            write_page(page, true)?;
+        }
+        for &page in &pages_to_update {
+            write_page(page, false)?;
         }
 
-        // Delete pages.
+        // Delete pages — empty store_page payload signals delete.
         for &page in &pages_to_delete {
             committer.store_page(page, &[])?;
-            // Drop from in-memory state too — the page is gone.
             self.pages.remove(&page);
             self.remove_from_priority(page);
             stats.deleted_page_count += 1;
         }
 
-        // Write root-metadata page (page 0).
-        self.write_metadata_page(root_id, element_length, committer)?;
+        // Write root-metadata page (page 0). `*root_id` reflects any
+        // root relocation performed by `reallocate_pending_pages`.
+        self.write_metadata_page(*root_id, element_length, committer)?;
 
         // Reset dirty tracking.
         self.pending_created.clear();
@@ -671,6 +693,419 @@ impl MerkleTrieCache {
         self.last_committed_node_id = self.next_node_id;
 
         Ok(stats)
+    }
+
+    // -----------------------------------------------------------------------
+    // PLAN-144 TASK-148: page-packing heuristic.
+    //
+    // Mirrors go-algorand's `crypto/merkletrie/cache.go::reallocatePendingPages`
+    // (cache.go:425-530) and its helpers `calculatePageHashes`,
+    // `getPageFillFactor`, `reallocatePage`, `reallocateNode`. The Rust
+    // version is split into two passes the way Go's combined function
+    // operates internally:
+    //
+    //   Pass A — fanout-driven child relocation.
+    //     For each newly-created page in ascending order, walk its
+    //     pending-created nodes in id-ascending order; for any internal
+    //     node whose fanout (unique child page count) exceeds
+    //     `max_children_pages_threshold`, relocate every child onto a
+    //     single fresh tail page. (Hashes do NOT need re-computation —
+    //     the parent's hash is over child *hashes*, not child IDs.)
+    //
+    //   Pass B — per-page fill-factor repack.
+    //     For each newly-created page whose fill factor is below
+    //     `target_page_fill_factor`, relocate every node on the page
+    //     onto fresh tail pages. Old→new IDs are recorded in
+    //     `reallocation_map`; parents have their child IDs remapped at
+    //     the end of the pass.
+    //
+    // The caller (`commit`) writes the (pagesToCreate, pagesToDelete,
+    // pagesToUpdate) triplet returned here through the committer.
+    // -----------------------------------------------------------------------
+
+    /// See module-level comment above. Mutates `root_id` if the root
+    /// node itself was relocated. Updates `self.pages`,
+    /// `self.next_node_id`, `self.pending_deletion_pages` as a side
+    /// effect; the returned page sets reference the post-reallocation
+    /// page IDs.
+    fn reallocate_pending_pages(
+        &mut self,
+        root_id: &mut Option<u64>,
+        stats: &mut CommitStats,
+    ) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
+        // newPageThreshold: pages with id >= this are "new" (created
+        // since the last commit). Mirrors cache.go:430-433.
+        let nodes_per_page = self.nodes_per_page;
+        let mut new_page_threshold = self.last_committed_node_id / nodes_per_page;
+        if self.last_committed_node_id % nodes_per_page > 0 {
+            new_page_threshold += 1;
+        }
+
+        // Collect pages with at least one pending-created node.
+        let mut created_pages: HashSet<u64> = HashSet::new();
+        for &nid in &self.pending_created {
+            created_pages.insert(nid / nodes_per_page);
+        }
+        let mut sorted_created: Vec<u64> = created_pages.iter().copied().collect();
+        sorted_created.sort_unstable();
+
+        // Advance next_node_id to the start of the next page so every
+        // relocated node lands on a fresh tail page. Mirrors cache.go:452-453.
+        self.next_node_id = self.next_node_id.div_ceil(nodes_per_page) * nodes_per_page;
+        let reallocated_base_page = self.next_node_id / nodes_per_page;
+
+        // Track pages created via relocation so the children-remap pass
+        // touches them. Go uses `mtc.reallocatedPages` for this AND for
+        // backing the page-map pointer; in Rust the page map lives in
+        // `self.pages` and `reallocated_pages` is just the id set.
+        let mut reallocated_pages: HashSet<u64> = HashSet::new();
+
+        // Pass A — fanout-relocate-children on dirty internal nodes.
+        // Mirrors `calculatePageHashes`'s fanout block (cache.go:550-564),
+        // minus the hash computation (already done by the trie).
+        for &page in &sorted_created {
+            let is_new_page = page >= new_page_threshold;
+            self.fanout_relocate_children_on_page(page, is_new_page, &mut reallocated_pages, stats);
+        }
+
+        // Pass B — per-page fill-factor repack.
+        // Mirrors cache.go:469-484.
+        let mut reallocation_map: HashMap<u64, u64> = HashMap::new();
+        let mut pages_to_create: Vec<u64> = Vec::new();
+        // Track which entries from `created_pages` survive the repack
+        // (didn't get fully relocated away). Mirrors Go's
+        // `createdPages` map mutation.
+        let mut surviving_created: HashSet<u64> = sorted_created.iter().copied().collect();
+        for &page in &sorted_created {
+            if page < new_page_threshold {
+                // Old page — fanout pass may have mutated it, but
+                // repacking old pages is unnecessary (they were already
+                // committed at their current layout).
+                continue;
+            }
+            if self.get_page_fill_factor(page) >= self.target_page_fill_factor {
+                if self.pages.get(&page).is_some_and(|m| !m.is_empty()) {
+                    pages_to_create.push(page);
+                }
+                continue;
+            }
+            let count = self.reallocate_page(page, &mut reallocation_map, &mut reallocated_pages);
+            stats.packing_reallocated_node_count += count;
+            surviving_created.remove(&page);
+        }
+
+        // Remap child IDs across all surviving created pages AND
+        // reallocated tail pages. Go folds this with `maps.Copy` then a
+        // single iteration; we iterate the union directly.
+        let pages_to_remap: HashSet<u64> = surviving_created
+            .union(&reallocated_pages)
+            .copied()
+            .collect();
+        for &p in &pages_to_remap {
+            let node_ids: Vec<u64> = self
+                .pages
+                .get(&p)
+                .map(|m| m.keys().copied().collect())
+                .unwrap_or_default();
+            for nid in node_ids {
+                if let Some(node) = self.pages.get_mut(&p).and_then(|m| m.get_mut(&nid)) {
+                    // Mirrors node.remapChildren (node.go:393-403): chase
+                    // chains and delete-on-use so repeat lookups don't
+                    // re-apply.
+                    for child in node.children.iter_mut() {
+                        while let Some(&new_id) = reallocation_map.get(&child.child_id) {
+                            child.child_id = new_id;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Root relocation. Mirrors cache.go:494-497.
+        if let Some(rid) = *root_id {
+            if let Some(&new_root) = reallocation_map.get(&rid) {
+                *root_id = Some(new_root);
+                reallocation_map.remove(&rid);
+            }
+        }
+
+        // toRemovePages = pendingDeletionPages, plus mark the FIRST
+        // created page as a removal candidate (it may have been emptied
+        // by fanout / repack). Then walk and demote anything still
+        // holding nodes back into the update set. Mirrors cache.go:500-527.
+        let mut to_remove: HashSet<u64> = self.pending_deletion_pages.iter().copied().collect();
+        if let Some(&first) = sorted_created.first() {
+            if self.pages.contains_key(&first) {
+                to_remove.insert(first);
+            }
+        }
+
+        // Continue picking up reallocated tail pages into pages_to_create
+        // (in ascending order from reallocated_base_page).
+        let mut p = reallocated_base_page;
+        loop {
+            match self.pages.get(&p) {
+                Some(m) if !m.is_empty() => {
+                    if reallocated_pages.contains(&p) {
+                        pages_to_create.push(p);
+                    }
+                    p += 1;
+                }
+                _ => break,
+            }
+        }
+
+        // Partition to_remove into true deletes vs. updates (page still
+        // has nodes → demote to update).
+        let mut pages_to_delete: Vec<u64> = Vec::new();
+        let mut pages_to_update: Vec<u64> = Vec::new();
+        for &page in &to_remove {
+            match self.pages.get(&page) {
+                Some(m) if !m.is_empty() => pages_to_update.push(page),
+                _ => pages_to_delete.push(page),
+            }
+        }
+
+        // Catch mutations to previously-committed nodes (via
+        // `get_mut`) that weren't already covered by the
+        // pending_created path. Production add/delete always CoW so
+        // this set is normally empty, but `get_node_mut` is a public
+        // escape hatch (used by tests + the trie's
+        // `recompute_all_hashes` for re-hashing internal nodes after
+        // structural changes), so we must persist any page it touched.
+        let handled: HashSet<u64> = pages_to_create
+            .iter()
+            .copied()
+            .chain(pages_to_delete.iter().copied())
+            .chain(pages_to_update.iter().copied())
+            .chain(reallocated_pages.iter().copied())
+            .chain(sorted_created.iter().copied())
+            .collect();
+        for &page in &self.pending_dirty_pages {
+            if !handled.contains(&page) && self.pages.get(&page).is_some_and(|m| !m.is_empty()) {
+                pages_to_update.push(page);
+            }
+        }
+
+        // Stable ordering for deterministic commit output (helps the
+        // page-count test be reproducible across runs).
+        pages_to_create.sort_unstable();
+        pages_to_create.dedup();
+        pages_to_delete.sort_unstable();
+        pages_to_delete.dedup();
+        pages_to_update.sort_unstable();
+        pages_to_update.dedup();
+
+        (pages_to_create, pages_to_delete, pages_to_update)
+    }
+
+    /// Per-page fanout check + child relocation. Mirrors the fanout
+    /// block of `calculatePageHashes` (cache.go:550-564). Walks nodes
+    /// on `page` in id-ascending order; for any internal node whose
+    /// unique child page count exceeds the threshold, relocate every
+    /// child onto a single fresh tail page (possibly bumping
+    /// `next_node_id` to a page boundary first).
+    fn fanout_relocate_children_on_page(
+        &mut self,
+        page: u64,
+        is_new_page: bool,
+        reallocated_pages: &mut HashSet<u64>,
+        stats: &mut CommitStats,
+    ) {
+        // Collect node ids on the page in ascending order.
+        let mut node_ids: Vec<u64> = self
+            .pages
+            .get(&page)
+            .map(|m| m.keys().copied().collect())
+            .unwrap_or_default();
+        node_ids.sort_unstable();
+
+        for nid in node_ids {
+            if !is_new_page && !self.pending_created.contains(&nid) {
+                continue;
+            }
+            // Read child count + unique-page count from a borrow that
+            // ends before we mutate.
+            let (child_count, unique_pages, child_ids) = {
+                let Some(node) = self.pages.get(&page).and_then(|m| m.get(&nid)) else {
+                    continue;
+                };
+                if node.is_leaf() {
+                    continue;
+                }
+                let cc = node.children.len() as u64;
+                let mut up: HashSet<u64> = HashSet::with_capacity(node.children.len());
+                let mut cids = Vec::with_capacity(node.children.len());
+                for c in &node.children {
+                    up.insert(c.child_id / self.nodes_per_page);
+                    cids.push(c.child_id);
+                }
+                (cc, up.len() as u64, cids)
+            };
+
+            if child_count <= self.max_children_pages_threshold
+                || unique_pages <= self.max_children_pages_threshold
+            {
+                continue;
+            }
+
+            // Optionally bump next_node_id to a fresh page so all
+            // relocated children land on the same page. Mirrors
+            // cache.go:556-560: only bump if (a) the children fit on a
+            // single page and (b) the current next page is at/over the
+            // target fill factor.
+            if child_count < self.nodes_per_page
+                && self.get_page_fill_factor(self.next_node_id / self.nodes_per_page)
+                    > self.target_page_fill_factor
+            {
+                self.next_node_id =
+                    (1 + self.next_node_id / self.nodes_per_page) * self.nodes_per_page;
+            }
+
+            // Relocate every child via `reallocate_node`. Mirrors
+            // node.reallocateChildren (node.go:383-387).
+            let mut new_child_ids = Vec::with_capacity(child_ids.len());
+            for cid in &child_ids {
+                new_child_ids.push(self.reallocate_node(*cid, reallocated_pages));
+            }
+
+            // Write the new ids back into the parent node.
+            if let Some(node) = self.pages.get_mut(&page).and_then(|m| m.get_mut(&nid)) {
+                for (i, new_cid) in new_child_ids.into_iter().enumerate() {
+                    node.children[i].child_id = new_cid;
+                }
+            }
+            stats.fanout_reallocated_node_count += 1;
+        }
+    }
+
+    /// Per-page fill factor: `live_nodes / nodes_per_page`. Returns 0.0
+    /// when the page is not in memory. Mirrors `getPageFillFactor`
+    /// (cache.go:570-575).
+    fn get_page_fill_factor(&self, page: u64) -> f32 {
+        match self.pages.get(&page) {
+            Some(m) => (m.len() as f32) / (self.nodes_per_page as f32),
+            None => 0.0,
+        }
+    }
+
+    /// Bulk-relocate every node on `page` onto fresh tail pages
+    /// starting at `next_node_id`. Records old→new IDs in
+    /// `reallocation_map`. Returns the number of nodes moved. Mirrors
+    /// `reallocatePage` (cache.go:577-622).
+    fn reallocate_page(
+        &mut self,
+        page: u64,
+        reallocation_map: &mut HashMap<u64, u64>,
+        reallocated_pages: &mut HashSet<u64>,
+    ) -> usize {
+        let next_id_start = self.next_node_id;
+        let count = self.pages.get(&page).map(|m| m.len()).unwrap_or(0);
+        if count == 0 {
+            self.pages.remove(&page);
+            reallocated_pages.remove(&page);
+            self.remove_from_priority(page);
+            return 0;
+        }
+
+        // Decide whether the new id range will write into an already-
+        // occupied page. Mirrors cache.go:589-598's nextPage-vs-lastPage
+        // logic — if the leading page collides AND the trailing page
+        // does not, jump to the trailing page; if both collide, use a
+        // sentinel ("skip page allocation") and rely on per-id
+        // insertion below.
+        //
+        // Implementation note: we ALWAYS insert nodes into
+        // `self.pages.entry(cur_page).or_default()` per id (the loop
+        // below), so the up-front page allocation is purely for the LRU
+        // bookkeeping / reallocated_pages tracking. The skip-sentinel
+        // ('SKIP') path means we'll just let the per-id loop allocate
+        // pages lazily without an explicit empty entry.
+        let mut next_page = next_id_start / self.nodes_per_page;
+        let mut skip_explicit_alloc = false;
+        if self.pages.contains_key(&next_page) {
+            let last_id = next_id_start + count as u64 - 1;
+            let last_page = last_id / self.nodes_per_page;
+            if !self.pages.contains_key(&last_page) {
+                next_page = last_page;
+            } else {
+                skip_explicit_alloc = true;
+            }
+        }
+        if !skip_explicit_alloc {
+            self.pages.entry(next_page).or_default();
+            reallocated_pages.insert(next_page);
+            self.prioritize_front(next_page);
+        }
+
+        // Drain nodes off the old page in id-ascending order so the
+        // new id stream is deterministic.
+        let mut old_nodes: Vec<(u64, TrieNode)> = self
+            .pages
+            .remove(&page)
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default();
+        old_nodes.sort_by_key(|(id, _)| *id);
+        self.next_node_id += count as u64;
+
+        let mut cur_id = next_id_start;
+        for (old_id, node) in old_nodes {
+            reallocation_map.insert(old_id, cur_id);
+            let cur_page = cur_id / self.nodes_per_page;
+            // Note: cached_node_count is conserved across moves — we're
+            // not adding or removing nodes, just changing their pages.
+            self.pages.entry(cur_page).or_default().insert(cur_id, node);
+            reallocated_pages.insert(cur_page);
+            self.prioritize_front(cur_page);
+            cur_id += 1;
+        }
+
+        // Old page is now empty; drop from LRU + reallocated set.
+        self.remove_from_priority(page);
+        reallocated_pages.remove(&page);
+        count
+    }
+
+    /// Move a single node onto the latest tail page; bumps
+    /// `next_node_id`. No-op when the node is already on the tail page.
+    /// Mirrors `reallocateNode` (cache.go:624-658).
+    fn reallocate_node(&mut self, nid: u64, reallocated_pages: &mut HashSet<u64>) -> u64 {
+        let next_id = self.next_node_id;
+        let next_page = next_id / self.nodes_per_page;
+        let current_page = nid / self.nodes_per_page;
+        if current_page == next_page {
+            return nid;
+        }
+
+        // Extract the node from its current page. We don't go through
+        // `delete()` because that touches `pending_created` /
+        // `pending_deletion_pages` and would treat this as a logical
+        // deletion. A relocation is a move; cached_node_count is
+        // conserved.
+        let Some(page_map) = self.pages.get_mut(&current_page) else {
+            // Defensive: nothing to move. This shouldn't happen given
+            // the caller iterates known children, but bail rather than
+            // corrupt the cache.
+            return nid;
+        };
+        let Some(node) = page_map.remove(&nid) else {
+            return nid;
+        };
+        if page_map.is_empty() {
+            self.pages.remove(&current_page);
+            reallocated_pages.remove(&current_page);
+            self.remove_from_priority(current_page);
+        }
+        self.pending_deletion_pages.insert(current_page);
+
+        self.next_node_id += 1;
+        self.pages
+            .entry(next_page)
+            .or_default()
+            .insert(next_id, node);
+        reallocated_pages.insert(next_page);
+        self.prioritize_front(next_page);
+        next_id
     }
 
     fn write_metadata_page<C: PageCommitter>(
@@ -895,7 +1330,8 @@ mod tests {
         let id = cache.allocate(TrieNode::leaf(vec![1; 4]));
 
         let committer = InMemoryPageCommitter::new();
-        cache.commit(Some(id), 4, &committer).unwrap();
+        let mut root = Some(id);
+        cache.commit(&mut root, 4, &committer).unwrap();
         // After commit, no pending-created records remain.
         assert!(cache.pending_created.is_empty());
 
@@ -913,7 +1349,8 @@ mod tests {
         let mut cache = MerkleTrieCache::new();
         let id_a = cache.allocate(TrieNode::leaf(vec![0xaa; 36]));
         let id_b = cache.allocate(TrieNode::leaf(vec![0xbb; 36]));
-        cache.commit(Some(id_a), 36, &committer).unwrap();
+        let mut root = Some(id_a);
+        cache.commit(&mut root, 36, &committer).unwrap();
 
         // Read metadata only; don't preload pages.
         let meta = MerkleTrieCache::read_metadata_page(&committer)
@@ -950,7 +1387,8 @@ mod tests {
         let committer = InMemoryPageCommitter::new();
 
         let mut cache = MerkleTrieCache::new();
-        cache.commit(None, 36, &committer).unwrap();
+        let mut root: Option<u64> = None;
+        cache.commit(&mut root, 36, &committer).unwrap();
 
         let meta = MerkleTrieCache::read_metadata_page(&committer)
             .unwrap()
@@ -969,27 +1407,34 @@ mod tests {
 
     #[test]
     fn evict_drops_lru_pages_until_under_target() {
-        // Set the target very small so eviction kicks in deterministically.
+        // Verify the LRU eviction core directly (no commit involved —
+        // commit's page-packing pass would repack the test's
+        // manually-spaced pages, so we operate on the LRU+page maps
+        // directly to exercise the eviction loop in isolation).
         let mut cache = MerkleTrieCache::with_target(1);
         // Allocate three nodes on three different pages by stepping
         // next_node_id forward between allocations.
         let a = cache.allocate(TrieNode::leaf(vec![1; 36]));
-        // Force the next allocation onto a different page.
         cache.next_node_id += NODES_PER_PAGE;
         let b = cache.allocate(TrieNode::leaf(vec![2; 36]));
         cache.next_node_id += NODES_PER_PAGE;
         let c = cache.allocate(TrieNode::leaf(vec![3; 36]));
-
         assert_ne!(cache.page_of(a), cache.page_of(b));
         assert_ne!(cache.page_of(b), cache.page_of(c));
+        assert_eq!(cache.cached_node_count(), 3);
 
-        let committer = InMemoryPageCommitter::new();
-        cache.commit(Some(c), 36, &committer).unwrap();
-        // 3 pages, 3 nodes → over target=1.
+        // Pin `c`'s page as the root; evict must drop at least one of
+        // a/b's pages (cached_node_count > target=1, and pages_priority
+        // has a → b → c → c-pinned front).
         cache.evict(Some(c));
-        assert!(cache.cached_node_count() <= 1);
-        // Root page (the page containing c) is pinned and must still be present.
+        // `c`'s page is pinned. `a` and `b` are on independent pages,
+        // both of which are eviction candidates. With target=1 and
+        // root page holding 1 node, evict must leave us at exactly 1.
+        assert_eq!(cache.cached_node_count(), 1);
         assert!(cache.contains_in_memory(c));
+        // a and b were on un-pinned pages; eviction took them.
+        assert!(!cache.contains_in_memory(a));
+        assert!(!cache.contains_in_memory(b));
     }
 
     #[test]
@@ -1002,12 +1447,15 @@ mod tests {
         let root = cache.allocate(TrieNode::leaf(vec![1; 36]));
 
         let committer = InMemoryPageCommitter::new();
-        cache.commit(Some(root), 36, &committer).unwrap();
-        cache.evict(Some(root));
+        let mut root_arg = Some(root);
+        cache.commit(&mut root_arg, 36, &committer).unwrap();
+        // Post-commit root id (relocation may have moved it).
+        let new_root = root_arg.expect("root survives commit");
+        cache.evict(Some(new_root));
         // Root must survive even when it's the only page and the target
         // is below the cached node count.
         assert!(
-            cache.contains_in_memory(root),
+            cache.contains_in_memory(new_root),
             "root page must remain when it's the only page left in cache"
         );
     }
@@ -1022,10 +1470,12 @@ mod tests {
         // After both allocations, `other` is at the front and `root` is
         // at the back (LRU). Without pinning, `root` would be evicted.
         let committer = InMemoryPageCommitter::new();
-        cache.commit(Some(root), 36, &committer).unwrap();
-        cache.evict(Some(root));
+        let mut root_arg = Some(root);
+        cache.commit(&mut root_arg, 36, &committer).unwrap();
+        let new_root = root_arg.expect("root survives commit");
+        cache.evict(Some(new_root));
         assert!(
-            cache.contains_in_memory(root),
+            cache.contains_in_memory(new_root),
             "root page must be pinned even when LRU"
         );
         // The other page may or may not be evicted depending on how
@@ -1075,7 +1525,8 @@ mod tests {
         let inner = InMemoryPageCommitter::new();
         let mut src = MerkleTrieCache::new();
         let id = src.allocate(TrieNode::leaf(vec![0xaa; 36]));
-        src.commit(Some(id), 36, &inner).unwrap();
+        let mut root_arg = Some(id);
+        src.commit(&mut root_arg, 36, &inner).unwrap();
 
         let failing = FailingCommitter {
             inner,
