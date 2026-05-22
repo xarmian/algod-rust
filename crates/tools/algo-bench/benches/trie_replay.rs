@@ -113,14 +113,21 @@ fn run_cold_load_phase(elements: &[[u8; ELEMENT_SIZE]], samples: usize) -> Vec<D
             }
             trie.commit(&committer).expect("commit");
         }
+        // Clone the committer into a Box so the trie owns its lazy
+        // loader (PLAN-144 TASK-146); the original `committer` keeps a
+        // shared handle via Arc for sample-loop reuse.
+        let loader: Box<dyn algo_ledger::merkle_cache::PageCommitter + Send> =
+            Box::new(committer.clone());
         let start = Instant::now();
-        let restored = MerkleTrie::load(&committer)
+        let restored = MerkleTrie::load(loader)
             .expect("load")
             .expect("load returned None after commit");
         let elapsed = start.elapsed();
         // Touch a load-time observable so the optimizer can't dead-code
-        // the load call.
-        debug_assert_eq!(restored.len(), elements.len());
+        // the load call. With lazy load, `len()` only reflects in-memory
+        // leaves — for the cold-load bench we only care that the call
+        // returned a trie at all.
+        let _ = restored.is_empty();
         out.push(elapsed);
     }
     out

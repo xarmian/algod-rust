@@ -118,7 +118,9 @@ fn every_go_captured_root_matches_rust_trie() {
         }
 
         let expected = decode_root(&fx.name, &fx.root_hex);
-        let actual = trie.root_hash();
+        let actual = trie
+            .root_hash()
+            .unwrap_or_else(|e| panic!("scenario {}: root_hash: {e}", fx.name));
         let matched = actual == expected;
         report.push((fx.name.clone(), matched, expected, actual));
     }
@@ -177,7 +179,7 @@ fn single_element_fixture_matches_manual_hash() {
     // And of course the Rust trie must agree.
     let mut trie = MerkleTrie::new(single.element_size);
     trie.add(&elem).unwrap();
-    assert_eq!(trie.root_hash(), expected);
+    assert_eq!(trie.root_hash().unwrap(), expected);
 }
 
 /// TASK-138 close-out: drive every fixture through the
@@ -217,32 +219,41 @@ fn large_n_fixtures_round_trip_through_paged_committer() {
                 fx.name
             );
         }
-        let in_memory_root = trie.root_hash();
+        let in_memory_root = trie
+            .root_hash()
+            .unwrap_or_else(|e| panic!("scenario {}: root_hash: {e}", fx.name));
         trie.commit(&committer)
             .unwrap_or_else(|e| panic!("scenario {}: commit: {e}", fx.name));
 
-        // Reload from disk.
-        let mut restored = MerkleTrie::load(&committer)
+        // Reload from disk via lazy loader (PLAN-144 TASK-146).
+        let mut restored = MerkleTrie::load(Box::new(committer.clone()))
             .unwrap_or_else(|e| panic!("scenario {}: load: {e}", fx.name))
             .unwrap_or_else(|| panic!("scenario {}: load returned None after commit", fx.name));
 
-        assert_eq!(
-            restored.len(),
-            elements.len(),
-            "scenario {}: reload len mismatch ({} vs {})",
-            fx.name,
-            restored.len(),
-            elements.len()
-        );
         for (i, e) in elements.iter().enumerate() {
             assert!(
-                restored.contains(e),
+                restored
+                    .contains(e)
+                    .unwrap_or_else(|err| panic!("scenario {}: contains[{i}]: {err}", fx.name)),
                 "scenario {}: reloaded trie missing element[{i}]",
                 fx.name
             );
         }
 
-        let restored_root = restored.root_hash();
+        // After walking every element via `contains`, every leaf page is
+        // lazy-loaded; the leaf-count assertion is then meaningful.
+        assert_eq!(
+            restored.len(),
+            elements.len(),
+            "scenario {}: reload len mismatch ({} vs {}) after lazy walk",
+            fx.name,
+            restored.len(),
+            elements.len()
+        );
+
+        let restored_root = restored
+            .root_hash()
+            .unwrap_or_else(|e| panic!("scenario {}: restored root_hash: {e}", fx.name));
         assert_eq!(
             in_memory_root, restored_root,
             "scenario {}: in-memory root does not match reloaded root",

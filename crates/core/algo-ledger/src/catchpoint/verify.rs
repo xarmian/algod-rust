@@ -758,7 +758,8 @@ pub fn rebuild_trie_from_db(conn: &Connection) -> Result<[u8; 32], CatchpointErr
         }
     }
 
-    Ok(trie.root_hash())
+    trie.root_hash()
+        .map_err(|e| CatchpointError::ImportError(format!("trie root_hash: {e}")))
 }
 
 // ---------------------------------------------------------------------------

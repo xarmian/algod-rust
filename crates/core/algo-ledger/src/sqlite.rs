@@ -2690,17 +2690,43 @@ impl SqliteLedger {
     /// runtime; the DDL is retained for PLAN-36 TASK-118 to drop
     /// separately.
     pub fn load_trie(&mut self) -> Result<(), AlgoError> {
-        let committer = crate::merkle_committer::SqliteMerkleCommitter::active(&self.conn);
-
-        // Try to load from page 0 metadata. If page 0 is missing
-        // (`load` returns `Ok(None)`), the DB is fresh w.r.t. the paged
-        // format — rebuild from `accountbase` / `resources` / `kvstore`
-        // and the next `commit_block` will persist it.
-        let trie = match crate::merkle_trie::MerkleTrie::load(&committer) {
+        // PLAN-144 TASK-146: lazy on-demand page loading.
+        //
+        // For on-disk ledgers we install an owned read-only
+        // [`crate::merkle_committer::OwnedSqliteCommitter`] as the
+        // trie cache's `lazy_loader`. Subsequent page reads go through
+        // that connection (SQLite WAL allows concurrent readers); the
+        // write path still uses [`SqliteMerkleCommitter`] against
+        // `self.conn` inside the block transaction.
+        //
+        // For in-memory ledgers (`db_prefix is None`) the lazy loader
+        // can't be constructed — `Connection::open_in_memory` returns a
+        // distinct DB per call. In-memory ledgers therefore skip the
+        // lazy path and rebuild from `accountbase` / `resources` /
+        // `kvstore`; this matches the historical behavior, since
+        // in-memory DBs never survive process restart anyway.
+        let load_result: Result<Option<crate::merkle_trie::MerkleTrie>, AlgoError> =
+            match self.db_prefix.as_ref() {
+                Some(prefix) => {
+                    let tracker = tracker_path_for_prefix(prefix);
+                    match crate::merkle_committer::OwnedSqliteCommitter::open_active(&tracker) {
+                        Ok(owned) => crate::merkle_trie::MerkleTrie::load(Box::new(owned)),
+                        Err(e) => {
+                            tracing::warn!(
+                                "merkle_trie: could not open owned lazy-loader for {}: {e}",
+                                tracker.display()
+                            );
+                            Ok(None)
+                        }
+                    }
+                }
+                None => Ok(None),
+            };
+        let trie = match load_result {
             Ok(Some(t)) => t,
             Ok(None) => {
                 tracing::debug!(
-                    "merkle_trie: no accounthashes metadata page found; rebuilding from DB"
+                    "merkle_trie: no accounthashes metadata page found (or in-memory ledger); rebuilding from DB"
                 );
                 self.rebuild_trie_from_db()?
             }
@@ -4819,7 +4845,15 @@ impl LedgerStore for SqliteLedger {
         // not the account's. This matches Go's ResourcesHashBuilderV6 which passes
         // resData.UpdateRound. Account affinity changes do not affect resource elements.
 
-        let root = trie.root_hash();
+        let root = match trie.root_hash() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("merkle_trie: root_hash failed during apply: {e}");
+                // Restore the trie so the caller can recover / retry.
+                self.trie = Some(trie);
+                return None;
+            }
+        };
         self.trie = Some(trie);
         Some(root)
     }
@@ -5594,7 +5628,7 @@ mod tests {
         // Load trie from DB.
         ledger.load_trie().unwrap();
         let trie = ledger.trie.as_mut().unwrap();
-        let root2 = trie.root_hash();
+        let root2 = trie.root_hash().unwrap();
         assert_eq!(root1, root2);
     }
 
@@ -5629,7 +5663,7 @@ mod tests {
         assert!(ledger.trie_enabled());
 
         let trie = ledger.trie.as_mut().unwrap();
-        let root = trie.root_hash();
+        let root = trie.root_hash().unwrap();
         // With 2 accounts in DB, trie should be non-empty.
         assert_ne!(root, [0u8; 32]);
         assert_eq!(trie.len(), 2);
@@ -5656,7 +5690,7 @@ mod tests {
         let _ = ledger.finalize_trie_updates();
         ledger.commit_block().unwrap();
 
-        let root_after_commit = ledger.trie.as_mut().unwrap().root_hash();
+        let root_after_commit = ledger.trie.as_mut().unwrap().root_hash().unwrap();
 
         // Start a new block, mutate, then rollback.
         ledger.begin_block().unwrap();
@@ -5671,12 +5705,12 @@ mod tests {
         let _ = ledger.finalize_trie_updates();
 
         // Trie hash should differ after mutation.
-        let root_during_block = ledger.trie.as_mut().unwrap().root_hash();
+        let root_during_block = ledger.trie.as_mut().unwrap().root_hash().unwrap();
         assert_ne!(root_after_commit, root_during_block);
 
         // Rollback should reload trie to committed state.
         ledger.rollback_block().unwrap();
-        let root_after_rollback = ledger.trie.as_mut().unwrap().root_hash();
+        let root_after_rollback = ledger.trie.as_mut().unwrap().root_hash().unwrap();
         assert_eq!(root_after_commit, root_after_rollback);
     }
 
