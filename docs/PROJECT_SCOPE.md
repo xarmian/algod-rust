@@ -1,8 +1,8 @@
 # PROJECT_SCOPE.md — Algod-Rust Full Project Scope
 
-_Last updated: 2026-03-04T02:03:00.565172Z_
+_Last updated: 2026-05-22_
 
-This document defines the **complete scope and definition of done** for the `algod-rust` project: a full Rust implementation of the Algorand node compatible with the existing network.
+This document defines the **complete scope and definition of done** for the `algod-rust` project: a full Rust implementation of the Algorand **node and operator toolchain**, compatible with the existing network and interoperable with the existing go-algorand binary set.
 
 ---
 
@@ -18,14 +18,17 @@ The goal of **Algod-Rust** is to create a **fully compatible, production-grade i
 - Provide compatible APIs
 - Interoperate seamlessly with existing nodes
 
+Beyond the node itself, the project must also deliver a **Rust operator toolchain** that is at functional parity with the go-algorand binary set an operator/user actually invokes day-to-day (`kmd`, `goal`, `algokey`, `tealdbg`). The Rust toolchain must interoperate with go-algorand binaries (Rust `goal` ↔ Go `kmd`, Go `goal` ↔ Rust `algod`, etc.) so the ecosystem can mix-and-match implementations.
+
 The Rust implementation should be:
 
 - **Consensus compatible**
 - **Protocol compatible**
 - **Operationally equivalent**
+- **CLI / toolchain compatible** — same subcommands, same flags, same output shapes for documented user-facing flows
 - **Performance competitive or superior**
 
-Ultimately, it should function as a **drop-in alternative to go-algorand**.
+Ultimately, the deliverable is a **drop-in alternative to go-algorand** — both the daemon and the CLI ecosystem an operator uses to run it.
 
 ---
 
@@ -61,6 +64,18 @@ Rust exposes equivalent APIs including:
 - node health endpoints
 - transaction submission endpoints
 - block and account queries
+- kmd REST endpoints (wallet, key, signing)
+
+## CLI / Toolchain Compatibility
+
+Rust ships drop-in equivalents of the user-facing go-algorand binaries:
+
+- `goal-rust` — operator CLI (account, asset, app, clerk, node, wallet, network subcommands)
+- `kmd-rust` — Key Management Daemon
+- `algokey-rust` — offline key tool
+- `tealdbg-rust` — TEAL debugger
+
+These must accept the same subcommands and flags as their Go counterparts for documented flows, and must interoperate bidirectionally (Rust CLI → Go daemon and Go CLI → Rust daemon).
 
 ## Operational Readiness
 
@@ -240,6 +255,32 @@ API compatibility allows existing tooling to work with the Rust node.
 
 ---
 
+## Operator Toolchain (CLI Ecosystem)
+
+The Rust toolchain mirrors the user-facing surface of go-algorand. Binaries are tiered by how often a real operator/user invokes them.
+
+### Tier 0 — Core daemons (drop-in mandatory)
+- `algod-rust` — the node (this repo's existing binary; covered by Phases 0–7)
+- `kmd-rust` — Key Management Daemon. Own REST API on its own port, SQLite-backed wallet store, mnemonic / Ed25519 / multisig / logicsig signing. Reference: `../go-algorand/daemon/kmd/`
+
+### Tier 1 — Daily operator CLIs (drop-in mandatory)
+- `goal-rust` — Primary operator CLI. Subcommand groups: `account`, `asset`, `app`, `clerk`, `node`, `wallet`, `network`, `kmd`, `protocol`. Talks to `algod` REST + `kmd` REST. Reference: `../go-algorand/cmd/goal/`
+- `algokey-rust` — Offline key tool. Generate, sign (txn / arbitrary bytes), mnemonic ↔ key, multisig partial sigs. No daemon dependencies. Reference: `../go-algorand/cmd/algokey/`
+- `tealdbg-rust` — TEAL debugger / DAP server for IDE integration. Drives the AVM interpreter step-by-step. Reference: `../go-algorand/cmd/tealdbg/`
+
+### Tier 2 — Power-user / config / ops (best-effort)
+- `algocfg`, `diagcfg`, `nodecfg` — config tooling
+- `msgpacktool` — canonical msgpack inspect/encode
+- `catchpointdump`, `catchupsrv` — catchpoint introspection / serving
+- `algofix`, `algoh`, `carpenter` — config migration / host wrapper / log viewer
+
+### Tier 3 — Internal release / test infra (not required for drop-in)
+- `algons`, `algorelay`, `dispenser`, `dbgen`, `genesis`, `incorporate`, `loadgenerator`, `netdummy`, `netgoal`, `pingpong`, `updater`, `util`, `opdoc`, `buildtools`, `partitiontest_linter`
+
+**Interop requirement.** Rust toolchain binaries must interoperate with their Go counterparts bidirectionally — Rust `goal` driving Go `kmd` + Go `algod`, Go `goal` driving Rust `kmd` + Rust `algod`, and all mixed permutations. This is what makes the toolchain drop-in rather than a parallel-but-isolated reimplementation.
+
+---
+
 # 5. Development Phases
 
 ## Phase 0 — Conformance Harness
@@ -330,6 +371,23 @@ Add:
 
 ---
 
+## Phase 8 — Operator Toolchain Parity
+
+Deliver Rust equivalents of the user-facing go-algorand binaries (Tier 0 + Tier 1):
+
+- `algokey-rust` — sequencing first (smallest surface, pure crypto, establishes the CLI crate pattern)
+- `kmd-rust` — wallet daemon (REST API + SQLite key store)
+- `goal-rust` — operator CLI (largest surface, decomposed by subcommand group; depends on algod REST + kmd REST)
+- `tealdbg-rust` — TEAL debugger / DAP server
+
+Acceptance:
+
+- Each subcommand documented in `../go-algorand/cmd/<bin>/README.md` (or equivalent help text) has a Rust equivalent with the same flags + output shape.
+- Cross-implementation interop tests pass: Rust CLI ↔ Go daemon and Go CLI ↔ Rust daemon for all documented flows.
+- Tier 2 / Tier 3 binaries tracked as opportunistic follow-ups, not gating drop-in claim.
+
+---
+
 # 6. Project Success Criteria
 
 The project succeeds when:
@@ -417,11 +475,12 @@ Phase 3 — 3–4 months
 Phase 4 — 2–3 months  
 Phase 5 — 4–6 months  
 Phase 6 — 3–4 months  
-Hardening — 3–6 months
+Phase 7 Hardening — 3–6 months  
+Phase 8 Toolchain Parity — 4–6 months (some work parallelizable with Phase 7)
 
 Estimated total:
 
-**2–3 years**
+**2.5–3.5 years**
 
 ---
 
@@ -434,5 +493,6 @@ Algod-Rust is complete when:
 - They **produce valid blocks**
 - They **maintain identical ledger state**
 - They run **reliably in production**
+- The Rust **operator toolchain** (`goal-rust`, `kmd-rust`, `algokey-rust`, `tealdbg-rust`) is at functional parity with the Go equivalents and **interoperates bidirectionally** with go-algorand binaries
 
-At that point the ecosystem benefits from **two independent node implementations**, increasing decentralization and resilience.
+At that point the ecosystem benefits from **two independent end-to-end stacks** — node and operator toolchain — increasing decentralization, resilience, and operator choice.
