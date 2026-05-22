@@ -32,11 +32,14 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use std::sync::Mutex;
+
 use algo_bench::trie_replay::{
     generate_elements, hash_input_set, stats_from_durations, PhaseStats, TrieReplayResult,
     ELEMENT_SIZE,
 };
-use algo_ledger::merkle_cache::InMemoryPageCommitter;
+use algo_error::AlgoError;
+use algo_ledger::merkle_cache::{InMemoryPageCommitter, PageCommitter};
 use algo_ledger::merkle_trie::MerkleTrie;
 
 fn env_usize(var: &str, default: usize) -> usize {
@@ -133,6 +136,93 @@ fn run_cold_load_phase(elements: &[[u8; ELEMENT_SIZE]], samples: usize) -> Vec<D
     out
 }
 
+/// `CountingCommitter` wraps an [`InMemoryPageCommitter`] and tallies
+/// bytes written via `store_page` (including empty-payload deletes,
+/// which count as 0). Used by the `add_then_commit_bytes_written`
+/// measurement (PLAN-144 TASK-149) to compare write-amplification on a
+/// single incremental commit before and after the refurbish refactor.
+struct CountingCommitter {
+    inner: InMemoryPageCommitter,
+    bytes_written: Mutex<u64>,
+    stores_called: Mutex<u64>,
+}
+
+impl CountingCommitter {
+    fn new() -> Self {
+        Self {
+            inner: InMemoryPageCommitter::new(),
+            bytes_written: Mutex::new(0),
+            stores_called: Mutex::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            *self.bytes_written.lock().unwrap(),
+            *self.stores_called.lock().unwrap(),
+        )
+    }
+
+    fn reset(&self) {
+        *self.bytes_written.lock().unwrap() = 0;
+        *self.stores_called.lock().unwrap() = 0;
+    }
+}
+
+impl PageCommitter for CountingCommitter {
+    fn load_page(&self, id: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        self.inner.load_page(id)
+    }
+    fn store_page(&self, id: u64, content: &[u8]) -> Result<(), AlgoError> {
+        *self.stores_called.lock().unwrap() += 1;
+        *self.bytes_written.lock().unwrap() += content.len() as u64;
+        self.inner.store_page(id, content)
+    }
+}
+
+/// Measure the byte cost of a SINGLE incremental commit — the
+/// scenario refurbish is designed to optimize.
+///
+/// Sequence (per sample):
+///   1. Build a fresh trie + commit `n_seed` elements (out of the
+///      measured window).
+///   2. Reset the counter.
+///   3. Add ONE extra element.
+///   4. Commit. Tally bytes written + store calls.
+///
+/// Returns (median bytes_written, median store_page calls) across
+/// `samples` runs.
+fn run_incremental_commit_bytes(
+    elements: &[[u8; ELEMENT_SIZE]],
+    extra: &[u8; ELEMENT_SIZE],
+    samples: usize,
+) -> (u64, u64) {
+    let mut byte_samples: Vec<u64> = Vec::with_capacity(samples);
+    let mut store_samples: Vec<u64> = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let committer = CountingCommitter::new();
+        let mut trie = MerkleTrie::new(ELEMENT_SIZE);
+        for e in elements {
+            trie.add(e).expect("seed add");
+        }
+        trie.commit(&committer).expect("seed commit");
+        committer.reset();
+
+        // Add one element, commit; counter now reflects ONLY this
+        // incremental commit.
+        let _ = trie.add(extra).expect("incremental add");
+        trie.commit(&committer).expect("incremental commit");
+        let (bytes, stores) = committer.snapshot();
+        byte_samples.push(bytes);
+        store_samples.push(stores);
+    }
+    byte_samples.sort_unstable();
+    store_samples.sort_unstable();
+    let median_bytes = byte_samples[byte_samples.len() / 2];
+    let median_stores = store_samples[store_samples.len() / 2];
+    (median_bytes, median_stores)
+}
+
 fn print_summary(result: &TrieReplayResult, out_path: &std::path::Path) {
     eprintln!(
         "trie_replay (rust): n_elements={} input_hash={}",
@@ -173,6 +263,18 @@ fn main() {
     let apply_durs = run_apply_phase(&elements, samples);
     let commit_durs = run_commit_phase(&elements, samples);
     let load_durs = run_cold_load_phase(&elements, samples);
+
+    // PLAN-144 TASK-149: incremental-commit byte measurement. Uses an
+    // element OUTSIDE the seed set so the add is guaranteed
+    // non-duplicate.
+    let extra_element =
+        algo_bench::trie_replay::make_element(u32::MAX, b"task-149 incremental commit probe");
+    let (incremental_bytes, incremental_stores) =
+        run_incremental_commit_bytes(&elements, &extra_element, samples);
+    eprintln!(
+        "incremental_commit (rust): bytes_written_median={} store_page_calls_median={}",
+        incremental_bytes, incremental_stores,
+    );
 
     let phases: Vec<PhaseStats> = vec![
         stats_from_durations("apply", n, &apply_durs),

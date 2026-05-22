@@ -337,6 +337,15 @@ impl MerkleTrie {
         self.cache.allocate(node)
     }
 
+    /// Recycle `old_id`'s storage to a freshly-allocated id. The
+    /// in-memory `TrieNode` value (which the caller may have just
+    /// mutated via `get_node_mut`) is moved to the new id without
+    /// being cloned. PLAN-144 TASK-149.
+    pub fn refurbish_node(&mut self, old_id: u64) -> u64 {
+        self.dirty = true;
+        self.cache.refurbish(old_id)
+    }
+
     /// Borrow a node by ID. Lazy-loads its page on a cache miss; may
     /// return `Ok(None)` if no lazy loader is installed and the node was
     /// never resident.
@@ -395,12 +404,11 @@ impl MerkleTrie {
         }
 
         let new_root = self.node_add(root_id, element, &[])?;
-        // Go does `cache.deleteNode(mt.root)` after add returns the new root.
-        // The old root's storage is reused via `refurbishNode`; we just
-        // remove the entry. The cache distinguishes "never committed" from
-        // "previously committed" — if the root was already on-disk, this
-        // marks its page for an update at the next commit.
-        self.cache.delete(root_id);
+        // PLAN-144 TASK-149: `node_add` now refurbishes the old root
+        // internally (via `MerkleTrieCache::refurbish`), which both
+        // recycles the id AND records the old slot as removed. No
+        // additional `delete(root_id)` here — that would be a no-op at
+        // best and a double-record at worst.
         self.root = Some(new_root);
         self.dirty = true;
         Ok(true)
@@ -447,8 +455,9 @@ impl MerkleTrie {
         }
 
         let new_root = self.node_remove(root_id, element, &[])?;
-        // Go: `cache.deleteNode(mt.root); mt.root = updatedRoot;`
-        self.cache.delete(root_id);
+        // PLAN-144 TASK-149: `node_remove` refurbishes the root in
+        // place (or deletes it during the collapse branch). No
+        // additional `delete(root_id)` here.
         self.root = new_root;
         self.dirty = true;
         Ok(true)
@@ -807,43 +816,43 @@ impl MerkleTrie {
 
         // Non-leaf: branch on d[0].
         if !node.children_mask.bit(d[0]) {
-            // No existing child at d[0]: insert a new leaf and rebuild this
-            // internal node with the additional child entry.
+            // No existing child at d[0]: insert a new leaf and refurbish
+            // this internal node's id. Mirrors Go's no-existing-child
+            // case at `node.go:162-181`: allocate the new leaf, then
+            // mutate the parent's children list in place and recycle
+            // its id via `refurbishNode`.
             let leaf = TrieNode::leaf(d[1..].to_vec());
             let leaf_id = self.allocate_node(leaf);
 
-            let mut new_children = Vec::with_capacity(node.children.len() + 1);
-            let mut inserted = false;
-            for c in &node.children {
-                if !inserted && d[0] < c.hash_index {
-                    new_children.push(ChildEntry {
+            // PLAN-144 TASK-149: mutate parent in place rather than
+            // building a new TrieNode + allocate+delete pair. Avoids
+            // cloning the children Vec.
+            {
+                let parent = self
+                    .cache
+                    .get_mut(node_id)?
+                    .ok_or_else(|| missing_node(node_id))?;
+                // Find insertion point (children are sorted by hash_index).
+                let pos = parent
+                    .children
+                    .binary_search_by_key(&d[0], |c| c.hash_index)
+                    .unwrap_or_else(|i| i);
+                parent.children.insert(
+                    pos,
+                    ChildEntry {
                         hash_index: d[0],
                         child_id: leaf_id,
-                    });
-                    inserted = true;
-                }
-                new_children.push(c.clone());
+                    },
+                );
+                parent.children_mask.set_bit(d[0]);
+                parent.hash = path.to_vec();
             }
-            if !inserted {
-                new_children.push(ChildEntry {
-                    hash_index: d[0],
-                    child_id: leaf_id,
-                });
-            }
-            let mut new_mask = node.children_mask;
-            new_mask.set_bit(d[0]);
-
-            let new_node = TrieNode {
-                hash: path.to_vec(),
-                children: new_children,
-                children_mask: new_mask,
-            };
-            self.cache.delete(node_id);
-            return Ok(self.allocate_node(new_node));
+            return Ok(self.refurbish_node(node_id));
         }
 
-        // Existing child at d[0]: recurse, then rebuild this node with the
-        // updated child id.
+        // Existing child at d[0]: recurse, mutate this node's child
+        // entry, then refurbish. Mirrors Go's existing-child branch at
+        // `node.go:184-217`.
         let child_idx = node.index_of(d[0]);
         let cur_child_id = node.children[child_idx].child_id;
         let mut sub_path = Vec::with_capacity(path.len() + 1);
@@ -851,15 +860,16 @@ impl MerkleTrie {
         sub_path.push(d[0]);
         let updated_child_id = self.node_add(cur_child_id, &d[1..], &sub_path)?;
 
-        let mut new_children = node.children.clone();
-        new_children[child_idx].child_id = updated_child_id;
-        let new_node = TrieNode {
-            hash: path.to_vec(),
-            children: new_children,
-            children_mask: node.children_mask,
-        };
-        self.cache.delete(node_id);
-        Ok(self.allocate_node(new_node))
+        // PLAN-144 TASK-149: in-place update + refurbish.
+        {
+            let parent = self
+                .cache
+                .get_mut(node_id)?
+                .ok_or_else(|| missing_node(node_id))?;
+            parent.children[child_idx].child_id = updated_child_id;
+            parent.hash = path.to_vec();
+        }
+        Ok(self.refurbish_node(node_id))
     }
 
     // -----------------------------------------------------------------------
@@ -882,91 +892,110 @@ impl MerkleTrie {
         key: &[u8],
         path: &[u8],
     ) -> Result<Option<u64>, AlgoError> {
-        let node = self
-            .cache
-            .get(node_id)?
-            .ok_or_else(|| missing_node(node_id))?
-            .clone();
-        debug_assert!(!node.is_leaf(), "node_remove must not be called on leaves");
+        // Snapshot fields we need from the parent + child before we
+        // start mutating the cache (each mutation may invalidate the
+        // borrow). Mirrors Go `node.remove` at `node.go:254-309`.
+        let (child_idx, child_id, child_is_leaf) = {
+            let node = self
+                .cache
+                .get(node_id)?
+                .ok_or_else(|| missing_node(node_id))?;
+            debug_assert!(!node.is_leaf(), "node_remove must not be called on leaves");
+            let ci = node.index_of(key[0]);
+            let cid = node.children[ci].child_id;
+            let cleaf = self
+                .cache
+                .get(cid)?
+                .ok_or_else(|| missing_node(cid))?
+                .is_leaf();
+            (ci, cid, cleaf)
+        };
 
-        let child_idx = node.index_of(key[0]);
-        let child_id = node.children[child_idx].child_id;
-        let child = self
-            .cache
-            .get(child_id)?
-            .ok_or_else(|| missing_node(child_id))?
-            .clone();
-
-        // Mirrors Go `node.remove` at node.go:266-289. We construct `new_node`
-        // — the surviving node at this position — then potentially collapse
-        // it if it ends up with a single leaf child (Go's "collapse" block at
-        // node.go:291-304).
-        let new_node: TrieNode = if child.is_leaf() {
-            // Remove this leaf entirely from our children. Per Go's comment
-            // at node.go:269, the tree forbids internal nodes with exactly
-            // one leaf child and no other children, so before this step we
-            // had ≥2 children — after removing one leaf, ≥1 remains.
-            let mut new_children = node.children.clone();
-            new_children.remove(child_idx);
-            let mut new_mask = node.children_mask;
-            new_mask.clear_bit(key[0]);
-            // Free the leaf's storage.
+        // PLAN-144 TASK-149: each branch mutates the parent in place
+        // and refurbishes it, instead of cloning the children Vec into
+        // a fresh TrieNode and allocate+delete-ing.
+        if child_is_leaf {
+            // Remove this leaf entirely from our children. Per Go's
+            // comment at `node.go:269`, the tree forbids internal nodes
+            // with exactly one leaf child and no other children, so
+            // before this step we had ≥2 children — after removing one
+            // leaf, ≥1 remains.
             self.cache.delete(child_id);
-            TrieNode {
-                hash: path.to_vec(),
-                children: new_children,
-                children_mask: new_mask,
+            {
+                let parent = self
+                    .cache
+                    .get_mut(node_id)?
+                    .ok_or_else(|| missing_node(node_id))?;
+                parent.children.remove(child_idx);
+                parent.children_mask.clear_bit(key[0]);
+                parent.hash = path.to_vec();
             }
         } else {
-            // Recurse. The child is non-leaf, so `remove` always returns
-            // `Some` (the tree-invariant guarantees the child has ≥2 children
-            // before, possibly collapsing to a leaf after — still `Some`).
+            // Recurse. The child is non-leaf, so `remove` always
+            // returns `Some` (the tree-invariant guarantees the child
+            // has ≥2 children before, possibly collapsing to a leaf
+            // after — still `Some`).
             let mut sub_path = Vec::with_capacity(path.len() + 1);
             sub_path.extend_from_slice(path);
             sub_path.push(key[0]);
             let updated = self
                 .node_remove(child_id, &key[1..], &sub_path)?
                 .expect("non-leaf remove always returns Some");
-            // Free the old child slot (Go's `cache.refurbishNode(childNodeID)`
-            // returns a new id; we mirror that by replacing the children
-            // entry's id).
-            let mut new_children = node.children.clone();
-            new_children[child_idx].child_id = updated;
-            TrieNode {
-                hash: path.to_vec(),
-                children: new_children,
-                children_mask: node.children_mask,
+            {
+                let parent = self
+                    .cache
+                    .get_mut(node_id)?
+                    .ok_or_else(|| missing_node(node_id))?;
+                parent.children[child_idx].child_id = updated;
+                parent.hash = path.to_vec();
             }
-        };
+        }
 
-        // Collapse: if `new_node` has exactly one child and that child is a
-        // leaf, convert `new_node` itself into a leaf carrying
-        // `[only_child.hash_index] || only_child.hash`. Matches Go
-        // `node.go:291-304`.
-        let collapsed = if new_node.children.len() == 1 {
-            let only_hi = new_node.children[0].hash_index;
-            let only_id = new_node.children[0].child_id;
-            let only_child = self
+        // Collapse: if the (now-mutated) parent has exactly one child
+        // and that child is a leaf, fold the parent itself into a leaf
+        // carrying `[only_child.hash_index] || only_child.hash`.
+        // Mirrors Go `node.go:291-304`.
+        //
+        // This branch builds a NEW TrieNode (leaf) with different
+        // content than the parent — no refurbish opportunity here;
+        // we delete the parent + only_child slots and allocate a fresh
+        // leaf.
+        let collapse = {
+            let parent = self
                 .cache
-                .get(only_id)?
-                .ok_or_else(|| missing_node(only_id))?;
-            if only_child.is_leaf() {
-                let mut merged = Vec::with_capacity(1 + only_child.hash.len());
-                merged.push(only_hi);
-                merged.extend_from_slice(&only_child.hash);
-                self.cache.delete(only_id);
-                Some(TrieNode::leaf(merged))
+                .get(node_id)?
+                .ok_or_else(|| missing_node(node_id))?;
+            if parent.children.len() == 1 {
+                let only_hi = parent.children[0].hash_index;
+                let only_id = parent.children[0].child_id;
+                let only_child = self
+                    .cache
+                    .get(only_id)?
+                    .ok_or_else(|| missing_node(only_id))?;
+                if only_child.is_leaf() {
+                    let mut merged = Vec::with_capacity(1 + only_child.hash.len());
+                    merged.push(only_hi);
+                    merged.extend_from_slice(&only_child.hash);
+                    Some((only_id, merged))
+                } else {
+                    None
+                }
             } else {
                 None
             }
-        } else {
-            None
         };
 
-        let final_node = collapsed.unwrap_or(new_node);
-        // Free the original node and allocate the surviving node.
-        self.cache.delete(node_id);
-        Ok(Some(self.allocate_node(final_node)))
+        if let Some((only_id, merged)) = collapse {
+            self.cache.delete(only_id);
+            self.cache.delete(node_id);
+            return Ok(Some(self.allocate_node(TrieNode::leaf(merged))));
+        }
+
+        // No collapse — refurbish the (in-place-mutated) parent to
+        // recycle its id. Mirrors Go `node.go:285` where `remove`
+        // returns `mtc.cache.refurbishNode(nid)` for the non-collapse
+        // case.
+        Ok(Some(self.refurbish_node(node_id)))
     }
 
     // -----------------------------------------------------------------------

@@ -406,6 +406,63 @@ impl MerkleTrieCache {
         id
     }
 
+    /// Recycle node `old_id`'s storage to a freshly-allocated id at
+    /// `next_node_id`. Mirrors Go's `merkleTrieCache::refurbishNode`
+    /// (`cache.go:139-164`). PLAN-144 TASK-149.
+    ///
+    /// Semantics:
+    /// - If `old_id` is in `pending_created` (never reached disk), the
+    ///   old node + page entry are dropped silently — no deletion
+    ///   record is needed.
+    /// - Otherwise (old_id is committed), the old slot is removed from
+    ///   the page map and the page is marked in `pending_deletion_pages`
+    ///   so the next commit will partition it correctly (update vs
+    ///   delete depending on remaining nodes).
+    ///
+    /// In both cases the in-memory `TrieNode` value is moved to the
+    /// new id (no clone of `hash` / `children` Vecs), which is the
+    /// heap-churn win refurbish exists for.
+    ///
+    /// Panics if `old_id` is not currently resident — refurbish is
+    /// only called on nodes the caller just touched (either via
+    /// `allocate` or `get_mut`), so a miss is a logic bug.
+    pub fn refurbish(&mut self, old_id: u64) -> u64 {
+        let old_page = self.page_of(old_id);
+        let node = self
+            .pages
+            .get_mut(&old_page)
+            .and_then(|m| m.remove(&old_id))
+            .unwrap_or_else(|| panic!("MerkleTrieCache::refurbish: node {old_id} not resident"));
+
+        if self.pending_created.remove(&old_id) {
+            // Old id never went to disk — drop its slot silently.
+            // cached_node_count drops by 1; we'll bump it back by 1
+            // when we insert at new_id, so the net is conserved.
+            self.cached_node_count -= 1;
+            if self.pages.get(&old_page).is_some_and(|m| m.is_empty()) {
+                self.pages.remove(&old_page);
+                self.remove_from_priority(old_page);
+                self.pending_dirty_pages.remove(&old_page);
+            }
+        } else {
+            // Old id is committed; record the page so the next commit
+            // partitions it correctly. The node is gone from the page
+            // map but the page itself may still hold other live nodes.
+            self.cached_node_count -= 1;
+            self.pending_deletion_pages.insert(old_page);
+        }
+
+        let new_id = self.next_node_id;
+        self.next_node_id += 1;
+        let new_page = self.page_of(new_id);
+        self.pages.entry(new_page).or_default().insert(new_id, node);
+        self.cached_node_count += 1;
+        self.pending_created.insert(new_id);
+        self.pending_dirty_pages.insert(new_page);
+        self.prioritize_front(new_page);
+        new_id
+    }
+
     /// Remove node `id` from the cache. Mirrors Go's
     /// `merkleTrieCache::deleteNode` (`cache.go:272-285`).
     pub fn delete(&mut self, id: u64) {
@@ -1403,6 +1460,79 @@ mod tests {
         let committer = InMemoryPageCommitter::new();
         let got = MerkleTrieCache::read_metadata_page(&committer).unwrap();
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn refurbish_pending_created_node_recycles_in_place() {
+        // PLAN-144 TASK-149: when the old id was never committed,
+        // refurbish drops the old slot silently (no
+        // pending_deletion_pages record).
+        let mut cache = MerkleTrieCache::new();
+        let old_id = cache.allocate(TrieNode::leaf(vec![0xaa; 36]));
+        assert!(cache.pending_created.contains(&old_id));
+        assert_eq!(cache.cached_node_count(), 1);
+        let pending_deletion_before = cache.pending_deletion_pages.len();
+
+        let new_id = cache.refurbish(old_id);
+        assert_ne!(old_id, new_id);
+        // Old id is gone from the cache; new id is resident.
+        assert!(!cache.contains_in_memory(old_id));
+        assert!(cache.contains_in_memory(new_id));
+        // Node count conserved (move, not add/delete).
+        assert_eq!(cache.cached_node_count(), 1);
+        // Old id was pending-only → no deletion record.
+        assert_eq!(
+            cache.pending_deletion_pages.len(),
+            pending_deletion_before,
+            "refurbish of a never-committed node must not record a pending deletion"
+        );
+        // New id is in pending_created.
+        assert!(cache.pending_created.contains(&new_id));
+        assert!(!cache.pending_created.contains(&old_id));
+        // The value was moved (not cloned).
+        let got = cache.get(new_id).unwrap().unwrap();
+        assert_eq!(got.hash, vec![0xaa; 36]);
+    }
+
+    #[test]
+    fn refurbish_committed_node_marks_old_page_for_deletion() {
+        let committer = InMemoryPageCommitter::new();
+        let mut cache = MerkleTrieCache::new();
+        let old_id = cache.allocate(TrieNode::leaf(vec![0xbb; 36]));
+        // Make the node committed.
+        let mut root = Some(old_id);
+        cache.commit(&mut root, 36, &committer).unwrap();
+        let committed_id = root.expect("root survives commit");
+        assert!(!cache.pending_created.contains(&committed_id));
+
+        let pending_deletion_before = cache.pending_deletion_pages.len();
+        let new_id = cache.refurbish(committed_id);
+        assert_ne!(committed_id, new_id);
+        // New id is resident.
+        assert!(cache.contains_in_memory(new_id));
+        // Cached count conserved.
+        assert_eq!(cache.cached_node_count(), 1);
+        // Old page (which had the committed node) is recorded for
+        // deletion-or-update at the next commit.
+        let old_page = cache.page_of(committed_id);
+        assert!(
+            cache.pending_deletion_pages.contains(&old_page),
+            "refurbish of a committed node must mark its page in pending_deletion_pages"
+        );
+        assert!(cache.pending_deletion_pages.len() > pending_deletion_before);
+        // New id is in pending_created.
+        assert!(cache.pending_created.contains(&new_id));
+        // Value preserved.
+        let got = cache.get(new_id).unwrap().unwrap();
+        assert_eq!(got.hash, vec![0xbb; 36]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not resident")]
+    fn refurbish_nonexistent_id_panics() {
+        // A logic bug surfaces loudly rather than corrupting state.
+        let mut cache = MerkleTrieCache::new();
+        let _ = cache.refurbish(FIRST_NODE_ID);
     }
 
     #[test]
