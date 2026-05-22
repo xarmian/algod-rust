@@ -263,6 +263,48 @@ impl MerkleTrie {
         self.element_length
     }
 
+    /// Set the eviction target for the underlying [`MerkleTrieCache`].
+    /// Pages are evicted by `evict` (called from
+    /// `SqliteLedger::commit_block`) when the in-memory node count
+    /// exceeds this value. Default is
+    /// [`crate::merkle_cache::DEFAULT_CACHED_NODES_TARGET`] (9000,
+    /// matching go-algorand's `TrieCachedNodesCount`).
+    pub fn set_cache_target(&mut self, target: usize) {
+        self.cache.set_cache_target(target);
+    }
+
+    /// Read-only view of the in-memory node-count target.
+    pub fn cache_target(&self) -> usize {
+        self.cache.cache_target()
+    }
+
+    /// In-memory node count across all resident pages. Used by tests +
+    /// `SqliteLedger`'s eviction wiring to log post-evict cache size.
+    pub fn cached_node_count(&self) -> usize {
+        self.cache.cached_node_count()
+    }
+
+    /// True iff a lazy loader has been installed on the cache. Eviction
+    /// is only safe when this returns `true`, because evicted pages
+    /// must be re-fetchable. Used by [`SqliteLedger::commit_block`] to
+    /// gate `evict` (and to decide whether to install a loader on first
+    /// commit). PLAN-144 TASK-147.
+    pub fn has_lazy_loader(&self) -> bool {
+        self.cache.has_lazy_loader()
+    }
+
+    /// Install an owned page committer as the cache's lazy loader after
+    /// construction. Production calls this from
+    /// [`SqliteLedger::commit_block`] on disk-backed ledgers after the
+    /// first successful commit so subsequent `evict` calls can re-load
+    /// evicted pages on demand. Tests use it directly when they want to
+    /// exercise the post-evict reload path against an
+    /// [`crate::merkle_cache::InMemoryPageCommitter`] without going
+    /// through [`MerkleTrie::load`].
+    pub fn set_lazy_loader(&mut self, loader: Box<dyn PageCommitter + Send>) {
+        self.cache.set_lazy_loader(loader);
+    }
+
     /// True iff no elements have been added (or all have been deleted).
     pub fn is_empty(&self) -> bool {
         self.root.is_none()
@@ -515,23 +557,31 @@ impl MerkleTrie {
     }
 
     /// Evict least-recently-used pages from memory back to the eviction
-    /// target. The root page is pinned.
+    /// target. The root page is pinned. Returns the number of pages
+    /// evicted.
     ///
-    /// **`pub(crate)`** until PLAN-144 Task 3 wires active eviction into
-    /// `SqliteLedger::commit_block`. Now that lazy load is implemented
-    /// (PLAN-144 TASK-146), evicted pages can be safely re-fetched on
-    /// demand via the cache's lazy loader; this method is therefore
-    /// safe to call any time the trie is not dirty.
+    /// Safe to call any time `self.dirty == false` (i.e. immediately
+    /// after `commit`). Evicted pages are re-fetched on demand by the
+    /// cache's lazy loader installed at [`MerkleTrie::load`] time
+    /// (PLAN-144 TASK-146); a dirty trie would lose data on eviction,
+    /// hence the check.
     ///
-    /// Caller must guarantee no dirty pages remain (i.e. `commit` was
-    /// called immediately before, or `dirty == false`). Returns the
-    /// number of pages evicted.
-    #[allow(dead_code)] // wired in PLAN-144 Task 3
-    pub(crate) fn evict(&mut self) -> Result<usize, AlgoError> {
+    /// Wired into `SqliteLedger::commit_block` (PLAN-144 TASK-147) so
+    /// runtime cache memory is bounded across long block replays.
+    pub fn evict(&mut self) -> Result<usize, AlgoError> {
         if self.dirty {
             return Err(AlgoError::Ledger {
                 message: "MerkleTrie::evict called with dirty cache — commit first".into(),
             });
+        }
+        // Safety: never evict pages we can't recover. Without a lazy
+        // loader, subsequent `get` for an evicted node returns
+        // `Ok(None)` and the trie's algorithms surface that as a
+        // `missing_node` error. The caller is responsible for
+        // installing a loader (via `set_lazy_loader` or `MerkleTrie::load`)
+        // before relying on eviction.
+        if !self.cache.has_lazy_loader() {
+            return Ok(0);
         }
         Ok(self.cache.evict(self.root))
     }

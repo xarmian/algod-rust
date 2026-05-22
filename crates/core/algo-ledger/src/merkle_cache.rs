@@ -251,9 +251,10 @@ pub struct MerkleTrieCache {
     cached_node_count: usize,
     /// Eviction target. After commit, pages are evicted from the LRU
     /// back until `cached_node_count <= cached_node_count_target`.
-    /// Read by [`MerkleTrieCache::evict`], which is `pub(crate)` until
-    /// PLAN-144 Task 3 wires active eviction into `commit_block`.
-    #[allow(dead_code)]
+    /// `SqliteLedger::commit_block` invokes [`MerkleTrieCache::evict`]
+    /// after every commit; the lazy loader installed by
+    /// [`crate::merkle_trie::MerkleTrie::load`] re-fetches evicted
+    /// pages on demand.
     cached_node_count_target: usize,
     /// Optional owned loader installed by [`crate::merkle_trie::MerkleTrie::load`].
     /// When present, [`MerkleTrieCache::get`] / [`MerkleTrieCache::get_mut`]
@@ -312,6 +313,20 @@ impl MerkleTrieCache {
             cached_node_count_target: target,
             lazy_loader: None,
         }
+    }
+
+    /// Set the in-memory node-count target used by [`MerkleTrieCache::evict`].
+    /// Production calls this on every load to apply
+    /// `SqliteLedger::trie_cache_target` (default
+    /// [`DEFAULT_CACHED_NODES_TARGET`]). Tests use a small value
+    /// (e.g. 200) to make the eviction path testable.
+    pub fn set_cache_target(&mut self, target: usize) {
+        self.cached_node_count_target = target;
+    }
+
+    /// Read-only view of the eviction target (for tests + diagnostics).
+    pub fn cache_target(&self) -> usize {
+        self.cached_node_count_target
     }
 
     /// Install an owned page committer as the cache's lazy loader.
@@ -532,10 +547,8 @@ impl MerkleTrieCache {
     /// a dirty page would lose data. The wrapper
     /// [`crate::merkle_trie::MerkleTrie::evict`] enforces this.
     ///
-    /// Currently `pub(crate)` until PLAN-144 Task 3 wires active eviction
-    /// into `SqliteLedger::commit_block`.
-    #[allow(dead_code)]
-    pub(crate) fn evict(&mut self, root_id: Option<u64>) -> usize {
+    /// Wired into `SqliteLedger::commit_block` (PLAN-144 TASK-147).
+    pub fn evict(&mut self, root_id: Option<u64>) -> usize {
         // Pin the root page at the front.
         let root_page = root_id.map(|rid| self.page_of(rid));
         if let Some(rp) = root_page {
