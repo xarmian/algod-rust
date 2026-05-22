@@ -143,7 +143,7 @@ fn long_replay_keeps_cache_below_target_and_preserves_root() {
         // Spot-check that the evicting trie's root matches the
         // never-evicted reference. Every 100 blocks is enough to catch
         // a divergence without blowing up the test runtime.
-        if block.is_multiple_of(100) || block == BLOCKS - 1 {
+        if block % 100 == 0 || block == BLOCKS - 1 {
             let r1 = trie.root_hash().unwrap();
             let r2 = reference.root_hash().unwrap();
             assert_eq!(
