@@ -525,7 +525,12 @@ impl MerkleTrie {
             }
             self.dirty = false;
         }
-        self.cache.commit(self.root, self.element_length, committer)
+        // The cache's commit performs the page-packing repack
+        // (PLAN-144 TASK-148), which may relocate the root node to a
+        // fresh tail page. Pass `&mut self.root` so the cache can update
+        // our root id in place.
+        self.cache
+            .commit(&mut self.root, self.element_length, committer)
     }
 
     /// Reconstruct a trie from a [`PageCommitter`].
@@ -1469,17 +1474,40 @@ mod tests {
         trie.get_node_mut(leaf_id).unwrap().unwrap().hash = mutated_marker.clone();
         trie.commit(&committer).unwrap();
 
+        // PLAN-144 TASK-148: the second commit's page-packing pass may
+        // relocate the mutated leaf to a new id (the original leaf_id
+        // was reported between commits, before the second relocation).
+        // Reload and walk the tree by content — assert that SOMEWHERE
+        // in the restored trie there is a leaf carrying the marker.
         let mut restored = MerkleTrie::load(Box::new(committer.clone()))
             .unwrap()
             .unwrap();
-        let got = restored
-            .get_node(leaf_id)
-            .unwrap()
-            .expect("leaf must still exist");
-        assert_eq!(
-            got.hash, mutated_marker,
-            "in-place mutation via get_node_mut must persist through commit + load"
+        let restored_root = restored.root_id().expect("non-empty trie");
+        let found = leaf_with_hash_exists(&mut restored, restored_root, &mutated_marker);
+        assert!(
+            found,
+            "in-place mutation via get_node_mut must persist through commit + load \
+             (no leaf with the mutated marker found in the reloaded trie)"
         );
+    }
+
+    /// DFS: true iff any leaf in the subtree rooted at `node_id`
+    /// carries `target_hash` as its `hash`.
+    fn leaf_with_hash_exists(trie: &mut MerkleTrie, node_id: u64, target_hash: &[u8]) -> bool {
+        let node = trie
+            .get_node(node_id)
+            .unwrap()
+            .expect("node in cache")
+            .clone();
+        if node.is_leaf() {
+            return node.hash == target_hash;
+        }
+        for c in &node.children {
+            if leaf_with_hash_exists(trie, c.child_id, target_hash) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Recursively find any leaf descendant of `node_id`. The trie's

@@ -46,6 +46,13 @@ struct Fixture {
     element_size: usize,
     elements_hex: Vec<String>,
     root_hex: String,
+    /// Node-page count (page id ≥ 1) recorded by go-algorand's
+    /// `merkleTrieCache::commit` for this scenario. Captured by
+    /// `tools/merkle-trie-root-capture` with the production
+    /// `MemoryConfig` (`PageFillFactor=0.95`,
+    /// `MaxChildrenPagesThreshold=64`). PLAN-144 TASK-148: Rust must
+    /// match within ±10%.
+    page_count_after_commit: usize,
 }
 
 fn load_fixtures() -> Vec<Fixture> {
@@ -180,6 +187,63 @@ fn single_element_fixture_matches_manual_hash() {
     let mut trie = MerkleTrie::new(single.element_size);
     trie.add(&elem).unwrap();
     assert_eq!(trie.root_hash().unwrap(), expected);
+}
+
+/// PLAN-144 TASK-148: post-commit node-page count must match Go's
+/// recorded count within ±10%, proving the `reallocatePendingPages`
+/// page-packing heuristic is correctly ported. Without the heuristic
+/// Rust packs less tightly than Go (lower fill factor → more pages);
+/// with it, the page count should agree across implementations.
+#[test]
+fn page_packing_matches_go_within_tolerance() {
+    use algo_ledger::merkle_cache::InMemoryPageCommitter;
+
+    let fixtures = load_fixtures();
+    let mut report: Vec<(String, usize, usize, bool)> = Vec::new();
+
+    for fx in &fixtures {
+        let mut trie = MerkleTrie::new(fx.element_size);
+        for (i, h) in fx.elements_hex.iter().enumerate() {
+            let bytes = hex::decode(h)
+                .unwrap_or_else(|e| panic!("scenario {}: hex decode[{i}]: {e}", fx.name));
+            trie.add(&bytes)
+                .unwrap_or_else(|e| panic!("scenario {}: add[{i}]: {e}", fx.name));
+        }
+        let committer = InMemoryPageCommitter::new();
+        trie.commit(&committer)
+            .unwrap_or_else(|e| panic!("scenario {}: commit: {e}", fx.name));
+        // page_count() includes the metadata page (page 0); subtract
+        // to align with the Go fixture's node-page-only count.
+        let rust_node_pages = committer.page_count().saturating_sub(1);
+        let go_node_pages = fx.page_count_after_commit;
+
+        // ±10% tolerance, with a floor of 1 so the tiny scenarios
+        // (1–5 elements) don't fail on a single-page rounding gap.
+        let tolerance = ((go_node_pages as f64 * 0.10).ceil() as usize).max(1);
+        let lo = go_node_pages.saturating_sub(tolerance);
+        let hi = go_node_pages + tolerance;
+        let ok = (lo..=hi).contains(&rust_node_pages);
+        report.push((fx.name.clone(), go_node_pages, rust_node_pages, ok));
+    }
+
+    let failures: Vec<&(String, usize, usize, bool)> =
+        report.iter().filter(|(_, _, _, ok)| !ok).collect();
+    if !failures.is_empty() {
+        let mut msg =
+            String::from("\nMerkle trie page-count divergence vs. go-algorand (>10% tolerance):\n");
+        for (name, go, rust, _) in &failures {
+            msg.push_str(&format!(
+                "  scenario {name}: go={go} rust={rust} (diff={diff})\n",
+                diff = (*rust as i64 - *go as i64).abs(),
+            ));
+        }
+        msg.push_str(&format!(
+            "\n{}/{} scenarios within ±10% of Go.\n",
+            report.len() - failures.len(),
+            report.len(),
+        ));
+        panic!("{msg}");
+    }
 }
 
 /// TASK-138 close-out: drive every fixture through the

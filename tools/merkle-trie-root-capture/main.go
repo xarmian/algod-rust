@@ -90,6 +90,56 @@ type fixture struct {
 	ElementSize  int      `json:"element_size"`
 	ElementsHex  []string `json:"elements_hex"`
 	RootHex      string   `json:"root_hex"`
+	// PageCountAfterCommit is the number of *node* pages (page id ≥ 1)
+	// stored by go-algorand's `merkleTrieCache::commit` after Trie.Add +
+	// Trie.Commit on the input element list. Page 0 carries the trie
+	// metadata and is excluded. PLAN-144 TASK-148: the Rust port must
+	// match this within ±10% after the `reallocatePendingPages` heuristic
+	// lands.
+	PageCountAfterCommit int `json:"page_count_after_commit"`
+}
+
+// countingCommitter wraps an in-memory committer and tracks the set of
+// node-page ids currently stored (i.e. with non-nil content). Used to
+// emit `page_count_after_commit` for the Rust conformance harness.
+type countingCommitter struct {
+	pages map[uint64][]byte
+}
+
+func (c *countingCommitter) StorePage(page uint64, content []byte) error {
+	if c.pages == nil {
+		c.pages = make(map[uint64][]byte)
+	}
+	if content == nil {
+		delete(c.pages, page)
+	} else {
+		// Copy so the caller's buffer can be reused.
+		buf := make([]byte, len(content))
+		copy(buf, content)
+		c.pages[page] = buf
+	}
+	return nil
+}
+
+func (c *countingCommitter) LoadPage(page uint64) ([]byte, error) {
+	if c.pages == nil {
+		return nil, nil
+	}
+	return c.pages[page], nil
+}
+
+// nodePageCount returns the number of pages with id ≥ 1 currently
+// stored. Page 0 carries the trie metadata and is excluded so the
+// number reflects "trie shape" — which is what the page-packing
+// heuristic optimizes.
+func (c *countingCommitter) nodePageCount() int {
+	n := 0
+	for id := range c.pages {
+		if id >= 1 {
+			n++
+		}
+	}
+	return n
 }
 
 // makeElement constructs a deterministic 36-byte trie element in the
@@ -123,34 +173,40 @@ func makeElementSeq(n int) [][elementSize]byte {
 	return out
 }
 
-// computeRoot builds a Go merkletrie from the supplied elements and returns
-// its 32-byte root hash. Uses the InMemoryCommitter (default when no
-// committer is passed to MakeTrie — see trie.go:86-87).
-func computeRoot(elements [][elementSize]byte) ([32]byte, error) {
+// computeRootAndPageCount builds a Go merkletrie from the supplied
+// elements, computes its root hash, commits to an in-memory committer,
+// and returns both the 32-byte root + the post-commit node-page count.
+// Uses Go's full `MemoryConfig` defaults (matching the production
+// trackerdb config at `ledger/store/trackerdb/catchpoint.go:35-37`).
+func computeRootAndPageCount(elements [][elementSize]byte) ([32]byte, int, error) {
 	memoryConfig := merkletrie.MemoryConfig{
 		NodesCountPerPage:         nodesCountPerPage,
 		CachedNodesCount:          9000,
 		PageFillFactor:            0.95,
 		MaxChildrenPagesThreshold: 64,
 	}
-	trie, err := merkletrie.MakeTrie(nil, memoryConfig)
+	committer := &countingCommitter{}
+	trie, err := merkletrie.MakeTrie(committer, memoryConfig)
 	if err != nil {
-		return [32]byte{}, fmt.Errorf("MakeTrie: %w", err)
+		return [32]byte{}, 0, fmt.Errorf("MakeTrie: %w", err)
 	}
 	for i, e := range elements {
 		added, err := trie.Add(e[:])
 		if err != nil {
-			return [32]byte{}, fmt.Errorf("trie.Add[%d]: %w", i, err)
+			return [32]byte{}, 0, fmt.Errorf("trie.Add[%d]: %w", i, err)
 		}
 		if !added {
-			return [32]byte{}, fmt.Errorf("trie.Add[%d]: unexpected duplicate", i)
+			return [32]byte{}, 0, fmt.Errorf("trie.Add[%d]: unexpected duplicate", i)
 		}
 	}
 	root, err := trie.RootHash()
 	if err != nil {
-		return [32]byte{}, fmt.Errorf("trie.RootHash: %w", err)
+		return [32]byte{}, 0, fmt.Errorf("trie.RootHash: %w", err)
 	}
-	return root, nil
+	if _, err := trie.Commit(); err != nil {
+		return [32]byte{}, 0, fmt.Errorf("trie.Commit: %w", err)
+	}
+	return root, committer.nodePageCount(), nil
 }
 
 // hexElements maps a slice of fixed-size elements to their hex strings.
@@ -231,17 +287,18 @@ func main() {
 
 	var out []fixture
 	for _, sc := range scenarios {
-		root, err := computeRoot(sc.elements)
+		root, pageCount, err := computeRootAndPageCount(sc.elements)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "scenario %q: %v\n", sc.name, err)
 			os.Exit(1)
 		}
 		out = append(out, fixture{
-			Name:         sc.name,
-			ElementCount: len(sc.elements),
-			ElementSize:  elementSize,
-			ElementsHex:  hexElements(sc.elements),
-			RootHex:      hex.EncodeToString(root[:]),
+			Name:                 sc.name,
+			ElementCount:         len(sc.elements),
+			ElementSize:          elementSize,
+			ElementsHex:          hexElements(sc.elements),
+			RootHex:              hex.EncodeToString(root[:]),
+			PageCountAfterCommit: pageCount,
 		})
 	}
 

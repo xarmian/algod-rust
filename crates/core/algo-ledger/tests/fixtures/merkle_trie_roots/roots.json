@@ -6,7 +6,8 @@
     "elements_hex": [
       "0000000000e076ab7609c7f8c763b5c571d07aea80b06b41452231b1437370f4964ed66e"
     ],
-    "root_hex": "3c0315cb5173b3362d38bbbc7ed2d7ac979f29be35c75b642c88cc68746125ce"
+    "root_hex": "3c0315cb5173b3362d38bbbc7ed2d7ac979f29be35c75b642c88cc68746125ce",
+    "page_count_after_commit": 1
   },
   {
     "name": "two-element-split-byte-0",
@@ -16,7 +17,8 @@
       "00000000008b71c345fac6e44dca4f7a762a560c3bdd7fa3001e84507c946a7d8fd46ee7",
       "ffffffff007294506d428b2e99da3a6cec5e8500b20bb19e6a3068df834d872dac6f3f5e"
     ],
-    "root_hex": "a8570ce976d74af052b27c77fade71ccf28577e37eec862c19cc756ea00f47c0"
+    "root_hex": "a8570ce976d74af052b27c77fade71ccf28577e37eec862c19cc756ea00f47c0",
+    "page_count_after_commit": 1
   },
   {
     "name": "two-element-shared-byte-0..4",
@@ -26,7 +28,8 @@
       "aabbccdd008b71c345fac6e44dca4f7a762a560c3bdd7fa3001e84507c946a7d8fd46ee7",
       "aabbccdd00ff71c345fac6e44dca4f7a762a560c3bdd7fa3001e84507c946a7d8fd46ee7"
     ],
-    "root_hex": "005620b906a54173320a397b5e2eb8994d3ca8f44d86dc05eacc87ef36edf84e"
+    "root_hex": "005620b906a54173320a397b5e2eb8994d3ca8f44d86dc05eacc87ef36edf84e",
+    "page_count_after_commit": 1
   },
   {
     "name": "5-account-trie",
@@ -39,7 +42,8 @@
       "0000000300de71547d38407798f39366dc716cb177c2e110c5a9c4d686b324d0e8d7461b",
       "0000000400ffe9d1db770a47459267ea1a1356c1e95fc526ee12489ea47cc6ee8615249e"
     ],
-    "root_hex": "7b46997ab2448004596e4063715f38a9e76738ea8c3b9cee9a21a8ed17595ec0"
+    "root_hex": "7b46997ab2448004596e4063715f38a9e76738ea8c3b9cee9a21a8ed17595ec0",
+    "page_count_after_commit": 1
   },
   {
     "name": "100-account-trie",
@@ -147,7 +151,8 @@
       "00000062009bcd901be5d5f5044a84ae939003c125e79512ff07b3f4f030d4cbf5cfaf68",
       "0000006300f832f9137f2d5588278a26f545033cb9b52315a0bd3416c920b74774c8bff0"
     ],
-    "root_hex": "04e8a10e0b57b34c6ea6e8622a19d7eb16825c279f64eb37cc5162c01a3beef5"
+    "root_hex": "04e8a10e0b57b34c6ea6e8622a19d7eb16825c279f64eb37cc5162c01a3beef5",
+    "page_count_after_commit": 2
   },
   {
     "name": "1000-account-trie",
@@ -1155,6 +1160,7 @@
       "000003e600bbfd3705e05f6061e190f5eb4ea7d383205ae8ae321f17d6df3a7c6919efe1",
       "000003e7000c135401789e1c974035a5ee942b66f58f3ae387f8a039c9e57cd89988bc94"
     ],
-    "root_hex": "ba124c753be56a496c2eef6a619cd4d19791053961960235938fadde73d93a59"
+    "root_hex": "ba124c753be56a496c2eef6a619cd4d19791053961960235938fadde73d93a59",
+    "page_count_after_commit": 10
   }
 ]
