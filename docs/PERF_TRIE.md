@@ -141,6 +141,7 @@ Rust samples per phase: 20. Go samples per phase: 20.
 | 2026-05-21 | commit | 0.23× | TASK-145 | Baseline. Rust ~4× faster on commit + page serialization. |
 | 2026-05-21 | cold-load | 20.71× | TASK-145 | Baseline; not apples-to-apples (Go is lazy). See note above; PLAN-144 Task 2 fixes. |
 | 2026-05-22 | cold-load | 0.04× | TASK-146 | Lazy load lands. Rust now reads only metadata at load time; ~575× faster than the eager baseline and faster than Go in absolute terms. |
+| 2026-05-22 | commit | 0.29× | TASK-147 | Active eviction wired into `SqliteLedger::commit_block`. Commit-phase wall clock unchanged within noise (eviction is amortized; the bench's commit phase doesn't install a loader, so `evict` is a no-op there). Bound on runtime cache memory enforced — verified by `trie_eviction_bound_test::long_replay_keeps_cache_below_target_and_preserves_root`. |
 
 Reproducer machine (baseline run): local dev; absolute nanoseconds vary,
 ratios are the durable metric.

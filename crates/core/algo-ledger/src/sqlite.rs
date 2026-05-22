@@ -2368,6 +2368,12 @@ pub struct SqliteLedger {
     trie: Option<crate::merkle_trie::MerkleTrie>,
     /// Pre-mutation records for trie updates.
     pre_mutations: Vec<SqlitePreMutation>,
+    /// Eviction target for the trie's in-memory page cache. `None` →
+    /// [`crate::merkle_cache::DEFAULT_CACHED_NODES_TARGET`] (9000,
+    /// matching go-algorand's `TrieCachedNodesCount`). Applied at
+    /// `load_trie` time and to any trie set via `enable_trie` /
+    /// `rebuild_trie_from_db`. PLAN-144 TASK-147.
+    trie_cache_target: Option<usize>,
 }
 
 impl SqliteLedger {
@@ -2632,6 +2638,7 @@ impl SqliteLedger {
             in_block: false,
             trie: None,
             pre_mutations: Vec::new(),
+            trie_cache_target: None,
         })
     }
 
@@ -2737,6 +2744,10 @@ impl SqliteLedger {
         };
 
         self.trie = Some(trie);
+        // Re-apply the configured cache target. `load_trie` is also
+        // called from `rollback_block`, so the target must stick across
+        // reloads.
+        self.apply_trie_cache_target();
         self.pre_mutations.clear();
         Ok(())
     }
@@ -2927,6 +2938,29 @@ impl SqliteLedger {
     }
 
     /// Commit the current block-level transaction and flush chain state.
+    /// Override the in-memory page-cache size for the trie. Takes
+    /// effect immediately on the currently loaded trie (if any) and is
+    /// applied to any future trie reloaded via `load_trie` /
+    /// `enable_trie`. Eviction occurs at the end of every successful
+    /// [`SqliteLedger::commit_block`] so the in-memory cache is
+    /// bounded by `target` after every block. PLAN-144 TASK-147.
+    pub fn set_trie_cache_target(&mut self, target: usize) {
+        self.trie_cache_target = Some(target);
+        self.apply_trie_cache_target();
+    }
+
+    /// Apply the configured `trie_cache_target` (or
+    /// [`crate::merkle_cache::DEFAULT_CACHED_NODES_TARGET`] when unset)
+    /// to the currently loaded trie, if any.
+    fn apply_trie_cache_target(&mut self) {
+        let target = self
+            .trie_cache_target
+            .unwrap_or(crate::merkle_cache::DEFAULT_CACHED_NODES_TARGET);
+        if let Some(t) = self.trie.as_mut() {
+            t.set_cache_target(target);
+        }
+    }
+
     pub fn commit_block(&mut self) -> Result<(), AlgoError> {
         // Flush chain-level state to meta table.
         self.flush_chain_state()?;
@@ -2939,6 +2973,53 @@ impl SqliteLedger {
         if let Some(ref mut trie) = self.trie {
             let committer = crate::merkle_committer::SqliteMerkleCommitter::active(&self.conn);
             trie.commit(&committer)?;
+            // PLAN-144 TASK-147: bound runtime cache memory. On the
+            // first commit for a freshly-built (`rebuild_trie_from_db`)
+            // trie the cache has no lazy loader installed — install one
+            // now so subsequent `evict` is safe. Only disk ledgers
+            // (with a tracker file we can re-open read-only) get a
+            // loader; in-memory ledgers skip eviction (cache stays
+            // unbounded, which is acceptable for the test-only paths
+            // that build in-memory ledgers).
+            if !trie.has_lazy_loader() {
+                if let Some(prefix) = self.db_prefix.as_ref() {
+                    let tracker = tracker_path_for_prefix(prefix);
+                    match crate::merkle_committer::OwnedSqliteCommitter::open_active(&tracker) {
+                        Ok(owned) => {
+                            trie.set_lazy_loader(Box::new(owned));
+                            tracing::debug!(
+                                "merkle_trie: installed OwnedSqliteCommitter as lazy loader (post first commit)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "merkle_trie: could not install lazy loader for {}: {e} (eviction will be skipped)",
+                                tracker.display()
+                            );
+                        }
+                    }
+                }
+            }
+            // Eviction is safe immediately after commit (dirty=false)
+            // and lazy load (PLAN-144 TASK-146) re-fetches evicted
+            // pages on demand if subsequent blocks touch them.
+            // `MerkleTrie::evict` is a no-op when no loader is
+            // installed.
+            match trie.evict() {
+                Ok(evicted) => {
+                    tracing::debug!(
+                        "merkle_trie: evicted {evicted} pages; cache_nodes={} target={}",
+                        trie.cached_node_count(),
+                        trie.cache_target()
+                    );
+                }
+                Err(e) => {
+                    // Defensive: evict refuses on a dirty trie; we just
+                    // committed so this shouldn't happen, but surface
+                    // rather than silently swallow.
+                    tracing::warn!("merkle_trie: post-commit evict failed: {e}");
+                }
+            }
         }
 
         self.conn
@@ -4731,6 +4812,7 @@ impl LedgerStore for SqliteLedger {
                 crate::trie_hash::ELEMENT_SIZE,
             ));
         }
+        self.apply_trie_cache_target();
         self.pre_mutations.clear();
     }
 
