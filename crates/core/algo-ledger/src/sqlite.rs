@@ -136,21 +136,15 @@ CREATE TABLE IF NOT EXISTS unfinishedcatchpoints (
 -- algod_rust_meta` runs at open below to clean up DBs initialized by
 -- a pre-G6-part-3 binary.
 
-CREATE TABLE IF NOT EXISTS merkle_trie (
-    id   INTEGER PRIMARY KEY CHECK (id = 0),
-    data BLOB NOT NULL
-);
-
 -- Go-compatible paged trie storage. Matches
 -- `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go:66-68`
 -- byte-for-byte modulo the IF NOT EXISTS clause. Each row is one page
 -- of the merkle trie serialized with the format documented on
--- `algo_ledger::merkle_page::Page`. The legacy single-blob `merkle_trie`
--- row (`id = 0`) is preserved alongside this table during the
--- migration window and is the source of truth for now; TASK-102's
--- legacy-data check refuses to open a DB that has the old blob without
--- the new pages so a future task can flip the source-of-truth without
--- silently dropping state.
+-- `algo_ledger::merkle_page::Page`. This is the sole source of truth
+-- for trie persistence; the Rust-only single-blob `merkle_trie` table
+-- (DDL removed in PLAN-36 G4 / TASK-118) is no longer created. Old
+-- Rust DBs may still carry an orphan `merkle_trie` row, but the
+-- runtime neither reads nor writes it.
 CREATE TABLE IF NOT EXISTS accounthashes (
     id   INTEGER PRIMARY KEY,
     data BLOB
@@ -2555,21 +2549,19 @@ impl SqliteLedger {
             message: format!("algod_rust_meta retirement error: {e}"),
         })?;
 
-        // Legacy-trie-format note (TASK-102 / PLAN-35 / DOC-24 §G2):
+        // Trie persistence (PLAN-35 G2 / PLAN-36 G4 / DOC-24):
         //
-        // Older Rust ledgers stored the trie as a single blob in the
-        // `merkle_trie` table; TASK-102 added the `accounthashes` /
-        // `catchpointaccounthashes` Go-compatible paged tables alongside
-        // it. The two formats are NOT interchangeable byte-for-byte:
-        // Rust's `MerkleTrie` is path-compressed while Go's is a
-        // 256-ary radix trie. Until the Rust trie is converted to
-        // Go's shape (a follow-up PLAN-35 task), the runtime still
-        // writes to `merkle_trie` and leaves the paged tables empty
-        // (Go reads will return no pages — same as an empty trie).
-        // We intentionally do NOT refuse to open a legacy-blob DB
-        // here yet; that gate lands together with the trie rewrite
-        // so the recovery path ("re-sync from a catchpoint") has a
-        // real new-format target to migrate to.
+        // The runtime trie is persisted exclusively as Go-compatible
+        // pages in `accounthashes` (see `crate::merkle_committer`).
+        // PLAN-35 G2 (TASK-136) ported the page-shaped format and
+        // PLAN-36 G4 (TASK-118) dropped the Rust-only single-blob
+        // `merkle_trie` table from the schema. Older Rust DBs that
+        // were initialized before G4 may still carry an orphan
+        // `merkle_trie` row; the runtime ignores it and a fresh
+        // tracker DB contains no such table. Existing-DB migration
+        // (DROP / recovery from the legacy blob) is intentionally
+        // out of scope for Phase B writer parity — recovery is via
+        // catchpoint re-sync, which lands the new format.
 
         // Load cached chain-level state. Sole source: derive from
         // `acctrounds.acctbase` (Go's tracker round) + that round's
@@ -2690,12 +2682,12 @@ impl SqliteLedger {
     /// Load the trie from the paged `accounthashes` table, or rebuild from
     /// DB contents if no paged state exists.
     ///
-    /// PLAN-130 TASK-136 swap: the runtime trie is now persisted as pages
+    /// PLAN-130 TASK-136 swap: the runtime trie is persisted as pages
     /// in `accounthashes` (the Go-compatible format), via
-    /// [`crate::merkle_committer::SqliteMerkleCommitter`]. The legacy
-    /// `merkle_trie` single-blob table is no longer consulted by the
-    /// runtime; the DDL is retained for PLAN-36 TASK-118 to drop
-    /// separately.
+    /// [`crate::merkle_committer::SqliteMerkleCommitter`]. PLAN-36 G4
+    /// (TASK-118) dropped the legacy Rust-only `merkle_trie`
+    /// single-blob table from the schema, so the page-shaped store is
+    /// now the sole on-disk trie representation.
     pub fn load_trie(&mut self) -> Result<(), AlgoError> {
         // PLAN-144 TASK-146: lazy on-demand page loading.
         //
@@ -2967,9 +2959,9 @@ impl SqliteLedger {
 
         // Persist the trie if enabled. Paged commit via the same SQLite
         // transaction we're about to COMMIT — page writes happen against
-        // `accounthashes` (PLAN-130 TASK-136). The legacy `merkle_trie`
-        // table is intentionally no longer touched by the runtime; its
-        // DDL is retained for PLAN-36 TASK-118 to drop separately.
+        // `accounthashes` (PLAN-130 TASK-136). PLAN-36 G4 (TASK-118)
+        // dropped the legacy `merkle_trie` single-blob table; the
+        // runtime no longer creates, reads, or writes it.
         if let Some(ref mut trie) = self.trie {
             let committer = crate::merkle_committer::SqliteMerkleCommitter::active(&self.conn);
             trie.commit(&committer)?;
@@ -5797,10 +5789,13 @@ mod tests {
     }
 
     #[test]
-    fn test_merkle_trie_table_created() {
+    fn test_legacy_merkle_trie_table_absent() {
+        // PLAN-36 G4 (TASK-118) dropped the Rust-only single-blob
+        // `merkle_trie` table from the schema. A freshly-opened
+        // tracker DB must not contain it; the paged `accounthashes`
+        // table is the sole on-disk trie representation.
         let ledger = SqliteLedger::open_in_memory().unwrap();
-        // Verify the merkle_trie table exists.
-        let count: i64 = ledger
+        let legacy_count: i64 = ledger
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='merkle_trie'",
@@ -5808,7 +5803,17 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(legacy_count, 0, "merkle_trie table should not be created");
+
+        let paged_count: i64 = ledger
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='accounthashes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(paged_count, 1, "accounthashes table must exist");
     }
 
     #[test]

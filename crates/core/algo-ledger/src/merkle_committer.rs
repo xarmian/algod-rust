@@ -6,14 +6,12 @@
 //! persistence. Each `(id, data)` row corresponds to one page of nodes
 //! serialized in the format owned by [`crate::merkle_page::Page`].
 //!
-//! This module is the low-level read/write surface only; the higher-
-//! level trie that calls into it (Rust's `MerkleTrie`) is being
-//! converted to use page-shaped persistence as a follow-up under
-//! PLAN-35. Today the committer is exercised exclusively by the
-//! fixture-driven round-trip tests that prove a Go-style page payload
-//! can be stored and reloaded through SQL; the runtime trie still
-//! writes its single-blob form to `merkle_trie` until that follow-up
-//! lands.
+//! This module is the low-level read/write surface only. The
+//! higher-level `MerkleTrie` calls into it for paged persistence —
+//! PLAN-130 (TASK-136) wired the runtime commit path through this
+//! committer, and PLAN-36 G4 (TASK-118) dropped the legacy Rust-only
+//! single-blob `merkle_trie` table, so `accounthashes` is now the
+//! sole on-disk trie representation.
 //!
 //! Both `Active` and `Staging` variants write to the **tracker**
 //! schema (`main.accounthashes` or `main.catchpointaccounthashes`) and
