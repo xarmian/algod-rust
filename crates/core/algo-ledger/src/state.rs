@@ -1457,7 +1457,13 @@ impl crate::store_trait::LedgerStore for LedgerState {
         // not the account's. This matches Go's ResourcesHashBuilderV6 which passes
         // resData.UpdateRound. Account affinity changes do not affect resource elements.
 
-        Some(trie.root_hash())
+        match trie.root_hash() {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!("trie root_hash failed: {e}");
+                None
+            }
+        }
     }
 
     // ---- Block / Certificate Storage ----

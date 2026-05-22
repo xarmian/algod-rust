@@ -17,40 +17,37 @@
 //! Reference (go-algorand v4.5.1-stable):
 //! - `crypto/merkletrie/cache.go:46-94`   — `merkleTrieCache` struct
 //! - `crypto/merkletrie/cache.go:122-203` — `allocateNewNode`, `getNode`
+//! - `crypto/merkletrie/cache.go:242-268` — `loadPage` (on-demand)
 //! - `crypto/merkletrie/cache.go:287-341` — transaction scopes
 //! - `crypto/merkletrie/cache.go:356-423` — `commit`
 //! - `crypto/merkletrie/cache.go:708-731` — `evict`
 //! - `crypto/merkletrie/trie.go:251-291`  — root-metadata page (page 0)
 //! - `crypto/merkletrie/trie.go:29,32`    — version constants
 //!
-//! Differences from Go (documented; preserved as follow-ups):
+//! ## Lazy on-demand page loading (PLAN-144 TASK-146)
 //!
-//! - **Eager load.** `MerkleTrieCache::load_all` reads every page at
-//!   load time, whereas Go's `loadPage` is on-demand. This is simpler
-//!   and adequate for the small trie sizes algod-rust handles today;
-//!   add lazy load once we hit large-N profiling.
-//! - **No `reallocatePendingPages` packing heuristic.** Go reorganizes
-//!   nodes across pages on commit to reduce fanout and improve fill
-//!   factor (`cache.go:428-530`). We skip this — the resulting page
-//!   layout is correct but may have lower fill factor and higher write
-//!   amplification. Follow-up under TASK-137's perf-tuning scope.
-//! - **No `refurbishNode` ID recycling.** Each `add`/`delete` allocates
-//!   fresh IDs; old node slots are not reused. Mirrors Go's
-//!   correctness contract; can be added once write amplification
-//!   matters in practice.
-//! - **Eviction is gated `pub(crate)` until lazy-load lands.** The
-//!   LRU bookkeeping, root-pinning, and dirty-page tracking are all
-//!   wired and tested in `#[cfg(test)]`, but no production path calls
-//!   `evict` because evicted pages have no on-demand reload. This
-//!   means **the runtime cache is currently unbounded** — it grows
-//!   monotonically across block applies until the trie is dropped or
-//!   reloaded via [`crate::merkle_trie::MerkleTrie::load`]. This is
-//!   a deliberate trade-off: TASK-136 needs paged persistence to
-//!   land first; lazy-load + active eviction is a follow-up under
-//!   the perf-tuning portion of TASK-137 scope. For the trie sizes
-//!   algod-rust handles today (test/local nets) this is acceptable.
+//! The cache stores an optional `Box<dyn PageCommitter + Send>`
+//! (`lazy_loader`) installed by [`crate::merkle_trie::MerkleTrie::load`].
+//! On `get` / `get_mut`, a node that isn't in memory triggers a page
+//! read via the loader, deserializes the page, and re-tries the lookup.
+//! This mirrors Go's `merkleTrieCache::getNode` at `cache.go:166-203`.
+//!
+//! The `Send` bound is required because `MerkleTrie` rides inside
+//! `SqliteLedger`, which `agreement_bridge` moves across thread
+//! boundaries when spawning agreement workers. Both shipped committers
+//! satisfy it: [`InMemoryPageCommitter`] holds an `Arc<Mutex<…>>`
+//! (`Send + Sync`), and the SQLite-backed `OwnedSqliteCommitter` (in
+//! `merkle_committer.rs`) owns its own `Connection` outright (rusqlite's
+//! `Connection: Send`). The borrowed `SqliteMerkleCommitter<'_>` is
+//! deliberately not boxed as a lazy loader — its connection borrow is
+//! call-scoped.
+//!
+//! Tries that never persist (catchpoint-verify ephemeral builds, unit
+//! tests that don't commit) leave `lazy_loader = None`; the cache
+//! behaves as a pure in-memory store and a miss returns `Ok(None)`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use algo_error::AlgoError;
 
@@ -120,9 +117,23 @@ pub trait PageCommitter {
 /// In-memory [`PageCommitter`] for tests and the catchpoint-verify path
 /// (which builds an ephemeral trie that's never persisted). Mirrors Go's
 /// `InMemoryCommitter` at `crypto/merkletrie/committer.go:32-69`.
-#[derive(Debug, Default)]
+///
+/// Internals are `Arc<Mutex<…>>` so the committer is cheaply [`Clone`].
+/// This lets tests retain a handle for inspection (page count, hit
+/// counter) after handing an owned clone to
+/// [`crate::merkle_trie::MerkleTrie::load`].
+///
+/// The hit counter — `load_page_hits` — is incremented every time
+/// `load_page` is invoked, regardless of whether the page exists. Used
+/// by lazy-load tests to assert that on-demand loading touches **exactly**
+/// the pages a traversal needs (and not the whole trie).
+#[derive(Debug, Default, Clone)]
 pub struct InMemoryPageCommitter {
-    pages: std::sync::Mutex<HashMap<u64, Vec<u8>>>,
+    pages: Arc<Mutex<HashMap<u64, Vec<u8>>>>,
+    /// `page_id -> hit count`. Incremented by `load_page` for any call,
+    /// including misses (so test assertions can detect "the lazy loader
+    /// asked for a page that didn't exist").
+    load_page_hits: Arc<Mutex<HashMap<u64, u64>>>,
 }
 
 impl InMemoryPageCommitter {
@@ -134,10 +145,27 @@ impl InMemoryPageCommitter {
     pub fn page_count(&self) -> usize {
         self.pages.lock().unwrap().len()
     }
+
+    /// Total `load_page` invocations across every page id.
+    pub fn total_load_page_calls(&self) -> u64 {
+        self.load_page_hits.lock().unwrap().values().sum()
+    }
+
+    /// Per-page `load_page` invocation counts.
+    pub fn load_page_hits(&self) -> HashMap<u64, u64> {
+        self.load_page_hits.lock().unwrap().clone()
+    }
+
+    /// Reset the hit counter. Useful when a test wants to measure only
+    /// the loads triggered by a specific operation (e.g. one `contains`).
+    pub fn reset_load_page_hits(&self) {
+        self.load_page_hits.lock().unwrap().clear();
+    }
 }
 
 impl PageCommitter for InMemoryPageCommitter {
     fn load_page(&self, id: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        *self.load_page_hits.lock().unwrap().entry(id).or_insert(0) += 1;
         Ok(self.pages.lock().unwrap().get(&id).cloned())
     }
 
@@ -178,10 +206,9 @@ pub struct CommitStats {
 /// page, and `commit` flushes only the dirty pages.
 ///
 /// The cache itself is committer-agnostic: any [`PageCommitter`] (SQLite
-/// or in-memory) can drive the persistence. The trie owns the cache; it
-/// passes the committer in at `commit` / `load` time so the cache
-/// doesn't need to hold a long-lived borrow.
-#[derive(Debug)]
+/// or in-memory) can drive the persistence. Tries that intend to lazy-
+/// load pages on demand install an owned [`PageCommitter`] via the
+/// `lazy_loader` field; without one, a cache miss returns `Ok(None)`.
 pub struct MerkleTrieCache {
     /// `page_id -> { node_id -> TrieNode }`. The inner map is per-page so
     /// page-level operations (load, write, evict) are O(1) over the
@@ -225,10 +252,36 @@ pub struct MerkleTrieCache {
     /// Eviction target. After commit, pages are evicted from the LRU
     /// back until `cached_node_count <= cached_node_count_target`.
     /// Read by [`MerkleTrieCache::evict`], which is `pub(crate)` until
-    /// lazy-load lands; clippy flags this field as unused on lib-only
-    /// builds where evict is referenced only from `#[cfg(test)]`.
+    /// PLAN-144 Task 3 wires active eviction into `commit_block`.
     #[allow(dead_code)]
     cached_node_count_target: usize,
+    /// Optional owned loader installed by [`crate::merkle_trie::MerkleTrie::load`].
+    /// When present, [`MerkleTrieCache::get`] / [`MerkleTrieCache::get_mut`]
+    /// lazy-fetch missing pages through this committer. When `None`,
+    /// a cache miss simply returns `Ok(None)`.
+    ///
+    /// No `Send` bound — see module docs.
+    lazy_loader: Option<Box<dyn PageCommitter + Send>>,
+}
+
+impl std::fmt::Debug for MerkleTrieCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MerkleTrieCache")
+            .field("page_count", &self.pages.len())
+            .field("next_node_id", &self.next_node_id)
+            .field("last_committed_node_id", &self.last_committed_node_id)
+            .field("nodes_per_page", &self.nodes_per_page)
+            .field("cached_node_count", &self.cached_node_count)
+            .field("cached_node_count_target", &self.cached_node_count_target)
+            .field("pending_created_count", &self.pending_created.len())
+            .field("pending_dirty_pages_count", &self.pending_dirty_pages.len())
+            .field(
+                "pending_deletion_pages_count",
+                &self.pending_deletion_pages.len(),
+            )
+            .field("has_lazy_loader", &self.lazy_loader.is_some())
+            .finish()
+    }
 }
 
 impl Default for MerkleTrieCache {
@@ -257,7 +310,23 @@ impl MerkleTrieCache {
             pages_priority_set: HashSet::new(),
             cached_node_count: 0,
             cached_node_count_target: target,
+            lazy_loader: None,
         }
+    }
+
+    /// Install an owned page committer as the cache's lazy loader.
+    /// Called by [`crate::merkle_trie::MerkleTrie::load`] immediately
+    /// after reading the metadata page, so subsequent `get` / `get_mut`
+    /// can on-demand fetch pages instead of requiring an eager
+    /// `load_all` pass.
+    pub fn set_lazy_loader(&mut self, loader: Box<dyn PageCommitter + Send>) {
+        self.lazy_loader = Some(loader);
+    }
+
+    /// True iff this cache has an installed lazy loader. Used by tests
+    /// + diagnostics; production code should not branch on this.
+    pub fn has_lazy_loader(&self) -> bool {
+        self.lazy_loader.is_some()
     }
 
     /// Page that holds node `id` under the configured page size.
@@ -315,36 +384,85 @@ impl MerkleTrieCache {
         }
     }
 
-    /// Borrow node `id`. Returns `None` if the node is not in memory
-    /// (lazy-load path is not implemented — the trie loads all pages
-    /// eagerly in `load_all`).
-    #[inline]
-    pub fn get(&self, id: u64) -> Option<&TrieNode> {
-        self.pages.get(&self.page_of(id))?.get(&id)
+    /// Borrow node `id`. Lazy-loads its containing page on miss when a
+    /// `lazy_loader` is installed. Mirrors Go's
+    /// `merkleTrieCache::getNode` (`cache.go:166-203`).
+    ///
+    /// Returns:
+    /// - `Ok(Some(&node))` — node is (now) in memory.
+    /// - `Ok(None)` — node is genuinely absent: either no `lazy_loader`,
+    ///   or the page doesn't exist in the committer.
+    /// - `Err(_)` — committer returned an error (e.g. SQLite I/O fail).
+    pub fn get(&mut self, id: u64) -> Result<Option<&TrieNode>, AlgoError> {
+        let page = self.page_of(id);
+        if self.pages.contains_key(&page) && self.pages[&page].contains_key(&id) {
+            self.prioritize_front(page);
+            return Ok(self.pages.get(&page).and_then(|p| p.get(&id)));
+        }
+        // Miss — attempt lazy load.
+        self.try_lazy_load_page(page)?;
+        Ok(self.pages.get(&page).and_then(|p| p.get(&id)))
     }
 
-    /// Borrow node `id` mutably. Marks the containing page as dirty —
-    /// any caller that holds a mutable borrow may modify fields that
-    /// participate in the persisted page bytes (notably `hash`, set by
-    /// `MerkleTrie::recompute_all_hashes` for previously-loaded internal
-    /// nodes), so the page must be included in the next commit's write
-    /// set. Conservative-dirty is the only safe default; we can't ask
-    /// the borrow what it intends to do.
-    ///
-    /// Returns `None` if the node is not in memory (lazy-load is not
-    /// implemented — the trie loads all pages eagerly in `load_all`).
-    pub fn get_mut(&mut self, id: u64) -> Option<&mut TrieNode> {
+    /// Borrow node `id` mutably. Lazy-loads on miss. Marks the
+    /// containing page as dirty — any caller that holds a mutable borrow
+    /// may modify fields that participate in the persisted page bytes
+    /// (notably `hash`, set by `MerkleTrie::recompute_all_hashes` for
+    /// previously-loaded internal nodes), so the page must be included
+    /// in the next commit's write set. Conservative-dirty is the only
+    /// safe default; we can't ask the borrow what it intends to do.
+    pub fn get_mut(&mut self, id: u64) -> Result<Option<&mut TrieNode>, AlgoError> {
         let page = self.page_of(id);
         if !self.pages.contains_key(&page) || !self.pages[&page].contains_key(&id) {
-            return None;
+            self.try_lazy_load_page(page)?;
+        }
+        if !self.pages.contains_key(&page) || !self.pages[&page].contains_key(&id) {
+            return Ok(None);
         }
         self.prioritize_front(page);
         self.pending_dirty_pages.insert(page);
-        self.pages.get_mut(&page)?.get_mut(&id)
+        Ok(self.pages.get_mut(&page).and_then(|p| p.get_mut(&id)))
     }
 
-    /// True iff node `id` is in memory.
-    pub fn contains(&self, id: u64) -> bool {
+    /// On a cache miss, try to load `page` via the installed lazy
+    /// loader. No-op when the loader is absent. Returns `Ok(())` on
+    /// success or when the loader is absent; propagates I/O errors.
+    fn try_lazy_load_page(&mut self, page: u64) -> Result<(), AlgoError> {
+        if self.pages.contains_key(&page) {
+            // Already in memory — load_page would be redundant.
+            return Ok(());
+        }
+        let loader = match self.lazy_loader.as_ref() {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+        // Page 0 is metadata, not nodes — never lazy-load it as a node
+        // page (it has its own dedicated reader).
+        if page == 0 {
+            return Ok(());
+        }
+        let Some(bytes) = loader.load_page(page)? else {
+            return Ok(());
+        };
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let decoded = Page::deserialize(&bytes)?;
+        let page_map: HashMap<u64, TrieNode> = decoded
+            .nodes
+            .into_iter()
+            .map(|(nid, pn)| (nid, page_node_to_trie_node(pn)))
+            .collect();
+        self.cached_node_count += page_map.len();
+        self.pages.insert(page, page_map);
+        self.prioritize_front(page);
+        Ok(())
+    }
+
+    /// True iff node `id` is in memory **right now** (no lazy load).
+    /// Used by tests + diagnostics; the trie's algorithms always go
+    /// through `get` / `get_mut` so they see lazy-loaded pages.
+    pub fn contains_in_memory(&self, id: u64) -> bool {
         self.pages
             .get(&self.page_of(id))
             .is_some_and(|p| p.contains_key(&id))
@@ -356,23 +474,15 @@ impl MerkleTrieCache {
     }
 
     /// Count of leaf nodes across the cache (used by `MerkleTrie::len`).
+    /// Counts only **in-memory** leaves — for a lazily-loaded trie the
+    /// returned value is a lower bound on the persisted leaf count until
+    /// the cache is fully populated. The trie's `len()` documents this.
     pub fn leaf_count(&self) -> usize {
         self.pages
             .values()
             .flat_map(|p| p.values())
             .filter(|n| n.is_leaf())
             .count()
-    }
-
-    /// Borrow a node by id, panicking if absent. Mirrors the `self.nodes[&id]`
-    /// indexed-access pattern used by the trie algorithms — keeps the
-    /// algorithm-side code structurally identical to the pre-cache
-    /// version. The trie eagerly loads all pages, so a missing node
-    /// indicates an algorithm bug, not a cache miss.
-    #[track_caller]
-    pub fn get_or_panic(&self, id: u64) -> &TrieNode {
-        self.get(id)
-            .unwrap_or_else(|| panic!("MerkleTrieCache: node {id} not in memory"))
     }
 
     // -----------------------------------------------------------------------
@@ -410,27 +520,21 @@ impl MerkleTrieCache {
     ///
     /// Returns the number of pages evicted.
     ///
-    /// ## Contract — lazy-load is NOT implemented
+    /// **Safe usage:** evicted pages are now only on disk; subsequent
+    /// `get` / `get_mut` for evicted nodes will lazy-load them back
+    /// through the installed [`PageCommitter`] (PLAN-144 TASK-146).
+    /// Without a lazy loader, evicted pages effectively vanish — calls
+    /// will return `Ok(None)`, which downstream algorithms will surface
+    /// as missing-node errors.
     ///
-    /// After eviction, evicted pages live only on disk via the committer.
-    /// However, the current cache has no lazy-load path: subsequent
-    /// `get` / `get_mut` calls for evicted nodes return `None`, and the
-    /// trie's algorithm helpers ([`crate::merkle_trie::MerkleTrie::node_find`]
-    /// etc.) call `get_or_panic` which panics on miss. This means the
-    /// only safe usage is **commit → evict → drop** (or
-    /// **commit → evict → `MerkleTrie::load`** for a fresh trie).
-    /// Calling `add` / `delete` / `contains` between `evict` and
-    /// `load` will panic.
-    ///
-    /// This is therefore exposed as `pub(crate)`. The LRU bookkeeping
-    /// is wired so a future PR that adds lazy-load can flip eviction
-    /// back to a public API without restructuring the cache.
-    ///
-    /// Caller must also guarantee no dirty pages remain (i.e. `commit`
-    /// was called immediately before, or the cache is read-only) —
-    /// evicting a dirty page would lose data. The wrapper
+    /// Caller must guarantee no dirty pages remain (i.e. `commit` was
+    /// called immediately before, or the cache is read-only) — evicting
+    /// a dirty page would lose data. The wrapper
     /// [`crate::merkle_trie::MerkleTrie::evict`] enforces this.
-    #[allow(dead_code)] // exercised in #[cfg(test)] only until lazy-load lands
+    ///
+    /// Currently `pub(crate)` until PLAN-144 Task 3 wires active eviction
+    /// into `SqliteLedger::commit_block`.
+    #[allow(dead_code)]
     pub(crate) fn evict(&mut self, root_id: Option<u64>) -> usize {
         // Pin the root page at the front.
         let root_page = root_id.map(|rid| self.page_of(rid));
@@ -579,7 +683,7 @@ impl MerkleTrieCache {
 
     /// Read the root-metadata page if present. Returns a [`TrieMetadata`]
     /// when page 0 exists, or `Ok(None)` when it doesn't (fresh DB).
-    pub fn read_metadata_page<C: PageCommitter>(
+    pub fn read_metadata_page<C: PageCommitter + ?Sized>(
         committer: &C,
     ) -> Result<Option<TrieMetadata>, AlgoError> {
         let Some(bytes) = committer.load_page(0)? else {
@@ -628,51 +732,20 @@ impl MerkleTrieCache {
         }))
     }
 
-    /// Eagerly load every node page reachable from the metadata into
-    /// memory. The simple approach: enumerate page ids starting at
-    /// `FIRST_NODE_ID / nodes_per_page` and stop at the first missing
-    /// page after `next_node_id / nodes_per_page`.
+    /// **Metadata-only stub** (PLAN-144 TASK-146): record the post-load
+    /// `next_node_id` and `last_committed_node_id` from the persisted
+    /// metadata. No pages are read here — subsequent `get` / `get_mut`
+    /// calls lazy-load pages through the installed
+    /// [`MerkleTrieCache::lazy_loader`].
     ///
-    /// This is the "load all" path mentioned in the module docs.
-    /// Replace with lazy on-demand loading if profiling shows it
-    /// matters; for the trie sizes algod-rust handles today it's
-    /// adequate.
-    pub fn load_all<C: PageCommitter>(
-        &mut self,
-        next_node_id: u64,
-        committer: &C,
-    ) -> Result<(), AlgoError> {
+    /// This replaces the prior eager iteration over every page id from
+    /// `FIRST_NODE_ID / nodes_per_page` up to `next_node_id /
+    /// nodes_per_page`. The eager path was simpler but forced an O(N)
+    /// read at every `MerkleTrie::load` (the cold-load phase of the
+    /// PLAN-144 trie bench measured this as ~20× Go's `MakeTrie`).
+    pub fn load_metadata_only(&mut self, next_node_id: u64) {
         self.next_node_id = next_node_id;
         self.last_committed_node_id = next_node_id;
-
-        let first_page = FIRST_NODE_ID / self.nodes_per_page;
-        let last_page = if next_node_id == 0 {
-            // No nodes allocated yet (fresh trie); nothing to load.
-            return Ok(());
-        } else {
-            (next_node_id - 1) / self.nodes_per_page
-        };
-
-        for page in first_page..=last_page {
-            let Some(bytes) = committer.load_page(page)? else {
-                // Sparse pages happen during reallocation; skip the
-                // missing ones.
-                continue;
-            };
-            if bytes.is_empty() {
-                continue;
-            }
-            let decoded = Page::deserialize(&bytes)?;
-            let page_map: HashMap<u64, TrieNode> = decoded
-                .nodes
-                .into_iter()
-                .map(|(nid, pn)| (nid, page_node_to_trie_node(pn)))
-                .collect();
-            self.cached_node_count += page_map.len();
-            self.pages.insert(page, page_map);
-            self.prioritize_front(page);
-        }
-        Ok(())
     }
 }
 
@@ -787,7 +860,7 @@ mod tests {
         let mut cache = MerkleTrieCache::new();
         let node = TrieNode::leaf(vec![1, 2, 3]);
         let id = cache.allocate(node.clone());
-        let got = cache.get(id).expect("just allocated");
+        let got = cache.get(id).unwrap().expect("just allocated");
         assert_eq!(got.hash, node.hash);
         assert!(got.is_leaf());
     }
@@ -796,9 +869,9 @@ mod tests {
     fn delete_pending_node_drops_from_cache() {
         let mut cache = MerkleTrieCache::new();
         let id = cache.allocate(TrieNode::leaf(vec![1; 4]));
-        assert!(cache.contains(id));
+        assert!(cache.contains_in_memory(id));
         cache.delete(id);
-        assert!(!cache.contains(id));
+        assert!(!cache.contains_in_memory(id));
         // Page was created+removed entirely → no pending deletion to flush.
         assert!(cache.pending_deletion_pages.is_empty());
     }
@@ -821,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_then_load_round_trip() {
+    fn commit_then_load_round_trip_with_lazy_loader() {
         let committer = InMemoryPageCommitter::new();
 
         let mut cache = MerkleTrieCache::new();
@@ -829,7 +902,7 @@ mod tests {
         let id_b = cache.allocate(TrieNode::leaf(vec![0xbb; 36]));
         cache.commit(Some(id_a), 36, &committer).unwrap();
 
-        // Load metadata + all pages into a fresh cache.
+        // Read metadata only; don't preload pages.
         let meta = MerkleTrieCache::read_metadata_page(&committer)
             .unwrap()
             .unwrap();
@@ -839,13 +912,24 @@ mod tests {
         assert_eq!(meta.next_node_id, cache.next_node_id);
 
         let mut restored = MerkleTrieCache::new();
-        restored.load_all(meta.next_node_id, &committer).unwrap();
+        restored.load_metadata_only(meta.next_node_id);
+        restored.set_lazy_loader(Box::new(committer.clone()));
 
-        // Both leaves should be present in the restored cache.
-        let got_a = restored.get(id_a).unwrap();
-        let got_b = restored.get(id_b).unwrap();
+        // First get triggers a lazy load of the shared page (both leaves
+        // share page 144 since they were allocated sequentially).
+        committer.reset_load_page_hits();
+        let got_a = restored.get(id_a).unwrap().expect("lazy loaded").clone();
         assert_eq!(got_a.hash, vec![0xaa; 36]);
+        // After loading id_a's page, id_b is also resident — same page.
+        let got_b = restored.get(id_b).unwrap().expect("same page").clone();
         assert_eq!(got_b.hash, vec![0xbb; 36]);
+        // Exactly one page (144) should have been loaded.
+        let hits = committer.load_page_hits();
+        let page_144_hits = hits.get(&144).copied().unwrap_or(0);
+        assert_eq!(
+            page_144_hits, 1,
+            "lazy load must touch page 144 exactly once for two nodes sharing it"
+        );
     }
 
     #[test]
@@ -892,7 +976,7 @@ mod tests {
         cache.evict(Some(c));
         assert!(cache.cached_node_count() <= 1);
         // Root page (the page containing c) is pinned and must still be present.
-        assert!(cache.contains(c));
+        assert!(cache.contains_in_memory(c));
     }
 
     #[test]
@@ -910,7 +994,7 @@ mod tests {
         // Root must survive even when it's the only page and the target
         // is below the cached node count.
         assert!(
-            cache.contains(root),
+            cache.contains_in_memory(root),
             "root page must remain when it's the only page left in cache"
         );
     }
@@ -928,12 +1012,73 @@ mod tests {
         cache.commit(Some(root), 36, &committer).unwrap();
         cache.evict(Some(root));
         assert!(
-            cache.contains(root),
+            cache.contains_in_memory(root),
             "root page must be pinned even when LRU"
         );
         // The other page may or may not be evicted depending on how
         // much over-target we are; the contract is just "root never
         // evicted".
         let _ = other;
+    }
+
+    #[test]
+    fn get_returns_none_when_no_loader_and_node_missing() {
+        let mut cache = MerkleTrieCache::new();
+        // Bumping next_node_id without an allocation simulates a node
+        // that "should exist" per metadata but isn't in memory and has
+        // no loader to fetch it.
+        cache.next_node_id = FIRST_NODE_ID + 10;
+        let got = cache.get(FIRST_NODE_ID).unwrap();
+        assert!(got.is_none(), "no loader → miss should return Ok(None)");
+    }
+
+    #[test]
+    fn lazy_load_propagates_committer_errors() {
+        // A committer that fails after N load_page calls; verifies the
+        // error flows up through cache.get().
+        #[derive(Default)]
+        struct FailingCommitter {
+            inner: InMemoryPageCommitter,
+            calls: std::sync::Mutex<u64>,
+            fail_after: u64,
+        }
+        impl PageCommitter for FailingCommitter {
+            fn load_page(&self, id: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+                let mut c = self.calls.lock().unwrap();
+                *c += 1;
+                if *c > self.fail_after {
+                    return Err(AlgoError::Ledger {
+                        message: "synthetic load failure".into(),
+                    });
+                }
+                self.inner.load_page(id)
+            }
+            fn store_page(&self, id: u64, content: &[u8]) -> Result<(), AlgoError> {
+                self.inner.store_page(id, content)
+            }
+        }
+
+        // Populate via the inner committer; then load via a failing wrapper.
+        let inner = InMemoryPageCommitter::new();
+        let mut src = MerkleTrieCache::new();
+        let id = src.allocate(TrieNode::leaf(vec![0xaa; 36]));
+        src.commit(Some(id), 36, &inner).unwrap();
+
+        let failing = FailingCommitter {
+            inner,
+            calls: std::sync::Mutex::new(0),
+            fail_after: 0, // fail on the very first load_page call
+        };
+
+        let mut restored = MerkleTrieCache::new();
+        restored.load_metadata_only(src.next_node_id);
+        restored.set_lazy_loader(Box::new(failing));
+
+        let err = restored.get(id).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("synthetic load failure"),
+            "expected committer error to propagate; got: {msg}"
+        );
     }
 }

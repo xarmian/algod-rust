@@ -19,8 +19,10 @@
 //! schema (`main.accounthashes` or `main.catchpointaccounthashes`) and
 //! do not touch the attached `blockdb` schema introduced by TASK-100.
 
+use std::path::{Path, PathBuf};
+
 use algo_error::AlgoError;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::merkle_cache::PageCommitter;
 use crate::merkle_page::Page;
@@ -190,6 +192,105 @@ impl<'c> PageCommitter for SqliteMerkleCommitter<'c> {
 
     fn store_page(&self, id: u64, content: &[u8]) -> Result<(), AlgoError> {
         self.store_page_bytes(id, content)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OwnedSqliteCommitter — `Send`-able owned committer for `MerkleTrieCache::lazy_loader`.
+// ---------------------------------------------------------------------------
+
+/// SQLite-backed [`PageCommitter`] that owns its own [`Connection`] —
+/// used by [`crate::merkle_trie::MerkleTrie::load`] to install a lazy
+/// loader on the cache. The cache's `lazy_loader` is
+/// `Box<dyn PageCommitter + Send>`, which the borrowed
+/// [`SqliteMerkleCommitter<'c>`] cannot satisfy (its `Connection` borrow
+/// is call-scoped). `OwnedSqliteCommitter` owns its connection outright
+/// and therefore satisfies `Send` (rusqlite's `Connection: Send`).
+///
+/// **Read-only by default.** The connection is opened with
+/// `SQLITE_OPEN_READ_ONLY`, since the lazy loader only ever issues
+/// `SELECT data FROM accounthashes WHERE id = ?`. The trie's
+/// write path uses the ledger's main connection via
+/// [`SqliteMerkleCommitter`] inside a transaction; the lazy loader's
+/// separate read-only connection participates in WAL concurrency.
+/// Attempting `store_page` on an `OwnedSqliteCommitter` returns an error
+/// — by construction the lazy loader path never writes.
+///
+/// In-memory databases (`Connection::open_in_memory`) cannot be
+/// re-opened by path; constructors that take a path skip this committer
+/// for in-memory ledgers. Callers handle that by passing `None` when no
+/// path is available, in which case the trie cache has no lazy loader
+/// and `get` returns `Ok(None)` on miss (the prior eager-load behavior).
+pub struct OwnedSqliteCommitter {
+    conn: Connection,
+    table: CommitterTable,
+    /// Retained for diagnostics — included in error messages so a
+    /// failing lazy-load points at the actual DB file.
+    path: PathBuf,
+}
+
+impl std::fmt::Debug for OwnedSqliteCommitter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedSqliteCommitter")
+            .field("path", &self.path)
+            .field("table", &self.table)
+            .finish()
+    }
+}
+
+impl OwnedSqliteCommitter {
+    /// Open a fresh read-only connection to `path` and bind it to
+    /// `table`. The connection is independent of any other connection
+    /// the ledger holds; SQLite's WAL allows the lazy loader to read
+    /// concurrently with the ledger's writers.
+    pub fn open(path: impl AsRef<Path>, table: CommitterTable) -> Result<Self, AlgoError> {
+        let path_ref = path.as_ref();
+        let conn = Connection::open_with_flags(
+            path_ref,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| AlgoError::Ledger {
+            message: format!("OwnedSqliteCommitter::open({}): {e}", path_ref.display()),
+        })?;
+        Ok(Self {
+            conn,
+            table,
+            path: path_ref.to_path_buf(),
+        })
+    }
+
+    /// Convenience: open a committer pointing at `accounthashes` (the
+    /// active runtime table).
+    pub fn open_active(path: impl AsRef<Path>) -> Result<Self, AlgoError> {
+        Self::open(path, CommitterTable::Active)
+    }
+}
+
+impl PageCommitter for OwnedSqliteCommitter {
+    fn load_page(&self, id: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+        let sql = format!("SELECT data FROM {} WHERE id = ?1", self.table.table_name());
+        self.conn
+            .query_row(&sql, params![id as i64], |row| row.get(0))
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!(
+                    "OwnedSqliteCommitter::load_page({}, id={id}) [{}]: {e}",
+                    self.path.display(),
+                    self.table.unqualified()
+                ),
+            })
+    }
+
+    fn store_page(&self, _id: u64, _content: &[u8]) -> Result<(), AlgoError> {
+        // The owned committer is the lazy LOAD path only. Writes go
+        // through the ledger's main connection via [`SqliteMerkleCommitter`]
+        // inside the block-apply transaction; routing them here would
+        // bypass that transaction and risk consistency violations.
+        Err(AlgoError::Ledger {
+            message: "OwnedSqliteCommitter is read-only; writes must go through \
+                      SqliteMerkleCommitter inside a transaction"
+                .into(),
+        })
     }
 }
 

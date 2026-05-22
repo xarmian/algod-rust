@@ -26,15 +26,28 @@
 //! metadata; pages ≥ 1 carry node contents in the Go-compatible
 //! `merkle_page::Page` format.
 //!
+//! ## Lazy on-demand page loading (PLAN-144 TASK-146)
+//!
+//! [`MerkleTrie::load`] now reads only the metadata page and installs the
+//! supplied owned [`PageCommitter`] as the cache's `lazy_loader`. Every
+//! algorithm helper (`node_find` / `node_add` / `node_remove` /
+//! `recompute_all_hashes`) goes through the cache's fallible `get` /
+//! `get_mut`, so a missing node triggers an on-demand page read instead
+//! of panicking. As a result, every public read API ([`MerkleTrie::contains`],
+//! [`MerkleTrie::root_hash`], [`MerkleTrie::get_node`],
+//! [`MerkleTrie::get_node_mut`]) is now `&mut self -> Result<…, AlgoError>`
+//! — the lazy load mutates the cache and may propagate committer I/O
+//! errors.
+//!
 //! History:
 //! - **PLAN-130 TASK-132/133/134** (PR #284): structural rewrite to
 //!   256-ary, Go conformance gate.
 //! - **PLAN-130 TASK-135** (PR #285): element-format fixture lock-in.
-//! - **PLAN-130 TASK-136/137** (this PR): swap single-blob `serialize`/
-//!   `deserialize` for paged `accounthashes` persistence via the
-//!   [`crate::merkle_cache::MerkleTrieCache`] with LRU eviction. The
-//!   legacy `merkle_trie` SQL table DDL is retained for [`PLAN-36`]
-//!   TASK-118 to drop separately.
+//! - **PLAN-130 TASK-136/137** (PR #286): paged `accounthashes` persistence
+//!   via the [`crate::merkle_cache::MerkleTrieCache`] with LRU eviction.
+//! - **PLAN-144 TASK-146** (this PR): lazy on-demand page loading;
+//!   `load` no longer iterates every page; public read API becomes
+//!   fallible.
 
 use algo_error::AlgoError;
 use sha2::{Digest, Sha512_256};
@@ -172,6 +185,20 @@ impl TrieNode {
     pub fn invalidate(&mut self) {}
 }
 
+/// Build a "missing node" `AlgoError` for an id the trie's algorithm
+/// expected to find in cache (after `get`'s lazy-load returned `None`).
+/// Centralised so the message format is consistent across call sites.
+#[inline]
+fn missing_node(id: u64) -> AlgoError {
+    AlgoError::Ledger {
+        message: format!(
+            "merkle trie: node {id} not found in cache and no lazy loader produced it \
+             (page {page})",
+            page = id / crate::merkle_page::NODES_PER_PAGE
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MerkleTrie — top-level trie wrapping the paged node store.
 // Mirrors `crypto/merkletrie/trie.go:62-77` + the cache initialization at
@@ -241,7 +268,12 @@ impl MerkleTrie {
         self.root.is_none()
     }
 
-    /// Number of leaf elements currently in the trie.
+    /// Number of leaf elements currently **resident in memory**.
+    ///
+    /// For a freshly lazy-loaded trie this can be less than the persisted
+    /// leaf count until pages are touched. Callers that need an
+    /// authoritative count must walk the trie via `contains` (forcing
+    /// lazy loads) or call this after a full traversal.
     pub fn len(&self) -> usize {
         self.cache.leaf_count()
     }
@@ -263,13 +295,15 @@ impl MerkleTrie {
         self.cache.allocate(node)
     }
 
-    /// Borrow a node by ID.
-    pub fn get_node(&self, id: u64) -> Option<&TrieNode> {
+    /// Borrow a node by ID. Lazy-loads its page on a cache miss; may
+    /// return `Ok(None)` if no lazy loader is installed and the node was
+    /// never resident.
+    pub fn get_node(&mut self, id: u64) -> Result<Option<&TrieNode>, AlgoError> {
         self.cache.get(id)
     }
 
-    /// Borrow a node by ID mutably.
-    pub fn get_node_mut(&mut self, id: u64) -> Option<&mut TrieNode> {
+    /// Borrow a node by ID mutably. Marks the containing page as dirty.
+    pub fn get_node_mut(&mut self, id: u64) -> Result<Option<&mut TrieNode>, AlgoError> {
         self.dirty = true;
         self.cache.get_mut(id)
     }
@@ -283,7 +317,7 @@ impl MerkleTrie {
     /// Returns `Ok(true)` if the element was newly added, `Ok(false)` if it
     /// was already present (silent no-op, matching go-algorand
     /// `trie.go:137-170` Add returning `(false, nil)` on duplicate).
-    /// Returns `Err` only on element-length mismatch.
+    /// Returns `Err` on element-length mismatch or lazy-load failure.
     pub fn add(&mut self, element: &[u8]) -> Result<bool, AlgoError> {
         // Length is checked on every add, including the first. Diverges from
         // go-algorand `trie.Add` at trie.go:144-145 (which infers element
@@ -314,11 +348,11 @@ impl MerkleTrie {
 
         // Existence check: silent-no-op on duplicate (matches Go trie.go:155-158).
         let root_id = self.root.unwrap();
-        if self.node_find(root_id, element) {
+        if self.node_find(root_id, element)? {
             return Ok(false);
         }
 
-        let new_root = self.node_add(root_id, element, &[]);
+        let new_root = self.node_add(root_id, element, &[])?;
         // Go does `cache.deleteNode(mt.root)` after add returns the new root.
         // The old root's storage is reused via `refurbishNode`; we just
         // remove the entry. The cache distinguishes "never committed" from
@@ -335,7 +369,7 @@ impl MerkleTrie {
     /// Returns `Ok(true)` if the element was removed, `Ok(false)` if it was
     /// not present (silent no-op, matching go-algorand `trie.go:174-200`
     /// Delete returning `(false, nil)` on missing).
-    /// Returns `Err` only on element-length mismatch.
+    /// Returns `Err` on element-length mismatch or lazy-load failure.
     pub fn delete(&mut self, element: &[u8]) -> Result<bool, AlgoError> {
         if self.root.is_none() {
             return Ok(false);
@@ -353,12 +387,16 @@ impl MerkleTrie {
         let root_id = self.root.unwrap();
 
         // Existence check (Go's trie.go:185-188 does `find` first).
-        if !self.node_find(root_id, element) {
+        if !self.node_find(root_id, element)? {
             return Ok(false);
         }
 
         // Special case: the root itself is the leaf we're deleting.
-        let root_is_leaf = self.cache.get_or_panic(root_id).is_leaf();
+        let root_is_leaf = self
+            .cache
+            .get(root_id)?
+            .ok_or_else(|| missing_node(root_id))?
+            .is_leaf();
         if root_is_leaf {
             self.cache.delete(root_id);
             self.root = None;
@@ -366,7 +404,7 @@ impl MerkleTrie {
             return Ok(true);
         }
 
-        let new_root = self.node_remove(root_id, element, &[]);
+        let new_root = self.node_remove(root_id, element, &[])?;
         // Go: `cache.deleteNode(mt.root); mt.root = updatedRoot;`
         self.cache.delete(root_id);
         self.root = new_root;
@@ -375,12 +413,15 @@ impl MerkleTrie {
     }
 
     /// True iff `element` is present in the trie.
-    pub fn contains(&self, element: &[u8]) -> bool {
+    ///
+    /// Now `&mut self` and fallible because traversal may lazy-load
+    /// pages from a stored committer (PLAN-144 TASK-146).
+    pub fn contains(&mut self, element: &[u8]) -> Result<bool, AlgoError> {
         if element.len() != self.element_length {
-            return false;
+            return Ok(false);
         }
         match self.root {
-            None => false,
+            None => Ok(false),
             Some(id) => self.node_find(id, element),
         }
     }
@@ -390,18 +431,24 @@ impl MerkleTrie {
     /// - Empty trie: `[0u8; 32]` (matches Go `RootHash` at `trie.go:115-118`).
     /// - Single-leaf root: `SHA512/256(0x00 || leaf.hash)`.
     /// - Internal root: `SHA512/256(0x01 || root.hash)` after recomputation.
-    pub fn root_hash(&mut self) -> [u8; 32] {
+    ///
+    /// Fallible because `recompute_all_hashes` traverses the entire trie
+    /// and may lazy-load pages.
+    pub fn root_hash(&mut self) -> Result<[u8; 32], AlgoError> {
         let root_id = match self.root {
-            None => return [0u8; 32],
+            None => return Ok([0u8; 32]),
             Some(id) => id,
         };
 
         if self.dirty {
-            self.recompute_all_hashes(root_id);
+            self.recompute_all_hashes(root_id)?;
             self.dirty = false;
         }
 
-        let node = self.cache.get_or_panic(root_id);
+        let node = self
+            .cache
+            .get(root_id)?
+            .ok_or_else(|| missing_node(root_id))?;
         let mut hasher = Sha512_256::new();
         if node.is_leaf() {
             hasher.update([0x00]);
@@ -411,7 +458,7 @@ impl MerkleTrie {
         hasher.update(&node.hash);
         let mut out = [0u8; 32];
         out.copy_from_slice(&hasher.finalize());
-        out
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------
@@ -432,7 +479,7 @@ impl MerkleTrie {
     pub fn commit<C: PageCommitter>(&mut self, committer: &C) -> Result<CommitStats, AlgoError> {
         if self.dirty {
             if let Some(root_id) = self.root {
-                self.recompute_all_hashes(root_id);
+                self.recompute_all_hashes(root_id)?;
             }
             self.dirty = false;
         }
@@ -441,17 +488,20 @@ impl MerkleTrie {
 
     /// Reconstruct a trie from a [`PageCommitter`].
     ///
-    /// Reads page 0 for metadata. Returns `Ok(None)` if page 0 doesn't
-    /// exist (fresh DB — caller should `rebuild_trie_from_db` or start
-    /// empty). On success eagerly loads every reachable node page; lazy
-    /// loading is a future optimization.
-    pub fn load<C: PageCommitter>(committer: &C) -> Result<Option<Self>, AlgoError> {
-        let Some(meta) = MerkleTrieCache::read_metadata_page(committer)? else {
+    /// Reads page 0 for metadata via `loader` and installs `loader` as
+    /// the cache's lazy loader. No node pages are read here — subsequent
+    /// `get` / `get_mut` calls lazy-load through `loader` (PLAN-144 TASK-146).
+    ///
+    /// Returns `Ok(None)` if page 0 doesn't exist (fresh DB — caller
+    /// should `rebuild_trie_from_db` or start empty).
+    pub fn load(loader: Box<dyn PageCommitter + Send>) -> Result<Option<Self>, AlgoError> {
+        let Some(meta) = MerkleTrieCache::read_metadata_page(loader.as_ref())? else {
             return Ok(None);
         };
 
         let mut cache = MerkleTrieCache::new();
-        cache.load_all(meta.next_node_id, committer)?;
+        cache.load_metadata_only(meta.next_node_id);
+        cache.set_lazy_loader(loader);
 
         Ok(Some(Self {
             root: meta.root,
@@ -467,19 +517,16 @@ impl MerkleTrie {
     /// Evict least-recently-used pages from memory back to the eviction
     /// target. The root page is pinned.
     ///
-    /// **`pub(crate)`** until lazy-load lands. See
-    /// [`crate::merkle_cache::MerkleTrieCache::evict`] for the rationale:
-    /// the current cache has no on-demand reload path, so any trie
-    /// operation that traverses to an evicted page will panic. Safe
-    /// usage is therefore restricted to `commit → evict → drop`
-    /// (memory reclamation before the trie is recycled). Tests and the
-    /// LRU plumbing live in-crate; external callers should not gate any
-    /// behavior on `evict` until lazy-load lands in a follow-up.
+    /// **`pub(crate)`** until PLAN-144 Task 3 wires active eviction into
+    /// `SqliteLedger::commit_block`. Now that lazy load is implemented
+    /// (PLAN-144 TASK-146), evicted pages can be safely re-fetched on
+    /// demand via the cache's lazy loader; this method is therefore
+    /// safe to call any time the trie is not dirty.
     ///
     /// Caller must guarantee no dirty pages remain (i.e. `commit` was
     /// called immediately before, or `dirty == false`). Returns the
     /// number of pages evicted.
-    #[allow(dead_code)] // exercised in #[cfg(test)] only until lazy-load lands
+    #[allow(dead_code)] // wired in PLAN-144 Task 3
     pub(crate) fn evict(&mut self) -> Result<usize, AlgoError> {
         if self.dirty {
             return Err(AlgoError::Ledger {
@@ -494,31 +541,37 @@ impl MerkleTrie {
     // `node.go:227-252`.
     // -----------------------------------------------------------------------
 
-    fn recompute_all_hashes(&mut self, root_id: u64) {
+    fn recompute_all_hashes(&mut self, root_id: u64) -> Result<(), AlgoError> {
         let mut path: Vec<u8> = Vec::new();
-        self.recompute_hash_at(root_id, &mut path);
+        self.recompute_hash_at(root_id, &mut path)
     }
 
-    fn recompute_hash_at(&mut self, node_id: u64, path: &mut Vec<u8>) {
-        let is_leaf = self.cache.get_or_panic(node_id).is_leaf();
+    fn recompute_hash_at(&mut self, node_id: u64, path: &mut Vec<u8>) -> Result<(), AlgoError> {
+        let is_leaf = self
+            .cache
+            .get(node_id)?
+            .ok_or_else(|| missing_node(node_id))?
+            .is_leaf();
         if is_leaf {
             // Leaves never recompute — their `hash` is the element remainder
             // (or full element for a single-leaf root) and is set at
             // construction time.
-            return;
+            return Ok(());
         }
 
-        // Recurse into children first so their hashes are up-to-date.
+        // Snapshot child descriptors so we can release the cache borrow
+        // before recursing (each recursive call needs `&mut self.cache`).
         let child_descriptors: Vec<(u8, u64)> = self
             .cache
-            .get_or_panic(node_id)
+            .get(node_id)?
+            .ok_or_else(|| missing_node(node_id))?
             .children
             .iter()
             .map(|c| (c.hash_index, c.child_id))
             .collect();
         for (hi, cid) in &child_descriptors {
             path.push(*hi);
-            self.recompute_hash_at(*cid, path);
+            self.recompute_hash_at(*cid, path)?;
             path.pop();
         }
 
@@ -535,7 +588,9 @@ impl MerkleTrie {
         acc.extend_from_slice(path);
 
         for (hi, cid) in &child_descriptors {
-            let child = self.cache.get_or_panic(*cid);
+            // Re-borrow per iteration so the cache mutation from any
+            // prior get's lazy-load is visible.
+            let child = self.cache.get(*cid)?.ok_or_else(|| missing_node(*cid))?;
             if child.is_leaf() {
                 acc.push(0x00);
             } else {
@@ -551,29 +606,47 @@ impl MerkleTrie {
         hasher.update(&acc);
         let result = hasher.finalize();
 
-        let node = self.cache.get_mut(node_id).unwrap();
+        let node = self
+            .cache
+            .get_mut(node_id)?
+            .ok_or_else(|| missing_node(node_id))?;
         node.hash = result.to_vec();
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
     // node_find — mirror of Go `node.find` at `node.go:82-96`.
     // -----------------------------------------------------------------------
 
-    fn node_find(&self, node_id: u64, d: &[u8]) -> bool {
-        let node = self.cache.get_or_panic(node_id);
-        if node.is_leaf() {
-            return d == node.hash.as_slice();
+    fn node_find(&mut self, node_id: u64, d: &[u8]) -> Result<bool, AlgoError> {
+        // Snapshot the data we need from the node, then release the
+        // borrow before recursing — the recursive call also needs
+        // `&mut self.cache`.
+        let (is_leaf, leaf_hash, bit_set, child_id_opt) = {
+            let node = self
+                .cache
+                .get(node_id)?
+                .ok_or_else(|| missing_node(node_id))?;
+            if node.is_leaf() {
+                (true, Some(node.hash.clone()), false, None)
+            } else if d.is_empty() {
+                // Shouldn't happen with fixed-length elements; guard anyway.
+                (false, None, false, None)
+            } else if !node.children_mask.bit(d[0]) {
+                (false, None, false, None)
+            } else {
+                let idx = node.index_of(d[0]);
+                (false, None, true, Some(node.children[idx].child_id))
+            }
+        };
+
+        if is_leaf {
+            return Ok(d == leaf_hash.as_deref().unwrap_or(&[]));
         }
-        if d.is_empty() {
-            // Shouldn't happen with fixed-length elements; guard anyway.
-            return false;
+        if d.is_empty() || !bit_set {
+            return Ok(false);
         }
-        if !node.children_mask.bit(d[0]) {
-            return false;
-        }
-        let idx = node.index_of(d[0]);
-        let child_id = node.children[idx].child_id;
-        self.node_find(child_id, &d[1..])
+        self.node_find(child_id_opt.unwrap(), &d[1..])
     }
 
     // -----------------------------------------------------------------------
@@ -585,8 +658,12 @@ impl MerkleTrie {
     // root pointer).
     // -----------------------------------------------------------------------
 
-    fn node_add(&mut self, node_id: u64, d: &[u8], path: &[u8]) -> u64 {
-        let node = self.cache.get_or_panic(node_id).clone();
+    fn node_add(&mut self, node_id: u64, d: &[u8], path: &[u8]) -> Result<u64, AlgoError> {
+        let node = self
+            .cache
+            .get(node_id)?
+            .ok_or_else(|| missing_node(node_id))?
+            .clone();
 
         if node.is_leaf() {
             // Find the first byte where this leaf's remainder and the new
@@ -670,7 +747,7 @@ impl MerkleTrie {
             // the old node here. The caller will plug `top_id` into its
             // children list (or the root pointer).
             self.cache.delete(node_id);
-            return top_id;
+            return Ok(top_id);
         }
 
         // Non-leaf: branch on d[0].
@@ -707,7 +784,7 @@ impl MerkleTrie {
                 children_mask: new_mask,
             };
             self.cache.delete(node_id);
-            return self.allocate_node(new_node);
+            return Ok(self.allocate_node(new_node));
         }
 
         // Existing child at d[0]: recurse, then rebuild this node with the
@@ -717,7 +794,7 @@ impl MerkleTrie {
         let mut sub_path = Vec::with_capacity(path.len() + 1);
         sub_path.extend_from_slice(path);
         sub_path.push(d[0]);
-        let updated_child_id = self.node_add(cur_child_id, &d[1..], &sub_path);
+        let updated_child_id = self.node_add(cur_child_id, &d[1..], &sub_path)?;
 
         let mut new_children = node.children.clone();
         new_children[child_idx].child_id = updated_child_id;
@@ -727,7 +804,7 @@ impl MerkleTrie {
             children_mask: node.children_mask,
         };
         self.cache.delete(node_id);
-        self.allocate_node(new_node)
+        Ok(self.allocate_node(new_node))
     }
 
     // -----------------------------------------------------------------------
@@ -744,13 +821,26 @@ impl MerkleTrie {
     //     trie root — sets `mt.root = None`).
     // -----------------------------------------------------------------------
 
-    fn node_remove(&mut self, node_id: u64, key: &[u8], path: &[u8]) -> Option<u64> {
-        let node = self.cache.get_or_panic(node_id).clone();
+    fn node_remove(
+        &mut self,
+        node_id: u64,
+        key: &[u8],
+        path: &[u8],
+    ) -> Result<Option<u64>, AlgoError> {
+        let node = self
+            .cache
+            .get(node_id)?
+            .ok_or_else(|| missing_node(node_id))?
+            .clone();
         debug_assert!(!node.is_leaf(), "node_remove must not be called on leaves");
 
         let child_idx = node.index_of(key[0]);
         let child_id = node.children[child_idx].child_id;
-        let child = self.cache.get_or_panic(child_id).clone();
+        let child = self
+            .cache
+            .get(child_id)?
+            .ok_or_else(|| missing_node(child_id))?
+            .clone();
 
         // Mirrors Go `node.remove` at node.go:266-289. We construct `new_node`
         // — the surviving node at this position — then potentially collapse
@@ -780,7 +870,7 @@ impl MerkleTrie {
             sub_path.extend_from_slice(path);
             sub_path.push(key[0]);
             let updated = self
-                .node_remove(child_id, &key[1..], &sub_path)
+                .node_remove(child_id, &key[1..], &sub_path)?
                 .expect("non-leaf remove always returns Some");
             // Free the old child slot (Go's `cache.refurbishNode(childNodeID)`
             // returns a new id; we mirror that by replacing the children
@@ -799,14 +889,17 @@ impl MerkleTrie {
         // `[only_child.hash_index] || only_child.hash`. Matches Go
         // `node.go:291-304`.
         let collapsed = if new_node.children.len() == 1 {
-            let only = &new_node.children[0];
-            let only_child = self.cache.get_or_panic(only.child_id);
+            let only_hi = new_node.children[0].hash_index;
+            let only_id = new_node.children[0].child_id;
+            let only_child = self
+                .cache
+                .get(only_id)?
+                .ok_or_else(|| missing_node(only_id))?;
             if only_child.is_leaf() {
                 let mut merged = Vec::with_capacity(1 + only_child.hash.len());
-                merged.push(only.hash_index);
+                merged.push(only_hi);
                 merged.extend_from_slice(&only_child.hash);
-                let only_child_id = only.child_id;
-                self.cache.delete(only_child_id);
+                self.cache.delete(only_id);
                 Some(TrieNode::leaf(merged))
             } else {
                 None
@@ -818,7 +911,7 @@ impl MerkleTrie {
         let final_node = collapsed.unwrap_or(new_node);
         // Free the original node and allocate the surviving node.
         self.cache.delete(node_id);
-        Some(self.allocate_node(final_node))
+        Ok(Some(self.allocate_node(final_node)))
     }
 
     // -----------------------------------------------------------------------
@@ -904,7 +997,7 @@ mod tests {
     #[test]
     fn test_empty_trie_root_hash() {
         let mut trie = MerkleTrie::new(36);
-        assert_eq!(trie.root_hash(), [0u8; 32]);
+        assert_eq!(trie.root_hash().unwrap(), [0u8; 32]);
     }
 
     #[test]
@@ -915,7 +1008,7 @@ mod tests {
         elem[35] = 0xCD;
 
         trie.add(&elem).unwrap();
-        let root = trie.root_hash();
+        let root = trie.root_hash().unwrap();
 
         let mut input = vec![0x00];
         input.extend_from_slice(&elem);
@@ -934,7 +1027,7 @@ mod tests {
 
         let mut input = vec![0x00];
         input.extend_from_slice(&elem);
-        assert_eq!(trie.root_hash(), sha512_256(&input));
+        assert_eq!(trie.root_hash().unwrap(), sha512_256(&input));
     }
 
     // -----------------------------------------------------------------------
@@ -949,11 +1042,11 @@ mod tests {
         trie.add(&elem_a).unwrap();
         trie.add(&elem_b).unwrap();
 
-        assert!(trie.contains(&elem_a));
-        assert!(trie.contains(&elem_b));
+        assert!(trie.contains(&elem_a).unwrap());
+        assert!(trie.contains(&elem_b).unwrap());
 
         let root = trie.root_id().unwrap();
-        let root_node = trie.get_node(root).unwrap();
+        let root_node = trie.get_node(root).unwrap().unwrap().clone();
         assert!(!root_node.is_leaf());
         assert_eq!(root_node.children.len(), 2);
         assert!(root_node.children_mask.bit(0x10));
@@ -967,7 +1060,7 @@ mod tests {
 
         let mut root_input = vec![0x01];
         root_input.extend_from_slice(&internal_hash);
-        assert_eq!(trie.root_hash(), sha512_256(&root_input));
+        assert_eq!(trie.root_hash().unwrap(), sha512_256(&root_input));
     }
 
     #[test]
@@ -978,17 +1071,17 @@ mod tests {
         trie.add(&elem_a).unwrap();
         trie.add(&elem_b).unwrap();
 
-        assert!(trie.contains(&elem_a));
-        assert!(trie.contains(&elem_b));
+        assert!(trie.contains(&elem_a).unwrap());
+        assert!(trie.contains(&elem_b).unwrap());
 
         let root = trie.root_id().unwrap();
-        let root_node = trie.get_node(root).unwrap();
+        let root_node = trie.get_node(root).unwrap().unwrap().clone();
         assert!(!root_node.is_leaf());
         assert_eq!(root_node.children.len(), 1);
         assert_eq!(root_node.children[0].hash_index, 0x10);
 
         let branch_id = root_node.children[0].child_id;
-        let branch = trie.get_node(branch_id).unwrap();
+        let branch = trie.get_node(branch_id).unwrap().unwrap().clone();
         assert!(!branch.is_leaf());
         assert_eq!(branch.children.len(), 2);
         assert_eq!(branch.children[0].hash_index, 0x20);
@@ -1008,7 +1101,7 @@ mod tests {
 
         let mut top = vec![0x01];
         top.extend_from_slice(&root_internal);
-        assert_eq!(trie.root_hash(), sha512_256(&top));
+        assert_eq!(trie.root_hash().unwrap(), sha512_256(&top));
     }
 
     // -----------------------------------------------------------------------
@@ -1020,8 +1113,8 @@ mod tests {
         let mut trie = MerkleTrie::new(4);
         let elem = vec![0x10, 0x20, 0x30, 0x40];
         trie.add(&elem).unwrap();
-        assert!(trie.contains(&elem));
-        assert!(!trie.contains(&[0x10, 0x20, 0x30, 0x41]));
+        assert!(trie.contains(&elem).unwrap());
+        assert!(!trie.contains(&[0x10, 0x20, 0x30, 0x41]).unwrap());
     }
 
     #[test]
@@ -1052,7 +1145,7 @@ mod tests {
         trie.add(&elem).unwrap();
         assert!(trie.delete(&elem).unwrap());
         assert!(trie.is_empty());
-        assert_eq!(trie.root_hash(), [0u8; 32]);
+        assert_eq!(trie.root_hash().unwrap(), [0u8; 32]);
     }
 
     #[test]
@@ -1071,7 +1164,7 @@ mod tests {
         trie2.add(&a).unwrap();
         trie2.add(&c).unwrap();
 
-        assert_eq!(trie1.root_hash(), trie2.root_hash());
+        assert_eq!(trie1.root_hash().unwrap(), trie2.root_hash().unwrap());
     }
 
     #[test]
@@ -1090,7 +1183,7 @@ mod tests {
             t2.add(e).unwrap();
         }
 
-        assert_eq!(t1.root_hash(), t2.root_hash());
+        assert_eq!(t1.root_hash().unwrap(), t2.root_hash().unwrap());
         assert_eq!(t1.len(), t2.len());
     }
 
@@ -1110,13 +1203,13 @@ mod tests {
             trie.add(e).unwrap();
         }
         for e in &elements {
-            assert!(trie.contains(e));
+            assert!(trie.contains(e).unwrap());
         }
         for e in &elements {
             assert!(trie.delete(e).unwrap());
         }
         assert!(trie.is_empty());
-        assert_eq!(trie.root_hash(), [0u8; 32]);
+        assert_eq!(trie.root_hash().unwrap(), [0u8; 32]);
     }
 
     #[test]
@@ -1124,11 +1217,11 @@ mod tests {
         let mut trie = MerkleTrie::new(4);
         let elem = vec![0x42, 0x43, 0x44, 0x45];
         trie.add(&elem).unwrap();
-        let h1 = trie.root_hash();
+        let h1 = trie.root_hash().unwrap();
         trie.delete(&elem).unwrap();
-        assert_eq!(trie.root_hash(), [0u8; 32]);
+        assert_eq!(trie.root_hash().unwrap(), [0u8; 32]);
         trie.add(&elem).unwrap();
-        let h2 = trie.root_hash();
+        let h2 = trie.root_hash().unwrap();
         assert_eq!(h1, h2);
     }
 
@@ -1139,14 +1232,14 @@ mod tests {
         let b = vec![0x20, 0x00, 0x00, 0x00];
 
         trie.add(&a).unwrap();
-        let h_a = trie.root_hash();
+        let h_a = trie.root_hash().unwrap();
 
         trie.add(&b).unwrap();
-        let h_ab = trie.root_hash();
+        let h_ab = trie.root_hash().unwrap();
         assert_ne!(h_a, h_ab);
 
         trie.delete(&b).unwrap();
-        let h_back = trie.root_hash();
+        let h_back = trie.root_hash().unwrap();
         assert_eq!(h_a, h_back);
     }
 
@@ -1226,7 +1319,9 @@ mod tests {
         // Only the metadata page (page 0) should exist.
         assert_eq!(committer.page_count(), 1);
 
-        let restored = MerkleTrie::load(&committer).unwrap().unwrap();
+        let restored = MerkleTrie::load(Box::new(committer.clone()))
+            .unwrap()
+            .unwrap();
         assert!(restored.is_empty());
         assert_eq!(restored.element_length(), 36);
     }
@@ -1238,13 +1333,14 @@ mod tests {
 
         let mut trie = MerkleTrie::new(4);
         trie.add(&elem).unwrap();
-        let hash_before = trie.root_hash();
+        let hash_before = trie.root_hash().unwrap();
         trie.commit(&committer).unwrap();
 
-        let mut restored = MerkleTrie::load(&committer).unwrap().unwrap();
-        assert_eq!(restored.len(), 1);
-        assert!(restored.contains(&elem));
-        assert_eq!(restored.root_hash(), hash_before);
+        let mut restored = MerkleTrie::load(Box::new(committer.clone()))
+            .unwrap()
+            .unwrap();
+        assert!(restored.contains(&elem).unwrap());
+        assert_eq!(restored.root_hash().unwrap(), hash_before);
     }
 
     #[test]
@@ -1261,22 +1357,25 @@ mod tests {
         for e in &elems {
             trie.add(e).unwrap();
         }
-        let hash_before = trie.root_hash();
-        let len_before = trie.len();
+        let hash_before = trie.root_hash().unwrap();
         trie.commit(&committer).unwrap();
 
-        let mut restored = MerkleTrie::load(&committer).unwrap().unwrap();
-        assert_eq!(restored.len(), len_before);
-        assert_eq!(restored.root_hash(), hash_before);
+        let mut restored = MerkleTrie::load(Box::new(committer.clone()))
+            .unwrap()
+            .unwrap();
+        // Lazy: walk every element via contains, then root_hash forces
+        // full traversal. After both, the leaf count matches.
         for e in &elems {
-            assert!(restored.contains(e));
+            assert!(restored.contains(e).unwrap());
         }
+        assert_eq!(restored.root_hash().unwrap(), hash_before);
+        assert_eq!(restored.len(), elems.len());
     }
 
     #[test]
     fn test_load_returns_none_on_fresh_committer() {
         let committer = InMemoryPageCommitter::new();
-        let got = MerkleTrie::load(&committer).unwrap();
+        let got = MerkleTrie::load(Box::new(committer)).unwrap();
         assert!(got.is_none());
     }
 
@@ -1289,44 +1388,44 @@ mod tests {
 
         // Add one more, then commit again.
         trie.add(&[0x50, 0x60, 0x70, 0x80]).unwrap();
-        let expected = trie.root_hash();
+        let expected = trie.root_hash().unwrap();
         trie.commit(&committer).unwrap();
 
-        let mut restored = MerkleTrie::load(&committer).unwrap().unwrap();
-        assert_eq!(restored.root_hash(), expected);
-        assert_eq!(restored.len(), 2);
+        let mut restored = MerkleTrie::load(Box::new(committer.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.root_hash().unwrap(), expected);
+        assert!(restored.contains(&[0x10, 0x20, 0x30, 0x40]).unwrap());
+        assert!(restored.contains(&[0x50, 0x60, 0x70, 0x80]).unwrap());
     }
 
     #[test]
     fn test_in_place_mutation_via_get_mut_survives_round_trip() {
-        // Regression for Codex round-1 finding: get_node_mut on a
-        // previously-committed node must dirty the page so commit
-        // includes it in the write set. Without that fix, the in-memory
-        // mutation would be lost on reload because commit only wrote
-        // pages with newly-allocated nodes (`pending_created`).
+        // Regression for the dirty-page-tracking fix (PR #286 Codex round 1):
+        // get_node_mut on a previously-committed node must dirty the page
+        // so commit includes it in the write set.
         //
-        // We mutate a LEAF's hash specifically: leaves are skipped by
-        // `recompute_all_hashes` (their hash IS the element bytes), so
-        // the mutation isn't overwritten by the commit-time recompute
-        // step. This isolates the cache's dirty-page tracking from
-        // the trie's recompute logic.
+        // Mutate a LEAF's hash (leaves are skipped by recompute_all_hashes).
         let committer = InMemoryPageCommitter::new();
         let mut trie = MerkleTrie::new(4);
         trie.add(&[0x10, 0x20, 0x30, 0x40]).unwrap();
         trie.add(&[0x10, 0x21, 0x30, 0x40]).unwrap();
-        let _ = trie.root_hash();
+        let _ = trie.root_hash().unwrap();
         trie.commit(&committer).unwrap();
 
-        // Find one of the leaves and mutate its hash via get_node_mut.
         let root_id = trie.root_id().unwrap();
-        let leaf_id = find_a_leaf_descendant(&trie, root_id);
+        let leaf_id = find_a_leaf_descendant(&mut trie, root_id);
         let mutated_marker = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        trie.get_node_mut(leaf_id).unwrap().hash = mutated_marker.clone();
+        trie.get_node_mut(leaf_id).unwrap().unwrap().hash = mutated_marker.clone();
         trie.commit(&committer).unwrap();
 
-        // Reload from disk and check the mutation persisted.
-        let restored = MerkleTrie::load(&committer).unwrap().unwrap();
-        let got = restored.get_node(leaf_id).expect("leaf must still exist");
+        let mut restored = MerkleTrie::load(Box::new(committer.clone()))
+            .unwrap()
+            .unwrap();
+        let got = restored
+            .get_node(leaf_id)
+            .unwrap()
+            .expect("leaf must still exist");
         assert_eq!(
             got.hash, mutated_marker,
             "in-place mutation via get_node_mut must persist through commit + load"
@@ -1335,9 +1434,13 @@ mod tests {
 
     /// Recursively find any leaf descendant of `node_id`. The trie's
     /// leaf-storage invariants guarantee at least one exists below any
-    /// non-empty internal node.
-    fn find_a_leaf_descendant(trie: &MerkleTrie, node_id: u64) -> u64 {
-        let node = trie.get_node(node_id).expect("node in cache");
+    /// non-empty internal node. `&mut self` because lookups may lazy-load.
+    fn find_a_leaf_descendant(trie: &mut MerkleTrie, node_id: u64) -> u64 {
+        let node = trie
+            .get_node(node_id)
+            .unwrap()
+            .expect("node in cache")
+            .clone();
         if node.is_leaf() {
             return node_id;
         }
@@ -1353,13 +1456,15 @@ mod tests {
         trie.commit(&committer).unwrap();
 
         trie.delete(&[0x10, 0x20, 0x30, 0x40]).unwrap();
-        let expected = trie.root_hash();
+        let expected = trie.root_hash().unwrap();
         trie.commit(&committer).unwrap();
 
-        let mut restored = MerkleTrie::load(&committer).unwrap().unwrap();
-        assert_eq!(restored.root_hash(), expected);
-        assert!(!restored.contains(&[0x10, 0x20, 0x30, 0x40]));
-        assert!(restored.contains(&[0x50, 0x60, 0x70, 0x80]));
+        let mut restored = MerkleTrie::load(Box::new(committer.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.root_hash().unwrap(), expected);
+        assert!(!restored.contains(&[0x10, 0x20, 0x30, 0x40]).unwrap());
+        assert!(restored.contains(&[0x50, 0x60, 0x70, 0x80]).unwrap());
     }
 
     #[test]
@@ -1372,27 +1477,152 @@ mod tests {
     }
 
     #[test]
-    fn test_evict_after_commit_keeps_root_page() {
+    fn test_evict_after_commit_then_load_back_via_lazy_loader() {
         let committer = InMemoryPageCommitter::new();
         // Tight cache target so eviction has work to do.
         let mut trie = MerkleTrie::with_cache_target(4, 1);
-        // Add a handful of elements that will land in multiple pages
-        // worth of internal nodes.
         for i in 0u8..20 {
             trie.add(&[i, i.wrapping_mul(3), 0, 0]).unwrap();
         }
-        let expected = trie.root_hash();
+        let expected = trie.root_hash().unwrap();
         trie.commit(&committer).unwrap();
-        let evicted = trie.evict().unwrap();
-        // We expect at least some pages to have been evicted given the
-        // tight target.
-        let _ = evicted; // not asserting an exact number — depends on layout
+        let _evicted = trie.evict().unwrap();
 
-        // Root page is pinned: the trie can still serve root_hash
-        // because it walks the root node first. (Re-load from disk
-        // also works — verified by the round-trip tests.)
-        let mut restored = MerkleTrie::load(&committer).unwrap().unwrap();
-        assert_eq!(restored.root_hash(), expected);
+        // Reload via lazy-loader path, recompute root hash — every page
+        // is fetched on demand.
+        let mut restored = MerkleTrie::load(Box::new(committer.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.root_hash().unwrap(), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Lazy-load specific coverage (PLAN-144 TASK-146).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lazy_load_populates_only_touched_pages() {
+        // Build a trie large enough to span multiple internal-node pages
+        // when committed. 200 distinct 4-byte elements with mixed
+        // prefixes is plenty.
+        let committer = InMemoryPageCommitter::new();
+        let mut trie = MerkleTrie::new(4);
+        let elements: Vec<[u8; 4]> = (0u16..200)
+            .map(|i| {
+                [
+                    (i & 0xff) as u8,
+                    ((i >> 8) & 0xff) as u8,
+                    i.wrapping_mul(7) as u8,
+                    i.wrapping_add(13) as u8,
+                ]
+            })
+            .collect();
+        for e in &elements {
+            trie.add(e).unwrap();
+        }
+        trie.commit(&committer).unwrap();
+
+        // Reload lazily.
+        let mut restored = MerkleTrie::load(Box::new(committer.clone()))
+            .unwrap()
+            .unwrap();
+        // Right after load the cache should hold NO node pages — only
+        // the metadata was read.
+        let touched_pages_initial = committer.load_page_hits();
+        assert!(
+            touched_pages_initial.keys().all(|&p| p == 0),
+            "load() must touch only page 0 (metadata); touched: {touched_pages_initial:?}"
+        );
+        committer.reset_load_page_hits();
+
+        // One contains for the first element should load only the pages
+        // along its root-to-leaf path — NOT every node page.
+        assert!(restored.contains(&elements[0]).unwrap());
+        let hits_after_contains = committer.load_page_hits();
+        assert!(
+            !hits_after_contains.is_empty(),
+            "contains must lazy-load at least one page"
+        );
+        // The element's path is at most ~4 hops deep for 200 elements,
+        // so we should not have loaded all of them. The exact number
+        // depends on layout; assert "fewer than total persisted pages".
+        let total_persisted = committer.page_count();
+        let loaded_distinct = hits_after_contains.len();
+        assert!(
+            loaded_distinct < total_persisted,
+            "lazy contains must NOT load every page (loaded {loaded_distinct} / {total_persisted})"
+        );
+    }
+
+    #[test]
+    fn test_lazy_load_propagates_committer_errors_through_contains() {
+        // A loader that fails on every load_page; contains() must
+        // surface the error.
+        struct AlwaysFail;
+        impl PageCommitter for AlwaysFail {
+            fn load_page(&self, id: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+                if id == 0 {
+                    // Must succeed for the metadata page (so we get past
+                    // load and into a real lazy_loader call).
+                    Err(AlgoError::Ledger {
+                        message: "load fail (metadata)".into(),
+                    })
+                } else {
+                    Err(AlgoError::Ledger {
+                        message: format!("load fail (node page {id})"),
+                    })
+                }
+            }
+            fn store_page(&self, _id: u64, _content: &[u8]) -> Result<(), AlgoError> {
+                Ok(())
+            }
+        }
+
+        // First commit to a real committer so metadata exists.
+        let real = InMemoryPageCommitter::new();
+        let mut trie = MerkleTrie::new(4);
+        for i in 0u8..10 {
+            trie.add(&[i, i.wrapping_mul(3), 0, 0]).unwrap();
+        }
+        trie.commit(&real).unwrap();
+
+        // Now construct a "two-phase" committer: succeeds for the
+        // metadata page (delegates to real), but fails for any node
+        // page (returns Err).
+        struct Probe {
+            real: InMemoryPageCommitter,
+            calls: std::sync::Mutex<u64>,
+        }
+        impl PageCommitter for Probe {
+            fn load_page(&self, id: u64) -> Result<Option<Vec<u8>>, AlgoError> {
+                if id == 0 {
+                    return self.real.load_page(id);
+                }
+                *self.calls.lock().unwrap() += 1;
+                Err(AlgoError::Ledger {
+                    message: format!("synthetic node-page load fail (page {id})"),
+                })
+            }
+            fn store_page(&self, id: u64, content: &[u8]) -> Result<(), AlgoError> {
+                self.real.store_page(id, content)
+            }
+        }
+
+        let probe = Probe {
+            real: real.clone(),
+            calls: std::sync::Mutex::new(0),
+        };
+        let mut restored = MerkleTrie::load(Box::new(probe)).unwrap().unwrap();
+        let err = restored.contains(&[0u8; 4]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("synthetic node-page load fail"),
+            "committer error must propagate up through contains; got: {msg}"
+        );
+
+        // Reference the AlwaysFail struct so it isn't dead code (it's
+        // here as documentation of the simpler shape for readers).
+        let _ = std::any::TypeId::of::<AlwaysFail>();
     }
 
     // -----------------------------------------------------------------------
@@ -1417,7 +1647,7 @@ mod tests {
             t2.add(e).unwrap();
         }
 
-        assert_eq!(t1.root_hash(), t2.root_hash());
+        assert_eq!(t1.root_hash().unwrap(), t2.root_hash().unwrap());
         assert_eq!(t1.len(), t2.len());
     }
 }
