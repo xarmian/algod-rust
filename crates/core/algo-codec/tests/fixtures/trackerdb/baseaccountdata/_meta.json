@@ -1,0 +1,9 @@
+{
+  "type": "baseaccountdata",
+  "source_go_algorand_version": "rel/stable-2.0.2-4277-ga8c16ecc2-dirty",
+  "source_data_dir_prefix": "/algod/data/dockernet-v1/ledger.tracker.sqlite",
+  "source_tracker_db": "/tmp/algod-rust-extract/ledger.tracker.sqlite",
+  "captured_at_utc": "2026-05-23T02:00:11Z",
+  "row_count": 5,
+  "notes": "One file per accountbase row; basename is the lowercase-hex 32-byte address."
+}

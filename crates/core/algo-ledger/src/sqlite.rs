@@ -553,143 +553,18 @@ fn make_box_key(app_id: u64, name: &[u8]) -> Vec<u8> {
 // Msgpack encode/decode helpers for AccountData (Go-compatible codec keys)
 // ---------------------------------------------------------------------------
 
+/// Encode an `AccountData` to the byte form stored in `accountbase.data`.
+///
+/// PLAN-36 G8 (TASK-120) routed this through
+/// [`algo_codec::canonical_encode_base_account_data`], which is the
+/// authoritative byte-exact encoder for go-algorand's
+/// `trackerdb.BaseAccountData` (codec tags `a`..`q`, `A`..`F`, `z`).
+/// Only the base fields of `AccountData` end up in this BLOB; the
+/// resource maps (`assets` / `asset_params` / `app_local_states` /
+/// `app_params`) live in the separate `resources` table and are
+/// encoded elsewhere.
 pub(crate) fn encode_account_data(acct: &AccountData) -> Vec<u8> {
-    let mut map: Vec<(&str, rmpv::Value)> = Vec::new();
-
-    // "a" = status
-    let status_val = acct.status as u8;
-    if status_val != 0 {
-        map.push(("a", rmpv::Value::from(status_val as u64)));
-    }
-
-    // "b" = micro_algos
-    if acct.micro_algos != 0 {
-        map.push(("b", rmpv::Value::from(acct.micro_algos)));
-    }
-
-    // "c" = rewards_base
-    if acct.rewards_base != 0 {
-        map.push(("c", rmpv::Value::from(acct.rewards_base)));
-    }
-
-    // "d" = rewarded_micro_algos
-    if acct.rewarded_micro_algos != 0 {
-        map.push(("d", rmpv::Value::from(acct.rewarded_micro_algos)));
-    }
-
-    // "e" = auth_addr (32 bytes, omit if None)
-    if let Some(ref auth) = acct.auth_addr {
-        map.push(("e", rmpv::Value::Binary(auth.0.to_vec())));
-    }
-
-    // "f" = total_app_schema_num_uint
-    if acct.total_app_schema.num_uint != 0 {
-        map.push(("f", rmpv::Value::from(acct.total_app_schema.num_uint)));
-    }
-
-    // "g" = total_app_schema_num_byte_slice
-    if acct.total_app_schema.num_byte_slice != 0 {
-        map.push(("g", rmpv::Value::from(acct.total_app_schema.num_byte_slice)));
-    }
-
-    // "h" = total_extra_app_pages
-    if acct.total_extra_app_pages != 0 {
-        map.push(("h", rmpv::Value::from(acct.total_extra_app_pages as u64)));
-    }
-
-    // "i" = total_created_assets (TotalAssetParams)
-    if acct.total_created_assets != 0 {
-        map.push(("i", rmpv::Value::from(acct.total_created_assets)));
-    }
-
-    // "j" = total_assets_opted_in (TotalAssets)
-    if acct.total_assets_opted_in != 0 {
-        map.push(("j", rmpv::Value::from(acct.total_assets_opted_in)));
-    }
-
-    // "k" = total_created_apps (TotalAppParams)
-    if acct.total_created_apps != 0 {
-        map.push(("k", rmpv::Value::from(acct.total_created_apps)));
-    }
-
-    // "l" = total_apps_opted_in (TotalAppLocalStates)
-    if acct.total_apps_opted_in != 0 {
-        map.push(("l", rmpv::Value::from(acct.total_apps_opted_in)));
-    }
-
-    // "m" = total_boxes
-    if acct.total_boxes != 0 {
-        map.push(("m", rmpv::Value::from(acct.total_boxes)));
-    }
-
-    // "n" = total_box_bytes
-    if acct.total_box_bytes != 0 {
-        map.push(("n", rmpv::Value::from(acct.total_box_bytes)));
-    }
-
-    // "o" = incentive_eligible
-    if acct.incentive_eligible {
-        map.push(("o", rmpv::Value::Boolean(true)));
-    }
-
-    // "p" = last_proposed
-    if acct.last_proposed != 0 {
-        map.push(("p", rmpv::Value::from(acct.last_proposed)));
-    }
-
-    // "q" = last_heartbeat
-    if acct.last_heartbeat != 0 {
-        map.push(("q", rmpv::Value::from(acct.last_heartbeat)));
-    }
-
-    // Participation keys
-    // "A" = vote_id
-    if let Some(ref vk) = acct.vote_id {
-        map.push(("A", rmpv::Value::Binary(vk.to_vec())));
-    }
-
-    // "B" = selection_id
-    if let Some(ref sk) = acct.selection_id {
-        map.push(("B", rmpv::Value::Binary(sk.to_vec())));
-    }
-
-    // "C" = vote_first_valid
-    if acct.vote_first_valid != 0 {
-        map.push(("C", rmpv::Value::from(acct.vote_first_valid)));
-    }
-
-    // "D" = vote_last_valid
-    if acct.vote_last_valid != 0 {
-        map.push(("D", rmpv::Value::from(acct.vote_last_valid)));
-    }
-
-    // "E" = vote_key_dilution
-    if acct.vote_key_dilution != 0 {
-        map.push(("E", rmpv::Value::from(acct.vote_key_dilution)));
-    }
-
-    // "F" = state_proof_id (64 bytes)
-    if let Some(ref sp) = acct.state_proof_id {
-        map.push(("F", rmpv::Value::Binary(sp.to_vec())));
-    }
-
-    // "z" = update_round
-    if acct.update_round != 0 {
-        map.push(("z", rmpv::Value::from(acct.update_round)));
-    }
-
-    // Build the msgpack map (sorted by key — Go's canonical encoding)
-    map.sort_by(|a, b| a.0.cmp(b.0));
-
-    let pairs: Vec<(rmpv::Value, rmpv::Value)> = map
-        .into_iter()
-        .map(|(k, v)| (rmpv::Value::String(k.into()), v))
-        .collect();
-
-    let val = rmpv::Value::Map(pairs);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    buf
+    algo_codec::canonical_encode_base_account_data(acct)
 }
 
 fn decode_account_data(data: &[u8]) -> Result<AccountData, AlgoError> {

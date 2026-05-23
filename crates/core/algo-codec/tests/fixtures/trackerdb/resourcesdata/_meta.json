@@ -1,0 +1,9 @@
+{
+  "type": "resourcesdata",
+  "source_go_algorand_version": "rel/stable-2.0.2-4277-ga8c16ecc2-dirty",
+  "source_data_dir_prefix": "/algod/data/dockernet-v1/ledger.tracker.sqlite",
+  "source_tracker_db": "/tmp/algod-rust-extract/ledger.tracker.sqlite",
+  "captured_at_utc": "2026-05-23T02:00:11Z",
+  "row_count": 2,
+  "notes": "Basename: \u003caddrhex\u003e_\u003caidx\u003e_\u003cctype\u003e. ctype 0=Asset, 1=App per go-algorand basics/teal."
+}
