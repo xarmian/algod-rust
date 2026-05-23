@@ -76,6 +76,20 @@ impl CanonicalMap {
         }
     }
 
+    /// Length-only omitempty for variable-length `[]byte` fields: the
+    /// value is included as long as `len > 0`, even when every byte is
+    /// zero. Used for things like `ResourcesData.ApprovalProgram` /
+    /// `ClearStateProgram` where Go's `[]byte` omitempty checks `len`
+    /// only — an all-zero non-empty program is still valid bytecode and
+    /// must be preserved. PLAN-36 G8 (TASK-122).
+    fn add_var_bytes(&mut self, key: &'static str, val: &[u8]) {
+        if !val.is_empty() {
+            let mut buf = Vec::new();
+            rmp::encode::write_bin(&mut buf, val).unwrap();
+            self.fields.push((key, buf));
+        }
+    }
+
     /// Encode a byte slice using msgpack `str` format (not `bin`).
     ///
     /// In Go, fields typed as `string` are encoded by go-codec as msgpack str,
@@ -1042,13 +1056,12 @@ pub fn canonical_encode_resources_data(d: &ResourcesData) -> Vec<u8> {
         m.add_map("p", d.key_value.clone());
     }
 
-    // App params (q-x).
-    if !d.approval_program.is_empty() {
-        m.add_bytes("q", &d.approval_program);
-    }
-    if !d.clear_state_program.is_empty() {
-        m.add_bytes("r", &d.clear_state_program);
-    }
+    // App params (q-x). `q`/`r` use the variable-length omitempty
+    // helper because an all-zero non-empty program is still valid
+    // bytecode (Go's `[]byte` omitempty checks `len == 0` only — see
+    // `CanonicalMap::add_var_bytes` for the contract).
+    m.add_var_bytes("q", &d.approval_program);
+    m.add_var_bytes("r", &d.clear_state_program);
     if !d.global_state.is_empty() {
         m.add_map("s", d.global_state.clone());
     }
