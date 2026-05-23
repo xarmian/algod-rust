@@ -280,14 +280,14 @@ func extractPayset(blockBytes []byte, payset *[]types.SignedTxnInBlock) error {
 // Fields are intentionally flat so this stays diffable as the corpus
 // regenerates round-to-round; only counts + provenance change.
 type blobMeta struct {
-	Type            string `json:"type"`
-	SourceVersion   string `json:"source_go_algorand_version,omitempty"`
-	SourcePrefix    string `json:"source_data_dir_prefix,omitempty"`
-	SourceDB        string `json:"source_tracker_db"`
-	CapturedAtUTC   string `json:"captured_at_utc"`
-	RowCount        int    `json:"row_count"`
-	HighestRound    *int64 `json:"highest_round,omitempty"`
-	Notes           string `json:"notes,omitempty"`
+	Type          string `json:"type"`
+	SourceVersion string `json:"source_go_algorand_version,omitempty"`
+	SourcePrefix  string `json:"source_data_dir_prefix,omitempty"`
+	SourceDB      string `json:"source_tracker_db"`
+	CapturedAtUTC string `json:"captured_at_utc"`
+	RowCount      int    `json:"row_count"`
+	HighestRound  *int64 `json:"highest_round,omitempty"`
+	Notes         string `json:"notes,omitempty"`
 }
 
 func runTrackerdbBlobsMode(trackerDB, outputDir, sourceVersion, sourcePrefix string) error {
