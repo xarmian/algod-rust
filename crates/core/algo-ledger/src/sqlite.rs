@@ -852,39 +852,12 @@ fn decode_asset_params(data: &[u8]) -> Result<AssetParams, AlgoError> {
     Ok(p)
 }
 
-pub(crate) fn encode_teal_key_value(kv: &BTreeMap<Vec<u8>, TealValue>) -> rmpv::Value {
-    if kv.is_empty() {
-        return rmpv::Value::Map(vec![]);
-    }
-    let pairs: Vec<(rmpv::Value, rmpv::Value)> = kv
-        .iter()
-        .map(|(k, v)| {
-            // Go msgpack encodes map keys as raw bytes (Binary), not UTF-8 strings.
-            let key = rmpv::Value::Binary(k.clone());
-            let val = match v {
-                TealValue::Uint(n) => {
-                    // {tt: 2, ui: n} — Go uses tt=2 for uint
-                    rmpv::Value::Map(vec![
-                        (rmpv::Value::String("tt".into()), rmpv::Value::from(2u64)),
-                        (rmpv::Value::String("ui".into()), rmpv::Value::from(*n)),
-                    ])
-                }
-                TealValue::Bytes(b) => {
-                    // {tt: 1, tb: bytes} — Go uses tt=1 for bytes
-                    rmpv::Value::Map(vec![
-                        (
-                            rmpv::Value::String("tb".into()),
-                            rmpv::Value::Binary(b.clone()),
-                        ),
-                        (rmpv::Value::String("tt".into()), rmpv::Value::from(1u64)),
-                    ])
-                }
-            };
-            (key, val)
-        })
-        .collect();
-    rmpv::Value::Map(pairs)
-}
+// Note: pre-PLAN-189 `encode_teal_key_value` (which emitted binary-keyed
+// rmpv::Value::Maps) was deleted in TASK-193 — every TEAL kv write path
+// now flows through `algo_codec::canonical_encode_teal_key_value`, which
+// produces Go's `map[string]TealValue` shape (msgpack STRING keys with
+// raw byte content). `decode_teal_key_value` remains tolerant of both
+// shapes for back-compat with legacy on-disk rows.
 
 fn decode_teal_key_value(val: &rmpv::Value) -> BTreeMap<Vec<u8>, TealValue> {
     let mut result = BTreeMap::new();
@@ -1126,47 +1099,25 @@ pub(crate) fn encode_app_local_state(s: &AppLocalState) -> Vec<u8> {
 }
 
 pub(crate) fn encode_app_local_state_with_round(s: &AppLocalState, update_round: u64) -> Vec<u8> {
-    let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-    // Schema
-    if s.schema.num_uint != 0 || s.schema.num_byte_slice != 0 {
-        pairs.push((
-            rmpv::Value::String("p".into()),
-            rmpv::Value::Map(vec![
-                (
-                    rmpv::Value::String("nui".into()),
-                    rmpv::Value::from(s.schema.num_uint),
-                ),
-                (
-                    rmpv::Value::String("nbs".into()),
-                    rmpv::Value::from(s.schema.num_byte_slice),
-                ),
-            ]),
-        ));
-    }
-
-    // Key-value store
-    if !s.key_value.is_empty() {
-        pairs.push((
-            rmpv::Value::String("s".into()),
-            encode_teal_key_value(&s.key_value),
-        ));
-    }
-
-    // Resource flags: bit 0 = holding present (local state)
-    pairs.push((rmpv::Value::String("y".into()), rmpv::Value::from(1u64)));
-    // UpdateRound — matches Go's ResourcesData.UpdateRound (codec "z").
-    if update_round != 0 {
-        pairs.push((
-            rmpv::Value::String("z".into()),
-            rmpv::Value::from(update_round),
-        ));
-    }
-
-    let val = rmpv::Value::Map(pairs);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    buf
+    // Delegate to canonical encoder. PLAN-189 / TASK-193.
+    //
+    // Field layout changes from the legacy hand-rolled encoder:
+    //   schema.num_uint        p.nui (nested submap)  →  n (u64)
+    //   schema.num_byte_slice  p.nbs (nested submap)  →  o (u64)
+    //   key_value              s (rmpv Map, BIN keys) →  p (rmpv Map, STR keys
+    //                                                       per Go's
+    //                                                       `map[string]TealValue`)
+    //   y (resource_flags)     1 (legacy HOLDING bit) →  0 (canonical HOLDING,
+    //                                                       omitted by canonical
+    //                                                       encoder)
+    //
+    // The standalone local-state row's canonical `y` is HOLDING (0), which
+    // the canonical encoder omits via add_u64; the resulting blob can be
+    // an empty map `{}` for an opted-in account with zero schema and no
+    // kv entries. `inspect_resource_blob` recognizes that shape as
+    // has_holding=true (TASK-191's empty-map fallback).
+    let rd = build_app_resource_data(Some(s), None, update_round);
+    algo_codec::canonical_encode_resources_data(&rd)
 }
 
 fn decode_app_local_state(data: &[u8]) -> Result<AppLocalState, AlgoError> {
@@ -5662,6 +5613,101 @@ mod tests {
         assert_eq!(decoded.global_state_schema.num_uint, 3);
         assert_eq!(decoded.global_state_schema.num_byte_slice, 4);
         assert_eq!(decoded.extra_program_pages, 5);
+    }
+
+    // ---------------------------------------------------------------------
+    // App local-state canonical delegation (TASK-193)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn encode_app_local_state_matches_canonical_encoder() {
+        let mut kv = BTreeMap::new();
+        kv.insert(b"key1".to_vec(), TealValue::Uint(42));
+        kv.insert(b"key2".to_vec(), TealValue::Bytes(b"value".to_vec()));
+        let s = AppLocalState {
+            schema: StateSchema {
+                num_uint: 3,
+                num_byte_slice: 5,
+            },
+            key_value: kv.clone(),
+        };
+        let actual = encode_app_local_state_with_round(&s, 77);
+
+        let rd = algo_codec::ResourcesData {
+            schema_num_uint: 3,
+            schema_num_byte_slice: 5,
+            key_value: algo_codec::canonical_encode_teal_key_value(&kv),
+            resource_flags: algo_codec::resource_flags::HOLDING,
+            update_round: 77,
+            ..Default::default()
+        };
+        let expected = algo_codec::canonical_encode_resources_data(&rd);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn encode_app_local_state_default_is_empty_map() {
+        // Empty opted-in row with zero schema and no kv: every field
+        // is omitempty-dropped (n=0, o=0, p empty, y=HOLDING=0 → all gone).
+        // Resulting blob is just `{}` (0x80).
+        let s = AppLocalState {
+            schema: StateSchema::default(),
+            key_value: BTreeMap::new(),
+        };
+        let bytes = encode_app_local_state_with_round(&s, 0);
+        assert_eq!(bytes, vec![0x80]);
+        // And the inspector still sees has_holding=true.
+        let meta = inspect_resource_blob(&bytes);
+        assert!(meta.has_holding);
+    }
+
+    #[test]
+    fn encode_app_local_state_round_trip_via_decoder() {
+        let mut kv = BTreeMap::new();
+        kv.insert(b"hello".to_vec(), TealValue::Bytes(b"world".to_vec()));
+        let s = AppLocalState {
+            schema: StateSchema {
+                num_uint: 2,
+                num_byte_slice: 1,
+            },
+            key_value: kv,
+        };
+        let bytes = encode_app_local_state_with_round(&s, 0);
+        let decoded = decode_app_local_state(&bytes).expect("decode");
+        assert_eq!(decoded.schema.num_uint, 2);
+        assert_eq!(decoded.schema.num_byte_slice, 1);
+        let entry = decoded.key_value.get(b"hello".as_slice()).expect("kv key");
+        assert!(matches!(entry, TealValue::Bytes(b) if b == b"world"));
+    }
+
+    #[test]
+    fn decode_app_local_state_legacy_shape_still_works() {
+        // Hand-build a legacy app-local-state blob: `p` as nested schema
+        // submap, `s` as kv map with binary keys, `y=1`.
+        let kv_map = rmpv::Value::Map(vec![(
+            rmpv::Value::Binary(b"k".to_vec()),
+            rmpv::Value::Map(vec![
+                (rmpv::Value::String("tt".into()), rmpv::Value::from(2u64)),
+                (rmpv::Value::String("ui".into()), rmpv::Value::from(99u64)),
+            ]),
+        )]);
+        let bytes = rmpv_map(&[
+            (
+                "p",
+                rmpv::Value::Map(vec![
+                    (rmpv::Value::String("nbs".into()), rmpv::Value::from(7u64)),
+                    (rmpv::Value::String("nui".into()), rmpv::Value::from(4u64)),
+                ]),
+            ),
+            ("s", kv_map),
+            ("y", rmpv::Value::from(1u64)),
+        ]);
+        let decoded = decode_app_local_state(&bytes).expect("decode");
+        assert_eq!(decoded.schema.num_uint, 4);
+        assert_eq!(decoded.schema.num_byte_slice, 7);
+        let entry = decoded.key_value.get(b"k".as_slice()).expect("kv key");
+        assert!(matches!(entry, TealValue::Uint(99)));
     }
 
     // ---------------------------------------------------------------------
