@@ -607,19 +607,30 @@ pub struct CatchpointOnlineRoundParamsData {
 }
 
 // ---------------------------------------------------------------------------
-// ResourceFlags constants (from trackerdb/data.go)
+// ResourceFlags constants — re-exported from `algo_codec::resource_flags`
 // ---------------------------------------------------------------------------
+//
+// PLAN-189 / TASK-190 consolidated these to a single source of truth in
+// `algo_codec::canonical::resource_flags` (which mirrors go-algorand's
+// `trackerdb.ResourceFlags` enum at
+// `../go-algorand/ledger/store/trackerdb/data.go:62-75`). The aliases
+// below keep existing call sites working without churn.
 
-/// Resource contains holding data.
-pub const RESOURCE_FLAGS_HOLDING: u8 = 0;
-/// Resource is completely empty (should not be persisted).
-pub const RESOURCE_FLAGS_NOT_HOLDING: u8 = 1;
-/// Resource contains asset/app params (ownership).
-pub const RESOURCE_FLAGS_OWNERSHIP: u8 = 2;
-/// Empty asset resource marker.
-pub const RESOURCE_FLAGS_EMPTY_ASSET: u8 = 4;
-/// Empty app resource marker.
-pub const RESOURCE_FLAGS_EMPTY_APP: u8 = 8;
+/// Resource contains holding data. Re-export of
+/// [`algo_codec::resource_flags::HOLDING`].
+pub const RESOURCE_FLAGS_HOLDING: u8 = algo_codec::resource_flags::HOLDING;
+/// Resource is completely empty (should not be persisted). Re-export
+/// of [`algo_codec::resource_flags::NOT_HOLDING`].
+pub const RESOURCE_FLAGS_NOT_HOLDING: u8 = algo_codec::resource_flags::NOT_HOLDING;
+/// Resource contains asset/app params (ownership). Re-export of
+/// [`algo_codec::resource_flags::OWNERSHIP`].
+pub const RESOURCE_FLAGS_OWNERSHIP: u8 = algo_codec::resource_flags::OWNERSHIP;
+/// Empty asset resource marker. Re-export of
+/// [`algo_codec::resource_flags::EMPTY_ASSET`].
+pub const RESOURCE_FLAGS_EMPTY_ASSET: u8 = algo_codec::resource_flags::EMPTY_ASSET;
+/// Empty app resource marker. Re-export of
+/// [`algo_codec::resource_flags::EMPTY_APP`].
+pub const RESOURCE_FLAGS_EMPTY_APP: u8 = algo_codec::resource_flags::EMPTY_APP;
 
 #[cfg(test)]
 mod tests {
