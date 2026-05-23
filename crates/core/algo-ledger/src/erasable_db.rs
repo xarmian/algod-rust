@@ -132,6 +132,26 @@ impl ErasableDb {
             });
         }
 
+        // Confirm journal_mode actually became `wal`. SQLite silently
+        // returns a different mode for paths it can't put into WAL
+        // (e.g. `:memory:` → `memory`, network-mounted files may stay
+        // `delete`). For partkey DBs we need WAL to match Go's
+        // behaviour and avoid divergent crash-recovery semantics.
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .map_err(|e| Error::Sqlite {
+                path: path.clone(),
+                source: e,
+            })?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(Error::PragmaMismatch {
+                path: path.clone(),
+                pragma: "journal_mode",
+                expected: "wal",
+                actual: mode,
+            });
+        }
+
         Ok(Self { conn, path })
     }
 
