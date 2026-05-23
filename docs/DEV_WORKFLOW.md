@@ -194,7 +194,7 @@ go-algorand 4.5.1 consensus versions → AVM versions:
 
 ## Go Canonical-Extract Tool
 
-Located at `docker/scripts/canonical-extract/`. Requires Go 1.21+ and a running localnet.
+Located at `docker/scripts/canonical-extract/`. Requires Go 1.25+ and a running localnet. (The 1.25 floor comes from the pure-Go SQLite driver `modernc.org/sqlite` used by `-mode trackerdb-blobs` — `-mode blocks` itself only needs 1.21+, but the module is shared.)
 
 ```bash
 # Run standalone

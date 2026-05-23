@@ -187,10 +187,16 @@ extract-trackerdb-fixtures:
 	fi; \
 	mkdir -p $(TRACKERDB_LOCAL_DIR); \
 	rm -f $(TRACKERDB_LOCAL_COPY) $(TRACKERDB_LOCAL_COPY)-wal $(TRACKERDB_LOCAL_COPY)-shm; \
+	echo "==> Pausing $(TRACKERDB_CONTAINER) to take a consistent snapshot ..."; \
+	docker pause $(TRACKERDB_CONTAINER) > /dev/null; \
+	trap 'docker unpause $(TRACKERDB_CONTAINER) > /dev/null 2>&1 || true' EXIT; \
 	echo "==> Copying tracker DB + WAL/SHM sidecars out of $(TRACKERDB_CONTAINER) ..."; \
 	docker cp $(TRACKERDB_CONTAINER):$$SRC_PATH $(TRACKERDB_LOCAL_COPY); \
 	docker cp $(TRACKERDB_CONTAINER):$$SRC_PATH-wal $(TRACKERDB_LOCAL_COPY)-wal 2>/dev/null || true; \
 	docker cp $(TRACKERDB_CONTAINER):$$SRC_PATH-shm $(TRACKERDB_LOCAL_COPY)-shm 2>/dev/null || true; \
+	echo "==> Resuming $(TRACKERDB_CONTAINER) ..."; \
+	docker unpause $(TRACKERDB_CONTAINER) > /dev/null; \
+	trap - EXIT; \
 	echo "==> Dumping trackerdb BLOBs ..."; \
 	cd docker/scripts/canonical-extract && go run . \
 		-mode trackerdb-blobs \
