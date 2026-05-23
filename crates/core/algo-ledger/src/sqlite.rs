@@ -393,13 +393,6 @@ const CTYPE_APP: i64 = 1;
 /// ignores everything else, so leaving the row in place is safe).
 const KVSTORE_NULL_NORM_MARKER: &str = "algod_rust_kvstore_null_norm_v1";
 
-/// Marker key for PLAN-189 / TASK-195's one-shot resources.data
-/// canonicalization. Bumped whenever the canonical shape changes — a
-/// fresh value forces an idempotent re-scan to catch any rows the
-/// previous migrator missed. Same `algod_rust_` namespace as
-/// [`KVSTORE_NULL_NORM_MARKER`] so Go's reader ignores it.
-const RESOURCES_CANONICAL_MIGRATION_MARKER: &str = "algod_rust_resources_canonical_v1";
-
 /// G13: one-shot conversion of NULL `kvstore.value` rows to empty BLOBs.
 /// Mirrors Go's `performKVStoreNullBlobConversion`. Persists a marker in
 /// `catchpointstate` so subsequent opens skip the table scan; idempotent
@@ -440,177 +433,6 @@ fn normalize_kvstore_nulls(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// PLAN-189 / TASK-195: one-shot canonicalization of `resources.data`
-/// BLOBs. Walks every row, decodes via the tolerant decoders, re-encodes
-/// via [`build_asset_resource_data`] / [`build_app_resource_data`] +
-/// `canonical_encode_resources_data`, and rewrites the row when the
-/// bytes changed. Persists a marker in `catchpointstate` so subsequent
-/// opens skip the scan; idempotent either way (a row already in
-/// canonical shape decodes-and-re-encodes to bit-identical bytes).
-///
-/// The migration is single-transaction so a crash mid-run rolls back
-/// cleanly; on the next open the marker is absent and the migrator
-/// runs to completion against the original (legacy) rows.
-fn migrate_resources_to_canonical(conn: &Connection) -> rusqlite::Result<()> {
-    let already_done: Option<i64> = conn
-        .query_row(
-            "SELECT intval FROM catchpointstate WHERE id = ?1",
-            [RESOURCES_CANONICAL_MIGRATION_MARKER],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if already_done == Some(1) {
-        return Ok(());
-    }
-
-    // Wrap the entire rewrite in a single immediate transaction so any
-    // mid-migration crash leaves the DB at the pre-migration state.
-    conn.execute("BEGIN IMMEDIATE TRANSACTION", [])?;
-
-    let migration_result = (|| -> rusqlite::Result<()> {
-        // Snapshot the (addrid, aidx, ctype, data) tuples upfront — we
-        // can't hold a statement borrow during nested execute() calls
-        // on the same connection.
-        let rows: Vec<(i64, i64, i64, Vec<u8>)> = {
-            let mut stmt = conn.prepare(
-                "SELECT addrid, aidx, ctype, data FROM resources",
-            )?;
-            let iter = stmt.query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?;
-            iter.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-
-        for (addrid, aidx, ctype, data) in rows {
-            let Some(canonical) = canonicalize_resource_blob(&data, ctype) else {
-                continue;
-            };
-            if canonical == data {
-                continue;
-            }
-            conn.execute(
-                "UPDATE resources SET data = ?1 \
-                     WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
-                params![canonical, addrid, aidx, ctype],
-            )?;
-        }
-
-        conn.execute(
-            "INSERT OR REPLACE INTO catchpointstate (id, intval) VALUES (?1, 1)",
-            [RESOURCES_CANONICAL_MIGRATION_MARKER],
-        )?;
-        Ok(())
-    })();
-
-    match migration_result {
-        Ok(()) => {
-            conn.execute("COMMIT", [])?;
-            Ok(())
-        }
-        Err(e) => {
-            // Best-effort rollback; the original error wins.
-            let _ = conn.execute("ROLLBACK", []);
-            Err(e)
-        }
-    }
-}
-
-/// Metadata fields preserved across canonical re-encoding: `z` (update_round),
-/// `A` (version), `B` (size_sponsor). Returned as a single struct so
-/// every migration call site picks them all up consistently. PLAN-189
-/// / TASK-195 (Codex review round 1).
-#[derive(Debug, Default, Clone, Copy)]
-struct ResourceMetadataFields {
-    update_round: u64,
-    version: u64,
-    size_sponsor: [u8; 32],
-}
-
-fn extract_resource_metadata_fields(data: &[u8]) -> ResourceMetadataFields {
-    let mut m = ResourceMetadataFields::default();
-    let Ok(val) = rmpv::decode::read_value(&mut &data[..]) else {
-        return m;
-    };
-    let rmpv::Value::Map(pairs) = val else {
-        return m;
-    };
-    for (k, v) in pairs {
-        match k.as_str().unwrap_or("") {
-            "z" => m.update_round = v.as_u64().unwrap_or(0),
-            "A" => m.version = v.as_u64().unwrap_or(0),
-            "B" => {
-                if let Some(slice) = v.as_slice() {
-                    if slice.len() == 32 {
-                        m.size_sponsor.copy_from_slice(slice);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    m
-}
-
-/// Decode a single `resources.data` blob and re-encode it via the
-/// canonical builders. Returns `None` if the blob is unrecognizable
-/// (in which case the migrator skips it without rewriting). The
-/// chosen builder depends on `ctype` + the row's flag/field shape.
-/// Metadata fields `z`/`A`/`B` are preserved across the re-encode so
-/// catchpoint-shaped rows with non-default `version`/`size_sponsor`
-/// values don't lose data.
-fn canonicalize_resource_blob(data: &[u8], ctype: i64) -> Option<Vec<u8>> {
-    let meta = inspect_resource_blob(data);
-    let metadata = extract_resource_metadata_fields(data);
-    match ctype {
-        x if x == CTYPE_ASSET => {
-            let holding = if meta.has_holding {
-                Some(decode_asset_holding(data).ok()?)
-            } else {
-                None
-            };
-            let params = if meta.has_ownership {
-                Some(decode_asset_params(data).ok()?)
-            } else {
-                None
-            };
-            if holding.is_none() && params.is_none() {
-                return None;
-            }
-            let mut rd = build_asset_resource_data(
-                holding.as_ref(),
-                params.as_ref(),
-                metadata.update_round,
-            );
-            rd.version = metadata.version;
-            rd.size_sponsor = metadata.size_sponsor;
-            Some(algo_codec::canonical_encode_resources_data(&rd))
-        }
-        x if x == CTYPE_APP => {
-            let local = if meta.has_holding {
-                Some(decode_app_local_state(data).ok()?)
-            } else {
-                None
-            };
-            let params = if meta.has_ownership {
-                Some(decode_app_params(data, Address([0u8; 32])).ok()?)
-            } else {
-                None
-            };
-            if local.is_none() && params.is_none() {
-                return None;
-            }
-            let mut rd = build_app_resource_data(
-                local.as_ref(),
-                params.as_ref(),
-                metadata.update_round,
-            );
-            rd.version = metadata.version;
-            rd.size_sponsor = metadata.size_sponsor;
-            Some(algo_codec::canonical_encode_resources_data(&rd))
-        }
-        _ => None,
-    }
-}
 
 /// Upgrade pre-G5 Rust DBs whose `resources.ctype` was declared `INTEGER`
 /// (nullable) to Go's post-migration shape `INTEGER NOT NULL DEFAULT -1`.
@@ -711,37 +533,16 @@ fn migrate_resources_ctype_not_null(conn: &Connection) -> Result<(), AlgoError> 
 }
 
 // ---------------------------------------------------------------------------
-// Resource flag handling (legacy `y` values written by older builds)
+// Resource flag handling
 // ---------------------------------------------------------------------------
 //
-// The canonical source of truth for `ResourceFlags` enum values is
+// Every encoder + merge/strip helper writes Go-canonical bytes via
+// `algo_codec::canonical_encode_resources_data`. The single source of
+// truth for `ResourceFlags` enum values is
 // [`algo_codec::resource_flags`] (`HOLDING = 0`, `NOT_HOLDING = 1`,
 // `OWNERSHIP = 2`, `EMPTY_ASSET = 4`, `EMPTY_APP = 8` — matching
 // go-algorand's `trackerdb.ResourceFlags` at
-// `../go-algorand/ledger/store/trackerdb/data.go:62-75`).
-//
-// Pre-PLAN-189 algod-rust DBs wrote a *different* (and broken) shape:
-// the `y` field was treated as a bitmask with bit 0 meaning
-// "has holding data" and bit 2 meaning "has params data" — directly
-// inverted from Go's bit-0-means-NotHolding semantics. The two
-// constants below preserve those legacy write-side values for the
-// encoders that haven't yet been migrated to
-// `canonical_encode_resources_data` (TASK-191/192/193). They MUST
-// NOT be used at read time — read paths go through
-// [`inspect_resource_blob`] / [`ResourceMeta`] instead, which
-// inspects field presence so it works for BOTH legacy and canonical
-// shapes.
-//
-// PLAN-189 / TASK-190.
-
-// After TASK-190/191/192 the LEGACY_Y_* bit constants are no longer
-// referenced — every encoder + merge/strip helper in this module and
-// in `state.rs` writes Go-canonical bytes via
-// `algo_codec::canonical_encode_resources_data`. Only the standalone
-// `encode_app_local_state_with_round` remains hand-rolled, and it
-// writes its `y=1` as a literal pending TASK-193's migration. The
-// constants can be revived if/when a legacy writer needs to be reintroduced;
-// they would just be small `pub(crate) const LEGACY_Y_*_BIT` items.
+// `../go-algorand/ledger/store/trackerdb/data.go:62-75`). PLAN-189.
 
 // Box key prefix and layout constants (matches go-algorand's avm-abi/apps.MakeBoxKey).
 const BOX_PREFIX: &[u8] = b"bx:";
@@ -1042,17 +843,13 @@ fn decode_teal_key_value(val: &rmpv::Value) -> BTreeMap<Vec<u8>, TealValue> {
     let mut result = BTreeMap::new();
     if let rmpv::Value::Map(pairs) = val {
         for (k, v) in pairs {
-            // Go's canonical `map[string]TealValue` encoder writes keys
-            // as msgpack STRINGS containing the raw key bytes (Go's
-            // `string` is a byte sequence; the bytes need not be valid
-            // UTF-8). Legacy Rust `encode_teal_key_value` wrote keys as
-            // BINARY. Read both shapes via the underlying byte slice —
-            // `rmpv::Utf8String::as_bytes` returns the raw bytes
-            // regardless of UTF-8 validity, so non-UTF-8 TEAL keys
-            // round-trip correctly through canonical bytes. PLAN-189 / TASK-192.
+            // Canonical Go `map[string]TealValue` writes keys as msgpack
+            // STRINGS holding raw bytes (`rmpv::Utf8String::as_bytes`
+            // returns them regardless of UTF-8 validity). TASK-196
+            // removed the legacy binary-key tolerance — only canonical
+            // shape is accepted.
             let key_bytes = match k {
                 rmpv::Value::String(s) => s.as_bytes().to_vec(),
-                rmpv::Value::Binary(b) => b.clone(),
                 _ => continue,
             };
             if let rmpv::Value::Map(inner) = v {
@@ -1170,103 +967,35 @@ fn decode_app_params(data: &[u8], creator: Address) -> Result<AppParams, AlgoErr
         extra_program_pages: 0,
     };
 
-    // Tolerant of BOTH legacy (nested {nui,nbs} submaps at `t`/`u`, `v` =
-    // extra_pages) AND canonical (flat u64s at `t/u/v/w`, `x` = extra_pages)
-    // shapes. Two-pass: first collect all values, then dispatch on layout.
-    // PLAN-189 / TASK-192.
-    let mut q_val: Option<Vec<u8>> = None;
-    let mut r_val: Option<Vec<u8>> = None;
-    let mut s_val: Option<rmpv::Value> = None;
-    let mut t_val: Option<rmpv::Value> = None;
-    let mut u_val: Option<rmpv::Value> = None;
-    let mut v_val: Option<rmpv::Value> = None;
-    let mut w_val: Option<rmpv::Value> = None;
-    let mut x_val: Option<rmpv::Value> = None;
-    let mut raw_y: u64 = 0;
-
+    // Canonical Go layout only (TASK-196 removed legacy tolerance):
+    //   q = approval, r = clear_state, s = global_state,
+    //   t = local_state_schema.num_uint, u = local_state_schema.num_byte_slice,
+    //   v = global_state_schema.num_uint, w = global_state_schema.num_byte_slice,
+    //   x = extra_program_pages.
     for (k, v) in &map {
         match k.as_str().unwrap_or("") {
-            "q" => q_val = v.as_slice().map(|b| b.to_vec()),
-            "r" => r_val = v.as_slice().map(|b| b.to_vec()),
-            "s" => s_val = Some(v.clone()),
-            "t" => t_val = Some(v.clone()),
-            "u" => u_val = Some(v.clone()),
-            "v" => v_val = Some(v.clone()),
-            "w" => w_val = Some(v.clone()),
-            "x" => x_val = Some(v.clone()),
-            "y" => raw_y = v.as_u64().unwrap_or(0),
+            "q" => {
+                if let Some(b) = v.as_slice() {
+                    p.approval_program = b.to_vec();
+                }
+            }
+            "r" => {
+                if let Some(b) = v.as_slice() {
+                    p.clear_state_program = b.to_vec();
+                }
+            }
+            "s" => p.global_state = decode_teal_key_value(v),
+            "t" => p.local_state_schema.num_uint = v.as_u64().unwrap_or(0),
+            "u" => p.local_state_schema.num_byte_slice = v.as_u64().unwrap_or(0),
+            "v" => p.global_state_schema.num_uint = v.as_u64().unwrap_or(0),
+            "w" => p.global_state_schema.num_byte_slice = v.as_u64().unwrap_or(0),
+            "x" => {
+                let raw = v.as_u64().unwrap_or(0);
+                p.extra_program_pages = u32::try_from(raw).map_err(|_| AlgoError::Ledger {
+                    message: format!("extra_program_pages {raw} exceeds u32::MAX"),
+                })?;
+            }
             _ => {}
-        }
-    }
-
-    // Layout detection: canonical iff
-    //   - any canonical-only key (`w`/`x`) is present, OR
-    //   - `t`/`u` are scalar u64s (legacy always wrote them as nested
-    //     Map submaps), OR
-    //   - `y == 2` (OWNERSHIP) or `y == 3` (NOT_HOLDING | OWNERSHIP),
-    //     canonical-only flag values that legacy never wrote.
-    // PLAN-189 / TASK-192 (Codex review round 3).
-    let is_canonical = w_val.is_some()
-        || x_val.is_some()
-        || matches!(&t_val, Some(v) if !matches!(v, rmpv::Value::Map(_)))
-        || matches!(&u_val, Some(v) if !matches!(v, rmpv::Value::Map(_)))
-        || raw_y == 2
-        || raw_y == 3;
-
-    if let Some(b) = q_val {
-        p.approval_program = b;
-    }
-    if let Some(b) = r_val {
-        p.clear_state_program = b;
-    }
-    if let Some(s) = s_val {
-        p.global_state = decode_teal_key_value(&s);
-    }
-
-    if is_canonical {
-        if let Some(t) = t_val {
-            p.local_state_schema.num_uint = t.as_u64().unwrap_or(0);
-        }
-        if let Some(u) = u_val {
-            p.local_state_schema.num_byte_slice = u.as_u64().unwrap_or(0);
-        }
-        if let Some(v) = v_val {
-            p.global_state_schema.num_uint = v.as_u64().unwrap_or(0);
-        }
-        if let Some(w) = w_val {
-            p.global_state_schema.num_byte_slice = w.as_u64().unwrap_or(0);
-        }
-        if let Some(x) = x_val {
-            let raw = x.as_u64().unwrap_or(0);
-            p.extra_program_pages = u32::try_from(raw).map_err(|_| AlgoError::Ledger {
-                message: format!("extra_program_pages {raw} exceeds u32::MAX"),
-            })?;
-        }
-    } else {
-        // Legacy: t/u are nested {nui,nbs} submaps, v is extra_pages.
-        if let Some(rmpv::Value::Map(inner)) = t_val {
-            for (ik, iv) in inner {
-                match ik.as_str().unwrap_or("") {
-                    "nui" => p.local_state_schema.num_uint = iv.as_u64().unwrap_or(0),
-                    "nbs" => p.local_state_schema.num_byte_slice = iv.as_u64().unwrap_or(0),
-                    _ => {}
-                }
-            }
-        }
-        if let Some(rmpv::Value::Map(inner)) = u_val {
-            for (ik, iv) in inner {
-                match ik.as_str().unwrap_or("") {
-                    "nui" => p.global_state_schema.num_uint = iv.as_u64().unwrap_or(0),
-                    "nbs" => p.global_state_schema.num_byte_slice = iv.as_u64().unwrap_or(0),
-                    _ => {}
-                }
-            }
-        }
-        if let Some(v) = v_val {
-            let raw = v.as_u64().unwrap_or(0);
-            p.extra_program_pages = u32::try_from(raw).map_err(|_| AlgoError::Ledger {
-                message: format!("extra_program_pages {raw} exceeds u32::MAX"),
-            })?;
         }
     }
 
@@ -1318,89 +1047,15 @@ fn decode_app_local_state(data: &[u8]) -> Result<AppLocalState, AlgoError> {
         key_value: BTreeMap::new(),
     };
 
-    // Tolerant of BOTH legacy (`p` = schema submap {nui,nbs}, `s` = kv)
-    // AND canonical (`n` = num_uint u64, `o` = num_byte_slice u64,
-    // `p` = kv map) shapes. PLAN-189 / TASK-192.
-    //
-    // Disambiguation for `p` (the only ambiguous key):
-    //   * Legacy → value is a Map whose keys are msgpack strings `"nui"`/`"nbs"`.
-    //   * Canonical → value is a Map whose keys are binary/raw bytes (the kv keys).
-    // We inspect the value type at `p` to decide.
-
-    // First pass: detect canonical signals. The blob is canonical if
-    // ANY of:
-    //   - a canonical-only key is present: `n`/`o` (canonical local-state
-    //     schemas) or `q`/`r`/`w`/`x` (canonical app-params signals
-    //     present iff this is a combined row)
-    //   - the `y` flag carries a canonical-only value: `y == 2` (OWNERSHIP)
-    //     or `y == 3` (NOT_HOLDING | OWNERSHIP). Legacy Rust encoders
-    //     only ever wrote y ∈ {1, 4, 5}, so these values are unambiguous.
-    // In a canonical combined row, `s` is the app-params global_state,
-    // NOT the local kv map; the local kv lives at `p`. So we must NOT
-    // treat `s` as local kv in canonical mode. PLAN-189 / TASK-192
-    // (Codex review round 3).
-    let mut is_canonical = false;
-    let mut raw_y: u64 = 0;
-    for (k, v) in &map {
-        if matches!(
-            k.as_str(),
-            Some("n") | Some("o") | Some("q") | Some("r") | Some("w") | Some("x")
-        ) {
-            is_canonical = true;
-        }
-        if k.as_str() == Some("y") {
-            raw_y = v.as_u64().unwrap_or(0);
-        }
-    }
-    if raw_y == 2 || raw_y == 3 {
-        is_canonical = true;
-    }
-
+    // Canonical Go layout only (TASK-196 removed legacy tolerance):
+    //   n = schema.num_uint, o = schema.num_byte_slice, p = key_value map.
+    // `s` belongs to app params (global_state) on a combined row, never
+    // to the local-state subset.
     for (k, v) in map {
         match k.as_str().unwrap_or("") {
             "n" => s.schema.num_uint = v.as_u64().unwrap_or(0),
             "o" => s.schema.num_byte_slice = v.as_u64().unwrap_or(0),
-            "p" => {
-                if is_canonical {
-                    // Canonical: `p` is the local key_value map.
-                    s.key_value = decode_teal_key_value(&v);
-                } else if let rmpv::Value::Map(inner) = &v {
-                    // Disambiguate by structure (NOT just key strings —
-                    // TEAL keys are user-controlled bytes that could
-                    // legitimately spell "nui"/"nbs"). A legacy schema
-                    // submap has *every* entry shaped {string-key,
-                    // integer-value} for keys "nui"/"nbs". A canonical
-                    // kv map's values are always Maps (TealValue structs
-                    // containing `tt` + `ui`/`tb`). PLAN-189 / TASK-192.
-                    let looks_like_legacy_schema = !inner.is_empty()
-                        && inner.iter().all(|(ik, iv)| {
-                            matches!(ik.as_str(), Some("nui") | Some("nbs"))
-                                && matches!(iv, rmpv::Value::Integer(_))
-                        });
-                    if looks_like_legacy_schema {
-                        for (ik, iv) in inner {
-                            match ik.as_str().unwrap_or("") {
-                                "nui" => s.schema.num_uint = iv.as_u64().unwrap_or(0),
-                                "nbs" => s.schema.num_byte_slice = iv.as_u64().unwrap_or(0),
-                                _ => {}
-                            }
-                        }
-                    } else {
-                        // Canonical kv map even without n/o (degenerate
-                        // canonical row with zero-value schema fields).
-                        s.key_value = decode_teal_key_value(&v);
-                    }
-                }
-            }
-            "s" => {
-                // `s` is local kv ONLY in legacy non-combined rows. In
-                // canonical combined rows, `s` is app-params global_state
-                // and must be ignored by the local-state decoder.
-                // PLAN-189 / TASK-192 (Codex review round 2).
-                if !is_canonical {
-                    s.key_value = decode_teal_key_value(&v);
-                }
-            }
+            "p" => s.key_value = decode_teal_key_value(&v),
             _ => {}
         }
     }
@@ -1412,73 +1067,42 @@ fn decode_app_local_state(data: &[u8]) -> Result<AppLocalState, AlgoError> {
 // App resource blob merging helpers
 // ---------------------------------------------------------------------------
 
-/// Semantic view of a resource blob, derived by inspecting both the
-/// `y` flag and the set of top-level keys present in the BLOB.
+/// Semantic view of a canonical resources.data BLOB.
 ///
-/// The two boolean fields are *tolerant* of both legacy (pre-PLAN-189
-/// algod-rust) and canonical (go-algorand) on-disk shapes. They MUST
-/// be used in place of bitwise checks against the raw `y` value
-/// because the legacy and canonical encodings assign opposite
-/// meaning to the same bit — see the module-level comment on
-/// the module-level comment above for the full story.
-///
-/// PLAN-189 / TASK-190.
+/// Derived by inspecting the `y` flag plus the set of top-level keys
+/// present in the BLOB. PLAN-189 / TASK-190; legacy-shape tolerance
+/// removed in TASK-196.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ResourceMeta {
-    /// Raw `y` field value as stored on disk. Carries Go semantics
-    /// for newly-written rows and legacy bitmask semantics for old
-    /// rows. Only consult this for migration-detection logic — use
+    /// Raw `y` field value as stored on disk. See
+    /// [`algo_codec::resource_flags`] for the enum values. Prefer
     /// `has_holding` / `has_ownership` for dispatch.
     pub raw_flags: u64,
-    /// `true` if the row carries asset-holding or app-local-state
-    /// data (regardless of which encoding produced it).
+    /// `true` if the row carries asset-holding or app-local-state data.
     pub has_holding: bool,
-    /// `true` if the row carries asset-params or app-params data
-    /// (regardless of which encoding produced it).
+    /// `true` if the row carries asset-params or app-params data.
     pub has_ownership: bool,
 }
 
 /// Inspect a raw `resources.data` BLOB and derive its semantic
-/// holding/ownership classification by walking the top-level keys.
+/// holding/ownership classification by walking the canonical
+/// top-level keys.
 ///
-/// # Scope (TASK-190 vs TASK-191/192/193)
-///
-/// This inspector is the **classifier**, not the field decoder. After
-/// TASK-190, callers correctly identify a canonical row as
-/// holding/ownership; the per-field decoders (`decode_asset_holding`,
-/// `decode_asset_params`, `decode_app_params`, `decode_app_local_state`)
-/// still read the **legacy** key positions only. So a canonical app
-/// local-state row (with `n`/`o` flat schema + `p` as key_value) would
-/// be classified `has_holding=true` here but decode to a default-valued
-/// `AppLocalState` via the legacy decoder.
-///
-/// This is intentional and not a regression: today no encoder writes
-/// canonical-shaped rows (write-side migration is TASK-191/192/193),
-/// so the code path is dormant. The decoder updates land alongside
-/// the encoder swaps in the matching tasks.
-///
-/// Field-presence rules (matching both legacy Rust and canonical Go
-/// on-disk shapes):
+/// Field-presence rules (Go canonical layout):
 ///
 /// * Asset holding: `l` (amount) or `m` (frozen) → `has_holding`.
 /// * Asset params: any of `a..k` → `has_ownership`.
-/// * App local state schema (canonical): `n` (num_uint) or `o`
-///   (num_byte_slice) → `has_holding`.
-/// * App params programs: `q` (approval) or `r` (clear_state) → `has_ownership`.
-/// * App params canonical-only fields: `w` (global_schema_nbs) or
-///   `x` (extra_program_pages) → `has_ownership`.
-/// * App params shared schema fields: `t` / `u` → `has_ownership`
-///   (Go uses these as flat u64s; legacy Rust uses them as nested
-///   `{nui, nbs}` submaps — either way, app-params row).
-/// * `v` → `has_ownership` (legacy: extra_program_pages;
-///   canonical: global_schema_num_uint).
-/// * `p` → `has_holding` (legacy: local-state schema submap;
-///   canonical: local-state key_value map — both signal local state).
-/// * `s` is the only genuinely ambiguous key (legacy: app local kv;
-///   canonical: app params global_state). Disambiguated via the
-///   `y` value: legacy holding-only `y=1` or holding+ownership `y=5`
-///   means `s` is local kv; otherwise (`y=2`, `y=4`, canonical
-///   `y=0`) it's global_state.
+/// * App local-state schema: `n` (num_uint) or `o` (num_byte_slice)
+///   → `has_holding`.
+/// * App local-state kv: `p` (a `map[string]TealValue`) → `has_holding`.
+/// * App params: `q` (approval) / `r` (clear_state) / `s`
+///   (global_state) / `t..w` (flat u64 schemas) / `x` (extra_pages)
+///   → `has_ownership`.
+///
+/// Plus the canonical `y` enum (`HOLDING=0`, `NOT_HOLDING=1`,
+/// `OWNERSHIP=2`, `NOT_HOLDING|OWNERSHIP=3`, `EMPTY_ASSET=4`,
+/// `EMPTY_APP=8`) layered on top — see the `match meta.raw_flags`
+/// arm at the bottom of the function.
 pub(crate) fn inspect_resource_blob(data: &[u8]) -> ResourceMeta {
     let val: rmpv::Value = match rmpv::decode::read_value(&mut &data[..]) {
         Ok(v) => v,
@@ -1490,8 +1114,6 @@ pub(crate) fn inspect_resource_blob(data: &[u8]) -> ResourceMeta {
     };
 
     let mut meta = ResourceMeta::default();
-    let mut has_s = false;
-    let mut has_q_or_r_or_canonical_app_params = false;
 
     for (k, v) in &pairs {
         let Some(key) = k.as_str() else { continue };
@@ -1503,40 +1125,11 @@ pub(crate) fn inspect_resource_blob(data: &[u8]) -> ResourceMeta {
             "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k" => {
                 meta.has_ownership = true;
             }
-            // App local-state schema (canonical-only).
-            "n" | "o" => meta.has_holding = true,
-            // App params programs.
-            "q" | "r" => {
-                meta.has_ownership = true;
-                has_q_or_r_or_canonical_app_params = true;
-            }
-            // App params canonical-only fields (`w` = global_schema_nbs,
-            // `x` = extra_program_pages in Go's layout).
-            "w" | "x" => {
-                meta.has_ownership = true;
-                has_q_or_r_or_canonical_app_params = true;
-            }
-            // App params schema fields (legacy nested OR canonical flat u64).
-            "t" | "u" | "v" => meta.has_ownership = true,
-            // App local state — presence always implies has_holding.
-            "p" => meta.has_holding = true,
-            // Ambiguous between local kv (legacy) and global_state (canonical app params).
-            "s" => has_s = true,
+            // App local-state schema + kv.
+            "n" | "o" | "p" => meta.has_holding = true,
+            // App params (programs, global_state, flat schemas, extra_pages).
+            "q" | "r" | "s" | "t" | "u" | "v" | "w" | "x" => meta.has_ownership = true,
             _ => {}
-        }
-    }
-
-    if has_s {
-        // Disambiguate via `y` flag and other-key presence:
-        //   - If we already have canonical app-params signals (q/r/w/x), `s` is global_state.
-        //   - Legacy `y=1` (holding only) or `y=5` (both) ⇒ `s` is local kv.
-        //   - Legacy `y=4`, canonical `y=2` ⇒ `s` is global_state.
-        //   - Default fallback: treat as kv (legacy holding) since canonical
-        //     ownership rows without q/r/w/x are vanishingly rare in practice.
-        if has_q_or_r_or_canonical_app_params || meta.raw_flags == 2 || meta.raw_flags == 4 {
-            meta.has_ownership = true;
-        } else {
-            meta.has_holding = true;
         }
     }
 
@@ -1549,7 +1142,7 @@ pub(crate) fn inspect_resource_blob(data: &[u8]) -> ResourceMeta {
     // holding row. Treat any blob that decoded as a non-empty *bytes*
     // sequence but produced an entirely empty *key set* as a canonical-
     // default holding row (set has_holding). PLAN-189 / TASK-191.
-    let saw_any_signal = meta.has_holding || meta.has_ownership || has_s;
+    let saw_any_signal = meta.has_holding || meta.has_ownership;
     let mut is_canonical_default_holding = false;
     if !saw_any_signal && meta.raw_flags == 0 {
         // We got here only after a successful msgpack decode, so the
@@ -1560,38 +1153,19 @@ pub(crate) fn inspect_resource_blob(data: &[u8]) -> ResourceMeta {
         is_canonical_default_holding = true;
     }
 
-    // Layer raw_flags semantics on top of field-presence signals. We
-    // need to handle BOTH the legacy Rust bitmask
-    // (HOLDING=0x01, OWNERSHIP=0x04, written by pre-PLAN-189 encoders)
-    // AND Go's canonical bitwise enum
-    // (NOT_HOLDING=0x01, OWNERSHIP=0x02, EMPTY_ASSET=0x04, EMPTY_APP=0x08).
+    // Canonical Go `ResourceFlags` enum (`../go-algorand/ledger/store/
+    // trackerdb/data.go:62-75`):
+    //   y == 0  HOLDING (default; usually omitted by canonical writer)
+    //   y == 1  NOT_HOLDING (no holding subset)
+    //   y == 2  OWNERSHIP (params + implicit holding; creator row)
+    //   y == 3  NOT_HOLDING | OWNERSHIP (params only)
+    //   y == 4  EMPTY_ASSET marker
+    //   y == 8  EMPTY_APP marker
     //
-    // The legacy and canonical schemes assign opposite meaning to the
-    // same numeric `y` values; disambiguation per concrete value:
-    //
-    //   y == 0  (canonical HOLDING default; legacy "y omitted" sentinel)
-    //           → rely on field presence for has_holding.
-    //   y == 1  (legacy HOLDING bit; canonical NOT_HOLDING)
-    //           → prefer legacy: set has_holding. Default asset
-    //             opt-ins (amount=0, frozen=false) are common and
-    //             encode as just `{y:1}` under the legacy encoder.
-    //             Canonical NOT_HOLDING-alone is a degenerate state
-    //             that isn't produced in practice.
-    //   y == 2  (canonical OWNERSHIP, NOT_HOLDING bit clear)
-    //           → has_ownership + implicit has_holding (creator row).
-    //   y == 3  (canonical NOT_HOLDING|OWNERSHIP)
-    //           → has_ownership; clear has_holding.
-    //   y == 4  (legacy OWNERSHIP bit; canonical EMPTY_ASSET marker)
-    //           → set has_ownership. Empty markers are rare; the
-    //             legacy reading is the safe default for back-compat.
-    //   y == 5  (legacy HOLDING|OWNERSHIP)
-    //           → has_holding + has_ownership.
-    //   y == 8  (canonical EMPTY_APP marker)
-    //           → neither; field presence falls through.
-    //
-    // PLAN-189 / TASK-190.
+    // TASK-196 removed the legacy-y tolerance arms (1/4/5 read as
+    // legacy bitmask). The migrator + canonical encoders have been the
+    // only writers, so every on-disk row is canonical.
     match meta.raw_flags {
-        1 => meta.has_holding = true,
         2 => {
             meta.has_ownership = true;
             meta.has_holding = true;
@@ -1599,11 +1173,6 @@ pub(crate) fn inspect_resource_blob(data: &[u8]) -> ResourceMeta {
         3 => {
             meta.has_ownership = true;
             meta.has_holding = false;
-        }
-        4 => meta.has_ownership = true,
-        5 => {
-            meta.has_holding = true;
-            meta.has_ownership = true;
         }
         _ => {}
     }
@@ -2534,16 +2103,6 @@ impl SqliteLedger {
             AlgoError::Ledger {
                 message: format!("catchpointstate key migration error: {e}"),
             }
-        })?;
-
-        // PLAN-189 / TASK-195: one-shot resources.data canonicalization.
-        // Walks every row, decodes via the tolerant decoders, re-encodes
-        // through `canonical_encode_resources_data`, and rewrites the
-        // row when bytes changed. Idempotent (canonical rows decode and
-        // re-encode to themselves); skipped via marker on subsequent
-        // opens.
-        migrate_resources_to_canonical(&conn).map_err(|e| AlgoError::Ledger {
-            message: format!("resources canonicalization migration error: {e}"),
         })?;
 
         // G6 part 3 (TASK-107): retire the legacy Rust-only
@@ -5201,47 +4760,6 @@ mod tests {
     }
 
     #[test]
-    fn inspect_legacy_asset_holding_row() {
-        // Legacy Rust asset holding: y=1, l/m fields.
-        let bytes = rmpv_map(&[
-            ("l", rmpv::Value::from(1000u64)),
-            ("m", rmpv::Value::Boolean(false)),
-            ("y", rmpv::Value::from(1u64)),
-        ]);
-        let meta = inspect_resource_blob(&bytes);
-        assert!(meta.has_holding);
-        assert!(!meta.has_ownership);
-        assert_eq!(meta.raw_flags, 1);
-    }
-
-    #[test]
-    fn inspect_legacy_asset_params_row() {
-        // Legacy Rust asset params: y=4, a..k fields.
-        let bytes = rmpv_map(&[
-            ("a", rmpv::Value::from(1_000_000u64)),
-            ("b", rmpv::Value::from(2u64)),
-            ("y", rmpv::Value::from(4u64)),
-        ]);
-        let meta = inspect_resource_blob(&bytes);
-        assert!(!meta.has_holding);
-        assert!(meta.has_ownership);
-        assert_eq!(meta.raw_flags, 4);
-    }
-
-    #[test]
-    fn inspect_legacy_combined_asset_row() {
-        // Legacy "holding + ownership" asset row: y=5, l/m + a..k.
-        let bytes = rmpv_map(&[
-            ("a", rmpv::Value::from(500u64)),
-            ("l", rmpv::Value::from(10u64)),
-            ("y", rmpv::Value::from(5u64)),
-        ]);
-        let meta = inspect_resource_blob(&bytes);
-        assert!(meta.has_holding);
-        assert!(meta.has_ownership);
-    }
-
-    #[test]
     fn inspect_canonical_asset_holding_row() {
         // Canonical Go asset holding: y omitted (defaults to 0=HOLDING), l/m fields.
         let bytes = rmpv_map(&[
@@ -5268,34 +4786,6 @@ mod tests {
         assert!(meta.has_holding, "y=2 has NOT_HOLDING clear → implicit holding");
         assert!(meta.has_ownership);
         assert_eq!(meta.raw_flags, 2);
-    }
-
-    #[test]
-    fn inspect_legacy_app_local_state_row() {
-        // Legacy app local state: y=1, p as schema submap, s as kv map.
-        let bytes = rmpv_map(&[
-            (
-                "p",
-                rmpv::Value::Map(vec![(
-                    rmpv::Value::String("nui".into()),
-                    rmpv::Value::from(3u64),
-                )]),
-            ),
-            (
-                "s",
-                rmpv::Value::Map(vec![(
-                    rmpv::Value::Binary(b"k".to_vec()),
-                    rmpv::Value::Map(vec![]),
-                )]),
-            ),
-            ("y", rmpv::Value::from(1u64)),
-        ]);
-        let meta = inspect_resource_blob(&bytes);
-        assert!(meta.has_holding, "p + legacy y=1 must imply local-state");
-        assert!(
-            !meta.has_ownership,
-            "no q/r/w/x present; s must be classified as kv (holding)"
-        );
     }
 
     #[test]
@@ -5375,21 +4865,6 @@ mod tests {
         let bytes = rmpv_map(&[("z", rmpv::Value::from(1234u64))]);
         let meta = inspect_resource_blob(&bytes);
         assert!(meta.has_holding);
-        assert!(!meta.has_ownership);
-    }
-
-    #[test]
-    fn inspect_legacy_zero_balance_holding_row() {
-        // Pre-PLAN-189 encoder for a default asset opt-in
-        // (amount=0, frozen=false) writes only `{y:1}` because both
-        // value fields are omitempty-dropped. Field presence is
-        // empty, so raw_flags must be the sole has_holding signal.
-        let bytes = rmpv_map(&[("y", rmpv::Value::from(1u64))]);
-        let meta = inspect_resource_blob(&bytes);
-        assert!(
-            meta.has_holding,
-            "legacy y=1 alone must signal has_holding (zero-balance opt-in)"
-        );
         assert!(!meta.has_ownership);
     }
 
@@ -5702,12 +5177,18 @@ mod tests {
         assert!(matches!(got.unwrap(), TealValue::Uint(7)));
     }
 
+    /// Build a canonical app local-state blob using only the local-state
+    /// subset of `build_app_resource_data`. Test helper. PLAN-189.
+    fn build_canonical_app_local_state_blob(als: &AppLocalState) -> Vec<u8> {
+        let rd = build_app_resource_data(Some(als), None, 0);
+        algo_codec::canonical_encode_resources_data(&rd)
+    }
+
     #[test]
-    fn decode_app_local_state_handles_kv_key_named_like_schema() {
-        // Pathological case: canonical app local state with zero schemas
-        // (n/o omitted) and a kv map containing a TEAL entry whose key
-        // happens to be "nui". Disambiguation must NOT misread this as
-        // a legacy schema submap. PLAN-189 / TASK-192 (Codex round 1).
+    fn decode_app_local_state_kv_with_schema_named_keys_round_trips() {
+        // Canonical app local state with zero schemas (n/o omitted) and
+        // a kv map containing entries keyed "nui"/"nbs" round-trips
+        // correctly — there's no ambiguous-`p` interpretation anymore.
         let mut kv = BTreeMap::new();
         kv.insert(b"nui".to_vec(), TealValue::Uint(123));
         let als = AppLocalState {
@@ -5717,20 +5198,9 @@ mod tests {
         let bytes = build_canonical_app_local_state_blob(&als);
         let decoded = decode_app_local_state(&bytes).expect("decode");
         let got = decoded.key_value.get(b"nui".as_slice());
-        assert!(
-            got.is_some(),
-            "user kv key named 'nui' must NOT be classified as legacy schema"
-        );
-        assert!(matches!(got.unwrap(), TealValue::Uint(123)));
+        assert!(matches!(got, Some(TealValue::Uint(123))));
         assert_eq!(decoded.schema.num_uint, 0);
         assert_eq!(decoded.schema.num_byte_slice, 0);
-    }
-
-    /// Build a canonical app local-state blob using only the local-state
-    /// subset of `build_app_resource_data`. Test helper. PLAN-189 / TASK-192.
-    fn build_canonical_app_local_state_blob(als: &AppLocalState) -> Vec<u8> {
-        let rd = build_app_resource_data(Some(als), None, 0);
-        algo_codec::canonical_encode_resources_data(&rd)
     }
 
     #[test]
@@ -5771,37 +5241,6 @@ mod tests {
             !decoded.key_value.contains_key(b"global_key".as_slice()),
             "global state must not leak into local-state decode"
         );
-    }
-
-    #[test]
-    fn decode_app_params_legacy_shape_still_works() {
-        // Hand-build a legacy app-params blob (nested schema submaps,
-        // `v` for extra_program_pages, `y=4`).
-        let bytes = rmpv_map(&[
-            ("q", rmpv::Value::Binary(vec![0x06])),
-            (
-                "t",
-                rmpv::Value::Map(vec![
-                    (rmpv::Value::String("nbs".into()), rmpv::Value::from(2u64)),
-                    (rmpv::Value::String("nui".into()), rmpv::Value::from(1u64)),
-                ]),
-            ),
-            (
-                "u",
-                rmpv::Value::Map(vec![
-                    (rmpv::Value::String("nbs".into()), rmpv::Value::from(4u64)),
-                    (rmpv::Value::String("nui".into()), rmpv::Value::from(3u64)),
-                ]),
-            ),
-            ("v", rmpv::Value::from(5u64)),
-            ("y", rmpv::Value::from(4u64)),
-        ]);
-        let decoded = decode_app_params(&bytes, Address([0u8; 32])).expect("decode");
-        assert_eq!(decoded.local_state_schema.num_uint, 1);
-        assert_eq!(decoded.local_state_schema.num_byte_slice, 2);
-        assert_eq!(decoded.global_state_schema.num_uint, 3);
-        assert_eq!(decoded.global_state_schema.num_byte_slice, 4);
-        assert_eq!(decoded.extra_program_pages, 5);
     }
 
     // ---------------------------------------------------------------------
@@ -5868,35 +5307,6 @@ mod tests {
         assert_eq!(decoded.schema.num_byte_slice, 1);
         let entry = decoded.key_value.get(b"hello".as_slice()).expect("kv key");
         assert!(matches!(entry, TealValue::Bytes(b) if b == b"world"));
-    }
-
-    #[test]
-    fn decode_app_local_state_legacy_shape_still_works() {
-        // Hand-build a legacy app-local-state blob: `p` as nested schema
-        // submap, `s` as kv map with binary keys, `y=1`.
-        let kv_map = rmpv::Value::Map(vec![(
-            rmpv::Value::Binary(b"k".to_vec()),
-            rmpv::Value::Map(vec![
-                (rmpv::Value::String("tt".into()), rmpv::Value::from(2u64)),
-                (rmpv::Value::String("ui".into()), rmpv::Value::from(99u64)),
-            ]),
-        )]);
-        let bytes = rmpv_map(&[
-            (
-                "p",
-                rmpv::Value::Map(vec![
-                    (rmpv::Value::String("nbs".into()), rmpv::Value::from(7u64)),
-                    (rmpv::Value::String("nui".into()), rmpv::Value::from(4u64)),
-                ]),
-            ),
-            ("s", kv_map),
-            ("y", rmpv::Value::from(1u64)),
-        ]);
-        let decoded = decode_app_local_state(&bytes).expect("decode");
-        assert_eq!(decoded.schema.num_uint, 4);
-        assert_eq!(decoded.schema.num_byte_slice, 7);
-        let entry = decoded.key_value.get(b"k".as_slice()).expect("kv key");
-        assert!(matches!(entry, TealValue::Uint(99)));
     }
 
     // ---------------------------------------------------------------------
