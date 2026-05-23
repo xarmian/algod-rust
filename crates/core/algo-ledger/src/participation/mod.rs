@@ -11,10 +11,12 @@
 //! with fields (in sorted order): `addr`, `fv`, `kd`, `lv`, `vote-id`, `vrfsk`.
 
 pub mod equivocation;
+pub mod registration_txn;
 pub mod restore;
 pub mod store;
 
 pub use equivocation::AntiEquivocationTracker;
+pub use registration_txn::generate_registration_transaction;
 pub use restore::{restore_participation, Error as RestoreError};
 pub use store::ParticipationStore;
 
