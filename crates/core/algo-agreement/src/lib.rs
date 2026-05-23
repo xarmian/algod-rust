@@ -46,7 +46,7 @@ pub mod vote_tracker;
 pub use bundle::{
     Bundle, BundleError, EquivocationVoteAuthenticator, UnauthenticatedBundle, VoteAuthenticator,
 };
-pub use certificate::{Certificate, CertificateError};
+pub use certificate::{canonical_encode_certificate, Certificate, CertificateError};
 pub use credential::{
     Credential, CredentialError, HashableCredential, Membership, UnauthenticatedCredential,
 };
