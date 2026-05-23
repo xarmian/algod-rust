@@ -163,6 +163,7 @@ name = "algo-consensus-crypto"
 version = "0.1.0"
 dependencies = [
  "algo-falcon",
+ "algo-types",
  "curve25519-dalek",
  "ed25519-dalek",
  "hex",

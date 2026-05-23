@@ -29,6 +29,7 @@ thiserror = { workspace = true }
 snap = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 rmpv = { workspace = true }
@@ -37,7 +38,6 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
-hex = { workspace = true }
 serde_json = { workspace = true }
 
 [[bench]]

@@ -11,9 +11,11 @@
 //! with fields (in sorted order): `addr`, `fv`, `kd`, `lv`, `vote-id`, `vrfsk`.
 
 pub mod equivocation;
+pub mod restore;
 pub mod store;
 
 pub use equivocation::AntiEquivocationTracker;
+pub use restore::{restore_participation, Error as RestoreError};
 pub use store::ParticipationStore;
 
 use algo_consensus_crypto::merklesig;
