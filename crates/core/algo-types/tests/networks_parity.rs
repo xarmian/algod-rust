@@ -51,10 +51,27 @@ fn each_network_hash_matches_pinned_bytes() {
     }
 }
 
+/// Resolve must return each network's pinned bytes via name lookup.
+///
+/// `resolve_genesis_hash` intentionally honors `ALGOKEY_GENESIS_HASH`
+/// as an override (mirrors Go's `getGenesisInformation`), so this test
+/// MUST run with that var cleared — otherwise an ambient override
+/// silently substitutes a different digest for every network and the
+/// parity assertion is meaningless.
 #[test]
 fn resolve_returns_each_pinned_hash_by_name() {
+    // SAFETY: env mutation is racy across threads. We're in an
+    // integration test crate (one process per `cargo test --test`),
+    // and this is the only test in this file that touches the env, so
+    // there's no other thread to race with.
+    std::env::remove_var("ALGOKEY_GENESIS_HASH");
     for (net, expected_hex) in FIXTURES {
         let resolved = resolve_genesis_hash(net.as_str()).expect("resolve");
-        assert_eq!(resolved.0, hex_to_32(expected_hex));
+        assert_eq!(
+            resolved.0,
+            hex_to_32(expected_hex),
+            "resolve diverged for {net:?} — \
+             check ALGOKEY_GENESIS_HASH isn't leaking into this test"
+        );
     }
 }
