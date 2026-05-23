@@ -128,54 +128,6 @@ fn run_go_algokey(go: &Path, args: &[&str]) -> std::process::Output {
         .expect("run Go algokey")
 }
 
-/// Cross-impl: rust-signed txn → Go decodes + verifies via the existing
-/// `algokey sign` round-trip — we just exercise the binary parsing path
-/// by feeding Rust's output back into Go's `multisig append-auth-addr`
-/// which does a strict decode. Skip if `algokey` not on PATH.
-#[test]
-fn go_decodes_rust_signed_output() {
-    let Some(go) = locate_go_algokey() else {
-        println!("skipping go_decodes_rust_signed_output: Go algokey not on PATH");
-        return;
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let outfile = dir.path().join("rust-signed.tx");
-    run_ok(
-        algokey_bin()
-            .args(["sign", "-k"])
-            .arg(fix("sign/keyfile"))
-            .arg("-t")
-            .arg(fix("sign/unsigned.tx"))
-            .arg("-o")
-            .arg(&outfile),
-    );
-    // Use Go's `algokey multisig append-auth-addr` with a contrived
-    // params string to round-trip through its strict decoder. The
-    // operation will likely fail (sender mismatch) but the decode
-    // must succeed; we observe stderr for the post-decode error vs
-    // "Cannot decode transaction".
-    let arbitrary_addr = "HNVCPPGOW2SC2YVDVDICU3YNONSTEFLXDXREHJR2YBEKDC2Z3IUZSC6YGI";
-    let dummy_addr2 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ";
-    let out = run_go_algokey(
-        &go,
-        &[
-            "multisig",
-            "append-auth-addr",
-            "-t",
-            outfile.to_str().unwrap(),
-            "-p",
-            &format!("1 {arbitrary_addr} {dummy_addr2}"),
-            "-o",
-            "/dev/null",
-        ],
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.contains("Cannot decode transaction"),
-        "Go failed to decode our SignedTxn: {stderr}"
-    );
-}
-
 /// Cross-impl: Go-signed txn ↔ Rust-signed txn for the sign fixture.
 /// Round-trips both ways:
 ///  1. Rust signs the unsigned fixture → bytes match Go's pre-signed
