@@ -2380,6 +2380,32 @@ pub struct SqliteLedger {
     delta_cache: crate::delta_cache::DeltaCache,
 }
 
+/// Whether the current `apply_block_with_delta` builder produces a
+/// `StateDelta` that is safe to cache and return through the REST
+/// `GET /v2/deltas/:round` endpoint for `block`.
+///
+/// Today the builder only populates `accts` / `txids` / `txleases` / `hdr`
+/// completely. The `app_resources` / `asset_resources` / `kv_mods` /
+/// `creatables` / `state_proof_next` fields are still `TODO(#190)`-stubbed,
+/// so a block whose payset touches those code paths would yield a
+/// silently-incomplete response. We refuse to cache such blocks (returning
+/// `NotFound` is preferable to a partial 200 a client cannot detect).
+///
+/// `Pay` / `Keyreg` / `Hb` payloads only touch account-base fields, which
+/// the builder handles correctly. Any other transaction type — including
+/// the `Unknown(_)` fallback for codec deserialization gaps — fails the
+/// check. See `apply_block_caching_delta` for the rest of the contract,
+/// including the per-field gaps that remain even on cached rounds.
+fn block_state_delta_is_complete(block: &algo_types::Block) -> bool {
+    use algo_types::TxnType;
+    block.payset.iter().all(|stx| {
+        matches!(
+            stx.txn.txn_type,
+            TxnType::Pay | TxnType::Keyreg | TxnType::Hb
+        )
+    })
+}
+
 impl SqliteLedger {
     /// Open or create a SQLite ledger database pair.
     ///
@@ -2964,7 +2990,7 @@ impl SqliteLedger {
         }
     }
 
-    // ---- Delta cache (PLAN-36 TASK-128) ----
+    // ---- Delta cache helpers below; see PLAN-36 TASK-128 ----
 
     /// Look up a recent state delta from the in-memory rolling window.
     ///
@@ -3005,28 +3031,51 @@ impl SqliteLedger {
         self.delta_cache.len()
     }
 
-    /// Apply a block and populate the in-memory delta cache as a side effect.
+    /// Apply a block and, when safe, populate the in-memory delta cache as
+    /// a side effect.
     ///
-    /// Wraps [`crate::apply::apply_block_with_delta`] so the resulting
-    /// `StateDelta` is captured into the rolling window keyed by
-    /// `block.round`. The wider node-level apply driver
-    /// (`bin/algod-rust/src/commands/sync.rs`) calls this instead of the bare
-    /// [`crate::apply::apply_block`] so the REST API's
-    /// `get_state_delta_for_round` endpoint can serve real data for recent
-    /// rounds.
+    /// The cache is populated only when [`block_state_delta_is_complete`]
+    /// reports the block's payset is fully covered by the current
+    /// [`crate::apply::apply_block_with_delta`] builder — practically that
+    /// means a payset of only `Pay` / `Keyreg` / `Hb` transactions. Blocks
+    /// that contain `Acfg` / `Axfer` / `Afrz` / `Appl` / `Stpf` transactions
+    /// (or any unrecognized type) skip the delta build entirely and run the
+    /// faster bare [`crate::apply::apply_block`] path — the REST endpoint
+    /// returns `NotFound` for those rounds, which is strictly preferable to
+    /// serving a known-incomplete `StateDelta` (app / asset / kv deltas,
+    /// `creatables`, and `state_proof_next` are all still
+    /// `TODO(#190)`-stubbed in the builder).
     ///
-    /// Note: today `apply_block_with_delta` builds account-level diffs only
-    /// (`accts` + `txids` + `txleases`); app / asset / kv deltas are still
-    /// `TODO(#190)`. The cache therefore returns partial deltas — strictly
-    /// better than the prior `NotFound`, and the fields fill in as #190 lands.
+    /// **Known limitation even on cached rounds** (#190): a few
+    /// `StateDelta` fields are still unconditionally defaulted by
+    /// `apply_block_with_delta` regardless of payset content —
+    /// `totals` (zero), `prev_timestamp` (zero), and `state_proof_next`
+    /// (zero). Consumers that rely on these fields must wait for #190 to
+    /// land before trusting the response. The `accts` / `txids` /
+    /// `txleases` / `hdr` fields are computed correctly under the gating
+    /// rule above, which is the primary use case today (account-balance /
+    /// keyreg replay).
+    ///
+    /// The wider node-level apply driver
+    /// (`bin/algod-rust/src/commands/sync.rs`) calls this instead of the
+    /// bare `apply_block` so a node serving REST populates the cache as a
+    /// normal side effect of block application.
     pub fn apply_block_caching_delta(
         &mut self,
         block: &algo_types::Block,
     ) -> Result<(), AlgoError> {
-        let round = block.round.0;
-        let delta = crate::apply::apply_block_with_delta(self, block)?;
-        self.cache_state_delta(round, delta);
-        Ok(())
+        if block_state_delta_is_complete(block) {
+            let round = block.round.0;
+            let delta = crate::apply::apply_block_with_delta(self, block)?;
+            self.cache_state_delta(round, delta);
+            Ok(())
+        } else {
+            // Payset contains a transaction type the builder doesn't yet
+            // fully cover. Apply via the bare path and leave the cache
+            // empty — the handler will return `NotFound` for this round
+            // rather than a partial delta.
+            crate::apply::apply_block(self, block)
+        }
     }
 
     pub fn commit_block(&mut self) -> Result<(), AlgoError> {
@@ -5862,6 +5911,67 @@ mod tests {
         ledger.rollback_block().unwrap();
         let root_after_rollback = ledger.trie.as_mut().unwrap().root_hash().unwrap();
         assert_eq!(root_after_commit, root_after_rollback);
+    }
+
+    /// PLAN-36 TASK-128: the payset-completeness gate that controls
+    /// whether `apply_block_caching_delta` caches a delta. Pay / Keyreg / Hb
+    /// blocks (including the empty-payset case) pass; anything else
+    /// — Acfg / Axfer / Afrz / Appl / Stpf, or an `Unknown(_)` fallback
+    /// — fails the gate so the REST endpoint stays at `NotFound` rather
+    /// than serving a known-incomplete delta.
+    #[test]
+    fn test_block_state_delta_is_complete_gate() {
+        use algo_types::{Block, SignedTransaction, Transaction, TxnType};
+
+        fn block_with_types(types: &[TxnType]) -> Block {
+            Block {
+                payset: types
+                    .iter()
+                    .map(|t| SignedTransaction {
+                        txn: Transaction {
+                            txn_type: t.clone(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Block::default()
+            }
+        }
+
+        // Empty payset is trivially "delta-complete".
+        assert!(block_state_delta_is_complete(&block_with_types(&[])));
+        // Pure Pay / Keyreg / Hb payloads pass.
+        assert!(block_state_delta_is_complete(&block_with_types(&[
+            TxnType::Pay
+        ])));
+        assert!(block_state_delta_is_complete(&block_with_types(&[
+            TxnType::Pay,
+            TxnType::Keyreg,
+            TxnType::Hb,
+        ])));
+        // Any unsupported transaction type fails the gate.
+        for unsupported in [
+            TxnType::Acfg,
+            TxnType::Axfer,
+            TxnType::Afrz,
+            TxnType::Appl,
+            TxnType::Stpf,
+            TxnType::Unknown(String::new()),
+            TxnType::Unknown("future-type".into()),
+        ] {
+            assert!(
+                !block_state_delta_is_complete(&block_with_types(std::slice::from_ref(
+                    &unsupported
+                ))),
+                "expected gate to reject {unsupported:?}"
+            );
+            // Single bad txn taints an otherwise-pure block.
+            assert!(
+                !block_state_delta_is_complete(&block_with_types(&[TxnType::Pay, unsupported,])),
+                "mixed payset should fail the gate"
+            );
+        }
     }
 
     /// PLAN-36 TASK-128: `cache_state_delta` / `get_cached_state_delta`
