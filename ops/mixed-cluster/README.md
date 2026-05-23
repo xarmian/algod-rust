@@ -129,6 +129,74 @@ next to the soak output (both gitignored). The underlying binaries
 `algo-fork-detector` and `algo-cert-crossverify` are standalone and
 scriptable outside the shell wrapper.
 
+## Phase B writer-side acceptance (TASK-127)
+
+The `handoff-rust-to-go.sh` script is PLAN-36's end-to-end acceptance
+gate: it proves that go-algorand can boot against a tracker DB + block
+DB produced exclusively by `algod-rust` and continue reading the last
+Rust-written round.
+
+```bash
+# Run the full handoff (default: 20 rounds).
+bash ops/mixed-cluster/scripts/handoff-rust-to-go.sh
+
+# Longer handoff:
+HANDOFF_ROUNDS=50 bash ops/mixed-cluster/scripts/handoff-rust-to-go.sh
+
+# Keep the temp dir on success (for inspection):
+KEEP_HANDOFF=1 bash ops/mixed-cluster/scripts/handoff-rust-to-go.sh
+
+# Don't re-bootstrap the Go cluster (assume it's already up):
+SKIP_CLUSTER_START=1 bash ops/mixed-cluster/scripts/handoff-rust-to-go.sh
+```
+
+What it does, in order:
+
+1. Bring up the 3 Go nodes via `start.sh` (idempotent — reuses `netroot/`).
+2. Wait until the Go cluster has produced at least `HANDOFF_ROUNDS`
+   blocks.
+3. Build `algod-rust` and run `algod-rust sync` against go-node-1,
+   writing `<HANDOFF_DIR>/node.tracker.sqlite` and
+   `<HANDOFF_DIR>/node.block.sqlite`.
+4. Verify no Rust-only tables leaked into the produced tracker DB
+   (`state_deltas`, `merkle_trie`, `catchpoint_import_state`,
+   `algod_rust_meta` must all be absent).
+5. Stage those files into a Go-shaped data dir at
+   `<HANDOFF_DIR>/godata/<genesisID>/ledger.{tracker,block}.sqlite`
+   alongside a minimal `config.json` + `genesis.json` + `algod.token`.
+6. Boot a one-shot `algorand/algod:4.5.1-stable` container against
+   that data dir on host port 7833.
+7. Assert `/v2/status` responds, `last-round >= HANDOFF_ROUNDS`, and
+   Go's startup logs contain no ERROR/FATAL lines.
+8. Fetch `/v2/blocks/N` from the resumed Go node and confirm it
+   serves the block.
+
+On PASS the temp dir is cleaned automatically (override with
+`KEEP_HANDOFF=1`). On FAIL the temp dir is preserved so the produced
+SQLite files + Go container logs can be inspected.
+
+The Rust integration test
+`crates/node/algo-network/tests/rust_writer_go_resume.rs` wraps this
+script for `cargo test`:
+
+```bash
+MIXED_CLUSTER=1 cargo test -p algo-network --test rust_writer_go_resume \
+    -- --ignored --nocapture
+```
+
+It's `#[ignore]`'d and gated on `MIXED_CLUSTER=1` so it stays out of
+the default workspace test path — handoffs take 3-5 minutes and
+require Docker.
+
+### Known scope
+
+Go runs in single-node mode against the imported DB, so it does NOT
+propose block `N+1` on its own. The acceptance gate is that Go can
+mount, read, and serve the Rust-written rounds without schema errors
+— **not** that Go produces fresh blocks atop them. Bidirectional
+handoff (Go advances atop Rust-written state, Rust verifies, etc.)
+is Phase C / PLAN-37 territory.
+
 ## Host ports
 
 | Service       | Host port | Container port | Purpose                |
