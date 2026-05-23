@@ -38,8 +38,7 @@ use algo_types::{
     Address, AppLocalState, AppParams, AssetHolding, AssetParams, StateSchema, TealValue,
 };
 
-const RESOURCES_FIXTURES_DIR: &str =
-    "../algo-codec/tests/fixtures/trackerdb/resourcesdata";
+const RESOURCES_FIXTURES_DIR: &str = "../algo-codec/tests/fixtures/trackerdb/resourcesdata";
 
 fn fixtures_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -118,7 +117,9 @@ fn as_array32(v: &rmpv::Value) -> Option<[u8; 32]> {
 }
 
 fn decode_teal_value(v: &rmpv::Value) -> Option<TealValue> {
-    let rmpv::Value::Map(inner) = v else { return None };
+    let rmpv::Value::Map(inner) = v else {
+        return None;
+    };
     let mut tt: u64 = 0;
     let mut ui: u64 = 0;
     let mut tb: Vec<u8> = Vec::new();
@@ -142,7 +143,9 @@ fn decode_teal_value(v: &rmpv::Value) -> Option<TealValue> {
 
 fn decode_teal_kv(v: &rmpv::Value) -> BTreeMap<Vec<u8>, TealValue> {
     let mut out = BTreeMap::new();
-    let rmpv::Value::Map(pairs) = v else { return out };
+    let rmpv::Value::Map(pairs) = v else {
+        return out;
+    };
     for (k, val) in pairs {
         let key_bytes = match k {
             rmpv::Value::String(s) => s.as_bytes().to_vec(),
@@ -276,9 +279,7 @@ fn has_ownership(raw_y: u64) -> bool {
 /// Parse `<addrhex>_<aidx>_<ctype>.canonical.hex` and return `ctype`.
 /// `ctype == 0` means asset; `ctype == 1` means app.
 fn ctype_from_name(name: &str) -> u8 {
-    let stem = name
-        .strip_suffix(".canonical.hex")
-        .unwrap_or(name);
+    let stem = name.strip_suffix(".canonical.hex").unwrap_or(name);
     let mut parts = stem.rsplit('_');
     let ctype_str = parts.next().expect("ctype segment");
     ctype_str.parse::<u8>().expect("ctype is u8")
