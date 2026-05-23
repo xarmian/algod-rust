@@ -1271,6 +1271,22 @@ pub(crate) struct ResourceMeta {
 /// Inspect a raw `resources.data` BLOB and derive its semantic
 /// holding/ownership classification by walking the top-level keys.
 ///
+/// # Scope (TASK-190 vs TASK-191/192/193)
+///
+/// This inspector is the **classifier**, not the field decoder. After
+/// TASK-190, callers correctly identify a canonical row as
+/// holding/ownership; the per-field decoders (`decode_asset_holding`,
+/// `decode_asset_params`, `decode_app_params`, `decode_app_local_state`)
+/// still read the **legacy** key positions only. So a canonical app
+/// local-state row (with `n`/`o` flat schema + `p` as key_value) would
+/// be classified `has_holding=true` here but decode to a default-valued
+/// `AppLocalState` via the legacy decoder.
+///
+/// This is intentional and not a regression: today no encoder writes
+/// canonical-shaped rows (write-side migration is TASK-191/192/193),
+/// so the code path is dormant. The decoder updates land alongside
+/// the encoder swaps in the matching tasks.
+///
 /// Field-presence rules (matching both legacy Rust and canonical Go
 /// on-disk shapes):
 ///
