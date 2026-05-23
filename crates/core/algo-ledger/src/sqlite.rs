@@ -890,8 +890,16 @@ fn decode_teal_key_value(val: &rmpv::Value) -> BTreeMap<Vec<u8>, TealValue> {
     let mut result = BTreeMap::new();
     if let rmpv::Value::Map(pairs) = val {
         for (k, v) in pairs {
+            // Go's canonical `map[string]TealValue` encoder writes keys
+            // as msgpack STRINGS containing the raw key bytes (Go's
+            // `string` is a byte sequence; the bytes need not be valid
+            // UTF-8). Legacy Rust `encode_teal_key_value` wrote keys as
+            // BINARY. Read both shapes via the underlying byte slice —
+            // `rmpv::Utf8String::as_bytes` returns the raw bytes
+            // regardless of UTF-8 validity, so non-UTF-8 TEAL keys
+            // round-trip correctly through canonical bytes. PLAN-189 / TASK-192.
             let key_bytes = match k {
-                rmpv::Value::String(s) => s.as_str().unwrap_or("").as_bytes().to_vec(),
+                rmpv::Value::String(s) => s.as_bytes().to_vec(),
                 rmpv::Value::Binary(b) => b.clone(),
                 _ => continue,
             };
@@ -1201,12 +1209,18 @@ fn decode_app_local_state(data: &[u8]) -> Result<AppLocalState, AlgoError> {
                     // Canonical: `p` is the local key_value map.
                     s.key_value = decode_teal_key_value(&v);
                 } else if let rmpv::Value::Map(inner) = &v {
-                    // Disambiguate by inspecting the first inner key:
-                    //   string "nui"/"nbs" → legacy schema submap
-                    //   binary or anything else → canonical kv map
-                    let looks_like_legacy_schema = inner
-                        .iter()
-                        .any(|(ik, _)| matches!(ik.as_str(), Some("nui") | Some("nbs")));
+                    // Disambiguate by structure (NOT just key strings —
+                    // TEAL keys are user-controlled bytes that could
+                    // legitimately spell "nui"/"nbs"). A legacy schema
+                    // submap has *every* entry shaped {string-key,
+                    // integer-value} for keys "nui"/"nbs". A canonical
+                    // kv map's values are always Maps (TealValue structs
+                    // containing `tt` + `ui`/`tb`). PLAN-189 / TASK-192.
+                    let looks_like_legacy_schema = !inner.is_empty()
+                        && inner.iter().all(|(ik, iv)| {
+                            matches!(ik.as_str(), Some("nui") | Some("nbs"))
+                                && matches!(iv, rmpv::Value::Integer(_))
+                        });
                     if looks_like_legacy_schema {
                         for (ik, iv) in inner {
                             match ik.as_str().unwrap_or("") {
@@ -5496,6 +5510,55 @@ mod tests {
             p.global_state_schema.num_byte_slice
         );
         assert_eq!(decoded.extra_program_pages, p.extra_program_pages);
+    }
+
+    #[test]
+    fn decode_teal_key_value_preserves_non_utf8_string_keys() {
+        // Go's canonical TealKeyValue encodes raw byte keys as msgpack
+        // STRINGS (Go's `string` is a byte sequence, not necessarily
+        // UTF-8). Round-trip a key with invalid UTF-8 bytes through the
+        // canonical encoder + the (legacy) decoder.
+        let key = vec![0xff, 0xfe, 0xfd];
+        let mut kv = BTreeMap::new();
+        kv.insert(key.clone(), TealValue::Uint(7));
+        let encoded = algo_codec::canonical_encode_teal_key_value(&kv);
+        // Wrap it as a Value via rmpv decode and run our decoder.
+        let val = rmpv::decode::read_value(&mut &encoded[..]).expect("decode rmpv");
+        let decoded = decode_teal_key_value(&val);
+        let got = decoded.get(&key);
+        assert!(got.is_some(), "non-UTF-8 key must survive decode");
+        assert!(matches!(got.unwrap(), TealValue::Uint(7)));
+    }
+
+    #[test]
+    fn decode_app_local_state_handles_kv_key_named_like_schema() {
+        // Pathological case: canonical app local state with zero schemas
+        // (n/o omitted) and a kv map containing a TEAL entry whose key
+        // happens to be "nui". Disambiguation must NOT misread this as
+        // a legacy schema submap. PLAN-189 / TASK-192 (Codex round 1).
+        let mut kv = BTreeMap::new();
+        kv.insert(b"nui".to_vec(), TealValue::Uint(123));
+        let als = AppLocalState {
+            schema: StateSchema::default(),
+            key_value: kv,
+        };
+        let bytes = build_canonical_app_local_state_blob(&als);
+        let decoded = decode_app_local_state(&bytes).expect("decode");
+        let got = decoded.key_value.get(b"nui".as_slice());
+        assert!(
+            got.is_some(),
+            "user kv key named 'nui' must NOT be classified as legacy schema"
+        );
+        assert!(matches!(got.unwrap(), TealValue::Uint(123)));
+        assert_eq!(decoded.schema.num_uint, 0);
+        assert_eq!(decoded.schema.num_byte_slice, 0);
+    }
+
+    /// Build a canonical app local-state blob using only the local-state
+    /// subset of `build_app_resource_data`. Test helper. PLAN-189 / TASK-192.
+    fn build_canonical_app_local_state_blob(als: &AppLocalState) -> Vec<u8> {
+        let rd = build_app_resource_data(Some(als), None, 0);
+        algo_codec::canonical_encode_resources_data(&rd)
     }
 
     #[test]
