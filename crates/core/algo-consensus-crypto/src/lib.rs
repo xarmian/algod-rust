@@ -10,12 +10,16 @@
 
 pub mod merklearray;
 pub mod merklesig;
+pub mod multisig;
 pub mod onetimesig;
 pub mod passphrase;
 pub mod sortition;
 pub mod sumhash;
 pub mod vrf;
 
+pub use multisig::{
+    multisig_addr_gen, multisig_assemble, multisig_preimage_from_pks, multisig_sign,
+};
 pub use passphrase::{key_to_mnemonic, mnemonic_to_key, PassphraseError};
 
 pub use onetimesig::{

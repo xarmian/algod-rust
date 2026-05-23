@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 algo-falcon.workspace = true
+algo-types.workspace = true
 curve25519-dalek.workspace = true
 ed25519-dalek.workspace = true
 serde.workspace = true
