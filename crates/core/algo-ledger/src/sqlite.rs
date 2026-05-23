@@ -1189,14 +1189,21 @@ fn decode_app_local_state(data: &[u8]) -> Result<AppLocalState, AlgoError> {
     //   * Canonical → value is a Map whose keys are binary/raw bytes (the kv keys).
     // We inspect the value type at `p` to decide.
 
-    // First pass: detect whether `n` or `o` is present (canonical-only signals).
-    let mut canonical_schema_seen = false;
+    // First pass: detect canonical signals. The blob is canonical iff
+    // any of the canonical-only keys are present:
+    //   `n`/`o` → canonical local-state schemas
+    //   `q`/`r`/`w`/`x` → canonical app-params signals (combined row)
+    // In a canonical combined row, `s` is the app-params global_state,
+    // NOT the local kv map; the local kv lives at `p`. So we must NOT
+    // treat `s` as local kv in canonical mode.
+    let mut is_canonical = false;
     for (k, _) in &map {
-        if let Some(key) = k.as_str() {
-            if key == "n" || key == "o" {
-                canonical_schema_seen = true;
-                break;
-            }
+        if matches!(
+            k.as_str(),
+            Some("n") | Some("o") | Some("q") | Some("r") | Some("w") | Some("x")
+        ) {
+            is_canonical = true;
+            break;
         }
     }
 
@@ -1205,7 +1212,7 @@ fn decode_app_local_state(data: &[u8]) -> Result<AppLocalState, AlgoError> {
             "n" => s.schema.num_uint = v.as_u64().unwrap_or(0),
             "o" => s.schema.num_byte_slice = v.as_u64().unwrap_or(0),
             "p" => {
-                if canonical_schema_seen {
+                if is_canonical {
                     // Canonical: `p` is the local key_value map.
                     s.key_value = decode_teal_key_value(&v);
                 } else if let rmpv::Value::Map(inner) = &v {
@@ -1237,7 +1244,13 @@ fn decode_app_local_state(data: &[u8]) -> Result<AppLocalState, AlgoError> {
                 }
             }
             "s" => {
-                s.key_value = decode_teal_key_value(&v);
+                // `s` is local kv ONLY in legacy non-combined rows. In
+                // canonical combined rows, `s` is app-params global_state
+                // and must be ignored by the local-state decoder.
+                // PLAN-189 / TASK-192 (Codex review round 2).
+                if !is_canonical {
+                    s.key_value = decode_teal_key_value(&v);
+                }
             }
             _ => {}
         }
@@ -5559,6 +5572,46 @@ mod tests {
     fn build_canonical_app_local_state_blob(als: &AppLocalState) -> Vec<u8> {
         let rd = build_app_resource_data(Some(als), None, 0);
         algo_codec::canonical_encode_resources_data(&rd)
+    }
+
+    #[test]
+    fn decode_app_local_state_ignores_global_state_in_combined_row() {
+        // Canonical combined app row: creator's local state AT `p`,
+        // app params global_state AT `s`. The local-state decoder must
+        // return ONLY the `p` kv, never overwrite from `s`. PLAN-189 /
+        // TASK-192 (Codex round 2).
+        let mut local_kv = BTreeMap::new();
+        local_kv.insert(b"local_key".to_vec(), TealValue::Uint(100));
+        let local = AppLocalState {
+            schema: StateSchema::default(),
+            key_value: local_kv,
+        };
+        let mut global = BTreeMap::new();
+        global.insert(b"global_key".to_vec(), TealValue::Uint(999));
+        let params = AppParams {
+            creator: Address([0u8; 32]),
+            approval_program: vec![0x06],
+            clear_state_program: vec![0x06],
+            global_state: global,
+            local_state_schema: StateSchema::default(),
+            global_state_schema: StateSchema::default(),
+            extra_program_pages: 0,
+        };
+        let rd = build_app_resource_data(Some(&local), Some(&params), 0);
+        let bytes = algo_codec::canonical_encode_resources_data(&rd);
+        let decoded = decode_app_local_state(&bytes).expect("decode");
+        assert_eq!(
+            decoded.key_value.len(),
+            1,
+            "local-state decoder must NOT pull in `s` (global_state) entries"
+        );
+        let local_val = decoded.key_value.get(b"local_key".as_slice());
+        assert!(local_val.is_some(), "local kv preserved");
+        assert!(matches!(local_val.unwrap(), TealValue::Uint(100)));
+        assert!(
+            !decoded.key_value.contains_key(b"global_key".as_slice()),
+            "global state must not leak into local-state decode"
+        );
     }
 
     #[test]
