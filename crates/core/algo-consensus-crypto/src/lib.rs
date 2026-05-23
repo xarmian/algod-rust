@@ -11,9 +11,12 @@
 pub mod merklearray;
 pub mod merklesig;
 pub mod onetimesig;
+pub mod passphrase;
 pub mod sortition;
 pub mod sumhash;
 pub mod vrf;
+
+pub use passphrase::{key_to_mnemonic, mnemonic_to_key, PassphraseError};
 
 pub use onetimesig::{
     one_time_id_for_round, verify_one_time_signature, OneTimeSignature, OneTimeSignatureIdentifier,
