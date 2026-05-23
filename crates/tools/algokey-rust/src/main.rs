@@ -21,7 +21,7 @@ fn main() -> ExitCode {
         Command::Generate(args) => commands::generate::run(args),
         Command::Import(args) => commands::import::run(args),
         Command::Export(args) => commands::export::run(args),
-        Command::Sign(_) => not_implemented(),
+        Command::Sign(args) => commands::sign::run(args),
         Command::Multisig(m) => match m.command {
             None => not_implemented(),
             Some(MultisigSub::AppendAuthAddr(_)) => not_implemented(),

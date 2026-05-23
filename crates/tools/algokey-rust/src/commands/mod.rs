@@ -4,3 +4,4 @@
 pub mod export;
 pub mod generate;
 pub mod import;
+pub mod sign;

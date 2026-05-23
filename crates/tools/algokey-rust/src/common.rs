@@ -36,6 +36,13 @@ pub fn write_private_key(keyfile: &Path, seed: &Seed) -> std::io::Result<()> {
     write_with_mode(keyfile, seed, 0o600)
 }
 
+/// Write arbitrary bytes at mode 0600. Used by `algokey sign` and
+/// `multisig` to write their output txfile (matches Go's
+/// `os.WriteFile(outfile, outBytes, 0600)` at `sign.go:80`).
+pub fn write_with_mode_0600(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    write_with_mode(path, data, 0o600)
+}
+
 /// Write `"<addr>\n"` to disk with mode 0666 (matches Go's
 /// `writePublicKey` at common.go:85-92).
 pub fn write_public_key(pubkeyfile: &Path, checksummed: &str) -> std::io::Result<()> {
