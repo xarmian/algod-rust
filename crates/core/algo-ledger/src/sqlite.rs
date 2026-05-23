@@ -1354,6 +1354,29 @@ pub(crate) fn inspect_resource_blob(data: &[u8]) -> ResourceMeta {
         }
     }
 
+    // Augment with canonical `y` signals that legacy Rust encoders never
+    // wrote. Legacy values were {1, 4, 5} (and the encoders always emitted
+    // a `y` key), so observing y ∈ {2, 3} unambiguously means a canonical
+    // row even when default-valued params fields cause field-presence
+    // signals to come up empty (e.g. an asset params row with `total=0`
+    // would encode to just `y=2` because Go's omitempty drops the rest).
+    //   y == 2 (OWNERSHIP)            — has_ownership; has_holding by default
+    //   y == 3 (NOT_HOLDING|OWNERSHIP) — has_ownership only; clear has_holding
+    //   y == 8 (EMPTY_APP)            — empty marker; neither
+    // y == 0 (canonical HOLDING default) is indistinguishable from a
+    // missing `y` field. Downstream callers query rows by resource
+    // `ctype`, so a default-valued canonical holding row's existence
+    // is the holding signal; this inspector can leave `has_holding`
+    // false for the empty-map degenerate case without losing data.
+    match meta.raw_flags {
+        2 => meta.has_ownership = true,
+        3 => {
+            meta.has_ownership = true;
+            meta.has_holding = false;
+        }
+        _ => {}
+    }
+
     meta
 }
 
@@ -5376,6 +5399,36 @@ mod tests {
         assert!(!meta.has_holding);
         assert!(!meta.has_ownership);
         assert_eq!(meta.raw_flags, 0);
+    }
+
+    #[test]
+    fn inspect_canonical_ownership_only_no_fields() {
+        // Canonical row that's nothing but y=2 (e.g. an asset params row
+        // with all-default values where Go's omitempty drops a..k entirely).
+        // Without consulting raw_flags this would look like an empty blob;
+        // the y=2 canonical signal must override.
+        let bytes = rmpv_map(&[("y", rmpv::Value::from(2u64))]);
+        let meta = inspect_resource_blob(&bytes);
+        assert!(meta.has_ownership, "y=2 alone must signal has_ownership");
+        assert!(!meta.has_holding);
+    }
+
+    #[test]
+    fn inspect_canonical_not_holding_ownership_clears_holding() {
+        // y=3 = NOT_HOLDING | OWNERSHIP. Even if a row somehow carried
+        // legacy holding fields, the canonical NOT_HOLDING bit must
+        // suppress has_holding.
+        let bytes = rmpv_map(&[
+            // Field-presence would otherwise set has_holding=true.
+            ("l", rmpv::Value::from(0u64)),
+            ("y", rmpv::Value::from(3u64)),
+        ]);
+        let meta = inspect_resource_blob(&bytes);
+        assert!(meta.has_ownership);
+        assert!(
+            !meta.has_holding,
+            "NOT_HOLDING bit must clear has_holding"
+        );
     }
 
     #[test]
