@@ -24,28 +24,61 @@ use crate::commands::sign::decode_one_signed_txn;
 use crate::common::write_with_mode_0600;
 
 /// Special filename meaning "write to stdout" — matches Go's
-/// `stdoutFilenameValue` constant at `common.go:29`.
-const STDOUT_FILENAME: &str = "-";
+/// `stdoutFilenameValue` constant at `common.go:29`. Used for `-i` too
+/// (`stdinFileNameValue`) which has the same literal value.
+const STDIN_STDOUT_FILENAME: &str = "-";
 
 pub fn run(args: AppendAuthAddrArgs) -> ExitCode {
-    run_with_io(args, &mut std::io::stdout(), &mut std::io::stderr())
+    let stdin_bytes = read_stdin_if_requested(&args);
+    run_with_io(
+        args,
+        stdin_bytes,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
+}
+
+/// If `-t -` was passed, read stdin once and return the bytes so the
+/// inner `run_with_io` (which tests drive directly) can stay
+/// IO-injectable.
+fn read_stdin_if_requested(args: &AppendAuthAddrArgs) -> Option<Vec<u8>> {
+    if args.txfile.as_os_str() == STDIN_STDOUT_FILENAME {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if std::io::stdin().read_to_end(&mut buf).is_ok() {
+            return Some(buf);
+        }
+    }
+    None
 }
 
 pub fn run_with_io<O: Write, E: Write>(
     args: AppendAuthAddrArgs,
+    stdin_bytes: Option<Vec<u8>>,
     stdout: &mut O,
     stderr: &mut E,
 ) -> ExitCode {
-    // Read input txn (single SignedTxn record).
-    let txdata = match std::fs::read(&args.txfile) {
-        Ok(b) => b,
-        Err(e) => {
-            let _ = writeln!(
-                stderr,
-                "Cannot read transactions from {}: {e}",
-                args.txfile.display()
-            );
-            return ExitCode::from(1);
+    // Read input txn (single SignedTxn record). `-t -` reads stdin
+    // (Go's readFile, common.go:119-124).
+    let txdata = if args.txfile.as_os_str() == STDIN_STDOUT_FILENAME {
+        match stdin_bytes {
+            Some(b) => b,
+            None => {
+                let _ = writeln!(stderr, "Cannot read transactions from stdin");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        match std::fs::read(&args.txfile) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = writeln!(
+                    stderr,
+                    "Cannot read transactions from {}: {e}",
+                    args.txfile.display()
+                );
+                return ExitCode::from(1);
+            }
         }
     };
 
@@ -127,7 +160,7 @@ pub fn run_with_io<O: Write, E: Write>(
         Some(p) => p.clone(),
         None => args.txfile.clone(),
     };
-    if target.as_os_str() == STDOUT_FILENAME {
+    if target.as_os_str() == STDIN_STDOUT_FILENAME {
         if let Err(e) = stdout.write_all(&encoded) {
             let _ = writeln!(stderr, "Cannot write to stdout: {e}");
             return ExitCode::from(1);
@@ -198,6 +231,7 @@ mod tests {
                 txfile,
                 outfile: Some(outfile.clone()),
             },
+            None,
             &mut out,
             &mut err,
         );
@@ -239,6 +273,7 @@ mod tests {
                 txfile: txfile.clone(),
                 outfile: None,
             },
+            None,
             &mut Vec::new(),
             &mut Vec::new(),
         );
@@ -263,6 +298,7 @@ mod tests {
                 txfile,
                 outfile: None,
             },
+            None,
             &mut Vec::new(),
             &mut err,
         );
@@ -291,6 +327,7 @@ mod tests {
                 txfile,
                 outfile: None,
             },
+            None,
             &mut Vec::new(),
             &mut err,
         );
@@ -300,6 +337,44 @@ mod tests {
             stderr.contains("The sender at the msig address should not be the same"),
             "stderr: {stderr}"
         );
+    }
+
+    /// `-t -` reads the input txn from stdin (matches Go's `readFile`).
+    #[test]
+    fn stdin_input_with_dash_txfile() {
+        let pks = [pk_for_seed(70), pk_for_seed(71)];
+        let addr_strs: Vec<String> = pks.iter().map(|pk| Address(*pk).to_string()).collect();
+        let sender = Address([0xBBu8; 32]);
+        let stxn = SignedTransaction {
+            txn: Transaction {
+                txn_type: TxnType::Pay,
+                sender,
+                fee: 1000,
+                first_valid: Round(1),
+                last_valid: Round(10),
+                genesis_hash: [7u8; 32],
+                ..Transaction::default()
+            },
+            ..SignedTransaction::default()
+        };
+        let stdin_bytes = canonical_encode_signed_transaction(&stxn);
+        let dir = tempdir().unwrap();
+        let outfile = dir.path().join("out.tx");
+        let params = format!("1 {} {}", addr_strs[0], addr_strs[1]);
+        let code = run_with_io(
+            AppendAuthAddrArgs {
+                params,
+                txfile: PathBuf::from("-"),
+                outfile: Some(outfile.clone()),
+            },
+            Some(stdin_bytes),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        let (signed, _) = decode_one_signed_txn(&std::fs::read(&outfile).unwrap()).unwrap();
+        let expected = multisig_addr_gen(1, 1, &pks).unwrap();
+        assert_eq!(signed.auth_addr, Some(expected));
     }
 
     /// Bad threshold (zero) → reject.
@@ -318,6 +393,7 @@ mod tests {
                 txfile,
                 outfile: None,
             },
+            None,
             &mut Vec::new(),
             &mut err,
         );
