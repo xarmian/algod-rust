@@ -2391,19 +2391,24 @@ pub struct SqliteLedger {
 /// silently-incomplete response. We refuse to cache such blocks (returning
 /// `NotFound` is preferable to a partial 200 a client cannot detect).
 ///
-/// `Pay` / `Keyreg` / `Hb` payloads only touch account-base fields, which
-/// the builder handles correctly. Any other transaction type — including
-/// the `Unknown(_)` fallback for codec deserialization gaps — fails the
-/// check. See `apply_block_caching_delta` for the rest of the contract,
-/// including the per-field gaps that remain even on cached rounds.
+/// Only `Pay` and `Keyreg` payloads are admitted — they touch only the
+/// account-base fields of the accounts already collected by
+/// `apply::collect_txn_addresses`. `Hb` (heartbeat) is intentionally
+/// excluded: `apply::apply_heartbeat` mutates the heartbeat **target**'s
+/// `last_heartbeat`, but the target address isn't currently included in
+/// the diff's address set, so a heartbeat for an off-payset target would
+/// produce an incomplete `accts` delta. `Acfg` / `Axfer` / `Afrz` /
+/// `Appl` / `Stpf` / `Unknown(_)` are excluded for the same builder-gap
+/// reasons documented above.
+///
+/// See `apply_block_caching_delta` for the rest of the contract, including
+/// the per-field gaps that remain even on cached rounds (#190).
 fn block_state_delta_is_complete(block: &algo_types::Block) -> bool {
     use algo_types::TxnType;
-    block.payset.iter().all(|stx| {
-        matches!(
-            stx.txn.txn_type,
-            TxnType::Pay | TxnType::Keyreg | TxnType::Hb
-        )
-    })
+    block
+        .payset
+        .iter()
+        .all(|stx| matches!(stx.txn.txn_type, TxnType::Pay | TxnType::Keyreg))
 }
 
 impl SqliteLedger {
@@ -3073,8 +3078,13 @@ impl SqliteLedger {
             // Payset contains a transaction type the builder doesn't yet
             // fully cover. Apply via the bare path and leave the cache
             // empty — the handler will return `NotFound` for this round
-            // rather than a partial delta.
-            crate::apply::apply_block(self, block)
+            // rather than a partial delta. Still advance the rolling
+            // window so stale entries from earlier cached rounds are
+            // evicted on schedule even when long runs of unsupported
+            // blocks intervene.
+            crate::apply::apply_block(self, block)?;
+            self.delta_cache.advance(block.round.0);
+            Ok(())
         }
     }
 
@@ -5914,11 +5924,13 @@ mod tests {
     }
 
     /// PLAN-36 TASK-128: the payset-completeness gate that controls
-    /// whether `apply_block_caching_delta` caches a delta. Pay / Keyreg / Hb
-    /// blocks (including the empty-payset case) pass; anything else
-    /// — Acfg / Axfer / Afrz / Appl / Stpf, or an `Unknown(_)` fallback
-    /// — fails the gate so the REST endpoint stays at `NotFound` rather
-    /// than serving a known-incomplete delta.
+    /// whether `apply_block_caching_delta` caches a delta. Pay / Keyreg
+    /// blocks (including the empty-payset case) pass; anything else —
+    /// Acfg / Axfer / Afrz / Appl / Stpf / Hb, or an `Unknown(_)`
+    /// fallback — fails the gate so the REST endpoint stays at
+    /// `NotFound` rather than serving a known-incomplete delta. `Hb` is
+    /// excluded because the heartbeat target address isn't included in
+    /// the diff's address set (see `block_state_delta_is_complete`).
     #[test]
     fn test_block_state_delta_is_complete_gate() {
         use algo_types::{Block, SignedTransaction, Transaction, TxnType};
@@ -5941,22 +5953,25 @@ mod tests {
 
         // Empty payset is trivially "delta-complete".
         assert!(block_state_delta_is_complete(&block_with_types(&[])));
-        // Pure Pay / Keyreg / Hb payloads pass.
+        // Pure Pay / Keyreg payloads pass.
         assert!(block_state_delta_is_complete(&block_with_types(&[
             TxnType::Pay
         ])));
         assert!(block_state_delta_is_complete(&block_with_types(&[
             TxnType::Pay,
             TxnType::Keyreg,
-            TxnType::Hb,
         ])));
-        // Any unsupported transaction type fails the gate.
+        // Any other transaction type fails the gate. `Hb` is excluded
+        // because `apply::collect_txn_addresses` does not include the
+        // heartbeat target — the resulting `accts` diff would be
+        // incomplete for off-payset targets.
         for unsupported in [
             TxnType::Acfg,
             TxnType::Axfer,
             TxnType::Afrz,
             TxnType::Appl,
             TxnType::Stpf,
+            TxnType::Hb,
             TxnType::Unknown(String::new()),
             TxnType::Unknown("future-type".into()),
         ] {

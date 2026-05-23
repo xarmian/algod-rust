@@ -35,10 +35,28 @@ impl DeltaCache {
     /// Insert a delta for the given round and evict old entries.
     pub fn insert(&mut self, round: u64, delta: StateDelta) {
         self.cache.insert(round, delta);
+        self.advance_window(round);
+    }
 
-        // Evict entries outside the window.
-        if round >= self.window_size as u64 {
-            let new_min = round - self.window_size as u64 + 1;
+    /// Advance the rolling-window cursor to `round` without inserting a
+    /// delta, evicting any entries that fall outside the window.
+    ///
+    /// Used by callers that successfully applied a block but intentionally
+    /// did not cache its delta (e.g. blocks whose payset contains
+    /// transaction types the current `StateDelta` builder doesn't fully
+    /// cover — see `SqliteLedger::apply_block_caching_delta`). Without this,
+    /// the only eviction path is [`Self::insert`], so a single cached delta
+    /// can remain served indefinitely while the chain advances past it.
+    /// PLAN-36 TASK-128.
+    pub fn advance(&mut self, round: u64) {
+        self.advance_window(round);
+    }
+
+    /// Compute the new minimum-retained round given `latest` and evict
+    /// anything older. Centralized so `insert` and `advance` cannot drift.
+    fn advance_window(&mut self, latest: u64) {
+        if latest >= self.window_size as u64 {
+            let new_min = latest - self.window_size as u64 + 1;
             if new_min > self.min_round {
                 self.evict_before(new_min);
             }
@@ -98,6 +116,24 @@ mod tests {
         assert!(cache.get(3).is_some());
         assert!(cache.get(4).is_some());
         assert_eq!(cache.len(), 3);
+    }
+
+    /// PLAN-36 TASK-128: `advance` must evict stale entries even when no
+    /// new delta is inserted, so callers that skip caching for unsupported
+    /// blocks still bound the cache by the rolling window.
+    #[test]
+    fn advance_without_insert_evicts() {
+        let mut cache = DeltaCache::new(3);
+        cache.insert(0, StateDelta::default());
+        cache.insert(1, StateDelta::default());
+        cache.insert(2, StateDelta::default());
+        assert_eq!(cache.len(), 3);
+
+        // Advance past the window without inserting anything new.
+        cache.advance(10);
+
+        assert!(cache.is_empty(), "advance should evict all stale entries");
+        assert_eq!(cache.min_round(), 10 - 3 + 1);
     }
 
     #[test]
