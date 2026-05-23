@@ -690,27 +690,19 @@ pub(crate) fn encode_asset_holding(h: &AssetHolding) -> Vec<u8> {
 }
 
 pub(crate) fn encode_asset_holding_with_round(h: &AssetHolding, update_round: u64) -> Vec<u8> {
-    let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-    if h.amount != 0 {
-        pairs.push((rmpv::Value::String("l".into()), rmpv::Value::from(h.amount)));
-    }
-    if h.frozen {
-        pairs.push((rmpv::Value::String("m".into()), rmpv::Value::Boolean(true)));
-    }
-    // Resource flags bitmask: bit 0 = holding present
-    pairs.push((rmpv::Value::String("y".into()), rmpv::Value::from(1u64)));
-    // UpdateRound — matches Go's ResourcesData.UpdateRound (codec "z").
-    if update_round != 0 {
-        pairs.push((
-            rmpv::Value::String("z".into()),
-            rmpv::Value::from(update_round),
-        ));
-    }
-
-    let val = rmpv::Value::Map(pairs);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    buf
+    // Delegate to the canonical Go-compatible encoder. The output BLOB
+    // is byte-identical to what go-algorand's `trackerdb.ResourcesData.MarshalMsg`
+    // would write for the equivalent struct value, modulo Go's omitempty
+    // defaults (e.g. a zero-balance opt-in encodes to `{}`).
+    // PLAN-189 / TASK-191.
+    let rd = algo_codec::ResourcesData {
+        amount: h.amount,
+        frozen: h.frozen,
+        resource_flags: algo_codec::resource_flags::HOLDING,
+        update_round,
+        ..Default::default()
+    };
+    algo_codec::canonical_encode_resources_data(&rd)
 }
 
 fn decode_asset_holding(data: &[u8]) -> Result<AssetHolding, AlgoError> {
@@ -747,90 +739,29 @@ pub(crate) fn encode_asset_params_with_round(
     creator: &Address,
     update_round: u64,
 ) -> Vec<u8> {
-    let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-    if p.total != 0 {
-        pairs.push((rmpv::Value::String("a".into()), rmpv::Value::from(p.total)));
-    }
-    if p.decimals != 0 {
-        pairs.push((
-            rmpv::Value::String("b".into()),
-            rmpv::Value::from(p.decimals as u64),
-        ));
-    }
-    if p.default_frozen {
-        pairs.push((rmpv::Value::String("c".into()), rmpv::Value::Boolean(true)));
-    }
-    if !p.unit_name.is_empty() {
-        pairs.push((
-            rmpv::Value::String("d".into()),
-            rmpv::Value::String(p.unit_name.clone().into()),
-        ));
-    }
-    if !p.asset_name.is_empty() {
-        pairs.push((
-            rmpv::Value::String("e".into()),
-            rmpv::Value::String(p.asset_name.clone().into()),
-        ));
-    }
-    if !p.url.is_empty() {
-        pairs.push((
-            rmpv::Value::String("f".into()),
-            rmpv::Value::String(p.url.clone().into()),
-        ));
-    }
-    if let Some(ref mh) = p.metadata_hash {
-        pairs.push((
-            rmpv::Value::String("g".into()),
-            rmpv::Value::Binary(mh.to_vec()),
-        ));
-    }
-    if let Some(ref addr) = p.manager {
-        pairs.push((
-            rmpv::Value::String("h".into()),
-            rmpv::Value::Binary(addr.0.to_vec()),
-        ));
-    }
-    if let Some(ref addr) = p.reserve {
-        pairs.push((
-            rmpv::Value::String("i".into()),
-            rmpv::Value::Binary(addr.0.to_vec()),
-        ));
-    }
-    if let Some(ref addr) = p.freeze {
-        pairs.push((
-            rmpv::Value::String("j".into()),
-            rmpv::Value::Binary(addr.0.to_vec()),
-        ));
-    }
-    if let Some(ref addr) = p.clawback {
-        pairs.push((
-            rmpv::Value::String("k".into()),
-            rmpv::Value::Binary(addr.0.to_vec()),
-        ));
-    }
-
-    // Store creator separately — not part of Go's AssetParams blob, but we
-    // also track it in assetcreators table. Include here for completeness.
-    // Actually, Go stores creator in assetcreators, not in the resource blob.
-    // We'll follow the same pattern and NOT include creator in the blob.
-
-    // Resource flags: bit 2 = ownership (asset params present)
-    pairs.push((rmpv::Value::String("y".into()), rmpv::Value::from(4u64)));
-    // UpdateRound — matches Go's ResourcesData.UpdateRound (codec "z").
-    if update_round != 0 {
-        pairs.push((
-            rmpv::Value::String("z".into()),
-            rmpv::Value::from(update_round),
-        ));
-    }
-
-    let val = rmpv::Value::Map(pairs);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    // Suppress unused variable warning — creator is stored in assetcreators table
+    // Delegate to canonical encoder. Note: creator is NOT part of the
+    // BLOB — go-algorand stores creator in the `assetcreators` table,
+    // not in `resources.data`. We accept it in the signature only to
+    // match the legacy ABI; it's intentionally unused.
+    // PLAN-189 / TASK-191.
     let _ = creator;
-    buf
+    let rd = algo_codec::ResourcesData {
+        total: p.total,
+        decimals: p.decimals,
+        default_frozen: p.default_frozen,
+        unit_name: p.unit_name.clone(),
+        asset_name: p.asset_name.clone(),
+        url: p.url.clone(),
+        metadata_hash: p.metadata_hash.unwrap_or([0u8; 32]),
+        manager: p.manager.map(|a| a.0).unwrap_or([0u8; 32]),
+        reserve: p.reserve.map(|a| a.0).unwrap_or([0u8; 32]),
+        freeze: p.freeze.map(|a| a.0).unwrap_or([0u8; 32]),
+        clawback: p.clawback.map(|a| a.0).unwrap_or([0u8; 32]),
+        resource_flags: algo_codec::resource_flags::OWNERSHIP,
+        update_round,
+        ..Default::default()
+    };
+    algo_codec::canonical_encode_resources_data(&rd)
 }
 
 fn decode_asset_params(data: &[u8]) -> Result<AssetParams, AlgoError> {
@@ -1370,6 +1301,26 @@ pub(crate) fn inspect_resource_blob(data: &[u8]) -> ResourceMeta {
         }
     }
 
+    // Canonical default holding rows (e.g., zero-balance asset opt-ins
+    // with amount=0, frozen=false, resource_flags=HOLDING=0) encode to
+    // a completely empty map `{}` because every field is omitempty-
+    // dropped including `y=0`. Without a special case we'd classify
+    // such a row as having neither signal — but its existence in the
+    // resources table (with an asset-holding `ctype`) means it IS a
+    // holding row. Treat any blob that decoded as a non-empty *bytes*
+    // sequence but produced an entirely empty *key set* as a canonical-
+    // default holding row (set has_holding). PLAN-189 / TASK-191.
+    let saw_any_signal = meta.has_holding || meta.has_ownership || has_s;
+    let mut is_canonical_default_holding = false;
+    if !saw_any_signal && meta.raw_flags == 0 {
+        // We got here only after a successful msgpack decode, so the
+        // input bytes were a valid (possibly empty) map. Anything we
+        // saw in the key loop would have set a signal flag; reaching
+        // here means the map carried only metadata keys (z/A/B) or
+        // was literally `{}`.
+        is_canonical_default_holding = true;
+    }
+
     // Layer raw_flags semantics on top of field-presence signals. We
     // need to handle BOTH the legacy Rust bitmask
     // (HOLDING=0x01, OWNERSHIP=0x04, written by pre-PLAN-189 encoders)
@@ -1416,6 +1367,10 @@ pub(crate) fn inspect_resource_blob(data: &[u8]) -> ResourceMeta {
             meta.has_ownership = true;
         }
         _ => {}
+    }
+
+    if is_canonical_default_holding && !meta.has_ownership {
+        meta.has_holding = true;
     }
 
     meta
@@ -1691,227 +1646,125 @@ fn strip_holding_from_blob(data: &[u8]) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 // Asset resource blob merging helpers
 // ---------------------------------------------------------------------------
+//
+// All helpers in this section delegate to
+// `algo_codec::canonical_encode_resources_data` for the final write so
+// that merged / stripped asset blobs are byte-identical to what
+// go-algorand would produce. The `y` flag follows Go's bitwise enum:
+//
+//   has_holding && has_ownership  → y = OWNERSHIP (NOT_HOLDING bit clear)
+//   !has_holding && has_ownership → y = NOT_HOLDING | OWNERSHIP
+//   has_holding && !has_ownership → y = HOLDING (omitted at canonical write)
+//
+// PLAN-189 / TASK-191.
 
-/// Asset params field keys: "a" through "k" (total, decimals, default_frozen,
-/// unit_name, asset_name, url, metadata_hash, manager, reserve, freeze, clawback).
-const ASSET_PARAMS_KEYS: &[&str] = &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"];
+/// Build a canonical `algo_codec::ResourcesData` carrying the union of
+/// an optional `AssetHolding` and an optional `AssetParams`. The
+/// `creator` address from `AssetParams` is intentionally NOT stored in
+/// the BLOB — go-algorand keeps that in the `assetcreators` table.
+pub(crate) fn build_asset_resource_data(
+    holding: Option<&AssetHolding>,
+    params: Option<&AssetParams>,
+    update_round: u64,
+) -> algo_codec::ResourcesData {
+    let mut rd = algo_codec::ResourcesData {
+        update_round,
+        ..Default::default()
+    };
 
-/// Asset holding field keys: "l" (amount), "m" (frozen).
-const ASSET_HOLDING_KEYS: &[&str] = &["l", "m"];
+    rd.resource_flags = match (holding.is_some(), params.is_some()) {
+        (true, true) => algo_codec::resource_flags::OWNERSHIP,
+        (false, true) => {
+            algo_codec::resource_flags::NOT_HOLDING | algo_codec::resource_flags::OWNERSHIP
+        }
+        (true, false) | (false, false) => algo_codec::resource_flags::HOLDING,
+    };
 
-/// Merge asset holding fields into an existing params blob, producing a
-/// combined blob with both ownership and holding flags set.
+    if let Some(h) = holding {
+        rd.amount = h.amount;
+        rd.frozen = h.frozen;
+    }
+    if let Some(p) = params {
+        rd.total = p.total;
+        rd.decimals = p.decimals;
+        rd.default_frozen = p.default_frozen;
+        rd.unit_name = p.unit_name.clone();
+        rd.asset_name = p.asset_name.clone();
+        rd.url = p.url.clone();
+        rd.metadata_hash = p.metadata_hash.unwrap_or([0u8; 32]);
+        rd.manager = p.manager.map(|a| a.0).unwrap_or([0u8; 32]);
+        rd.reserve = p.reserve.map(|a| a.0).unwrap_or([0u8; 32]);
+        rd.freeze = p.freeze.map(|a| a.0).unwrap_or([0u8; 32]);
+        rd.clawback = p.clawback.map(|a| a.0).unwrap_or([0u8; 32]);
+    }
+
+    rd
+}
+
+/// Extract the `z` (update_round) field from a raw resource blob, if
+/// present. Used by merge/strip helpers that must preserve metadata
+/// across the canonical re-encode.
+fn extract_update_round(data: &[u8]) -> u64 {
+    let Ok(val) = rmpv::decode::read_value(&mut &data[..]) else {
+        return 0;
+    };
+    let rmpv::Value::Map(pairs) = val else {
+        return 0;
+    };
+    for (k, v) in pairs {
+        if k.as_str() == Some("z") {
+            return v.as_u64().unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// Merge asset holding fields into an existing params blob, producing
+/// a canonical combined blob (`y = OWNERSHIP`).
 fn merge_asset_holding_into_params(
     existing_params_blob: &[u8],
     new_holding: &AssetHolding,
 ) -> Vec<u8> {
-    let existing_val: rmpv::Value = rmpv::decode::read_value(&mut &existing_params_blob[..])
-        .unwrap_or(rmpv::Value::Map(vec![]));
-
-    let mut merged: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-    // Preserve existing params fields (a-k), skip y and any holding fields
-    if let rmpv::Value::Map(pairs) = existing_val {
-        for (k, v) in pairs {
-            let key_str = k.as_str().unwrap_or("");
-            if key_str == "y" {
-                continue;
-            }
-            if ASSET_HOLDING_KEYS.contains(&key_str) {
-                continue;
-            }
-            merged.push((k, v));
-        }
-    }
-
-    // Add holding fields
-    if new_holding.amount != 0 {
-        merged.push((
-            rmpv::Value::String("l".into()),
-            rmpv::Value::from(new_holding.amount),
-        ));
-    }
-    if new_holding.frozen {
-        merged.push((rmpv::Value::String("m".into()), rmpv::Value::Boolean(true)));
-    }
-
-    // Combined flags
-    merged.push((
-        rmpv::Value::String("y".into()),
-        rmpv::Value::from(LEGACY_Y_HOLDING_BIT | LEGACY_Y_OWNERSHIP_BIT),
-    ));
-
-    let val = rmpv::Value::Map(merged);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    buf
+    let existing_params = decode_asset_params(existing_params_blob).unwrap_or_default();
+    let update_round = extract_update_round(existing_params_blob);
+    let rd = build_asset_resource_data(Some(new_holding), Some(&existing_params), update_round);
+    algo_codec::canonical_encode_resources_data(&rd)
 }
 
-/// Merge asset params fields into an existing holding blob, producing a
-/// combined blob with both ownership and holding flags set.
+/// Merge asset params fields into an existing holding blob, producing
+/// a canonical combined blob (`y = OWNERSHIP`).
 fn merge_asset_params_into_holding(
     existing_holding_blob: &[u8],
     new_params: &AssetParams,
     creator: &Address,
 ) -> Vec<u8> {
-    let existing_val: rmpv::Value = rmpv::decode::read_value(&mut &existing_holding_blob[..])
-        .unwrap_or(rmpv::Value::Map(vec![]));
-
-    let mut merged: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-    // Preserve existing holding fields (l, m), skip y and any params fields
-    if let rmpv::Value::Map(pairs) = existing_val {
-        for (k, v) in pairs {
-            let key_str = k.as_str().unwrap_or("");
-            if key_str == "y" {
-                continue;
-            }
-            if ASSET_PARAMS_KEYS.contains(&key_str) {
-                continue;
-            }
-            merged.push((k, v));
-        }
-    }
-
-    // Add params fields (same encoding as encode_asset_params but without the "y" flag)
-    if new_params.total != 0 {
-        merged.push((
-            rmpv::Value::String("a".into()),
-            rmpv::Value::from(new_params.total),
-        ));
-    }
-    if new_params.decimals != 0 {
-        merged.push((
-            rmpv::Value::String("b".into()),
-            rmpv::Value::from(new_params.decimals as u64),
-        ));
-    }
-    if new_params.default_frozen {
-        merged.push((rmpv::Value::String("c".into()), rmpv::Value::Boolean(true)));
-    }
-    if !new_params.unit_name.is_empty() {
-        merged.push((
-            rmpv::Value::String("d".into()),
-            rmpv::Value::String(new_params.unit_name.clone().into()),
-        ));
-    }
-    if !new_params.asset_name.is_empty() {
-        merged.push((
-            rmpv::Value::String("e".into()),
-            rmpv::Value::String(new_params.asset_name.clone().into()),
-        ));
-    }
-    if !new_params.url.is_empty() {
-        merged.push((
-            rmpv::Value::String("f".into()),
-            rmpv::Value::String(new_params.url.clone().into()),
-        ));
-    }
-    if let Some(ref mh) = new_params.metadata_hash {
-        merged.push((
-            rmpv::Value::String("g".into()),
-            rmpv::Value::Binary(mh.to_vec()),
-        ));
-    }
-    if let Some(ref addr) = new_params.manager {
-        merged.push((
-            rmpv::Value::String("h".into()),
-            rmpv::Value::Binary(addr.0.to_vec()),
-        ));
-    }
-    if let Some(ref addr) = new_params.reserve {
-        merged.push((
-            rmpv::Value::String("i".into()),
-            rmpv::Value::Binary(addr.0.to_vec()),
-        ));
-    }
-    if let Some(ref addr) = new_params.freeze {
-        merged.push((
-            rmpv::Value::String("j".into()),
-            rmpv::Value::Binary(addr.0.to_vec()),
-        ));
-    }
-    if let Some(ref addr) = new_params.clawback {
-        merged.push((
-            rmpv::Value::String("k".into()),
-            rmpv::Value::Binary(addr.0.to_vec()),
-        ));
-    }
-
-    // Combined flags
-    merged.push((
-        rmpv::Value::String("y".into()),
-        rmpv::Value::from(LEGACY_Y_HOLDING_BIT | LEGACY_Y_OWNERSHIP_BIT),
-    ));
-
-    let val = rmpv::Value::Map(merged);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    // Suppress unused variable warning — creator is stored in assetcreators table
     let _ = creator;
-    buf
+    let existing_holding = decode_asset_holding(existing_holding_blob).unwrap_or_default();
+    let update_round = extract_update_round(existing_holding_blob);
+    let rd = build_asset_resource_data(Some(&existing_holding), Some(new_params), update_round);
+    algo_codec::canonical_encode_resources_data(&rd)
 }
 
-/// Strip asset holding fields from a combined blob, keeping only params fields.
-/// Returns the params-only blob with ownership flag, or None if nothing remains.
+/// Strip asset holding fields from a combined blob, keeping only
+/// params fields. Returns the params-only blob (`y = NOT_HOLDING |
+/// OWNERSHIP`), or None if the input cannot be decoded.
 fn strip_asset_holding_from_blob(data: &[u8]) -> Option<Vec<u8>> {
-    let val: rmpv::Value = rmpv::decode::read_value(&mut &data[..]).ok()?;
-
-    let mut params_pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-    if let rmpv::Value::Map(pairs) = val {
-        for (k, v) in pairs {
-            let key_str = k.as_str().unwrap_or("");
-            match key_str {
-                "l" | "m" => continue, // holding fields — strip
-                "y" => continue,       // will be rewritten
-                _ => params_pairs.push((k, v)),
-            }
-        }
-    }
-
-    // Add ownership-only flag
-    params_pairs.push((
-        rmpv::Value::String("y".into()),
-        rmpv::Value::from(LEGACY_Y_OWNERSHIP_BIT),
-    ));
-
-    let val = rmpv::Value::Map(params_pairs);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    Some(buf)
+    rmpv::decode::read_value(&mut &data[..]).ok()?;
+    let params = decode_asset_params(data).unwrap_or_default();
+    let update_round = extract_update_round(data);
+    let rd = build_asset_resource_data(None, Some(&params), update_round);
+    Some(algo_codec::canonical_encode_resources_data(&rd))
 }
 
-/// Strip asset params fields from a combined blob, keeping only holding fields.
-/// Returns the holding-only blob with holding flag, or None if nothing remains.
+/// Strip asset params fields from a combined blob, keeping only
+/// holding fields. Returns the holding-only blob (`y = HOLDING`,
+/// omitted), or None if the input cannot be decoded.
 fn strip_asset_params_from_blob(data: &[u8]) -> Option<Vec<u8>> {
-    let val: rmpv::Value = rmpv::decode::read_value(&mut &data[..]).ok()?;
-
-    let mut holding_pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-    if let rmpv::Value::Map(pairs) = val {
-        for (k, v) in pairs {
-            let key_str = k.as_str().unwrap_or("");
-            if ASSET_PARAMS_KEYS.contains(&key_str) {
-                continue; // params fields — strip
-            }
-            if key_str == "y" {
-                continue; // will be rewritten
-            }
-            holding_pairs.push((k, v));
-        }
-    }
-
-    // Add holding-only flag
-    holding_pairs.push((
-        rmpv::Value::String("y".into()),
-        rmpv::Value::from(LEGACY_Y_HOLDING_BIT),
-    ));
-
-    let val = rmpv::Value::Map(holding_pairs);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    Some(buf)
+    rmpv::decode::read_value(&mut &data[..]).ok()?;
+    let holding = decode_asset_holding(data).unwrap_or_default();
+    let update_round = extract_update_round(data);
+    let rd = build_asset_resource_data(Some(&holding), None, update_round);
+    Some(algo_codec::canonical_encode_resources_data(&rd))
 }
 
 /// Set or overwrite the `"z"` (UpdateRound) field in a resource msgpack blob.
@@ -5448,6 +5301,32 @@ mod tests {
     }
 
     #[test]
+    fn inspect_canonical_default_holding_blob() {
+        // Canonical asset holding with all-default fields encodes to
+        // `{}` (empty map) because Go's omitempty drops y=0 along with
+        // amount=0/frozen=false. The inspector must still classify it
+        // as has_holding so callers don't drop the row.
+        let bytes = rmpv_map(&[]);
+        let meta = inspect_resource_blob(&bytes);
+        assert!(
+            meta.has_holding,
+            "empty canonical map must classify as has_holding"
+        );
+        assert!(!meta.has_ownership);
+    }
+
+    #[test]
+    fn inspect_canonical_default_holding_with_only_metadata() {
+        // Canonical holding row carrying only the optional `z`
+        // (update_round) metadata key — still has no data signals and
+        // y is omitted because resource_flags=HOLDING=0.
+        let bytes = rmpv_map(&[("z", rmpv::Value::from(1234u64))]);
+        let meta = inspect_resource_blob(&bytes);
+        assert!(meta.has_holding);
+        assert!(!meta.has_ownership);
+    }
+
+    #[test]
     fn inspect_legacy_zero_balance_holding_row() {
         // Pre-PLAN-189 encoder for a default asset opt-in
         // (amount=0, frozen=false) writes only `{y:1}` because both
@@ -5507,6 +5386,148 @@ mod tests {
         let meta = inspect_resource_blob(b"\xff\xff\xff\xff");
         assert!(!meta.has_holding);
         assert!(!meta.has_ownership);
+    }
+
+    // ---------------------------------------------------------------------
+    // Asset encoder canonical delegation (TASK-191)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn encode_asset_holding_matches_canonical_encoder() {
+        let h = AssetHolding {
+            amount: 1_000_000,
+            frozen: false,
+        };
+        let actual = encode_asset_holding_with_round(&h, 42);
+
+        // Reference: build the equivalent ResourcesData and call
+        // the canonical encoder directly.
+        let rd = algo_codec::ResourcesData {
+            amount: 1_000_000,
+            frozen: false,
+            resource_flags: algo_codec::resource_flags::HOLDING,
+            update_round: 42,
+            ..Default::default()
+        };
+        let expected = algo_codec::canonical_encode_resources_data(&rd);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn encode_asset_holding_default_is_empty_map() {
+        // Canonical zero-balance opt-in: amount=0, frozen=false,
+        // update_round=0 → every field omitempty-dropped → `{}` (0x80).
+        let h = AssetHolding {
+            amount: 0,
+            frozen: false,
+        };
+        let bytes = encode_asset_holding_with_round(&h, 0);
+        assert_eq!(bytes, vec![0x80], "canonical default holding must be empty map");
+        // And the inspector must still classify it as has_holding so
+        // get_asset_holding doesn't silently drop it.
+        let meta = inspect_resource_blob(&bytes);
+        assert!(meta.has_holding);
+    }
+
+    #[test]
+    fn encode_asset_holding_round_trip_via_decoder() {
+        let cases = [
+            AssetHolding { amount: 0, frozen: false },
+            AssetHolding { amount: 1, frozen: false },
+            AssetHolding { amount: 0, frozen: true },
+            AssetHolding { amount: u64::MAX, frozen: true },
+        ];
+        for h in cases {
+            let bytes = encode_asset_holding_with_round(&h, 0);
+            let decoded = decode_asset_holding(&bytes).expect("decode");
+            assert_eq!(decoded.amount, h.amount);
+            assert_eq!(decoded.frozen, h.frozen);
+        }
+    }
+
+    #[test]
+    fn encode_asset_params_matches_canonical_encoder() {
+        let creator = Address([7u8; 32]);
+        let p = algo_types::AssetParams {
+            total: 1_000_000,
+            decimals: 6,
+            default_frozen: false,
+            unit_name: "TST".to_string(),
+            asset_name: "TestAsset".to_string(),
+            url: "https://example".to_string(),
+            metadata_hash: Some([9u8; 32]),
+            manager: Some(Address([1u8; 32])),
+            reserve: Some(Address([2u8; 32])),
+            freeze: None,
+            clawback: None,
+        };
+        let actual = encode_asset_params_with_round(&p, &creator, 100);
+
+        let rd = algo_codec::ResourcesData {
+            total: 1_000_000,
+            decimals: 6,
+            default_frozen: false,
+            unit_name: "TST".to_string(),
+            asset_name: "TestAsset".to_string(),
+            url: "https://example".to_string(),
+            metadata_hash: [9u8; 32],
+            manager: [1u8; 32],
+            reserve: [2u8; 32],
+            freeze: [0u8; 32],
+            clawback: [0u8; 32],
+            resource_flags: algo_codec::resource_flags::OWNERSHIP,
+            update_round: 100,
+            ..Default::default()
+        };
+        let expected = algo_codec::canonical_encode_resources_data(&rd);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn encode_asset_params_round_trip_via_decoder() {
+        let creator = Address([7u8; 32]);
+        let p = algo_types::AssetParams {
+            total: 5_000,
+            decimals: 2,
+            default_frozen: true,
+            unit_name: "U".to_string(),
+            asset_name: "A".to_string(),
+            url: "".to_string(),
+            metadata_hash: None,
+            manager: Some(Address([3u8; 32])),
+            reserve: None,
+            freeze: None,
+            clawback: Some(Address([4u8; 32])),
+        };
+        let bytes = encode_asset_params_with_round(&p, &creator, 0);
+        let decoded = decode_asset_params(&bytes).expect("decode");
+        assert_eq!(decoded.total, p.total);
+        assert_eq!(decoded.decimals, p.decimals);
+        assert_eq!(decoded.default_frozen, p.default_frozen);
+        assert_eq!(decoded.unit_name, p.unit_name);
+        assert_eq!(decoded.asset_name, p.asset_name);
+        assert_eq!(decoded.manager, p.manager);
+        assert_eq!(decoded.reserve, p.reserve);
+        assert_eq!(decoded.clawback, p.clawback);
+    }
+
+    #[test]
+    fn encode_asset_params_canonical_y_value() {
+        // Canonical OWNERSHIP = 2, NOT legacy 4. The on-disk y byte
+        // must reflect Go's enum value.
+        let creator = Address([7u8; 32]);
+        let p = algo_types::AssetParams {
+            total: 1,
+            ..Default::default()
+        };
+        let bytes = encode_asset_params_with_round(&p, &creator, 0);
+        let val: rmpv::Value = rmpv::decode::read_value(&mut &bytes[..]).expect("decode");
+        let rmpv::Value::Map(pairs) = val else { panic!("not a map") };
+        let y = pairs.iter().find(|(k, _)| k.as_str() == Some("y"));
+        let y_val = y.expect("y present").1.as_u64().expect("y u64");
+        assert_eq!(y_val, 2, "canonical OWNERSHIP = 2");
     }
 
     // ---------------------------------------------------------------------
