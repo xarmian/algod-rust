@@ -10,3 +10,11 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
+algo-consensus-crypto.workspace = true
+algo-types.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+tempfile = "3"

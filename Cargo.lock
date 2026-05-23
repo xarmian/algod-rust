@@ -448,7 +448,13 @@ dependencies = [
 name = "algokey-rust"
 version = "0.1.0"
 dependencies = [
+ "algo-consensus-crypto",
+ "algo-types",
  "clap",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.5",
+ "tempfile",
 ]
 
 [[package]]

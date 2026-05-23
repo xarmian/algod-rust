@@ -6,6 +6,8 @@
 //! `keyreg`.
 
 mod cli;
+mod commands;
+mod common;
 
 use std::process::ExitCode;
 
@@ -16,9 +18,8 @@ use crate::cli::{Cli, Command, MultisigSub, PartSub};
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Generate(_) | Command::Import(_) | Command::Export(_) | Command::Sign(_) => {
-            not_implemented()
-        }
+        Command::Generate(args) => commands::generate::run(args),
+        Command::Import(_) | Command::Export(_) | Command::Sign(_) => not_implemented(),
         Command::Multisig(m) => match m.command {
             None => not_implemented(),
             Some(MultisigSub::AppendAuthAddr(_)) => not_implemented(),
