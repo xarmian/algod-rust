@@ -1370,35 +1370,50 @@ pub(crate) fn inspect_resource_blob(data: &[u8]) -> ResourceMeta {
         }
     }
 
-    // Augment with canonical `y` signals that legacy Rust encoders never
-    // wrote. Go's semantic interpretation of the `y` byte is bit-wise:
-    //   `(flags & NOT_HOLDING) == 0`  ⇒ row holds (HOLDING is the implicit default)
-    //   `(flags & OWNERSHIP)   != 0`  ⇒ row carries params (ownership)
-    // Concrete canonical values:
-    //   y == 0 (HOLDING)                — holding only (indistinguishable from missing y;
-    //                                     callers query by `ctype` so row existence is enough)
-    //   y == 1 (NOT_HOLDING)            — neither subset valid for this row (rare)
-    //   y == 2 (OWNERSHIP)              — ownership AND holding (creator's own row)
-    //   y == 3 (NOT_HOLDING|OWNERSHIP)  — ownership only (e.g. another account owning params)
-    //   y == 4 (EMPTY_ASSET)            — empty marker (no subsets valid)
-    //   y == 8 (EMPTY_APP)              — empty marker (no subsets valid)
+    // Layer raw_flags semantics on top of field-presence signals. We
+    // need to handle BOTH the legacy Rust bitmask
+    // (HOLDING=0x01, OWNERSHIP=0x04, written by pre-PLAN-189 encoders)
+    // AND Go's canonical bitwise enum
+    // (NOT_HOLDING=0x01, OWNERSHIP=0x02, EMPTY_ASSET=0x04, EMPTY_APP=0x08).
     //
-    // Legacy Rust encoders only wrote y ∈ {1, 4, 5}, so y ∈ {2, 3} is
-    // unambiguous canonical. For y=2 specifically, a creator's params
-    // row with default-valued holding (`l=0` and `m=false` both
-    // omitempty-dropped) encodes to just `{y:2}` — field presence alone
-    // would miss the implicit holding. We trust the canonical bit
-    // interpretation here.
+    // The legacy and canonical schemes assign opposite meaning to the
+    // same numeric `y` values; disambiguation per concrete value:
+    //
+    //   y == 0  (canonical HOLDING default; legacy "y omitted" sentinel)
+    //           → rely on field presence for has_holding.
+    //   y == 1  (legacy HOLDING bit; canonical NOT_HOLDING)
+    //           → prefer legacy: set has_holding. Default asset
+    //             opt-ins (amount=0, frozen=false) are common and
+    //             encode as just `{y:1}` under the legacy encoder.
+    //             Canonical NOT_HOLDING-alone is a degenerate state
+    //             that isn't produced in practice.
+    //   y == 2  (canonical OWNERSHIP, NOT_HOLDING bit clear)
+    //           → has_ownership + implicit has_holding (creator row).
+    //   y == 3  (canonical NOT_HOLDING|OWNERSHIP)
+    //           → has_ownership; clear has_holding.
+    //   y == 4  (legacy OWNERSHIP bit; canonical EMPTY_ASSET marker)
+    //           → set has_ownership. Empty markers are rare; the
+    //             legacy reading is the safe default for back-compat.
+    //   y == 5  (legacy HOLDING|OWNERSHIP)
+    //           → has_holding + has_ownership.
+    //   y == 8  (canonical EMPTY_APP marker)
+    //           → neither; field presence falls through.
+    //
+    // PLAN-189 / TASK-190.
     match meta.raw_flags {
+        1 => meta.has_holding = true,
         2 => {
-            // OWNERSHIP, NOT_HOLDING bit clear → ownership + implicit holding.
             meta.has_ownership = true;
             meta.has_holding = true;
         }
         3 => {
-            // NOT_HOLDING | OWNERSHIP → ownership only.
             meta.has_ownership = true;
             meta.has_holding = false;
+        }
+        4 => meta.has_ownership = true,
+        5 => {
+            meta.has_holding = true;
+            meta.has_ownership = true;
         }
         _ => {}
     }
@@ -5430,6 +5445,21 @@ mod tests {
         assert!(!meta.has_holding);
         assert!(!meta.has_ownership);
         assert_eq!(meta.raw_flags, 0);
+    }
+
+    #[test]
+    fn inspect_legacy_zero_balance_holding_row() {
+        // Pre-PLAN-189 encoder for a default asset opt-in
+        // (amount=0, frozen=false) writes only `{y:1}` because both
+        // value fields are omitempty-dropped. Field presence is
+        // empty, so raw_flags must be the sole has_holding signal.
+        let bytes = rmpv_map(&[("y", rmpv::Value::from(1u64))]);
+        let meta = inspect_resource_blob(&bytes);
+        assert!(
+            meta.has_holding,
+            "legacy y=1 alone must signal has_holding (zero-balance opt-in)"
+        );
+        assert!(!meta.has_ownership);
     }
 
     #[test]
