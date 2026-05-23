@@ -139,12 +139,14 @@ fn load_keyfile_or_mnemonic(
     match (keyfile, mnemonic) {
         (Some(_), Some(_)) => Err("Cannot specify both keyfile and mnemonic"),
         (Some(path), None) => {
+            // Mirror Go's loadKeyfile (common.go:65-75): read whatever
+            // bytes exist, then `copy(seed[:], bytes)` — which zero-
+            // pads short reads and truncates long ones. Matches
+            // existing `algokey export` loader behavior in this repo.
             let bytes = std::fs::read(path).map_err(|_| "Cannot read key seed from keyfile")?;
-            if bytes.len() < 32 {
-                return Err("Cannot read key seed from keyfile");
-            }
             let mut seed = [0u8; 32];
-            seed.copy_from_slice(&bytes[..32]);
+            let n = bytes.len().min(32);
+            seed[..n].copy_from_slice(&bytes[..n]);
             Ok(seed)
         }
         (None, Some(m)) => mnemonic_to_key(m).map_err(|_| "Cannot recover key seed from mnemonic"),
