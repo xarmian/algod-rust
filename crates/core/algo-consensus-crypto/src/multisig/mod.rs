@@ -127,19 +127,25 @@ pub fn multisig_sign(
     let _ = multisig_addr_gen(version, threshold, pks)?;
 
     let signer_pk: [u8; 32] = signer.verifying_key().to_bytes();
-    let key_idx = pks.iter().position(|pk| pk == &signer_pk);
-    let Some(key_idx) = key_idx else {
+    // Go's MultisigSign fills *every* subsig whose key matches the
+    // signer (multisig.go:172-176) — duplicates count. We mirror that
+    // exactly so that a duplicate-key preimage like 2-of-2 `[pk, pk]`
+    // produces two filled subsigs (matching Go), not one.
+    if !pks.iter().any(|pk| pk == &signer_pk) {
         return Err(Error::KeyNotExist);
-    };
+    }
 
     let signature = signer.sign(msg).to_bytes();
 
     let subsigs = pks
         .iter()
-        .enumerate()
-        .map(|(i, pk)| MultisigSubsig {
+        .map(|pk| MultisigSubsig {
             public_key: *pk,
-            signature: if i == key_idx { signature } else { [0u8; 64] },
+            signature: if pk == &signer_pk {
+                signature
+            } else {
+                [0u8; 64]
+            },
         })
         .collect();
 
@@ -422,5 +428,23 @@ mod tests {
         let (sk, pk) = fresh_signer();
         let msig = multisig_sign(b"hi", 1, 1, &[pk], &sk).unwrap();
         assert_eq!(msig.subsigs[0].signature.len(), 64);
+    }
+
+    /// Go-parity edge case (Codex round 1 finding): a preimage with
+    /// duplicate public keys fills every matching slot. A 2-of-2
+    /// `[pk, pk]` signed by `pk`'s holder must produce two filled
+    /// subsigs, matching Go's MultisigSign at multisig.go:172-176.
+    #[test]
+    fn sign_fills_every_matching_subsig_for_duplicate_keys() {
+        let (sk, pk) = fresh_signer();
+        // 2-of-2 with the same key in both slots.
+        let pks = [pk, pk];
+        let msig = multisig_sign(b"dup", 1, 2, &pks, &sk).unwrap();
+        assert_eq!(msig.subsigs.len(), 2);
+        assert_ne!(msig.subsigs[0].signature, [0u8; 64], "slot 0 must be filled");
+        assert_ne!(msig.subsigs[1].signature, [0u8; 64], "slot 1 must be filled");
+        // Both signatures should be identical (deterministic ed25519
+        // for the same key+msg).
+        assert_eq!(msig.subsigs[0].signature, msig.subsigs[1].signature);
     }
 }
