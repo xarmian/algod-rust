@@ -40,9 +40,10 @@ fn main() -> ExitCode {
                 println!();
                 ExitCode::SUCCESS
             }
-            Some(
-                PartSub::Generate(_) | PartSub::Info(_) | PartSub::Reparent(_) | PartSub::Keyreg(_),
-            ) => not_implemented(),
+            Some(PartSub::Keyreg(args)) => commands::keyreg::run(args),
+            Some(PartSub::Generate(_) | PartSub::Info(_) | PartSub::Reparent(_)) => {
+                not_implemented()
+            }
         },
     }
 }

@@ -206,6 +206,8 @@ fn fully_specified_subcommands_stub_to_not_implemented() {
         // unit tests in src/commands/multisig/sign.rs.
         // `multisig append-auth-addr` is no longer stubbed (TASK-169);
         // see src/commands/multisig/append_auth_addr.rs.
+        // `part keyreg` is no longer stubbed (TASK-170); see
+        // src/commands/keyreg.rs.
         &[
             "part",
             "generate",
@@ -218,14 +220,6 @@ fn fully_specified_subcommands_stub_to_not_implemented() {
         ],
         &["part", "info", "--keyfile", "/tmp/k"],
         &["part", "reparent", "--keyfile", "/tmp/k", "--parent", "A"],
-        &[
-            "part",
-            "keyreg",
-            "--firstvalid",
-            "1",
-            "--network",
-            "mainnet",
-        ],
     ];
     for argv in cases {
         let out = algokey().args(*argv).output().expect("run algokey-rust");
