@@ -1,31 +1,56 @@
-// canonical-extract: Extract canonical msgpack bytes from algod via the Go SDK.
+// canonical-extract: Extract canonical msgpack bytes from algod for
+// Rust conformance testing.
 //
-// Connects to a local algod node, fetches blocks as raw msgpack, extracts
-// transactions, and outputs canonical encoding for Rust conformance testing.
+// Two operating modes:
 //
-// Usage:
+//  1. -mode blocks (default): connect to a local algod node, fetch
+//     blocks as raw msgpack, and write per-block canonical fixtures
+//     (transaction, signed transaction, txid, header digest).
 //
+//  2. -mode trackerdb-blobs: open a Go-produced tracker SQLite file
+//     directly and dump every BLOB column (account / online-account /
+//     resource / online-round-params / txtail / state-proof) as a
+//     hex fixture, plus a `_meta.json` per type. PLAN-36 G8
+//     (TASK-119) — the byte corpus for the G8 canonical-encoder
+//     tasks (TASK-120..125).
+//
+// Examples:
+//
+//	# Blocks mode (existing behavior — default mode):
 //	go run . -algod-url http://localhost:4001 \
-//	  -algod-token aaaa...aa -rounds 1-5 \
-//	  -output-dir ../../crates/core/algo-codec/tests/fixtures/canonical
-
+//	    -algod-token aaaa...aa -rounds 1-5 \
+//	    -output-dir ../../../crates/core/algo-codec/tests/fixtures/canonical
+//
+//	# trackerdb-blobs mode (new):
+//	go run . -mode trackerdb-blobs \
+//	    -tracker-db /tmp/devnet.tracker.sqlite \
+//	    -output-dir ../../../crates/core/algo-codec/tests/fixtures/trackerdb \
+//	    -source-version v4.5.1-stable \
+//	    -source-prefix /algod/data/Node
 package main
 
 import (
 	"context"
 	"crypto/sha512"
+	"database/sql"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/algorand/go-algorand-sdk/v2/client/v2/algod"
 	"github.com/algorand/go-algorand-sdk/v2/encoding/msgpack"
 	"github.com/algorand/go-algorand-sdk/v2/types"
+
+	_ "modernc.org/sqlite"
 )
 
 // blockResponseRaw is a minimal block response that uses raw msgpack for
@@ -36,20 +61,55 @@ type blockResponseRaw struct {
 
 // blockRaw extracts only the payset from the block, ignoring unknown header fields.
 type blockRaw struct {
-	BlockHeader types.BlockHeader                  `codec:",inline"`
-	Payset      []types.SignedTxnInBlock           `codec:"txns,allocbound=100000"`
+	BlockHeader types.BlockHeader        `codec:",inline"`
+	Payset      []types.SignedTxnInBlock `codec:"txns,allocbound=100000"`
 }
 
 func main() {
-	algodURL := flag.String("algod-url", "http://localhost:4001", "algod REST API URL")
-	algodToken := flag.String("algod-token", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "algod API token")
-	rounds := flag.String("rounds", "1-5", "round range (e.g., 1-5)")
+	mode := flag.String("mode", "blocks", "extraction mode: 'blocks' or 'trackerdb-blobs'")
+
+	// Shared flag.
 	outputDir := flag.String("output-dir", ".", "output directory for canonical bytes")
+
+	// blocks-mode flags.
+	algodURL := flag.String("algod-url", "http://localhost:4001", "[blocks mode] algod REST API URL")
+	algodToken := flag.String("algod-token", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "[blocks mode] algod API token")
+	rounds := flag.String("rounds", "1-5", "[blocks mode] round range (e.g., 1-5)")
+
+	// trackerdb-blobs-mode flags.
+	trackerDB := flag.String("tracker-db", "", "[trackerdb-blobs mode] path to the Go-produced <prefix>.tracker.sqlite file")
+	sourceVersion := flag.String("source-version", "", "[trackerdb-blobs mode] go-algorand version that produced the DB (recorded in _meta.json)")
+	sourcePrefix := flag.String("source-prefix", "", "[trackerdb-blobs mode] original data-dir prefix that produced the DB (recorded in _meta.json)")
+
 	flag.Parse()
 
-	parts := strings.Split(*rounds, "-")
+	if err := os.MkdirAll(*outputDir, 0o755); err != nil {
+		log.Fatalf("mkdir %s: %v", *outputDir, err)
+	}
+
+	switch *mode {
+	case "blocks":
+		runBlocksMode(*algodURL, *algodToken, *rounds, *outputDir)
+	case "trackerdb-blobs":
+		if *trackerDB == "" {
+			log.Fatalf("-mode trackerdb-blobs requires -tracker-db <path>")
+		}
+		if err := runTrackerdbBlobsMode(*trackerDB, *outputDir, *sourceVersion, *sourcePrefix); err != nil {
+			log.Fatalf("trackerdb-blobs: %v", err)
+		}
+	default:
+		log.Fatalf("unknown -mode %q (expected 'blocks' or 'trackerdb-blobs')", *mode)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// blocks mode (pre-existing behavior, refactored into a single entry point)
+// ---------------------------------------------------------------------------
+
+func runBlocksMode(algodURL, algodToken, rounds, outputDir string) {
+	parts := strings.Split(rounds, "-")
 	if len(parts) != 2 {
-		log.Fatalf("invalid rounds format: %s (expected start-end)", *rounds)
+		log.Fatalf("invalid rounds format: %s (expected start-end)", rounds)
 	}
 	startRound, err := strconv.ParseUint(parts[0], 10, 64)
 	if err != nil {
@@ -60,11 +120,7 @@ func main() {
 		log.Fatalf("invalid end round: %v", err)
 	}
 
-	if err := os.MkdirAll(*outputDir, 0o755); err != nil {
-		log.Fatalf("mkdir %s: %v", *outputDir, err)
-	}
-
-	client, err := algod.MakeClient(*algodURL, *algodToken)
+	client, err := algod.MakeClient(algodURL, algodToken)
 	if err != nil {
 		log.Fatalf("failed to create algod client: %v", err)
 	}
@@ -93,7 +149,7 @@ func main() {
 			// Canonical encode of the inner Transaction (used for txn ID)
 			txnBytes := msgpack.Encode(&stxn.Txn)
 			txnHex := hex.EncodeToString(txnBytes)
-			txnFile := filepath.Join(*outputDir, fmt.Sprintf("block_%d_txn_%d.canonical.hex", round, i))
+			txnFile := filepath.Join(outputDir, fmt.Sprintf("block_%d_txn_%d.canonical.hex", round, i))
 			if err := os.WriteFile(txnFile, []byte(txnHex+"\n"), 0o644); err != nil {
 				log.Fatalf("write %s: %v", txnFile, err)
 			}
@@ -101,7 +157,7 @@ func main() {
 
 			// Compute transaction ID: SHA512/256("TX" || canonical_bytes)
 			txnID := hashWithPrefix([]byte("TX"), txnBytes)
-			txnIDFile := filepath.Join(*outputDir, fmt.Sprintf("block_%d_txn_%d.txid.hex", round, i))
+			txnIDFile := filepath.Join(outputDir, fmt.Sprintf("block_%d_txn_%d.txid.hex", round, i))
 			if err := os.WriteFile(txnIDFile, []byte(hex.EncodeToString(txnID[:])+"\n"), 0o644); err != nil {
 				log.Fatalf("write %s: %v", txnIDFile, err)
 			}
@@ -110,7 +166,7 @@ func main() {
 			// Canonical encode of the SignedTxn
 			stxnBytes := msgpack.Encode(&stxn)
 			stxnHex := hex.EncodeToString(stxnBytes)
-			stxnFile := filepath.Join(*outputDir, fmt.Sprintf("block_%d_stxn_%d.canonical.hex", round, i))
+			stxnFile := filepath.Join(outputDir, fmt.Sprintf("block_%d_stxn_%d.canonical.hex", round, i))
 			if err := os.WriteFile(stxnFile, []byte(stxnHex+"\n"), 0o644); err != nil {
 				log.Fatalf("write %s: %v", stxnFile, err)
 			}
@@ -130,7 +186,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("failed to extract prev hash from block %d: %v", round+1, err)
 		}
-		digestFile := filepath.Join(*outputDir, fmt.Sprintf("block_%d.digest.hex", round))
+		digestFile := filepath.Join(outputDir, fmt.Sprintf("block_%d.digest.hex", round))
 		if err := os.WriteFile(digestFile, []byte(hex.EncodeToString(prevHash)+"\n"), 0o644); err != nil {
 			log.Fatalf("write %s: %v", digestFile, err)
 		}
@@ -213,4 +269,317 @@ func extractPayset(blockBytes []byte, payset *[]types.SignedTxnInBlock) error {
 	// Re-encode just the txns array and decode into typed slice
 	txnsBytes := msgpack.Encode(txnsRaw)
 	return msgpack.Decode(txnsBytes, payset)
+}
+
+// ---------------------------------------------------------------------------
+// trackerdb-blobs mode (PLAN-36 TASK-119)
+// ---------------------------------------------------------------------------
+
+// blobMeta is the schema for every `<type>/_meta.json` sibling file.
+//
+// Fields are intentionally flat so this stays diffable as the corpus
+// regenerates round-to-round; only counts + provenance change.
+type blobMeta struct {
+	Type            string `json:"type"`
+	SourceVersion   string `json:"source_go_algorand_version,omitempty"`
+	SourcePrefix    string `json:"source_data_dir_prefix,omitempty"`
+	SourceDB        string `json:"source_tracker_db"`
+	CapturedAtUTC   string `json:"captured_at_utc"`
+	RowCount        int    `json:"row_count"`
+	HighestRound    *int64 `json:"highest_round,omitempty"`
+	Notes           string `json:"notes,omitempty"`
+}
+
+func runTrackerdbBlobsMode(trackerDB, outputDir, sourceVersion, sourcePrefix string) error {
+	abs, err := filepath.Abs(trackerDB)
+	if err != nil {
+		return fmt.Errorf("resolve tracker-db path: %w", err)
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return fmt.Errorf("tracker-db not accessible: %w", err)
+	}
+
+	// Open read-only. Use the modernc.org/sqlite driver's URI form so
+	// `mode=ro` is honored — we never want this tool to mutate a
+	// captured DB.
+	dsn := fmt.Sprintf("file:%s?mode=ro&immutable=1", abs)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return fmt.Errorf("open sqlite: %w", err)
+	}
+	defer db.Close()
+	if err := db.Ping(); err != nil {
+		return fmt.Errorf("ping sqlite: %w", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	fmt.Printf("=== trackerdb-blobs: %s ===\n", abs)
+
+	if err := dumpAccountbase(db, outputDir, sourceVersion, sourcePrefix, abs, now); err != nil {
+		return fmt.Errorf("accountbase: %w", err)
+	}
+	if err := dumpOnlineAccounts(db, outputDir, sourceVersion, sourcePrefix, abs, now); err != nil {
+		return fmt.Errorf("onlineaccounts: %w", err)
+	}
+	if err := dumpResources(db, outputDir, sourceVersion, sourcePrefix, abs, now); err != nil {
+		return fmt.Errorf("resources: %w", err)
+	}
+	if err := dumpOnlineRoundParams(db, outputDir, sourceVersion, sourcePrefix, abs, now); err != nil {
+		return fmt.Errorf("onlineroundparamstail: %w", err)
+	}
+	if err := dumpTxTail(db, outputDir, sourceVersion, sourcePrefix, abs, now); err != nil {
+		return fmt.Errorf("txtail: %w", err)
+	}
+	if err := dumpStateProofVerification(db, outputDir, sourceVersion, sourcePrefix, abs, now); err != nil {
+		return fmt.Errorf("stateproofverification: %w", err)
+	}
+
+	fmt.Println("\nDone. Trackerdb BLOB fixtures written.")
+	return nil
+}
+
+// writeBlob writes `data` (hex-encoded, trailing newline matching the
+// existing canonical/*.hex convention) to <dir>/<basename>.canonical.hex.
+func writeBlob(dir, basename string, data []byte) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, basename+".canonical.hex")
+	return os.WriteFile(path, []byte(hex.EncodeToString(data)+"\n"), 0o644)
+}
+
+// writeMeta writes a `_meta.json` sibling describing the just-written
+// fixture set. Pretty-printed for readable diffs.
+func writeMeta(dir string, m blobMeta) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	body, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	body = append(body, '\n')
+	return os.WriteFile(filepath.Join(dir, "_meta.json"), body, 0o644)
+}
+
+// dumpAccountbase walks `accountbase(address, data)` and writes
+// `baseaccountdata/<addrhex>.canonical.hex` per row.
+func dumpAccountbase(db *sql.DB, outputDir, ver, prefix, src, now string) error {
+	dir := filepath.Join(outputDir, "baseaccountdata")
+	rows, err := db.Query(`SELECT address, data FROM accountbase`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		var addr, data []byte
+		if err := rows.Scan(&addr, &data); err != nil {
+			return err
+		}
+		if len(data) == 0 {
+			continue
+		}
+		if err := writeBlob(dir, hex.EncodeToString(addr), data); err != nil {
+			return err
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	fmt.Printf("  baseaccountdata: %d rows\n", count)
+	return writeMeta(dir, blobMeta{
+		Type:          "baseaccountdata",
+		SourceVersion: ver, SourcePrefix: prefix, SourceDB: src,
+		CapturedAtUTC: now, RowCount: count,
+		Notes: "One file per accountbase row; basename is the lowercase-hex 32-byte address.",
+	})
+}
+
+// dumpOnlineAccounts walks `onlineaccounts(address, updround, data)`.
+func dumpOnlineAccounts(db *sql.DB, outputDir, ver, prefix, src, now string) error {
+	dir := filepath.Join(outputDir, "baseonlineaccountdata")
+	rows, err := db.Query(`SELECT address, updround, data FROM onlineaccounts`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	count := 0
+	var highest int64
+	for rows.Next() {
+		var addr, data []byte
+		var updround int64
+		if err := rows.Scan(&addr, &updround, &data); err != nil {
+			return err
+		}
+		if len(data) == 0 {
+			continue
+		}
+		name := fmt.Sprintf("%s_%d", hex.EncodeToString(addr), updround)
+		if err := writeBlob(dir, name, data); err != nil {
+			return err
+		}
+		if updround > highest {
+			highest = updround
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	fmt.Printf("  baseonlineaccountdata: %d rows (highest updround %d)\n", count, highest)
+	m := blobMeta{
+		Type:          "baseonlineaccountdata",
+		SourceVersion: ver, SourcePrefix: prefix, SourceDB: src,
+		CapturedAtUTC: now, RowCount: count,
+		Notes: "Basename: <addrhex>_<updround>. Multiple rows per address are normal — onlineaccounts tracks history.",
+	}
+	if count > 0 {
+		m.HighestRound = &highest
+	}
+	return writeMeta(dir, m)
+}
+
+// dumpResources walks `resources(addrid, aidx, ctype, data)` joined with
+// `accountbase` so the output uses addresses (not rowids) as keys.
+//
+// ctype may be missing on very old DBs that haven't run the
+// `ALTER TABLE resources ADD COLUMN ctype INTEGER NOT NULL DEFAULT -1`
+// migration (see `../go-algorand/ledger/store/trackerdb/sqlitedriver/schema.go`
+// line ~970). We refuse to dump in that case so a downstream encoder
+// task doesn't silently key fixtures by a stale `-1` sentinel.
+func dumpResources(db *sql.DB, outputDir, ver, prefix, src, now string) error {
+	dir := filepath.Join(outputDir, "resourcesdata")
+
+	if !hasColumn(db, "resources", "ctype") {
+		return errors.New("resources table missing `ctype` column; run a recent go-algorand binary that applies the resources-ctype migration before capturing")
+	}
+
+	rows, err := db.Query(`
+		SELECT a.address, r.aidx, r.ctype, r.data
+		FROM resources r
+		JOIN accountbase a ON a.rowid = r.addrid`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		var addr, data []byte
+		var aidx, ctype int64
+		if err := rows.Scan(&addr, &aidx, &ctype, &data); err != nil {
+			return err
+		}
+		if len(data) == 0 {
+			continue
+		}
+		name := fmt.Sprintf("%s_%d_%d", hex.EncodeToString(addr), aidx, ctype)
+		if err := writeBlob(dir, name, data); err != nil {
+			return err
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	fmt.Printf("  resourcesdata: %d rows\n", count)
+	return writeMeta(dir, blobMeta{
+		Type:          "resourcesdata",
+		SourceVersion: ver, SourcePrefix: prefix, SourceDB: src,
+		CapturedAtUTC: now, RowCount: count,
+		Notes: "Basename: <addrhex>_<aidx>_<ctype>. ctype 0=Asset, 1=App per go-algorand basics/teal.",
+	})
+}
+
+// dumpOnlineRoundParams walks `onlineroundparamstail(rnd, data)`.
+func dumpOnlineRoundParams(db *sql.DB, outputDir, ver, prefix, src, now string) error {
+	dir := filepath.Join(outputDir, "onlineroundparams")
+	return dumpRoundKeyed(db, dir, ver, prefix, src, now,
+		"onlineroundparams",
+		`SELECT rnd, data FROM onlineroundparamstail`,
+		"Basename: <round>. One row per round in the rolling param window.")
+}
+
+// dumpTxTail walks `txtail(rnd, data)`.
+func dumpTxTail(db *sql.DB, outputDir, ver, prefix, src, now string) error {
+	dir := filepath.Join(outputDir, "txtailround")
+	return dumpRoundKeyed(db, dir, ver, prefix, src, now,
+		"txtailround",
+		`SELECT rnd, data FROM txtail`,
+		"Basename: <round>. msgp-encoded TxTailRound per round.")
+}
+
+// dumpStateProofVerification walks `stateproofverification(lastattestedround, verificationcontext)`.
+//
+// State-proof rows only exist on networks that have actually produced
+// state proofs — a fresh localnet won't have any. We tolerate an
+// empty table and record the fact in `_meta.json` so a downstream
+// encoder test can skip gracefully.
+func dumpStateProofVerification(db *sql.DB, outputDir, ver, prefix, src, now string) error {
+	dir := filepath.Join(outputDir, "stateproof")
+	return dumpRoundKeyed(db, dir, ver, prefix, src, now,
+		"stateproof",
+		`SELECT lastattestedround, verificationcontext FROM stateproofverification`,
+		"Basename: <lastattestedround>. May be empty on networks that haven't produced state proofs.")
+}
+
+// dumpRoundKeyed is the shared `SELECT rnd, blob FROM ...` walker used
+// by the four `<round>.canonical.hex` types.
+func dumpRoundKeyed(db *sql.DB, dir, ver, prefix, src, now, typ, query, notes string) error {
+	rows, err := db.Query(query)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	count := 0
+	var rounds []int64
+	for rows.Next() {
+		var rnd int64
+		var data []byte
+		if err := rows.Scan(&rnd, &data); err != nil {
+			return err
+		}
+		if len(data) == 0 {
+			continue
+		}
+		if err := writeBlob(dir, strconv.FormatInt(rnd, 10), data); err != nil {
+			return err
+		}
+		rounds = append(rounds, rnd)
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	m := blobMeta{
+		Type:          typ,
+		SourceVersion: ver, SourcePrefix: prefix, SourceDB: src,
+		CapturedAtUTC: now, RowCount: count, Notes: notes,
+	}
+	if count > 0 {
+		sort.Slice(rounds, func(i, j int) bool { return rounds[i] < rounds[j] })
+		highest := rounds[len(rounds)-1]
+		m.HighestRound = &highest
+	}
+	fmt.Printf("  %s: %d rows\n", typ, count)
+	return writeMeta(dir, m)
+}
+
+// hasColumn returns whether `table` carries a `column` named exactly
+// `col`. Used to gate migration-dependent dumps so the tool returns a
+// clear error instead of a SQL "no such column" on stale DBs.
+func hasColumn(db *sql.DB, table, col string) bool {
+	row := db.QueryRow(`SELECT 1 FROM pragma_table_info(?) WHERE name = ?`, table, col)
+	var x int
+	if err := row.Scan(&x); err != nil {
+		return false
+	}
+	return x == 1
 }

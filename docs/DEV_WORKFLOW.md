@@ -211,6 +211,51 @@ Output files per block:
 - `block_N_stxn_I.canonical.hex` — Canonical encoded signed transaction
 - `block_N.digest.hex` — Block digest (from block N+1's `prev` field)
 
+### Trackerdb BLOB fixtures (PLAN-36 G8 / TASK-119)
+
+The same tool, under `-mode trackerdb-blobs`, opens a Go-produced
+`<prefix>.tracker.sqlite` directly and dumps every BLOB column as a hex
+fixture — the byte corpus for the G8 canonical-encoder tasks
+(`BaseAccountData`, `BaseOnlineAccountData`, `ResourcesData`,
+`OnlineRoundParamsData`, `TxTailRound`, `StateProofVerificationContext`).
+
+Run the full pipeline against a running localnet:
+
+```bash
+# Bring up localnet + push enough txns to populate the trackerdb tables.
+make fixtures-diverse
+
+# Copy the Go-produced tracker DB out of the algod-go container, then
+# dump every BLOB row to <repo>/crates/core/algo-codec/tests/fixtures/trackerdb/.
+make extract-trackerdb-fixtures
+```
+
+Output layout (one subdirectory per BLOB type, each containing one
+`.canonical.hex` per row plus a `_meta.json` recording the source
+go-algorand version, source data-dir prefix, capture timestamp, and
+highest round seen):
+
+- `trackerdb/baseaccountdata/<addrhex>.canonical.hex` (from `accountbase.data`)
+- `trackerdb/baseonlineaccountdata/<addrhex>_<updround>.canonical.hex` (from `onlineaccounts.data`)
+- `trackerdb/resourcesdata/<addrhex>_<aidx>_<ctype>.canonical.hex` (from `resources.data` joined with `accountbase.address`)
+- `trackerdb/onlineroundparams/<round>.canonical.hex` (from `onlineroundparamstail.data`)
+- `trackerdb/txtailround/<round>.canonical.hex` (from `txtail.data`)
+- `trackerdb/stateproof/<round>.canonical.hex` (from `stateproofverification.verificationcontext`)
+
+**Caveat:** `stateproof/` is typically empty on a fresh localnet — state-proof rows only land after enough rounds with `EnableStateProof=true`. The
+`_meta.json` records `row_count: 0` in that case so a downstream encoder
+test can skip gracefully. Run the localnet longer (≥256 rounds with
+state-proof participation enabled) or capture from a long-running testnet
+node to get coverage for that type.
+
+Overrides for the Make target:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TRACKERDB_CONTAINER` | `algod-go` | docker-compose service name shipping the DB |
+| `TRACKERDB_CONTAINER_PATH` | `/algod/data/Node/ledger.tracker.sqlite` | in-container path |
+| `TRACKERDB_LOCAL_COPY` | `/tmp/algod-rust-extract.tracker.sqlite` | host-side scratch copy |
+
 ## V13 Opcode Vector Regeneration
 
 TEAL v13 opcodes (`sumhash512` 0x86, `sha512` 0x87) are tested against fixture

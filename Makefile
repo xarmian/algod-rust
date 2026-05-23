@@ -13,6 +13,7 @@ PHASE6_CLUSTER := ops/mixed-cluster
 .PHONY: localnet-up localnet-down localnet-status localnet-logs
 .PHONY: capture validate validate-only generate-txns fixtures help
 .PHONY: generate-diverse-txns fixtures-diverse
+.PHONY: canonical-extract extract-trackerdb-fixtures
 .PHONY: relay-up relay-down relay-test
 .PHONY: mixed-cluster-up mixed-cluster-down mixed-cluster-smoke mixed-cluster-test mixed-cluster-conformance
 .PHONY: phase6-cluster-up phase6-cluster-down phase6-cluster-status
@@ -137,6 +138,44 @@ canonical-extract:
 		-algod-token $(ALGOD_TOKEN) \
 		-rounds $(CANONICAL_ROUNDS) \
 		-output-dir ../../../crates/core/algo-codec/tests/fixtures/canonical
+
+## ── Trackerdb BLOB fixture capture (PLAN-36 G8 / TASK-119) ───
+##
+## Copies the Go-produced tracker SQLite out of the running localnet
+## container and dumps every BLOB column as a hex fixture under
+## `crates/core/algo-codec/tests/fixtures/trackerdb/<type>/`. Each
+## type-subdirectory also gets a `_meta.json` recording provenance
+## (go-algorand version, source data-dir prefix, capture timestamp,
+## highest round seen).
+##
+## Prerequisites: localnet must have advanced far enough that the
+## trackerdb tables are populated — `make fixtures-diverse` (default
+## ~20 rounds) is sufficient for everything except `stateproof/`,
+## which requires state-proof participation (typically ≥256 rounds
+## with `EnableStateProof=true`).
+
+# Algod container that ships the tracker DB (matches docker-compose service
+# name in `docker/docker-compose.yml`).
+TRACKERDB_CONTAINER ?= algod-go
+# In-container path to the network's data dir. `Node` is the default
+# devnet network name for the algorand/algod image; override if the
+# container layout changes.
+TRACKERDB_CONTAINER_PATH ?= /algod/data/Node/ledger.tracker.sqlite
+# Local scratch copy. `make clean` does not touch this; remove
+# manually after a regen run if you want to redo the export.
+TRACKERDB_LOCAL_COPY ?= /tmp/algod-rust-extract.tracker.sqlite
+
+extract-trackerdb-fixtures:
+	@echo "==> Copying tracker DB from container $(TRACKERDB_CONTAINER):$(TRACKERDB_CONTAINER_PATH) ..."
+	@docker cp $(TRACKERDB_CONTAINER):$(TRACKERDB_CONTAINER_PATH) $(TRACKERDB_LOCAL_COPY)
+	@echo "==> Dumping trackerdb BLOBs ..."
+	cd docker/scripts/canonical-extract && go run . \
+		-mode trackerdb-blobs \
+		-tracker-db $(TRACKERDB_LOCAL_COPY) \
+		-output-dir ../../../crates/core/algo-codec/tests/fixtures/trackerdb \
+		-source-version $$(cd ../../../../go-algorand && git describe --always --dirty 2>/dev/null || echo unknown) \
+		-source-prefix $(TRACKERDB_CONTAINER_PATH)
+	@echo "==> Trackerdb BLOB fixtures regenerated under crates/core/algo-codec/tests/fixtures/trackerdb/"
 
 ## ── Conformance Tools ─────────────────────────────────────────
 
@@ -419,7 +458,10 @@ help:
 	@echo "  make fixtures-diverse       Fixture regeneration with all txn types"
 	@echo "                              (localnet-up + diverse txns + capture + extract)"
 	@echo "  make capture          Capture block fixtures from algod"
-	@echo "  make canonical-extract  Run Go tool to extract reference bytes"
+	@echo "  make canonical-extract       Run Go tool to extract reference bytes"
+	@echo "  make extract-trackerdb-fixtures"
+	@echo "                              Dump trackerdb BLOBs as hex fixtures"
+	@echo "                              (PLAN-36 G8; requires running localnet)"
 	@echo ""
 	@echo "Conformance:"
 	@echo "  make validate         End-to-end: build + localnet + txns + validate"
