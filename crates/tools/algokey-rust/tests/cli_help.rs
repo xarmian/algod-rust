@@ -202,7 +202,8 @@ fn fully_specified_subcommands_stub_to_not_implemented() {
         // tests/export_smoke.rs.
         // `sign` is no longer stubbed (TASK-167); it has its own unit
         // tests in src/commands/sign.rs.
-        &["multisig", "-t", "/tmp/in", "-o", "/tmp/out"],
+        // `multisig` is no longer stubbed (TASK-168); its sign body has
+        // unit tests in src/commands/multisig/sign.rs.
         &[
             "multisig",
             "append-auth-addr",

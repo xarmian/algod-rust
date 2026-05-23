@@ -23,8 +23,10 @@ fn main() -> ExitCode {
         Command::Export(args) => commands::export::run(args),
         Command::Sign(args) => commands::sign::run(args),
         Command::Multisig(m) => match m.command {
-            None => not_implemented(),
-            Some(MultisigSub::AppendAuthAddr(_)) => not_implemented(),
+            None => commands::multisig::sign::run(m),
+            Some(MultisigSub::AppendAuthAddr(args)) => {
+                commands::multisig::append_auth_addr::run(args)
+            }
         },
         Command::Part(p) => match p.command {
             // Go's `partCmd.Run` (part.go:43-46) prints help when `part`

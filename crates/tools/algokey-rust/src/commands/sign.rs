@@ -30,7 +30,7 @@ use crate::common::{write_with_mode_0600, Seed};
 /// Domain separator prepended to canonical transaction bytes before
 /// ed25519-signing. Matches Go's `protocol.HashID("TX")` for
 /// `transactions.Transaction` (used by `crypto.SignatureSecrets.Sign`).
-const TX_PREFIX: &[u8] = b"TX";
+pub(crate) const TX_PREFIX: &[u8] = b"TX";
 
 pub fn run(args: SignArgs) -> ExitCode {
     run_with_io(args, &mut std::io::stdout(), &mut std::io::stderr())
@@ -121,7 +121,7 @@ fn sign_one(
 /// decoded value plus how many input bytes it consumed. Uses a Cursor
 /// so we can observe the post-decode position (rmp_serde's bare
 /// `Deserializer<&[u8]>` doesn't expose one).
-fn decode_one_signed_txn(buf: &[u8]) -> Result<(SignedTransaction, usize), String> {
+pub(crate) fn decode_one_signed_txn(buf: &[u8]) -> Result<(SignedTransaction, usize), String> {
     let cursor = std::io::Cursor::new(buf);
     let mut de = rmp_serde::Deserializer::new(cursor);
     let stxn: SignedTransaction =
@@ -132,7 +132,7 @@ fn decode_one_signed_txn(buf: &[u8]) -> Result<(SignedTransaction, usize), Strin
 
 /// Mirrors `loadKeyfileOrMnemonic` (common.go:33-51): exactly one of
 /// `keyfile` / `mnemonic` must be given; both → error, neither → error.
-fn load_keyfile_or_mnemonic(
+pub(crate) fn load_keyfile_or_mnemonic(
     keyfile: Option<&Path>,
     mnemonic: Option<&str>,
 ) -> Result<Seed, &'static str> {
