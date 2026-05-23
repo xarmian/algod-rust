@@ -791,6 +791,111 @@ pub fn canonical_encode_base_account_data(acct: &AccountData) -> Vec<u8> {
     m.encode()
 }
 
+/// Mirror of go-algorand's `trackerdb.BaseOnlineAccountData`
+/// (`../go-algorand/ledger/store/trackerdb/data.go:153` @ `v4.5.1-stable`).
+///
+/// Holds the BLOB shape stored in `onlineaccounts.data`: the embedded
+/// `BaseVotingData` (codec tags `A`..`F`) followed by five
+/// online-specific fields (`V`..`Z`). Lives in `algo-codec` (rather
+/// than `algo-types`) because no Rust runtime call site composes one
+/// today — the runtime reads onlineaccounts rows produced by Go's
+/// writer or by catchpoint import, and the Go-mirroring
+/// `CatchpointBaseOnlineAccountData` (in `algo-ledger::catchpoint`)
+/// owns the decode side. PLAN-36 G8 (TASK-121).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BaseOnlineAccountData {
+    // ── Embedded `BaseVotingData` (codec A-F) ──────────────────
+    /// One-time signature verifier key (32 bytes). Codec: `A`.
+    pub vote_id: [u8; 32],
+    /// VRF verifier key (32 bytes). Codec: `B`.
+    pub selection_id: [u8; 32],
+    /// Vote first valid round. Codec: `C`.
+    pub vote_first_valid: u64,
+    /// Vote last valid round. Codec: `D`.
+    pub vote_last_valid: u64,
+    /// Vote key dilution. Codec: `E`.
+    pub vote_key_dilution: u64,
+    /// State proof / Merkle signature commitment (64 bytes). Codec: `F`.
+    pub state_proof_id: [u8; 64],
+
+    // ── Online-specific (codec V-Z) ────────────────────────────
+    /// Round at which this account last proposed a block. Codec: `V`.
+    pub last_proposed: u64,
+    /// Round at which this account last sent a heartbeat. Codec: `W`.
+    pub last_heartbeat: u64,
+    /// V40+ incentive eligibility. Codec: `X`.
+    pub incentive_eligible: bool,
+    /// MicroAlgos balance. Codec: `Y`.
+    pub micro_algos: u64,
+    /// Rewards base. Codec: `Z`.
+    pub rewards_base: u64,
+}
+
+impl Default for BaseOnlineAccountData {
+    fn default() -> Self {
+        Self {
+            vote_id: [0u8; 32],
+            selection_id: [0u8; 32],
+            vote_first_valid: 0,
+            vote_last_valid: 0,
+            vote_key_dilution: 0,
+            state_proof_id: [0u8; 64],
+            last_proposed: 0,
+            last_heartbeat: 0,
+            incentive_eligible: false,
+            micro_algos: 0,
+            rewards_base: 0,
+        }
+    }
+}
+
+/// Canonically encode the Go `trackerdb.BaseOnlineAccountData` struct.
+///
+/// Mirrors go-algorand's generated `BaseOnlineAccountData.MarshalMsg`
+/// (`../go-algorand/ledger/store/trackerdb/msgp_gen.go:748` @
+/// `v4.5.1-stable`). Field set + codec tags + omitempty semantics
+/// stay bit-identical to Go because these bytes land in the
+/// `onlineaccounts.data` BLOB column that both implementations read.
+///
+/// Tag layout (lex-sorted by raw bytes — uppercase ASCII):
+///
+/// | Tag | Field |
+/// | --- | --- |
+/// | `A` | `vote_id` (32B)            |
+/// | `B` | `selection_id` (32B)       |
+/// | `C` | `vote_first_valid`         |
+/// | `D` | `vote_last_valid`          |
+/// | `E` | `vote_key_dilution`        |
+/// | `F` | `state_proof_id` (64B)     |
+/// | `V` | `last_proposed`            |
+/// | `W` | `last_heartbeat`           |
+/// | `X` | `incentive_eligible`       |
+/// | `Y` | `micro_algos`              |
+/// | `Z` | `rewards_base`             |
+///
+/// PLAN-36 G8 (TASK-121).
+pub fn canonical_encode_base_online_account_data(d: &BaseOnlineAccountData) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    // BaseVotingData (A-F). `add_bytes` mirrors Go's
+    // omitempty-on-all-zeros for fixed-size [N]byte fields.
+    m.add_bytes("A", &d.vote_id);
+    m.add_bytes("B", &d.selection_id);
+    m.add_u64("C", d.vote_first_valid);
+    m.add_u64("D", d.vote_last_valid);
+    m.add_u64("E", d.vote_key_dilution);
+    m.add_bytes("F", &d.state_proof_id);
+
+    // Online-specific (V-Z).
+    m.add_u64("V", d.last_proposed);
+    m.add_u64("W", d.last_heartbeat);
+    m.add_bool("X", d.incentive_eligible);
+    m.add_u64("Y", d.micro_algos);
+    m.add_u64("Z", d.rewards_base);
+
+    m.encode()
+}
+
 /// Canonically encode AssetParams as a nested msgpack map.
 pub fn canonical_encode_asset_params(apar: &AssetParams) -> Vec<u8> {
     let mut m = CanonicalMap::new();

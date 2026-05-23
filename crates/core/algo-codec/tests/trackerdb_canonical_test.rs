@@ -20,7 +20,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use algo_codec::canonical_encode_base_account_data;
+use algo_codec::{
+    canonical_encode_base_account_data, canonical_encode_base_online_account_data,
+    BaseOnlineAccountData,
+};
 use algo_types::{AccountData, AccountStatus, Address};
 
 /// Root of the trackerdb fixture corpus, relative to the crate manifest.
@@ -104,6 +107,96 @@ fn base_account_data_round_trip_via_value() {
             .unwrap_or_else(|e| panic!("re-decode after encode baseaccountdata/{name}: {e}"));
         assert_eq!(first, second, "round-trip drift on baseaccountdata/{name}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// BaseOnlineAccountData byte-exact + round-trip (PLAN-36 G8 / TASK-121)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn base_online_account_data_byte_exact_against_go_fixtures() {
+    let dir = fixtures_root().join("baseonlineaccountdata");
+    let fixtures = load_canonical_hex_dir(&dir);
+    if fixtures.is_empty() {
+        eprintln!(
+            "SKIPPED: no baseonlineaccountdata fixtures at {}. \
+             Run `make extract-trackerdb-fixtures` against a populated localnet to generate them.",
+            dir.display()
+        );
+        return;
+    }
+
+    let mut checked = 0;
+    for (name, expected) in &fixtures {
+        let decoded = decode_base_online_account_data_value(expected)
+            .unwrap_or_else(|e| panic!("decode baseonlineaccountdata/{name}.canonical.hex: {e}"));
+        let actual = canonical_encode_base_online_account_data(&decoded);
+        assert_eq!(
+            hex::encode(&actual),
+            hex::encode(expected),
+            "byte-exact mismatch for baseonlineaccountdata/{name}.canonical.hex"
+        );
+        checked += 1;
+    }
+    println!("baseonlineaccountdata: {checked} fixtures byte-exact ✓");
+}
+
+#[test]
+fn base_online_account_data_round_trip_via_value() {
+    let dir = fixtures_root().join("baseonlineaccountdata");
+    let fixtures = load_canonical_hex_dir(&dir);
+    if fixtures.is_empty() {
+        eprintln!(
+            "SKIPPED: no baseonlineaccountdata fixtures at {}.",
+            dir.display()
+        );
+        return;
+    }
+
+    for (name, raw) in &fixtures {
+        let first = decode_base_online_account_data_value(raw)
+            .unwrap_or_else(|e| panic!("decode baseonlineaccountdata/{name}.canonical.hex: {e}"));
+        let encoded = canonical_encode_base_online_account_data(&first);
+        let second = decode_base_online_account_data_value(&encoded)
+            .unwrap_or_else(|e| panic!("re-decode after encode baseonlineaccountdata/{name}: {e}"));
+        assert_eq!(
+            first, second,
+            "round-trip drift on baseonlineaccountdata/{name}"
+        );
+    }
+}
+
+/// Minimal rmpv-walker for trackerdb `BaseOnlineAccountData`. Only used
+/// to decode fixtures back into a struct so the round-trip + byte-exact
+/// tests can re-encode them; the production decoder for this BLOB
+/// lives in `algo_ledger::catchpoint::msgp_compat` (out of scope here).
+fn decode_base_online_account_data_value(data: &[u8]) -> Result<BaseOnlineAccountData, String> {
+    let val: rmpv::Value =
+        rmpv::decode::read_value(&mut &data[..]).map_err(|e| format!("rmpv decode: {e}"))?;
+    let pairs = match val {
+        rmpv::Value::Map(m) => m,
+        other => return Err(format!("expected msgpack map, got {other:?}")),
+    };
+
+    let mut d = BaseOnlineAccountData::default();
+    for (k, v) in pairs {
+        let key = k.as_str().ok_or_else(|| format!("non-string key: {k:?}"))?;
+        match key {
+            "A" => d.vote_id = as_array32(&v)?,
+            "B" => d.selection_id = as_array32(&v)?,
+            "C" => d.vote_first_valid = as_u64(&v),
+            "D" => d.vote_last_valid = as_u64(&v),
+            "E" => d.vote_key_dilution = as_u64(&v),
+            "F" => d.state_proof_id = as_array64(&v)?,
+            "V" => d.last_proposed = as_u64(&v),
+            "W" => d.last_heartbeat = as_u64(&v),
+            "X" => d.incentive_eligible = v.as_bool().unwrap_or(false),
+            "Y" => d.micro_algos = as_u64(&v),
+            "Z" => d.rewards_base = as_u64(&v),
+            other => return Err(format!("unexpected BaseOnlineAccountData tag {other:?}")),
+        }
+    }
+    Ok(d)
 }
 
 // ---------------------------------------------------------------------------
