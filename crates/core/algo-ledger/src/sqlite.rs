@@ -515,13 +515,52 @@ fn migrate_resources_to_canonical(conn: &Connection) -> rusqlite::Result<()> {
     }
 }
 
+/// Metadata fields preserved across canonical re-encoding: `z` (update_round),
+/// `A` (version), `B` (size_sponsor). Returned as a single struct so
+/// every migration call site picks them all up consistently. PLAN-189
+/// / TASK-195 (Codex review round 1).
+#[derive(Debug, Default, Clone, Copy)]
+struct ResourceMetadataFields {
+    update_round: u64,
+    version: u64,
+    size_sponsor: [u8; 32],
+}
+
+fn extract_resource_metadata_fields(data: &[u8]) -> ResourceMetadataFields {
+    let mut m = ResourceMetadataFields::default();
+    let Ok(val) = rmpv::decode::read_value(&mut &data[..]) else {
+        return m;
+    };
+    let rmpv::Value::Map(pairs) = val else {
+        return m;
+    };
+    for (k, v) in pairs {
+        match k.as_str().unwrap_or("") {
+            "z" => m.update_round = v.as_u64().unwrap_or(0),
+            "A" => m.version = v.as_u64().unwrap_or(0),
+            "B" => {
+                if let Some(slice) = v.as_slice() {
+                    if slice.len() == 32 {
+                        m.size_sponsor.copy_from_slice(slice);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    m
+}
+
 /// Decode a single `resources.data` blob and re-encode it via the
 /// canonical builders. Returns `None` if the blob is unrecognizable
 /// (in which case the migrator skips it without rewriting). The
 /// chosen builder depends on `ctype` + the row's flag/field shape.
+/// Metadata fields `z`/`A`/`B` are preserved across the re-encode so
+/// catchpoint-shaped rows with non-default `version`/`size_sponsor`
+/// values don't lose data.
 fn canonicalize_resource_blob(data: &[u8], ctype: i64) -> Option<Vec<u8>> {
     let meta = inspect_resource_blob(data);
-    let update_round = extract_update_round(data);
+    let metadata = extract_resource_metadata_fields(data);
     match ctype {
         x if x == CTYPE_ASSET => {
             let holding = if meta.has_holding {
@@ -537,11 +576,13 @@ fn canonicalize_resource_blob(data: &[u8], ctype: i64) -> Option<Vec<u8>> {
             if holding.is_none() && params.is_none() {
                 return None;
             }
-            let rd = build_asset_resource_data(
+            let mut rd = build_asset_resource_data(
                 holding.as_ref(),
                 params.as_ref(),
-                update_round,
+                metadata.update_round,
             );
+            rd.version = metadata.version;
+            rd.size_sponsor = metadata.size_sponsor;
             Some(algo_codec::canonical_encode_resources_data(&rd))
         }
         x if x == CTYPE_APP => {
@@ -558,11 +599,13 @@ fn canonicalize_resource_blob(data: &[u8], ctype: i64) -> Option<Vec<u8>> {
             if local.is_none() && params.is_none() {
                 return None;
             }
-            let rd = build_app_resource_data(
+            let mut rd = build_app_resource_data(
                 local.as_ref(),
                 params.as_ref(),
-                update_round,
+                metadata.update_round,
             );
+            rd.version = metadata.version;
+            rd.size_sponsor = metadata.size_sponsor;
             Some(algo_codec::canonical_encode_resources_data(&rd))
         }
         _ => None,

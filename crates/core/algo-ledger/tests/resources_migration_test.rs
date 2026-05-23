@@ -335,6 +335,77 @@ fn migrator_rewrites_legacy_app_params_nested_schema() {
 }
 
 #[test]
+fn migrator_preserves_update_round_version_and_size_sponsor_metadata() {
+    // PLAN-189 / TASK-195 (Codex review round 1): the migrator must
+    // preserve `z` (update_round), `A` (version), and `B` (size_sponsor)
+    // from the original BLOB. Otherwise catchpoint-shaped rows with
+    // non-default metadata silently lose data on first open.
+    let dir = TempDir::new().unwrap();
+    let prefix = dir.path().join("ledger");
+    let tracker_path = dir.path().join("ledger.tracker.sqlite");
+
+    {
+        let _ = SqliteLedger::open_with_prefix(&prefix).expect("first open");
+    }
+
+    // Build a synthetic legacy asset-params row carrying all three
+    // metadata fields. Layout: a (total), y=4, z (update_round),
+    // A (version), B (size_sponsor as 32-byte blob).
+    let sponsor = [0x7au8; 32];
+    let legacy_with_metadata = {
+        let pairs = vec![
+            (rmpv::Value::String("a".into()), rmpv::Value::from(1000u64)),
+            (rmpv::Value::String("y".into()), rmpv::Value::from(4u64)),
+            (rmpv::Value::String("z".into()), rmpv::Value::from(42u64)),
+            (rmpv::Value::String("A".into()), rmpv::Value::from(7u64)),
+            (
+                rmpv::Value::String("B".into()),
+                rmpv::Value::Binary(sponsor.to_vec()),
+            ),
+        ];
+        let val = rmpv::Value::Map(pairs);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &val).unwrap();
+        buf
+    };
+
+    seed_legacy_rows(&tracker_path, &[(1, 999, 0, legacy_with_metadata)]);
+
+    {
+        let _ = SqliteLedger::open_with_prefix(&prefix).expect("re-open");
+    }
+
+    let conn = Connection::open(&tracker_path).unwrap();
+    let rows = read_all_resources(&conn);
+    assert_eq!(rows.len(), 1);
+
+    let val: rmpv::Value = rmpv::decode::read_value(&mut &rows[0].3[..]).unwrap();
+    let rmpv::Value::Map(pairs) = val else {
+        panic!("not a map");
+    };
+
+    let z = pairs
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("z"))
+        .map(|(_, v)| v.as_u64().unwrap_or(0))
+        .unwrap_or(0);
+    let a = pairs
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("A"))
+        .map(|(_, v)| v.as_u64().unwrap_or(0))
+        .unwrap_or(0);
+    let b = pairs
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("B"))
+        .and_then(|(_, v)| v.as_slice().map(|s| s.to_vec()))
+        .unwrap_or_default();
+
+    assert_eq!(z, 42, "z (update_round) must be preserved");
+    assert_eq!(a, 7, "A (version) must be preserved");
+    assert_eq!(b, sponsor.to_vec(), "B (size_sponsor) must be preserved");
+}
+
+#[test]
 fn migrator_skips_when_marker_already_set() {
     let dir = TempDir::new().unwrap();
     let prefix = dir.path().join("ledger");
