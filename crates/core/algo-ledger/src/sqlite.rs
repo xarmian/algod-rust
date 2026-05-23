@@ -1355,22 +1355,32 @@ pub(crate) fn inspect_resource_blob(data: &[u8]) -> ResourceMeta {
     }
 
     // Augment with canonical `y` signals that legacy Rust encoders never
-    // wrote. Legacy values were {1, 4, 5} (and the encoders always emitted
-    // a `y` key), so observing y ∈ {2, 3} unambiguously means a canonical
-    // row even when default-valued params fields cause field-presence
-    // signals to come up empty (e.g. an asset params row with `total=0`
-    // would encode to just `y=2` because Go's omitempty drops the rest).
-    //   y == 2 (OWNERSHIP)            — has_ownership; has_holding by default
-    //   y == 3 (NOT_HOLDING|OWNERSHIP) — has_ownership only; clear has_holding
-    //   y == 8 (EMPTY_APP)            — empty marker; neither
-    // y == 0 (canonical HOLDING default) is indistinguishable from a
-    // missing `y` field. Downstream callers query rows by resource
-    // `ctype`, so a default-valued canonical holding row's existence
-    // is the holding signal; this inspector can leave `has_holding`
-    // false for the empty-map degenerate case without losing data.
+    // wrote. Go's semantic interpretation of the `y` byte is bit-wise:
+    //   `(flags & NOT_HOLDING) == 0`  ⇒ row holds (HOLDING is the implicit default)
+    //   `(flags & OWNERSHIP)   != 0`  ⇒ row carries params (ownership)
+    // Concrete canonical values:
+    //   y == 0 (HOLDING)                — holding only (indistinguishable from missing y;
+    //                                     callers query by `ctype` so row existence is enough)
+    //   y == 1 (NOT_HOLDING)            — neither subset valid for this row (rare)
+    //   y == 2 (OWNERSHIP)              — ownership AND holding (creator's own row)
+    //   y == 3 (NOT_HOLDING|OWNERSHIP)  — ownership only (e.g. another account owning params)
+    //   y == 4 (EMPTY_ASSET)            — empty marker (no subsets valid)
+    //   y == 8 (EMPTY_APP)              — empty marker (no subsets valid)
+    //
+    // Legacy Rust encoders only wrote y ∈ {1, 4, 5}, so y ∈ {2, 3} is
+    // unambiguous canonical. For y=2 specifically, a creator's params
+    // row with default-valued holding (`l=0` and `m=false` both
+    // omitempty-dropped) encodes to just `{y:2}` — field presence alone
+    // would miss the implicit holding. We trust the canonical bit
+    // interpretation here.
     match meta.raw_flags {
-        2 => meta.has_ownership = true,
+        2 => {
+            // OWNERSHIP, NOT_HOLDING bit clear → ownership + implicit holding.
+            meta.has_ownership = true;
+            meta.has_holding = true;
+        }
         3 => {
+            // NOT_HOLDING | OWNERSHIP → ownership only.
             meta.has_ownership = true;
             meta.has_holding = false;
         }
@@ -5310,13 +5320,16 @@ mod tests {
 
     #[test]
     fn inspect_canonical_asset_params_row() {
-        // Canonical Go asset params: y=2 (OWNERSHIP), a..k fields.
+        // Canonical Go asset params (creator's own row): y=2 (OWNERSHIP),
+        // a..k fields. Under Go semantics y=2 has NOT_HOLDING clear, so
+        // the row holds implicitly (creator carries amount/frozen even
+        // if both are zero and omitempty-dropped).
         let bytes = rmpv_map(&[
             ("a", rmpv::Value::from(1_000_000u64)),
             ("y", rmpv::Value::from(2u64)),
         ]);
         let meta = inspect_resource_blob(&bytes);
-        assert!(!meta.has_holding);
+        assert!(meta.has_holding, "y=2 has NOT_HOLDING clear → implicit holding");
         assert!(meta.has_ownership);
         assert_eq!(meta.raw_flags, 2);
     }
@@ -5389,7 +5402,9 @@ mod tests {
             ("y", rmpv::Value::from(2u64)),
         ]);
         let meta = inspect_resource_blob(&bytes);
-        assert!(!meta.has_holding);
+        // y=2 implies holding under Go semantics — the creator's own
+        // local-state defaults to existing. Combined rows are valid.
+        assert!(meta.has_holding);
         assert!(meta.has_ownership, "q/r/w/x must signal app params row");
     }
 
@@ -5402,14 +5417,24 @@ mod tests {
     }
 
     #[test]
-    fn inspect_canonical_ownership_only_no_fields() {
-        // Canonical row that's nothing but y=2 (e.g. an asset params row
-        // with all-default values where Go's omitempty drops a..k entirely).
-        // Without consulting raw_flags this would look like an empty blob;
-        // the y=2 canonical signal must override.
+    fn inspect_canonical_y2_implies_holding_plus_ownership() {
+        // y=2 (OWNERSHIP) under Go bitwise semantics: NOT_HOLDING clear,
+        // so the row holds AND carries params. Even with no field-presence
+        // signals (a default-valued creator row), both predicates must
+        // be true.
         let bytes = rmpv_map(&[("y", rmpv::Value::from(2u64))]);
         let meta = inspect_resource_blob(&bytes);
-        assert!(meta.has_ownership, "y=2 alone must signal has_ownership");
+        assert!(meta.has_ownership);
+        assert!(meta.has_holding);
+    }
+
+    #[test]
+    fn inspect_canonical_y3_is_ownership_only() {
+        // y=3 (NOT_HOLDING | OWNERSHIP) — params row that does NOT hold.
+        // No field-presence required; raw_flags signal alone is enough.
+        let bytes = rmpv_map(&[("y", rmpv::Value::from(3u64))]);
+        let meta = inspect_resource_blob(&bytes);
+        assert!(meta.has_ownership);
         assert!(!meta.has_holding);
     }
 
