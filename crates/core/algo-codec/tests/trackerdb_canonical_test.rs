@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 
 use algo_codec::{
     canonical_encode_base_account_data, canonical_encode_base_online_account_data,
-    canonical_encode_resources_data, BaseOnlineAccountData, ResourcesData,
+    canonical_encode_online_round_params_data, canonical_encode_resources_data,
+    BaseOnlineAccountData, OnlineRoundParamsData, ResourcesData,
 };
 use algo_types::{AccountData, AccountStatus, Address};
 
@@ -330,6 +331,86 @@ fn reencode_map_value(v: &rmpv::Value) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     rmpv::encode::write_value(&mut buf, v).map_err(|e| format!("re-encode map: {e}"))?;
     Ok(buf)
+}
+
+// ---------------------------------------------------------------------------
+// OnlineRoundParamsData byte-exact + round-trip (PLAN-36 G8 / TASK-123)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn online_round_params_data_byte_exact_against_go_fixtures() {
+    let dir = fixtures_root().join("onlineroundparams");
+    let fixtures = load_canonical_hex_dir(&dir);
+    if fixtures.is_empty() {
+        eprintln!(
+            "SKIPPED: no onlineroundparams fixtures at {}. \
+             Run `make extract-trackerdb-fixtures` against a populated localnet to generate them.",
+            dir.display()
+        );
+        return;
+    }
+
+    let mut checked = 0;
+    for (name, expected) in &fixtures {
+        let decoded = decode_online_round_params_data_value(expected)
+            .unwrap_or_else(|e| panic!("decode onlineroundparams/{name}.canonical.hex: {e}"));
+        let actual = canonical_encode_online_round_params_data(&decoded);
+        assert_eq!(
+            hex::encode(&actual),
+            hex::encode(expected),
+            "byte-exact mismatch for onlineroundparams/{name}.canonical.hex"
+        );
+        checked += 1;
+    }
+    println!("onlineroundparams: {checked} fixtures byte-exact ✓");
+}
+
+#[test]
+fn online_round_params_data_round_trip_via_value() {
+    let dir = fixtures_root().join("onlineroundparams");
+    let fixtures = load_canonical_hex_dir(&dir);
+    if fixtures.is_empty() {
+        eprintln!(
+            "SKIPPED: no onlineroundparams fixtures at {}.",
+            dir.display()
+        );
+        return;
+    }
+
+    for (name, raw) in &fixtures {
+        let first = decode_online_round_params_data_value(raw)
+            .unwrap_or_else(|e| panic!("decode onlineroundparams/{name}.canonical.hex: {e}"));
+        let encoded = canonical_encode_online_round_params_data(&first);
+        let second = decode_online_round_params_data_value(&encoded)
+            .unwrap_or_else(|e| panic!("re-decode after encode onlineroundparams/{name}: {e}"));
+        assert_eq!(
+            first, second,
+            "round-trip drift on onlineroundparams/{name}"
+        );
+    }
+}
+
+/// Minimal rmpv-walker for `OnlineRoundParamsData`. Used only by the
+/// fixture-driven tests; the production decoder lives in
+/// `algo_ledger::catchpoint::msgp_compat`.
+fn decode_online_round_params_data_value(data: &[u8]) -> Result<OnlineRoundParamsData, String> {
+    let val: rmpv::Value =
+        rmpv::decode::read_value(&mut &data[..]).map_err(|e| format!("rmpv decode: {e}"))?;
+    let pairs = match val {
+        rmpv::Value::Map(m) => m,
+        other => return Err(format!("expected msgpack map, got {other:?}")),
+    };
+    let mut d = OnlineRoundParamsData::default();
+    for (k, v) in pairs {
+        let key = k.as_str().ok_or_else(|| format!("non-string key: {k:?}"))?;
+        match key {
+            "online" => d.online_supply = as_u64(&v),
+            "proto" => d.current_protocol = as_str(&v)?,
+            "rwdlvl" => d.rewards_level = as_u64(&v),
+            other => return Err(format!("unexpected OnlineRoundParamsData tag {other:?}")),
+        }
+    }
+    Ok(d)
 }
 
 // ---------------------------------------------------------------------------

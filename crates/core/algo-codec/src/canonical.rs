@@ -1083,6 +1083,51 @@ pub fn canonical_encode_resources_data(d: &ResourcesData) -> Vec<u8> {
     m.encode()
 }
 
+/// Mirror of go-algorand's `ledgercore.OnlineRoundParamsData`
+/// (`../go-algorand/ledger/ledgercore/totals.go:56` @ `v4.5.1-stable`).
+///
+/// The inner BLOB stored at `onlineroundparamstail.data`. Tracks the
+/// agreement-side params at each round in the rolling
+/// `maxBalLookback` window (online supply + rewards level + protocol
+/// version). PLAN-36 G8 (TASK-123).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OnlineRoundParamsData {
+    /// Total stake of online accounts. Codec: `online`.
+    pub online_supply: u64,
+    /// Cumulative rewards-per-unit since genesis. Codec: `rwdlvl`.
+    pub rewards_level: u64,
+    /// Consensus protocol version active at this round. Codec: `proto`.
+    pub current_protocol: String,
+}
+
+/// Canonically encode the Go `ledgercore.OnlineRoundParamsData` struct
+/// (the inner BLOB stored at `onlineroundparamstail.data`).
+///
+/// Mirrors go-algorand's generated `OnlineRoundParamsData.MarshalMsg`
+/// (`../go-algorand/ledger/ledgercore/msgp_gen.go:838` @
+/// `v4.5.1-stable`). Bit-identity required: the row hash that
+/// participates in catchpoint label computation
+/// (`calculate_online_round_params_hash` in `algo_ledger::catchpoint`)
+/// chains through these bytes, and the catchpoint signer needs Rust
+/// and Go to produce the same input.
+///
+/// Tag layout (lex-sorted by raw bytes):
+///
+/// | Tag | Field |
+/// | --- | --- |
+/// | `online`  | `online_supply`     |
+/// | `proto`   | `current_protocol`  |
+/// | `rwdlvl`  | `rewards_level`     |
+///
+/// PLAN-36 G8 (TASK-123).
+pub fn canonical_encode_online_round_params_data(d: &OnlineRoundParamsData) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_u64("online", d.online_supply);
+    m.add_string("proto", &d.current_protocol);
+    m.add_u64("rwdlvl", d.rewards_level);
+    m.encode()
+}
+
 /// Canonically encode AssetParams as a nested msgpack map.
 pub fn canonical_encode_asset_params(apar: &AssetParams) -> Vec<u8> {
     let mut m = CanonicalMap::new();
