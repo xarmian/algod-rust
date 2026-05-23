@@ -1646,227 +1646,125 @@ fn strip_holding_from_blob(data: &[u8]) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 // Asset resource blob merging helpers
 // ---------------------------------------------------------------------------
+//
+// All helpers in this section delegate to
+// `algo_codec::canonical_encode_resources_data` for the final write so
+// that merged / stripped asset blobs are byte-identical to what
+// go-algorand would produce. The `y` flag follows Go's bitwise enum:
+//
+//   has_holding && has_ownership  → y = OWNERSHIP (NOT_HOLDING bit clear)
+//   !has_holding && has_ownership → y = NOT_HOLDING | OWNERSHIP
+//   has_holding && !has_ownership → y = HOLDING (omitted at canonical write)
+//
+// PLAN-189 / TASK-191.
 
-/// Asset params field keys: "a" through "k" (total, decimals, default_frozen,
-/// unit_name, asset_name, url, metadata_hash, manager, reserve, freeze, clawback).
-const ASSET_PARAMS_KEYS: &[&str] = &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"];
+/// Build a canonical `algo_codec::ResourcesData` carrying the union of
+/// an optional `AssetHolding` and an optional `AssetParams`. The
+/// `creator` address from `AssetParams` is intentionally NOT stored in
+/// the BLOB — go-algorand keeps that in the `assetcreators` table.
+pub(crate) fn build_asset_resource_data(
+    holding: Option<&AssetHolding>,
+    params: Option<&AssetParams>,
+    update_round: u64,
+) -> algo_codec::ResourcesData {
+    let mut rd = algo_codec::ResourcesData {
+        update_round,
+        ..Default::default()
+    };
 
-/// Asset holding field keys: "l" (amount), "m" (frozen).
-const ASSET_HOLDING_KEYS: &[&str] = &["l", "m"];
+    rd.resource_flags = match (holding.is_some(), params.is_some()) {
+        (true, true) => algo_codec::resource_flags::OWNERSHIP,
+        (false, true) => {
+            algo_codec::resource_flags::NOT_HOLDING | algo_codec::resource_flags::OWNERSHIP
+        }
+        (true, false) | (false, false) => algo_codec::resource_flags::HOLDING,
+    };
 
-/// Merge asset holding fields into an existing params blob, producing a
-/// combined blob with both ownership and holding flags set.
+    if let Some(h) = holding {
+        rd.amount = h.amount;
+        rd.frozen = h.frozen;
+    }
+    if let Some(p) = params {
+        rd.total = p.total;
+        rd.decimals = p.decimals;
+        rd.default_frozen = p.default_frozen;
+        rd.unit_name = p.unit_name.clone();
+        rd.asset_name = p.asset_name.clone();
+        rd.url = p.url.clone();
+        rd.metadata_hash = p.metadata_hash.unwrap_or([0u8; 32]);
+        rd.manager = p.manager.map(|a| a.0).unwrap_or([0u8; 32]);
+        rd.reserve = p.reserve.map(|a| a.0).unwrap_or([0u8; 32]);
+        rd.freeze = p.freeze.map(|a| a.0).unwrap_or([0u8; 32]);
+        rd.clawback = p.clawback.map(|a| a.0).unwrap_or([0u8; 32]);
+    }
+
+    rd
+}
+
+/// Extract the `z` (update_round) field from a raw resource blob, if
+/// present. Used by merge/strip helpers that must preserve metadata
+/// across the canonical re-encode.
+fn extract_update_round(data: &[u8]) -> u64 {
+    let Ok(val) = rmpv::decode::read_value(&mut &data[..]) else {
+        return 0;
+    };
+    let rmpv::Value::Map(pairs) = val else {
+        return 0;
+    };
+    for (k, v) in pairs {
+        if k.as_str() == Some("z") {
+            return v.as_u64().unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// Merge asset holding fields into an existing params blob, producing
+/// a canonical combined blob (`y = OWNERSHIP`).
 fn merge_asset_holding_into_params(
     existing_params_blob: &[u8],
     new_holding: &AssetHolding,
 ) -> Vec<u8> {
-    let existing_val: rmpv::Value = rmpv::decode::read_value(&mut &existing_params_blob[..])
-        .unwrap_or(rmpv::Value::Map(vec![]));
-
-    let mut merged: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-    // Preserve existing params fields (a-k), skip y and any holding fields
-    if let rmpv::Value::Map(pairs) = existing_val {
-        for (k, v) in pairs {
-            let key_str = k.as_str().unwrap_or("");
-            if key_str == "y" {
-                continue;
-            }
-            if ASSET_HOLDING_KEYS.contains(&key_str) {
-                continue;
-            }
-            merged.push((k, v));
-        }
-    }
-
-    // Add holding fields
-    if new_holding.amount != 0 {
-        merged.push((
-            rmpv::Value::String("l".into()),
-            rmpv::Value::from(new_holding.amount),
-        ));
-    }
-    if new_holding.frozen {
-        merged.push((rmpv::Value::String("m".into()), rmpv::Value::Boolean(true)));
-    }
-
-    // Combined flags
-    merged.push((
-        rmpv::Value::String("y".into()),
-        rmpv::Value::from(LEGACY_Y_HOLDING_BIT | LEGACY_Y_OWNERSHIP_BIT),
-    ));
-
-    let val = rmpv::Value::Map(merged);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    buf
+    let existing_params = decode_asset_params(existing_params_blob).unwrap_or_default();
+    let update_round = extract_update_round(existing_params_blob);
+    let rd = build_asset_resource_data(Some(new_holding), Some(&existing_params), update_round);
+    algo_codec::canonical_encode_resources_data(&rd)
 }
 
-/// Merge asset params fields into an existing holding blob, producing a
-/// combined blob with both ownership and holding flags set.
+/// Merge asset params fields into an existing holding blob, producing
+/// a canonical combined blob (`y = OWNERSHIP`).
 fn merge_asset_params_into_holding(
     existing_holding_blob: &[u8],
     new_params: &AssetParams,
     creator: &Address,
 ) -> Vec<u8> {
-    let existing_val: rmpv::Value = rmpv::decode::read_value(&mut &existing_holding_blob[..])
-        .unwrap_or(rmpv::Value::Map(vec![]));
-
-    let mut merged: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-    // Preserve existing holding fields (l, m), skip y and any params fields
-    if let rmpv::Value::Map(pairs) = existing_val {
-        for (k, v) in pairs {
-            let key_str = k.as_str().unwrap_or("");
-            if key_str == "y" {
-                continue;
-            }
-            if ASSET_PARAMS_KEYS.contains(&key_str) {
-                continue;
-            }
-            merged.push((k, v));
-        }
-    }
-
-    // Add params fields (same encoding as encode_asset_params but without the "y" flag)
-    if new_params.total != 0 {
-        merged.push((
-            rmpv::Value::String("a".into()),
-            rmpv::Value::from(new_params.total),
-        ));
-    }
-    if new_params.decimals != 0 {
-        merged.push((
-            rmpv::Value::String("b".into()),
-            rmpv::Value::from(new_params.decimals as u64),
-        ));
-    }
-    if new_params.default_frozen {
-        merged.push((rmpv::Value::String("c".into()), rmpv::Value::Boolean(true)));
-    }
-    if !new_params.unit_name.is_empty() {
-        merged.push((
-            rmpv::Value::String("d".into()),
-            rmpv::Value::String(new_params.unit_name.clone().into()),
-        ));
-    }
-    if !new_params.asset_name.is_empty() {
-        merged.push((
-            rmpv::Value::String("e".into()),
-            rmpv::Value::String(new_params.asset_name.clone().into()),
-        ));
-    }
-    if !new_params.url.is_empty() {
-        merged.push((
-            rmpv::Value::String("f".into()),
-            rmpv::Value::String(new_params.url.clone().into()),
-        ));
-    }
-    if let Some(ref mh) = new_params.metadata_hash {
-        merged.push((
-            rmpv::Value::String("g".into()),
-            rmpv::Value::Binary(mh.to_vec()),
-        ));
-    }
-    if let Some(ref addr) = new_params.manager {
-        merged.push((
-            rmpv::Value::String("h".into()),
-            rmpv::Value::Binary(addr.0.to_vec()),
-        ));
-    }
-    if let Some(ref addr) = new_params.reserve {
-        merged.push((
-            rmpv::Value::String("i".into()),
-            rmpv::Value::Binary(addr.0.to_vec()),
-        ));
-    }
-    if let Some(ref addr) = new_params.freeze {
-        merged.push((
-            rmpv::Value::String("j".into()),
-            rmpv::Value::Binary(addr.0.to_vec()),
-        ));
-    }
-    if let Some(ref addr) = new_params.clawback {
-        merged.push((
-            rmpv::Value::String("k".into()),
-            rmpv::Value::Binary(addr.0.to_vec()),
-        ));
-    }
-
-    // Combined flags
-    merged.push((
-        rmpv::Value::String("y".into()),
-        rmpv::Value::from(LEGACY_Y_HOLDING_BIT | LEGACY_Y_OWNERSHIP_BIT),
-    ));
-
-    let val = rmpv::Value::Map(merged);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    // Suppress unused variable warning — creator is stored in assetcreators table
     let _ = creator;
-    buf
+    let existing_holding = decode_asset_holding(existing_holding_blob).unwrap_or_default();
+    let update_round = extract_update_round(existing_holding_blob);
+    let rd = build_asset_resource_data(Some(&existing_holding), Some(new_params), update_round);
+    algo_codec::canonical_encode_resources_data(&rd)
 }
 
-/// Strip asset holding fields from a combined blob, keeping only params fields.
-/// Returns the params-only blob with ownership flag, or None if nothing remains.
+/// Strip asset holding fields from a combined blob, keeping only
+/// params fields. Returns the params-only blob (`y = NOT_HOLDING |
+/// OWNERSHIP`), or None if the input cannot be decoded.
 fn strip_asset_holding_from_blob(data: &[u8]) -> Option<Vec<u8>> {
-    let val: rmpv::Value = rmpv::decode::read_value(&mut &data[..]).ok()?;
-
-    let mut params_pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-    if let rmpv::Value::Map(pairs) = val {
-        for (k, v) in pairs {
-            let key_str = k.as_str().unwrap_or("");
-            match key_str {
-                "l" | "m" => continue, // holding fields — strip
-                "y" => continue,       // will be rewritten
-                _ => params_pairs.push((k, v)),
-            }
-        }
-    }
-
-    // Add ownership-only flag
-    params_pairs.push((
-        rmpv::Value::String("y".into()),
-        rmpv::Value::from(LEGACY_Y_OWNERSHIP_BIT),
-    ));
-
-    let val = rmpv::Value::Map(params_pairs);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    Some(buf)
+    rmpv::decode::read_value(&mut &data[..]).ok()?;
+    let params = decode_asset_params(data).unwrap_or_default();
+    let update_round = extract_update_round(data);
+    let rd = build_asset_resource_data(None, Some(&params), update_round);
+    Some(algo_codec::canonical_encode_resources_data(&rd))
 }
 
-/// Strip asset params fields from a combined blob, keeping only holding fields.
-/// Returns the holding-only blob with holding flag, or None if nothing remains.
+/// Strip asset params fields from a combined blob, keeping only
+/// holding fields. Returns the holding-only blob (`y = HOLDING`,
+/// omitted), or None if the input cannot be decoded.
 fn strip_asset_params_from_blob(data: &[u8]) -> Option<Vec<u8>> {
-    let val: rmpv::Value = rmpv::decode::read_value(&mut &data[..]).ok()?;
-
-    let mut holding_pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-    if let rmpv::Value::Map(pairs) = val {
-        for (k, v) in pairs {
-            let key_str = k.as_str().unwrap_or("");
-            if ASSET_PARAMS_KEYS.contains(&key_str) {
-                continue; // params fields — strip
-            }
-            if key_str == "y" {
-                continue; // will be rewritten
-            }
-            holding_pairs.push((k, v));
-        }
-    }
-
-    // Add holding-only flag
-    holding_pairs.push((
-        rmpv::Value::String("y".into()),
-        rmpv::Value::from(LEGACY_Y_HOLDING_BIT),
-    ));
-
-    let val = rmpv::Value::Map(holding_pairs);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    Some(buf)
+    rmpv::decode::read_value(&mut &data[..]).ok()?;
+    let holding = decode_asset_holding(data).unwrap_or_default();
+    let update_round = extract_update_round(data);
+    let rd = build_asset_resource_data(Some(&holding), None, update_round);
+    Some(algo_codec::canonical_encode_resources_data(&rd))
 }
 
 /// Set or overwrite the `"z"` (UpdateRound) field in a resource msgpack blob.

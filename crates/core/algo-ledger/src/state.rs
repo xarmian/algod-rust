@@ -1550,64 +1550,18 @@ fn encode_merged_asset_resource_with_round(
     params: Option<(&algo_types::AssetParams, &Address)>,
     update_round: u64,
 ) -> Vec<u8> {
-    use crate::sqlite::{encode_asset_holding_with_round, encode_asset_params_with_round};
-
-    match (holding, params) {
-        (Some(h), Some((p, creator))) => {
-            // Merge both into one blob — combine fields from both encodings.
-            // The simplest correct approach: decode both, merge maps, re-encode.
-            let h_bytes = encode_asset_holding_with_round(h, update_round);
-            let p_bytes = encode_asset_params_with_round(p, creator, update_round);
-
-            let h_val: rmpv::Value =
-                rmpv::decode::read_value(&mut &h_bytes[..]).unwrap_or(rmpv::Value::Map(vec![]));
-            let p_val: rmpv::Value =
-                rmpv::decode::read_value(&mut &p_bytes[..]).unwrap_or(rmpv::Value::Map(vec![]));
-
-            let mut merged: std::collections::BTreeMap<String, rmpv::Value> =
-                std::collections::BTreeMap::new();
-
-            if let rmpv::Value::Map(m) = p_val {
-                for (k, v) in m {
-                    if let Some(key) = k.as_str() {
-                        // Skip the "y" flags from params — we'll set our own.
-                        if key != "y" {
-                            merged.insert(key.to_string(), v);
-                        }
-                    }
-                }
-            }
-            if let rmpv::Value::Map(m) = h_val {
-                for (k, v) in m {
-                    if let Some(key) = k.as_str() {
-                        if key != "y" {
-                            merged.insert(key.to_string(), v);
-                        }
-                    }
-                }
-            }
-
-            // Set combined flags: holding (0x01) | ownership (0x04) = 0x05
-            merged.insert(
-                "y".to_string(),
-                rmpv::Value::from(
-                    crate::sqlite::LEGACY_Y_HOLDING_BIT | crate::sqlite::LEGACY_Y_OWNERSHIP_BIT,
-                ),
-            );
-
-            let pairs: Vec<(rmpv::Value, rmpv::Value)> = merged
-                .into_iter()
-                .map(|(k, v)| (rmpv::Value::String(k.into()), v))
-                .collect();
-            let val = rmpv::Value::Map(pairs);
-            let mut buf = Vec::new();
-            rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-            buf
-        }
-        (Some(h), None) => encode_asset_holding_with_round(h, update_round),
-        (None, Some((p, creator))) => encode_asset_params_with_round(p, creator, update_round),
-        (None, None) => Vec::new(),
+    // Delegate to the canonical builder so combined asset rows produce
+    // Go-compatible y values (OWNERSHIP for "creator with own holding",
+    // NOT_HOLDING|OWNERSHIP for params-only). PLAN-189 / TASK-191.
+    if holding.is_none() && params.is_none() {
+        return Vec::new();
     }
+    let rd = crate::sqlite::build_asset_resource_data(
+        holding,
+        params.map(|(p, _)| p),
+        update_round,
+    );
+    algo_codec::canonical_encode_resources_data(&rd)
 }
 
 /// Encode a merged app resource blob (local state + params) matching Go's format.
