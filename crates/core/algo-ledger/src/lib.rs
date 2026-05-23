@@ -59,7 +59,7 @@ pub use sqlite::{
 pub use state::{schema_min_balance, LedgerState, StateSnapshot};
 pub use store_trait::LedgerStore;
 
-pub use delta_cache::DeltaCache;
+pub use delta_cache::{DeltaCache, DEFAULT_WINDOW_SIZE};
 
 pub use agreement_bridge::AgreementLedgerBridge;
 pub use agreement_key_manager::AgreementKeyManagerBridge;
