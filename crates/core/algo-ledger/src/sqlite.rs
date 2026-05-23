@@ -393,6 +393,13 @@ const CTYPE_APP: i64 = 1;
 /// ignores everything else, so leaving the row in place is safe).
 const KVSTORE_NULL_NORM_MARKER: &str = "algod_rust_kvstore_null_norm_v1";
 
+/// Marker key for PLAN-189 / TASK-195's one-shot resources.data
+/// canonicalization. Bumped whenever the canonical shape changes — a
+/// fresh value forces an idempotent re-scan to catch any rows the
+/// previous migrator missed. Same `algod_rust_` namespace as
+/// [`KVSTORE_NULL_NORM_MARKER`] so Go's reader ignores it.
+const RESOURCES_CANONICAL_MIGRATION_MARKER: &str = "algod_rust_resources_canonical_v1";
+
 /// G13: one-shot conversion of NULL `kvstore.value` rows to empty BLOBs.
 /// Mirrors Go's `performKVStoreNullBlobConversion`. Persists a marker in
 /// `catchpointstate` so subsequent opens skip the table scan; idempotent
@@ -431,6 +438,178 @@ fn normalize_kvstore_nulls(conn: &Connection) -> rusqlite::Result<()> {
         [KVSTORE_NULL_NORM_MARKER],
     )?;
     Ok(())
+}
+
+/// PLAN-189 / TASK-195: one-shot canonicalization of `resources.data`
+/// BLOBs. Walks every row, decodes via the tolerant decoders, re-encodes
+/// via [`build_asset_resource_data`] / [`build_app_resource_data`] +
+/// `canonical_encode_resources_data`, and rewrites the row when the
+/// bytes changed. Persists a marker in `catchpointstate` so subsequent
+/// opens skip the scan; idempotent either way (a row already in
+/// canonical shape decodes-and-re-encodes to bit-identical bytes).
+///
+/// The migration is single-transaction so a crash mid-run rolls back
+/// cleanly; on the next open the marker is absent and the migrator
+/// runs to completion against the original (legacy) rows.
+fn migrate_resources_to_canonical(conn: &Connection) -> rusqlite::Result<()> {
+    let already_done: Option<i64> = conn
+        .query_row(
+            "SELECT intval FROM catchpointstate WHERE id = ?1",
+            [RESOURCES_CANONICAL_MIGRATION_MARKER],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if already_done == Some(1) {
+        return Ok(());
+    }
+
+    // Wrap the entire rewrite in a single immediate transaction so any
+    // mid-migration crash leaves the DB at the pre-migration state.
+    conn.execute("BEGIN IMMEDIATE TRANSACTION", [])?;
+
+    let migration_result = (|| -> rusqlite::Result<()> {
+        // Snapshot the (addrid, aidx, ctype, data) tuples upfront — we
+        // can't hold a statement borrow during nested execute() calls
+        // on the same connection.
+        let rows: Vec<(i64, i64, i64, Vec<u8>)> = {
+            let mut stmt = conn.prepare(
+                "SELECT addrid, aidx, ctype, data FROM resources",
+            )?;
+            let iter = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            iter.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        for (addrid, aidx, ctype, data) in rows {
+            let Some(canonical) = canonicalize_resource_blob(&data, ctype) else {
+                continue;
+            };
+            if canonical == data {
+                continue;
+            }
+            conn.execute(
+                "UPDATE resources SET data = ?1 \
+                     WHERE addrid = ?2 AND aidx = ?3 AND ctype = ?4",
+                params![canonical, addrid, aidx, ctype],
+            )?;
+        }
+
+        conn.execute(
+            "INSERT OR REPLACE INTO catchpointstate (id, intval) VALUES (?1, 1)",
+            [RESOURCES_CANONICAL_MIGRATION_MARKER],
+        )?;
+        Ok(())
+    })();
+
+    match migration_result {
+        Ok(()) => {
+            conn.execute("COMMIT", [])?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort rollback; the original error wins.
+            let _ = conn.execute("ROLLBACK", []);
+            Err(e)
+        }
+    }
+}
+
+/// Metadata fields preserved across canonical re-encoding: `z` (update_round),
+/// `A` (version), `B` (size_sponsor). Returned as a single struct so
+/// every migration call site picks them all up consistently. PLAN-189
+/// / TASK-195 (Codex review round 1).
+#[derive(Debug, Default, Clone, Copy)]
+struct ResourceMetadataFields {
+    update_round: u64,
+    version: u64,
+    size_sponsor: [u8; 32],
+}
+
+fn extract_resource_metadata_fields(data: &[u8]) -> ResourceMetadataFields {
+    let mut m = ResourceMetadataFields::default();
+    let Ok(val) = rmpv::decode::read_value(&mut &data[..]) else {
+        return m;
+    };
+    let rmpv::Value::Map(pairs) = val else {
+        return m;
+    };
+    for (k, v) in pairs {
+        match k.as_str().unwrap_or("") {
+            "z" => m.update_round = v.as_u64().unwrap_or(0),
+            "A" => m.version = v.as_u64().unwrap_or(0),
+            "B" => {
+                if let Some(slice) = v.as_slice() {
+                    if slice.len() == 32 {
+                        m.size_sponsor.copy_from_slice(slice);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    m
+}
+
+/// Decode a single `resources.data` blob and re-encode it via the
+/// canonical builders. Returns `None` if the blob is unrecognizable
+/// (in which case the migrator skips it without rewriting). The
+/// chosen builder depends on `ctype` + the row's flag/field shape.
+/// Metadata fields `z`/`A`/`B` are preserved across the re-encode so
+/// catchpoint-shaped rows with non-default `version`/`size_sponsor`
+/// values don't lose data.
+fn canonicalize_resource_blob(data: &[u8], ctype: i64) -> Option<Vec<u8>> {
+    let meta = inspect_resource_blob(data);
+    let metadata = extract_resource_metadata_fields(data);
+    match ctype {
+        x if x == CTYPE_ASSET => {
+            let holding = if meta.has_holding {
+                Some(decode_asset_holding(data).ok()?)
+            } else {
+                None
+            };
+            let params = if meta.has_ownership {
+                Some(decode_asset_params(data).ok()?)
+            } else {
+                None
+            };
+            if holding.is_none() && params.is_none() {
+                return None;
+            }
+            let mut rd = build_asset_resource_data(
+                holding.as_ref(),
+                params.as_ref(),
+                metadata.update_round,
+            );
+            rd.version = metadata.version;
+            rd.size_sponsor = metadata.size_sponsor;
+            Some(algo_codec::canonical_encode_resources_data(&rd))
+        }
+        x if x == CTYPE_APP => {
+            let local = if meta.has_holding {
+                Some(decode_app_local_state(data).ok()?)
+            } else {
+                None
+            };
+            let params = if meta.has_ownership {
+                Some(decode_app_params(data, Address([0u8; 32])).ok()?)
+            } else {
+                None
+            };
+            if local.is_none() && params.is_none() {
+                return None;
+            }
+            let mut rd = build_app_resource_data(
+                local.as_ref(),
+                params.as_ref(),
+                metadata.update_round,
+            );
+            rd.version = metadata.version;
+            rd.size_sponsor = metadata.size_sponsor;
+            Some(algo_codec::canonical_encode_resources_data(&rd))
+        }
+        _ => None,
+    }
 }
 
 /// Upgrade pre-G5 Rust DBs whose `resources.ctype` was declared `INTEGER`
@@ -2355,6 +2534,16 @@ impl SqliteLedger {
             AlgoError::Ledger {
                 message: format!("catchpointstate key migration error: {e}"),
             }
+        })?;
+
+        // PLAN-189 / TASK-195: one-shot resources.data canonicalization.
+        // Walks every row, decodes via the tolerant decoders, re-encodes
+        // through `canonical_encode_resources_data`, and rewrites the
+        // row when bytes changed. Idempotent (canonical rows decode and
+        // re-encode to themselves); skipped via marker on subsequent
+        // opens.
+        migrate_resources_to_canonical(&conn).map_err(|e| AlgoError::Ledger {
+            message: format!("resources canonicalization migration error: {e}"),
         })?;
 
         // G6 part 3 (TASK-107): retire the legacy Rust-only
