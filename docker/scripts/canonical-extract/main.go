@@ -354,6 +354,35 @@ func writeBlob(dir, basename string, data []byte) error {
 	return os.WriteFile(path, []byte(hex.EncodeToString(data)+"\n"), 0o644)
 }
 
+// resetTypeDir clears any stale `*.canonical.hex` files (and the
+// `_meta.json` sibling) from a per-type output directory before a new
+// capture writes fresh fixtures into it. Without this, a regenerated
+// corpus would mix new + stale files when a later capture has fewer
+// rows than an earlier one (Codex review, PR #295) — for example,
+// `stateproof/` going from populated → empty, or an account leaving
+// the online set. The function tolerates a non-existent dir (first
+// run) and only removes the file types this tool writes, so a manual
+// `README` placed in the dir would survive.
+func resetTypeDir(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".canonical.hex") && name != "_meta.json" {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // writeMeta writes a `_meta.json` sibling describing the just-written
 // fixture set. Pretty-printed for readable diffs.
 func writeMeta(dir string, m blobMeta) error {
@@ -372,6 +401,9 @@ func writeMeta(dir string, m blobMeta) error {
 // `baseaccountdata/<addrhex>.canonical.hex` per row.
 func dumpAccountbase(db *sql.DB, outputDir, ver, prefix, src, now string) error {
 	dir := filepath.Join(outputDir, "baseaccountdata")
+	if err := resetTypeDir(dir); err != nil {
+		return err
+	}
 	rows, err := db.Query(`SELECT address, data FROM accountbase`)
 	if err != nil {
 		return err
@@ -407,6 +439,9 @@ func dumpAccountbase(db *sql.DB, outputDir, ver, prefix, src, now string) error 
 // dumpOnlineAccounts walks `onlineaccounts(address, updround, data)`.
 func dumpOnlineAccounts(db *sql.DB, outputDir, ver, prefix, src, now string) error {
 	dir := filepath.Join(outputDir, "baseonlineaccountdata")
+	if err := resetTypeDir(dir); err != nil {
+		return err
+	}
 	rows, err := db.Query(`SELECT address, updround, data FROM onlineaccounts`)
 	if err != nil {
 		return err
@@ -459,6 +494,9 @@ func dumpOnlineAccounts(db *sql.DB, outputDir, ver, prefix, src, now string) err
 // task doesn't silently key fixtures by a stale `-1` sentinel.
 func dumpResources(db *sql.DB, outputDir, ver, prefix, src, now string) error {
 	dir := filepath.Join(outputDir, "resourcesdata")
+	if err := resetTypeDir(dir); err != nil {
+		return err
+	}
 
 	if !hasColumn(db, "resources", "ctype") {
 		return errors.New("resources table missing `ctype` column; run a recent go-algorand binary that applies the resources-ctype migration before capturing")
@@ -536,6 +574,9 @@ func dumpStateProofVerification(db *sql.DB, outputDir, ver, prefix, src, now str
 // dumpRoundKeyed is the shared `SELECT rnd, blob FROM ...` walker used
 // by the four `<round>.canonical.hex` types.
 func dumpRoundKeyed(db *sql.DB, dir, ver, prefix, src, now, typ, query, notes string) error {
+	if err := resetTypeDir(dir); err != nil {
+		return err
+	}
 	rows, err := db.Query(query)
 	if err != nil {
 		return err
