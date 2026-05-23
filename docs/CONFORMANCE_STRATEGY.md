@@ -222,6 +222,68 @@ Key metrics:
 - state root equality
 - snapshot correctness
 
+## 9.1. Phase B writer-side acceptance (PLAN-36 / TASK-127)
+
+PLAN-36 ("DB Interchange — Phase B: Writer Side") makes algod-rust's
+trackerdb + block DB on-disk format byte-compatible with what
+go-algorand reads on startup. The end-to-end acceptance gate is the
+**Rust-writer → Go-resumer handoff**:
+
+1. A 3-node go-algorand cluster produces N blocks.
+2. `algod-rust sync` consumes those blocks via REST against one of the
+   Go nodes and writes them into a fresh ledger prefix using only the
+   canonical encoders (`canonical_encode_base_account_data`,
+   `canonical_encode_base_online_account_data`,
+   `canonical_encode_resources_data`,
+   `canonical_encode_online_round_params_data`,
+   `canonical_encode_txtail_round`,
+   `canonical_encode_state_proof_verification_context`,
+   `canonical_encode_certificate`).
+3. The Rust-produced `<prefix>.tracker.sqlite` and `<prefix>.block.sqlite`
+   are staged into a Go-shaped data dir.
+4. A clean go-algorand v4.5.1-stable container boots against that data
+   dir and must:
+   - start with zero ERROR / FATAL log lines
+   - report `last-round >= N` via `/v2/status`
+   - serve `/v2/blocks/N` from the Rust-written rows
+   - leave no Rust-only tables in the trackerdb
+     (`state_deltas`, `merkle_trie`, `catchpoint_import_state`,
+     `algod_rust_meta` must all be absent)
+
+How to run:
+
+```bash
+# Bash orchestration directly (reproducible by hand):
+bash ops/mixed-cluster/scripts/handoff-rust-to-go.sh
+
+# Or wrapped as a gated cargo test:
+MIXED_CLUSTER=1 cargo test -p algo-network --test rust_writer_go_resume \
+    -- --ignored --nocapture
+```
+
+Interpreting results:
+
+- **PASS** = the Phase B writer-side contract holds. The Rust node
+  produces an on-disk shape that go-algorand can mount and read
+  without migration.
+- **FAIL with Rust-only tables present** = a writer path is still
+  emitting non-canonical schema. Grep `crates/core/algo-ledger/src/`
+  for `CREATE TABLE` to find the offender.
+- **FAIL with Go ERROR lines on startup** = canonical encoding for at
+  least one BLOB type drifted. Run the targeted unit tests
+  (`cargo test -p algo-codec trackerdb_canonical`) and inspect which
+  fixture round-trip diverged.
+- **FAIL with /v2/blocks/N empty** = the block DB row layout
+  (round / cert / blkdata column tuple) doesn't match what Go's
+  `blockdb` package expects. Verify `algo_codec::
+  canonical_encode_certificate` and the `blocks` table schema.
+
+The script preserves the working directory (`$HANDOFF_DIR`) on failure
+so the produced SQLite files + Go container logs can be inspected
+side-by-side. Out of scope for Phase B (deferred to Phase C / PLAN-37):
+bidirectional handoff where Go advances atop Rust-written state and
+Rust then verifies the resulting blocks.
+
 ---
 
 # 10. Layer 8 — Network Message Compatibility
