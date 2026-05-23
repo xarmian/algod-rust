@@ -1128,6 +1128,61 @@ pub fn canonical_encode_online_round_params_data(d: &OnlineRoundParamsData) -> V
     m.encode()
 }
 
+/// Mirror of go-algorand's `ledgercore.StateProofVerificationContext`
+/// (`../go-algorand/ledger/ledgercore/stateproofverification.go:27` @
+/// `v4.5.1-stable`).
+///
+/// The BLOB shape stored at `stateproofverification.verificationcontext`
+/// — the per-attested-round state-proof verifier that downstream nodes
+/// use to validate state proofs without re-deriving them. Carries the
+/// last attested round, voters' commitment (Merkle root), total online
+/// weight, and the consensus protocol active at the attestation.
+///
+/// PLAN-36 G8 (TASK-125).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StateProofVerificationContext {
+    /// Last round this verifier attests to. Codec: `spround`.
+    pub last_attested_round: u64,
+    /// Voters' Merkle-root commitment. Codec: `vc`.
+    pub voters_commitment: Vec<u8>,
+    /// Total online weight at attestation time. Codec: `pw`.
+    pub online_total_weight: u64,
+    /// Consensus protocol version active at the attestation. Codec: `v`.
+    pub version: String,
+}
+
+/// Canonically encode the Go `ledgercore.StateProofVerificationContext`
+/// struct (the BLOB stored at
+/// `stateproofverification.verificationcontext`).
+///
+/// Promoted to a public encoder from the previously-private
+/// `encode_sp_verification_context` in `algo_ledger::catchpoint::verify`,
+/// which was scoped only to catchpoint-label hashing. The catchpoint
+/// path now delegates to this encoder so the same canonical bytes
+/// participate in both the per-row trackerdb BLOB and the catchpoint
+/// label hash.
+///
+/// Tag layout (lex-sorted by raw bytes):
+///
+/// | Tag | Field |
+/// | --- | --- |
+/// | `pw`      | `online_total_weight`     |
+/// | `spround` | `last_attested_round`     |
+/// | `v`       | `version`                 |
+/// | `vc`      | `voters_commitment`       |
+///
+/// PLAN-36 G8 (TASK-125).
+pub fn canonical_encode_state_proof_verification_context(
+    c: &StateProofVerificationContext,
+) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+    m.add_u64("pw", c.online_total_weight);
+    m.add_u64("spround", c.last_attested_round);
+    m.add_string("v", &c.version);
+    m.add_var_bytes("vc", &c.voters_commitment);
+    m.encode()
+}
+
 /// Canonically encode AssetParams as a nested msgpack map.
 pub fn canonical_encode_asset_params(apar: &AssetParams) -> Vec<u8> {
     let mut m = CanonicalMap::new();
