@@ -204,14 +204,8 @@ fn fully_specified_subcommands_stub_to_not_implemented() {
         // tests in src/commands/sign.rs.
         // `multisig` is no longer stubbed (TASK-168); its sign body has
         // unit tests in src/commands/multisig/sign.rs.
-        &[
-            "multisig",
-            "append-auth-addr",
-            "-p",
-            "1 A B",
-            "-t",
-            "/tmp/in",
-        ],
+        // `multisig append-auth-addr` is no longer stubbed (TASK-169);
+        // see src/commands/multisig/append_auth_addr.rs.
         &[
             "part",
             "generate",
