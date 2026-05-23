@@ -196,7 +196,8 @@ fn fully_specified_subcommands_stub_to_not_implemented() {
     let cases: &[&[&str]] = &[
         // `generate` is no longer stubbed (TASK-157); it lives in
         // tests/generate_smoke.rs.
-        &["import", "-m", "invalid mnemonic"],
+        // `import` is no longer stubbed (TASK-158); it lives in
+        // tests/import_smoke.rs.
         &["export", "-f", "/tmp/does-not-exist"],
         &["sign", "-t", "/tmp/in", "-o", "/tmp/out"],
         &["multisig", "-t", "/tmp/in", "-o", "/tmp/out"],

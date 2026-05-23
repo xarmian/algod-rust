@@ -2,3 +2,4 @@
 //! `../go-algorand/cmd/algokey/`.
 
 pub mod generate;
+pub mod import;
