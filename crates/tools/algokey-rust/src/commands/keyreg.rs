@@ -34,8 +34,20 @@ pub fn run_with_io<O: Write, E: Write>(
     stderr: &mut E,
 ) -> ExitCode {
     // Implicit last_valid = first_valid + txnLife (matches keyreg.go:137).
+    // Use checked_add so a pathologically-large firstvalid surfaces a
+    // clean error instead of a debug-build overflow panic.
     if args.lastvalid == 0 {
-        args.lastvalid = args.firstvalid + TXN_LIFE;
+        match args.firstvalid.checked_add(TXN_LIFE) {
+            Some(lv) => args.lastvalid = lv,
+            None => {
+                let _ = writeln!(
+                    stderr,
+                    "firstvalid ({}) is too large; firstvalid + {} overflows",
+                    args.firstvalid, TXN_LIFE
+                );
+                return ExitCode::from(1);
+            }
+        }
     }
 
     if args.fee < MIN_FEE {
