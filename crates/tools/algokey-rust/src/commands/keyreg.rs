@@ -100,11 +100,17 @@ pub fn run_with_io<O: Write, E: Write>(
         }
     }
 
-    // Default outputFile = <keyfile>.tx (keyreg.go:173-175).
+    // Default outputFile = <keyfile>.tx (keyreg.go:173-175). When
+    // offline (no keyfile), Go's `fmt.Sprintf("%s.tx", "")` yields a
+    // literal `.tx`; mirror that exactly so operators get a
+    // predictable default in both modes.
     if args.output_file.is_none() {
-        if let Some(p) = args.keyfile.as_ref() {
-            args.output_file = Some(format!("{}.tx", p.display()));
-        }
+        let stem = args
+            .keyfile
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        args.output_file = Some(format!("{stem}.tx"));
     }
 
     let output_file = args.output_file.clone().unwrap_or_default();
