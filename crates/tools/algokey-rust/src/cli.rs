@@ -179,10 +179,14 @@ pub struct AppendAuthAddrArgs {
 
 /// `part` command tree (`part.go:181-202`). Go places `keyreg` under
 /// `part` (`part.go:185`); we mirror that exactly.
+///
+/// Go's `partCmd.Run` (`part.go:43-46`) falls back to printing help when
+/// invoked with no subcommand. We mirror that by making the subcommand
+/// optional and dispatching to clap's help printer in `main.rs`.
 #[derive(Debug, Args)]
 pub struct PartCli {
     #[command(subcommand)]
-    pub command: PartSub,
+    pub command: Option<PartSub>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -258,8 +262,11 @@ pub struct KeyregArgs {
     #[arg(long = "lastvalid", default_value_t = 0)]
     pub lastvalid: u64,
     /// Network where the provided keys will be registered, one of
-    /// mainnet/testnet/betanet.
-    #[arg(long = "network", default_value = "mainnet")]
+    /// mainnet/testnet/betanet. Required (mirrors Go's
+    /// `MarkFlagRequired("network")` at keyreg.go:84). Go documents a
+    /// default of "mainnet" in help text, but the required-flag rule means
+    /// the user must always pass `--network` explicitly.
+    #[arg(long = "network", required = true)]
     pub network: String,
     /// Set to bring an account offline.
     #[arg(long = "offline", default_value_t = false)]

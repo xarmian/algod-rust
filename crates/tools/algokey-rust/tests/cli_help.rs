@@ -105,6 +105,26 @@ fn multisig_append_auth_addr_help_has_required_flags() {
     }
 }
 
+/// Mirrors Go's `partCmd.Run` (part.go:43-46): invoking `part` with no
+/// subcommand falls back to printing the help text and exits 0.
+#[test]
+fn part_with_no_subcommand_prints_help_and_exits_zero() {
+    let out = algokey().arg("part").output().expect("run algokey-rust");
+    assert!(
+        out.status.success(),
+        "expected `part` (no subcommand) to succeed; got {:?}, stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for sub in ["generate", "info", "reparent", "keyreg"] {
+        assert!(
+            stdout.contains(sub),
+            "`part` help should list subcommand `{sub}`:\n{stdout}"
+        );
+    }
+}
+
 #[test]
 fn part_help_has_subcommands_including_keyreg() {
     let h = help(&["part"]);
@@ -144,15 +164,16 @@ fn required_flags_are_enforced() {
     // usage errors and our stubs exit with code 2 for "not implemented" —
     // distinguish via stderr content (clap writes a usage line).
     let cases: &[&[&str]] = &[
-        &["import"],                       // missing --mnemonic
-        &["export"],                       // missing --keyfile
-        &["sign"],                         // missing --txfile/--outfile
-        &["multisig"],                     // missing --txfile/--outfile
-        &["multisig", "append-auth-addr"], // missing --params/--txfile
-        &["part", "generate"],             // missing --first/--last/--keyfile
-        &["part", "info"],                 // missing --keyfile
-        &["part", "reparent"],             // missing --keyfile/--parent
-        &["part", "keyreg"],               // missing --firstvalid
+        &["import"],                              // missing --mnemonic
+        &["export"],                              // missing --keyfile
+        &["sign"],                                // missing --txfile/--outfile
+        &["multisig"],                            // missing --txfile/--outfile
+        &["multisig", "append-auth-addr"],        // missing --params/--txfile
+        &["part", "generate"],                    // missing --first/--last/--keyfile
+        &["part", "info"],                        // missing --keyfile
+        &["part", "reparent"],                    // missing --keyfile/--parent
+        &["part", "keyreg"],                      // missing --firstvalid AND --network
+        &["part", "keyreg", "--firstvalid", "1"], // missing --network (mirrors Go's MarkFlagRequired)
     ];
     for argv in cases {
         let out = algokey().args(*argv).output().expect("run algokey-rust");
@@ -198,7 +219,14 @@ fn fully_specified_subcommands_stub_to_not_implemented() {
         ],
         &["part", "info", "--keyfile", "/tmp/k"],
         &["part", "reparent", "--keyfile", "/tmp/k", "--parent", "A"],
-        &["part", "keyreg", "--firstvalid", "1"],
+        &[
+            "part",
+            "keyreg",
+            "--firstvalid",
+            "1",
+            "--network",
+            "mainnet",
+        ],
     ];
     for argv in cases {
         let out = algokey().args(*argv).output().expect("run algokey-rust");
