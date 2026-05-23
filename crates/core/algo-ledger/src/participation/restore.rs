@@ -84,6 +84,14 @@ struct PartkeyRow {
 pub fn restore_participation(db: &ErasableDb) -> Result<Participation, Error> {
     let conn = db.conn();
 
+    // We unconditionally SELECT `stateProof`. Go's `RestoreParticipation`
+    // first runs `Migrate` to add this column to pre-v3 partkey DBs
+    // (schema v2, predating state proofs). algod-rust intentionally
+    // does NOT preserve back-compat with non-existent deployments
+    // (CONVE-197): no v2 partkey DB was ever in production with this
+    // tool, so handling that legacy shape would be a deferred-cleanup
+    // anti-pattern. Any Go-produced partkey DB from v4.5.1-stable has
+    // the stateProof column.
     let row: Option<PartkeyRow> = conn
         .query_row(
             "SELECT parent, vrf, voting, firstValid, lastValid, keyDilution, stateProof \
