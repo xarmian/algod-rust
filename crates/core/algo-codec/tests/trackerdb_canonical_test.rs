@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use algo_codec::{
     canonical_encode_base_account_data, canonical_encode_base_online_account_data,
     canonical_encode_online_round_params_data, canonical_encode_resources_data,
-    BaseOnlineAccountData, OnlineRoundParamsData, ResourcesData,
+    canonical_encode_txtail_round, BaseOnlineAccountData, OnlineRoundParamsData, ResourcesData,
 };
 use algo_types::{AccountData, AccountStatus, Address};
 
@@ -411,6 +411,68 @@ fn decode_online_round_params_data_value(data: &[u8]) -> Result<OnlineRoundParam
         }
     }
     Ok(d)
+}
+
+// ---------------------------------------------------------------------------
+// TxTailRound byte-exact + round-trip (PLAN-36 G8 / TASK-124)
+//
+// `canonical_encode_txtail_round` already existed (block-derived). This
+// adds fixture coverage using actual `txtail.data` BLOBs captured from
+// go-algorand, plus the round-trip property.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn txtail_round_byte_exact_against_go_fixtures() {
+    use algo_types::TxTailRound;
+
+    let dir = fixtures_root().join("txtailround");
+    let fixtures = load_canonical_hex_dir(&dir);
+    if fixtures.is_empty() {
+        eprintln!(
+            "SKIPPED: no txtailround fixtures at {}. \
+             Run `make extract-trackerdb-fixtures` against a populated localnet to generate them.",
+            dir.display()
+        );
+        return;
+    }
+
+    let mut checked = 0;
+    for (name, expected) in &fixtures {
+        // Use rmp_serde to decode the Go-produced bytes through the
+        // existing `TxTailRound` serde derive. The encoder is the
+        // unit under test here; the decode side is incidental.
+        let decoded: TxTailRound = rmp_serde::from_slice(expected)
+            .unwrap_or_else(|e| panic!("rmp_serde decode txtailround/{name}: {e}"));
+        let actual = canonical_encode_txtail_round(&decoded);
+        assert_eq!(
+            hex::encode(&actual),
+            hex::encode(expected),
+            "byte-exact mismatch for txtailround/{name}.canonical.hex"
+        );
+        checked += 1;
+    }
+    println!("txtailround: {checked} fixtures byte-exact ✓");
+}
+
+#[test]
+fn txtail_round_round_trip_via_value() {
+    use algo_types::TxTailRound;
+
+    let dir = fixtures_root().join("txtailround");
+    let fixtures = load_canonical_hex_dir(&dir);
+    if fixtures.is_empty() {
+        eprintln!("SKIPPED: no txtailround fixtures at {}.", dir.display());
+        return;
+    }
+
+    for (name, raw) in &fixtures {
+        let first: TxTailRound = rmp_serde::from_slice(raw)
+            .unwrap_or_else(|e| panic!("rmp_serde decode txtailround/{name}: {e}"));
+        let encoded = canonical_encode_txtail_round(&first);
+        let second: TxTailRound = rmp_serde::from_slice(&encoded)
+            .unwrap_or_else(|e| panic!("re-decode after encode txtailround/{name}: {e}"));
+        assert_eq!(first, second, "round-trip drift on txtailround/{name}");
+    }
 }
 
 // ---------------------------------------------------------------------------

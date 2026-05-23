@@ -1770,9 +1770,14 @@ fn build_txtail_entry(block: &Block) -> Result<Vec<u8>, AlgoError> {
         hdr,
     };
 
-    rmp_serde::to_vec_named(&txtail).map_err(|e| AlgoError::Ledger {
-        message: format!("encode txtail entry: {e}"),
-    })
+    // PLAN-36 G8 (TASK-124): route the sync-driver txtail write path
+    // through `canonical_encode_txtail_round` so the bytes Rust stamps
+    // into `txtail.data` are byte-identical to Go's
+    // `TxTailRound.MarshalMsg`. The previous `rmp_serde::to_vec_named`
+    // produced serde-default named encoding (no lex-sorted keys, no
+    // omitempty per Go's struct tags), which would diverge from the
+    // bytes Go writes for the same block.
+    Ok(algo_codec::canonical_encode_txtail_round(&txtail))
 }
 
 // ---------------------------------------------------------------------------
