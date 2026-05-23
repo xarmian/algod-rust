@@ -1564,67 +1564,20 @@ fn encode_merged_asset_resource_with_round(
     algo_codec::canonical_encode_resources_data(&rd)
 }
 
-/// Encode a merged app resource blob (local state + params) matching Go's format.
+/// Encode a merged app resource blob (local state + params) via the
+/// canonical builder so combined app rows produce Go-compatible bytes
+/// (`y = OWNERSHIP`, distinct `p` vs `s` for local-kv vs global-state).
+/// PLAN-189 / TASK-192.
 fn encode_merged_app_resource_with_round(
     local_state: Option<&AppLocalState>,
     params: Option<&AppParams>,
     update_round: u64,
 ) -> Vec<u8> {
-    use crate::sqlite::{encode_app_local_state_with_round, encode_app_params_with_round};
-
-    match (local_state, params) {
-        (Some(s), Some(p)) => {
-            let s_bytes = encode_app_local_state_with_round(s, update_round);
-            let p_bytes = encode_app_params_with_round(p, update_round);
-
-            let s_val: rmpv::Value =
-                rmpv::decode::read_value(&mut &s_bytes[..]).unwrap_or(rmpv::Value::Map(vec![]));
-            let p_val: rmpv::Value =
-                rmpv::decode::read_value(&mut &p_bytes[..]).unwrap_or(rmpv::Value::Map(vec![]));
-
-            let mut merged: std::collections::BTreeMap<String, rmpv::Value> =
-                std::collections::BTreeMap::new();
-
-            if let rmpv::Value::Map(m) = p_val {
-                for (k, v) in m {
-                    if let Some(key) = k.as_str() {
-                        if key != "y" {
-                            merged.insert(key.to_string(), v);
-                        }
-                    }
-                }
-            }
-            if let rmpv::Value::Map(m) = s_val {
-                for (k, v) in m {
-                    if let Some(key) = k.as_str() {
-                        if key != "y" {
-                            merged.insert(key.to_string(), v);
-                        }
-                    }
-                }
-            }
-
-            // Combined flags: holding (0x01) | ownership (0x04) = 0x05
-            merged.insert(
-                "y".to_string(),
-                rmpv::Value::from(
-                    crate::sqlite::LEGACY_Y_HOLDING_BIT | crate::sqlite::LEGACY_Y_OWNERSHIP_BIT,
-                ),
-            );
-
-            let pairs: Vec<(rmpv::Value, rmpv::Value)> = merged
-                .into_iter()
-                .map(|(k, v)| (rmpv::Value::String(k.into()), v))
-                .collect();
-            let val = rmpv::Value::Map(pairs);
-            let mut buf = Vec::new();
-            rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-            buf
-        }
-        (Some(s), None) => encode_app_local_state_with_round(s, update_round),
-        (None, Some(p)) => encode_app_params_with_round(p, update_round),
-        (None, None) => Vec::new(),
+    if local_state.is_none() && params.is_none() {
+        return Vec::new();
     }
+    let rd = crate::sqlite::build_app_resource_data(local_state, params, update_round);
+    algo_codec::canonical_encode_resources_data(&rd)
 }
 
 #[cfg(test)]

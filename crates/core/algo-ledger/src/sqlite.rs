@@ -555,16 +555,14 @@ fn migrate_resources_ctype_not_null(conn: &Connection) -> Result<(), AlgoError> 
 //
 // PLAN-189 / TASK-190.
 
-/// Legacy "has holding" bit written by pre-canonical asset-holding
-/// and app-local-state encoders. Reads must NOT depend on this value
-/// — use [`inspect_resource_blob`] instead. Retained only so the
-/// not-yet-migrated encoders in this module (and the merge helpers in
-/// `state.rs`) keep producing the same bytes pending TASK-191/192/193.
-pub(crate) const LEGACY_Y_HOLDING_BIT: u64 = 0x01;
-
-/// Legacy "has params" bit written by pre-canonical asset-params and
-/// app-params encoders. Same caveat as [`LEGACY_Y_HOLDING_BIT`].
-pub(crate) const LEGACY_Y_OWNERSHIP_BIT: u64 = 0x04;
+// After TASK-190/191/192 the LEGACY_Y_* bit constants are no longer
+// referenced — every encoder + merge/strip helper in this module and
+// in `state.rs` writes Go-canonical bytes via
+// `algo_codec::canonical_encode_resources_data`. Only the standalone
+// `encode_app_local_state_with_round` remains hand-rolled, and it
+// writes its `y=1` as a literal pending TASK-193's migration. The
+// constants can be revived if/when a legacy writer needs to be reintroduced;
+// they would just be small `pub(crate) const LEGACY_Y_*_BIT` items.
 
 // Box key prefix and layout constants (matches go-algorand's avm-abi/apps.MakeBoxKey).
 const BOX_PREFIX: &[u8] = b"bx:";
@@ -892,8 +890,16 @@ fn decode_teal_key_value(val: &rmpv::Value) -> BTreeMap<Vec<u8>, TealValue> {
     let mut result = BTreeMap::new();
     if let rmpv::Value::Map(pairs) = val {
         for (k, v) in pairs {
+            // Go's canonical `map[string]TealValue` encoder writes keys
+            // as msgpack STRINGS containing the raw key bytes (Go's
+            // `string` is a byte sequence; the bytes need not be valid
+            // UTF-8). Legacy Rust `encode_teal_key_value` wrote keys as
+            // BINARY. Read both shapes via the underlying byte slice —
+            // `rmpv::Utf8String::as_bytes` returns the raw bytes
+            // regardless of UTF-8 validity, so non-UTF-8 TEAL keys
+            // round-trip correctly through canonical bytes. PLAN-189 / TASK-192.
             let key_bytes = match k {
-                rmpv::Value::String(s) => s.as_str().unwrap_or("").as_bytes().to_vec(),
+                rmpv::Value::String(s) => s.as_bytes().to_vec(),
                 rmpv::Value::Binary(b) => b.clone(),
                 _ => continue,
             };
@@ -930,77 +936,62 @@ pub(crate) fn encode_app_params(p: &AppParams) -> Vec<u8> {
 }
 
 pub(crate) fn encode_app_params_with_round(p: &AppParams, update_round: u64) -> Vec<u8> {
-    let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
+    // Delegate to canonical encoder. PLAN-189 / TASK-192.
+    //
+    // Field layout changes from the legacy hand-rolled encoder:
+    //   local_state_schema   t (nested {nui,nbs})  →  t (nui u64), u (nbs u64)
+    //   global_state_schema  u (nested {nui,nbs})  →  v (nui u64), w (nbs u64)
+    //   extra_program_pages  v (u64)               →  x (u64)
+    //   y (resource_flags)   4 (legacy OWNERSHIP)  →  2 (canonical OWNERSHIP)
+    //   global_state         encoded with binary keys (rmpv Map)
+    //                                              →  encoded with string keys
+    //                                                 (Go's `map[string]TealValue`)
+    let rd = build_app_resource_data(None, Some(p), update_round);
+    algo_codec::canonical_encode_resources_data(&rd)
+}
 
-    if !p.approval_program.is_empty() {
-        pairs.push((
-            rmpv::Value::String("q".into()),
-            rmpv::Value::Binary(p.approval_program.clone()),
-        ));
+/// Build a canonical `algo_codec::ResourcesData` carrying the union of
+/// an optional `AppLocalState` and an optional `AppParams`. Mirrors
+/// [`build_asset_resource_data`] for the app side. PLAN-189 / TASK-192.
+pub(crate) fn build_app_resource_data(
+    local_state: Option<&AppLocalState>,
+    params: Option<&AppParams>,
+    update_round: u64,
+) -> algo_codec::ResourcesData {
+    let mut rd = algo_codec::ResourcesData {
+        update_round,
+        ..Default::default()
+    };
+
+    rd.resource_flags = match (local_state.is_some(), params.is_some()) {
+        (true, true) => algo_codec::resource_flags::OWNERSHIP,
+        (false, true) => {
+            algo_codec::resource_flags::NOT_HOLDING | algo_codec::resource_flags::OWNERSHIP
+        }
+        (true, false) | (false, false) => algo_codec::resource_flags::HOLDING,
+    };
+
+    if let Some(s) = local_state {
+        rd.schema_num_uint = s.schema.num_uint;
+        rd.schema_num_byte_slice = s.schema.num_byte_slice;
+        if !s.key_value.is_empty() {
+            rd.key_value = algo_codec::canonical_encode_teal_key_value(&s.key_value);
+        }
     }
-    if !p.clear_state_program.is_empty() {
-        pairs.push((
-            rmpv::Value::String("r".into()),
-            rmpv::Value::Binary(p.clear_state_program.clone()),
-        ));
-    }
-    if !p.global_state.is_empty() {
-        pairs.push((
-            rmpv::Value::String("s".into()),
-            encode_teal_key_value(&p.global_state),
-        ));
-    }
-    if p.local_state_schema.num_uint != 0 || p.local_state_schema.num_byte_slice != 0 {
-        pairs.push((
-            rmpv::Value::String("t".into()),
-            rmpv::Value::Map(vec![
-                (
-                    rmpv::Value::String("nui".into()),
-                    rmpv::Value::from(p.local_state_schema.num_uint),
-                ),
-                (
-                    rmpv::Value::String("nbs".into()),
-                    rmpv::Value::from(p.local_state_schema.num_byte_slice),
-                ),
-            ]),
-        ));
-    }
-    if p.global_state_schema.num_uint != 0 || p.global_state_schema.num_byte_slice != 0 {
-        pairs.push((
-            rmpv::Value::String("u".into()),
-            rmpv::Value::Map(vec![
-                (
-                    rmpv::Value::String("nui".into()),
-                    rmpv::Value::from(p.global_state_schema.num_uint),
-                ),
-                (
-                    rmpv::Value::String("nbs".into()),
-                    rmpv::Value::from(p.global_state_schema.num_byte_slice),
-                ),
-            ]),
-        ));
-    }
-    if p.extra_program_pages != 0 {
-        pairs.push((
-            rmpv::Value::String("v".into()),
-            rmpv::Value::from(p.extra_program_pages as u64),
-        ));
+    if let Some(p) = params {
+        rd.approval_program = p.approval_program.clone();
+        rd.clear_state_program = p.clear_state_program.clone();
+        if !p.global_state.is_empty() {
+            rd.global_state = algo_codec::canonical_encode_teal_key_value(&p.global_state);
+        }
+        rd.local_state_schema_num_uint = p.local_state_schema.num_uint;
+        rd.local_state_schema_num_byte_slice = p.local_state_schema.num_byte_slice;
+        rd.global_state_schema_num_uint = p.global_state_schema.num_uint;
+        rd.global_state_schema_num_byte_slice = p.global_state_schema.num_byte_slice;
+        rd.extra_program_pages = p.extra_program_pages;
     }
 
-    // Resource flags: bit 2 = ownership (app params present)
-    pairs.push((rmpv::Value::String("y".into()), rmpv::Value::from(4u64)));
-    // UpdateRound — matches Go's ResourcesData.UpdateRound (codec "z").
-    if update_round != 0 {
-        pairs.push((
-            rmpv::Value::String("z".into()),
-            rmpv::Value::from(update_round),
-        ));
-    }
-
-    let val = rmpv::Value::Map(pairs);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    buf
+    rd
 }
 
 fn decode_app_params(data: &[u8], creator: Address) -> Result<AppParams, AlgoError> {
@@ -1027,52 +1018,103 @@ fn decode_app_params(data: &[u8], creator: Address) -> Result<AppParams, AlgoErr
         extra_program_pages: 0,
     };
 
-    for (k, v) in map {
+    // Tolerant of BOTH legacy (nested {nui,nbs} submaps at `t`/`u`, `v` =
+    // extra_pages) AND canonical (flat u64s at `t/u/v/w`, `x` = extra_pages)
+    // shapes. Two-pass: first collect all values, then dispatch on layout.
+    // PLAN-189 / TASK-192.
+    let mut q_val: Option<Vec<u8>> = None;
+    let mut r_val: Option<Vec<u8>> = None;
+    let mut s_val: Option<rmpv::Value> = None;
+    let mut t_val: Option<rmpv::Value> = None;
+    let mut u_val: Option<rmpv::Value> = None;
+    let mut v_val: Option<rmpv::Value> = None;
+    let mut w_val: Option<rmpv::Value> = None;
+    let mut x_val: Option<rmpv::Value> = None;
+    let mut raw_y: u64 = 0;
+
+    for (k, v) in &map {
         match k.as_str().unwrap_or("") {
-            "q" => {
-                if let Some(b) = v.as_slice() {
-                    p.approval_program = b.to_vec();
-                }
-            }
-            "r" => {
-                if let Some(b) = v.as_slice() {
-                    p.clear_state_program = b.to_vec();
-                }
-            }
-            "s" => {
-                p.global_state = decode_teal_key_value(&v);
-            }
-            "t" => {
-                if let rmpv::Value::Map(inner) = v {
-                    for (ik, iv) in inner {
-                        match ik.as_str().unwrap_or("") {
-                            "nui" => p.local_state_schema.num_uint = iv.as_u64().unwrap_or(0),
-                            "nbs" => p.local_state_schema.num_byte_slice = iv.as_u64().unwrap_or(0),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            "u" => {
-                if let rmpv::Value::Map(inner) = v {
-                    for (ik, iv) in inner {
-                        match ik.as_str().unwrap_or("") {
-                            "nui" => p.global_state_schema.num_uint = iv.as_u64().unwrap_or(0),
-                            "nbs" => {
-                                p.global_state_schema.num_byte_slice = iv.as_u64().unwrap_or(0)
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            "v" => {
-                let raw = v.as_u64().unwrap_or(0);
-                p.extra_program_pages = u32::try_from(raw).map_err(|_| AlgoError::Ledger {
-                    message: format!("extra_program_pages {raw} exceeds u32::MAX"),
-                })?;
-            }
+            "q" => q_val = v.as_slice().map(|b| b.to_vec()),
+            "r" => r_val = v.as_slice().map(|b| b.to_vec()),
+            "s" => s_val = Some(v.clone()),
+            "t" => t_val = Some(v.clone()),
+            "u" => u_val = Some(v.clone()),
+            "v" => v_val = Some(v.clone()),
+            "w" => w_val = Some(v.clone()),
+            "x" => x_val = Some(v.clone()),
+            "y" => raw_y = v.as_u64().unwrap_or(0),
             _ => {}
+        }
+    }
+
+    // Layout detection: canonical iff
+    //   - any canonical-only key (`w`/`x`) is present, OR
+    //   - `t`/`u` are scalar u64s (legacy always wrote them as nested
+    //     Map submaps), OR
+    //   - `y == 2` (OWNERSHIP) or `y == 3` (NOT_HOLDING | OWNERSHIP),
+    //     canonical-only flag values that legacy never wrote.
+    // PLAN-189 / TASK-192 (Codex review round 3).
+    let is_canonical = w_val.is_some()
+        || x_val.is_some()
+        || matches!(&t_val, Some(v) if !matches!(v, rmpv::Value::Map(_)))
+        || matches!(&u_val, Some(v) if !matches!(v, rmpv::Value::Map(_)))
+        || raw_y == 2
+        || raw_y == 3;
+
+    if let Some(b) = q_val {
+        p.approval_program = b;
+    }
+    if let Some(b) = r_val {
+        p.clear_state_program = b;
+    }
+    if let Some(s) = s_val {
+        p.global_state = decode_teal_key_value(&s);
+    }
+
+    if is_canonical {
+        if let Some(t) = t_val {
+            p.local_state_schema.num_uint = t.as_u64().unwrap_or(0);
+        }
+        if let Some(u) = u_val {
+            p.local_state_schema.num_byte_slice = u.as_u64().unwrap_or(0);
+        }
+        if let Some(v) = v_val {
+            p.global_state_schema.num_uint = v.as_u64().unwrap_or(0);
+        }
+        if let Some(w) = w_val {
+            p.global_state_schema.num_byte_slice = w.as_u64().unwrap_or(0);
+        }
+        if let Some(x) = x_val {
+            let raw = x.as_u64().unwrap_or(0);
+            p.extra_program_pages = u32::try_from(raw).map_err(|_| AlgoError::Ledger {
+                message: format!("extra_program_pages {raw} exceeds u32::MAX"),
+            })?;
+        }
+    } else {
+        // Legacy: t/u are nested {nui,nbs} submaps, v is extra_pages.
+        if let Some(rmpv::Value::Map(inner)) = t_val {
+            for (ik, iv) in inner {
+                match ik.as_str().unwrap_or("") {
+                    "nui" => p.local_state_schema.num_uint = iv.as_u64().unwrap_or(0),
+                    "nbs" => p.local_state_schema.num_byte_slice = iv.as_u64().unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(rmpv::Value::Map(inner)) = u_val {
+            for (ik, iv) in inner {
+                match ik.as_str().unwrap_or("") {
+                    "nui" => p.global_state_schema.num_uint = iv.as_u64().unwrap_or(0),
+                    "nbs" => p.global_state_schema.num_byte_slice = iv.as_u64().unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(v) = v_val {
+            let raw = v.as_u64().unwrap_or(0);
+            p.extra_program_pages = u32::try_from(raw).map_err(|_| AlgoError::Ledger {
+                message: format!("extra_program_pages {raw} exceeds u32::MAX"),
+            })?;
         }
     }
 
@@ -1146,21 +1188,88 @@ fn decode_app_local_state(data: &[u8]) -> Result<AppLocalState, AlgoError> {
         key_value: BTreeMap::new(),
     };
 
+    // Tolerant of BOTH legacy (`p` = schema submap {nui,nbs}, `s` = kv)
+    // AND canonical (`n` = num_uint u64, `o` = num_byte_slice u64,
+    // `p` = kv map) shapes. PLAN-189 / TASK-192.
+    //
+    // Disambiguation for `p` (the only ambiguous key):
+    //   * Legacy → value is a Map whose keys are msgpack strings `"nui"`/`"nbs"`.
+    //   * Canonical → value is a Map whose keys are binary/raw bytes (the kv keys).
+    // We inspect the value type at `p` to decide.
+
+    // First pass: detect canonical signals. The blob is canonical if
+    // ANY of:
+    //   - a canonical-only key is present: `n`/`o` (canonical local-state
+    //     schemas) or `q`/`r`/`w`/`x` (canonical app-params signals
+    //     present iff this is a combined row)
+    //   - the `y` flag carries a canonical-only value: `y == 2` (OWNERSHIP)
+    //     or `y == 3` (NOT_HOLDING | OWNERSHIP). Legacy Rust encoders
+    //     only ever wrote y ∈ {1, 4, 5}, so these values are unambiguous.
+    // In a canonical combined row, `s` is the app-params global_state,
+    // NOT the local kv map; the local kv lives at `p`. So we must NOT
+    // treat `s` as local kv in canonical mode. PLAN-189 / TASK-192
+    // (Codex review round 3).
+    let mut is_canonical = false;
+    let mut raw_y: u64 = 0;
+    for (k, v) in &map {
+        if matches!(
+            k.as_str(),
+            Some("n") | Some("o") | Some("q") | Some("r") | Some("w") | Some("x")
+        ) {
+            is_canonical = true;
+        }
+        if k.as_str() == Some("y") {
+            raw_y = v.as_u64().unwrap_or(0);
+        }
+    }
+    if raw_y == 2 || raw_y == 3 {
+        is_canonical = true;
+    }
+
     for (k, v) in map {
         match k.as_str().unwrap_or("") {
+            "n" => s.schema.num_uint = v.as_u64().unwrap_or(0),
+            "o" => s.schema.num_byte_slice = v.as_u64().unwrap_or(0),
             "p" => {
-                if let rmpv::Value::Map(inner) = v {
-                    for (ik, iv) in inner {
-                        match ik.as_str().unwrap_or("") {
-                            "nui" => s.schema.num_uint = iv.as_u64().unwrap_or(0),
-                            "nbs" => s.schema.num_byte_slice = iv.as_u64().unwrap_or(0),
-                            _ => {}
+                if is_canonical {
+                    // Canonical: `p` is the local key_value map.
+                    s.key_value = decode_teal_key_value(&v);
+                } else if let rmpv::Value::Map(inner) = &v {
+                    // Disambiguate by structure (NOT just key strings —
+                    // TEAL keys are user-controlled bytes that could
+                    // legitimately spell "nui"/"nbs"). A legacy schema
+                    // submap has *every* entry shaped {string-key,
+                    // integer-value} for keys "nui"/"nbs". A canonical
+                    // kv map's values are always Maps (TealValue structs
+                    // containing `tt` + `ui`/`tb`). PLAN-189 / TASK-192.
+                    let looks_like_legacy_schema = !inner.is_empty()
+                        && inner.iter().all(|(ik, iv)| {
+                            matches!(ik.as_str(), Some("nui") | Some("nbs"))
+                                && matches!(iv, rmpv::Value::Integer(_))
+                        });
+                    if looks_like_legacy_schema {
+                        for (ik, iv) in inner {
+                            match ik.as_str().unwrap_or("") {
+                                "nui" => s.schema.num_uint = iv.as_u64().unwrap_or(0),
+                                "nbs" => s.schema.num_byte_slice = iv.as_u64().unwrap_or(0),
+                                _ => {}
+                            }
                         }
+                    } else {
+                        // Canonical kv map even without n/o (degenerate
+                        // canonical row with zero-value schema fields).
+                        s.key_value = decode_teal_key_value(&v);
                     }
                 }
             }
             "s" => {
-                s.key_value = decode_teal_key_value(&v);
+                // `s` is local kv ONLY in legacy non-combined rows. In
+                // canonical combined rows, `s` is app-params global_state
+                // and must be ignored by the local-state decoder.
+                // PLAN-189 / TASK-192 (Codex review round 2).
+                if !is_canonical {
+                    s.key_value = decode_teal_key_value(&v);
+                }
             }
             _ => {}
         }
@@ -1181,7 +1290,7 @@ fn decode_app_local_state(data: &[u8]) -> Result<AppLocalState, AlgoError> {
 /// be used in place of bitwise checks against the raw `y` value
 /// because the legacy and canonical encodings assign opposite
 /// meaning to the same bit — see the module-level comment on
-/// [`LEGACY_Y_HOLDING_BIT`] for the full story.
+/// the module-level comment above for the full story.
 ///
 /// PLAN-189 / TASK-190.
 #[derive(Debug, Clone, Copy, Default)]
@@ -1383,264 +1492,67 @@ pub(crate) fn inspect_resource_blob(data: &[u8]) -> ResourceMeta {
 /// `new_params` is the AppParams to merge in.
 /// Returns the combined blob with flags = HOLDING | OWNERSHIP.
 fn merge_app_params_into_local_state(existing_blob: &[u8], new_params: &AppParams) -> Vec<u8> {
-    let existing_val: rmpv::Value =
-        rmpv::decode::read_value(&mut &existing_blob[..]).unwrap_or(rmpv::Value::Map(vec![]));
-
-    let mut merged: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-    // Preserve existing local-state fields (p, s)
-    if let rmpv::Value::Map(pairs) = existing_val {
-        for (k, v) in pairs {
-            let key_str = k.as_str().unwrap_or("");
-            if key_str == "y" {
-                continue; // we'll write combined flags at the end
-            }
-            merged.push((k, v));
-        }
-    }
-
-    // Add app-params fields (q, r, s, t, u, v)
-    // Note: "s" key is used by both global_state (app params) and key_value (local state).
-    // In Go, they use the same key "s" for TealKeyValue in both roles.
-    // App params global_state goes under "s", local state key_value also goes under "s".
-    // When merged, the existing "s" from local state is already in the map.
-    // App params global_state is a separate field. We need to check if global_state
-    // should overwrite or coexist. In Go's resource blob, the app-params fields use
-    // different keys than local-state fields, so they coexist:
-    //   Local state: p (schema), s (key_value)
-    //   App params:  q (approval), r (clear), s (global_state), t (local_schema), u (global_schema), v (extra_pages)
-    // Actually "s" collides! In Go, the resource blob stores both app params and local state
-    // in the same map. The "s" key is used by global_state for app params. When both are
-    // present, the local state key_value is stored differently. Let me re-check...
-    // Actually in our encode_app_local_state, local state key_value uses "s".
-    // And in encode_app_params, global_state also uses "s".
-    // This means they DO collide on "s". When merged, we need to handle this.
-    // For now: if app params has global_state, it replaces local state's "s" in the blob.
-    // This is acceptable because Go stores them in the same blob and the "s" field
-    // represents global_state when ownership flag is set, key_value when holding flag is set.
-    // Actually, looking at Go's resourcesData struct, it has separate fields:
-    //   ResourceData has both AppParams and AppLocalState embedded.
-    // The msgpack keys are different in Go because the struct fields have different codec tags.
-    // Let me use the Go-compatible approach: local state uses "p" (schema) and "w" (key_value),
-    // while app params uses "q","r","s","t","u","v".
-    // Wait - our existing encode uses "s" for local state key_value and "s" for global_state.
-    // We need to check Go's actual codec tags...
-    // For correctness, let's just remove the existing "s" from local state before adding
-    // app params, and re-add it. The app params global_state takes "s", local state key_value
-    // should not collide because Go uses different keys.
-    // Actually in our current code, the collision IS a problem. But since the existing tests
-    // pass without merging, let's keep the existing key scheme and just handle the merge
-    // carefully: app params owns "q","r","s","t","u","v" and local state owns "p","s".
-    // When both are present, we strip "s" from local state (it will be overwritten by
-    // app params global_state if non-empty, or absent if both are empty).
-    // This is a known simplification — in practice the "s" collision is rare.
-
-    // Remove "s" from merged if app params has global_state (it will be re-added below)
-    if !new_params.global_state.is_empty() {
-        merged.retain(|(k, _)| k.as_str() != Some("s"));
-    }
-
-    if !new_params.approval_program.is_empty() {
-        merged.push((
-            rmpv::Value::String("q".into()),
-            rmpv::Value::Binary(new_params.approval_program.clone()),
-        ));
-    }
-    if !new_params.clear_state_program.is_empty() {
-        merged.push((
-            rmpv::Value::String("r".into()),
-            rmpv::Value::Binary(new_params.clear_state_program.clone()),
-        ));
-    }
-    if !new_params.global_state.is_empty() {
-        merged.push((
-            rmpv::Value::String("s".into()),
-            encode_teal_key_value(&new_params.global_state),
-        ));
-    }
-    if new_params.local_state_schema.num_uint != 0
-        || new_params.local_state_schema.num_byte_slice != 0
-    {
-        merged.push((
-            rmpv::Value::String("t".into()),
-            rmpv::Value::Map(vec![
-                (
-                    rmpv::Value::String("nui".into()),
-                    rmpv::Value::from(new_params.local_state_schema.num_uint),
-                ),
-                (
-                    rmpv::Value::String("nbs".into()),
-                    rmpv::Value::from(new_params.local_state_schema.num_byte_slice),
-                ),
-            ]),
-        ));
-    }
-    if new_params.global_state_schema.num_uint != 0
-        || new_params.global_state_schema.num_byte_slice != 0
-    {
-        merged.push((
-            rmpv::Value::String("u".into()),
-            rmpv::Value::Map(vec![
-                (
-                    rmpv::Value::String("nui".into()),
-                    rmpv::Value::from(new_params.global_state_schema.num_uint),
-                ),
-                (
-                    rmpv::Value::String("nbs".into()),
-                    rmpv::Value::from(new_params.global_state_schema.num_byte_slice),
-                ),
-            ]),
-        ));
-    }
-    if new_params.extra_program_pages != 0 {
-        merged.push((
-            rmpv::Value::String("v".into()),
-            rmpv::Value::from(new_params.extra_program_pages as u64),
-        ));
-    }
-
-    // Combined flags
-    merged.push((
-        rmpv::Value::String("y".into()),
-        rmpv::Value::from(LEGACY_Y_HOLDING_BIT | LEGACY_Y_OWNERSHIP_BIT),
-    ));
-
-    let val = rmpv::Value::Map(merged);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    buf
+    // Decode the existing local state (tolerates both legacy and
+    // canonical shapes via the updated `decode_app_local_state`), then
+    // re-encode via the canonical builder with both subsets. PLAN-189 / TASK-192.
+    //
+    // Canonical layout avoids the legacy `s` collision entirely:
+    //   local state key_value → `p`
+    //   app params global_state → `s`
+    // so the old hand-rolled "strip s if global_state present" logic
+    // is no longer needed.
+    let existing_local = decode_app_local_state(existing_blob).unwrap_or_else(|_| AppLocalState {
+        schema: StateSchema::default(),
+        key_value: BTreeMap::new(),
+    });
+    let update_round = extract_update_round(existing_blob);
+    let rd = build_app_resource_data(Some(&existing_local), Some(new_params), update_round);
+    algo_codec::canonical_encode_resources_data(&rd)
 }
 
 /// Merge local-state blob fields into an existing app-params blob, producing a
-/// combined blob with both ownership and holding flags set.
-///
-/// `existing_blob` contains app-params fields (q, r, s, t, u, v) with ownership flag.
-/// `new_local` is the AppLocalState to merge in.
-/// Returns the combined blob with flags = HOLDING | OWNERSHIP.
+/// canonical combined blob (`y = OWNERSHIP`). PLAN-189 / TASK-192.
 fn merge_app_local_state_into_params(existing_blob: &[u8], new_local: &AppLocalState) -> Vec<u8> {
-    let existing_val: rmpv::Value =
-        rmpv::decode::read_value(&mut &existing_blob[..]).unwrap_or(rmpv::Value::Map(vec![]));
-
-    let mut merged: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-    // Preserve existing app-params fields (q, r, s, t, u, v)
-    if let rmpv::Value::Map(pairs) = existing_val {
-        for (k, v) in pairs {
-            let key_str = k.as_str().unwrap_or("");
-            if key_str == "y" {
-                continue; // we'll write combined flags at the end
-            }
-            // Don't preserve "p" — that's the local state schema field we're about to write
-            if key_str == "p" {
-                continue;
-            }
-            merged.push((k, v));
-        }
-    }
-
-    // Add local-state fields
-    if new_local.schema.num_uint != 0 || new_local.schema.num_byte_slice != 0 {
-        merged.push((
-            rmpv::Value::String("p".into()),
-            rmpv::Value::Map(vec![
-                (
-                    rmpv::Value::String("nui".into()),
-                    rmpv::Value::from(new_local.schema.num_uint),
-                ),
-                (
-                    rmpv::Value::String("nbs".into()),
-                    rmpv::Value::from(new_local.schema.num_byte_slice),
-                ),
-            ]),
-        ));
-    }
-
-    // Note: local state key_value uses "s" which may collide with app params global_state.
-    // If the existing blob already has "s" (global_state from app params), we don't overwrite
-    // it with local state key_value. The "s" key belongs to app params when ownership is set.
-    // Local state key_value is only stored under "s" when there is NO ownership flag.
-    // When both flags are set, "s" = global_state (app params takes precedence).
-    // This matches Go's behavior where the combined resource blob has one TealKeyValue
-    // for global state and a separate one for local state, but they use different struct fields.
-
-    // Combined flags
-    merged.push((
-        rmpv::Value::String("y".into()),
-        rmpv::Value::from(LEGACY_Y_HOLDING_BIT | LEGACY_Y_OWNERSHIP_BIT),
-    ));
-
-    let val = rmpv::Value::Map(merged);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    buf
+    // Decode existing params using the dummy creator placeholder; we only
+    // need the BLOB fields, not the creator address (creator lives in a
+    // separate column).
+    let existing_params =
+        decode_app_params(existing_blob, Address([0u8; 32])).unwrap_or_else(|_| AppParams {
+            creator: Address([0u8; 32]),
+            approval_program: Vec::new(),
+            clear_state_program: Vec::new(),
+            global_state: BTreeMap::new(),
+            local_state_schema: StateSchema::default(),
+            global_state_schema: StateSchema::default(),
+            extra_program_pages: 0,
+        });
+    let update_round = extract_update_round(existing_blob);
+    let rd = build_app_resource_data(Some(new_local), Some(&existing_params), update_round);
+    algo_codec::canonical_encode_resources_data(&rd)
 }
 
-/// Strip ownership fields from a combined blob, keeping only local-state fields.
-/// Returns the local-state-only blob with holding flag, or None if nothing remains.
+/// Strip ownership (app params) fields from a combined app blob,
+/// keeping only the local-state subset. Returns a canonical
+/// local-state-only blob (`y = HOLDING`), or None if the input cannot
+/// be decoded. PLAN-189 / TASK-192.
 fn strip_ownership_from_blob(data: &[u8]) -> Option<Vec<u8>> {
-    let val: rmpv::Value = rmpv::decode::read_value(&mut &data[..]).ok()?;
-
-    let mut local_pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-    if let rmpv::Value::Map(pairs) = val {
-        for (k, v) in pairs {
-            let key_str = k.as_str().unwrap_or("");
-            match key_str {
-                // App-params fields — strip these
-                "q" | "r" | "t" | "u" | "v" => continue,
-                // "s" belongs to app params (global_state) when ownership was set — strip it
-                "s" => continue,
-                // "y" — will be rewritten
-                "y" => continue,
-                // Everything else (local state fields like "p") — keep
-                _ => local_pairs.push((k, v)),
-            }
-        }
-    }
-
-    // Add holding-only flag
-    local_pairs.push((
-        rmpv::Value::String("y".into()),
-        rmpv::Value::from(LEGACY_Y_HOLDING_BIT),
-    ));
-
-    let val = rmpv::Value::Map(local_pairs);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    Some(buf)
+    rmpv::decode::read_value(&mut &data[..]).ok()?;
+    let local = decode_app_local_state(data).ok()?;
+    let update_round = extract_update_round(data);
+    let rd = build_app_resource_data(Some(&local), None, update_round);
+    Some(algo_codec::canonical_encode_resources_data(&rd))
 }
 
-/// Strip holding fields from a combined blob, keeping only app-params fields.
-/// Returns the app-params-only blob with ownership flag, or None if nothing remains.
+/// Strip holding (app local-state) fields from a combined app blob,
+/// keeping only the app-params subset. Returns a canonical app-params-only
+/// blob (`y = NOT_HOLDING | OWNERSHIP`), or None if the input cannot
+/// be decoded. PLAN-189 / TASK-192.
 fn strip_holding_from_blob(data: &[u8]) -> Option<Vec<u8>> {
-    let val: rmpv::Value = rmpv::decode::read_value(&mut &data[..]).ok()?;
-
-    let mut params_pairs: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-    if let rmpv::Value::Map(pairs) = val {
-        for (k, v) in pairs {
-            let key_str = k.as_str().unwrap_or("");
-            match key_str {
-                // Local-state field — strip
-                "p" => continue,
-                // "y" — will be rewritten
-                "y" => continue,
-                // Everything else (app params fields like q, r, s, t, u, v) — keep
-                _ => params_pairs.push((k, v)),
-            }
-        }
-    }
-
-    // Add ownership-only flag
-    params_pairs.push((
-        rmpv::Value::String("y".into()),
-        rmpv::Value::from(LEGACY_Y_OWNERSHIP_BIT),
-    ));
-
-    let val = rmpv::Value::Map(params_pairs);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &val).expect("msgpack encode");
-    Some(buf)
+    rmpv::decode::read_value(&mut &data[..]).ok()?;
+    let params = decode_app_params(data, Address([0u8; 32])).ok()?;
+    let update_round = extract_update_round(data);
+    let rd = build_app_resource_data(None, Some(&params), update_round);
+    Some(algo_codec::canonical_encode_resources_data(&rd))
 }
 
 // ---------------------------------------------------------------------------
@@ -5528,6 +5440,228 @@ mod tests {
         let y = pairs.iter().find(|(k, _)| k.as_str() == Some("y"));
         let y_val = y.expect("y present").1.as_u64().expect("y u64");
         assert_eq!(y_val, 2, "canonical OWNERSHIP = 2");
+    }
+
+    // ---------------------------------------------------------------------
+    // App params canonical delegation (TASK-192)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn encode_app_params_matches_canonical_encoder() {
+        let mut global = BTreeMap::new();
+        global.insert(b"k1".to_vec(), TealValue::Uint(42));
+        let p = AppParams {
+            creator: Address([0u8; 32]),
+            approval_program: vec![0x06, 0x81, 0x01],
+            clear_state_program: vec![0x06],
+            global_state: global.clone(),
+            local_state_schema: StateSchema {
+                num_uint: 5,
+                num_byte_slice: 7,
+            },
+            global_state_schema: StateSchema {
+                num_uint: 11,
+                num_byte_slice: 13,
+            },
+            extra_program_pages: 2,
+        };
+        let actual = encode_app_params_with_round(&p, 99);
+
+        let rd = algo_codec::ResourcesData {
+            approval_program: vec![0x06, 0x81, 0x01],
+            clear_state_program: vec![0x06],
+            global_state: algo_codec::canonical_encode_teal_key_value(&global),
+            local_state_schema_num_uint: 5,
+            local_state_schema_num_byte_slice: 7,
+            global_state_schema_num_uint: 11,
+            global_state_schema_num_byte_slice: 13,
+            extra_program_pages: 2,
+            resource_flags: algo_codec::resource_flags::NOT_HOLDING
+                | algo_codec::resource_flags::OWNERSHIP,
+            update_round: 99,
+            ..Default::default()
+        };
+        let expected = algo_codec::canonical_encode_resources_data(&rd);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn encode_app_params_canonical_y_value() {
+        // Standalone app params row: NOT_HOLDING | OWNERSHIP = 3.
+        let p = AppParams {
+            creator: Address([0u8; 32]),
+            approval_program: vec![0x06],
+            clear_state_program: vec![0x06],
+            global_state: BTreeMap::new(),
+            local_state_schema: StateSchema::default(),
+            global_state_schema: StateSchema::default(),
+            extra_program_pages: 0,
+        };
+        let bytes = encode_app_params_with_round(&p, 0);
+        let val: rmpv::Value = rmpv::decode::read_value(&mut &bytes[..]).expect("decode");
+        let rmpv::Value::Map(pairs) = val else {
+            panic!("not a map")
+        };
+        let y = pairs.iter().find(|(k, _)| k.as_str() == Some("y"));
+        let y_val = y.expect("y present").1.as_u64().expect("y u64");
+        assert_eq!(y_val, 3, "canonical app params standalone = NOT_HOLDING|OWNERSHIP = 3");
+    }
+
+    #[test]
+    fn encode_app_params_round_trip_via_decoder() {
+        let mut global = BTreeMap::new();
+        global.insert(b"k".to_vec(), TealValue::Bytes(b"v".to_vec()));
+        let p = AppParams {
+            creator: Address([7u8; 32]),
+            approval_program: vec![0xff; 8],
+            clear_state_program: vec![0xee; 4],
+            global_state: global,
+            local_state_schema: StateSchema {
+                num_uint: 1,
+                num_byte_slice: 2,
+            },
+            global_state_schema: StateSchema {
+                num_uint: 3,
+                num_byte_slice: 4,
+            },
+            extra_program_pages: 1,
+        };
+        let bytes = encode_app_params_with_round(&p, 0);
+        let decoded = decode_app_params(&bytes, p.creator).expect("decode");
+        assert_eq!(decoded.approval_program, p.approval_program);
+        assert_eq!(decoded.clear_state_program, p.clear_state_program);
+        assert_eq!(decoded.local_state_schema.num_uint, p.local_state_schema.num_uint);
+        assert_eq!(
+            decoded.local_state_schema.num_byte_slice,
+            p.local_state_schema.num_byte_slice
+        );
+        assert_eq!(decoded.global_state_schema.num_uint, p.global_state_schema.num_uint);
+        assert_eq!(
+            decoded.global_state_schema.num_byte_slice,
+            p.global_state_schema.num_byte_slice
+        );
+        assert_eq!(decoded.extra_program_pages, p.extra_program_pages);
+    }
+
+    #[test]
+    fn decode_teal_key_value_preserves_non_utf8_string_keys() {
+        // Go's canonical TealKeyValue encodes raw byte keys as msgpack
+        // STRINGS (Go's `string` is a byte sequence, not necessarily
+        // UTF-8). Round-trip a key with invalid UTF-8 bytes through the
+        // canonical encoder + the (legacy) decoder.
+        let key = vec![0xff, 0xfe, 0xfd];
+        let mut kv = BTreeMap::new();
+        kv.insert(key.clone(), TealValue::Uint(7));
+        let encoded = algo_codec::canonical_encode_teal_key_value(&kv);
+        // Wrap it as a Value via rmpv decode and run our decoder.
+        let val = rmpv::decode::read_value(&mut &encoded[..]).expect("decode rmpv");
+        let decoded = decode_teal_key_value(&val);
+        let got = decoded.get(&key);
+        assert!(got.is_some(), "non-UTF-8 key must survive decode");
+        assert!(matches!(got.unwrap(), TealValue::Uint(7)));
+    }
+
+    #[test]
+    fn decode_app_local_state_handles_kv_key_named_like_schema() {
+        // Pathological case: canonical app local state with zero schemas
+        // (n/o omitted) and a kv map containing a TEAL entry whose key
+        // happens to be "nui". Disambiguation must NOT misread this as
+        // a legacy schema submap. PLAN-189 / TASK-192 (Codex round 1).
+        let mut kv = BTreeMap::new();
+        kv.insert(b"nui".to_vec(), TealValue::Uint(123));
+        let als = AppLocalState {
+            schema: StateSchema::default(),
+            key_value: kv,
+        };
+        let bytes = build_canonical_app_local_state_blob(&als);
+        let decoded = decode_app_local_state(&bytes).expect("decode");
+        let got = decoded.key_value.get(b"nui".as_slice());
+        assert!(
+            got.is_some(),
+            "user kv key named 'nui' must NOT be classified as legacy schema"
+        );
+        assert!(matches!(got.unwrap(), TealValue::Uint(123)));
+        assert_eq!(decoded.schema.num_uint, 0);
+        assert_eq!(decoded.schema.num_byte_slice, 0);
+    }
+
+    /// Build a canonical app local-state blob using only the local-state
+    /// subset of `build_app_resource_data`. Test helper. PLAN-189 / TASK-192.
+    fn build_canonical_app_local_state_blob(als: &AppLocalState) -> Vec<u8> {
+        let rd = build_app_resource_data(Some(als), None, 0);
+        algo_codec::canonical_encode_resources_data(&rd)
+    }
+
+    #[test]
+    fn decode_app_local_state_ignores_global_state_in_combined_row() {
+        // Canonical combined app row: creator's local state AT `p`,
+        // app params global_state AT `s`. The local-state decoder must
+        // return ONLY the `p` kv, never overwrite from `s`. PLAN-189 /
+        // TASK-192 (Codex round 2).
+        let mut local_kv = BTreeMap::new();
+        local_kv.insert(b"local_key".to_vec(), TealValue::Uint(100));
+        let local = AppLocalState {
+            schema: StateSchema::default(),
+            key_value: local_kv,
+        };
+        let mut global = BTreeMap::new();
+        global.insert(b"global_key".to_vec(), TealValue::Uint(999));
+        let params = AppParams {
+            creator: Address([0u8; 32]),
+            approval_program: vec![0x06],
+            clear_state_program: vec![0x06],
+            global_state: global,
+            local_state_schema: StateSchema::default(),
+            global_state_schema: StateSchema::default(),
+            extra_program_pages: 0,
+        };
+        let rd = build_app_resource_data(Some(&local), Some(&params), 0);
+        let bytes = algo_codec::canonical_encode_resources_data(&rd);
+        let decoded = decode_app_local_state(&bytes).expect("decode");
+        assert_eq!(
+            decoded.key_value.len(),
+            1,
+            "local-state decoder must NOT pull in `s` (global_state) entries"
+        );
+        let local_val = decoded.key_value.get(b"local_key".as_slice());
+        assert!(local_val.is_some(), "local kv preserved");
+        assert!(matches!(local_val.unwrap(), TealValue::Uint(100)));
+        assert!(
+            !decoded.key_value.contains_key(b"global_key".as_slice()),
+            "global state must not leak into local-state decode"
+        );
+    }
+
+    #[test]
+    fn decode_app_params_legacy_shape_still_works() {
+        // Hand-build a legacy app-params blob (nested schema submaps,
+        // `v` for extra_program_pages, `y=4`).
+        let bytes = rmpv_map(&[
+            ("q", rmpv::Value::Binary(vec![0x06])),
+            (
+                "t",
+                rmpv::Value::Map(vec![
+                    (rmpv::Value::String("nbs".into()), rmpv::Value::from(2u64)),
+                    (rmpv::Value::String("nui".into()), rmpv::Value::from(1u64)),
+                ]),
+            ),
+            (
+                "u",
+                rmpv::Value::Map(vec![
+                    (rmpv::Value::String("nbs".into()), rmpv::Value::from(4u64)),
+                    (rmpv::Value::String("nui".into()), rmpv::Value::from(3u64)),
+                ]),
+            ),
+            ("v", rmpv::Value::from(5u64)),
+            ("y", rmpv::Value::from(4u64)),
+        ]);
+        let decoded = decode_app_params(&bytes, Address([0u8; 32])).expect("decode");
+        assert_eq!(decoded.local_state_schema.num_uint, 1);
+        assert_eq!(decoded.local_state_schema.num_byte_slice, 2);
+        assert_eq!(decoded.global_state_schema.num_uint, 3);
+        assert_eq!(decoded.global_state_schema.num_byte_slice, 4);
+        assert_eq!(decoded.extra_program_pages, 5);
     }
 
     // ---------------------------------------------------------------------
