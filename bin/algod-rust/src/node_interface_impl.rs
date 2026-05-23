@@ -3,9 +3,9 @@
 //! Backs the REST API crate's [`NodeInterface`] trait with a live
 //! [`SqliteLedger`] and cached genesis / build metadata. This file is the
 //! *skeleton* established by PLAN-74 / TASK-75 — it covers the read-only
-//! surface (status, genesis, block lookups, account state). The state-delta
-//! endpoint is wired but stubbed pending DeltaCache integration; see the
-//! `get_state_delta_for_round` impl below.
+//! surface (status, genesis, block lookups, account state). PLAN-36
+//! TASK-128 wired `get_state_delta_for_round` to the ledger's in-memory
+//! `DeltaCache` rolling window.
 //! Downstream tasks layer additional methods onto the same struct:
 //!
 //! - Pool methods (`TASK-76`) — `pending_transactions`, `get_pending_transaction`
@@ -679,17 +679,21 @@ impl NodeInterface for AlgodNodeInterface {
     /// Look up the ledger state delta for `round`.
     ///
     /// PLAN-36 / TASK-116 removed the Rust-only `state_deltas` SQLite table
-    /// that previously backed this lookup (the table was never written to,
-    /// so the endpoint already behaved this way in practice). The in-memory
-    /// [`algo_ledger::DeltaCache`] is the intended replacement — once it's
-    /// wired into this handler the endpoint will start returning real data
-    /// for rounds inside the rolling window (default 320). Until then, every
-    /// round is `NotFound`, matching the prior on-the-wire behavior. See
-    /// the PLAN-36 follow-up task for the wiring work.
+    /// that previously backed this lookup; PLAN-36 TASK-128 wires the
+    /// in-memory [`algo_ledger::DeltaCache`] (rolling 320-round window,
+    /// populated by `SqliteLedger::apply_block_caching_delta` from the live
+    /// sync driver) into this handler. Rounds inside the window return their
+    /// captured delta; rounds outside the window (older than the cache's
+    /// retention, or never applied through the caching path — e.g. a node
+    /// serving REST while still in catchpoint-replay mode) return
+    /// `NotFound`. Mirrors go-algorand's
+    /// `daemon/algod/api/server/v2/handlers.go::GetLedgerStateDelta`, which
+    /// also bounds its lookup window in-memory.
     async fn get_state_delta_for_round(&self, round: u64) -> Result<StateDelta, NodeError> {
-        Err(NodeError::NotFound(format!(
-            "no state delta for round {round}"
-        )))
+        let ledger = self.lock_ledger("get_state_delta_for_round")?;
+        ledger
+            .get_cached_state_delta(round)
+            .ok_or_else(|| NodeError::NotFound(format!("no state delta for round {round}")))
     }
 
     // ---- Account state ----
@@ -1212,6 +1216,55 @@ mod tests {
             other => panic!("expected NotFound, got {other:?}"),
         }
         assert!(matches!(adapter.get_block_hash(1).await, Ok(None)));
+    }
+
+    /// PLAN-36 TASK-128: `get_state_delta_for_round` returns the cached
+    /// `StateDelta` for rounds inside the rolling window, and `NotFound`
+    /// for rounds that fell out of the window via eviction. Seeds the
+    /// cache directly via `SqliteLedger::cache_state_delta` so the test
+    /// does not depend on a fully-wired block-apply driver.
+    #[tokio::test]
+    async fn get_state_delta_for_round_returns_cached_delta() {
+        use algo_ledger::StateDelta;
+
+        let ledger = Arc::new(Mutex::new(
+            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+        ));
+        // Seed two rounds with sentinel deltas. We can't assert on the
+        // *contents* without re-importing the whole StateDelta surface here,
+        // so we use `StateDelta::default()` and just assert presence vs.
+        // NotFound — that's the contract the handler exposes.
+        {
+            let mut guard = ledger.lock().expect("ledger lock");
+            guard.cache_state_delta(5, StateDelta::default());
+            guard.cache_state_delta(7, StateDelta::default());
+        }
+        let adapter = adapter_with_ledger(ledger.clone());
+
+        // Round inside the window → Ok.
+        assert!(adapter.get_state_delta_for_round(5).await.is_ok());
+        assert!(adapter.get_state_delta_for_round(7).await.is_ok());
+
+        // Round inside the window but never cached → NotFound.
+        match adapter.get_state_delta_for_round(6).await {
+            Err(NodeError::NotFound(_)) => {}
+            other => panic!("expected NotFound for uncached round, got {other:?}"),
+        }
+
+        // Round outside the window → NotFound. Drive enough inserts to
+        // push round 5 below the default 320-round window.
+        {
+            let mut guard = ledger.lock().expect("ledger lock");
+            // After this, min_round >= 5 + 1 = 6, so round 5 is evicted.
+            guard.cache_state_delta(
+                5 + algo_ledger::DEFAULT_WINDOW_SIZE as u64,
+                StateDelta::default(),
+            );
+        }
+        match adapter.get_state_delta_for_round(5).await {
+            Err(NodeError::NotFound(_)) => {}
+            other => panic!("expected NotFound after eviction, got {other:?}"),
+        }
     }
 
     #[tokio::test]

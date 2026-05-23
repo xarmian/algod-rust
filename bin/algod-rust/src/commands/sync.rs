@@ -410,12 +410,20 @@ pub async fn run(
 
         // Apply block to ledger.
         store.begin_block()?;
+        // PLAN-36 TASK-128: route the non-comparison branch through
+        // `apply_block_caching_delta` so the REST API's
+        // `get_state_delta_for_round` endpoint can serve recent rounds out of
+        // the in-memory delta cache. The comparison branch (used when the
+        // `--avm-execute` flag is set, exercised by conformance comparisons)
+        // still goes through `apply_block_with_comparison` and does not
+        // populate the cache — those runs are offline / conformance-only and
+        // don't expose a REST API.
         let apply_result = if avm_execute {
             let (result, block_stats) = algo_ledger::apply_block_with_comparison(&mut store, block);
             eval_delta_stats += block_stats;
             result
         } else {
-            algo_ledger::apply_block(&mut store, block)
+            store.apply_block_caching_delta(block)
         };
 
         match apply_result {

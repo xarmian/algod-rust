@@ -2368,6 +2368,16 @@ pub struct SqliteLedger {
     /// `load_trie` time and to any trie set via `enable_trie` /
     /// `rebuild_trie_from_db`. PLAN-144 TASK-147.
     trie_cache_target: Option<usize>,
+    /// In-memory rolling window of recent [`crate::state_delta::StateDelta`]s,
+    /// keyed by round. Populated by [`Self::apply_block_caching_delta`] (used
+    /// by the live sync driver in `bin/algod-rust`) and served by the REST API
+    /// adapter's `get_state_delta_for_round`. Window size is
+    /// [`crate::delta_cache::DEFAULT_WINDOW_SIZE`] (320 rounds), matching
+    /// go-algorand's in-memory delta retention in `accountUpdates.deltas`
+    /// (`../go-algorand/ledger/acctupdates.go` @ `v4.5.1-stable`). The cache is
+    /// in-memory only — it does not survive a restart, matching Go.
+    /// PLAN-36 TASK-128.
+    delta_cache: crate::delta_cache::DeltaCache,
 }
 
 impl SqliteLedger {
@@ -2631,6 +2641,7 @@ impl SqliteLedger {
             trie: None,
             pre_mutations: Vec::new(),
             trie_cache_target: None,
+            delta_cache: crate::delta_cache::DeltaCache::with_default_window(),
         })
     }
 
@@ -2951,6 +2962,71 @@ impl SqliteLedger {
         if let Some(t) = self.trie.as_mut() {
             t.set_cache_target(target);
         }
+    }
+
+    // ---- Delta cache (PLAN-36 TASK-128) ----
+
+    /// Look up a recent state delta from the in-memory rolling window.
+    ///
+    /// Returns `Some(StateDelta)` when `round` falls inside the cache window
+    /// (default 320 rounds back from the latest cached round) and `None`
+    /// otherwise. Mirrors go-algorand's `accountUpdates.deltas` window served
+    /// from `daemon/algod/api/server/v2/handlers.go::GetLedgerStateDelta`.
+    ///
+    /// The returned delta is a clone — the cache continues to own its entry
+    /// so the next block-apply can evict it safely.
+    pub fn get_cached_state_delta(&self, round: u64) -> Option<crate::state_delta::StateDelta> {
+        self.delta_cache.get(round).cloned()
+    }
+
+    /// Insert (or overwrite) a state delta into the in-memory rolling window.
+    ///
+    /// The cache evicts entries older than `round - window_size + 1` after the
+    /// insert, so callers don't need to evict explicitly. Public so tests and
+    /// alternative apply drivers (catchpoint replay, future block producer)
+    /// can populate the cache without going through
+    /// [`Self::apply_block_caching_delta`].
+    pub fn cache_state_delta(&mut self, round: u64, delta: crate::state_delta::StateDelta) {
+        self.delta_cache.insert(round, delta);
+    }
+
+    /// Smallest round currently present in the in-memory delta cache.
+    ///
+    /// Used by callers that need to distinguish "round outside the rolling
+    /// window" (caller should respond `NotFound`) from "round inside the
+    /// window but never cached" (an internal invariant violation). Returns
+    /// `0` before any delta has been inserted.
+    pub fn delta_cache_min_round(&self) -> u64 {
+        self.delta_cache.min_round()
+    }
+
+    /// Number of entries currently held in the delta cache. Test helper.
+    pub fn delta_cache_len(&self) -> usize {
+        self.delta_cache.len()
+    }
+
+    /// Apply a block and populate the in-memory delta cache as a side effect.
+    ///
+    /// Wraps [`crate::apply::apply_block_with_delta`] so the resulting
+    /// `StateDelta` is captured into the rolling window keyed by
+    /// `block.round`. The wider node-level apply driver
+    /// (`bin/algod-rust/src/commands/sync.rs`) calls this instead of the bare
+    /// [`crate::apply::apply_block`] so the REST API's
+    /// `get_state_delta_for_round` endpoint can serve real data for recent
+    /// rounds.
+    ///
+    /// Note: today `apply_block_with_delta` builds account-level diffs only
+    /// (`accts` + `txids` + `txleases`); app / asset / kv deltas are still
+    /// `TODO(#190)`. The cache therefore returns partial deltas — strictly
+    /// better than the prior `NotFound`, and the fields fill in as #190 lands.
+    pub fn apply_block_caching_delta(
+        &mut self,
+        block: &algo_types::Block,
+    ) -> Result<(), AlgoError> {
+        let round = block.round.0;
+        let delta = crate::apply::apply_block_with_delta(self, block)?;
+        self.cache_state_delta(round, delta);
+        Ok(())
     }
 
     pub fn commit_block(&mut self) -> Result<(), AlgoError> {
@@ -5786,6 +5862,35 @@ mod tests {
         ledger.rollback_block().unwrap();
         let root_after_rollback = ledger.trie.as_mut().unwrap().root_hash().unwrap();
         assert_eq!(root_after_commit, root_after_rollback);
+    }
+
+    /// PLAN-36 TASK-128: `cache_state_delta` / `get_cached_state_delta`
+    /// implement the rolling-window contract the REST adapter relies on.
+    /// Exercises the trio of API methods directly (no apply needed) so
+    /// the test is independent of unrelated apply-path regressions.
+    #[test]
+    fn test_delta_cache_round_trip_and_eviction() {
+        use crate::state_delta::StateDelta;
+
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+
+        // Empty cache: any round is None.
+        assert!(ledger.get_cached_state_delta(0).is_none());
+        assert_eq!(ledger.delta_cache_len(), 0);
+
+        // Inside the window: round survives.
+        ledger.cache_state_delta(10, StateDelta::default());
+        assert!(ledger.get_cached_state_delta(10).is_some());
+        assert_eq!(ledger.delta_cache_len(), 1);
+
+        // Eviction: insert a round far enough ahead to push round 10 out
+        // of the default 320-round window. After insert, min_round should
+        // be 11 (latest - window_size + 1).
+        let latest = 10 + crate::delta_cache::DEFAULT_WINDOW_SIZE as u64;
+        ledger.cache_state_delta(latest, StateDelta::default());
+        assert!(ledger.get_cached_state_delta(10).is_none());
+        assert!(ledger.get_cached_state_delta(latest).is_some());
+        assert_eq!(ledger.delta_cache_min_round(), 11);
     }
 
     #[test]
