@@ -1591,7 +1591,7 @@ fn encode_merged_asset_resource_with_round(
             merged.insert(
                 "y".to_string(),
                 rmpv::Value::from(
-                    crate::sqlite::RESOURCE_FLAGS_HOLDING | crate::sqlite::RESOURCE_FLAGS_OWNERSHIP,
+                    crate::sqlite::LEGACY_Y_HOLDING_BIT | crate::sqlite::LEGACY_Y_OWNERSHIP_BIT,
                 ),
             );
 
@@ -1654,7 +1654,7 @@ fn encode_merged_app_resource_with_round(
             merged.insert(
                 "y".to_string(),
                 rmpv::Value::from(
-                    crate::sqlite::RESOURCE_FLAGS_HOLDING | crate::sqlite::RESOURCE_FLAGS_OWNERSHIP,
+                    crate::sqlite::LEGACY_Y_HOLDING_BIT | crate::sqlite::LEGACY_Y_OWNERSHIP_BIT,
                 ),
             );
 

@@ -531,9 +531,40 @@ fn migrate_resources_ctype_not_null(conn: &Connection) -> Result<(), AlgoError> 
     Ok(())
 }
 
-// Resource flags bitmask (stored in the "y" field of resource blobs)
-pub(crate) const RESOURCE_FLAGS_HOLDING: u64 = 0x01; // bit 0: has local state / holding data
-pub(crate) const RESOURCE_FLAGS_OWNERSHIP: u64 = 0x04; // bit 2: has creator/params data
+// ---------------------------------------------------------------------------
+// Resource flag handling (legacy `y` values written by older builds)
+// ---------------------------------------------------------------------------
+//
+// The canonical source of truth for `ResourceFlags` enum values is
+// [`algo_codec::resource_flags`] (`HOLDING = 0`, `NOT_HOLDING = 1`,
+// `OWNERSHIP = 2`, `EMPTY_ASSET = 4`, `EMPTY_APP = 8` — matching
+// go-algorand's `trackerdb.ResourceFlags` at
+// `../go-algorand/ledger/store/trackerdb/data.go:62-75`).
+//
+// Pre-PLAN-189 algod-rust DBs wrote a *different* (and broken) shape:
+// the `y` field was treated as a bitmask with bit 0 meaning
+// "has holding data" and bit 2 meaning "has params data" — directly
+// inverted from Go's bit-0-means-NotHolding semantics. The two
+// constants below preserve those legacy write-side values for the
+// encoders that haven't yet been migrated to
+// `canonical_encode_resources_data` (TASK-191/192/193). They MUST
+// NOT be used at read time — read paths go through
+// [`inspect_resource_blob`] / [`ResourceMeta`] instead, which
+// inspects field presence so it works for BOTH legacy and canonical
+// shapes.
+//
+// PLAN-189 / TASK-190.
+
+/// Legacy "has holding" bit written by pre-canonical asset-holding
+/// and app-local-state encoders. Reads must NOT depend on this value
+/// — use [`inspect_resource_blob`] instead. Retained only so the
+/// not-yet-migrated encoders in this module (and the merge helpers in
+/// `state.rs`) keep producing the same bytes pending TASK-191/192/193.
+pub(crate) const LEGACY_Y_HOLDING_BIT: u64 = 0x01;
+
+/// Legacy "has params" bit written by pre-canonical asset-params and
+/// app-params encoders. Same caveat as [`LEGACY_Y_HOLDING_BIT`].
+pub(crate) const LEGACY_Y_OWNERSHIP_BIT: u64 = 0x04;
 
 // Box key prefix and layout constants (matches go-algorand's avm-abi/apps.MakeBoxKey).
 const BOX_PREFIX: &[u8] = b"bx:";
@@ -1211,20 +1242,119 @@ fn decode_app_local_state(data: &[u8]) -> Result<AppLocalState, AlgoError> {
 // App resource blob merging helpers
 // ---------------------------------------------------------------------------
 
-/// Extract the resource flags ("y" field) from a raw resource blob.
-fn extract_resource_flags(data: &[u8]) -> u64 {
+/// Semantic view of a resource blob, derived by inspecting both the
+/// `y` flag and the set of top-level keys present in the BLOB.
+///
+/// The two boolean fields are *tolerant* of both legacy (pre-PLAN-189
+/// algod-rust) and canonical (go-algorand) on-disk shapes. They MUST
+/// be used in place of bitwise checks against the raw `y` value
+/// because the legacy and canonical encodings assign opposite
+/// meaning to the same bit — see the module-level comment on
+/// [`LEGACY_Y_HOLDING_BIT`] for the full story.
+///
+/// PLAN-189 / TASK-190.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ResourceMeta {
+    /// Raw `y` field value as stored on disk. Carries Go semantics
+    /// for newly-written rows and legacy bitmask semantics for old
+    /// rows. Only consult this for migration-detection logic — use
+    /// `has_holding` / `has_ownership` for dispatch.
+    pub raw_flags: u64,
+    /// `true` if the row carries asset-holding or app-local-state
+    /// data (regardless of which encoding produced it).
+    pub has_holding: bool,
+    /// `true` if the row carries asset-params or app-params data
+    /// (regardless of which encoding produced it).
+    pub has_ownership: bool,
+}
+
+/// Inspect a raw `resources.data` BLOB and derive its semantic
+/// holding/ownership classification by walking the top-level keys.
+///
+/// Field-presence rules (matching both legacy Rust and canonical Go
+/// on-disk shapes):
+///
+/// * Asset holding: `l` (amount) or `m` (frozen) → `has_holding`.
+/// * Asset params: any of `a..k` → `has_ownership`.
+/// * App local state schema (canonical): `n` (num_uint) or `o`
+///   (num_byte_slice) → `has_holding`.
+/// * App params programs: `q` (approval) or `r` (clear_state) → `has_ownership`.
+/// * App params canonical-only fields: `w` (global_schema_nbs) or
+///   `x` (extra_program_pages) → `has_ownership`.
+/// * App params shared schema fields: `t` / `u` → `has_ownership`
+///   (Go uses these as flat u64s; legacy Rust uses them as nested
+///   `{nui, nbs}` submaps — either way, app-params row).
+/// * `v` → `has_ownership` (legacy: extra_program_pages;
+///   canonical: global_schema_num_uint).
+/// * `p` → `has_holding` (legacy: local-state schema submap;
+///   canonical: local-state key_value map — both signal local state).
+/// * `s` is the only genuinely ambiguous key (legacy: app local kv;
+///   canonical: app params global_state). Disambiguated via the
+///   `y` value: legacy holding-only `y=1` or holding+ownership `y=5`
+///   means `s` is local kv; otherwise (`y=2`, `y=4`, canonical
+///   `y=0`) it's global_state.
+pub(crate) fn inspect_resource_blob(data: &[u8]) -> ResourceMeta {
     let val: rmpv::Value = match rmpv::decode::read_value(&mut &data[..]) {
         Ok(v) => v,
-        Err(_) => return 0,
+        Err(_) => return ResourceMeta::default(),
     };
-    if let rmpv::Value::Map(pairs) = val {
-        for (k, v) in pairs {
-            if k.as_str() == Some("y") {
-                return v.as_u64().unwrap_or(0);
+    let pairs = match val {
+        rmpv::Value::Map(m) => m,
+        _ => return ResourceMeta::default(),
+    };
+
+    let mut meta = ResourceMeta::default();
+    let mut has_s = false;
+    let mut has_q_or_r_or_canonical_app_params = false;
+
+    for (k, v) in &pairs {
+        let Some(key) = k.as_str() else { continue };
+        match key {
+            "y" => meta.raw_flags = v.as_u64().unwrap_or(0),
+            // Asset holding fields.
+            "l" | "m" => meta.has_holding = true,
+            // Asset params fields.
+            "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k" => {
+                meta.has_ownership = true;
             }
+            // App local-state schema (canonical-only).
+            "n" | "o" => meta.has_holding = true,
+            // App params programs.
+            "q" | "r" => {
+                meta.has_ownership = true;
+                has_q_or_r_or_canonical_app_params = true;
+            }
+            // App params canonical-only fields (`w` = global_schema_nbs,
+            // `x` = extra_program_pages in Go's layout).
+            "w" | "x" => {
+                meta.has_ownership = true;
+                has_q_or_r_or_canonical_app_params = true;
+            }
+            // App params schema fields (legacy nested OR canonical flat u64).
+            "t" | "u" | "v" => meta.has_ownership = true,
+            // App local state — presence always implies has_holding.
+            "p" => meta.has_holding = true,
+            // Ambiguous between local kv (legacy) and global_state (canonical app params).
+            "s" => has_s = true,
+            _ => {}
         }
     }
-    0
+
+    if has_s {
+        // Disambiguate via `y` flag and other-key presence:
+        //   - If we already have canonical app-params signals (q/r/w/x), `s` is global_state.
+        //   - Legacy `y=1` (holding only) or `y=5` (both) ⇒ `s` is local kv.
+        //   - Legacy `y=4`, canonical `y=2` ⇒ `s` is global_state.
+        //   - Default fallback: treat as kv (legacy holding) since canonical
+        //     ownership rows without q/r/w/x are vanishingly rare in practice.
+        if has_q_or_r_or_canonical_app_params || meta.raw_flags == 2 || meta.raw_flags == 4 {
+            meta.has_ownership = true;
+        } else {
+            meta.has_holding = true;
+        }
+    }
+
+    meta
 }
 
 /// Merge app-params blob fields into an existing local-state blob, producing a
@@ -1353,7 +1483,7 @@ fn merge_app_params_into_local_state(existing_blob: &[u8], new_params: &AppParam
     // Combined flags
     merged.push((
         rmpv::Value::String("y".into()),
-        rmpv::Value::from(RESOURCE_FLAGS_HOLDING | RESOURCE_FLAGS_OWNERSHIP),
+        rmpv::Value::from(LEGACY_Y_HOLDING_BIT | LEGACY_Y_OWNERSHIP_BIT),
     ));
 
     let val = rmpv::Value::Map(merged);
@@ -1417,7 +1547,7 @@ fn merge_app_local_state_into_params(existing_blob: &[u8], new_local: &AppLocalS
     // Combined flags
     merged.push((
         rmpv::Value::String("y".into()),
-        rmpv::Value::from(RESOURCE_FLAGS_HOLDING | RESOURCE_FLAGS_OWNERSHIP),
+        rmpv::Value::from(LEGACY_Y_HOLDING_BIT | LEGACY_Y_OWNERSHIP_BIT),
     ));
 
     let val = rmpv::Value::Map(merged);
@@ -1452,7 +1582,7 @@ fn strip_ownership_from_blob(data: &[u8]) -> Option<Vec<u8>> {
     // Add holding-only flag
     local_pairs.push((
         rmpv::Value::String("y".into()),
-        rmpv::Value::from(RESOURCE_FLAGS_HOLDING),
+        rmpv::Value::from(LEGACY_Y_HOLDING_BIT),
     ));
 
     let val = rmpv::Value::Map(local_pairs);
@@ -1485,7 +1615,7 @@ fn strip_holding_from_blob(data: &[u8]) -> Option<Vec<u8>> {
     // Add ownership-only flag
     params_pairs.push((
         rmpv::Value::String("y".into()),
-        rmpv::Value::from(RESOURCE_FLAGS_OWNERSHIP),
+        rmpv::Value::from(LEGACY_Y_OWNERSHIP_BIT),
     ));
 
     let val = rmpv::Value::Map(params_pairs);
@@ -1544,7 +1674,7 @@ fn merge_asset_holding_into_params(
     // Combined flags
     merged.push((
         rmpv::Value::String("y".into()),
-        rmpv::Value::from(RESOURCE_FLAGS_HOLDING | RESOURCE_FLAGS_OWNERSHIP),
+        rmpv::Value::from(LEGACY_Y_HOLDING_BIT | LEGACY_Y_OWNERSHIP_BIT),
     ));
 
     let val = rmpv::Value::Map(merged);
@@ -1647,7 +1777,7 @@ fn merge_asset_params_into_holding(
     // Combined flags
     merged.push((
         rmpv::Value::String("y".into()),
-        rmpv::Value::from(RESOURCE_FLAGS_HOLDING | RESOURCE_FLAGS_OWNERSHIP),
+        rmpv::Value::from(LEGACY_Y_HOLDING_BIT | LEGACY_Y_OWNERSHIP_BIT),
     ));
 
     let val = rmpv::Value::Map(merged);
@@ -1679,7 +1809,7 @@ fn strip_asset_holding_from_blob(data: &[u8]) -> Option<Vec<u8>> {
     // Add ownership-only flag
     params_pairs.push((
         rmpv::Value::String("y".into()),
-        rmpv::Value::from(RESOURCE_FLAGS_OWNERSHIP),
+        rmpv::Value::from(LEGACY_Y_OWNERSHIP_BIT),
     ));
 
     let val = rmpv::Value::Map(params_pairs);
@@ -1711,7 +1841,7 @@ fn strip_asset_params_from_blob(data: &[u8]) -> Option<Vec<u8>> {
     // Add holding-only flag
     holding_pairs.push((
         rmpv::Value::String("y".into()),
-        rmpv::Value::from(RESOURCE_FLAGS_HOLDING),
+        rmpv::Value::from(LEGACY_Y_HOLDING_BIT),
     ));
 
     let val = rmpv::Value::Map(holding_pairs);
@@ -3831,8 +3961,8 @@ impl LedgerStore for SqliteLedger {
             })?;
 
         // Check that the blob has the holding flag set (could be params-only).
-        let flags = extract_resource_flags(&data);
-        if flags & RESOURCE_FLAGS_HOLDING == 0 {
+        let meta = inspect_resource_blob(&data);
+        if !meta.has_holding {
             return None;
         }
 
@@ -3846,8 +3976,8 @@ impl LedgerStore for SqliteLedger {
 
         // Check if an existing blob has ownership (params) flag set; if so, merge.
         let data = if let Some(existing) = self.get_asset_resource_blob(rowid, asset_id) {
-            let flags = extract_resource_flags(&existing);
-            if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
+            let meta = inspect_resource_blob(&existing);
+            if meta.has_ownership {
                 // Existing blob has asset params — merge holding into it.
                 merge_asset_holding_into_params(&existing, &holding)
             } else {
@@ -3873,8 +4003,8 @@ impl LedgerStore for SqliteLedger {
         if let Some(rowid) = self.get_rowid(addr) {
             // Check if the blob also has ownership (asset params) data.
             if let Some(existing) = self.get_asset_resource_blob(rowid, asset_id) {
-                let flags = extract_resource_flags(&existing);
-                if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
+                let meta = inspect_resource_blob(&existing);
+                if meta.has_ownership {
                     // Both flags set — strip holding, keep asset params.
                     if let Some(stripped) = strip_asset_holding_from_blob(&existing) {
                         let stripped = set_blob_update_round(&stripped, update_round);
@@ -3926,8 +4056,8 @@ impl LedgerStore for SqliteLedger {
 
         let update_round = self.current_round.0;
         for (rowid, data, addr_bytes) in &rows {
-            let flags = extract_resource_flags(data);
-            if flags & RESOURCE_FLAGS_HOLDING == 0 {
+            let meta = inspect_resource_blob(data);
+            if !meta.has_holding {
                 continue; // no holding in this blob
             }
             // Record this address for counter update.
@@ -3936,7 +4066,7 @@ impl LedgerStore for SqliteLedger {
                 arr.copy_from_slice(addr_bytes);
                 affected_addrs.push(Address(arr));
             }
-            if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
+            if meta.has_ownership {
                 // Both flags set — strip holding, keep asset params.
                 if let Some(stripped) = strip_asset_holding_from_blob(data) {
                     let stripped = set_blob_update_round(&stripped, update_round);
@@ -3984,8 +4114,8 @@ impl LedgerStore for SqliteLedger {
             })?;
 
         // Check that the blob has the ownership flag set.
-        let flags = extract_resource_flags(&data);
-        if flags & RESOURCE_FLAGS_OWNERSHIP == 0 {
+        let meta = inspect_resource_blob(&data);
+        if !meta.has_ownership {
             return None;
         }
 
@@ -4002,8 +4132,8 @@ impl LedgerStore for SqliteLedger {
 
         // Check if an existing blob has holding flag set; if so, merge.
         let data = if let Some(existing) = self.get_asset_resource_blob(rowid, asset_id) {
-            let flags = extract_resource_flags(&existing);
-            if flags & RESOURCE_FLAGS_HOLDING != 0 {
+            let meta = inspect_resource_blob(&existing);
+            if meta.has_holding {
                 // Existing blob has asset holding — merge params into it.
                 merge_asset_params_into_holding(&existing, &record.params, &record.creator)
             } else {
@@ -4045,8 +4175,8 @@ impl LedgerStore for SqliteLedger {
             if let Some(rowid) = self.get_rowid(&creator) {
                 // Check if the blob also has holding data.
                 if let Some(existing) = self.get_asset_resource_blob(rowid, asset_id) {
-                    let flags = extract_resource_flags(&existing);
-                    if flags & RESOURCE_FLAGS_HOLDING != 0 {
+                    let meta = inspect_resource_blob(&existing);
+                    if meta.has_holding {
                         // Both flags set — strip params, keep holding.
                         if let Some(stripped) = strip_asset_params_from_blob(&existing) {
                             let stripped = set_blob_update_round(&stripped, update_round);
@@ -4103,8 +4233,8 @@ impl LedgerStore for SqliteLedger {
             })?;
 
         // Check that the blob has the ownership flag set.
-        let flags = extract_resource_flags(&data);
-        if flags & RESOURCE_FLAGS_OWNERSHIP == 0 {
+        let meta = inspect_resource_blob(&data);
+        if !meta.has_ownership {
             return None;
         }
 
@@ -4121,8 +4251,8 @@ impl LedgerStore for SqliteLedger {
 
         // Check if a local-state blob already exists at this key; if so, merge.
         let data = if let Some(existing) = self.get_app_resource_blob(rowid, app_id) {
-            let flags = extract_resource_flags(&existing);
-            if flags & RESOURCE_FLAGS_HOLDING != 0 {
+            let meta = inspect_resource_blob(&existing);
+            if meta.has_holding {
                 // Existing blob has local state — merge app params into it.
                 merge_app_params_into_local_state(&existing, &params)
             } else {
@@ -4161,8 +4291,8 @@ impl LedgerStore for SqliteLedger {
             if let Some(rowid) = self.get_rowid(&creator) {
                 // Check if the blob also has holding (local state) data.
                 if let Some(existing) = self.get_app_resource_blob(rowid, app_id) {
-                    let flags = extract_resource_flags(&existing);
-                    if flags & RESOURCE_FLAGS_HOLDING != 0 {
+                    let meta = inspect_resource_blob(&existing);
+                    if meta.has_holding {
                         // Both flags set — strip ownership, keep local state.
                         if let Some(stripped) = strip_ownership_from_blob(&existing) {
                             let stripped = set_blob_update_round(&stripped, update_round);
@@ -4219,8 +4349,8 @@ impl LedgerStore for SqliteLedger {
             .filter_map(|r| r.ok())
             .filter_map(|data| {
                 // Only include blobs with ownership flag.
-                let flags = extract_resource_flags(&data);
-                if flags & RESOURCE_FLAGS_OWNERSHIP == 0 {
+                let meta = inspect_resource_blob(&data);
+                if !meta.has_ownership {
                     return None;
                 }
                 decode_app_params(&data, *creator).ok()
@@ -4252,8 +4382,8 @@ impl LedgerStore for SqliteLedger {
             })?;
 
         // Check that the blob has the holding flag set.
-        let flags = extract_resource_flags(&data);
-        if flags & RESOURCE_FLAGS_HOLDING == 0 {
+        let meta = inspect_resource_blob(&data);
+        if !meta.has_holding {
             // No holding flag — this is app params only, not local state.
             return None;
         }
@@ -4268,8 +4398,8 @@ impl LedgerStore for SqliteLedger {
 
         // Check if an app-params blob already exists at this key; if so, merge.
         let data = if let Some(existing) = self.get_app_resource_blob(rowid, app_id) {
-            let flags = extract_resource_flags(&existing);
-            if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
+            let meta = inspect_resource_blob(&existing);
+            if meta.has_ownership {
                 // Existing blob has app params — merge local state into it.
                 merge_app_local_state_into_params(&existing, &local_state)
             } else {
@@ -4295,8 +4425,8 @@ impl LedgerStore for SqliteLedger {
         if let Some(rowid) = self.get_rowid(addr) {
             // Check if the blob also has ownership (app params) data.
             if let Some(existing) = self.get_app_resource_blob(rowid, app_id) {
-                let flags = extract_resource_flags(&existing);
-                if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
+                let meta = inspect_resource_blob(&existing);
+                if meta.has_ownership {
                     // Both flags set — strip holding, keep app params.
                     if let Some(stripped) = strip_holding_from_blob(&existing) {
                         let stripped = set_blob_update_round(&stripped, update_round);
@@ -4348,8 +4478,8 @@ impl LedgerStore for SqliteLedger {
 
         let update_round = self.current_round.0;
         for (rowid, data, addr_bytes) in &rows {
-            let flags = extract_resource_flags(data);
-            if flags & RESOURCE_FLAGS_HOLDING == 0 {
+            let meta = inspect_resource_blob(data);
+            if !meta.has_holding {
                 continue; // no local state in this blob
             }
             // Decode the local state schema before removing.
@@ -4361,7 +4491,7 @@ impl LedgerStore for SqliteLedger {
                     .unwrap_or_default();
                 affected.push((Address(arr), local_schema));
             }
-            if flags & RESOURCE_FLAGS_OWNERSHIP != 0 {
+            if meta.has_ownership {
                 // Both flags set — strip local state, keep app params.
                 if let Some(stripped) = strip_holding_from_blob(data) {
                     let stripped = set_blob_update_round(&stripped, update_round);
@@ -4409,8 +4539,8 @@ impl LedgerStore for SqliteLedger {
             .filter_map(|r| r.ok())
             .filter_map(|(aidx, data)| {
                 // Check that the holding flag is set (local state present).
-                let flags = extract_resource_flags(&data);
-                if flags & RESOURCE_FLAGS_HOLDING == 0 {
+                let meta = inspect_resource_blob(&data);
+                if !meta.has_holding {
                     return None; // no local state in this blob
                 }
                 let local = decode_app_local_state(&data).ok()?;
@@ -4442,8 +4572,8 @@ impl LedgerStore for SqliteLedger {
             .filter_map(|r| r.ok())
             .filter_map(|(aidx, data)| {
                 // Check that the holding flag is set.
-                let flags = extract_resource_flags(&data);
-                if flags & RESOURCE_FLAGS_HOLDING == 0 {
+                let meta = inspect_resource_blob(&data);
+                if !meta.has_holding {
                     return None;
                 }
                 let holding = decode_asset_holding(&data).ok()?;
@@ -4475,8 +4605,8 @@ impl LedgerStore for SqliteLedger {
             .filter_map(|r| r.ok())
             .filter_map(|(aidx, data)| {
                 // Only include blobs with ownership flag (creator/params data).
-                let flags = extract_resource_flags(&data);
-                if flags & RESOURCE_FLAGS_OWNERSHIP == 0 {
+                let meta = inspect_resource_blob(&data);
+                if !meta.has_ownership {
                     return None;
                 }
                 let params = decode_asset_params(&data).ok()?;
@@ -4514,8 +4644,8 @@ impl LedgerStore for SqliteLedger {
             .filter_map(|r| r.ok())
             .filter_map(|(aidx, data)| {
                 // Only include blobs with ownership flag.
-                let flags = extract_resource_flags(&data);
-                if flags & RESOURCE_FLAGS_OWNERSHIP == 0 {
+                let meta = inspect_resource_blob(&data);
+                if !meta.has_ownership {
                     return None;
                 }
                 decode_app_params(&data, *addr)
@@ -5084,6 +5214,178 @@ impl LedgerStore for SqliteLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // ResourceMeta / inspect_resource_blob (TASK-190)
+    // ---------------------------------------------------------------------
+
+    fn rmpv_map(pairs: &[(&str, rmpv::Value)]) -> Vec<u8> {
+        let val = rmpv::Value::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| (rmpv::Value::String((*k).into()), v.clone()))
+                .collect(),
+        );
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &val).expect("rmpv encode");
+        buf
+    }
+
+    #[test]
+    fn inspect_legacy_asset_holding_row() {
+        // Legacy Rust asset holding: y=1, l/m fields.
+        let bytes = rmpv_map(&[
+            ("l", rmpv::Value::from(1000u64)),
+            ("m", rmpv::Value::Boolean(false)),
+            ("y", rmpv::Value::from(1u64)),
+        ]);
+        let meta = inspect_resource_blob(&bytes);
+        assert!(meta.has_holding);
+        assert!(!meta.has_ownership);
+        assert_eq!(meta.raw_flags, 1);
+    }
+
+    #[test]
+    fn inspect_legacy_asset_params_row() {
+        // Legacy Rust asset params: y=4, a..k fields.
+        let bytes = rmpv_map(&[
+            ("a", rmpv::Value::from(1_000_000u64)),
+            ("b", rmpv::Value::from(2u64)),
+            ("y", rmpv::Value::from(4u64)),
+        ]);
+        let meta = inspect_resource_blob(&bytes);
+        assert!(!meta.has_holding);
+        assert!(meta.has_ownership);
+        assert_eq!(meta.raw_flags, 4);
+    }
+
+    #[test]
+    fn inspect_legacy_combined_asset_row() {
+        // Legacy "holding + ownership" asset row: y=5, l/m + a..k.
+        let bytes = rmpv_map(&[
+            ("a", rmpv::Value::from(500u64)),
+            ("l", rmpv::Value::from(10u64)),
+            ("y", rmpv::Value::from(5u64)),
+        ]);
+        let meta = inspect_resource_blob(&bytes);
+        assert!(meta.has_holding);
+        assert!(meta.has_ownership);
+    }
+
+    #[test]
+    fn inspect_canonical_asset_holding_row() {
+        // Canonical Go asset holding: y omitted (defaults to 0=HOLDING), l/m fields.
+        let bytes = rmpv_map(&[
+            ("l", rmpv::Value::from(1000u64)),
+            ("m", rmpv::Value::Boolean(false)),
+        ]);
+        let meta = inspect_resource_blob(&bytes);
+        assert!(meta.has_holding);
+        assert!(!meta.has_ownership);
+        assert_eq!(meta.raw_flags, 0);
+    }
+
+    #[test]
+    fn inspect_canonical_asset_params_row() {
+        // Canonical Go asset params: y=2 (OWNERSHIP), a..k fields.
+        let bytes = rmpv_map(&[
+            ("a", rmpv::Value::from(1_000_000u64)),
+            ("y", rmpv::Value::from(2u64)),
+        ]);
+        let meta = inspect_resource_blob(&bytes);
+        assert!(!meta.has_holding);
+        assert!(meta.has_ownership);
+        assert_eq!(meta.raw_flags, 2);
+    }
+
+    #[test]
+    fn inspect_legacy_app_local_state_row() {
+        // Legacy app local state: y=1, p as schema submap, s as kv map.
+        let bytes = rmpv_map(&[
+            (
+                "p",
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::String("nui".into()),
+                    rmpv::Value::from(3u64),
+                )]),
+            ),
+            (
+                "s",
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::Binary(b"k".to_vec()),
+                    rmpv::Value::Map(vec![]),
+                )]),
+            ),
+            ("y", rmpv::Value::from(1u64)),
+        ]);
+        let meta = inspect_resource_blob(&bytes);
+        assert!(meta.has_holding, "p + legacy y=1 must imply local-state");
+        assert!(
+            !meta.has_ownership,
+            "no q/r/w/x present; s must be classified as kv (holding)"
+        );
+    }
+
+    #[test]
+    fn inspect_canonical_app_local_state_row() {
+        // Canonical app local state: y omitted/0, n/o flat u64 schema, p as kv map.
+        let bytes = rmpv_map(&[
+            ("n", rmpv::Value::from(3u64)),
+            ("o", rmpv::Value::from(0u64)),
+            (
+                "p",
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::Binary(b"k".to_vec()),
+                    rmpv::Value::Map(vec![]),
+                )]),
+            ),
+        ]);
+        let meta = inspect_resource_blob(&bytes);
+        assert!(meta.has_holding);
+        assert!(!meta.has_ownership);
+    }
+
+    #[test]
+    fn inspect_canonical_app_params_row() {
+        // Canonical app params: y=2, q/r programs, t/u/v/w/x flat schema, s as global_state.
+        let bytes = rmpv_map(&[
+            ("q", rmpv::Value::Binary(vec![0x80])),
+            ("r", rmpv::Value::Binary(vec![0x80])),
+            (
+                "s",
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::Binary(b"k".to_vec()),
+                    rmpv::Value::Map(vec![]),
+                )]),
+            ),
+            ("t", rmpv::Value::from(0u64)),
+            ("u", rmpv::Value::from(0u64)),
+            ("v", rmpv::Value::from(0u64)),
+            ("w", rmpv::Value::from(0u64)),
+            ("x", rmpv::Value::from(0u64)),
+            ("y", rmpv::Value::from(2u64)),
+        ]);
+        let meta = inspect_resource_blob(&bytes);
+        assert!(!meta.has_holding);
+        assert!(meta.has_ownership, "q/r/w/x must signal app params row");
+    }
+
+    #[test]
+    fn inspect_empty_blob_is_default() {
+        let meta = inspect_resource_blob(&[]);
+        assert!(!meta.has_holding);
+        assert!(!meta.has_ownership);
+        assert_eq!(meta.raw_flags, 0);
+    }
+
+    #[test]
+    fn inspect_malformed_blob_is_default() {
+        let meta = inspect_resource_blob(b"\xff\xff\xff\xff");
+        assert!(!meta.has_holding);
+        assert!(!meta.has_ownership);
+    }
+
+    // ---------------------------------------------------------------------
 
     #[test]
     fn test_open_in_memory() {
