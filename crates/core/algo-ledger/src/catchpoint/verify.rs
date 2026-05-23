@@ -261,6 +261,13 @@ pub fn make_catchpoint_label_v8(
 // ---------------------------------------------------------------------------
 
 /// Encode a string as msgpack string format.
+///
+/// Production callers in this module now route through
+/// `algo_codec::canonical_encode_state_proof_verification_context`
+/// (PLAN-36 TASK-125), but the unit tests below still construct
+/// msgpack maps by hand and rely on this helper. Kept `#[cfg(test)]`
+/// so the lib build doesn't fail the clippy `dead_code` lint.
+#[cfg(test)]
 fn encode_msgpack_str(s: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     rmp::encode::write_str(&mut buf, s).expect("write_str to Vec never fails");
@@ -304,24 +311,21 @@ struct SpVerificationCtxFull {
 
 /// Canonically encode a single `StateProofVerificationContext` as msgpack.
 ///
-/// Keys (sorted): `"pw"`, `"spround"`, `"v"`, `"vc"`.
-/// Uses omitempty: zero uint fields, empty strings, and empty byte slices are omitted.
+/// PLAN-36 G8 (TASK-125) promoted this to a public encoder in
+/// `algo-codec`. This helper now adapts the decoder-side
+/// [`SpVerificationCtxFull`] (which carries the `version` field
+/// alongside the trio in the shared catchpoint types) into the public
+/// [`algo_codec::StateProofVerificationContext`] and delegates. The
+/// catchpoint label hash and the trackerdb BLOB write path now share
+/// the same byte producer.
 fn encode_sp_verification_context(ctx: &SpVerificationCtxFull) -> Vec<u8> {
-    // Sorted key order: pw < spround < v < vc
-    let mut entries: Vec<(&str, Vec<u8>)> = Vec::new();
-    if ctx.online_total_weight != 0 {
-        entries.push(("pw", encode_msgpack_uint(ctx.online_total_weight)));
-    }
-    if ctx.last_attested_round != 0 {
-        entries.push(("spround", encode_msgpack_uint(ctx.last_attested_round)));
-    }
-    if !ctx.version.is_empty() {
-        entries.push(("v", encode_msgpack_str(&ctx.version)));
-    }
-    if !ctx.voters_commitment.is_empty() {
-        entries.push(("vc", encode_msgpack_bin(&ctx.voters_commitment)));
-    }
-    encode_mixed_map(&entries)
+    let public = algo_codec::StateProofVerificationContext {
+        last_attested_round: ctx.last_attested_round,
+        voters_commitment: ctx.voters_commitment.to_vec(),
+        online_total_weight: ctx.online_total_weight,
+        version: ctx.version.clone(),
+    };
+    algo_codec::canonical_encode_state_proof_verification_context(&public)
 }
 
 /// Canonically encode the SP verification wrapper struct.

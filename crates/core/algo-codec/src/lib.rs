@@ -11,10 +11,11 @@ pub use canonical::{
     canonical_encode_logicsig, canonical_encode_multisig, canonical_encode_multisig_subsig,
     canonical_encode_online_round_params_data, canonical_encode_resources_data,
     canonical_encode_signed_transaction, canonical_encode_signed_txn_in_block,
-    canonical_encode_state_schema, canonical_encode_teal_key_value, canonical_encode_transaction,
-    canonical_encode_tx_group, canonical_encode_txtail_round, canonical_encode_txtail_round_lease,
+    canonical_encode_state_proof_verification_context, canonical_encode_state_schema,
+    canonical_encode_teal_key_value, canonical_encode_transaction, canonical_encode_tx_group,
+    canonical_encode_txtail_round, canonical_encode_txtail_round_lease,
     canonical_encode_unauthenticated_proposal, resource_flags, BaseOnlineAccountData,
-    OnlineRoundParamsData, ResourcesData,
+    OnlineRoundParamsData, ResourcesData, StateProofVerificationContext,
 };
 pub use digest::{compute_block_digest, compute_txn_id};
 

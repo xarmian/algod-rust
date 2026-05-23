@@ -23,7 +23,8 @@ use std::path::{Path, PathBuf};
 use algo_codec::{
     canonical_encode_base_account_data, canonical_encode_base_online_account_data,
     canonical_encode_online_round_params_data, canonical_encode_resources_data,
-    canonical_encode_txtail_round, BaseOnlineAccountData, OnlineRoundParamsData, ResourcesData,
+    canonical_encode_state_proof_verification_context, canonical_encode_txtail_round,
+    BaseOnlineAccountData, OnlineRoundParamsData, ResourcesData, StateProofVerificationContext,
 };
 use algo_types::{AccountData, AccountStatus, Address};
 
@@ -473,6 +474,124 @@ fn txtail_round_round_trip_via_value() {
             .unwrap_or_else(|e| panic!("re-decode after encode txtailround/{name}: {e}"));
         assert_eq!(first, second, "round-trip drift on txtailround/{name}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// StateProofVerificationContext byte-exact + round-trip (PLAN-36 G8 / TASK-125)
+//
+// State-proof rows only exist on networks that have actually produced
+// state proofs — a fresh localnet won't have any, so the captured
+// fixture dir typically contains only `_meta.json` with `row_count: 0`.
+// Both tests SKIP gracefully in that case (matching the behavior the
+// task body explicitly tolerates).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn state_proof_verification_context_byte_exact_against_go_fixtures() {
+    let dir = fixtures_root().join("stateproof");
+    let fixtures = load_canonical_hex_dir(&dir);
+    if fixtures.is_empty() {
+        eprintln!(
+            "SKIPPED: no stateproof fixtures at {}. State-proof rows \
+             land only on networks that have produced ≥256 rounds with \
+             state-proof participation enabled — see `_meta.json` for \
+             provenance of the empty capture.",
+            dir.display()
+        );
+        return;
+    }
+
+    let mut checked = 0;
+    for (name, expected) in &fixtures {
+        let decoded = decode_state_proof_verification_context_value(expected)
+            .unwrap_or_else(|e| panic!("decode stateproof/{name}.canonical.hex: {e}"));
+        let actual = canonical_encode_state_proof_verification_context(&decoded);
+        assert_eq!(
+            hex::encode(&actual),
+            hex::encode(expected),
+            "byte-exact mismatch for stateproof/{name}.canonical.hex"
+        );
+        checked += 1;
+    }
+    println!("stateproof: {checked} fixtures byte-exact ✓");
+}
+
+#[test]
+fn state_proof_verification_context_round_trip_via_value() {
+    let dir = fixtures_root().join("stateproof");
+    let fixtures = load_canonical_hex_dir(&dir);
+    if fixtures.is_empty() {
+        eprintln!("SKIPPED: no stateproof fixtures at {}.", dir.display());
+        return;
+    }
+
+    for (name, raw) in &fixtures {
+        let first = decode_state_proof_verification_context_value(raw)
+            .unwrap_or_else(|e| panic!("decode stateproof/{name}.canonical.hex: {e}"));
+        let encoded = canonical_encode_state_proof_verification_context(&first);
+        let second = decode_state_proof_verification_context_value(&encoded)
+            .unwrap_or_else(|e| panic!("re-decode after encode stateproof/{name}: {e}"));
+        assert_eq!(first, second, "round-trip drift on stateproof/{name}");
+    }
+}
+
+/// PLAN-36 G8 (TASK-125): an additional algebraic round-trip on
+/// synthetic data, so the encoder is exercised end-to-end even when
+/// the localnet capture didn't produce real fixtures. Covers the
+/// per-field omitempty contract that fixture absence would otherwise
+/// leave unverified.
+#[test]
+fn state_proof_verification_context_round_trip_synthetic() {
+    let cases = [
+        StateProofVerificationContext::default(),
+        StateProofVerificationContext {
+            last_attested_round: 256,
+            voters_commitment: vec![0xab; 32],
+            online_total_weight: 10_000_000,
+            version: "future".into(),
+        },
+        // Only the trio fields populated, no version — exercises the
+        // `v` omitempty path.
+        StateProofVerificationContext {
+            last_attested_round: 512,
+            voters_commitment: vec![1, 2, 3, 4],
+            online_total_weight: 42,
+            version: String::new(),
+        },
+    ];
+    for (i, ctx) in cases.iter().enumerate() {
+        let encoded = canonical_encode_state_proof_verification_context(ctx);
+        let decoded = decode_state_proof_verification_context_value(&encoded)
+            .unwrap_or_else(|e| panic!("round-trip case[{i}]: {e}"));
+        assert_eq!(*ctx, decoded, "synthetic round-trip drift case[{i}]");
+    }
+}
+
+fn decode_state_proof_verification_context_value(
+    data: &[u8],
+) -> Result<StateProofVerificationContext, String> {
+    let val: rmpv::Value =
+        rmpv::decode::read_value(&mut &data[..]).map_err(|e| format!("rmpv decode: {e}"))?;
+    let pairs = match val {
+        rmpv::Value::Map(m) => m,
+        other => return Err(format!("expected msgpack map, got {other:?}")),
+    };
+    let mut c = StateProofVerificationContext::default();
+    for (k, v) in pairs {
+        let key = k.as_str().ok_or_else(|| format!("non-string key: {k:?}"))?;
+        match key {
+            "pw" => c.online_total_weight = as_u64(&v),
+            "spround" => c.last_attested_round = as_u64(&v),
+            "v" => c.version = as_str(&v)?,
+            "vc" => c.voters_commitment = as_bytes(&v)?,
+            other => {
+                return Err(format!(
+                    "unexpected StateProofVerificationContext tag {other:?}"
+                ))
+            }
+        }
+    }
+    Ok(c)
 }
 
 // ---------------------------------------------------------------------------
