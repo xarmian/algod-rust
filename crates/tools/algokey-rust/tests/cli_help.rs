@@ -194,7 +194,8 @@ fn fully_specified_subcommands_stub_to_not_implemented() {
     // When all required flags are present, the command body should fire
     // and exit 2 with "not implemented" on stderr.
     let cases: &[&[&str]] = &[
-        &["generate"],
+        // `generate` is no longer stubbed (TASK-157); it lives in
+        // tests/generate_smoke.rs.
         &["import", "-m", "invalid mnemonic"],
         &["export", "-f", "/tmp/does-not-exist"],
         &["sign", "-t", "/tmp/in", "-o", "/tmp/out"],
