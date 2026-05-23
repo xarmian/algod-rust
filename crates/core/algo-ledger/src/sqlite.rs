@@ -1030,6 +1030,7 @@ fn decode_app_params(data: &[u8], creator: Address) -> Result<AppParams, AlgoErr
     let mut v_val: Option<rmpv::Value> = None;
     let mut w_val: Option<rmpv::Value> = None;
     let mut x_val: Option<rmpv::Value> = None;
+    let mut raw_y: u64 = 0;
 
     for (k, v) in &map {
         match k.as_str().unwrap_or("") {
@@ -1041,17 +1042,24 @@ fn decode_app_params(data: &[u8], creator: Address) -> Result<AppParams, AlgoErr
             "v" => v_val = Some(v.clone()),
             "w" => w_val = Some(v.clone()),
             "x" => x_val = Some(v.clone()),
+            "y" => raw_y = v.as_u64().unwrap_or(0),
             _ => {}
         }
     }
 
-    // Layout detection: canonical iff any canonical-only key (`w`/`x`) is
-    // present OR `t`/`u` are scalar u64s (legacy always wrote them as
-    // nested Map submaps).
+    // Layout detection: canonical iff
+    //   - any canonical-only key (`w`/`x`) is present, OR
+    //   - `t`/`u` are scalar u64s (legacy always wrote them as nested
+    //     Map submaps), OR
+    //   - `y == 2` (OWNERSHIP) or `y == 3` (NOT_HOLDING | OWNERSHIP),
+    //     canonical-only flag values that legacy never wrote.
+    // PLAN-189 / TASK-192 (Codex review round 3).
     let is_canonical = w_val.is_some()
         || x_val.is_some()
         || matches!(&t_val, Some(v) if !matches!(v, rmpv::Value::Map(_)))
-        || matches!(&u_val, Some(v) if !matches!(v, rmpv::Value::Map(_)));
+        || matches!(&u_val, Some(v) if !matches!(v, rmpv::Value::Map(_)))
+        || raw_y == 2
+        || raw_y == 3;
 
     if let Some(b) = q_val {
         p.approval_program = b;
@@ -1189,22 +1197,33 @@ fn decode_app_local_state(data: &[u8]) -> Result<AppLocalState, AlgoError> {
     //   * Canonical → value is a Map whose keys are binary/raw bytes (the kv keys).
     // We inspect the value type at `p` to decide.
 
-    // First pass: detect canonical signals. The blob is canonical iff
-    // any of the canonical-only keys are present:
-    //   `n`/`o` → canonical local-state schemas
-    //   `q`/`r`/`w`/`x` → canonical app-params signals (combined row)
+    // First pass: detect canonical signals. The blob is canonical if
+    // ANY of:
+    //   - a canonical-only key is present: `n`/`o` (canonical local-state
+    //     schemas) or `q`/`r`/`w`/`x` (canonical app-params signals
+    //     present iff this is a combined row)
+    //   - the `y` flag carries a canonical-only value: `y == 2` (OWNERSHIP)
+    //     or `y == 3` (NOT_HOLDING | OWNERSHIP). Legacy Rust encoders
+    //     only ever wrote y ∈ {1, 4, 5}, so these values are unambiguous.
     // In a canonical combined row, `s` is the app-params global_state,
     // NOT the local kv map; the local kv lives at `p`. So we must NOT
-    // treat `s` as local kv in canonical mode.
+    // treat `s` as local kv in canonical mode. PLAN-189 / TASK-192
+    // (Codex review round 3).
     let mut is_canonical = false;
-    for (k, _) in &map {
+    let mut raw_y: u64 = 0;
+    for (k, v) in &map {
         if matches!(
             k.as_str(),
             Some("n") | Some("o") | Some("q") | Some("r") | Some("w") | Some("x")
         ) {
             is_canonical = true;
-            break;
         }
+        if k.as_str() == Some("y") {
+            raw_y = v.as_u64().unwrap_or(0);
+        }
+    }
+    if raw_y == 2 || raw_y == 3 {
+        is_canonical = true;
     }
 
     for (k, v) in map {
