@@ -20,7 +20,8 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Generate(args) => commands::generate::run(args),
         Command::Import(args) => commands::import::run(args),
-        Command::Export(_) | Command::Sign(_) => not_implemented(),
+        Command::Export(args) => commands::export::run(args),
+        Command::Sign(_) => not_implemented(),
         Command::Multisig(m) => match m.command {
             None => not_implemented(),
             Some(MultisigSub::AppendAuthAddr(_)) => not_implemented(),

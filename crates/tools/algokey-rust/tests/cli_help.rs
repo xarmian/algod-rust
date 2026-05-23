@@ -198,7 +198,8 @@ fn fully_specified_subcommands_stub_to_not_implemented() {
         // tests/generate_smoke.rs.
         // `import` is no longer stubbed (TASK-158); it lives in
         // tests/import_smoke.rs.
-        &["export", "-f", "/tmp/does-not-exist"],
+        // `export` is no longer stubbed (TASK-159); it lives in
+        // tests/export_smoke.rs.
         &["sign", "-t", "/tmp/in", "-o", "/tmp/out"],
         &["multisig", "-t", "/tmp/in", "-o", "/tmp/out"],
         &[
