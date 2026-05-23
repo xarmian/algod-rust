@@ -12,6 +12,7 @@ path = "src/main.rs"
 clap = { workspace = true }
 algo-codec.workspace = true
 algo-consensus-crypto.workspace = true
+algo-ledger.workspace = true
 algo-types.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
@@ -21,3 +22,4 @@ serde = { workspace = true }
 [dev-dependencies]
 hex.workspace = true
 tempfile = "3"
+data-encoding = { workspace = true }
