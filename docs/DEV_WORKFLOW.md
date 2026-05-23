@@ -194,7 +194,7 @@ go-algorand 4.5.1 consensus versions → AVM versions:
 
 ## Go Canonical-Extract Tool
 
-Located at `docker/scripts/canonical-extract/`. Requires Go 1.21+ and a running localnet.
+Located at `docker/scripts/canonical-extract/`. Requires Go 1.25+ and a running localnet. (The 1.25 floor comes from the pure-Go SQLite driver `modernc.org/sqlite` used by `-mode trackerdb-blobs` — `-mode blocks` itself only needs 1.21+, but the module is shared.)
 
 ```bash
 # Run standalone
@@ -210,6 +210,59 @@ Output files per block:
 - `block_N_txn_I.txid.hex` — Transaction ID (SHA512/256)
 - `block_N_stxn_I.canonical.hex` — Canonical encoded signed transaction
 - `block_N.digest.hex` — Block digest (from block N+1's `prev` field)
+
+### Trackerdb BLOB fixtures (PLAN-36 G8 / TASK-119)
+
+The same tool, under `-mode trackerdb-blobs`, opens a Go-produced
+`<prefix>.tracker.sqlite` directly and dumps every BLOB column as a hex
+fixture — the byte corpus for the G8 canonical-encoder tasks
+(`BaseAccountData`, `BaseOnlineAccountData`, `ResourcesData`,
+`OnlineRoundParamsData`, `TxTailRound`, `StateProofVerificationContext`).
+
+Run the full pipeline against a running localnet:
+
+```bash
+# Bring up localnet + push enough txns to populate the trackerdb tables.
+make fixtures-diverse
+
+# Copy the Go-produced tracker DB out of the algod-go container, then
+# dump every BLOB row to <repo>/crates/core/algo-codec/tests/fixtures/trackerdb/.
+make extract-trackerdb-fixtures
+```
+
+Output layout (one subdirectory per BLOB type, each containing one
+`.canonical.hex` per row plus a `_meta.json` recording the source
+go-algorand version, source data-dir prefix, capture timestamp, and
+highest round seen):
+
+- `trackerdb/baseaccountdata/<addrhex>.canonical.hex` (from `accountbase.data`)
+- `trackerdb/baseonlineaccountdata/<addrhex>_<updround>.canonical.hex` (from `onlineaccounts.data`)
+- `trackerdb/resourcesdata/<addrhex>_<aidx>_<ctype>.canonical.hex` (from `resources.data` joined with `accountbase.address`)
+- `trackerdb/onlineroundparams/<round>.canonical.hex` (from `onlineroundparamstail.data`)
+- `trackerdb/txtailround/<round>.canonical.hex` (from `txtail.data`)
+- `trackerdb/stateproof/<round>.canonical.hex` (from `stateproofverification.verificationcontext`)
+
+**Caveat:** `stateproof/` is typically empty on a fresh localnet — state-proof rows only land after enough rounds with `EnableStateProof=true`. The
+`_meta.json` records `row_count: 0` in that case so a downstream encoder
+test can skip gracefully. Run the localnet longer (≥256 rounds with
+state-proof participation enabled) or capture from a long-running testnet
+node to get coverage for that type.
+
+The Make recipe `docker cp`s the tracker `.sqlite` file **plus** its
+`-wal` and `-shm` sidecars out of the container — go-algorand opens
+the tracker DB in WAL mode, so the latest rows can live in the WAL
+until the next checkpoint. The Go tool opens the captured DB with
+`mode=ro` (no `immutable=1`) so SQLite replays the captured WAL on
+read and produces a consistent view.
+
+Overrides for the Make target:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TRACKERDB_CONTAINER` | `algod-go` | docker-compose service name shipping the DB |
+| `TRACKERDB_CONTAINER_PATH` | _(autodiscovered)_ | in-container path. When unset, the recipe runs `find /algod/data -maxdepth 4 -name ledger.tracker.sqlite` inside the container. Pin manually when the container hosts >1 network. |
+| `TRACKERDB_LOCAL_DIR` | `/tmp/algod-rust-extract` | host-side scratch directory for the three captured files |
+| `TRACKERDB_LOCAL_COPY` | `$(TRACKERDB_LOCAL_DIR)/ledger.tracker.sqlite` | host-side main DB file (WAL/SHM sit beside it) |
 
 ## V13 Opcode Vector Regeneration
 
