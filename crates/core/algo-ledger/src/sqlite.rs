@@ -687,7 +687,7 @@ pub(crate) fn encode_asset_holding(h: &AssetHolding) -> Vec<u8> {
     encode_asset_holding_with_round(h, 0)
 }
 
-pub(crate) fn encode_asset_holding_with_round(h: &AssetHolding, update_round: u64) -> Vec<u8> {
+pub fn encode_asset_holding_with_round(h: &AssetHolding, update_round: u64) -> Vec<u8> {
     // Delegate to the canonical Go-compatible encoder. The output BLOB
     // is byte-identical to what go-algorand's `trackerdb.ResourcesData.MarshalMsg`
     // would write for the equivalent struct value, modulo Go's omitempty
@@ -732,7 +732,7 @@ pub(crate) fn encode_asset_params(p: &AssetParams, creator: &Address) -> Vec<u8>
     encode_asset_params_with_round(p, creator, 0)
 }
 
-pub(crate) fn encode_asset_params_with_round(
+pub fn encode_asset_params_with_round(
     p: &AssetParams,
     creator: &Address,
     update_round: u64,
@@ -908,7 +908,7 @@ pub(crate) fn encode_app_params(p: &AppParams) -> Vec<u8> {
     encode_app_params_with_round(p, 0)
 }
 
-pub(crate) fn encode_app_params_with_round(p: &AppParams, update_round: u64) -> Vec<u8> {
+pub fn encode_app_params_with_round(p: &AppParams, update_round: u64) -> Vec<u8> {
     // Delegate to canonical encoder. PLAN-189 / TASK-192.
     //
     // Field layout changes from the legacy hand-rolled encoder:
@@ -926,7 +926,7 @@ pub(crate) fn encode_app_params_with_round(p: &AppParams, update_round: u64) -> 
 /// Build a canonical `algo_codec::ResourcesData` carrying the union of
 /// an optional `AppLocalState` and an optional `AppParams`. Mirrors
 /// [`build_asset_resource_data`] for the app side. PLAN-189 / TASK-192.
-pub(crate) fn build_app_resource_data(
+pub fn build_app_resource_data(
     local_state: Option<&AppLocalState>,
     params: Option<&AppParams>,
     update_round: u64,
@@ -1098,7 +1098,7 @@ pub(crate) fn encode_app_local_state(s: &AppLocalState) -> Vec<u8> {
     encode_app_local_state_with_round(s, 0)
 }
 
-pub(crate) fn encode_app_local_state_with_round(s: &AppLocalState, update_round: u64) -> Vec<u8> {
+pub fn encode_app_local_state_with_round(s: &AppLocalState, update_round: u64) -> Vec<u8> {
     // Delegate to canonical encoder. PLAN-189 / TASK-193.
     //
     // Field layout changes from the legacy hand-rolled encoder:
@@ -1525,7 +1525,7 @@ fn strip_holding_from_blob(data: &[u8]) -> Option<Vec<u8>> {
 /// an optional `AssetHolding` and an optional `AssetParams`. The
 /// `creator` address from `AssetParams` is intentionally NOT stored in
 /// the BLOB — go-algorand keeps that in the `assetcreators` table.
-pub(crate) fn build_asset_resource_data(
+pub fn build_asset_resource_data(
     holding: Option<&AssetHolding>,
     params: Option<&AssetParams>,
     update_round: u64,
