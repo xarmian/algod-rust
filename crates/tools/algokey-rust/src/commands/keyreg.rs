@@ -169,8 +169,23 @@ pub fn run_with_io<O: Write, E: Write>(
         )
     };
 
-    // Validity-range check (keyreg.go:202-205).
-    let valid_range = args.lastvalid.saturating_sub(args.firstvalid);
+    // Explicit `lv >= fv` check. Go relies on uint64 underflow wrapping
+    // here (keyreg.go:202: `validRange := params.lastValid - params.
+    // firstValid`) so a lastvalid < firstvalid produces a giant number
+    // that fails the txnLife check anyway. We surface that as an
+    // explicit error so operators see a clear message instead of the
+    // confusing "validity range > 1000" wording.
+    if args.lastvalid < args.firstvalid {
+        let _ = writeln!(
+            stderr,
+            "the transaction's lastvalid round ({}) must be \
+             greater than or equal to firstvalid ({})",
+            args.lastvalid, args.firstvalid
+        );
+        return ExitCode::from(1);
+    }
+    // Validity-range check (keyreg.go:202-205). Safe to subtract now.
+    let valid_range = args.lastvalid - args.firstvalid;
     if valid_range > TXN_LIFE {
         let _ = writeln!(
             stderr,
@@ -214,17 +229,21 @@ pub fn run_with_io<O: Write, E: Write>(
         return ExitCode::from(1);
     }
 
-    // Summary line.
-    if args.offline {
-        let _ = writeln!(
-            stdout,
-            "Account key go offline transaction written to '{output_file}'."
-        );
+    // Summary line. When the txn bytes were piped to stdout (`-o -`)
+    // we route the summary to stderr to avoid corrupting the binary
+    // payload — Go has the same code path write to stdout too, which
+    // is a Go-side footgun for any pipe consumer. We diverge here on
+    // operational grounds; the consensus-critical byte stream (the
+    // signed txn) is unchanged.
+    let summary = if args.offline {
+        format!("Account key go offline transaction written to '{output_file}'.")
     } else {
-        let _ = writeln!(
-            stdout,
-            "Key registration transaction written to '{output_file}'."
-        );
+        format!("Key registration transaction written to '{output_file}'.")
+    };
+    if write_to_stdout {
+        let _ = writeln!(stderr, "{summary}");
+    } else {
+        let _ = writeln!(stdout, "{summary}");
     }
     ExitCode::SUCCESS
 }
@@ -261,9 +280,11 @@ mod tests {
     }
 
     /// Offline txn carries the right type, sender, rounds, fee, and
-    /// genesis hash from the network name.
+    /// genesis hash from the network name. Holds the env lock to keep
+    /// the no-override path stable against parallel env-mutating tests.
     #[test]
     fn offline_txn_has_expected_fields() {
+        let _guard = EnvGuard::clear("ALGOKEY_GENESIS_HASH");
         let dir = tempdir().unwrap();
         let outfile = dir.path().join("offline.tx");
         let acct = "HNVCPPGOW2SC2YVDVDICU3YNONSTEFLXDXREHJR2YBEKDC2Z3IUZSC6YGI".to_string();
@@ -297,9 +318,10 @@ mod tests {
     }
 
     /// Online txn (read partkey) populates vote_pk + selection_pk +
-    /// state_proof_pk + vote_first/last/dilution.
+    /// state_proof_pk + vote_first/last/dilution. Env-guarded.
     #[test]
     fn online_txn_uses_partkey_fields() {
+        let _guard = EnvGuard::clear("ALGOKEY_GENESIS_HASH");
         let dir = tempdir().unwrap();
         let outfile = dir.path().join("online.tx");
         let mut args = base_args();
@@ -405,26 +427,79 @@ mod tests {
         );
     }
 
+    /// Process-wide lock for tests that mutate `ALGOKEY_GENESIS_HASH`.
+    /// Without this, parallel test threads observe each other's env
+    /// mutations — Codex caught this in round 1.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// Scoped env-var guard: serializes against `env_lock` and restores
+    /// the prior value on drop. Mirrors the pattern in
+    /// algo-types::networks tests.
+    struct EnvGuard<'a> {
+        key: &'a str,
+        prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl<'a> EnvGuard<'a> {
+        fn set(key: &'a str, value: &str) -> Self {
+            let _lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev, _lock }
+        }
+        fn clear(key: &'a str) -> Self {
+            let _lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, prev, _lock }
+        }
+    }
+
+    impl Drop for EnvGuard<'_> {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     /// ALGOKEY_GENESIS_HASH env override flows through resolve_genesis_hash.
     #[test]
     fn genesis_hash_env_override_propagates() {
         let dir = tempdir().unwrap();
         let outfile = dir.path().join("env_override.tx");
-        // 32-byte custom hash, b64-encoded.
         use data_encoding::BASE64;
         let custom = [0xAAu8; 32];
         let custom_b64 = BASE64.encode(&custom);
-        // Use a process-local env mutex via a scope (other tests in
-        // this binary don't touch the var).
-        std::env::set_var("ALGOKEY_GENESIS_HASH", &custom_b64);
+        let _guard = EnvGuard::set("ALGOKEY_GENESIS_HASH", &custom_b64);
         let mut args = base_args();
         args.offline = true;
         args.account = Some("HNVCPPGOW2SC2YVDVDICU3YNONSTEFLXDXREHJR2YBEKDC2Z3IUZSC6YGI".into());
         args.output_file = Some(outfile.to_string_lossy().into_owned());
         let code = run_with_io(args, &mut Vec::new(), &mut Vec::new());
-        std::env::remove_var("ALGOKEY_GENESIS_HASH");
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         let (signed, _) = decode_one_signed_txn(&std::fs::read(&outfile).unwrap()).unwrap();
         assert_eq!(signed.txn.genesis_hash, custom);
+    }
+
+    /// lv < fv → explicit reject (no underflow path through validity-
+    /// range check). Codex round 1.
+    #[test]
+    fn lastvalid_below_firstvalid_rejected() {
+        let mut args = base_args();
+        args.firstvalid = 100;
+        args.lastvalid = 50;
+        args.offline = true;
+        args.account = Some("HNVCPPGOW2SC2YVDVDICU3YNONSTEFLXDXREHJR2YBEKDC2Z3IUZSC6YGI".into());
+        let mut err = Vec::new();
+        let code = run_with_io(args, &mut Vec::new(), &mut err);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(stderr.contains("lastvalid round (50)"), "stderr: {stderr}");
     }
 }
