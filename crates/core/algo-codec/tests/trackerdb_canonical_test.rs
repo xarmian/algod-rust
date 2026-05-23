@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use algo_codec::{
     canonical_encode_base_account_data, canonical_encode_base_online_account_data,
-    BaseOnlineAccountData,
+    canonical_encode_resources_data, BaseOnlineAccountData, ResourcesData,
 };
 use algo_types::{AccountData, AccountStatus, Address};
 
@@ -197,6 +197,139 @@ fn decode_base_online_account_data_value(data: &[u8]) -> Result<BaseOnlineAccoun
         }
     }
     Ok(d)
+}
+
+// ---------------------------------------------------------------------------
+// ResourcesData byte-exact + round-trip (PLAN-36 G8 / TASK-122)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resources_data_byte_exact_against_go_fixtures() {
+    let dir = fixtures_root().join("resourcesdata");
+    let fixtures = load_canonical_hex_dir(&dir);
+    if fixtures.is_empty() {
+        eprintln!(
+            "SKIPPED: no resourcesdata fixtures at {}. \
+             Run `make extract-trackerdb-fixtures` against a populated localnet to generate them.",
+            dir.display()
+        );
+        return;
+    }
+
+    let mut checked = 0;
+    for (name, expected) in &fixtures {
+        let decoded = decode_resources_data_value(expected)
+            .unwrap_or_else(|e| panic!("decode resourcesdata/{name}.canonical.hex: {e}"));
+        let actual = canonical_encode_resources_data(&decoded);
+        assert_eq!(
+            hex::encode(&actual),
+            hex::encode(expected),
+            "byte-exact mismatch for resourcesdata/{name}.canonical.hex"
+        );
+        checked += 1;
+    }
+    println!("resourcesdata: {checked} fixtures byte-exact ✓");
+}
+
+#[test]
+fn resources_data_round_trip_via_value() {
+    let dir = fixtures_root().join("resourcesdata");
+    let fixtures = load_canonical_hex_dir(&dir);
+    if fixtures.is_empty() {
+        eprintln!("SKIPPED: no resourcesdata fixtures at {}.", dir.display());
+        return;
+    }
+
+    for (name, raw) in &fixtures {
+        let first = decode_resources_data_value(raw)
+            .unwrap_or_else(|e| panic!("decode resourcesdata/{name}.canonical.hex: {e}"));
+        let encoded = canonical_encode_resources_data(&first);
+        let second = decode_resources_data_value(&encoded)
+            .unwrap_or_else(|e| panic!("re-decode after encode resourcesdata/{name}: {e}"));
+        assert_eq!(first, second, "round-trip drift on resourcesdata/{name}");
+    }
+}
+
+/// Minimal rmpv-walker for trackerdb `ResourcesData`. Only used by the
+/// fixture-driven tests; the production decoder lives in
+/// `algo_ledger::catchpoint::msgp_compat`.
+///
+/// For the `p` (local key-value) and `s` (global state) fields the
+/// walker stores the **raw msgpack bytes** of the nested map exactly
+/// as encoded by Go — that's the contract `canonical_encode_resources_data`
+/// expects when re-encoding (it embeds those bytes verbatim).
+fn decode_resources_data_value(data: &[u8]) -> Result<ResourcesData, String> {
+    let val: rmpv::Value =
+        rmpv::decode::read_value(&mut &data[..]).map_err(|e| format!("rmpv decode: {e}"))?;
+    let pairs = match val {
+        rmpv::Value::Map(m) => m,
+        other => return Err(format!("expected msgpack map, got {other:?}")),
+    };
+
+    let mut d = ResourcesData::default();
+    for (k, v) in pairs {
+        let key = k.as_str().ok_or_else(|| format!("non-string key: {k:?}"))?;
+        match key {
+            // Asset params (a-k).
+            "a" => d.total = as_u64(&v),
+            "b" => d.decimals = as_u64(&v) as u32,
+            "c" => d.default_frozen = v.as_bool().unwrap_or(false),
+            "d" => d.unit_name = as_str(&v)?,
+            "e" => d.asset_name = as_str(&v)?,
+            "f" => d.url = as_str(&v)?,
+            "g" => d.metadata_hash = as_array32(&v)?,
+            "h" => d.manager = as_array32(&v)?,
+            "i" => d.reserve = as_array32(&v)?,
+            "j" => d.freeze = as_array32(&v)?,
+            "k" => d.clawback = as_array32(&v)?,
+            // Asset holding (l-m).
+            "l" => d.amount = as_u64(&v),
+            "m" => d.frozen = v.as_bool().unwrap_or(false),
+            // App local state (n-p).
+            "n" => d.schema_num_uint = as_u64(&v),
+            "o" => d.schema_num_byte_slice = as_u64(&v),
+            "p" => d.key_value = reencode_map_value(&v)?,
+            // App params (q-x).
+            "q" => d.approval_program = as_bytes(&v)?,
+            "r" => d.clear_state_program = as_bytes(&v)?,
+            "s" => d.global_state = reencode_map_value(&v)?,
+            "t" => d.local_state_schema_num_uint = as_u64(&v),
+            "u" => d.local_state_schema_num_byte_slice = as_u64(&v),
+            "v" => d.global_state_schema_num_uint = as_u64(&v),
+            "w" => d.global_state_schema_num_byte_slice = as_u64(&v),
+            "x" => d.extra_program_pages = as_u64(&v) as u32,
+            // Flags + metadata (y, z, A, B).
+            "y" => d.resource_flags = as_u64(&v) as u8,
+            "z" => d.update_round = as_u64(&v),
+            "A" => d.version = as_u64(&v),
+            "B" => d.size_sponsor = as_array32(&v)?,
+            other => return Err(format!("unexpected ResourcesData tag {other:?}")),
+        }
+    }
+    Ok(d)
+}
+
+fn as_str(v: &rmpv::Value) -> Result<String, String> {
+    v.as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("expected string, got {v:?}"))
+}
+
+fn as_bytes(v: &rmpv::Value) -> Result<Vec<u8>, String> {
+    v.as_slice()
+        .map(|b| b.to_vec())
+        .ok_or_else(|| format!("expected bytes, got {v:?}"))
+}
+
+/// Re-encode a generic `rmpv::Value::Map` to canonical msgpack bytes
+/// for embedding through `add_map`. Because the fixtures already came
+/// from Go (which produced canonical output), a re-encode through
+/// `rmpv::encode::write_value` over the same key order produces the
+/// same bytes.
+fn reencode_map_value(v: &rmpv::Value) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    rmpv::encode::write_value(&mut buf, v).map_err(|e| format!("re-encode map: {e}"))?;
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------

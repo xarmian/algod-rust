@@ -76,6 +76,20 @@ impl CanonicalMap {
         }
     }
 
+    /// Length-only omitempty for variable-length `[]byte` fields: the
+    /// value is included as long as `len > 0`, even when every byte is
+    /// zero. Used for things like `ResourcesData.ApprovalProgram` /
+    /// `ClearStateProgram` where Go's `[]byte` omitempty checks `len`
+    /// only — an all-zero non-empty program is still valid bytecode and
+    /// must be preserved. PLAN-36 G8 (TASK-122).
+    fn add_var_bytes(&mut self, key: &'static str, val: &[u8]) {
+        if !val.is_empty() {
+            let mut buf = Vec::new();
+            rmp::encode::write_bin(&mut buf, val).unwrap();
+            self.fields.push((key, buf));
+        }
+    }
+
     /// Encode a byte slice using msgpack `str` format (not `bin`).
     ///
     /// In Go, fields typed as `string` are encoded by go-codec as msgpack str,
@@ -892,6 +906,179 @@ pub fn canonical_encode_base_online_account_data(d: &BaseOnlineAccountData) -> V
     m.add_bool("X", d.incentive_eligible);
     m.add_u64("Y", d.micro_algos);
     m.add_u64("Z", d.rewards_base);
+
+    m.encode()
+}
+
+/// Go-algorand resource-flags bitmask
+/// (`../go-algorand/ledger/store/trackerdb/data.go:62-75` @
+/// `v4.5.1-stable`).
+///
+/// These constants are the **on-the-wire** values that the `y` field of
+/// `ResourcesData` carries; consumers (Go writers, catchpoint imports)
+/// rely on them to determine which subset of the union struct is valid.
+///
+/// Note: the legacy Rust encoders in `algo_ledger::sqlite` historically
+/// wrote `1` for plain asset holding and `4` for asset params ownership
+/// — both **wrong** vs Go's `0` / `2` semantics. Switching the live
+/// write paths is a separate follow-up so existing DBs remain
+/// migrate-able; the canonical encoder here uses Go's values
+/// unconditionally. PLAN-36 G8 (TASK-122).
+pub mod resource_flags {
+    /// Asset/app holding present without ownership.
+    pub const HOLDING: u8 = 0;
+    /// Resource is completely empty (should not persist; see Go docs).
+    pub const NOT_HOLDING: u8 = 1;
+    /// Asset/app params present (creator's row).
+    pub const OWNERSHIP: u8 = 2;
+    /// This is an asset resource and it is empty.
+    pub const EMPTY_ASSET: u8 = 4;
+    /// This is an app resource and it is empty.
+    pub const EMPTY_APP: u8 = 8;
+}
+
+/// Mirror of go-algorand's `trackerdb.ResourcesData`
+/// (`../go-algorand/ledger/store/trackerdb/data.go:88` @ `v4.5.1-stable`).
+///
+/// The unified BLOB shape stored in `resources.data` — a single struct
+/// that carries the union of asset-params, asset-holding,
+/// app-local-state, and app-params fields. The `resource_flags` field
+/// (codec `y`, see [`resource_flags`]) tells consumers which subset is
+/// valid for a given row.
+///
+/// Lives in `algo-codec` for the same reason as
+/// [`BaseOnlineAccountData`]: there is no equivalent Rust runtime
+/// type, and constructing one from the live `AccountData` resource
+/// maps is mechanical at the call site. PLAN-36 G8 (TASK-122).
+///
+/// Field grouping (codec tags inline):
+/// - **Asset params** (`a`..`k`): `total`/`decimals`/`default_frozen`/
+///   `unit_name`/`asset_name`/`url`/`metadata_hash`/`manager`/
+///   `reserve`/`freeze`/`clawback`.
+/// - **Asset holding** (`l`,`m`): `amount`/`frozen`.
+/// - **App local state** (`n`,`o`,`p`): `schema_num_uint`/
+///   `schema_num_byte_slice`/`key_value` (raw pre-encoded msgpack
+///   map bytes, may be empty).
+/// - **App params** (`q`..`x`): `approval_program`/`clear_state_program`/
+///   `global_state` (raw msgpack map) / four flat schema fields /
+///   `extra_program_pages`.
+/// - **Flags + metadata** (`y`,`z`,`A`,`B`): `resource_flags`/
+///   `update_round`/`version`/`size_sponsor`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourcesData {
+    // Asset params (a-k).
+    pub total: u64,
+    pub decimals: u32,
+    pub default_frozen: bool,
+    pub unit_name: String,
+    pub asset_name: String,
+    pub url: String,
+    pub metadata_hash: [u8; 32],
+    pub manager: [u8; 32],
+    pub reserve: [u8; 32],
+    pub freeze: [u8; 32],
+    pub clawback: [u8; 32],
+
+    // Asset holding (l-m).
+    pub amount: u64,
+    pub frozen: bool,
+
+    // App local state (n-p).
+    pub schema_num_uint: u64,
+    pub schema_num_byte_slice: u64,
+    /// Pre-encoded canonical msgpack map bytes for the local
+    /// `TealKeyValue`. Empty (`Vec::new()`) when absent; otherwise
+    /// the caller must supply bytes that already match Go's canonical
+    /// encoding (key-sorted, omitempty, etc.) — typically produced
+    /// by [`canonical_encode_teal_key_value`].
+    pub key_value: Vec<u8>,
+
+    // App params (q-x).
+    pub approval_program: Vec<u8>,
+    pub clear_state_program: Vec<u8>,
+    /// Pre-encoded canonical msgpack map bytes for the global
+    /// `TealKeyValue`. Same contract as `key_value` above.
+    pub global_state: Vec<u8>,
+    pub local_state_schema_num_uint: u64,
+    pub local_state_schema_num_byte_slice: u64,
+    pub global_state_schema_num_uint: u64,
+    pub global_state_schema_num_byte_slice: u64,
+    pub extra_program_pages: u32,
+
+    // Flags + metadata (y, z, A, B).
+    /// See [`resource_flags`] for the documented bit values.
+    pub resource_flags: u8,
+    pub update_round: u64,
+    pub version: u64,
+    pub size_sponsor: [u8; 32],
+}
+
+/// Canonically encode the Go `trackerdb.ResourcesData` struct.
+///
+/// Mirrors go-algorand's generated `ResourcesData.MarshalMsg`
+/// (`../go-algorand/ledger/store/trackerdb/msgp_gen.go:1743` @
+/// `v4.5.1-stable`). Bit-identity is required because these bytes land
+/// in the `resources.data` BLOB column that both implementations read.
+///
+/// The `y` field (`resource_flags`) is the only field that may legally
+/// be the integer `0` and still survive omitempty — that's the special
+/// case for `ResourceFlagsHolding`, the most common asset-holding row.
+/// To preserve that semantics we use [`CanonicalMap::add_u64_always`]
+/// for `y`; every other field follows standard omitempty.
+///
+/// PLAN-36 G8 (TASK-122).
+pub fn canonical_encode_resources_data(d: &ResourcesData) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    // Asset params (a-k).
+    m.add_u64("a", d.total);
+    m.add_u64("b", d.decimals as u64);
+    m.add_bool("c", d.default_frozen);
+    m.add_string("d", &d.unit_name);
+    m.add_string("e", &d.asset_name);
+    m.add_string("f", &d.url);
+    m.add_bytes("g", &d.metadata_hash);
+    m.add_bytes("h", &d.manager);
+    m.add_bytes("i", &d.reserve);
+    m.add_bytes("j", &d.freeze);
+    m.add_bytes("k", &d.clawback);
+
+    // Asset holding (l-m).
+    m.add_u64("l", d.amount);
+    m.add_bool("m", d.frozen);
+
+    // App local state (n-p). `p` is a pre-encoded msgpack map; skip
+    // when empty (which is also how `add_map` interprets a lone
+    // `0x80` fixmap-zero header).
+    m.add_u64("n", d.schema_num_uint);
+    m.add_u64("o", d.schema_num_byte_slice);
+    if !d.key_value.is_empty() {
+        m.add_map("p", d.key_value.clone());
+    }
+
+    // App params (q-x). `q`/`r` use the variable-length omitempty
+    // helper because an all-zero non-empty program is still valid
+    // bytecode (Go's `[]byte` omitempty checks `len == 0` only — see
+    // `CanonicalMap::add_var_bytes` for the contract).
+    m.add_var_bytes("q", &d.approval_program);
+    m.add_var_bytes("r", &d.clear_state_program);
+    if !d.global_state.is_empty() {
+        m.add_map("s", d.global_state.clone());
+    }
+    m.add_u64("t", d.local_state_schema_num_uint);
+    m.add_u64("u", d.local_state_schema_num_byte_slice);
+    m.add_u64("v", d.global_state_schema_num_uint);
+    m.add_u64("w", d.global_state_schema_num_byte_slice);
+    m.add_u64("x", d.extra_program_pages as u64);
+
+    // Flags + metadata (y, z, A, B). `y` is u64-encoded but uses
+    // standard omitempty — Go's generated MarshalMsg omits `y` when
+    // it's zero (`ResourceFlagsHolding`), and the consumer infers the
+    // default. So we use `add_u64` here, not `add_u64_always`.
+    m.add_u64("y", d.resource_flags as u64);
+    m.add_u64("z", d.update_round);
+    m.add_u64("A", d.version);
+    m.add_bytes("B", &d.size_sponsor);
 
     m.encode()
 }
