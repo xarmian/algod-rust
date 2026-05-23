@@ -1699,84 +1699,23 @@ fn derive_txn_counter(conn: &Connection) -> u64 {
 
 /// Build a serialized TxTailRound entry from a block for txtail storage.
 ///
-/// Extracts lease information and last_valid values from the block's
-/// transactions for later lease table reconstruction.
+/// Delegates to `algo_codec::build_txtail_from_block` (which mirrors
+/// go-algorand's `TxTailRoundFromBlock`: populates `txn_ids`, `last_valid`,
+/// `leases`, and the inlined `hdr`) and then byte-canonical-encodes via
+/// `canonical_encode_txtail_round`. The resulting bytes are
+/// byte-identical to what Go writes into `txtail.data` for the same
+/// block.
+///
+/// PLAN-36 G8 (TASK-124): the pre-PR version of this function (a) used
+/// `rmp_serde::to_vec_named` (serde-default named encoding, no
+/// lex-sorted keys, no Go-omitempty) and (b) constructed the
+/// `TxTailRound` locally with `txn_ids: Vec::new()`, leaving the `i`
+/// field empty for any lookback block with transactions. Both bugs
+/// produced bytes divergent from Go's `TxTailRoundFromBlock` output;
+/// delegating to the canonical builder + encoder eliminates the
+/// divergence in one shot.
 fn build_txtail_entry(block: &Block) -> Result<Vec<u8>, AlgoError> {
-    use algo_types::{BlockHeader, TxTailRound};
-    use serde_bytes::ByteBuf;
-
-    let mut last_valid_vec = Vec::new();
-    let mut leases = Vec::new();
-
-    for stib in &block.payset {
-        let txn = &stib.txn;
-        last_valid_vec.push(txn.last_valid.0);
-
-        // Record lease if present (non-empty and non-zero).
-        if txn.lease.len() == 32 {
-            let all_zero = txn.lease.iter().all(|&b| b == 0);
-            if !all_zero {
-                let txn_idx = (last_valid_vec.len() - 1) as u64;
-                let sender = txn.sender;
-                leases.push(algo_types::TxTailRoundLease {
-                    sender,
-                    lease: ByteBuf::from(txn.lease.as_ref()),
-                    txn_idx,
-                });
-            }
-        }
-    }
-
-    // Construct the BlockHeader from the Block's header fields.
-    let hdr = BlockHeader {
-        round: block.round,
-        branch: block.branch,
-        seed: block.seed,
-        txn_commitment: block.txn_commitment,
-        timestamp: block.timestamp,
-        genesis_id: block.genesis_id.clone(),
-        genesis_hash: block.genesis_hash,
-        proposer: block.proposer,
-        fee_sink: block.fee_sink,
-        rewards_pool: block.rewards_pool,
-        rewards_level: block.rewards_level,
-        rewards_rate: block.rewards_rate,
-        rewards_residue: block.rewards_residue,
-        rewards_recalculation_round: block.rewards_recalculation_round,
-        current_protocol: block.current_protocol.clone(),
-        next_protocol: block.next_protocol.clone(),
-        next_protocol_approvals: block.next_protocol_approvals,
-        next_protocol_switch_on: block.next_protocol_switch_on,
-        next_protocol_vote_before: block.next_protocol_vote_before,
-        txn_counter: block.txn_counter,
-        fees_collected: block.fees_collected,
-        bonus: block.bonus,
-        proposer_payout: block.proposer_payout,
-        prev512: block.prev512,
-        txn256: block.txn256,
-        txn512: block.txn512,
-        state_proof_tracking: block.state_proof_tracking.clone(),
-        upgrade_propose: block.upgrade_propose.clone(),
-        upgrade_delay: block.upgrade_delay,
-        upgrade_approve: block.upgrade_approve,
-        expired_participation_accounts: block.expired_participation_accounts.clone(),
-        absent_participation_accounts: block.absent_participation_accounts.clone(),
-    };
-
-    let txtail = TxTailRound {
-        txn_ids: Vec::new(),
-        last_valid: last_valid_vec,
-        leases,
-        hdr,
-    };
-
-    // PLAN-36 G8 (TASK-124): route the sync-driver txtail write path
-    // through `canonical_encode_txtail_round` so the bytes Rust stamps
-    // into `txtail.data` are byte-identical to Go's
-    // `TxTailRound.MarshalMsg`. The previous `rmp_serde::to_vec_named`
-    // produced serde-default named encoding (no lex-sorted keys, no
-    // omitempty per Go's struct tags), which would diverge from the
-    // bytes Go writes for the same block.
+    let txtail = algo_codec::build_txtail_from_block(block);
     Ok(algo_codec::canonical_encode_txtail_round(&txtail))
 }
 
