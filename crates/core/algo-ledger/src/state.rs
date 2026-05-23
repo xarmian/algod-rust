@@ -1556,11 +1556,8 @@ fn encode_merged_asset_resource_with_round(
     if holding.is_none() && params.is_none() {
         return Vec::new();
     }
-    let rd = crate::sqlite::build_asset_resource_data(
-        holding,
-        params.map(|(p, _)| p),
-        update_round,
-    );
+    let rd =
+        crate::sqlite::build_asset_resource_data(holding, params.map(|(p, _)| p), update_round);
     algo_codec::canonical_encode_resources_data(&rd)
 }
 

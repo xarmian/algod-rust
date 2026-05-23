@@ -433,7 +433,6 @@ fn normalize_kvstore_nulls(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-
 /// Upgrade pre-G5 Rust DBs whose `resources.ctype` was declared `INTEGER`
 /// (nullable) to Go's post-migration shape `INTEGER NOT NULL DEFAULT -1`.
 /// SQLite can't change a column's `NOT NULL` in place, so we rebuild the
@@ -4783,7 +4782,10 @@ mod tests {
             ("y", rmpv::Value::from(2u64)),
         ]);
         let meta = inspect_resource_blob(&bytes);
-        assert!(meta.has_holding, "y=2 has NOT_HOLDING clear → implicit holding");
+        assert!(
+            meta.has_holding,
+            "y=2 has NOT_HOLDING clear → implicit holding"
+        );
         assert!(meta.has_ownership);
         assert_eq!(meta.raw_flags, 2);
     }
@@ -4902,10 +4904,7 @@ mod tests {
         ]);
         let meta = inspect_resource_blob(&bytes);
         assert!(meta.has_ownership);
-        assert!(
-            !meta.has_holding,
-            "NOT_HOLDING bit must clear has_holding"
-        );
+        assert!(!meta.has_holding, "NOT_HOLDING bit must clear has_holding");
     }
 
     #[test]
@@ -4950,7 +4949,11 @@ mod tests {
             frozen: false,
         };
         let bytes = encode_asset_holding_with_round(&h, 0);
-        assert_eq!(bytes, vec![0x80], "canonical default holding must be empty map");
+        assert_eq!(
+            bytes,
+            vec![0x80],
+            "canonical default holding must be empty map"
+        );
         // And the inspector must still classify it as has_holding so
         // get_asset_holding doesn't silently drop it.
         let meta = inspect_resource_blob(&bytes);
@@ -4960,10 +4963,22 @@ mod tests {
     #[test]
     fn encode_asset_holding_round_trip_via_decoder() {
         let cases = [
-            AssetHolding { amount: 0, frozen: false },
-            AssetHolding { amount: 1, frozen: false },
-            AssetHolding { amount: 0, frozen: true },
-            AssetHolding { amount: u64::MAX, frozen: true },
+            AssetHolding {
+                amount: 0,
+                frozen: false,
+            },
+            AssetHolding {
+                amount: 1,
+                frozen: false,
+            },
+            AssetHolding {
+                amount: 0,
+                frozen: true,
+            },
+            AssetHolding {
+                amount: u64::MAX,
+                frozen: true,
+            },
         ];
         for h in cases {
             let bytes = encode_asset_holding_with_round(&h, 0);
@@ -5051,7 +5066,9 @@ mod tests {
         };
         let bytes = encode_asset_params_with_round(&p, &creator, 0);
         let val: rmpv::Value = rmpv::decode::read_value(&mut &bytes[..]).expect("decode");
-        let rmpv::Value::Map(pairs) = val else { panic!("not a map") };
+        let rmpv::Value::Map(pairs) = val else {
+            panic!("not a map")
+        };
         let y = pairs.iter().find(|(k, _)| k.as_str() == Some("y"));
         let y_val = y.expect("y present").1.as_u64().expect("y u64");
         assert_eq!(y_val, 2, "canonical OWNERSHIP = 2");
@@ -5120,7 +5137,10 @@ mod tests {
         };
         let y = pairs.iter().find(|(k, _)| k.as_str() == Some("y"));
         let y_val = y.expect("y present").1.as_u64().expect("y u64");
-        assert_eq!(y_val, 3, "canonical app params standalone = NOT_HOLDING|OWNERSHIP = 3");
+        assert_eq!(
+            y_val, 3,
+            "canonical app params standalone = NOT_HOLDING|OWNERSHIP = 3"
+        );
     }
 
     #[test]
@@ -5146,12 +5166,18 @@ mod tests {
         let decoded = decode_app_params(&bytes, p.creator).expect("decode");
         assert_eq!(decoded.approval_program, p.approval_program);
         assert_eq!(decoded.clear_state_program, p.clear_state_program);
-        assert_eq!(decoded.local_state_schema.num_uint, p.local_state_schema.num_uint);
+        assert_eq!(
+            decoded.local_state_schema.num_uint,
+            p.local_state_schema.num_uint
+        );
         assert_eq!(
             decoded.local_state_schema.num_byte_slice,
             p.local_state_schema.num_byte_slice
         );
-        assert_eq!(decoded.global_state_schema.num_uint, p.global_state_schema.num_uint);
+        assert_eq!(
+            decoded.global_state_schema.num_uint,
+            p.global_state_schema.num_uint
+        );
         assert_eq!(
             decoded.global_state_schema.num_byte_slice,
             p.global_state_schema.num_byte_slice

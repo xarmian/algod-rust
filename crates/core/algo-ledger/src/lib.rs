@@ -6,6 +6,7 @@ pub mod block_entry;
 pub mod catchpoint;
 pub mod catchup_service;
 pub mod delta_cache;
+pub mod erasable_db;
 pub mod eval_compare;
 pub mod eval_delta;
 pub mod genesis;
