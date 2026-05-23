@@ -709,6 +709,88 @@ pub fn canonical_encode_block_header_response(header: &BlockHeader) -> Vec<u8> {
     buf
 }
 
+/// Canonically encode the Go `trackerdb.BaseAccountData` struct.
+///
+/// Mirrors go-algorand's generated `BaseAccountData.MarshalMsg`
+/// (`../go-algorand/ledger/store/trackerdb/data.go:32` and
+/// `../go-algorand/ledger/store/trackerdb/msgp_gen.go:99` @
+/// `v4.5.1-stable`). Field set + codec tags + omitempty semantics
+/// must stay bit-identical to Go because these bytes land in the
+/// `accountbase.data` BLOB column that both implementations read.
+///
+/// We take a `&AccountData` (algo-types' Rust-side union of
+/// base+resource fields) for caller convenience — only the base
+/// fields are emitted; the resource maps (`assets`, `asset_params`,
+/// `app_local_states`, `app_params`) live in the separate `resources`
+/// table and are encoded elsewhere.
+///
+/// Tag layout (lex-sorted by raw bytes — `A`..`F` precede `a`..`z`
+/// because uppercase ASCII < lowercase):
+///
+/// | Tag | Field | Source |
+/// | --- | --- | --- |
+/// | `A` | `vote_id` (32B)            | BaseVotingData |
+/// | `B` | `selection_id` (32B)       | BaseVotingData |
+/// | `C` | `vote_first_valid`         | BaseVotingData |
+/// | `D` | `vote_last_valid`          | BaseVotingData |
+/// | `E` | `vote_key_dilution`        | BaseVotingData |
+/// | `F` | `state_proof_id` (64B)     | BaseVotingData |
+/// | `a` | `status`                   | baseAccountData |
+/// | `b` | `micro_algos`              | baseAccountData |
+/// | `c` | `rewards_base`             | baseAccountData |
+/// | `d` | `rewarded_micro_algos`     | baseAccountData |
+/// | `e` | `auth_addr` (32B)          | baseAccountData |
+/// | `f` | `total_app_schema.num_uint`        | baseAccountData |
+/// | `g` | `total_app_schema.num_byte_slice`  | baseAccountData |
+/// | `h` | `total_extra_app_pages`    | baseAccountData |
+/// | `i` | `total_created_assets`     | baseAccountData |
+/// | `j` | `total_assets_opted_in`    | baseAccountData |
+/// | `k` | `total_created_apps`       | baseAccountData |
+/// | `l` | `total_apps_opted_in`      | baseAccountData |
+/// | `m` | `total_boxes`              | baseAccountData |
+/// | `n` | `total_box_bytes`          | baseAccountData |
+/// | `o` | `incentive_eligible`       | baseAccountData |
+/// | `p` | `last_proposed`            | baseAccountData |
+/// | `q` | `last_heartbeat`           | baseAccountData |
+/// | `z` | `update_round`             | baseAccountData |
+///
+/// PLAN-36 G8 (TASK-120).
+pub fn canonical_encode_base_account_data(acct: &AccountData) -> Vec<u8> {
+    let mut m = CanonicalMap::new();
+
+    // a-q: baseAccountData fields.
+    m.add_u64("a", acct.status as u64);
+    m.add_u64("b", acct.micro_algos);
+    m.add_u64("c", acct.rewards_base);
+    m.add_u64("d", acct.rewarded_micro_algos);
+    m.add_option_address("e", &acct.auth_addr);
+    m.add_u64("f", acct.total_app_schema.num_uint);
+    m.add_u64("g", acct.total_app_schema.num_byte_slice);
+    m.add_u64("h", acct.total_extra_app_pages as u64);
+    m.add_u64("i", acct.total_created_assets);
+    m.add_u64("j", acct.total_assets_opted_in);
+    m.add_u64("k", acct.total_created_apps);
+    m.add_u64("l", acct.total_apps_opted_in);
+    m.add_u64("m", acct.total_boxes);
+    m.add_u64("n", acct.total_box_bytes);
+    m.add_bool("o", acct.incentive_eligible);
+    m.add_u64("p", acct.last_proposed);
+    m.add_u64("q", acct.last_heartbeat);
+
+    // A-F: embedded BaseVotingData fields.
+    m.add_option_fixed_bytes("A", &acct.vote_id);
+    m.add_option_fixed_bytes("B", &acct.selection_id);
+    m.add_u64("C", acct.vote_first_valid);
+    m.add_u64("D", acct.vote_last_valid);
+    m.add_u64("E", acct.vote_key_dilution);
+    m.add_option_fixed_bytes("F", &acct.state_proof_id);
+
+    // z: update_round (tagged after the base fields in Go's struct).
+    m.add_u64("z", acct.update_round);
+
+    m.encode()
+}
+
 /// Canonically encode AssetParams as a nested msgpack map.
 pub fn canonical_encode_asset_params(apar: &AssetParams) -> Vec<u8> {
     let mut m = CanonicalMap::new();
