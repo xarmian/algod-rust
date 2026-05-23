@@ -299,10 +299,15 @@ func runTrackerdbBlobsMode(trackerDB, outputDir, sourceVersion, sourcePrefix str
 		return fmt.Errorf("tracker-db not accessible: %w", err)
 	}
 
-	// Open read-only. Use the modernc.org/sqlite driver's URI form so
-	// `mode=ro` is honored — we never want this tool to mutate a
-	// captured DB.
-	dsn := fmt.Sprintf("file:%s?mode=ro&immutable=1", abs)
+	// Open read-only. `mode=ro` blocks writes; we intentionally do NOT
+	// pass `immutable=1` because the algod writer keeps the DB in WAL
+	// mode, so recent rows may live in `<file>-wal` until checkpoint.
+	// `immutable=1` would tell SQLite to ignore the WAL entirely and
+	// produce stale fixtures (Codex review, PR #295). The Make target
+	// docker-cps both `-wal` and `-shm` sidecars alongside the main
+	// file so this read sees a consistent view of any unflushed
+	// frames.
+	dsn := fmt.Sprintf("file:%s?mode=ro", abs)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return fmt.Errorf("open sqlite: %w", err)

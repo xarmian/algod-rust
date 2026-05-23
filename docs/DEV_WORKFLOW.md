@@ -248,13 +248,21 @@ test can skip gracefully. Run the localnet longer (≥256 rounds with
 state-proof participation enabled) or capture from a long-running testnet
 node to get coverage for that type.
 
+The Make recipe `docker cp`s the tracker `.sqlite` file **plus** its
+`-wal` and `-shm` sidecars out of the container — go-algorand opens
+the tracker DB in WAL mode, so the latest rows can live in the WAL
+until the next checkpoint. The Go tool opens the captured DB with
+`mode=ro` (no `immutable=1`) so SQLite replays the captured WAL on
+read and produces a consistent view.
+
 Overrides for the Make target:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `TRACKERDB_CONTAINER` | `algod-go` | docker-compose service name shipping the DB |
-| `TRACKERDB_CONTAINER_PATH` | `/algod/data/Node/ledger.tracker.sqlite` | in-container path |
-| `TRACKERDB_LOCAL_COPY` | `/tmp/algod-rust-extract.tracker.sqlite` | host-side scratch copy |
+| `TRACKERDB_CONTAINER_PATH` | _(autodiscovered)_ | in-container path. When unset, the recipe runs `find /algod/data -maxdepth 4 -name ledger.tracker.sqlite` inside the container. Pin manually when the container hosts >1 network. |
+| `TRACKERDB_LOCAL_DIR` | `/tmp/algod-rust-extract` | host-side scratch directory for the three captured files |
+| `TRACKERDB_LOCAL_COPY` | `$(TRACKERDB_LOCAL_DIR)/ledger.tracker.sqlite` | host-side main DB file (WAL/SHM sit beside it) |
 
 ## V13 Opcode Vector Regeneration
 

@@ -157,24 +157,47 @@ canonical-extract:
 # Algod container that ships the tracker DB (matches docker-compose service
 # name in `docker/docker-compose.yml`).
 TRACKERDB_CONTAINER ?= algod-go
-# In-container path to the network's data dir. `Node` is the default
-# devnet network name for the algorand/algod image; override if the
-# container layout changes.
-TRACKERDB_CONTAINER_PATH ?= /algod/data/Node/ledger.tracker.sqlite
-# Local scratch copy. `make clean` does not touch this; remove
-# manually after a regen run if you want to redo the export.
-TRACKERDB_LOCAL_COPY ?= /tmp/algod-rust-extract.tracker.sqlite
+# In-container path to the tracker file. Empty by default — the recipe
+# autodiscovers it under `/algod/data` so the target keeps working
+# regardless of which network-name subdir the algod docker image
+# creates (devnet templates have varied between releases). Set this
+# manually to pin a specific node when the container hosts more than
+# one network.
+TRACKERDB_CONTAINER_PATH ?=
+# Local scratch directory. `make clean` does not touch it; remove
+# manually after a regen run if you want to redo the export. Three
+# files land here per capture: the main DB plus its `-wal` / `-shm`
+# sidecars, so the SQLite reader sees a consistent view of any WAL
+# frames the writer hasn't checkpointed yet.
+TRACKERDB_LOCAL_DIR ?= /tmp/algod-rust-extract
+TRACKERDB_LOCAL_COPY ?= $(TRACKERDB_LOCAL_DIR)/ledger.tracker.sqlite
 
 extract-trackerdb-fixtures:
-	@echo "==> Copying tracker DB from container $(TRACKERDB_CONTAINER):$(TRACKERDB_CONTAINER_PATH) ..."
-	@docker cp $(TRACKERDB_CONTAINER):$(TRACKERDB_CONTAINER_PATH) $(TRACKERDB_LOCAL_COPY)
-	@echo "==> Dumping trackerdb BLOBs ..."
+	@set -e; \
+	SRC_PATH="$(TRACKERDB_CONTAINER_PATH)"; \
+	if [ -z "$$SRC_PATH" ]; then \
+		echo "==> Discovering tracker DB inside $(TRACKERDB_CONTAINER) ..."; \
+		SRC_PATH=$$(docker exec $(TRACKERDB_CONTAINER) sh -c 'find /algod/data -maxdepth 4 -name ledger.tracker.sqlite 2>/dev/null | head -1'); \
+		if [ -z "$$SRC_PATH" ]; then \
+			echo "ERROR: ledger.tracker.sqlite not found under /algod/data in $(TRACKERDB_CONTAINER)."; \
+			echo "       Override with 'make extract-trackerdb-fixtures TRACKERDB_CONTAINER_PATH=...'"; \
+			exit 1; \
+		fi; \
+		echo "    found: $$SRC_PATH"; \
+	fi; \
+	mkdir -p $(TRACKERDB_LOCAL_DIR); \
+	rm -f $(TRACKERDB_LOCAL_COPY) $(TRACKERDB_LOCAL_COPY)-wal $(TRACKERDB_LOCAL_COPY)-shm; \
+	echo "==> Copying tracker DB + WAL/SHM sidecars out of $(TRACKERDB_CONTAINER) ..."; \
+	docker cp $(TRACKERDB_CONTAINER):$$SRC_PATH $(TRACKERDB_LOCAL_COPY); \
+	docker cp $(TRACKERDB_CONTAINER):$$SRC_PATH-wal $(TRACKERDB_LOCAL_COPY)-wal 2>/dev/null || true; \
+	docker cp $(TRACKERDB_CONTAINER):$$SRC_PATH-shm $(TRACKERDB_LOCAL_COPY)-shm 2>/dev/null || true; \
+	echo "==> Dumping trackerdb BLOBs ..."; \
 	cd docker/scripts/canonical-extract && go run . \
 		-mode trackerdb-blobs \
 		-tracker-db $(TRACKERDB_LOCAL_COPY) \
 		-output-dir ../../../crates/core/algo-codec/tests/fixtures/trackerdb \
 		-source-version $$(cd ../../../../go-algorand && git describe --always --dirty 2>/dev/null || echo unknown) \
-		-source-prefix $(TRACKERDB_CONTAINER_PATH)
+		-source-prefix $$SRC_PATH
 	@echo "==> Trackerdb BLOB fixtures regenerated under crates/core/algo-codec/tests/fixtures/trackerdb/"
 
 ## ── Conformance Tools ─────────────────────────────────────────
