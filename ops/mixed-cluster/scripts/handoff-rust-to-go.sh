@@ -86,6 +86,7 @@ require curl
 require sqlite3
 require jq
 require cargo
+require xxd
 
 mkdir -p "$HANDOFF_DIR"
 log "handoff dir: $HANDOFF_DIR"
