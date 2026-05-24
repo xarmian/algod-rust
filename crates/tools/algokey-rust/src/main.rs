@@ -8,6 +8,7 @@
 mod cli;
 mod commands;
 mod common;
+mod ui;
 
 use std::process::ExitCode;
 
