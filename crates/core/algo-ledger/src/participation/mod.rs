@@ -11,6 +11,7 @@
 //! with fields (in sorted order): `addr`, `fv`, `kd`, `lv`, `vote-id`, `vrfsk`.
 
 pub mod equivocation;
+pub mod fill;
 pub mod install;
 pub mod persist;
 pub mod registration_txn;
@@ -19,6 +20,7 @@ pub mod stateproof_persist;
 pub mod store;
 
 pub use equivocation::AntiEquivocationTracker;
+pub use fill::{fill_db_with_participation_keys, FillError};
 pub use install::{
     part_install_database, part_migrate, InstallError, PART_TABLE_SCHEMA_NAME,
     PART_TABLE_SCHEMA_VERSION,
