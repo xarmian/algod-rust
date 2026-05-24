@@ -210,16 +210,8 @@ fn fully_specified_subcommands_stub_to_not_implemented() {
         // src/commands/keyreg.rs.
         // `part info` is no longer stubbed (TASK-179); see
         // src/commands/part/info.rs and tests/part_info_test.rs.
-        &[
-            "part",
-            "generate",
-            "--keyfile",
-            "/tmp/k",
-            "--first",
-            "1",
-            "--last",
-            "1000",
-        ],
+        // `part generate` is no longer stubbed (TASK-180); see
+        // src/commands/part/generate.rs and tests/part_generate_test.rs.
         &["part", "reparent", "--keyfile", "/tmp/k", "--parent", "A"],
     ];
     for argv in cases {

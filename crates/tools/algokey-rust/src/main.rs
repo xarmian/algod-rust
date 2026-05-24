@@ -43,7 +43,8 @@ fn main() -> ExitCode {
             }
             Some(PartSub::Keyreg(args)) => commands::keyreg::run(args),
             Some(PartSub::Info(args)) => commands::part::info::run(args),
-            Some(PartSub::Generate(_) | PartSub::Reparent(_)) => not_implemented(),
+            Some(PartSub::Generate(args)) => commands::part::generate::run(args),
+            Some(PartSub::Reparent(_)) => not_implemented(),
         },
     }
 }
