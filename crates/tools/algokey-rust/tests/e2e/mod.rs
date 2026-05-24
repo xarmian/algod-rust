@@ -20,6 +20,7 @@
 #![allow(unused_imports, dead_code)]
 
 pub mod accounts;
+pub mod compat_framework;
 pub mod localnet;
 pub mod submission;
 

@@ -458,6 +458,7 @@ dependencies = [
  "algo-ledger",
  "algo-rest-client",
  "algo-types",
+ "algo-validate",
  "assert_cmd",
  "base64",
  "clap",

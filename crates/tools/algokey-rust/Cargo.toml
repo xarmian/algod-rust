@@ -33,6 +33,7 @@ data-encoding = { workspace = true }
 # Used by the e2e harness (gated behind `--features e2e`).
 algo-error.workspace = true
 algo-rest-client.workspace = true
+algo-validate.workspace = true
 assert_cmd = "2"
 base64.workspace = true
 reqwest.workspace = true
@@ -55,4 +56,12 @@ required-features = ["e2e"]
 [[test]]
 name = "e2e_keyreg"
 path = "tests/e2e/keyreg_flow_test.rs"
+required-features = ["e2e"]
+
+# Cross-implementation compatibility matrix — core (TASK-199). Bidirectional
+# Go↔Rust algokey artifact round-trips: keyfile, mnemonic, signed-txn single,
+# signed-txn rekeyed. Skip-with-notice if Go `algokey` isn't on PATH.
+[[test]]
+name = "compat_matrix_core"
+path = "tests/e2e/compat_matrix_core_test.rs"
 required-features = ["e2e"]
