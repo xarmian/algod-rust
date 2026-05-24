@@ -6,7 +6,10 @@ use algo_types::{BlockResponse, Round};
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
-use crate::{AccountInfo, BlockSource, NodeStatus};
+use crate::{
+    AccountInfo, BlockSource, NodeStatus, PendingTxnInfo, PostTransactionResponse, SuggestedParams,
+    TxId,
+};
 
 /// Configuration for the REST client.
 #[derive(Debug, Clone)]
@@ -145,6 +148,60 @@ impl AlgodClient {
 
         unreachable!("retry loop should always return")
     }
+
+    /// Execute a POST request without retries.
+    ///
+    /// POSTs on this client today are exclusively non-idempotent transaction
+    /// submission (`/v2/transactions`). Retrying after an ambiguous failure
+    /// (timeout, connection drop, 5xx after the request reached algod) can
+    /// silently double-submit and cause algod to reject the retry as a
+    /// duplicate, even though the original submission succeeded. We propagate
+    /// the original error and let the caller recover via
+    /// [`AlgodClient::get_pending_transaction`] using the client-computed txid.
+    ///
+    /// Behavior:
+    /// - 2xx → response returned to caller
+    /// - 404  → [`AlgoError::NotFound`]
+    /// - other non-2xx → [`AlgoError::Conformance`] with body context
+    /// - transport / send error → [`AlgoError::RestClient`]
+    async fn post_no_retry(
+        &self,
+        path: &str,
+        content_type: &'static str,
+        body: Vec<u8>,
+    ) -> Result<reqwest::Response> {
+        let url = format!("{}{}", self.base_url, path);
+
+        let mut request = self
+            .http
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body);
+
+        if !self.token.is_empty() {
+            request = request.header("X-Algo-API-Token", &self.token);
+        }
+
+        match request.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return Ok(resp);
+                }
+                let body_text = resp.text().await.unwrap_or_default();
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    return Err(AlgoError::NotFound(format!("POST {path}: {body_text}")));
+                }
+                Err(AlgoError::Conformance {
+                    message: format!("POST {path} returned {status}: {body_text}"),
+                })
+            }
+            Err(e) => Err(AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("POST {path}"),
+            }),
+        }
+    }
 }
 
 impl AlgodClient {
@@ -180,6 +237,96 @@ impl AlgodClient {
                     addr.to_algorand_string(),
                     round
                 ),
+            })
+    }
+}
+
+impl AlgodClient {
+    /// Submit a single msgpack-encoded `SignedTxn` (or transaction group) to the
+    /// node via `POST /v2/transactions`. Returns the txid the node assigns to
+    /// (the first transaction of) the group.
+    ///
+    /// The node validates the txn against the current consensus protocol and
+    /// adds it to the transaction pool synchronously. A 400 response indicates
+    /// the pool rejected the transaction (bad signature, insufficient fee,
+    /// stale validity window, etc.); a 503 indicates the node is currently
+    /// catching up.
+    ///
+    /// Ported reference: `../go-algorand/daemon/algod/api/server/v2/handlers.go:1090`
+    /// (`RawTransaction`). Content-Type is `application/x-binary` per the
+    /// algod OpenAPI spec.
+    ///
+    /// **Not retried.** Transaction submission is not idempotent — retrying
+    /// after an ambiguous failure (timeout, dropped connection, 5xx after the
+    /// request reached the node) can cause silent double-submission. On error,
+    /// callers can recover by computing the txid locally and polling
+    /// [`Self::get_pending_transaction`].
+    pub async fn send_raw_transaction(&self, raw: &[u8]) -> Result<TxId> {
+        debug!(bytes = raw.len(), "submitting raw transaction");
+
+        let resp = self
+            .post_no_retry("/v2/transactions", "application/x-binary", raw.to_vec())
+            .await?;
+
+        let parsed: PostTransactionResponse =
+            resp.json().await.map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: "parsing POST /v2/transactions response".into(),
+            })?;
+
+        Ok(TxId(parsed.tx_id))
+    }
+
+    /// Look up a transaction by txid in the pool or in recent blocks via
+    /// `GET /v2/transactions/pending/{txid}`.
+    ///
+    /// Distinguishes three states:
+    /// - **Committed**: `confirmed_round = Some(round)`, `pool_error = ""`
+    /// - **Pending**: `confirmed_round = None`, `pool_error = ""`
+    /// - **Rejected**: `pool_error != ""` (rare — usually the txn drops out
+    ///   of the pool before this is observable)
+    ///
+    /// A txid the node has never seen returns `AlgoError::NotFound`; a txid
+    /// that has been evicted past `MaxTxnLife` rounds returns the same.
+    ///
+    /// Ported reference: `../go-algorand/daemon/algod/api/server/v2/handlers.go:1505`
+    /// (`PendingTransactionInformation`). We request the default JSON encoding
+    /// (`format=json`); the msgpack form carries the same fields.
+    pub async fn get_pending_transaction(&self, txid: &TxId) -> Result<PendingTxnInfo> {
+        debug!(%txid, "fetching pending transaction");
+
+        let path = format!("/v2/transactions/pending/{}", txid.as_str());
+        let resp = self.get_with_retry(&path, &self.http).await?;
+
+        resp.json::<PendingTxnInfo>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("parsing GET /v2/transactions/pending/{}", txid.as_str()),
+            })
+    }
+
+    /// Fetch suggested transaction parameters via `GET /v2/transactions/params`.
+    ///
+    /// The returned `SuggestedParams` carries the genesis hash as a decoded
+    /// `Digest` (algod returns it base64-encoded over the wire), and includes
+    /// the current consensus version's `min_fee` so callers don't have to look
+    /// it up separately.
+    ///
+    /// Ported reference: `../go-algorand/daemon/algod/api/server/v2/handlers.go:1459`
+    /// (`TransactionParams`).
+    pub async fn suggested_transaction_params(&self) -> Result<SuggestedParams> {
+        debug!("fetching suggested transaction params");
+
+        let resp = self
+            .get_with_retry("/v2/transactions/params", &self.http)
+            .await?;
+
+        resp.json::<SuggestedParams>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: "parsing GET /v2/transactions/params response".into(),
             })
     }
 }
