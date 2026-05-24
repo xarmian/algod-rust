@@ -57,23 +57,31 @@ where
             value
         });
 
-        let mut stderr = std::io::stderr().lock();
+        // Re-acquire the stderr lock per tick (NOT held for the worker's
+        // whole lifetime) so a worker that writes to stderr — via
+        // `eprintln!`, `std::io::stderr()`, etc. — cannot deadlock waiting
+        // for us to release the lock while we wait for its done signal.
         let mut idx = 0usize;
         loop {
             // Wait for either a "done" notification or the tick interval.
             match done_rx.recv_timeout(tick) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let mut stderr = std::io::stderr().lock();
                     let _ = stderr.write_all(&[CURSOR[idx], b'\x08']);
                     let _ = stderr.flush();
+                    drop(stderr);
                     idx = (idx + 1) % CURSOR.len();
                 }
             }
         }
         // Erase the lingering cursor: space-then-backspace overwrites
         // whatever character is sitting at the terminal cursor.
-        let _ = stderr.write_all(b" \x08");
-        let _ = stderr.flush();
+        {
+            let mut stderr = std::io::stderr().lock();
+            let _ = stderr.write_all(b" \x08");
+            let _ = stderr.flush();
+        }
 
         handle.join()
     });
@@ -124,6 +132,32 @@ mod tests {
             .or_else(|| err.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("(non-string panic payload)");
         assert!(msg.contains("worker bomb"), "actual: {msg}");
+    }
+
+    #[test]
+    fn worker_can_write_to_stderr_without_deadlock() {
+        // Regression test for the Codex-round-1 finding: the spinner held
+        // the stderr lock for the entire worker lifetime, which would
+        // deadlock against any `eprintln!` / `std::io::stderr()` write
+        // from inside the closure. Drive the internal helper (TTY path)
+        // with a short tick so we definitely hit the spinner-write loop
+        // while the worker is also writing to stderr.
+        let n = run_with_spinner_inner(
+            || {
+                use std::io::Write as _;
+                for _ in 0..50 {
+                    // Direct stderr lock — same code path eprintln! takes.
+                    let mut s = std::io::stderr().lock();
+                    let _ = writeln!(s, "");
+                    let _ = s.flush();
+                    drop(s);
+                    thread::sleep(Duration::from_millis(2));
+                }
+                123_u32
+            },
+            Duration::from_millis(5),
+        );
+        assert_eq!(n, 123, "worker must complete despite contending for stderr");
     }
 
     #[test]
