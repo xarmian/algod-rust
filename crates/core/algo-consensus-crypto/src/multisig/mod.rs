@@ -441,8 +441,14 @@ mod tests {
         let pks = [pk, pk];
         let msig = multisig_sign(b"dup", 1, 2, &pks, &sk).unwrap();
         assert_eq!(msig.subsigs.len(), 2);
-        assert_ne!(msig.subsigs[0].signature, [0u8; 64], "slot 0 must be filled");
-        assert_ne!(msig.subsigs[1].signature, [0u8; 64], "slot 1 must be filled");
+        assert_ne!(
+            msig.subsigs[0].signature, [0u8; 64],
+            "slot 0 must be filled"
+        );
+        assert_ne!(
+            msig.subsigs[1].signature, [0u8; 64],
+            "slot 1 must be filled"
+        );
         // Both signatures should be identical (deterministic ed25519
         // for the same key+msg).
         assert_eq!(msig.subsigs[0].signature, msig.subsigs[1].signature);
