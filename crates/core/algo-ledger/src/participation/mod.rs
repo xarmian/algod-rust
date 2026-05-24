@@ -11,11 +11,18 @@
 //! with fields (in sorted order): `addr`, `fv`, `kd`, `lv`, `vote-id`, `vrfsk`.
 
 pub mod equivocation;
+pub mod install;
+pub mod persist;
 pub mod registration_txn;
 pub mod restore;
 pub mod store;
 
 pub use equivocation::AntiEquivocationTracker;
+pub use install::{
+    part_install_database, part_migrate, InstallError, PART_TABLE_SCHEMA_NAME,
+    PART_TABLE_SCHEMA_VERSION,
+};
+pub use persist::{persist_new_parent, persist_participation, PersistError};
 pub use registration_txn::generate_registration_transaction;
 pub use restore::{restore_participation, Error as RestoreError};
 pub use store::ParticipationStore;
