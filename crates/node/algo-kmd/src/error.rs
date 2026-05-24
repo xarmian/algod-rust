@@ -115,6 +115,22 @@ pub enum Error {
     #[error("multiple wallets with the same id")]
     IdConflict,
 
+    /// Address not found in the `keys` table. Mirrors `errKeyNotFound`
+    /// (`sqlite_errors.go`).
+    #[error("key not found")]
+    KeyNotFound,
+
+    /// Re-deriving a public key from the decrypted secret key didn't
+    /// match the address we used to look it up — indicates on-disk
+    /// tampering. Mirrors `errTampering` (sqlite.go:829).
+    #[error("on-disk tampering detected")]
+    Tampering,
+
+    /// Reached the hard cap on derived-key indices (`sqliteIntOverflow`
+    /// = `1 << 63`). Mirrors `errTooManyKeys` (sqlite.go:919).
+    #[error("wallet exceeded the derived-key index limit")]
+    TooManyKeys,
+
     /// Operation requires [`crate::wallet::Wallet::init`] to have
     /// succeeded first. Go enforces this implicitly because every key
     /// op runs `Init`-like checks; we make it explicit.

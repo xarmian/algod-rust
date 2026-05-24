@@ -252,6 +252,45 @@ impl WalletDb {
         &self.path
     }
 
+    /// Run `f` inside an **exclusive** SQLite transaction (`BEGIN
+    /// EXCLUSIVE`). Mirrors the `db.Beginx() ... tx.Commit() /
+    /// tx.Rollback()` pattern in `GenerateKey` (sqlite.go:857–878)
+    /// combined with the `_txlock=exclusive` URL option Go sets on
+    /// the connection string (sqlite.go:46) — every BEGIN acquires
+    /// the write lock immediately, so concurrent `generate_key`
+    /// callers can never both observe the same `max_key_idx` before
+    /// one of them commits.
+    ///
+    /// We don't use `rusqlite::Connection::transaction_with_behavior`
+    /// because it requires `&mut self`, which would force the
+    /// surrounding `WalletDb` API to take `&mut` everywhere. Raw
+    /// `BEGIN EXCLUSIVE` / `COMMIT` / `ROLLBACK` keeps the `&self`
+    /// signature and gives the same SQLite-level semantics.
+    ///
+    /// On error from `f`, a best-effort `ROLLBACK` runs; any error
+    /// from that path is suppressed in favor of `f`'s error.
+    pub fn with_transaction<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&Self) -> Result<R>,
+    {
+        self.conn
+            .execute_batch("BEGIN EXCLUSIVE")
+            .map_err(|_| Error::Database)?;
+        match f(self) {
+            Ok(result) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|_| Error::Database)?;
+                Ok(result)
+            }
+            Err(e) => {
+                // Best-effort rollback; surface the original error.
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     /// Insert the single metadata row. Encrypted blobs are opaque to
     /// this layer — the caller provides whatever bytes the crypto path
     /// produces. Mirrors the `INSERT INTO metadata` in `CreateWallet`
@@ -355,6 +394,106 @@ impl WalletDb {
             .query_row([], |row| row.get::<_, Vec<u8>>(0))
             .map_err(|_| Error::Database)?;
         Ok(bytes)
+    }
+
+    /// Replace the `max_key_idx_encrypted` blob. Mirrors
+    /// `generateKeyTxLocked`'s `UPDATE metadata SET
+    /// max_key_idx_encrypted = ?` (sqlite.go:968).
+    pub fn update_max_key_idx_encrypted(&self, blob: &[u8]) -> Result<()> {
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE metadata SET max_key_idx_encrypted = ?1",
+                rusqlite::params![blob],
+            )
+            .map_err(|_| Error::Database)?;
+        if rows == 0 {
+            return Err(Error::WalletNotFound);
+        }
+        Ok(())
+    }
+
+    /// Insert a row into `keys`. `key_idx` is `Some(n)` for keys derived
+    /// from the MDK via `extractKeyWithIndex`, `None` for imported keys
+    /// (the column allows NULL per the schema). Mirrors both inserts in
+    /// the Go reference: `GenerateKey` (sqlite.go:956) and `ImportKey`
+    /// (sqlite.go:764).
+    pub fn insert_key(
+        &self,
+        addr: &[u8],
+        secret_key_encrypted: &[u8],
+        key_idx: Option<u64>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO keys (address, secret_key_encrypted, key_idx) VALUES (?1, ?2, ?3)",
+                rusqlite::params![addr, secret_key_encrypted, key_idx],
+            )
+            .map_err(map_constraint_error)?;
+        Ok(())
+    }
+
+    /// True iff a row in `keys` has the supplied address. Mirrors the
+    /// `SELECT COUNT(1) FROM keys WHERE address=?` probe used both
+    /// during derived-key generation (`generateKeyTxLocked`, sqlite.go:934)
+    /// and as the underlying lookup primitive.
+    pub fn key_exists(&self, addr: &[u8]) -> Result<bool> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT 1 FROM keys WHERE address = ?1 LIMIT 1")
+            .map_err(|_| Error::Database)?;
+        let exists = stmt
+            .query_row(rusqlite::params![addr], |_| Ok(()))
+            .map(|_| true)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                _ => Err(Error::Database),
+            })?;
+        Ok(exists)
+    }
+
+    /// Read `secret_key_encrypted` for the supplied address, or return
+    /// `Error::KeyNotFound`. Mirrors `fetchSecretKey`'s SELECT
+    /// (sqlite.go:799).
+    pub fn read_secret_key_encrypted(&self, addr: &[u8]) -> Result<Vec<u8>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT secret_key_encrypted FROM keys WHERE address = ?1")
+            .map_err(|_| Error::Database)?;
+        stmt.query_row(rusqlite::params![addr], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Error::KeyNotFound,
+                _ => Error::Database,
+            })
+    }
+
+    /// All addresses in `keys`. Mirrors `ListKeys` (sqlite.go:707).
+    pub fn list_key_addresses(&self) -> Result<Vec<Vec<u8>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT address FROM keys")
+            .map_err(|_| Error::Database)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|_| Error::Database)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|_| Error::Database)?);
+        }
+        Ok(out)
+    }
+
+    /// Delete a key row. Mirrors `DeleteKey` (sqlite.go:993). Returns
+    /// `Ok(())` even when the address doesn't exist, matching Go's
+    /// behavior (the underlying DELETE is silent on no-match).
+    pub fn delete_key(&self, addr: &[u8]) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM keys WHERE address = ?1",
+                rusqlite::params![addr],
+            )
+            .map_err(|_| Error::Database)?;
+        Ok(())
     }
 
     /// `UPDATE metadata SET wallet_name=? WHERE wallet_id=?`. Mirrors
