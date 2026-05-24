@@ -5,7 +5,7 @@
 //! down on `Drop`. If no localnet is up, the harness shells out to
 //! `make localnet-up` and `Drop` runs `make localnet-down`.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use algo_error::{AlgoError, Result};
@@ -17,8 +17,15 @@ pub const REST_URL: &str = "http://localhost:4001";
 /// Localnet's algod REST token (matches `docker/docker-compose.yml`).
 pub const REST_TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-/// How long to wait for `make localnet-up` to produce a healthy node.
-const BRING_UP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Upper bound on `make localnet-up` itself. The Makefile target runs an
+/// unbounded `until docker inspect ... healthy` loop, so we spawn it as a
+/// child and kill it if it doesn't complete within this budget.
+const MAKE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Additional budget for the post-Make REST health-wait loop (algod's HTTP
+/// surface may need a beat after docker reports healthy). Small — if make
+/// returned but REST never answers, something is wrong.
+const REST_HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Container name (matches `docker/docker-compose.yml`).
 pub(crate) const ALGOD_CONTAINER: &str = "algod-go";
@@ -59,23 +66,14 @@ impl Localnet {
             });
         }
 
-        // Otherwise shell out to the Makefile.
-        let status = Command::new("make")
-            .arg("localnet-up")
-            .status()
-            .map_err(|e| AlgoError::Network {
-                message: format!("failed to spawn `make localnet-up`: {e}"),
-            })?;
-        if !status.success() {
-            return Err(AlgoError::Network {
-                message: format!("`make localnet-up` exited with status {status}"),
-            });
-        }
+        // Otherwise shell out to the Makefile, with a hard upper bound on
+        // wall-clock so a stuck docker health-check can't hang the test.
+        run_make_localnet_up().await?;
 
-        // Health-wait — the Makefile already waits for docker's healthcheck,
-        // but algod's REST surface may need a beat after the container reports
-        // healthy. Cheap to confirm here.
-        let deadline = Instant::now() + BRING_UP_TIMEOUT;
+        // Post-make REST health-wait — the Makefile already waited on docker
+        // health, but algod's HTTP surface may need a beat after the container
+        // reports healthy.
+        let deadline = Instant::now() + REST_HEALTH_TIMEOUT;
         while Instant::now() < deadline {
             if status_ok(&client).await {
                 return Ok(Self {
@@ -88,8 +86,8 @@ impl Localnet {
 
         Err(AlgoError::Network {
             message: format!(
-                "localnet did not become responsive within {}s after `make localnet-up`",
-                BRING_UP_TIMEOUT.as_secs()
+                "localnet did not become REST-responsive within {}s after `make localnet-up`",
+                REST_HEALTH_TIMEOUT.as_secs()
             ),
         })
     }
@@ -129,6 +127,54 @@ impl Drop for Localnet {
         } else if let Ok(status) = result {
             if !status.success() {
                 eprintln!("warning: `make localnet-down` exited with status {status}");
+            }
+        }
+    }
+}
+
+/// Spawn `make localnet-up` and wait for it to finish, killing it if it
+/// exceeds [`MAKE_TIMEOUT`]. The Makefile's `until docker inspect ... healthy`
+/// loop has no internal timeout, so without this guard a stuck docker health
+/// check would hang the test indefinitely.
+async fn run_make_localnet_up() -> Result<()> {
+    let mut child = Command::new("make")
+        .arg("localnet-up")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| AlgoError::Network {
+            message: format!("failed to spawn `make localnet-up`: {e}"),
+        })?;
+
+    let deadline = Instant::now() + MAKE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return Err(AlgoError::Network {
+                        message: format!("`make localnet-up` exited with status {status}"),
+                    });
+                }
+                return Ok(());
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Best-effort kill; don't shadow the original timeout error.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(AlgoError::Network {
+                        message: format!(
+                            "`make localnet-up` did not complete within {}s — killed",
+                            MAKE_TIMEOUT.as_secs()
+                        ),
+                    });
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => {
+                return Err(AlgoError::Network {
+                    message: format!("error polling `make localnet-up`: {e}"),
+                });
             }
         }
     }
