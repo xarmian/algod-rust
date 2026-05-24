@@ -59,6 +59,26 @@ where
     Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// Serialize an empty `Vec<String>` as JSON `null`, mirroring Go's
+/// `json.Marshal` on a nil `[]string`. A populated vec serializes as a
+/// normal JSON array.
+///
+/// This pairs with [`null_to_empty_vec`] so the round-trip is byte-stable
+/// against the example file kmd writes on first start.
+fn serialize_empty_vec_as_null<S>(
+    v: &[String],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if v.is_empty() {
+        serializer.serialize_none()
+    } else {
+        v.serialize(serializer)
+    }
+}
+
 /// Global configuration for kmd.
 ///
 /// Ported from `KMDConfig` (config.go:37). `data_dir` carries Go's
@@ -84,12 +104,15 @@ pub struct KMDConfig {
     pub address: String,
 
     /// `[]string` in Go. Go's `json.Marshal` writes a nil slice as `null`,
-    /// so the deserializer must accept both `null` and a JSON array — see
-    /// [`null_to_empty_vec`].
+    /// so the deserializer must accept both `null` and a JSON array
+    /// ([`null_to_empty_vec`]) and the serializer must emit `null` when
+    /// the slice is empty ([`serialize_empty_vec_as_null`]) to round-trip
+    /// byte-for-byte against the example file kmd itself writes.
     #[serde(
         rename = "allowed_origins",
         default,
-        deserialize_with = "null_to_empty_vec"
+        deserialize_with = "null_to_empty_vec",
+        serialize_with = "serialize_empty_vec_as_null"
     )]
     pub allowed_origins: Vec<String>,
 
@@ -236,8 +259,16 @@ pub fn save_kmd_config(data_dir: impl AsRef<Path>, cfg: &KMDConfig) -> Result<()
 }
 
 fn write_config_json(path: &Path, cfg: &KMDConfig) -> Result<()> {
-    let json = serde_json::to_string_pretty(cfg)?;
-    std::fs::write(path, json)?;
+    // Match Go's `codecs.NewFormattedJSONEncoder` exactly: tab indent
+    // (util/codecs/json.go:35) + trailing newline (json.Encoder.Encode
+    // always appends one). Without this, a file written by kmd-rust would
+    // not be byte-equal to one written by Go kmd for the same config.
+    let mut buf = Vec::with_capacity(256);
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"\t");
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+    cfg.serialize(&mut ser)?;
+    buf.push(b'\n');
+    std::fs::write(path, buf)?;
     Ok(())
 }
 

@@ -109,6 +109,23 @@ fn save_then_load_roundtrip() {
 }
 
 #[test]
+fn save_format_matches_go_byte_for_byte() {
+    // Go's codecs.SaveObjectToFile uses tab indent (util/codecs/json.go:35)
+    // and json.Encoder.Encode appends a trailing newline. A nil []string
+    // marshals as null. The fixture reflects all three; saving the default
+    // config under kmd-rust must produce identical bytes so a file written
+    // by either implementation reads cleanly under the other.
+    let dir = TempDir::new().unwrap();
+    let cfg = KMDConfig::defaults(dir.path());
+    save_kmd_config(dir.path(), &cfg).unwrap();
+    let written = std::fs::read_to_string(dir.path().join(KMD_CONFIG_FILENAME)).unwrap();
+    assert_eq!(
+        written, GO_FIXTURE,
+        "kmd-rust's serialization must match Go's byte-for-byte"
+    );
+}
+
+#[test]
 fn load_rejects_relative_wallets_dir() {
     let dir = TempDir::new().unwrap();
     let bad = br#"{"drivers": {"sqlite": {"wallets_dir": "relative/path"}}}"#;
