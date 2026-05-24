@@ -58,6 +58,32 @@ pub enum Error {
     #[error("wallet database already exists at {0}")]
     WalletExists(PathBuf),
 
+    /// Scrypt key derivation failed or was supplied invalid parameters.
+    /// Mirrors `errDeriveKey` (`sqlite_crypto.go`).
+    #[error("failed to derive encryption key")]
+    DeriveKey,
+
+    /// OS RNG returned an error. Mirrors `errRandBytes`.
+    #[error("failed to read random bytes")]
+    RandBytes,
+
+    /// secretbox open failed (wrong key, corrupted blob, tampered
+    /// nonce). Mirrors `errDecrypt`.
+    #[error("failed to decrypt blob")]
+    Decrypt,
+
+    /// `plaintext_type` on a decrypted envelope did not match what the
+    /// caller expected. Mirrors `errTypeMismatch`.
+    #[error("decrypted plaintext type does not match expected type")]
+    TypeMismatch,
+
+    /// Generic crypto / msgpack envelope error (malformed blob, AEAD
+    /// init failure). Coarser than Go's surface; the kmd reference uses
+    /// `errDecrypt` for AEAD failures and never surfaces parse errors
+    /// directly to the caller.
+    #[error("wallet crypto envelope error")]
+    Crypto,
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

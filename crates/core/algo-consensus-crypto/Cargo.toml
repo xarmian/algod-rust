@@ -19,6 +19,7 @@ rmp.workspace = true
 num-bigint.workspace = true
 statrs.workspace = true
 zeroize.workspace = true
+scrypt.workspace = true
 
 [dev-dependencies]
 hex.workspace = true

@@ -12,8 +12,15 @@
 //! deferred to Phases B+.
 
 pub mod config;
+pub mod crypto;
 pub mod error;
 pub mod sqlite;
+
+pub use crypto::{
+    decrypt_blob_with_password, encrypt_blob_with_key, encrypt_blob_with_nonce_and_salt,
+    encrypt_blob_with_password, Kdf, PlaintextType, MASTER_KEY_LEN, MIN_SCRYPT_N, MIN_SCRYPT_P,
+    MIN_SCRYPT_R, NONCE_LEN, SALT_LEN,
+};
 
 pub use config::{
     load_kmd_config, save_kmd_config, DriverConfig, KMDConfig, LedgerWalletDriverConfig,
