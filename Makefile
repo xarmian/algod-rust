@@ -499,7 +499,7 @@ help:
 	@echo "algokey-rust E2E:"
 	@echo "  make algokey-e2e      Bring up localnet, run algokey-rust e2e suite (smoke +"
 	@echo "                        keyreg + Go↔Rust compat matrix), tear down. Requires"
-	@echo "                        go-algorand@v4.5.1-stable `algokey` on PATH for the"
+	@echo '                        go-algorand@v4.5.1-stable `algokey` on PATH for the'
 	@echo "                        compat matrix (else skipped). PLAN-183."
 	@echo ""
 	@echo "Transaction Generation:"
