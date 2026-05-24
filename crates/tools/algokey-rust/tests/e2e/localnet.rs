@@ -2,9 +2,14 @@
 //!
 //! `Localnet::bring_up()` is idempotent: if a localnet is already responding
 //! on the well-known port (4001), the harness reuses it and does NOT tear it
-//! down on `Drop`. If no localnet is up, the harness shells out to
-//! `make localnet-up` and `Drop` runs `make localnet-down`.
+//! down on `Drop`. If no localnet is up, the harness drives
+//! `docker compose up -d algod-go` directly (matching the `make localnet-up`
+//! target's content but skipping the Makefile's unbounded shell `until` loop)
+//! and `Drop` runs `docker compose down -v`. All health-waiting happens in
+//! Rust with explicit timeouts — no risk of an orphaned shell loop hanging
+//! the test.
 
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -17,15 +22,15 @@ pub const REST_URL: &str = "http://localhost:4001";
 /// Localnet's algod REST token (matches `docker/docker-compose.yml`).
 pub const REST_TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-/// Upper bound on `make localnet-up` itself. The Makefile target runs an
-/// unbounded `until docker inspect ... healthy` loop, so we spawn it as a
-/// child and kill it if it doesn't complete within this budget.
-const MAKE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Upper bound on `docker compose up -d`. With `-d` the command exits as soon
+/// as the container is started (NOT healthy), so this is just to catch the
+/// pathological case where the docker daemon itself hangs.
+const COMPOSE_UP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Additional budget for the post-Make REST health-wait loop (algod's HTTP
-/// surface may need a beat after docker reports healthy). Small — if make
-/// returned but REST never answers, something is wrong.
-const REST_HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long to wait for algod's REST surface to start responding after
+/// `docker compose up -d` returns. Generous because dev-mode algod needs to
+/// produce a genesis block before `/v2/status` is reachable.
+const REST_HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Container name (matches `docker/docker-compose.yml`).
 pub(crate) const ALGOD_CONTAINER: &str = "algod-go";
@@ -33,9 +38,9 @@ pub(crate) const ALGOD_CONTAINER: &str = "algod-go";
 /// A live (or borrowed) algod-go localnet plus a configured REST client.
 pub struct Localnet {
     client: AlgodClient,
-    /// True if this instance ran `make localnet-up`; controls whether `Drop`
-    /// tears the localnet down. When `false`, an existing localnet was reused
-    /// and is left running for the next test (or for a developer's session).
+    /// True if this instance brought the localnet up itself; controls whether
+    /// `Drop` tears it down. When `false`, an existing localnet was reused and
+    /// is left running for the next test (or for a developer's session).
     owned: bool,
 }
 
@@ -66,13 +71,15 @@ impl Localnet {
             });
         }
 
-        // Otherwise shell out to the Makefile, with a hard upper bound on
-        // wall-clock so a stuck docker health-check can't hang the test.
-        run_make_localnet_up().await?;
+        // Otherwise start algod-go via docker compose directly. We deliberately
+        // do NOT use `make localnet-up` here — the Makefile target wraps the
+        // compose invocation in an unbounded `until docker inspect ... healthy`
+        // shell loop, and killing that loop reliably across process boundaries
+        // is more work than just driving compose ourselves.
+        run_compose(&["up", "-d", "algod-go"], COMPOSE_UP_TIMEOUT)?;
 
-        // Post-make REST health-wait — the Makefile already waited on docker
-        // health, but algod's HTTP surface may need a beat after the container
-        // reports healthy.
+        // Health-wait for algod's REST surface. `docker compose up -d` returns
+        // as soon as the container is started, not when it's healthy.
         let deadline = Instant::now() + REST_HEALTH_TIMEOUT;
         while Instant::now() < deadline {
             if status_ok(&client).await {
@@ -86,7 +93,7 @@ impl Localnet {
 
         Err(AlgoError::Network {
             message: format!(
-                "localnet did not become REST-responsive within {}s after `make localnet-up`",
+                "localnet did not become REST-responsive within {}s after `docker compose up -d algod-go`",
                 REST_HEALTH_TIMEOUT.as_secs()
             ),
         })
@@ -121,59 +128,74 @@ impl Drop for Localnet {
             return;
         }
         // Best-effort teardown — log on failure but don't panic from Drop.
-        let result = Command::new("make").arg("localnet-down").status();
-        if let Err(e) = result {
-            eprintln!("warning: `make localnet-down` failed to spawn: {e}");
-        } else if let Ok(status) = result {
-            if !status.success() {
-                eprintln!("warning: `make localnet-down` exited with status {status}");
-            }
+        // `down -v` matches the `make localnet-down` target.
+        if let Err(e) = run_compose(&["down", "-v"], COMPOSE_UP_TIMEOUT) {
+            eprintln!("warning: localnet teardown failed: {e}");
         }
     }
 }
 
-/// Spawn `make localnet-up` and wait for it to finish, killing it if it
-/// exceeds [`MAKE_TIMEOUT`]. The Makefile's `until docker inspect ... healthy`
-/// loop has no internal timeout, so without this guard a stuck docker health
-/// check would hang the test indefinitely.
-async fn run_make_localnet_up() -> Result<()> {
-    let mut child = Command::new("make")
-        .arg("localnet-up")
+/// Path to the workspace's docker-compose.yml, resolved at compile time from
+/// the algokey-rust crate's manifest dir. Lets the harness run from any CWD
+/// (cargo sets it to the package dir during tests).
+fn compose_file() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../docker/docker-compose.yml")
+}
+
+/// Run `docker compose -f <compose_file> <args>` with the given wall-clock
+/// budget. The single subprocess (`docker`) is well-behaved on kill — no
+/// runaway shell loops to worry about, unlike `make localnet-up`.
+fn run_compose(args: &[&str], timeout: Duration) -> Result<()> {
+    let compose = compose_file();
+    let mut child = Command::new("docker")
+        .arg("compose")
+        .arg("-f")
+        .arg(&compose)
+        .args(args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| AlgoError::Network {
-            message: format!("failed to spawn `make localnet-up`: {e}"),
+            message: format!(
+                "failed to spawn `docker compose -f {} {}`: {e}",
+                compose.display(),
+                args.join(" ")
+            ),
         })?;
 
-    let deadline = Instant::now() + MAKE_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
                     return Err(AlgoError::Network {
-                        message: format!("`make localnet-up` exited with status {status}"),
+                        message: format!(
+                            "`docker compose {}` exited with status {status}",
+                            args.join(" ")
+                        ),
                     });
                 }
                 return Ok(());
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    // Best-effort kill; don't shadow the original timeout error.
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(AlgoError::Network {
                         message: format!(
-                            "`make localnet-up` did not complete within {}s — killed",
-                            MAKE_TIMEOUT.as_secs()
+                            "`docker compose {}` did not complete within {}s — killed",
+                            args.join(" "),
+                            timeout.as_secs()
                         ),
                     });
                 }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                // Synchronous sleep — Drop also calls this from outside an
+                // async context, so we can't `tokio::time::sleep` here.
+                std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) => {
                 return Err(AlgoError::Network {
-                    message: format!("error polling `make localnet-up`: {e}"),
+                    message: format!("error polling docker compose: {e}"),
                 });
             }
         }
