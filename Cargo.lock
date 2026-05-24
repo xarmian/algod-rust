@@ -454,16 +454,22 @@ version = "0.1.0"
 dependencies = [
  "algo-codec",
  "algo-consensus-crypto",
+ "algo-error",
  "algo-ledger",
+ "algo-rest-client",
  "algo-types",
+ "base64",
  "clap",
  "data-encoding",
  "ed25519-dalek",
  "hex",
  "rand 0.8.5",
+ "reqwest",
  "rmp-serde",
  "serde",
+ "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

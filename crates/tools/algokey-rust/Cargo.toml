@@ -8,6 +8,12 @@ rust-version.workspace = true
 name = "algokey-rust"
 path = "src/main.rs"
 
+[features]
+# Opt-in feature for end-to-end tests that drive a live algod-go localnet
+# (`make localnet-up`). Default `cargo test -p algokey-rust` runs in-process
+# unit tests only — no docker required.
+e2e = []
+
 [dependencies]
 clap = { workspace = true }
 algo-codec.workspace = true
@@ -24,3 +30,19 @@ serde = { workspace = true }
 hex.workspace = true
 tempfile = "3"
 data-encoding = { workspace = true }
+# Used by the e2e harness (gated behind `--features e2e`).
+algo-error.workspace = true
+algo-rest-client.workspace = true
+base64.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+# E2E smoke test — only compiled with `--features e2e`. Validates that the
+# harness can bring up a localnet, discover the funded account, submit a
+# self-pay, and observe confirmation. See TASK-184.
+[[test]]
+name = "e2e_smoke"
+path = "tests/e2e/smoke_test.rs"
+required-features = ["e2e"]
