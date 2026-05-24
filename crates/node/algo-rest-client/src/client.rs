@@ -149,82 +149,58 @@ impl AlgodClient {
         unreachable!("retry loop should always return")
     }
 
-    /// Execute a POST request with retry and exponential backoff.
+    /// Execute a POST request without retries.
     ///
-    /// Mirrors `get_with_retry`: retries on connection errors, timeouts, and
-    /// 5xx responses; does not retry on 4xx (those propagate as
-    /// [`AlgoError::NotFound`] for 404 or [`AlgoError::Conformance`] otherwise).
-    async fn post_with_retry(
+    /// POSTs on this client today are exclusively non-idempotent transaction
+    /// submission (`/v2/transactions`). Retrying after an ambiguous failure
+    /// (timeout, connection drop, 5xx after the request reached algod) can
+    /// silently double-submit and cause algod to reject the retry as a
+    /// duplicate, even though the original submission succeeded. We propagate
+    /// the original error and let the caller recover via
+    /// [`AlgodClient::get_pending_transaction`] using the client-computed txid.
+    ///
+    /// Behavior:
+    /// - 2xx → response returned to caller
+    /// - 404  → [`AlgoError::NotFound`]
+    /// - other non-2xx → [`AlgoError::Conformance`] with body context
+    /// - transport / send error → [`AlgoError::RestClient`]
+    async fn post_no_retry(
         &self,
         path: &str,
         content_type: &'static str,
         body: Vec<u8>,
     ) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.base_url, path);
-        let mut backoff = self.config.initial_backoff;
 
-        for attempt in 0..=self.config.max_retries {
-            let mut request = self
-                .http
-                .post(&url)
-                .header(reqwest::header::CONTENT_TYPE, content_type)
-                .body(body.clone());
+        let mut request = self
+            .http
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body);
 
-            if !self.token.is_empty() {
-                request = request.header("X-Algo-API-Token", &self.token);
-            }
-
-            let result = request.send().await;
-
-            match result {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        return Ok(resp);
-                    }
-                    if status.is_server_error() && attempt < self.config.max_retries {
-                        warn!(
-                            attempt = attempt + 1,
-                            max = self.config.max_retries,
-                            status = %status,
-                            path,
-                            backoff_ms = backoff.as_millis() as u64,
-                            "server error, retrying"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        backoff *= 2;
-                        continue;
-                    }
-                    let body_text = resp.text().await.unwrap_or_default();
-                    if status == reqwest::StatusCode::NOT_FOUND {
-                        return Err(AlgoError::NotFound(format!("POST {path}: {body_text}")));
-                    }
-                    return Err(AlgoError::Conformance {
-                        message: format!("POST {path} returned {status}: {body_text}"),
-                    });
-                }
-                Err(e) if is_retryable(&e) && attempt < self.config.max_retries => {
-                    warn!(
-                        attempt = attempt + 1,
-                        max = self.config.max_retries,
-                        error = %e,
-                        path,
-                        backoff_ms = backoff.as_millis() as u64,
-                        "transient error, retrying"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff *= 2;
-                }
-                Err(e) => {
-                    return Err(AlgoError::RestClient {
-                        source: Box::new(e),
-                        context: format!("POST {path}"),
-                    });
-                }
-            }
+        if !self.token.is_empty() {
+            request = request.header("X-Algo-API-Token", &self.token);
         }
 
-        unreachable!("retry loop should always return")
+        match request.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return Ok(resp);
+                }
+                let body_text = resp.text().await.unwrap_or_default();
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    return Err(AlgoError::NotFound(format!("POST {path}: {body_text}")));
+                }
+                Err(AlgoError::Conformance {
+                    message: format!("POST {path} returned {status}: {body_text}"),
+                })
+            }
+            Err(e) => Err(AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("POST {path}"),
+            }),
+        }
     }
 }
 
@@ -279,11 +255,17 @@ impl AlgodClient {
     /// Ported reference: `../go-algorand/daemon/algod/api/server/v2/handlers.go:1090`
     /// (`RawTransaction`). Content-Type is `application/x-binary` per the
     /// algod OpenAPI spec.
+    ///
+    /// **Not retried.** Transaction submission is not idempotent — retrying
+    /// after an ambiguous failure (timeout, dropped connection, 5xx after the
+    /// request reached the node) can cause silent double-submission. On error,
+    /// callers can recover by computing the txid locally and polling
+    /// [`Self::get_pending_transaction`].
     pub async fn send_raw_transaction(&self, raw: &[u8]) -> Result<TxId> {
         debug!(bytes = raw.len(), "submitting raw transaction");
 
         let resp = self
-            .post_with_retry("/v2/transactions", "application/x-binary", raw.to_vec())
+            .post_no_retry("/v2/transactions", "application/x-binary", raw.to_vec())
             .await?;
 
         let parsed: PostTransactionResponse =
