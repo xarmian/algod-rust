@@ -243,7 +243,9 @@ name = "algo-kmd"
 version = "0.1.0"
 dependencies = [
  "algo-consensus-crypto",
+ "ed25519-dalek",
  "hex",
+ "hkdf",
  "rand 0.8.5",
  "regex",
  "rmp",
@@ -1863,6 +1865,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac",
 ]
 
 [[package]]

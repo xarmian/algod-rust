@@ -1,0 +1,42 @@
+{
+  "wallet_dir": "sqlite_wallets",
+  "db_relpath": "sqlite_wallets/interop-with-keys.interop-keys-1.db",
+  "wallet_name": "interop-with-keys",
+  "wallet_id": "interop-keys-1",
+  "password": "correct horse battery staple",
+  "mdk_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "scrypt_n": 1024,
+  "scrypt_r": 1,
+  "scrypt_p": 1,
+  "keys": [
+    {
+      "address_hex": "e271df507548f6ffd026f28987d972897c7ff1fe67ab09502c5ada7477306bab",
+      "secret_key_hex": "99bec184bb0cf82c8038910fa1bae4c7a37e1560f7d49ab991e8dd27ab5898b3e271df507548f6ffd026f28987d972897c7ff1fe67ab09502c5ada7477306bab",
+      "key_idx": 1,
+      "source": "derived"
+    },
+    {
+      "address_hex": "ed1470ca5ecc2a187634091e60cc8debdef1a02ceefa89e816c9e6149f5c9c67",
+      "secret_key_hex": "16522921eea0f7bcf0870ded2098b7622d18feda4330307509e07fbf535b0fb9ed1470ca5ecc2a187634091e60cc8debdef1a02ceefa89e816c9e6149f5c9c67",
+      "key_idx": 2,
+      "source": "derived"
+    },
+    {
+      "address_hex": "8907c9908586d90f0e955c84903f7507195ea850592eb74ac95e014593938088",
+      "secret_key_hex": "1fceedbeb6c764f3333cd02c46ce031b4daba43687a6fd9516f81492844d5f638907c9908586d90f0e955c84903f7507195ea850592eb74ac95e014593938088",
+      "key_idx": 3,
+      "source": "derived"
+    },
+    {
+      "address_hex": "cd14b37f956e953194ff7fb73b3d81dcc561d61a7538094b7c3e1a643ee5f3aa",
+      "secret_key_hex": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fcd14b37f956e953194ff7fb73b3d81dcc561d61a7538094b7c3e1a643ee5f3aa",
+      "source": "imported"
+    },
+    {
+      "address_hex": "d2eb993b63143528e70dcdc7eb9ca21010dd769be95250c2c5babfad15d458e2",
+      "secret_key_hex": "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafd2eb993b63143528e70dcdc7eb9ca21010dd769be95250c2c5babfad15d458e2",
+      "source": "imported"
+    }
+  ],
+  "description": "wallet with 3 derived + 2 imported keys, produced by go-algorand v4.5.1-stable kmd driver; consumed by algo-kmd's TASK-205 interop test"
+}

@@ -375,13 +375,24 @@ impl Wallet {
     /// The cached master-encryption-password (MEP) — populated by
     /// [`Self::init`], consumed by key/multisig encryption in
     /// TASK-205+. Returns `None` if the wallet is still locked.
-    #[allow(dead_code)] // wired up by key-ops PR (TASK-205)
     pub(crate) fn master_encryption_key(&self) -> Option<&[u8; MASTER_KEY_LEN]> {
         match &self.state {
             WalletState::Unlocked {
                 master_encryption_key,
                 ..
             } => Some(master_encryption_key),
+            WalletState::Locked => None,
+        }
+    }
+
+    /// Internal accessor for the cached MDK. The public-facing
+    /// derivation-key consumer is [`crate::keys`].
+    pub(crate) fn master_derivation_key_internal(&self) -> Option<&[u8; MASTER_KEY_LEN]> {
+        match &self.state {
+            WalletState::Unlocked {
+                master_derivation_key,
+                ..
+            } => Some(master_derivation_key),
             WalletState::Locked => None,
         }
     }
