@@ -203,7 +203,10 @@ async fn row_multisig_partial(report: &mut MatrixReport, workdir: &Path, net: &L
         }
     }
 
-    // Rust → Go: Rust signs slot A; verify msig block has only slot 0 filled.
+    // Rust → Go: Rust signs slot A, Go signs slot A independently with the
+    // same input + same mnemonic. Ed25519 is deterministic, so the wire
+    // bytes MUST match exactly — strong byte-level cross-impl evidence that
+    // Rust's output is something Go would have produced identically.
     {
         let (unsigned, _msig_addr) = build_unsigned_msig_txn(
             &[&a, &b, &c],
@@ -217,33 +220,41 @@ async fn row_multisig_partial(report: &mut MatrixReport, workdir: &Path, net: &L
             &params.genesis_id,
         );
         let unsigned_path = workdir.join("msig_r2g_partial.unsigned");
-        let signed_path = workdir.join("msig_r2g_partial.signed");
+        let rust_signed = workdir.join("msig_r2g_partial.rust");
+        let go_signed = workdir.join("msig_r2g_partial.go");
         write_msgpack_signed(&unsigned_path, &unsigned);
 
         rust_algokey()
             .args(["multisig", "-m", &a.mnemonic, "-t"])
             .arg(&unsigned_path)
             .arg("-o")
-            .arg(&signed_path)
+            .arg(&rust_signed)
             .assert()
             .success();
+        let _ = run_go(&[
+            "multisig",
+            "-m",
+            &a.mnemonic,
+            "-t",
+            unsigned_path.to_str().unwrap(),
+            "-o",
+            go_signed.to_str().unwrap(),
+        ]);
 
-        let signed = read_signed_txn(&signed_path);
-        let msig = signed.msig.as_ref().expect("msig must round-trip");
-        if msig.subsigs[0].signature == [0u8; 64] {
-            report.fail(
-                artifact,
-                Direction::RustToGo,
-                "Rust's multisig left slot 0 empty",
-            );
-        } else if msig.subsigs[1].signature != [0u8; 64] || msig.subsigs[2].signature != [0u8; 64] {
-            report.fail(
-                artifact,
-                Direction::RustToGo,
-                "Rust filled more than slot 0 — expected partial",
-            );
-        } else {
+        let rust_bytes = std::fs::read(&rust_signed).expect("read rust");
+        let go_bytes = std::fs::read(&go_signed).expect("read go");
+        if rust_bytes == go_bytes {
             report.pass(artifact, Direction::RustToGo);
+        } else {
+            report.fail(
+                artifact,
+                Direction::RustToGo,
+                format!(
+                    "Rust multisig partial bytes diverge from Go's for the same input: rust={} go={}",
+                    hex::encode(&rust_bytes),
+                    hex::encode(&go_bytes)
+                ),
+            );
         }
     }
 }
@@ -504,43 +515,51 @@ async fn row_append_auth_addr(report: &mut MatrixReport, workdir: &Path, net: &L
         }
     }
 
-    // Rust → Go: Rust produces, Go decodes and inspects via stdin... actually
-    // there's no Go "inspect" command. We decode in Rust and compare to what
-    // Go would produce — both produce the same preimage.
+    // Rust → Go: Byte-equality. `append-auth-addr` is pure (no randomness,
+    // no time-varying state), so Rust and Go must produce identical wire
+    // bytes for the same input. Stronger cross-impl evidence than just
+    // decoding the Rust output with Rust.
     {
-        let out_path = workdir.join("aaa_r2g.signed");
+        let rust_path = workdir.join("aaa_r2g.rust");
+        let go_path = workdir.join("aaa_r2g.go");
         rust_algokey()
             .args(["multisig", "append-auth-addr", "-p", &params_str, "-t"])
             .arg(&unsigned_path)
             .arg("-o")
-            .arg(&out_path)
+            .arg(&rust_path)
             .assert()
             .success();
-        let signed = read_signed_txn(&out_path);
-        let msig = signed
-            .msig
-            .as_ref()
-            .expect("Rust append-auth-addr must add msig preimage");
-        let derived = multisig_addr_gen(
-            msig.version,
-            msig.threshold,
-            &msig
-                .subsigs
-                .iter()
-                .map(|s| s.public_key)
-                .collect::<Vec<_>>(),
-        )
-        .expect("derive msig addr");
-        if derived == msig_addr && msig.threshold == 2 {
+        let _ = run_go(&[
+            "multisig",
+            "append-auth-addr",
+            "-p",
+            &params_str,
+            "-t",
+            unsigned_path.to_str().unwrap(),
+            "-o",
+            go_path.to_str().unwrap(),
+        ]);
+
+        let rust_bytes = std::fs::read(&rust_path).expect("read rust output");
+        let go_bytes = std::fs::read(&go_path).expect("read go output");
+        if rust_bytes == go_bytes {
             report.pass(artifact, Direction::RustToGo);
         } else {
+            // Mismatch indicates a real serialization or preimage divergence
+            // (ed25519 is deterministic, so equal inputs must produce equal
+            // outputs).
             report.fail(
                 artifact,
                 Direction::RustToGo,
-                format!("derived msig {derived} ≠ expected {msig_addr} (or threshold ≠ 2)"),
+                format!(
+                    "Rust append-auth-addr bytes diverge from Go's: rust={} go={}",
+                    hex::encode(&rust_bytes),
+                    hex::encode(&go_bytes)
+                ),
             );
         }
     }
+    let _ = msig_addr; // Only used by the Go→Rust branch; quiet unused warning.
 }
 
 // ---------------------------------------------------------------------------
