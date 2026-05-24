@@ -8,5 +8,6 @@
 //! Until TASK-180 / TASK-181 land, dispatch for `generate` / `reparent`
 //! still routes through `main.rs`'s `not_implemented` stub.
 
+pub mod generate;
 pub mod info;
 pub mod print_partkey;
