@@ -12,4 +12,6 @@ pub use gossip_block_source::{decode_block_cert, GossipBlockSource, GossipBlockS
 pub use http_block_fetcher::{HttpBlockFetchError, HttpBlockFetcher, BLOCK_RESPONSE_CONTENT_TYPE};
 pub use parallel_fetch::{ParallelBlockFetcher, DEFAULT_CONCURRENCY};
 pub use traits::BlockSource;
-pub use types::{AccountInfo, NodeStatus};
+pub use types::{
+    AccountInfo, NodeStatus, PendingTxnInfo, PostTransactionResponse, SuggestedParams, TxId,
+};
