@@ -252,31 +252,43 @@ impl WalletDb {
         &self.path
     }
 
-    /// Run `f` inside an exclusive SQLite transaction. Mirrors the
-    /// `db.Beginx() ... tx.Commit() / tx.Rollback()` pattern in
-    /// `GenerateKey` (sqlite.go:857–878). Any error from `f` is
-    /// propagated and the transaction is rolled back (rusqlite's
-    /// `Transaction` rolls back on drop unless committed).
+    /// Run `f` inside an **exclusive** SQLite transaction (`BEGIN
+    /// EXCLUSIVE`). Mirrors the `db.Beginx() ... tx.Commit() /
+    /// tx.Rollback()` pattern in `GenerateKey` (sqlite.go:857–878)
+    /// combined with the `_txlock=exclusive` URL option Go sets on
+    /// the connection string (sqlite.go:46) — every BEGIN acquires
+    /// the write lock immediately, so concurrent `generate_key`
+    /// callers can never both observe the same `max_key_idx` before
+    /// one of them commits.
     ///
-    /// The closure receives `&self` so it can call the existing
-    /// `insert_key` / `update_max_key_idx_encrypted` / etc. methods —
-    /// those issue SQL through `self.conn`, which while a transaction
-    /// is open executes inside it.
+    /// We don't use `rusqlite::Connection::transaction_with_behavior`
+    /// because it requires `&mut self`, which would force the
+    /// surrounding `WalletDb` API to take `&mut` everywhere. Raw
+    /// `BEGIN EXCLUSIVE` / `COMMIT` / `ROLLBACK` keeps the `&self`
+    /// signature and gives the same SQLite-level semantics.
+    ///
+    /// On error from `f`, a best-effort `ROLLBACK` runs; any error
+    /// from that path is suppressed in favor of `f`'s error.
     pub fn with_transaction<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(&Self) -> Result<R>,
     {
-        // unchecked_transaction lets us hand out a Transaction without
-        // needing &mut self; the borrow checker is satisfied because
-        // the Transaction holds a borrow of self.conn and we don't
-        // touch self.conn directly while it's alive.
-        let tx = self
-            .conn
-            .unchecked_transaction()
+        self.conn
+            .execute_batch("BEGIN EXCLUSIVE")
             .map_err(|_| Error::Database)?;
-        let result = f(self)?;
-        tx.commit().map_err(|_| Error::Database)?;
-        Ok(result)
+        match f(self) {
+            Ok(result) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|_| Error::Database)?;
+                Ok(result)
+            }
+            Err(e) => {
+                // Best-effort rollback; surface the original error.
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Insert the single metadata row. Encrypted blobs are opaque to

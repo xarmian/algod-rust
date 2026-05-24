@@ -192,6 +192,43 @@ fn name_id_to_path_collapses_when_sanitized_equal() {
 }
 
 #[test]
+fn with_transaction_acquires_exclusive_lock() {
+    // Regression for Codex PR #349 round 1: with_transaction used to
+    // run BEGIN DEFERRED, so two concurrent generate_key callers
+    // could both observe the same max_key_idx before either wrote.
+    // BEGIN EXCLUSIVE acquires the write lock immediately, so a
+    // competing writer on a second connection must error with BUSY
+    // until the transaction commits — matching Go's
+    // _txlock=exclusive (sqlite.go:46).
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("excl.db");
+    let primary = WalletDb::create(&path).unwrap();
+    primary
+        .insert_metadata(b"id", b"name", b"", b"", b"")
+        .unwrap();
+
+    // Open a second connection on the same file.
+    let other = WalletDb::open(&path).unwrap();
+
+    primary
+        .with_transaction(|_db| {
+            // While `primary` holds the exclusive lock, `other` must
+            // be unable to start its own write (BEGIN EXCLUSIVE
+            // returns SQLITE_BUSY).
+            let busy = other.with_transaction(|_| Ok::<_, Error>(()));
+            assert!(
+                busy.is_err(),
+                "second BEGIN EXCLUSIVE while another tx holds the write lock must fail"
+            );
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+    // After commit, the second connection can start a transaction.
+    other.with_transaction(|_| Ok::<_, Error>(())).unwrap();
+}
+
+#[test]
 fn claimed_wallets_thread_safety_smoke() {
     use std::sync::Arc;
     use std::thread;
