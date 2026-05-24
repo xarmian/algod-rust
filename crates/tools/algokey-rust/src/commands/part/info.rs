@@ -14,9 +14,13 @@ use crate::commands::part::print_partkey::print_partkey;
 pub fn run(args: PartInfoArgs) -> ExitCode {
     let keyfile_display = args.keyfile.display().to_string();
 
-    // Match Go's two distinct error wordings (`Cannot open …` vs
-    // `Cannot load …`) by separating the open + load failures.
-    let db = match ErasableDb::open_read_only(&args.keyfile) {
+    // Open read-write to mirror Go's `db.MakeErasableAccessor` semantics:
+    // on a path that doesn't yet exist sqlite creates an empty file
+    // (so the open call succeeds), and the subsequent restore fails
+    // with `Cannot load partkey database …` rather than `Cannot open
+    // …`. Aligning the open mode keeps both error paths byte-equal to
+    // Go's `part info` wording.
+    let db = match ErasableDb::open(&args.keyfile) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Cannot open partkey database {keyfile_display}: {e}");

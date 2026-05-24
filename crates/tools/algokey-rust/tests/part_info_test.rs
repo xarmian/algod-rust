@@ -105,8 +105,11 @@ fn part_info_prints_every_field_with_go_compatible_formatting() {
 
 #[test]
 fn part_info_errors_on_missing_keyfile_with_go_wording() {
+    // Mirrors Go's behavior exactly: db.MakeErasableAccessor is
+    // read-write, so a missing path causes sqlite to create an empty
+    // DB (open succeeds) and restore_participation then fails with
+    // `Cannot load partkey database …`.
     let path = tmp_db_path("missing");
-    // Don't create the file — expect open to fail.
     let output = algokey_bin()
         .args(["part", "info", "--keyfile"])
         .arg(&path)
@@ -120,11 +123,42 @@ fn part_info_errors_on_missing_keyfile_with_go_wording() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Cannot open partkey database"),
-        "expected `Cannot open partkey database` in stderr, got:\n{stderr}"
+        stderr.contains("Cannot load partkey database"),
+        "expected `Cannot load partkey database` in stderr, got:\n{stderr}"
     );
     assert!(
         stderr.contains(&path.display().to_string()),
         "stderr should mention the missing path"
+    );
+
+    // Best-effort cleanup of the empty DB sqlite just created.
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn part_info_errors_on_unopenable_path_with_open_wording() {
+    // A path inside a non-existent directory cannot be opened at all
+    // (sqlite cannot create the parent), so we hit the `Cannot open
+    // partkey database …` branch.
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "algokey-rust-part-info-no-such-dir-{}/never.sqlite",
+        std::process::id()
+    ));
+    let output = algokey_bin()
+        .args(["part", "info", "--keyfile"])
+        .arg(&path)
+        .output()
+        .expect("spawn binary");
+
+    assert!(
+        !output.status.success(),
+        "missing-dir path must exit non-zero, got {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Cannot open partkey database"),
+        "expected `Cannot open partkey database` in stderr, got:\n{stderr}"
     );
 }
