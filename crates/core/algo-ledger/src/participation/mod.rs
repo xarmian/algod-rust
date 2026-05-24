@@ -15,6 +15,7 @@ pub mod install;
 pub mod persist;
 pub mod registration_txn;
 pub mod restore;
+pub mod stateproof_persist;
 pub mod store;
 
 pub use equivocation::AntiEquivocationTracker;
@@ -25,6 +26,10 @@ pub use install::{
 pub use persist::{persist_new_parent, persist_participation, PersistError};
 pub use registration_txn::generate_registration_transaction;
 pub use restore::{restore_participation, Error as RestoreError};
+pub use stateproof_persist::{
+    install_state_proof_table, persist_secrets, StateProofPersistError,
+    MERKLE_SIGNATURE_SCHEMA_VERSION, MERKLE_SIGNATURE_TABLE_SCHEMA_NAME,
+};
 pub use store::ParticipationStore;
 
 use algo_consensus_crypto::merklesig;
