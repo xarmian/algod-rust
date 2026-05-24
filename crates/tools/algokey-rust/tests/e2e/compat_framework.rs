@@ -8,6 +8,7 @@
 //! emitter that aggregates BOTH halves of the matrix.
 
 use std::fmt;
+use std::path::Path;
 use std::process::Command;
 
 /// Which side produced the artifact and which side is consuming it.
@@ -91,9 +92,9 @@ impl MatrixReport {
         &self.rows
     }
 
-    /// Print the stdout summary table and panic if any row failed.
-    pub fn finish(self) {
-        // Group rows by artifact, with both directions side-by-side.
+    /// Print the human-readable summary table to stdout. Doesn't fail —
+    /// callers run [`Self::assert_all_pass`] after to enforce success.
+    pub fn print_summary(&self) {
         use std::collections::BTreeMap;
         let mut by_artifact: BTreeMap<&'static str, [Option<&Verdict>; 2]> = BTreeMap::new();
         for r in &self.rows {
@@ -112,11 +113,7 @@ impl MatrixReport {
         }
 
         let total = self.rows.len();
-        let passed = self
-            .rows
-            .iter()
-            .filter(|r| matches!(r.verdict, Verdict::Pass))
-            .count();
+        let passed = self.passed();
         let failed = total - passed;
         if failed == 0 {
             println!("All {total} round-trips passed.");
@@ -127,9 +124,82 @@ impl MatrixReport {
                     println!("  ✗ {} {}: {}", r.artifact, r.direction, detail);
                 }
             }
+        }
+    }
+
+    /// Write a JUnit-format XML report to `path`. The schema is the standard
+    /// `<testsuite><testcase>` flavor consumable by GitHub Actions
+    /// `test-reporter`, `junit-viewer`, IntelliJ, etc. Each row becomes one
+    /// `<testcase>`; failed rows include a `<failure>` child carrying the
+    /// detail string.
+    pub fn write_junit(&self, path: &Path, suite_name: &str) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let total = self.rows.len();
+        let failed = total - self.passed();
+        let mut xml = String::new();
+        xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        xml.push_str(&format!(
+            "<testsuite name=\"{}\" tests=\"{total}\" failures=\"{failed}\" errors=\"0\">\n",
+            xml_escape(suite_name),
+        ));
+        for r in &self.rows {
+            let name = format!("{}/{}", r.artifact, r.direction);
+            xml.push_str(&format!(
+                "  <testcase name=\"{}\" classname=\"{}\">\n",
+                xml_escape(&name),
+                xml_escape(suite_name),
+            ));
+            if let Verdict::Fail { detail } = &r.verdict {
+                xml.push_str(&format!(
+                    "    <failure message=\"{}\">{}</failure>\n",
+                    xml_escape(detail),
+                    xml_escape(detail),
+                ));
+            }
+            xml.push_str("  </testcase>\n");
+        }
+        xml.push_str("</testsuite>\n");
+        std::fs::write(path, xml)
+    }
+
+    /// Panic with the full detail of every failed row if any row failed.
+    pub fn assert_all_pass(self) {
+        let total = self.rows.len();
+        let failed = total - self.passed();
+        if failed > 0 {
             panic!("{failed}/{total} matrix round-trips failed; see stdout above");
         }
     }
+
+    fn passed(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| matches!(r.verdict, Verdict::Pass))
+            .count()
+    }
+}
+
+/// Minimal XML attribute/content escaper. Avoids pulling in a heavy XML crate
+/// for the trivial test-report use case.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c if (c as u32) < 0x20 && c != '\n' && c != '\r' && c != '\t' => {
+                // Control characters aren't valid in XML 1.0; replace with U+FFFD.
+                out.push('\u{FFFD}');
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn format_cell(v: Option<&Verdict>) -> &'static str {
@@ -151,6 +221,17 @@ pub fn go_algokey_available() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Workspace-root `target/algokey-compat-matrix-{half}.xml`. Cargo runs
+/// integration tests with CWD = package dir, so we have to resolve up from
+/// `CARGO_MANIFEST_DIR`. `half` is e.g. "core" or "extended".
+pub fn junit_report_path(half: &str) -> std::path::PathBuf {
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest.join("../../..");
+    workspace_root
+        .join("target")
+        .join(format!("algokey-compat-matrix-{half}.xml"))
 }
 
 /// Standard skip message for tests when the Go `algokey` binary is absent.
