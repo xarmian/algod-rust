@@ -65,3 +65,12 @@ required-features = ["e2e"]
 name = "compat_matrix_core"
 path = "tests/e2e/compat_matrix_core_test.rs"
 required-features = ["e2e"]
+
+# Cross-implementation compatibility matrix — extended (TASK-200). Multisig
+# (partial + assembled cross-signer), append-auth-addr, partkey DB +
+# reparent, keyreg offline, plus pass-through for online keyreg (TASK-185).
+# Writes JUnit XML to target/algokey-compat-matrix-extended.xml.
+[[test]]
+name = "compat_matrix_extended"
+path = "tests/e2e/compat_matrix_extended_test.rs"
+required-features = ["e2e"]

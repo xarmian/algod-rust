@@ -594,5 +594,11 @@ async fn algokey_compat_matrix_core() {
     row_signed_txn_rekeyed(&mut report, &root, &net).await;
     row_negative_control(&mut report, &root);
 
-    report.finish();
+    report.print_summary();
+    let xml_path = e2e::compat_framework::junit_report_path("core");
+    report
+        .write_junit(&xml_path, "algokey-compat-matrix-core")
+        .expect("write JUnit XML");
+    println!("JUnit report written to {}", xml_path.display());
+    report.assert_all_pass();
 }
