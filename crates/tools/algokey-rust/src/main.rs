@@ -44,15 +44,15 @@ fn main() -> ExitCode {
             Some(PartSub::Keyreg(args)) => commands::keyreg::run(args),
             Some(PartSub::Info(args)) => commands::part::info::run(args),
             Some(PartSub::Generate(args)) => commands::part::generate::run(args),
-            Some(PartSub::Reparent(_)) => not_implemented(),
+            Some(PartSub::Reparent(args)) => commands::part::reparent::run(args),
         },
     }
 }
 
-/// Stub return matching the contract documented in TASK-154/TASK-155:
-/// every Phase A leaf prints `"not implemented"` to stderr and exits 2.
-/// TASK-157, TASK-158, TASK-159 replace these with real implementations.
-fn not_implemented() -> ExitCode {
-    eprintln!("not implemented");
-    ExitCode::from(2)
-}
+// All Phase A stub leaves are now backed by real implementations:
+// TASK-157 (generate), TASK-158 (import), TASK-159 (export),
+// TASK-167 (sign), TASK-168 (multisig sign),
+// TASK-169 (multisig append-auth-addr), TASK-170 (part keyreg),
+// TASK-179 (part info), TASK-180 (part generate), and
+// TASK-181 (part reparent) — so `not_implemented` is no longer
+// referenced and has been removed.
