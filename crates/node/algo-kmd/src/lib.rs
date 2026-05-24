@@ -13,6 +13,7 @@
 
 pub mod config;
 pub mod error;
+pub mod sqlite;
 
 pub use config::{
     load_kmd_config, save_kmd_config, DriverConfig, KMDConfig, LedgerWalletDriverConfig,
@@ -20,3 +21,9 @@ pub use config::{
     DEFAULT_SESSION_LIFETIME_SECS, KMD_CONFIG_EXAMPLE_FILENAME, KMD_CONFIG_FILENAME,
 };
 pub use error::{Error, Result};
+pub use sqlite::{
+    is_database_filename, name_id_to_path, sanitize_filename, ClaimedWallets, WalletDb,
+    WalletMetadata, SQLITE_MAX_WALLET_ID_LEN, SQLITE_MAX_WALLET_NAME_LEN, SQLITE_WALLETS_DIR_NAME,
+    SQLITE_WALLETS_DIR_PERMISSIONS, SQLITE_WALLET_DRIVER_NAME, SQLITE_WALLET_DRIVER_VERSION,
+    WALLET_SCHEMA,
+};
