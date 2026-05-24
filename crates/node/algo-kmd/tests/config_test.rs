@@ -163,6 +163,36 @@ fn null_fields_fall_back_to_go_defaults() {
 }
 
 #[test]
+fn allowed_origins_distinguishes_null_from_empty_array() {
+    // Go distinguishes a nil []string (marshals to null) from an empty
+    // []string{} (marshals to []). Both must round-trip through Rust
+    // byte-stably so a config written by either implementation is
+    // re-readable byte-equal by the other.
+
+    // null → None → null on re-serialize
+    let cfg: KMDConfig = serde_json::from_slice(br#"{"allowed_origins": null}"#).unwrap();
+    assert_eq!(cfg.allowed_origins, None);
+    let out = serde_json::to_value(&cfg).unwrap();
+    assert!(out["allowed_origins"].is_null());
+
+    // [] → Some(vec![]) → [] on re-serialize
+    let cfg: KMDConfig = serde_json::from_slice(br#"{"allowed_origins": []}"#).unwrap();
+    assert_eq!(cfg.allowed_origins, Some(vec![]));
+    let out = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(out["allowed_origins"], serde_json::json!([]));
+
+    // ["a"] → Some(vec!["a"]) → ["a"] on re-serialize
+    let cfg: KMDConfig = serde_json::from_slice(br#"{"allowed_origins": ["a"]}"#).unwrap();
+    assert_eq!(cfg.allowed_origins, Some(vec!["a".to_string()]));
+    let out = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(out["allowed_origins"], serde_json::json!(["a"]));
+
+    // Absent → None (matches Go nil default), which serializes back to null
+    let cfg: KMDConfig = serde_json::from_slice(br#"{}"#).unwrap();
+    assert_eq!(cfg.allowed_origins, None);
+}
+
+#[test]
 fn save_format_matches_go_byte_for_byte() {
     // Go's codecs.SaveObjectToFile uses tab indent (util/codecs/json.go:35)
     // and json.Encoder.Encode appends a trailing newline. A nil []string

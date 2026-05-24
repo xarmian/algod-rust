@@ -50,15 +50,6 @@ fn default_scrypt_p() -> i64 {
     DEFAULT_SCRYPT_P
 }
 
-/// Treat JSON `null` as an empty `Vec`, mirroring Go's behavior where a
-/// nil `[]string` marshals to `null` and round-trips back to nil.
-fn null_to_empty_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
-}
-
 /// Treat JSON `null` as `T::default()`. Mirrors Go's `json.Unmarshal`
 /// behavior on a pre-populated struct: an explicit `null` for a non-pointer
 /// field is a no-op (the field keeps its existing value), so on a struct
@@ -106,26 +97,6 @@ where
     Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or(DEFAULT_SCRYPT_P))
 }
 
-/// Serialize an empty `Vec<String>` as JSON `null`, mirroring Go's
-/// `json.Marshal` on a nil `[]string`. A populated vec serializes as a
-/// normal JSON array.
-///
-/// This pairs with [`null_to_empty_vec`] so the round-trip is byte-stable
-/// against the example file kmd writes on first start.
-fn serialize_empty_vec_as_null<S>(
-    v: &[String],
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    if v.is_empty() {
-        serializer.serialize_none()
-    } else {
-        v.serialize(serializer)
-    }
-}
-
 /// Global configuration for kmd.
 ///
 /// Ported from `KMDConfig` (config.go:37). `data_dir` carries Go's
@@ -151,18 +122,14 @@ pub struct KMDConfig {
     #[serde(default, deserialize_with = "null_or_type_default")]
     pub address: String,
 
-    /// `[]string` in Go. Go's `json.Marshal` writes a nil slice as `null`,
-    /// so the deserializer must accept both `null` and a JSON array
-    /// ([`null_to_empty_vec`]) and the serializer must emit `null` when
-    /// the slice is empty ([`serialize_empty_vec_as_null`]) to round-trip
-    /// byte-for-byte against the example file kmd itself writes.
-    #[serde(
-        rename = "allowed_origins",
-        default,
-        deserialize_with = "null_to_empty_vec",
-        serialize_with = "serialize_empty_vec_as_null"
-    )]
-    pub allowed_origins: Vec<String>,
+    /// `[]string` in Go. Go's `json.Marshal` distinguishes a *nil* slice
+    /// (writes `null`) from an *empty* slice (writes `[]`); on unmarshal
+    /// `null` produces nil and `[]` produces a non-nil empty slice. We
+    /// preserve both states via `Option<Vec<String>>` so a config written
+    /// by either implementation round-trips byte-stably under the other:
+    /// `None` ↔ `null`, `Some(vec)` ↔ JSON array (even when empty).
+    #[serde(rename = "allowed_origins", default)]
+    pub allowed_origins: Option<Vec<String>>,
 
     #[serde(
         rename = "allow_header_pna",
@@ -179,7 +146,10 @@ impl Default for KMDConfig {
             driver_config: DriverConfig::default(),
             session_lifetime_secs: DEFAULT_SESSION_LIFETIME_SECS,
             address: String::new(),
-            allowed_origins: Vec::new(),
+            // Matches Go: zero-valued KMDConfig has a nil AllowedOrigins,
+            // which marshals as `null` — see fixture
+            // `tests/fixtures/kmd_config_default.json`.
+            allowed_origins: None,
             allow_header_pna: false,
         }
     }
