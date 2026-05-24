@@ -59,6 +59,53 @@ where
     Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// Treat JSON `null` as `T::default()`. Mirrors Go's `json.Unmarshal`
+/// behavior on a pre-populated struct: an explicit `null` for a non-pointer
+/// field is a no-op (the field keeps its existing value), so on a struct
+/// pre-populated with Go defaults `null` effectively resolves to the
+/// default. We replicate that here by deserializing into `Option<T>` and
+/// falling back to `T::default()` on `None`.
+///
+/// For fields whose Go default is *not* the type's zero value
+/// (`session_lifetime_secs`, `scrypt_n`, `scrypt_r`, `scrypt_p`), use a
+/// per-field helper below so the fallback returns the Go default rather
+/// than the numeric zero.
+fn null_or_type_default<'de, T, D>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    T: Deserialize<'de> + Default,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn null_or_default_session_lifetime<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u64>::deserialize(deserializer)?.unwrap_or(DEFAULT_SESSION_LIFETIME_SECS))
+}
+
+fn null_or_default_scrypt_n<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or(DEFAULT_SCRYPT_N))
+}
+
+fn null_or_default_scrypt_r<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or(DEFAULT_SCRYPT_R))
+}
+
+fn null_or_default_scrypt_p<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or(DEFAULT_SCRYPT_P))
+}
+
 /// Serialize an empty `Vec<String>` as JSON `null`, mirroring Go's
 /// `json.Marshal` on a nil `[]string`. A populated vec serializes as a
 /// normal JSON array.
@@ -91,16 +138,17 @@ pub struct KMDConfig {
     #[serde(skip)]
     pub data_dir: PathBuf,
 
-    #[serde(rename = "drivers", default)]
+    #[serde(rename = "drivers", default, deserialize_with = "null_or_type_default")]
     pub driver_config: DriverConfig,
 
     #[serde(
         rename = "session_lifetime_secs",
-        default = "default_session_lifetime_secs"
+        default = "default_session_lifetime_secs",
+        deserialize_with = "null_or_default_session_lifetime"
     )]
     pub session_lifetime_secs: u64,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_or_type_default")]
     pub address: String,
 
     /// `[]string` in Go. Go's `json.Marshal` writes a nil slice as `null`,
@@ -116,7 +164,11 @@ pub struct KMDConfig {
     )]
     pub allowed_origins: Vec<String>,
 
-    #[serde(rename = "allow_header_pna", default)]
+    #[serde(
+        rename = "allow_header_pna",
+        default,
+        deserialize_with = "null_or_type_default"
+    )]
     pub allow_header_pna: bool,
 }
 
@@ -137,10 +189,10 @@ impl Default for KMDConfig {
 /// (config.go:47).
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct DriverConfig {
-    #[serde(rename = "sqlite", default)]
+    #[serde(rename = "sqlite", default, deserialize_with = "null_or_type_default")]
     pub sqlite: SQLiteWalletDriverConfig,
 
-    #[serde(rename = "ledger", default)]
+    #[serde(rename = "ledger", default, deserialize_with = "null_or_type_default")]
     pub ledger: LedgerWalletDriverConfig,
 }
 
@@ -148,16 +200,24 @@ pub struct DriverConfig {
 /// `SQLiteWalletDriverConfig` (config.go:53).
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SQLiteWalletDriverConfig {
-    #[serde(rename = "wallets_dir", default)]
+    #[serde(
+        rename = "wallets_dir",
+        default,
+        deserialize_with = "null_or_type_default"
+    )]
     pub wallets_dir: String,
 
     /// Mirrors Go's `UnsafeScrypt bool \`json:"allow_unsafe_scrypt"\``.
     /// Allows running with scrypt parameters below the production minimum;
     /// only intended for tests.
-    #[serde(rename = "allow_unsafe_scrypt", default)]
+    #[serde(
+        rename = "allow_unsafe_scrypt",
+        default,
+        deserialize_with = "null_or_type_default"
+    )]
     pub unsafe_scrypt: bool,
 
-    #[serde(rename = "scrypt", default)]
+    #[serde(rename = "scrypt", default, deserialize_with = "null_or_type_default")]
     pub scrypt_params: ScryptParams,
 }
 
@@ -165,7 +225,7 @@ pub struct SQLiteWalletDriverConfig {
 /// `LedgerWalletDriverConfig` (config.go:60).
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct LedgerWalletDriverConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_or_type_default")]
     pub disable: bool,
 }
 
@@ -177,13 +237,25 @@ pub struct LedgerWalletDriverConfig {
 /// pre-populated struct.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScryptParams {
-    #[serde(rename = "scrypt_n", default = "default_scrypt_n")]
+    #[serde(
+        rename = "scrypt_n",
+        default = "default_scrypt_n",
+        deserialize_with = "null_or_default_scrypt_n"
+    )]
     pub scrypt_n: i64,
 
-    #[serde(rename = "scrypt_r", default = "default_scrypt_r")]
+    #[serde(
+        rename = "scrypt_r",
+        default = "default_scrypt_r",
+        deserialize_with = "null_or_default_scrypt_r"
+    )]
     pub scrypt_r: i64,
 
-    #[serde(rename = "scrypt_p", default = "default_scrypt_p")]
+    #[serde(
+        rename = "scrypt_p",
+        default = "default_scrypt_p",
+        deserialize_with = "null_or_default_scrypt_p"
+    )]
     pub scrypt_p: i64,
 }
 

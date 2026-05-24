@@ -109,6 +109,60 @@ fn save_then_load_roundtrip() {
 }
 
 #[test]
+fn null_fields_fall_back_to_go_defaults() {
+    // Go's json.Unmarshal on a pre-populated struct treats explicit null for
+    // non-pointer fields (scalars + nested structs) as a no-op — the field
+    // keeps its existing value. Verify each null path resolves to the Go
+    // default.
+
+    // Scalar null → Go default
+    let cfg: KMDConfig = serde_json::from_slice(br#"{"session_lifetime_secs": null}"#).unwrap();
+    assert_eq!(cfg.session_lifetime_secs, DEFAULT_SESSION_LIFETIME_SECS);
+
+    // Top-level struct null → defaults
+    let cfg: KMDConfig = serde_json::from_slice(br#"{"drivers": null}"#).unwrap();
+    assert_eq!(
+        cfg.driver_config.sqlite.scrypt_params.scrypt_n,
+        DEFAULT_SCRYPT_N
+    );
+
+    // Nested struct null → defaults
+    let cfg: KMDConfig =
+        serde_json::from_slice(br#"{"drivers": {"sqlite": {"scrypt": null}}}"#).unwrap();
+    assert_eq!(
+        cfg.driver_config.sqlite.scrypt_params.scrypt_n,
+        DEFAULT_SCRYPT_N
+    );
+    assert_eq!(
+        cfg.driver_config.sqlite.scrypt_params.scrypt_r,
+        DEFAULT_SCRYPT_R
+    );
+    assert_eq!(
+        cfg.driver_config.sqlite.scrypt_params.scrypt_p,
+        DEFAULT_SCRYPT_P
+    );
+
+    // Per-scrypt-field null → that field's Go default, others untouched
+    let cfg: KMDConfig = serde_json::from_slice(
+        br#"{"drivers": {"sqlite": {"scrypt": {"scrypt_n": null, "scrypt_r": 9}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.driver_config.sqlite.scrypt_params.scrypt_n,
+        DEFAULT_SCRYPT_N
+    );
+    assert_eq!(cfg.driver_config.sqlite.scrypt_params.scrypt_r, 9);
+
+    // String null → empty
+    let cfg: KMDConfig = serde_json::from_slice(br#"{"address": null}"#).unwrap();
+    assert_eq!(cfg.address, "");
+
+    // Bool null → false
+    let cfg: KMDConfig = serde_json::from_slice(br#"{"allow_header_pna": null}"#).unwrap();
+    assert!(!cfg.allow_header_pna);
+}
+
+#[test]
 fn save_format_matches_go_byte_for_byte() {
     // Go's codecs.SaveObjectToFile uses tab indent (util/codecs/json.go:35)
     // and json.Encoder.Encode appends a trailing newline. A nil []string
