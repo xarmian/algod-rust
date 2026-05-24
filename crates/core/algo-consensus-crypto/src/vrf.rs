@@ -778,11 +778,24 @@ impl VrfKeypair {
         VrfKeypair { pk, sk }
     }
 
-    /// Generate a random keypair.
+    /// Generate a random keypair using the OS RNG.
+    ///
+    /// Matches go-algorand's `crypto.GenerateVRFSecrets` (which reads from
+    /// `crypto/rand` — equivalent to Rust's `OsRng` via `thread_rng`).
     #[must_use]
     pub fn generate() -> Self {
+        Self::generate_with_rng(&mut rand::thread_rng())
+    }
+
+    /// Generate a random keypair using the supplied RNG.
+    ///
+    /// Equivalent to go-algorand's RNG-injected keygen path
+    /// (`ed25519GenerateKeyRNG` with an explicit `crypto.RNG`). Use for
+    /// deterministic testing or to plumb a `crypto.PRNG`-equivalent through.
+    #[must_use]
+    pub fn generate_with_rng<R: RngCore>(rng: &mut R) -> Self {
         let mut seed = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut seed);
+        rng.fill_bytes(&mut seed);
         Self::from_seed(seed)
     }
 }
