@@ -121,3 +121,41 @@ unit test in `src/commands/generate.rs` (a fixed seed injected via
 EOF
 
 echo "Captured $i fixture cases under $FIX_DIR"
+
+# ---------------------------------------------------------------------------
+# Phase C captures: partkey DB + `part info` stdout
+# ---------------------------------------------------------------------------
+
+PART_FIX_DIR="$REPO_ROOT/crates/tools/algokey-rust/tests/fixtures/partkey"
+mkdir -p "$PART_FIX_DIR/part_info_outputs"
+
+# Deterministic checksummed test address used as `--parent`.
+# Phase C parity tests assert against the same string.
+TEST_PARENT="7777777777777777777777777777777777777777777777777774MSJUVU"
+
+capture_partkey() {
+    local name="$1"
+    local first="$2"
+    local last="$3"
+    local dilution="$4"
+    local db_path="$PART_FIX_DIR/$name.db"
+    local stdout_path="$PART_FIX_DIR/part_info_outputs/$name.stdout"
+
+    rm -f "$db_path" "$db_path-shm" "$db_path-wal"
+    echo "Generating partkey fixture: $name (first=$first last=$last dilution=$dilution)"
+    "$ALGOKEY" part generate \
+        --keyfile "$db_path" \
+        --first "$first" --last "$last" \
+        --dilution "$dilution" \
+        --parent "$TEST_PARENT" \
+        >/dev/null
+
+    "$ALGOKEY" part info --keyfile "$db_path" >"$stdout_path"
+    # Strip WAL/SHM sidecars so only the canonical DB ships in-tree.
+    rm -f "$db_path-shm" "$db_path-wal"
+}
+
+# Small fixture used by tests/part_info_parity.rs.
+capture_partkey "small_with_sp" 1 512 100
+
+echo "Captured Phase C partkey fixtures under $PART_FIX_DIR"
