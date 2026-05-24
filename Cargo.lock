@@ -228,6 +228,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "algo-kmd"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "algo-ledger"
 version = "0.1.0"
 dependencies = [
@@ -2191,6 +2201,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"
 dependencies = [
  "cpufeatures",
+]
+
+[[package]]
+name = "kmd-rust"
+version = "0.1.0"
+dependencies = [
+ "algo-kmd",
+ "clap",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

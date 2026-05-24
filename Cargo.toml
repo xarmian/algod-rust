@@ -16,11 +16,13 @@ members = [
     "crates/core/algo-pool",
     "crates/node/algo-network",
     "crates/node/algo-rest-api",
+    "crates/node/algo-kmd",
     "crates/tools/algo-bench",
     "crates/tools/algo-fork-detector",
     "crates/tools/algo-cert-crossverify",
     "crates/tools/algokey-rust",
     "bin/algod-rust",
+    "bin/kmd-rust",
 ]
 exclude = ["fuzz"]
 
@@ -98,6 +100,7 @@ algo-pool = { path = "crates/core/algo-pool" }
 algo-falcon = { path = "crates/core/algo-falcon" }
 algo-network = { path = "crates/node/algo-network" }
 algo-rest-api = { path = "crates/node/algo-rest-api" }
+algo-kmd = { path = "crates/node/algo-kmd" }
 algo-bench = { path = "crates/tools/algo-bench" }
 num-bigint = "0.4"
 statrs = "0.18"
