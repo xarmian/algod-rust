@@ -212,7 +212,8 @@ fn fully_specified_subcommands_stub_to_not_implemented() {
         // src/commands/part/info.rs and tests/part_info_test.rs.
         // `part generate` is no longer stubbed (TASK-180); see
         // src/commands/part/generate.rs and tests/part_generate_test.rs.
-        &["part", "reparent", "--keyfile", "/tmp/k", "--parent", "A"],
+        // `part reparent` is no longer stubbed (TASK-181); see
+        // src/commands/part/reparent.rs and tests/part_reparent_test.rs.
     ];
     for argv in cases {
         let out = algokey().args(*argv).output().expect("run algokey-rust");
