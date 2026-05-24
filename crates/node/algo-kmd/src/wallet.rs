@@ -120,20 +120,24 @@ impl WalletDriver {
             return Err(Error::IdTooLong);
         }
 
-        // Reserve the (name, id) pair, and reject if a file with this
-        // path already exists or another wallet with the same name/id
-        // is on disk.
-        self.claimed.claim(name, id)?;
+        // Reserve the (name, id) pair atomically with the on-disk
+        // dup-check, matching Go's claimWalletNameID (sqlite.go:364).
+        // The registry is only appended to after every check passes,
+        // so a failed creation leaves no stale claim that would block
+        // a legitimate retry.
         let db_path = name_id_to_path(&self.cfg.wallets_dir, name, id);
-        if db_path.exists() {
-            return Err(Error::WalletExists(db_path));
-        }
-        if !self.find_db_paths_by_name(name)?.is_empty() {
-            return Err(Error::SameName);
-        }
-        if !self.find_db_paths_by_id(id)?.is_empty() {
-            return Err(Error::SameId);
-        }
+        self.claimed.claim_with(name, id, |n, i| {
+            if db_path.exists() {
+                return Err(Error::WalletExists(db_path.clone()));
+            }
+            if !self.find_db_paths_by_name(n)?.is_empty() {
+                return Err(Error::SameName);
+            }
+            if !self.find_db_paths_by_id(i)?.is_empty() {
+                return Err(Error::SameId);
+            }
+            Ok(())
+        })?;
 
         let db = WalletDb::create(&db_path)?;
 

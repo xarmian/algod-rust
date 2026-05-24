@@ -100,6 +100,55 @@ fn create_rejects_duplicate_name_or_id() {
 }
 
 #[test]
+fn failed_create_does_not_poison_claimed_registry() {
+    // Regression for Codex PR #348 round 1: claim() used to append to
+    // the in-memory list before checking on-disk dup state. A failed
+    // CreateWallet (on-disk conflict) would leave a stale entry that
+    // rejected a legitimate retry after the conflict was cleared.
+    //
+    // Go's claimWalletNameID (sqlite.go:382–409) appends only after
+    // every check passes, so we must do the same.
+    let dir = TempDir::new().unwrap();
+    let driver = WalletDriver::new(weak_cfg(dir.path())).unwrap();
+
+    // Stage 1: a *different* driver instance creates the on-disk
+    // conflict. This way the in-memory registry of `driver` starts
+    // empty, so any stale entry it ends up with must have come from
+    // the failed claim path.
+    {
+        let driver_a = WalletDriver::new(weak_cfg(dir.path())).unwrap();
+        driver_a
+            .create_wallet(b"shared", b"id-existing", b"pw", None)
+            .unwrap();
+    }
+
+    // Stage 2: `driver` (empty claim list) attempts to create a
+    // wallet whose name collides with what's on disk. Must fail with
+    // SameName (on-disk path).
+    let err = driver
+        .create_wallet(b"shared", b"id-new", b"pw", None)
+        .unwrap_err();
+    assert!(matches!(err, Error::SameName), "got {err:?}");
+
+    // Stage 3: clear the on-disk conflict.
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+
+    // Stage 4: retry on the *same* `driver`. With the bug
+    // (pre-emptive append), the failed Stage 2 left "shared" in the
+    // registry and this retry would fail with SameName even though
+    // the disk is clean. With the fix, the registry stayed empty
+    // and the retry succeeds.
+    driver
+        .create_wallet(b"shared", b"id-new", b"pw", None)
+        .expect("retry must succeed after disk conflict is cleared");
+}
+
+#[test]
 fn create_rejects_oversized_name_and_id() {
     let dir = TempDir::new().unwrap();
     let driver = WalletDriver::new(weak_cfg(dir.path())).unwrap();

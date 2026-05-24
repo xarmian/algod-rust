@@ -132,10 +132,28 @@ impl ClaimedWallets {
         Self::default()
     }
 
-    /// Reserve `(name, id)`. Returns `ErrSameName` or `ErrSameId` if a
-    /// matching entry is already claimed. Mirrors the duplicate check
-    /// in `claimWalletNameID` (sqlite.go:369–376).
+    /// Reserve `(name, id)` against the in-memory list only. Returns
+    /// `ErrSameName` or `ErrSameId` if a matching entry is already
+    /// claimed. Most callers should use [`Self::claim_with`] so the
+    /// on-disk dup-check happens inside the same critical section
+    /// (matching Go's `claimWalletNameID`).
     pub fn claim(&self, name: &[u8], id: &[u8]) -> Result<()> {
+        self.claim_with(name, id, |_, _| Ok(()))
+    }
+
+    /// Reserve `(name, id)` atomically with an extra validation step.
+    /// Mirrors `claimWalletNameID` (sqlite.go:364–410): under a single
+    /// lock acquisition, check the in-memory list, run the caller's
+    /// disk-side dup check, and only then append to the registry. If
+    /// `extra_check` fails the registry is unchanged, so a later retry
+    /// after the on-disk conflict is cleared can succeed — matching
+    /// Go's behavior where `claimedWallets` is only appended *after*
+    /// `os.Stat` + `findDBPathsBy{Name,ID}` all return clean
+    /// (sqlite.go:382–409).
+    pub fn claim_with<F>(&self, name: &[u8], id: &[u8], extra_check: F) -> Result<()>
+    where
+        F: FnOnce(&[u8], &[u8]) -> Result<()>,
+    {
         let mut guard = self.inner.lock().expect("ClaimedWallets mutex poisoned");
         for (n, i) in guard.iter() {
             if n.as_slice() == name {
@@ -145,6 +163,7 @@ impl ClaimedWallets {
                 return Err(Error::SameId);
             }
         }
+        extra_check(name, id)?;
         guard.push((name.to_vec(), id.to_vec()));
         Ok(())
     }
