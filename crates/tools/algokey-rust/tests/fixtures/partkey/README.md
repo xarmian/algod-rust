@@ -19,12 +19,15 @@ captured — it's gated for the feature-on slow path; add it under
 
 ## Regenerating
 
+Run both commands from the **algod-rust** repo root. The Go build
+happens in a subshell so the second line stays in the right cwd.
+
 ```bash
 # Build the Go binary at the pinned tag.
-cd ../go-algorand && git checkout v4.5.1-stable
-go build -o /tmp/algokey-go ./cmd/algokey
+(cd ../go-algorand && git checkout v4.5.1-stable && \
+ go build -o /tmp/algokey-go ./cmd/algokey)
 
-# Drive the capture script.
+# Drive the capture script (must run from the algod-rust repo root).
 ALGOKEY=/tmp/algokey-go bash scripts/capture-algokey-fixtures.sh
 ```
 
