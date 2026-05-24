@@ -38,10 +38,15 @@ A subset of tests cross-checks Rust outputs against the pinned Go
 `algokey` binary. Install it once:
 
 ```bash
+mkdir -p ~/.local/bin
 cd ../go-algorand
 go build -o ~/.local/bin/algokey ./cmd/algokey
 ~/.local/bin/algokey -v
 ```
+
+Ensure `~/.local/bin` is on your `PATH` (it usually is on Debian-family
+distros; on others add `export PATH="$HOME/.local/bin:$PATH"` to your
+shell rc).
 
 Then re-run `cargo test`. Tests gracefully skip-with-notice (printing
 the install command above) when the Go binary isn't on `PATH`.
