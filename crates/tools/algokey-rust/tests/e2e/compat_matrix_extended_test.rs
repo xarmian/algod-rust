@@ -880,15 +880,36 @@ async fn row_keyreg_offline(report: &mut MatrixReport, workdir: &Path, net: &Loc
             }
         }
 
-        // Sign with whichever side is opposite the producer. Both produce the
-        // same wire bytes, so signing with Rust's CLI is fine for both rows.
-        rust_algokey()
-            .args(["sign", "-m", &mnemonic, "-t"])
-            .arg(&off_txn)
-            .arg("-o")
-            .arg(&off_signed)
-            .assert()
-            .success();
+        // Sign with the OPPOSITE side from the producer — that's the actual
+        // cross-impl consumer step. Without this, the row could falsely pass
+        // even if the producer side emitted a txn the other side couldn't
+        // decode (same class of gap Codex flagged on multisig-partial).
+        match direction {
+            Direction::GoToRust => {
+                // Go produced the off_txn; Rust signs to prove Rust can
+                // decode + sign Go's keyreg artifact.
+                rust_algokey()
+                    .args(["sign", "-m", &mnemonic, "-t"])
+                    .arg(&off_txn)
+                    .arg("-o")
+                    .arg(&off_signed)
+                    .assert()
+                    .success();
+            }
+            Direction::RustToGo => {
+                // Rust produced the off_txn; Go signs to prove Go can decode
+                // + sign Rust's keyreg artifact.
+                let _ = run_go(&[
+                    "sign",
+                    "-m",
+                    &mnemonic,
+                    "-t",
+                    off_txn.to_str().unwrap(),
+                    "-o",
+                    off_signed.to_str().unwrap(),
+                ]);
+            }
+        }
         let off_stx = read_signed_txn(&off_signed);
         let off_txid = e2e::submit_raw_txn(net, &canonical_encode_signed_transaction(&off_stx))
             .await
