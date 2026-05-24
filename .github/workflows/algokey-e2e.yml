@@ -1,0 +1,111 @@
+name: algokey-rust e2e
+
+# End-to-end test suite for algokey-rust against a live algod-go localnet
+# AND the pinned go-algorand@v4.5.1-stable `algokey` binary for the
+# bidirectional compatibility matrix.
+#
+# Runs only when paths the suite actually exercises change, so most PRs
+# don't pay the 5-10 minute localnet + Go build cost. See PLAN-183 for
+# the underlying Phase D scope.
+
+on:
+  pull_request:
+    paths:
+      - "crates/tools/algokey-rust/**"
+      - "crates/core/algo-consensus-crypto/src/passphrase/**"
+      - "crates/core/algo-consensus-crypto/src/multisig/**"
+      - "crates/core/algo-consensus-crypto/src/merklesig/**"
+      - "crates/core/algo-ledger/src/participation/**"
+      - "crates/core/algo-ledger/src/erasable_db.rs"
+      - "crates/core/algo-types/src/networks.rs"
+      - "crates/node/algo-rest-client/**"
+      - "docker/docker-compose.yml"
+      - "Makefile"
+      - ".github/workflows/algokey-e2e.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/tools/algokey-rust/**"
+      - "crates/core/algo-consensus-crypto/src/passphrase/**"
+      - "crates/core/algo-consensus-crypto/src/multisig/**"
+      - "crates/core/algo-consensus-crypto/src/merklesig/**"
+      - "crates/core/algo-ledger/src/participation/**"
+      - "crates/core/algo-ledger/src/erasable_db.rs"
+      - "crates/core/algo-types/src/networks.rs"
+      - "crates/node/algo-rest-client/**"
+      - "docker/docker-compose.yml"
+      - "Makefile"
+      - ".github/workflows/algokey-e2e.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: algokey-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+  # Pin go-algorand to the same rev the rest of the repo references. Bumping
+  # this also requires updating the local `../go-algorand` checkout and any
+  # fixture READMEs that mention v4.5.1-stable.
+  GO_ALGORAND_REV: "v4.5.1-stable"
+
+jobs:
+  e2e:
+    name: algokey-rust e2e against live algod-go localnet
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: algokey-e2e
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Build pinned `algokey` from go-algorand
+        run: |
+          set -euo pipefail
+          # `go build -o <path>` needs the parent directory to exist.
+          mkdir -p "$HOME/.local/bin"
+          mkdir -p "$RUNNER_TEMP/go-algorand-src"
+          git clone --depth 1 --branch "$GO_ALGORAND_REV" \
+            https://github.com/algorand/go-algorand.git \
+            "$RUNNER_TEMP/go-algorand-src"
+          cd "$RUNNER_TEMP/go-algorand-src"
+          go build -o "$HOME/.local/bin/algokey" ./cmd/algokey
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/algokey" -v | head -3
+
+      - name: Bring up algod-go localnet
+        run: make localnet-up
+
+      - name: Run algokey-rust e2e suite (smoke + keyreg + compat matrix)
+        # `--test-threads=1` serializes the e2e test binaries so they don't
+        # race on the shared localnet's account/round state.
+        run: cargo test -p algokey-rust --features e2e -- --test-threads=1
+
+      - name: Upload JUnit compat-matrix reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: algokey-compat-matrix-${{ github.sha }}
+          path: target/algokey-compat-matrix-*.xml
+          if-no-files-found: warn
+
+      - name: Tear down localnet
+        if: always()
+        run: make localnet-down

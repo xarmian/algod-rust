@@ -10,7 +10,7 @@ PHASE6_CLUSTER := ops/mixed-cluster
 .PHONY: avm-replay avm-replay-mainnet
 .PHONY: bench-rust bench-decode bench-go bench-micro bench-micro-go bench-cluster benchmark
 .PHONY: archival-up archival-down
-.PHONY: localnet-up localnet-down localnet-status localnet-logs
+.PHONY: localnet-up localnet-down localnet-status localnet-logs algokey-e2e
 .PHONY: capture validate validate-only generate-txns fixtures help
 .PHONY: generate-diverse-txns fixtures-diverse
 .PHONY: canonical-extract extract-trackerdb-fixtures
@@ -64,6 +64,25 @@ localnet-status:
 
 localnet-logs:
 	$(COMPOSE) logs -f algod-go
+
+## algokey-rust end-to-end suite against a live algod-go localnet (PLAN-183 Phase D).
+## Brings the localnet up, runs the smoke + keyreg + compat-matrix tests,
+## and tears the localnet down even if the test suite fails.
+##
+## Prerequisites:
+##   - docker + docker compose
+##   - go-algorand@v4.5.1-stable `algokey` binary on PATH (compat matrix only;
+##     missing binary causes the matrix tests to skip-with-notice rather than fail)
+##
+## `--test-threads=1` serializes the e2e test binaries so they don't race on
+## the shared localnet's account/round state.
+algokey-e2e:
+	$(MAKE) localnet-up
+	@echo "==> Running algokey-rust e2e suite..."
+	@cargo test -p algokey-rust --features e2e -- --test-threads=1; \
+	  STATUS=$$?; \
+	  $(MAKE) localnet-down; \
+	  exit $$STATUS
 
 ## ── Transaction Generation ───────────────────────────────────
 
@@ -476,6 +495,12 @@ help:
 	@echo "  make localnet-down    Stop devnet and remove volumes"
 	@echo "  make localnet-status  Query node status"
 	@echo "  make localnet-logs    Tail algod-go logs"
+	@echo ""
+	@echo "algokey-rust E2E:"
+	@echo "  make algokey-e2e      Bring up localnet, run algokey-rust e2e suite (smoke +"
+	@echo "                        keyreg + Go↔Rust compat matrix), tear down. Requires"
+	@echo '                        go-algorand@v4.5.1-stable `algokey` on PATH for the'
+	@echo "                        compat matrix (else skipped). PLAN-183."
 	@echo ""
 	@echo "Transaction Generation:"
 	@echo "  make generate-txns          Send N payment transactions (default N=6)"

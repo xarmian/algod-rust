@@ -818,3 +818,23 @@ mkdir -p "$FIXDIR"
    the fixture pair using the new binary. The bit-identical check
    then proves the Rust REST layer's encoder agrees with the new
    Go release on the same on-disk DB.
+
+## algokey-rust End-to-End Suite
+
+The `algokey-rust` tool ships with an end-to-end test suite that drives
+a live `algod-go` localnet and cross-checks every artifact against the
+pinned `go-algorand@v4.5.1-stable` `algokey` binary.
+
+```bash
+# One-command run (brings up localnet, runs all e2e binaries, tears down):
+make algokey-e2e
+```
+
+See [`crates/tools/algokey-rust/README.md`](../crates/tools/algokey-rust/README.md)
+for the full workflow — prerequisites, individual test invocations, the
+JUnit XML output, and CI path-filter details.
+
+The suite is also wired into CI as
+[`.github/workflows/algokey-e2e.yml`](../.github/workflows/algokey-e2e.yml),
+triggered automatically on PRs touching `algokey-rust` or its
+dependencies. Unrelated commits skip it.
