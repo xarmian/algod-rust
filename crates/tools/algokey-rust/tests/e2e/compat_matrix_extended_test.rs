@@ -24,14 +24,14 @@ mod e2e;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use algo_codec::canonical_encode_signed_transaction;
+use algo_codec::{canonical_encode_signed_transaction, canonical_encode_transaction};
 use algo_consensus_crypto::{key_to_mnemonic, multisig::multisig_addr_gen};
 use algo_types::{
     Address, MultisigSig, MultisigSubsig, Round, SignedTransaction, Transaction, TxnType,
 };
 use algo_validate::signature::verify_multisig;
 use assert_cmd::Command as AssertCmd;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use rand::RngCore;
 use tempfile::TempDir;
 
@@ -74,6 +74,24 @@ fn read_signed_txn(path: &Path) -> SignedTransaction {
 fn write_msgpack_signed(path: &Path, stx: &SignedTransaction) {
     let bytes = canonical_encode_signed_transaction(stx);
     std::fs::write(path, bytes).expect("write SignedTransaction");
+}
+
+/// Verify an ed25519 signature over `"TX" || canonical_encode(txn)`. Mirrors
+/// what `verify_single_sig` does for the `sig` field, but operates on any
+/// supplied (pubkey, sig) pair so we can audit individual msig subsig slots.
+fn verify_ed25519_over_txn(
+    txn: &Transaction,
+    pubkey: &[u8; 32],
+    signature: &[u8; 64],
+) -> Result<(), String> {
+    let vk = VerifyingKey::from_bytes(pubkey).map_err(|e| format!("invalid pubkey: {e}"))?;
+    let sig = Signature::from_bytes(signature);
+    let canonical = canonical_encode_transaction(txn);
+    let mut msg = Vec::with_capacity(2 + canonical.len());
+    msg.extend_from_slice(b"TX");
+    msg.extend_from_slice(&canonical);
+    vk.verify(&msg, &sig)
+        .map_err(|e| format!("ed25519 verify: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +217,17 @@ async fn row_multisig_partial(report: &mut MatrixReport, workdir: &Path, net: &L
                 "Go filled more than slot 0 — expected partial",
             );
         } else {
-            report.pass(artifact, Direction::GoToRust);
+            // Cryptographically verify Go's signature against A's pubkey
+            // over "TX" || canonical_encode(txn). Otherwise arbitrary
+            // nonzero bytes in slot 0 would slip past.
+            match verify_ed25519_over_txn(&signed.txn, &a.address.0, &msig.subsigs[0].signature) {
+                Ok(()) => report.pass(artifact, Direction::GoToRust),
+                Err(e) => report.fail(
+                    artifact,
+                    Direction::GoToRust,
+                    format!("Rust rejects Go's slot-A signature: {e}"),
+                ),
+            }
         }
     }
 
@@ -504,7 +532,19 @@ async fn row_append_auth_addr(report: &mut MatrixReport, workdir: &Path, net: &L
                 .collect::<Vec<_>>(),
         )
         .expect("derive msig addr");
-        if derived == msig_addr && msig.threshold == 2 {
+        // The defining behavior of append-auth-addr is setting the txn's
+        // AuthAddr to the multisig address — assert that, not just the
+        // preimage's correctness.
+        if signed.auth_addr != Some(msig_addr) {
+            report.fail(
+                artifact,
+                Direction::GoToRust,
+                format!(
+                    "Go output's auth_addr {:?} ≠ expected msig_addr {msig_addr}",
+                    signed.auth_addr
+                ),
+            );
+        } else if derived == msig_addr && msig.threshold == 2 {
             report.pass(artifact, Direction::GoToRust);
         } else {
             report.fail(
