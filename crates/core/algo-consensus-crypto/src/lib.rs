@@ -10,6 +10,7 @@
 
 pub mod merklearray;
 pub mod merklesig;
+pub mod merklesignature;
 pub mod multisig;
 pub mod onetimesig;
 pub mod passphrase;
