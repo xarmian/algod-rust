@@ -79,13 +79,14 @@ jobs:
       - name: Build pinned `algokey` from go-algorand
         run: |
           set -euo pipefail
+          # `go build -o <path>` needs the parent directory to exist.
+          mkdir -p "$HOME/.local/bin"
           mkdir -p "$RUNNER_TEMP/go-algorand-src"
           git clone --depth 1 --branch "$GO_ALGORAND_REV" \
             https://github.com/algorand/go-algorand.git \
             "$RUNNER_TEMP/go-algorand-src"
           cd "$RUNNER_TEMP/go-algorand-src"
           go build -o "$HOME/.local/bin/algokey" ./cmd/algokey
-          mkdir -p "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/algokey" -v | head -3
 
