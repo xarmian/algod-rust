@@ -1,6 +1,9 @@
 /target/
 **/target/
 .claude/
+.codex
+# Compiled vector-capture binaries (built via `go build` in their dirs)
+tools/*-vector-capture/*-vector-capture
 # Bench output JSON — produced by `trie_replay` and `go-trie-replay-bench`.
 bench-results/
 **/bench-results/
