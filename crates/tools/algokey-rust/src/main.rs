@@ -42,9 +42,8 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Some(PartSub::Keyreg(args)) => commands::keyreg::run(args),
-            Some(PartSub::Generate(_) | PartSub::Info(_) | PartSub::Reparent(_)) => {
-                not_implemented()
-            }
+            Some(PartSub::Info(args)) => commands::part::info::run(args),
+            Some(PartSub::Generate(_) | PartSub::Reparent(_)) => not_implemented(),
         },
     }
 }

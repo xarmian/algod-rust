@@ -6,4 +6,5 @@ pub mod generate;
 pub mod import;
 pub mod keyreg;
 pub mod multisig;
+pub mod part;
 pub mod sign;

@@ -14,6 +14,7 @@ algo-codec.workspace = true
 algo-consensus-crypto.workspace = true
 algo-ledger.workspace = true
 algo-types.workspace = true
+data-encoding = { workspace = true }
 ed25519-dalek.workspace = true
 rand.workspace = true
 rmp-serde = { workspace = true }

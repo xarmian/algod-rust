@@ -208,6 +208,8 @@ fn fully_specified_subcommands_stub_to_not_implemented() {
         // see src/commands/multisig/append_auth_addr.rs.
         // `part keyreg` is no longer stubbed (TASK-170); see
         // src/commands/keyreg.rs.
+        // `part info` is no longer stubbed (TASK-179); see
+        // src/commands/part/info.rs and tests/part_info_test.rs.
         &[
             "part",
             "generate",
@@ -218,7 +220,6 @@ fn fully_specified_subcommands_stub_to_not_implemented() {
             "--last",
             "1000",
         ],
-        &["part", "info", "--keyfile", "/tmp/k"],
         &["part", "reparent", "--keyfile", "/tmp/k", "--parent", "A"],
     ];
     for argv in cases {
