@@ -91,6 +91,13 @@ impl Localnet {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
+        // Health-wait timed out. We brought the container up but never
+        // produced a Localnet instance, so Drop won't run — best-effort
+        // teardown here to avoid leaking a half-started container + volume.
+        if let Err(e) = run_compose(&["down", "-v"], COMPOSE_UP_TIMEOUT) {
+            eprintln!("warning: cleanup after failed bring-up also failed: {e}");
+        }
+
         Err(AlgoError::Network {
             message: format!(
                 "localnet did not become REST-responsive within {}s after `docker compose up -d algod-go`",
