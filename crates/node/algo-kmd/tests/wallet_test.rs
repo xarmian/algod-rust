@@ -207,6 +207,31 @@ fn fetch_missing_wallet_returns_not_found() {
 }
 
 #[test]
+fn driver_new_creates_missing_parent_directories() {
+    // Regression for Codex PR #348 round 2: previously used
+    // std::fs::create_dir, which errors if any parent component
+    // doesn't exist. WalletDriver::new now uses create_dir_all so a
+    // fresh install on a deep path succeeds.
+    let dir = TempDir::new().unwrap();
+    let deep = dir.path().join("a").join("b").join("c").join("wallets");
+    let driver = WalletDriver::new(WalletDriverConfig {
+        wallets_dir: deep.clone(),
+        scrypt_params: ScryptParams {
+            scrypt_n: 1024,
+            scrypt_r: 1,
+            scrypt_p: 1,
+        },
+        allow_unsafe_scrypt: true,
+    })
+    .expect("deep path must be created");
+    assert!(deep.exists(), "deep wallets_dir must exist after new()");
+    // And the driver remains usable end-to-end on the fresh path.
+    driver
+        .create_wallet(b"deep", b"id-deep", b"pw", None)
+        .unwrap();
+}
+
+#[test]
 fn from_kmd_config_substitutes_default_subdir() {
     let dir = TempDir::new().unwrap();
     let sqlite_cfg = SQLiteWalletDriverConfig {

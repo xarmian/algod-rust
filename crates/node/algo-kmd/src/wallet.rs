@@ -62,8 +62,11 @@ impl std::fmt::Debug for WalletDriver {
 impl WalletDriver {
     /// Construct a driver and ensure the wallets directory exists.
     /// Mirrors `InitWithConfig` (sqlite.go:137) — same scrypt-params
-    /// validation, same `maybeMakeWalletsDir` semantics
-    /// (`mkdir -p` with 0700 perms on Unix; ignore "already exists").
+    /// validation, then `maybeMakeWalletsDir` (sqlite.go:310). We
+    /// deliberately widen Go's non-recursive `os.Mkdir` to a recursive
+    /// `create_dir_all` so a fresh kmd-rust install on a path whose
+    /// parents don't yet exist succeeds rather than erroring out; the
+    /// leaf permissions (`0700` on Unix) still match Go.
     pub fn new(cfg: WalletDriverConfig) -> Result<Self> {
         if !cfg.allow_unsafe_scrypt {
             if (cfg.scrypt_params.scrypt_n as u32) < MIN_SCRYPT_N {
@@ -430,11 +433,16 @@ fn encode_max_key_idx(n: u64) -> Result<Vec<u8>> {
 }
 
 fn maybe_make_wallets_dir(dir: &Path) -> Result<()> {
-    match std::fs::create_dir(dir) {
-        Ok(_) => set_unix_perms(dir, SQLITE_WALLETS_DIR_PERMISSIONS),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(Error::Io(e)),
+    // Recursive create — see WalletDriver::new doc for the deliberate
+    // divergence from Go's non-recursive os.Mkdir (sqlite.go:312). We
+    // still apply 0700 perms to the leaf directory below so a freshly
+    // created tree gets the same final mode Go uses.
+    let already_existed = dir.exists();
+    std::fs::create_dir_all(dir).map_err(Error::Io)?;
+    if !already_existed {
+        set_unix_perms(dir, SQLITE_WALLETS_DIR_PERMISSIONS)?;
     }
+    Ok(())
 }
 
 #[cfg(unix)]
