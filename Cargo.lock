@@ -169,6 +169,7 @@ dependencies = [
  "hex",
  "num-bigint",
  "rand 0.8.5",
+ "rand_chacha 0.3.1",
  "rmp",
  "serde",
  "serde_bytes",
@@ -449,12 +450,17 @@ dependencies = [
 name = "algokey-rust"
 version = "0.1.0"
 dependencies = [
+ "algo-codec",
  "algo-consensus-crypto",
+ "algo-ledger",
  "algo-types",
  "clap",
+ "data-encoding",
  "ed25519-dalek",
  "hex",
  "rand 0.8.5",
+ "rmp-serde",
+ "serde",
  "tempfile",
 ]
 

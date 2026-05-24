@@ -21,7 +21,7 @@
 //! These match go-algorand's `protocol.OneTimeSigKey1` / `OneTimeSigKey2`.
 
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use rand::Rng;
+use rand::{Rng, RngCore};
 use zeroize::Zeroize;
 
 // ── Domain separation prefixes ─────────────────────────────────────────────
@@ -29,6 +29,16 @@ use zeroize::Zeroize;
 /// Generate a random ed25519 signing key using the thread-local RNG.
 fn random_signing_key() -> SigningKey {
     let seed: [u8; 32] = rand::thread_rng().gen();
+    SigningKey::from_bytes(&seed)
+}
+
+/// Generate a random ed25519 signing key from the supplied RNG.
+///
+/// Mirrors go-algorand's `ed25519GenerateKeyRNG(rng crypto.RNG)`: a 32-byte
+/// seed is drawn from `rng` and expanded by ed25519 to (pk, sk).
+fn random_signing_key_with_rng<R: RngCore>(rng: &mut R) -> SigningKey {
+    let mut seed = [0u8; 32];
+    rng.fill_bytes(&mut seed);
     SigningKey::from_bytes(&seed)
 }
 
@@ -304,9 +314,57 @@ impl OneTimeSignatureSecrets {
     ///
     /// This creates a fresh master ed25519 keypair and pre-generates all batch subkeys.
     /// Offset subkeys are generated lazily during `sign` or `delete_before`.
+    ///
+    /// Matches go-algorand's
+    /// `crypto.GenerateOneTimeSignatureSecrets(startBatch, numBatches)`
+    /// (`crypto/onetimesig.go:282`), which delegates to `…RNG(…, SystemRNG)`.
     pub fn generate(start_batch: u64, num_batches: u64) -> Self {
         let master = random_signing_key();
         Self::generate_with_master(master, start_batch, num_batches)
+    }
+
+    /// Generate a new OTS key tree drawing all randomness from `rng`.
+    ///
+    /// Mirrors go-algorand's
+    /// `crypto.GenerateOneTimeSignatureSecretsRNG(startBatch, numBatches, rng)`
+    /// (`crypto/onetimesig.go:253`). All ed25519 seeds — master and every
+    /// batch subkey — are drawn from `rng` in the same order as Go:
+    /// first the master seed, then `num_batches` batch seeds.
+    ///
+    /// Note: byte-for-byte parity with a Go `crypto.PRNG`-seeded run requires
+    /// matching Go's HMAC-DRBG; this entry point lets callers feed any
+    /// `RngCore`, which is sufficient for deterministic-Rust testing and for
+    /// `FillDBWithParticipationKeys` to inject randomness.
+    pub fn generate_with_rng<R: RngCore>(start_batch: u64, num_batches: u64, rng: &mut R) -> Self {
+        let master = random_signing_key_with_rng(rng);
+        let mut batches = Vec::with_capacity(num_batches as usize);
+
+        for i in 0..num_batches {
+            let batch_key = random_signing_key_with_rng(rng);
+            let batch_num = start_batch + i;
+            let batch_pk = batch_key.verifying_key().to_bytes();
+
+            // Master signs BatchID(batch_pk, batch_num)
+            let msg = batch_id_message(&batch_pk, batch_num);
+            let sig = master.sign(&msg);
+
+            batches.push(EphemeralSubkey::from_signing_key(
+                &batch_key,
+                sig.to_bytes(),
+            ));
+        }
+
+        OneTimeSignatureSecrets {
+            master,
+            batches,
+            first_batch: start_batch,
+            offsets: Vec::new(),
+            first_offset: 0,
+            offsets_pk2: [0u8; 32],
+            offsets_pk2_sig: [0u8; 64],
+            restored_verifier: None,
+            is_restored: false,
+        }
     }
 
     /// Generate from a specific master key (useful for deterministic testing).
