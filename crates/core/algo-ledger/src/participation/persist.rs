@@ -17,6 +17,7 @@ use thiserror::Error;
 
 use crate::erasable_db::ErasableDb;
 use crate::participation::install::{part_install_database, InstallError};
+use crate::participation::stateproof_persist::{persist_secrets, StateProofPersistError};
 use crate::participation::Participation;
 
 /// Errors from [`persist_participation`] / [`persist_new_parent`].
@@ -28,19 +29,30 @@ pub enum PersistError {
     /// Schema install failed (table create conflict, etc.).
     #[error("install: {0}")]
     Install(#[from] InstallError),
+    /// StateProofKeys persistence (per-row INSERT) failed.
+    #[error("state proof keys: {0}")]
+    StateProofPersist(#[from] StateProofPersistError),
 }
 
 /// Persist a [`Participation`] into an empty partkey DB.
 ///
-/// Mirrors `(PersistedParticipation).Persist` in
-/// `participation.go:281-305`: installs the schema, then INSERTs one row
-/// with the msgpack-encoded VRF, Voting, and StateProof blobs. The
-/// `StateProofKeys` table is NOT written here — that is owned by
-/// TASK-176 and called as a follow-up under the same db transaction (Go
-/// uses `PersistWithSecrets` to chain the two together).
+/// Mirrors Go's `(PersistedParticipation).PersistWithSecrets` chain
+/// (`participation.go:281-305` + `persistentMerkleSignatureScheme.go::Persist`):
 ///
-/// The whole operation runs inside a single sqlite transaction so a
-/// partial-install on error leaves the file empty.
+/// 1. First tx: install the partkey schema + INSERT the single
+///    `ParticipationAccount` row with msgpack-encoded VRF, Voting and
+///    StateProof-metadata blobs (mirrors `Persist`).
+/// 2. Second tx (if `part.state_proof_secrets` is `Some`): install the
+///    StateProofKeys table and INSERT one row per ephemeral Falcon key
+///    (mirrors `(*Secrets).Persist`).
+///
+/// Go runs the two writes in separate `Atomic` blocks — we follow the
+/// same boundary so a state-proof-persist failure leaves the
+/// `ParticipationAccount` row written (matches Go behaviour). A
+/// participation with `state_proof_secrets == None` skips the second
+/// transaction and produces a DB without the StateProofKeys table —
+/// matches Go's behaviour for participations generated without state
+/// proof support.
 pub fn persist_participation(
     db: &mut ErasableDb,
     part: &Participation,
@@ -70,6 +82,17 @@ pub fn persist_participation(
         ],
     )?;
     tx.commit()?;
+
+    // Second transaction (mirrors Go's PersistWithSecrets chain): when
+    // the participation owns state-proof secrets, also persist the
+    // ephemeral Falcon keys into the StateProofKeys table.
+    if let Some(ref secrets) = part.state_proof_secrets {
+        // Persist only when the secrets actually carry ephemeral keys
+        // (zero-key windows produce no rows). A non-empty key vector with
+        // a zero key_lifetime is the only configuration that errors —
+        // surface that as a PersistError.
+        persist_secrets(db, secrets)?;
+    }
     Ok(())
 }
 

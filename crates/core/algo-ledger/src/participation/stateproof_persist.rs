@@ -1,5 +1,14 @@
 //! StateProofKeys table writer — installs the table + persists the in-memory
-//! Falcon ephemeral keys from a `merklesignature::Secrets` (TASK-174).
+//! Falcon ephemeral keys from an MSS [`merklesig::Secrets`].
+//!
+//! The writer accepts [`algo_consensus_crypto::merklesig::Secrets`] (the
+//! type the participation pipeline produces and stores in
+//! `Participation::state_proof_secrets`), NOT the parallel-keygen
+//! [`algo_consensus_crypto::merklesignature::Secrets`] introduced in
+//! TASK-174. TASK-174's `Secrets` is a primitive used by future writer
+//! paths that want parallel Falcon keygen; the existing participation
+//! flow continues to use `merklesig::Secrets`, which is what this
+//! writer must persist.
 //!
 //! Mirrors `../go-algorand/crypto/merklesignature/persistentMerkleSignatureScheme.go`
 //! lines 39-135 (v4.5.1-stable). The schema-version tracking row lives in
@@ -39,7 +48,7 @@
 //! for any downstream consumer. We match that exactly: `persist_secrets`
 //! does not clear `secrets.ephemeral_keys`.
 
-use algo_consensus_crypto::merklesignature::{posdivs::index_to_round, FalconSigner, Secrets};
+use algo_consensus_crypto::merklesig::{index_to_round, Secrets};
 use rusqlite::{params, Transaction};
 use thiserror::Error;
 
@@ -173,7 +182,9 @@ pub fn persist_secrets(
         let mut stmt =
             tx.prepare("INSERT INTO StateProofKeys (id, round, key) VALUES (?1, ?2, ?3)")?;
         for (i, key) in secrets.ephemeral_keys.iter().enumerate() {
-            let encoded = encode_falcon_signer(key);
+            // Use the canonical encoder colocated with FalconSigner so the
+            // wire format always matches what the Phase B reader expects.
+            let encoded = key.to_msgpack();
             stmt.execute(params![i as i64, round as i64, &encoded])?;
             round += key_lifetime;
         }
@@ -198,48 +209,11 @@ fn mss_schema_row_is_current(conn: &rusqlite::Connection) -> bool {
     .unwrap_or(false)
 }
 
-/// Encode a `merklesignature::FalconSigner` in the wire format the
-/// existing Phase B reader (`merklesig::FalconSigner::from_msgpack`)
-/// understands: a 2-entry fixmap `{ "pk": bin, "sk": bin }`.
-///
-/// The reader matches Go's `msgp_gen.go`-generated `FalconSigner` decoder
-/// (`codec:"pk"` / `codec:"sk"`), so the canonical encoding here is the
-/// same map. Field order is alphabetical: `pk` then `sk`.
-fn encode_falcon_signer(signer: &FalconSigner) -> Vec<u8> {
-    use rmp::encode::{write_bin, write_str};
-    let pk = signer.public_key();
-    let sk = signer.private_key();
-
-    let pk_zero = pk.iter().all(|&b| b == 0);
-    let sk_zero = sk.iter().all(|&b| b == 0);
-
-    let mut field_count: u8 = 0;
-    if !pk_zero {
-        field_count += 1;
-    }
-    if !sk_zero {
-        field_count += 1;
-    }
-
-    let mut buf = Vec::with_capacity(pk.len() + sk.len() + 16);
-    buf.push(0x80 | field_count);
-
-    if !pk_zero {
-        write_str(&mut buf, "pk").unwrap();
-        write_bin(&mut buf, pk).unwrap();
-    }
-    if !sk_zero {
-        write_str(&mut buf, "sk").unwrap();
-        write_bin(&mut buf, sk).unwrap();
-    }
-    buf
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::participation::install::part_install_database;
-    use algo_consensus_crypto::merklesignature::Secrets as MssSecrets;
+    use algo_consensus_crypto::merklesig::Secrets as MssSecrets;
     use rusqlite::Connection;
 
     fn fresh_partkey_conn() -> Connection {
@@ -363,8 +337,8 @@ mod tests {
             assert!(!blob.is_empty(), "row {i} blob empty");
             let (decoded, _) =
                 algo_consensus_crypto::merklesig::FalconSigner::from_msgpack(blob).expect("decode");
-            assert_eq!(decoded.pk, secrets.ephemeral_keys[i].public_key());
-            assert_eq!(decoded.sk, secrets.ephemeral_keys[i].private_key());
+            assert_eq!(decoded.pk, secrets.ephemeral_keys[i].pk);
+            assert_eq!(decoded.sk, secrets.ephemeral_keys[i].sk);
         }
 
         drop(db);
