@@ -195,12 +195,13 @@ fn get_verifier_commitment_matches_tree_root() {
 }
 
 #[test]
-fn get_key_finds_each_round_and_misses_others() {
+fn get_key_finds_each_round_and_floors_within_lifetime() {
     let secrets =
         Secrets::new(1, KEY_LIFETIME_DEFAULT * 3, KEY_LIFETIME_DEFAULT).expect("must succeed");
     let pairs = secrets.get_all_keys();
     assert_eq!(pairs.len(), 3);
 
+    // Exact-aligned round returns the owning key.
     for pair in &pairs {
         let key = secrets
             .get_key(pair.round)
@@ -208,14 +209,28 @@ fn get_key_finds_each_round_and_misses_others() {
         assert_eq!(key.public_key(), pair.key.public_key());
     }
 
-    // Non-aligned round returns None.
-    assert!(
-        secrets.get_key(KEY_LIFETIME_DEFAULT + 1).is_none(),
-        "round not divisible by key_lifetime must return None"
+    // Any round inside a key's lifetime window floors to that key —
+    // matches Go's `firstRoundInKeyLifetime`-then-index semantics.
+    let mid_round = KEY_LIFETIME_DEFAULT + 1;
+    let mid_key = secrets
+        .get_key(mid_round)
+        .expect("rounds inside a key lifetime must resolve to the floor key");
+    assert_eq!(
+        mid_key.public_key(),
+        pairs[0].key.public_key(),
+        "round {mid_round} should map to the round-{} key",
+        KEY_LIFETIME_DEFAULT
     );
+
     // Round before first owned round returns None.
     assert!(
         secrets.get_key(0).is_none(),
         "round 0 is not owned when first_valid=1"
+    );
+
+    // Round past the end of the participation window returns None.
+    assert!(
+        secrets.get_key(KEY_LIFETIME_DEFAULT * 10).is_none(),
+        "rounds past last_valid must return None"
     );
 }

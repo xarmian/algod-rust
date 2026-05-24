@@ -210,27 +210,29 @@ impl Secrets {
             .collect()
     }
 
-    /// Return the ephemeral key for `round`, if one exists.
+    /// Return the ephemeral key covering `round`, if one exists.
     ///
-    /// Mirrors `(*Secrets).GetSigner` (down to the existence check, not the
-    /// `Signer` wrapper which is signer-side and out of scope for TASK-174).
+    /// Mirrors `(*Secrets).GetSigner` semantics: a request for any round
+    /// floors to the key's first round in its key-lifetime window
+    /// (`firstRoundInKeyLifetime`) and indexes into `ephemeral_keys`. So
+    /// `get_key(300)` for `Secrets::new(256, 512, 256)` returns the key
+    /// at the round-256 slot.
+    ///
+    /// Returns `None` only when the round falls outside the participation
+    /// window (i.e. before the first owned key's round, or past the end
+    /// of `ephemeral_keys`).
     pub fn get_key(&self, round: u64) -> Option<&FalconSigner> {
         let first_valid = self.signer_context.first_valid;
         let key_lifetime = self.signer_context.key_lifetime;
         if key_lifetime == 0 {
             return None;
         }
-        // Only rounds that are exact multiples of key_lifetime (and ≥ rofi)
-        // are addressable.
         let valid_round = posdivs::first_round_in_key_lifetime(round, key_lifetime);
-        if valid_round != round {
-            return None;
-        }
         let rofi = posdivs::round_of_first_index(first_valid, key_lifetime);
-        if round < rofi {
+        if valid_round < rofi {
             return None;
         }
-        let idx = posdivs::round_to_index(first_valid, round, key_lifetime) as usize;
+        let idx = posdivs::round_to_index(first_valid, valid_round, key_lifetime) as usize;
         self.ephemeral_keys.get(idx)
     }
 }
