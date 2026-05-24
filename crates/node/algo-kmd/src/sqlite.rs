@@ -132,10 +132,28 @@ impl ClaimedWallets {
         Self::default()
     }
 
-    /// Reserve `(name, id)`. Returns `ErrSameName` or `ErrSameId` if a
-    /// matching entry is already claimed. Mirrors the duplicate check
-    /// in `claimWalletNameID` (sqlite.go:369–376).
+    /// Reserve `(name, id)` against the in-memory list only. Returns
+    /// `ErrSameName` or `ErrSameId` if a matching entry is already
+    /// claimed. Most callers should use [`Self::claim_with`] so the
+    /// on-disk dup-check happens inside the same critical section
+    /// (matching Go's `claimWalletNameID`).
     pub fn claim(&self, name: &[u8], id: &[u8]) -> Result<()> {
+        self.claim_with(name, id, |_, _| Ok(()))
+    }
+
+    /// Reserve `(name, id)` atomically with an extra validation step.
+    /// Mirrors `claimWalletNameID` (sqlite.go:364–410): under a single
+    /// lock acquisition, check the in-memory list, run the caller's
+    /// disk-side dup check, and only then append to the registry. If
+    /// `extra_check` fails the registry is unchanged, so a later retry
+    /// after the on-disk conflict is cleared can succeed — matching
+    /// Go's behavior where `claimedWallets` is only appended *after*
+    /// `os.Stat` + `findDBPathsBy{Name,ID}` all return clean
+    /// (sqlite.go:382–409).
+    pub fn claim_with<F>(&self, name: &[u8], id: &[u8], extra_check: F) -> Result<()>
+    where
+        F: FnOnce(&[u8], &[u8]) -> Result<()>,
+    {
         let mut guard = self.inner.lock().expect("ClaimedWallets mutex poisoned");
         for (n, i) in guard.iter() {
             if n.as_slice() == name {
@@ -145,6 +163,7 @@ impl ClaimedWallets {
                 return Err(Error::SameId);
             }
         }
+        extra_check(name, id)?;
         guard.push((name.to_vec(), id.to_vec()));
         Ok(())
     }
@@ -307,6 +326,51 @@ impl WalletDb {
     /// and version probes; not part of Go's surface.
     pub fn sqlite_version(&self) -> String {
         rusqlite::version().to_string()
+    }
+
+    /// Fetch the `mep_encrypted` blob from the metadata row. Mirrors
+    /// `decryptAndGetMasterKey`'s SELECT (sqlite.go:613).
+    pub fn read_mep_encrypted(&self) -> Result<Vec<u8>> {
+        self.read_blob_column("mep_encrypted")
+    }
+
+    /// Fetch the `mdk_encrypted` blob from the metadata row. Mirrors
+    /// `decryptAndGetMasterDerivationKey`'s SELECT (sqlite.go:637).
+    pub fn read_mdk_encrypted(&self) -> Result<Vec<u8>> {
+        self.read_blob_column("mdk_encrypted")
+    }
+
+    /// Fetch the `max_key_idx_encrypted` blob from the metadata row.
+    /// Used by key-derivation operations (TASK-205).
+    pub fn read_max_key_idx_encrypted(&self) -> Result<Vec<u8>> {
+        self.read_blob_column("max_key_idx_encrypted")
+    }
+
+    fn read_blob_column(&self, column: &'static str) -> Result<Vec<u8>> {
+        // `column` is a compile-time constant chosen from a known set
+        // above, so concatenation here is safe from injection.
+        let sql = format!("SELECT {column} FROM metadata LIMIT 1");
+        let mut stmt = self.conn.prepare(&sql).map_err(|_| Error::Database)?;
+        let bytes: Vec<u8> = stmt
+            .query_row([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|_| Error::Database)?;
+        Ok(bytes)
+    }
+
+    /// `UPDATE metadata SET wallet_name=? WHERE wallet_id=?`. Mirrors
+    /// `RenameWallet`'s UPDATE (sqlite.go:581).
+    pub fn update_wallet_name(&self, id: &[u8], new_name: &[u8]) -> Result<()> {
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE metadata SET wallet_name = ?1 WHERE wallet_id = ?2",
+                rusqlite::params![new_name, id],
+            )
+            .map_err(|_| Error::Database)?;
+        if rows == 0 {
+            return Err(Error::WalletNotFound);
+        }
+        Ok(())
     }
 }
 

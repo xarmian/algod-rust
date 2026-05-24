@@ -1,0 +1,12 @@
+{
+  "wallet_dir": "sqlite_wallets",
+  "db_relpath": "sqlite_wallets/interop-wallet.interop-id-1.db",
+  "wallet_name": "interop-wallet",
+  "wallet_id": "interop-id-1",
+  "password": "correct horse battery staple",
+  "mdk_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "scrypt_n": 1024,
+  "scrypt_r": 1,
+  "scrypt_p": 1,
+  "description": "wallet produced by go-algorand v4.5.1-stable daemon/kmd/wallet/driver.SQLiteWalletDriver.CreateWallet; used by algo-kmd's interop test to verify Rust can open and export the MDK"
+}
