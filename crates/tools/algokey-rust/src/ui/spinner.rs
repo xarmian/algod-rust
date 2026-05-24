@@ -148,7 +148,7 @@ mod tests {
                 for _ in 0..50 {
                     // Direct stderr lock — same code path eprintln! takes.
                     let mut s = std::io::stderr().lock();
-                    let _ = writeln!(s, "");
+                    let _ = s.write_all(b"\n");
                     let _ = s.flush();
                     drop(s);
                     thread::sleep(Duration::from_millis(2));
