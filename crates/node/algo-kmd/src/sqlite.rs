@@ -308,6 +308,51 @@ impl WalletDb {
     pub fn sqlite_version(&self) -> String {
         rusqlite::version().to_string()
     }
+
+    /// Fetch the `mep_encrypted` blob from the metadata row. Mirrors
+    /// `decryptAndGetMasterKey`'s SELECT (sqlite.go:613).
+    pub fn read_mep_encrypted(&self) -> Result<Vec<u8>> {
+        self.read_blob_column("mep_encrypted")
+    }
+
+    /// Fetch the `mdk_encrypted` blob from the metadata row. Mirrors
+    /// `decryptAndGetMasterDerivationKey`'s SELECT (sqlite.go:637).
+    pub fn read_mdk_encrypted(&self) -> Result<Vec<u8>> {
+        self.read_blob_column("mdk_encrypted")
+    }
+
+    /// Fetch the `max_key_idx_encrypted` blob from the metadata row.
+    /// Used by key-derivation operations (TASK-205).
+    pub fn read_max_key_idx_encrypted(&self) -> Result<Vec<u8>> {
+        self.read_blob_column("max_key_idx_encrypted")
+    }
+
+    fn read_blob_column(&self, column: &'static str) -> Result<Vec<u8>> {
+        // `column` is a compile-time constant chosen from a known set
+        // above, so concatenation here is safe from injection.
+        let sql = format!("SELECT {column} FROM metadata LIMIT 1");
+        let mut stmt = self.conn.prepare(&sql).map_err(|_| Error::Database)?;
+        let bytes: Vec<u8> = stmt
+            .query_row([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|_| Error::Database)?;
+        Ok(bytes)
+    }
+
+    /// `UPDATE metadata SET wallet_name=? WHERE wallet_id=?`. Mirrors
+    /// `RenameWallet`'s UPDATE (sqlite.go:581).
+    pub fn update_wallet_name(&self, id: &[u8], new_name: &[u8]) -> Result<()> {
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE metadata SET wallet_name = ?1 WHERE wallet_id = ?2",
+                rusqlite::params![new_name, id],
+            )
+            .map_err(|_| Error::Database)?;
+        if rows == 0 {
+            return Err(Error::WalletNotFound);
+        }
+        Ok(())
+    }
 }
 
 /// Map a rusqlite error to the closest Go counterpart. UNIQUE-constraint

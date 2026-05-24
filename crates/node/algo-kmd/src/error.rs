@@ -84,6 +84,43 @@ pub enum Error {
     #[error("wallet crypto envelope error")]
     Crypto,
 
+    /// Configured scrypt parameter is below the production minimum and
+    /// `allow_unsafe_scrypt` is not set. Mirrors the `errors.New(...)`
+    /// calls in `InitWithConfig` (sqlite.go:142–151). The carried
+    /// `&'static str` names which parameter (`"N"`, `"R"`, `"P"`).
+    #[error("scrypt parameter {0} is below the production minimum")]
+    ScryptTooWeak(&'static str),
+
+    /// Wallet name longer than `sqliteMaxWalletNameLen`. Mirrors
+    /// `errNameTooLong` (sqlite.go:415).
+    #[error(
+        "wallet name exceeds {} bytes",
+        crate::sqlite::SQLITE_MAX_WALLET_NAME_LEN
+    )]
+    NameTooLong,
+
+    /// Wallet id longer than `sqliteMaxWalletIDLen`. Mirrors
+    /// `errIDTooLong` (sqlite.go:419).
+    #[error("wallet id exceeds {} bytes", crate::sqlite::SQLITE_MAX_WALLET_ID_LEN)]
+    IdTooLong,
+
+    /// No wallet with the requested id exists. Mirrors
+    /// `errWalletNotFound` (sqlite.go:512).
+    #[error("wallet not found")]
+    WalletNotFound,
+
+    /// Multiple wallets share the requested id (i.e. someone dropped a
+    /// duplicate `.db` file into the wallets directory). Mirrors
+    /// `errIDConflict` (sqlite.go:518).
+    #[error("multiple wallets with the same id")]
+    IdConflict,
+
+    /// Operation requires [`crate::wallet::Wallet::init`] to have
+    /// succeeded first. Go enforces this implicitly because every key
+    /// op runs `Init`-like checks; we make it explicit.
+    #[error("wallet has not been unlocked (call Wallet::init first)")]
+    WalletNotInitialized,
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

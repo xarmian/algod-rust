@@ -15,6 +15,9 @@ pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod sqlite;
+pub mod wallet;
+
+pub use wallet::{Wallet, WalletDriver, WalletDriverConfig};
 
 pub use crypto::{
     decrypt_blob_with_password, encrypt_blob_with_key, encrypt_blob_with_nonce_and_salt,
