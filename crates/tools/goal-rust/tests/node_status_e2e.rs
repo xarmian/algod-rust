@@ -333,6 +333,33 @@ fn node_generatetoken_refuses_when_algod_unreachable_ambiguously() {
 }
 
 #[test]
+fn node_generatetoken_refuses_when_algod_net_is_empty() {
+    // Regression guard (Codex review of TASK-224 round 3): an
+    // empty `algod.net` is ambiguous (partial write, truncation,
+    // half-initialized data dir). The conservative guard must
+    // refuse rotation in that case.
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(data_dir.path().join("algod.net"), "").unwrap();
+    std::fs::write(data_dir.path().join("algod.token"), "preserve\n").unwrap();
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(data_dir.path())
+        .args(["node", "generatetoken"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("run goal-rust node generatetoken");
+    assert!(
+        !out.status.success(),
+        "empty algod.net is ambiguous — generatetoken must refuse",
+    );
+    assert_eq!(
+        std::fs::read_to_string(data_dir.path().join("algod.token")).unwrap(),
+        "preserve\n",
+        "token file must NOT be rewritten",
+    );
+}
+
+#[test]
 fn node_generatetoken_writes_64_hex_token_when_algod_down() {
     // No mock algod ⇒ /health connect-refuses ⇒ `algod_is_running`
     // returns false ⇒ rotation proceeds. Token must be 64 lowercase

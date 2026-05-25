@@ -273,8 +273,11 @@ async fn algod_is_running(data_dir: &Path) -> bool {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
         Err(_) => return true,
     };
+    // Empty algod.net is ambiguous (partial / truncated write,
+    // corrupted data dir). Be conservative — refuse rotation
+    // (Codex review TASK-224 round 3).
     if net.is_empty() {
-        return false;
+        return true;
     }
     // Strip any scheme prefix so we can hand a bare `host:port` to
     // tokio's TcpStream::connect — that's the form `algod.net`
