@@ -891,6 +891,12 @@ async fn post_multisig_import(
             error_message(&Error::MultisigInvalidThreshold),
         );
     }
+    // Known divergence (TASK-219): algo-consensus-crypto adds a
+    // `pks.len() > MAX_MULTISIG (255)` rejection that Go's
+    // `MultisigAddrGen` doesn't have, so a 256+-pk import with a
+    // valid threshold returns 400 here but succeeds in Go.  Tracked
+    // for follow-up; practical impact is low because SDKs don't
+    // construct 256+-pk multisigs.
 
     let addr = match blocking(move || handle.wallet.import_multisig(version, threshold, &pks)).await
     {
