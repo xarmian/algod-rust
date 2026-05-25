@@ -1,7 +1,7 @@
-//! End-to-end smoke test: spawn a minimal mock algod that serves
-//! `/v2/status` and `/versions` from canned JSON, then run
-//! `goal-rust node status -d <tmp>` and assert the stdout matches the
-//! Go-format golden text.
+//! End-to-end smoke tests for `goal-rust node {status,lastround,
+//! generatetoken}`. Spawns a minimal mock algod that serves
+//! `/v2/status`, `/versions`, and `/health` from canned JSON / status
+//! codes, then runs `goal-rust` with `-d <tmp>` and asserts stdout.
 //!
 //! Using a hand-rolled `std::net::TcpListener` mock instead of spawning
 //! `algod-rust` itself — that crate has a heavyweight startup path
@@ -61,15 +61,20 @@ fn spawn_mock_algod(
                 }
             }
             log.lock().unwrap().push(token);
-            let body = if first.contains("/v2/status") {
-                status_json
+            let (status_line, body) = if first.contains("/v2/status") {
+                ("HTTP/1.1 200 OK", status_json)
             } else if first.contains("/versions") {
-                versions_json
+                ("HTTP/1.1 200 OK", versions_json)
+            } else if first.contains("/health") {
+                // `algod_is_running` probes /health; the mock claims
+                // health by default so generatetoken's "running" guard
+                // can be exercised in one of the integration tests.
+                ("HTTP/1.1 200 OK", "")
             } else {
-                "{}"
+                ("HTTP/1.1 200 OK", "{}")
             };
             let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body,
             );
@@ -220,4 +225,115 @@ fn node_status_prints_go_format_text_for_synced_node() {
         stdout, expected,
         "stdout did not match golden text (stderr={stderr:?})",
     );
+}
+
+#[test]
+fn node_lastround_prints_round_decimal_with_trailing_newline() {
+    // Mirrors Go's `reportInfof("%d\n", round)` at node.go:527.
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let status_json = r#"{"last-round": 4096, "last-version": "v", "next-version": "v", "next-version-supported": true}"#;
+    // `/versions` shouldn't be hit by lastround, but keep the mock
+    // responsive in case retry logic touches it.
+    let versions_json = r#"{"versions": ["v2"], "genesis_id": "", "genesis_hash_b64": ""}"#;
+    let (port, _tokens, _server) = spawn_mock_algod(status_json, versions_json);
+    write_algod_files(data_dir.path(), port, "deadbeef");
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(data_dir.path())
+        .args(["node", "lastround"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("run goal-rust node lastround");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "node lastround failed: exit={:?}, stdout={stdout:?}, stderr={stderr:?}",
+        out.status.code(),
+    );
+    assert_eq!(stdout, "4096\n", "lastround must print `<round>\\n`");
+}
+
+#[test]
+fn node_generatetoken_refuses_when_algod_running() {
+    // Mirrors `node.go:393-396`: HealthCheck success ⇒
+    // `reportErrorln(errorNodeRunning)`. Our mock returns 200 on
+    // `/health`, so generatetoken must refuse and exit 1 without
+    // writing the file.
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let (port, _tokens, _server) = spawn_mock_algod(
+        r#"{}"#, // status unused
+        r#"{}"#, // versions unused
+    );
+    write_algod_files(data_dir.path(), port, "tok");
+    let token_path = data_dir.path().join("algod.token");
+    let original = std::fs::read_to_string(&token_path).unwrap();
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(data_dir.path())
+        .args(["node", "generatetoken"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("run goal-rust node generatetoken");
+    assert!(
+        !out.status.success(),
+        "generatetoken must exit non-zero when /health responds",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Node must be stopped before writing APIToken"),
+        "stderr must carry Go's errorNodeRunning text; got {stderr:?}",
+    );
+    let after = std::fs::read_to_string(&token_path).unwrap();
+    assert_eq!(after, original, "token file must not be rewritten");
+}
+
+#[test]
+fn node_generatetoken_writes_64_hex_token_when_algod_down() {
+    // No mock algod ⇒ /health connect-refuses ⇒ `algod_is_running`
+    // returns false ⇒ rotation proceeds. Token must be 64 lowercase
+    // hex chars and the file must end up at `<data_dir>/algod.token`.
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    // Point at an unbound port so the health probe fails fast.
+    std::fs::write(data_dir.path().join("algod.net"), "127.0.0.1:1\n").unwrap();
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(data_dir.path())
+        .args(["node", "generatetoken"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("run goal-rust node generatetoken");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "generatetoken must succeed when algod is down; exit={:?}, stderr={stderr:?}",
+        out.status.code(),
+    );
+    let token_path = data_dir.path().join("algod.token");
+    let on_disk = std::fs::read_to_string(&token_path).expect("token file written");
+    assert_eq!(
+        on_disk.len(),
+        64,
+        "token on disk must be 64 chars; got {:?}",
+        on_disk,
+    );
+    assert!(
+        on_disk
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "token must be lowercase hex; got {on_disk:?}",
+    );
+    let info_prefix = "Successfully wrote new API token: ";
+    assert!(
+        stdout.starts_with(info_prefix),
+        "stdout must begin with Go's infoNodeWroteToken; got {stdout:?}",
+    );
+    let printed = stdout
+        .trim_start_matches(info_prefix)
+        .trim_end_matches('\n');
+    assert_eq!(printed, on_disk, "printed token must match on-disk token");
 }
