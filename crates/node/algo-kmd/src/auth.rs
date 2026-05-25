@@ -97,11 +97,21 @@ pub fn generate_api_token(data_dir: &Path) -> Result<String> {
 /// caller sees the underlying length error rather than getting a
 /// silently-rewritten token that invalidates every existing client.
 pub fn validate_or_generate_api_token(data_dir: &Path) -> Result<String> {
-    // Mirrors Go's `GetAndValidateAPIToken` followed by an explicit
-    // empty-string check. Read errors (missing file, permission issue)
-    // produce an empty token here so we fall through to generation,
-    // matching Go's `apiToken, _ := ...` line.
-    let read_token = read_first_line(data_dir).unwrap_or_default();
+    // Read the first line. `NotFound` becomes `Ok("")` (the
+    // "generate" trigger); other read failures (permission denied,
+    // invalid UTF-8, …) propagate up so a misconfigured daemon
+    // doesn't silently rotate its API token and invalidate every
+    // existing client.
+    //
+    // This is a deliberate divergence from Go's
+    // `apiToken, _ := GetAndValidateAPIToken(...)` (tokens.go:108)
+    // which ignores all read errors and treats any failure mode as
+    // "generate". Our behavior is a strict superset: anything Go
+    // accepts (file missing → generate; file present + valid → use;
+    // file present + invalid → surface ApiToken{TooShort,TooLong}),
+    // we also accept identically. We additionally surface
+    // PermissionDenied / IO errors that Go silently swallowed.
+    let read_token = read_first_line(data_dir)?;
 
     let token = if read_token.is_empty() {
         generate_api_token(data_dir)?
@@ -114,10 +124,9 @@ pub fn validate_or_generate_api_token(data_dir: &Path) -> Result<String> {
 }
 
 /// Helper used by [`validate_or_generate_api_token`]: read the token
-/// file's first line, returning `Ok("")` (NOT an error) when the file
-/// is absent so the caller can hit the "generate" branch the way Go
-/// does. Other I/O errors are surfaced so misconfigured permissions
-/// don't get silently swallowed.
+/// file's first line, returning `Ok("")` only when the file is
+/// genuinely absent so the caller can hit the "generate" branch.
+/// Other I/O errors are surfaced.
 fn read_first_line(data_dir: &Path) -> Result<String> {
     let path = token_path(data_dir);
     match std::fs::read_to_string(&path) {
