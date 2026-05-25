@@ -147,20 +147,23 @@ pub enum RootCommand {
 /// Print help for a (possibly nested) subcommand and exit 0, mirroring
 /// cobra's no-`Run` fallback for command groups (e.g. `goal app` ⇒
 /// help). `path` is the slice walked from the root, e.g. `["app", "box"]`.
-fn print_group_help(path: &[&str]) -> ExitCode {
-    let mut cmd = <Cli as clap::CommandFactory>::command();
-    let mut current: Option<&mut clap::Command> = Some(&mut cmd);
-    for name in path {
-        current = current.and_then(|c| c.find_subcommand_mut(*name));
-        if current.is_none() {
-            break;
-        }
+///
+/// Implemented by re-parsing `[goal-rust, <path...>, --help]` through
+/// the full root parser so the rendered help is byte-identical to what
+/// the user would get by typing `goal-rust <path...> --help` directly
+/// — same `Usage: goal-rust ... [OPTIONS] ...` line, same global flag
+/// list. `try_parse_from` with `--help` returns a `Help` error whose
+/// `.exit()` prints to stdout and terminates with exit code 0.
+pub fn print_group_help(path: &[&str]) -> ExitCode {
+    let mut argv: Vec<String> = vec!["goal-rust".to_string()];
+    argv.extend(path.iter().map(|s| (*s).to_string()));
+    argv.push("--help".to_string());
+    match Cli::try_parse_from(&argv) {
+        // Unreachable in practice: `--help` always short-circuits to
+        // the `Help` error path inside clap.
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => e.exit(),
     }
-    if let Some(c) = current {
-        let _ = c.print_help();
-        println!();
-    }
-    ExitCode::SUCCESS
 }
 
 /// Print the "not yet implemented" message Go-side never emits but every

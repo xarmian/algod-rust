@@ -208,6 +208,19 @@ fn group_without_leaf_falls_back_to_help_and_exits_zero() {
             stdout.contains("Commands:") || stdout.contains("Available Commands:"),
             "argv={argv:?} expected help on stdout, got {stdout:?}",
         );
+        // Regression guard (Codex review round 4): the fallback help
+        // must include the binary name in the Usage line, not just
+        // the leaf subcommand name — otherwise it diverges from
+        // `goal-rust <group> --help` and loses the global flag list.
+        assert!(
+            stdout.contains("goal-rust"),
+            "argv={argv:?} fallback help missing bin name; got {stdout:?}",
+        );
+        let datadir_mentioned = stdout.contains("--datadir") || stdout.contains("-d, --datadir");
+        assert!(
+            datadir_mentioned,
+            "argv={argv:?} fallback help missing global --datadir flag; got {stdout:?}",
+        );
     }
 }
 
