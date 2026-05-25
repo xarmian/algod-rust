@@ -173,6 +173,13 @@ pub enum Error {
     #[error("wallet has not been unlocked (call Wallet::init first)")]
     WalletNotInitialized,
 
+    /// Caller asked for a wallet driver we don't recognize (or sent
+    /// an empty driver name).  Mirrors the `"unknown wallet driver"`
+    /// error returned by Go's `FetchWalletDriver` at
+    /// `daemon/kmd/wallet/driver/driver.go:62`.
+    #[error("unknown wallet driver")]
+    UnknownWalletDriver,
+
     /// Another kmd-rust process holds the file lock on this data dir.
     /// Mirrors `ErrAlreadyRunning` (`daemon/kmd/server/server.go`).
     #[error("kmd is already running in this data directory")]

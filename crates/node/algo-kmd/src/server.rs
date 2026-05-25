@@ -31,9 +31,11 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+use crate::api_v1;
 use crate::auth::validate_api_token;
 use crate::error::{Error, Result};
 use crate::session::SessionManager;
+use crate::wallet::WalletDriver;
 
 /// `NetFilename` (server.go:40) — file containing `host:port`.
 pub const NET_FILENAME: &str = "kmd.net";
@@ -92,6 +94,8 @@ pub struct WalletServerConfig {
     pub allow_header_pna: bool,
     /// Shared session manager.  Wired through to v1 handlers in B5–B8.
     pub session_manager: Arc<SessionManager>,
+    /// Wallet driver — backs the v1 wallet routes (B5+).
+    pub wallet_driver: Arc<WalletDriver>,
 }
 
 /// Outcome of [`WalletServer::bind`] — the bound address, plus the
@@ -201,6 +205,10 @@ impl WalletServer {
             self.config.api_token.clone(),
             self.config.allowed_origins.clone(),
             self.config.allow_header_pna,
+            api_v1::AppState {
+                session_manager: self.config.session_manager.clone(),
+                wallet_driver: self.config.wallet_driver.clone(),
+            },
         )
     }
 
@@ -250,7 +258,12 @@ impl WalletServer {
 
 /// Build the root router.  Exposed so tests can drive it with
 /// `tower::Service` without binding a real socket.
-fn build_router(api_token: String, allowed_origins: Vec<String>, allow_header_pna: bool) -> Router {
+fn build_router(
+    api_token: String,
+    allowed_origins: Vec<String>,
+    allow_header_pna: bool,
+    state: api_v1::AppState,
+) -> Router {
     let auth_state = AuthState {
         expected_token: Arc::new(api_token),
     };
@@ -260,16 +273,14 @@ fn build_router(api_token: String, allowed_origins: Vec<String>, allow_header_pn
         .route("/versions", get(versions_handler))
         .route("/swagger.json", get(swagger_handler));
 
-    // `/v1/*` — auth middleware applied; no real handlers yet (B5–B8
-    // will register them).  Unmatched paths fall through to the
-    // outer 404 handler AFTER auth has validated the token, so a
-    // bad token never reveals which routes exist.
-    let v1 = Router::new()
-        .fallback(any(v1_not_found))
-        .layer(axum::middleware::from_fn_with_state(
-            auth_state.clone(),
-            require_kmd_token,
-        ));
+    // `/v1/*` — register all v1 routes via the [`api_v1`] module
+    // (B5+ wallet routes; B6/B7/B8 will extend it), then stack the
+    // bearer-token auth middleware on top.  Unmatched paths under
+    // `/v1` fall through to the v1 fallback AFTER auth has validated
+    // the token, so a bad token never reveals which routes exist.
+    let v1 = api_v1::router(state).fallback(any(v1_not_found)).layer(
+        axum::middleware::from_fn_with_state(auth_state.clone(), require_kmd_token),
+    );
 
     let mut app = Router::new()
         .merge(public)
@@ -493,6 +504,22 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_config(dir: &Path) -> WalletServerConfig {
+        use crate::config::ScryptParams;
+        use crate::wallet::{WalletDriver, WalletDriverConfig};
+        // Spin up a real WalletDriver pointed at a wallets/ subdir of
+        // the data dir.  Unsafe scrypt for fast tests.
+        let wallets_dir = dir.join("wallets");
+        std::fs::create_dir_all(&wallets_dir).unwrap();
+        let driver = WalletDriver::new(WalletDriverConfig {
+            wallets_dir,
+            scrypt_params: ScryptParams {
+                scrypt_n: 2,
+                scrypt_r: 1,
+                scrypt_p: 1,
+            },
+            allow_unsafe_scrypt: true,
+        })
+        .unwrap();
         WalletServerConfig {
             api_token: "a".repeat(64),
             data_dir: dir.to_path_buf(),
@@ -500,6 +527,7 @@ mod tests {
             allowed_origins: vec!["*".to_string()],
             allow_header_pna: false,
             session_manager: Arc::new(SessionManager::new(StdDuration::from_secs(60))),
+            wallet_driver: Arc::new(driver),
         }
     }
 
@@ -598,25 +626,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v1_request_with_correct_token_reaches_not_found() {
+    async fn v1_request_with_correct_token_reaches_unknown_route() {
         let dir = TempDir::new().unwrap();
         let cfg = test_config(dir.path());
         let token = cfg.api_token.clone();
         let (addr, tx, handle) = spawn(cfg).await;
 
         let client = reqwest::Client::new();
+        // A path that isn't a real v1 route — auth-passing requests
+        // fall through to the v1 fallback, which returns 404 with
+        // the standard error envelope.
+        let resp = client
+            .get(format!("http://{addr}/v1/no-such-route"))
+            .header(KMD_TOKEN_HEADER, &token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], true);
+
+        // The real `/v1/wallets` route now serves 200 with an empty
+        // (or omitted) `wallets` field once authenticated.
         let resp = client
             .get(format!("http://{addr}/v1/wallets"))
             .header(KMD_TOKEN_HEADER, &token)
             .send()
             .await
             .unwrap();
-        // No routes wired yet (B5+); auth-passing requests fall
-        // through to the v1 fallback, which returns 404 with the
-        // standard error envelope.
-        assert_eq!(resp.status(), 404);
+        assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["error"], true);
+        assert!(body.get("wallets").is_none() || body["wallets"].as_array().unwrap().is_empty());
 
         tx.send(()).unwrap();
         handle.await.unwrap().unwrap();

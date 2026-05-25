@@ -11,6 +11,7 @@
 //! REST API surface, signing operations, and participation-key wallet ops are
 //! deferred to Phases B+.
 
+pub mod api_v1;
 pub mod auth;
 pub mod config;
 pub mod crypto;
