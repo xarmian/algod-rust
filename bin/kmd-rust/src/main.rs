@@ -145,9 +145,9 @@ fn main() -> ExitCode {
 
 async fn serve(
     data_dir: PathBuf,
-    address: Option<SocketAddr>,
-    allowed_origins: Vec<String>,
-    allow_header_pna: bool,
+    cli_address: Option<SocketAddr>,
+    cli_allowed_origins: Vec<String>,
+    cli_allow_header_pna: bool,
 ) -> Result<(), String> {
     let cfg = load_kmd_config(&data_dir).map_err(|e| format!("load config: {e}"))?;
 
@@ -163,6 +163,32 @@ async fn serve(
     let session_manager = Arc::new(SessionManager::from_lifetime_secs(
         cfg.session_lifetime_secs,
     ));
+
+    // Merge CLI flags with kmd_config.json fields.  CLI wins when
+    // the user passed it explicitly; otherwise fall back to the
+    // config's `address`, `allowed_origins`, and `allow_header_pna`
+    // — Go does the same at `daemon/kmd/kmd.go`'s `Start` call site
+    // (the binary glue passes CLI overrides into the config struct
+    // before constructing the server).
+    let address = match cli_address {
+        Some(a) => Some(a),
+        None if cfg.address.is_empty() => None,
+        None => Some(
+            cfg.address
+                .parse::<SocketAddr>()
+                .map_err(|e| format!("kmd_config.json address {:?}: {e}", cfg.address))?,
+        ),
+    };
+    let allowed_origins = if !cli_allowed_origins.is_empty() {
+        cli_allowed_origins
+    } else {
+        cfg.allowed_origins.clone().unwrap_or_default()
+    };
+    // `--allow-header-pna` is a boolean flag; the CLI sets it to
+    // `true` when present and `false` otherwise.  We OR it with the
+    // config field so either source can enable PNA, mirroring Go's
+    // "enable if any source asks for it" semantics.
+    let allow_header_pna = cli_allow_header_pna || cfg.allow_header_pna;
 
     let server_cfg = WalletServerConfig {
         api_token,
