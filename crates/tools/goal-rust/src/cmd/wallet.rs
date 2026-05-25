@@ -158,18 +158,20 @@ pub fn run_list(cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>) -> ExitCode 
         }
     };
     let multi = dirs.len() > 1;
-    let mut exit = ExitCode::SUCCESS;
     for d in &dirs {
         if multi {
             // Mirrors `cmd/util/datadir/messages.go:infoDataDir`.
             println!("[Data Directory: {}]", d.display());
         }
-        let client = match ensure_kmd_client_for_dir(d, kmd_dir_flag.as_deref()) {
+        // Go's OnDataDirs callback uses reportErrorf which os.Exits
+        // immediately — we mirror that by returning a non-zero exit
+        // code on the first per-dir failure rather than continuing to
+        // later dirs and producing partial mixed output (Codex review
+        // TASK-227 round 2).
+        let client = match ensure_kmd_client_for_dir(d, kmd_dir_flag.as_deref(), ERROR_COULDNT_LIST)
+        {
             Ok(c) => c,
-            Err(()) => {
-                exit = ExitCode::from(1);
-                continue;
-            }
+            Err(()) => return ExitCode::from(1),
         };
         match rt.block_on(client.list_wallets()) {
             Ok(resp) => print_wallets(&resp.wallets),
@@ -179,19 +181,23 @@ pub fn run_list(cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>) -> ExitCode 
                     other => other.to_string(),
                 };
                 eprintln!("{}", format_message(ERROR_COULDNT_LIST, &[&msg]));
-                exit = ExitCode::from(1);
+                return ExitCode::from(1);
             }
         }
     }
-    exit
+    ExitCode::SUCCESS
 }
 
 /// Per-data-dir variant of [`ensure_kmd_client_single`]: builds the
-/// kmd client for one already-resolved data dir. Used by the
-/// multi-`-d` loop above.
+/// kmd client for one already-resolved data dir. `client_error_tpl`
+/// is the error-message template the caller wants used when
+/// `KmdClient::new` itself fails (so a kmd-dir read error from
+/// `wallet list` is labeled "Couldn't list wallets" rather than
+/// "Couldn't create wallet" — Codex review TASK-227 round 2).
 fn ensure_kmd_client_for_dir(
     data_dir_path: &Path,
     kmd_dir_flag: Option<&Path>,
+    client_error_tpl: &str,
 ) -> Result<KmdClient, ()> {
     let kmd_dir = match data_dir::resolve_kmd_data_dir(kmd_dir_flag, data_dir_path) {
         Ok(d) => d,
@@ -202,10 +208,7 @@ fn ensure_kmd_client_for_dir(
     };
     let (kmd_addr, kmd_token) = read_kmd_endpoint(&kmd_dir)?;
     KmdClient::new(&kmd_addr, &kmd_token).map_err(|e| {
-        eprintln!(
-            "{}",
-            format_message(ERROR_COULDNT_CREATE, &[&e.to_string()])
-        );
+        eprintln!("{}", format_message(client_error_tpl, &[&e.to_string()]));
     })
 }
 
