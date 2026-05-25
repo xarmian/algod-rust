@@ -136,8 +136,17 @@ fn read_kmd_endpoint(kmd_dir: &Path) -> Result<(String, String), ()> {
 /// - `--password <pw>` flag → use it.
 /// - TTY stdin → prompt twice and confirm. Mirrors
 ///   `wallet.go:127-137`.
-/// - Non-TTY stdin → read one line (the test seam). Mirrors what
-///   Go's `ensurePassword` does when stdin isn't a terminal.
+/// - Non-TTY stdin (piped) → read one line as the password.
+///
+/// **Intentional divergence from Go (TASK-226 scope):** Go's
+/// `wallet.go` always calls `terminal.ReadPassword(os.Stdin.Fd())`,
+/// which errors on piped stdin. The Phase-A task spec explicitly
+/// chose "non-TTY stdin reads one line" for CI/scripting
+/// friendliness — this lets `echo pw | goal-rust wallet new …`
+/// work in CI without a tty allocation, and it's the behavior
+/// goal-rust's downstream users expect when wrapping the binary.
+/// Operators who want Go-strict behavior should pass `--password`
+/// (still the safest in scripts anyway).
 fn resolve_password(args: &NewArgs) -> Result<String, ()> {
     if let Some(pw) = &args.password {
         return Ok(pw.clone());
