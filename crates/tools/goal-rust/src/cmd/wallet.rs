@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use algo_kmd_client::{KmdClient, KmdError};
 
 use crate::data_dir::{self, DataDirError};
-use crate::groups::wallet::NewArgs;
+use crate::groups::wallet::{NewArgs, RenameArgs};
 
 /// Mirrors `messages.go:170` (`infoChoosePasswordPrompt`).
 const PROMPT_CHOOSE: &str = "Please choose a password for wallet '{}': ";
@@ -43,6 +43,20 @@ const INFO_NO_WALLETS: &str = "No wallets found. You can create a wallet with `g
 
 /// Mirrors `messages.go:184` (`errorCouldntListWallets`).
 const ERROR_COULDNT_LIST: &str = "Couldn't list wallets: {}";
+
+/// Mirrors `messages.go:179` (`infoRenamedWallet`).
+const INFO_RENAMED: &str = "Renamed wallet '{}' to '{}'";
+
+/// Mirrors `messages.go:185` (`errorCouldntFindWallet`).
+const ERROR_COULDNT_FIND: &str = "Couldn't find wallet: {}";
+
+/// Mirrors `messages.go:191` (`errorCouldntRenameWallet`).
+const ERROR_COULDNT_RENAME: &str = "Couldn't rename wallet: {}";
+
+/// Mirrors `messages.go:194` (`infoPasswordPrompt` for the
+/// existing-wallet password). Distinct from `infoChoosePasswordPrompt`
+/// (which is the `wallet new` prompt).
+const PROMPT_EXISTING_PASSWORD: &str = "Please enter the password for wallet '{}': ";
 
 /// Banner / separator emitted between and around each wallet block.
 /// Mirrors `wallet.go:275` and `:281`
@@ -230,6 +244,145 @@ fn print_wallets(wallets: &[algo_kmd_api_types::common::APIV1Wallet]) {
         println!("ID:\t{}", w.id);
     }
     println!("{WALLET_SEPARATOR}");
+}
+
+/// Port of `renameWalletCmd` (`wallet.go:215-280`).
+pub fn run_rename(
+    args: RenameArgs,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    if args.old_name == args.new_name {
+        eprintln!(
+            "{}",
+            format_message(
+                ERROR_COULDNT_RENAME,
+                &["new name is identical to current name"],
+            ),
+        );
+        return ExitCode::from(1);
+    }
+
+    let client = match ensure_kmd_client_single(&cli_d, kmd_dir_flag.as_deref()) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "{}",
+                format_message(ERROR_COULDNT_RENAME, &[&e.to_string()])
+            );
+            return ExitCode::from(1);
+        }
+    };
+
+    // Resolve old name → wallet id via ListWallets. Mirrors Go's
+    // `FindWalletIDByName` (wallet.go:241) which loops the list and
+    // also detects duplicates.
+    let wallets = match rt.block_on(client.list_wallets()) {
+        Ok(r) => r.wallets,
+        Err(e) => {
+            let msg = match &e {
+                KmdError::Api { message, .. } => message.clone(),
+                other => other.to_string(),
+            };
+            eprintln!("{}", format_message(ERROR_COULDNT_RENAME, &[&msg]));
+            return ExitCode::from(1);
+        }
+    };
+    let mut matched_id: Option<String> = None;
+    let mut duplicate = false;
+    for w in &wallets {
+        if w.name == args.old_name {
+            if matched_id.is_some() {
+                duplicate = true;
+                break;
+            }
+            matched_id = Some(w.id.clone());
+        }
+    }
+    let Some(wallet_id) = matched_id else {
+        eprintln!("{}", format_message(ERROR_COULDNT_FIND, &[&args.old_name]));
+        return ExitCode::from(1);
+    };
+    if duplicate {
+        eprintln!(
+            "{}",
+            format_message(
+                ERROR_COULDNT_RENAME,
+                &["Multiple wallets by the same name are not supported"],
+            ),
+        );
+        return ExitCode::from(1);
+    }
+
+    let password = match resolve_password_for_existing(&args) {
+        Ok(p) => p,
+        Err(()) => return ExitCode::from(1),
+    };
+
+    match rt.block_on(client.rename_wallet(&wallet_id, &args.new_name, &password)) {
+        Ok(_) => {
+            println!(
+                "{}",
+                format_message(INFO_RENAMED, &[&args.old_name, &args.new_name]),
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            let msg = match &e {
+                KmdError::Api { message, .. } => message.clone(),
+                other => other.to_string(),
+            };
+            eprintln!("{}", format_message(ERROR_COULDNT_RENAME, &[&msg]));
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Password prompt for `wallet rename` — distinct from `wallet new`'s
+/// because we're asking for an EXISTING wallet's password (no
+/// confirmation step). Same TTY-vs-non-TTY Phase-A semantics as
+/// `resolve_password`.
+fn resolve_password_for_existing(args: &RenameArgs) -> Result<String, ()> {
+    if let Some(pw) = &args.password {
+        return Ok(pw.clone());
+    }
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        use std::io::Write;
+        print!(
+            "{}",
+            format_message(PROMPT_EXISTING_PASSWORD, &[&args.old_name])
+        );
+        let _ = std::io::stdout().flush();
+        let pw = rpassword::read_password().map_err(|e| {
+            eprintln!(
+                "{}",
+                format_message(ERROR_COULDNT_RENAME, &[&e.to_string()])
+            );
+        })?;
+        println!();
+        Ok(pw)
+    } else {
+        let mut line = String::new();
+        if let Err(e) = std::io::stdin().read_line(&mut line) {
+            eprintln!(
+                "{}",
+                format_message(ERROR_COULDNT_RENAME, &[&e.to_string()])
+            );
+            return Err(());
+        }
+        let trimmed = line.strip_suffix('\n').unwrap_or(&line);
+        let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+        Ok(trimmed.to_string())
+    }
 }
 
 fn read_kmd_endpoint(kmd_dir: &Path) -> Result<(String, String), ()> {
