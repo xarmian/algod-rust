@@ -2298,6 +2298,10 @@ version = "0.1.0"
 dependencies = [
  "algo-kmd",
  "clap",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
