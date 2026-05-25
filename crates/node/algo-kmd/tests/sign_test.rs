@@ -181,7 +181,7 @@ fn sign_multisig_transaction_assembles_and_verifies() {
     // multisig" path that reads the preimage from the wallet.
     let empty_partial = AtMultisigSig::default();
     let part_a = wallet
-        .sign_multisig_transaction(&txn, &empty_partial, pk_a, b"pw")
+        .sign_multisig_transaction(&txn, &empty_partial, pk_a, b"pw", None)
         .unwrap();
     assert_eq!(part_a.version, 1);
     assert_eq!(part_a.threshold, 2);
@@ -190,7 +190,7 @@ fn sign_multisig_transaction_assembles_and_verifies() {
     // Signer B extends part_a — partial path validates the derived
     // address matches and the signer's pk is in the subsigs list.
     let part_ab = wallet
-        .sign_multisig_transaction(&txn, &part_a, pk_b, b"pw")
+        .sign_multisig_transaction(&txn, &part_a, pk_b, b"pw", None)
         .unwrap();
     assert_eq!(part_ab.subsigs.len(), 3);
     // Both A and B subsigs must now be non-zero.
@@ -236,15 +236,73 @@ fn sign_multisig_transaction_rejects_outside_signer() {
 
     // Signer A produces the initial partial.
     let part_a = wallet
-        .sign_multisig_transaction(&txn, &AtMultisigSig::default(), pk_a, b"pw")
+        .sign_multisig_transaction(&txn, &AtMultisigSig::default(), pk_a, b"pw", None)
         .unwrap();
 
     // A key that isn't in the preimage must be rejected (Go's
     // errMsigWrongKey at sqlite.go:1230).
     let err = wallet
-        .sign_multisig_transaction(&txn, &part_a, pk_outside, b"pw")
+        .sign_multisig_transaction(&txn, &part_a, pk_outside, b"pw", None)
         .unwrap_err();
     assert!(matches!(err, Error::MultisigInvalid), "got {err:?}");
+}
+
+#[test]
+fn sign_multisig_transaction_accepts_auth_signer_for_rekey() {
+    // Regression for Codex PR #353 round 1: Go accepts a partial
+    // multisig whose derived address matches EITHER tx.Src() OR the
+    // auth-signer (rekey'd accounts). We reject otherwise. This
+    // simulates that rekey case: the txn's sender is a non-multisig
+    // address; the multisig that actually holds signing authority
+    // is the auth_signer.
+    let dir = TempDir::new().unwrap();
+    let driver = WalletDriver::new(weak_cfg(dir.path())).unwrap();
+    driver.create_wallet(b"rk", b"id-rk", b"pw", None).unwrap();
+    let mut wallet = driver.fetch_wallet(b"id-rk").unwrap();
+    wallet.init(b"pw").unwrap();
+
+    let pk_a = imported_addr(0x61);
+    let pk_b = imported_addr(0x62);
+    wallet.import_key(&expanded_sk_for_seed(0x61)).unwrap();
+    wallet.import_key(&expanded_sk_for_seed(0x62)).unwrap();
+
+    let pks = vec![pk_a, pk_b];
+    let msig_addr = wallet.import_multisig(1, 2, &pks).unwrap();
+
+    // Sender is a standalone address; the multisig is the auth-signer.
+    let other_sender = [0xEEu8; 32];
+    let txn = payment_txn(other_sender, [0x77u8; 32]);
+
+    // Bootstrap a partial directly via the standalone primitive
+    // (the fresh-sign path can't reach this configuration via
+    // sign_multisig_transaction because it looks up by txn.sender).
+    let signing_a = SigningKey::from_bytes(&[0x61u8; 32]);
+    let signing_msg = {
+        let canonical = algo_codec::canonical_encode_transaction(&txn);
+        let mut m = Vec::with_capacity(2 + canonical.len());
+        m.extend_from_slice(b"TX");
+        m.extend_from_slice(&canonical);
+        m
+    };
+    let part_a =
+        algo_consensus_crypto::multisig::multisig_sign(&signing_msg, 1, 2, &pks, &signing_a)
+            .unwrap();
+
+    // Without auth_signer, the partial's address differs from
+    // txn.sender so we must reject.
+    let err = wallet
+        .sign_multisig_transaction(&txn, &part_a, pk_b, b"pw", None)
+        .unwrap_err();
+    assert!(matches!(err, Error::MultisigInvalid), "got {err:?}");
+
+    // With the right auth_signer the partial is accepted and B
+    // extends it cleanly.
+    let part_ab = wallet
+        .sign_multisig_transaction(&txn, &part_a, pk_b, b"pw", Some(msig_addr))
+        .unwrap();
+    assert_eq!(part_ab.subsigs.len(), 2);
+    assert!(part_ab.subsigs[0].signature != [0u8; 64]);
+    assert!(part_ab.subsigs[1].signature != [0u8; 64]);
 }
 
 #[test]

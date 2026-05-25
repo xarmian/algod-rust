@@ -150,25 +150,41 @@ impl Wallet {
     /// - Otherwise, validate that `public_key` is one of the subsig
     ///   keys in `partial`, sign with that key, and merge into
     ///   `partial`.
+    ///
+    /// `auth_signer` carries the rekey/auth-address override from
+    /// Go's `signer` argument (sqlite.go:1175). When present, the
+    /// partial's derived multisig address is allowed to match
+    /// **either** `txn.sender` **or** `auth_signer` — Go's check at
+    /// sqlite.go:1224. Pass `None` for the common non-rekeyed case
+    /// (the multisig IS the sender).
     pub fn sign_multisig_transaction(
         &self,
         txn: &Transaction,
         partial: &MultisigSig,
         public_key: [u8; ADDRESS_LEN],
         password: &[u8],
+        auth_signer: Option<[u8; ADDRESS_LEN]>,
     ) -> Result<MultisigSig> {
         self.check_password(password)?;
 
         let msg = txn_signing_message(txn);
-        let signer_addr = txn.sender;
+        let sender = address_to_bytes(&txn.sender);
 
-        self.sign_multisig_inner(
-            &msg,
-            address_to_bytes(&signer_addr),
-            partial,
-            public_key,
-            password,
-        )
+        // Fresh-sign path looks up the preimage by the txn sender;
+        // the rekey override is irrelevant when no partial exists
+        // because the wallet only stores preimages under one address.
+        //
+        // Partial-extend path: derived multisig address must match
+        // either the sender or the auth-signer (Go: sqlite.go:1224
+        // — `addr != tx.Src() && addr != signer`).
+        let mut allowed: Vec<[u8; ADDRESS_LEN]> = vec![sender];
+        if let Some(s) = auth_signer {
+            if s != sender {
+                allowed.push(s);
+            }
+        }
+
+        self.sign_multisig_inner(&msg, &allowed, partial, public_key, password)
     }
 
     /// Produce or extend a multisig program signature. Mirrors
@@ -186,13 +202,21 @@ impl Wallet {
     ) -> Result<MultisigSig> {
         self.check_password(password)?;
         let msg = msig_program_signing_message(&msig_address, program);
-        self.sign_multisig_inner(&msg, msig_address, partial, public_key, password)
+        // The program path has no rekey concept — only one allowed
+        // address (sqlite.go:1317).
+        self.sign_multisig_inner(&msg, &[msig_address], partial, public_key, password)
     }
 
+    /// Shared body for the multisig sign-or-extend flow. `allowed_addrs`
+    /// is the set of multisig addresses the partial may resolve to —
+    /// the txn-sign path passes `{sender, auth_signer?}` per Go's
+    /// check at sqlite.go:1224; the program-sign path passes just the
+    /// msig address. The fresh path looks up the preimage by
+    /// `allowed_addrs[0]` (the sender / msig address).
     fn sign_multisig_inner(
         &self,
         msg: &[u8],
-        msig_address: [u8; ADDRESS_LEN],
+        allowed_addrs: &[[u8; ADDRESS_LEN]],
         partial: &MultisigSig,
         signer_pk: [u8; ADDRESS_LEN],
         password: &[u8],
@@ -204,14 +228,19 @@ impl Wallet {
             partial.version == 0 && partial.threshold == 0 && partial.subsigs.is_empty();
 
         let (version, threshold, pks) = if partial_is_empty {
-            // No partial — look up the preimage from msig_addrs.
-            let pre = self.lookup_multisig(&msig_address)?;
+            // No partial — look up the preimage by the primary
+            // allowed address (sender for txns, msig_address for
+            // programs).
+            let lookup_addr = allowed_addrs[0];
+            let pre = self.lookup_multisig(&lookup_addr)?;
             (pre.version, pre.threshold, pre.pks)
         } else {
-            // Validate: derived address from partial must equal
-            // msig_address (matches Go's check at sqlite.go:1224/1317).
+            // Validate: derived address from partial must equal one
+            // of the allowed addresses. Matches Go's sqlite.go:1224
+            // (sender OR signer) and sqlite.go:1317 (just src) —
+            // passed in as a single- or two-element slice.
             let derived = multisig_addr_gen_from_partial(partial).map_err(map_multisig_err)?;
-            if derived.0 != msig_address {
+            if !allowed_addrs.contains(&derived.0) {
                 return Err(Error::MultisigInvalid);
             }
             // Signer's pk must appear in the preimage (Go: errMsigWrongKey
