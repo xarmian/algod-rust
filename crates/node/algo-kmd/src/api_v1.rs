@@ -135,6 +135,8 @@ pub fn status_for_error(err: &Error) -> StatusCode {
         | Error::WrongDriverVersion
         | Error::MultisigInvalid
         | Error::MultisigNotFound
+        | Error::MultisigUnknownVersion
+        | Error::MultisigInvalidThreshold
         | Error::KeyExists
         | Error::KeyNotFound
         | Error::ApiTokenTooShort
@@ -867,6 +869,29 @@ async fn post_multisig_import(
     let version = req.version;
     let threshold = req.threshold;
     let pks = req.pks;
+
+    // Surface MultisigAddrGen's two distinct error texts before
+    // the blocking call (which collapses both into one variant on
+    // the Rust side).  Go's order:
+    //   - version != 1            → "unknown version"
+    //   - threshold == 0 OR len(pks) == 0 OR threshold > len(pks)
+    //                             → "Invalid threshold"
+    // (`crypto/multisig.go:97-105`).  Returning these distinct
+    // strings preserves wire-message parity for clients that match
+    // on the exact text.
+    if version != 1 {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            error_message(&Error::MultisigUnknownVersion),
+        );
+    }
+    if threshold == 0 || pks.is_empty() || (threshold as usize) > pks.len() {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            error_message(&Error::MultisigInvalidThreshold),
+        );
+    }
+
     let addr = match blocking(move || handle.wallet.import_multisig(version, threshold, &pks)).await
     {
         Ok(a) => a,
@@ -1668,9 +1693,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multisig_import_invalid_preimage_returns_400() {
-        // version=2 is unsupported; Go's MultisigAddrGen rejects it
-        // with `invalid multisig preimage` text.
+    async fn multisig_import_unknown_version_returns_go_text() {
+        // Regression for Codex PR #358 round 1 (P2): Go returns
+        // errUnknownVersion ("unknown version") for version != 1.
         let pwd = "pw";
         let (router, _tmp, token) = make_unlocked(pwd).await;
         let pks = fixture_pks();
@@ -1689,11 +1714,13 @@ mod tests {
         )
         .await;
         assert_eq!(s, 400, "{body}");
-        assert_eq!(body["error"], true);
+        assert_eq!(body["message"], "unknown version");
     }
 
     #[tokio::test]
-    async fn multisig_import_threshold_greater_than_keys_returns_400() {
+    async fn multisig_import_invalid_threshold_returns_go_text() {
+        // Regression for Codex PR #358 round 1 (P2): Go returns
+        // errInvalidThreshold ("Invalid threshold" — capital I).
         let pwd = "pw";
         let (router, _tmp, token) = make_unlocked(pwd).await;
         let pks = fixture_pks();
@@ -1712,11 +1739,14 @@ mod tests {
         )
         .await;
         assert_eq!(s, 400, "{body}");
-        assert_eq!(body["error"], true);
+        assert_eq!(body["message"], "Invalid threshold");
     }
 
     #[tokio::test]
-    async fn multisig_export_unknown_address_returns_400() {
+    async fn multisig_export_unknown_address_returns_go_text() {
+        // Regression for Codex PR #358 round 1 (P2): Go returns
+        // errMsigDataNotFound's full text, not a generic
+        // "multisig address not found".
         let (router, _tmp, token) = make_unlocked("pw").await;
         let zero = Address([0u8; 32]).to_algorand_string();
         let (s, body) = post(
@@ -1726,14 +1756,9 @@ mod tests {
         )
         .await;
         assert_eq!(s, 400, "{body}");
-        assert_eq!(body["error"], true);
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap()
-                .contains("multisig address not found"),
-            "message: {}",
-            body["message"]
+        assert_eq!(
+            body["message"],
+            "multisig information (pks, threshold) for address does not exist in this wallet"
         );
     }
 
