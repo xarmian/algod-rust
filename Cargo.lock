@@ -242,7 +242,10 @@ dependencies = [
 name = "algo-kmd"
 version = "0.1.0"
 dependencies = [
+ "algo-codec",
  "algo-consensus-crypto",
+ "algo-types",
+ "algo-validate",
  "ed25519-dalek",
  "hex",
  "hkdf",

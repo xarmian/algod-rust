@@ -16,6 +16,7 @@ pub mod crypto;
 pub mod error;
 pub mod keys;
 pub mod multisig;
+pub mod sign;
 pub mod sqlite;
 pub mod wallet;
 
