@@ -13,5 +13,6 @@ pub use http_block_fetcher::{HttpBlockFetchError, HttpBlockFetcher, BLOCK_RESPON
 pub use parallel_fetch::{ParallelBlockFetcher, DEFAULT_CONCURRENCY};
 pub use traits::BlockSource;
 pub use types::{
-    AccountInfo, NodeStatus, PendingTxnInfo, PostTransactionResponse, SuggestedParams, TxId,
+    AccountInfo, AlgodVersions, NodeStatus, PendingTxnInfo, PostTransactionResponse,
+    SuggestedParams, TxId,
 };

@@ -306,14 +306,8 @@ impl BlockSource for GossipBlockSource {
         let last_round = self.last_fetched_round.load(Ordering::Relaxed);
         Ok(NodeStatus {
             last_round,
-            time_since_last_round: 0,
-            catchup_time: 0,
-            last_version: String::new(),
-            next_version: String::new(),
-            next_version_round: 0,
             next_version_supported: true,
-            stopped_at_unsupported_round: false,
-            last_catchpoint: None,
+            ..NodeStatus::default()
         })
     }
 

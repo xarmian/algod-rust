@@ -1777,10 +1777,13 @@ dependencies = [
 name = "goal-rust"
 version = "0.1.0"
 dependencies = [
+ "algo-error",
+ "algo-rest-client",
  "clap",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -2,7 +2,7 @@ use algo_types::Digest;
 use serde::{Deserialize, Serialize};
 
 /// Node status as returned by `GET /v2/status`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeStatus {
     /// The last committed round.
     #[serde(rename = "last-round")]
@@ -39,6 +39,59 @@ pub struct NodeStatus {
     /// The last catchpoint seen by the node.
     #[serde(rename = "last-catchpoint", default)]
     pub last_catchpoint: Option<String>,
+
+    /// Catchpoint label being downloaded; `None` (or empty) outside
+    /// catchpoint catchup. Mirrors Go's `model.NodeStatusResponse.Catchpoint`.
+    #[serde(rename = "catchpoint", default)]
+    pub catchpoint: Option<String>,
+
+    /// Catchpoint catchup progress (account-trie download).
+    #[serde(rename = "catchpoint-total-accounts", default)]
+    pub catchpoint_total_accounts: Option<u64>,
+    #[serde(rename = "catchpoint-processed-accounts", default)]
+    pub catchpoint_processed_accounts: Option<u64>,
+    #[serde(rename = "catchpoint-verified-accounts", default)]
+    pub catchpoint_verified_accounts: Option<u64>,
+    #[serde(rename = "catchpoint-total-kvs", default)]
+    pub catchpoint_total_kvs: Option<u64>,
+    #[serde(rename = "catchpoint-processed-kvs", default)]
+    pub catchpoint_processed_kvs: Option<u64>,
+    #[serde(rename = "catchpoint-verified-kvs", default)]
+    pub catchpoint_verified_kvs: Option<u64>,
+
+    /// Catchpoint block-replay progress.
+    #[serde(rename = "catchpoint-acquired-blocks", default)]
+    pub catchpoint_acquired_blocks: Option<u64>,
+    #[serde(rename = "catchpoint-total-blocks", default)]
+    pub catchpoint_total_blocks: Option<u64>,
+
+    /// Consensus-upgrade-voting fields. Optional in Go's model; we
+    /// default-zero everywhere `nilToZero` would in
+    /// `cmd/goal/node.go:480-494`.
+    #[serde(rename = "upgrade-next-protocol-vote-before", default)]
+    pub upgrade_next_protocol_vote_before: Option<u64>,
+    #[serde(rename = "upgrade-votes-required", default)]
+    pub upgrade_votes_required: Option<u64>,
+    #[serde(rename = "upgrade-no-votes", default)]
+    pub upgrade_no_votes: Option<u64>,
+    #[serde(rename = "upgrade-yes-votes", default)]
+    pub upgrade_yes_votes: Option<u64>,
+    #[serde(rename = "upgrade-vote-rounds", default)]
+    pub upgrade_vote_rounds: Option<u64>,
+}
+
+/// `GET /versions` (or `/v2/versions`) response. Mirrors Go's
+/// `daemon/algod/api/spec/common/model.go:25` (`Version`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AlgodVersions {
+    #[serde(rename = "versions", default)]
+    pub versions: Vec<String>,
+    #[serde(rename = "genesis_id", default)]
+    pub genesis_id: String,
+    /// Standard-base64-encoded 32-byte genesis hash. Kept as the raw
+    /// string so callers print byte-exactly what Go does.
+    #[serde(rename = "genesis_hash_b64", default)]
+    pub genesis_hash_b64: String,
 }
 
 /// Account information as returned by `GET /v2/accounts/{addr}`.
