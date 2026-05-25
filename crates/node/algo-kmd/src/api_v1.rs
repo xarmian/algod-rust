@@ -24,12 +24,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 
-use algo_kmd_api_types::common::{APIV1ResponseEnvelope, APIV1Wallet, APIV1WalletHandle};
+use algo_kmd_api_types::common::{
+    APIV1ResponseEnvelope, APIV1Wallet, APIV1WalletHandle, MultisigSig as WireMultisigSig,
+};
 use algo_kmd_api_types::requests::{
     APIV1DELETEKeyRequest, APIV1DELETEMultisigRequest, APIV1POSTKeyExportRequest,
     APIV1POSTKeyImportRequest, APIV1POSTKeyListRequest, APIV1POSTKeyRequest,
     APIV1POSTMasterKeyExportRequest, APIV1POSTMultisigExportRequest,
-    APIV1POSTMultisigImportRequest, APIV1POSTMultisigListRequest, APIV1POSTWalletInfoRequest,
+    APIV1POSTMultisigImportRequest, APIV1POSTMultisigListRequest,
+    APIV1POSTMultisigProgramSignRequest, APIV1POSTMultisigTransactionSignRequest,
+    APIV1POSTProgramSignRequest, APIV1POSTTransactionSignRequest, APIV1POSTWalletInfoRequest,
     APIV1POSTWalletInitRequest, APIV1POSTWalletReleaseRequest, APIV1POSTWalletRenameRequest,
     APIV1POSTWalletRenewRequest, APIV1POSTWalletRequest,
 };
@@ -37,11 +41,13 @@ use algo_kmd_api_types::responses::{
     APIV1DELETEKeyResponse, APIV1DELETEMultisigResponse, APIV1GETWalletsResponse,
     APIV1POSTKeyExportResponse, APIV1POSTKeyImportResponse, APIV1POSTKeyListResponse,
     APIV1POSTKeyResponse, APIV1POSTMasterKeyExportResponse, APIV1POSTMultisigExportResponse,
-    APIV1POSTMultisigImportResponse, APIV1POSTMultisigListResponse, APIV1POSTWalletInfoResponse,
+    APIV1POSTMultisigImportResponse, APIV1POSTMultisigListResponse,
+    APIV1POSTMultisigProgramSignResponse, APIV1POSTMultisigTransactionSignResponse,
+    APIV1POSTProgramSignResponse, APIV1POSTTransactionSignResponse, APIV1POSTWalletInfoResponse,
     APIV1POSTWalletInitResponse, APIV1POSTWalletReleaseResponse, APIV1POSTWalletRenameResponse,
     APIV1POSTWalletRenewResponse, APIV1POSTWalletResponse,
 };
-use algo_types::Address;
+use algo_types::{Address, MultisigSig, MultisigSubsig, Transaction};
 
 use crate::error::Error;
 use crate::session::SessionManager;
@@ -94,6 +100,11 @@ pub fn router(state: AppState) -> Router {
         .route("/multisig/list", post(post_multisig_list))
         .route("/multisig/import", post(post_multisig_import))
         .route("/multisig/export", post(post_multisig_export))
+        // Sign routes (B8)
+        .route("/transaction/sign", post(post_transaction_sign))
+        .route("/program/sign", post(post_program_sign))
+        .route("/multisig/sign", post(post_multisig_sign))
+        .route("/multisig/signprogram", post(post_multisig_signprogram))
         .with_state(state)
 }
 
@@ -210,6 +221,12 @@ const ERR_COULD_NOT_DECODE: &str = "could not decode request body";
 /// (`api/v1/errors.go:24`).  Returned for any unparseable
 /// base32-with-checksum address string.
 const ERR_COULD_NOT_DECODE_ADDRESS: &str = "could not decode address";
+
+/// `errCouldNotDecodeTx = "could not decode transaction"`
+/// (`api/v1/errors.go:25`).  Returned when the base64-msgpack
+/// `transaction` field on the sign / multisig-sign requests
+/// can't be deserialized to a [`Transaction`].
+const ERR_COULD_NOT_DECODE_TX: &str = "could not decode transaction";
 
 /// Parse an Algorand checksum-address string into its 32-byte form.
 /// On any parse error, returns Go's `errCouldNotDecodeAddress` 400
@@ -986,6 +1003,283 @@ async fn delete_multisig(State(state): State<AppState>, req: axum::extract::Requ
         Ok(()) => ok_json(APIV1DELETEMultisigResponse::default()),
         Err(r) => r,
     }
+}
+
+// ---------------------------------------------------------------- Sign handlers (B8)
+
+/// Decode a base64-msgpack `transaction` field into a typed
+/// [`Transaction`].  Returns Go's `errCouldNotDecodeTx` 400 on any
+/// failure — matches the v1 handler call sites at handlers.go:1119
+/// (multisig sign) and elsewhere.
+#[allow(clippy::result_large_err)]
+fn decode_transaction(bytes: &[u8]) -> Result<Transaction, Response> {
+    rmp_serde::from_slice::<Transaction>(bytes)
+        .map_err(|_| err_response(StatusCode::BAD_REQUEST, ERR_COULD_NOT_DECODE_TX))
+}
+
+/// Convert the wire-shape MultisigSig (defined in algo-kmd-api-types
+/// so external SDK consumers don't need algo-types) into the typed
+/// `algo_types::MultisigSig` the wallet sign methods consume.  The
+/// two structs are bit-identical on the wire — this is purely a
+/// type-system bridge.
+fn wire_to_typed_msig(wire: &WireMultisigSig) -> MultisigSig {
+    MultisigSig {
+        version: wire.version,
+        threshold: wire.threshold,
+        subsigs: wire
+            .subsigs
+            .iter()
+            .map(|s| MultisigSubsig {
+                public_key: s.public_key,
+                signature: s.signature,
+            })
+            .collect(),
+    }
+}
+
+/// `POST /v1/transaction/sign` — sign a single-signer transaction.
+/// Mirrors `postTransactionSignHandler` (handlers.go:800).
+async fn post_transaction_sign(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Response {
+    let req: APIV1POSTTransactionSignRequest = match decode_body(req).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+
+    // Auth first (handlers.go:813), then decode txn (handlers.go:822).
+    let session_manager = state.session_manager.clone();
+    let token = req.wallet_handle_token;
+    let handle = match blocking_with_status(
+        move || session_manager.auth_with_token(&token),
+        StatusCode::UNAUTHORIZED,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+
+    let txn = match decode_transaction(&req.transaction) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+
+    // All-zero public_key means "infer from txn.sender" (Go's
+    // sqlite.go:1122 branch).
+    let pk = if req.public_key == [0u8; 32] {
+        None
+    } else {
+        Some(req.public_key)
+    };
+    let password = req.wallet_password;
+
+    let signed = match blocking(move || {
+        handle
+            .wallet
+            .sign_transaction(&txn, pk, password.as_bytes())
+    })
+    .await
+    {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+
+    ok_json(APIV1POSTTransactionSignResponse {
+        envelope: APIV1ResponseEnvelope::default(),
+        signed_transaction: signed,
+    })
+}
+
+/// `POST /v1/program/sign` — sign raw program bytes for a single
+/// address.  Mirrors `postProgramSignHandler` (handlers.go:862).
+async fn post_program_sign(State(state): State<AppState>, req: axum::extract::Request) -> Response {
+    let req: APIV1POSTProgramSignRequest = match decode_body(req).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+
+    // Decode address before auth (Go's order — handlers.go:880).
+    let addr = match parse_address(&req.address) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+
+    let session_manager = state.session_manager.clone();
+    let token = req.wallet_handle_token;
+    let handle = match blocking_with_status(
+        move || session_manager.auth_with_token(&token),
+        StatusCode::UNAUTHORIZED,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+
+    let program = req.program;
+    let password = req.wallet_password;
+    let sig = match blocking(move || {
+        handle
+            .wallet
+            .sign_program(&program, addr, password.as_bytes())
+    })
+    .await
+    {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+
+    ok_json(APIV1POSTProgramSignResponse {
+        envelope: APIV1ResponseEnvelope::default(),
+        signature: sig.to_vec(),
+    })
+}
+
+/// `POST /v1/multisig/sign` — produce or extend a multisig
+/// transaction signature.  Mirrors
+/// `postMultisigTransactionSignHandler` (handlers.go:1083).
+async fn post_multisig_sign(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Response {
+    let req: APIV1POSTMultisigTransactionSignRequest = match decode_body(req).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+
+    let session_manager = state.session_manager.clone();
+    let token = req.wallet_handle_token;
+    let handle = match blocking_with_status(
+        move || session_manager.auth_with_token(&token),
+        StatusCode::UNAUTHORIZED,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+
+    let txn = match decode_transaction(&req.transaction) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+
+    let partial = wire_to_typed_msig(&req.partial_msig);
+    let signer_pk = req.public_key;
+    let password = req.wallet_password;
+    // All-zero auth_addr means "no rekey override" — Go's
+    // `sqlite.go:1224` allows the partial to derive to either the
+    // sender or the auth-addr (when non-zero).
+    let auth_signer = if req.auth_addr == [0u8; 32] {
+        None
+    } else {
+        Some(req.auth_addr)
+    };
+
+    let msig = match blocking(move || {
+        handle.wallet.sign_multisig_transaction(
+            &txn,
+            &partial,
+            signer_pk,
+            password.as_bytes(),
+            auth_signer,
+        )
+    })
+    .await
+    {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+
+    let msig_bytes = match rmp_serde::to_vec_named(&msig) {
+        Ok(b) => b,
+        Err(_) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode multisig response",
+            );
+        }
+    };
+    ok_json(APIV1POSTMultisigTransactionSignResponse {
+        envelope: APIV1ResponseEnvelope::default(),
+        multisig: msig_bytes,
+    })
+}
+
+/// `POST /v1/multisig/signprogram` — produce or extend a multisig
+/// program signature.  Mirrors `postMultisigProgramSignHandler`
+/// (handlers.go:1146).
+async fn post_multisig_signprogram(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Response {
+    let req: APIV1POSTMultisigProgramSignRequest = match decode_body(req).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+
+    let session_manager = state.session_manager.clone();
+    let token = req.wallet_handle_token;
+    let handle = match blocking_with_status(
+        move || session_manager.auth_with_token(&token),
+        StatusCode::UNAUTHORIZED,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+
+    let addr = match parse_address(&req.address) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+
+    // Note: B8 only wires the modern (use_legacy_msig=false) path,
+    // matching Go's default.  Legacy mode is a known follow-up
+    // tracked alongside the rest of `sign_multisig_program`'s API.
+    if req.use_legacy_msig {
+        return err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "use_legacy_msig is not yet supported in kmd-rust",
+        );
+    }
+
+    let partial = wire_to_typed_msig(&req.partial_msig);
+    let signer_pk = req.public_key;
+    let program = req.program;
+    let password = req.wallet_password;
+
+    let msig = match blocking(move || {
+        handle.wallet.sign_multisig_program(
+            &program,
+            addr,
+            &partial,
+            signer_pk,
+            password.as_bytes(),
+        )
+    })
+    .await
+    {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+
+    let msig_bytes = match rmp_serde::to_vec_named(&msig) {
+        Ok(b) => b,
+        Err(_) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode multisig response",
+            );
+        }
+    };
+    ok_json(APIV1POSTMultisigProgramSignResponse {
+        envelope: APIV1ResponseEnvelope::default(),
+        multisig: msig_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -1792,6 +2086,307 @@ mod tests {
             "DELETE",
             "/multisig",
             json!({"wallet_handle_token": "bogus", "address": zero, "wallet_password": "x"}),
+        )
+        .await;
+        assert_eq!(s, 401);
+    }
+
+    // ---- B8 sign handler tests ----
+
+    /// Make a minimal pay transaction for sign tests.  Only the
+    /// fields the signing path inspects matter — sender + type +
+    /// a couple of header bytes so the codec round-trips.
+    fn make_pay_txn(sender_pk: &[u8; 32]) -> Transaction {
+        use algo_types::{Round, TxnType};
+        Transaction {
+            txn_type: TxnType::Pay,
+            sender: Address(*sender_pk),
+            fee: 1000,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            ..Transaction::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn transaction_sign_round_trips_through_verify() {
+        let pwd = "pw";
+        let (router, _tmp, token) = make_unlocked(pwd).await;
+
+        // Generate a key, then sign a payment txn with that sender.
+        let (_, body) = post(&router, "/key", json!({"wallet_handle_token": token})).await;
+        let addr_str = body["address"].as_str().unwrap().to_string();
+        let sender_pk = Address::from_algorand_string(&addr_str).unwrap().0;
+
+        let txn = make_pay_txn(&sender_pk);
+        let txn_bytes = rmp_serde::to_vec_named(&txn).unwrap();
+
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let (s, body) = post(
+            &router,
+            "/transaction/sign",
+            json!({
+                "wallet_handle_token": token,
+                "transaction": B64.encode(&txn_bytes),
+                "wallet_password": pwd,
+            }),
+        )
+        .await;
+        assert_eq!(s, 200, "sign: {body}");
+        let signed_b64 = body["signed_transaction"].as_str().unwrap();
+        let signed_bytes = B64.decode(signed_b64).unwrap();
+
+        // Decode the signed-transaction blob and verify via the
+        // production validation path — anything kmd-rust signs must
+        // pass go-algorand-equivalent verification.
+        let signed: algo_types::SignedTransaction = rmp_serde::from_slice(&signed_bytes).unwrap();
+        algo_validate::signature::verify_single_sig(&signed).expect("signature must verify");
+    }
+
+    #[tokio::test]
+    async fn transaction_sign_wrong_password_returns_400() {
+        let pwd = "right";
+        let (router, _tmp, token) = make_unlocked(pwd).await;
+        let (_, body) = post(&router, "/key", json!({"wallet_handle_token": token})).await;
+        let addr_str = body["address"].as_str().unwrap().to_string();
+        let sender_pk = Address::from_algorand_string(&addr_str).unwrap().0;
+        let txn = make_pay_txn(&sender_pk);
+        let txn_bytes = rmp_serde::to_vec_named(&txn).unwrap();
+
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let (s, body) = post(
+            &router,
+            "/transaction/sign",
+            json!({
+                "wallet_handle_token": token,
+                "transaction": B64.encode(&txn_bytes),
+                "wallet_password": "WRONG",
+            }),
+        )
+        .await;
+        assert_eq!(s, 400);
+        assert_eq!(body["error"], true);
+    }
+
+    #[tokio::test]
+    async fn transaction_sign_undecodeable_returns_could_not_decode_tx() {
+        let (router, _tmp, token) = make_unlocked("pw").await;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let (s, body) = post(
+            &router,
+            "/transaction/sign",
+            json!({
+                "wallet_handle_token": token,
+                "transaction": B64.encode(b"\xff\xff\xff not a txn"),
+                "wallet_password": "pw",
+            }),
+        )
+        .await;
+        assert_eq!(s, 400, "{body}");
+        assert_eq!(body["message"], "could not decode transaction");
+    }
+
+    #[tokio::test]
+    async fn program_sign_returns_64_byte_signature() {
+        let pwd = "pw";
+        let (router, _tmp, token) = make_unlocked(pwd).await;
+        let (_, body) = post(&router, "/key", json!({"wallet_handle_token": token})).await;
+        let addr = body["address"].as_str().unwrap().to_string();
+
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let program = b"\x02\x20\x01\x01\x22\x43"; // tiny TEAL
+        let (s, body) = post(
+            &router,
+            "/program/sign",
+            json!({
+                "wallet_handle_token": token,
+                "address": addr,
+                "data": B64.encode(program),
+                "wallet_password": pwd,
+            }),
+        )
+        .await;
+        assert_eq!(s, 200, "{body}");
+        let sig = B64.decode(body["sig"].as_str().unwrap()).unwrap();
+        assert_eq!(sig.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn program_sign_bad_address_returns_could_not_decode_address() {
+        let (router, _tmp, token) = make_unlocked("pw").await;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let (s, body) = post(
+            &router,
+            "/program/sign",
+            json!({
+                "wallet_handle_token": token,
+                "address": "NOT-AN-ADDRESS",
+                "data": B64.encode(b"\x02"),
+                "wallet_password": "pw",
+            }),
+        )
+        .await;
+        assert_eq!(s, 400);
+        assert_eq!(body["message"], "could not decode address");
+    }
+
+    #[tokio::test]
+    async fn multisig_sign_2_of_3_threshold_met() {
+        // Import a 2-of-3 multisig where signers 0 and 1 are in this
+        // wallet; round-trip a fresh signature, then add the second
+        // subsig and verify the merged multisig.
+        let pwd = "pw";
+        let (router, _tmp, token) = make_unlocked(pwd).await;
+
+        // Generate two wallet keys (signers 0 and 1).
+        let (_, body) = post(&router, "/key", json!({"wallet_handle_token": token})).await;
+        let pk0 = Address::from_algorand_string(body["address"].as_str().unwrap())
+            .unwrap()
+            .0;
+        let (_, body) = post(&router, "/key", json!({"wallet_handle_token": token})).await;
+        let pk1 = Address::from_algorand_string(body["address"].as_str().unwrap())
+            .unwrap()
+            .0;
+        // Third signer never participates — just need a third PK for
+        // the preimage.
+        let pk2 = [0x33u8; 32];
+
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let pks_b64 = vec![B64.encode(pk0), B64.encode(pk1), B64.encode(pk2)];
+        // Import the multisig preimage so /multisig/sign can find it.
+        let (_, body) = post(
+            &router,
+            "/multisig/import",
+            json!({
+                "wallet_handle_token": token,
+                "multisig_version": 1,
+                "threshold": 2,
+                "pks": pks_b64,
+            }),
+        )
+        .await;
+        let msig_addr = body["address"].as_str().unwrap().to_string();
+        let msig_pk = Address::from_algorand_string(&msig_addr).unwrap().0;
+
+        // Build a payment from the multisig sender.
+        let txn = make_pay_txn(&msig_pk);
+        let txn_bytes = rmp_serde::to_vec_named(&txn).unwrap();
+
+        // First signer (pk0) — empty partial → fresh-sign path.
+        let (s, body) = post(
+            &router,
+            "/multisig/sign",
+            json!({
+                "wallet_handle_token": token,
+                "transaction": B64.encode(&txn_bytes),
+                "public_key": B64.encode(pk0),
+                "wallet_password": pwd,
+            }),
+        )
+        .await;
+        assert_eq!(s, 200, "1st subsig: {body}");
+        let partial1: MultisigSig =
+            rmp_serde::from_slice(&B64.decode(body["multisig"].as_str().unwrap()).unwrap())
+                .unwrap();
+
+        // Convert partial1 → wire shape for the next request.
+        let partial1_wire = json!({
+            "v": partial1.version,
+            "thr": partial1.threshold,
+            "subsig": partial1.subsigs.iter().map(|s| {
+                if s.signature == [0u8; 64] {
+                    json!({"pk": B64.encode(s.public_key)})
+                } else {
+                    json!({"pk": B64.encode(s.public_key), "s": B64.encode(s.signature)})
+                }
+            }).collect::<Vec<_>>(),
+        });
+
+        // Second signer (pk1) — extend the partial.
+        let (s, body) = post(
+            &router,
+            "/multisig/sign",
+            json!({
+                "wallet_handle_token": token,
+                "transaction": B64.encode(&txn_bytes),
+                "public_key": B64.encode(pk1),
+                "partial_multisig": partial1_wire,
+                "wallet_password": pwd,
+            }),
+        )
+        .await;
+        assert_eq!(s, 200, "2nd subsig: {body}");
+
+        let merged: MultisigSig =
+            rmp_serde::from_slice(&B64.decode(body["multisig"].as_str().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(merged.subsigs.len(), 3);
+        // Both pk0 and pk1 now carry a non-zero signature.
+        let signed_count = merged
+            .subsigs
+            .iter()
+            .filter(|s| s.signature != [0u8; 64])
+            .count();
+        assert_eq!(signed_count, 2, "two subsigs should be filled");
+    }
+
+    #[tokio::test]
+    async fn sign_routes_reject_invalid_token() {
+        let (router, _tmp) = make_router();
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let zero = Address([0u8; 32]).to_algorand_string();
+        let valid_txn_bytes = rmp_serde::to_vec_named(&Transaction::default()).unwrap();
+
+        // /transaction/sign: auth-before-tx-decode → 401 even with garbage tx.
+        let (s, _) = post(
+            &router,
+            "/transaction/sign",
+            json!({
+                "wallet_handle_token": "bogus",
+                "transaction": B64.encode(&valid_txn_bytes),
+                "wallet_password": "x",
+            }),
+        )
+        .await;
+        assert_eq!(s, 401);
+
+        // /program/sign: address-before-auth → 401 with valid addr.
+        let (s, _) = post(
+            &router,
+            "/program/sign",
+            json!({
+                "wallet_handle_token": "bogus",
+                "address": zero,
+                "data": B64.encode(b"\x02"),
+                "wallet_password": "x",
+            }),
+        )
+        .await;
+        assert_eq!(s, 401);
+
+        // /multisig/sign and /multisig/signprogram both auth first.
+        let (s, _) = post(
+            &router,
+            "/multisig/sign",
+            json!({
+                "wallet_handle_token": "bogus",
+                "transaction": B64.encode(&valid_txn_bytes),
+                "public_key": B64.encode([0u8; 32]),
+                "wallet_password": "x",
+            }),
+        )
+        .await;
+        assert_eq!(s, 401);
+        let (s, _) = post(
+            &router,
+            "/multisig/signprogram",
+            json!({
+                "wallet_handle_token": "bogus",
+                "address": zero,
+                "data": B64.encode(b"\x02"),
+                "public_key": B64.encode([0u8; 32]),
+                "wallet_password": "x",
+            }),
         )
         .await;
         assert_eq!(s, 401);
