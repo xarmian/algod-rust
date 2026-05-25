@@ -37,3 +37,4 @@ tempfile = "3"
 hex.workspace = true
 algo-validate.workspace = true
 reqwest.workspace = true
+base64.workspace = true
