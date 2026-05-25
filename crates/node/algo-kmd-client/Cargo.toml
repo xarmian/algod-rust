@@ -17,4 +17,8 @@ tokio = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+algo-codec = { workspace = true }
+algo-types = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
 tempfile = "3"

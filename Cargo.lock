@@ -290,7 +290,11 @@ dependencies = [
 name = "algo-kmd-client"
 version = "0.1.0"
 dependencies = [
+ "algo-codec",
  "algo-kmd-api-types",
+ "algo-types",
+ "base64",
+ "ed25519-dalek",
  "reqwest",
  "serde",
  "serde_json",

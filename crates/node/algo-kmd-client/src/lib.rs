@@ -12,9 +12,15 @@
 //! ([`crates/node/algo-kmd`]) and Go's `kmd`.
 //!
 //! Phase-A scope (TASK-222 under PLAN-152): wallet + handle ops only
-//! (versions, list-wallets, create, init, rename, release, info). Key
-//! / multisig / sign methods land in Phase B alongside the
-//! `account` / `clerk` subcommands of `goal-rust`.
+//! (versions, list-wallets, create, init, rename, release, info).
+//!
+//! Phase-B scope (TASK-233 under PLAN-232): key / multisig / sign /
+//! program-sign / renew-handle wrappers used by `goal-rust account *`
+//! and (eventually) `goal-rust clerk *`. Method names mirror Go's
+//! `wrappers.go` verbatim, snake-cased. One Go gap intentionally
+//! filled: `export_key` — kmdapi/requests.go has the route + types
+//! but `wrappers.go` ships no client wrapper, and Phase B's `account
+//! export` leaf needs it.
 //!
 //! ## Error mapping
 //!
@@ -32,15 +38,26 @@
 use std::time::Duration;
 
 use algo_kmd_api_types::{
-    common::APIV1ResponseEnvelope,
+    common::{APIV1PrivateKey, APIV1PublicKey, APIV1ResponseEnvelope, MultisigSig},
     requests::{
-        APIV1GETWalletsRequest, APIV1POSTWalletInfoRequest, APIV1POSTWalletInitRequest,
-        APIV1POSTWalletReleaseRequest, APIV1POSTWalletRenameRequest, APIV1POSTWalletRequest,
-        VersionsRequest,
+        APIV1DELETEKeyRequest, APIV1DELETEMultisigRequest, APIV1GETWalletsRequest,
+        APIV1POSTKeyExportRequest, APIV1POSTKeyImportRequest, APIV1POSTKeyListRequest,
+        APIV1POSTKeyRequest, APIV1POSTMasterKeyExportRequest, APIV1POSTMultisigExportRequest,
+        APIV1POSTMultisigImportRequest, APIV1POSTMultisigListRequest,
+        APIV1POSTMultisigProgramSignRequest, APIV1POSTMultisigTransactionSignRequest,
+        APIV1POSTProgramSignRequest, APIV1POSTTransactionSignRequest, APIV1POSTWalletInfoRequest,
+        APIV1POSTWalletInitRequest, APIV1POSTWalletReleaseRequest, APIV1POSTWalletRenameRequest,
+        APIV1POSTWalletRenewRequest, APIV1POSTWalletRequest, VersionsRequest,
     },
     responses::{
-        APIV1GETWalletsResponse, APIV1POSTWalletInfoResponse, APIV1POSTWalletInitResponse,
-        APIV1POSTWalletReleaseResponse, APIV1POSTWalletRenameResponse, APIV1POSTWalletResponse,
+        APIV1DELETEKeyResponse, APIV1DELETEMultisigResponse, APIV1GETWalletsResponse,
+        APIV1POSTKeyExportResponse, APIV1POSTKeyImportResponse, APIV1POSTKeyListResponse,
+        APIV1POSTKeyResponse, APIV1POSTMasterKeyExportResponse, APIV1POSTMultisigExportResponse,
+        APIV1POSTMultisigImportResponse, APIV1POSTMultisigListResponse,
+        APIV1POSTMultisigProgramSignResponse, APIV1POSTMultisigTransactionSignResponse,
+        APIV1POSTProgramSignResponse, APIV1POSTTransactionSignResponse,
+        APIV1POSTWalletInfoResponse, APIV1POSTWalletInitResponse, APIV1POSTWalletReleaseResponse,
+        APIV1POSTWalletRenameResponse, APIV1POSTWalletRenewResponse, APIV1POSTWalletResponse,
         VersionsResponse,
     },
 };
@@ -104,6 +121,96 @@ fn wallet_info_route() -> Route {
     Route {
         method: reqwest::Method::POST,
         path: "v1/wallet/info",
+    }
+}
+fn wallet_renew_route() -> Route {
+    Route {
+        method: reqwest::Method::POST,
+        path: "v1/wallet/renew",
+    }
+}
+fn master_key_export_route() -> Route {
+    Route {
+        method: reqwest::Method::POST,
+        path: "v1/master-key/export",
+    }
+}
+fn key_generate_route() -> Route {
+    Route {
+        method: reqwest::Method::POST,
+        path: "v1/key",
+    }
+}
+fn key_delete_route() -> Route {
+    Route {
+        method: reqwest::Method::DELETE,
+        path: "v1/key",
+    }
+}
+fn key_list_route() -> Route {
+    Route {
+        method: reqwest::Method::POST,
+        path: "v1/key/list",
+    }
+}
+fn key_import_route() -> Route {
+    Route {
+        method: reqwest::Method::POST,
+        path: "v1/key/import",
+    }
+}
+fn key_export_route() -> Route {
+    Route {
+        method: reqwest::Method::POST,
+        path: "v1/key/export",
+    }
+}
+fn transaction_sign_route() -> Route {
+    Route {
+        method: reqwest::Method::POST,
+        path: "v1/transaction/sign",
+    }
+}
+fn program_sign_route() -> Route {
+    Route {
+        method: reqwest::Method::POST,
+        path: "v1/program/sign",
+    }
+}
+fn multisig_list_route() -> Route {
+    Route {
+        method: reqwest::Method::POST,
+        path: "v1/multisig/list",
+    }
+}
+fn multisig_import_route() -> Route {
+    Route {
+        method: reqwest::Method::POST,
+        path: "v1/multisig/import",
+    }
+}
+fn multisig_export_route() -> Route {
+    Route {
+        method: reqwest::Method::POST,
+        path: "v1/multisig/export",
+    }
+}
+fn multisig_delete_route() -> Route {
+    Route {
+        method: reqwest::Method::DELETE,
+        path: "v1/multisig",
+    }
+}
+fn multisig_sign_route() -> Route {
+    Route {
+        method: reqwest::Method::POST,
+        path: "v1/multisig/sign",
+    }
+}
+fn multisig_sign_program_route() -> Route {
+    Route {
+        method: reqwest::Method::POST,
+        path: "v1/multisig/signprogram",
     }
 }
 
@@ -297,6 +404,281 @@ impl KmdClient {
         self.do_request(wallet_info_route(), &req).await
     }
 
+    /// Mirrors `RenewWalletHandle(walletHandle)`.
+    /// `POST /v1/wallet/renew`. Bumps the server-side expiry on an
+    /// existing handle without re-prompting the user for the wallet
+    /// password.
+    pub async fn renew_wallet_handle(
+        &self,
+        wallet_handle: &str,
+    ) -> Result<APIV1POSTWalletRenewResponse, KmdError> {
+        let req = APIV1POSTWalletRenewRequest {
+            wallet_handle_token: wallet_handle.to_string(),
+        };
+        self.do_request(wallet_renew_route(), &req).await
+    }
+
+    /// Mirrors `ExportMasterDerivationKey(walletHandle, walletPassword)`.
+    /// `POST /v1/master-key/export`. Returns the wallet's 32-byte MDK
+    /// so it can be rendered as a mnemonic by the caller.
+    pub async fn master_key_export(
+        &self,
+        wallet_handle: &str,
+        wallet_password: &str,
+    ) -> Result<APIV1POSTMasterKeyExportResponse, KmdError> {
+        let req = APIV1POSTMasterKeyExportRequest {
+            wallet_handle_token: wallet_handle.to_string(),
+            wallet_password: wallet_password.to_string(),
+        };
+        self.do_request(master_key_export_route(), &req).await
+    }
+
+    /// Mirrors `GenerateKey(walletHandle)`. `POST /v1/key`. The SQLite
+    /// driver always rejects `display_mnemonic=true` (sqlite.go:850,
+    /// `errNoMnemonicUX`), so we pin it to `false` — matching the call
+    /// site Go's `goal account new` uses.
+    pub async fn generate_key(
+        &self,
+        wallet_handle: &str,
+    ) -> Result<APIV1POSTKeyResponse, KmdError> {
+        let req = APIV1POSTKeyRequest {
+            wallet_handle_token: wallet_handle.to_string(),
+            display_mnemonic: false,
+        };
+        self.do_request(key_generate_route(), &req).await
+    }
+
+    /// Mirrors `ListKeys(walletHandle)`. `POST /v1/key/list`. Returns
+    /// every public address held by the wallet (32-byte pubkeys formatted
+    /// as Algorand base32 strings).
+    pub async fn list_keys(
+        &self,
+        wallet_handle: &str,
+    ) -> Result<APIV1POSTKeyListResponse, KmdError> {
+        let req = APIV1POSTKeyListRequest {
+            wallet_handle_token: wallet_handle.to_string(),
+        };
+        self.do_request(key_list_route(), &req).await
+    }
+
+    /// Mirrors `ImportKey(walletHandle, secretKey)`. `POST /v1/key/import`.
+    /// `secret_key` is the 64-byte Ed25519 expanded private key (the
+    /// same shape Go's `crypto.PrivateKey` carries).
+    pub async fn import_key(
+        &self,
+        wallet_handle: &str,
+        secret_key: APIV1PrivateKey,
+    ) -> Result<APIV1POSTKeyImportResponse, KmdError> {
+        let req = APIV1POSTKeyImportRequest {
+            wallet_handle_token: wallet_handle.to_string(),
+            private_key: secret_key,
+        };
+        self.do_request(key_import_route(), &req).await
+    }
+
+    /// `POST /v1/key/export`. Returns the 64-byte expanded private key
+    /// for `address`. NOTE: Go's `wrappers.go` ships no `ExportKey`
+    /// wrapper, but the route + request/response types are defined in
+    /// `kmdapi/{requests,responses}.go` and kmd-rust serves the route.
+    /// Phase B's `goal account export` consumes this method directly.
+    pub async fn export_key(
+        &self,
+        wallet_handle: &str,
+        wallet_password: &str,
+        address: &str,
+    ) -> Result<APIV1POSTKeyExportResponse, KmdError> {
+        let req = APIV1POSTKeyExportRequest {
+            wallet_handle_token: wallet_handle.to_string(),
+            address: address.to_string(),
+            wallet_password: wallet_password.to_string(),
+        };
+        self.do_request(key_export_route(), &req).await
+    }
+
+    /// Mirrors `DeleteKey(walletHandle, pw, addr)`. `DELETE /v1/key`.
+    /// Removes the key for `address` from the wallet. Server validates
+    /// the password before deletion.
+    pub async fn delete_key(
+        &self,
+        wallet_handle: &str,
+        wallet_password: &str,
+        address: &str,
+    ) -> Result<APIV1DELETEKeyResponse, KmdError> {
+        let req = APIV1DELETEKeyRequest {
+            wallet_handle_token: wallet_handle.to_string(),
+            address: address.to_string(),
+            wallet_password: wallet_password.to_string(),
+        };
+        self.do_request(key_delete_route(), &req).await
+    }
+
+    /// Mirrors `SignTransaction(walletHandle, pw, pk, tx)`.
+    /// `POST /v1/transaction/sign`.
+    ///
+    /// Unlike Go's wrapper — which takes a `transactions.Transaction`
+    /// struct and msgpack-encodes it internally — this client takes
+    /// **pre-encoded** canonical msgpack bytes so the kmd-client crate
+    /// stays independent of `algo-types`. Callers (goal-rust, clerk)
+    /// already have a `Transaction` and run it through
+    /// `algo_codec::canonical_encode_transaction`. The wire field is
+    /// `transaction` either way.
+    ///
+    /// `signer` is the 32-byte public key to sign with; passing
+    /// `[0u8; 32]` matches Go's "infer the signer from `txn.snd`"
+    /// behavior at the sqlite-driver call site.
+    pub async fn sign_transaction(
+        &self,
+        wallet_handle: &str,
+        wallet_password: &str,
+        transaction: Vec<u8>,
+        signer: APIV1PublicKey,
+    ) -> Result<APIV1POSTTransactionSignResponse, KmdError> {
+        let req = APIV1POSTTransactionSignRequest {
+            wallet_handle_token: wallet_handle.to_string(),
+            transaction,
+            public_key: signer,
+            wallet_password: wallet_password.to_string(),
+        };
+        self.do_request(transaction_sign_route(), &req).await
+    }
+
+    /// Mirrors `SignProgram(walletHandle, pw, addr, data)`.
+    /// `POST /v1/program/sign`. Signs `program` under the key for
+    /// `address`. Returns a raw 64-byte Ed25519 signature over
+    /// `"Program" || program` (the LogicSig signing rule).
+    pub async fn sign_program(
+        &self,
+        wallet_handle: &str,
+        wallet_password: &str,
+        address: &str,
+        program: Vec<u8>,
+    ) -> Result<APIV1POSTProgramSignResponse, KmdError> {
+        let req = APIV1POSTProgramSignRequest {
+            wallet_handle_token: wallet_handle.to_string(),
+            address: address.to_string(),
+            program,
+            wallet_password: wallet_password.to_string(),
+        };
+        self.do_request(program_sign_route(), &req).await
+    }
+
+    /// Mirrors `ListMultisigAddrs(walletHandle)`.
+    /// `POST /v1/multisig/list`. Returns the base32 addresses of every
+    /// multisig preimage held by the wallet.
+    pub async fn list_multisig_addrs(
+        &self,
+        wallet_handle: &str,
+    ) -> Result<APIV1POSTMultisigListResponse, KmdError> {
+        let req = APIV1POSTMultisigListRequest {
+            wallet_handle_token: wallet_handle.to_string(),
+        };
+        self.do_request(multisig_list_route(), &req).await
+    }
+
+    /// Mirrors `ImportMultisigAddr(walletHandle, version, threshold, pks)`.
+    /// `POST /v1/multisig/import`. Stores the multisig preimage and
+    /// returns the derived multisig address.
+    pub async fn import_multisig(
+        &self,
+        wallet_handle: &str,
+        version: u8,
+        threshold: u8,
+        pks: Vec<APIV1PublicKey>,
+    ) -> Result<APIV1POSTMultisigImportResponse, KmdError> {
+        let req = APIV1POSTMultisigImportRequest {
+            wallet_handle_token: wallet_handle.to_string(),
+            version,
+            threshold,
+            pks,
+        };
+        self.do_request(multisig_import_route(), &req).await
+    }
+
+    /// Mirrors `ExportMultisigAddr(walletHandle, addr)`.
+    /// `POST /v1/multisig/export`. Returns the version / threshold /
+    /// pks that derive `address`.
+    pub async fn export_multisig(
+        &self,
+        wallet_handle: &str,
+        address: &str,
+    ) -> Result<APIV1POSTMultisigExportResponse, KmdError> {
+        let req = APIV1POSTMultisigExportRequest {
+            wallet_handle_token: wallet_handle.to_string(),
+            address: address.to_string(),
+        };
+        self.do_request(multisig_export_route(), &req).await
+    }
+
+    /// Mirrors `DeleteMultisigAddr(walletHandle, pw, addr)`.
+    /// `DELETE /v1/multisig`. Drops the multisig preimage; the
+    /// underlying component keys are untouched.
+    pub async fn delete_multisig(
+        &self,
+        wallet_handle: &str,
+        wallet_password: &str,
+        address: &str,
+    ) -> Result<APIV1DELETEMultisigResponse, KmdError> {
+        let req = APIV1DELETEMultisigRequest {
+            wallet_handle_token: wallet_handle.to_string(),
+            address: address.to_string(),
+            wallet_password: wallet_password.to_string(),
+        };
+        self.do_request(multisig_delete_route(), &req).await
+    }
+
+    /// Mirrors `MultisigSignTransaction(walletHandle, pw, tx, pk,
+    /// partial, msigSigner)`. `POST /v1/multisig/sign`.
+    ///
+    /// As with `sign_transaction`, `transaction` is **pre-encoded**
+    /// canonical msgpack bytes. `public_key` is the component pubkey
+    /// for our subsig; `partial_msig` is the in-progress multisig (or
+    /// `MultisigSig::default()` if we're the first signer);
+    /// `auth_addr` is the rekey/auth address (all-zero means none).
+    pub async fn multisig_sign_transaction(
+        &self,
+        wallet_handle: &str,
+        wallet_password: &str,
+        transaction: Vec<u8>,
+        public_key: APIV1PublicKey,
+        partial_msig: MultisigSig,
+        auth_addr: APIV1PublicKey,
+    ) -> Result<APIV1POSTMultisigTransactionSignResponse, KmdError> {
+        let req = APIV1POSTMultisigTransactionSignRequest {
+            wallet_handle_token: wallet_handle.to_string(),
+            transaction,
+            public_key,
+            partial_msig,
+            wallet_password: wallet_password.to_string(),
+            auth_addr,
+        };
+        self.do_request(multisig_sign_route(), &req).await
+    }
+
+    /// Mirrors `MultisigSignProgram(walletHandle, pw, addr, data, pk,
+    /// partial, useLegacyMsig)`. `POST /v1/multisig/signprogram`.
+    #[allow(clippy::too_many_arguments)] // mirrors Go's 7-arg wrapper verbatim
+    pub async fn multisig_sign_program(
+        &self,
+        wallet_handle: &str,
+        wallet_password: &str,
+        address: &str,
+        public_key: APIV1PublicKey,
+        partial_msig: MultisigSig,
+        program: Vec<u8>,
+        use_legacy_msig: bool,
+    ) -> Result<APIV1POSTMultisigProgramSignResponse, KmdError> {
+        let req = APIV1POSTMultisigProgramSignRequest {
+            wallet_handle_token: wallet_handle.to_string(),
+            address: address.to_string(),
+            program,
+            public_key,
+            partial_msig,
+            wallet_password: wallet_password.to_string(),
+            use_legacy_msig,
+        };
+        self.do_request(multisig_sign_program_route(), &req).await
+    }
+
     fn join(&self, path: &str) -> Result<Url, KmdError> {
         // `Url::join` treats the LHS as a base — by ensuring `path`
         // never starts with `/` and the base ends with `/`, we always
@@ -402,6 +784,21 @@ impl_envelope! {
     APIV1POSTWalletReleaseResponse,
     APIV1POSTWalletRenameResponse,
     APIV1POSTWalletInfoResponse,
+    APIV1POSTWalletRenewResponse,
+    APIV1POSTMasterKeyExportResponse,
+    APIV1POSTKeyResponse,
+    APIV1DELETEKeyResponse,
+    APIV1POSTKeyListResponse,
+    APIV1POSTKeyImportResponse,
+    APIV1POSTKeyExportResponse,
+    APIV1POSTTransactionSignResponse,
+    APIV1POSTProgramSignResponse,
+    APIV1POSTMultisigListResponse,
+    APIV1POSTMultisigImportResponse,
+    APIV1POSTMultisigExportResponse,
+    APIV1DELETEMultisigResponse,
+    APIV1POSTMultisigTransactionSignResponse,
+    APIV1POSTMultisigProgramSignResponse,
 }
 
 #[cfg(test)]
@@ -429,6 +826,61 @@ mod tests {
                 "v1/wallet/release",
             ),
             (wallet_info_route(), reqwest::Method::POST, "v1/wallet/info"),
+            (
+                wallet_renew_route(),
+                reqwest::Method::POST,
+                "v1/wallet/renew",
+            ),
+            (
+                master_key_export_route(),
+                reqwest::Method::POST,
+                "v1/master-key/export",
+            ),
+            (key_generate_route(), reqwest::Method::POST, "v1/key"),
+            (key_delete_route(), reqwest::Method::DELETE, "v1/key"),
+            (key_list_route(), reqwest::Method::POST, "v1/key/list"),
+            (key_import_route(), reqwest::Method::POST, "v1/key/import"),
+            (key_export_route(), reqwest::Method::POST, "v1/key/export"),
+            (
+                transaction_sign_route(),
+                reqwest::Method::POST,
+                "v1/transaction/sign",
+            ),
+            (
+                program_sign_route(),
+                reqwest::Method::POST,
+                "v1/program/sign",
+            ),
+            (
+                multisig_list_route(),
+                reqwest::Method::POST,
+                "v1/multisig/list",
+            ),
+            (
+                multisig_import_route(),
+                reqwest::Method::POST,
+                "v1/multisig/import",
+            ),
+            (
+                multisig_export_route(),
+                reqwest::Method::POST,
+                "v1/multisig/export",
+            ),
+            (
+                multisig_delete_route(),
+                reqwest::Method::DELETE,
+                "v1/multisig",
+            ),
+            (
+                multisig_sign_route(),
+                reqwest::Method::POST,
+                "v1/multisig/sign",
+            ),
+            (
+                multisig_sign_program_route(),
+                reqwest::Method::POST,
+                "v1/multisig/signprogram",
+            ),
         ] {
             assert_eq!(got.method, want_method, "method for {want_path}");
             assert_eq!(got.path, want_path, "path for {want_path}");
