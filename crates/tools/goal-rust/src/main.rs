@@ -74,43 +74,43 @@ pub enum RootCommand {
     /// Control and manage Algorand accounts.
     Account {
         #[command(subcommand)]
-        cmd: groups::account::AccountCmd,
+        cmd: Option<groups::account::AccountCmd>,
     },
 
     /// Manage applications.
     App {
         #[command(subcommand)]
-        cmd: groups::app::AppCmd,
+        cmd: Option<groups::app::AppCmd>,
     },
 
     /// Manage assets.
     Asset {
         #[command(subcommand)]
-        cmd: groups::asset::AssetCmd,
+        cmd: Option<groups::asset::AssetCmd>,
     },
 
     /// Provides the tools to control transactions.
     Clerk {
         #[command(subcommand)]
-        cmd: groups::clerk::ClerkCmd,
+        cmd: Option<groups::clerk::ClerkCmd>,
     },
 
     /// Shell completion helper.
     Completion {
         #[command(subcommand)]
-        cmd: groups::completion::CompletionCmd,
+        cmd: Option<groups::completion::CompletionCmd>,
     },
 
     /// Interact with kmd, the key management daemon.
     Kmd {
         #[command(subcommand)]
-        cmd: groups::kmd::KmdCmd,
+        cmd: Option<groups::kmd::KmdCmd>,
     },
 
     /// Access ledger-related details.
     Ledger {
         #[command(subcommand)]
-        cmd: groups::ledger::LedgerCmd,
+        cmd: Option<groups::ledger::LedgerCmd>,
     },
 
     /// Display license information.
@@ -119,13 +119,13 @@ pub enum RootCommand {
     /// Create and manage private, multi-node, locally-hosted networks.
     Network {
         #[command(subcommand)]
-        cmd: groups::network::NetworkCmd,
+        cmd: Option<groups::network::NetworkCmd>,
     },
 
     /// Manage a specified algorand node.
     Node {
         #[command(subcommand)]
-        cmd: groups::node::NodeCmd,
+        cmd: Option<groups::node::NodeCmd>,
     },
 
     /// Dump standard consensus protocols as json to stdout.
@@ -140,8 +140,27 @@ pub enum RootCommand {
     /// Manage wallets: encrypted collections of Algorand account keys.
     Wallet {
         #[command(subcommand)]
-        cmd: groups::wallet::WalletCmd,
+        cmd: Option<groups::wallet::WalletCmd>,
     },
+}
+
+/// Print help for a (possibly nested) subcommand and exit 0, mirroring
+/// cobra's no-`Run` fallback for command groups (e.g. `goal app` ⇒
+/// help). `path` is the slice walked from the root, e.g. `["app", "box"]`.
+fn print_group_help(path: &[&str]) -> ExitCode {
+    let mut cmd = <Cli as clap::CommandFactory>::command();
+    let mut current: Option<&mut clap::Command> = Some(&mut cmd);
+    for name in path {
+        current = current.and_then(|c| c.find_subcommand_mut(*name));
+        if current.is_none() {
+            break;
+        }
+    }
+    if let Some(c) = current {
+        let _ = c.print_help();
+        println!();
+    }
+    ExitCode::SUCCESS
 }
 
 /// Print the "not yet implemented" message Go-side never emits but every
@@ -171,19 +190,29 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     };
     match command {
-        RootCommand::Account { cmd } => groups::account::run(cmd),
-        RootCommand::App { cmd } => groups::app::run(cmd),
-        RootCommand::Asset { cmd } => groups::asset::run(cmd),
-        RootCommand::Clerk { cmd } => groups::clerk::run(cmd),
-        RootCommand::Completion { cmd } => groups::completion::run(cmd),
-        RootCommand::Kmd { cmd } => groups::kmd::run(cmd),
-        RootCommand::Ledger { cmd } => groups::ledger::run(cmd),
+        RootCommand::Account { cmd: Some(c) } => groups::account::run(c),
+        RootCommand::Account { cmd: None } => print_group_help(&["account"]),
+        RootCommand::App { cmd: Some(c) } => groups::app::run(c),
+        RootCommand::App { cmd: None } => print_group_help(&["app"]),
+        RootCommand::Asset { cmd: Some(c) } => groups::asset::run(c),
+        RootCommand::Asset { cmd: None } => print_group_help(&["asset"]),
+        RootCommand::Clerk { cmd: Some(c) } => groups::clerk::run(c),
+        RootCommand::Clerk { cmd: None } => print_group_help(&["clerk"]),
+        RootCommand::Completion { cmd: Some(c) } => groups::completion::run(c),
+        RootCommand::Completion { cmd: None } => print_group_help(&["completion"]),
+        RootCommand::Kmd { cmd: Some(c) } => groups::kmd::run(c),
+        RootCommand::Kmd { cmd: None } => print_group_help(&["kmd"]),
+        RootCommand::Ledger { cmd: Some(c) } => groups::ledger::run(c),
+        RootCommand::Ledger { cmd: None } => print_group_help(&["ledger"]),
         RootCommand::License => unimplemented("", "license"),
-        RootCommand::Network { cmd } => groups::network::run(cmd),
-        RootCommand::Node { cmd } => groups::node::run(cmd),
+        RootCommand::Network { cmd: Some(c) } => groups::network::run(c),
+        RootCommand::Network { cmd: None } => print_group_help(&["network"]),
+        RootCommand::Node { cmd: Some(c) } => groups::node::run(c),
+        RootCommand::Node { cmd: None } => print_group_help(&["node"]),
         RootCommand::Protocols => unimplemented("", "protocols"),
         RootCommand::Report => unimplemented("", "report"),
         RootCommand::Version => unimplemented("", "version"),
-        RootCommand::Wallet { cmd } => groups::wallet::run(cmd),
+        RootCommand::Wallet { cmd: Some(c) } => groups::wallet::run(c),
+        RootCommand::Wallet { cmd: None } => print_group_help(&["wallet"]),
     }
 }

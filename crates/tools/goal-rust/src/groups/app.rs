@@ -11,7 +11,7 @@ pub enum AppCmd {
     /// Read application box data.
     Box {
         #[command(subcommand)]
-        cmd: BoxCmd,
+        cmd: Option<BoxCmd>,
     },
     /// Call an application.
     Call,
@@ -44,8 +44,11 @@ pub enum BoxCmd {
 }
 
 pub fn run(cmd: AppCmd) -> ExitCode {
-    let leaf: &str = match &cmd {
+    let leaf: &str = match cmd {
         AppCmd::Box { cmd } => {
+            let Some(cmd) = cmd else {
+                return crate::print_group_help(&["app", "box"]);
+            };
             let leaf = match cmd {
                 BoxCmd::Info => "info",
                 BoxCmd::List => "list",

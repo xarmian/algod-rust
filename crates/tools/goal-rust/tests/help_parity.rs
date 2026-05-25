@@ -177,6 +177,41 @@ fn root_version_flag_is_lowercase_v_not_uppercase_v() {
 }
 
 #[test]
+fn group_without_leaf_falls_back_to_help_and_exits_zero() {
+    // Regression guard (Codex review of TASK-220 round 3): Go's cobra
+    // treats `goal app` (group, no leaf) as a help fallback — prints
+    // group help on stdout and exits 0. Our scaffold previously
+    // rejected with a clap parse error.
+    let cases: &[&[&str]] = &[
+        &["account"],
+        &["app"],
+        &["app", "box"],
+        &["account", "multisig"],
+        &["clerk"],
+        &["clerk", "multisig"],
+        &["wallet"],
+    ];
+    for argv in cases {
+        let out = Command::new(GOAL_RUST_BIN)
+            .args(*argv)
+            .output()
+            .expect("run goal-rust group");
+        assert!(
+            out.status.success(),
+            "argv={argv:?} expected exit 0 (help fallback), got {:?}\n  stdout={:?}\n  stderr={:?}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("Commands:") || stdout.contains("Available Commands:"),
+            "argv={argv:?} expected help on stdout, got {stdout:?}",
+        );
+    }
+}
+
+#[test]
 fn unimplemented_leaf_exits_with_code_two_and_message() {
     // Spot-check a handful of leaves across different groups, including
     // hyphenated names and nested subgroups.

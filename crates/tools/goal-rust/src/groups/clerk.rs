@@ -23,7 +23,7 @@ pub enum ClerkCmd {
     /// Provides tools working with multisig transactions.
     Multisig {
         #[command(subcommand)]
-        cmd: MultisigCmd,
+        cmd: Option<MultisigCmd>,
     },
     /// Send raw transactions.
     Rawsend,
@@ -52,13 +52,16 @@ pub enum MultisigCmd {
 }
 
 pub fn run(cmd: ClerkCmd) -> ExitCode {
-    let leaf: &str = match &cmd {
+    let leaf: &str = match cmd {
         ClerkCmd::Compile => "compile",
         ClerkCmd::Dryrun => "dryrun",
         ClerkCmd::DryrunRemote => "dryrun-remote",
         ClerkCmd::Group => "group",
         ClerkCmd::Inspect => "inspect",
         ClerkCmd::Multisig { cmd } => {
+            let Some(cmd) = cmd else {
+                return crate::print_group_help(&["clerk", "multisig"]);
+            };
             let leaf = match cmd {
                 MultisigCmd::Merge => "merge",
                 MultisigCmd::Sign => "sign",

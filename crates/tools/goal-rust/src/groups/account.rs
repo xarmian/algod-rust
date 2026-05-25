@@ -55,7 +55,7 @@ pub enum AccountCmd {
     /// Control and manage multisig accounts.
     Multisig {
         #[command(subcommand)]
-        cmd: MultisigCmd,
+        cmd: Option<MultisigCmd>,
     },
     /// Create a new account.
     New,
@@ -85,7 +85,7 @@ pub enum MultisigCmd {
 }
 
 pub fn run(cmd: AccountCmd) -> ExitCode {
-    let leaf: &str = match &cmd {
+    let leaf: &str = match cmd {
         AccountCmd::Addpartkey => "addpartkey",
         AccountCmd::Assetdetails => "assetdetails",
         AccountCmd::Balance => "balance",
@@ -102,6 +102,9 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
         AccountCmd::Listpartkeys => "listpartkeys",
         AccountCmd::Marknonparticipating => "marknonparticipating",
         AccountCmd::Multisig { cmd } => {
+            let Some(cmd) = cmd else {
+                return crate::print_group_help(&["account", "multisig"]);
+            };
             let leaf = match cmd {
                 MultisigCmd::Delete => "delete",
                 MultisigCmd::Info => "info",
