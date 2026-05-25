@@ -1,0 +1,13 @@
+Last committed block: 42
+Time since last block: 3.5s
+Sync Time: 0.0s
+Last consensus protocol: future
+Next consensus protocol: future
+Round for next consensus protocol: 100
+Next consensus protocol supported: true
+Consensus upgrade state: Voting
+Yes votes: 3000
+No votes: 500
+Votes remaining: 6500
+Yes votes required: 10000
+Vote window close round: 1000
