@@ -173,6 +173,17 @@ pub enum Error {
     #[error("wallet has not been unlocked (call Wallet::init first)")]
     WalletNotInitialized,
 
+    /// Another kmd-rust process holds the file lock on this data dir.
+    /// Mirrors `ErrAlreadyRunning` (`daemon/kmd/server/server.go`).
+    #[error("kmd is already running in this data directory")]
+    AlreadyRunning,
+
+    /// The configured data dir does not exist or is not a directory.
+    /// Surfaced by [`crate::server::WalletServer::bind`] before it
+    /// tries to write `kmd.net` / `kmd.pid`.
+    #[error("kmd data directory does not exist: {0}")]
+    DataDirMissing(PathBuf),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
