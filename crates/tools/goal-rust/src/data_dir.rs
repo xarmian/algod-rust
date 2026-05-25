@@ -123,15 +123,11 @@ pub fn resolve_data_dirs_with_env(
 ) -> Result<Vec<PathBuf>, DataDirError> {
     if let Some(first) = cli_d.first() {
         let mut out = Vec::with_capacity(cli_d.len());
-        // Mirror Go's filepath.Abs on the first entry only.
-        let abs_first = match fs::canonicalize(first) {
-            Ok(p) => p,
-            // If the path doesn't exist yet, fall back to a plain
-            // absolute join with cwd — matches Go's `filepath.Abs`
-            // which does NOT require the path to exist.
-            Err(_) => absolutize(first),
-        };
-        out.push(abs_first);
+        // Mirror Go's `filepath.Abs`: makes the path absolute relative
+        // to cwd but does NOT resolve symlinks and does NOT require the
+        // path to exist. `fs::canonicalize` would do both and would
+        // diverge from `goal` (see Codex review round 1 of TASK-221).
+        out.push(absolutize(first));
         for d in &cli_d[1..] {
             out.push(d.clone());
         }
@@ -286,15 +282,19 @@ pub fn resolve_kmd_data_dir(
         kmd_dir_flag,
         env::var_os(ALGORAND_KMD_ENV).as_deref(),
         algod_data_dir,
+        algorand_data_env().as_deref(),
         &global_config_file_root().unwrap_or_default(),
     )
 }
 
-/// Test seam for [`resolve_kmd_data_dir`].
+/// Test seam for [`resolve_kmd_data_dir`]. `algod_data_env` mirrors
+/// Go's fallback `dataDir = datadir.ResolveDataDir()` applied inside
+/// `resolveKmdDataDir` when the input data dir is empty.
 pub fn resolve_kmd_data_dir_with(
     kmd_dir_flag: Option<&Path>,
     kmd_env: Option<&std::ffi::OsStr>,
     algod_data_dir: &Path,
+    algod_data_env: Option<&std::ffi::OsStr>,
     global_config_root: &Path,
 ) -> Result<PathBuf, DataDirError> {
     if let Some(p) = kmd_dir_flag {
@@ -305,10 +305,19 @@ pub fn resolve_kmd_data_dir_with(
             return Ok(absolutize(Path::new(env)));
         }
     }
-    if is_algorand_data_private(algod_data_dir) {
-        return Ok(absolutize(&algod_data_dir.join(DEFAULT_KMD_DATA_DIR)));
+    // Go: `if dataDir == "" { dataDir = datadir.ResolveDataDir() }`.
+    let effective: PathBuf = if algod_data_dir.as_os_str().is_empty() {
+        match algod_data_env.filter(|s| !s.is_empty()) {
+            Some(env) => PathBuf::from(env),
+            None => PathBuf::new(),
+        }
+    } else {
+        algod_data_dir.to_path_buf()
+    };
+    if is_algorand_data_private(&effective) {
+        return Ok(absolutize(&effective.join(DEFAULT_KMD_DATA_DIR)));
     }
-    let genesis_id = read_genesis_id(algod_data_dir)?;
+    let genesis_id = read_genesis_id(&effective)?;
     Ok(global_config_root
         .join(genesis_id)
         .join(DEFAULT_KMD_DATA_DIR))
@@ -455,6 +464,7 @@ mod tests {
             Some(&flag),
             Some(OsStr::new("/env/should/lose")),
             d.path(),
+            None,
             Path::new("/global/should/lose"),
         )
         .unwrap();
@@ -468,6 +478,7 @@ mod tests {
             None,
             Some(OsStr::new("/tmp/env-kmd")),
             d.path(),
+            None,
             Path::new("/global/should/lose"),
         )
         .unwrap();
@@ -478,7 +489,8 @@ mod tests {
     fn kmd_private_data_dir_uses_default_kmd_subdir() {
         let d = tmp();
         // No system.json ⇒ private (the developer default).
-        let got = resolve_kmd_data_dir_with(None, None, d.path(), Path::new("/global")).unwrap();
+        let got =
+            resolve_kmd_data_dir_with(None, None, d.path(), None, Path::new("/global")).unwrap();
         let expected = absolutize(&d.path().join(DEFAULT_KMD_DATA_DIR));
         assert_eq!(got, expected);
     }
@@ -492,8 +504,51 @@ mod tests {
             r#"{"network":"mainnet","id":"v1"}"#,
         )
         .unwrap();
-        let got = resolve_kmd_data_dir_with(None, None, d.path(), Path::new("/global/.algorand"))
-            .unwrap();
-        assert_eq!(got, PathBuf::from("/global/.algorand/mainnet-v1/kmd-v0.5"),);
+        let got =
+            resolve_kmd_data_dir_with(None, None, d.path(), None, Path::new("/global/.algorand"))
+                .unwrap();
+        assert_eq!(got, PathBuf::from("/global/.algorand/mainnet-v1/kmd-v0.5"));
+    }
+
+    #[test]
+    fn kmd_empty_data_dir_falls_back_to_algorand_data_env() {
+        // Regression guard (Codex review of TASK-221 round 1): when
+        // both -k and $ALGORAND_KMD are unset AND the algod data dir
+        // arg is empty, Go's resolveKmdDataDir calls
+        // `datadir.ResolveDataDir()` to recover from $ALGORAND_DATA.
+        // We must not return `<cwd>/kmd-v0.5`.
+        let d = tmp();
+        // Make `d` a "private" data dir (no system.json).
+        let got = resolve_kmd_data_dir_with(
+            None,
+            None,
+            Path::new(""),
+            Some(d.path().as_os_str()),
+            Path::new("/global"),
+        )
+        .unwrap();
+        let expected = absolutize(&d.path().join(DEFAULT_KMD_DATA_DIR));
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn first_d_entry_preserves_symlink_path() {
+        // Regression guard (Codex review round 1): Go's filepath.Abs
+        // does NOT resolve symlinks; fs::canonicalize would. Verify
+        // that a symlinked path comes back as the symlink, not its
+        // target.
+        #[cfg(unix)]
+        {
+            let d = tmp();
+            let real = d.path().join("real");
+            let link = d.path().join("link");
+            std::fs::create_dir(&real).unwrap();
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let dirs = resolve_data_dirs_with_env(std::slice::from_ref(&link), None).unwrap();
+            assert_eq!(
+                dirs[0], link,
+                "first -d entry must preserve the symlink path",
+            );
+        }
     }
 }
