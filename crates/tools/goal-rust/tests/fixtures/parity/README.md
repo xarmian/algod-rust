@@ -46,6 +46,11 @@ MIXED_CLUSTER=1 ./crates/tools/goal-rust/tools/capture-goal-fixtures.sh
 
 The script is currently a scaffold — the algod+kmd state-fixture
 rig for the catchpoint / upgrade-voting branches lives outside
-Phase A. Until that lands, refresh by editing the `.txt` files by
-hand against the Go source line references in the table above, and
-inspect the diff carefully before committing.
+Phase A. The fixtures committed here were hand-derived from Go's
+`messages.go` format-string constants (with the line references in
+the table above) during Phase A's initial bring-up, AT WHICH POINT
+the constants were also embedded byte-exactly in `src/cmd/*.rs` to
+form a complete cross-check. New fixtures may only be added with
+that same dual-source verification, never by editing the `.txt`
+files post-hoc — once the file exists, only the Go capture script
+should write it.

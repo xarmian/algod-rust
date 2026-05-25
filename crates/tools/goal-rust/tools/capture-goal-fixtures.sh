@@ -3,9 +3,11 @@
 # from a running Go `goal` binary against deterministic data dirs.
 #
 # Gated on MIXED_CLUSTER=1 (the canonical algod-rust signal for
-# "you may exec / talk to ../go-algorand") and writes through the
-# Rust test harness's UPDATE_FIXTURES=1 contract so the diff path
-# is the same one CI exercises.
+# "you may exec / talk to ../go-algorand"). Writes Go's stdout
+# DIRECTLY to tests/fixtures/parity/<name>.txt — the Rust assertion
+# helper has no "rewrite from actual" path (deliberately, per
+# Codex review TASK-229 round 1), so this script is the only
+# sanctioned writer.
 #
 # Phase A ships the harness + 7 hand-derived fixtures from Go's
 # messages.go template constants. The live-capture body below is a
