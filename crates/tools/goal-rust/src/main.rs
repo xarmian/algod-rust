@@ -14,6 +14,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+pub mod data_dir;
 mod groups;
 
 /// goal-rust — CLI for interacting with Algorand.
