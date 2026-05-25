@@ -130,15 +130,22 @@ pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>
 }
 
 /// Port of `listWalletsCmd` + `printWallets`
-/// (`wallet.go:199-281`). Output byte-identical to Go for the
-/// empty + populated cases (the `(default)` indicator isn't
-/// surfaced — Phase A doesn't persist a default wallet selection,
-/// so the suffix never applies and operators get the same shape
-/// as Go on a freshly-created data dir with one wallet).
+/// (`wallet.go:199-281`). Iterates every `-d` data dir Go's
+/// `datadir.OnDataDirs` would visit (with the same `[Data Directory:
+/// <dir>]` header when more than one) and lists each kmd's wallets.
+/// Output byte-identical to Go for the empty + populated cases on a
+/// single data dir.
+///
+/// (The `(default)` suffix isn't surfaced — Phase A doesn't persist a
+/// default-wallet selection; tracking under Phase B with the account
+/// group.)
 pub fn run_list(cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>) -> ExitCode {
-    let client = match ensure_kmd_client_single(&cli_d, kmd_dir_flag.as_deref()) {
-        Ok(c) => c,
-        Err(()) => return ExitCode::from(1),
+    let dirs = match data_dir::resolve_data_dirs(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
     };
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -150,19 +157,56 @@ pub fn run_list(cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>) -> ExitCode 
             return ExitCode::from(1);
         }
     };
-    let resp = match rt.block_on(client.list_wallets()) {
-        Ok(r) => r,
+    let multi = dirs.len() > 1;
+    let mut exit = ExitCode::SUCCESS;
+    for d in &dirs {
+        if multi {
+            // Mirrors `cmd/util/datadir/messages.go:infoDataDir`.
+            println!("[Data Directory: {}]", d.display());
+        }
+        let client = match ensure_kmd_client_for_dir(d, kmd_dir_flag.as_deref()) {
+            Ok(c) => c,
+            Err(()) => {
+                exit = ExitCode::from(1);
+                continue;
+            }
+        };
+        match rt.block_on(client.list_wallets()) {
+            Ok(resp) => print_wallets(&resp.wallets),
+            Err(e) => {
+                let msg = match &e {
+                    KmdError::Api { message, .. } => message.clone(),
+                    other => other.to_string(),
+                };
+                eprintln!("{}", format_message(ERROR_COULDNT_LIST, &[&msg]));
+                exit = ExitCode::from(1);
+            }
+        }
+    }
+    exit
+}
+
+/// Per-data-dir variant of [`ensure_kmd_client_single`]: builds the
+/// kmd client for one already-resolved data dir. Used by the
+/// multi-`-d` loop above.
+fn ensure_kmd_client_for_dir(
+    data_dir_path: &Path,
+    kmd_dir_flag: Option<&Path>,
+) -> Result<KmdClient, ()> {
+    let kmd_dir = match data_dir::resolve_kmd_data_dir(kmd_dir_flag, data_dir_path) {
+        Ok(d) => d,
         Err(e) => {
-            let msg = match &e {
-                KmdError::Api { message, .. } => message.clone(),
-                other => other.to_string(),
-            };
-            eprintln!("{}", format_message(ERROR_COULDNT_LIST, &[&msg]));
-            return ExitCode::from(1);
+            eprintln!("{e}");
+            return Err(());
         }
     };
-    print_wallets(&resp.wallets);
-    ExitCode::SUCCESS
+    let (kmd_addr, kmd_token) = read_kmd_endpoint(&kmd_dir)?;
+    KmdClient::new(&kmd_addr, &kmd_token).map_err(|e| {
+        eprintln!(
+            "{}",
+            format_message(ERROR_COULDNT_CREATE, &[&e.to_string()])
+        );
+    })
 }
 
 /// Port of `printWallets` (`wallet.go:261-281`). Each wallet block

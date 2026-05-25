@@ -209,6 +209,63 @@ fn wallet_list_two_wallets_emits_go_format_banners() {
 }
 
 #[test]
+fn wallet_list_iterates_multi_data_dirs_with_header() {
+    // Regression guard (Codex review of TASK-227 round 1): Go's
+    // listWalletsCmd uses datadir.OnDataDirs, so multiple `-d`
+    // flags must list each data dir with a `[Data Directory: <d>]`
+    // header. Set up two separate algod data dirs each with their
+    // own kmd-rust instance.
+    let (dir_a, kmd_a) = setup_data_dir();
+    let (dir_b, kmd_b) = setup_data_dir();
+    let (_g1, net_a, tok_a) = spawn_kmd(&kmd_a);
+    let (_g2, net_b, tok_b) = spawn_kmd(&kmd_b);
+
+    rt().block_on(async {
+        KmdClient::new(&net_a, &tok_a)
+            .unwrap()
+            .create_wallet("only-a", "sqlite", "pw", [0u8; 32])
+            .await
+            .unwrap();
+        KmdClient::new(&net_b, &tok_b)
+            .unwrap()
+            .create_wallet("only-b", "sqlite", "pw", [0u8; 32])
+            .await
+            .unwrap();
+    });
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .args(["-d"])
+        .arg(dir_a.path())
+        .args(["-d"])
+        .arg(dir_b.path())
+        .args(["wallet", "list"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("run goal-rust wallet list");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "list must succeed; stdout={stdout}");
+
+    let header_a = format!("[Data Directory: {}]", dir_a.path().display());
+    let header_b = format!("[Data Directory: {}]", dir_b.path().display());
+    assert!(
+        stdout.contains(&header_a),
+        "missing header for dir_a; got {stdout}",
+    );
+    assert!(
+        stdout.contains(&header_b),
+        "missing header for dir_b; got {stdout}",
+    );
+    assert!(
+        stdout.contains("Wallet:\tonly-a"),
+        "dir_a's wallet should appear in output; got {stdout}",
+    );
+    assert!(
+        stdout.contains("Wallet:\tonly-b"),
+        "dir_b's wallet should appear in output; got {stdout}",
+    );
+}
+
+#[test]
 fn wallet_list_surfaces_unreachable_kmd_text() {
     let (data_dir, _kmd_dir) = setup_data_dir();
     let out = Command::new(GOAL_RUST_BIN)
