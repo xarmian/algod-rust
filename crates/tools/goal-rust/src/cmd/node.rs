@@ -149,6 +149,61 @@ async fn get_status(data_dir: &Path, watch_ms: u64) -> Result<(), ()> {
     Ok(())
 }
 
+/// Phase-A advisory: `goal-rust node start` delegates process
+/// supervision to the host's supervisor. Prints guidance to stderr
+/// and exits 0 (advisory, not an error).
+///
+/// Go's `startCmd` (node.go:235-289) forks `algod`, writes
+/// `algod.pid`, and runs as a supervisor — that's a heavy port we've
+/// scoped out of Phase A. A follow-up Idea tracks the full port.
+pub fn run_start(cli_d: Vec<PathBuf>) -> ExitCode {
+    advisory_supervision(
+        &cli_d,
+        "goal-rust does not yet manage the algod process directly. \
+        Start algod via your supervisor (systemd, supervisord, or \
+        'algod -d {dir}' as a child of your shell).",
+    )
+}
+
+/// Phase-A advisory: `goal-rust node stop`. Counterpart to
+/// [`run_start`] — guidance + exit 0.
+pub fn run_stop(cli_d: Vec<PathBuf>) -> ExitCode {
+    advisory_supervision(
+        &cli_d,
+        "goal-rust does not manage the algod process. Stop algod via \
+        your supervisor or SIGTERM the PID in {dir}/algod.pid.",
+    )
+}
+
+/// Phase-A advisory: `goal-rust node restart`. Combined stop/start
+/// guidance.
+pub fn run_restart(cli_d: Vec<PathBuf>) -> ExitCode {
+    advisory_supervision(
+        &cli_d,
+        "goal-rust does not manage the algod process. Restart algod \
+        via your supervisor: stop the PID in {dir}/algod.pid, then \
+        start a fresh 'algod -d {dir}'.",
+    )
+}
+
+/// Shared advisory printer. Substitutes `{dir}` with each resolved
+/// data dir and emits one line per dir to stderr. Returns exit 0
+/// because invoking the command isn't a usage error — the operator
+/// can read the message and act.
+fn advisory_supervision(cli_d: &[PathBuf], template: &str) -> ExitCode {
+    // We don't *require* a data dir to be set (the message is still
+    // useful without one), but if `-d` / `$ALGORAND_DATA` resolves to
+    // a real path, embed it in the message for copy-paste convenience.
+    let dirs = crate::data_dir::resolve_data_dirs(cli_d)
+        .unwrap_or_else(|_| vec![PathBuf::from("<data-dir>")]);
+    for dir in &dirs {
+        let dir_str = dir.display().to_string();
+        let msg = template.replace("{dir}", &dir_str);
+        eprintln!("{msg}");
+    }
+    ExitCode::SUCCESS
+}
+
 /// Port of `lastroundCmd` (`node.go:519-534`). Per-data-dir, calls
 /// `client.CurrentRound()` and prints `{round}\n`.
 pub fn run_lastround(cli_d: Vec<PathBuf>) -> ExitCode {

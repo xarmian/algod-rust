@@ -333,6 +333,46 @@ fn node_generatetoken_refuses_when_algod_unreachable_ambiguously() {
 }
 
 #[test]
+fn node_start_stop_restart_print_advisory_on_stderr_and_exit_zero() {
+    // Phase A's advisory stubs (TASK-225): start / stop / restart
+    // delegate to the host supervisor and print guidance. They MUST
+    // exit 0 (running them isn't a usage error) and the text MUST go
+    // to stderr (so scripts that grep stdout don't trip).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for sub in ["start", "stop", "restart"] {
+        let out = Command::new(GOAL_RUST_BIN)
+            .arg("-d")
+            .arg(tmp.path())
+            .args(["node", sub])
+            .env_remove("ALGORAND_DATA")
+            .output()
+            .unwrap_or_else(|e| panic!("run goal-rust node {sub}: {e}"));
+        assert!(
+            out.status.success(),
+            "node {sub} must exit 0 (advisory); got exit={:?}, stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "node {sub} must not write to stdout; got {:?}",
+            String::from_utf8_lossy(&out.stdout),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("goal-rust does"),
+            "node {sub} stderr must carry the advisory text; got {stderr:?}",
+        );
+        // Sanity: the resolved data dir is embedded for
+        // copy-paste convenience.
+        assert!(
+            stderr.contains(&tmp.path().display().to_string()),
+            "node {sub} stderr must embed the data dir; got {stderr:?}",
+        );
+    }
+}
+
+#[test]
 fn node_generatetoken_refuses_when_algod_net_is_empty() {
     // Regression guard (Codex review of TASK-224 round 3): an
     // empty `algod.net` is ambiguous (partial write, truncation,
