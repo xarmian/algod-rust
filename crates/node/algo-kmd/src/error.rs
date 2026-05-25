@@ -138,10 +138,24 @@ pub enum Error {
     #[error("invalid multisig preimage")]
     MultisigInvalid,
 
-    /// Multisig address not found in `msig_addrs`. Mirrors
-    /// `errMsigDataNotFound` (`sqlite_errors.go`).
-    #[error("multisig address not found")]
+    /// Multisig address not found in `msig_addrs`.  Mirrors
+    /// `errMsigDataNotFound` (`daemon/kmd/wallet/driver/sqlite_errors.go:26`),
+    /// whose Go text is the full message below — used as-is on the
+    /// wire by the REST layer's `errorResponse(... err.Error())`.
+    #[error("multisig information (pks, threshold) for address does not exist in this wallet")]
     MultisigNotFound,
+
+    /// `MultisigAddrGen(version != 1, ...)` rejection — Go's
+    /// `errUnknownVersion` (`crypto/cryptoerror.go:32`).
+    #[error("unknown version")]
+    MultisigUnknownVersion,
+
+    /// `MultisigAddrGen(threshold == 0 || threshold > len(pks))`
+    /// rejection — Go's `errInvalidThreshold`
+    /// (`crypto/cryptoerror.go:24`).  Note the capital "I" — Go's
+    /// string is literally `"Invalid threshold"`.
+    #[error("Invalid threshold")]
+    MultisigInvalidThreshold,
 
     /// Wallet-handle token is malformed, the handle ID is unknown,
     /// or the secret doesn't match. Mirrors the "wrong number of

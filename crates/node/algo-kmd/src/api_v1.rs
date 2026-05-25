@@ -26,17 +26,20 @@ use axum::{Json, Router};
 
 use algo_kmd_api_types::common::{APIV1ResponseEnvelope, APIV1Wallet, APIV1WalletHandle};
 use algo_kmd_api_types::requests::{
-    APIV1DELETEKeyRequest, APIV1POSTKeyExportRequest, APIV1POSTKeyImportRequest,
-    APIV1POSTKeyListRequest, APIV1POSTKeyRequest, APIV1POSTMasterKeyExportRequest,
-    APIV1POSTWalletInfoRequest, APIV1POSTWalletInitRequest, APIV1POSTWalletReleaseRequest,
-    APIV1POSTWalletRenameRequest, APIV1POSTWalletRenewRequest, APIV1POSTWalletRequest,
+    APIV1DELETEKeyRequest, APIV1DELETEMultisigRequest, APIV1POSTKeyExportRequest,
+    APIV1POSTKeyImportRequest, APIV1POSTKeyListRequest, APIV1POSTKeyRequest,
+    APIV1POSTMasterKeyExportRequest, APIV1POSTMultisigExportRequest,
+    APIV1POSTMultisigImportRequest, APIV1POSTMultisigListRequest, APIV1POSTWalletInfoRequest,
+    APIV1POSTWalletInitRequest, APIV1POSTWalletReleaseRequest, APIV1POSTWalletRenameRequest,
+    APIV1POSTWalletRenewRequest, APIV1POSTWalletRequest,
 };
 use algo_kmd_api_types::responses::{
-    APIV1DELETEKeyResponse, APIV1GETWalletsResponse, APIV1POSTKeyExportResponse,
-    APIV1POSTKeyImportResponse, APIV1POSTKeyListResponse, APIV1POSTKeyResponse,
-    APIV1POSTMasterKeyExportResponse, APIV1POSTWalletInfoResponse, APIV1POSTWalletInitResponse,
-    APIV1POSTWalletReleaseResponse, APIV1POSTWalletRenameResponse, APIV1POSTWalletRenewResponse,
-    APIV1POSTWalletResponse,
+    APIV1DELETEKeyResponse, APIV1DELETEMultisigResponse, APIV1GETWalletsResponse,
+    APIV1POSTKeyExportResponse, APIV1POSTKeyImportResponse, APIV1POSTKeyListResponse,
+    APIV1POSTKeyResponse, APIV1POSTMasterKeyExportResponse, APIV1POSTMultisigExportResponse,
+    APIV1POSTMultisigImportResponse, APIV1POSTMultisigListResponse, APIV1POSTWalletInfoResponse,
+    APIV1POSTWalletInitResponse, APIV1POSTWalletReleaseResponse, APIV1POSTWalletRenameResponse,
+    APIV1POSTWalletRenewResponse, APIV1POSTWalletResponse,
 };
 use algo_types::Address;
 
@@ -86,6 +89,11 @@ pub fn router(state: AppState) -> Router {
         .route("/key/list", post(post_key_list))
         .route("/key/import", post(post_key_import))
         .route("/key/export", post(post_key_export))
+        // Multisig routes (B7) — sign / signprogram land in B8
+        .route("/multisig", axum::routing::delete(delete_multisig))
+        .route("/multisig/list", post(post_multisig_list))
+        .route("/multisig/import", post(post_multisig_import))
+        .route("/multisig/export", post(post_multisig_export))
         .with_state(state)
 }
 
@@ -127,6 +135,8 @@ pub fn status_for_error(err: &Error) -> StatusCode {
         | Error::WrongDriverVersion
         | Error::MultisigInvalid
         | Error::MultisigNotFound
+        | Error::MultisigUnknownVersion
+        | Error::MultisigInvalidThreshold
         | Error::KeyExists
         | Error::KeyNotFound
         | Error::ApiTokenTooShort
@@ -796,6 +806,188 @@ async fn delete_key(State(state): State<AppState>, req: axum::extract::Request) 
     }
 }
 
+// ---------------------------------------------------------------- Multisig handlers (B7)
+
+/// `POST /v1/multisig/list` — list stored multisig addresses.
+/// Mirrors `postMultisigListHandler` (handlers.go:920).
+async fn post_multisig_list(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Response {
+    let req: APIV1POSTMultisigListRequest = match decode_body(req).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+
+    let session_manager = state.session_manager.clone();
+    let token = req.wallet_handle_token;
+    let handle = match blocking_with_status(
+        move || session_manager.auth_with_token(&token),
+        StatusCode::UNAUTHORIZED,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+
+    let addrs = match blocking(move || handle.wallet.list_multisig()).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let addresses = addrs.iter().map(encode_address).collect();
+
+    ok_json(APIV1POSTMultisigListResponse {
+        envelope: APIV1ResponseEnvelope::default(),
+        addresses,
+    })
+}
+
+/// `POST /v1/multisig/import` — import a multisig preimage.
+/// Mirrors `postMultisigImportHandler` (handlers.go:970).
+async fn post_multisig_import(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Response {
+    let req: APIV1POSTMultisigImportRequest = match decode_body(req).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+
+    let session_manager = state.session_manager.clone();
+    let token = req.wallet_handle_token;
+    let handle = match blocking_with_status(
+        move || session_manager.auth_with_token(&token),
+        StatusCode::UNAUTHORIZED,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+
+    let version = req.version;
+    let threshold = req.threshold;
+    let pks = req.pks;
+
+    // Surface MultisigAddrGen's two distinct error texts before
+    // the blocking call (which collapses both into one variant on
+    // the Rust side).  Go's order:
+    //   - version != 1            → "unknown version"
+    //   - threshold == 0 OR len(pks) == 0 OR threshold > len(pks)
+    //                             → "Invalid threshold"
+    // (`crypto/multisig.go:97-105`).  Returning these distinct
+    // strings preserves wire-message parity for clients that match
+    // on the exact text.
+    if version != 1 {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            error_message(&Error::MultisigUnknownVersion),
+        );
+    }
+    if threshold == 0 || pks.is_empty() || (threshold as usize) > pks.len() {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            error_message(&Error::MultisigInvalidThreshold),
+        );
+    }
+    // Known divergence (TASK-219): algo-consensus-crypto adds a
+    // `pks.len() > MAX_MULTISIG (255)` rejection that Go's
+    // `MultisigAddrGen` doesn't have, so a 256+-pk import with a
+    // valid threshold returns 400 here but succeeds in Go.  Tracked
+    // for follow-up; practical impact is low because SDKs don't
+    // construct 256+-pk multisigs.
+
+    let addr = match blocking(move || handle.wallet.import_multisig(version, threshold, &pks)).await
+    {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+
+    ok_json(APIV1POSTMultisigImportResponse {
+        envelope: APIV1ResponseEnvelope::default(),
+        address: encode_address(&addr),
+    })
+}
+
+/// `POST /v1/multisig/export` — export the (version, threshold,
+/// pks) preimage for a stored multisig address.  Mirrors
+/// `postMultisigExportHandler` (handlers.go:1022).
+async fn post_multisig_export(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Response {
+    let req: APIV1POSTMultisigExportRequest = match decode_body(req).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+
+    // Address parsed BEFORE token check (handlers.go:1052) so a bad
+    // address surfaces as 400 even when the token is also bad.
+    let addr = match parse_address(&req.address) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+
+    let session_manager = state.session_manager.clone();
+    let token = req.wallet_handle_token;
+    let handle = match blocking_with_status(
+        move || session_manager.auth_with_token(&token),
+        StatusCode::UNAUTHORIZED,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+
+    let preimage = match blocking(move || handle.wallet.lookup_multisig(&addr)).await {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+
+    ok_json(APIV1POSTMultisigExportResponse {
+        envelope: APIV1ResponseEnvelope::default(),
+        version: preimage.version,
+        threshold: preimage.threshold,
+        pks: preimage.pks,
+    })
+}
+
+/// `DELETE /v1/multisig` — drop a stored multisig preimage by
+/// address, after a password re-verify.  Mirrors
+/// `deleteMultisigHandler` (handlers.go:1205).
+async fn delete_multisig(State(state): State<AppState>, req: axum::extract::Request) -> Response {
+    let req: APIV1DELETEMultisigRequest = match decode_body(req).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+
+    // Address parsed BEFORE token check (handlers.go:1233).
+    let addr = match parse_address(&req.address) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+
+    let session_manager = state.session_manager.clone();
+    let token = req.wallet_handle_token;
+    let handle = match blocking_with_status(
+        move || session_manager.auth_with_token(&token),
+        StatusCode::UNAUTHORIZED,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+
+    let password = req.wallet_password;
+    match blocking(move || handle.wallet.delete_multisig(&addr, password.as_bytes())).await {
+        Ok(()) => ok_json(APIV1DELETEMultisigResponse::default()),
+        Err(r) => r,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1406,6 +1598,203 @@ mod tests {
         )
         .await;
         assert_eq!(s, 401, "DELETE /key: {body}");
+    }
+
+    // ---- B7 multisig handler tests ----
+
+    /// Build three deterministic 32-byte public keys for multisig tests.
+    fn fixture_pks() -> Vec<[u8; 32]> {
+        use ed25519_dalek::SigningKey;
+        let mut out = Vec::with_capacity(3);
+        for i in 0u8..3 {
+            let mut seed = [0u8; 32];
+            seed[0] = i + 1;
+            let sk = SigningKey::from_bytes(&seed);
+            out.push(sk.verifying_key().to_bytes());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn multisig_full_lifecycle_import_list_export_delete() {
+        let pwd = "pw";
+        let (router, _tmp, token) = make_unlocked(pwd).await;
+        let pks = fixture_pks();
+
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let pks_b64: Vec<String> = pks.iter().map(|p| B64.encode(p)).collect();
+
+        // Import.
+        let (s, body) = post(
+            &router,
+            "/multisig/import",
+            json!({
+                "wallet_handle_token": token,
+                "multisig_version": 1,
+                "threshold": 2,
+                "pks": pks_b64,
+            }),
+        )
+        .await;
+        assert_eq!(s, 200, "import: {body}");
+        let addr = body["address"].as_str().unwrap().to_string();
+        assert_eq!(addr.len(), 58);
+
+        // List.
+        let (s, body) = post(
+            &router,
+            "/multisig/list",
+            json!({"wallet_handle_token": token}),
+        )
+        .await;
+        assert_eq!(s, 200, "list: {body}");
+        let addresses: Vec<String> = body["addresses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(addresses.contains(&addr), "list: {addresses:?}");
+
+        // Export — preimage round-trips byte-for-byte.
+        let (s, body) = post(
+            &router,
+            "/multisig/export",
+            json!({"wallet_handle_token": token, "address": addr}),
+        )
+        .await;
+        assert_eq!(s, 200, "export: {body}");
+        assert_eq!(body["multisig_version"], 1);
+        assert_eq!(body["threshold"], 2);
+        let exported_pks: Vec<String> = body["pks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(exported_pks, pks_b64, "pks round-trip");
+
+        // Delete with the right password.
+        let (s, body) = post_method(
+            &router,
+            "DELETE",
+            "/multisig",
+            json!({"wallet_handle_token": token, "address": addr, "wallet_password": pwd}),
+        )
+        .await;
+        assert_eq!(s, 200, "delete: {body}");
+
+        // List now empty (or omitted).
+        let (s, body) = post(
+            &router,
+            "/multisig/list",
+            json!({"wallet_handle_token": token}),
+        )
+        .await;
+        assert_eq!(s, 200);
+        assert!(
+            body.get("addresses").is_none() || body["addresses"].as_array().unwrap().is_empty(),
+            "list after delete: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multisig_import_unknown_version_returns_go_text() {
+        // Regression for Codex PR #358 round 1 (P2): Go returns
+        // errUnknownVersion ("unknown version") for version != 1.
+        let pwd = "pw";
+        let (router, _tmp, token) = make_unlocked(pwd).await;
+        let pks = fixture_pks();
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let pks_b64: Vec<String> = pks.iter().map(|p| B64.encode(p)).collect();
+
+        let (s, body) = post(
+            &router,
+            "/multisig/import",
+            json!({
+                "wallet_handle_token": token,
+                "multisig_version": 2, // invalid
+                "threshold": 2,
+                "pks": pks_b64,
+            }),
+        )
+        .await;
+        assert_eq!(s, 400, "{body}");
+        assert_eq!(body["message"], "unknown version");
+    }
+
+    #[tokio::test]
+    async fn multisig_import_invalid_threshold_returns_go_text() {
+        // Regression for Codex PR #358 round 1 (P2): Go returns
+        // errInvalidThreshold ("Invalid threshold" — capital I).
+        let pwd = "pw";
+        let (router, _tmp, token) = make_unlocked(pwd).await;
+        let pks = fixture_pks();
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let pks_b64: Vec<String> = pks.iter().map(|p| B64.encode(p)).collect();
+
+        let (s, body) = post(
+            &router,
+            "/multisig/import",
+            json!({
+                "wallet_handle_token": token,
+                "multisig_version": 1,
+                "threshold": 99, // > len(pks)
+                "pks": pks_b64,
+            }),
+        )
+        .await;
+        assert_eq!(s, 400, "{body}");
+        assert_eq!(body["message"], "Invalid threshold");
+    }
+
+    #[tokio::test]
+    async fn multisig_export_unknown_address_returns_go_text() {
+        // Regression for Codex PR #358 round 1 (P2): Go returns
+        // errMsigDataNotFound's full text, not a generic
+        // "multisig address not found".
+        let (router, _tmp, token) = make_unlocked("pw").await;
+        let zero = Address([0u8; 32]).to_algorand_string();
+        let (s, body) = post(
+            &router,
+            "/multisig/export",
+            json!({"wallet_handle_token": token, "address": zero}),
+        )
+        .await;
+        assert_eq!(s, 400, "{body}");
+        assert_eq!(
+            body["message"],
+            "multisig information (pks, threshold) for address does not exist in this wallet"
+        );
+    }
+
+    #[tokio::test]
+    async fn multisig_routes_reject_invalid_token() {
+        let (router, _tmp) = make_router();
+        // /multisig/list and /multisig/import have no address-first
+        // step; bad token → 401 immediately.
+        for path in ["/multisig/list", "/multisig/import"] {
+            let (s, body) = post(&router, path, json!({"wallet_handle_token": "bogus"})).await;
+            assert_eq!(s, 401, "{path}: {body}");
+        }
+        // /multisig/export and DELETE /multisig parse address first;
+        // pass a valid address so the token check fires.
+        let zero = Address([0u8; 32]).to_algorand_string();
+        let (s, _) = post(
+            &router,
+            "/multisig/export",
+            json!({"wallet_handle_token": "bogus", "address": zero}),
+        )
+        .await;
+        assert_eq!(s, 401);
+        let (s, _) = post_method(
+            &router,
+            "DELETE",
+            "/multisig",
+            json!({"wallet_handle_token": "bogus", "address": zero, "wallet_password": "x"}),
+        )
+        .await;
+        assert_eq!(s, 401);
     }
 
     /// Helper that lets us post a body with a non-POST method (used
