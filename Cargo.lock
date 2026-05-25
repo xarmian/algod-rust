@@ -263,6 +263,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "algo-kmd-api-types"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "hex",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "algo-ledger"
 version = "0.1.0"
 dependencies = [
