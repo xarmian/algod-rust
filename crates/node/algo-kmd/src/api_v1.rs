@@ -1100,12 +1100,10 @@ async fn post_program_sign(State(state): State<AppState>, req: axum::extract::Re
         Err(r) => return r,
     };
 
-    // Decode address before auth (Go's order — handlers.go:880).
-    let addr = match parse_address(&req.address) {
-        Ok(a) => a,
-        Err(r) => return r,
-    };
-
+    // Auth FIRST, then address-decode — Go's order at handlers.go
+    // :891 (AuthWithWalletHandleToken) followed by :898
+    // (UnmarshalChecksumAddress).  An unauthenticated request with
+    // a malformed address must return 401, not 400.
     let session_manager = state.session_manager.clone();
     let token = req.wallet_handle_token;
     let handle = match blocking_with_status(
@@ -1115,6 +1113,11 @@ async fn post_program_sign(State(state): State<AppState>, req: axum::extract::Re
     .await
     {
         Ok(h) => h,
+        Err(r) => return r,
+    };
+
+    let addr = match parse_address(&req.address) {
+        Ok(a) => a,
         Err(r) => return r,
     };
 
@@ -1237,20 +1240,11 @@ async fn post_multisig_signprogram(
         Err(r) => return r,
     };
 
-    // Note: B8 only wires the modern (use_legacy_msig=false) path,
-    // matching Go's default.  Legacy mode is a known follow-up
-    // tracked alongside the rest of `sign_multisig_program`'s API.
-    if req.use_legacy_msig {
-        return err_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "use_legacy_msig is not yet supported in kmd-rust",
-        );
-    }
-
     let partial = wire_to_typed_msig(&req.partial_msig);
     let signer_pk = req.public_key;
     let program = req.program;
     let password = req.wallet_password;
+    let use_legacy_msig = req.use_legacy_msig;
 
     let msig = match blocking(move || {
         handle.wallet.sign_multisig_program(
@@ -1259,6 +1253,7 @@ async fn post_multisig_signprogram(
             &partial,
             signer_pk,
             password.as_bytes(),
+            use_legacy_msig,
         )
     })
     .await
@@ -2212,6 +2207,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn program_sign_bad_token_and_bad_address_returns_401_not_400() {
+        // Regression for Codex PR #359 round 1 (P2):
+        // Go's /program/sign authenticates BEFORE decoding the
+        // address (handlers.go:891 then :898).  An unauthenticated
+        // request with a malformed address must return 401, not
+        // 400 "could not decode address".
+        let (router, _tmp) = make_router();
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let (s, body) = post(
+            &router,
+            "/program/sign",
+            json!({
+                "wallet_handle_token": "bogus",
+                "address": "NOT-AN-ADDRESS",
+                "data": B64.encode(b"\x02"),
+                "wallet_password": "x",
+            }),
+        )
+        .await;
+        assert_eq!(s, 401, "{body}");
+        assert_eq!(body["error"], true);
+    }
+
+    #[tokio::test]
     async fn program_sign_bad_address_returns_could_not_decode_address() {
         let (router, _tmp, token) = make_unlocked("pw").await;
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -2328,6 +2347,70 @@ mod tests {
             .filter(|s| s.signature != [0u8; 64])
             .count();
         assert_eq!(signed_count, 2, "two subsigs should be filled");
+    }
+
+    #[tokio::test]
+    async fn multisig_signprogram_legacy_and_modern_differ() {
+        // Regression for Codex PR #359 round 1 (P1):
+        // Go's /multisig/signprogram supports use_legacy_msig=true
+        // (signs the "Program"||data tag, sqlite.go:1302) and
+        // use_legacy_msig=false (signs MultisigProgram{Addr, Program}).
+        // The two paths MUST be wired and produce different
+        // signatures (different signing messages → different sigs).
+        let pwd = "pw";
+        let (router, _tmp, token) = make_unlocked(pwd).await;
+
+        // Generate one wallet key, build a 1-of-1 multisig with it.
+        let (_, body) = post(&router, "/key", json!({"wallet_handle_token": token})).await;
+        let pk = Address::from_algorand_string(body["address"].as_str().unwrap())
+            .unwrap()
+            .0;
+
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let (_, body) = post(
+            &router,
+            "/multisig/import",
+            json!({
+                "wallet_handle_token": token,
+                "multisig_version": 1,
+                "threshold": 1,
+                "pks": vec![B64.encode(pk)],
+            }),
+        )
+        .await;
+        let msig_addr = body["address"].as_str().unwrap().to_string();
+
+        let program = b"\x02\x20\x01\x01\x22\x43";
+        let make_req = |legacy: bool| {
+            json!({
+                "wallet_handle_token": token,
+                "address": msig_addr,
+                "data": B64.encode(program),
+                "public_key": B64.encode(pk),
+                "wallet_password": pwd,
+                "use_legacy_msig": legacy,
+            })
+        };
+
+        let (s, body) = post(&router, "/multisig/signprogram", make_req(false)).await;
+        assert_eq!(s, 200, "modern: {body}");
+        let modern: MultisigSig =
+            rmp_serde::from_slice(&B64.decode(body["multisig"].as_str().unwrap()).unwrap())
+                .unwrap();
+
+        let (s, body) = post(&router, "/multisig/signprogram", make_req(true)).await;
+        assert_eq!(s, 200, "legacy: {body}");
+        let legacy: MultisigSig =
+            rmp_serde::from_slice(&B64.decode(body["multisig"].as_str().unwrap()).unwrap())
+                .unwrap();
+
+        // Same key signs both, but the signing messages differ
+        // ("Program"||data vs "MultisigProgram"||addr||data), so
+        // the resulting subsig signatures must NOT match.
+        assert_ne!(
+            modern.subsigs[0].signature, legacy.subsigs[0].signature,
+            "legacy vs modern multisig signprogram must produce different signatures"
+        );
     }
 
     #[tokio::test]

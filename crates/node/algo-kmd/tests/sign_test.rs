@@ -323,10 +323,17 @@ fn sign_multisig_program_produces_verifiable_signature() {
 
     let program: Vec<u8> = vec![0x02, 0x20, 0x01, 0x01, 0x22, 0x43];
     let part_a = wallet
-        .sign_multisig_program(&program, msig_addr, &AtMultisigSig::default(), pk_a, b"pw")
+        .sign_multisig_program(
+            &program,
+            msig_addr,
+            &AtMultisigSig::default(),
+            pk_a,
+            b"pw",
+            false,
+        )
         .unwrap();
     let part_ab = wallet
-        .sign_multisig_program(&program, msig_addr, &part_a, pk_b, b"pw")
+        .sign_multisig_program(&program, msig_addr, &part_a, pk_b, b"pw", false)
         .unwrap();
     assert!(part_ab.subsigs[0].signature != [0u8; 64]);
     assert!(part_ab.subsigs[1].signature != [0u8; 64]);

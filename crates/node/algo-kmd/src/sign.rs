@@ -188,10 +188,13 @@ impl Wallet {
     }
 
     /// Produce or extend a multisig program signature. Mirrors
-    /// `MultisigSignProgram` (sqlite.go:1266) for the **modern**
-    /// (`useLegacyMsig=false`) path. The legacy path
-    /// (`"Program" || raw_program`) is deferred to TASK-216 alongside
-    /// the REST flag that selects it.
+    /// `MultisigSignProgram` (sqlite.go:1266). When
+    /// `use_legacy_msig=true`, signs the **legacy** `"Program" ||
+    /// raw_program` message (`logic.Program(data)` in Go); when
+    /// `false`, signs the **modern** `"MultisigProgram" || addr ||
+    /// program` message (`logic.MultisigProgram{Addr, Program}`).
+    /// The legacy path is what older SDKs (and existing
+    /// already-signed partial multisigs) expect.
     pub fn sign_multisig_program(
         &self,
         program: &[u8],
@@ -199,9 +202,17 @@ impl Wallet {
         partial: &MultisigSig,
         public_key: [u8; ADDRESS_LEN],
         password: &[u8],
+        use_legacy_msig: bool,
     ) -> Result<MultisigSig> {
         self.check_password(password)?;
-        let msg = msig_program_signing_message(&msig_address, program);
+        let msg = if use_legacy_msig {
+            // Go: `crypto.MultisigSign(logic.Program(data), ...)`
+            // (sqlite.go:1302).  `logic.Program` prepends the same
+            // `"Program"` tag as the non-multisig program sign path.
+            program_signing_message(program)
+        } else {
+            msig_program_signing_message(&msig_address, program)
+        };
         // The program path has no rekey concept — only one allowed
         // address (sqlite.go:1317).
         self.sign_multisig_inner(&msg, &[msig_address], partial, public_key, password)
