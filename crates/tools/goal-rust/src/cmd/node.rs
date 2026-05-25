@@ -245,27 +245,53 @@ pub fn run_generate_token(cli_d: Vec<PathBuf>) -> ExitCode {
     exit
 }
 
-/// Best-effort liveness probe: returns true iff `GET /health` returns
-/// a 2xx status. Anything else (connection refused, timeout, 4xx/5xx)
-/// counts as "not running" so the rotation can proceed.
+/// Liveness probe used by `generatetoken`'s safety guard.
+///
+/// Returns true iff we can prove algod is reachable on this data
+/// dir's `algod.net`:
+///
+/// - missing `algod.net` ⇒ false (fresh data dir; rotation can
+///   proceed, matching Go where HealthCheck would also fail)
+/// - TCP connect to `host:port` refused (ECONNREFUSED) ⇒ false
+///   (definitely no listener — safe to rotate)
+/// - anything else (TCP connect succeeds; or any other connect
+///   error like DNS failure, timeout, TLS, route unreachable) ⇒
+///   true (conservatively refuse rotation — Codex review TASK-224
+///   round 1: a slow-but-running node must not slip past)
+///
+/// The TCP-first design avoids ambiguity in reqwest's
+/// `Error::is_connect`, which lumps DNS failures together with
+/// genuine connection refusals.
 async fn algod_is_running(data_dir: &Path) -> bool {
     let Ok(net) = read_algod_net(data_dir) else {
         return false;
     };
-    let url = if net.starts_with("http://") || net.starts_with("https://") {
-        format!("{net}/health")
-    } else {
-        format!("http://{net}/health")
-    };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(500))
-        .build();
-    let Ok(client) = client else {
-        return false;
-    };
-    match client.get(url).send().await {
-        Ok(resp) => resp.status().is_success(),
-        Err(_) => false,
+    // Strip any scheme prefix so we can hand a bare `host:port` to
+    // tokio's TcpStream::connect — that's the form `algod.net`
+    // contains in practice.
+    let host_port = net
+        .strip_prefix("http://")
+        .or_else(|| net.strip_prefix("https://"))
+        .unwrap_or(&net);
+    let host_port = host_port.trim_end_matches('/').to_string();
+
+    let connect = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&host_port),
+    )
+    .await;
+
+    match connect {
+        // Connected → something is listening → refuse rotation.
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            // ECONNREFUSED is the one firm "down" signal. Anything
+            // else (DNS, route, permission, …) → conservatively
+            // treat as running and refuse rotation.
+            e.kind() != std::io::ErrorKind::ConnectionRefused
+        }
+        // Timeout reaching the host: conservative — refuse rotation.
+        Err(_) => true,
     }
 }
 

@@ -291,6 +291,48 @@ fn node_generatetoken_refuses_when_algod_running() {
 }
 
 #[test]
+fn node_generatetoken_refuses_when_algod_unreachable_ambiguously() {
+    // Regression guard (Codex review of TASK-224 round 1): the
+    // safety guard must refuse rotation on ambiguous errors (DNS
+    // failure, timeout, TLS, …) rather than only when the server
+    // returns 2xx. Point algod.net at an invalid `.invalid` TLD
+    // which RFC 6761 guarantees is never resolvable — that's a
+    // DNS error, NOT a connect-refused, so algod_is_running's
+    // conservative path must engage and refuse rotation.
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        data_dir.path().join("algod.net"),
+        "definitely-not-resolvable.invalid:1\n",
+    )
+    .unwrap();
+    let original_token = "preserve-me\n";
+    std::fs::write(data_dir.path().join("algod.token"), original_token).unwrap();
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(data_dir.path())
+        .args(["node", "generatetoken"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("run goal-rust node generatetoken");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "generatetoken must refuse rotation on ambiguous probe failure; exit={:?} stderr={stderr:?}",
+        out.status.code(),
+    );
+    assert!(
+        stderr.contains("Node must be stopped before writing APIToken"),
+        "must surface errorNodeRunning text; got {stderr:?}",
+    );
+    let after = std::fs::read_to_string(data_dir.path().join("algod.token")).unwrap();
+    assert_eq!(
+        after, original_token,
+        "token file must NOT be rotated when probe is ambiguous",
+    );
+}
+
+#[test]
 fn node_generatetoken_writes_64_hex_token_when_algod_down() {
     // No mock algod ⇒ /health connect-refuses ⇒ `algod_is_running`
     // returns false ⇒ rotation proceeds. Token must be 64 lowercase
