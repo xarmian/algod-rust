@@ -131,6 +131,18 @@ pub enum Error {
     #[error("wallet exceeded the derived-key index limit")]
     TooManyKeys,
 
+    /// `(version, threshold, pks)` rejected by multisig address
+    /// derivation — version != 1, threshold == 0 or > len(pks),
+    /// pks empty, or > 255 keys. Mirrors errors from `MultisigAddrGen`
+    /// (`crypto/multisig.go:96–112`).
+    #[error("invalid multisig preimage")]
+    MultisigInvalid,
+
+    /// Multisig address not found in `msig_addrs`. Mirrors
+    /// `errMsigDataNotFound` (`sqlite_errors.go`).
+    #[error("multisig address not found")]
+    MultisigNotFound,
+
     /// Operation requires [`crate::wallet::Wallet::init`] to have
     /// succeeded first. Go enforces this implicitly because every key
     /// op runs `Init`-like checks; we make it explicit.

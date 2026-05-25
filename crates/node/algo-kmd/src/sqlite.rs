@@ -483,6 +483,75 @@ impl WalletDb {
         Ok(out)
     }
 
+    /// Insert a row into `msig_addrs`. Mirrors
+    /// `ImportMultisigAddr` (sqlite.go:1016).
+    pub fn insert_multisig(
+        &self,
+        addr: &[u8],
+        version: u8,
+        threshold: u8,
+        pks_blob: &[u8],
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO msig_addrs (address, version, threshold, pks) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![addr, version, threshold, pks_blob],
+            )
+            .map_err(map_constraint_error)?;
+        Ok(())
+    }
+
+    /// Read `(version, threshold, pks_blob)` for the multisig address,
+    /// or return [`Error::MultisigNotFound`]. Mirrors the SELECT in
+    /// `LookupMultisigPreimage` (sqlite.go:1039).
+    pub fn read_multisig_row(&self, addr: &[u8]) -> Result<(u8, u8, Vec<u8>)> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT version, threshold, pks FROM msig_addrs WHERE address = ?1")
+            .map_err(|_| Error::Database)?;
+        stmt.query_row(rusqlite::params![addr], |row| {
+            Ok((
+                row.get::<_, u8>(0)?,
+                row.get::<_, u8>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Error::MultisigNotFound,
+            _ => Error::Database,
+        })
+    }
+
+    /// All addresses in `msig_addrs`. Mirrors `ListMultisigAddrs`
+    /// (sqlite.go:1099).
+    pub fn list_multisig_addresses(&self) -> Result<Vec<Vec<u8>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT address FROM msig_addrs")
+            .map_err(|_| Error::Database)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|_| Error::Database)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|_| Error::Database)?);
+        }
+        Ok(out)
+    }
+
+    /// Delete a multisig row. Mirrors `DeleteMultisigAddr` SQL
+    /// (sqlite.go:1080). Silent on no-match.
+    pub fn delete_multisig(&self, addr: &[u8]) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM msig_addrs WHERE address = ?1",
+                rusqlite::params![addr],
+            )
+            .map_err(|_| Error::Database)?;
+        Ok(())
+    }
+
     /// Delete a key row. Mirrors `DeleteKey` (sqlite.go:993). Returns
     /// `Ok(())` even when the address doesn't exist, matching Go's
     /// behavior (the underlying DELETE is silent on no-match).
