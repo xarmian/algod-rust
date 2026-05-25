@@ -45,8 +45,8 @@ fn write_minimal_config(data_dir: &Path) {
     // Use insecure scrypt params so the serve smoke test isn't
     // dominated by KDF cost.
     let cfg = serde_json::json!({
-        "driver_config": {
-            "sqlite_wallet_driver_config": {
+        "drivers": {
+            "sqlite": {
                 "scrypt": {
                     "scrypt_n": 2,
                     "scrypt_r": 1,
@@ -221,8 +221,8 @@ async fn serve_uses_address_from_kmd_config_json_when_cli_absent() {
     drop(probe);
 
     let cfg = serde_json::json!({
-        "driver_config": {
-            "sqlite_wallet_driver_config": {
+        "drivers": {
+            "sqlite": {
                 "scrypt": {"scrypt_n": 2, "scrypt_r": 1, "scrypt_p": 1},
                 "allow_unsafe_scrypt": true,
             },

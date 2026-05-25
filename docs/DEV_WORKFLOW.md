@@ -871,3 +871,37 @@ the latter's `WALLET_NAME`, `NUM_DERIVED`, `SCRYPT_N`, etc., plus the
 `fixed_mdk()` / `imported_seeds()` / `msig_inputs()` helpers. They
 must stay in sync — any drift breaks the `rust_writes_go_reads`
 direction.
+
+### REST interop (TASK-218 / B10)
+
+`crates/node/algo-kmd/tests/rest_interop_test.rs` covers the
+end-to-end REST surface: it spawns the `kmd-rust serve` binary
+against a fresh data dir, then drives the full v1 workflow through
+go-algorand's official `KMDClient` and verifies every signed payload
+under go-algorand's crypto layer. Like the schema-level tests above
+it's gated by `MIXED_CLUSTER=1`:
+
+```bash
+# Default run: gated, skips with a friendly note.
+cargo test -p algo-kmd --test rest_interop_test
+
+# Full REST interop:
+MIXED_CLUSTER=1 cargo test -p algo-kmd --test rest_interop_test
+```
+
+The driver lives at [`tools/kmd-rest-interop/`](../tools/kmd-rest-interop/)
+and exercises (in order):
+
+1. `/versions` (no auth)
+2. `/v1/wallets` (empty list)
+3. `/v1/wallet` (create) → `/v1/wallet/init` (handle)
+4. `/v1/key` (×2 derived keys)
+5. `/v1/transaction/sign` → verify Ed25519 sig over `crypto.HashRep(txn)`
+6. `/v1/multisig/import` (1-of-1) → `/v1/multisig/sign` → `crypto.MultisigVerify`
+7. `/v1/program/sign` → verify Ed25519 sig over `"Program" || data`
+8. `/v1/wallet/release` → `/v1/wallet/renew` (must 401)
+
+Any wire-shape, signing-message, or status-code drift between the
+two implementations trips the test immediately. The Rust harness
+graceful-shutdowns kmd-rust between runs and verifies `kmd.net` /
+`kmd.pid` are cleaned up.
