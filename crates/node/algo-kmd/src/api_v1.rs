@@ -162,18 +162,19 @@ fn err_response(status: StatusCode, message: impl Into<String>) -> Response {
 /// `errorResponse(w, StatusBadRequest, errCouldNotDecode)`).
 async fn decode_body<T>(req: axum::extract::Request) -> Result<T, Response>
 where
-    T: serde::de::DeserializeOwned + Default,
+    T: serde::de::DeserializeOwned,
 {
     let bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
         Ok(b) => b,
         Err(_) => return Err(err_response(StatusCode::BAD_REQUEST, ERR_COULD_NOT_DECODE)),
     };
+    // Go's `json.NewDecoder(r.Body).Decode(&req)` returns `io.EOF`
+    // on an empty body, which the v1 handlers translate to
+    // `errCouldNotDecode` → 400.  We mirror that — refusing to
+    // silently accept a default-valued request lets clients catch
+    // missing-content-type / unsent-body bugs early.
     if bytes.is_empty() {
-        // Match Go's `Decode(&req)` on an empty body: zero-value
-        // struct, no error.  Useful for `GET /v1/wallets` (which
-        // accepts an empty body) and tolerant of clients that POST
-        // `{}` vs nothing.
-        return Ok(T::default());
+        return Err(err_response(StatusCode::BAD_REQUEST, ERR_COULD_NOT_DECODE));
     }
     match serde_json::from_slice::<T>(&bytes) {
         Ok(req) => Ok(req),
@@ -292,13 +293,17 @@ async fn post_wallet(State(state): State<AppState>, req: axum::extract::Request)
         Err(r) => return r,
     };
 
-    // We support exactly the SQLite driver — any other name is
-    // rejected with Go's `errWrongDriver`.  Go uses
-    // `driver.FetchWalletDriver(req.WalletDriverName)` and reports
-    // "unknown wallet driver" if the name is unrecognized; we use
-    // `WrongDriver` for the same response text.
-    if !req.wallet_driver_name.is_empty() && req.wallet_driver_name != SQLITE_WALLET_DRIVER_NAME {
-        return err_response(StatusCode::BAD_REQUEST, error_message(&Error::WrongDriver));
+    // We support exactly the SQLite driver — any other name (or an
+    // empty name) is rejected with Go's `"unknown wallet driver"`
+    // (`daemon/kmd/wallet/driver/driver.go:62`).  Go's registry
+    // lookup `walletDrivers[req.WalletDriverName]` returns nil for
+    // the empty string too, so a body like `{"wallet_password":"x"}`
+    // must fail rather than silently default to SQLite.
+    if req.wallet_driver_name != SQLITE_WALLET_DRIVER_NAME {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            error_message(&Error::UnknownWalletDriver),
+        );
     }
 
     // Generate the wallet ID (Go does this in `postWalletHandler` at
@@ -656,7 +661,7 @@ mod tests {
         let (s, body) = post(
             &router,
             "/wallet",
-            json!({"wallet_name": "alpha", "wallet_password": pwd}),
+            json!({"wallet_name": "alpha", "wallet_driver_name": "sqlite", "wallet_password": pwd}),
         )
         .await;
         assert_eq!(s, 200, "create wallet: {body}");
@@ -745,7 +750,7 @@ mod tests {
         let (s, body) = post(
             &router,
             "/wallet",
-            json!({"wallet_name": "alpha", "wallet_password": "right"}),
+            json!({"wallet_name": "alpha", "wallet_driver_name": "sqlite", "wallet_password": "right"}),
         )
         .await;
         assert_eq!(s, 200, "create: {body}");
@@ -792,7 +797,7 @@ mod tests {
         let (_, body) = post(
             &router,
             "/wallet",
-            json!({"wallet_name": "old", "wallet_password": pwd}),
+            json!({"wallet_name": "old", "wallet_driver_name": "sqlite", "wallet_password": pwd}),
         )
         .await;
         let id = body["wallet"]["id"].as_str().unwrap().to_string();
@@ -813,7 +818,7 @@ mod tests {
         let (_, body) = post(
             &router,
             "/wallet",
-            json!({"wallet_name": "old", "wallet_password": "right"}),
+            json!({"wallet_name": "old", "wallet_driver_name": "sqlite", "wallet_password": "right"}),
         )
         .await;
         let id = body["wallet"]["id"].as_str().unwrap().to_string();
@@ -831,7 +836,12 @@ mod tests {
     #[tokio::test]
     async fn master_key_export_wrong_password_returns_400_not_401() {
         let (router, _tmp) = make_router();
-        let (_, body) = post(&router, "/wallet", json!({"wallet_password": "right"})).await;
+        let (_, body) = post(
+            &router,
+            "/wallet",
+            json!({"wallet_driver_name": "sqlite", "wallet_password": "right"}),
+        )
+        .await;
         let id = body["wallet"]["id"].as_str().unwrap().to_string();
         let (_, body) = post(
             &router,
@@ -865,6 +875,43 @@ mod tests {
         .await;
         assert_eq!(s, 400);
         assert_eq!(body["error"], true);
+    }
+
+    #[tokio::test]
+    async fn empty_post_body_returns_could_not_decode() {
+        // Regression for Codex PR #356 round 1 (P1):
+        // Go's `json.Decode(r.Body)` returns io.EOF on an empty body
+        // — the v1 handlers map that to errCouldNotDecode → 400.
+        // We must NOT silently accept the default request shape.
+        let (router, _tmp) = make_router();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/wallet")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], true);
+        assert_eq!(v["message"], ERR_COULD_NOT_DECODE);
+    }
+
+    #[tokio::test]
+    async fn create_wallet_missing_driver_name_returns_unknown_driver_400() {
+        // Regression for Codex PR #356 round 1 (P1):
+        // Go's `FetchWalletDriver("")` returns "unknown wallet driver"
+        // because the registry doesn't have an empty-string key.  A
+        // body like `{"wallet_password":"x"}` (no driver name) must
+        // fail rather than silently default to SQLite.
+        let (router, _tmp) = make_router();
+        let (s, body) = post(&router, "/wallet", json!({"wallet_password": "x"})).await;
+        assert_eq!(s, 400);
+        assert_eq!(body["error"], true);
+        assert_eq!(body["message"], "unknown wallet driver");
     }
 
     #[tokio::test]
