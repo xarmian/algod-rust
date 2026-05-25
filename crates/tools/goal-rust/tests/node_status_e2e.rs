@@ -16,16 +16,23 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 const GOAL_RUST_BIN: &str = env!("CARGO_BIN_EXE_goal-rust");
 
+/// Captured tokens (`X-Algo-API-Token` header values) observed across
+/// every accepted request, in arrival order.
+type TokenLog = Arc<Mutex<Vec<String>>>;
+
 fn spawn_mock_algod(
     status_json: &'static str,
     versions_json: &'static str,
-) -> (u16, thread::JoinHandle<()>) {
+) -> (u16, TokenLog, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
     let port = listener.local_addr().unwrap().port();
+    let tokens: TokenLog = Arc::new(Mutex::new(Vec::new()));
+    let log = tokens.clone();
     let handle = thread::spawn(move || {
         // Accept-once-per-route, then exit. The client makes two
         // requests (status, versions); we accept both before
@@ -39,13 +46,21 @@ fn spawn_mock_algod(
             if reader.read_line(&mut first).is_err() {
                 continue;
             }
-            // Drain remaining headers.
+            // Drain remaining headers, capturing the API token header.
+            let mut token = String::new();
             loop {
                 let mut buf = String::new();
                 if reader.read_line(&mut buf).is_err() || buf == "\r\n" || buf.is_empty() {
                     break;
                 }
+                if let Some(rest) = buf
+                    .strip_prefix("X-Algo-API-Token: ")
+                    .or_else(|| buf.strip_prefix("x-algo-api-token: "))
+                {
+                    token = rest.trim_end_matches(['\r', '\n']).to_string();
+                }
             }
+            log.lock().unwrap().push(token);
             let body = if first.contains("/v2/status") {
                 status_json
             } else if first.contains("/versions") {
@@ -62,19 +77,12 @@ fn spawn_mock_algod(
             let _ = stream.flush();
         }
     });
-    (port, handle)
+    (port, tokens, handle)
 }
 
 fn write_algod_files(data_dir: &Path, port: u16, token: &str) {
     std::fs::write(data_dir.join("algod.net"), format!("127.0.0.1:{port}\n")).unwrap();
     std::fs::write(data_dir.join("algod.token"), format!("{token}\n")).unwrap();
-}
-
-/// Helper that writes algod.net + a chosen token file (so we can
-/// exercise the admin-token-first preference Go enforces).
-fn write_algod_files_with(data_dir: &Path, port: u16, token_file: &str, token: &str) {
-    std::fs::write(data_dir.join("algod.net"), format!("127.0.0.1:{port}\n")).unwrap();
-    std::fs::write(data_dir.join(token_file), format!("{token}\n")).unwrap();
 }
 
 #[test]
@@ -126,8 +134,17 @@ fn node_status_prefers_admin_token_when_both_present() {
         "genesis_id": "g",
         "genesis_hash_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     }"#;
-    let (port, _server) = spawn_mock_algod(status_json, versions_json);
-    write_algod_files_with(data_dir.path(), port, "algod.admin.token", "admin-tok");
+    let (port, tokens, _server) = spawn_mock_algod(status_json, versions_json);
+    // Write BOTH tokens with distinct values so the test actually
+    // exercises the preference (Codex round 2): the admin one must
+    // be the value transmitted on the wire.
+    std::fs::write(
+        data_dir.path().join("algod.net"),
+        format!("127.0.0.1:{port}\n"),
+    )
+    .unwrap();
+    std::fs::write(data_dir.path().join("algod.token"), "regular-tok\n").unwrap();
+    std::fs::write(data_dir.path().join("algod.admin.token"), "admin-tok\n").unwrap();
 
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
@@ -138,10 +155,21 @@ fn node_status_prefers_admin_token_when_both_present() {
         .expect("run goal-rust node status");
     assert!(
         out.status.success(),
-        "expected success with only algod.admin.token present; exit={:?}, stderr={}",
+        "expected success; exit={:?}, stderr={}",
         out.status.code(),
         String::from_utf8_lossy(&out.stderr),
     );
+    let seen = tokens.lock().unwrap().clone();
+    assert!(
+        !seen.is_empty(),
+        "mock algod should have observed at least one request",
+    );
+    for t in &seen {
+        assert_eq!(
+            t, "admin-tok",
+            "admin token must be preferred over algod.token; got {seen:?}",
+        );
+    }
 }
 
 #[test]
@@ -162,7 +190,7 @@ fn node_status_prints_go_format_text_for_synced_node() {
         "genesis_id": "testnet-v1",
         "genesis_hash_b64": "SGVsbG8gV29ybGQAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     }"#;
-    let (port, _server) = spawn_mock_algod(status_json, versions_json);
+    let (port, _tokens, _server) = spawn_mock_algod(status_json, versions_json);
     write_algod_files(data_dir.path(), port, "deadbeef");
 
     let out = Command::new(GOAL_RUST_BIN)
