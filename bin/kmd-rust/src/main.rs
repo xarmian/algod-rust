@@ -301,6 +301,12 @@ async fn wait_for_shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+fn init_tracing() {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+}
+
 #[cfg(test)]
 mod resolve_address_tests {
     use super::*;
@@ -332,10 +338,4 @@ mod resolve_address_tests {
         assert!(resolve_address("not-an-address").await.is_err());
         assert!(resolve_address(":not-a-port").await.is_err());
     }
-}
-
-fn init_tracing() {
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 }
