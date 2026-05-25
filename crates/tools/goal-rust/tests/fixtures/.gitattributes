@@ -1,0 +1,6 @@
+# Fixtures captured byte-exact from Go's `goal --help` (v4.5.1-stable).
+# Some cobra help lines have trailing whitespace (e.g. commands with
+# empty Short text like `protocols`). Don't auto-strip on commit and
+# don't flag as whitespace violations — these are reference data, not
+# source code edits.
+*.txt -whitespace

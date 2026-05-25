@@ -1,0 +1,24 @@
+Manage assets
+
+Usage:
+  goal asset [flags]
+  goal asset [command]
+
+Available Commands:
+  config      Configure an asset
+  create      Create an asset
+  destroy     Destroy an asset
+  freeze      Freeze assets
+  info        Look up current parameters for an asset
+  optin       Optin to assets
+  send        Transfer assets
+
+Flags:
+  -h, --help            help for asset
+  -w, --wallet string   Set the wallet to be used for the selected operation
+
+Global Flags:
+  -d, --datadir stringArray   Data directory for the node
+  -k, --kmddir string         Data directory for kmd
+
+Use "goal asset [command] --help" for more information about a command.

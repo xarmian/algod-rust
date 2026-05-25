@@ -1760,6 +1760,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "goal-rust"
+version = "0.1.0"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

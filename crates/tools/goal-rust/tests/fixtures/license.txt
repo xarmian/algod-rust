@@ -1,0 +1,11 @@
+Display license information
+
+Usage:
+  goal license [flags]
+
+Flags:
+  -h, --help   help for license
+
+Global Flags:
+  -d, --datadir stringArray   Data directory for the node
+  -k, --kmddir string         Data directory for kmd
