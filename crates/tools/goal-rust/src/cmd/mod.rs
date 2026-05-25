@@ -2,3 +2,4 @@
 //! body from `../go-algorand/cmd/goal/`.
 
 pub mod node;
+pub mod wallet;
