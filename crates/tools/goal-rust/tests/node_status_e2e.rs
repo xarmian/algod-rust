@@ -70,6 +70,80 @@ fn write_algod_files(data_dir: &Path, port: u16, token: &str) {
     std::fs::write(data_dir.join("algod.token"), format!("{token}\n")).unwrap();
 }
 
+/// Helper that writes algod.net + a chosen token file (so we can
+/// exercise the admin-token-first preference Go enforces).
+fn write_algod_files_with(data_dir: &Path, port: u16, token_file: &str, token: &str) {
+    std::fs::write(data_dir.join("algod.net"), format!("127.0.0.1:{port}\n")).unwrap();
+    std::fs::write(data_dir.join(token_file), format!("{token}\n")).unwrap();
+}
+
+#[test]
+fn node_status_short_w_flag_accepted() {
+    // Regression guard (Codex review of TASK-223 round 1): Go's
+    // `goal node status -w 1` is valid (`--watch`'s short alias).
+    // Verify clap accepts `-w 0` (single shot) without erroring on
+    // an unknown flag. We don't actually invoke the loop with
+    // non-zero millis; just confirm the parser path.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // No algod files written: status will fail to read algod.net,
+    // exit 1 — but only AFTER clap accepts `-w 0`. Failure-mode
+    // matters: an "unexpected argument '-w'" message would mean we
+    // never got past parsing.
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(tmp.path())
+        .args(["node", "status", "-w", "0"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("run goal-rust node status -w 0");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "-w should be accepted; got stderr: {stderr:?}",
+    );
+}
+
+#[test]
+fn node_status_prefers_admin_token_when_both_present() {
+    // Regression guard (Codex review of TASK-223 round 1): Go's
+    // ensureAlgodClient reads algod.admin.token first, falls back to
+    // algod.token. With only algod.admin.token present, the call
+    // must still go through (we're not asserting which token reaches
+    // the server; just that the run doesn't fail before connecting).
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let status_json = r#"{
+        "last-round": 1,
+        "time-since-last-round": 0,
+        "catchup-time": 0,
+        "last-version": "v",
+        "next-version": "v",
+        "next-version-round": 2,
+        "next-version-supported": true,
+        "stopped-at-unsupported-round": false
+    }"#;
+    let versions_json = r#"{
+        "versions": ["v2"],
+        "genesis_id": "g",
+        "genesis_hash_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    }"#;
+    let (port, _server) = spawn_mock_algod(status_json, versions_json);
+    write_algod_files_with(data_dir.path(), port, "algod.admin.token", "admin-tok");
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(data_dir.path())
+        .args(["node", "status"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("run goal-rust node status");
+    assert!(
+        out.status.success(),
+        "expected success with only algod.admin.token present; exit={:?}, stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
 #[test]
 fn node_status_prints_go_format_text_for_synced_node() {
     let data_dir = tempfile::tempdir().expect("tempdir");

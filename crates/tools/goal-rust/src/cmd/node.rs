@@ -14,7 +14,7 @@ use algo_rest_client::{AlgodClient, BlockSource, NodeStatus};
 #[cfg(test)]
 use algo_rest_client::AlgodVersions;
 
-use crate::data_dir::{read_algod_net, read_algod_token};
+use crate::data_dir::{read_algod_admin_token, read_algod_net, read_algod_token};
 use crate::groups::node::StatusArgs;
 
 /// Mirrors `messages.go:64` (`infoNodeStatus`).
@@ -105,12 +105,17 @@ async fn get_status(data_dir: &Path, watch_ms: u64) -> Result<(), ()> {
     } else {
         format!("http://{net}")
     };
-    let token = match read_algod_token(data_dir) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("{}", format_message(ERROR_NODE_STATUS, &[&e.to_string()]));
-            return Err(());
-        }
+    // Mirrors Go's `nodecontrol/algodControl.go:72-75`: prefer
+    // `algod.admin.token`, fall back to `algod.token`.
+    let token = match read_algod_admin_token(data_dir) {
+        Ok(t) if !t.is_empty() => t,
+        _ => match read_algod_token(data_dir) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("{}", format_message(ERROR_NODE_STATUS, &[&e.to_string()]));
+                return Err(());
+            }
+        },
     };
     let client = AlgodClient::new(url, token);
 

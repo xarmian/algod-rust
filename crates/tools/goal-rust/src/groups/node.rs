@@ -40,9 +40,10 @@ pub enum NodeCmd {
 #[derive(Args, Debug, Default)]
 pub struct StatusArgs {
     /// Repeat poll every N milliseconds; 0 = single shot. Mirrors
-    /// Go's `--watch` flag on `goal node status`
-    /// (`cmd/goal/node.go` global `watchMillisecond`).
-    #[arg(long = "watch", default_value_t = 0)]
+    /// Go's `-w, --watch` flag on `goal node status`
+    /// (`cmd/goal/node.go` global `watchMillisecond`, registered
+    /// with `Uint64VarP(..., "watch", "w", ...)`).
+    #[arg(short = 'w', long = "watch", default_value_t = 0)]
     pub watch: u64,
 }
 
