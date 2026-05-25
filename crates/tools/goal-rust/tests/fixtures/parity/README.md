@@ -32,15 +32,20 @@ strings — every constant is also embedded byte-exactly in
 `src/cmd/*.rs`, so renaming or rewording on the Go side is caught
 both at the per-leaf assertion and the harness level.
 
-To refresh from an actual Go `goal` binary (e.g. after a go-algorand
+**These fixtures may only be refreshed from a Go binary.** The
+Rust assertion helper deliberately has no "rewrite from
+`actual`" escape hatch — that would let a Rust regression bake
+itself in as the new expected without ever comparing against Go.
+
+To refresh from an actual `goal` binary (e.g. after a go-algorand
 version bump):
 
 ```bash
-MIXED_CLUSTER=1 UPDATE_FIXTURES=1 cargo test -p goal-rust --test parity_fixtures
+MIXED_CLUSTER=1 ./crates/tools/goal-rust/tools/capture-goal-fixtures.sh
 ```
 
-This currently writes a stub since the full algod+kmd capture rig
-isn't yet shipped; the env-var contract is in place so a follow-up
-task can wire it in without changing the harness API. (See the
-script at `crates/tools/goal-rust/tools/capture-goal-fixtures.sh`
-for the planned shape.)
+The script is currently a scaffold — the algod+kmd state-fixture
+rig for the catchpoint / upgrade-voting branches lives outside
+Phase A. Until that lands, refresh by editing the `.txt` files by
+hand against the Go source line references in the table above, and
+inspect the diff carefully before committing.

@@ -34,36 +34,22 @@ pub fn load_fixture(name: &str) -> String {
     })
 }
 
-/// Diff-clean assertion: panics with the standard
-/// `assert_eq!`-style message but also emits the fixture path and a
-/// hint about `UPDATE_FIXTURES=1` so a Go-side wording change has
-/// an obvious next step.
+/// Diff-clean assertion. The harness deliberately has no "rewrite
+/// the fixture from Rust output" escape hatch: doing that would let
+/// a Rust regression bake itself in as the new expected without ever
+/// being compared against Go (Codex review TASK-229 round 1). The
+/// only sanctioned refresh path runs the Go binary via
+/// `tools/capture-goal-fixtures.sh`; see
+/// `tests/fixtures/parity/README.md`.
 pub fn assert_matches_fixture(name: &str, actual: &str) {
     let expected = load_fixture(name);
-    if expected == actual {
-        return;
-    }
-    if update_requested() {
-        // Honour the refresh contract documented in the fixtures
-        // README — let `UPDATE_FIXTURES=1` rewrite the file instead
-        // of failing, so a CI run can bake in the new snapshot.
-        std::fs::write(fixture_path(name), actual).expect("write fixture");
-        return;
-    }
-    panic!(
-        "parity fixture mismatch: {}\n  expected ({} bytes):\n{}\n  actual ({} bytes):\n{}\n\
-         (re-run with UPDATE_FIXTURES=1 to refresh after a deliberate Go-side change)",
-        fixture_path(name).display(),
-        expected.len(),
-        expected,
-        actual.len(),
+    assert_eq!(
         actual,
+        expected,
+        "parity fixture mismatch: {}\n\
+         To refresh after an INTENTIONAL Go-side wording change, run\n\
+         `MIXED_CLUSTER=1 ./crates/tools/goal-rust/tools/capture-goal-fixtures.sh`\n\
+         and inspect the diff before committing.",
+        fixture_path(name).display(),
     );
-}
-
-/// True when `UPDATE_FIXTURES=1` is in the env. Gated by Go-binary
-/// availability for the live-capture path; the harness itself just
-/// uses it as a "write expected, don't fail" toggle.
-pub fn update_requested() -> bool {
-    matches!(std::env::var("UPDATE_FIXTURES").as_deref(), Ok("1"))
 }
