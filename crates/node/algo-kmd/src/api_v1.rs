@@ -713,20 +713,15 @@ async fn post_key(State(state): State<AppState>, req: axum::extract::Request) ->
         Ok(r) => r,
         Err(r) => return r,
     };
-    // The SQLite driver never displays mnemonics — Go's
-    // `SQLiteWallet.GenerateKey` returns `errNoMnemonicUX` whenever
-    // the request sets `display_mnemonic: true`
-    // (sqlite.go:850-852).  We do the same so a client that asked
-    // for mnemonic UX isn't silently downgraded to a regular
-    // generate.  Status 500 matches Go's call site
-    // (`handlers.go:681` reports any GenerateKey error as 500).
-    if req.display_mnemonic {
-        return err_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            error_message(&Error::NoMnemonicUX),
-        );
-    }
 
+    // Match Go's call order at handlers.go:661-683:
+    //   1. decode body
+    //   2. authenticate the wallet-handle token (401 on bad token)
+    //   3. call wallet.GenerateKey(display_mnemonic), which returns
+    //      errNoMnemonicUX inside the driver when display_mnemonic=true
+    // The driver-level rejection runs AFTER auth, so an unauthenticated
+    // request with display_mnemonic=true must still return 401, not
+    // 500.  (Regression: Codex PR #357 round 2.)
     let session_manager = state.session_manager.clone();
     let token = req.wallet_handle_token;
     let handle = match blocking_with_status(
@@ -738,6 +733,16 @@ async fn post_key(State(state): State<AppState>, req: axum::extract::Request) ->
         Ok(h) => h,
         Err(r) => return r,
     };
+
+    // Now we're authenticated — surface the SQLite-driver mnemonic
+    // rejection with Go's exact error text and status 500
+    // (matches handlers.go:681 mapping any GenerateKey error to 500).
+    if req.display_mnemonic {
+        return err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_message(&Error::NoMnemonicUX),
+        );
+    }
 
     // Go reports any error from GenerateKey as 500 (handlers.go:681).
     // We use the default mapping so e.g. WalletNotInitialized still
@@ -1319,6 +1324,23 @@ mod tests {
         let exported_b64 = body["private_key"].as_str().unwrap();
         let exported = B64.decode(exported_b64).unwrap();
         assert_eq!(exported, expanded);
+    }
+
+    #[tokio::test]
+    async fn key_generate_with_display_mnemonic_and_bad_token_returns_401() {
+        // Regression for Codex PR #357 round 2 (P2):
+        // The display_mnemonic check must run AFTER token auth.
+        // An unauthenticated request with display_mnemonic=true
+        // should still get 401, not 500.
+        let (router, _tmp) = make_router();
+        let (s, body) = post(
+            &router,
+            "/key",
+            json!({"wallet_handle_token": "bogus", "display_mnemonic": true}),
+        )
+        .await;
+        assert_eq!(s, 401, "bad token + display_mnemonic=true: {body}");
+        assert_eq!(body["error"], true);
     }
 
     #[tokio::test]
