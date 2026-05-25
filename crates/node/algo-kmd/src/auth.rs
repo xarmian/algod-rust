@@ -79,10 +79,51 @@ pub fn generate_api_token(data_dir: &Path) -> Result<String> {
 /// Read the existing token, or generate one if missing. Mirrors
 /// `ValidateOrGenerateAPIToken` (tokens.go:106). Idempotent: calling
 /// twice with the same data dir returns the same token.
+///
+/// **Important parity note**: a present-but-invalid token is
+/// **preserved**, not regenerated — the function surfaces the
+/// validation error instead of silently rotating a corrupted/
+/// misconfigured token. Go's logic at tokens.go:108–122:
+///
+/// ```text
+/// apiToken, _ := GetAndValidateAPIToken(...)   // ignore read err
+/// if apiToken == "" { apiToken, err = GenerateAPIToken(...) }
+/// err = ValidateAPIToken(apiToken)             // surface validation
+/// return
+/// ```
+///
+/// We only generate when the file is genuinely missing or empty;
+/// any present content goes through `validate_api_token` and the
+/// caller sees the underlying length error rather than getting a
+/// silently-rewritten token that invalidates every existing client.
 pub fn validate_or_generate_api_token(data_dir: &Path) -> Result<String> {
-    match get_and_validate_api_token(data_dir) {
-        Ok(token) => Ok(token),
-        Err(_) => generate_api_token(data_dir),
+    // Mirrors Go's `GetAndValidateAPIToken` followed by an explicit
+    // empty-string check. Read errors (missing file, permission issue)
+    // produce an empty token here so we fall through to generation,
+    // matching Go's `apiToken, _ := ...` line.
+    let read_token = read_first_line(data_dir).unwrap_or_default();
+
+    let token = if read_token.is_empty() {
+        generate_api_token(data_dir)?
+    } else {
+        read_token
+    };
+
+    validate_api_token(&token)?;
+    Ok(token)
+}
+
+/// Helper used by [`validate_or_generate_api_token`]: read the token
+/// file's first line, returning `Ok("")` (NOT an error) when the file
+/// is absent so the caller can hit the "generate" branch the way Go
+/// does. Other I/O errors are surfaced so misconfigured permissions
+/// don't get silently swallowed.
+fn read_first_line(data_dir: &Path) -> Result<String> {
+    let path = token_path(data_dir);
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => Ok(raw.lines().next().unwrap_or("").to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(Error::Io(e)),
     }
 }
 
@@ -163,6 +204,43 @@ mod tests {
         .unwrap();
         let got = get_and_validate_api_token(dir.path()).unwrap();
         assert_eq!(got, tok);
+    }
+
+    #[test]
+    fn existing_invalid_token_is_preserved_not_rotated() {
+        // Regression for Codex PR #354 round 1: Go preserves a
+        // present-but-invalid kmd.token (surfaces ApiTokenTooShort)
+        // rather than silently regenerating it. Rotating a token
+        // unexpectedly invalidates every existing client and hides
+        // startup config bugs.
+        let dir = TempDir::new().unwrap();
+        let short_token = "abc"; // 3 chars — well under the 64 min
+        std::fs::write(dir.path().join(KMD_TOKEN_FILENAME), short_token).unwrap();
+
+        // First call must surface the validation error.
+        let err = validate_or_generate_api_token(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, Error::ApiTokenTooShort),
+            "expected ApiTokenTooShort, got {err:?}"
+        );
+
+        // The on-disk file must remain unchanged — no silent rotation.
+        let after = std::fs::read_to_string(dir.path().join(KMD_TOKEN_FILENAME)).unwrap();
+        assert_eq!(
+            after, short_token,
+            "validate_or_generate must not rewrite a present-but-invalid token"
+        );
+    }
+
+    #[test]
+    fn empty_token_file_triggers_generation() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(KMD_TOKEN_FILENAME), "").unwrap();
+        let token = validate_or_generate_api_token(dir.path()).unwrap();
+        assert_eq!(token.len(), MINIMUM_API_TOKEN_LENGTH);
+        // Subsequent call returns the same (now-persisted) token.
+        let again = validate_or_generate_api_token(dir.path()).unwrap();
+        assert_eq!(token, again);
     }
 
     #[test]
