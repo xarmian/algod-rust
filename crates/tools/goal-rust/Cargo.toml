@@ -13,10 +13,12 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 algo-rest-client = { workspace = true }
+algo-kmd-client = { workspace = true }
 algo-error = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 rand = { workspace = true }
+rpassword = "7"
 
 [dev-dependencies]
 tempfile = "3"
