@@ -713,11 +713,19 @@ async fn post_key(State(state): State<AppState>, req: axum::extract::Request) ->
         Ok(r) => r,
         Err(r) => return r,
     };
-    // `display_mnemonic` is accepted on the wire for parity but the
-    // SQLite driver rejects mnemonic-UX requests (sqlite.go:850).
-    // Our `Wallet::generate_key` doesn't take a `display_mnemonic`
-    // parameter — it always behaves as `display_mnemonic == false`
-    // for the SQLite driver, which is what Go does.
+    // The SQLite driver never displays mnemonics — Go's
+    // `SQLiteWallet.GenerateKey` returns `errNoMnemonicUX` whenever
+    // the request sets `display_mnemonic: true`
+    // (sqlite.go:850-852).  We do the same so a client that asked
+    // for mnemonic UX isn't silently downgraded to a regular
+    // generate.  Status 500 matches Go's call site
+    // (`handlers.go:681` reports any GenerateKey error as 500).
+    if req.display_mnemonic {
+        return err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_message(&Error::NoMnemonicUX),
+        );
+    }
 
     let session_manager = state.session_manager.clone();
     let token = req.wallet_handle_token;
@@ -1311,6 +1319,28 @@ mod tests {
         let exported_b64 = body["private_key"].as_str().unwrap();
         let exported = B64.decode(exported_b64).unwrap();
         assert_eq!(exported, expanded);
+    }
+
+    #[tokio::test]
+    async fn key_generate_with_display_mnemonic_returns_no_mnemonic_ux() {
+        // Regression for Codex PR #357 round 1 (P2):
+        // Go's SQLiteWallet.GenerateKey returns errNoMnemonicUX when
+        // displayMnemonic == true (sqlite.go:850-852). We previously
+        // ignored the flag and silently generated a key, misleading
+        // clients that explicitly requested mnemonic display.
+        let (router, _tmp, token) = make_unlocked("pw").await;
+        let (s, body) = post(
+            &router,
+            "/key",
+            json!({"wallet_handle_token": token, "display_mnemonic": true}),
+        )
+        .await;
+        assert_eq!(s, 500, "{body}");
+        assert_eq!(body["error"], true);
+        assert_eq!(
+            body["message"],
+            "sqlite wallet driver cannot display mnemonics"
+        );
     }
 
     #[tokio::test]

@@ -180,6 +180,12 @@ pub enum Error {
     #[error("unknown wallet driver")]
     UnknownWalletDriver,
 
+    /// `POST /v1/key { display_mnemonic: true }` against the SQLite
+    /// driver, which never supports mnemonic UX.  Mirrors
+    /// `errNoMnemonicUX` (`daemon/kmd/wallet/driver/sqlite_errors.go:29`).
+    #[error("sqlite wallet driver cannot display mnemonics")]
+    NoMnemonicUX,
+
     /// Another kmd-rust process holds the file lock on this data dir.
     /// Mirrors `ErrAlreadyRunning` (`daemon/kmd/server/server.go`).
     #[error("kmd is already running in this data directory")]
