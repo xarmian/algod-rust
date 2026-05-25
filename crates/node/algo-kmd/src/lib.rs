@@ -15,10 +15,12 @@ pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod keys;
+pub mod multisig;
 pub mod sqlite;
 pub mod wallet;
 
 pub use keys::{extract_seed_with_index, ADDRESS_LEN, SECRET_KEY_LEN};
+pub use multisig::MultisigPreimage;
 pub use wallet::{Wallet, WalletDriver, WalletDriverConfig};
 
 pub use crypto::{
