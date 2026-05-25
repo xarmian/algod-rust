@@ -153,7 +153,18 @@ fn resolve_password(args: &NewArgs) -> Result<String, ()> {
     }
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
-        let p1 = match rpassword::prompt_password(format_message(PROMPT_CHOOSE, &[&args.name])) {
+        // Print the prompt to stdout via Rust's print! (matches Go's
+        // fmt.Printf at wallet.go:130-136 which goes to stdout —
+        // tools that capture stdout from an interactive run see the
+        // prompt text). Then use rpassword::read_password() for the
+        // masked terminal read so the typed password isn't echoed.
+        // (Codex review TASK-226 round 2: rpassword::prompt_password
+        // writes the prompt to /dev/tty rather than stdout, which
+        // diverges from Go.)
+        use std::io::Write;
+        print!("{}", format_message(PROMPT_CHOOSE, &[&args.name]));
+        let _ = std::io::stdout().flush();
+        let p1 = match rpassword::read_password() {
             Ok(p) => p,
             Err(e) => {
                 eprintln!(
@@ -163,7 +174,9 @@ fn resolve_password(args: &NewArgs) -> Result<String, ()> {
                 return Err(());
             }
         };
-        let p2 = match rpassword::prompt_password(PROMPT_CONFIRM) {
+        print!("{PROMPT_CONFIRM}");
+        let _ = std::io::stdout().flush();
+        let p2 = match rpassword::read_password() {
             Ok(p) => p,
             Err(e) => {
                 eprintln!(
