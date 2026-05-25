@@ -1,0 +1,11 @@
+Produces report helpful for debugging.
+
+Usage:
+  goal report [flags]
+
+Flags:
+  -h, --help   help for report
+
+Global Flags:
+  -d, --datadir stringArray   Data directory for the node
+  -k, --kmddir string         Data directory for kmd

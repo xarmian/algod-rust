@@ -1,0 +1,11 @@
+Dump standard consensus protocols as json to stdout.
+
+Usage:
+  goal protocols [flags]
+
+Flags:
+  -h, --help   help for protocols
+
+Global Flags:
+  -d, --datadir stringArray   Data directory for the node
+  -k, --kmddir string         Data directory for kmd

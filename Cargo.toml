@@ -22,6 +22,7 @@ members = [
     "crates/tools/algo-fork-detector",
     "crates/tools/algo-cert-crossverify",
     "crates/tools/algokey-rust",
+    "crates/tools/goal-rust",
     "bin/algod-rust",
     "bin/kmd-rust",
 ]
