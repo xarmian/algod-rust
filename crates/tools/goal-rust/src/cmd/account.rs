@@ -239,13 +239,13 @@ pub fn run_dump(args: DumpArgs, cli_d: Vec<PathBuf>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let address = match algo_types::Address::from_algorand_string(&args.address) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("Could not parse address: {e}");
-            return ExitCode::from(1);
-        }
-    };
+    // Validate the address so a typo errors before we issue the HTTP
+    // call (Go does the same in account.go:838-841 via
+    // basics.UnmarshalChecksumAddress).
+    if let Err(e) = algo_types::Address::from_algorand_string(&args.address) {
+        eprintln!("Could not parse address: {e}");
+        return ExitCode::from(1);
+    }
     let net = match std::fs::read_to_string(data_dir_path.join("algod.net")) {
         Ok(s) => s.trim().to_string(),
         Err(_) => {
@@ -265,28 +265,61 @@ pub fn run_dump(args: DumpArgs, cli_d: Vec<PathBuf>) -> ExitCode {
     } else {
         format!("http://{net}")
     };
-    let client = algo_rest_client::AlgodClient::new(&base, &token);
     let rt = match build_runtime() {
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-    let info = match rt.block_on(client.get_account(&address)) {
-        Ok(i) => i,
+    // Fetch as untyped JSON so unknown fields (assets, created-assets,
+    // apps-local-state, created-apps, participation, etc.) round-trip
+    // unmolested. The narrow `algo_rest_client::AccountInfo` deserialize
+    // would silently drop them (Codex review TASK-235 round 1).
+    let url = format!(
+        "{}/v2/accounts/{}",
+        base.trim_end_matches('/'),
+        args.address
+    );
+    let body_result = rt.block_on(async {
+        let http = reqwest::Client::new();
+        let resp = http
+            .get(&url)
+            .header("X-Algo-API-Token", &token)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(format!(
+                "HTTP {}: {}",
+                status.as_u16(),
+                String::from_utf8_lossy(&bytes).trim()
+            ));
+        }
+        // Re-pretty-print to match Go's MarshalIndent shape (2-space
+        // indent). Use serde_json::Value so all REST fields survive.
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON from algod: {e}"))?;
+        let pretty =
+            serde_json::to_string_pretty(&parsed).map_err(|e| format!("re-encode failed: {e}"))?;
+        Ok::<String, String>(pretty)
+    });
+    let body = match body_result {
+        Ok(b) => b,
         Err(e) => {
-            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e]));
             return ExitCode::from(1);
         }
     };
-    match serde_json::to_string_pretty(&info) {
-        Ok(s) => {
-            println!("{s}");
-            ExitCode::SUCCESS
+    match args.outfile {
+        Some(path) => {
+            if let Err(e) = std::fs::write(&path, body.as_bytes()) {
+                eprintln!("Failed to write {}: {e}", path.display());
+                return ExitCode::from(1);
+            }
         }
-        Err(e) => {
-            eprintln!("Failed to render JSON: {e}");
-            ExitCode::from(1)
-        }
+        None => println!("{body}"),
     }
+    ExitCode::SUCCESS
 }
 
 // ---- shared helpers -------------------------------------------------------

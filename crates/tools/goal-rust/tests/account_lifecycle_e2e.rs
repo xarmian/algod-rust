@@ -375,6 +375,10 @@ fn account_dump_pretty_prints_rest_response() {
     // doesn't depend on a hand-typed checksum.
     let addr = algo_types::Address([0xab; 32]).to_algorand_string();
     let addr = addr.as_str();
+    // Include a field the narrow algo-rest-client AccountInfo struct
+    // does NOT model (`assets`) to verify dump round-trips the raw
+    // REST JSON without dropping unknown fields (Codex review TASK-235
+    // round 1 finding).
     let canned = serde_json::json!({
         "address": addr,
         "amount": 12345,
@@ -384,6 +388,7 @@ fn account_dump_pretty_prints_rest_response() {
         "status": "Online",
         "min-balance": 100000,
         "round": 42,
+        "assets": [{"asset-id": 999, "amount": 7, "is-frozen": false}],
     });
     let (stop, jh, port) = spawn_mock_algod(canned);
     std::fs::write(dd.join("algod.net"), format!("127.0.0.1:{port}\n")).unwrap();
@@ -412,6 +417,62 @@ fn account_dump_pretty_prints_rest_response() {
         "must be pretty-printed: {stdout:?}"
     );
     assert!(stdout.contains("\"amount\": 12345"));
+    // Unknown REST fields survive (Codex round-1 finding).
+    assert!(
+        stdout.contains("\"asset-id\": 999"),
+        "unknown REST fields must round-trip in dump output: {stdout:?}",
+    );
+}
+
+#[test]
+fn account_dump_writes_outfile_when_o_flag_given() {
+    use std::sync::atomic::Ordering;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dd = tmp.path().to_path_buf();
+    std::fs::write(
+        dd.join("genesis.json"),
+        r#"{"id":"v1","network":"testnet","proto":"future","alloc":[],"rwd":"FEESINKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANY3ZN3I","fees":"FEESINKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANY3ZN3I"}"#,
+    )
+    .unwrap();
+    let addr = algo_types::Address([0xcd; 32]).to_algorand_string();
+    let canned = serde_json::json!({
+        "address": addr,
+        "amount": 1,
+        "amount-without-pending-rewards": 1,
+        "pending-rewards": 0,
+        "rewards": 0,
+        "status": "Online",
+        "round": 1,
+    });
+    let (stop, jh, port) = spawn_mock_algod(canned);
+    std::fs::write(dd.join("algod.net"), format!("127.0.0.1:{port}\n")).unwrap();
+    std::fs::write(dd.join("algod.token"), "x".repeat(64)).unwrap();
+    let outfile = tmp.path().join("dump.json");
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(&dd)
+        .args(["account", "dump", "-a", &addr, "-o"])
+        .arg(&outfile)
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("dump");
+    stop.store(true, Ordering::Relaxed);
+    let _ = jh.join();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "dump -o must succeed; stderr={stderr:?}"
+    );
+    let body = std::fs::read_to_string(&outfile).expect("outfile written");
+    assert!(
+        body.contains(&addr),
+        "outfile must carry the response: {body}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).is_empty(),
+        "stdout must be empty when -o is used",
+    );
 }
 
 /// Sanity guard: feeding `wallet new` an explicit stdin password line

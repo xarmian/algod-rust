@@ -3,6 +3,7 @@
 //! Leaf list and `Short` text taken from cobra `Use` / `Short` fields
 //! (account.go:81-109).
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
@@ -150,6 +151,14 @@ pub struct DumpArgs {
     /// Address to dump. Mirrors Go's `-a, --address` flag.
     #[arg(short = 'a', long = "address")]
     pub address: String,
+
+    /// Write the response to this file instead of stdout. Mirrors
+    /// Go's `-o, --outfile` flag (`account.go`). Go writes msgpack-
+    /// encoded `BalanceRecord` to disk; since we render the REST JSON
+    /// instead (see [`DumpArgs`] doc), the file gets the same raw
+    /// JSON body that would otherwise hit stdout.
+    #[arg(short = 'o', long = "outfile")]
+    pub outfile: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
