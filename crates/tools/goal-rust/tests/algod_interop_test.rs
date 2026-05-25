@@ -97,11 +97,26 @@ fn stage_data_dir() -> tempfile::TempDir {
     tmp
 }
 
-fn poll_for_ready(data_dir: &Path) -> Result<(), String> {
+/// Poll for algod's readiness markers, also watching the child
+/// process. If algod exits before `algod.net` / `algod.token`
+/// appear, surface the captured stdout/stderr so the test reporter
+/// shows the actual startup failure (Codex review TASK-230 round 1:
+/// the readiness-timeout-only path was hiding errors like
+/// "listen tcp 127.0.0.1:0: socket: operation not permitted").
+fn poll_for_ready(child: &mut Child, data_dir: &Path) -> Result<(), String> {
     let net = data_dir.join("algod.net");
     let tok = data_dir.join("algod.token");
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(60) {
+        // If algod has exited, no point waiting for files it'll
+        // never write. Pull its captured streams into the error so
+        // the operator sees the actual diagnostic.
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "algod exited before readiness (status {status:?}):\n{}",
+                drain_child_output(child),
+            ));
+        }
         if let (Ok(n), Ok(t)) = (std::fs::read_to_string(&net), std::fs::read_to_string(&tok)) {
             if !n.trim().is_empty() && !t.trim().is_empty() {
                 return Ok(());
@@ -109,10 +124,46 @@ fn poll_for_ready(data_dir: &Path) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+    // Timeout: kill the child first so its stdout/stderr handles
+    // close, then drain.
+    let _ = child.kill();
+    let _ = child.wait();
     Err(format!(
-        "algod did not write algod.net/algod.token within 60s at {}",
+        "algod did not write algod.net/algod.token within 60s at {}:\n{}",
         data_dir.display(),
+        drain_child_output(child),
     ))
+}
+
+/// Read everything that's accumulated on the child's piped stdout +
+/// stderr into a single newline-tagged blob suitable for embedding
+/// in an `assert!` message.
+fn drain_child_output(child: &mut Child) -> String {
+    use std::io::Read;
+    let mut buf = String::new();
+    if let Some(mut s) = child.stdout.take() {
+        let mut tmp = Vec::new();
+        let _ = s.read_to_end(&mut tmp);
+        if !tmp.is_empty() {
+            buf.push_str("[algod stdout]\n");
+            buf.push_str(&String::from_utf8_lossy(&tmp));
+            buf.push('\n');
+        }
+    }
+    if let Some(mut s) = child.stderr.take() {
+        let mut tmp = Vec::new();
+        let _ = s.read_to_end(&mut tmp);
+        if !tmp.is_empty() {
+            buf.push_str("[algod stderr]\n");
+            buf.push_str(&String::from_utf8_lossy(&tmp));
+            buf.push('\n');
+        }
+    }
+    if buf.is_empty() {
+        "(no algod output captured)".to_string()
+    } else {
+        buf
+    }
 }
 
 fn sigterm(pid: u32) {
@@ -133,16 +184,25 @@ impl Drop for AlgodGuard {
 }
 
 fn spawn_algod(bin: &Path, data_dir: &Path) -> AlgodGuard {
-    let child = Command::new(bin)
+    // Pipe stdout/stderr so we can surface them on startup failures —
+    // dropping to /dev/null hid real errors like
+    // "listen tcp 127.0.0.1:0: socket: operation not permitted"
+    // (Codex review TASK-230 round 1).
+    let mut child = Command::new(bin)
         .args(["-d"])
         .arg(data_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn algod");
-    let guard = AlgodGuard(child);
-    poll_for_ready(data_dir).expect("algod ready");
-    guard
+    if let Err(e) = poll_for_ready(&mut child, data_dir) {
+        // Best-effort SIGTERM in case the child is still alive but
+        // wedged in some non-readiness state.
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("algod ready: {e}");
+    }
+    AlgodGuard(child)
 }
 
 #[test]
