@@ -276,6 +276,21 @@ fn build_router(api_token: String, allowed_origins: Vec<String>, allow_header_pn
         .nest("/v1", v1)
         .fallback(any(root_not_found));
 
+    // Add the OPTIONS short-circuit BEFORE the CORS layer so the
+    // outer CORS layer (and PNA layer below) can stamp their
+    // `Access-Control-*` headers onto the 200 response on the way
+    // out.  Matches Go's `rootRouter.Methods("OPTIONS").HandlerFunc(
+    // optionsHandler)` (`api/api.go:150`): every OPTIONS request —
+    // preflight or not — short-circuits to 200, and the CORS
+    // middleware that ran on the way in attaches the right headers
+    // on the way out.
+    //
+    // Axum layer semantics: the most recently added `.layer(...)` is
+    // outermost (runs first on the request, last on the response),
+    // so adding the short-circuit first puts it innermost — which is
+    // what we want.
+    app = app.layer(axum::middleware::from_fn(options_short_circuit));
+
     app = app.layer(build_cors_layer(allowed_origins));
 
     if allow_header_pna {
@@ -283,6 +298,19 @@ fn build_router(api_token: String, allowed_origins: Vec<String>, allow_header_pn
     }
 
     app
+}
+
+/// Top-of-stack middleware that mirrors Go's catch-all
+/// `optionsHandler` (api/api.go:113): any OPTIONS request — with or
+/// without an `Origin` header — short-circuits to 200 without
+/// invoking the inner router.  CORS / PNA layers wrap this one, so
+/// the response still gets the right `Access-Control-Allow-*`
+/// headers when the request is a preflight.
+async fn options_short_circuit(req: Request, next: Next) -> Response {
+    if req.method() == Method::OPTIONS {
+        return StatusCode::OK.into_response();
+    }
+    next.run(req).await
 }
 
 /// `versionsHandler` (api/api.go:88-109).  Returns
@@ -667,6 +695,42 @@ mod tests {
             matches!(err, Error::DataDirMissing(_)),
             "expected DataDirMissing, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn options_on_v1_returns_200_even_without_origin_header() {
+        // Regression for Codex PR #355 round 1: Go registers a
+        // catch-all `Methods("OPTIONS")` handler that returns 200
+        // for any OPTIONS request, with or without the CORS preflight
+        // headers.  Without the short-circuit middleware, OPTIONS
+        // /v1/wallets fell through to the v1 404 fallback.
+        let dir = TempDir::new().unwrap();
+        let (addr, tx, handle) = spawn(test_config(dir.path())).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("http://{addr}/v1/wallets"),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "non-preflight OPTIONS must return 200");
+
+        // And on a path that doesn't exist at all under /:
+        let resp = client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("http://{addr}/some/unknown/path"),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "OPTIONS catch-all applies to any path");
+
+        tx.send(()).unwrap();
+        handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]
