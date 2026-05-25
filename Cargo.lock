@@ -1778,6 +1778,7 @@ name = "goal-rust"
 version = "0.1.0"
 dependencies = [
  "algo-error",
+ "algo-kmd-api-types",
  "algo-kmd-client",
  "algo-rest-client",
  "clap",

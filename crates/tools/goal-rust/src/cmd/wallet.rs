@@ -38,37 +38,56 @@ const ERROR_PW_CONFIRM: &str = "Password confirmation did not match";
 /// missing, the Go libgoal client surfaces this exact text).
 const ERROR_KMD_UNREACHABLE: &str = "Could not contact kmd; is it running?";
 
+/// Mirrors `messages.go:178` (`infoNoWallets`).
+const INFO_NO_WALLETS: &str = "No wallets found. You can create a wallet with `goal wallet new`";
+
+/// Mirrors `messages.go:184` (`errorCouldntListWallets`).
+const ERROR_COULDNT_LIST: &str = "Couldn't list wallets: {}";
+
+/// Banner / separator emitted between and around each wallet block.
+/// Mirrors `wallet.go:275` and `:281`
+/// (`strings.Repeat("#", 50)` = 50 hash characters).
+const WALLET_SEPARATOR: &str = "##################################################";
+
+/// Resolve the single `-d` data dir, derive the kmd directory via
+/// A2, read `kmd.net` + `kmd.token`, and build a [`KmdClient`].
+/// Returns `Err(())` after writing the matching Go error text to
+/// stderr — caller maps to `ExitCode::from(1)`.
+///
+/// Factored out of `run_new` so `run_list` and subsequent wallet
+/// subcommands share one place for kmd discovery (Codex-style
+/// review pass for TASK-227).
+fn ensure_kmd_client_single(
+    cli_d: &[PathBuf],
+    kmd_dir_flag: Option<&Path>,
+) -> Result<KmdClient, ()> {
+    let data_dir = match data_dir::ensure_single_data_dir(cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return Err(());
+        }
+    };
+    let kmd_dir = match data_dir::resolve_kmd_data_dir(kmd_dir_flag, &data_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return Err(());
+        }
+    };
+    let (kmd_addr, kmd_token) = read_kmd_endpoint(&kmd_dir)?;
+    KmdClient::new(&kmd_addr, &kmd_token).map_err(|e| {
+        eprintln!(
+            "{}",
+            format_message(ERROR_COULDNT_CREATE, &[&e.to_string()])
+        );
+    })
+}
+
 pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>) -> ExitCode {
-    let data_dir = match data_dir::ensure_single_data_dir(&cli_d) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    let kmd_dir = match data_dir::resolve_kmd_data_dir(kmd_dir_flag.as_deref(), &data_dir) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    let (kmd_addr, kmd_token) = match read_kmd_endpoint(&kmd_dir) {
-        Ok(t) => t,
-        Err(()) => return ExitCode::from(1),
-    };
-
-    let client = match KmdClient::new(&kmd_addr, &kmd_token) {
+    let client = match ensure_kmd_client_single(&cli_d, kmd_dir_flag.as_deref()) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "{}",
-                format_message(ERROR_COULDNT_CREATE, &[&e.to_string()])
-            );
-            return ExitCode::from(1);
-        }
+        Err(()) => return ExitCode::from(1),
     };
 
     let password = match resolve_password(&args) {
@@ -108,6 +127,109 @@ pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>
             ExitCode::from(1)
         }
     }
+}
+
+/// Port of `listWalletsCmd` + `printWallets`
+/// (`wallet.go:199-281`). Iterates every `-d` data dir Go's
+/// `datadir.OnDataDirs` would visit (with the same `[Data Directory:
+/// <dir>]` header when more than one) and lists each kmd's wallets.
+/// Output byte-identical to Go for the empty + populated cases on a
+/// single data dir.
+///
+/// (The `(default)` suffix isn't surfaced — Phase A doesn't persist a
+/// default-wallet selection; tracking under Phase B with the account
+/// group.)
+pub fn run_list(cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>) -> ExitCode {
+    let dirs = match data_dir::resolve_data_dirs(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}", format_message(ERROR_COULDNT_LIST, &[&e.to_string()]));
+            return ExitCode::from(1);
+        }
+    };
+    let multi = dirs.len() > 1;
+    for d in &dirs {
+        if multi {
+            // Mirrors `cmd/util/datadir/messages.go:infoDataDir`.
+            println!("[Data Directory: {}]", d.display());
+        }
+        // Go's OnDataDirs callback uses reportErrorf which os.Exits
+        // immediately — we mirror that by returning a non-zero exit
+        // code on the first per-dir failure rather than continuing to
+        // later dirs and producing partial mixed output (Codex review
+        // TASK-227 round 2).
+        let client = match ensure_kmd_client_for_dir(d, kmd_dir_flag.as_deref(), ERROR_COULDNT_LIST)
+        {
+            Ok(c) => c,
+            Err(()) => return ExitCode::from(1),
+        };
+        match rt.block_on(client.list_wallets()) {
+            Ok(resp) => print_wallets(&resp.wallets),
+            Err(e) => {
+                let msg = match &e {
+                    KmdError::Api { message, .. } => message.clone(),
+                    other => other.to_string(),
+                };
+                eprintln!("{}", format_message(ERROR_COULDNT_LIST, &[&msg]));
+                return ExitCode::from(1);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Per-data-dir variant of [`ensure_kmd_client_single`]: builds the
+/// kmd client for one already-resolved data dir. `client_error_tpl`
+/// is the error-message template the caller wants used when
+/// `KmdClient::new` itself fails (so a kmd-dir read error from
+/// `wallet list` is labeled "Couldn't list wallets" rather than
+/// "Couldn't create wallet" — Codex review TASK-227 round 2).
+fn ensure_kmd_client_for_dir(
+    data_dir_path: &Path,
+    kmd_dir_flag: Option<&Path>,
+    client_error_tpl: &str,
+) -> Result<KmdClient, ()> {
+    let kmd_dir = match data_dir::resolve_kmd_data_dir(kmd_dir_flag, data_dir_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return Err(());
+        }
+    };
+    let (kmd_addr, kmd_token) = read_kmd_endpoint(&kmd_dir)?;
+    KmdClient::new(&kmd_addr, &kmd_token).map_err(|e| {
+        eprintln!("{}", format_message(client_error_tpl, &[&e.to_string()]));
+    })
+}
+
+/// Port of `printWallets` (`wallet.go:261-281`). Each wallet block
+/// is bracketed by `##########...` (50 `#` chars). Empty list →
+/// Go's `infoNoWallets` line + return.
+///
+/// Default-wallet indicator (`(default)` suffix on Wallet line) is
+/// not produced in Phase A — `goal-rust wallet new` doesn't persist
+/// a per-data-dir default. Tracking under the Phase B account work.
+fn print_wallets(wallets: &[algo_kmd_api_types::common::APIV1Wallet]) {
+    if wallets.is_empty() {
+        println!("{INFO_NO_WALLETS}");
+        return;
+    }
+    for w in wallets {
+        println!("{WALLET_SEPARATOR}");
+        println!("Wallet:\t{}", w.name);
+        println!("ID:\t{}", w.id);
+    }
+    println!("{WALLET_SEPARATOR}");
 }
 
 fn read_kmd_endpoint(kmd_dir: &Path) -> Result<(String, String), ()> {

@@ -233,7 +233,9 @@ fn unimplemented_leaf_exits_with_code_two_and_message() {
         (&["account", "multisig", "new"], "account multisig new"),
         (&["clerk", "dryrun-remote"], "clerk dryrun-remote"),
         (&["node", "generate-p2pid"], "node generate-p2pid"),
-        (&["wallet", "list"], "wallet list"),
+        // `wallet list` and `wallet new` are no longer stubs (TASK-226/227);
+        // use `wallet rename` as the still-unimplemented spot check.
+        (&["wallet", "rename"], "wallet rename"),
     ];
     for (argv, expected) in cases {
         let out = Command::new(GOAL_RUST_BIN)
