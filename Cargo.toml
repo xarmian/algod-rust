@@ -18,6 +18,7 @@ members = [
     "crates/node/algo-rest-api",
     "crates/node/algo-kmd",
     "crates/node/algo-kmd-api-types",
+    "crates/node/algo-kmd-client",
     "crates/tools/algo-bench",
     "crates/tools/algo-fork-detector",
     "crates/tools/algo-cert-crossverify",
@@ -107,6 +108,7 @@ algo-network = { path = "crates/node/algo-network" }
 algo-rest-api = { path = "crates/node/algo-rest-api" }
 algo-kmd = { path = "crates/node/algo-kmd" }
 algo-kmd-api-types = { path = "crates/node/algo-kmd-api-types" }
+algo-kmd-client = { path = "crates/node/algo-kmd-client" }
 algo-bench = { path = "crates/tools/algo-bench" }
 num-bigint = "0.4"
 statrs = "0.18"
