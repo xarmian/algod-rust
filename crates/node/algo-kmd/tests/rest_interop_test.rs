@@ -107,6 +107,13 @@ fn send_sigterm(pid: u32) {
     }
 }
 
+// Unix-only: this test SIGTERMs the spawned kmd-rust child to shut
+// it down cleanly. Windows lacks a tokio-portable SIGTERM equivalent;
+// `taskkill` would work but would land outside the kmd-rust graceful
+// shutdown path (the binary's own signal handler is also Unix-only —
+// see `wait_for_shutdown_signal` in `bin/kmd-rust/src/main.rs`). On
+// non-Unix the test would otherwise hang in `wait_with_output`.
+#[cfg(unix)]
 #[test]
 fn rest_interop_full_workflow() {
     if !mixed_cluster_enabled() {
