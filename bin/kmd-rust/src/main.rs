@@ -170,12 +170,17 @@ async fn serve(
     // — Go does the same at `daemon/kmd/kmd.go`'s `Start` call site
     // (the binary glue passes CLI overrides into the config struct
     // before constructing the server).
+    //
+    // Go feeds the config's `address` string directly to
+    // `net.Listen("tcp", addr)`, which accepts forms like
+    // `"localhost:7833"`, `":7833"`, and `"127.0.0.1:0"`.  We
+    // resolve the same set via [`resolve_address`].
     let address = match cli_address {
         Some(a) => Some(a),
         None if cfg.address.is_empty() => None,
         None => Some(
-            cfg.address
-                .parse::<SocketAddr>()
+            resolve_address(&cfg.address)
+                .await
                 .map_err(|e| format!("kmd_config.json address {:?}: {e}", cfg.address))?,
         ),
     };
@@ -245,6 +250,40 @@ async fn serve(
     result.map_err(|e| format!("server error: {e}"))
 }
 
+/// Resolve a Go-style `net.Listen` address string into a single
+/// [`SocketAddr`] for binding.  Accepts:
+///
+/// - `"host:port"` — resolved via [`tokio::net::lookup_host`]
+///   (handles `localhost:7833`, `example.local:0`, etc.).  When
+///   DNS returns multiple records we pick the first — same as
+///   passing it to `net.Listen` in Go, which binds the first
+///   address its resolver returns.
+/// - `":port"` — Go treats this as "listen on every interface".
+///   We expand it to `0.0.0.0:port` so the SocketAddr type carries
+///   the same intent.
+/// - `"ip:port"` (numeric) — falls through to lookup_host, which
+///   short-circuits to a no-DNS parse.
+///
+/// Returns an error if the string is malformed or resolves to no
+/// addresses.
+async fn resolve_address(s: &str) -> Result<SocketAddr, String> {
+    // Special-case `":<port>"` so we don't depend on
+    // `lookup_host(":7833")` returning anything sensible (its
+    // platform-specific behavior).
+    if let Some(port_str) = s.strip_prefix(':') {
+        let port: u16 = port_str
+            .parse()
+            .map_err(|e| format!("invalid port {port_str:?}: {e}"))?;
+        return Ok(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)));
+    }
+
+    let mut iter = tokio::net::lookup_host(s)
+        .await
+        .map_err(|e| format!("dns lookup: {e}"))?;
+    iter.next()
+        .ok_or_else(|| "no addresses resolved".to_string())
+}
+
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
@@ -260,6 +299,39 @@ async fn wait_for_shutdown_signal() {
 async fn wait_for_shutdown_signal() {
     // Windows: only Ctrl-C is portably available via tokio.
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod resolve_address_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ip_port_resolves_without_dns() {
+        let a = resolve_address("127.0.0.1:7833").await.unwrap();
+        assert_eq!(a, "127.0.0.1:7833".parse::<SocketAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn localhost_port_resolves_to_loopback() {
+        let a = resolve_address("localhost:0").await.unwrap();
+        assert!(
+            a.ip().is_loopback(),
+            "localhost should resolve to loopback, got {a}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hostless_port_expands_to_unspecified_v4() {
+        // Go's net.Listen("tcp", ":7833") binds 0.0.0.0:7833.
+        let a = resolve_address(":7833").await.unwrap();
+        assert_eq!(a, "0.0.0.0:7833".parse::<SocketAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn malformed_address_errors() {
+        assert!(resolve_address("not-an-address").await.is_err());
+        assert!(resolve_address(":not-a-port").await.is_err());
+    }
 }
 
 fn init_tracing() {
