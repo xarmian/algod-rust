@@ -4,8 +4,6 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 
-use crate::unimplemented;
-
 #[derive(Subcommand, Debug)]
 pub enum WalletCmd {
     /// List wallets managed by kmd.
@@ -13,7 +11,21 @@ pub enum WalletCmd {
     /// Create a new wallet.
     New(NewArgs),
     /// Rename wallet.
-    Rename,
+    Rename(RenameArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct RenameArgs {
+    /// Existing wallet name. Mirrors Go's first positional
+    /// (`wallet.go:218` `cobra.ExactArgs(2)`).
+    pub old_name: String,
+    /// New wallet name. Mirrors Go's second positional.
+    pub new_name: String,
+    /// Wallet password (skip the interactive prompt). Same semantics
+    /// as `wallet new --password`: TTY → prompt; non-TTY → one line
+    /// from stdin (CI-friendly Phase-A divergence from Go).
+    #[arg(short = 'w', long = "password")]
+    pub password: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -44,6 +56,10 @@ pub fn run(cmd: WalletCmd) -> ExitCode {
             crate::cli_state::datadirs(),
             crate::cli_state::kmddir(),
         ),
-        WalletCmd::Rename => unimplemented("wallet", "rename"),
+        WalletCmd::Rename(args) => crate::cmd::wallet::run_rename(
+            args,
+            crate::cli_state::datadirs(),
+            crate::cli_state::kmddir(),
+        ),
     }
 }
