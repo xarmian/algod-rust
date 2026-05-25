@@ -254,3 +254,197 @@ fn wallet_new_reads_password_from_non_tty_stdin() {
         "stdout must confirm creation: {stdout:?}",
     );
 }
+
+// ------- TASK-234 (B2): --recover, --unencrypted, --no-display-seed -------
+
+/// Known 25-word "all-abandon" mnemonic ⇒ a deterministic 32-byte key.
+/// The same constant the algokey-rust test suite uses
+/// (`commands/import.rs:69`). Decoding it via `mnemonic_to_key`
+/// returns the all-zero key, so recovery → MDK = [0u8; 32] →
+/// re-export → mnemonic should round-trip back to this string.
+const ZERO_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon invest";
+
+#[test]
+fn wallet_new_recover_mnemonic_creates_wallet_from_seed() {
+    let (data_dir, kmd_dir) = setup_data_dir();
+    let _guard = spawn_kmd(&kmd_dir);
+
+    // Feed the password on stdin (non-TTY path) after the mnemonic.
+    // Order matches Go: mnemonic read first (`wallet.go:101-117`),
+    // password second. --no-display-seed suppresses the backup prompt
+    // so we don't have to feed a third line.
+    let mut child = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(data_dir.path())
+        .args([
+            "wallet",
+            "new",
+            "recovered",
+            "--recover",
+            "--no-display-seed",
+        ])
+        .env_remove("ALGORAND_DATA")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        // Mnemonic first (terminated with newline so read_line
+        // returns), then password.
+        stdin.write_all(ZERO_MNEMONIC.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.write_all(b"pw\n").unwrap();
+    }
+    let out = child.wait_with_output().expect("wait");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "recover path must succeed; exit={:?}, stdout={stdout:?}, stderr={stderr:?}",
+        out.status.code(),
+    );
+    assert!(
+        stdout.contains("Created wallet 'recovered'"),
+        "stdout must confirm creation: {stdout:?}",
+    );
+    // --no-display-seed ⇒ no backup-phrase prompt or mnemonic.
+    assert!(
+        !stdout.contains("Your backup phrase is printed below"),
+        "--no-display-seed must suppress backup prompt; got {stdout:?}",
+    );
+}
+
+#[test]
+fn wallet_new_unencrypted_prints_info_unencrypted() {
+    let (data_dir, kmd_dir) = setup_data_dir();
+    let _guard = spawn_kmd(&kmd_dir);
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(data_dir.path())
+        .args([
+            "wallet",
+            "new",
+            "unenc",
+            "--unencrypted",
+            "--no-display-seed",
+        ])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "unencrypted create must succeed; exit={:?}, stdout={stdout:?}, stderr={stderr:?}",
+        out.status.code(),
+    );
+    // Go's infoUnencrypted line — byte-exact.
+    assert!(
+        stderr.contains("Creating unencrypted wallet"),
+        "stderr missing infoUnencrypted: {stderr:?}",
+    );
+    assert!(
+        stdout.contains("Created wallet 'unenc'"),
+        "stdout missing infoCreatedWallet: {stdout:?}",
+    );
+}
+
+#[test]
+fn wallet_new_no_display_seed_suppresses_backup_phrase() {
+    let (data_dir, kmd_dir) = setup_data_dir();
+    let _guard = spawn_kmd(&kmd_dir);
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(data_dir.path())
+        .args(["wallet", "new", "no-seed", "-w", "pw", "--no-display-seed"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "must succeed; stdout={stdout:?}");
+    assert!(
+        !stdout.contains("Your new wallet has a backup phrase"),
+        "--no-display-seed must omit infoBackupExplanation; got {stdout:?}",
+    );
+    assert!(
+        !stdout.contains("Your backup phrase is printed below"),
+        "--no-display-seed must omit infoPrintedBackupPhrase; got {stdout:?}",
+    );
+}
+
+/// Build a fake private data dir with genesis.json so AccountsList
+/// can resolve `<data_dir>/<genesis_id>/accountList.json`. Returns
+/// (tempdir guard, data_dir path, kmd-v0.5 path).
+fn setup_data_dir_with_genesis() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().to_path_buf();
+    let kmd = data_dir.join("kmd-v0.5");
+    std::fs::create_dir_all(&kmd).unwrap();
+    write_kmd_config(&kmd);
+    // Minimal genesis.json — `read_genesis_id` concatenates
+    // `network-id` so we need both fields.
+    let genesis = serde_json::json!({
+        "id": "v1",
+        "network": "testnet",
+        "proto": "future",
+        "alloc": [],
+        "rwd": "FEESINKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANY3ZN3I",
+        "fees": "FEESINKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANY3ZN3I",
+    });
+    std::fs::write(
+        data_dir.join("genesis.json"),
+        serde_json::to_string_pretty(&genesis).unwrap(),
+    )
+    .unwrap();
+    (tmp, data_dir, kmd)
+}
+
+#[test]
+fn wallet_new_first_wallet_persists_default_for_wallet_list() {
+    let (_tmp, data_dir, kmd_dir) = setup_data_dir_with_genesis();
+    let _guard = spawn_kmd(&kmd_dir);
+
+    // Create the wallet (also exercises the set-default-on-first
+    // path with --no-display-seed to keep output focused).
+    let create = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(&data_dir)
+        .args(["wallet", "new", "primary", "-w", "pw", "--no-display-seed"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("run wallet new");
+    let create_stdout = String::from_utf8_lossy(&create.stdout);
+    let create_stderr = String::from_utf8_lossy(&create.stderr);
+    assert!(
+        create.status.success(),
+        "create must succeed; stdout={create_stdout:?}, stderr={create_stderr:?}",
+    );
+    // accountList.json landed under <data_dir>/<gid>/accountList.json.
+    let acct = data_dir.join("testnet-v1").join("accountList.json");
+    assert!(
+        acct.exists(),
+        "accountList.json must be written for set-default-on-first; expected at {acct:?}",
+    );
+
+    // wallet list should mark this wallet as the default.
+    let list = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(&data_dir)
+        .args(["wallet", "list"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("run wallet list");
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        list.status.success(),
+        "wallet list must succeed; stdout={stdout:?}",
+    );
+    assert!(
+        stdout.contains("Wallet:\tprimary (default)"),
+        "wallet list must mark primary as default; got {stdout:?}",
+    );
+}

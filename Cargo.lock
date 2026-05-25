@@ -1781,10 +1781,12 @@ dependencies = [
 name = "goal-rust"
 version = "0.1.0"
 dependencies = [
+ "algo-consensus-crypto",
  "algo-error",
  "algo-kmd-api-types",
  "algo-kmd-client",
  "algo-rest-client",
+ "algo-types",
  "clap",
  "rand 0.8.5",
  "reqwest",
@@ -1792,6 +1794,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
 ]
 

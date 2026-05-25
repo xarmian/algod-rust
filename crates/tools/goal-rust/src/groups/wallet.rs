@@ -44,6 +44,24 @@ pub struct NewArgs {
     /// to allow future driver names without a CLI break.
     #[arg(long = "driver", default_value = "sqlite")]
     pub driver: String,
+
+    /// Recover a wallet from a 25-word mnemonic instead of generating
+    /// a fresh master derivation key. Mirrors Go's `--recover` flag
+    /// on `newWalletCmd` (`wallet.go:84-87`, `recoverWallet bool`).
+    #[arg(short = 'r', long = "recover")]
+    pub recover_mnemonic: bool,
+
+    /// Create an unencrypted wallet (empty password). Mirrors Go's
+    /// `--unencrypted` flag (`wallet.go:51` — Go's internal variable
+    /// is `createUnencryptedWallet` but the CLI flag is just
+    /// `--unencrypted`).
+    #[arg(long = "unencrypted")]
+    pub unencrypted_wallet: bool,
+
+    /// Suppress the post-create backup-phrase prompt. Mirrors Go's
+    /// `--no-display-seed` flag (`wallet.go:86`, `noDisplaySeed bool`).
+    #[arg(long = "no-display-seed")]
+    pub no_display_seed: bool,
 }
 
 pub fn run(cmd: WalletCmd) -> ExitCode {
