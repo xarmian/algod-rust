@@ -905,3 +905,39 @@ Any wire-shape, signing-message, or status-code drift between the
 two implementations trips the test immediately. The Rust harness
 graceful-shutdowns kmd-rust between runs and verifies `kmd.net` /
 `kmd.pid` are cleaned up.
+
+## goal-rust ↔ Go-algod MIXED_CLUSTER Interop Test
+
+[`crates/tools/goal-rust/tests/algod_interop_test.rs`](../crates/tools/goal-rust/tests/algod_interop_test.rs)
+is the cross-impl gate for the `goal-rust` operator CLI. It proves
+that `goal-rust` is wire-compatible with **Go's** `algod` binary —
+not just our in-tree algod-rust port. Gated by `MIXED_CLUSTER=1`
+like every other cross-impl test:
+
+```bash
+# Default run: gated, skips with a friendly note.
+cargo test -p goal-rust --test algod_interop_test
+
+# Full cross-impl interop:
+MIXED_CLUSTER=1 cargo test -p goal-rust --test algod_interop_test
+```
+
+Sequence:
+
+1. `go build -o target/algod-interop/algod ../go-algorand/cmd/algod`
+   (cached between runs).
+2. Stage a fresh data dir with the devnet genesis from
+   `../go-algorand/installer/genesis/devnet/genesis.json` plus a
+   minimal `config.json` (DNS bootstrap off, endpoint
+   `127.0.0.1:0` so the OS picks a free port).
+3. Spawn the Go `algod` against the data dir; poll for the
+   daemon-written `algod.net` + `algod.token` (60s timeout).
+4. Run `goal-rust node status -d <dir>` — assert exit 0 and
+   stdout starts with `Last committed block: ` + carries a
+   `Genesis hash: ` line.
+5. Run `goal-rust node lastround -d <dir>` — assert exit 0 and
+   stdout is `<round>\n`.
+6. SIGTERM algod, wait for clean exit.
+
+Wire-shape drift on `/v2/status` or `/v2/versions` between the two
+implementations trips the test immediately.
