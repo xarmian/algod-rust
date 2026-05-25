@@ -280,11 +280,23 @@ impl WalletDriver {
 /// Starts in `Locked` state — [`Wallet::init`] (or
 /// [`Wallet::check_password`] with a password attempt) decrypts the MEP
 /// and MDK into memory, mirroring `Init` (sqlite.go:652).
+#[derive(Clone)]
 pub struct Wallet {
     db_path: PathBuf,
     state: WalletState,
 }
 
+impl std::fmt::Debug for Wallet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let locked = matches!(self.state, WalletState::Locked);
+        f.debug_struct("Wallet")
+            .field("db_path", &self.db_path)
+            .field("locked", &locked)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
 enum WalletState {
     Locked,
     Unlocked {

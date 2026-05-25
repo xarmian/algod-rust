@@ -11,14 +11,19 @@
 //! REST API surface, signing operations, and participation-key wallet ops are
 //! deferred to Phases B+.
 
+pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod keys;
 pub mod multisig;
+pub mod session;
 pub mod sign;
 pub mod sqlite;
 pub mod wallet;
+
+pub use auth::{validate_api_token, validate_or_generate_api_token, KMD_TOKEN_FILENAME};
+pub use session::{AuthorizedHandle, SessionManager, HANDLE_CLEANUP_INTERVAL};
 
 pub use keys::{extract_seed_with_index, ADDRESS_LEN, SECRET_KEY_LEN};
 pub use multisig::MultisigPreimage;

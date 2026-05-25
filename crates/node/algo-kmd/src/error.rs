@@ -143,6 +143,30 @@ pub enum Error {
     #[error("multisig address not found")]
     MultisigNotFound,
 
+    /// Wallet-handle token is malformed, the handle ID is unknown,
+    /// or the secret doesn't match. Mirrors the "wrong number of
+    /// token parts" / "invalid wallet handle id" / "handle does not
+    /// exist" / "invalid token" errors in
+    /// `daemon/kmd/session/auth.go`.
+    #[error("invalid wallet handle token")]
+    WalletHandleInvalid,
+
+    /// Wallet handle has expired (no use within the session lifetime).
+    /// Mirrors `fmt.Errorf("handle expired")` at
+    /// `daemon/kmd/session/auth.go:75`.
+    #[error("wallet handle expired")]
+    WalletHandleExpired,
+
+    /// API token shorter than `minimumAPITokenLength` (64). Mirrors
+    /// the length-too-short error in `util/tokens/tokens.go:93`.
+    #[error("API token is too short")]
+    ApiTokenTooShort,
+
+    /// API token longer than `maximumAPITokenLength` (256). Mirrors
+    /// `util/tokens/tokens.go:97`.
+    #[error("API token is too long")]
+    ApiTokenTooLong,
+
     /// Operation requires [`crate::wallet::Wallet::init`] to have
     /// succeeded first. Go enforces this implicitly because every key
     /// op runs `Init`-like checks; we make it explicit.
