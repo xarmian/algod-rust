@@ -1,0 +1,9 @@
+Last committed block: 42
+Time since last block: 3.5s
+Sync Time: 0.0s
+Last consensus protocol: future
+Next consensus protocol: future
+Round for next consensus protocol: 100
+Next consensus protocol supported: true
+Genesis ID: testnet-v1
+Genesis hash: SGVsbG8gV29ybGQAAAAAAAAAAAAAAAAAAAAAAAAAAAA=

@@ -1,0 +1,1 @@
+Renamed wallet 'foo' to 'bar'

@@ -1,0 +1,11 @@
+Last committed block: 1234
+Sync Time: 12.3s
+Catchpoint: 1234#abc
+Catchpoint total accounts: 100
+Catchpoint accounts processed: 50
+Catchpoint accounts verified: 40
+Catchpoint total KVs: 200
+Catchpoint KVs processed: 150
+Catchpoint KVs verified: 140
+Catchpoint total blocks: 20
+Catchpoint downloaded blocks: 10
