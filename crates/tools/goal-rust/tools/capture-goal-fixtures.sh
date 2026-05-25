@@ -36,20 +36,26 @@ if ! command -v goal >/dev/null 2>&1; then
 fi
 
 want_ver="v4.5.1-stable"
-if ! goal -v 2>&1 | head -1 | grep -q .; then
-  echo "goal -v didn't print a version string; cannot verify v4.5.1 baseline" >&2
+goal_ver_out="$(goal -v 2>&1 || true)"
+if ! grep -qF "$want_ver" <<<"$goal_ver_out"; then
+  echo "goal version mismatch: refusing to capture fixtures." >&2
+  echo "  expected: ${want_ver} (substring of \`goal -v\`)" >&2
+  echo "  got:" >&2
+  echo "${goal_ver_out}" | sed 's/^/    /' >&2
+  echo "Rebuild the Go binary from ../go-algorand at that tag and re-run." >&2
   exit 1
 fi
-
-echo "goal version output:" >&2
-goal -v >&2 || true
 
 fixtures_dir="$(cd "$(dirname "$0")/.." && pwd)/tests/fixtures/parity"
 mkdir -p "$fixtures_dir"
 
 # Reserved for the algod+kmd state-fixture rig (a later phase wires
-# this in alongside MIXED_CLUSTER algod cross-impl tests).
+# this in alongside MIXED_CLUSTER algod cross-impl tests). When
+# implemented, write each fixture by capturing Go's stdout directly:
+#   goal <args> -d "$tmp_data_dir" >"$fixtures_dir/<name>.txt"
 echo "Phase A: live-capture rig not yet implemented." >&2
-echo "Edit tests/fixtures/parity/*.txt by hand from go-algorand v$want_ver's messages.go." >&2
-echo "  see tests/fixtures/parity/README.md for the per-fixture provenance." >&2
+echo "The committed fixtures were produced during Phase A bring-up via the" >&2
+echo "dual-source provenance documented at tests/fixtures/parity/README.md." >&2
+echo "Once the algod+kmd state-fixture rig lands, this script will capture" >&2
+echo "Go's stdout directly — existing .txt files must not be hand-edited." >&2
 exit 0
