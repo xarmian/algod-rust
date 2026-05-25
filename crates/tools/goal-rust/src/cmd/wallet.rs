@@ -174,6 +174,12 @@ fn resolve_password(args: &NewArgs) -> Result<String, ()> {
                 return Err(());
             }
         };
+        // Go's ensurePassword() emits a trailing newline on stdout
+        // after each masked read (terminal.ReadPassword consumes the
+        // user's CR but doesn't echo it). Match that so callers
+        // capturing stdout see the same line breaks Go produces.
+        // (Codex review TASK-226 round 3.)
+        println!();
         print!("{PROMPT_CONFIRM}");
         let _ = std::io::stdout().flush();
         let p2 = match rpassword::read_password() {
@@ -186,6 +192,7 @@ fn resolve_password(args: &NewArgs) -> Result<String, ()> {
                 return Err(());
             }
         };
+        println!();
         if p1 != p2 {
             eprintln!("{ERROR_PW_CONFIRM}");
             return Err(());
