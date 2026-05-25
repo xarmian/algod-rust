@@ -855,7 +855,8 @@ cargo test -p algo-kmd
 MIXED_CLUSTER=1 cargo test -p algo-kmd --test interop_test
 ```
 
-The gated tests cover all four directions:
+The gated tests cover both write-read directions, each asserting MDK +
+every key SK + every multisig preimage:
 
 | Test | Writes | Reads | Asserts |
 |---|---|---|---|
