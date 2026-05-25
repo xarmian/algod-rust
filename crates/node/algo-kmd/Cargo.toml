@@ -8,6 +8,7 @@ rust-version.workspace = true
 algo-consensus-crypto.workspace = true
 algo-types.workspace = true
 algo-codec.workspace = true
+algo-kmd-api-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_bytes.workspace = true
@@ -23,8 +24,16 @@ sha2.workspace = true
 subtle.workspace = true
 ed25519-dalek.workspace = true
 hkdf.workspace = true
+# HTTP server (Phase B / B4)
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
 hex.workspace = true
 algo-validate.workspace = true
+reqwest.workspace = true

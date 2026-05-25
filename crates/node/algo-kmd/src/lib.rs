@@ -17,12 +17,17 @@ pub mod crypto;
 pub mod error;
 pub mod keys;
 pub mod multisig;
+pub mod server;
 pub mod session;
 pub mod sign;
 pub mod sqlite;
 pub mod wallet;
 
 pub use auth::{validate_api_token, validate_or_generate_api_token, KMD_TOKEN_FILENAME};
+pub use server::{
+    read_net_file, WalletServer, WalletServerConfig, DEFAULT_KMD_HOST, DEFAULT_KMD_PORT,
+    KMD_TOKEN_HEADER, LOCK_FILENAME, NET_FILENAME, PID_FILENAME,
+};
 pub use session::{AuthorizedHandle, SessionManager, HANDLE_CLEANUP_INTERVAL};
 
 pub use keys::{extract_seed_with_index, ADDRESS_LEN, SECRET_KEY_LEN};
