@@ -26,12 +26,24 @@ pub enum NodeCmd {
     /// Get a snapshot of current pending transactions on this node.
     Pendingtxns,
     /// Stop, and then start, the specified Algorand node.
+    ///
+    /// Phase A note: process supervision is delegated to the host's
+    /// supervisor (systemd, supervisord, etc.); the full Go port of
+    /// `restartCmd` is tracked under a later goal-rust phase.
     Restart,
     /// Initialize the specified Algorand node.
+    ///
+    /// Phase A note: process supervision is delegated to the host's
+    /// supervisor (systemd, supervisord, etc.); the full Go port of
+    /// `startCmd` is tracked under a later goal-rust phase.
     Start,
     /// Get the current node status.
     Status(StatusArgs),
     /// Stop the specified Algorand node.
+    ///
+    /// Phase A note: process supervision is delegated to the host's
+    /// supervisor (systemd, supervisord, etc.); the full Go port of
+    /// `stopCmd` is tracked under a later goal-rust phase.
     Stop,
     /// Waits for the node to make progress.
     Wait,
@@ -56,10 +68,10 @@ pub fn run(cmd: NodeCmd) -> ExitCode {
         NodeCmd::Generatetoken => crate::cmd::node::run_generate_token(datadirs_from_cli()),
         NodeCmd::Lastround => crate::cmd::node::run_lastround(datadirs_from_cli()),
         NodeCmd::Pendingtxns => unimplemented("node", "pendingtxns"),
-        NodeCmd::Restart => unimplemented("node", "restart"),
-        NodeCmd::Start => unimplemented("node", "start"),
+        NodeCmd::Restart => crate::cmd::node::run_restart(datadirs_from_cli()),
+        NodeCmd::Start => crate::cmd::node::run_start(datadirs_from_cli()),
         NodeCmd::Status(args) => crate::cmd::node::run_status(args, datadirs_from_cli()),
-        NodeCmd::Stop => unimplemented("node", "stop"),
+        NodeCmd::Stop => crate::cmd::node::run_stop(datadirs_from_cli()),
         NodeCmd::Wait => unimplemented("node", "wait"),
     }
 }
