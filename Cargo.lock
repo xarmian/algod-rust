@@ -1780,6 +1780,8 @@ dependencies = [
  "algo-error",
  "algo-rest-client",
  "clap",
+ "rand 0.8.5",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

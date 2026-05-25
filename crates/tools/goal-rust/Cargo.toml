@@ -15,6 +15,8 @@ serde_json = { workspace = true }
 algo-rest-client = { workspace = true }
 algo-error = { workspace = true }
 tokio = { workspace = true }
+reqwest = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

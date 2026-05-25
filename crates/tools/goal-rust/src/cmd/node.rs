@@ -47,6 +47,22 @@ const NODE_LAST_CATCHPOINT: &str = "Last Catchpoint: {}";
 /// Mirrors `messages.go:76` (`errorNodeStatus`).
 const ERROR_NODE_STATUS: &str = "Cannot contact Algorand node: {}";
 
+/// Mirrors `messages.go:78`.
+const ERROR_NODE_RUNNING: &str = "Node must be stopped before writing APIToken";
+
+/// Mirrors `messages.go:79`.
+const ERROR_NODE_FAIL_GEN_TOKEN: &str = "Cannot generate API token: {}";
+
+/// Mirrors `messages.go:85`.
+const INFO_NODE_WROTE_TOKEN: &str = "Successfully wrote new API token: {}";
+
+/// Token filename rotated by `goal node generatetoken`. Tracks Go's
+/// `tokens.AlgodTokenFilename` — `node.go:402` passes this filename
+/// to `tokens.GenerateAPIToken`. Note: this is `algod.token`, NOT
+/// `algod.admin.token`; the original TASK-224 spec named the admin
+/// variant but Go's source rotates the public token. We mirror Go.
+const ALGOD_TOKEN_ROTATE_FILE: &str = "algod.token";
+
 /// Top-level entry point invoked from `groups::node::run`. Maps
 /// resolved data dirs onto algod connections and prints status for
 /// each, mirroring Go's `datadir.OnDataDirs(getStatus)`.
@@ -93,31 +109,7 @@ async fn get_status(data_dir: &Path, watch_ms: u64) -> Result<(), ()> {
     const CUU: &str = "\x1b[A";
     const DL: &str = "\x1b[M";
 
-    let net = match read_algod_net(data_dir) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("{}", format_message(ERROR_NODE_STATUS, &[&e.to_string()]));
-            return Err(());
-        }
-    };
-    let url = if net.starts_with("http://") || net.starts_with("https://") {
-        net
-    } else {
-        format!("http://{net}")
-    };
-    // Mirrors Go's `nodecontrol/algodControl.go:72-75`: prefer
-    // `algod.admin.token`, fall back to `algod.token`.
-    let token = match read_algod_admin_token(data_dir) {
-        Ok(t) if !t.is_empty() => t,
-        _ => match read_algod_token(data_dir) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("{}", format_message(ERROR_NODE_STATUS, &[&e.to_string()]));
-                return Err(());
-            }
-        },
-    };
-    let client = AlgodClient::new(url, token);
+    let client = build_client(data_dir)?;
 
     let mut cleanup_fmt = String::new();
     loop {
@@ -155,6 +147,231 @@ async fn get_status(data_dir: &Path, watch_ms: u64) -> Result<(), ()> {
         }
     }
     Ok(())
+}
+
+/// Port of `lastroundCmd` (`node.go:519-534`). Per-data-dir, calls
+/// `client.CurrentRound()` and prints `{round}\n`.
+pub fn run_lastround(cli_d: Vec<PathBuf>) -> ExitCode {
+    let dirs = match crate::data_dir::resolve_data_dirs(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("tokio runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let multi = dirs.len() > 1;
+    let mut exit = ExitCode::SUCCESS;
+    for dir in &dirs {
+        if multi {
+            println!("[Data Directory: {}]", dir.display());
+        }
+        let client = match build_client(dir) {
+            Ok(c) => c,
+            Err(()) => {
+                exit = ExitCode::from(1);
+                continue;
+            }
+        };
+        match rt.block_on(client.get_status()) {
+            Ok(stat) => println!("{}", stat.last_round),
+            Err(e) => {
+                eprintln!("{}", format_message(ERROR_NODE_STATUS, &[&e.to_string()]));
+                exit = ExitCode::from(1);
+            }
+        }
+    }
+    exit
+}
+
+/// Port of `generateTokenCmd` (`node.go:380-410`). For each data dir:
+///
+/// 1. Try to contact algod's `/health`. If reachable → print
+///    `ERROR_NODE_RUNNING` and exit 1 (matches Go's `client.HealthCheck()`
+///    success ⇒ `reportErrorln(errorNodeRunning)`).
+/// 2. Generate a fresh 64-hex-char token (32 random bytes encoded).
+/// 3. Write it to `<data_dir>/algod.token` with `0600` mode.
+/// 4. Print `Successfully wrote new API token: <token>`.
+pub fn run_generate_token(cli_d: Vec<PathBuf>) -> ExitCode {
+    let dirs = match crate::data_dir::resolve_data_dirs(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("tokio runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let multi = dirs.len() > 1;
+    let mut exit = ExitCode::SUCCESS;
+    for dir in &dirs {
+        if multi {
+            println!("[Data Directory: {}]", dir.display());
+        }
+        if rt.block_on(algod_is_running(dir)) {
+            eprintln!("{ERROR_NODE_RUNNING}");
+            exit = ExitCode::from(1);
+            continue;
+        }
+        let token = generate_api_token_hex();
+        match write_token(&dir.join(ALGOD_TOKEN_ROTATE_FILE), &token) {
+            Ok(()) => println!("{}", format_message(INFO_NODE_WROTE_TOKEN, &[&token])),
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    format_message(ERROR_NODE_FAIL_GEN_TOKEN, &[&e.to_string()]),
+                );
+                exit = ExitCode::from(1);
+            }
+        }
+    }
+    exit
+}
+
+/// Liveness probe used by `generatetoken`'s safety guard.
+///
+/// Returns true iff we can prove algod is reachable on this data
+/// dir's `algod.net`:
+///
+/// - missing `algod.net` ⇒ false (fresh data dir; rotation can
+///   proceed, matching Go where HealthCheck would also fail)
+/// - TCP connect to `host:port` refused (ECONNREFUSED) ⇒ false
+///   (definitely no listener — safe to rotate)
+/// - anything else (TCP connect succeeds; or any other connect
+///   error like DNS failure, timeout, TLS, route unreachable) ⇒
+///   true (conservatively refuse rotation — Codex review TASK-224
+///   round 1: a slow-but-running node must not slip past)
+///
+/// The TCP-first design avoids ambiguity in reqwest's
+/// `Error::is_connect`, which lumps DNS failures together with
+/// genuine connection refusals.
+async fn algod_is_running(data_dir: &Path) -> bool {
+    // Distinguish "the file doesn't exist" from other read errors
+    // (permission denied, mid-write, etc.). Only the genuinely-
+    // missing case is safe to treat as "fresh data dir, no node" —
+    // anything else is ambiguous and we refuse rotation (Codex
+    // review TASK-224 round 2).
+    let net = match std::fs::read_to_string(data_dir.join("algod.net")) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    // Empty algod.net is ambiguous (partial / truncated write,
+    // corrupted data dir). Be conservative — refuse rotation
+    // (Codex review TASK-224 round 3).
+    if net.is_empty() {
+        return true;
+    }
+    // Strip any scheme prefix so we can hand a bare `host:port` to
+    // tokio's TcpStream::connect — that's the form `algod.net`
+    // contains in practice.
+    let host_port = net
+        .strip_prefix("http://")
+        .or_else(|| net.strip_prefix("https://"))
+        .unwrap_or(&net);
+    let host_port = host_port.trim_end_matches('/').to_string();
+
+    let connect = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&host_port),
+    )
+    .await;
+
+    match connect {
+        // Connected → something is listening → refuse rotation.
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            // ECONNREFUSED is the one firm "down" signal. Anything
+            // else (DNS, route, permission, …) → conservatively
+            // treat as running and refuse rotation.
+            e.kind() != std::io::ErrorKind::ConnectionRefused
+        }
+        // Timeout reaching the host: conservative — refuse rotation.
+        Err(_) => true,
+    }
+}
+
+fn generate_api_token_hex() -> String {
+    use rand::RngCore;
+    // 32 bytes → 64 hex chars. Mirrors Go's
+    // `util/tokens/tokens.go:GenerateAPIToken` (entropyLen =
+    // (minimumAPITokenLength + 1) / 2 = 32).
+    let mut buf = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut buf);
+    let mut s = String::with_capacity(64);
+    for b in buf {
+        use std::fmt::Write;
+        // {:02x} matches Go's fmt.Sprintf("%x", tokenBytes) exactly.
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
+fn write_token(path: &Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // OpenOptions::mode only sets the mode at *creation* time; an
+        // existing token file with looser permissions would keep its
+        // old mode after a rewrite. We follow up with set_permissions
+        // below to ensure 0o600 either way (Codex review TASK-224 r2).
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(token.as_bytes())?;
+    drop(f);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn build_client(data_dir: &Path) -> Result<AlgodClient, ()> {
+    let net = match read_algod_net(data_dir) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("{}", format_message(ERROR_NODE_STATUS, &[&e.to_string()]));
+            return Err(());
+        }
+    };
+    let url = if net.starts_with("http://") || net.starts_with("https://") {
+        net
+    } else {
+        format!("http://{net}")
+    };
+    let token = match read_algod_admin_token(data_dir) {
+        Ok(t) if !t.is_empty() => t,
+        _ => match read_algod_token(data_dir) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("{}", format_message(ERROR_NODE_STATUS, &[&e.to_string()]));
+                return Err(());
+            }
+        },
+    };
+    Ok(AlgodClient::new(url, token))
 }
 
 /// Pure formatter — covers the three Go branches at `node.go:455-516`.
@@ -461,5 +678,64 @@ mod tests {
     #[allow(dead_code)]
     fn _ensure_versions_compiles() -> AlgodVersions {
         AlgodVersions::default()
+    }
+
+    #[test]
+    fn generate_api_token_hex_is_64_lowercase_hex_chars() {
+        // Mirrors Go's util/tokens/tokens.go:GenerateAPIToken: 32
+        // random bytes hex-encoded ⇒ 64 chars [0-9a-f].
+        let t1 = generate_api_token_hex();
+        let t2 = generate_api_token_hex();
+        assert_eq!(t1.len(), 64, "token must be 64 hex chars; got {t1:?}");
+        assert!(
+            t1.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "token must be lowercase hex; got {t1:?}",
+        );
+        assert_ne!(t1, t2, "two consecutive calls must differ (random)");
+    }
+
+    #[test]
+    fn write_token_creates_file_with_token_contents() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let p = d.path().join("algod.token");
+        write_token(&p, "deadbeef".repeat(8).as_str()).expect("write");
+        let got = std::fs::read_to_string(&p).expect("read");
+        assert_eq!(got, "deadbeef".repeat(8));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_token_tightens_existing_file_to_0600() {
+        // Regression guard (Codex review TASK-224 round 2):
+        // OpenOptions::mode only applies at creation time. If
+        // algod.token already exists with looser perms (e.g. 0644
+        // from a previous bug or manual edit), the rotation must
+        // still leave it at 0600.
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().expect("tempdir");
+        let p = d.path().join("algod.token");
+        std::fs::write(&p, "old-token").expect("seed");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "fixture must start at 0644",
+        );
+        write_token(&p, "new-token").expect("rotate");
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "rotation must tighten to 0600; got {mode:o}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "new-token");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_token_sets_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().expect("tempdir");
+        let p = d.path().join("algod.token");
+        write_token(&p, "x").expect("write");
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "token file mode must be 0600; got {mode:o}");
     }
 }
