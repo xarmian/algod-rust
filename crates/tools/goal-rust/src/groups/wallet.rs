@@ -36,7 +36,9 @@ pub struct NewArgs {
 
 pub fn run(cmd: WalletCmd) -> ExitCode {
     match cmd {
-        WalletCmd::List => unimplemented("wallet", "list"),
+        WalletCmd::List => {
+            crate::cmd::wallet::run_list(crate::cli_state::datadirs(), crate::cli_state::kmddir())
+        }
         WalletCmd::New(args) => crate::cmd::wallet::run_new(
             args,
             crate::cli_state::datadirs(),
