@@ -23,13 +23,16 @@ mod groups;
 #[derive(Parser, Debug)]
 #[command(
     name = "goal-rust",
-    version,
     about = "CLI for interacting with Algorand",
     long_about = "GOAL is the CLI for interacting Algorand software instance. \
 The binary 'goal' is installed alongside the algod binary and is considered \
 an integral part of the complete installation. The binaries should be used \
 in tandem - you should not try to use a version of goal with a different \
 version of algod.",
+    // Go's `goal` binds `-v, --version` (lowercase) to the version flag.
+    // clap's default is `-V, --version`. Disable clap's auto-flag and
+    // declare our own below to preserve byte-exact help parity.
+    disable_version_flag = true,
     disable_help_subcommand = false
 )]
 pub struct Cli {
@@ -47,8 +50,18 @@ pub struct Cli {
     #[arg(short = 'k', long = "kmddir", global = true, value_name = "PATH")]
     pub kmddir: Option<String>,
 
+    /// Display and write current build version and exit.
+    ///
+    /// Mirrors Go's `-v, --version` root flag (set on `rootCmd` in
+    /// `commands.go`; the `goal version` subcommand below is a separate
+    /// entry point that prints the same thing). The flag is wired
+    /// manually because clap's default `version` attribute would emit
+    /// `-V` (uppercase) which would break help-parity.
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::SetTrue)]
+    pub version: bool,
+
     #[command(subcommand)]
-    pub command: RootCommand,
+    pub command: Option<RootCommand>,
 }
 
 /// Root command set.
@@ -142,7 +155,22 @@ pub fn unimplemented(group: &str, leaf: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match cli.command {
+    // `-v, --version` mirrors Go's root flag: print and exit (Phase A
+    // stub keeps the "not yet implemented" contract so wrappers can
+    // detect un-ported behavior — A2..A11 will fill in the real
+    // version string from build metadata).
+    if cli.version {
+        return unimplemented("", "version");
+    }
+    let Some(command) = cli.command else {
+        // `goal-rust` with no subcommand: print help to stdout and exit
+        // 0, matching Go's `goal` (cobra default).
+        let mut cmd = <Cli as clap::CommandFactory>::command();
+        let _ = cmd.print_help();
+        println!();
+        return ExitCode::SUCCESS;
+    };
+    match command {
         RootCommand::Account { cmd } => groups::account::run(cmd),
         RootCommand::App { cmd } => groups::app::run(cmd),
         RootCommand::Asset { cmd } => groups::asset::run(cmd),

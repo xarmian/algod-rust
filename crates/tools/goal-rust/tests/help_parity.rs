@@ -151,6 +151,32 @@ fn root_help_lists_every_top_level_group() {
 }
 
 #[test]
+fn root_version_flag_is_lowercase_v_not_uppercase_v() {
+    // Regression guard (Codex review of TASK-220): Go's `goal` binds
+    // `-v, --version` as the root flag; clap's default emits `-V`.
+    // Verify the lowercase short is accepted and the uppercase one is
+    // rejected, so we'd notice if clap's default ever leaks back in.
+    let ok = Command::new(GOAL_RUST_BIN)
+        .arg("-v")
+        .output()
+        .expect("run goal-rust -v");
+    let stderr = String::from_utf8_lossy(&ok.stderr);
+    assert!(
+        stderr.contains("goal-rust:  version is not yet implemented"),
+        "expected `-v` to hit the version stub; stderr={stderr:?}",
+    );
+
+    let nope = Command::new(GOAL_RUST_BIN)
+        .arg("-V")
+        .output()
+        .expect("run goal-rust -V");
+    assert!(
+        !nope.status.success(),
+        "expected `-V` to be rejected (Go's `goal` only binds lowercase -v)",
+    );
+}
+
+#[test]
 fn unimplemented_leaf_exits_with_code_two_and_message() {
     // Spot-check a handful of leaves across different groups, including
     // hyphenated names and nested subgroups.
