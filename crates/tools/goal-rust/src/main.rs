@@ -14,6 +14,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+pub mod cli_state;
+pub mod cmd;
 pub mod data_dir;
 mod groups;
 
@@ -178,6 +180,13 @@ pub fn unimplemented(group: &str, leaf: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Snapshot global flags into a thread-local so leaves can read
+    // them without each subcommand body taking the whole `Cli` by
+    // value (clap subcommand enums don't propagate the parent's
+    // `global = true` args).
+    let datadirs: Vec<std::path::PathBuf> = cli.datadir.iter().map(Into::into).collect();
+    let kmddir = cli.kmddir.as_ref().map(Into::into);
+    cli_state::install(datadirs, kmddir);
     // `-v, --version` mirrors Go's root flag: print and exit (Phase A
     // stub keeps the "not yet implemented" contract so wrappers can
     // detect un-ported behavior — A2..A11 will fill in the real

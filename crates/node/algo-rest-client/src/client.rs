@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use tracing::{debug, warn};
 
 use crate::{
-    AccountInfo, BlockSource, NodeStatus, PendingTxnInfo, PostTransactionResponse, SuggestedParams,
-    TxId,
+    AccountInfo, AlgodVersions, BlockSource, NodeStatus, PendingTxnInfo, PostTransactionResponse,
+    SuggestedParams, TxId,
 };
 
 /// Configuration for the REST client.
@@ -205,6 +205,20 @@ impl AlgodClient {
 }
 
 impl AlgodClient {
+    /// Fetch `/versions` (also reachable as `/v2/versions`) — returns
+    /// API version list + genesis ID + base64-encoded genesis hash +
+    /// build info. Mirrors Go's `algodClient.AlgodVersions()` used by
+    /// `goal node status`.
+    pub async fn get_versions(&self) -> algo_error::Result<AlgodVersions> {
+        let resp = self.get_with_retry("/versions", &self.http).await?;
+        resp.json::<AlgodVersions>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: "parsing /versions response".into(),
+            })
+    }
+
     /// Fetch account information for the given address at the latest round.
     pub async fn get_account(&self, addr: &algo_types::Address) -> algo_error::Result<AccountInfo> {
         let path = format!("/v2/accounts/{}", addr.to_algorand_string());
