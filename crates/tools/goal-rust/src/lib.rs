@@ -11,6 +11,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+pub mod accounts_list;
 pub mod cli_state;
 pub mod cmd;
 pub mod data_dir;
