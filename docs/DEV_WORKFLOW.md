@@ -838,3 +838,33 @@ The suite is also wired into CI as
 [`.github/workflows/algokey-e2e.yml`](../.github/workflows/algokey-e2e.yml),
 triggered automatically on PRs touching `algokey-rust` or its
 dependencies. Unrelated commits skip it.
+
+## kmd-rust MIXED_CLUSTER Interop Test
+
+`crates/node/algo-kmd/tests/interop_test.rs` covers bidirectional
+schema-level interop between `algo-kmd` and go-algorand's actual kmd
+driver. The test is **gated** — it runs only when `MIXED_CLUSTER=1` is
+set, because it needs the `go` toolchain and the `../go-algorand`
+source tree pinned to `v4.5.1-stable`.
+
+```bash
+# Default run: gated tests skip cleanly, no `go` needed.
+cargo test -p algo-kmd
+
+# Full bidirectional interop:
+MIXED_CLUSTER=1 cargo test -p algo-kmd --test interop_test
+```
+
+The gated tests cover all four directions:
+
+| Test | Writes | Reads | Asserts |
+|---|---|---|---|
+| `go_writes_rust_reads` | Go's `driver.SQLiteWalletDriver` (`CreateWallet` + `GenerateKey` + `ImportKey` + `ImportMultisigAddr`) | `algo-kmd::WalletDriver` | MDK + every key SK + every multisig preimage |
+| `rust_writes_go_reads` | `algo-kmd::WalletDriver` with the same workload | Go's driver via `tools/kmd-wallet-interop verify` | Same — Go side asserts and exits non-zero on mismatch |
+
+The shared Go driver lives at [`tools/kmd-wallet-interop/`](../tools/kmd-wallet-interop/)
+and exposes two subcommands (`write`, `verify`). Workload constants
+(`numDerived`, `numImported`, MDK bytes, multisig inputs) are mirrored
+between `tools/kmd-wallet-interop/main.go` and the `WORKLOAD_*`
+constants in `interop_test.rs`. They must stay in sync — any drift
+breaks the `rust_writes_go_reads` direction.
