@@ -255,7 +255,7 @@ fn wallet_new_reads_password_from_non_tty_stdin() {
     );
 }
 
-// ------- TASK-234 (B2): --recover, --unencrypted-wallet, --no-display-seed -------
+// ------- TASK-234 (B2): --recover, --unencrypted, --no-display-seed -------
 
 /// Known 25-word "all-abandon" mnemonic ⇒ a deterministic 32-byte key.
 /// The same constant the algokey-rust test suite uses
@@ -328,7 +328,7 @@ fn wallet_new_unencrypted_prints_info_unencrypted() {
             "wallet",
             "new",
             "unenc",
-            "--unencrypted-wallet",
+            "--unencrypted",
             "--no-display-seed",
         ])
         .env_remove("ALGORAND_DATA")

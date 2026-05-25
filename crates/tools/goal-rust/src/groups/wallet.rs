@@ -52,9 +52,10 @@ pub struct NewArgs {
     pub recover_mnemonic: bool,
 
     /// Create an unencrypted wallet (empty password). Mirrors Go's
-    /// `--unencrypted-wallet` flag (`wallet.go:85`,
-    /// `createUnencryptedWallet bool`).
-    #[arg(long = "unencrypted-wallet")]
+    /// `--unencrypted` flag (`wallet.go:51` — Go's internal variable
+    /// is `createUnencryptedWallet` but the CLI flag is just
+    /// `--unencrypted`).
+    #[arg(long = "unencrypted")]
     pub unencrypted_wallet: bool,
 
     /// Suppress the post-create backup-phrase prompt. Mirrors Go's
