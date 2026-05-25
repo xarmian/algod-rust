@@ -263,9 +263,19 @@ pub fn run_generate_token(cli_d: Vec<PathBuf>) -> ExitCode {
 /// `Error::is_connect`, which lumps DNS failures together with
 /// genuine connection refusals.
 async fn algod_is_running(data_dir: &Path) -> bool {
-    let Ok(net) = read_algod_net(data_dir) else {
-        return false;
+    // Distinguish "the file doesn't exist" from other read errors
+    // (permission denied, mid-write, etc.). Only the genuinely-
+    // missing case is safe to treat as "fresh data dir, no node" —
+    // anything else is ambiguous and we refuse rotation (Codex
+    // review TASK-224 round 2).
+    let net = match std::fs::read_to_string(data_dir.join("algod.net")) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
     };
+    if net.is_empty() {
+        return false;
+    }
     // Strip any scheme prefix so we can hand a bare `host:port` to
     // tokio's TcpStream::connect — that's the form `algod.net`
     // contains in practice.
@@ -318,10 +328,20 @@ fn write_token(path: &Path, token: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        // OpenOptions::mode only sets the mode at *creation* time; an
+        // existing token file with looser permissions would keep its
+        // old mode after a rewrite. We follow up with set_permissions
+        // below to ensure 0o600 either way (Codex review TASK-224 r2).
         opts.mode(0o600);
     }
     let mut f = opts.open(path)?;
     f.write_all(token.as_bytes())?;
+    drop(f);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
@@ -679,6 +699,30 @@ mod tests {
         write_token(&p, "deadbeef".repeat(8).as_str()).expect("write");
         let got = std::fs::read_to_string(&p).expect("read");
         assert_eq!(got, "deadbeef".repeat(8));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_token_tightens_existing_file_to_0600() {
+        // Regression guard (Codex review TASK-224 round 2):
+        // OpenOptions::mode only applies at creation time. If
+        // algod.token already exists with looser perms (e.g. 0644
+        // from a previous bug or manual edit), the rotation must
+        // still leave it at 0600.
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().expect("tempdir");
+        let p = d.path().join("algod.token");
+        std::fs::write(&p, "old-token").expect("seed");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "fixture must start at 0644",
+        );
+        write_token(&p, "new-token").expect("rotate");
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "rotation must tighten to 0600; got {mode:o}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "new-token");
     }
 
     #[cfg(unix)]
