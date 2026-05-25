@@ -141,18 +141,69 @@ pub fn resolve_data_dirs_with_env(
     Err(DataDirError::NoDataDirectory)
 }
 
-/// Join `path` with the current working directory if it's relative,
-/// without requiring `path` to exist. Equivalent to Go's
-/// `filepath.Abs` (modulo symlink resolution, which Go also doesn't
-/// do).
+/// Mirror Go's `filepath.Abs`: make the path absolute relative to cwd
+/// (without requiring it to exist and without resolving symlinks) and
+/// lexically `Clean` it — i.e. collapse `.` / `..` / repeated
+/// separators purely on path components, never touching the
+/// filesystem. Diverging from this on relative `-d` / `-k` paths
+/// would break the byte-exact contract operators script against.
 fn absolutize(path: &Path) -> PathBuf {
-    if path.is_absolute() {
+    let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         match env::current_dir() {
             Ok(cwd) => cwd.join(path),
+            // If we can't read cwd, fall back to the raw input — Go's
+            // filepath.Abs returns an error in this case; we degrade
+            // to a non-cleaned path rather than panic.
             Err(_) => path.to_path_buf(),
         }
+    };
+    lexically_clean(&absolute)
+}
+
+/// Lexical `filepath.Clean`: collapse `.`, `..`, and redundant
+/// separators without touching the filesystem. Matches Go's
+/// `path/filepath.Clean` for the inputs we care about (no Windows
+/// volume prefixes — those would need extra handling).
+fn lexically_clean(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    let mut popped_root = false;
+    for c in path.components() {
+        match c {
+            Component::Prefix(p) => {
+                out.push(p.as_os_str());
+            }
+            Component::RootDir => {
+                out.push(c.as_os_str());
+                popped_root = true;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // If the last segment is a normal component, drop it.
+                // If we're at the root (or before any normal segment
+                // on a relative path), keep `..`.
+                let popped = match out.components().next_back() {
+                    Some(Component::Normal(_)) => {
+                        out.pop();
+                        true
+                    }
+                    _ => false,
+                };
+                if !popped && !popped_root {
+                    out.push("..");
+                }
+            }
+            Component::Normal(s) => {
+                out.push(s);
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
     }
 }
 
@@ -529,6 +580,26 @@ mod tests {
         .unwrap();
         let expected = absolutize(&d.path().join(DEFAULT_KMD_DATA_DIR));
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn lexical_clean_collapses_dot_and_double_dot() {
+        // Regression guard (Codex review of TASK-221 round 2): Go's
+        // filepath.Abs calls Clean lexically. `..` must walk up the
+        // path, and `.` must drop, without touching the filesystem.
+        assert_eq!(
+            lexically_clean(Path::new("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
+        assert_eq!(lexically_clean(Path::new("/a/./b")), PathBuf::from("/a/b"));
+        assert_eq!(lexically_clean(Path::new("/a//b")), PathBuf::from("/a/b"));
+        assert_eq!(lexically_clean(Path::new("/..")), PathBuf::from("/"));
+        assert_eq!(lexically_clean(Path::new("./a/b")), PathBuf::from("a/b"));
+        assert_eq!(lexically_clean(Path::new("a/b/..")), PathBuf::from("a"));
+        // `..` at the start of a relative path stays.
+        assert_eq!(lexically_clean(Path::new("../a")), PathBuf::from("../a"));
+        // Empty path normalizes to ".".
+        assert_eq!(lexically_clean(Path::new("")), PathBuf::from("."));
     }
 
     #[test]
