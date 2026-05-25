@@ -39,14 +39,14 @@ import (
 )
 
 const (
-	walletName    = "interop"
-	walletID      = "interop-id"
-	password      = "interop-pw"
-	numDerived    = 2
-	numImported   = 2
-	scryptN       = 1024
-	scryptR       = 1
-	scryptP       = 1
+	walletName  = "interop"
+	walletID    = "interop-id"
+	password    = "interop-pw"
+	numDerived  = 2
+	numImported = 2
+	scryptN     = 1024
+	scryptR     = 1
+	scryptP     = 1
 )
 
 type keyEntry struct {
@@ -121,7 +121,11 @@ func importedSeeds() []crypto.Seed {
 	return out
 }
 
-type msigDef struct{ version, threshold uint8; pkOffset byte; pkCount int }
+type msigDef struct {
+	version, threshold uint8
+	pkOffset           byte
+	pkCount            int
+}
 
 func msigInputs() []msigDef {
 	return []msigDef{
