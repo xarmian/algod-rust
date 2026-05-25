@@ -19,8 +19,10 @@
 //   - Direction B (Rust-writes, Go-reads): Rust uses algo-kmd to create a
 //     wallet + write a manifest, then shells out to `verify`.
 //
-// Workload constants must stay in sync with the Rust side
-// (tests/interop_test.rs::WORKLOAD_*).
+// Workload constants must stay in sync with the Rust side — see
+// `WALLET_NAME`, `WALLET_ID`, `PASSWORD`, `NUM_DERIVED`, `NUM_IMPORTED`,
+// `SCRYPT_N/R/P` in `crates/node/algo-kmd/tests/interop_test.rs` plus
+// `fixed_mdk()`, `imported_seeds()`, and `msig_inputs()` there.
 package main
 
 import (

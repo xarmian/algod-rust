@@ -866,6 +866,8 @@ every key SK + every multisig preimage:
 The shared Go driver lives at [`tools/kmd-wallet-interop/`](../tools/kmd-wallet-interop/)
 and exposes two subcommands (`write`, `verify`). Workload constants
 (`numDerived`, `numImported`, MDK bytes, multisig inputs) are mirrored
-between `tools/kmd-wallet-interop/main.go` and the `WORKLOAD_*`
-constants in `interop_test.rs`. They must stay in sync — any drift
-breaks the `rust_writes_go_reads` direction.
+between `tools/kmd-wallet-interop/main.go` and `interop_test.rs` — see
+the latter's `WALLET_NAME`, `NUM_DERIVED`, `SCRYPT_N`, etc., plus the
+`fixed_mdk()` / `imported_seeds()` / `msig_inputs()` helpers. They
+must stay in sync — any drift breaks the `rust_writes_go_reads`
+direction.
