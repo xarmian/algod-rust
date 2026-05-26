@@ -17,12 +17,14 @@ use std::io::{BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use algo_consensus_crypto::{key_to_mnemonic, mnemonic_to_key};
 use algo_kmd_client::{KmdClient, KmdError};
 
 use crate::accounts_list::AccountsList;
 use crate::data_dir;
 use crate::groups::account::{
-    AddressArgs, AssetdetailsArgs, DeleteArgs, DumpArgs, InfoArgs, ListArgs, NewArgs, RenameArgs,
+    AddressArgs, AssetdetailsArgs, DeleteArgs, DumpArgs, ExportArgs, ImportArgs, InfoArgs,
+    ListArgs, NewArgs, RenameArgs,
 };
 
 /// Mirrors `messages.go:32` (`infoRenamedAccount`).
@@ -764,6 +766,196 @@ fn format_message(template: &str, args: &[&str]) -> String {
     }
     out.push_str(rest);
     out
+}
+
+// ---- account import / export (TASK-238 / B6) ------------------------------
+
+/// `account import [name] [-w] [--password] [--mnemonic] [-f]` —
+/// recover a key from a 25-word mnemonic into the chosen wallet's kmd.
+/// Mirrors `importCmd` (account.go:1281-1338).
+pub fn run_import(
+    args: ImportArgs,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+
+    let mut accounts = AccountsList::load(&data_dir_path);
+
+    // Account name selection (same isValidName / isTaken guards as
+    // run_new — account.go:1289-1303).
+    let account_name = match args.name {
+        Some(n) => n,
+        None => accounts.next_unnamed(),
+    };
+    if algo_types::Address::from_algorand_string(&account_name).is_ok() {
+        eprintln!("An Algorand address cannot be used as an account name.");
+        return ExitCode::from(1);
+    }
+    if accounts.is_taken(&account_name) {
+        eprintln!(
+            "{}",
+            format_message(ERROR_NAME_ALREADY_TAKEN, &[&account_name])
+        );
+        return ExitCode::from(1);
+    }
+
+    // Read the mnemonic (--mnemonic flag overrides stdin).
+    let mnemonic = match args.mnemonic {
+        Some(m) => m,
+        None => {
+            // Go prints `fmt.Println(infoRecoveryPrompt)` → prompt + \n.
+            println!(
+                "Please type your recovery mnemonic below, and hit return when you are done: "
+            );
+            let mut line = String::new();
+            if let Err(e) = std::io::stdin().lock().read_line(&mut line) {
+                eprintln!("Failed to read mnemonic: {e}");
+                return ExitCode::from(1);
+            }
+            line.trim().to_string()
+        }
+    };
+
+    // Decode mnemonic → 32-byte seed.
+    let seed = match mnemonic_to_key(&mnemonic) {
+        Ok(k) => k,
+        Err(e) => {
+            // messages.go:187: `errorBadMnemonic = "Problem with mnemonic: %s"`
+            eprintln!("Problem with mnemonic: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // kmd expects 64-byte expanded SK: seed[0..32] || pubkey[32..64].
+    let expanded = expand_seed_to_sk(&seed);
+
+    // Resolve wallet + open handle.
+    let (handle, _wallet_name, _password) = match resolve_wallet_and_init(
+        &rt,
+        &client,
+        &mut accounts,
+        args.wallet.as_deref(),
+        args.password.as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(()) => return ExitCode::from(1),
+    };
+
+    let imported = match rt.block_on(client.import_key(&handle, expanded)) {
+        Ok(r) => r.address,
+        Err(e) => {
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
+            return ExitCode::from(1);
+        }
+    };
+
+    println!("Imported {imported}"); // messages.go:33
+
+    // Persist friendly name + optional default.
+    if let Err(e) = accounts.add_account(&account_name, &imported) {
+        eprintln!("{e}");
+    }
+    if args.set_default {
+        if let Err(e) = accounts.set_default(&account_name) {
+            eprintln!("{e}");
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// `account export -a <addr> [-w] [--password]` — export the account
+/// key as a 25-word mnemonic. Mirrors `exportCmd`
+/// (account.go:1339-1371).
+pub fn run_export(
+    args: ExportArgs,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = algo_types::Address::from_algorand_string(&args.address) {
+        eprintln!("Could not parse address: {e}");
+        return ExitCode::from(1);
+    }
+    let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+
+    let mut accounts = AccountsList::load(&data_dir_path);
+    let (handle, _wallet_name, password) = match resolve_wallet_and_init(
+        &rt,
+        &client,
+        &mut accounts,
+        args.wallet.as_deref(),
+        args.password.as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(()) => return ExitCode::from(1),
+    };
+
+    let exported = match rt.block_on(client.export_key(&handle, &password, &args.address)) {
+        Ok(r) => r.private_key,
+        Err(e) => {
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
+            return ExitCode::from(1);
+        }
+    };
+
+    // First 32 bytes of the expanded SK is the seed (kmd-rust's
+    // `keypair_from_expanded` at keys.rs:74-82 confirms the layout
+    // and validates pubkey consistency on the server side).
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&exported[..32]);
+    let mnemonic = match key_to_mnemonic(&seed) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Could not convert key to mnemonic: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // messages.go:34: `infoExportedKey = "Exported key for account %s: \"%s\""`
+    println!("Exported key for account {}: \"{mnemonic}\"", args.address);
+    ExitCode::SUCCESS
+}
+
+/// Build kmd's expanded 64-byte SK from a 32-byte seed by deriving the
+/// public key via ed25519 and laying out `seed[0..32] || pubkey[32..64]`.
+/// Matches `keypair_from_seed` in kmd-rust (`keys.rs:60-67`) and the
+/// canonical Ed25519/libsodium representation Algorand uses.
+fn expand_seed_to_sk(seed: &[u8; 32]) -> [u8; 64] {
+    let signing = ed25519_dalek::SigningKey::from_bytes(seed);
+    let pubkey: [u8; 32] = signing.verifying_key().to_bytes();
+    let mut sk = [0u8; 64];
+    sk[..32].copy_from_slice(seed);
+    sk[32..].copy_from_slice(&pubkey);
+    sk
 }
 
 // ---- account info / balance / rewards / assetdetails (TASK-237 / B5) ------
