@@ -304,11 +304,57 @@ pub struct DumpArgs {
 #[derive(Subcommand, Debug)]
 pub enum MultisigCmd {
     /// Delete a multisig account.
-    Delete,
+    Delete(MsigDeleteArgs),
     /// Print information about a multisig account.
-    Info,
+    Info(MsigInfoArgs),
     /// Create a new multisig account.
-    New,
+    New(MsigNewArgs),
+}
+
+// ---- TASK-240 (B8) multisig args ----
+
+/// `account multisig new [-T <threshold>] <addr1> <addr2> ... [-w] [--password]`
+/// Mirrors Go's `newMultisigCmd` (account.go:400-441).
+#[derive(Args, Debug)]
+pub struct MsigNewArgs {
+    /// Component addresses (≥ 1 positional, Go uses `MinimumNArgs(1)`).
+    pub addresses: Vec<String>,
+    /// Multisig signing threshold (number of signatures required).
+    /// Mirrors Go's `-T, --threshold` flag (account.go:124).
+    #[arg(short = 'T', long = "threshold")]
+    pub threshold: u8,
+    /// Wallet to import into.
+    #[arg(short = 'w', long = "wallet")]
+    pub wallet: Option<String>,
+    /// Wallet password (skip the prompt).
+    #[arg(long = "password")]
+    pub password: Option<String>,
+}
+
+/// `account multisig delete -a <addr> [-w] [--password]`. Mirrors
+/// `deleteMultisigCmd` (account.go:443-462).
+#[derive(Args, Debug)]
+pub struct MsigDeleteArgs {
+    /// Multisig address to delete.
+    #[arg(short = 'a', long = "address")]
+    pub address: String,
+    #[arg(short = 'w', long = "wallet")]
+    pub wallet: Option<String>,
+    #[arg(long = "password")]
+    pub password: Option<String>,
+}
+
+/// `account multisig info -a <addr> [-w] [--password]`. Mirrors
+/// `infoMultisigCmd` (account.go:464-487).
+#[derive(Args, Debug)]
+pub struct MsigInfoArgs {
+    /// Multisig address to inspect.
+    #[arg(short = 'a', long = "address")]
+    pub address: String,
+    #[arg(short = 'w', long = "wallet")]
+    pub wallet: Option<String>,
+    #[arg(long = "password")]
+    pub password: Option<String>,
 }
 
 pub fn run(cmd: AccountCmd) -> ExitCode {
@@ -370,12 +416,23 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
             let Some(cmd) = cmd else {
                 return crate::print_group_help(&["account", "multisig"]);
             };
-            let leaf = match cmd {
-                MultisigCmd::Delete => "delete",
-                MultisigCmd::Info => "info",
-                MultisigCmd::New => "new",
+            return match cmd {
+                MultisigCmd::Delete(args) => crate::cmd::account::run_multisig_delete(
+                    args,
+                    crate::cli_state::datadirs(),
+                    crate::cli_state::kmddir(),
+                ),
+                MultisigCmd::Info(args) => crate::cmd::account::run_multisig_info(
+                    args,
+                    crate::cli_state::datadirs(),
+                    crate::cli_state::kmddir(),
+                ),
+                MultisigCmd::New(args) => crate::cmd::account::run_multisig_new(
+                    args,
+                    crate::cli_state::datadirs(),
+                    crate::cli_state::kmddir(),
+                ),
             };
-            return unimplemented("account multisig", leaf);
         }
         AccountCmd::New(args) => {
             return crate::cmd::account::run_new(

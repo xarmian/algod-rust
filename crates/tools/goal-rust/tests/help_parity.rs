@@ -229,10 +229,9 @@ fn unimplemented_leaf_exits_with_code_two_and_message() {
     // Spot-check a handful of leaves across different groups, including
     // hyphenated names and nested subgroups.
     let cases: &[(&[&str], &str)] = &[
-        // Almost every account leaf shipped through TASK-235..239.
+        // Almost every account leaf shipped through TASK-235..240.
         // Use a still-stubbed leaf (`addpartkey`) as the spot check.
         (&["account", "addpartkey"], "account addpartkey"),
-        (&["account", "multisig", "new"], "account multisig new"),
         (&["clerk", "dryrun-remote"], "clerk dryrun-remote"),
         (&["node", "generate-p2pid"], "node generate-p2pid"),
         // All `wallet` leaves are implemented (TASK-226/227/228);
