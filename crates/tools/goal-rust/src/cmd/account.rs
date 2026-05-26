@@ -25,7 +25,8 @@ use crate::data_dir;
 use crate::groups::account::{
     AddpartkeyArgs, AddressArgs, AssetdetailsArgs, DeleteArgs, DeletepartkeyArgs, DumpArgs,
     ExportArgs, ImportArgs, ImportRootKeyArgs, InfoArgs, InstallpartkeyArgs, ListArgs,
-    MsigDeleteArgs, MsigInfoArgs, MsigNewArgs, NewArgs, RenameArgs,
+    MsigDeleteArgs, MsigInfoArgs, MsigNewArgs, NewArgs, RenameArgs, RenewallpartkeysArgs,
+    RenewpartkeyArgs,
 };
 
 /// Mirrors `messages.go:32` (`infoRenamedAccount`).
@@ -1292,6 +1293,158 @@ fn round_or_na(value: Option<u64>) -> String {
         Some(v) if v != 0 => v.to_string(),
         _ => "N/A".to_string(),
     }
+}
+
+// ---- account renewpartkey / renewallpartkeys (TASK-243 / B11) -------------
+
+const RENEW_REGISTER_DEFERRED: &str =
+    "--register requires keyreg-transaction submission, which lands in B12 \
+     (Phase B12: account changeonlinestatus). Use `goal-rust account \
+     changeonlinestatus -a <addr> --online` after this command in the \
+     meantime.";
+
+/// `account renewpartkey -a <addr> --roundLastValid <r> [--keyDilution]
+/// [--register]`. Mirrors `renewParticipationKeyCmd`
+/// (account.go:1053-1099). See `RenewpartkeyArgs` for divergences.
+pub fn run_renewpartkey(args: RenewpartkeyArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    if args.register {
+        eprintln!("{RENEW_REGISTER_DEFERRED}");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = algo_types::Address::from_algorand_string(&args.address) {
+        eprintln!("Could not parse address: {e}");
+        return ExitCode::from(1);
+    }
+    let client = match build_algod_client(&cli_d) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+    let renewed = rt.block_on(renew_one(
+        &client,
+        &args.address,
+        args.round_last_valid,
+        args.key_dilution,
+    ));
+    match renewed {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e]));
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `account renewallpartkeys --roundLastValid <r> [--keyDilution]
+/// [--register]`. Mirrors `renewAllParticipationKeyCmd`
+/// (account.go:1132-1219). Iterates every -d data dir; per dir,
+/// lists existing partkeys, renews each unique address. Skips
+/// addresses that already have a partkey with `vote_last_valid >=
+/// round_last_valid` (Go's preflight check at
+/// account.go:1080-1088).
+pub fn run_renewallpartkeys(args: RenewallpartkeysArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    if args.register {
+        eprintln!("{RENEW_REGISTER_DEFERRED}");
+        return ExitCode::from(1);
+    }
+    let dirs = match data_dir::resolve_data_dirs(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+    let mut had_error = false;
+    for dd in &dirs {
+        println!("Renewing participation keys in {}...", dd.display());
+        let client = match build_algod_client_for_dir(dd) {
+            Ok(c) => c,
+            Err(()) => {
+                had_error = true;
+                continue;
+            }
+        };
+        let parts = match rt.block_on(client.list_participation_keys()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
+                had_error = true;
+                continue;
+            }
+        };
+        let mut seen_addrs: std::collections::HashSet<String> = Default::default();
+        for part in &parts {
+            if !seen_addrs.insert(part.address.clone()) {
+                continue;
+            }
+            // Skip accounts that already have a partkey valid through
+            // the requested roundLastValid (Go's preflight check at
+            // account.go:1080-1088 — "renewed partkey would be older
+            // than current one").
+            if parts.iter().any(|p| {
+                p.address == part.address && p.key.vote_last_valid >= args.round_last_valid
+            }) {
+                let part_address = &part.address;
+                println!(
+                    "  Skipping {part_address}: an existing partkey is already valid \
+                     through round {}",
+                    args.round_last_valid
+                );
+                continue;
+            }
+            if let Err(e) = rt.block_on(renew_one(
+                &client,
+                &part.address,
+                args.round_last_valid,
+                args.key_dilution,
+            )) {
+                let part_address = &part.address;
+                eprintln!("  Renew failed for {part_address}: {e}");
+                had_error = true;
+            }
+        }
+    }
+    if had_error {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Issue one renew via the REST generate endpoint. Uses
+/// `first = current_round` (matches Go's `client.GenParticipationKeys`
+/// call which passes `currentRound` as first) and the requested
+/// `last`. Status fetch picks up `last_round` from `/v2/status`.
+async fn renew_one(
+    client: &algo_rest_client::AlgodClient,
+    address: &str,
+    round_last_valid: u64,
+    key_dilution: Option<u64>,
+) -> Result<(), String> {
+    use algo_rest_client::BlockSource;
+    let status = BlockSource::get_status(client)
+        .await
+        .map_err(|e| e.to_string())?;
+    let first = status.last_round;
+    if round_last_valid <= first {
+        return Err(format!(
+            "--roundLastValid ({round_last_valid}) must be greater than current round ({first})"
+        ));
+    }
+    println!("Renewing participation key for {address} (rounds {first}..{round_last_valid})");
+    client
+        .generate_participation_keys(address, first, round_last_valid, key_dilution)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("  Participation key generation requested");
+    Ok(())
 }
 
 // ---- account multisig new/delete/info (TASK-240 / B8) ---------------------

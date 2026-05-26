@@ -67,10 +67,10 @@ pub enum AccountCmd {
     Rename(RenameArgs),
     /// Renew all existing participation keys.
     #[command(name = "renewallpartkeys")]
-    Renewallpartkeys,
+    Renewallpartkeys(RenewallpartkeysArgs),
     /// Renew an account's participation key.
     #[command(name = "renewpartkey")]
-    Renewpartkey,
+    Renewpartkey(RenewpartkeyArgs),
     /// Retrieve the rewards for the specified account.
     Rewards(AddressArgs),
 }
@@ -179,6 +179,46 @@ pub struct AssetdetailsArgs {
     /// `NextToken`. Mirrors Go's `-n, --next`.
     #[arg(short = 'n', long = "next")]
     pub next: Option<String>,
+}
+
+/// `account renewpartkey --address <addr> --roundLastValid <r>
+/// [--keyDilution <n>] [--register]`. Mirrors Go's
+/// `renewParticipationKeyCmd` (account.go:1053-1099).
+///
+/// **Divergences (documented):**
+/// - Same algokey-rust-no-lib limitation as addpartkey: uses B9's
+///   REST generate endpoint (server-side generation + install).
+/// - Go's renewpartkey ALWAYS issues a keyreg (online) transaction
+///   after generating; we skip that step (lands in B12) and the
+///   operator runs `goal account changeonlinestatus` themselves.
+///   `--register` is wired but errors with a deferral message.
+#[derive(Args, Debug)]
+pub struct RenewpartkeyArgs {
+    #[arg(short = 'a', long = "address")]
+    pub address: String,
+    /// Last round for which the new key is valid.
+    #[arg(long = "roundLastValid", alias = "round-last-valid")]
+    pub round_last_valid: u64,
+    /// Optional key dilution.
+    #[arg(long = "keyDilution", alias = "key-dilution")]
+    pub key_dilution: Option<u64>,
+    /// Issue a keyreg-online transaction after generation. Defers to
+    /// B12 — set today exits 1 with a clear deferral message.
+    #[arg(long = "register")]
+    pub register: bool,
+}
+
+/// `account renewallpartkeys --roundLastValid <r> [--keyDilution <n>]
+/// [--register]`. Mirrors Go's `renewAllParticipationKeyCmd`
+/// (account.go:1132-1219).
+#[derive(Args, Debug)]
+pub struct RenewallpartkeysArgs {
+    #[arg(long = "roundLastValid", alias = "round-last-valid")]
+    pub round_last_valid: u64,
+    #[arg(long = "keyDilution", alias = "key-dilution")]
+    pub key_dilution: Option<u64>,
+    #[arg(long = "register")]
+    pub register: bool,
 }
 
 /// `account addpartkey --address <addr> --roundFirstValid <r> --roundLastValid <r> [--keyDilution <n>]`.
@@ -505,8 +545,12 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
         AccountCmd::Rename(args) => {
             return crate::cmd::account::run_rename(args, crate::cli_state::datadirs());
         }
-        AccountCmd::Renewallpartkeys => "renewallpartkeys",
-        AccountCmd::Renewpartkey => "renewpartkey",
+        AccountCmd::Renewallpartkeys(args) => {
+            return crate::cmd::account::run_renewallpartkeys(args, crate::cli_state::datadirs());
+        }
+        AccountCmd::Renewpartkey(args) => {
+            return crate::cmd::account::run_renewpartkey(args, crate::cli_state::datadirs());
+        }
         AccountCmd::Rewards(args) => {
             return crate::cmd::account::run_rewards(args, crate::cli_state::datadirs());
         }
