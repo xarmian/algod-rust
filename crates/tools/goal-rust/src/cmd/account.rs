@@ -21,13 +21,16 @@ use algo_kmd_client::{KmdClient, KmdError};
 
 use crate::accounts_list::AccountsList;
 use crate::data_dir;
-use crate::groups::account::{DeleteArgs, DumpArgs, NewArgs, RenameArgs};
+use crate::groups::account::{DeleteArgs, DumpArgs, ListArgs, NewArgs, RenameArgs};
 
 /// Mirrors `messages.go:32` (`infoRenamedAccount`).
 const INFO_RENAMED_ACCOUNT: &str = "Renamed account '{}' to '{}'";
 
 /// Mirrors `messages.go:36` (`infoCreatedNewAccount`).
 const INFO_CREATED_NEW_ACCOUNT: &str = "Created new account with address {}";
+
+/// Mirrors `messages.go:31` (`infoNoAccounts`).
+const INFO_NO_ACCOUNTS: &str = "Did not find any account. Please import or create a new one.";
 
 /// Mirrors `messages.go:37` (`errorNameAlreadyTaken`).
 const ERROR_NAME_ALREADY_TAKEN: &str =
@@ -133,6 +136,214 @@ pub fn run_new(args: NewArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>
         format_message(INFO_CREATED_NEW_ACCOUNT, &[&generated])
     );
     ExitCode::SUCCESS
+}
+
+// ---- account list ---------------------------------------------------------
+
+pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>) -> ExitCode {
+    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+    let accounts = AccountsList::load(&data_dir_path);
+
+    // Enumerate wallets (filtered by -w if given).
+    let listed = match rt.block_on(client.list_wallets()) {
+        Ok(l) => l.wallets,
+        Err(e) => {
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
+            return ExitCode::from(1);
+        }
+    };
+    let wallets: Vec<_> = match &args.wallet {
+        Some(name) => listed.into_iter().filter(|w| &w.name == name).collect(),
+        None => listed,
+    };
+    if wallets.is_empty() {
+        // No wallets at all (or none matched -w) — Go prints infoNoAccounts.
+        println!("{INFO_NO_ACCOUNTS}");
+        return ExitCode::SUCCESS;
+    }
+
+    // Optional REST client for balances. Failure to read algod files
+    // is non-fatal — we still list addresses with `[n/a]` balance.
+    let algod = build_algod_endpoint(&data_dir_path);
+
+    // Collect every (address, wallet_name) pair. init_wallet requires
+    // a password; for non-interactive use, --password applies to ALL
+    // wallets (kmd's single-password mode).
+    let mut rows: Vec<AccountRow> = Vec::new();
+    let mut had_kmd_error = false;
+    for w in &wallets {
+        // For each wallet, open a handle. Use the supplied password
+        // (or prompt once per wallet on TTY). If init fails, log + skip.
+        let pw = match &args.password {
+            Some(p) => p.clone(),
+            None => match read_password_for(&w.name) {
+                Ok(p) => p,
+                Err(()) => return ExitCode::from(1),
+            },
+        };
+        let handle = match rt.block_on(client.init_wallet(&w.id, &pw)) {
+            Ok(r) => r.wallet_handle_token,
+            Err(e) => {
+                eprintln!("Could not open wallet '{}': {}", w.name, kmd_msg(&e));
+                had_kmd_error = true;
+                continue;
+            }
+        };
+        let key_list = match rt.block_on(client.list_keys(&handle)) {
+            Ok(r) => r.addresses,
+            Err(e) => {
+                eprintln!(
+                    "Could not list keys for wallet '{}': {}",
+                    w.name,
+                    kmd_msg(&e)
+                );
+                had_kmd_error = true;
+                let _ = rt.block_on(client.release_wallet_handle(&handle));
+                continue;
+            }
+        };
+        let _ = rt.block_on(client.release_wallet_handle(&handle));
+
+        for addr in key_list {
+            rows.push(AccountRow {
+                address: addr,
+                wallet_name: w.name.clone(),
+            });
+        }
+    }
+
+    if rows.is_empty() {
+        println!("{INFO_NO_ACCOUNTS}");
+        return if had_kmd_error {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
+
+    // Fetch balances + statuses (best-effort).
+    let mut any_balance_error = false;
+    for row in &rows {
+        let (status, amount) = match &algod {
+            Some((base, token)) => fetch_status_and_amount(&rt, base, token, &row.address)
+                .unwrap_or_else(|_| {
+                    any_balance_error = true;
+                    ("n/a".to_string(), None)
+                }),
+            None => {
+                any_balance_error = true;
+                ("n/a".to_string(), None)
+            }
+        };
+        let name = accounts.name_for(&row.address);
+        let name_display = if name == row.address {
+            "<no name>".to_string()
+        } else {
+            name
+        };
+        let default_marker = if accounts.is_default(&row.address) {
+            "*"
+        } else {
+            " "
+        };
+        let amount_display = match amount {
+            Some(a) => format!("{a} microAlgos"),
+            None => "[n/a] microAlgos".to_string(),
+        };
+        println!(
+            "{default_marker}[{status}]\t{:<54}\t{name_display}\t{amount_display}",
+            row.address
+        );
+    }
+
+    if had_kmd_error {
+        ExitCode::from(1)
+    } else {
+        // Balance fetch failures are non-fatal — Go's listCmd also
+        // proceeds without algod info when AccountInformation errors
+        // (account.go:519 "it's okay to proceed without algod info").
+        let _ = any_balance_error;
+        ExitCode::SUCCESS
+    }
+}
+
+struct AccountRow {
+    address: String,
+    // wallet_name kept for future per-wallet headers (multi-wallet
+    // grouping when len > 1). Currently informational only.
+    #[allow(dead_code)]
+    wallet_name: String,
+}
+
+/// Resolve algod base URL + token for the data dir. Returns None when
+/// `algod.net` or `algod.token` is missing — list_addresses still
+/// renders with `[n/a]` balances in that case.
+fn build_algod_endpoint(data_dir_path: &Path) -> Option<(String, String)> {
+    let net = std::fs::read_to_string(data_dir_path.join("algod.net")).ok()?;
+    let tok = std::fs::read_to_string(data_dir_path.join("algod.token")).ok()?;
+    let net = net.trim();
+    let tok = tok.trim();
+    if net.is_empty() || tok.is_empty() {
+        return None;
+    }
+    let base = if net.starts_with("http://") || net.starts_with("https://") {
+        net.to_string()
+    } else {
+        format!("http://{net}")
+    };
+    Some((base, tok.to_string()))
+}
+
+fn fetch_status_and_amount(
+    rt: &tokio::runtime::Runtime,
+    base: &str,
+    token: &str,
+    address: &str,
+) -> Result<(String, Option<u64>), String> {
+    let url = format!("{}/v2/accounts/{}", base.trim_end_matches('/'), address);
+    rt.block_on(async {
+        let http = reqwest::Client::new();
+        let resp = http
+            .get(&url)
+            .header("X-Algo-API-Token", token)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(format!("HTTP {}", status.as_u16()));
+        }
+        let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let status_str = match v.get("status").and_then(|s| s.as_str()) {
+            Some("Online") => "online",
+            Some("Offline") => "offline",
+            Some("NotParticipating") => "NotParticipating",
+            Some(other) => {
+                // Pass through anything algod returns we don't model;
+                // matches the spirit of Go's switch+default-panic by
+                // surfacing the verbatim status instead.
+                return Ok((other.to_string(), v.get("amount").and_then(|a| a.as_u64())));
+            }
+            None => "n/a",
+        };
+        let amount = v.get("amount").and_then(|a| a.as_u64());
+        Ok::<_, String>((status_str.to_string(), amount))
+    })
 }
 
 // ---- account delete -------------------------------------------------------
