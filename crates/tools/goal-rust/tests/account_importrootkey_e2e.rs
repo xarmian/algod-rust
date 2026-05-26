@@ -254,6 +254,47 @@ fn importrootkey_empty_directory_prints_imported_zero_keys() {
 }
 
 #[test]
+fn importrootkey_u_with_empty_dir_does_not_create_default_wallet() {
+    // Codex round-3 finding: Go opens the wallet handle inside the
+    // per-file loop AFTER restoring a rootkey, so an empty key dir
+    // must NOT auto-create `unencrypted-default-wallet`.
+    use algo_kmd_client::KmdClient;
+    let (_t, dd, kmd_dir, _kd) = setup_data_dir();
+    let _g = spawn_kmd(&kmd_dir);
+    // No wallets at all + no .rootkey files.
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(&dd)
+        .args(["account", "importrootkey", "-u"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("importrootkey");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "must exit 0 on empty dir");
+    assert!(stdout.contains("Imported 0 keys"));
+
+    // Verify no `unencrypted-default-wallet` was created — query kmd
+    // directly so we don't depend on goal-rust's own listing.
+    let net = std::fs::read_to_string(kmd_dir.join("kmd.net")).unwrap();
+    let tok = std::fs::read_to_string(kmd_dir.join("kmd.token")).unwrap();
+    let client = KmdClient::new(net.trim(), tok.trim()).expect("client");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let wallets = rt.block_on(client.list_wallets()).expect("list_wallets");
+    assert!(
+        !wallets
+            .wallets
+            .iter()
+            .any(|w| w.name == "unencrypted-default-wallet"),
+        "empty .rootkey dir must NOT trigger unencrypted-default-wallet creation; got {:?}",
+        wallets.wallets,
+    );
+}
+
+#[test]
 fn importrootkey_unencrypted_wallet_flag_auto_creates_default_wallet() {
     // No `wallet new` pre-step — Go's GetUnencryptedWalletHandle must
     // create `unencrypted-default-wallet` on demand

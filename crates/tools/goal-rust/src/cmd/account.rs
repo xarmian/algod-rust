@@ -1000,35 +1000,15 @@ pub fn run_importrootkey(
         Err(_) => return ExitCode::SUCCESS,
     };
 
-    // Open the wallet handle once. Go opens a fresh handle per file
-    // (account.go:1422-1434); we factor it out — kmd's handle expiry
-    // is per-session, so reusing within one importrootkey call is
-    // safe and avoids N password prompts.
-    let handle = if args.unencrypted {
-        // Mirrors `client.GetUnencryptedWalletHandle()`
-        // (libgoal/unencryptedWallet.go:45-61): look up the wallet
-        // named `unencrypted-default-wallet`, create it with empty
-        // password if missing, then init a handle. Codex round-1
-        // P1: the prior implementation tried password "" on the
-        // resolved default wallet, which fails against encrypted
-        // wallets and can't recover when no wallets exist.
-        match resolve_unencrypted_wallet_handle(&rt, &client) {
-            Ok(h) => h,
-            Err(()) => return ExitCode::from(1),
-        }
-    } else {
-        let (h, _wallet_name, _pw) = match resolve_wallet_and_init(
-            &rt,
-            &client,
-            &mut accounts,
-            args.wallet.as_deref(),
-            args.password.as_deref(),
-        ) {
-            Ok(v) => v,
-            Err(()) => return ExitCode::from(1),
-        };
-        h
-    };
+    // Wallet-handle resolution is deferred until we've actually
+    // opened + restored a `.rootkey` (Go opens a fresh handle inside
+    // the per-file loop AFTER the restore succeeds — account.go:1422).
+    // That means an empty or all-corrupt key dir must NOT prompt for a
+    // password, NOT auto-create unencrypted-default-wallet, and must
+    // just print `Imported 0 keys`. We cache the handle after the
+    // first successful restore so subsequent imports reuse it (avoids
+    // N password prompts within one call). Codex round-3 finding.
+    let mut handle: Option<String> = None;
 
     let mut imported = 0u64;
     for entry in entries.flatten() {
@@ -1041,7 +1021,33 @@ pub fn run_importrootkey(
             Ok(s) => s,
             Err(_) => continue, // matches Go's "couldn't read it, skip it"
         };
-        let address_for_log = match rt.block_on(client.import_key(&handle, secrets.sk)) {
+        // Lazily resolve the wallet handle now that we have at least
+        // one valid rootkey to import.
+        if handle.is_none() {
+            let h = if args.unencrypted {
+                // Mirrors `client.GetUnencryptedWalletHandle()`
+                // (libgoal/unencryptedWallet.go:45-61).
+                match resolve_unencrypted_wallet_handle(&rt, &client) {
+                    Ok(h) => h,
+                    Err(()) => return ExitCode::from(1),
+                }
+            } else {
+                let (h, _wallet_name, _pw) = match resolve_wallet_and_init(
+                    &rt,
+                    &client,
+                    &mut accounts,
+                    args.wallet.as_deref(),
+                    args.password.as_deref(),
+                ) {
+                    Ok(v) => v,
+                    Err(()) => return ExitCode::from(1),
+                };
+                h
+            };
+            handle = Some(h);
+        }
+        let handle_ref = handle.as_deref().expect("handle resolved");
+        let address_for_log = match rt.block_on(client.import_key(handle_ref, secrets.sk)) {
             Ok(r) => r.address,
             Err(e) => {
                 let msg = kmd_msg(&e);
