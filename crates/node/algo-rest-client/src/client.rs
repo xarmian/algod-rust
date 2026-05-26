@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use tracing::{debug, warn};
 
 use crate::{
-    AccountInfo, AlgodVersions, BlockSource, NodeStatus, PendingTxnInfo, PostTransactionResponse,
-    SuggestedParams, TxId,
+    AccountInfo, AlgodVersions, BlockSource, NodeStatus, ParticipationKey, ParticipationKeyAdded,
+    PendingTxnInfo, PostTransactionResponse, SuggestedParams, TxId,
 };
 
 /// Configuration for the REST client.
@@ -342,6 +342,135 @@ impl AlgodClient {
                 source: Box::new(e),
                 context: "parsing GET /v2/transactions/params response".into(),
             })
+    }
+}
+
+// ---- Participation key surface (TASK-241 / B9) ----
+//
+// Mirrors `../go-algorand/daemon/algod/api/server/v2/handlers.go:243-330`.
+// Five endpoints: list, get-by-id, add, delete-by-id,
+// generate-for-address. Used by goal-rust's `account addpartkey`,
+// `installpartkey`, `listpartkeys`, `partkeyinfo`, `deletepartkey`
+// (B10) and `renewpartkey` / `renewallpartkeys` (B11).
+
+impl AlgodClient {
+    /// `GET /v2/participation` — list every participation key the node
+    /// knows about. Go's `convertParticipationRecord` loop appends to
+    /// a nil slice, so an empty list serializes as JSON `null` rather
+    /// than `[]` (handlers.go:252-258 + our own server mirrors at
+    /// algo-rest-api/handlers.rs:3296). Deserialize as
+    /// `Option<Vec<…>>` and default `None` to an empty vec so a fresh
+    /// node doesn't surface as a parse error.
+    pub async fn list_participation_keys(&self) -> Result<Vec<ParticipationKey>> {
+        let resp = self.get_with_retry("/v2/participation", &self.http).await?;
+        let parsed: Option<Vec<ParticipationKey>> =
+            resp.json().await.map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: "parsing GET /v2/participation response".into(),
+            })?;
+        Ok(parsed.unwrap_or_default())
+    }
+
+    /// `GET /v2/participation/{id}` — fetch one participation key by
+    /// its ParticipationID. 404 ⇒ `AlgoError::NotFound`.
+    pub async fn get_participation_key(&self, id: &str) -> Result<ParticipationKey> {
+        let path = format!("/v2/participation/{id}");
+        let resp = self.get_with_retry(&path, &self.http).await?;
+        resp.json::<ParticipationKey>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("parsing GET /v2/participation/{id} response"),
+            })
+    }
+
+    /// `POST /v2/participation` — install a partkey from on-disk
+    /// bytes. The body is the raw partkey-file payload that algod
+    /// passes through to `Node.InstallParticipationKey`. Content-Type
+    /// is `application/msgpack` to match Go's handler at
+    /// handlers.go:303 (the handler is content-agnostic — it just
+    /// reads the body — but msgpack is what the partkey file format
+    /// uses on disk).
+    pub async fn add_participation_key(
+        &self,
+        partkey_bytes: &[u8],
+    ) -> Result<ParticipationKeyAdded> {
+        let resp = self
+            .post_no_retry(
+                "/v2/participation",
+                "application/msgpack",
+                partkey_bytes.to_vec(),
+            )
+            .await?;
+        resp.json::<ParticipationKeyAdded>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: "parsing POST /v2/participation response".into(),
+            })
+    }
+
+    /// `DELETE /v2/participation/{id}` — remove a partkey by id.
+    pub async fn delete_participation_key(&self, id: &str) -> Result<()> {
+        let url = format!("{}/v2/participation/{id}", self.base_url);
+        let mut req = self.http.delete(&url);
+        if !self.token.is_empty() {
+            req = req.header("X-Algo-API-Token", &self.token);
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return Ok(());
+                }
+                let body_text = resp.text().await.unwrap_or_default();
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    return Err(AlgoError::NotFound(format!(
+                        "DELETE /v2/participation/{id}: {body_text}"
+                    )));
+                }
+                Err(AlgoError::Conformance {
+                    message: format!(
+                        "DELETE /v2/participation/{id} returned {status}: {body_text}"
+                    ),
+                })
+            }
+            Err(e) => Err(AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("DELETE /v2/participation/{id}"),
+            }),
+        }
+    }
+
+    /// `POST /v2/participation/generate/{address}?first=<n>&last=<n>[&dilution=<n>]`
+    /// — ask the node to generate a partkey for `address` in the
+    /// background, install it, and return immediately. Mirrors
+    /// handlers.go:262-300 (`GenerateParticipationKeys`).
+    ///
+    /// Algod's response is intentionally just `"{}"` today (the
+    /// handler comment notes a future field for the partkey id);
+    /// we return the raw body string so callers can match Go's
+    /// surface even after a server-side enrichment.
+    pub async fn generate_participation_keys(
+        &self,
+        address: &str,
+        first_valid: u64,
+        last_valid: u64,
+        key_dilution: Option<u64>,
+    ) -> Result<String> {
+        let mut path =
+            format!("/v2/participation/generate/{address}?first={first_valid}&last={last_valid}");
+        if let Some(d) = key_dilution {
+            path.push_str(&format!("&dilution={d}"));
+        }
+        // Empty body — the handler does not read the request body.
+        let resp = self
+            .post_no_retry(&path, "application/x-binary", Vec::new())
+            .await?;
+        resp.text().await.map_err(|e| AlgoError::RestClient {
+            source: Box::new(e),
+            context: format!("reading POST {path} response body"),
+        })
     }
 }
 
