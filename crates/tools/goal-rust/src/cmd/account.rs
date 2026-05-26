@@ -1048,6 +1048,41 @@ pub fn run_installpartkey(args: InstallpartkeyArgs, cli_d: Vec<PathBuf>) -> Exit
             return ExitCode::from(1);
         }
     };
+
+    // Verify the key is actually installed before deleting the input
+    // file. Mirrors Go's `client.VerifyParticipationKey(time.Minute,
+    // addResponse.PartId)` (account.go:1040-1045) — algod can ack
+    // the POST then drop the key, and silently deleting the only copy
+    // would leave the operator with no way to retry. Poll
+    // list_participation_keys for up to 60s. Codex round-1 P1 finding.
+    let verified = rt.block_on(async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match client.list_participation_keys().await {
+                Ok(parts) => {
+                    if parts.iter().any(|p| p.id == part_id) {
+                        return Ok::<(), String>(());
+                    }
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "key install acknowledged but not visible after 60s"
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    });
+    if let Err(why) = verified {
+        eprintln!(
+            "unable to verify key installation. Verify with 'goal account partkeyinfo' \
+             and delete '{}', or retry the command. Error: {why}",
+            args.partkey.display(),
+        );
+        return ExitCode::from(1);
+    }
+
     println!("Participation key installed successfully, Participation ID: {part_id}");
     // Go deletes the input file on success (account.go:1048-1051).
     if let Err(e) = std::fs::remove_file(&args.partkey) {

@@ -4,6 +4,7 @@
 
 #![cfg(unix)]
 
+use base64::Engine as _;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -27,8 +28,11 @@ fn mk_data_dir() -> (tempfile::TempDir, PathBuf) {
 
 #[derive(Default)]
 struct MockState {
-    /// Path → canned JSON response (200 OK). Missing path → 404.
-    table: HashMap<String, serde_json::Value>,
+    /// (method, path) → canned JSON response (200 OK). Missing pair →
+    /// 404 (or 200 `{}` for DELETE/POST so happy-path tests don't
+    /// have to register a body explicitly). Method-keyed because
+    /// install needs different shapes for POST vs the followup GET.
+    table: HashMap<(String, String), serde_json::Value>,
     /// Records each method+path the mock saw, for assertion.
     requests: Vec<(String, String)>,
     /// POST bodies received, keyed by path. Last write wins.
@@ -78,9 +82,9 @@ fn spawn_mock_algod(
                         // generate_participation_keys uses ?first=…&last=…).
                         let path_no_qs = path.split('?').next().unwrap_or(&path).to_string();
                         s.table
-                            .get(&path_no_qs)
+                            .get(&(method.clone(), path_no_qs.clone()))
                             .cloned()
-                            .or_else(|| s.table.get(&path).cloned())
+                            .or_else(|| s.table.get(&(method.clone(), path.clone())).cloned())
                     };
                     let (code, msg, body) = match lookup {
                         Some(v) => (200u16, "OK", v.to_string().into_bytes()),
@@ -247,10 +251,27 @@ fn installpartkey_uploads_bytes_and_deletes_input() {
     let pk_bytes = b"synthetic-partkey-bytes-for-test";
     std::fs::write(&pk, pk_bytes).unwrap();
 
+    // Post returns the new partId; the follow-up verification GET
+    // must show that id in the list (mirrors Go's
+    // VerifyParticipationKey poll loop).
     let mut initial = MockState::default();
     initial.table.insert(
-        "/v2/participation".to_string(),
+        ("POST".to_string(), "/v2/participation".to_string()),
         serde_json::json!({"partId": "NEWPARTID"}),
+    );
+    initial.table.insert(
+        ("GET".to_string(), "/v2/participation".to_string()),
+        serde_json::json!([{
+            "id": "NEWPARTID",
+            "address": "ADDR",
+            "key": {
+                "selection-participation-key": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                "vote-participation-key": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                "vote-first-valid": 1,
+                "vote-last-valid": 2,
+                "vote-key-dilution": 1,
+            },
+        }]),
     );
     let (state, stop, jh, port) = spawn_mock_algod(initial);
     wire_algod(&dd, port);
@@ -290,9 +311,10 @@ fn installpartkey_uploads_bytes_and_deletes_input() {
 fn listpartkeys_renders_columns_and_short_address_id() {
     let (_t, dd) = mk_data_dir();
     let mut initial = MockState::default();
-    initial
-        .table
-        .insert("/v2/participation".to_string(), sample_partkey_list());
+    initial.table.insert(
+        ("GET".to_string(), "/v2/participation".to_string()),
+        sample_partkey_list(),
+    );
     let (_state, stop, jh, port) = spawn_mock_algod(initial);
     wire_algod(&dd, port);
 
@@ -341,9 +363,10 @@ fn listpartkeys_renders_columns_and_short_address_id() {
 fn partkeyinfo_renders_full_block_per_key() {
     let (_t, dd) = mk_data_dir();
     let mut initial = MockState::default();
-    initial
-        .table
-        .insert("/v2/participation".to_string(), sample_partkey_list());
+    initial.table.insert(
+        ("GET".to_string(), "/v2/participation".to_string()),
+        sample_partkey_list(),
+    );
     let (_state, stop, jh, port) = spawn_mock_algod(initial);
     wire_algod(&dd, port);
 
@@ -387,9 +410,10 @@ fn partkeyinfo_iterates_every_data_dir() {
     let (_t2, dd2) = mk_data_dir();
 
     let mut initial = MockState::default();
-    initial
-        .table
-        .insert("/v2/participation".to_string(), sample_partkey_list());
+    initial.table.insert(
+        ("GET".to_string(), "/v2/participation".to_string()),
+        sample_partkey_list(),
+    );
     let (_state, stop, jh, port) = spawn_mock_algod(initial);
     wire_algod(&dd1, port);
     wire_algod(&dd2, port);
