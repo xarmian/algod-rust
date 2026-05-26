@@ -18,9 +18,9 @@ pub enum AccountCmd {
     /// Retrieve information about the assets belonging to the specified
     /// account inclusive of asset metadata.
     #[command(name = "assetdetails")]
-    Assetdetails,
+    Assetdetails(AddressArgs),
     /// Retrieve the balances for the specified account.
-    Balance,
+    Balance(AddressArgs),
     /// Change online status for the specified account.
     #[command(name = "changeonlinestatus")]
     Changeonlinestatus,
@@ -40,7 +40,7 @@ pub enum AccountCmd {
     Importrootkey,
     /// Retrieve information about the assets and applications belonging
     /// to the specified account.
-    Info,
+    Info(AddressArgs),
     /// Install a participation key.
     #[command(name = "installpartkey")]
     Installpartkey,
@@ -72,7 +72,7 @@ pub enum AccountCmd {
     #[command(name = "renewpartkey")]
     Renewpartkey,
     /// Retrieve the rewards for the specified account.
-    Rewards,
+    Rewards(AddressArgs),
 }
 
 // ------- TASK-235 (B3) args -------
@@ -134,6 +134,16 @@ pub struct RenameArgs {
     pub old_name: String,
     /// New account name. Go's second positional.
     pub new_name: String,
+}
+
+/// Shared `-a <address>` flag for the read-path leaves (TASK-237 / B5):
+/// info / balance / rewards / assetdetails. Mirrors Go's account-group
+/// persistent `-a, --address` flag (`account.go:121`).
+#[derive(Args, Debug)]
+pub struct AddressArgs {
+    /// Algorand address to operate on. Mirrors Go's `-a, --address` flag.
+    #[arg(short = 'a', long = "address")]
+    pub address: String,
 }
 
 /// `account dump -a <address>` — pretty-print the REST
@@ -198,8 +208,12 @@ pub enum MultisigCmd {
 pub fn run(cmd: AccountCmd) -> ExitCode {
     let leaf: &str = match cmd {
         AccountCmd::Addpartkey => "addpartkey",
-        AccountCmd::Assetdetails => "assetdetails",
-        AccountCmd::Balance => "balance",
+        AccountCmd::Assetdetails(args) => {
+            return crate::cmd::account::run_assetdetails(args, crate::cli_state::datadirs());
+        }
+        AccountCmd::Balance(args) => {
+            return crate::cmd::account::run_balance(args, crate::cli_state::datadirs());
+        }
         AccountCmd::Changeonlinestatus => "changeonlinestatus",
         AccountCmd::Delete(args) => {
             return crate::cmd::account::run_delete(
@@ -215,7 +229,9 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
         AccountCmd::Export => "export",
         AccountCmd::Import => "import",
         AccountCmd::Importrootkey => "importrootkey",
-        AccountCmd::Info => "info",
+        AccountCmd::Info(args) => {
+            return crate::cmd::account::run_info(args, crate::cli_state::datadirs());
+        }
         AccountCmd::Installpartkey => "installpartkey",
         AccountCmd::List(args) => {
             return crate::cmd::account::run_list(
@@ -250,7 +266,9 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
         }
         AccountCmd::Renewallpartkeys => "renewallpartkeys",
         AccountCmd::Renewpartkey => "renewpartkey",
-        AccountCmd::Rewards => "rewards",
+        AccountCmd::Rewards(args) => {
+            return crate::cmd::account::run_rewards(args, crate::cli_state::datadirs());
+        }
     };
     unimplemented("account", leaf)
 }

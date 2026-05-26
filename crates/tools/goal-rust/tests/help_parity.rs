@@ -229,9 +229,10 @@ fn unimplemented_leaf_exits_with_code_two_and_message() {
     // Spot-check a handful of leaves across different groups, including
     // hyphenated names and nested subgroups.
     let cases: &[(&[&str], &str)] = &[
-        // `account list` shipped in TASK-236 (B4); use a still-stubbed
-        // account leaf (`info`) as the spot check.
-        (&["account", "info"], "account info"),
+        // `account list/info/balance/rewards/assetdetails/new/delete/rename/dump`
+        // are all shipped (TASK-235/236/237). Use a still-stubbed
+        // account leaf (`export`) as the spot check.
+        (&["account", "export"], "account export"),
         (&["account", "multisig", "new"], "account multisig new"),
         (&["clerk", "dryrun-remote"], "clerk dryrun-remote"),
         (&["node", "generate-p2pid"], "node generate-p2pid"),
