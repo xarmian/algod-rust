@@ -229,13 +229,23 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
             }
         };
         // Multisig preimages are stored separately in kmd; Go's
-        // ListAddressesWithInfo returns the union. Mirror that so a
-        // wallet that holds only multisig accounts doesn't appear
-        // empty (Codex round-2 finding).
-        let msig_list = rt
-            .block_on(client.list_multisig_addrs(&handle))
-            .map(|r| r.addresses)
-            .unwrap_or_default();
+        // ListAddressesWithInfo returns the union AND surfaces an
+        // error if ListMultisigAddrs fails (mirror that — a silent
+        // unwrap_or_default would let a wallet that holds only msig
+        // preimages print infoNoAccounts and exit 0).
+        let msig_list = match rt.block_on(client.list_multisig_addrs(&handle)) {
+            Ok(r) => r.addresses,
+            Err(e) => {
+                eprintln!(
+                    "Could not list multisig accounts for wallet '{}': {}",
+                    w.name,
+                    kmd_msg(&e)
+                );
+                had_kmd_error = true;
+                let _ = rt.block_on(client.release_wallet_handle(&handle));
+                continue;
+            }
+        };
         let _ = rt.block_on(client.release_wallet_handle(&handle));
 
         for addr in key_list {
