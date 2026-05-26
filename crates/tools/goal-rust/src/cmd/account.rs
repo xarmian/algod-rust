@@ -167,11 +167,23 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
         }
     };
     let wallets: Vec<_> = match &args.wallet {
-        Some(name) => listed.into_iter().filter(|w| &w.name == name).collect(),
+        Some(name) => {
+            let filtered: Vec<_> = listed.into_iter().filter(|w| &w.name == name).collect();
+            // An explicit -w that matches nothing should error rather
+            // than silently print infoNoAccounts (Codex round-1 P2 — a
+            // typo'd wallet name was previously indistinguishable from
+            // an empty wallet). No -w + no wallets ⇒ still prints
+            // infoNoAccounts below.
+            if filtered.is_empty() {
+                eprintln!("Could not find a wallet named '{name}'.");
+                return ExitCode::from(1);
+            }
+            filtered
+        }
         None => listed,
     };
     if wallets.is_empty() {
-        // No wallets at all (or none matched -w) — Go prints infoNoAccounts.
+        // No wallets at all — Go prints infoNoAccounts.
         println!("{INFO_NO_ACCOUNTS}");
         return ExitCode::SUCCESS;
     }
@@ -255,17 +267,22 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
         } else {
             name
         };
-        let default_marker = if accounts.is_default(&row.address) {
-            "*"
-        } else {
-            " "
-        };
         let amount_display = match amount {
             Some(a) => format!("{a} microAlgos"),
             None => "[n/a] microAlgos".to_string(),
         };
+        // Column order matches Go's outputAccount (accountsList.go:207-280):
+        // `[status]\t<name>\t<address>\t<amount> microAlgos[\t*Default]`.
+        // Round-1 Codex review flagged that the earlier prefix-`*` /
+        // address-before-name layout broke existing scripts that key
+        // on field position.
+        let default_suffix = if accounts.is_default(&row.address) {
+            "\t*Default"
+        } else {
+            ""
+        };
         println!(
-            "{default_marker}[{status}]\t{:<54}\t{name_display}\t{amount_display}",
+            "[{status}]\t{name_display}\t{}\t{amount_display}{default_suffix}",
             row.address
         );
     }
@@ -332,7 +349,9 @@ fn fetch_status_and_amount(
         let status_str = match v.get("status").and_then(|s| s.as_str()) {
             Some("Online") => "online",
             Some("Offline") => "offline",
-            Some("NotParticipating") => "NotParticipating",
+            // Go renders NotParticipating as `[excluded]`
+            // (accountsList.go:226). Match for parity.
+            Some("NotParticipating") => "excluded",
             Some(other) => {
                 // Pass through anything algod returns we don't model;
                 // matches the spirit of Go's switch+default-panic by

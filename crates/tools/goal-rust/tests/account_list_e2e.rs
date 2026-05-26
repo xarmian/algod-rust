@@ -265,21 +265,30 @@ fn account_list_renders_status_address_name_balance_and_default_marker() {
     assert!(stdout.contains("12345 microAlgos"));
     assert!(stdout.contains("100 microAlgos"));
     // alice is the first account created → marked default by add_account.
+    // Column order matches Go: [status]\t<name>\t<address>\t<amount>...\t*Default
     let alice_line = stdout
         .lines()
         .find(|l| l.contains(&alice))
         .expect("alice row present");
     assert!(
-        alice_line.starts_with("*"),
-        "alice row must start with default marker; got {alice_line:?}",
+        alice_line.starts_with("[online]\talice\t"),
+        "alice row must use Go's column order [status]\\t<name>\\t<address>...; got {alice_line:?}",
+    );
+    assert!(
+        alice_line.ends_with("\t*Default"),
+        "alice row must end with *Default suffix; got {alice_line:?}",
     );
     let bob_line = stdout
         .lines()
         .find(|l| l.contains(&bob))
         .expect("bob row present");
     assert!(
-        !bob_line.starts_with("*"),
-        "bob row must NOT carry the default marker; got {bob_line:?}",
+        bob_line.starts_with("[offline]\tbob\t"),
+        "bob row must use Go's column order; got {bob_line:?}",
+    );
+    assert!(
+        !bob_line.contains("*Default"),
+        "bob row must NOT carry *Default; got {bob_line:?}",
     );
 }
 
@@ -343,6 +352,61 @@ fn account_list_unreachable_kmd_surfaces_go_text() {
     assert!(
         stderr.contains("Could not contact kmd; is it running?"),
         "stderr must carry Go's unreachable text; got {stderr:?}",
+    );
+}
+
+#[test]
+fn account_list_renders_notparticipating_as_excluded() {
+    let (_t, dd, kmd_dir) = setup_data_dir();
+    let _g = spawn_kmd(&kmd_dir);
+    create_default_wallet(&dd);
+    let acct = create_account(&dd, "alice");
+
+    let mut table = HashMap::new();
+    table.insert(acct.clone(), ("NotParticipating".to_string(), 50u64));
+    let (stop, jh, port) = spawn_mock_algod(table);
+    std::fs::write(dd.join("algod.net"), format!("127.0.0.1:{port}\n")).unwrap();
+    std::fs::write(dd.join("algod.token"), "x".repeat(64)).unwrap();
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(&dd)
+        .args(["account", "list", "--password", "pw"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("list");
+    stop.store(true, Ordering::Relaxed);
+    let _ = jh.join();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "list must succeed");
+    // Go maps NotParticipating → "excluded" (accountsList.go:226).
+    assert!(
+        stdout.contains("[excluded]"),
+        "stdout must render NotParticipating as [excluded]; got {stdout:?}",
+    );
+}
+
+#[test]
+fn account_list_w_unknown_wallet_errors() {
+    let (_t, dd, kmd_dir) = setup_data_dir();
+    let _g = spawn_kmd(&kmd_dir);
+    create_default_wallet(&dd);
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(&dd)
+        .args(["account", "list", "-w", "nosuchwallet"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("list");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "list with unknown -w must fail; stderr={stderr:?}",
+    );
+    assert!(
+        stderr.contains("Could not find a wallet named 'nosuchwallet'"),
+        "stderr must explain missing wallet; got {stderr:?}",
     );
 }
 
