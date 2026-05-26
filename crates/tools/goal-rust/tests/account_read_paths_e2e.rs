@@ -143,24 +143,20 @@ fn account_assetdetails_prints_per_asset_block() {
     let (_t, dd) = mk_data_dir();
     let addr = algo_types::Address([0x33; 32]).to_algorand_string();
     let mut table = HashMap::new();
+    // assetdetails now uses the paginated /v2/accounts/{addr}/assets
+    // endpoint that returns asset-holdings entries with nested
+    // asset-holding + asset-params per row (Codex round-1 finding).
     table.insert(
-        format!("/v2/accounts/{addr}"),
+        format!("/v2/accounts/{addr}/assets"),
         serde_json::json!({
-            "address": addr, "amount": 0, "amount-without-pending-rewards": 0,
-            "pending-rewards": 0, "rewards": 0, "status": "Offline", "round": 5,
-            "assets": [
-                {"asset-id": 100, "amount": 250, "is-frozen": false},
-            ],
-        }),
-    );
-    table.insert(
-        "/v2/assets/100".to_string(),
-        serde_json::json!({
-            "index": 100,
-            "params": {
-                "creator": "CR", "name": "ACME", "unit-name": "AC",
-                "total": 1000, "decimals": 2, "url": "https://acme",
-            },
+            "round": 5,
+            "asset-holdings": [{
+                "asset-holding": {"asset-id": 100, "amount": 250, "is-frozen": false},
+                "asset-params": {
+                    "creator": "CR", "name": "ACME", "unit-name": "AC",
+                    "total": 1000, "decimals": 2, "url": "https://acme",
+                },
+            }],
         }),
     );
     let (stop, jh, port) = spawn_mock_algod(table);
@@ -354,6 +350,102 @@ fn account_info_held_asset_404_renders_deleted_unknown() {
     assert!(
         stdout.contains("\tID 999, <deleted/unknown asset>"),
         "info must render 404 asset as deleted/unknown; got {stdout:?}",
+    );
+}
+
+#[test]
+fn account_assetdetails_paginates_with_limit_and_next() {
+    let (_t, dd) = mk_data_dir();
+    let addr = algo_types::Address([0x77; 32]).to_algorand_string();
+    let mut table = HashMap::new();
+    // Mock the paginated endpoint with limit=1&next=tok2 in the path.
+    table.insert(
+        format!("/v2/accounts/{addr}/assets?limit=1&next=tok2"),
+        serde_json::json!({
+            "round": 9,
+            "next-token": "tok3",
+            "asset-holdings": [{
+                "asset-holding": {"asset-id": 5, "amount": 1, "is-frozen": false},
+                "asset-params": {
+                    "creator": "X", "name": "X", "unit-name": "X",
+                    "total": 1, "decimals": 0, "url": "",
+                },
+            }],
+        }),
+    );
+    let (stop, jh, port) = spawn_mock_algod(table);
+    wire_algod(&dd, port);
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(&dd)
+        .args([
+            "account",
+            "assetdetails",
+            "-a",
+            &addr,
+            "-l",
+            "1",
+            "-n",
+            "tok2",
+        ])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("assetdetails");
+    stop.store(true, Ordering::Relaxed);
+    let _ = jh.join();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "paginated assetdetails: {stdout:?}");
+    assert!(stdout.contains("Round: 9"));
+    assert!(
+        stdout.contains("NextToken (to retrieve more account assets): tok3"),
+        "stdout must surface the next-token line; got {stdout:?}",
+    );
+}
+
+#[test]
+fn account_info_only_show_asset_ids_skips_metadata_fetch() {
+    let (_t, dd) = mk_data_dir();
+    let addr = algo_types::Address([0x88; 32]).to_algorand_string();
+    let mut table = HashMap::new();
+    table.insert(
+        format!("/v2/accounts/{addr}"),
+        serde_json::json!({
+            "address": addr, "amount": 0, "amount-without-pending-rewards": 0,
+            "pending-rewards": 0, "rewards": 0, "status": "Offline", "round": 1,
+            "min-balance": 0,
+            // Two held assets with no `/v2/assets/{id}` entries in the
+            // mock — the only way the test passes is if --onlyShowAssetIDs
+            // is honored and the per-asset fetch is skipped entirely.
+            "assets": [
+                {"asset-id": 11, "amount": 1, "is-frozen": false},
+                {"asset-id": 22, "amount": 2, "is-frozen": false},
+            ],
+        }),
+    );
+    let (stop, jh, port) = spawn_mock_algod(table);
+    wire_algod(&dd, port);
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(&dd)
+        .args(["account", "info", "-a", &addr, "--onlyShowAssetIDs"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("info");
+    stop.store(true, Ordering::Relaxed);
+    let _ = jh.join();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "--onlyShowAssetIDs must succeed without per-asset fetches; got {stdout:?}",
+    );
+    assert!(stdout.contains("\tID 11\n"));
+    assert!(stdout.contains("\tID 22\n"));
+    // No metadata fields rendered.
+    assert!(
+        !stdout.contains("balance"),
+        "--onlyShowAssetIDs must not render `balance` line; got {stdout:?}",
     );
 }
 

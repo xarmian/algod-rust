@@ -21,7 +21,9 @@ use algo_kmd_client::{KmdClient, KmdError};
 
 use crate::accounts_list::AccountsList;
 use crate::data_dir;
-use crate::groups::account::{AddressArgs, DeleteArgs, DumpArgs, ListArgs, NewArgs, RenameArgs};
+use crate::groups::account::{
+    AddressArgs, AssetdetailsArgs, DeleteArgs, DumpArgs, InfoArgs, ListArgs, NewArgs, RenameArgs,
+};
 
 /// Mirrors `messages.go:32` (`infoRenamedAccount`).
 const INFO_RENAMED_ACCOUNT: &str = "Renamed account '{}' to '{}'";
@@ -792,16 +794,26 @@ pub fn run_rewards(args: AddressArgs, cli_d: Vec<PathBuf>) -> ExitCode {
     }
 }
 
-/// `account assetdetails -a <addr>` — print the per-asset detail
-/// block. Mirrors `printAccountAssetsInformation`
-/// (`account.go:797-?`). Uses `/v2/accounts/{addr}` to enumerate
-/// holdings and `/v2/assets/{aid}` for each asset's params.
-pub fn run_assetdetails(args: AddressArgs, cli_d: Vec<PathBuf>) -> ExitCode {
-    let v = match fetch_account_json(&args.address, &cli_d) {
-        Ok(v) => v,
-        Err(()) => return ExitCode::from(1),
+/// `account assetdetails -a <addr> [-l <n>] [-n <token>]` — print
+/// the per-asset detail block. Mirrors `printAccountAssetsInformation`
+/// (`account.go:797+`). Routes through the paginated
+/// `/v2/accounts/{addr}/assets` endpoint so `--limit` / `--next` round-
+/// trip with Go's `goal account assetdetails` semantics (Codex round-1
+/// finding — the prior implementation incorrectly walked the unpaged
+/// `/v2/accounts/{addr}` shape and ignored both flags).
+pub fn run_assetdetails(args: AssetdetailsArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    let dd = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
     };
-    let endpoint = match build_algod_endpoint_from(&cli_d) {
+    if let Err(e) = algo_types::Address::from_algorand_string(&args.address) {
+        eprintln!("Could not parse address: {e}");
+        return ExitCode::from(1);
+    }
+    let endpoint = match build_algod_endpoint(&dd) {
         Some(e) => e,
         None => {
             eprintln!("Could not contact algod: algod.net/algod.token missing");
@@ -813,17 +825,68 @@ pub fn run_assetdetails(args: AddressArgs, cli_d: Vec<PathBuf>) -> ExitCode {
         Err(()) => return ExitCode::from(1),
     };
 
-    let mut assets = Vec::new();
-    if let Some(arr) = v.get("assets").and_then(|a| a.as_array()) {
-        for h in arr {
-            let aid = h.get("asset-id").and_then(|x| x.as_u64()).unwrap_or(0);
-            let params = fetch_asset_params(&rt, &endpoint, aid).ok();
-            assets.push((h.clone(), params));
+    // Build the paginated assets URL.
+    let mut url = format!(
+        "{}/v2/accounts/{}/assets",
+        endpoint.0.trim_end_matches('/'),
+        args.address
+    );
+    let mut qs: Vec<String> = Vec::new();
+    if let Some(l) = args.limit {
+        qs.push(format!("limit={l}"));
+    }
+    if let Some(n) = args.next.as_deref().filter(|s| !s.is_empty()) {
+        qs.push(format!("next={n}"));
+    }
+    if !qs.is_empty() {
+        url.push('?');
+        url.push_str(&qs.join("&"));
+    }
+
+    let resp_json = rt.block_on(async {
+        let http = reqwest::Client::new();
+        let r = http
+            .get(&url)
+            .header("X-Algo-API-Token", &endpoint.1)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = r.status();
+        let bytes = r.bytes().await.map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(format!("HTTP {}", status.as_u16()));
+        }
+        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| e.to_string())
+    });
+    let resp = match resp_json {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e]));
+            return ExitCode::from(1);
+        }
+    };
+
+    let round = resp.get("round").and_then(|r| r.as_u64()).unwrap_or(0);
+    let next_token = resp
+        .get("next-token")
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_string());
+    let mut assets: Vec<(serde_json::Value, Option<serde_json::Value>)> = Vec::new();
+    if let Some(arr) = resp.get("asset-holdings").and_then(|a| a.as_array()) {
+        for entry in arr {
+            // The paginated endpoint nests holding + optional params
+            // under each `asset-holdings[i]` entry as:
+            //   { "asset-holding": {...}, "asset-params": {...?} }
+            let holding = entry
+                .get("asset-holding")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let params = entry.get("asset-params").cloned();
+            assets.push((holding, params));
         }
     }
 
-    let round = v.get("round").and_then(|r| r.as_u64()).unwrap_or(0);
-    let s = format_assetdetails(&args.address, round, &assets);
+    let s = format_assetdetails(&args.address, round, next_token.as_deref(), &assets);
     print!("{s}");
     ExitCode::SUCCESS
 }
@@ -831,7 +894,7 @@ pub fn run_assetdetails(args: AddressArgs, cli_d: Vec<PathBuf>) -> ExitCode {
 /// `account info -a <addr>` — multi-section dump: Created Assets,
 /// Held Assets, Created Apps, Opted In Apps, Minimum Balance.
 /// Mirrors `printAccountInfo` (`account.go:592-770`).
-pub fn run_info(args: AddressArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+pub fn run_info(args: InfoArgs, cli_d: Vec<PathBuf>) -> ExitCode {
     let v = match fetch_account_json(&args.address, &cli_d) {
         Ok(v) => v,
         Err(()) => return ExitCode::from(1),
@@ -842,34 +905,40 @@ pub fn run_info(args: AddressArgs, cli_d: Vec<PathBuf>) -> ExitCode {
         Err(()) => return ExitCode::from(1),
     };
 
-    // Pre-fetch params for every held asset so the formatter is pure.
+    // When --onlyShowAssetIDs is set, skip the per-asset metadata
+    // fetch entirely. Mirrors Go's onlyShowAssetIDs branch
+    // (account.go:660-664) which prints `\tID N\n` per holding without
+    // an AssetInformation call.
     let mut held_params: std::collections::HashMap<u64, AssetFetch> =
         std::collections::HashMap::new();
-    if let (Some(ep), Some(holdings)) = (&endpoint, v.get("assets").and_then(|a| a.as_array())) {
-        for h in holdings {
-            let aid = h.get("asset-id").and_then(|x| x.as_u64()).unwrap_or(0);
-            let fetched = match fetch_asset_params_with_status(&rt, ep, aid) {
-                Ok((404, _)) => AssetFetch::Missing,
-                Ok((_, Some(p))) => AssetFetch::Found(p),
-                Ok((_, None)) => AssetFetch::Error,
-                Err(_) => AssetFetch::Error,
-            };
-            held_params.insert(aid, fetched);
-        }
-    } else if v
-        .get("assets")
-        .and_then(|a| a.as_array())
-        .is_some_and(|a| !a.is_empty())
-    {
-        // No algod endpoint but holdings exist — every held asset
-        // becomes AssetFetch::Error so the rendered row is `\tID N, error`.
-        for h in v.get("assets").unwrap().as_array().unwrap() {
-            let aid = h.get("asset-id").and_then(|x| x.as_u64()).unwrap_or(0);
-            held_params.insert(aid, AssetFetch::Error);
+    if !args.only_show_asset_ids {
+        if let (Some(ep), Some(holdings)) = (&endpoint, v.get("assets").and_then(|a| a.as_array()))
+        {
+            for h in holdings {
+                let aid = h.get("asset-id").and_then(|x| x.as_u64()).unwrap_or(0);
+                let fetched = match fetch_asset_params_with_status(&rt, ep, aid) {
+                    Ok((404, _)) => AssetFetch::Missing,
+                    Ok((_, Some(p))) => AssetFetch::Found(p),
+                    Ok((_, None)) => AssetFetch::Error,
+                    Err(_) => AssetFetch::Error,
+                };
+                held_params.insert(aid, fetched);
+            }
+        } else if v
+            .get("assets")
+            .and_then(|a| a.as_array())
+            .is_some_and(|a| !a.is_empty())
+        {
+            // No algod endpoint but holdings exist — every held asset
+            // becomes AssetFetch::Error so the rendered row is `\tID N, error`.
+            for h in v.get("assets").unwrap().as_array().unwrap() {
+                let aid = h.get("asset-id").and_then(|x| x.as_u64()).unwrap_or(0);
+                held_params.insert(aid, AssetFetch::Error);
+            }
         }
     }
 
-    let (report, errors, has_error) = format_info(&v, &held_params);
+    let (report, errors, has_error) = format_info(&v, &held_params, args.only_show_asset_ids);
     if !errors.is_empty() {
         eprint!("{errors}");
     }
@@ -973,14 +1042,9 @@ fn fetch_asset_params_with_status(
     })
 }
 
-fn fetch_asset_params(
-    rt: &tokio::runtime::Runtime,
-    endpoint: &(String, String),
-    asset_id: u64,
-) -> Result<serde_json::Value, String> {
-    let (_, params) = fetch_asset_params_with_status(rt, endpoint, asset_id)?;
-    params.ok_or_else(|| format!("asset {asset_id} not found"))
-}
+// `fetch_asset_params` (single-shot, non-status-aware) was used by the
+// earlier non-paginated assetdetails path. The paginated endpoint
+// surfaces asset-params inline, so the helper has been removed.
 
 /// Outcome of a per-asset fetch in `account info`'s Held Assets section.
 enum AssetFetch {
@@ -996,6 +1060,7 @@ enum AssetFetch {
 fn format_info(
     v: &serde_json::Value,
     held_params: &std::collections::HashMap<u64, AssetFetch>,
+    only_show_asset_ids: bool,
 ) -> (String, String, bool) {
     use std::fmt::Write as _;
     let mut report = String::new();
@@ -1070,6 +1135,12 @@ fn format_info(
     }
     for h in &held_assets {
         let aid = h.get("asset-id").and_then(|i| i.as_u64()).unwrap_or(0);
+        if only_show_asset_ids {
+            // Go's onlyShowAssetIDs branch (account.go:660-664) skips
+            // the AssetInformation call and just prints `\tID N\n`.
+            let _ = writeln!(report, "\tID {aid}");
+            continue;
+        }
         match held_params.get(&aid) {
             Some(AssetFetch::Found(params)) => {
                 let decimals = params.get("decimals").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
@@ -1213,16 +1284,22 @@ fn asset_decimals_fmt(value: u64, decimals: u32) -> String {
 
 /// `printAccountAssetsInformation` (account.go:797+). Pure, returns
 /// the rendered string. Each `(holding, params_opt)` pair is one
-/// asset block.
+/// asset block. `next_token` is rendered between `Round:` and
+/// `Assets:` when non-empty (Go's
+/// `NextToken (to retrieve more account assets): <token>` line).
 fn format_assetdetails(
     address: &str,
     round: u64,
+    next_token: Option<&str>,
     assets: &[(serde_json::Value, Option<serde_json::Value>)],
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let _ = writeln!(out, "Account: {address}");
     let _ = writeln!(out, "Round: {round}");
+    if let Some(t) = next_token.filter(|s| !s.is_empty()) {
+        let _ = writeln!(out, "NextToken (to retrieve more account assets): {t}");
+    }
     let _ = writeln!(out, "Assets:");
     for (holding, params) in assets {
         let aid = holding
@@ -1346,7 +1423,7 @@ mod tests {
             "round": 1,
             "status": "Offline",
         });
-        let (report, errors, has_error) = format_info(&v, &std::collections::HashMap::new());
+        let (report, errors, has_error) = format_info(&v, &std::collections::HashMap::new(), false);
         assert_eq!(errors, "");
         assert!(!has_error);
         // Every section header present with the <none> placeholder.
@@ -1415,7 +1492,7 @@ mod tests {
                 "decimals": 2, "name": "ACME", "unit-name": "AC",
             })),
         );
-        let (report, errors, has_error) = format_info(&v, &held);
+        let (report, errors, has_error) = format_info(&v, &held, false);
         assert_eq!(errors, "");
         assert!(!has_error);
         assert!(
@@ -1447,7 +1524,7 @@ mod tests {
         });
         let mut held = std::collections::HashMap::new();
         held.insert(99u64, AssetFetch::Missing);
-        let (report, _errors, has_error) = format_info(&v, &held);
+        let (report, _errors, has_error) = format_info(&v, &held, false);
         assert!(!has_error, "404 must not flag has_error");
         assert!(report.contains("\tID 99, <deleted/unknown asset>\n"));
     }
@@ -1460,7 +1537,7 @@ mod tests {
         });
         let mut held = std::collections::HashMap::new();
         held.insert(99u64, AssetFetch::Error);
-        let (report, errors, has_error) = format_info(&v, &held);
+        let (report, errors, has_error) = format_info(&v, &held, false);
         assert!(has_error, "non-404 fetch error must set has_error");
         assert!(report.contains("\tID 99, error\n"));
         assert!(errors.contains("Error: Unable to retrieve asset information for asset 99"));
@@ -1473,7 +1550,7 @@ mod tests {
             "creator": "CREATOR", "name": "ACME", "unit-name": "AC",
             "total": 1000, "decimals": 2, "url": "https://acme",
         });
-        let s = format_assetdetails("ADDR", 99, &[(holding, Some(params))]);
+        let s = format_assetdetails("ADDR", 99, None, &[(holding, Some(params))]);
         // Pin every header + value Go emits, in order.
         let expected = "\
 Account: ADDR
@@ -1496,7 +1573,7 @@ Assets:
     #[test]
     fn format_assetdetails_without_params_uses_unformatted_amount() {
         let holding = serde_json::json!({"asset-id": 5, "amount": 17, "is-frozen": true});
-        let s = format_assetdetails("ADDR", 1, &[(holding, None)]);
+        let s = format_assetdetails("ADDR", 1, None, &[(holding, None)]);
         assert!(
             s.contains("    Amount (without formatting): 17\n"),
             "no-params branch must render `Amount (without formatting):`; got {s}",
