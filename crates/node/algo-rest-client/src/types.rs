@@ -125,6 +125,129 @@ pub struct AccountInfo {
     pub total_created_apps: u64,
 }
 
+/// Serde adapter for `Vec<u8>` ↔ base64-string-on-the-wire. Algorand's
+/// REST surface base64-encodes every `[]byte` field per Go's stdlib
+/// `encoding/json` default; we mirror that for the participation
+/// types.
+mod base64_vec {
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(v))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+mod base64_vec_opt {
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(bytes) => {
+                s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+            }
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let opt: Option<String> = Option::deserialize(d)?;
+        opt.map(|s| {
+            base64::engine::general_purpose::STANDARD
+                .decode(s.as_bytes())
+                .map_err(serde::de::Error::custom)
+        })
+        .transpose()
+    }
+}
+
+/// `AccountParticipation` — the participation parameters Go's REST
+/// surface exposes on a participation key.
+/// Mirrors `../go-algorand/daemon/algod/api/server/v2/generated/model/types.go::AccountParticipation`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountParticipation {
+    /// `[sel]` selection public key (32 bytes).
+    #[serde(rename = "selection-participation-key", with = "base64_vec")]
+    pub selection_participation_key: Vec<u8>,
+    /// `[stprf]` root of the state proof key (optional, ~64-byte commitment).
+    #[serde(
+        rename = "state-proof-key",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "base64_vec_opt"
+    )]
+    pub state_proof_key: Option<Vec<u8>>,
+    /// `[voteFst]` first round for which this participation is valid.
+    #[serde(rename = "vote-first-valid")]
+    pub vote_first_valid: u64,
+    /// `[voteKD]` number of subkeys in each batch of participation keys.
+    #[serde(rename = "vote-key-dilution")]
+    pub vote_key_dilution: u64,
+    /// `[voteLst]` last round for which this participation is valid.
+    #[serde(rename = "vote-last-valid")]
+    pub vote_last_valid: u64,
+    /// `[vote]` root participation public key (32 bytes).
+    #[serde(rename = "vote-participation-key", with = "base64_vec")]
+    pub vote_participation_key: Vec<u8>,
+}
+
+/// `ParticipationKey` — the wrapper Algod returns from
+/// `GET /v2/participation` and `GET /v2/participation/{id}`. Mirrors
+/// Go's `model.ParticipationKey`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipationKey {
+    /// The key's ParticipationID (base32 string).
+    pub id: String,
+    /// Address the key was generated for.
+    pub address: String,
+    /// When registered, first round usable.
+    #[serde(
+        rename = "effective-first-valid",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub effective_first_valid: Option<u64>,
+    /// When registered, last round usable.
+    #[serde(
+        rename = "effective-last-valid",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub effective_last_valid: Option<u64>,
+    /// Round when this key was last used to propose a block.
+    #[serde(
+        rename = "last-block-proposal",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_block_proposal: Option<u64>,
+    /// Round when this key was last used to generate a state proof.
+    #[serde(
+        rename = "last-state-proof",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_state_proof: Option<u64>,
+    /// Round when this key was last used to vote.
+    #[serde(rename = "last-vote", default, skip_serializing_if = "Option::is_none")]
+    pub last_vote: Option<u64>,
+    /// Participation parameters.
+    pub key: AccountParticipation,
+}
+
+/// Response shape from `POST /v2/participation` (algod returns the
+/// just-installed key's ParticipationID).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipationKeyAdded {
+    /// The newly-installed key's ParticipationID.
+    #[serde(rename = "partId")]
+    pub part_id: String,
+}
+
 /// A transaction identifier — the base32-encoded SHA-512/256 of the canonical
 /// msgpack encoding of the `Transaction` struct. Algod returns this from
 /// `POST /v2/transactions` and accepts it in `GET /v2/transactions/pending/{txid}`.
