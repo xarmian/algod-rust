@@ -32,9 +32,9 @@ pub enum AccountCmd {
     /// Dump the balance record for the specified account.
     Dump(DumpArgs),
     /// Export an account key for use with account import.
-    Export,
+    Export(ExportArgs),
     /// Import an account key from mnemonic.
-    Import,
+    Import(ImportArgs),
     /// Import .rootkey files from the data directory into a kmd wallet.
     #[command(name = "importrootkey")]
     Importrootkey,
@@ -181,6 +181,53 @@ pub struct AssetdetailsArgs {
     pub next: Option<String>,
 }
 
+/// `account import [name]` — read mnemonic on stdin (or supply via
+/// `--mnemonic`), import into the named wallet's kmd. Mirrors Go's
+/// `importCmd` (account.go:1281-1338).
+#[derive(Args, Debug)]
+pub struct ImportArgs {
+    /// Friendly account name. Optional positional (Go uses
+    /// `cobra.RangeArgs(0, 1)`; auto-generates via accountList
+    /// `getUnnamed()` when omitted).
+    pub name: Option<String>,
+
+    /// Wallet to import into. Mirrors Go's persistent `-w` flag.
+    #[arg(short = 'w', long = "wallet")]
+    pub wallet: Option<String>,
+
+    /// Wallet password (skip the prompt). Non-TTY stdin reads one
+    /// line after the mnemonic.
+    #[arg(long = "password")]
+    pub password: Option<String>,
+
+    /// 25-word mnemonic instead of reading from stdin. Mirrors Go's
+    /// `--mnemonic` flag.
+    #[arg(long = "mnemonic")]
+    pub mnemonic: Option<String>,
+
+    /// Mark the imported account as default in accountList.json.
+    /// Mirrors Go's `-f, --default` flag (account.go:118 — `importDefault`).
+    #[arg(short = 'f', long = "default")]
+    pub set_default: bool,
+}
+
+/// `account export -a <addr>` — export the account key as a 25-word
+/// mnemonic. Mirrors Go's `exportCmd` (account.go:1339-1371).
+#[derive(Args, Debug)]
+pub struct ExportArgs {
+    /// Address to export. Mirrors Go's `-a, --address` flag.
+    #[arg(short = 'a', long = "address")]
+    pub address: String,
+
+    /// Wallet holding the key.
+    #[arg(short = 'w', long = "wallet")]
+    pub wallet: Option<String>,
+
+    /// Wallet password (skip the prompt).
+    #[arg(long = "password")]
+    pub password: Option<String>,
+}
+
 /// `account dump -a <address>` — pretty-print the REST
 /// `/v2/accounts/{addr}` response.
 ///
@@ -261,8 +308,20 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
         AccountCmd::Dump(args) => {
             return crate::cmd::account::run_dump(args, crate::cli_state::datadirs());
         }
-        AccountCmd::Export => "export",
-        AccountCmd::Import => "import",
+        AccountCmd::Export(args) => {
+            return crate::cmd::account::run_export(
+                args,
+                crate::cli_state::datadirs(),
+                crate::cli_state::kmddir(),
+            );
+        }
+        AccountCmd::Import(args) => {
+            return crate::cmd::account::run_import(
+                args,
+                crate::cli_state::datadirs(),
+                crate::cli_state::kmddir(),
+            );
+        }
         AccountCmd::Importrootkey => "importrootkey",
         AccountCmd::Info(args) => {
             return crate::cmd::account::run_info(args, crate::cli_state::datadirs());

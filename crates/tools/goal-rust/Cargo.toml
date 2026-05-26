@@ -17,6 +17,7 @@ algo-kmd-client = { workspace = true }
 algo-kmd-api-types = { workspace = true }
 algo-consensus-crypto = { workspace = true }
 algo-types = { workspace = true }
+ed25519-dalek = { workspace = true }
 algo-error = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
