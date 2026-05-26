@@ -1067,9 +1067,7 @@ pub fn run_installpartkey(args: InstallpartkeyArgs, cli_d: Vec<PathBuf>) -> Exit
                 Err(e) => return Err(e.to_string()),
             }
             if std::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "key install acknowledged but not visible after 60s"
-                ));
+                return Err("key install acknowledged but not visible after 60s".to_string());
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
