@@ -18,9 +18,9 @@ pub enum AccountCmd {
     /// Retrieve information about the assets belonging to the specified
     /// account inclusive of asset metadata.
     #[command(name = "assetdetails")]
-    Assetdetails,
+    Assetdetails(AssetdetailsArgs),
     /// Retrieve the balances for the specified account.
-    Balance,
+    Balance(AddressArgs),
     /// Change online status for the specified account.
     #[command(name = "changeonlinestatus")]
     Changeonlinestatus,
@@ -40,7 +40,7 @@ pub enum AccountCmd {
     Importrootkey,
     /// Retrieve information about the assets and applications belonging
     /// to the specified account.
-    Info,
+    Info(InfoArgs),
     /// Install a participation key.
     #[command(name = "installpartkey")]
     Installpartkey,
@@ -72,7 +72,7 @@ pub enum AccountCmd {
     #[command(name = "renewpartkey")]
     Renewpartkey,
     /// Retrieve the rewards for the specified account.
-    Rewards,
+    Rewards(AddressArgs),
 }
 
 // ------- TASK-235 (B3) args -------
@@ -134,6 +134,51 @@ pub struct RenameArgs {
     pub old_name: String,
     /// New account name. Go's second positional.
     pub new_name: String,
+}
+
+/// Shared `-a <address>` flag for the read-path leaves
+/// `balance` / `rewards`. `info` and `assetdetails` carry richer args
+/// (see [`InfoArgs`], [`AssetdetailsArgs`]). Mirrors Go's account-group
+/// persistent `-a, --address` flag (`account.go:121`).
+#[derive(Args, Debug)]
+pub struct AddressArgs {
+    /// Algorand address to operate on. Mirrors Go's `-a, --address` flag.
+    #[arg(short = 'a', long = "address")]
+    pub address: String,
+}
+
+/// `account info -a <addr> [--onlyShowAssetIDs]`. Adds Go's
+/// `--onlyShowAssetIDs` flag (account.go:108) to suppress per-asset
+/// metadata fetch on the Held Assets section.
+#[derive(Args, Debug)]
+pub struct InfoArgs {
+    /// Algorand address to operate on.
+    #[arg(short = 'a', long = "address")]
+    pub address: String,
+    /// Skip the per-asset metadata fetch on Held Assets; each held
+    /// asset row becomes `\tID N\n`. Mirrors Go's identically-named
+    /// flag — useful against algods that throttle or when the caller
+    /// just wants the asset-id catalog.
+    #[arg(long = "onlyShowAssetIDs", alias = "only-show-asset-ids")]
+    pub only_show_asset_ids: bool,
+}
+
+/// `account assetdetails -a <addr> [-l <n>] [-n <token>]`. Mirrors
+/// Go's `--limit/-l` + `--next/-n` flags (account.go:117) and routes
+/// through the paginated `/v2/accounts/{addr}/assets` endpoint.
+#[derive(Args, Debug)]
+pub struct AssetdetailsArgs {
+    /// Algorand address to operate on.
+    #[arg(short = 'a', long = "address")]
+    pub address: String,
+    /// Cap the number of asset entries returned. Mirrors Go's
+    /// `-l, --limit` (unset ⇒ algod's default).
+    #[arg(short = 'l', long = "limit")]
+    pub limit: Option<u64>,
+    /// Opaque continuation token from a previous response's
+    /// `NextToken`. Mirrors Go's `-n, --next`.
+    #[arg(short = 'n', long = "next")]
+    pub next: Option<String>,
 }
 
 /// `account dump -a <address>` — pretty-print the REST
@@ -198,8 +243,12 @@ pub enum MultisigCmd {
 pub fn run(cmd: AccountCmd) -> ExitCode {
     let leaf: &str = match cmd {
         AccountCmd::Addpartkey => "addpartkey",
-        AccountCmd::Assetdetails => "assetdetails",
-        AccountCmd::Balance => "balance",
+        AccountCmd::Assetdetails(args) => {
+            return crate::cmd::account::run_assetdetails(args, crate::cli_state::datadirs());
+        }
+        AccountCmd::Balance(args) => {
+            return crate::cmd::account::run_balance(args, crate::cli_state::datadirs());
+        }
         AccountCmd::Changeonlinestatus => "changeonlinestatus",
         AccountCmd::Delete(args) => {
             return crate::cmd::account::run_delete(
@@ -215,7 +264,9 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
         AccountCmd::Export => "export",
         AccountCmd::Import => "import",
         AccountCmd::Importrootkey => "importrootkey",
-        AccountCmd::Info => "info",
+        AccountCmd::Info(args) => {
+            return crate::cmd::account::run_info(args, crate::cli_state::datadirs());
+        }
         AccountCmd::Installpartkey => "installpartkey",
         AccountCmd::List(args) => {
             return crate::cmd::account::run_list(
@@ -250,7 +301,9 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
         }
         AccountCmd::Renewallpartkeys => "renewallpartkeys",
         AccountCmd::Renewpartkey => "renewpartkey",
-        AccountCmd::Rewards => "rewards",
+        AccountCmd::Rewards(args) => {
+            return crate::cmd::account::run_rewards(args, crate::cli_state::datadirs());
+        }
     };
     unimplemented("account", leaf)
 }
