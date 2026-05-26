@@ -355,15 +355,20 @@ impl AlgodClient {
 
 impl AlgodClient {
     /// `GET /v2/participation` — list every participation key the node
-    /// knows about.
+    /// knows about. Go's `convertParticipationRecord` loop appends to
+    /// a nil slice, so an empty list serializes as JSON `null` rather
+    /// than `[]` (handlers.go:252-258 + our own server mirrors at
+    /// algo-rest-api/handlers.rs:3296). Deserialize as
+    /// `Option<Vec<…>>` and default `None` to an empty vec so a fresh
+    /// node doesn't surface as a parse error.
     pub async fn list_participation_keys(&self) -> Result<Vec<ParticipationKey>> {
         let resp = self.get_with_retry("/v2/participation", &self.http).await?;
-        resp.json::<Vec<ParticipationKey>>()
-            .await
-            .map_err(|e| AlgoError::RestClient {
+        let parsed: Option<Vec<ParticipationKey>> =
+            resp.json().await.map_err(|e| AlgoError::RestClient {
                 source: Box::new(e),
                 context: "parsing GET /v2/participation response".into(),
-            })
+            })?;
+        Ok(parsed.unwrap_or_default())
     }
 
     /// `GET /v2/participation/{id}` — fetch one participation key by

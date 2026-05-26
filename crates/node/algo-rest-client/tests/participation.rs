@@ -73,6 +73,23 @@ async fn list_participation_keys_returns_all() {
 }
 
 #[tokio::test]
+async fn list_participation_keys_handles_null_response_as_empty() {
+    // Go's GetParticipationKeys appends to a nil slice, which
+    // serializes as JSON `null` when no keys are installed. Codex
+    // round-1: the prior Vec<ParticipationKey> deserializer failed
+    // on that wire shape.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/participation"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("null"))
+        .mount(&server)
+        .await;
+    let client = client_for(&server);
+    let keys = client.list_participation_keys().await.expect("list");
+    assert!(keys.is_empty(), "JSON null must deserialize as empty vec");
+}
+
+#[tokio::test]
 async fn get_participation_key_returns_one() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
