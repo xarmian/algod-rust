@@ -37,7 +37,7 @@ pub enum AccountCmd {
     Import(ImportArgs),
     /// Import .rootkey files from the data directory into a kmd wallet.
     #[command(name = "importrootkey")]
-    Importrootkey,
+    Importrootkey(ImportRootKeyArgs),
     /// Retrieve information about the assets and applications belonging
     /// to the specified account.
     Info(InfoArgs),
@@ -181,6 +181,28 @@ pub struct AssetdetailsArgs {
     pub next: Option<String>,
 }
 
+/// `account importrootkey [-u/--unencrypted] [-w <wallet>]` — discover
+/// every `<data_dir>/<gid>/*.rootkey` SQLite file and import each into
+/// the named wallet's kmd. Mirrors `importRootKeysCmd`
+/// (account.go:1372-1463).
+#[derive(Args, Debug)]
+pub struct ImportRootKeyArgs {
+    /// Use the kmd unencrypted wallet (no password prompt). Mirrors
+    /// Go's `-u, --unencrypted` flag (account.go:1376
+    /// `unencryptedWallet`).
+    #[arg(short = 'u', long = "unencrypted")]
+    pub unencrypted: bool,
+
+    /// Wallet to import into. Mirrors Go's persistent `-w` flag.
+    #[arg(short = 'w', long = "wallet")]
+    pub wallet: Option<String>,
+
+    /// Wallet password (skip the prompt). Non-TTY stdin reads one
+    /// line.
+    #[arg(long = "password")]
+    pub password: Option<String>,
+}
+
 /// `account import [name]` — read mnemonic on stdin (or supply via
 /// `--mnemonic`), import into the named wallet's kmd. Mirrors Go's
 /// `importCmd` (account.go:1281-1338).
@@ -322,7 +344,13 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
                 crate::cli_state::kmddir(),
             );
         }
-        AccountCmd::Importrootkey => "importrootkey",
+        AccountCmd::Importrootkey(args) => {
+            return crate::cmd::account::run_importrootkey(
+                args,
+                crate::cli_state::datadirs(),
+                crate::cli_state::kmddir(),
+            );
+        }
         AccountCmd::Info(args) => {
             return crate::cmd::account::run_info(args, crate::cli_state::datadirs());
         }
