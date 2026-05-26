@@ -24,7 +24,7 @@ use crate::accounts_list::AccountsList;
 use crate::data_dir;
 use crate::groups::account::{
     AddressArgs, AssetdetailsArgs, DeleteArgs, DumpArgs, ExportArgs, ImportArgs, ImportRootKeyArgs,
-    InfoArgs, ListArgs, NewArgs, RenameArgs,
+    InfoArgs, ListArgs, MsigDeleteArgs, MsigInfoArgs, MsigNewArgs, NewArgs, RenameArgs,
 };
 
 /// Mirrors `messages.go:32` (`infoRenamedAccount`).
@@ -956,6 +956,213 @@ fn expand_seed_to_sk(seed: &[u8; 32]) -> [u8; 64] {
     sk[..32].copy_from_slice(seed);
     sk[32..].copy_from_slice(&pubkey);
     sk
+}
+
+// ---- account multisig new/delete/info (TASK-240 / B8) ---------------------
+
+/// `account multisig new -T <threshold> <addr1> <addr2> ...`. Mirrors
+/// `newMultisigCmd` (account.go:400-441).
+pub fn run_multisig_new(
+    args: MsigNewArgs,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    if args.addresses.is_empty() {
+        eprintln!("error: need at least one component address");
+        return ExitCode::from(1);
+    }
+    if args.threshold == 0 {
+        eprintln!("Threshold must be greater than zero.");
+        return ExitCode::from(1);
+    }
+    if (args.threshold as usize) > args.addresses.len() {
+        // Mirror Go's pre-kmd validation rejecting impossible thresholds.
+        // Go's CreateMultisigAccount surfaces this via kmd; we add a
+        // local guard so the error doesn't require a round-trip.
+        eprintln!(
+            "Threshold ({}) cannot exceed the number of component addresses ({}).",
+            args.threshold,
+            args.addresses.len()
+        );
+        return ExitCode::from(1);
+    }
+
+    // Parse each address to its 32-byte pubkey before any kmd call.
+    let mut pks: Vec<[u8; 32]> = Vec::with_capacity(args.addresses.len());
+    for addr in &args.addresses {
+        match algo_types::Address::from_algorand_string(addr) {
+            Ok(a) => pks.push(a.0),
+            Err(e) => {
+                eprintln!("Could not parse address '{addr}': {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    // Duplicate-PK warning (Go's warnMultisigDuplicatesDetected at
+    // account.go:425-432).
+    let mut seen: std::collections::HashMap<&String, usize> = std::collections::HashMap::new();
+    for a in &args.addresses {
+        *seen.entry(a).or_insert(0) += 1;
+    }
+    if seen.values().any(|c| *c > 1) {
+        eprintln!("Warning: multisig has duplicate component addresses.");
+    }
+
+    let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+    let mut accounts = AccountsList::load(&data_dir_path);
+    let (handle, _wallet_name, _pw) = match resolve_wallet_and_init(
+        &rt,
+        &client,
+        &mut accounts,
+        args.wallet.as_deref(),
+        args.password.as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(()) => return ExitCode::from(1),
+    };
+
+    // Multisig version is fixed at 1 (Algorand's only ratified
+    // version — protocol/multisig.go).
+    let msig_addr = match rt.block_on(client.import_multisig(&handle, 1, args.threshold, pks)) {
+        Ok(r) => r.address,
+        Err(e) => {
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
+            return ExitCode::from(1);
+        }
+    };
+
+    // Persist friendly name from accountList's next_unnamed (Go does
+    // the same at account.go:436).
+    let name = accounts.next_unnamed();
+    if let Err(e) = accounts.add_account(&name, &msig_addr) {
+        eprintln!("{e}");
+    }
+
+    // Go uses infoCreatedNewAccount (`Created new account with
+    // address %s`) — the same template used by `account new`.
+    println!(
+        "{}",
+        format_message(INFO_CREATED_NEW_ACCOUNT, &[&msig_addr])
+    );
+    ExitCode::SUCCESS
+}
+
+/// `account multisig delete -a <addr>`. Mirrors `deleteMultisigCmd`
+/// (account.go:443-462).
+pub fn run_multisig_delete(
+    args: MsigDeleteArgs,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+    let mut accounts = AccountsList::load(&data_dir_path);
+    let (handle, _wallet_name, password) = match resolve_wallet_and_init(
+        &rt,
+        &client,
+        &mut accounts,
+        args.wallet.as_deref(),
+        args.password.as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(()) => return ExitCode::from(1),
+    };
+    if let Err(e) = rt.block_on(client.delete_multisig(&handle, &password, &args.address)) {
+        eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
+        return ExitCode::from(1);
+    }
+    if let Err(e) = accounts.remove_account(&args.address) {
+        eprintln!("{e}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// `account multisig info -a <addr>`. Mirrors `infoMultisigCmd`
+/// (account.go:464-487).
+pub fn run_multisig_info(
+    args: MsigInfoArgs,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+    let mut accounts = AccountsList::load(&data_dir_path);
+    // Go's infoMultisigCmd uses ensureWalletHandle (no password
+    // needed — multisig export is structural metadata). Pass "" as
+    // a sentinel so resolve_wallet_and_init doesn't prompt. The
+    // unencrypted-default-wallet would accept this; encrypted
+    // wallets surface a kmd error verbatim.
+    let pw_override = args.password.as_deref().or(Some(""));
+    let (handle, _wallet_name, _pw) = match resolve_wallet_and_init(
+        &rt,
+        &client,
+        &mut accounts,
+        args.wallet.as_deref(),
+        pw_override,
+    ) {
+        Ok(v) => v,
+        Err(()) => return ExitCode::from(1),
+    };
+
+    let exp = match rt.block_on(client.export_multisig(&handle, &args.address)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
+            return ExitCode::from(1);
+        }
+    };
+
+    println!("Version: {}", exp.version);
+    println!("Threshold: {}", exp.threshold);
+    println!("Public keys:");
+    for pk in &exp.pks {
+        // Render each pubkey as a base32-checksummed address — Go
+        // returns these in PKs as already-formatted strings; we
+        // format them ourselves from the raw [u8; 32].
+        println!("  {}", algo_types::Address(*pk).to_algorand_string());
+    }
+    ExitCode::SUCCESS
 }
 
 // ---- account importrootkey (TASK-239 / B7) --------------------------------
