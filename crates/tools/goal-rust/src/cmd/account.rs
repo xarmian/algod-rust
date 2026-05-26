@@ -1049,10 +1049,15 @@ pub fn run_importrootkey(
                     // Go warns + continues for duplicates
                     // (account.go:1442-1444).
                     eprintln!("Warning: {msg}\n > Key File: {filename}");
-                } else {
-                    eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&msg]));
+                    continue;
                 }
-                continue;
+                // Go's reportErrorf hard-exits on every non-duplicate
+                // import failure (account.go:1445-1447) — anything
+                // else is a real wallet/session/server error and
+                // letting the loop silently roll past would mask
+                // failures. Codex round-2 finding.
+                eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&msg]));
+                return ExitCode::from(1);
             }
         };
         imported += 1;
