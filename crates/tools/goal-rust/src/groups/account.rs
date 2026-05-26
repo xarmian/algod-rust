@@ -45,7 +45,7 @@ pub enum AccountCmd {
     #[command(name = "installpartkey")]
     Installpartkey,
     /// Show the list of Algorand accounts on this machine.
-    List,
+    List(ListArgs),
     /// List participation keys summary.
     #[command(name = "listpartkeys")]
     Listpartkeys,
@@ -146,6 +146,30 @@ pub struct RenameArgs {
 /// REST response (`/v2/accounts/{addr}`) and pretty-print it instead —
 /// more useful for operators piping into `jq`, less Go-byte-exact.
 /// Porting the BalanceRecord JSON encoder is out of scope for B3.
+/// `account list [-w <wallet>]` — TASK-236 / B4. Lists every address
+/// kmd knows about with status flag, balance, friendly name, and the
+/// `*` default-account marker.
+///
+/// **Divergence from Go**: Go's `listCmd` (`account.go:488-543`) takes
+/// `ensureWalletHandle(dataDir, walletName)` and lists only one
+/// wallet's addresses. The task body + plan prescribe multi-wallet
+/// aggregation across every wallet kmd knows about, since the
+/// AccountsList we ship in TASK-234 tracks wallet-level defaults. We
+/// follow the plan; `-w` still narrows to a single wallet for parity
+/// with Go's actual filter semantics.
+#[derive(Args, Debug)]
+pub struct ListArgs {
+    /// Restrict to a single wallet by name. When omitted, list every
+    /// address across every wallet kmd knows about.
+    #[arg(short = 'w', long = "wallet")]
+    pub wallet: Option<String>,
+
+    /// Wallet password for the open-handle step. Required for each
+    /// wallet's `init_wallet` call; non-TTY stdin reads one line.
+    #[arg(long = "password")]
+    pub password: Option<String>,
+}
+
 #[derive(Args, Debug)]
 pub struct DumpArgs {
     /// Address to dump. Mirrors Go's `-a, --address` flag.
@@ -193,7 +217,13 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
         AccountCmd::Importrootkey => "importrootkey",
         AccountCmd::Info => "info",
         AccountCmd::Installpartkey => "installpartkey",
-        AccountCmd::List => "list",
+        AccountCmd::List(args) => {
+            return crate::cmd::account::run_list(
+                args,
+                crate::cli_state::datadirs(),
+                crate::cli_state::kmddir(),
+            );
+        }
         AccountCmd::Listpartkeys => "listpartkeys",
         AccountCmd::Marknonparticipating => "marknonparticipating",
         AccountCmd::Multisig { cmd } => {
