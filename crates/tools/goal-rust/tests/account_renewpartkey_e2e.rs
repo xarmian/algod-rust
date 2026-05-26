@@ -162,6 +162,11 @@ fn renewpartkey_invokes_generate_with_current_round_as_first() {
         ("GET".to_string(), "/v2/status".to_string()),
         status_response(1000),
     );
+    // Empty partkey list — preflight succeeds without finding a duplicate.
+    initial.table.insert(
+        ("GET".to_string(), "/v2/participation".to_string()),
+        serde_json::json!([]),
+    );
     let (state, stop, jh, port) = spawn_mock_algod(initial);
     wire_algod(&dd, port);
 
@@ -212,6 +217,10 @@ fn renewpartkey_round_last_must_exceed_current_plus_maxtxnlife() {
     initial.table.insert(
         ("GET".to_string(), "/v2/status".to_string()),
         status_response(5000),
+    );
+    initial.table.insert(
+        ("GET".to_string(), "/v2/participation".to_string()),
+        serde_json::json!([]),
     );
     let (_state, stop, jh, port) = spawn_mock_algod(initial);
     wire_algod(&dd, port);
@@ -286,6 +295,52 @@ fn renewpartkey_skips_when_existing_key_already_covers_round() {
     assert!(
         stderr.contains("already valid through round"),
         "stderr must explain duplicate-cover rejection; got {stderr:?}",
+    );
+}
+
+#[test]
+fn renewpartkey_aborts_when_preflight_list_fails() {
+    // Codex round-2: silent fall-through on list failure would
+    // re-introduce the duplicate-install path.
+    let (_t, dd) = mk_data_dir();
+    let addr = algo_types::Address([0xAA; 32]).to_algorand_string();
+    let mut initial = MockState::default();
+    initial.table.insert(
+        ("GET".to_string(), "/v2/status".to_string()),
+        status_response(1000),
+    );
+    // Deliberately return non-JSON garbage so the deserialization
+    // fails. The mock's default 200 OK with `{}` payload for unknown
+    // GETs would otherwise pass; so insert garbage explicitly. We
+    // can't easily return a non-2xx here without extending the mock,
+    // so use a malformed JSON shape (a number) that will fail to
+    // deserialize as Option<Vec<ParticipationKey>>.
+    initial.table.insert(
+        ("GET".to_string(), "/v2/participation".to_string()),
+        serde_json::json!(42),
+    );
+    let (_state, stop, jh, port) = spawn_mock_algod(initial);
+    wire_algod(&dd, port);
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(&dd)
+        .args([
+            "account",
+            "renewpartkey",
+            "-a",
+            &addr,
+            "--roundLastValid",
+            "5000",
+        ])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("renewpartkey");
+    stop.store(true, Ordering::Relaxed);
+    let _ = jh.join();
+    assert!(
+        !out.status.success(),
+        "list_participation_keys failure must be fatal",
     );
 }
 

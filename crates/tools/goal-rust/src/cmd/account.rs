@@ -1325,19 +1325,25 @@ pub fn run_renewpartkey(args: RenewpartkeyArgs, cli_d: Vec<PathBuf>) -> ExitCode
     };
     // Preflight: list existing partkeys; reject if a key for this
     // address already covers roundLastValid. Mirrors Go's
-    // errExistingPartKey at account.go:1080-1088. Codex round-1.
-    let rt_ref = &rt;
-    let preflight = rt_ref.block_on(client.list_participation_keys());
-    if let Ok(parts) = preflight {
-        if parts
-            .iter()
-            .any(|p| p.address == args.address && p.key.vote_last_valid >= args.round_last_valid)
-        {
-            eprintln!(
-                "An existing partkey for {} is already valid through round >= {}; \
-                 renewing would install an older duplicate.",
-                args.address, args.round_last_valid,
-            );
+    // errExistingPartKey at account.go:1080-1088. A list failure is
+    // fatal — silently proceeding would re-introduce the
+    // duplicate-install path (Codex round-2 finding).
+    let preflight = rt.block_on(client.list_participation_keys());
+    match preflight {
+        Ok(parts) => {
+            if parts.iter().any(|p| {
+                p.address == args.address && p.key.vote_last_valid >= args.round_last_valid
+            }) {
+                eprintln!(
+                    "An existing partkey for {} is already valid through round >= {}; \
+                     renewing would install an older duplicate.",
+                    args.address, args.round_last_valid,
+                );
+                return ExitCode::from(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
             return ExitCode::from(1);
         }
     }
