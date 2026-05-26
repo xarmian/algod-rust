@@ -970,9 +970,12 @@ pub fn run_addpartkey(args: AddpartkeyArgs, cli_d: Vec<PathBuf>) -> ExitCode {
         eprintln!("Could not parse address: {e}");
         return ExitCode::from(1);
     }
-    if args.round_last_valid <= args.round_first_valid {
+    // Inclusive range — `algokey-rust part generate` accepts
+    // last==first (a one-round participation key) and only rejects
+    // last < first. Codex round-1 finding.
+    if args.round_last_valid < args.round_first_valid {
         eprintln!(
-            "--roundLastValid ({}) must be greater than --roundFirstValid ({})",
+            "--roundLastValid ({}) must be >= --roundFirstValid ({})",
             args.round_last_valid, args.round_first_valid
         );
         return ExitCode::from(1);
@@ -1125,69 +1128,85 @@ pub fn run_listpartkeys(cli_d: Vec<PathBuf>) -> ExitCode {
 /// `account partkeyinfo`. Mirrors `partkeyInfoCmd`
 /// (account.go:1464-1502).
 pub fn run_partkeyinfo(cli_d: Vec<PathBuf>) -> ExitCode {
-    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
+    // Go's partkeyInfoCmd uses datadir.OnDataDirs (account.go:1470)
+    // which iterates every -d data dir, printing a block per dir.
+    // Codex round-1 finding: the single-dir ensure_single_data_dir
+    // call rejected multi -d invocations.
+    let dirs = match data_dir::resolve_data_dirs(&cli_d) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(1);
         }
     };
-    let client = match build_algod_client_for_dir(&data_dir_path) {
-        Ok(c) => c,
-        Err(()) => return ExitCode::from(1),
-    };
     let rt = match build_runtime() {
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
-    let parts = match rt.block_on(client.list_participation_keys()) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
-            return ExitCode::from(1);
-        }
-    };
-    println!(
-        "Dumping participation key info from {}...",
-        data_dir_path.display()
-    );
     use base64::Engine;
-    for part in &parts {
-        println!();
-        println!("Participation ID:          {}", part.id);
-        println!("Parent address:            {}", part.address);
-        println!("Last vote round:           {}", round_or_na(part.last_vote));
+    let mut had_error = false;
+    for data_dir_path in &dirs {
         println!(
-            "Last block proposal round: {}",
-            round_or_na(part.last_block_proposal)
+            "Dumping participation key info from {}...",
+            data_dir_path.display()
         );
-        println!(
-            "Effective first round:     {}",
-            round_or_na(part.effective_first_valid)
-        );
-        println!(
-            "Effective last round:      {}",
-            round_or_na(part.effective_last_valid)
-        );
-        println!("First round:               {}", part.key.vote_first_valid);
-        println!("Last round:                {}", part.key.vote_last_valid);
-        println!("Key dilution:              {}", part.key.vote_key_dilution);
-        println!(
-            "Selection key:             {}",
-            base64::engine::general_purpose::STANDARD.encode(&part.key.selection_participation_key)
-        );
-        println!(
-            "Voting key:                {}",
-            base64::engine::general_purpose::STANDARD.encode(&part.key.vote_participation_key)
-        );
-        if let Some(spk) = &part.key.state_proof_key {
+        let client = match build_algod_client_for_dir(data_dir_path) {
+            Ok(c) => c,
+            Err(()) => {
+                had_error = true;
+                continue;
+            }
+        };
+        let parts = match rt.block_on(client.list_participation_keys()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
+                had_error = true;
+                continue;
+            }
+        };
+        for part in &parts {
+            println!();
+            println!("Participation ID:          {}", part.id);
+            println!("Parent address:            {}", part.address);
+            println!("Last vote round:           {}", round_or_na(part.last_vote));
             println!(
-                "State proof key:           {}",
-                base64::engine::general_purpose::STANDARD.encode(spk)
+                "Last block proposal round: {}",
+                round_or_na(part.last_block_proposal)
             );
+            println!(
+                "Effective first round:     {}",
+                round_or_na(part.effective_first_valid)
+            );
+            println!(
+                "Effective last round:      {}",
+                round_or_na(part.effective_last_valid)
+            );
+            println!("First round:               {}", part.key.vote_first_valid);
+            println!("Last round:                {}", part.key.vote_last_valid);
+            println!("Key dilution:              {}", part.key.vote_key_dilution);
+            println!(
+                "Selection key:             {}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(&part.key.selection_participation_key)
+            );
+            println!(
+                "Voting key:                {}",
+                base64::engine::general_purpose::STANDARD.encode(&part.key.vote_participation_key)
+            );
+            if let Some(spk) = &part.key.state_proof_key {
+                println!(
+                    "State proof key:           {}",
+                    base64::engine::general_purpose::STANDARD.encode(spk)
+                );
+            }
         }
     }
-    ExitCode::SUCCESS
+    if had_error {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// `account deletepartkey --partkeyid <id>`. Mirrors

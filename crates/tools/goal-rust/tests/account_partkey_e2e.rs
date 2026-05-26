@@ -380,6 +380,79 @@ fn partkeyinfo_renders_full_block_per_key() {
 }
 
 #[test]
+fn partkeyinfo_iterates_every_data_dir() {
+    // Codex round-1 finding: Go's partkeyInfoCmd uses OnDataDirs;
+    // single-dir ensure_single_data_dir was wrong.
+    let (_t1, dd1) = mk_data_dir();
+    let (_t2, dd2) = mk_data_dir();
+
+    let mut initial = MockState::default();
+    initial
+        .table
+        .insert("/v2/participation".to_string(), sample_partkey_list());
+    let (_state, stop, jh, port) = spawn_mock_algod(initial);
+    wire_algod(&dd1, port);
+    wire_algod(&dd2, port);
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .args(["-d"])
+        .arg(&dd1)
+        .args(["-d"])
+        .arg(&dd2)
+        .args(["account", "partkeyinfo"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("partkeyinfo");
+    stop.store(true, Ordering::Relaxed);
+    let _ = jh.join();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "multi-dir partkeyinfo: {stdout:?}");
+    let dd1_marker = format!("Dumping participation key info from {}", dd1.display());
+    let dd2_marker = format!("Dumping participation key info from {}", dd2.display());
+    assert!(
+        stdout.contains(&dd1_marker),
+        "stdout must include dd1 header; got {stdout:?}",
+    );
+    assert!(
+        stdout.contains(&dd2_marker),
+        "stdout must include dd2 header; got {stdout:?}",
+    );
+}
+
+#[test]
+fn addpartkey_accepts_one_round_range() {
+    // Codex round-1 finding: last==first must be allowed.
+    let (_t, dd) = mk_data_dir();
+    let addr = algo_types::Address([0x22; 32]).to_algorand_string();
+    let (_state, stop, jh, port) = spawn_mock_algod(MockState::default());
+    wire_algod(&dd, port);
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(&dd)
+        .args([
+            "account",
+            "addpartkey",
+            "-a",
+            &addr,
+            "--roundFirstValid",
+            "1000",
+            "--roundLastValid",
+            "1000",
+        ])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("addpartkey");
+    stop.store(true, Ordering::Relaxed);
+    let _ = jh.join();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "last==first must be accepted; stderr={stderr:?}",
+    );
+}
+
+#[test]
 fn deletepartkey_issues_delete_request() {
     let (_t, dd) = mk_data_dir();
     let (state, stop, jh, port) = spawn_mock_algod(MockState::default());
