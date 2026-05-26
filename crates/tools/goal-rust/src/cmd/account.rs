@@ -1004,22 +1004,20 @@ pub fn run_importrootkey(
     // (account.go:1422-1434); we factor it out — kmd's handle expiry
     // is per-session, so reusing within one importrootkey call is
     // safe and avoids N password prompts.
-    let (handle, _wallet_name, _pw) = if args.unencrypted {
-        // No password, but kmd-rust still expects init_wallet to be
-        // called. For unencrypted wallets the password is the empty
-        // string.
-        match resolve_wallet_and_init(
-            &rt,
-            &client,
-            &mut accounts,
-            args.wallet.as_deref(),
-            Some(""),
-        ) {
-            Ok(v) => v,
+    let handle = if args.unencrypted {
+        // Mirrors `client.GetUnencryptedWalletHandle()`
+        // (libgoal/unencryptedWallet.go:45-61): look up the wallet
+        // named `unencrypted-default-wallet`, create it with empty
+        // password if missing, then init a handle. Codex round-1
+        // P1: the prior implementation tried password "" on the
+        // resolved default wallet, which fails against encrypted
+        // wallets and can't recover when no wallets exist.
+        match resolve_unencrypted_wallet_handle(&rt, &client) {
+            Ok(h) => h,
             Err(()) => return ExitCode::from(1),
         }
     } else {
-        match resolve_wallet_and_init(
+        let (h, _wallet_name, _pw) = match resolve_wallet_and_init(
             &rt,
             &client,
             &mut accounts,
@@ -1028,7 +1026,8 @@ pub fn run_importrootkey(
         ) {
             Ok(v) => v,
             Err(()) => return ExitCode::from(1),
-        }
+        };
+        h
     };
 
     let mut imported = 0u64;
@@ -1064,6 +1063,52 @@ pub fn run_importrootkey(
     let plural = if imported == 1 { "" } else { "s" };
     println!("Imported {imported} key{plural}");
     ExitCode::SUCCESS
+}
+
+/// Mirrors Go's `client.GetUnencryptedWalletHandle()`
+/// (libgoal/unencryptedWallet.go:45-61): look up the kmd wallet
+/// named `unencrypted-default-wallet`, auto-create it with empty
+/// password if missing, then `init_wallet` (also with empty
+/// password) and return the handle.
+fn resolve_unencrypted_wallet_handle(
+    rt: &tokio::runtime::Runtime,
+    client: &KmdClient,
+) -> Result<String, ()> {
+    const UNENCRYPTED_WALLET_NAME: &str = "unencrypted-default-wallet";
+    let listed = rt.block_on(client.list_wallets()).map_err(|e| {
+        eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
+    })?;
+    let mut wallet_id: Option<String> = None;
+    let mut duplicates = 0usize;
+    for w in listed.wallets {
+        if w.name == UNENCRYPTED_WALLET_NAME {
+            duplicates += 1;
+            wallet_id.get_or_insert(w.id);
+        }
+    }
+    if duplicates > 1 {
+        eprintln!("multiple default unencrypted wallets exist");
+        return Err(());
+    }
+    let wallet_id = match wallet_id {
+        Some(id) => id,
+        None => {
+            // Create with empty password + zero MDK (mirrors Go's
+            // `kmd.CreateWallet(UnencryptedWalletName, "sqlite", nil, crypto.MasterDerivationKey{})`).
+            let created = rt
+                .block_on(client.create_wallet(UNENCRYPTED_WALLET_NAME, "sqlite", "", [0u8; 32]))
+                .map_err(|e| {
+                    eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
+                })?;
+            created.wallet.id
+        }
+    };
+    let init = rt
+        .block_on(client.init_wallet(&wallet_id, ""))
+        .map_err(|e| {
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
+        })?;
+    Ok(init.wallet_handle_token)
 }
 
 /// Mirrors Go's `IsRootKeyFilename` (config/keyfile.go:81): the file

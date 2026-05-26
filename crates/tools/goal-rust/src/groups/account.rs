@@ -187,10 +187,12 @@ pub struct AssetdetailsArgs {
 /// (account.go:1372-1463).
 #[derive(Args, Debug)]
 pub struct ImportRootKeyArgs {
-    /// Use the kmd unencrypted wallet (no password prompt). Mirrors
-    /// Go's `-u, --unencrypted` flag (account.go:1376
-    /// `unencryptedWallet`).
-    #[arg(short = 'u', long = "unencrypted")]
+    /// Use the kmd unencrypted-default-wallet (no password prompt;
+    /// auto-creates if missing). Mirrors Go's `-u, --unencrypted-wallet`
+    /// flag (account.go:193). Note this flag name differs from
+    /// `wallet new --unencrypted` (the wallet-create leaf uses just
+    /// `--unencrypted`).
+    #[arg(short = 'u', long = "unencrypted-wallet")]
     pub unencrypted: bool,
 
     /// Wallet to import into. Mirrors Go's persistent `-w` flag.

@@ -254,6 +254,35 @@ fn importrootkey_empty_directory_prints_imported_zero_keys() {
 }
 
 #[test]
+fn importrootkey_unencrypted_wallet_flag_auto_creates_default_wallet() {
+    // No `wallet new` pre-step — Go's GetUnencryptedWalletHandle must
+    // create `unencrypted-default-wallet` on demand
+    // (libgoal/unencryptedWallet.go:45-85).
+    let (_t, dd, kmd_dir, key_dir) = setup_data_dir();
+    let _g = spawn_kmd(&kmd_dir);
+    let pk = write_synthetic_rootkey(&key_dir, "uenc", 0x55);
+    let addr = pubkey_to_address(&pk);
+
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(&dd)
+        .args(["account", "importrootkey", "-u"])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("importrootkey -u");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "-u must auto-create unencrypted-default-wallet; stderr={stderr:?}, stdout={stdout:?}",
+    );
+    assert!(
+        stdout.contains(&format!("Imported {addr}")),
+        "stdout must report import; got {stdout:?}",
+    );
+}
+
+#[test]
 fn importrootkey_skips_corrupt_files_and_imports_the_rest() {
     let (_t, dd, kmd_dir, key_dir) = setup_data_dir();
     let _g = spawn_kmd(&kmd_dir);
