@@ -1128,18 +1128,20 @@ pub fn run_multisig_info(
         Err(()) => return ExitCode::from(1),
     };
     let mut accounts = AccountsList::load(&data_dir_path);
-    // Go's infoMultisigCmd uses ensureWalletHandle (no password
-    // needed — multisig export is structural metadata). Pass "" as
-    // a sentinel so resolve_wallet_and_init doesn't prompt. The
-    // unencrypted-default-wallet would accept this; encrypted
-    // wallets surface a kmd error verbatim.
-    let pw_override = args.password.as_deref().or(Some(""));
+    // Multisig info is structural metadata, but kmd still requires
+    // a wallet handle which requires a password for encrypted
+    // wallets. The earlier code forced empty password unconditionally,
+    // which failed encrypted wallets even when the operator passed
+    // --password explicitly. Go's libgoal uses a cached-handle path
+    // we don't have; mirror the other read-leaves and let
+    // resolve_wallet_and_init prompt on TTY when --password is
+    // omitted. Unencrypted wallets still work via `--password ''`.
     let (handle, _wallet_name, _pw) = match resolve_wallet_and_init(
         &rt,
         &client,
         &mut accounts,
         args.wallet.as_deref(),
-        pw_override,
+        args.password.as_deref(),
     ) {
         Ok(v) => v,
         Err(()) => return ExitCode::from(1),
