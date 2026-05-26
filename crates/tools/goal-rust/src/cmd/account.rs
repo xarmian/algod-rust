@@ -1323,6 +1323,24 @@ pub fn run_renewpartkey(args: RenewpartkeyArgs, cli_d: Vec<PathBuf>) -> ExitCode
         Ok(r) => r,
         Err(()) => return ExitCode::from(1),
     };
+    // Preflight: list existing partkeys; reject if a key for this
+    // address already covers roundLastValid. Mirrors Go's
+    // errExistingPartKey at account.go:1080-1088. Codex round-1.
+    let rt_ref = &rt;
+    let preflight = rt_ref.block_on(client.list_participation_keys());
+    if let Ok(parts) = preflight {
+        if parts
+            .iter()
+            .any(|p| p.address == args.address && p.key.vote_last_valid >= args.round_last_valid)
+        {
+            eprintln!(
+                "An existing partkey for {} is already valid through round >= {}; \
+                 renewing would install an older duplicate.",
+                args.address, args.round_last_valid,
+            );
+            return ExitCode::from(1);
+        }
+    }
     let renewed = rt.block_on(renew_one(
         &client,
         &args.address,
@@ -1433,9 +1451,19 @@ async fn renew_one(
         .await
         .map_err(|e| e.to_string())?;
     let first = status.last_round;
-    if round_last_valid <= first {
+    // Go's renew commands require `roundLastValid > currentRound +
+    // MaxTxnLife` (account.go:1074-1076 + 1180-1184) — the generated
+    // key must stay valid long enough for the keyreg-online
+    // transaction to land. We don't have the consensus-param table
+    // loaded, so use the typical default MaxTxnLife=1000. Operators
+    // who know their consensus version can bypass via a wider window.
+    // Codex round-1 finding.
+    const TYPICAL_MAX_TXN_LIFE: u64 = 1000;
+    let earliest_valid = first.saturating_add(TYPICAL_MAX_TXN_LIFE);
+    if round_last_valid <= earliest_valid {
         return Err(format!(
-            "--roundLastValid ({round_last_valid}) must be greater than current round ({first})"
+            "--roundLastValid ({round_last_valid}) must be greater than \
+             current round ({first}) + MaxTxnLife (~{TYPICAL_MAX_TXN_LIFE}) = {earliest_valid}"
         ));
     }
     println!("Renewing participation key for {address} (rounds {first}..{round_last_valid})");

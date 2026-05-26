@@ -204,13 +204,60 @@ fn renewpartkey_invokes_generate_with_current_round_as_first() {
 }
 
 #[test]
-fn renewpartkey_round_last_must_exceed_current() {
+fn renewpartkey_round_last_must_exceed_current_plus_maxtxnlife() {
+    // Codex round-1: Go requires roundLastValid > currentRound + MaxTxnLife.
     let (_t, dd) = mk_data_dir();
     let addr = algo_types::Address([0x66; 32]).to_algorand_string();
     let mut initial = MockState::default();
     initial.table.insert(
         ("GET".to_string(), "/v2/status".to_string()),
         status_response(5000),
+    );
+    let (_state, stop, jh, port) = spawn_mock_algod(initial);
+    wire_algod(&dd, port);
+
+    // Within 1000-round window of current → must fail
+    // (current + MaxTxnLife = 6000).
+    let out = Command::new(GOAL_RUST_BIN)
+        .arg("-d")
+        .arg(&dd)
+        .args([
+            "account",
+            "renewpartkey",
+            "-a",
+            &addr,
+            "--roundLastValid",
+            "5500",
+        ])
+        .env_remove("ALGORAND_DATA")
+        .output()
+        .expect("renewpartkey");
+    stop.store(true, Ordering::Relaxed);
+    let _ = jh.join();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "roundLastValid within MaxTxnLife must fail",
+    );
+    assert!(
+        stderr.contains("MaxTxnLife"),
+        "stderr must explain MaxTxnLife rule; got {stderr:?}",
+    );
+}
+
+#[test]
+fn renewpartkey_skips_when_existing_key_already_covers_round() {
+    // Codex round-1: preflight existing partkey vs roundLastValid.
+    let (_t, dd) = mk_data_dir();
+    let addr = algo_types::Address([0x99; 32]).to_algorand_string();
+    let mut initial = MockState::default();
+    initial.table.insert(
+        ("GET".to_string(), "/v2/status".to_string()),
+        status_response(1000),
+    );
+    initial.table.insert(
+        ("GET".to_string(), "/v2/participation".to_string()),
+        serde_json::json!([partkey_entry(&addr, "IDX", 9000)]),
     );
     let (_state, stop, jh, port) = spawn_mock_algod(initial);
     wire_algod(&dd, port);
@@ -224,7 +271,7 @@ fn renewpartkey_round_last_must_exceed_current() {
             "-a",
             &addr,
             "--roundLastValid",
-            "4000",
+            "5000",
         ])
         .env_remove("ALGORAND_DATA")
         .output()
@@ -232,10 +279,13 @@ fn renewpartkey_round_last_must_exceed_current() {
     stop.store(true, Ordering::Relaxed);
     let _ = jh.join();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "roundLastValid <= current must fail");
     assert!(
-        stderr.contains("must be greater than current round"),
-        "stderr must explain round comparison; got {stderr:?}",
+        !out.status.success(),
+        "preflight must reject duplicate-covered renewal",
+    );
+    assert!(
+        stderr.contains("already valid through round"),
+        "stderr must explain duplicate-cover rejection; got {stderr:?}",
     );
 }
 
