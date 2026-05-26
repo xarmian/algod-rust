@@ -23,8 +23,8 @@ use algo_kmd_client::{KmdClient, KmdError};
 use crate::accounts_list::AccountsList;
 use crate::data_dir;
 use crate::groups::account::{
-    AddressArgs, AssetdetailsArgs, DeleteArgs, DumpArgs, ExportArgs, ImportArgs, InfoArgs,
-    ListArgs, NewArgs, RenameArgs,
+    AddressArgs, AssetdetailsArgs, DeleteArgs, DumpArgs, ExportArgs, ImportArgs, ImportRootKeyArgs,
+    InfoArgs, ListArgs, NewArgs, RenameArgs,
 };
 
 /// Mirrors `messages.go:32` (`infoRenamedAccount`).
@@ -958,6 +958,254 @@ fn expand_seed_to_sk(seed: &[u8; 32]) -> [u8; 64] {
     sk
 }
 
+// ---- account importrootkey (TASK-239 / B7) --------------------------------
+
+/// `account importrootkey [-u] [-w <wallet>]` — iterate
+/// `<data_dir>/<gid>/*.rootkey` SQLite files, decode the
+/// msgpack-encoded SignatureSecrets, and import each into the named
+/// wallet's kmd. Mirrors `importRootKeysCmd` (account.go:1372-1463).
+pub fn run_importrootkey(
+    args: ImportRootKeyArgs,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let client = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+    let mut accounts = AccountsList::load(&data_dir_path);
+
+    // Go's `client.GenesisID()` returns the genesis id from algod's
+    // GenesisJSON; we read it directly from disk via the data_dir
+    // helper. Failure → exit silently (matches Go's `return` at
+    // account.go:1386).
+    let genesis_id = match data_dir::read_genesis_id(&data_dir_path) {
+        Ok(g) => g,
+        Err(_) => return ExitCode::SUCCESS,
+    };
+    let key_dir = data_dir_path.join(&genesis_id);
+    let entries = match std::fs::read_dir(&key_dir) {
+        Ok(e) => e,
+        Err(_) => return ExitCode::SUCCESS,
+    };
+
+    // Wallet-handle resolution is deferred until we've actually
+    // opened + restored a `.rootkey` (Go opens a fresh handle inside
+    // the per-file loop AFTER the restore succeeds — account.go:1422).
+    // That means an empty or all-corrupt key dir must NOT prompt for a
+    // password, NOT auto-create unencrypted-default-wallet, and must
+    // just print `Imported 0 keys`. We cache the handle after the
+    // first successful restore so subsequent imports reuse it (avoids
+    // N password prompts within one call). Codex round-3 finding.
+    let mut handle: Option<String> = None;
+
+    let mut imported = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let filename = entry.file_name().to_string_lossy().into_owned();
+        if !is_root_key_filename(&filename) {
+            continue;
+        }
+        let secrets = match read_rootkey_secrets(&path) {
+            Ok(s) => s,
+            Err(_) => continue, // matches Go's "couldn't read it, skip it"
+        };
+        // Lazily resolve the wallet handle now that we have at least
+        // one valid rootkey to import.
+        if handle.is_none() {
+            let h = if args.unencrypted {
+                // Mirrors `client.GetUnencryptedWalletHandle()`
+                // (libgoal/unencryptedWallet.go:45-61).
+                match resolve_unencrypted_wallet_handle(&rt, &client) {
+                    Ok(h) => h,
+                    Err(()) => return ExitCode::from(1),
+                }
+            } else {
+                let (h, _wallet_name, _pw) = match resolve_wallet_and_init(
+                    &rt,
+                    &client,
+                    &mut accounts,
+                    args.wallet.as_deref(),
+                    args.password.as_deref(),
+                ) {
+                    Ok(v) => v,
+                    Err(()) => return ExitCode::from(1),
+                };
+                h
+            };
+            handle = Some(h);
+        }
+        let handle_ref = handle.as_deref().expect("handle resolved");
+        let address_for_log = match rt.block_on(client.import_key(handle_ref, secrets.sk)) {
+            Ok(r) => r.address,
+            Err(e) => {
+                let msg = kmd_msg(&e);
+                if msg.contains("key already exists") {
+                    // Go warns + continues for duplicates
+                    // (account.go:1442-1444).
+                    eprintln!("Warning: {msg}\n > Key File: {filename}");
+                    continue;
+                }
+                // Go's reportErrorf hard-exits on every non-duplicate
+                // import failure (account.go:1445-1447) — anything
+                // else is a real wallet/session/server error and
+                // letting the loop silently roll past would mask
+                // failures. Codex round-2 finding.
+                eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&msg]));
+                return ExitCode::from(1);
+            }
+        };
+        imported += 1;
+        println!("Imported {address_for_log}"); // messages.go:33 infoImportedKey
+    }
+
+    // messages.go:35 `infoImportedNKeys = "Imported %d key%s"`
+    let plural = if imported == 1 { "" } else { "s" };
+    println!("Imported {imported} key{plural}");
+    ExitCode::SUCCESS
+}
+
+/// Mirrors Go's `client.GetUnencryptedWalletHandle()`
+/// (libgoal/unencryptedWallet.go:45-61): look up the kmd wallet
+/// named `unencrypted-default-wallet`, auto-create it with empty
+/// password if missing, then `init_wallet` (also with empty
+/// password) and return the handle.
+fn resolve_unencrypted_wallet_handle(
+    rt: &tokio::runtime::Runtime,
+    client: &KmdClient,
+) -> Result<String, ()> {
+    const UNENCRYPTED_WALLET_NAME: &str = "unencrypted-default-wallet";
+    let listed = rt.block_on(client.list_wallets()).map_err(|e| {
+        eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
+    })?;
+    let mut wallet_id: Option<String> = None;
+    let mut duplicates = 0usize;
+    for w in listed.wallets {
+        if w.name == UNENCRYPTED_WALLET_NAME {
+            duplicates += 1;
+            wallet_id.get_or_insert(w.id);
+        }
+    }
+    if duplicates > 1 {
+        eprintln!("multiple default unencrypted wallets exist");
+        return Err(());
+    }
+    let wallet_id = match wallet_id {
+        Some(id) => id,
+        None => {
+            // Create with empty password + zero MDK (mirrors Go's
+            // `kmd.CreateWallet(UnencryptedWalletName, "sqlite", nil, crypto.MasterDerivationKey{})`).
+            let created = rt
+                .block_on(client.create_wallet(UNENCRYPTED_WALLET_NAME, "sqlite", "", [0u8; 32]))
+                .map_err(|e| {
+                    eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
+                })?;
+            created.wallet.id
+        }
+    };
+    let init = rt
+        .block_on(client.init_wallet(&wallet_id, ""))
+        .map_err(|e| {
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&kmd_msg(&e)]));
+        })?;
+    Ok(init.wallet_handle_token)
+}
+
+/// Mirrors Go's `IsRootKeyFilename` (config/keyfile.go:81): the file
+/// must end in `.rootkey` and have a non-empty stem (Go's check is
+/// that the trimmed name re-formats to the original filename).
+fn is_root_key_filename(filename: &str) -> bool {
+    if let Some(stem) = filename.strip_suffix(".rootkey") {
+        !stem.is_empty()
+    } else {
+        false
+    }
+}
+
+/// Decoded `crypto.SignatureSecrets` from one `.rootkey` SQLite file.
+#[derive(Debug)]
+struct RootKeySecrets {
+    sk: [u8; 64],
+    #[allow(dead_code)]
+    pubkey: [u8; 32],
+}
+
+/// Read `<path>` as a SQLite database; pull `RootAccount.data` (the
+/// canonical msgpack-encoded SignatureSecrets blob — see
+/// `../go-algorand/crypto/msgp_gen.go::SignatureSecrets.MarshalMsg`),
+/// decode the 2-key map (`SK` 64 bytes + `SignatureVerifier` 32 bytes),
+/// and return both.
+fn read_rootkey_secrets(path: &Path) -> Result<RootKeySecrets, String> {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let blob: Vec<u8> = conn
+        .query_row("SELECT data FROM RootAccount", [], |row| row.get(0))
+        .map_err(|e| format!("select RootAccount.data: {e}"))?;
+    parse_signature_secrets_blob(&blob)
+}
+
+/// Parse the msgpack `SignatureSecrets` blob. Wire shape (per
+/// `MarshalMsg` at `../go-algorand/crypto/msgp_gen.go`):
+/// `{ "SK": <64 bytes>, "SignatureVerifier": <32 bytes> }`.
+fn parse_signature_secrets_blob(blob: &[u8]) -> Result<RootKeySecrets, String> {
+    let mut rd: &[u8] = blob;
+    let v = rmpv::decode::read_value(&mut rd).map_err(|e| format!("msgpack decode: {e}"))?;
+    let map = v
+        .as_map()
+        .ok_or_else(|| "rootkey blob is not a msgpack map".to_string())?;
+    let mut sk: Option<Vec<u8>> = None;
+    let mut sv: Option<Vec<u8>> = None;
+    for (k, value) in map {
+        let key = k.as_str().ok_or_else(|| "non-string map key".to_string())?;
+        match key {
+            "SK" => {
+                let bytes = value
+                    .as_slice()
+                    .ok_or_else(|| "SK is not bin".to_string())?;
+                sk = Some(bytes.to_vec());
+            }
+            "SignatureVerifier" => {
+                let bytes = value
+                    .as_slice()
+                    .ok_or_else(|| "SignatureVerifier is not bin".to_string())?;
+                sv = Some(bytes.to_vec());
+            }
+            _ => {} // unknown key — tolerate forward additions
+        }
+    }
+    let sk = sk.ok_or_else(|| "missing SK in rootkey blob".to_string())?;
+    let sv = sv.ok_or_else(|| "missing SignatureVerifier in rootkey blob".to_string())?;
+    if sk.len() != 64 {
+        return Err(format!("SK has wrong length: {} (want 64)", sk.len()));
+    }
+    if sv.len() != 32 {
+        return Err(format!(
+            "SignatureVerifier has wrong length: {} (want 32)",
+            sv.len(),
+        ));
+    }
+    let mut sk_arr = [0u8; 64];
+    sk_arr.copy_from_slice(&sk);
+    let mut sv_arr = [0u8; 32];
+    sv_arr.copy_from_slice(&sv);
+    Ok(RootKeySecrets {
+        sk: sk_arr,
+        pubkey: sv_arr,
+    })
+}
+
 // ---- account info / balance / rewards / assetdetails (TASK-237 / B5) ------
 
 /// `account balance -a <addr>` — print `<microAlgos> microAlgos\n`.
@@ -1760,6 +2008,50 @@ Assets:
     URL: https://acme
 ";
         assert_eq!(s, expected, "assetdetails block diverges from Go format");
+    }
+
+    // ---- TASK-239 (B7) unit tests --------------------------------------
+
+    #[test]
+    fn is_root_key_filename_matches_go_rule() {
+        // Go's IsRootKeyFilename requires `<stem>.rootkey` with
+        // non-empty stem (config/keyfile.go:81).
+        assert!(is_root_key_filename("alice.rootkey"));
+        assert!(is_root_key_filename("X.rootkey"));
+        assert!(!is_root_key_filename(".rootkey"));
+        assert!(!is_root_key_filename("alice.partkey"));
+        assert!(!is_root_key_filename("alice"));
+        assert!(!is_root_key_filename(""));
+    }
+
+    #[test]
+    fn parse_signature_secrets_blob_round_trips() {
+        // Mirror Go's wire format from crypto/msgp_gen.go: 2-key map
+        // { "SK": <64 bytes>, "SignatureVerifier": <32 bytes> }.
+        // Hand-build the msgpack bytes to be sure we're matching Go.
+        let sk = [0xABu8; 64];
+        let sv = [0xCDu8; 32];
+        let mut buf = Vec::new();
+        rmp::encode::write_map_len(&mut buf, 2).unwrap();
+        rmp::encode::write_str(&mut buf, "SK").unwrap();
+        rmp::encode::write_bin(&mut buf, &sk).unwrap();
+        rmp::encode::write_str(&mut buf, "SignatureVerifier").unwrap();
+        rmp::encode::write_bin(&mut buf, &sv).unwrap();
+        let parsed = parse_signature_secrets_blob(&buf).expect("decode");
+        assert_eq!(parsed.sk, sk);
+        assert_eq!(parsed.pubkey, sv);
+    }
+
+    #[test]
+    fn parse_signature_secrets_blob_rejects_wrong_sizes() {
+        let mut buf = Vec::new();
+        rmp::encode::write_map_len(&mut buf, 2).unwrap();
+        rmp::encode::write_str(&mut buf, "SK").unwrap();
+        rmp::encode::write_bin(&mut buf, &[0u8; 32]).unwrap(); // wrong size
+        rmp::encode::write_str(&mut buf, "SignatureVerifier").unwrap();
+        rmp::encode::write_bin(&mut buf, &[0u8; 32]).unwrap();
+        let err = parse_signature_secrets_blob(&buf).unwrap_err();
+        assert!(err.contains("SK has wrong length"), "got {err}");
     }
 
     #[test]
