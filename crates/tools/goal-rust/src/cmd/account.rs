@@ -228,12 +228,28 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
                 continue;
             }
         };
+        // Multisig preimages are stored separately in kmd; Go's
+        // ListAddressesWithInfo returns the union. Mirror that so a
+        // wallet that holds only multisig accounts doesn't appear
+        // empty (Codex round-2 finding).
+        let msig_list = rt
+            .block_on(client.list_multisig_addrs(&handle))
+            .map(|r| r.addresses)
+            .unwrap_or_default();
         let _ = rt.block_on(client.release_wallet_handle(&handle));
 
         for addr in key_list {
             rows.push(AccountRow {
                 address: addr,
                 wallet_name: w.name.clone(),
+                is_multisig: false,
+            });
+        }
+        for addr in msig_list {
+            rows.push(AccountRow {
+                address: addr,
+                wallet_name: w.name.clone(),
+                is_multisig: true,
             });
         }
     }
@@ -261,12 +277,12 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
                 ("n/a".to_string(), None)
             }
         };
-        let name = accounts.name_for(&row.address);
-        let name_display = if name == row.address {
-            "<no name>".to_string()
-        } else {
-            name
-        };
+        // Go's getNameByAddress falls back to the address itself when
+        // no friendly name is registered (accountsList.go:174-177);
+        // `AccountsList::name_for` already does that. Use as-is —
+        // earlier `<no name>` placeholder broke the fixed-column
+        // contract (Codex round-2 finding).
+        let name_display = accounts.name_for(&row.address);
         let amount_display = match amount {
             Some(a) => format!("{a} microAlgos"),
             None => "[n/a] microAlgos".to_string(),
@@ -281,8 +297,17 @@ pub fn run_list(args: ListArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
         } else {
             ""
         };
+        let multisig_suffix = if row.is_multisig {
+            // Go renders `\t[N/M multisig]` after the amount; we
+            // don't yet know N/M without an export_multisig call
+            // per address, so emit the constant marker. B8's
+            // multisig leaves can fill in the threshold later.
+            "\t[multisig]"
+        } else {
+            ""
+        };
         println!(
-            "[{status}]\t{name_display}\t{}\t{amount_display}{default_suffix}",
+            "[{status}]\t{name_display}\t{}\t{amount_display}{multisig_suffix}{default_suffix}",
             row.address
         );
     }
@@ -304,6 +329,10 @@ struct AccountRow {
     // grouping when len > 1). Currently informational only.
     #[allow(dead_code)]
     wallet_name: String,
+    /// True if this address came from `list_multisig_addrs` rather
+    /// than `list_keys`. Used to render `[multisig]` suffix matching
+    /// Go's outputAccount path.
+    is_multisig: bool,
 }
 
 /// Resolve algod base URL + token for the data dir. Returns None when
