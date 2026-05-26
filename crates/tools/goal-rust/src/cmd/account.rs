@@ -23,8 +23,9 @@ use algo_kmd_client::{KmdClient, KmdError};
 use crate::accounts_list::AccountsList;
 use crate::data_dir;
 use crate::groups::account::{
-    AddressArgs, AssetdetailsArgs, DeleteArgs, DumpArgs, ExportArgs, ImportArgs, ImportRootKeyArgs,
-    InfoArgs, ListArgs, MsigDeleteArgs, MsigInfoArgs, MsigNewArgs, NewArgs, RenameArgs,
+    AddpartkeyArgs, AddressArgs, AssetdetailsArgs, DeleteArgs, DeletepartkeyArgs, DumpArgs,
+    ExportArgs, ImportArgs, ImportRootKeyArgs, InfoArgs, InstallpartkeyArgs, ListArgs,
+    MsigDeleteArgs, MsigInfoArgs, MsigNewArgs, NewArgs, RenameArgs,
 };
 
 /// Mirrors `messages.go:32` (`infoRenamedAccount`).
@@ -956,6 +957,341 @@ fn expand_seed_to_sk(seed: &[u8; 32]) -> [u8; 64] {
     sk[..32].copy_from_slice(seed);
     sk[32..].copy_from_slice(&pubkey);
     sk
+}
+
+// ---- account partkey leaves (TASK-242 / B10) ------------------------------
+
+/// `account addpartkey -a <addr> --roundFirstValid <r> --roundLastValid <r>
+/// [--keyDilution <n>]`. Mirrors `addParticipationKeyCmd`
+/// (account.go:973-1011). See [`AddpartkeyArgs`] for the documented
+/// divergence from Go (REST server-side generation vs client-side).
+pub fn run_addpartkey(args: AddpartkeyArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    if let Err(e) = algo_types::Address::from_algorand_string(&args.address) {
+        eprintln!("Could not parse address: {e}");
+        return ExitCode::from(1);
+    }
+    // Inclusive range — `algokey-rust part generate` accepts
+    // last==first (a one-round participation key) and only rejects
+    // last < first. Codex round-1 finding.
+    if args.round_last_valid < args.round_first_valid {
+        eprintln!(
+            "--roundLastValid ({}) must be >= --roundFirstValid ({})",
+            args.round_last_valid, args.round_first_valid
+        );
+        return ExitCode::from(1);
+    }
+
+    let client = match build_algod_client(&cli_d) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+
+    println!("Please stand by while generating keys. This might take a few minutes...");
+    if let Err(e) = rt.block_on(client.generate_participation_keys(
+        &args.address,
+        args.round_first_valid,
+        args.round_last_valid,
+        args.key_dilution,
+    )) {
+        eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
+        return ExitCode::from(1);
+    }
+    // Go prints the new ParticipationID; the REST generate endpoint
+    // currently returns just "{}" (handlers.go:300 — future
+    // enrichment), so we surface a generic success message instead.
+    println!(
+        "Participation key generation requested for {}.",
+        args.address
+    );
+    ExitCode::SUCCESS
+}
+
+/// `account installpartkey --partkey <path> --delete-input`. Mirrors
+/// `installParticipationKeyCmd` (account.go:1012-1052).
+pub fn run_installpartkey(args: InstallpartkeyArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    if !args.delete_input {
+        // Byte-exact Go refusal text (account.go:1017-1026).
+        eprintln!("The installpartkey command deletes the input participation file on");
+        eprintln!("successful installation.  Please acknowledge this by passing the");
+        eprintln!("\"--delete-input\" flag to the installpartkey command.  You can make");
+        eprintln!("a copy of the input file if needed, but please keep in mind that");
+        eprintln!("participation keys must be securely deleted for each round, to ensure");
+        eprintln!("forward security.  Storing old participation keys compromises overall");
+        eprintln!("system security.");
+        eprintln!();
+        eprintln!("No --delete-input flag specified, exiting without installing key.");
+        return ExitCode::from(1);
+    }
+    let client = match build_algod_client(&cli_d) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let bytes = match std::fs::read(&args.partkey) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Could not read {}: {e}", args.partkey.display());
+            return ExitCode::from(1);
+        }
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+    let part_id = match rt.block_on(client.add_participation_key(&bytes)) {
+        Ok(r) => r.part_id,
+        Err(e) => {
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
+            return ExitCode::from(1);
+        }
+    };
+
+    // Verify the key is actually installed before deleting the input
+    // file. Mirrors Go's `client.VerifyParticipationKey(time.Minute,
+    // addResponse.PartId)` (account.go:1040-1045) — algod can ack
+    // the POST then drop the key, and silently deleting the only copy
+    // would leave the operator with no way to retry. Poll
+    // list_participation_keys for up to 60s. Codex round-1 P1 finding.
+    let verified = rt.block_on(async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match client.list_participation_keys().await {
+                Ok(parts) => {
+                    if parts.iter().any(|p| p.id == part_id) {
+                        return Ok::<(), String>(());
+                    }
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("key install acknowledged but not visible after 60s".to_string());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    });
+    if let Err(why) = verified {
+        eprintln!(
+            "unable to verify key installation. Verify with 'goal account partkeyinfo' \
+             and delete '{}', or retry the command. Error: {why}",
+            args.partkey.display(),
+        );
+        return ExitCode::from(1);
+    }
+
+    println!("Participation key installed successfully, Participation ID: {part_id}");
+    // Go deletes the input file on success (account.go:1048-1051).
+    if let Err(e) = std::fs::remove_file(&args.partkey) {
+        eprintln!(
+            "An error occurred while removing the partkey file, please delete it manually: {e}"
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// `account listpartkeys`. Mirrors `listParticipationKeysCmd`
+/// (account.go:1220-1278). Columns + format match Go's hdrFormat /
+/// rowFormat (squeezed to 77 chars wide).
+pub fn run_listpartkeys(cli_d: Vec<PathBuf>) -> ExitCode {
+    let client = match build_algod_client(&cli_d) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+    let parts = match rt.block_on(client.list_participation_keys()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
+            return ExitCode::from(1);
+        }
+    };
+    // Mirror Go's `%-10s  %-11s  %-15s  %10s  %11s  %10s\n` header
+    // (account.go:1235-1237).
+    println!(
+        "{:<10}  {:<11}  {:<15}  {:>10}  {:>11}  {:>10}",
+        "Registered", "Account", "ParticipationID", "Last Used", "First round", "Last round"
+    );
+    for part in &parts {
+        // Online / registered determination requires AccountInformation
+        // — we don't compute it (would require a per-row REST call and
+        // doesn't change the table shape). Show `?` instead.
+        let online = "?";
+        let addr_short = if part.address.len() >= 8 {
+            format!(
+                "{}...{}",
+                &part.address[..4],
+                &part.address[part.address.len() - 4..]
+            )
+        } else {
+            part.address.clone()
+        };
+        let id_short = if part.id.len() >= 8 {
+            format!("{}...", &part.id[..8])
+        } else {
+            part.id.clone()
+        };
+        let last_used = part
+            .last_vote
+            .max(part.last_block_proposal)
+            .max(part.last_state_proof)
+            .unwrap_or(0);
+        let last_used_str = if last_used == 0 {
+            "N/A".to_string()
+        } else {
+            last_used.to_string()
+        };
+        println!(
+            "{:<10}  {:<11}  {:<15}  {:>10}  {:>11}  {:>10}",
+            online,
+            addr_short,
+            id_short,
+            last_used_str,
+            part.key.vote_first_valid,
+            part.key.vote_last_valid,
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// `account partkeyinfo`. Mirrors `partkeyInfoCmd`
+/// (account.go:1464-1502).
+pub fn run_partkeyinfo(cli_d: Vec<PathBuf>) -> ExitCode {
+    // Go's partkeyInfoCmd uses datadir.OnDataDirs (account.go:1470)
+    // which iterates every -d data dir, printing a block per dir.
+    // Codex round-1 finding: the single-dir ensure_single_data_dir
+    // call rejected multi -d invocations.
+    let dirs = match data_dir::resolve_data_dirs(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+    use base64::Engine;
+    let mut had_error = false;
+    for data_dir_path in &dirs {
+        println!(
+            "Dumping participation key info from {}...",
+            data_dir_path.display()
+        );
+        let client = match build_algod_client_for_dir(data_dir_path) {
+            Ok(c) => c,
+            Err(()) => {
+                had_error = true;
+                continue;
+            }
+        };
+        let parts = match rt.block_on(client.list_participation_keys()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
+                had_error = true;
+                continue;
+            }
+        };
+        for part in &parts {
+            println!();
+            println!("Participation ID:          {}", part.id);
+            println!("Parent address:            {}", part.address);
+            println!("Last vote round:           {}", round_or_na(part.last_vote));
+            println!(
+                "Last block proposal round: {}",
+                round_or_na(part.last_block_proposal)
+            );
+            println!(
+                "Effective first round:     {}",
+                round_or_na(part.effective_first_valid)
+            );
+            println!(
+                "Effective last round:      {}",
+                round_or_na(part.effective_last_valid)
+            );
+            println!("First round:               {}", part.key.vote_first_valid);
+            println!("Last round:                {}", part.key.vote_last_valid);
+            println!("Key dilution:              {}", part.key.vote_key_dilution);
+            println!(
+                "Selection key:             {}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(&part.key.selection_participation_key)
+            );
+            println!(
+                "Voting key:                {}",
+                base64::engine::general_purpose::STANDARD.encode(&part.key.vote_participation_key)
+            );
+            if let Some(spk) = &part.key.state_proof_key {
+                println!(
+                    "State proof key:           {}",
+                    base64::engine::general_purpose::STANDARD.encode(spk)
+                );
+            }
+        }
+    }
+    if had_error {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `account deletepartkey --partkeyid <id>`. Mirrors
+/// `deletePartKeyCmd` (account.go:361-377).
+pub fn run_deletepartkey(args: DeletepartkeyArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    let client = match build_algod_client(&cli_d) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+    if let Err(e) = rt.block_on(client.delete_participation_key(&args.partkeyid)) {
+        eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+/// Build an `AlgodClient` from the single -d data dir, reading
+/// algod.net + algod.token. Returns Err after printing Go-style
+/// "Could not contact algod" text.
+fn build_algod_client(cli_d: &[PathBuf]) -> Result<algo_rest_client::AlgodClient, ()> {
+    let dd = match data_dir::ensure_single_data_dir(cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return Err(());
+        }
+    };
+    build_algod_client_for_dir(&dd)
+}
+
+fn build_algod_client_for_dir(dd: &Path) -> Result<algo_rest_client::AlgodClient, ()> {
+    let (base, token) = match build_algod_endpoint(dd) {
+        Some(e) => e,
+        None => {
+            eprintln!("Could not contact algod: algod.net/algod.token missing");
+            return Err(());
+        }
+    };
+    Ok(algo_rest_client::AlgodClient::new(&base, &token))
+}
+
+/// `roundOrNA(value)` — Go's helper for printing optional rounds
+/// (account.go:1454-1459). 0/None ⇒ `N/A`.
+fn round_or_na(value: Option<u64>) -> String {
+    match value {
+        Some(v) if v != 0 => v.to_string(),
+        _ => "N/A".to_string(),
+    }
 }
 
 // ---- account multisig new/delete/info (TASK-240 / B8) ---------------------

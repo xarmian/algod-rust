@@ -14,7 +14,7 @@ use crate::unimplemented;
 pub enum AccountCmd {
     /// Generate and install participation key for the specified account.
     #[command(name = "addpartkey")]
-    Addpartkey,
+    Addpartkey(AddpartkeyArgs),
     /// Retrieve information about the assets belonging to the specified
     /// account inclusive of asset metadata.
     #[command(name = "assetdetails")]
@@ -28,7 +28,7 @@ pub enum AccountCmd {
     Delete(DeleteArgs),
     /// Delete a participation key.
     #[command(name = "deletepartkey")]
-    Deletepartkey,
+    Deletepartkey(DeletepartkeyArgs),
     /// Dump the balance record for the specified account.
     Dump(DumpArgs),
     /// Export an account key for use with account import.
@@ -43,7 +43,7 @@ pub enum AccountCmd {
     Info(InfoArgs),
     /// Install a participation key.
     #[command(name = "installpartkey")]
-    Installpartkey,
+    Installpartkey(InstallpartkeyArgs),
     /// Show the list of Algorand accounts on this machine.
     List(ListArgs),
     /// List participation keys summary.
@@ -179,6 +179,56 @@ pub struct AssetdetailsArgs {
     /// `NextToken`. Mirrors Go's `-n, --next`.
     #[arg(short = 'n', long = "next")]
     pub next: Option<String>,
+}
+
+/// `account addpartkey --address <addr> --roundFirstValid <r> --roundLastValid <r> [--keyDilution <n>]`.
+/// Mirrors Go's `addParticipationKeyCmd` (account.go:973-1011).
+///
+/// **Divergence from Go**: Go's addpartkey calls
+/// `participation.GenParticipationKeysTo` (client-side generation to
+/// disk, then upload). We use B9's `generate_participation_keys` REST
+/// endpoint (server-side generation) since algokey-rust has no lib
+/// facade yet. As a result, `--partkeyoutputdir` is omitted — algod
+/// picks the on-disk location. Documented in PR #383.
+#[derive(Args, Debug)]
+pub struct AddpartkeyArgs {
+    #[arg(short = 'a', long = "address")]
+    pub address: String,
+    /// First valid round for the new participation key.
+    #[arg(long = "roundFirstValid", alias = "round-first-valid")]
+    pub round_first_valid: u64,
+    /// Last valid round for the new participation key.
+    #[arg(long = "roundLastValid", alias = "round-last-valid")]
+    pub round_last_valid: u64,
+    /// Key dilution (subkeys per batch). Optional; algod picks a
+    /// sensible default when omitted. Mirrors Go's `--keyDilution`.
+    #[arg(long = "keyDilution", alias = "key-dilution")]
+    pub key_dilution: Option<u64>,
+}
+
+/// `account installpartkey --partkey <path> --delete-input`. Mirrors
+/// Go's `installParticipationKeyCmd` (account.go:1012-1052).
+#[derive(Args, Debug)]
+pub struct InstallpartkeyArgs {
+    /// Path to the partkey file to install. Mirrors Go's
+    /// `--partkey` flag.
+    #[arg(long = "partkey")]
+    pub partkey: std::path::PathBuf,
+    /// Acknowledge forward-security deletion. Go refuses to install
+    /// without this flag — forward security requires the input file
+    /// to be deleted post-install (account.go:1016-1027).
+    #[arg(long = "delete-input")]
+    pub delete_input: bool,
+}
+
+/// `account deletepartkey <participation-id>`. Mirrors Go's
+/// `deletePartKeyCmd` (account.go:361-377). Go uses
+/// `--partkeyid` flag, not a positional — we follow.
+#[derive(Args, Debug)]
+pub struct DeletepartkeyArgs {
+    /// ParticipationID to delete. Mirrors Go's `--partkeyid` flag.
+    #[arg(long = "partkeyid")]
+    pub partkeyid: String,
 }
 
 /// `account importrootkey [-u/--unencrypted] [-w <wallet>]` — discover
@@ -359,7 +409,9 @@ pub struct MsigInfoArgs {
 
 pub fn run(cmd: AccountCmd) -> ExitCode {
     let leaf: &str = match cmd {
-        AccountCmd::Addpartkey => "addpartkey",
+        AccountCmd::Addpartkey(args) => {
+            return crate::cmd::account::run_addpartkey(args, crate::cli_state::datadirs());
+        }
         AccountCmd::Assetdetails(args) => {
             return crate::cmd::account::run_assetdetails(args, crate::cli_state::datadirs());
         }
@@ -374,7 +426,9 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
                 crate::cli_state::kmddir(),
             );
         }
-        AccountCmd::Deletepartkey => "deletepartkey",
+        AccountCmd::Deletepartkey(args) => {
+            return crate::cmd::account::run_deletepartkey(args, crate::cli_state::datadirs());
+        }
         AccountCmd::Dump(args) => {
             return crate::cmd::account::run_dump(args, crate::cli_state::datadirs());
         }
@@ -402,7 +456,9 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
         AccountCmd::Info(args) => {
             return crate::cmd::account::run_info(args, crate::cli_state::datadirs());
         }
-        AccountCmd::Installpartkey => "installpartkey",
+        AccountCmd::Installpartkey(args) => {
+            return crate::cmd::account::run_installpartkey(args, crate::cli_state::datadirs());
+        }
         AccountCmd::List(args) => {
             return crate::cmd::account::run_list(
                 args,
@@ -410,7 +466,9 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
                 crate::cli_state::kmddir(),
             );
         }
-        AccountCmd::Listpartkeys => "listpartkeys",
+        AccountCmd::Listpartkeys => {
+            return crate::cmd::account::run_listpartkeys(crate::cli_state::datadirs());
+        }
         AccountCmd::Marknonparticipating => "marknonparticipating",
         AccountCmd::Multisig { cmd } => {
             let Some(cmd) = cmd else {
@@ -441,7 +499,9 @@ pub fn run(cmd: AccountCmd) -> ExitCode {
                 crate::cli_state::kmddir(),
             );
         }
-        AccountCmd::Partkeyinfo => "partkeyinfo",
+        AccountCmd::Partkeyinfo => {
+            return crate::cmd::account::run_partkeyinfo(crate::cli_state::datadirs());
+        }
         AccountCmd::Rename(args) => {
             return crate::cmd::account::run_rename(args, crate::cli_state::datadirs());
         }
