@@ -45,7 +45,14 @@ pub struct TokenConfig {
 ///   `Authorization: Bearer <token>`.
 /// - **Admin routes**: endpoints that require the admin token
 ///   (`algod.admin.token`). Reserved for future admin endpoints.
+/// - **Data routes**: the follower-mode `/v2/ledger/sync` endpoints, registered
+///   only when the node is in follower mode and guarded by the public API token
+///   (matching go-algorand's `data.RegisterHandlers` under `EnableFollowMode`).
 pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Router {
+    // The data API (`/v2/ledger/sync`) is only exposed in follower mode, matching
+    // go-algorand's conditional `data.RegisterHandlers` under `EnableFollowMode`.
+    let follower_mode = node.is_follower_mode();
+
     // Public routes (no auth required)
     let public = Router::new()
         .route("/health", get(handlers::health::<N>))
@@ -150,16 +157,6 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             "/v2/devmode/blocks/offset/:offset",
             post(handlers::set_block_timestamp_offset::<N>),
         )
-        // TODO: In go-algorand, /v2/ledger/sync endpoints are on the "data" API
-        // with a separate auth token. For now they use the public API token.
-        .route(
-            "/v2/ledger/sync",
-            get(handlers::get_sync_round::<N>).delete(handlers::unset_sync_round::<N>),
-        )
-        .route(
-            "/v2/ledger/sync/:round",
-            post(handlers::set_sync_round::<N>),
-        )
         .layer(middleware::from_fn_with_state(
             tokens.api_token.clone(),
             auth::require_token,
@@ -198,6 +195,26 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
 
     // Merge all route groups
     let mut router = public.merge(authenticated).merge(admin);
+
+    // Data API routes (follower mode only), guarded by the public API token —
+    // matches go-algorand, where `data.RegisterHandlers` is wired with the
+    // public middleware and only when `EnableFollowMode` is set (router.go).
+    if follower_mode {
+        let data = Router::new()
+            .route(
+                "/v2/ledger/sync",
+                get(handlers::get_sync_round::<N>).delete(handlers::unset_sync_round::<N>),
+            )
+            .route(
+                "/v2/ledger/sync/:round",
+                post(handlers::set_sync_round::<N>),
+            )
+            .layer(middleware::from_fn_with_state(
+                tokens.api_token.clone(),
+                auth::require_token,
+            ));
+        router = router.merge(data);
+    }
 
     // Conditionally register experimental API routes (router-level gating).
     // Handlers also check enable_experimental_api() as a belt-and-suspenders safety net.
