@@ -73,8 +73,11 @@ pub struct AppStateAccess<'a> {
     /// The state key (global/local key, or box name).
     pub key: &'a [u8],
     /// The on-chain value immediately before this operation, or `None` if the
-    /// key/box did not exist.
+    /// key/box did not exist. Used for initial-state capture.
     pub pre_value: Option<TealValue>,
+    /// The value written by this operation (for `Write`), or `None` for reads
+    /// and deletes. Used for per-opcode state-change capture.
+    pub new_value: Option<TealValue>,
 }
 
 /// Trait for observing AVM program execution.

@@ -6,7 +6,9 @@
 
 use std::collections::BTreeMap;
 
-use algo_ledger::simulation::{ExecTraceConfig, SimulationRequest, Simulator, SimulatorError};
+use algo_ledger::simulation::{
+    AvmValueTrace, ExecTraceConfig, SimulationRequest, Simulator, SimulatorError, StateChangeKind,
+};
 use algo_ledger::{LedgerState, LedgerStore};
 use algo_types::{AccountData, Address, AppParams, SignedTransaction, StateSchema, Transaction};
 
@@ -364,6 +366,70 @@ fn simulation_trace_with_stack() {
     assert!(
         !first_opcode.stack_additions.is_empty(),
         "pushint should add a value to the stack trace"
+    );
+}
+
+/// With state-change tracing on, an app that writes global state should record
+/// a per-opcode state change (operation `w`) in the exec trace.
+#[test]
+fn simulation_captures_state_change_on_global_write() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 100;
+    // v8: pushbytes "w", pushint 42, app_global_put, pushint 1, return
+    let approval = vec![0x08, 0x80, 0x01, 0x77, 0x81, 0x2a, 0x67, 0x81, 0x01, 0x43];
+    let mut state = setup_state(sender, app_id, approval);
+    // Allow one uint global write.
+    let mut params = state.get_app_params(app_id).expect("app exists").clone();
+    params.global_state_schema = StateSchema {
+        num_uint: 1,
+        num_byte_slice: 0,
+    };
+    state.set_app_params(app_id, params);
+
+    let txn = make_appl_txn(sender, app_id);
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn]],
+        allow_empty_signatures: true,
+        trace_config: ExecTraceConfig {
+            enable: true,
+            stack: false,
+            scratch: false,
+            state: true,
+        },
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("simulation should succeed");
+    assert!(
+        result.txn_groups[0].failure_message.is_none(),
+        "simulation should not fail: {:?}",
+        result.txn_groups[0].failure_message
+    );
+
+    let trace = result.txn_groups[0].txn_results[0]
+        .trace
+        .as_ref()
+        .expect("trace present");
+    let approval = trace
+        .approval_program_trace
+        .as_ref()
+        .expect("approval trace present");
+
+    let changes: Vec<_> = approval
+        .opcodes
+        .iter()
+        .flat_map(|u| u.state_changes.iter())
+        .collect();
+    assert_eq!(changes.len(), 1, "expected exactly one state change");
+    assert_eq!(changes[0].kind, StateChangeKind::GlobalState);
+    assert_eq!(changes[0].key, b"w");
+    assert!(
+        matches!(changes[0].new_value, Some(AvmValueTrace::Uint64(42))),
+        "expected written value 42, got {:?}",
+        changes[0].new_value
     );
 }
 

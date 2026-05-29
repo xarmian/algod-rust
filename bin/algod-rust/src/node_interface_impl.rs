@@ -26,17 +26,18 @@ use algo_codec::{canonical_encode_block_header, compute_block_digest};
 use algo_ledger::simulation::{
     AppInitialState, AvmValueTrace, ExecTraceConfig, OpcodeTraceUnit, ProgramTrace,
     ResourcesInitialStates, ResultEvalOverrides, SimulationRequest, SimulationResult, Simulator,
-    SimulatorError, TransactionTrace, TxnGroupResult, TxnResult,
+    SimulatorError, StateChange, StateChangeKind, TransactionTrace, TxnGroupResult, TxnResult,
 };
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{SqliteLedger, StateDelta};
 use algo_network::local_tx_broadcast::{LocalTxBroadcaster, LocalTxError};
 use algo_pool::TransactionPool;
 use algo_rest_api::models::{
-    ApplicationInitialStates, ApplicationKVStorage, AvmKeyValue, AvmValue, PreEncodedTxInfo,
-    ScratchChange, SimulateInitialStates, SimulateRequest, SimulateResponse, SimulateTraceConfig,
-    SimulateTransactionGroupResult, SimulateTransactionResult, SimulationEvalOverrides,
-    SimulationOpcodeTraceUnit, SimulationTransactionExecTrace,
+    ApplicationInitialStates, ApplicationKVStorage, ApplicationStateOperation, AvmKeyValue,
+    AvmValue, PreEncodedTxInfo, ScratchChange, SimulateInitialStates, SimulateRequest,
+    SimulateResponse, SimulateTraceConfig, SimulateTransactionGroupResult,
+    SimulateTransactionResult, SimulationEvalOverrides, SimulationOpcodeTraceUnit,
+    SimulationTransactionExecTrace,
 };
 use algo_rest_api::node::{
     AccountLookup, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
@@ -1142,14 +1143,48 @@ impl AlgodNodeInterface {
                     .collect(),
             )
         };
+        let state_changes = if unit.state_changes.is_empty() {
+            None
+        } else {
+            Some(
+                unit.state_changes
+                    .iter()
+                    .map(Self::state_change_to_model)
+                    .collect(),
+            )
+        };
         SimulationOpcodeTraceUnit {
             pc: unit.pc as u64,
             scratch_changes,
-            // spawned-inners and state-changes are follow-up tasks.
+            // spawned-inners is a follow-up task (TASK-249).
             spawned_inners: None,
             stack_additions,
             stack_pop_count,
-            state_changes: None,
+            state_changes,
+        }
+    }
+
+    /// Convert a captured [`StateChange`] (global/local write or delete) into
+    /// the REST [`ApplicationStateOperation`]. Operation is `w` when a value was
+    /// written and `d` for a delete (no new value), matching go-algorand's
+    /// AppStateOpEnum encoding.
+    fn state_change_to_model(change: &StateChange) -> ApplicationStateOperation {
+        let app_state_type = match change.kind {
+            StateChangeKind::GlobalState => "g",
+            StateChangeKind::LocalState => "l",
+            StateChangeKind::BoxState => "b",
+        }
+        .to_string();
+        let operation = if change.new_value.is_some() { "w" } else { "d" }.to_string();
+        ApplicationStateOperation {
+            account: change.account.map(|a| a.to_string()),
+            app_state_type,
+            key: change.key.clone(),
+            new_value: change
+                .new_value
+                .as_ref()
+                .map(Self::avm_value_trace_to_model),
+            operation,
         }
     }
 
@@ -1472,6 +1507,38 @@ mod tests {
         // Clear-state absent here; inner traces are deferred to TASK-249.
         assert!(model.clear_state_program_trace.is_none());
         assert!(model.inner_trace.is_none());
+    }
+
+    #[test]
+    fn state_change_to_model_write_and_delete() {
+        let addr = Address([0xCD; 32]);
+
+        let write = StateChange {
+            kind: StateChangeKind::LocalState,
+            app_id: 5,
+            key: b"k".to_vec(),
+            new_value: Some(AvmValueTrace::Uint64(9)),
+            account: Some(addr),
+        };
+        let m = AlgodNodeInterface::state_change_to_model(&write);
+        assert_eq!(m.operation, "w");
+        assert_eq!(m.app_state_type, "l");
+        assert_eq!(m.key, b"k");
+        assert_eq!(m.account, Some(addr.to_string()));
+        assert_eq!(m.new_value.unwrap().uint, Some(9));
+
+        let del = StateChange {
+            kind: StateChangeKind::GlobalState,
+            app_id: 5,
+            key: b"k".to_vec(),
+            new_value: None,
+            account: None,
+        };
+        let m = AlgodNodeInterface::state_change_to_model(&del);
+        assert_eq!(m.operation, "d");
+        assert_eq!(m.app_state_type, "g");
+        assert!(m.new_value.is_none());
+        assert!(m.account.is_none());
     }
 
     #[test]

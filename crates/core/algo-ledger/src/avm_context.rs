@@ -823,6 +823,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
     ///
     /// `pre_value` must be the on-chain value *before* the operation mutates
     /// state; callers read it prior to any write.
+    #[allow(clippy::too_many_arguments)]
     fn record_app_state_access(
         &self,
         app_id: u64,
@@ -831,6 +832,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         account: Option<[u8; 32]>,
         key: &[u8],
         pre_value: Option<TealValue>,
+        new_value: Option<TealValue>,
     ) {
         if let Some(p) = self.tracer_ptr {
             let access = AppStateAccess {
@@ -841,6 +843,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
                 account,
                 key,
                 pre_value,
+                new_value,
             };
             // SAFETY: `tracer_ptr` is valid for the lifetime of this context and
             // only one mutable borrow of the tracer is live at a time. The
@@ -1728,6 +1731,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             Some(*account),
             key,
             value.clone(),
+            None,
         );
         Ok(value)
     }
@@ -1744,6 +1748,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             None,
             key,
             value.clone(),
+            None,
         );
         Ok(value)
     }
@@ -1775,6 +1780,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             Some(*account),
             key,
             pre,
+            Some(value.clone()),
         );
         local.key_value.insert(key.to_vec(), value.clone());
         self.store.set_app_local_state(&addr, app_id, local);
@@ -1804,6 +1810,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             Some(*account),
             key,
             pre,
+            None,
         );
         if let Some(mut local) = self.store.get_app_local_state(&addr, app_id) {
             local.key_value.remove(key);
@@ -1836,6 +1843,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             None,
             key,
             pre,
+            Some(value.clone()),
         );
         p.global_state.insert(key.to_vec(), value.clone());
         self.store.set_app_params(app_id, p);
@@ -1858,6 +1866,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             None,
             key,
             pre,
+            None,
         );
         if let Some(mut p) = self.store.get_app_params(app_id) {
             p.global_state.remove(key);
@@ -3029,6 +3038,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             None,
             name,
             pre,
+            None,
         );
         let (contents, exists) = self.available_box(name, BoxOperation::Read, 0)?;
         if exists {
@@ -3049,6 +3059,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             None,
             name,
             pre,
+            None,
         );
 
         // BoxWriteOperation — pass value length as create_size because the
@@ -3092,6 +3103,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             None,
             name,
             pre,
+            None,
         );
         let (_, exists) = self.available_box(name, BoxOperation::Delete, 0)?;
         if exists {
@@ -3124,6 +3136,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             None,
             name,
             pre,
+            None,
         );
         let (contents, exists) = self.available_box(name, BoxOperation::Read, 0)?;
         Ok((contents.len() as u64, exists))
@@ -3139,6 +3152,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             None,
             name,
             pre,
+            None,
         );
         let (_, exists) = self.available_box(name, BoxOperation::Create, size)?;
         if !exists {
@@ -3167,6 +3181,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             None,
             name,
             pre,
+            None,
         );
         let (contents, exists) = self.available_box(name, BoxOperation::Read, 0)?;
         if !exists {
@@ -3194,6 +3209,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             None,
             name,
             pre,
+            None,
         );
         let (contents, exists) = self.available_box(name, BoxOperation::Write, 0)?;
         if !exists {
@@ -3224,6 +3240,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             None,
             name,
             pre,
+            None,
         );
         let (contents, exists) = self.available_box(name, BoxOperation::Resize, new_size)?;
         if !exists {
@@ -3277,6 +3294,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             None,
             name,
             pre,
+            None,
         );
         let (contents, exists) = self.available_box(name, BoxOperation::Write, 0)?;
         if !exists {
