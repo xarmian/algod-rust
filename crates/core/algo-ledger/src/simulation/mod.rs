@@ -492,14 +492,24 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 }));
             }
 
-            // Check well-formedness.
-            validate_transaction_wellformed(&stx.txn, true, consensus, Some(&spec)).map_err(
-                |e| {
-                    SimulatorError::InvalidRequest(InvalidRequestError {
-                        message: e.to_string(),
-                    })
-                },
-            )?;
+            // Check well-formedness. Pass `allow_fee_pooling = enable_fee_pooling`
+            // so that on pre-fee-pooling protocols (before v28) each transaction
+            // is held to the per-transaction minimum fee, matching go-algorand's
+            // `Transaction.WellFormed` (`!proto.EnableFeePooling && fee < min`).
+            // On fee-pooling protocols the per-txn check is skipped here and the
+            // pooled group-fee check below enforces the minimum (mirroring
+            // `verify.TxnGroup`).
+            validate_transaction_wellformed(
+                &stx.txn,
+                consensus.enable_fee_pooling,
+                consensus,
+                Some(&spec),
+            )
+            .map_err(|e| {
+                SimulatorError::InvalidRequest(InvalidRequestError {
+                    message: e.to_string(),
+                })
+            })?;
 
             // Handle empty signatures when allowed.
             let has_sig = stx.sig != [0u8; 64];
