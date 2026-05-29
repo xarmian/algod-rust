@@ -1223,6 +1223,12 @@ fn execute_inner_appl<L: LedgerStore>(
         create_application(store, &stxn.txn, new_app_id, ApplErrorContext::Inner)?;
         // Record the created app ID on the SignedTransaction.
         stxn.apply_data_application_id = new_app_id;
+        // Exclude this inner-created app's state from initial-state capture
+        // (it has no pre-simulation state). No-op without a tracer. Mirrors the
+        // top-level app-create hook in `apply_appl`.
+        if let Some(ref mut t) = tracer {
+            t.record_created_app(new_app_id);
+        }
         new_app_id
     } else {
         called_app_id

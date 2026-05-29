@@ -394,7 +394,11 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             };
 
             // Create a per-transaction tracer to capture execution details.
+            // Seed it with apps created by earlier transactions in the group so
+            // the created-app exclusion persists across the whole simulation
+            // (go-algorand keeps a single ResourcesInitialStates for the run).
             let mut tracer = SimulationTracer::new(request.trace_config.clone());
+            tracer.seed_created_apps(&initial_states.created_app_ids());
 
             // Use apply_transaction_with_budget for ALL transactions (not just appl)
             // so they all share the group context.

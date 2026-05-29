@@ -85,6 +85,15 @@ impl SimulationTracer {
         std::mem::take(&mut self.initial_states)
     }
 
+    /// Seed the created-app exclusion set from apps created by earlier
+    /// transactions in the group, so a later transaction that executes as (or
+    /// reads the state of) a previously-created app excludes it correctly.
+    pub fn seed_created_apps(&mut self, app_ids: &[u64]) {
+        for &app_id in app_ids {
+            self.initial_states.mark_created_app(app_id);
+        }
+    }
+
     /// Consume the tracer and return the accumulated transaction trace.
     ///
     /// Returns `None` if tracing was not enabled.
@@ -321,6 +330,37 @@ mod tests {
         assert_eq!(approval.opcodes.len(), 2);
         assert_eq!(approval.opcodes[0].pc, 0);
         assert_eq!(approval.opcodes[1].pc, 1);
+    }
+
+    #[test]
+    fn test_seeded_created_app_is_excluded() {
+        use algo_avm::tracer::{AppStateAccess, AppStateOp, AppStateType};
+
+        let config = ExecTraceConfig {
+            enable: true,
+            stack: false,
+            scratch: false,
+            state: true,
+        };
+        let mut tracer = SimulationTracer::new(config);
+        // Seed an app created by an earlier transaction in the group.
+        tracer.seed_created_apps(&[1001]);
+
+        // A later transaction executing as app 1001 reads its own global state.
+        let access = AppStateAccess {
+            executing_app_id: 1001,
+            app_id: 1001,
+            state: AppStateType::Global,
+            op: AppStateOp::Read,
+            account: None,
+            key: b"k",
+            pre_value: Some(algo_types::TealValue::Uint(7)),
+        };
+        tracer.record_app_state_access(&access);
+
+        // The seeded created app must be excluded from initial states.
+        let states = tracer.take_initial_states().into_resources_initial_states();
+        assert!(states.app_initial_states.is_empty());
     }
 
     #[test]

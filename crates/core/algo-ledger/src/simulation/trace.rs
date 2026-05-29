@@ -356,6 +356,14 @@ impl InitialStatesAccumulator {
         self.created_apps.insert(app_id);
     }
 
+    /// Snapshot of the apps created so far during simulation. Used to seed a
+    /// later transaction's tracer so the created-app exclusion persists across
+    /// the whole group (go-algorand keeps one `ResourcesInitialStates` for the
+    /// entire simulation; the Rust engine uses per-transaction tracers).
+    pub fn created_app_ids(&self) -> Vec<u64> {
+        self.created_apps.iter().copied().collect()
+    }
+
     /// Record an application-state access, following go-algorand's
     /// `AppsInitialStates.increment` semantics.
     pub fn record(&mut self, access: &AppStateAccess<'_>) {
