@@ -117,6 +117,15 @@ pub struct TransactionTrace {
     pub clear_state_program_trace: Option<ProgramTrace>,
     /// SHA-512/256 hash of the clear-state program, if one was executed.
     pub clear_state_program_hash: Option<[u8; 32]>,
+    /// `true` if the clear-state program failed (rejected or errored) and its
+    /// persistent state changes were rolled back. Mirrors go-algorand's
+    /// `TransactionTrace.ClearStateRollback`.
+    pub clear_state_rollback: bool,
+    /// Error message explaining why the clear-state program failed. Populated
+    /// only when [`Self::clear_state_rollback`] is `true` and the failure was
+    /// due to an execution error (not a plain rejection). Mirrors
+    /// go-algorand's `TransactionTrace.ClearStateRollbackError`.
+    pub clear_state_rollback_error: Option<String>,
     /// Trace of the logic signature execution (if applicable).
     pub logicsig_trace: Option<ProgramTrace>,
     /// SHA-512/256 hash of the logic signature program, if one was executed.

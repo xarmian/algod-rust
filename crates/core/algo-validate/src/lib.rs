@@ -17,5 +17,5 @@ pub use rules::{
 };
 pub use signature::{
     verify_auth_addr_sender_diff, verify_group_logicsig_size, verify_heartbeat_proof,
-    verify_single_sig, verify_transaction_signature,
+    verify_single_sig, verify_transaction_signature, verify_transaction_signature_with_tracer,
 };

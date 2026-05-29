@@ -965,9 +965,10 @@ impl AlgodNodeInterface {
         let txn_result = Self::pre_encoded_txinfo_from_txn_result(&result);
         SimulateTransactionResult {
             app_budget_consumed: Self::opt_nonzero_u64(result.app_budget_consumed),
-            // Translate the captured top-level execution trace (TASK-248).
-            // Logic-sig and inner-transaction traces, spawned-inners wiring,
-            // and per-opcode state-changes are follow-up tasks (TASK-249/259).
+            // Translate the captured execution trace: top-level opcode units
+            // (TASK-248), logic-sig + inner-transaction traces and
+            // spawned-inners wiring (TASK-249). Per-opcode state-changes are
+            // TASK-259.
             exec_trace: result.trace.as_ref().map(Self::exec_trace_to_model),
             fixed_signer: result.fixed_signer.map(|a| a.to_string()),
             logic_sig_budget_consumed: Self::opt_nonzero_u64(result.logicsig_budget_consumed),
@@ -1078,11 +1079,24 @@ impl AlgodNodeInterface {
     }
 
     /// Convert the captured top-level [`TransactionTrace`] into the REST
-    /// [`SimulationTransactionExecTrace`] (TASK-248: approval/clear-state/
-    /// logic-sig opcode units + program hashes). Inner-transaction traces and
-    /// spawned-inners wiring are TASK-249; per-opcode state changes are
-    /// TASK-259.
+    /// [`SimulationTransactionExecTrace`]: approval/clear-state/logic-sig opcode
+    /// units + program hashes (TASK-248), recursive inner-transaction traces
+    /// with spawned-inners wiring and clear-state-rollback fields (TASK-249).
+    /// Per-opcode state-changes are TASK-259. Field omission follows
+    /// go-algorand's `convertTxnTrace` (`utils.go:455`): empty slices and
+    /// zero/false scalars are omitted.
     fn exec_trace_to_model(trace: &TransactionTrace) -> SimulationTransactionExecTrace {
+        let inner_trace = if trace.inner_traces.is_empty() {
+            None
+        } else {
+            Some(
+                trace
+                    .inner_traces
+                    .iter()
+                    .map(Self::exec_trace_to_model)
+                    .collect(),
+            )
+        };
         SimulationTransactionExecTrace {
             approval_program_hash: trace.approval_program_hash.map(|h| h.to_vec()),
             approval_program_trace: trace
@@ -1094,11 +1108,10 @@ impl AlgodNodeInterface {
                 .clear_state_program_trace
                 .as_ref()
                 .map(Self::program_trace_to_units),
-            clear_state_rollback: None,
-            clear_state_rollback_error: None,
-            // Inner-transaction trace recursion + spawned-inners wiring are
-            // TASK-249; per-opcode state-changes are TASK-259.
-            inner_trace: None,
+            // omitEmpty: false → None, true → Some(true).
+            clear_state_rollback: trace.clear_state_rollback.then_some(true),
+            clear_state_rollback_error: trace.clear_state_rollback_error.clone(),
+            inner_trace,
             logic_sig_hash: trace.logicsig_hash.map(|h| h.to_vec()),
             logic_sig_trace: trace
                 .logicsig_trace
@@ -1153,11 +1166,15 @@ impl AlgodNodeInterface {
                     .collect(),
             )
         };
+        let spawned_inners = if unit.spawned_inners.is_empty() {
+            None
+        } else {
+            Some(unit.spawned_inners.iter().map(|i| *i as u64).collect())
+        };
         SimulationOpcodeTraceUnit {
             pc: unit.pc as u64,
             scratch_changes,
-            // spawned-inners is a follow-up task (TASK-249).
-            spawned_inners: None,
+            spawned_inners,
             stack_additions,
             stack_pop_count,
             state_changes,
@@ -1504,9 +1521,81 @@ mod tests {
         assert_eq!(model.logic_sig_hash, Some(vec![9u8; 32]));
         assert_eq!(model.logic_sig_trace.as_ref().unwrap().len(), 1);
 
-        // Clear-state absent here; inner traces are deferred to TASK-249.
+        // No clear-state, no inners here.
         assert!(model.clear_state_program_trace.is_none());
         assert!(model.inner_trace.is_none());
+        assert!(model.clear_state_rollback.is_none());
+        assert!(model.clear_state_rollback_error.is_none());
+    }
+
+    #[test]
+    fn exec_trace_to_model_recurses_inner_traces_and_spawned_inners() {
+        use algo_ledger::simulation::{OpcodeTraceUnit, ProgramTrace, TransactionTrace};
+
+        // Outer approval program with one opcode (itxn_submit) spawning inner 0.
+        let trace = TransactionTrace {
+            approval_program_trace: Some(ProgramTrace {
+                opcodes: vec![
+                    OpcodeTraceUnit {
+                        pc: 0,
+                        ..Default::default()
+                    },
+                    OpcodeTraceUnit {
+                        pc: 1,
+                        spawned_inners: vec![0],
+                        ..Default::default()
+                    },
+                ],
+            }),
+            inner_traces: vec![TransactionTrace {
+                approval_program_trace: Some(ProgramTrace {
+                    opcodes: vec![OpcodeTraceUnit {
+                        pc: 0,
+                        ..Default::default()
+                    }],
+                }),
+                approval_program_hash: Some([3u8; 32]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let model = AlgodNodeInterface::exec_trace_to_model(&trace);
+
+        // spawned-inners: empty omitted, populated carried through.
+        let units = model.approval_program_trace.unwrap();
+        assert!(units[0].spawned_inners.is_none());
+        assert_eq!(units[1].spawned_inners, Some(vec![0]));
+
+        // inner-trace recurses one level.
+        let inner = model.inner_trace.expect("inner trace present");
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0].approval_program_hash, Some(vec![3u8; 32]));
+        assert!(inner[0].inner_trace.is_none());
+    }
+
+    #[test]
+    fn exec_trace_to_model_maps_clear_state_rollback() {
+        use algo_ledger::simulation::TransactionTrace;
+
+        // Errored clear-state: rollback true + error message.
+        let errored = TransactionTrace {
+            clear_state_rollback: true,
+            clear_state_rollback_error: Some("assert failed".to_string()),
+            ..Default::default()
+        };
+        let model = AlgodNodeInterface::exec_trace_to_model(&errored);
+        assert_eq!(model.clear_state_rollback, Some(true));
+        assert_eq!(
+            model.clear_state_rollback_error.as_deref(),
+            Some("assert failed")
+        );
+
+        // No rollback: false is omitted (not Some(false)).
+        let ok = TransactionTrace::default();
+        let model = AlgodNodeInterface::exec_trace_to_model(&ok);
+        assert_eq!(model.clear_state_rollback, None);
+        assert_eq!(model.clear_state_rollback_error, None);
     }
 
     #[test]
