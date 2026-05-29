@@ -41,6 +41,13 @@ struct ProgramTraceState {
     stack_before: Vec<AvmValueTrace>,
     /// Scratch snapshot before the current opcode (for computing diffs).
     scratch_before: Vec<AvmValueTrace>,
+    /// Inner-transaction trace indices spawned by the currently-executing
+    /// opcode, buffered between `before_txn` and `after_opcode`. go-algorand
+    /// attaches `SpawnedInners` to the opcode unit as inners are created
+    /// (`tracer.go:228`); since this tracer flushes opcode units at
+    /// `after_opcode` (after inner execution finishes), the indices are
+    /// buffered here and drained when the spawning opcode's unit is built.
+    pending_spawned_inners: Vec<usize>,
 }
 
 /// A tracer that captures execution details for the simulation endpoint.
@@ -149,10 +156,11 @@ impl EvalTracer for SimulationTracer {
             trace: ProgramTrace::default(),
             stack_before: Vec::new(),
             scratch_before: Vec::new(),
+            pending_spawned_inners: Vec::new(),
         });
     }
 
-    fn after_program(&mut self, _program_type: ProgramType, _pass: bool, _error: Option<&str>) {
+    fn after_program(&mut self, _program_type: ProgramType, pass: bool, error: Option<&str>) {
         if !self.config.is_enabled() {
             return;
         }
@@ -167,6 +175,17 @@ impl EvalTracer for SimulationTracer {
                 ProgramType::ClearState => {
                     trace.clear_state_program_trace = Some(state.trace);
                     trace.clear_state_program_hash = Some(state.program_hash);
+                    // A clear-state program that rejected or errored has its
+                    // persistent state changes rolled back, but the txn itself
+                    // still succeeds (go-algorand `tracer.go:506-513`). Record
+                    // the rollback and, when it was an execution error, the
+                    // error message.
+                    if !pass || error.is_some() {
+                        trace.clear_state_rollback = true;
+                        if let Some(msg) = error {
+                            trace.clear_state_rollback_error = Some(msg.to_string());
+                        }
+                    }
                 }
                 ProgramType::LogicSig => {
                     trace.logicsig_trace = Some(state.trace);
@@ -180,13 +199,23 @@ impl EvalTracer for SimulationTracer {
         if !self.config.is_enabled() {
             return;
         }
-        // Save the current program state (the outer program is mid-execution).
-        self.program_state_stack.push(self.current_program.take());
         // Push a new TransactionTrace onto the current trace's inner_traces
-        // and descend into it.
-        let current = self.current_trace_mut();
-        current.inner_traces.push(TransactionTrace::default());
-        let idx = current.inner_traces.len() - 1;
+        // and record its index.
+        let idx = {
+            let current = self.current_trace_mut();
+            current.inner_traces.push(TransactionTrace::default());
+            current.inner_traces.len() - 1
+        };
+        // Attach this inner's index to the spawning opcode. The spawning
+        // opcode's trace unit is flushed at `after_opcode` (after the inner
+        // finishes executing), so buffer the index on the parent program state
+        // and drain it when that unit is built (go-algorand `tracer.go:224-228`).
+        if let Some(parent) = self.current_program.as_mut() {
+            parent.pending_spawned_inners.push(idx);
+        }
+        // Save the current program state (the outer program is mid-execution)
+        // and descend into the inner trace.
+        self.program_state_stack.push(self.current_program.take());
         self.trace_path.push(idx);
     }
 
@@ -231,6 +260,8 @@ impl EvalTracer for SimulationTracer {
         let mut unit = OpcodeTraceUnit {
             pc,
             state_changes,
+            // Drain any inner-transaction indices spawned by this opcode.
+            spawned_inners: std::mem::take(&mut state.pending_spawned_inners),
             ..Default::default()
         };
 
@@ -634,5 +665,121 @@ mod tests {
         assert_eq!(trace.inner_traces.len(), 2);
         assert!(trace.inner_traces[0].approval_program_trace.is_some());
         assert!(trace.inner_traces[1].approval_program_trace.is_some());
+    }
+
+    /// When an opcode spawns inner transactions, its trace unit records the
+    /// indices of those inners (go-algorand `OpcodeTraceUnit.SpawnedInners`).
+    /// The inners spawn *during* the opcode (between `before_opcode` and
+    /// `after_opcode`), and the indices must land on that opcode's unit.
+    #[test]
+    fn test_simulation_tracer_spawned_inners_recorded() {
+        let config = ExecTraceConfig {
+            enable: true,
+            ..Default::default()
+        };
+        let mut tracer = SimulationTracer::new(config);
+
+        tracer.before_program(ProgramType::Approval, [0u8; 32]);
+        // Opcode 0: a plain push (no inners).
+        tracer.before_opcode(0, 0x81);
+        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+
+        // Opcode 1: itxn_submit. Two inners spawn during its execution.
+        tracer.before_opcode(1, 0xb6);
+        tracer.before_txn_group(2);
+        tracer.before_txn(0);
+        tracer.before_program(ProgramType::Approval, [0u8; 32]);
+        tracer.before_opcode(0, 0x81);
+        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.after_program(ProgramType::Approval, true, None);
+        tracer.after_txn(0, None);
+        tracer.before_txn(1);
+        tracer.before_program(ProgramType::Approval, [0u8; 32]);
+        tracer.before_opcode(0, 0x81);
+        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(2)], &[], None);
+        tracer.after_program(ProgramType::Approval, true, None);
+        tracer.after_txn(1, None);
+        tracer.after_txn_group(None);
+        // itxn_submit completes — its unit is flushed here with the inners.
+        tracer.after_opcode(1, 0xb6, &[], &[], None);
+
+        tracer.after_program(ProgramType::Approval, true, None);
+
+        let trace = tracer.into_transaction_trace().unwrap();
+        let approval = trace.approval_program_trace.unwrap();
+        assert_eq!(approval.opcodes.len(), 2);
+        // The push opcode spawned nothing.
+        assert!(approval.opcodes[0].spawned_inners.is_empty());
+        // itxn_submit spawned inner traces 0 and 1.
+        assert_eq!(approval.opcodes[1].spawned_inners, vec![0, 1]);
+        assert_eq!(trace.inner_traces.len(), 2);
+    }
+
+    /// A failing clear-state program sets `clear_state_rollback` and, when the
+    /// failure is an execution error, `clear_state_rollback_error`
+    /// (go-algorand `tracer.go:506-513`).
+    #[test]
+    fn test_simulation_tracer_clear_state_rollback_on_error() {
+        let config = ExecTraceConfig {
+            enable: true,
+            ..Default::default()
+        };
+        let mut tracer = SimulationTracer::new(config);
+
+        tracer.before_program(ProgramType::ClearState, [7u8; 32]);
+        tracer.before_opcode(0, 0x81);
+        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(0)], &[], None);
+        tracer.after_program(
+            ProgramType::ClearState,
+            false,
+            Some("logic eval error: assert failed"),
+        );
+
+        let trace = tracer.into_transaction_trace().unwrap();
+        assert!(trace.clear_state_program_trace.is_some());
+        assert!(trace.clear_state_rollback);
+        assert_eq!(
+            trace.clear_state_rollback_error.as_deref(),
+            Some("logic eval error: assert failed")
+        );
+    }
+
+    /// A clear-state program that merely rejects (returns 0, no error) still
+    /// rolls back, but records no rollback error.
+    #[test]
+    fn test_simulation_tracer_clear_state_rollback_on_reject_no_error() {
+        let config = ExecTraceConfig {
+            enable: true,
+            ..Default::default()
+        };
+        let mut tracer = SimulationTracer::new(config);
+
+        tracer.before_program(ProgramType::ClearState, [7u8; 32]);
+        tracer.before_opcode(0, 0x81);
+        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(0)], &[], None);
+        tracer.after_program(ProgramType::ClearState, false, None);
+
+        let trace = tracer.into_transaction_trace().unwrap();
+        assert!(trace.clear_state_rollback);
+        assert!(trace.clear_state_rollback_error.is_none());
+    }
+
+    /// A clear-state program that passes records no rollback.
+    #[test]
+    fn test_simulation_tracer_clear_state_no_rollback_on_pass() {
+        let config = ExecTraceConfig {
+            enable: true,
+            ..Default::default()
+        };
+        let mut tracer = SimulationTracer::new(config);
+
+        tracer.before_program(ProgramType::ClearState, [7u8; 32]);
+        tracer.before_opcode(0, 0x81);
+        tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
+        tracer.after_program(ProgramType::ClearState, true, None);
+
+        let trace = tracer.into_transaction_trace().unwrap();
+        assert!(!trace.clear_state_rollback);
+        assert!(trace.clear_state_rollback_error.is_none());
     }
 }

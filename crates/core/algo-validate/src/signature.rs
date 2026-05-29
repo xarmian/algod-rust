@@ -1,6 +1,6 @@
 use algo_avm::group::GroupBudget;
 use algo_avm::logicsig_context::LogicSigAvmContext;
-use algo_avm::run_logicsig_program;
+use algo_avm::{run_logicsig_program, run_logicsig_program_with_tracer, EvalTracer};
 use algo_codec::canonical_encode_transaction;
 use algo_error::AlgoError;
 use algo_types::consensus::ConsensusParams;
@@ -233,6 +233,23 @@ pub fn verify_logicsig(
     budget: &mut GroupBudget,
     consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
+    verify_logicsig_with_tracer(stx, lsig, group, group_index, budget, consensus, None)
+}
+
+/// Like [`verify_logicsig`], but threads an optional [`EvalTracer`] through the
+/// TEAL program execution so the simulation engine can capture logic-sig opcode
+/// traces. All callers that don't need a trace use [`verify_logicsig`], which
+/// passes `None`.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_logicsig_with_tracer(
+    stx: &SignedTransaction,
+    lsig: &LogicSig,
+    group: &[SignedTransaction],
+    group_index: usize,
+    budget: &mut GroupBudget,
+    consensus: &ConsensusParams,
+    tracer: Option<&mut dyn EvalTracer>,
+) -> Result<(), AlgoError> {
     // ── Structural sanity checks (Go: logicSigSanityCheckBatchPrep) ──
     // Empty program is always invalid.
     if lsig.logic.is_empty() {
@@ -345,10 +362,16 @@ pub fn verify_logicsig(
 
     let mut ctx = LogicSigAvmContext::new(group, group_index, &lsig.logic, args, consensus.clone());
 
-    let pass =
-        run_logicsig_program(&lsig.logic, &mut ctx, budget).map_err(|e| AlgoError::Validation {
-            message: format!("LogicSig program error: {e}"),
-        })?;
+    // Run the program, capturing an opcode trace when a tracer is supplied
+    // (simulation `exec-trace`). The untraced path is identical aside from the
+    // tracer callbacks.
+    let pass = match tracer {
+        Some(tracer) => run_logicsig_program_with_tracer(&lsig.logic, &mut ctx, budget, tracer),
+        None => run_logicsig_program(&lsig.logic, &mut ctx, budget),
+    }
+    .map_err(|e| AlgoError::Validation {
+        message: format!("LogicSig program error: {e}"),
+    })?;
 
     if !pass {
         return Err(AlgoError::Validation {
@@ -540,6 +563,21 @@ pub fn verify_transaction_signature(
     lsig_budget: &mut GroupBudget,
     consensus: &ConsensusParams,
 ) -> Result<(), AlgoError> {
+    verify_transaction_signature_with_tracer(stx, group, group_index, lsig_budget, consensus, None)
+}
+
+/// Like [`verify_transaction_signature`], but threads an optional [`EvalTracer`]
+/// through the LogicSig program execution so the simulation engine can capture
+/// logic-sig opcode traces. The tracer is only consulted on the LogicSig path;
+/// for single-sig and multisig transactions it is ignored.
+pub fn verify_transaction_signature_with_tracer(
+    stx: &SignedTransaction,
+    group: &[SignedTransaction],
+    group_index: usize,
+    lsig_budget: &mut GroupBudget,
+    consensus: &ConsensusParams,
+    tracer: Option<&mut dyn EvalTracer>,
+) -> Result<(), AlgoError> {
     // Go-algorand requires exactly one of sig/msig/lsig.
     let has_sig = stx.sig != [0u8; 64];
     let has_msig = stx.msig.is_some();
@@ -565,7 +603,15 @@ pub fn verify_transaction_signature(
     }
 
     if let Some(lsig) = &stx.lsig {
-        return verify_logicsig(stx, lsig, group, group_index, lsig_budget, consensus);
+        return verify_logicsig_with_tracer(
+            stx,
+            lsig,
+            group,
+            group_index,
+            lsig_budget,
+            consensus,
+            tracer,
+        );
     }
 
     unreachable!()

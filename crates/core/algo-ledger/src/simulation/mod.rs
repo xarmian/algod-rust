@@ -33,7 +33,7 @@ use algo_types::consensus::{consensus_params_for_version, ConsensusParams};
 use algo_types::{Address, Round, SignedTransaction};
 use algo_validate::{
     is_free_heartbeat, validate_transaction_wellformed, verify_transaction_signature,
-    SpecialAddresses,
+    verify_transaction_signature_with_tracer, SpecialAddresses,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -329,11 +329,22 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             .map(|h| h.timestamp.max(0) as u64)
             .unwrap_or(0);
 
-        // Run validation (signature verification + well-formedness) before execution.
-        if let Err(e) = self.check(txn_group, request.allow_empty_signatures, &consensus) {
-            self.store.restore_snapshot(snapshot);
-            return Err(e);
-        }
+        // Run validation (signature verification + well-formedness) before
+        // execution. When tracing is enabled, `check` also captures logic-sig
+        // opcode traces, since LogicSig programs run during signature
+        // verification — before the per-transaction execution tracer exists.
+        let logicsig_traces = match self.check(
+            txn_group,
+            request.allow_empty_signatures,
+            &consensus,
+            &request.trace_config,
+        ) {
+            Ok(traces) => traces,
+            Err(e) => {
+                self.store.restore_snapshot(snapshot);
+                return Err(e);
+            }
+        };
 
         // Compute group fee credit so inner transactions can draw from
         // overpayment by outer transactions (matches go-algorand's feeCredit).
@@ -417,7 +428,8 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 Ok(apply_data) => {
                     group_result.txn_results[i].apply_data = Some(apply_data);
                     initial_states.merge(tracer.take_initial_states());
-                    group_result.txn_results[i].trace = tracer.into_transaction_trace();
+                    group_result.txn_results[i].trace =
+                        merge_logicsig_trace(tracer.into_transaction_trace(), &logicsig_traces, i);
                 }
                 Err(e) => {
                     // Record failure. Collect any partial trace data before
@@ -426,7 +438,8 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     failure_message = Some(e.to_string());
                     failed_at = Some(vec![i]);
                     initial_states.merge(tracer.take_initial_states());
-                    group_result.txn_results[i].trace = tracer.into_transaction_trace();
+                    group_result.txn_results[i].trace =
+                        merge_logicsig_trace(tracer.into_transaction_trace(), &logicsig_traces, i);
                     break;
                 }
             }
@@ -470,7 +483,8 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         txn_group: &[SignedTransaction],
         allow_empty_signatures: bool,
         consensus: &ConsensusParams,
-    ) -> Result<(), SimulatorError> {
+        trace_config: &ExecTraceConfig,
+    ) -> Result<Vec<Option<TransactionTrace>>, SimulatorError> {
         let spec = SpecialAddresses {
             fee_sink: self.store.fee_sink(),
             rewards_pool: self.store.rewards_pool(),
@@ -574,19 +588,63 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         }
 
         // Pass 2: verify signatures on the (possibly proxy-signed) group.
+        // When tracing is enabled, capture each LogicSig program's opcode trace
+        // here — the LogicSig runs during signature verification, before the
+        // per-transaction execution tracer is created (go-algorand captures
+        // both in one pass; this engine splits check() from execution, so the
+        // logic-sig trace is captured now and merged into the execution trace
+        // for the same transaction afterwards).
+        let mut logicsig_traces: Vec<Option<TransactionTrace>> = vec![None; verify_group.len()];
         let mut budget = GroupBudget::for_logicsig(verify_group.len());
         for (i, stx) in verify_group.iter().enumerate() {
-            verify_transaction_signature(stx, &verify_group, i, &mut budget, consensus).map_err(
-                |e| {
-                    SimulatorError::InvalidRequest(InvalidRequestError {
-                        message: e.to_string(),
-                    })
-                },
-            )?;
+            let result = if trace_config.is_enabled() && stx.lsig.is_some() {
+                let mut lsig_tracer = SimulationTracer::new(trace_config.clone());
+                let r = verify_transaction_signature_with_tracer(
+                    stx,
+                    &verify_group,
+                    i,
+                    &mut budget,
+                    consensus,
+                    Some(&mut lsig_tracer),
+                );
+                logicsig_traces[i] = lsig_tracer.into_transaction_trace();
+                r
+            } else {
+                verify_transaction_signature(stx, &verify_group, i, &mut budget, consensus)
+            };
+            result.map_err(|e| {
+                SimulatorError::InvalidRequest(InvalidRequestError {
+                    message: e.to_string(),
+                })
+            })?;
         }
 
-        Ok(())
+        Ok(logicsig_traces)
     }
+}
+
+/// Merge a logic-sig trace captured during `check()` into the execution-phase
+/// trace for the same transaction. The LogicSig program runs during signature
+/// verification (before the per-transaction execution tracer exists), so its
+/// `logicsig_trace` / `logicsig_hash` are captured separately and grafted onto
+/// the transaction's execution trace here, matching go-algorand's single
+/// `TransactionTrace` that holds both the logic-sig and app-call traces.
+fn merge_logicsig_trace(
+    exec_trace: Option<TransactionTrace>,
+    logicsig_traces: &[Option<TransactionTrace>],
+    index: usize,
+) -> Option<TransactionTrace> {
+    let lsig = match logicsig_traces.get(index).and_then(|t| t.as_ref()) {
+        Some(t) if t.logicsig_trace.is_some() => t,
+        _ => return exec_trace,
+    };
+    // Tracing is enabled (a logic-sig trace was captured), so the execution
+    // tracer always produced a `Some` trace; fall back to a default trace if
+    // for some reason it didn't, so the logic-sig trace is never dropped.
+    let mut trace = exec_trace.unwrap_or_default();
+    trace.logicsig_trace = lsig.logicsig_trace.clone();
+    trace.logicsig_hash = lsig.logicsig_hash;
+    Some(trace)
 }
 
 #[cfg(test)]

@@ -10,7 +10,10 @@ use algo_ledger::simulation::{
     AvmValueTrace, ExecTraceConfig, SimulationRequest, Simulator, SimulatorError, StateChangeKind,
 };
 use algo_ledger::{LedgerState, LedgerStore};
-use algo_types::{AccountData, Address, AppParams, SignedTransaction, StateSchema, Transaction};
+use algo_types::{
+    AccountData, Address, AppParams, LogicSig, SignedTransaction, StateSchema, Transaction,
+};
+use sha2::{Digest, Sha512_256};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -184,139 +187,6 @@ fn simulation_no_trace_when_disabled() {
         txn_result.trace.is_none(),
         "trace should be None when tracing is disabled"
     );
-}
-
-/// When an inner transaction is traced, the result should contain inner traces
-/// with opcode entries for the inner program.
-#[test]
-fn simulation_trace_inner_txn_populated() {
-    let sender = Address([0xAA; 32]);
-    let outer_app_id = 100;
-    let inner_app_id = 200;
-
-    // Inner app: version 6, pushint 1, return
-    let inner_approval = vec![0x06, 0x81, 0x01, 0x43];
-
-    // Outer app approval program (TEAL v6):
-    // We need: itxn_begin, pushint 6, itxn_field TypeEnum, pushint 200, itxn_field ApplicationID, itxn_submit, pushint 1, return
-    // Opcodes:
-    //   0xb4 = itxn_begin
-    //   0x81 = pushint (varint follows)
-    //   0xb5 = itxn_field (field index follows)
-    //   0xb6 = itxn_submit
-    //   0x43 = return
-    // TypeEnum field index = 1 (in go-algorand TxnField table, TypeEnum is at index 1... let's check)
-    // Actually, we need the exact field indices. Let's construct a minimal outer program.
-    // For itxn_field, the field index byte maps to the TxnFieldIndex enum.
-    // TypeEnum = field 1, ApplicationID = field 24 in go-algorand.
-
-    // Bytecode: [version=6] [itxn_begin] [pushint 6] [itxn_field TypeEnum(1)] [pushint 200(varint)] [itxn_field ApplicationID(24)] [itxn_submit] [pushint 1] [return]
-    // varint 200 = 0xC8 0x01
-    let outer_approval = vec![
-        0x06, // version 6
-        0xb4, // itxn_begin
-        0x81, 0x06, // pushint 6 (appl)
-        0xb5, 0x01, // itxn_field TypeEnum (field index 1)
-        0x81, 0xC8, 0x01, // pushint 200
-        0xb5, 0x18, // itxn_field ApplicationID (field index 24)
-        0xb6, // itxn_submit
-        0x81, 0x01, // pushint 1
-        0x43, // return
-    ];
-
-    let fee_sink = Address([0xFE; 32]);
-
-    let mut state = LedgerState::new();
-    state.fee_sink = fee_sink;
-    state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
-
-    // Fund the sender.
-    let sender_account = AccountData {
-        micro_algos: 10_000_000,
-        total_created_apps: 2,
-        ..Default::default()
-    };
-    state.set_account(&sender, sender_account);
-
-    // Fee sink.
-    state.set_account(
-        &fee_sink,
-        AccountData {
-            micro_algos: 0,
-            ..Default::default()
-        },
-    );
-
-    // Register outer app.
-    state.set_app_params(
-        outer_app_id,
-        AppParams {
-            creator: sender,
-            approval_program: outer_approval,
-            clear_state_program: vec![0x06, 0x81, 0x01, 0x43],
-            global_state: BTreeMap::new(),
-            local_state_schema: StateSchema::default(),
-            global_state_schema: StateSchema::default(),
-            extra_program_pages: 0,
-        },
-    );
-
-    // Register inner app.
-    state.set_app_params(
-        inner_app_id,
-        AppParams {
-            creator: sender,
-            approval_program: inner_approval,
-            clear_state_program: vec![0x06, 0x81, 0x01, 0x43],
-            global_state: BTreeMap::new(),
-            local_state_schema: StateSchema::default(),
-            global_state_schema: StateSchema::default(),
-            extra_program_pages: 0,
-        },
-    );
-
-    let txn = make_appl_txn(sender, outer_app_id);
-
-    let request = SimulationRequest {
-        txn_groups: vec![vec![txn]],
-        allow_empty_signatures: true,
-        trace_config: ExecTraceConfig {
-            enable: true,
-            stack: false,
-            scratch: false,
-            state: false,
-        },
-        ..Default::default()
-    };
-
-    let mut simulator = Simulator::new(&mut state);
-    let result = simulator.simulate(request);
-
-    // The simulation may fail if the AVM doesn't fully support inner txns yet.
-    // If it succeeds, verify inner traces are populated.
-    if let Ok(result) = result {
-        let group = &result.txn_groups[0];
-        if group.failure_message.is_none() {
-            let txn_result = &group.txn_results[0];
-            if let Some(trace) = txn_result.trace.as_ref() {
-                // If inner txn execution happened, we should have inner traces.
-                if !trace.inner_traces.is_empty() {
-                    let inner = &trace.inner_traces[0];
-                    assert!(
-                        inner.approval_program_trace.is_some(),
-                        "inner trace should have an approval program trace"
-                    );
-                    let inner_approval = inner.approval_program_trace.as_ref().unwrap();
-                    assert!(
-                        !inner_approval.opcodes.is_empty(),
-                        "inner approval trace should have opcode entries"
-                    );
-                }
-            }
-        }
-    }
-    // If simulation fails (e.g., itxn not fully supported yet), the test
-    // still passes — the unit tests in tracer.rs cover the core logic.
 }
 
 /// When stack tracing is enabled, opcode entries should contain stack data.
@@ -578,5 +448,255 @@ fn simulation_no_initial_states_without_state_config() {
     assert!(
         result.initial_states.is_none(),
         "initial_states must be None when state tracing is off"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// LogicSig trace capture (TASK-249)
+// ---------------------------------------------------------------------------
+
+/// SHA512/256("Program" || program) — the contract-account address.
+fn contract_account_address(program: &[u8]) -> Address {
+    let mut hasher = Sha512_256::new();
+    hasher.update(b"Program");
+    hasher.update(program);
+    Address(hasher.finalize().into())
+}
+
+/// SHA512/256(program) — the LogicSigHash reported in the exec trace.
+fn program_hash(program: &[u8]) -> [u8; 32] {
+    Sha512_256::digest(program).into()
+}
+
+/// A LogicSig-authorized payment, simulated with `exec-trace` enabled, must
+/// capture the logic-sig opcode trace and program hash. The LogicSig runs
+/// during `check()` (signature verification), so this exercises the tracer
+/// threaded through that path.
+#[test]
+fn simulation_trace_captures_logicsig_program() {
+    // v6 program: pushint 1 (approves). The contract account is its hash.
+    let program = vec![0x06, 0x81, 0x01];
+    let sender = contract_account_address(&program);
+    let receiver = Address([0x20; 32]);
+    let fee_sink = Address([0xFE; 32]);
+
+    let mut state = LedgerState::new();
+    state.fee_sink = fee_sink;
+    state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
+    state.set_account(
+        &sender,
+        AccountData {
+            micro_algos: 10_000_000,
+            ..Default::default()
+        },
+    );
+    state.set_account(
+        &fee_sink,
+        AccountData {
+            micro_algos: 0,
+            ..Default::default()
+        },
+    );
+
+    let txn = SignedTransaction {
+        txn: Transaction {
+            txn_type: "pay".into(),
+            sender,
+            fee: 1000,
+            first_valid: 0.into(),
+            last_valid: 1000.into(),
+            receiver,
+            amount: 0,
+            ..Default::default()
+        },
+        lsig: Some(LogicSig {
+            logic: serde_bytes::ByteBuf::from(program.clone()),
+            sig: [0u8; 64],
+            msig: None,
+            lmsig: None,
+            args: None,
+        }),
+        ..Default::default()
+    };
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn]],
+        allow_empty_signatures: false,
+        trace_config: ExecTraceConfig {
+            enable: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("logicsig simulation should succeed");
+
+    let group = &result.txn_groups[0];
+    assert!(
+        group.failure_message.is_none(),
+        "unexpected failure: {:?}",
+        group.failure_message
+    );
+    let trace = group.txn_results[0]
+        .trace
+        .as_ref()
+        .expect("trace should be present when tracing is enabled");
+
+    let lsig_trace = trace
+        .logicsig_trace
+        .as_ref()
+        .expect("logic-sig trace must be captured");
+    assert!(
+        !lsig_trace.opcodes.is_empty(),
+        "logic-sig trace should contain opcode units"
+    );
+    assert_eq!(
+        trace.logicsig_hash,
+        Some(program_hash(&program)),
+        "logic-sig hash must be SHA512/256(program)"
+    );
+    // The payment itself runs no app program, so there is no approval trace.
+    assert!(trace.approval_program_trace.is_none());
+}
+
+/// An app issuing an inner app call must produce a nested `inner_trace` and the
+/// spawning `itxn_submit` opcode must record the inner's index in
+/// `spawned_inners` (go-algorand `OpcodeTraceUnit.SpawnedInners`).
+#[test]
+fn simulation_trace_inner_txn_spawned_inners() {
+    let sender = Address([0xAA; 32]);
+    let outer_app_id = 100;
+    let inner_app_id = 200;
+
+    let inner_approval = vec![0x06, 0x81, 0x01, 0x43]; // v6: pushint 1, return
+
+    // Outer app (v6): itxn_begin; pushint 6 (appl); itxn_field TypeEnum(16);
+    // pushint 200; itxn_field ApplicationID(24); itxn_submit; pushint 1; return.
+    // Opcodes: itxn_begin=0xb1, itxn_field=0xb2, itxn_submit=0xb3.
+    let outer_approval = vec![
+        0x06, // version 6
+        0xb1, // itxn_begin
+        0x81, 0x06, // pushint 6 (appl)
+        0xb2, 0x10, // itxn_field TypeEnum (field 16)
+        0x81, 0xC8, 0x01, // pushint 200
+        0xb2, 0x18, // itxn_field ApplicationID (field 24)
+        0xb3, // itxn_submit
+        0x81, 0x01, // pushint 1
+        0x43, // return
+    ];
+
+    let fee_sink = Address([0xFE; 32]);
+    let mut state = LedgerState::new();
+    state.fee_sink = fee_sink;
+    state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
+    state.set_account(
+        &sender,
+        AccountData {
+            micro_algos: 10_000_000,
+            total_created_apps: 2,
+            ..Default::default()
+        },
+    );
+    state.set_account(
+        &fee_sink,
+        AccountData {
+            micro_algos: 0,
+            ..Default::default()
+        },
+    );
+    state.set_app_params(
+        outer_app_id,
+        AppParams {
+            creator: sender,
+            approval_program: outer_approval,
+            clear_state_program: vec![0x06, 0x81, 0x01, 0x43],
+            global_state: BTreeMap::new(),
+            local_state_schema: StateSchema::default(),
+            global_state_schema: StateSchema::default(),
+            extra_program_pages: 0,
+        },
+    );
+    state.set_app_params(
+        inner_app_id,
+        AppParams {
+            creator: sender,
+            approval_program: inner_approval,
+            clear_state_program: vec![0x06, 0x81, 0x01, 0x43],
+            global_state: BTreeMap::new(),
+            local_state_schema: StateSchema::default(),
+            global_state_schema: StateSchema::default(),
+            extra_program_pages: 0,
+        },
+    );
+    // The outer app account must hold a min-balance for the inner app's fee.
+    let outer_app_addr = Address(algo_ledger::avm_context::app_address(outer_app_id));
+    state.set_account(
+        &outer_app_addr,
+        AccountData {
+            micro_algos: 10_000_000,
+            ..Default::default()
+        },
+    );
+
+    // The inner app must be a referenced resource of the outer call.
+    let mut txn = make_appl_txn(sender, outer_app_id);
+    txn.txn.foreign_apps = Some(vec![inner_app_id]);
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn]],
+        allow_empty_signatures: true,
+        trace_config: ExecTraceConfig {
+            enable: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("inner-txn simulation should succeed");
+
+    let group = &result.txn_groups[0];
+    assert!(
+        group.failure_message.is_none(),
+        "unexpected failure: {:?}",
+        group.failure_message
+    );
+    let trace = group.txn_results[0]
+        .trace
+        .as_ref()
+        .expect("trace should be present");
+
+    // Exactly one inner transaction was spawned.
+    assert_eq!(trace.inner_traces.len(), 1, "expected one inner trace");
+    assert!(
+        trace.inner_traces[0].approval_program_trace.is_some(),
+        "inner trace should carry the inner app's approval trace"
+    );
+
+    // Exactly one opcode (itxn_submit) records the spawned inner, and its index
+    // must point at inner_traces[0].
+    let approval = trace
+        .approval_program_trace
+        .as_ref()
+        .expect("approval trace present");
+    let spawning: Vec<&Vec<usize>> = approval
+        .opcodes
+        .iter()
+        .map(|u| &u.spawned_inners)
+        .filter(|s| !s.is_empty())
+        .collect();
+    assert_eq!(
+        spawning.len(),
+        1,
+        "exactly one opcode (itxn_submit) should spawn inners"
+    );
+    assert_eq!(
+        spawning[0],
+        &vec![0usize],
+        "spawned-inners index must reference inner_traces[0]"
     );
 }
