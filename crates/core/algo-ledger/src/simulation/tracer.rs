@@ -5,11 +5,12 @@
 //! [`TransactionTrace`] structures for the simulation result.
 
 use algo_avm::machine::AvmValue;
-use algo_avm::tracer::{AppStateAccess, EvalTracer, ProgramType};
+use algo_avm::tracer::{AppStateAccess, AppStateOp, AppStateType, EvalTracer, ProgramType};
+use algo_types::{Address, TealValue};
 
 use super::trace::{
     AvmValueTrace, ExecTraceConfig, InitialStatesAccumulator, OpcodeTraceUnit, ProgramTrace,
-    TransactionTrace,
+    StateChange, StateChangeKind, TransactionTrace,
 };
 
 /// Converts an AVM machine value to a trace-friendly representation.
@@ -17,6 +18,14 @@ fn to_trace_value(v: &AvmValue) -> AvmValueTrace {
     match v {
         AvmValue::Uint64(n) => AvmValueTrace::Uint64(*n),
         AvmValue::Bytes(b) => AvmValueTrace::Bytes(b.clone()),
+    }
+}
+
+/// Converts a ledger [`TealValue`] to a trace-friendly representation.
+fn teal_to_trace_value(v: &TealValue) -> AvmValueTrace {
+    match v {
+        TealValue::Uint(n) => AvmValueTrace::Uint64(*n),
+        TealValue::Bytes(b) => AvmValueTrace::Bytes(b.clone()),
     }
 }
 
@@ -65,6 +74,9 @@ pub struct SimulationTracer {
     /// when `config.state` is set). The simulation engine drains this after
     /// each transaction and merges it into the simulation-level snapshot.
     initial_states: InitialStatesAccumulator,
+    /// State changes (global/local writes/deletes) recorded during the current
+    /// opcode, flushed into the opcode's trace unit at `after_opcode`.
+    pending_state_changes: Vec<StateChange>,
 }
 
 impl SimulationTracer {
@@ -77,6 +89,7 @@ impl SimulationTracer {
             trace_path: Vec::new(),
             program_state_stack: Vec::new(),
             initial_states: InitialStatesAccumulator::default(),
+            pending_state_changes: Vec::new(),
         }
     }
 
@@ -205,6 +218,11 @@ impl EvalTracer for SimulationTracer {
             return;
         }
 
+        // Drain state changes recorded during this opcode before borrowing the
+        // current program (avoids a double mutable borrow of `self`). Empty
+        // unless `config.state` and a write/delete occurred.
+        let state_changes = std::mem::take(&mut self.pending_state_changes);
+
         let state = match self.current_program.as_mut() {
             Some(s) => s,
             None => return,
@@ -212,6 +230,7 @@ impl EvalTracer for SimulationTracer {
 
         let mut unit = OpcodeTraceUnit {
             pc,
+            state_changes,
             ..Default::default()
         };
 
@@ -284,9 +303,32 @@ impl EvalTracer for SimulationTracer {
         // Initial-state capture is gated on the state-change trace config,
         // matching go-algorand's `newResourcesInitialStates` (nil unless
         // `TraceConfig.State`).
-        if self.config.state {
-            self.initial_states.record(access);
+        if !self.config.state {
+            return;
         }
+        self.initial_states.record(access);
+
+        // Per-opcode state-change capture (go-algorand `appendStateOperations`):
+        // record only write/delete operations, never reads. Box state-changes
+        // are a follow-up task; only global/local are captured here.
+        let kind = match (access.op, access.state) {
+            (AppStateOp::Write | AppStateOp::Delete, AppStateType::Global) => {
+                StateChangeKind::GlobalState
+            }
+            (AppStateOp::Write | AppStateOp::Delete, AppStateType::Local) => {
+                StateChangeKind::LocalState
+            }
+            _ => return,
+        };
+        self.pending_state_changes.push(StateChange {
+            kind,
+            app_id: access.app_id,
+            key: access.key.to_vec(),
+            // Delete leaves `new_value` None (serialized as omitted), matching
+            // go-algorand's empty TealValue for deletes.
+            new_value: access.new_value.as_ref().map(teal_to_trace_value),
+            account: access.account.map(Address),
+        });
     }
 
     fn record_created_app(&mut self, app_id: u64) {
@@ -361,6 +403,7 @@ mod tests {
             account: None,
             key: b"k",
             pre_value: Some(algo_types::TealValue::Uint(7)),
+            new_value: None,
         };
         tracer.record_app_state_access(&access);
 

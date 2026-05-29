@@ -523,6 +523,7 @@ mod tests {
             account: None,
             key,
             pre_value: pre,
+            new_value: None,
         }
     }
 
@@ -636,6 +637,7 @@ mod tests {
             account: Some(addr),
             key: b"lk",
             pre_value: Some(TealValue::Uint(3)),
+            new_value: None,
         });
         acc.record(&AppStateAccess {
             executing_app_id: 100,
@@ -645,6 +647,7 @@ mod tests {
             account: None,
             key: b"bk",
             pre_value: Some(TealValue::Bytes(b"boxval".to_vec())),
+            new_value: None,
         });
         let states = acc.into_resources_initial_states();
         let (_, app) = &states.app_initial_states[0];
