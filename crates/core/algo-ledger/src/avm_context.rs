@@ -3210,6 +3210,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
     fn box_resize(&mut self, name: &[u8], new_size: u64) -> Result<(), AlgoError> {
         self.box_length_checks(name, new_size)?;
+        let pre = self.box_pre_value(name);
+        self.record_app_state_access(
+            self.app_id,
+            AppStateType::Box,
+            AppStateOp::Write,
+            None,
+            name,
+            pre,
+        );
         let (contents, exists) = self.available_box(name, BoxOperation::Resize, new_size)?;
         if !exists {
             return Err(AlgoError::Avm {
@@ -3254,6 +3263,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         value: &[u8],
     ) -> Result<(), AlgoError> {
         self.box_length_checks(name, 0)?;
+        let pre = self.box_pre_value(name);
+        self.record_app_state_access(
+            self.app_id,
+            AppStateType::Box,
+            AppStateOp::Write,
+            None,
+            name,
+            pre,
+        );
         let (contents, exists) = self.available_box(name, BoxOperation::Write, 0)?;
         if !exists {
             return Err(AlgoError::Avm {
