@@ -8,6 +8,8 @@
 //! `logic.EvalTracer` interface (transaction-group-level hooks live in the
 //! simulation layer in `algo-ledger`).
 
+use algo_types::TealValue;
+
 use crate::machine::AvmValue;
 
 /// The type of AVM program being executed.
@@ -22,6 +24,57 @@ pub enum ProgramType {
     ClearState,
     /// LogicSig (stateless signature) program.
     LogicSig,
+}
+
+/// The category of application state involved in an access.
+///
+/// Mirrors the `logic.AppStateEnum` categories used by go-algorand's
+/// `OpSpec.AppStateExplain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppStateType {
+    /// Application global state.
+    Global,
+    /// Application local state (tied to an account address).
+    Local,
+    /// Application box storage.
+    Box,
+}
+
+/// The kind of operation performed on application state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppStateOp {
+    /// A read access (e.g. `app_global_get`, `box_get`).
+    Read,
+    /// A write access (e.g. `app_global_put`, `box_put`).
+    Write,
+    /// A delete access (e.g. `app_global_del`, `box_del`).
+    Delete,
+}
+
+/// A single application-state access reported to an [`EvalTracer`] so that
+/// simulation can capture pre-execution ("initial") state.
+///
+/// Mirrors the inputs go-algorand derives from `OpSpec.AppStateExplain` +
+/// `AppStateQuerying` (see `ledger/simulation/initialStates.go`).
+pub struct AppStateAccess<'a> {
+    /// The currently-executing application (go-algorand's `cx.AppID()`).
+    /// Used for the created-app exclusion check.
+    pub executing_app_id: u64,
+    /// The application whose state is being accessed. Equals
+    /// `executing_app_id` for non-`_ex` opcodes; may differ for foreign-app
+    /// reads (e.g. `app_global_get_ex`).
+    pub app_id: u64,
+    /// The category of state being accessed.
+    pub state: AppStateType,
+    /// The operation kind.
+    pub op: AppStateOp,
+    /// The account address for local-state accesses; `None` for global/box.
+    pub account: Option<[u8; 32]>,
+    /// The state key (global/local key, or box name).
+    pub key: &'a [u8],
+    /// The on-chain value immediately before this operation, or `None` if the
+    /// key/box did not exist.
+    pub pre_value: Option<TealValue>,
 }
 
 /// Trait for observing AVM program execution.
@@ -81,6 +134,21 @@ pub trait EvalTracer {
         _error: Option<&str>,
     ) {
     }
+
+    /// Report an application-state access for initial-state capture.
+    ///
+    /// Called by the ledger AVM context before each application global/local/box
+    /// read, write, or delete during simulation. The default is a no-op, so the
+    /// consensus apply path (which attaches no tracer) is entirely unaffected.
+    fn record_app_state_access(&mut self, _access: &AppStateAccess<'_>) {}
+
+    /// Report that an application was created during simulation.
+    ///
+    /// The initial states of apps created mid-simulation are excluded from
+    /// capture (they have no pre-existing on-chain state). Mirrors
+    /// go-algorand's `ResourcesInitialStates.CreatedApp` population in
+    /// `ledger/simulation/tracer.go`.
+    fn record_created_app(&mut self, _app_id: u64) {}
 }
 
 /// A no-op tracer that discards all events.

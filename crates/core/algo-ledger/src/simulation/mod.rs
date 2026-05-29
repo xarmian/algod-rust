@@ -17,9 +17,9 @@ pub mod trace;
 pub mod tracer;
 
 pub use trace::{
-    AvmValueTrace, ExecTraceConfig, OpcodeTraceUnit, ProgramTrace, ResultEvalOverrides,
-    SimulationResult, StateChange, StateChangeKind, TransactionTrace, TxnGroupResult, TxnPath,
-    TxnResult,
+    AppInitialState, AvmValueTrace, ExecTraceConfig, InitialStatesAccumulator, OpcodeTraceUnit,
+    ProgramTrace, ResourcesInitialStates, ResultEvalOverrides, SimulationResult, StateChange,
+    StateChangeKind, TransactionTrace, TxnGroupResult, TxnPath, TxnResult,
 };
 pub use tracer::SimulationTracer;
 
@@ -368,6 +368,12 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         let mut failure_message: Option<String> = None;
         let mut failed_at: Option<TxnPath> = None;
 
+        // Initial application state captured across the group (populated only
+        // when state-change tracing is requested). Each transaction's tracer
+        // captures into its own accumulator; we merge them here with
+        // first-touch-wins semantics so the earliest-seen pre-value persists.
+        let mut initial_states = InitialStatesAccumulator::default();
+
         // Count app calls for group budget
         let num_app_calls = txn_group
             .iter()
@@ -405,6 +411,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             match apply_result {
                 Ok(apply_data) => {
                     group_result.txn_results[i].apply_data = Some(apply_data);
+                    initial_states.merge(tracer.take_initial_states());
                     group_result.txn_results[i].trace = tracer.into_transaction_trace();
                 }
                 Err(e) => {
@@ -413,6 +420,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     // the point of failure).
                     failure_message = Some(e.to_string());
                     failed_at = Some(vec![i]);
+                    initial_states.merge(tracer.take_initial_states());
                     group_result.txn_results[i].trace = tracer.into_transaction_trace();
                     break;
                 }
@@ -428,6 +436,14 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         group_result.app_budget_consumed = (total_budget - group_budget.remaining()).max(0) as u64;
 
         result.txn_groups.push(group_result);
+
+        // Surface captured initial states when state-change tracing was
+        // requested (go-algorand returns a non-nil `InitialStates` whenever
+        // `TraceConfig.State` is set). Must happen before the store is
+        // restored, though the accumulator already owns the captured values.
+        if request.trace_config.state {
+            result.initial_states = Some(initial_states.into_resources_initial_states());
+        }
 
         // --- Restore the store to its pre-simulation state ---
 

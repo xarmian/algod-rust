@@ -24,15 +24,16 @@ use std::time::Duration;
 
 use algo_codec::{canonical_encode_block_header, compute_block_digest};
 use algo_ledger::simulation::{
-    ExecTraceConfig, SimulationRequest, SimulationResult, Simulator, SimulatorError,
-    TxnGroupResult, TxnResult,
+    AppInitialState, AvmValueTrace, ExecTraceConfig, ResourcesInitialStates, SimulationRequest,
+    SimulationResult, Simulator, SimulatorError, TxnGroupResult, TxnResult,
 };
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{SqliteLedger, StateDelta};
 use algo_network::local_tx_broadcast::{LocalTxBroadcaster, LocalTxError};
 use algo_pool::TransactionPool;
 use algo_rest_api::models::{
-    PreEncodedTxInfo, SimulateRequest, SimulateResponse, SimulateTraceConfig,
+    ApplicationInitialStates, ApplicationKVStorage, AvmKeyValue, AvmValue, PreEncodedTxInfo,
+    SimulateInitialStates, SimulateRequest, SimulateResponse, SimulateTraceConfig,
     SimulateTransactionGroupResult, SimulateTransactionResult,
 };
 use algo_rest_api::node::{
@@ -995,13 +996,15 @@ impl AlgodNodeInterface {
     /// Build the top-level [`SimulateResponse`] from the simulator's
     /// [`SimulationResult`].
     ///
-    /// `eval_overrides`, `initial_states`, and `exec_trace_config` are
-    /// intentionally left `None` — populating them is PLAN-34 scope.
+    /// `eval_overrides` and `exec_trace_config` are still left `None` — they are
+    /// the scope of a sibling PLAN-34 task (TASK-247). `initial_states` is
+    /// populated here (TASK-246) when state-change tracing captured any.
     fn build_simulate_response(result: SimulationResult) -> SimulateResponse {
+        let initial_states = result.initial_states.map(Self::initial_states_to_model);
         SimulateResponse {
             eval_overrides: None,
             exec_trace_config: None,
-            initial_states: None,
+            initial_states,
             last_round: result.last_round.0,
             txn_groups: result
                 .txn_groups
@@ -1009,6 +1012,99 @@ impl AlgodNodeInterface {
                 .map(Self::txn_group_result_to_model)
                 .collect(),
             version: result.version,
+        }
+    }
+
+    /// Convert a captured [`AvmValueTrace`] into the REST [`AvmValue`].
+    ///
+    /// Uses go-algorand's TEAL value type tags: `1` = bytes, `2` = uint.
+    fn avm_value_trace_to_model(value: &AvmValueTrace) -> AvmValue {
+        match value {
+            AvmValueTrace::Uint64(n) => AvmValue {
+                bytes: None,
+                value_type: 2,
+                uint: Some(*n),
+            },
+            AvmValueTrace::Bytes(b) => AvmValue {
+                bytes: Some(b.clone()),
+                value_type: 1,
+                uint: None,
+            },
+        }
+    }
+
+    /// Convert the ledger's [`ResourcesInitialStates`] into the REST
+    /// [`SimulateInitialStates`]. Returns a present-but-possibly-empty value
+    /// (the caller only calls this when state-change tracing was requested,
+    /// mirroring go-algorand's non-nil `InitialStates`).
+    fn initial_states_to_model(states: ResourcesInitialStates) -> SimulateInitialStates {
+        let app_states: Vec<ApplicationInitialStates> = states
+            .app_initial_states
+            .into_iter()
+            .map(|(id, app)| Self::app_initial_states_to_model(id, app))
+            .collect();
+
+        SimulateInitialStates {
+            app_initial_states: if app_states.is_empty() {
+                None
+            } else {
+                Some(app_states)
+            },
+        }
+    }
+
+    /// Convert a single app's captured [`AppInitialState`] into the REST
+    /// [`ApplicationInitialStates`]. Empty state categories are omitted.
+    fn app_initial_states_to_model(id: u64, app: AppInitialState) -> ApplicationInitialStates {
+        let app_globals = (!app.global_state.is_empty()).then(|| ApplicationKVStorage {
+            account: None,
+            kvs: app
+                .global_state
+                .into_iter()
+                .map(|(key, value)| AvmKeyValue {
+                    key,
+                    value: Self::avm_value_trace_to_model(&value),
+                })
+                .collect(),
+        });
+
+        let app_locals = (!app.local_states.is_empty()).then(|| {
+            app.local_states
+                .into_iter()
+                .map(|(addr, kvs)| ApplicationKVStorage {
+                    account: Some(addr.to_string()),
+                    kvs: kvs
+                        .into_iter()
+                        .map(|(key, value)| AvmKeyValue {
+                            key,
+                            value: Self::avm_value_trace_to_model(&value),
+                        })
+                        .collect(),
+                })
+                .collect()
+        });
+
+        let app_boxes = (!app.boxes.is_empty()).then(|| ApplicationKVStorage {
+            account: None,
+            kvs: app
+                .boxes
+                .into_iter()
+                .map(|(key, bytes)| AvmKeyValue {
+                    key,
+                    value: AvmValue {
+                        bytes: Some(bytes),
+                        value_type: 1,
+                        uint: None,
+                    },
+                })
+                .collect(),
+        });
+
+        ApplicationInitialStates {
+            app_boxes,
+            app_globals,
+            app_locals,
+            id,
         }
     }
 
@@ -1116,6 +1212,61 @@ mod tests {
             branch: "main".into(),
             channel: "dev".into(),
         }
+    }
+
+    #[test]
+    fn initial_states_to_model_maps_globals_locals_boxes() {
+        let addr = Address([0xAB; 32]);
+        let states = ResourcesInitialStates {
+            app_initial_states: vec![(
+                42,
+                AppInitialState {
+                    global_state: vec![(b"g".to_vec(), AvmValueTrace::Uint64(7))],
+                    local_states: vec![(
+                        addr,
+                        vec![(b"l".to_vec(), AvmValueTrace::Bytes(b"v".to_vec()))],
+                    )],
+                    boxes: vec![(b"b".to_vec(), b"boxdata".to_vec())],
+                },
+            )],
+        };
+
+        let model = AlgodNodeInterface::initial_states_to_model(states);
+        let apps = model
+            .app_initial_states
+            .expect("app-initial-states populated");
+        assert_eq!(apps.len(), 1);
+        let app = &apps[0];
+        assert_eq!(app.id, 42);
+
+        // Global: uint type tag (2), value 7.
+        let globals = app.app_globals.as_ref().expect("globals present");
+        assert_eq!(globals.kvs.len(), 1);
+        assert_eq!(globals.kvs[0].key, b"g");
+        assert_eq!(globals.kvs[0].value.value_type, 2);
+        assert_eq!(globals.kvs[0].value.uint, Some(7));
+
+        // Local: keyed by account address string, bytes type tag (1).
+        let locals = app.app_locals.as_ref().expect("locals present");
+        assert_eq!(locals.len(), 1);
+        assert_eq!(locals[0].account, Some(addr.to_string()));
+        assert_eq!(locals[0].kvs[0].value.value_type, 1);
+        assert_eq!(locals[0].kvs[0].value.bytes, Some(b"v".to_vec()));
+
+        // Box: bytes type tag (1), raw contents.
+        let boxes = app.app_boxes.as_ref().expect("boxes present");
+        assert_eq!(boxes.kvs[0].key, b"b");
+        assert_eq!(boxes.kvs[0].value.value_type, 1);
+        assert_eq!(boxes.kvs[0].value.bytes, Some(b"boxdata".to_vec()));
+    }
+
+    #[test]
+    fn initial_states_to_model_empty_app_states_omitted() {
+        let states = ResourcesInitialStates {
+            app_initial_states: vec![],
+        };
+        let model = AlgodNodeInterface::initial_states_to_model(states);
+        assert!(model.app_initial_states.is_none());
     }
 
     fn make_adapter() -> AlgodNodeInterface {

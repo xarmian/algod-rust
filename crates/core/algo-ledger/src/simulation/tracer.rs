@@ -5,10 +5,11 @@
 //! [`TransactionTrace`] structures for the simulation result.
 
 use algo_avm::machine::AvmValue;
-use algo_avm::tracer::{EvalTracer, ProgramType};
+use algo_avm::tracer::{AppStateAccess, EvalTracer, ProgramType};
 
 use super::trace::{
-    AvmValueTrace, ExecTraceConfig, OpcodeTraceUnit, ProgramTrace, TransactionTrace,
+    AvmValueTrace, ExecTraceConfig, InitialStatesAccumulator, OpcodeTraceUnit, ProgramTrace,
+    TransactionTrace,
 };
 
 /// Converts an AVM machine value to a trace-friendly representation.
@@ -58,6 +59,10 @@ pub struct SimulationTracer {
     /// When `before_txn` is called, the current program state is pushed here
     /// so it can be restored after the inner transaction completes.
     program_state_stack: Vec<Option<ProgramTraceState>>,
+    /// Initial application state captured for this transaction (populated only
+    /// when `config.state` is set). The simulation engine drains this after
+    /// each transaction and merges it into the simulation-level snapshot.
+    initial_states: InitialStatesAccumulator,
 }
 
 impl SimulationTracer {
@@ -69,7 +74,15 @@ impl SimulationTracer {
             transaction_trace: TransactionTrace::default(),
             trace_path: Vec::new(),
             program_state_stack: Vec::new(),
+            initial_states: InitialStatesAccumulator::default(),
         }
+    }
+
+    /// Take the initial-state snapshot captured during this transaction,
+    /// leaving an empty accumulator behind. Called by the simulation engine
+    /// before consuming the tracer for its execution trace.
+    pub fn take_initial_states(&mut self) -> InitialStatesAccumulator {
+        std::mem::take(&mut self.initial_states)
     }
 
     /// Consume the tracer and return the accumulated transaction trace.
@@ -250,6 +263,21 @@ impl EvalTracer for SimulationTracer {
         }
 
         state.trace.opcodes.push(unit);
+    }
+
+    fn record_app_state_access(&mut self, access: &AppStateAccess<'_>) {
+        // Initial-state capture is gated on the state-change trace config,
+        // matching go-algorand's `newResourcesInitialStates` (nil unless
+        // `TraceConfig.State`).
+        if self.config.state {
+            self.initial_states.record(access);
+        }
+    }
+
+    fn record_created_app(&mut self, app_id: u64) {
+        if self.config.state {
+            self.initial_states.mark_created_app(app_id);
+        }
     }
 }
 
