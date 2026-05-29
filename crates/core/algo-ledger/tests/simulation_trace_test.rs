@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use algo_ledger::simulation::{ExecTraceConfig, SimulationRequest, Simulator};
+use algo_ledger::simulation::{ExecTraceConfig, SimulationRequest, Simulator, SimulatorError};
 use algo_ledger::{LedgerState, LedgerStore};
 use algo_types::{AccountData, Address, AppParams, SignedTransaction, StateSchema, Transaction};
 
@@ -365,6 +365,39 @@ fn simulation_trace_with_stack() {
         !first_opcode.stack_additions.is_empty(),
         "pushint should add a value to the stack trace"
     );
+}
+
+/// A group whose pooled fees are below the minimum must be rejected by the
+/// simulator's check() phase (matching go-algorand's verify.TxnGroup), not
+/// silently evaluated.
+#[test]
+fn simulation_rejects_underpaid_group() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 100;
+    let approval = vec![0x06, 0x81, 0x01, 0x43];
+    let mut state = setup_state(sender, app_id, approval);
+
+    // App call with zero fee — below the per-transaction minimum.
+    let mut txn = make_appl_txn(sender, app_id);
+    txn.txn.fee = 0;
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new(&mut state);
+    match simulator.simulate(request) {
+        Err(SimulatorError::InvalidRequest(e)) => {
+            assert!(
+                e.message.contains("fees"),
+                "expected a group-fee error, got: {}",
+                e.message
+            );
+        }
+        other => panic!("expected InvalidRequest fee error, got {other:?}"),
+    }
 }
 
 /// Approval program (v8) that reads global key "g", pops it, and approves.

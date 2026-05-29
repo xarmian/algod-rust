@@ -32,7 +32,8 @@ use algo_error::AlgoError;
 use algo_types::consensus::{consensus_params_for_version, ConsensusParams};
 use algo_types::{Address, Round, SignedTransaction};
 use algo_validate::{
-    validate_transaction_wellformed, verify_transaction_signature, SpecialAddresses,
+    is_free_heartbeat, validate_transaction_wellformed, verify_transaction_signature,
+    SpecialAddresses,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -523,6 +524,43 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     stx.auth_addr = Some(Address(proxy_pub));
                 }
             }
+        }
+
+        // Group-level fee validation (matches go-algorand's verify.TxnGroup,
+        // txn.go): the submitted group is a single fee pool — total fees must
+        // cover MinTxnFee for each non-exempt transaction. State proofs and
+        // ungrouped heartbeats are exempt. Without this, an underpaid group
+        // would only fail later during apply rather than as a clean check()
+        // error (this is the check() phase, before evaluation).
+        let mut fees_paid: u64 = 0;
+        let mut min_fee_count: u64 = 0;
+        for stx in &verify_group {
+            fees_paid = fees_paid.saturating_add(stx.txn.fee);
+            // State proofs are always free.
+            if stx.txn.txn_type == "stpf" {
+                continue;
+            }
+            // Ungrouped heartbeats are free when heartbeats are enabled.
+            if is_free_heartbeat(&stx.txn, consensus) {
+                continue;
+            }
+            min_fee_count += 1;
+        }
+        let fee_needed = consensus
+            .min_txn_fee
+            .checked_mul(min_fee_count)
+            .ok_or_else(|| {
+                SimulatorError::InvalidRequest(InvalidRequestError {
+                    message: "txgroup fee overflow".to_string(),
+                })
+            })?;
+        if fees_paid < fee_needed {
+            return Err(SimulatorError::InvalidRequest(InvalidRequestError {
+                message: format!(
+                    "txgroup had {fees_paid} in fees, which is less than the minimum {min_fee_count} * {}",
+                    consensus.min_txn_fee
+                ),
+            }));
         }
 
         // Pass 2: verify signatures on the (possibly proxy-signed) group.
