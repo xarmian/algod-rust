@@ -6586,6 +6586,7 @@ async fn get_config_success() {
 #[tokio::test]
 async fn get_sync_round_success() {
     let mut node = MockNode::synced();
+    node.is_follower_mode = true;
     node.sync_round = 500;
     let server = TestServer::start(node).await;
 
@@ -6603,7 +6604,9 @@ async fn get_sync_round_success() {
 
 #[tokio::test]
 async fn get_sync_round_not_set() {
-    let server = TestServer::start(MockNode::synced()).await;
+    let mut node = MockNode::synced();
+    node.is_follower_mode = true;
+    let server = TestServer::start(node).await;
 
     let resp = server
         .client
@@ -6616,8 +6619,43 @@ async fn get_sync_round_not_set() {
 }
 
 #[tokio::test]
+async fn sync_endpoints_absent_when_not_follower() {
+    // go-algorand registers the data API (/v2/ledger/sync) only in follower
+    // mode; a non-follower node must not expose these routes (404).
+    let node = MockNode::synced();
+    assert!(!node.is_follower_mode);
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/ledger/sync"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    let sync_status = resp.status();
+    // Compare to a path that is definitely not registered: the sync endpoint
+    // must behave identically (i.e. not be exposed) in non-follower mode.
+    let bogus = server
+        .client
+        .get(server.url("/v2/ledger/definitely-not-a-route"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        sync_status,
+        bogus.status(),
+        "sync endpoint should be as unavailable as an unregistered path in non-follower mode"
+    );
+    assert_ne!(sync_status, 200, "sync must not succeed outside follower mode");
+}
+
+#[tokio::test]
 async fn set_sync_round_success() {
-    let server = TestServer::start(MockNode::synced()).await;
+    let mut node = MockNode::synced();
+    node.is_follower_mode = true;
+    let server = TestServer::start(node).await;
 
     let resp = server
         .client
@@ -6632,6 +6670,7 @@ async fn set_sync_round_success() {
 #[tokio::test]
 async fn set_sync_round_invalid() {
     let mut node = MockNode::synced();
+    node.is_follower_mode = true;
     node.set_sync_round_result = Some("sync round invalid".to_string());
     let server = TestServer::start(node).await;
 
@@ -6647,7 +6686,9 @@ async fn set_sync_round_invalid() {
 
 #[tokio::test]
 async fn unset_sync_round_success() {
-    let server = TestServer::start(MockNode::synced()).await;
+    let mut node = MockNode::synced();
+    node.is_follower_mode = true;
+    let server = TestServer::start(node).await;
 
     let resp = server
         .client
