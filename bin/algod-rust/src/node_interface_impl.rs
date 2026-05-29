@@ -1077,10 +1077,10 @@ impl AlgodNodeInterface {
     }
 
     /// Convert the captured top-level [`TransactionTrace`] into the REST
-    /// [`SimulationTransactionExecTrace`] (TASK-248: approval/clear-state opcode
-    /// units + program hashes). Logic-sig trace, inner traces, spawned-inners
-    /// wiring, and per-opcode state changes are populated by follow-up tasks
-    /// (TASK-249 / TASK-259).
+    /// [`SimulationTransactionExecTrace`] (TASK-248: approval/clear-state/
+    /// logic-sig opcode units + program hashes). Inner-transaction traces and
+    /// spawned-inners wiring are TASK-249; per-opcode state changes are
+    /// TASK-259.
     fn exec_trace_to_model(trace: &TransactionTrace) -> SimulationTransactionExecTrace {
         SimulationTransactionExecTrace {
             approval_program_hash: trace.approval_program_hash.map(|h| h.to_vec()),
@@ -1095,9 +1095,14 @@ impl AlgodNodeInterface {
                 .map(Self::program_trace_to_units),
             clear_state_rollback: None,
             clear_state_rollback_error: None,
+            // Inner-transaction trace recursion + spawned-inners wiring are
+            // TASK-249; per-opcode state-changes are TASK-259.
             inner_trace: None,
-            logic_sig_hash: None,
-            logic_sig_trace: None,
+            logic_sig_hash: trace.logicsig_hash.map(|h| h.to_vec()),
+            logic_sig_trace: trace
+                .logicsig_trace
+                .as_ref()
+                .map(Self::program_trace_to_units),
         }
     }
 
@@ -1431,6 +1436,13 @@ mod tests {
                 ],
             }),
             approval_program_hash: Some([7u8; 32]),
+            logicsig_trace: Some(ProgramTrace {
+                opcodes: vec![OpcodeTraceUnit {
+                    pc: 0,
+                    ..Default::default()
+                }],
+            }),
+            logicsig_hash: Some([9u8; 32]),
             ..Default::default()
         };
 
@@ -1453,9 +1465,12 @@ mod tests {
         let sc = units[1].scratch_changes.as_ref().unwrap();
         assert_eq!(sc[0].slot, 3);
 
-        // Top-level only: clear-state / logic-sig / inner are deferred.
+        // Logic-sig trace + hash are translated (top-level).
+        assert_eq!(model.logic_sig_hash, Some(vec![9u8; 32]));
+        assert_eq!(model.logic_sig_trace.as_ref().unwrap().len(), 1);
+
+        // Clear-state absent here; inner traces are deferred to TASK-249.
         assert!(model.clear_state_program_trace.is_none());
-        assert!(model.logic_sig_trace.is_none());
         assert!(model.inner_trace.is_none());
     }
 
