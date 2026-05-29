@@ -5,10 +5,11 @@
 //! [`TransactionTrace`] structures for the simulation result.
 
 use algo_avm::machine::AvmValue;
-use algo_avm::tracer::{EvalTracer, ProgramType};
+use algo_avm::tracer::{AppStateAccess, EvalTracer, ProgramType};
 
 use super::trace::{
-    AvmValueTrace, ExecTraceConfig, OpcodeTraceUnit, ProgramTrace, TransactionTrace,
+    AvmValueTrace, ExecTraceConfig, InitialStatesAccumulator, OpcodeTraceUnit, ProgramTrace,
+    TransactionTrace,
 };
 
 /// Converts an AVM machine value to a trace-friendly representation.
@@ -58,6 +59,10 @@ pub struct SimulationTracer {
     /// When `before_txn` is called, the current program state is pushed here
     /// so it can be restored after the inner transaction completes.
     program_state_stack: Vec<Option<ProgramTraceState>>,
+    /// Initial application state captured for this transaction (populated only
+    /// when `config.state` is set). The simulation engine drains this after
+    /// each transaction and merges it into the simulation-level snapshot.
+    initial_states: InitialStatesAccumulator,
 }
 
 impl SimulationTracer {
@@ -69,6 +74,23 @@ impl SimulationTracer {
             transaction_trace: TransactionTrace::default(),
             trace_path: Vec::new(),
             program_state_stack: Vec::new(),
+            initial_states: InitialStatesAccumulator::default(),
+        }
+    }
+
+    /// Take the initial-state snapshot captured during this transaction,
+    /// leaving an empty accumulator behind. Called by the simulation engine
+    /// before consuming the tracer for its execution trace.
+    pub fn take_initial_states(&mut self) -> InitialStatesAccumulator {
+        std::mem::take(&mut self.initial_states)
+    }
+
+    /// Seed the created-app exclusion set from apps created by earlier
+    /// transactions in the group, so a later transaction that executes as (or
+    /// reads the state of) a previously-created app excludes it correctly.
+    pub fn seed_created_apps(&mut self, app_ids: &[u64]) {
+        for &app_id in app_ids {
+            self.initial_states.mark_created_app(app_id);
         }
     }
 
@@ -251,6 +273,21 @@ impl EvalTracer for SimulationTracer {
 
         state.trace.opcodes.push(unit);
     }
+
+    fn record_app_state_access(&mut self, access: &AppStateAccess<'_>) {
+        // Initial-state capture is gated on the state-change trace config,
+        // matching go-algorand's `newResourcesInitialStates` (nil unless
+        // `TraceConfig.State`).
+        if self.config.state {
+            self.initial_states.record(access);
+        }
+    }
+
+    fn record_created_app(&mut self, app_id: u64) {
+        if self.config.state {
+            self.initial_states.mark_created_app(app_id);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +330,37 @@ mod tests {
         assert_eq!(approval.opcodes.len(), 2);
         assert_eq!(approval.opcodes[0].pc, 0);
         assert_eq!(approval.opcodes[1].pc, 1);
+    }
+
+    #[test]
+    fn test_seeded_created_app_is_excluded() {
+        use algo_avm::tracer::{AppStateAccess, AppStateOp, AppStateType};
+
+        let config = ExecTraceConfig {
+            enable: true,
+            stack: false,
+            scratch: false,
+            state: true,
+        };
+        let mut tracer = SimulationTracer::new(config);
+        // Seed an app created by an earlier transaction in the group.
+        tracer.seed_created_apps(&[1001]);
+
+        // A later transaction executing as app 1001 reads its own global state.
+        let access = AppStateAccess {
+            executing_app_id: 1001,
+            app_id: 1001,
+            state: AppStateType::Global,
+            op: AppStateOp::Read,
+            account: None,
+            key: b"k",
+            pre_value: Some(algo_types::TealValue::Uint(7)),
+        };
+        tracer.record_app_state_access(&access);
+
+        // The seeded created app must be excluded from initial states.
+        let states = tracer.take_initial_states().into_resources_initial_states();
+        assert!(states.app_initial_states.is_empty());
     }
 
     #[test]

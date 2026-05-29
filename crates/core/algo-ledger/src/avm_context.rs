@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use algo_avm::context::AvmContext;
 use algo_avm::eval::AvmResult;
+use algo_avm::tracer::{AppStateAccess, AppStateOp, AppStateType};
 use algo_avm::txn_fields;
 use algo_error::AlgoError;
 use algo_types::consensus::ConsensusParams;
@@ -815,6 +816,47 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         self.lsig_args = args;
     }
 
+    /// Report an application-state access to the attached tracer for
+    /// initial-state capture during simulation. A no-op when no tracer is
+    /// attached (the consensus apply path), so this adds nothing but a pointer
+    /// check on the hot path.
+    ///
+    /// `pre_value` must be the on-chain value *before* the operation mutates
+    /// state; callers read it prior to any write.
+    fn record_app_state_access(
+        &self,
+        app_id: u64,
+        state: AppStateType,
+        op: AppStateOp,
+        account: Option<[u8; 32]>,
+        key: &[u8],
+        pre_value: Option<TealValue>,
+    ) {
+        if let Some(p) = self.tracer_ptr {
+            let access = AppStateAccess {
+                executing_app_id: self.app_id,
+                app_id,
+                state,
+                op,
+                account,
+                key,
+                pre_value,
+            };
+            // SAFETY: `tracer_ptr` is valid for the lifetime of this context and
+            // only one mutable borrow of the tracer is live at a time. The
+            // tracer is distinct memory from `self.store`, so this does not
+            // alias any other borrow held by the caller.
+            unsafe { &mut *p }.record_app_state_access(&access);
+        }
+    }
+
+    /// Read the current box contents as a [`TealValue`] for initial-state
+    /// capture, bypassing the I/O-budget accounting in `available_box` (which
+    /// the caller has already performed for the real operation).
+    fn box_pre_value(&self, name: &[u8]) -> Option<TealValue> {
+        self.store.get_box(self.app_id, name).map(TealValue::Bytes)
+    }
+
     /// Get the current transaction in the group.
     fn current_txn(&self) -> &SignedTransaction {
         &self.group[self.group_index]
@@ -1181,6 +1223,12 @@ fn execute_inner_appl<L: LedgerStore>(
         create_application(store, &stxn.txn, new_app_id, ApplErrorContext::Inner)?;
         // Record the created app ID on the SignedTransaction.
         stxn.apply_data_application_id = new_app_id;
+        // Exclude this inner-created app's state from initial-state capture
+        // (it has no pre-simulation state). No-op without a tracer. Mirrors the
+        // top-level app-create hook in `apply_appl`.
+        if let Some(ref mut t) = tracer {
+            t.record_created_app(new_app_id);
+        }
         new_app_id
     } else {
         called_app_id
@@ -1669,17 +1717,35 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         key: &[u8],
     ) -> Result<Option<TealValue>, AlgoError> {
         let addr = Address(*account);
-        match self.store.get_app_local_state(&addr, app_id) {
-            Some(local) => Ok(local.key_value.get(key).cloned()),
-            None => Ok(None),
-        }
+        let value = match self.store.get_app_local_state(&addr, app_id) {
+            Some(local) => local.key_value.get(key).cloned(),
+            None => None,
+        };
+        self.record_app_state_access(
+            app_id,
+            AppStateType::Local,
+            AppStateOp::Read,
+            Some(*account),
+            key,
+            value.clone(),
+        );
+        Ok(value)
     }
 
     fn app_global_get(&self, app_id: u64, key: &[u8]) -> Result<Option<TealValue>, AlgoError> {
-        match self.store.get_app_params(app_id) {
-            Some(params) => Ok(params.global_state.get(key).cloned()),
-            None => Ok(None),
-        }
+        let value = match self.store.get_app_params(app_id) {
+            Some(params) => params.global_state.get(key).cloned(),
+            None => None,
+        };
+        self.record_app_state_access(
+            app_id,
+            AppStateType::Global,
+            AppStateOp::Read,
+            None,
+            key,
+            value.clone(),
+        );
+        Ok(value)
     }
 
     // ---- State writes ----
@@ -1701,6 +1767,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     Address(*account)
                 ),
             })?;
+        let pre = local.key_value.get(key).cloned();
+        self.record_app_state_access(
+            app_id,
+            AppStateType::Local,
+            AppStateOp::Write,
+            Some(*account),
+            key,
+            pre,
+        );
         local.key_value.insert(key.to_vec(), value.clone());
         self.store.set_app_local_state(&addr, app_id, local);
         // Track delta for EvalDelta comparison.
@@ -1718,6 +1793,18 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         key: &[u8],
     ) -> Result<(), AlgoError> {
         let addr = Address(*account);
+        let pre = self
+            .store
+            .get_app_local_state(&addr, app_id)
+            .and_then(|l| l.key_value.get(key).cloned());
+        self.record_app_state_access(
+            app_id,
+            AppStateType::Local,
+            AppStateOp::Delete,
+            Some(*account),
+            key,
+            pre,
+        );
         if let Some(mut local) = self.store.get_app_local_state(&addr, app_id) {
             local.key_value.remove(key);
             self.store.set_app_local_state(&addr, app_id, local);
@@ -1741,6 +1828,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             .ok_or_else(|| AlgoError::Avm {
                 message: format!("app_global_put: app {app_id} not found"),
             })?;
+        let pre = p.global_state.get(key).cloned();
+        self.record_app_state_access(
+            app_id,
+            AppStateType::Global,
+            AppStateOp::Write,
+            None,
+            key,
+            pre,
+        );
         p.global_state.insert(key.to_vec(), value.clone());
         self.store.set_app_params(app_id, p);
         // Track delta for EvalDelta comparison.
@@ -1751,6 +1847,18 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     }
 
     fn app_global_del(&mut self, app_id: u64, key: &[u8]) -> Result<(), AlgoError> {
+        let pre = self
+            .store
+            .get_app_params(app_id)
+            .and_then(|p| p.global_state.get(key).cloned());
+        self.record_app_state_access(
+            app_id,
+            AppStateType::Global,
+            AppStateOp::Delete,
+            None,
+            key,
+            pre,
+        );
         if let Some(mut p) = self.store.get_app_params(app_id) {
             p.global_state.remove(key);
             self.store.set_app_params(app_id, p);
@@ -2913,6 +3021,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
     fn box_get(&mut self, name: &[u8]) -> Result<(Vec<u8>, bool), AlgoError> {
         self.box_length_checks(name, 0)?;
+        let pre = self.box_pre_value(name);
+        self.record_app_state_access(
+            self.app_id,
+            AppStateType::Box,
+            AppStateOp::Read,
+            None,
+            name,
+            pre,
+        );
         let (contents, exists) = self.available_box(name, BoxOperation::Read, 0)?;
         if exists {
             Ok((contents, true))
@@ -2923,6 +3040,16 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
     fn box_put(&mut self, name: &[u8], value: &[u8]) -> Result<(), AlgoError> {
         self.box_length_checks(name, value.len() as u64)?;
+
+        let pre = self.box_pre_value(name);
+        self.record_app_state_access(
+            self.app_id,
+            AppStateType::Box,
+            AppStateOp::Write,
+            None,
+            name,
+            pre,
+        );
 
         // BoxWriteOperation — pass value length as create_size because the
         // box may not exist yet.
@@ -2957,6 +3084,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
     fn box_del(&mut self, name: &[u8]) -> Result<bool, AlgoError> {
         self.box_length_checks(name, 0)?;
+        let pre = self.box_pre_value(name);
+        self.record_app_state_access(
+            self.app_id,
+            AppStateType::Box,
+            AppStateOp::Delete,
+            None,
+            name,
+            pre,
+        );
         let (_, exists) = self.available_box(name, BoxOperation::Delete, 0)?;
         if exists {
             // Update min-balance accounting before deleting.
@@ -2980,12 +3116,30 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
     fn box_len(&mut self, name: &[u8]) -> Result<(u64, bool), AlgoError> {
         self.box_length_checks(name, 0)?;
+        let pre = self.box_pre_value(name);
+        self.record_app_state_access(
+            self.app_id,
+            AppStateType::Box,
+            AppStateOp::Read,
+            None,
+            name,
+            pre,
+        );
         let (contents, exists) = self.available_box(name, BoxOperation::Read, 0)?;
         Ok((contents.len() as u64, exists))
     }
 
     fn box_create(&mut self, name: &[u8], size: u64) -> Result<bool, AlgoError> {
         self.box_length_checks(name, size)?;
+        let pre = self.box_pre_value(name);
+        self.record_app_state_access(
+            self.app_id,
+            AppStateType::Box,
+            AppStateOp::Write,
+            None,
+            name,
+            pre,
+        );
         let (_, exists) = self.available_box(name, BoxOperation::Create, size)?;
         if !exists {
             // Create the box (zero-filled) and update min-balance.
@@ -3005,6 +3159,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
     fn box_extract(&mut self, name: &[u8], offset: u64, length: u64) -> Result<Vec<u8>, AlgoError> {
         self.box_length_checks(name, offset.saturating_add(length))?;
+        let pre = self.box_pre_value(name);
+        self.record_app_state_access(
+            self.app_id,
+            AppStateType::Box,
+            AppStateOp::Read,
+            None,
+            name,
+            pre,
+        );
         let (contents, exists) = self.available_box(name, BoxOperation::Read, 0)?;
         if !exists {
             return Err(AlgoError::Avm {
@@ -3023,6 +3186,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
     fn box_replace(&mut self, name: &[u8], offset: u64, value: &[u8]) -> Result<(), AlgoError> {
         self.box_length_checks(name, offset.saturating_add(value.len() as u64))?;
+        let pre = self.box_pre_value(name);
+        self.record_app_state_access(
+            self.app_id,
+            AppStateType::Box,
+            AppStateOp::Write,
+            None,
+            name,
+            pre,
+        );
         let (contents, exists) = self.available_box(name, BoxOperation::Write, 0)?;
         if !exists {
             return Err(AlgoError::Avm {
@@ -3044,6 +3216,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
     fn box_resize(&mut self, name: &[u8], new_size: u64) -> Result<(), AlgoError> {
         self.box_length_checks(name, new_size)?;
+        let pre = self.box_pre_value(name);
+        self.record_app_state_access(
+            self.app_id,
+            AppStateType::Box,
+            AppStateOp::Write,
+            None,
+            name,
+            pre,
+        );
         let (contents, exists) = self.available_box(name, BoxOperation::Resize, new_size)?;
         if !exists {
             return Err(AlgoError::Avm {
@@ -3088,6 +3269,15 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         value: &[u8],
     ) -> Result<(), AlgoError> {
         self.box_length_checks(name, 0)?;
+        let pre = self.box_pre_value(name);
+        self.record_app_state_access(
+            self.app_id,
+            AppStateType::Box,
+            AppStateOp::Write,
+            None,
+            name,
+            pre,
+        );
         let (contents, exists) = self.available_box(name, BoxOperation::Write, 0)?;
         if !exists {
             return Err(AlgoError::Avm {

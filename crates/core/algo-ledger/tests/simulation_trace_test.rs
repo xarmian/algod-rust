@@ -353,3 +353,118 @@ fn simulation_trace_with_stack() {
         "pushint should add a value to the stack trace"
     );
 }
+
+/// Approval program (v8) that reads global key "g", pops it, and approves.
+/// Bytecode:
+///   0x08                version 8
+///   0x80 0x01 0x67      pushbytes "g"
+///   0x64                app_global_get
+///   0x48                pop
+///   0x81 0x01           pushint 1
+///   0x43                return
+fn global_read_program() -> Vec<u8> {
+    vec![0x08, 0x80, 0x01, 0x67, 0x64, 0x48, 0x81, 0x01, 0x43]
+}
+
+/// Build state with an app whose global state has `"g" => Uint(7)` pre-set, so
+/// a read captures a known initial value.
+fn setup_state_with_global(sender: Address, app_id: u64, approval_program: Vec<u8>) -> LedgerState {
+    let mut state = setup_state(sender, app_id, approval_program);
+    let mut params = state.get_app_params(app_id).expect("app exists").clone();
+    params
+        .global_state
+        .insert(b"g".to_vec(), algo_types::TealValue::Uint(7));
+    params.global_state_schema = StateSchema {
+        num_uint: 1,
+        num_byte_slice: 1,
+    };
+    state.set_app_params(app_id, params);
+    state
+}
+
+/// With state-change tracing on, simulating an app that reads global state
+/// should capture the pre-simulation value under `initial_states`.
+#[test]
+fn simulation_captures_initial_global_state() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 100;
+
+    let mut state = setup_state_with_global(sender, app_id, global_read_program());
+    let txn = make_appl_txn(sender, app_id);
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn]],
+        allow_empty_signatures: true,
+        trace_config: ExecTraceConfig {
+            enable: true,
+            stack: false,
+            scratch: false,
+            state: true,
+        },
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("simulation should succeed");
+
+    assert!(
+        result.txn_groups[0].failure_message.is_none(),
+        "simulation should not fail: {:?}",
+        result.txn_groups[0].failure_message
+    );
+
+    let initial = result
+        .initial_states
+        .as_ref()
+        .expect("initial_states should be present when state tracing is on");
+    let app_entry = initial
+        .app_initial_states
+        .iter()
+        .find(|(id, _)| *id == app_id)
+        .expect("app should appear in initial states");
+    let global = &app_entry.1.global_state;
+    assert_eq!(global.len(), 1);
+    assert_eq!(global[0].0, b"g");
+    assert!(
+        matches!(
+            global[0].1,
+            algo_ledger::simulation::AvmValueTrace::Uint64(7)
+        ),
+        "captured initial value should be the pre-simulation Uint(7)"
+    );
+}
+
+/// Without state-change tracing, `initial_states` must be `None` even if the
+/// program reads application state.
+#[test]
+fn simulation_no_initial_states_without_state_config() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 100;
+
+    let mut state = setup_state_with_global(sender, app_id, global_read_program());
+    let txn = make_appl_txn(sender, app_id);
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn]],
+        allow_empty_signatures: true,
+        trace_config: ExecTraceConfig {
+            enable: true,
+            stack: false,
+            scratch: false,
+            state: false,
+        },
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("simulation should succeed");
+
+    assert!(
+        result.initial_states.is_none(),
+        "initial_states must be None when state tracing is off"
+    );
+}

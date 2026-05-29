@@ -2292,6 +2292,14 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
 
     if is_create {
         create_application(store, txn, app_id, ApplErrorContext::Outer)?;
+        // During simulation with state-change tracing, apps created
+        // mid-simulation are excluded from initial-state capture (they have no
+        // pre-existing on-chain state). No-op when no tracer is attached, so the
+        // consensus apply path is unaffected. Mirrors go-algorand's
+        // `tracer.go` `CreatedApp` population on app-create calls.
+        if let Some(ref mut t) = tracer {
+            t.record_created_app(app_id);
+        }
     }
 
     // ClearState requires the sender to be opted in (have local state).
