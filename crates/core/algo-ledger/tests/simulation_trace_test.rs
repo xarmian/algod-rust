@@ -132,6 +132,19 @@ fn simulation_trace_captures_approval_opcodes() {
         !approval_trace.opcodes.is_empty(),
         "approval program trace should contain at least one opcode entry"
     );
+
+    // The approval program hash should be captured (SHA-512/256 of the program).
+    let expected_hash: [u8; 32] = {
+        use sha2::{Digest, Sha512_256};
+        let mut h = Sha512_256::new();
+        h.update([0x06, 0x81, 0x01, 0x43]);
+        h.finalize().into()
+    };
+    assert_eq!(
+        trace.approval_program_hash,
+        Some(expected_hash),
+        "approval program hash should be the SHA-512/256 of the program bytes"
+    );
 }
 
 /// When tracing is disabled the transaction trace should be `None`.

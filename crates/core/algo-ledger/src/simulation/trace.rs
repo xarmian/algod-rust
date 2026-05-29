@@ -111,10 +111,16 @@ pub struct ProgramTrace {
 pub struct TransactionTrace {
     /// Trace of the approval program execution (if applicable).
     pub approval_program_trace: Option<ProgramTrace>,
+    /// SHA-512/256 hash of the approval program, if one was executed.
+    pub approval_program_hash: Option<[u8; 32]>,
     /// Trace of the clear-state program execution (if applicable).
     pub clear_state_program_trace: Option<ProgramTrace>,
+    /// SHA-512/256 hash of the clear-state program, if one was executed.
+    pub clear_state_program_hash: Option<[u8; 32]>,
     /// Trace of the logic signature execution (if applicable).
     pub logicsig_trace: Option<ProgramTrace>,
+    /// SHA-512/256 hash of the logic signature program, if one was executed.
+    pub logicsig_hash: Option<[u8; 32]>,
     /// Traces of inner transactions spawned during execution.
     pub inner_traces: Vec<TransactionTrace>,
 }

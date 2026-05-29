@@ -16,6 +16,15 @@ use crate::group::GroupBudget;
 use crate::machine::{AvmMachine, ExecMode, OpcodeCoverage};
 use crate::tracer::{EvalTracer, ProgramType};
 
+/// SHA-512/256 hash of program bytes, matching go-algorand's
+/// `crypto.Hash(program)` used for exec-trace program-hash fields.
+fn program_trace_hash(program: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha512_256};
+    let mut hasher = Sha512_256::new();
+    hasher.update(program);
+    hasher.finalize().into()
+}
+
 // ---------------------------------------------------------------------------
 // Budget constants — sourced from ConsensusParams (V41 defaults).
 //
@@ -278,7 +287,7 @@ pub fn run_approval_program_with_tracer(
     // LogicSigVersion ceiling (go-algorand eval.go pre-eval check).
     if let (Some(ceiling), Some(&version)) = (ctx.consensus_logic_sig_version(), program.first()) {
         if let Err(e) = crate::validator::check_program_version_allowed(version, ceiling) {
-            tracer.before_program(ProgramType::Approval);
+            tracer.before_program(ProgramType::Approval, program_trace_hash(program));
             tracer.after_program(ProgramType::Approval, false, Some(&e.to_string()));
             return Err(e);
         }
@@ -289,7 +298,7 @@ pub fn run_approval_program_with_tracer(
         Err(e) => {
             // Notify tracer of the failed program so it sees balanced
             // before/after calls even on parse errors.
-            tracer.before_program(ProgramType::Approval);
+            tracer.before_program(ProgramType::Approval, program_trace_hash(program));
             tracer.after_program(ProgramType::Approval, false, Some(&e.to_string()));
             return Err(e);
         }
@@ -297,7 +306,7 @@ pub fn run_approval_program_with_tracer(
     let budget_before = budget.remaining();
     let mut machine = AvmMachine::new(parsed, ExecMode::Application, budget_before);
 
-    tracer.before_program(ProgramType::Approval);
+    tracer.before_program(ProgramType::Approval, program_trace_hash(program));
 
     match machine.run_with_tracer(ctx, tracer) {
         Ok(pass) => {
@@ -350,7 +359,7 @@ pub fn run_clear_state_program_with_tracer(
         if let Err(e) =
             crate::validator::check_program_version_allowed(program[0], consensus.logic_sig_version)
         {
-            tracer.before_program(ProgramType::ClearState);
+            tracer.before_program(ProgramType::ClearState, program_trace_hash(program));
             tracer.after_program(ProgramType::ClearState, false, Some(&e.to_string()));
             return AvmResult::empty();
         }
@@ -361,7 +370,7 @@ pub fn run_clear_state_program_with_tracer(
         Err(e) => {
             // Notify tracer of the failed program so it sees balanced
             // before/after calls even on parse errors.
-            tracer.before_program(ProgramType::ClearState);
+            tracer.before_program(ProgramType::ClearState, program_trace_hash(program));
             tracer.after_program(ProgramType::ClearState, false, Some(&e.to_string()));
             return AvmResult::empty();
         }
@@ -370,7 +379,7 @@ pub fn run_clear_state_program_with_tracer(
     let clear_budget = consensus.max_app_program_cost as i64;
     let mut machine = AvmMachine::new(parsed, ExecMode::Application, clear_budget);
 
-    tracer.before_program(ProgramType::ClearState);
+    tracer.before_program(ProgramType::ClearState, program_trace_hash(program));
 
     match machine.run_with_tracer(ctx, tracer) {
         Ok(true) => {
@@ -417,7 +426,7 @@ pub fn run_logicsig_program_with_tracer(
     // LogicSigVersion ceiling (go-algorand eval.go pre-eval check).
     if let (Some(ceiling), Some(&version)) = (ctx.consensus_logic_sig_version(), program.first()) {
         if let Err(e) = crate::validator::check_program_version_allowed(version, ceiling) {
-            tracer.before_program(ProgramType::LogicSig);
+            tracer.before_program(ProgramType::LogicSig, program_trace_hash(program));
             tracer.after_program(ProgramType::LogicSig, false, Some(&e.to_string()));
             return Err(e);
         }
@@ -426,7 +435,7 @@ pub fn run_logicsig_program_with_tracer(
     let parsed = match bytecode::parse(program) {
         Ok(p) => p,
         Err(e) => {
-            tracer.before_program(ProgramType::LogicSig);
+            tracer.before_program(ProgramType::LogicSig, program_trace_hash(program));
             tracer.after_program(ProgramType::LogicSig, false, Some(&e.to_string()));
             return Err(e);
         }
@@ -434,7 +443,7 @@ pub fn run_logicsig_program_with_tracer(
     let budget_before = budget.remaining();
     let mut machine = AvmMachine::new(parsed, ExecMode::LogicSig, budget_before);
 
-    tracer.before_program(ProgramType::LogicSig);
+    tracer.before_program(ProgramType::LogicSig, program_trace_hash(program));
 
     match machine.run_with_tracer(ctx, tracer) {
         Ok(pass) => {
