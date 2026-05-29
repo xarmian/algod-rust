@@ -24,8 +24,9 @@ use std::time::Duration;
 
 use algo_codec::{canonical_encode_block_header, compute_block_digest};
 use algo_ledger::simulation::{
-    AppInitialState, AvmValueTrace, ExecTraceConfig, ResourcesInitialStates, ResultEvalOverrides,
-    SimulationRequest, SimulationResult, Simulator, SimulatorError, TxnGroupResult, TxnResult,
+    AppInitialState, AvmValueTrace, ExecTraceConfig, OpcodeTraceUnit, ProgramTrace,
+    ResourcesInitialStates, ResultEvalOverrides, SimulationRequest, SimulationResult, Simulator,
+    SimulatorError, TransactionTrace, TxnGroupResult, TxnResult,
 };
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{SqliteLedger, StateDelta};
@@ -33,8 +34,9 @@ use algo_network::local_tx_broadcast::{LocalTxBroadcaster, LocalTxError};
 use algo_pool::TransactionPool;
 use algo_rest_api::models::{
     ApplicationInitialStates, ApplicationKVStorage, AvmKeyValue, AvmValue, PreEncodedTxInfo,
-    SimulateInitialStates, SimulateRequest, SimulateResponse, SimulateTraceConfig,
+    ScratchChange, SimulateInitialStates, SimulateRequest, SimulateResponse, SimulateTraceConfig,
     SimulateTransactionGroupResult, SimulateTransactionResult, SimulationEvalOverrides,
+    SimulationOpcodeTraceUnit, SimulationTransactionExecTrace,
 };
 use algo_rest_api::node::{
     AccountLookup, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
@@ -962,12 +964,10 @@ impl AlgodNodeInterface {
         let txn_result = Self::pre_encoded_txinfo_from_txn_result(&result);
         SimulateTransactionResult {
             app_budget_consumed: Self::opt_nonzero_u64(result.app_budget_consumed),
-            // `exec-trace` population is PLAN-34 (Dryrun / Simulate trace
-            // capture — the simulator already records the trace on
-            // `result.trace`, but translating the nested trace types to
-            // the REST `SimulationTransactionExecTrace` schema is its
-            // own sub-project).
-            exec_trace: None,
+            // Translate the captured top-level execution trace (TASK-248).
+            // Logic-sig and inner-transaction traces, spawned-inners wiring,
+            // and per-opcode state-changes are follow-up tasks (TASK-249/259).
+            exec_trace: result.trace.as_ref().map(Self::exec_trace_to_model),
             fixed_signer: result.fixed_signer.map(|a| a.to_string()),
             logic_sig_budget_consumed: Self::opt_nonzero_u64(result.logicsig_budget_consumed),
             txn_result,
@@ -1073,6 +1073,83 @@ impl AlgodNodeInterface {
                 value_type: 1,
                 uint: None,
             },
+        }
+    }
+
+    /// Convert the captured top-level [`TransactionTrace`] into the REST
+    /// [`SimulationTransactionExecTrace`] (TASK-248: approval/clear-state/
+    /// logic-sig opcode units + program hashes). Inner-transaction traces and
+    /// spawned-inners wiring are TASK-249; per-opcode state changes are
+    /// TASK-259.
+    fn exec_trace_to_model(trace: &TransactionTrace) -> SimulationTransactionExecTrace {
+        SimulationTransactionExecTrace {
+            approval_program_hash: trace.approval_program_hash.map(|h| h.to_vec()),
+            approval_program_trace: trace
+                .approval_program_trace
+                .as_ref()
+                .map(Self::program_trace_to_units),
+            clear_state_program_hash: trace.clear_state_program_hash.map(|h| h.to_vec()),
+            clear_state_program_trace: trace
+                .clear_state_program_trace
+                .as_ref()
+                .map(Self::program_trace_to_units),
+            clear_state_rollback: None,
+            clear_state_rollback_error: None,
+            // Inner-transaction trace recursion + spawned-inners wiring are
+            // TASK-249; per-opcode state-changes are TASK-259.
+            inner_trace: None,
+            logic_sig_hash: trace.logicsig_hash.map(|h| h.to_vec()),
+            logic_sig_trace: trace
+                .logicsig_trace
+                .as_ref()
+                .map(Self::program_trace_to_units),
+        }
+    }
+
+    /// Convert a [`ProgramTrace`] into a list of REST opcode trace units.
+    fn program_trace_to_units(trace: &ProgramTrace) -> Vec<SimulationOpcodeTraceUnit> {
+        trace
+            .opcodes
+            .iter()
+            .map(Self::opcode_unit_to_model)
+            .collect()
+    }
+
+    /// Convert one captured [`OpcodeTraceUnit`] into the REST shape, omitting
+    /// empty/zero fields to match go-algorand's `omitempty` codec tags.
+    fn opcode_unit_to_model(unit: &OpcodeTraceUnit) -> SimulationOpcodeTraceUnit {
+        let stack_additions = if unit.stack_additions.is_empty() {
+            None
+        } else {
+            Some(
+                unit.stack_additions
+                    .iter()
+                    .map(Self::avm_value_trace_to_model)
+                    .collect(),
+            )
+        };
+        let stack_pop_count = (unit.stack_pop_count != 0).then_some(unit.stack_pop_count as u64);
+        let scratch_changes = if unit.scratch_changes.is_empty() {
+            None
+        } else {
+            Some(
+                unit.scratch_changes
+                    .iter()
+                    .map(|(slot, value)| ScratchChange {
+                        slot: *slot as u64,
+                        new_value: Self::avm_value_trace_to_model(value),
+                    })
+                    .collect(),
+            )
+        };
+        SimulationOpcodeTraceUnit {
+            pc: unit.pc as u64,
+            scratch_changes,
+            // spawned-inners and state-changes are follow-up tasks.
+            spawned_inners: None,
+            stack_additions,
+            stack_pop_count,
+            state_changes: None,
         }
     }
 
@@ -1336,6 +1413,65 @@ mod tests {
         assert_eq!(model.extra_opcode_budget, Some(200));
         assert_eq!(model.max_log_calls, Some(40));
         assert_eq!(model.max_log_size, None);
+    }
+
+    #[test]
+    fn exec_trace_to_model_maps_top_level_opcode_units() {
+        use algo_ledger::simulation::{OpcodeTraceUnit, ProgramTrace, TransactionTrace};
+
+        let trace = TransactionTrace {
+            approval_program_trace: Some(ProgramTrace {
+                opcodes: vec![
+                    OpcodeTraceUnit {
+                        pc: 0,
+                        stack_additions: vec![AvmValueTrace::Uint64(1)],
+                        ..Default::default()
+                    },
+                    OpcodeTraceUnit {
+                        pc: 1,
+                        stack_pop_count: 1,
+                        scratch_changes: vec![(3, AvmValueTrace::Bytes(b"x".to_vec()))],
+                        ..Default::default()
+                    },
+                ],
+            }),
+            approval_program_hash: Some([7u8; 32]),
+            logicsig_trace: Some(ProgramTrace {
+                opcodes: vec![OpcodeTraceUnit {
+                    pc: 0,
+                    ..Default::default()
+                }],
+            }),
+            logicsig_hash: Some([9u8; 32]),
+            ..Default::default()
+        };
+
+        let model = AlgodNodeInterface::exec_trace_to_model(&trace);
+        assert_eq!(model.approval_program_hash, Some(vec![7u8; 32]));
+        let units = model
+            .approval_program_trace
+            .expect("approval trace present");
+        assert_eq!(units.len(), 2);
+
+        // unit 0: one stack addition, pop count 0 omitted.
+        assert_eq!(units[0].pc, 0);
+        assert_eq!(units[0].stack_additions.as_ref().unwrap().len(), 1);
+        assert_eq!(units[0].stack_pop_count, None);
+        assert!(units[0].scratch_changes.is_none());
+
+        // unit 1: pop count 1, empty stack additions omitted, one scratch change.
+        assert_eq!(units[1].stack_pop_count, Some(1));
+        assert!(units[1].stack_additions.is_none());
+        let sc = units[1].scratch_changes.as_ref().unwrap();
+        assert_eq!(sc[0].slot, 3);
+
+        // Logic-sig trace + hash are translated (top-level).
+        assert_eq!(model.logic_sig_hash, Some(vec![9u8; 32]));
+        assert_eq!(model.logic_sig_trace.as_ref().unwrap().len(), 1);
+
+        // Clear-state absent here; inner traces are deferred to TASK-249.
+        assert!(model.clear_state_program_trace.is_none());
+        assert!(model.inner_trace.is_none());
     }
 
     #[test]

@@ -149,7 +149,7 @@ impl DryrunDebugReceiver {
 }
 
 impl EvalTracer for DryrunDebugReceiver {
-    fn before_program(&mut self, program_type: ProgramType) {
+    fn before_program(&mut self, program_type: ProgramType, _program_hash: [u8; 32]) {
         self.program_type = Some(program_type);
     }
 

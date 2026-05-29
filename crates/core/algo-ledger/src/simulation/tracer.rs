@@ -24,6 +24,8 @@ fn to_trace_value(v: &AvmValue) -> AvmValueTrace {
 struct ProgramTraceState {
     /// The type of program being traced.
     program_type: ProgramType,
+    /// SHA-512/256 hash of the program bytes being executed.
+    program_hash: [u8; 32],
     /// Accumulated opcode trace entries.
     trace: ProgramTrace,
     /// Stack snapshot before the current opcode (for computing diffs).
@@ -123,13 +125,14 @@ impl SimulationTracer {
 }
 
 impl EvalTracer for SimulationTracer {
-    fn before_program(&mut self, program_type: ProgramType) {
+    fn before_program(&mut self, program_type: ProgramType, program_hash: [u8; 32]) {
         if !self.config.is_enabled() {
             return;
         }
 
         self.current_program = Some(ProgramTraceState {
             program_type,
+            program_hash,
             trace: ProgramTrace::default(),
             stack_before: Vec::new(),
             scratch_before: Vec::new(),
@@ -146,12 +149,15 @@ impl EvalTracer for SimulationTracer {
             match state.program_type {
                 ProgramType::Approval => {
                     trace.approval_program_trace = Some(state.trace);
+                    trace.approval_program_hash = Some(state.program_hash);
                 }
                 ProgramType::ClearState => {
                     trace.clear_state_program_trace = Some(state.trace);
+                    trace.clear_state_program_hash = Some(state.program_hash);
                 }
                 ProgramType::LogicSig => {
                     trace.logicsig_trace = Some(state.trace);
+                    trace.logicsig_hash = Some(state.program_hash);
                 }
             }
         }
@@ -299,7 +305,7 @@ mod tests {
         let config = ExecTraceConfig::default();
         let mut tracer = SimulationTracer::new(config);
 
-        tracer.before_program(ProgramType::Approval);
+        tracer.before_program(ProgramType::Approval, [0u8; 32]);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
         tracer.after_program(ProgramType::Approval, true, None);
@@ -318,7 +324,7 @@ mod tests {
         };
         let mut tracer = SimulationTracer::new(config);
 
-        tracer.before_program(ProgramType::Approval);
+        tracer.before_program(ProgramType::Approval, [0u8; 32]);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
         tracer.before_opcode(1, 0x43);
@@ -373,7 +379,7 @@ mod tests {
         };
         let mut tracer = SimulationTracer::new(config);
 
-        tracer.before_program(ProgramType::LogicSig);
+        tracer.before_program(ProgramType::LogicSig, [0u8; 32]);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
         tracer.after_program(ProgramType::LogicSig, true, None);
@@ -393,7 +399,7 @@ mod tests {
         };
         let mut tracer = SimulationTracer::new(config);
 
-        tracer.before_program(ProgramType::Approval);
+        tracer.before_program(ProgramType::Approval, [0u8; 32]);
 
         // First opcode pushes 1 value.
         tracer.before_opcode(0, 0x81);
@@ -427,7 +433,7 @@ mod tests {
         let mut tracer = SimulationTracer::new(config);
 
         // Top-level approval program begins
-        tracer.before_program(ProgramType::Approval);
+        tracer.before_program(ProgramType::Approval, [0u8; 32]);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
 
@@ -436,7 +442,7 @@ mod tests {
         tracer.before_txn(0);
 
         // Inner program executes
-        tracer.before_program(ProgramType::Approval);
+        tracer.before_program(ProgramType::Approval, [0u8; 32]);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
         tracer.after_program(ProgramType::Approval, true, None);
@@ -473,7 +479,7 @@ mod tests {
         let mut tracer = SimulationTracer::new(config);
 
         // Top-level program
-        tracer.before_program(ProgramType::Approval);
+        tracer.before_program(ProgramType::Approval, [0u8; 32]);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
 
@@ -481,7 +487,7 @@ mod tests {
         tracer.before_txn_group(1);
         tracer.before_txn(0);
 
-        tracer.before_program(ProgramType::Approval);
+        tracer.before_program(ProgramType::Approval, [0u8; 32]);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
 
@@ -489,7 +495,7 @@ mod tests {
         tracer.before_txn_group(1);
         tracer.before_txn(0);
 
-        tracer.before_program(ProgramType::Approval);
+        tracer.before_program(ProgramType::Approval, [0u8; 32]);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
         tracer.after_program(ProgramType::Approval, true, None);
@@ -551,7 +557,7 @@ mod tests {
         };
         let mut tracer = SimulationTracer::new(config);
 
-        tracer.before_program(ProgramType::Approval);
+        tracer.before_program(ProgramType::Approval, [0u8; 32]);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
 
@@ -560,7 +566,7 @@ mod tests {
 
         // Sibling 1
         tracer.before_txn(0);
-        tracer.before_program(ProgramType::Approval);
+        tracer.before_program(ProgramType::Approval, [0u8; 32]);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(1)], &[], None);
         tracer.after_program(ProgramType::Approval, true, None);
@@ -568,7 +574,7 @@ mod tests {
 
         // Sibling 2
         tracer.before_txn(1);
-        tracer.before_program(ProgramType::Approval);
+        tracer.before_program(ProgramType::Approval, [0u8; 32]);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[AvmValue::Uint64(2)], &[], None);
         tracer.after_program(ProgramType::Approval, true, None);

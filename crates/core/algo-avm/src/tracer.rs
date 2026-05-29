@@ -107,7 +107,11 @@ pub trait EvalTracer {
     fn after_txn(&mut self, _group_index: usize, _error: Option<&str>) {}
 
     /// Called before a program begins executing.
-    fn before_program(&mut self, _program_type: ProgramType) {}
+    ///
+    /// `program_hash` is the SHA-512/256 hash of the program bytes about to run
+    /// (go-algorand's `crypto.Hash(cx.GetProgram())`), used to populate the
+    /// exec-trace program hash fields.
+    fn before_program(&mut self, _program_type: ProgramType, _program_hash: [u8; 32]) {}
 
     /// Called after a program finishes executing.
     ///
@@ -167,7 +171,7 @@ mod tests {
     #[test]
     fn test_null_tracer_is_usable() {
         let mut tracer = NullTracer;
-        tracer.before_program(ProgramType::Approval);
+        tracer.before_program(ProgramType::Approval, [0u8; 32]);
         tracer.before_opcode(0, 0x81);
         tracer.after_opcode(0, 0x81, &[], &[], None);
         tracer.after_program(ProgramType::Approval, true, None);
