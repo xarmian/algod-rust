@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use algo_codec::{canonical_encode_block_header, compute_block_digest};
 use algo_ledger::simulation::{
-    AppInitialState, AvmValueTrace, ExecTraceConfig, ResourcesInitialStates, SimulationRequest,
-    SimulationResult, Simulator, SimulatorError, TxnGroupResult, TxnResult,
+    AppInitialState, AvmValueTrace, ExecTraceConfig, ResourcesInitialStates, ResultEvalOverrides,
+    SimulationRequest, SimulationResult, Simulator, SimulatorError, TxnGroupResult, TxnResult,
 };
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{SqliteLedger, StateDelta};
@@ -34,7 +34,7 @@ use algo_pool::TransactionPool;
 use algo_rest_api::models::{
     ApplicationInitialStates, ApplicationKVStorage, AvmKeyValue, AvmValue, PreEncodedTxInfo,
     SimulateInitialStates, SimulateRequest, SimulateResponse, SimulateTraceConfig,
-    SimulateTransactionGroupResult, SimulateTransactionResult,
+    SimulateTransactionGroupResult, SimulateTransactionResult, SimulationEvalOverrides,
 };
 use algo_rest_api::node::{
     AccountLookup, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
@@ -996,14 +996,17 @@ impl AlgodNodeInterface {
     /// Build the top-level [`SimulateResponse`] from the simulator's
     /// [`SimulationResult`].
     ///
-    /// `eval_overrides` and `exec_trace_config` are still left `None` — they are
-    /// the scope of a sibling PLAN-34 task (TASK-247). `initial_states` is
-    /// populated here (TASK-246) when state-change tracing captured any.
+    /// `version` is the simulator format version (2). `eval_overrides`,
+    /// `exec_trace_config`, and `initial_states` mirror go-algorand's
+    /// `convertSimulationResult` (`utils.go`): each is present only when it
+    /// carries non-default information.
     fn build_simulate_response(result: SimulationResult) -> SimulateResponse {
         let initial_states = result.initial_states.map(Self::initial_states_to_model);
+        let eval_overrides = Self::eval_overrides_to_model(&result.eval_overrides);
+        let exec_trace_config = Self::exec_trace_config_to_response(&result.trace_config);
         SimulateResponse {
-            eval_overrides: None,
-            exec_trace_config: None,
+            eval_overrides,
+            exec_trace_config,
             initial_states,
             last_round: result.last_round.0,
             txn_groups: result
@@ -1013,6 +1016,46 @@ impl AlgodNodeInterface {
                 .collect(),
             version: result.version,
         }
+    }
+
+    /// Convert the simulator's applied [`ResultEvalOverrides`] into the REST
+    /// [`SimulationEvalOverrides`]. Returns `None` when no overrides were
+    /// applied, and omits individual fields at their zero value — matching
+    /// go-algorand's `convertSimulationResult` / `omitEmpty` semantics.
+    fn eval_overrides_to_model(ov: &ResultEvalOverrides) -> Option<SimulationEvalOverrides> {
+        let is_default = !ov.allow_empty_signatures
+            && !ov.allow_unnamed_resources
+            && ov.extra_opcode_budget == 0
+            && !ov.fix_signers
+            && ov.max_log_calls.is_none()
+            && ov.max_log_size.is_none();
+        if is_default {
+            return None;
+        }
+        Some(SimulationEvalOverrides {
+            allow_empty_signatures: ov.allow_empty_signatures.then_some(true),
+            allow_unnamed_resources: ov.allow_unnamed_resources.then_some(true),
+            extra_opcode_budget: (ov.extra_opcode_budget != 0).then_some(ov.extra_opcode_budget),
+            fix_signers: ov.fix_signers.then_some(true),
+            max_log_calls: ov.max_log_calls,
+            max_log_size: ov.max_log_size,
+        })
+    }
+
+    /// Convert the simulator's [`ExecTraceConfig`] into the REST
+    /// [`SimulateTraceConfig`] for the response. Returns `None` when no trace
+    /// features were enabled (zero value), and omits individual `false` flags —
+    /// matching go-algorand's `omitempty` codec tags on `ExecTraceConfig`.
+    fn exec_trace_config_to_response(cfg: &ExecTraceConfig) -> Option<SimulateTraceConfig> {
+        if !cfg.enable && !cfg.stack && !cfg.scratch && !cfg.state {
+            return None;
+        }
+        Some(SimulateTraceConfig {
+            enable: cfg.enable.then_some(true),
+            scratch_change: cfg.scratch.then_some(true),
+            stack_change: cfg.stack.then_some(true),
+            state_change: cfg.state.then_some(true),
+        })
     }
 
     /// Convert a captured [`AvmValueTrace`] into the REST [`AvmValue`].
@@ -1267,6 +1310,54 @@ mod tests {
         };
         let model = AlgodNodeInterface::initial_states_to_model(states);
         assert!(model.app_initial_states.is_none());
+    }
+
+    #[test]
+    fn eval_overrides_default_is_none() {
+        let ov = ResultEvalOverrides::default();
+        assert!(AlgodNodeInterface::eval_overrides_to_model(&ov).is_none());
+    }
+
+    #[test]
+    fn eval_overrides_populates_set_fields_and_omits_zero() {
+        let ov = ResultEvalOverrides {
+            allow_empty_signatures: true,
+            allow_unnamed_resources: false,
+            extra_opcode_budget: 200,
+            fix_signers: false,
+            max_log_calls: Some(40),
+            max_log_size: None,
+        };
+        let model = AlgodNodeInterface::eval_overrides_to_model(&ov).expect("overrides present");
+        assert_eq!(model.allow_empty_signatures, Some(true));
+        // false flags are omitted, not Some(false).
+        assert_eq!(model.allow_unnamed_resources, None);
+        assert_eq!(model.fix_signers, None);
+        assert_eq!(model.extra_opcode_budget, Some(200));
+        assert_eq!(model.max_log_calls, Some(40));
+        assert_eq!(model.max_log_size, None);
+    }
+
+    #[test]
+    fn exec_trace_config_disabled_is_none() {
+        let cfg = ExecTraceConfig::default();
+        assert!(AlgodNodeInterface::exec_trace_config_to_response(&cfg).is_none());
+    }
+
+    #[test]
+    fn exec_trace_config_populates_enabled_flags() {
+        let cfg = ExecTraceConfig {
+            enable: true,
+            stack: false,
+            scratch: false,
+            state: true,
+        };
+        let model =
+            AlgodNodeInterface::exec_trace_config_to_response(&cfg).expect("config present");
+        assert_eq!(model.enable, Some(true));
+        assert_eq!(model.state_change, Some(true));
+        assert_eq!(model.stack_change, None);
+        assert_eq!(model.scratch_change, None);
     }
 
     fn make_adapter() -> AlgodNodeInterface {
