@@ -6648,7 +6648,10 @@ async fn sync_endpoints_absent_when_not_follower() {
         bogus.status(),
         "sync endpoint should be as unavailable as an unregistered path in non-follower mode"
     );
-    assert_ne!(sync_status, 200, "sync must not succeed outside follower mode");
+    assert_ne!(
+        sync_status, 200,
+        "sync must not succeed outside follower mode"
+    );
 }
 
 #[tokio::test]
