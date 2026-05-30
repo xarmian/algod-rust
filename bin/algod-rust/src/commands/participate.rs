@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use algo_agreement::{
-    AsyncCryptoVerifier, BlockFactoryBridge, BlockValidatorBridge, EventsProcessingMonitor,
-    NetworkAdvancer, Parameters, RandomSource, Service, SystemClock,
+    AccountSigningKeys, AsyncCryptoVerifier, BlockFactoryBridge, BlockValidatorBridge,
+    EventsProcessingMonitor, NetworkAdvancer, Parameters, RandomSource, Service, SystemClock,
 };
 use algo_avm::group::GroupBudget;
 use algo_codec::{canonical_encode_signed_txn_in_block, canonical_encode_transaction};
@@ -1820,6 +1820,64 @@ fn parse_genesis_hash(hex_str: &str) -> anyhow::Result<[u8; 32]> {
     Ok(arr)
 }
 
+/// Load the VRF + one-time-signature signing secrets for every participation
+/// key valid at `round`, keyed by account address, for the agreement
+/// `Parameters.signing_keys` map.
+///
+/// Without these secrets the `AsyncPseudonode` emits placeholder (zero-filled)
+/// VRF proofs and OTS signatures, which the crypto verifier rejects — so the
+/// node can never produce a valid proposal or vote and rounds never advance.
+/// This is the node-side analogue of Go's wiring, where `account.Participation`
+/// carries the `*crypto.VRFSecrets` + `*crypto.OneTimeSignatureSecrets` into the
+/// agreement service. Here the secrets live in the [`ParticipationStore`]; we
+/// reconstruct them per key via `get_for_round` (VRF from its 32-byte seed, OTS
+/// from its msgpack blob).
+///
+/// Keys with no entry valid at `round` (outside their validity window, or a
+/// legacy record with no voting blob) are skipped; a load error for one key is
+/// logged and skipped rather than failing the whole node.
+fn load_signing_keys_for_round(
+    part_store: &ParticipationStore,
+    round: Round,
+) -> HashMap<Address, AccountSigningKeys> {
+    let mut signing_keys = HashMap::new();
+    let records = match part_store.get_all() {
+        Ok(records) => records,
+        Err(e) => {
+            warn!(error = %e, "failed to enumerate participation keys; node will not sign consensus messages");
+            return signing_keys;
+        }
+    };
+    for record in &records {
+        match part_store.get_for_round(&record.participation_id, round) {
+            Ok(Some(part)) => {
+                // `part.parent` is the root account the key votes for; the
+                // pseudonode looks up signing keys by that address.
+                signing_keys.insert(
+                    part.parent,
+                    AccountSigningKeys {
+                        vrf: part.vrf,
+                        ots: part.voting,
+                    },
+                );
+            }
+            Ok(None) => {
+                // No keyset valid for this round, or a legacy record with no
+                // voting secrets — it simply won't contribute signatures.
+            }
+            Err(e) => {
+                warn!(
+                    account = %record.account,
+                    participation_id = %record.participation_id,
+                    error = %e,
+                    "failed to load participation secrets; this key will not sign",
+                );
+            }
+        }
+    }
+    signing_keys
+}
+
 /// Open (or create) the agreement crash recovery database.
 ///
 /// Mirrors go-algorand v4.5.1-stable `node/node.go:305-323`, which opens
@@ -2350,6 +2408,25 @@ pub async fn run(
     let (agreement_ledger, cert_rx) =
         AgreementLedgerBridge::new_with_catchup(ledger.clone(), network_advancer.clone());
 
+    // Load the actual signing secrets (VRF + OTS) before the store is moved
+    // into the key-manager bridge. The bridge only exposes public voting
+    // records; the pseudonode needs the secrets to sign proposals/votes. Load
+    // for the next round to produce (latest + 1), which selects the keyset
+    // valid for the rounds this node will participate in.
+    let signing_keys = load_signing_keys_for_round(&part_store, Round(latest + 1));
+    if signing_keys.is_empty() {
+        warn!(
+            round = latest + 1,
+            "no participation signing secrets loaded — node will not produce valid proposals or votes"
+        );
+    } else {
+        info!(
+            accounts = signing_keys.len(),
+            round = latest + 1,
+            "loaded participation signing secrets for consensus"
+        );
+    }
+
     // Key manager bridge: wraps ParticipationStore for voting key lookups.
     let key_manager = AgreementKeyManagerBridge::new(part_store);
 
@@ -2463,7 +2540,7 @@ pub async fn run(
         crypto,
         clock: SystemClock::new(),
         crash_db: Some(crash_db),
-        signing_keys: std::collections::HashMap::new(),
+        signing_keys,
     };
 
     let service = Service::new(params);
@@ -2537,6 +2614,42 @@ mod tests {
         Arc::new(Mutex::new(
             SqliteLedger::open_in_memory().expect("in-memory ledger"),
         ))
+    }
+
+    // ── load_signing_keys_for_round ─────────────────────────────────
+
+    #[test]
+    fn load_signing_keys_returns_secrets_for_valid_round() {
+        use algo_ledger::participation::Participation;
+
+        let store = ParticipationStore::open_in_memory().expect("in-memory part store");
+        let account = Address([7u8; 32]);
+        // Generate a key valid for rounds [0, 1000]. key_lifetime=0 skips
+        // state-proof key generation — irrelevant to VRF/OTS signing.
+        let part = Participation::generate(account, Round(0), Round(1000), 10_000, 0)
+            .expect("generate participation");
+        let want_vrf_pk = part.vrf_pubkey().0;
+        store.insert(&part).expect("insert participation");
+
+        // A round inside the validity window loads the secrets, keyed by the
+        // parent account, with the VRF keypair reconstructed from its seed.
+        let keys = load_signing_keys_for_round(&store, Round(1));
+        assert_eq!(keys.len(), 1, "exactly one account's secrets loaded");
+        let signing = keys.get(&account).expect("secrets for the account");
+        assert_eq!(
+            signing.vrf.pk.0, want_vrf_pk,
+            "loaded VRF keypair must match the inserted key",
+        );
+
+        // A round outside the validity window loads nothing.
+        let none = load_signing_keys_for_round(&store, Round(2_000));
+        assert!(none.is_empty(), "no secrets outside the validity window");
+    }
+
+    #[test]
+    fn load_signing_keys_empty_store_returns_empty() {
+        let store = ParticipationStore::open_in_memory().expect("in-memory part store");
+        assert!(load_signing_keys_for_round(&store, Round(1)).is_empty());
     }
 
     // ── Helpers: RestOptions / load_genesis_json ────────────────────
