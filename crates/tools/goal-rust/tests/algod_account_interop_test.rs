@@ -106,15 +106,19 @@ fn stage_data_dir() -> tempfile::TempDir {
 }
 
 /// A funded address from the devnet genesis alloc (a `WalletN` entry — not the
-/// RewardsPool/FeeSink), for the read-path (`info`/`balance`) checks. These are
-/// online and genesis-funded; we never need their (absent) spending keys.
-fn genesis_funded_address(data_dir: &Path) -> String {
+/// RewardsPool/FeeSink) and its genesis `algo` balance, for the read-path
+/// (`info`/`balance`) checks. These are online and genesis-funded; we never
+/// need their (absent) spending keys. Returning the amount lets the balance
+/// assertion cross-check the real value rather than just "is a number".
+fn genesis_funded_address(data_dir: &Path) -> (String, u64) {
     let raw = std::fs::read_to_string(data_dir.join("genesis.json")).expect("read genesis.json");
     let v: serde_json::Value = serde_json::from_str(&raw).expect("parse genesis.json");
     for entry in v["alloc"].as_array().expect("alloc array") {
         let comment = entry["comment"].as_str().unwrap_or("");
         if comment.starts_with("Wallet") {
-            return entry["addr"].as_str().expect("addr string").to_string();
+            let addr = entry["addr"].as_str().expect("addr string").to_string();
+            let algo = entry["state"]["algo"].as_u64().expect("alloc algo amount");
+            return (addr, algo);
         }
     }
     panic!("no WalletN funded address in devnet genesis alloc");
@@ -238,6 +242,16 @@ fn goal(dd: &Path, args: &[&str]) -> std::process::Output {
         .expect("run goal-rust")
 }
 
+/// Parse the microAlgo count from a `goal` output line like
+/// `Minimum Balance:\t100000 microAlgos` — the first integer token following
+/// `label`. Returns `None` if the label or a number isn't present.
+fn parse_labeled_microalgos(out: &str, label: &str) -> Option<u64> {
+    out.lines()
+        .find_map(|line| line.split_once(label).map(|(_, rest)| rest))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|t| t.parse().ok())
+}
+
 fn assert_ok(out: &std::process::Output, what: &str) -> String {
     assert!(
         out.status.success(),
@@ -315,29 +329,37 @@ fn goal_rust_account_group_against_go_algod_and_kmd() {
 
     // 4-5. account info + balance against a genesis-funded address (read-only;
     // no spending key needed).
-    let funded = genesis_funded_address(dd);
+    let (funded, genesis_algo) = genesis_funded_address(dd);
     let info_out = assert_ok(
         &goal(dd, &["account", "info", "-a", &funded]),
         "account info",
     );
     // `account info` renders the account's assets/apps/min-balance sections (it
-    // doesn't echo the queried address). Assert a stable structural line so
-    // wire-shape drift on `/v2/accounts/{addr}` would trip the test.
+    // doesn't echo the queried address). Assert a *nonzero* Minimum Balance so a
+    // missing/renamed `min-balance` field (which would default to 0) trips the
+    // test rather than passing spuriously.
+    let min_balance = parse_labeled_microalgos(&info_out, "Minimum Balance:")
+        .unwrap_or_else(|| panic!("account info missing a Minimum Balance line; got:\n{info_out}"));
     assert!(
-        info_out.contains("Minimum Balance:"),
-        "account info missing the Minimum Balance line; got:\n{info_out}"
+        min_balance > 0,
+        "Minimum Balance parsed as 0 — likely `/v2/accounts/{{addr}}` wire drift; got:\n{info_out}"
     );
     let bal_out = assert_ok(
         &goal(dd, &["account", "balance", "-a", &funded]),
         "account balance",
     );
-    let bal_trimmed = bal_out.trim_end_matches('\n');
+    // The balance must be the genesis-funded amount (rewards only add to it), so
+    // assert `>= genesis algo`. A missing/renamed `amount` field defaults to 0
+    // and would be caught here rather than passing as a bare "0 microAlgos".
+    let balance: u64 = bal_out
+        .split_whitespace()
+        .next()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("account balance not a leading integer; got {bal_out:?}"));
     assert!(
-        bal_trimmed
-            .split_whitespace()
-            .next()
-            .is_some_and(|t| t.chars().all(|c| c.is_ascii_digit())),
-        "account balance must start with a microalgo count; got {bal_out:?}"
+        balance >= genesis_algo,
+        "balance {balance} < genesis-allocated {genesis_algo} for {funded}; \
+         likely `/v2/accounts/{{addr}}.amount` wire drift"
     );
 
     // NOTE: `addpartkey` / `listpartkeys` / `deletepartkey` are NOT driven here.
