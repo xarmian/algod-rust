@@ -693,10 +693,23 @@ impl NodeInterface for MockNode {
     }
 
     async fn get_block_raw_msgpack(&self, round: u64) -> Result<Vec<u8>, NodeError> {
-        match self.block_raw_msgpack.get(&round) {
-            Some(bytes) => Ok(bytes.clone()),
-            None => Err(NodeError::NotFound("block not found".to_string())),
+        if let Some(bytes) = self.block_raw_msgpack.get(&round) {
+            return Ok(bytes.clone());
         }
+        // Fall back to synthesizing the `{"block": <block>}` envelope from a
+        // typed block, mirroring the real node's hand-built map. Lets tests that
+        // populate `blocks` exercise the canonical block-JSON path.
+        if let Some(block) = self.blocks.get(&round) {
+            let block_bytes = algo_codec::encode_block(block)
+                .map_err(|e| NodeError::Internal(format!("encode block: {e}")))?;
+            let mut buf = Vec::with_capacity(block_bytes.len() + 8);
+            buf.push(0x81); // fixmap(1)
+            buf.push(0xa5); // fixstr(5)
+            buf.extend_from_slice(b"block");
+            buf.extend_from_slice(&block_bytes);
+            return Ok(buf);
+        }
+        Err(NodeError::NotFound("block not found".to_string()))
     }
 
     async fn get_state_proof_transaction_for_round(
