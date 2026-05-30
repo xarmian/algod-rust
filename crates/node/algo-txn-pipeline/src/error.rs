@@ -29,13 +29,13 @@ pub enum PipelineError {
         pool_error: String,
     },
 
-    /// The transaction did not confirm within the allotted rounds.
-    #[error("transaction {txid} not confirmed within {rounds} rounds")]
+    /// The transaction was not committed by its last valid round (expired).
+    #[error("transaction {txid} expired (not committed by last valid round {last_valid})")]
     NotConfirmed {
         /// The transaction id being awaited.
         txid: String,
-        /// The number of rounds waited.
-        rounds: u64,
+        /// The transaction's last valid round.
+        last_valid: u64,
     },
 
     /// An error talking to algod.

@@ -1368,6 +1368,7 @@ async fn sign_submit_confirm(
     no_wait: bool,
     label: &str,
 ) -> Result<(), String> {
+    let last_valid = txn.last_valid.0;
     let signed = pipeline
         .sign_with_kmd(handle, password, txn)
         .await
@@ -1383,8 +1384,10 @@ async fn sign_submit_confirm(
         return Ok(());
     }
 
+    // Wait until the txn commits or its last valid round passes (go's
+    // waitForCommit takes the txn's lastTxRound, not a relative window).
     let info = pipeline
-        .wait_for_confirmation(&txid, MAX_TXN_LIFE)
+        .wait_for_confirmation(&txid, last_valid)
         .await
         .map_err(|e| e.to_string())?;
     if let Some(round) = info.confirmed_round {
@@ -1497,13 +1500,15 @@ async fn submit_offline_keyreg(
         .await
         .map_err(|e| e.to_string())?;
     let (first, last) = compute_validity(first_valid, last_valid, params.last_round)?;
-    let txn = algo_txn_pipeline::KeyregBuilder::offline(sender)
-        .fee(fee.unwrap_or(params.min_fee))
+    let mut txn = algo_txn_pipeline::KeyregBuilder::offline(sender)
+        .fee(fee.unwrap_or(0))
         .validity(first, last)
         .genesis_hash(params.genesis_hash.0)
-        .genesis_id(params.genesis_id.clone())
         .build()
         .map_err(|e| e.to_string())?;
+    if fee.is_none() {
+        txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
+    }
     sign_submit_confirm(pipeline, &txn, handle, password, no_wait, "status change").await
 }
 
@@ -1557,13 +1562,10 @@ pub fn run_marknonparticipating(
             return ExitCode::from(1);
         }
     };
-    let fee = args.fee.unwrap_or(params.min_fee);
-
-    let txn = match algo_txn_pipeline::KeyregBuilder::nonparticipating(sender)
-        .fee(fee)
+    let mut txn = match algo_txn_pipeline::KeyregBuilder::nonparticipating(sender)
+        .fee(args.fee.unwrap_or(0))
         .validity(first, last)
         .genesis_hash(params.genesis_hash.0)
-        .genesis_id(params.genesis_id.clone())
         .build()
     {
         Ok(t) => t,
@@ -1572,6 +1574,9 @@ pub fn run_marknonparticipating(
             return ExitCode::from(1);
         }
     };
+    if args.fee.is_none() {
+        txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
+    }
 
     eprintln!(
         "Warning: marking {} non-participating is permanent and irreversible; \
@@ -1758,14 +1763,16 @@ async fn register_online_keyreg(
              in the participation registry"
         )
     })?;
-    let txn = algo_txn_pipeline::KeyregBuilder::online(sender, &part.key)
+    let mut txn = algo_txn_pipeline::KeyregBuilder::online(sender, &part.key)
         .map_err(|e| e.to_string())?
-        .fee(fee.unwrap_or(params.min_fee))
+        .fee(fee.unwrap_or(0))
         .validity(first, last)
         .genesis_hash(params.genesis_hash.0)
-        .genesis_id(params.genesis_id.clone())
         .build()
         .map_err(|e| e.to_string())?;
+    if fee.is_none() {
+        txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
+    }
     sign_submit_confirm(pipeline, &txn, handle, password, no_wait, "status change").await
 }
 

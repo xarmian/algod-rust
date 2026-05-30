@@ -17,7 +17,7 @@ mod pipeline;
 
 pub use error::{PipelineError, Result};
 pub use keyreg::KeyregBuilder;
-pub use pipeline::TxnPipeline;
+pub use pipeline::{estimate_fee, TxnPipeline};
 
 // Re-export the client-layer types a consumer needs so they don't have to
 // depend on `algo-rest-client` directly just to name a pipeline input/output.

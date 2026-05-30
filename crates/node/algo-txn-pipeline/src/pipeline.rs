@@ -2,15 +2,33 @@
 
 use std::time::Duration;
 
-use algo_codec::canonical_encode_transaction;
+use algo_codec::{canonical_encode_signed_transaction, canonical_encode_transaction};
 use algo_kmd_client::KmdClient;
 use algo_rest_client::{AlgodClient, BlockSource, PendingTxnInfo, SuggestedParams, TxId};
-use algo_types::Transaction;
+use algo_types::{SignedTransaction, Transaction};
 
 use crate::error::{PipelineError, Result};
 
 /// How long to wait between confirmation polls.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Effective fee for a transaction when the caller didn't pin one, mirroring
+/// go-algorand's `MakeUnsigned*Tx` fee logic: `fee_per_byte *
+/// EstimateEncodedSize()`, floored at `min_fee` (`libgoal/transactions.go:356`).
+/// The estimate encodes the txn wrapped in a single-sig `SignedTransaction`
+/// with a nonzero signature, matching `Transaction.EstimateEncodedSize`
+/// (`data/transactions/transaction.go:505`).
+pub fn estimate_fee(txn: &Transaction, fee_per_byte: u64, min_fee: u64) -> u64 {
+    let mut sig = [0u8; 64];
+    sig[0] = 1; // nonzero so the 64-byte sig is encoded (go's crypto.Signature{1}).
+    let stx = SignedTransaction {
+        txn: txn.clone(),
+        sig,
+        ..SignedTransaction::default()
+    };
+    let size = canonical_encode_signed_transaction(&stx).len() as u64;
+    fee_per_byte.saturating_mul(size).max(min_fee)
+}
 
 /// Composes the algod REST client and (optionally) the kmd wallet client into
 /// the single path goal-rust subcommands use to construct, sign, broadcast, and
@@ -72,17 +90,17 @@ impl TxnPipeline {
         Ok(self.algod.send_raw_transaction(raw_signed).await?)
     }
 
-    /// Poll until the transaction is committed, rejected, or `max_rounds` have
-    /// elapsed since the call began. Mirrors go-algorand's `waitForCommit`
-    /// (`cmd/goal/clerk.go:198`): commit returns the pending info, a pool error
-    /// surfaces as [`PipelineError::PoolRejected`], and exhausting the window
-    /// surfaces as [`PipelineError::NotConfirmed`].
+    /// Poll until the transaction is committed, rejected, or expired. Mirrors
+    /// go-algorand's `waitForCommit` (`cmd/goal/clerk.go:198`): a commit returns
+    /// the pending info, a pool error surfaces as [`PipelineError::PoolRejected`],
+    /// and reaching the transaction's `last_valid_round` without a commit
+    /// surfaces as [`PipelineError::NotConfirmed`] (go's
+    /// `errorTransactionExpired`). `last_valid_round == 0` waits indefinitely.
     pub async fn wait_for_confirmation(
         &self,
         txid: &TxId,
-        max_rounds: u64,
+        last_valid_round: u64,
     ) -> Result<PendingTxnInfo> {
-        let start_round = self.current_round().await?;
         loop {
             let info = self.algod.get_pending_transaction(txid).await?;
             if info.is_committed() {
@@ -95,10 +113,10 @@ impl TxnPipeline {
                 });
             }
             let current = self.current_round().await?;
-            if current.saturating_sub(start_round) >= max_rounds {
+            if last_valid_round > 0 && current >= last_valid_round {
                 return Err(PipelineError::NotConfirmed {
                     txid: txid.to_string(),
-                    rounds: max_rounds,
+                    last_valid: last_valid_round,
                 });
             }
             tokio::time::sleep(POLL_INTERVAL).await;
