@@ -824,3 +824,100 @@ fn simulation_logicsig_budget_consumed_populated() {
     // A bare payment runs no app program.
     assert_eq!(txn_result.app_budget_consumed, 0);
 }
+
+/// In a group where an earlier transaction fails execution, a later
+/// LogicSig transaction's `logicsig_budget_consumed` must still be reported:
+/// LogicSig programs run during `check()` (whole-group signature verification),
+/// before evaluation, so their budget is known even past the failure point.
+#[test]
+fn simulation_logicsig_budget_set_for_txn_after_execution_failure() {
+    let app_sender = Address([0xAA; 32]);
+    let app_id = 100;
+    // Approval program that rejects: pushint 0, return. Passes check() (a
+    // rejection is an execution outcome, not a signature failure) but fails
+    // during evaluation, breaking the apply loop at index 0.
+    let reject_program = vec![0x06, 0x81, 0x00, 0x43];
+
+    let lsig_program = vec![0x06, 0x81, 0x01]; // pushint 1 (approves)
+    let lsig_sender = contract_account_address(&lsig_program);
+    let fee_sink = Address([0xFE; 32]);
+
+    let mut state = LedgerState::new();
+    state.fee_sink = fee_sink;
+    state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
+    state.set_account(
+        &app_sender,
+        AccountData {
+            micro_algos: 10_000_000,
+            total_created_apps: 1,
+            ..Default::default()
+        },
+    );
+    state.set_account(
+        &lsig_sender,
+        AccountData {
+            micro_algos: 10_000_000,
+            ..Default::default()
+        },
+    );
+    state.set_account(
+        &fee_sink,
+        AccountData {
+            micro_algos: 0,
+            ..Default::default()
+        },
+    );
+    state.set_app_params(
+        app_id,
+        AppParams {
+            creator: app_sender,
+            approval_program: reject_program,
+            clear_state_program: vec![0x06, 0x81, 0x01, 0x43],
+            global_state: BTreeMap::new(),
+            local_state_schema: StateSchema::default(),
+            global_state_schema: StateSchema::default(),
+            extra_program_pages: 0,
+        },
+    );
+
+    let app_txn = make_appl_txn(app_sender, app_id);
+    let lsig_txn = SignedTransaction {
+        txn: Transaction {
+            txn_type: "pay".into(),
+            sender: lsig_sender,
+            fee: 1000,
+            first_valid: 0.into(),
+            last_valid: 1000.into(),
+            receiver: Address([0x20; 32]),
+            amount: 0,
+            ..Default::default()
+        },
+        lsig: Some(LogicSig {
+            logic: serde_bytes::ByteBuf::from(lsig_program.clone()),
+            sig: [0u8; 64],
+            msig: None,
+            lmsig: None,
+            args: None,
+        }),
+        ..Default::default()
+    };
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![app_txn, lsig_txn]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("simulation should return results even on execution failure");
+
+    let group = &result.txn_groups[0];
+    // txn 0 rejected → the group records a failure.
+    assert!(group.failure_message.is_some());
+    assert_eq!(group.failed_at, Some(vec![0]));
+    // txn 1 never executed (app budget 0) but its LogicSig ran during check().
+    assert_eq!(group.txn_results[1].app_budget_consumed, 0);
+    assert_eq!(group.txn_results[1].logicsig_budget_consumed, 1);
+}

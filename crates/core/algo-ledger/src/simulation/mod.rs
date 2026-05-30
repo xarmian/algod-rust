@@ -377,6 +377,15 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             });
         }
 
+        // Seed per-transaction LogicSig budget consumed for the whole group.
+        // LogicSig programs run during `check()` (signature verification of the
+        // entire group), so their budgets are known even for transactions past
+        // an execution failure point — matching go-algorand, where the verify
+        // pass populates `LogicSigBudgetConsumed` before evaluation begins.
+        for (i, consumed) in logicsig_budgets.iter().enumerate() {
+            group_result.txn_results[i].logicsig_budget_consumed = *consumed;
+        }
+
         let mut failure_message: Option<String> = None;
         let mut failed_at: Option<TxnPath> = None;
 
@@ -431,9 +440,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // calls add `MaxAppProgramCost` to the pool and clear-state programs
             // run on an isolated budget, so the net pool delta under-reports.
             group_result.txn_results[i].app_budget_consumed = tracer.app_budget_consumed();
-            // LogicSig budget consumed for this txn was measured during check().
-            group_result.txn_results[i].logicsig_budget_consumed =
-                logicsig_budgets.get(i).copied().unwrap_or(0);
+            // (logicsig_budget_consumed was pre-seeded for the whole group above.)
 
             match apply_result {
                 Ok(apply_data) => {
