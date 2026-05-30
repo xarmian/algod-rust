@@ -125,6 +125,21 @@ async fn node_start_serves_reads_and_accepts_both_tokens() {
         "/genesis must echo the configured allocation"
     );
 
+    // /v2/blocks/0 serves the genesis block (TASK-270) — previously 500'd
+    // because no round-0 block existed.
+    let r = get(
+        &client,
+        &format!("{base}/v2/blocks/0?format=json"),
+        &api_token,
+    )
+    .await;
+    assert_eq!(r.status(), 200, "genesis block must serve");
+    let blk: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(
+        blk["block"]["gen"], "localnet-v1",
+        "genesis block carries the genesis id"
+    );
+
     // /v2/accounts/{addr} returns the genesis-funded balance.
     let r = get(
         &client,

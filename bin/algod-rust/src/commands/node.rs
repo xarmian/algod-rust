@@ -15,9 +15,11 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use algo_codec::{canonical_encode_block_header_from_block, encode_block};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{
-    parse_genesis_json, populate_store, seed_account_totals_from_genesis, SqliteLedger,
+    make_genesis_block, parse_genesis_json, populate_store, seed_account_totals_from_genesis,
+    SqliteLedger,
 };
 use algo_rest_api::node::BuildVersion;
 use algo_rest_api::server::{ApiServer, ApiServerConfig};
@@ -99,6 +101,22 @@ async fn run_start(
             .map_err(|e| anyhow::anyhow!("populate_store from genesis: {e}"))?;
         seed_account_totals_from_genesis(&mut sqlite_ledger, &genesis)
             .map_err(|e| anyhow::anyhow!("seed_account_totals_from_genesis: {e}"))?;
+        // Store the round-0 genesis block so the ledger has a tip header for the
+        // pool evaluator to chain block 1 from, and so /v2/blocks/0 serves. No
+        // apply — genesis state is already seeded above (mirrors relay's
+        // round-0 handling).
+        let genesis_block = make_genesis_block(&genesis)
+            .map_err(|e| anyhow::anyhow!("building genesis block: {e}"))?;
+        let blk_data = encode_block(&genesis_block)
+            .map_err(|e| anyhow::anyhow!("encoding genesis block: {e}"))?;
+        let hdr_data = canonical_encode_block_header_from_block(&genesis_block);
+        sqlite_ledger
+            .put_block(0, &genesis_block.current_protocol, &hdr_data, &blk_data)
+            .map_err(|e| anyhow::anyhow!("put_block(0) for genesis: {e}"))?;
+        // No certificate for the genesis block — it isn't agreed upon. Leaving
+        // certdata NULL makes `get_block_cert(0)` return None, so the
+        // `/v2/blocks/0` envelope is a valid `{block}` map (an empty-bytes cert
+        // would emit a `cert` key with no value → invalid msgpack).
         sqlite_ledger
             .commit_block()
             .map_err(|e| anyhow::anyhow!("commit_block during genesis seed: {e}"))?;

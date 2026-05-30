@@ -256,7 +256,6 @@ impl BlockHeader {
     pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
         let len = rmp_decode::read_map_len(rd)?;
         let mut h = Self::default();
-        let mut has_rnd = false;
         for _ in 0..len {
             let key = rmp_decode::read_key_bytes(rd)?;
             match (key.len(), key.first().copied().unwrap_or(0)) {
@@ -278,7 +277,6 @@ impl BlockHeader {
                 (3, b'r') => match key {
                     b"rnd" => {
                         h.round = Round(rmp_decode::read_u64(rd)?);
-                        has_rnd = true;
                     }
                     b"rwd" => h.rewards_pool = rmp_decode::read_address(rd)?,
                     _ => rmp_decode::skip_value(rd)?,
@@ -347,13 +345,11 @@ impl BlockHeader {
                 _ => rmp_decode::skip_value(rd)?,
             }
         }
-        // The serde path requires `rnd` (no #[serde(default)]), so validate here.
-        if !has_rnd {
-            return Err(algo_error::AlgoError::Codec {
-                source: "BlockHeader: missing required 'rnd' field".into(),
-                context: "rmp_decode".into(),
-            });
-        }
+        // A missing `rnd` means round 0: go-algorand's msgpack omits zero-valued
+        // fields, and the **genesis block** is the one header that carries round
+        // 0 (so `rnd` is absent). `h.round` is already the `Round::default()` of
+        // 0, so we accept it rather than erroring — non-genesis blocks all have
+        // round > 0 and therefore always include `rnd`.
         Ok(h)
     }
 
