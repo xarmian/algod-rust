@@ -131,7 +131,7 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<(), AlgoError> {
-    apply_block_impl(store, block, ApplyMode::Replay, false, None)
+    apply_block_impl(store, block, ApplyMode::Replay, false, None, None)
 }
 
 /// Apply a full block to the ledger state with the specified mode.
@@ -142,7 +142,7 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
     block: &Block,
     mode: ApplyMode,
 ) -> Result<(), AlgoError> {
-    apply_block_impl(store, block, mode, false, None)
+    apply_block_impl(store, block, mode, false, None, None)
 }
 
 /// Apply a full block to the ledger state with validation enabled.
@@ -154,7 +154,77 @@ pub fn apply_block_validating<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<(), AlgoError> {
-    apply_block_impl(store, block, ApplyMode::Replay, true, None)
+    apply_block_impl(store, block, ApplyMode::Replay, true, None, None)
+}
+
+/// Apply a full block (Execute mode) while capturing per-transaction-group
+/// state deltas into `group_deltas`, for the `GET /v2/deltas/txn/group/...`
+/// endpoints. The tracer records each group's delta indexed by every txn ID and
+/// the group ID, within its rolling lookback window. Behaves like
+/// [`apply_block_with_mode`] with [`ApplyMode::Execute`] otherwise.
+pub fn apply_block_capturing_group_deltas<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    group_deltas: &mut crate::txn_group_delta_tracer::TxnGroupDeltaTracer,
+) -> Result<(), AlgoError> {
+    apply_block_impl(
+        store,
+        block,
+        ApplyMode::Execute,
+        false,
+        None,
+        Some(group_deltas),
+    )
+}
+
+/// Build a `StateDelta` balance record from an account's post-state, matching
+/// the field mapping in [`apply_block_with_delta`] and the per-group capture in
+/// [`apply_block_impl`].
+fn balance_record_for(
+    addr: &Address,
+    ad: &algo_types::AccountData,
+) -> crate::state_delta::BalanceRecord {
+    use crate::state_delta::{AccountBaseData, BalanceRecord, LedgercoreAccountData, VotingData};
+    let voting = VotingData {
+        vote_id: ad.vote_id.unwrap_or([0u8; 32]),
+        selection_id: ad.selection_id.unwrap_or([0u8; 32]),
+        state_proof_id: ad.state_proof_id.unwrap_or([0u8; 64]),
+        vote_first_valid: Round(ad.vote_first_valid),
+        vote_last_valid: Round(ad.vote_last_valid),
+        vote_key_dilution: ad.vote_key_dilution,
+    };
+    let base = AccountBaseData {
+        status: ad.status as u64,
+        micro_algos: ad.micro_algos,
+        rewards_base: ad.rewards_base,
+        rewarded_micro_algos: ad.rewarded_micro_algos,
+        auth_addr: ad.auth_addr.unwrap_or(Address::ZERO),
+        incentive_eligible: ad.incentive_eligible,
+        total_app_schema: ad.total_app_schema.clone(),
+        total_extra_app_pages: ad.total_extra_app_pages,
+        total_app_params: ad.total_created_apps,
+        total_app_local_states: ad.total_apps_opted_in,
+        total_asset_params: ad.total_created_assets,
+        total_assets: ad.total_assets_opted_in,
+        total_boxes: ad.total_boxes,
+        total_box_bytes: ad.total_box_bytes,
+        last_proposed: Round(ad.last_proposed),
+        last_heartbeat: Round(ad.last_heartbeat),
+    };
+    BalanceRecord {
+        addr: *addr,
+        account_data: LedgercoreAccountData { base, voting },
+    }
+}
+
+/// Compute a transaction's ID: `SHA-512/256("TX" || canonical(txn))`.
+fn transaction_id(txn: &algo_types::Transaction) -> algo_types::Digest {
+    let canonical = algo_codec::canonical_encode_transaction(txn);
+    let mut hasher = Sha512_256::new();
+    hasher.update(b"TX");
+    hasher.update(&canonical);
+    let hash: [u8; 32] = hasher.finalize().into();
+    algo_types::Digest(hash)
 }
 
 /// Apply a full block and return the resulting [`StateDelta`].
@@ -204,7 +274,7 @@ pub fn apply_block_with_delta<L: crate::store_trait::LedgerStore>(
     let prev_timestamp = 0i64;
 
     // ── 3. Apply the block ────────────────────────────────────────
-    apply_block_impl(store, block, ApplyMode::Replay, false, None)?;
+    apply_block_impl(store, block, ApplyMode::Replay, false, None, None)?;
 
     // ── 4. Build the StateDelta by diffing pre vs post state ──────
     let mut accts = Vec::new();
@@ -409,6 +479,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     mode: ApplyMode,
     validate: bool,
     mut tracer: Option<&mut dyn EvalTracer>,
+    mut group_deltas: Option<&mut crate::txn_group_delta_tracer::TxnGroupDeltaTracer>,
 ) -> Result<(), AlgoError> {
     // Validate round monotonicity.
     let expected = Round(store.current_round().0 + 1);
@@ -487,6 +558,12 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                 // and pass them through to apply_appl for AVM execution.
                 let groups = detect_transaction_groups(&block.payset);
                 let mut global_txn_idx: usize = 0;
+
+                // Per-group state-delta capture (opt-in via `group_deltas`).
+                if let Some(t) = group_deltas.as_deref_mut() {
+                    t.before_block(block.round.0);
+                }
+
                 for group in &groups {
                     let num_app_calls = group
                         .iter()
@@ -498,6 +575,29 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                     let group_fee_credit =
                         compute_group_fee_credit(group, ctx.consensus.min_txn_fee);
                     ctx.fee_credit.set(group_fee_credit);
+
+                    // Snapshot the group's touched accounts before applying it, so
+                    // the per-group state delta can be built by diffing afterwards
+                    // (the diff-based equivalent of go's per-group cow delta).
+                    let group_start_idx = global_txn_idx;
+                    let group_pre: Option<
+                        std::collections::HashMap<Address, Option<algo_types::AccountData>>,
+                    > = if group_deltas.is_some() {
+                        let mut addrs = std::collections::HashSet::new();
+                        for stx in group.iter() {
+                            collect_txn_addresses(&stx.txn, &mut addrs);
+                        }
+                        addrs.insert(ctx.fee_sink);
+                        addrs.insert(block.rewards_pool);
+                        Some(
+                            addrs
+                                .into_iter()
+                                .map(|a| (a, store.get_account(&a)))
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    };
 
                     for (gi_idx, stx) in group.iter().enumerate() {
                         ctx.txn_index.set(global_txn_idx);
@@ -532,6 +632,50 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                             break 'block Err(e);
                         }
                         global_txn_idx += 1;
+                    }
+
+                    // Build and record this group's state delta (account diff +
+                    // txids + txleases, matching the per-round delta's scope).
+                    if let (Some(t), Some(pre)) = (group_deltas.as_deref_mut(), group_pre) {
+                        use crate::state_delta::{IncludedTransactions, StateDelta, Txlease};
+                        let mut delta = StateDelta::default();
+                        for (addr, pre_ad) in &pre {
+                            let post = store.get_account(addr);
+                            if *pre_ad != post {
+                                delta
+                                    .accts
+                                    .accts
+                                    .push(balance_record_for(addr, &post.unwrap_or_default()));
+                            }
+                        }
+                        let mut ids = Vec::new();
+                        let mut group_id_added = false;
+                        for (j, stx) in group.iter().enumerate() {
+                            let tid = transaction_id(&stx.txn);
+                            delta.txids.insert(
+                                tid,
+                                IncludedTransactions {
+                                    last_valid: stx.txn.last_valid,
+                                    intra: (group_start_idx + j) as u64,
+                                },
+                            );
+                            ids.push(tid);
+                            // The shared group ID resolves to the same delta.
+                            if stx.txn.group != [0u8; 32] && !group_id_added {
+                                ids.push(algo_types::Digest(stx.txn.group));
+                                group_id_added = true;
+                            }
+                            if stx.txn.lease != [0u8; 32] {
+                                delta.txleases.get_or_insert_with(Vec::new).push((
+                                    Txlease {
+                                        sender: stx.txn.sender,
+                                        lease: stx.txn.lease,
+                                    },
+                                    stx.txn.last_valid,
+                                ));
+                            }
+                        }
+                        t.record_group(ids, delta);
                     }
                 }
             }
