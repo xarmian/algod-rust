@@ -23,10 +23,10 @@ use algo_kmd_client::{KmdClient, KmdError};
 use crate::accounts_list::AccountsList;
 use crate::data_dir;
 use crate::groups::account::{
-    AddpartkeyArgs, AddressArgs, AssetdetailsArgs, DeleteArgs, DeletepartkeyArgs, DumpArgs,
-    ExportArgs, ImportArgs, ImportRootKeyArgs, InfoArgs, InstallpartkeyArgs, ListArgs,
-    MsigDeleteArgs, MsigInfoArgs, MsigNewArgs, NewArgs, RenameArgs, RenewallpartkeysArgs,
-    RenewpartkeyArgs,
+    AddpartkeyArgs, AddressArgs, AssetdetailsArgs, ChangeonlinestatusArgs, DeleteArgs,
+    DeletepartkeyArgs, DumpArgs, ExportArgs, ImportArgs, ImportRootKeyArgs, InfoArgs,
+    InstallpartkeyArgs, ListArgs, MarknonparticipatingArgs, MsigDeleteArgs, MsigInfoArgs,
+    MsigNewArgs, NewArgs, RenameArgs, RenewallpartkeysArgs, RenewpartkeyArgs,
 };
 
 /// Mirrors `messages.go:32` (`infoRenamedAccount`).
@@ -1295,27 +1295,357 @@ fn round_or_na(value: Option<u64>) -> String {
     }
 }
 
+// ---- keyreg status-change pipeline (TASK-244 / B12) -----------------------
+
+/// Typical protocol `MaxTxnLife` (rounds). The consensus-param table isn't
+/// loaded client-side, so the default validity window + confirmation wait use
+/// this — matching the assumption already made by `renew_one`.
+const MAX_TXN_LIFE: u64 = 1000;
+
+/// Compute a transaction's `[first_valid, last_valid]` window, mirroring
+/// go-algorand's `libgoal.computeValidityRounds` (libgoal.go:525) with
+/// `validRounds = 0`: an unset `first` defaults to the current round (or 1),
+/// an unset `last` defaults to `first + MaxTxnLife`, and the span is validated.
+fn compute_validity(
+    first_valid: Option<u64>,
+    last_valid: Option<u64>,
+    last_round: u64,
+) -> Result<(u64, u64), String> {
+    let first = match first_valid {
+        Some(f) if f != 0 => f,
+        _ => {
+            if last_round > 0 {
+                last_round
+            } else {
+                1
+            }
+        }
+    };
+    let last = match last_valid {
+        Some(l) if l != 0 => l,
+        _ => first.saturating_add(MAX_TXN_LIFE),
+    };
+    if first > last {
+        return Err(format!(
+            "txn would first be valid on round {first} which is after last valid round {last}"
+        ));
+    }
+    if last - first > MAX_TXN_LIFE {
+        return Err(format!(
+            "txn validity period ({first} to {last}) is greater than max txn lifetime {MAX_TXN_LIFE}"
+        ));
+    }
+    Ok((first, last))
+}
+
+/// Pick the participation key for `address` valid at `round` that expires
+/// farthest in the future. Mirrors go-algorand's `Client.chooseParticipation`
+/// (libgoal/participation.go:30).
+fn choose_participation<'a>(
+    parts: &'a [algo_rest_client::ParticipationKey],
+    address: &str,
+    round: u64,
+) -> Option<&'a algo_rest_client::ParticipationKey> {
+    parts
+        .iter()
+        .filter(|p| {
+            p.address == address
+                && p.key.vote_first_valid <= round
+                && round <= p.key.vote_last_valid
+        })
+        .max_by_key(|p| p.key.vote_last_valid)
+}
+
+/// Sign (via kmd), broadcast, and optionally wait for a status-change keyreg.
+/// `label` is interpolated into Go's `Transaction id for {label} transaction:`
+/// line (account.go:921 / 1542). On confirmation prints Go's `infoTxCommitted`
+/// (messages.go:113).
+async fn sign_submit_confirm(
+    pipeline: &algo_txn_pipeline::TxnPipeline,
+    txn: &algo_types::Transaction,
+    handle: &str,
+    password: &str,
+    no_wait: bool,
+    label: &str,
+) -> Result<(), String> {
+    let last_valid = txn.last_valid.0;
+    let signed = pipeline
+        .sign_with_kmd(handle, password, txn)
+        .await
+        .map_err(|e| format!("Couldn't sign tx with kmd: {e}"))?;
+    let txid = pipeline
+        .submit(&signed)
+        .await
+        .map_err(|e| format!("Couldn't broadcast tx with algod: {e}"))?;
+    println!("Transaction id for {label} transaction: {txid}");
+
+    if no_wait {
+        println!("Note: status will not change until transaction is finalized");
+        return Ok(());
+    }
+
+    // Wait until the txn commits or its last valid round passes (go's
+    // waitForCommit takes the txn's lastTxRound, not a relative window).
+    let info = pipeline
+        .wait_for_confirmation(&txid, last_valid)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(round) = info.confirmed_round {
+        // Mirrors `infoTxCommitted` (messages.go:113).
+        println!("Transaction {txid} committed in round {round}");
+    }
+    Ok(())
+}
+
+/// `account changeonlinestatus -a <addr> [--online|--offline] ...`. Mirrors
+/// Go's `changeOnlineCmd` + `changeAccountOnlineStatus` (account.go:873-972).
+pub fn run_changeonlinestatus(
+    args: ChangeonlinestatusArgs,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    let sender = match algo_types::Address::from_algorand_string(&args.address) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Could not parse address: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let algod = match build_algod_client_for_dir(&data_dir_path) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let kmd = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+
+    let go_online = !args.offline;
+    let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, Some(kmd));
+
+    let mut accounts = AccountsList::load(&data_dir_path);
+    let (handle, _wallet_name, password) = match resolve_wallet_and_init(
+        &rt,
+        pipeline.kmd().expect("kmd configured above"),
+        &mut accounts,
+        args.wallet.as_deref(),
+        args.password.as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(()) => return ExitCode::from(1),
+    };
+
+    let result = if go_online {
+        // Online: pull participation material from /v2/participation (Go's
+        // chooseParticipation) and register it.
+        rt.block_on(register_online_keyreg(
+            &pipeline,
+            sender,
+            &args.address,
+            args.fee,
+            args.first_valid,
+            args.last_valid,
+            &handle,
+            &password,
+            args.no_wait,
+        ))
+    } else {
+        // Offline: a bare keyreg clears the account's voting keys.
+        rt.block_on(submit_offline_keyreg(
+            &pipeline,
+            sender,
+            args.fee,
+            args.first_valid,
+            args.last_valid,
+            &handle,
+            &password,
+            args.no_wait,
+        ))
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Build → sign → submit a go-offline keyreg (clears the account's voting keys).
+#[allow(clippy::too_many_arguments)]
+async fn submit_offline_keyreg(
+    pipeline: &algo_txn_pipeline::TxnPipeline,
+    sender: algo_types::Address,
+    fee: Option<u64>,
+    first_valid: Option<u64>,
+    last_valid: Option<u64>,
+    handle: &str,
+    password: &str,
+    no_wait: bool,
+) -> Result<(), String> {
+    let params = pipeline
+        .suggested_params()
+        .await
+        .map_err(|e| e.to_string())?;
+    let (first, last) = compute_validity(first_valid, last_valid, params.last_round)?;
+    let mut txn = algo_txn_pipeline::KeyregBuilder::offline(sender)
+        .fee(fee.unwrap_or(0))
+        .validity(first, last)
+        .genesis_hash(params.genesis_hash.0)
+        .build()
+        .map_err(|e| e.to_string())?;
+    if fee.is_none() {
+        txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
+    }
+    sign_submit_confirm(pipeline, &txn, handle, password, no_wait, "status change").await
+}
+
+/// `account marknonparticipating -a <addr> ...`. Mirrors Go's
+/// `markNonparticipatingCmd` (account.go:1503-1554). Irreversible on-chain.
+pub fn run_marknonparticipating(
+    args: MarknonparticipatingArgs,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    let sender = match algo_types::Address::from_algorand_string(&args.address) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Could not parse address: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let algod = match build_algod_client_for_dir(&data_dir_path) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let kmd = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(()) => return ExitCode::from(1),
+    };
+
+    let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, Some(kmd));
+    let params = match rt.block_on(pipeline.suggested_params()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e.to_string()]));
+            return ExitCode::from(1);
+        }
+    };
+    let (first, last) = match compute_validity(args.first_valid, args.last_valid, params.last_round)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Could not construct transaction: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut txn = match algo_txn_pipeline::KeyregBuilder::nonparticipating(sender)
+        .fee(args.fee.unwrap_or(0))
+        .validity(first, last)
+        .genesis_hash(params.genesis_hash.0)
+        .build()
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Could not construct transaction: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if args.fee.is_none() {
+        txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
+    }
+
+    eprintln!(
+        "Warning: marking {} non-participating is permanent and irreversible; \
+         the account can never go online or offline again and earns no rewards.",
+        args.address
+    );
+
+    let mut accounts = AccountsList::load(&data_dir_path);
+    let (handle, _wallet_name, password) = match resolve_wallet_and_init(
+        &rt,
+        pipeline.kmd().expect("kmd configured above"),
+        &mut accounts,
+        args.wallet.as_deref(),
+        args.password.as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(()) => return ExitCode::from(1),
+    };
+
+    match rt.block_on(sign_submit_confirm(
+        &pipeline,
+        &txn,
+        &handle,
+        &password,
+        args.no_wait,
+        "mark-nonparticipating",
+    )) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 // ---- account renewpartkey / renewallpartkeys (TASK-243 / B11) -------------
 
-const RENEW_REGISTER_DEFERRED: &str =
-    "--register requires keyreg-transaction submission, which lands in B12 \
-     (Phase B12: account changeonlinestatus). Use `goal-rust account \
-     changeonlinestatus -a <addr> --online` after this command in the \
-     meantime.";
+/// `renewallpartkeys --register` is deferred: batch-registering every renewed
+/// key requires per-account wallet resolution + signing, tracked as a
+/// follow-up. The single-account `renewpartkey --register` (B12) is wired.
+const RENEWALL_REGISTER_DEFERRED: &str =
+    "--register on renewallpartkeys is not yet supported (batch keyreg \
+     submission is a follow-up). Renew, then run `goal-rust account \
+     changeonlinestatus -a <addr> --online` per account, or use \
+     `renewpartkey --register` for a single account.";
 
 /// `account renewpartkey -a <addr> --roundLastValid <r> [--keyDilution]
 /// [--register]`. Mirrors `renewParticipationKeyCmd`
 /// (account.go:1053-1099). See `RenewpartkeyArgs` for divergences.
-pub fn run_renewpartkey(args: RenewpartkeyArgs, cli_d: Vec<PathBuf>) -> ExitCode {
-    if args.register {
-        eprintln!("{RENEW_REGISTER_DEFERRED}");
-        return ExitCode::from(1);
-    }
-    if let Err(e) = algo_types::Address::from_algorand_string(&args.address) {
-        eprintln!("Could not parse address: {e}");
-        return ExitCode::from(1);
-    }
-    let client = match build_algod_client(&cli_d) {
+pub fn run_renewpartkey(
+    args: RenewpartkeyArgs,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    let sender = match algo_types::Address::from_algorand_string(&args.address) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Could not parse address: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let data_dir_path = match data_dir::ensure_single_data_dir(&cli_d) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let client = match build_algod_client_for_dir(&data_dir_path) {
         Ok(c) => c,
         Err(()) => return ExitCode::from(1),
     };
@@ -1347,19 +1677,103 @@ pub fn run_renewpartkey(args: RenewpartkeyArgs, cli_d: Vec<PathBuf>) -> ExitCode
             return ExitCode::from(1);
         }
     }
-    let renewed = rt.block_on(renew_one(
+    if let Err(e) = rt.block_on(renew_one(
         &client,
         &args.address,
         args.round_last_valid,
         args.key_dilution,
-    ));
-    match renewed {
-        Ok(()) => ExitCode::SUCCESS,
+    )) {
+        eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e]));
+        return ExitCode::from(1);
+    }
+
+    if !args.register {
+        return ExitCode::SUCCESS;
+    }
+
+    // --register: issue a keyreg-online transaction for the freshly generated
+    // key, mirroring Go's `generateAndRegisterPartKey` (account.go:1101-1131).
+    let kmd = match build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref()) {
+        Ok(c) => c,
+        Err(()) => return ExitCode::from(1),
+    };
+    let pipeline = algo_txn_pipeline::TxnPipeline::new(client, Some(kmd));
+    let mut accounts = AccountsList::load(&data_dir_path);
+    let (handle, _wallet_name, password) = match resolve_wallet_and_init(
+        &rt,
+        pipeline.kmd().expect("kmd configured above"),
+        &mut accounts,
+        None,
+        None,
+    ) {
+        Ok(v) => v,
+        Err(()) => return ExitCode::from(1),
+    };
+    match rt.block_on(register_online_keyreg(
+        &pipeline,
+        sender,
+        &args.address,
+        None,
+        None,
+        None,
+        &handle,
+        &password,
+        false,
+    )) {
+        Ok(()) => {
+            println!("Participation key registered successfully");
+            ExitCode::SUCCESS
+        }
         Err(e) => {
-            eprintln!("{}", format_message(ERROR_REQUEST_FAIL, &[&e]));
+            eprintln!("Error registering keys: {e}");
             ExitCode::from(1)
         }
     }
+}
+
+/// Build → sign → submit a go-online keyreg for `address`, selecting the
+/// node's participation key via `/v2/participation` (Go's `chooseParticipation`
+/// + `changeAccountOnlineStatus(goOnline=true)`). Shared by `changeonlinestatus
+/// --online` and `renewpartkey --register`.
+#[allow(clippy::too_many_arguments)]
+async fn register_online_keyreg(
+    pipeline: &algo_txn_pipeline::TxnPipeline,
+    sender: algo_types::Address,
+    address: &str,
+    fee: Option<u64>,
+    first_valid: Option<u64>,
+    last_valid: Option<u64>,
+    handle: &str,
+    password: &str,
+    no_wait: bool,
+) -> Result<(), String> {
+    let params = pipeline
+        .suggested_params()
+        .await
+        .map_err(|e| e.to_string())?;
+    let (first, last) = compute_validity(first_valid, last_valid, params.last_round)?;
+    let parts = pipeline
+        .algod()
+        .list_participation_keys()
+        .await
+        .map_err(|e| e.to_string())?;
+    let part = choose_participation(&parts, address, first).ok_or_else(|| {
+        format!(
+            "couldn't find a participation key for address {address} valid at round {first} \
+             in the participation registry"
+        )
+    })?;
+    let mut txn = algo_txn_pipeline::KeyregBuilder::online(sender, &part.key)
+        .map_err(|e| e.to_string())?
+        .fee(fee.unwrap_or(0))
+        .validity(first, last)
+        .genesis_hash(params.genesis_hash.0)
+        .build()
+        .map_err(|e| e.to_string())?;
+    if fee.is_none() {
+        txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
+    }
+    sign_submit_confirm(pipeline, &txn, handle, password, no_wait, "status change").await
 }
 
 /// `account renewallpartkeys --roundLastValid <r> [--keyDilution]
@@ -1371,7 +1785,7 @@ pub fn run_renewpartkey(args: RenewpartkeyArgs, cli_d: Vec<PathBuf>) -> ExitCode
 /// account.go:1080-1088).
 pub fn run_renewallpartkeys(args: RenewallpartkeysArgs, cli_d: Vec<PathBuf>) -> ExitCode {
     if args.register {
-        eprintln!("{RENEW_REGISTER_DEFERRED}");
+        eprintln!("{RENEWALL_REGISTER_DEFERRED}");
         return ExitCode::from(1);
     }
     let dirs = match data_dir::resolve_data_dirs(&cli_d) {
@@ -2526,6 +2940,56 @@ fn format_assetdetails(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_validity_defaults_to_current_round_window() {
+        // Unset first ⇒ current round; unset last ⇒ first + MaxTxnLife.
+        assert_eq!(compute_validity(None, None, 500).unwrap(), (500, 1500));
+        // first==0 with no last_round ⇒ first defaults to 1.
+        assert_eq!(compute_validity(Some(0), None, 0).unwrap(), (1, 1001));
+        // Explicit window honored.
+        assert_eq!(compute_validity(Some(10), Some(20), 999).unwrap(), (10, 20));
+    }
+
+    #[test]
+    fn compute_validity_rejects_bad_windows() {
+        assert!(compute_validity(Some(100), Some(50), 0).is_err());
+        // Span wider than MaxTxnLife.
+        assert!(compute_validity(Some(1), Some(1 + MAX_TXN_LIFE + 1), 0).is_err());
+    }
+
+    #[test]
+    fn choose_participation_picks_farthest_expiry_for_address() {
+        let mk = |addr: &str, first: u64, last: u64| algo_rest_client::ParticipationKey {
+            id: format!("{addr}-{last}"),
+            address: addr.to_string(),
+            effective_first_valid: None,
+            effective_last_valid: None,
+            last_block_proposal: None,
+            last_state_proof: None,
+            last_vote: None,
+            key: algo_rest_client::AccountParticipation {
+                selection_participation_key: vec![0; 32],
+                state_proof_key: Some(vec![0; 64]),
+                vote_first_valid: first,
+                vote_key_dilution: 100,
+                vote_last_valid: last,
+                vote_participation_key: vec![0; 32],
+            },
+        };
+        let parts = vec![
+            mk("AAA", 1, 4000),
+            mk("AAA", 1, 5000),    // farthest expiry for AAA
+            mk("BBB", 1, 9000),    // different address — ignored
+            mk("AAA", 6000, 9000), // not valid at round 100
+        ];
+        let chosen = choose_participation(&parts, "AAA", 100).expect("a valid key for AAA");
+        assert_eq!(chosen.key.vote_last_valid, 5000);
+        // No key for an unknown address.
+        assert!(choose_participation(&parts, "CCC", 100).is_none());
+        // No key valid at a round beyond every key's window.
+        assert!(choose_participation(&parts, "AAA", 100_000).is_none());
+    }
 
     #[test]
     fn info_created_template_matches_go() {

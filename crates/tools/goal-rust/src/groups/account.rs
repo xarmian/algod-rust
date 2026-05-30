@@ -8,8 +8,6 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 
-use crate::unimplemented;
-
 #[derive(Subcommand, Debug)]
 pub enum AccountCmd {
     /// Generate and install participation key for the specified account.
@@ -23,7 +21,7 @@ pub enum AccountCmd {
     Balance(AddressArgs),
     /// Change online status for the specified account.
     #[command(name = "changeonlinestatus")]
-    Changeonlinestatus,
+    Changeonlinestatus(ChangeonlinestatusArgs),
     /// Delete an account.
     Delete(DeleteArgs),
     /// Delete a participation key.
@@ -52,7 +50,7 @@ pub enum AccountCmd {
     /// Permanently mark an account as not participating (i.e. offline and
     /// earns no rewards).
     #[command(name = "marknonparticipating")]
-    Marknonparticipating,
+    Marknonparticipating(MarknonparticipatingArgs),
     /// Control and manage multisig accounts.
     Multisig {
         #[command(subcommand)]
@@ -206,6 +204,79 @@ pub struct RenewpartkeyArgs {
     /// B12 — set today exits 1 with a clear deferral message.
     #[arg(long = "register")]
     pub register: bool,
+}
+
+/// `account changeonlinestatus -a <addr> [--online|--offline] [--firstvalid <r>]
+/// [--lastvalid <r>] [--fee <f>] [--no-wait] [-w <wallet>] [--password <pw>]`.
+/// Mirrors Go's `changeOnlineCmd` (account.go:873-928).
+///
+/// **Divergences (documented):**
+/// - Go's `--online` is a single bool defaulting to `true`; we expose the
+///   clearer `--online`/`--offline` pair, defaulting to online when neither is
+///   given (same effective default as Go).
+/// - The online path sources participation material from algod's
+///   `/v2/participation` (Go's `chooseParticipation`); Go's `--partkeyfile`
+///   (load from a local file) is out of scope — install the key first, then run
+///   this command.
+/// - `--signer`, `--lease`, `--txfile`, and `--validrounds` are not yet wired.
+#[derive(Args, Debug)]
+pub struct ChangeonlinestatusArgs {
+    #[arg(short = 'a', long = "address")]
+    pub address: String,
+    /// Bring the account online (register its participation key). Default when
+    /// neither `--online` nor `--offline` is given.
+    #[arg(short = 'o', long = "online", conflicts_with = "offline")]
+    pub online: bool,
+    /// Bring the account offline (clear its voting keys).
+    #[arg(long = "offline", conflicts_with = "online")]
+    pub offline: bool,
+    /// First valid round for the status-change transaction (0/unset ⇒ current).
+    #[arg(long = "firstvalid", alias = "first-valid")]
+    pub first_valid: Option<u64>,
+    /// Last valid round (unset ⇒ firstvalid + max txn lifetime).
+    #[arg(long = "lastvalid", alias = "last-valid")]
+    pub last_valid: Option<u64>,
+    /// Transaction fee in microAlgos (unset ⇒ suggested minimum).
+    #[arg(short = 'f', long = "fee")]
+    pub fee: Option<u64>,
+    /// Wallet name.
+    #[arg(short = 'w', long = "wallet")]
+    pub wallet: Option<String>,
+    /// Wallet password (skip the prompt).
+    #[arg(long = "password")]
+    pub password: Option<String>,
+    /// Don't wait for the transaction to commit.
+    #[arg(short = 'N', long = "no-wait")]
+    pub no_wait: bool,
+}
+
+/// `account marknonparticipating -a <addr> [--firstvalid <r>] [--lastvalid <r>]
+/// [--fee <f>] [--no-wait] [-w <wallet>] [--password <pw>]`. Mirrors Go's
+/// `markNonparticipatingCmd` (account.go:1503-1554).
+///
+/// Permanently marks the account non-participating — irreversible on-chain.
+#[derive(Args, Debug)]
+pub struct MarknonparticipatingArgs {
+    #[arg(short = 'a', long = "address")]
+    pub address: String,
+    /// First valid round (0/unset ⇒ current).
+    #[arg(long = "firstvalid", alias = "first-valid")]
+    pub first_valid: Option<u64>,
+    /// Last valid round (unset ⇒ firstvalid + max txn lifetime).
+    #[arg(long = "lastvalid", alias = "last-valid")]
+    pub last_valid: Option<u64>,
+    /// Transaction fee in microAlgos (unset ⇒ suggested minimum).
+    #[arg(short = 'f', long = "fee")]
+    pub fee: Option<u64>,
+    /// Wallet name.
+    #[arg(short = 'w', long = "wallet")]
+    pub wallet: Option<String>,
+    /// Wallet password (skip the prompt).
+    #[arg(long = "password")]
+    pub password: Option<String>,
+    /// Don't wait for the transaction to commit.
+    #[arg(short = 'N', long = "no-wait")]
+    pub no_wait: bool,
 }
 
 /// `account renewallpartkeys --roundLastValid <r> [--keyDilution <n>]
@@ -448,112 +519,41 @@ pub struct MsigInfoArgs {
 }
 
 pub fn run(cmd: AccountCmd) -> ExitCode {
-    let leaf: &str = match cmd {
-        AccountCmd::Addpartkey(args) => {
-            return crate::cmd::account::run_addpartkey(args, crate::cli_state::datadirs());
+    use crate::cli_state::{datadirs, kmddir};
+    use crate::cmd::account as h;
+
+    // Every account leaf is now implemented; each arm dispatches to its handler.
+    match cmd {
+        AccountCmd::Addpartkey(args) => h::run_addpartkey(args, datadirs()),
+        AccountCmd::Assetdetails(args) => h::run_assetdetails(args, datadirs()),
+        AccountCmd::Balance(args) => h::run_balance(args, datadirs()),
+        AccountCmd::Changeonlinestatus(args) => {
+            h::run_changeonlinestatus(args, datadirs(), kmddir())
         }
-        AccountCmd::Assetdetails(args) => {
-            return crate::cmd::account::run_assetdetails(args, crate::cli_state::datadirs());
+        AccountCmd::Delete(args) => h::run_delete(args, datadirs(), kmddir()),
+        AccountCmd::Deletepartkey(args) => h::run_deletepartkey(args, datadirs()),
+        AccountCmd::Dump(args) => h::run_dump(args, datadirs()),
+        AccountCmd::Export(args) => h::run_export(args, datadirs(), kmddir()),
+        AccountCmd::Import(args) => h::run_import(args, datadirs(), kmddir()),
+        AccountCmd::Importrootkey(args) => h::run_importrootkey(args, datadirs(), kmddir()),
+        AccountCmd::Info(args) => h::run_info(args, datadirs()),
+        AccountCmd::Installpartkey(args) => h::run_installpartkey(args, datadirs()),
+        AccountCmd::List(args) => h::run_list(args, datadirs(), kmddir()),
+        AccountCmd::Listpartkeys => h::run_listpartkeys(datadirs()),
+        AccountCmd::Marknonparticipating(args) => {
+            h::run_marknonparticipating(args, datadirs(), kmddir())
         }
-        AccountCmd::Balance(args) => {
-            return crate::cmd::account::run_balance(args, crate::cli_state::datadirs());
-        }
-        AccountCmd::Changeonlinestatus => "changeonlinestatus",
-        AccountCmd::Delete(args) => {
-            return crate::cmd::account::run_delete(
-                args,
-                crate::cli_state::datadirs(),
-                crate::cli_state::kmddir(),
-            );
-        }
-        AccountCmd::Deletepartkey(args) => {
-            return crate::cmd::account::run_deletepartkey(args, crate::cli_state::datadirs());
-        }
-        AccountCmd::Dump(args) => {
-            return crate::cmd::account::run_dump(args, crate::cli_state::datadirs());
-        }
-        AccountCmd::Export(args) => {
-            return crate::cmd::account::run_export(
-                args,
-                crate::cli_state::datadirs(),
-                crate::cli_state::kmddir(),
-            );
-        }
-        AccountCmd::Import(args) => {
-            return crate::cmd::account::run_import(
-                args,
-                crate::cli_state::datadirs(),
-                crate::cli_state::kmddir(),
-            );
-        }
-        AccountCmd::Importrootkey(args) => {
-            return crate::cmd::account::run_importrootkey(
-                args,
-                crate::cli_state::datadirs(),
-                crate::cli_state::kmddir(),
-            );
-        }
-        AccountCmd::Info(args) => {
-            return crate::cmd::account::run_info(args, crate::cli_state::datadirs());
-        }
-        AccountCmd::Installpartkey(args) => {
-            return crate::cmd::account::run_installpartkey(args, crate::cli_state::datadirs());
-        }
-        AccountCmd::List(args) => {
-            return crate::cmd::account::run_list(
-                args,
-                crate::cli_state::datadirs(),
-                crate::cli_state::kmddir(),
-            );
-        }
-        AccountCmd::Listpartkeys => {
-            return crate::cmd::account::run_listpartkeys(crate::cli_state::datadirs());
-        }
-        AccountCmd::Marknonparticipating => "marknonparticipating",
-        AccountCmd::Multisig { cmd } => {
-            let Some(cmd) = cmd else {
-                return crate::print_group_help(&["account", "multisig"]);
-            };
-            return match cmd {
-                MultisigCmd::Delete(args) => crate::cmd::account::run_multisig_delete(
-                    args,
-                    crate::cli_state::datadirs(),
-                    crate::cli_state::kmddir(),
-                ),
-                MultisigCmd::Info(args) => crate::cmd::account::run_multisig_info(
-                    args,
-                    crate::cli_state::datadirs(),
-                    crate::cli_state::kmddir(),
-                ),
-                MultisigCmd::New(args) => crate::cmd::account::run_multisig_new(
-                    args,
-                    crate::cli_state::datadirs(),
-                    crate::cli_state::kmddir(),
-                ),
-            };
-        }
-        AccountCmd::New(args) => {
-            return crate::cmd::account::run_new(
-                args,
-                crate::cli_state::datadirs(),
-                crate::cli_state::kmddir(),
-            );
-        }
-        AccountCmd::Partkeyinfo => {
-            return crate::cmd::account::run_partkeyinfo(crate::cli_state::datadirs());
-        }
-        AccountCmd::Rename(args) => {
-            return crate::cmd::account::run_rename(args, crate::cli_state::datadirs());
-        }
-        AccountCmd::Renewallpartkeys(args) => {
-            return crate::cmd::account::run_renewallpartkeys(args, crate::cli_state::datadirs());
-        }
-        AccountCmd::Renewpartkey(args) => {
-            return crate::cmd::account::run_renewpartkey(args, crate::cli_state::datadirs());
-        }
-        AccountCmd::Rewards(args) => {
-            return crate::cmd::account::run_rewards(args, crate::cli_state::datadirs());
-        }
-    };
-    unimplemented("account", leaf)
+        AccountCmd::Multisig { cmd } => match cmd {
+            None => crate::print_group_help(&["account", "multisig"]),
+            Some(MultisigCmd::Delete(args)) => h::run_multisig_delete(args, datadirs(), kmddir()),
+            Some(MultisigCmd::Info(args)) => h::run_multisig_info(args, datadirs(), kmddir()),
+            Some(MultisigCmd::New(args)) => h::run_multisig_new(args, datadirs(), kmddir()),
+        },
+        AccountCmd::New(args) => h::run_new(args, datadirs(), kmddir()),
+        AccountCmd::Partkeyinfo => h::run_partkeyinfo(datadirs()),
+        AccountCmd::Rename(args) => h::run_rename(args, datadirs()),
+        AccountCmd::Renewallpartkeys(args) => h::run_renewallpartkeys(args, datadirs()),
+        AccountCmd::Renewpartkey(args) => h::run_renewpartkey(args, datadirs(), kmddir()),
+        AccountCmd::Rewards(args) => h::run_rewards(args, datadirs()),
+    }
 }

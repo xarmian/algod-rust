@@ -126,29 +126,29 @@ fn partkey_entry(address: &str, id: &str, vote_last: u64) -> serde_json::Value {
     })
 }
 
+/// `renewpartkey --register` is now implemented (B12); the batch
+/// `renewallpartkeys --register` remains deferred and must still exit with a
+/// clear message rather than silently renewing without registering.
 #[test]
-fn renewpartkey_register_flag_exits_with_deferral() {
+fn renewallpartkeys_register_flag_exits_with_deferral() {
     let (_t, dd) = mk_data_dir();
-    let addr = algo_types::Address([0x44; 32]).to_algorand_string();
     let out = Command::new(GOAL_RUST_BIN)
         .arg("-d")
         .arg(&dd)
         .args([
             "account",
-            "renewpartkey",
-            "-a",
-            &addr,
+            "renewallpartkeys",
             "--roundLastValid",
             "5000",
             "--register",
         ])
         .env_remove("ALGORAND_DATA")
         .output()
-        .expect("renewpartkey");
+        .expect("renewallpartkeys");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "--register must error");
     assert!(
-        stderr.contains("--register requires keyreg-transaction submission"),
+        stderr.contains("not yet supported"),
         "stderr must carry deferral message; got {stderr:?}",
     );
 }

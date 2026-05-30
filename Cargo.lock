@@ -453,6 +453,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "algo-txn-pipeline"
+version = "0.1.0"
+dependencies = [
+ "algo-codec",
+ "algo-error",
+ "algo-kmd-client",
+ "algo-rest-client",
+ "algo-types",
+ "base64",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "algo-types"
 version = "0.1.0"
 dependencies = [
@@ -1786,6 +1800,7 @@ dependencies = [
  "algo-kmd-api-types",
  "algo-kmd-client",
  "algo-rest-client",
+ "algo-txn-pipeline",
  "algo-types",
  "base64",
  "clap",
