@@ -122,6 +122,15 @@ pub trait EvalTracer {
     /// (`false`). `error` is `Some` if the program terminated with an error.
     fn after_program(&mut self, _program_type: ProgramType, _pass: bool, _error: Option<&str>) {}
 
+    /// Called once a program finishes, reporting the opcode `cost` it consumed
+    /// (go-algorand's `cx.Cost()`). Inner app calls invoke this on the same
+    /// tracer as their caller, so a tracer can roll the cost up into the
+    /// top-level transaction's budget figure (`tracer.go:495,504`). Unlike the
+    /// trace-capture callbacks, implementors should record this regardless of
+    /// whether opcode tracing is enabled, since per-transaction budget is a
+    /// standard simulate response field.
+    fn record_program_cost(&mut self, _program_type: ProgramType, _cost: u64) {}
+
     /// Called before each opcode is dispatched.
     ///
     /// `pc` is the instruction index (not byte offset). `opcode` is the raw

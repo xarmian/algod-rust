@@ -84,6 +84,13 @@ pub struct SimulationTracer {
     /// State changes (global/local writes/deletes) recorded during the current
     /// opcode, flushed into the opcode's trace unit at `after_opcode`.
     pending_state_changes: Vec<StateChange>,
+    /// Total app opcode cost consumed by this transaction — the sum of every
+    /// approval and clear-state program run under it, including inner app calls
+    /// (which invoke `record_program_cost` on this same tracer). Mirrors
+    /// go-algorand's per-transaction `AppBudgetConsumed` roll-up
+    /// (`tracer.go:504`). Accumulated even when opcode tracing is disabled,
+    /// since per-transaction budget is a standard simulate response field.
+    app_cost_consumed: u64,
 }
 
 impl SimulationTracer {
@@ -97,7 +104,15 @@ impl SimulationTracer {
             program_state_stack: Vec::new(),
             initial_states: InitialStatesAccumulator::default(),
             pending_state_changes: Vec::new(),
+            app_cost_consumed: 0,
         }
+    }
+
+    /// Total app opcode cost consumed by this transaction (approval +
+    /// clear-state programs, including inner app calls). This is the
+    /// per-transaction `AppBudgetConsumed` figure for the simulate response.
+    pub fn app_budget_consumed(&self) -> u64 {
+        self.app_cost_consumed
     }
 
     /// Take the initial-state snapshot captured during this transaction,
@@ -365,6 +380,21 @@ impl EvalTracer for SimulationTracer {
     fn record_created_app(&mut self, app_id: u64) {
         if self.config.state {
             self.initial_states.mark_created_app(app_id);
+        }
+    }
+
+    fn record_program_cost(&mut self, program_type: ProgramType, cost: u64) {
+        // Roll approval + clear-state program costs (including inner app calls,
+        // which call this on the same tracer) into the transaction's app budget
+        // consumed — go-algorand `tracer.go:504`. LogicSig cost is measured
+        // separately during signature verification in `Simulator::check()`, so
+        // it is not accumulated here. Not gated on trace config: per-transaction
+        // budget is always reported.
+        match program_type {
+            ProgramType::Approval | ProgramType::ClearState => {
+                self.app_cost_consumed = self.app_cost_consumed.saturating_add(cost);
+            }
+            ProgramType::LogicSig => {}
         }
     }
 }
