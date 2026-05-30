@@ -569,9 +569,15 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                 // returning a partial one.
                 let capture_group_deltas =
                     group_deltas.is_some() && crate::sqlite::block_state_delta_is_complete(block);
-                if capture_group_deltas {
-                    if let Some(t) = group_deltas.as_deref_mut() {
+                if let Some(t) = group_deltas.as_deref_mut() {
+                    if capture_group_deltas {
+                        // Advance the window and retain this round for recording.
                         t.before_block(block.round.0);
+                    } else {
+                        // Still advance/evict the window so a run of incomplete
+                        // blocks can't leave stale deltas past the lookback, but
+                        // leave this round unretained (delta unavailable).
+                        t.advance(block.round.0);
                     }
                 }
 

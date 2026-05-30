@@ -61,13 +61,21 @@ impl TxnGroupDeltaTracer {
         }
     }
 
-    /// Begin capturing deltas for `round`, dropping the round that has aged out
-    /// of the `lookback` window. Mirrors go's `BeforeBlock`.
-    pub fn before_block(&mut self, round: u64) {
+    /// Advance the rolling window to `round`, evicting the round that has aged
+    /// out of the `lookback` window, without retaining `round` itself. Called
+    /// for *every* applied block (including those whose deltas are not captured)
+    /// so stale deltas can never outlive the window.
+    pub fn advance(&mut self, round: u64) {
         if let Some(expired) = round.checked_sub(self.lookback) {
             self.rounds.remove(&expired);
         }
         self.latest_round = round;
+    }
+
+    /// Begin capturing deltas for `round`: advance the window and retain an
+    /// (initially empty) entry for `round`. Mirrors go's `BeforeBlock`.
+    pub fn before_block(&mut self, round: u64) {
+        self.advance(round);
         self.rounds.entry(round).or_default();
     }
 
@@ -148,5 +156,23 @@ mod tests {
         assert!(!t.has_round(1));
         assert!(t.has_round(2));
         assert!(t.has_round(3));
+    }
+
+    /// `advance` evicts aged-out rounds even when no group is recorded, so a run
+    /// of uncaptured (incomplete) blocks can't leave stale deltas behind.
+    #[test]
+    fn advance_evicts_without_recording() {
+        let mut t = TxnGroupDeltaTracer::new(2);
+        t.before_block(1);
+        t.record_group(vec![digest(0xAA)], StateDelta::default());
+        assert!(t.has_round(1));
+        assert!(t.get_delta_for_id(&digest(0xAA)).is_some());
+
+        // Incomplete blocks at rounds 2 and 3 — no recording, but the window
+        // still advances and round 1 (== 3 - 2) is evicted.
+        t.advance(2);
+        t.advance(3);
+        assert!(!t.has_round(1));
+        assert!(t.get_delta_for_id(&digest(0xAA)).is_none());
     }
 }
