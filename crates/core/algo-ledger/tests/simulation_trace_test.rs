@@ -6,12 +6,13 @@
 
 use std::collections::BTreeMap;
 
+use algo_ledger::avm_context::app_address;
 use algo_ledger::simulation::{
     AvmValueTrace, ExecTraceConfig, SimulationRequest, Simulator, SimulatorError, StateChangeKind,
 };
 use algo_ledger::{LedgerState, LedgerStore};
 use algo_types::{
-    AccountData, Address, AppParams, LogicSig, SignedTransaction, StateSchema, Transaction,
+    AccountData, Address, AppParams, BoxRef, LogicSig, SignedTransaction, StateSchema, Transaction,
 };
 use sha2::{Digest, Sha512_256};
 
@@ -920,4 +921,139 @@ fn simulation_logicsig_budget_set_for_txn_after_execution_failure() {
     // txn 1 never executed (app budget 0) but its LogicSig ran during check().
     assert_eq!(group.txn_results[1].app_budget_consumed, 0);
     assert_eq!(group.txn_results[1].logicsig_budget_consumed, 1);
+}
+
+/// Box state-changes are captured per opcode with the *post-write* whole-box
+/// content (TASK-260), matching go-algorand's `AppStateQuerying` GetBox read.
+/// Exercises a full-box write (`box_put`), a create (`box_create`, zero-filled),
+/// a partial write (`box_replace`, which must report the resulting full box, not
+/// the opcode argument), and a delete (`box_del`, no new value).
+#[test]
+fn simulation_captures_box_state_changes_with_post_write_values() {
+    let sender = Address([0xAB; 32]);
+    let app_id = 100;
+    // v8 program operating on boxes "b1" and "b2":
+    //   box_put    "b1", "hello"        (create + full write)
+    //   box_create "b2", 4              (zero-filled)   ; pop the pushed flag
+    //   box_replace"b2", 1, "XY"        (partial write of the full box)
+    //   box_del    "b1"                 (delete)        ; return uses pushed flag
+    #[rustfmt::skip]
+    let approval = vec![
+        0x08,                                     // version 8
+        0x80, 0x02, 0x62, 0x31,                   // pushbytes "b1"
+        0x80, 0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f, // pushbytes "hello"
+        0xbf,                                     // box_put
+        0x80, 0x02, 0x62, 0x32,                   // pushbytes "b2"
+        0x81, 0x04,                               // pushint 4
+        0xb9,                                     // box_create -> pushes 1
+        0x48,                                     // pop
+        0x80, 0x02, 0x62, 0x32,                   // pushbytes "b2"
+        0x81, 0x01,                               // pushint 1
+        0x80, 0x02, 0x58, 0x59,                   // pushbytes "XY"
+        0xbb,                                     // box_replace
+        0x80, 0x02, 0x62, 0x31,                   // pushbytes "b1"
+        0xbc,                                     // box_del -> pushes 1
+        0x43,                                     // return
+    ];
+
+    let mut state = setup_state(sender, app_id, approval);
+    // Fund the app account so box creation does not trip the min-balance check.
+    state.set_account(
+        &Address(app_address(app_id)),
+        AccountData {
+            micro_algos: 1_000_000,
+            ..Default::default()
+        },
+    );
+
+    // The app call must declare box references for "b1" and "b2".
+    let mut txn = make_appl_txn(sender, app_id);
+    txn.txn.boxes = Some(vec![
+        BoxRef {
+            index: 0,
+            name: Some(b"b1".to_vec().into()),
+        },
+        BoxRef {
+            index: 0,
+            name: Some(b"b2".to_vec().into()),
+        },
+    ]);
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn]],
+        allow_empty_signatures: true,
+        trace_config: ExecTraceConfig {
+            enable: true,
+            stack: false,
+            scratch: false,
+            state: true,
+        },
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("simulation should succeed");
+    assert!(
+        result.txn_groups[0].failure_message.is_none(),
+        "simulation should not fail: {:?}",
+        result.txn_groups[0].failure_message
+    );
+
+    let approval_trace = result.txn_groups[0].txn_results[0]
+        .trace
+        .as_ref()
+        .expect("trace present")
+        .approval_program_trace
+        .as_ref()
+        .expect("approval trace present");
+
+    let changes: Vec<_> = approval_trace
+        .opcodes
+        .iter()
+        .flat_map(|u| u.state_changes.iter())
+        .collect();
+
+    // Exactly four box state-changes, in execution order.
+    assert_eq!(
+        changes.len(),
+        4,
+        "expected box_put, box_create, box_replace, box_del"
+    );
+    for c in &changes {
+        assert_eq!(c.kind, StateChangeKind::BoxState);
+        assert_eq!(c.app_id, app_id);
+    }
+
+    // `AvmValueTrace` has no `PartialEq`; extract the byte payload for asserts.
+    let box_bytes = |v: &Option<AvmValueTrace>| -> Option<Vec<u8>> {
+        match v {
+            Some(AvmValueTrace::Bytes(b)) => Some(b.clone()),
+            _ => None,
+        }
+    };
+
+    // box_put "b1" -> full content "hello".
+    assert_eq!(changes[0].key, b"b1");
+    assert_eq!(
+        box_bytes(&changes[0].new_value).as_deref(),
+        Some(&b"hello"[..])
+    );
+
+    // box_create "b2", 4 -> zero-filled.
+    assert_eq!(changes[1].key, b"b2");
+    assert_eq!(box_bytes(&changes[1].new_value), Some(vec![0u8; 4]));
+
+    // box_replace "b2", offset 1, "XY" -> the *resulting* full box, not "XY".
+    assert_eq!(changes[2].key, b"b2");
+    assert_eq!(
+        box_bytes(&changes[2].new_value),
+        Some(vec![0x00, 0x58, 0x59, 0x00]),
+        "box_replace must report the post-write whole-box content"
+    );
+
+    // box_del "b1" -> no new value.
+    assert_eq!(changes[3].key, b"b1");
+    assert!(changes[3].new_value.is_none());
 }

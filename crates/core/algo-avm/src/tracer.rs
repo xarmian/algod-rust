@@ -158,6 +158,21 @@ pub trait EvalTracer {
     /// consensus apply path (which attaches no tracer) is entirely unaffected.
     fn record_app_state_access(&mut self, _access: &AppStateAccess<'_>) {}
 
+    /// Fill in the *post-write* whole-box content for the box state-change just
+    /// recorded via [`record_app_state_access`].
+    ///
+    /// Box writes (`box_put`/`box_create`/`box_replace`/`box_resize`/
+    /// `box_splice`) — unlike global/local writes — produce a new value that is
+    /// only known after the mutation (partial writes modify the full box). The
+    /// AVM context records the state-change *operation* before mutating (so it
+    /// is captured even if the opcode errors, like go-algorand's `BeforeOpcode`
+    /// `appendStateOperations`), then calls this once the write succeeds to
+    /// attach the box's resulting content — mirroring go-algorand's
+    /// `AfterOpcode` → `updateNewStateValues` → `AppStateQuerying` GetBox read
+    /// (`ledger/simulation/tracer.go:386`, `opcodeExplain.go:314`). `box_del`
+    /// never calls this, leaving the new value empty. The default is a no-op.
+    fn record_box_new_value(&mut self, _new_value: Option<TealValue>) {}
+
     /// Report that an application was created during simulation.
     ///
     /// The initial states of apps created mid-simulation are excluded from

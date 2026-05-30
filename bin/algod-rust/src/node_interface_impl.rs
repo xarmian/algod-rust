@@ -26,7 +26,8 @@ use algo_codec::{canonical_encode_block_header, compute_block_digest};
 use algo_ledger::simulation::{
     AppInitialState, AvmValueTrace, ExecTraceConfig, OpcodeTraceUnit, ProgramTrace,
     ResourcesInitialStates, ResultEvalOverrides, SimulationRequest, SimulationResult, Simulator,
-    SimulatorError, StateChange, StateChangeKind, TransactionTrace, TxnGroupResult, TxnResult,
+    SimulatorError, StateChange, StateChangeKind, StateChangeOp, TransactionTrace, TxnGroupResult,
+    TxnResult,
 };
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{SqliteLedger, StateDelta};
@@ -1211,10 +1212,11 @@ impl AlgodNodeInterface {
         }
     }
 
-    /// Convert a captured [`StateChange`] (global/local write or delete) into
-    /// the REST [`ApplicationStateOperation`]. Operation is `w` when a value was
-    /// written and `d` for a delete (no new value), matching go-algorand's
-    /// AppStateOpEnum encoding.
+    /// Convert a captured [`StateChange`] (global/local/box write or delete)
+    /// into the REST [`ApplicationStateOperation`]. Operation is `w` for a write
+    /// and `d` for a delete (taken from the recorded op, not inferred from the
+    /// new value — a box write whose opcode errored is still a `w` with no
+    /// value), matching go-algorand's AppStateOpEnum encoding.
     fn state_change_to_model(change: &StateChange) -> ApplicationStateOperation {
         let app_state_type = match change.kind {
             StateChangeKind::GlobalState => "g",
@@ -1222,7 +1224,11 @@ impl AlgodNodeInterface {
             StateChangeKind::BoxState => "b",
         }
         .to_string();
-        let operation = if change.new_value.is_some() { "w" } else { "d" }.to_string();
+        let operation = match change.op {
+            StateChangeOp::Write => "w",
+            StateChangeOp::Delete => "d",
+        }
+        .to_string();
         ApplicationStateOperation {
             account: change.account.map(|a| a.to_string()),
             app_state_type,
@@ -1634,6 +1640,7 @@ mod tests {
 
         let write = StateChange {
             kind: StateChangeKind::LocalState,
+            op: StateChangeOp::Write,
             app_id: 5,
             key: b"k".to_vec(),
             new_value: Some(AvmValueTrace::Uint64(9)),
@@ -1648,6 +1655,7 @@ mod tests {
 
         let del = StateChange {
             kind: StateChangeKind::GlobalState,
+            op: StateChangeOp::Delete,
             app_id: 5,
             key: b"k".to_vec(),
             new_value: None,
