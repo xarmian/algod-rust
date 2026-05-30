@@ -243,6 +243,79 @@ pub fn genesis_hash(genesis: &GenesisJson) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Build the round-0 **genesis block** from parsed genesis data, porting
+/// go-algorand's `bookkeeping.MakeGenesisBlock`
+/// (`data/bookkeeping/genesis.go:218`). The genesis block has no transactions;
+/// it exists so the ledger has a tip header to chain block 1 from (the
+/// transaction pool's evaluator reads `block_hdr(latest)`), and so
+/// `/v2/blocks/0` serves.
+///
+/// Faithful for the consequential header fields (round, protocol, seed =
+/// genesis hash, rewards state, genesis hash/id, timestamp). Two go gating
+/// consensus params are not modeled in [`algo_types::ConsensusParams`], so we
+/// apply the behavior every localnet-relevant (modern) protocol uses and
+/// document it:
+/// - `InitialRewardsRateCalculation` (enabled on modern protocols) → the
+///   rewards rate subtracts `MinBalance` from the rewards-pool balance.
+/// - `AppForbidLowResources` (enabled on modern protocols) → `TxnCounter`
+///   starts at 1000, so the first created asset/app gets id 1001 like a real
+///   network.
+///
+/// `txn_commitment` is left as algo-rust's empty-payset commitment (zero);
+/// go's genesis commits to an empty *non-nil* payset (`Payset::CommitGenesis`),
+/// a value that differs but is never cross-validated on an isolated localnet.
+pub fn make_genesis_block(genesis: &GenesisJson) -> Result<algo_types::Block, AlgoError> {
+    let params =
+        algo_types::consensus::consensus_params_for_version(&genesis.proto).ok_or_else(|| {
+            AlgoError::Ledger {
+                message: format!("make_genesis_block: unknown protocol '{}'", genesis.proto),
+            }
+        })?;
+    let gh = genesis_hash(genesis);
+    let fee_sink = Address::from_algorand_string(&genesis.fees)?;
+    let rewards_pool = Address::from_algorand_string(&genesis.rwd)?;
+    let genesis_id = format!("{}-{}", genesis.network, genesis.id);
+
+    // Rewards rate: go's MakeGenesisBlock divides the rewards-pool balance by
+    // the refresh interval (subtracting MinBalance under
+    // InitialRewardsRateCalculation, which modern protocols enable).
+    let refresh = params.rewards_rate_refresh_interval;
+    let rewards_pool_balance = genesis
+        .alloc
+        .iter()
+        .find(|a| a.addr == genesis.rwd)
+        .map(|a| a.state.algo)
+        .unwrap_or(0);
+    let rewards_rate = if refresh == 0 {
+        0
+    } else {
+        rewards_pool_balance.saturating_sub(params.min_balance) / refresh
+    };
+
+    Ok(algo_types::Block {
+        round: algo_types::Round(0),
+        branch: [0u8; 32],
+        seed: gh, // committee.Seed(genesisHash)
+        timestamp: genesis.timestamp,
+        genesis_id,
+        genesis_hash: if params.support_genesis_hash {
+            gh
+        } else {
+            [0u8; 32]
+        },
+        fee_sink,
+        rewards_pool,
+        rewards_level: 0,
+        rewards_rate,
+        rewards_residue: 0,
+        rewards_recalculation_round: algo_types::Round(refresh),
+        current_protocol: genesis.proto.clone(),
+        // Modern-protocol AppForbidLowResources behavior (see doc comment).
+        txn_counter: 1000,
+        ..Default::default()
+    })
+}
+
 /// Encode a single `GenesisAllocation` as a msgpack map.
 ///
 /// IMPORTANT: addr, comment, and state are ALWAYS emitted — Go's
@@ -824,5 +897,38 @@ mod tests {
         assert!(s.contains("comment"));
         assert!(s.contains("devmode"));
         assert!(s.contains("timestamp"));
+    }
+}
+
+#[cfg(test)]
+mod genesis_block_tests {
+    use super::*;
+
+    fn test_genesis() -> GenesisJson {
+        let fees = Address([0xFE; 32]).to_algorand_string();
+        let rwd = Address([0xFD; 32]).to_algorand_string();
+        let json = format!(
+            r#"{{"id":"v1","network":"localnet","proto":"future","fees":"{fees}","rwd":"{rwd}","timestamp":0,"alloc":[{{"addr":"{rwd}","comment":"RewardsPool","state":{{"algo":1000000000000,"onl":0}}}}]}}"#
+        );
+        parse_genesis_json(&json).unwrap()
+    }
+
+    #[test]
+    fn genesis_block_round_trips_through_codec() {
+        let g = test_genesis();
+        let blk = make_genesis_block(&g).unwrap();
+        assert_eq!(blk.round, algo_types::Round(0));
+        assert_eq!(blk.seed, genesis_hash(&g));
+        assert_eq!(blk.current_protocol, "future");
+        assert_eq!(blk.txn_counter, 1000);
+        // Full block must round-trip through the codec the REST layer uses.
+        let encoded = algo_codec::encode_block(&blk).expect("encode");
+        let decoded = algo_codec::decode_block(&encoded).expect("decode full block");
+        assert_eq!(decoded.round, blk.round);
+        // Header must round-trip too (what get_block_header decodes).
+        let hdr = algo_codec::canonical_encode_block_header_from_block(&blk);
+        let dh = algo_types::BlockHeader::decode_from_reader(&mut hdr.as_slice())
+            .expect("decode header");
+        assert_eq!(dh.round, algo_types::Round(0));
     }
 }
