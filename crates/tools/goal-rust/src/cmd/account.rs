@@ -354,20 +354,43 @@ struct AccountRow {
 /// Resolve algod base URL + token for the data dir. Returns None when
 /// `algod.net` or `algod.token` is missing — list_addresses still
 /// renders with `[n/a]` balances in that case.
+/// Whether an API token passes go-algorand's length check (`ValidateAPIToken`,
+/// `util/tokens/tokens.go`): 64–256 chars. goal-rust falls back from the admin
+/// token to the regular one when the admin token is missing *or* invalid,
+/// matching `tokens.GetAndValidateAPIToken`.
+fn is_valid_api_token(token: &str) -> bool {
+    (64..=256).contains(&token.len())
+}
+
 fn build_algod_endpoint(data_dir_path: &Path) -> Option<(String, String)> {
     let net = std::fs::read_to_string(data_dir_path.join("algod.net")).ok()?;
-    let tok = std::fs::read_to_string(data_dir_path.join("algod.token")).ok()?;
     let net = net.trim();
-    let tok = tok.trim();
-    if net.is_empty() || tok.is_empty() {
+    if net.is_empty() {
         return None;
     }
+    // Prefer the admin token, falling back to the regular token. The admin
+    // token is accepted on every endpoint AND is required for the admin-gated
+    // `/v2/participation*` handlers (addpartkey/listpartkeys/deletepartkey) —
+    // the regular token alone gets a 401 from a real Go algod there. A token is
+    // only used if it passes go's length check (an invalid admin token falls
+    // back to the regular one). Mirrors go-algorand's libgoal `nc.AlgodClient()`
+    // → `tokens.GetAndValidateAPIToken` (nodecontrol/algodControl.go:72,
+    // util/tokens/tokens.go) and our own `cmd/node.rs` (TASK-261).
+    let admin = data_dir::read_algod_admin_token(data_dir_path)
+        .ok()
+        .filter(|t| is_valid_api_token(t));
+    let tok = match admin {
+        Some(t) => t,
+        None => data_dir::read_algod_token(data_dir_path)
+            .ok()
+            .filter(|t| is_valid_api_token(t))?,
+    };
     let base = if net.starts_with("http://") || net.starts_with("https://") {
         net.to_string()
     } else {
         format!("http://{net}")
     };
-    Some((base, tok.to_string()))
+    Some((base, tok))
 }
 
 fn fetch_status_and_amount(
@@ -521,24 +544,15 @@ pub fn run_dump(args: DumpArgs, cli_d: Vec<PathBuf>) -> ExitCode {
         eprintln!("Could not parse address: {e}");
         return ExitCode::from(1);
     }
-    let net = match std::fs::read_to_string(data_dir_path.join("algod.net")) {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => {
-            eprintln!("Could not contact algod: algod.net missing");
+    // Route through build_algod_endpoint for the same admin-token-first
+    // resolution every other account command uses (Go's dumpCmd reaches
+    // NodeController.AlgodClient() too).
+    let (base, token) = match build_algod_endpoint(&data_dir_path) {
+        Some(e) => e,
+        None => {
+            eprintln!("Could not contact algod: algod.net/algod.token missing");
             return ExitCode::from(1);
         }
-    };
-    let token = match std::fs::read_to_string(data_dir_path.join("algod.token")) {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => {
-            eprintln!("Could not contact algod: algod.token missing");
-            return ExitCode::from(1);
-        }
-    };
-    let base = if net.starts_with("http://") || net.starts_with("https://") {
-        net
-    } else {
-        format!("http://{net}")
     };
     let rt = match build_runtime() {
         Ok(r) => r,
@@ -2940,6 +2954,40 @@ fn format_assetdetails(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_algod_endpoint_prefers_admin_token() {
+        let admin = "a".repeat(64);
+        let regular = "b".repeat(64);
+        let tmp = tempfile::tempdir().unwrap();
+        let dd = tmp.path();
+        std::fs::write(dd.join("algod.net"), "127.0.0.1:1234\n").unwrap();
+        std::fs::write(dd.join("algod.token"), format!("{regular}\n")).unwrap();
+        std::fs::write(dd.join("algod.admin.token"), format!("{admin}\n")).unwrap();
+        let (base, tok) = build_algod_endpoint(dd).expect("endpoint");
+        assert_eq!(base, "http://127.0.0.1:1234");
+        assert_eq!(tok, admin, "admin token must win when present + valid");
+    }
+
+    #[test]
+    fn build_algod_endpoint_falls_back_to_regular_token() {
+        let regular = "b".repeat(64);
+        let tmp = tempfile::tempdir().unwrap();
+        let dd = tmp.path();
+        std::fs::write(dd.join("algod.net"), "http://host:9\n").unwrap();
+        std::fs::write(dd.join("algod.token"), format!("{regular}\n")).unwrap();
+        // No admin token file → regular.
+        let (base, tok) = build_algod_endpoint(dd).expect("endpoint");
+        assert_eq!(base, "http://host:9");
+        assert_eq!(tok, regular);
+        // Empty admin token → regular.
+        std::fs::write(dd.join("algod.admin.token"), "\n").unwrap();
+        assert_eq!(build_algod_endpoint(dd).unwrap().1, regular);
+        // Present-but-invalid (too-short) admin token also falls back, matching
+        // go's GetAndValidateAPIToken (Codex review TASK-261).
+        std::fs::write(dd.join("algod.admin.token"), "tooshort\n").unwrap();
+        assert_eq!(build_algod_endpoint(dd).unwrap().1, regular);
+    }
 
     #[test]
     fn compute_validity_defaults_to_current_round_window() {
