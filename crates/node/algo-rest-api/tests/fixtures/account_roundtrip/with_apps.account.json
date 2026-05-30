@@ -1,0 +1,75 @@
+{
+  "address": "IQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC5VMUQQUE",
+  "amount": 3000000,
+  "amount-without-pending-rewards": 3000000,
+  "apps-local-state": [
+    {
+      "id": 5,
+      "key-value": [
+        {
+          "key": "Yg==",
+          "value": {
+            "bytes": "dg==",
+            "type": 1,
+            "uint": 0
+          }
+        },
+        {
+          "key": "aw==",
+          "value": {
+            "bytes": "",
+            "type": 2,
+            "uint": 9
+          }
+        }
+      ],
+      "schema": {
+        "num-byte-slice": 0,
+        "num-uint": 1
+      }
+    }
+  ],
+  "apps-total-extra-pages": 1,
+  "apps-total-schema": {
+    "num-byte-slice": 2,
+    "num-uint": 3
+  },
+  "created-apps": [
+    {
+      "id": 8,
+      "params": {
+        "approval-program": "BoEB",
+        "clear-state-program": "BoEB",
+        "creator": "IQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC5VMUQQUE",
+        "extra-program-pages": 1,
+        "global-state": [
+          {
+            "key": "Zw==",
+            "value": {
+              "bytes": "",
+              "type": 2,
+              "uint": 7
+            }
+          }
+        ],
+        "global-state-schema": {
+          "num-byte-slice": 1,
+          "num-uint": 0
+        },
+        "local-state-schema": {
+          "num-byte-slice": 0,
+          "num-uint": 1
+        }
+      }
+    }
+  ],
+  "min-balance": 585500,
+  "pending-rewards": 0,
+  "rewards": 0,
+  "round": 300,
+  "status": "Offline",
+  "total-apps-opted-in": 1,
+  "total-assets-opted-in": 0,
+  "total-created-apps": 1,
+  "total-created-assets": 0
+}

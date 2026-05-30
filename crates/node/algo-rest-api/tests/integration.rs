@@ -2170,17 +2170,48 @@ async fn account_info_exclude_all_omits_resource_lists() {
 
 #[tokio::test]
 async fn account_info_exclude_none_returns_full_info() {
+    // Populate one of each resource so the lists appear. go (and now the Rust
+    // response) omits *empty* resource lists, so a fully-empty account would
+    // have them absent — to verify exclude=none includes resources, the account
+    // must actually hold some.
     let lookup = AccountLookup {
         account_data: AccountData {
             micro_algos: 1_000_000,
+            total_assets_opted_in: 1,
+            total_created_assets: 1,
+            total_apps_opted_in: 1,
+            total_created_apps: 1,
             ..AccountData::default()
         },
         last_round: 1000,
         amount_without_pending_rewards: 1_000_000,
-        assets: BTreeMap::new(),
-        created_assets: BTreeMap::new(),
-        app_local_states: BTreeMap::new(),
-        created_apps: BTreeMap::new(),
+        assets: BTreeMap::from([(
+            1,
+            AssetHolding {
+                amount: 5,
+                frozen: false,
+            },
+        )]),
+        created_assets: BTreeMap::from([(2, AssetParams::default())]),
+        app_local_states: BTreeMap::from([(
+            3,
+            AppLocalState {
+                schema: Default::default(),
+                key_value: BTreeMap::new(),
+            },
+        )]),
+        created_apps: BTreeMap::from([(
+            4,
+            AppParams {
+                creator: Address::ZERO,
+                approval_program: vec![0x06],
+                clear_state_program: vec![0x06],
+                global_state: BTreeMap::new(),
+                local_state_schema: Default::default(),
+                global_state_schema: Default::default(),
+                extra_program_pages: 0,
+            },
+        )]),
     };
     let server = TestServer::start(mock_node_with_account(lookup)).await;
 
@@ -2195,7 +2226,7 @@ async fn account_info_exclude_none_returns_full_info() {
 
     let body: serde_json::Value = resp.json().await.unwrap();
 
-    // Resource lists should be present (as empty arrays) with exclude=none
+    // Resource lists should be present with exclude=none
     assert!(
         body.get("assets").is_some(),
         "assets should be present with exclude=none"

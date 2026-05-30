@@ -1,0 +1,20 @@
+{
+  "index": 7,
+  "params": {
+    "clawback": "MYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACM7DWVNLQ",
+    "creator": "GMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADGDOYMAJA",
+    "decimals": 6,
+    "default-frozen": true,
+    "freeze": "KUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACVPUZ4YQM",
+    "manager": "GMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADGDOYMAJA",
+    "metadata-hash": "qwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "name": "Test Asset",
+    "name-b64": "VGVzdCBBc3NldA==",
+    "reserve": "IQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC5VMUQQUE",
+    "total": 1000000,
+    "unit-name": "TST",
+    "unit-name-b64": "VFNU",
+    "url": "https://x.io",
+    "url-b64": "aHR0cHM6Ly94Lmlv"
+  }
+}
