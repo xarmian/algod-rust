@@ -158,7 +158,10 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             post(handlers::set_block_timestamp_offset::<N>),
         )
         .layer(middleware::from_fn_with_state(
-            tokens.api_token.clone(),
+            // Authenticated routes accept either the admin or the public token,
+            // matching go-algorand's `[adminToken, apiToken]` public middleware
+            // (router.go:96) — the admin token is valid everywhere.
+            vec![tokens.admin_token.clone(), tokens.api_token.clone()],
             auth::require_token,
         ));
 
@@ -189,7 +192,8 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
                 .post(handlers::append_keys::<N>),
         )
         .layer(middleware::from_fn_with_state(
-            tokens.admin_token.clone(),
+            // Admin routes require the admin token only (go router.go:83).
+            vec![tokens.admin_token.clone()],
             auth::require_token,
         ));
 
@@ -210,7 +214,8 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
                 post(handlers::set_sync_round::<N>),
             )
             .layer(middleware::from_fn_with_state(
-                tokens.api_token.clone(),
+                // Data API uses the public middleware (admin token also valid).
+                vec![tokens.admin_token.clone(), tokens.api_token.clone()],
                 auth::require_token,
             ));
         router = router.merge(data);
@@ -230,7 +235,8 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
                 post(handlers::raw_transaction_async::<N>),
             )
             .layer(middleware::from_fn_with_state(
-                tokens.api_token.clone(),
+                // Experimental routes use the public middleware (admin token also valid).
+                vec![tokens.admin_token.clone(), tokens.api_token.clone()],
                 auth::require_token,
             ));
         router = router.merge(experimental);

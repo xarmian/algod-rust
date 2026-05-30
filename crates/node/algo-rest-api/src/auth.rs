@@ -43,8 +43,15 @@ const INVALID_TOKEN_MESSAGE: &str = "Invalid API Token";
 /// 2. The `Authorization: Bearer <token>` header (fallback)
 ///
 /// OPTIONS requests are always allowed through without auth (matching go-algorand).
+///
+/// The state is the set of *acceptable* tokens: a request is authorized if the
+/// provided token matches any of them (constant-time). go-algorand's `MakeAuth`
+/// takes a token list the same way — public/authenticated routes are wired with
+/// `[adminToken, apiToken]` (the admin token is accepted everywhere) and admin
+/// routes with `[adminToken]` only
+/// (`daemon/algod/api/server/router.go:83,96`).
 pub async fn require_token(
-    axum::extract::State(expected_token): axum::extract::State<String>,
+    axum::extract::State(accepted_tokens): axum::extract::State<Vec<String>>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -76,8 +83,16 @@ pub async fn require_token(
         }
     }
 
-    // Constant-time comparison to prevent timing side-channels.
-    if provided.as_bytes().ct_eq(expected_token.as_bytes()).into() {
+    // Constant-time comparison against every acceptable token to prevent timing
+    // side-channels. We OR the per-token results and check once at the end so
+    // the matched token's position isn't observable. `ct_eq` on byte slices
+    // already handles unequal lengths in constant time.
+    let provided_bytes = provided.as_bytes();
+    let mut matched = subtle::Choice::from(0u8);
+    for token in &accepted_tokens {
+        matched |= provided_bytes.ct_eq(token.as_bytes());
+    }
+    if matched.into() {
         next.run(request).await
     } else {
         let body = crate::error::ErrorResponse::new(INVALID_TOKEN_MESSAGE);

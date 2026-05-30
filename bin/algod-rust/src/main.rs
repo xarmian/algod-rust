@@ -349,6 +349,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             commands::follow::run(&algod_url, &algod_token, report_dir.as_deref()).await?;
         }
+        Commands::Node { cmd } => {
+            commands::node::run(cmd).await?;
+        }
     }
 
     Ok(())

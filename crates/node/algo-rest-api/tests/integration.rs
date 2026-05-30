@@ -1476,13 +1476,14 @@ async fn authenticated_route_returns_200_with_valid_token() {
 }
 
 #[tokio::test]
-async fn admin_token_does_not_work_on_public_token_routes() {
+async fn admin_token_works_on_public_routes_but_api_token_does_not_work_on_admin_routes() {
     let server = TestServer::start(MockNode::synced()).await;
 
-    // The admin token is different from the api_token. The authenticated routes
-    // use the api_token specifically, so admin_token should not grant access
-    // to standard v2 endpoints (unless they happen to match, which they won't
-    // since both are randomly generated).
+    // The admin token is accepted on public/authenticated routes — go-algorand
+    // wires the public middleware with `[adminToken, apiToken]`
+    // (`daemon/algod/api/server/router.go:96`), so the admin token is valid
+    // everywhere. This is what lets `goal` (which prefers the admin token) drive
+    // standard v2 endpoints. (TASK-261/263.)
     let resp = server
         .client
         .get(server.url("/v2/transactions/params"))
@@ -1490,8 +1491,26 @@ async fn admin_token_does_not_work_on_public_token_routes() {
         .send()
         .await
         .unwrap();
-    // Admin token is not the api token, so it should be rejected
-    assert_eq!(resp.status(), 401);
+    assert_ne!(
+        resp.status(),
+        401,
+        "admin token must be accepted on public routes (go router.go:96)"
+    );
+
+    // The asymmetry holds: the public/api token does NOT grant access to
+    // admin-only routes, which go wires with `[adminToken]` only (router.go:83).
+    let resp = server
+        .client
+        .get(server.url("/v2/participation"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "public token must be rejected on admin-only routes (go router.go:83)"
+    );
 }
 
 // ===========================================================================
