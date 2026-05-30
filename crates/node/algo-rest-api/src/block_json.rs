@@ -28,28 +28,27 @@ use base64::Engine;
 use data_encoding::BASE32_NOPAD;
 use sha2::{Digest, Sha512_256};
 
-/// Codec keys whose binary value is a `basics.Address` (or `[]basics.Address`),
-/// rendered as a checksummed base32 address. Sourced from the `basics.Address`
-/// codec tags across `data/transactions/*.go`, `data/bookkeeping/*.go`, and
-/// `data/basics/*.go` (asset-params manager/reserve/freeze/clawback: `m`/`r`/
-/// `f`/`c`).
+/// Codec keys whose binary value is unambiguously a `basics.Address` (or
+/// `[]basics.Address`) in any context, rendered as a checksummed base32 address.
+/// Sourced from `basics.Address` codec tags across `data/transactions/*.go`,
+/// `data/bookkeeping/*.go`, and `data/basics/*.go`. Short keys that *also* name a
+/// binary non-address field elsewhere are handled by [`APAR_ADDRESS_KEYS`]
+/// instead; the remaining short keys here (`a`, `d`) only collide with `uint64`
+/// fields, which decode as integers, not binary, so they are unambiguous for a
+/// binary leaf.
 const ADDRESS_KEYS: &[&str] = &[
     "a",
     "aclose",
     "apat",
     "arcv",
     "asnd",
-    "c",
     "close",
     "d",
-    "f",
     "fadd",
     "fees",
-    "m",
     "partupdabs",
     "partupdrmv",
     "prp",
-    "r",
     "rcv",
     "rekey",
     "rwd",
@@ -57,6 +56,12 @@ const ADDRESS_KEYS: &[&str] = &[
     "sgnr",
     "snd",
 ];
+
+/// Asset-params address keys (`AssetParams` manager/reserve/freeze/clawback).
+/// These single letters collide with binary non-address fields elsewhere — most
+/// notably `c` is also `StateProof.SigCommit` (a 32-byte digest → base64) — so
+/// they are only treated as addresses when nested directly under `apar`.
+const APAR_ADDRESS_KEYS: &[&str] = &["c", "f", "m", "r"];
 
 /// Codec keys whose binary value is a `bookkeeping.BlockHash`, rendered as
 /// `blk-` + base32 (no checksum).
@@ -80,12 +85,16 @@ fn base64_std(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Render a binary leaf as the JSON string go would, given the codec key it
-/// sits under.
-fn binary_to_string(bytes: &[u8], key: &str) -> String {
+/// Render a binary leaf as the JSON string go would, given the codec `key` it
+/// sits under and the `parent` key of the map containing it (needed to
+/// disambiguate the asset-params address letters from like-named binary fields).
+fn binary_to_string(bytes: &[u8], key: &str, parent: Option<&str>) -> String {
+    let is_address = (ADDRESS_KEYS.contains(&key)
+        || (APAR_ADDRESS_KEYS.contains(&key) && parent == Some("apar")))
+        && bytes.len() == 32;
     if BLOCKHASH_KEYS.contains(&key) {
         block_hash_to_string(bytes)
-    } else if ADDRESS_KEYS.contains(&key) && bytes.len() == 32 {
+    } else if is_address {
         let mut a = [0u8; 32];
         a.copy_from_slice(bytes);
         address_to_base32(&a)
@@ -166,10 +175,17 @@ fn push_indent(out: &mut String, level: usize) {
 }
 
 /// Recursively render an msgpack value as canonical JSON into `out`. `key` is
-/// the codec key this value sits under (selecting the address/block-hash/base64
-/// rendering for binary leaves); array elements inherit their parent key so a
-/// `[]basics.Address` (e.g. `apat`) renders each element as an address.
-fn write_value(out: &mut String, value: &rmpv::Value, key: Option<&str>, level: usize) {
+/// the codec key this value sits under and `parent` is the key of the enclosing
+/// map (both select the address/block-hash/base64 rendering for binary leaves).
+/// Array elements inherit their parent key/context so a `[]basics.Address` (e.g.
+/// `apat`) renders each element as an address.
+fn write_value(
+    out: &mut String,
+    value: &rmpv::Value,
+    key: Option<&str>,
+    parent: Option<&str>,
+    level: usize,
+) {
     match value {
         rmpv::Value::Nil => out.push_str("null"),
         rmpv::Value::Boolean(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -177,9 +193,10 @@ fn write_value(out: &mut String, value: &rmpv::Value, key: Option<&str>, level: 
         rmpv::Value::F32(f) => out.push_str(&json_number(*f as f64)),
         rmpv::Value::F64(f) => out.push_str(&json_number(*f)),
         rmpv::Value::String(s) => write_json_string(out, s.as_bytes()),
-        rmpv::Value::Binary(b) => {
-            write_json_string(out, binary_to_string(b, key.unwrap_or_default()).as_bytes())
-        }
+        rmpv::Value::Binary(b) => write_json_string(
+            out,
+            binary_to_string(b, key.unwrap_or_default(), parent).as_bytes(),
+        ),
         rmpv::Value::Array(arr) => {
             if arr.is_empty() {
                 out.push_str("[]");
@@ -192,7 +209,7 @@ fn write_value(out: &mut String, value: &rmpv::Value, key: Option<&str>, level: 
                 }
                 out.push('\n');
                 push_indent(out, level + 1);
-                write_value(out, elem, key, level + 1);
+                write_value(out, elem, key, parent, level + 1);
             }
             out.push('\n');
             push_indent(out, level);
@@ -218,7 +235,9 @@ fn write_value(out: &mut String, value: &rmpv::Value, key: Option<&str>, level: 
                 push_indent(out, level + 1);
                 write_json_string(out, k.as_bytes());
                 out.push_str(": ");
-                write_value(out, v, Some(k), level + 1);
+                // The entries of this map have it as their parent; `key` is the
+                // key this map itself sits under.
+                write_value(out, v, Some(k), key, level + 1);
             }
             out.push('\n');
             push_indent(out, level);
@@ -278,8 +297,44 @@ pub fn encode_block_json(raw_block_response: &[u8]) -> Result<Vec<u8>, BlockJson
     out.push_str("{\n");
     push_indent(&mut out, 1);
     out.push_str("\"block\": ");
-    write_value(&mut out, block_val, Some("block"), 1);
+    write_value(&mut out, block_val, Some("block"), None, 1);
     out.push('\n');
     out.push('}');
     Ok(out.into_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The single-letter asset-params address keys must only be treated as
+    /// addresses under `apar`. In particular `c` is `AssetParams.Clawback`
+    /// (address) under `apar` but `StateProof.SigCommit` (a 32-byte digest →
+    /// base64) elsewhere.
+    #[test]
+    fn apar_address_keys_are_context_qualified() {
+        let bytes = [0u8; 32];
+        // Under `apar`: clawback → checksummed base32 address.
+        let as_addr = binary_to_string(&bytes, "c", Some("apar"));
+        assert_eq!(as_addr, address_to_base32(&bytes));
+        assert!(!as_addr.contains('='), "address must not be base64");
+        // Outside `apar` (e.g. state-proof sig-commit): base64 digest.
+        let as_b64 = binary_to_string(&bytes, "c", Some("sp"));
+        assert_eq!(as_b64, base64_std(&bytes));
+        assert_ne!(as_addr, as_b64);
+    }
+
+    /// Unambiguous address keys render as addresses regardless of parent.
+    #[test]
+    fn unambiguous_address_keys_ignore_parent() {
+        let bytes = [1u8; 32];
+        assert_eq!(
+            binary_to_string(&bytes, "snd", None),
+            address_to_base32(&bytes)
+        );
+        assert_eq!(
+            binary_to_string(&bytes, "rcv", Some("txn")),
+            address_to_base32(&bytes)
+        );
+    }
 }
