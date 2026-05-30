@@ -490,6 +490,36 @@ pub enum Commands {
         #[arg(long)]
         report_dir: Option<PathBuf>,
     },
+
+    /// Run a node: serve the algod v2 REST API backed by a local ledger.
+    Node {
+        #[command(subcommand)]
+        cmd: NodeCommands,
+    },
+}
+
+/// Subcommands for `algod-rust node`.
+#[derive(Subcommand)]
+pub enum NodeCommands {
+    /// Start the node: initialize the ledger from `genesis.json` if needed and
+    /// serve the REST API so `goal -d <datadir>` can drive it. Read-serving
+    /// today (TASK-263); transaction submit/confirm lands in TASK-264.
+    Start {
+        /// Node data directory (Go layout): holds `genesis.json`, the
+        /// per-genesis ledger subdirectory, and the
+        /// `algod.net`/`algod.token`/`algod.admin.token` discovery files the
+        /// server writes.
+        #[arg(long, short = 'd')]
+        data_dir: PathBuf,
+
+        /// Address to bind the REST API (default `127.0.0.1:8080`).
+        #[arg(long, short = 'l')]
+        listen: Option<String>,
+
+        /// Path to `genesis.json` (default `<data-dir>/genesis.json`).
+        #[arg(long, short = 'g')]
+        genesis: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
