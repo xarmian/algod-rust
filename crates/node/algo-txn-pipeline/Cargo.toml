@@ -1,0 +1,17 @@
+[package]
+name = "algo-txn-pipeline"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+algo-types.workspace = true
+algo-codec.workspace = true
+algo-rest-client.workspace = true
+algo-kmd-client.workspace = true
+algo-error.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
