@@ -145,8 +145,12 @@ pub fn next_rewards_state(
         } else {
             new_rate / params.rewards_rate_refresh_interval
         };
+        // go computes `nextRound + Round(interval)` with plain unsigned
+        // (wrapping) arithmetic; use wrapping_add for bit-for-bit parity rather
+        // than saturating (which would clamp at u64::MAX) in this consensus
+        // state transition.
         res.rewards_recalculation_round =
-            next_round.saturating_add(params.rewards_rate_refresh_interval);
+            next_round.wrapping_add(params.rewards_rate_refresh_interval);
     }
 
     if total_reward_units == 0 {
