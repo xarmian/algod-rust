@@ -1836,6 +1836,16 @@ fn parse_genesis_hash(hex_str: &str) -> anyhow::Result<[u8; 32]> {
 /// Keys with no entry valid at `round` (outside their validity window, or a
 /// legacy record with no voting blob) are skipped; a load error for one key is
 /// logged and skipped rather than failing the whole node.
+///
+/// This is a **startup snapshot** for the imminent round: the returned map is
+/// keyed by account address and handed to the agreement service once. It does
+/// not refresh as rounds advance, so it does not survive participation-key
+/// validity-window boundaries — a key that only becomes valid later, or an
+/// account that rotates to a new key mid-run, won't be picked up. Per-round
+/// secret refresh in the pseudonode is tracked in TASK-272. Loading for the
+/// imminent round (rather than every record) is deliberate: it selects the key
+/// valid for the round about to be produced, avoiding an address collision that
+/// would otherwise let a rotated-out key overwrite the active one.
 fn load_signing_keys_for_round(
     part_store: &ParticipationStore,
     round: Round,
