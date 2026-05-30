@@ -1,0 +1,24 @@
+{
+  "address": "EIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADOTLFMNHU",
+  "amount": 5000000,
+  "amount-without-pending-rewards": 4999000,
+  "incentive-eligible": true,
+  "min-balance": 100000,
+  "participation": {
+    "selection-participation-key": "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "state-proof-key": "AwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+    "vote-first-valid": 1,
+    "vote-key-dilution": 100,
+    "vote-last-valid": 10000,
+    "vote-participation-key": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
+  "pending-rewards": 1000,
+  "reward-base": 7,
+  "rewards": 1234,
+  "round": 5000,
+  "status": "Online",
+  "total-apps-opted-in": 0,
+  "total-assets-opted-in": 0,
+  "total-created-apps": 0,
+  "total-created-assets": 0
+}

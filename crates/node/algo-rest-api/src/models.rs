@@ -710,6 +710,16 @@ use base64::Engine;
 
 use crate::node::AccountLookup;
 
+/// Return `None` for an empty vector, mirroring go's omitempty on `*[]T` fields
+/// (an empty slice is omitted, not serialized as `[]`).
+fn none_if_empty<T>(v: Vec<T>) -> Option<Vec<T>> {
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
 /// Convert an `AccountLookup` to an `AccountResponse`, matching go-algorand's
 /// `AccountDataToAccount` logic.
 ///
@@ -783,11 +793,17 @@ pub fn account_data_to_response(
         }
     };
 
-    // Total app schema
-    let apps_total_schema = Some(ApiApplicationStateSchema {
-        num_byte_slice: record.total_app_schema.num_byte_slice,
-        num_uint: record.total_app_schema.num_uint,
-    });
+    // Total app schema. go renders this as `*model.ApplicationStateSchema` with
+    // omitempty + RecursiveEmptyCheck, so a zero schema is omitted entirely.
+    let apps_total_schema =
+        if record.total_app_schema.num_byte_slice == 0 && record.total_app_schema.num_uint == 0 {
+            None
+        } else {
+            Some(ApiApplicationStateSchema {
+                num_byte_slice: record.total_app_schema.num_byte_slice,
+                num_uint: record.total_app_schema.num_uint,
+            })
+        };
 
     let total_extra_pages = record.total_extra_app_pages as u64;
 
@@ -803,7 +819,7 @@ pub fn account_data_to_response(
             status,
             round: lookup.last_round,
             sig_type: None,
-            reward_base: Some(record.rewards_base),
+            reward_base: omit_empty_u64(record.rewards_base),
             participation,
             incentive_eligible: omit_empty_bool(record.incentive_eligible),
             auth_addr,
@@ -865,14 +881,16 @@ pub fn account_data_to_response(
         status,
         round: lookup.last_round,
         sig_type: None,
-        reward_base: Some(record.rewards_base),
+        reward_base: omit_empty_u64(record.rewards_base),
         participation,
         incentive_eligible: omit_empty_bool(record.incentive_eligible),
         auth_addr,
-        assets: Some(assets),
-        created_assets: Some(created_assets),
-        apps_local_state: Some(apps_local_state),
-        created_apps: Some(created_apps),
+        // go renders these as `*[]…` with omitempty, so empty resource lists
+        // are omitted entirely (not serialized as `[]`).
+        assets: none_if_empty(assets),
+        created_assets: none_if_empty(created_assets),
+        apps_local_state: none_if_empty(apps_local_state),
+        created_apps: none_if_empty(created_apps),
         apps_total_schema,
         apps_total_extra_pages: omit_empty_u64(total_extra_pages),
         total_assets_opted_in: record.total_assets_opted_in,

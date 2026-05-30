@@ -1,0 +1,49 @@
+{
+  "address": "GMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADGDOYMAJA",
+  "amount": 2000000,
+  "amount-without-pending-rewards": 2000000,
+  "assets": [
+    {
+      "amount": 9,
+      "asset-id": 2,
+      "is-frozen": false
+    },
+    {
+      "amount": 500,
+      "asset-id": 10,
+      "is-frozen": true
+    }
+  ],
+  "auth-addr": "TEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABTOGWHVXQ",
+  "created-assets": [
+    {
+      "index": 7,
+      "params": {
+        "clawback": "MYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACM7DWVNLQ",
+        "creator": "GMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADGDOYMAJA",
+        "decimals": 6,
+        "default-frozen": true,
+        "freeze": "KUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACVPUZ4YQM",
+        "manager": "GMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADGDOYMAJA",
+        "metadata-hash": "qwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "name": "Test Asset",
+        "name-b64": "VGVzdCBBc3NldA==",
+        "reserve": "IQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC5VMUQQUE",
+        "total": 1000000,
+        "unit-name": "TST",
+        "unit-name-b64": "VFNU",
+        "url": "https://x.io",
+        "url-b64": "aHR0cHM6Ly94Lmlv"
+      }
+    }
+  ],
+  "min-balance": 300000,
+  "pending-rewards": 0,
+  "rewards": 0,
+  "round": 200,
+  "status": "Offline",
+  "total-apps-opted-in": 0,
+  "total-assets-opted-in": 2,
+  "total-created-apps": 0,
+  "total-created-assets": 1
+}

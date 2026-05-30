@@ -1,0 +1,27 @@
+{
+  "id": 8,
+  "params": {
+    "approval-program": "BoEB",
+    "clear-state-program": "BoEB",
+    "creator": "IQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC5VMUQQUE",
+    "extra-program-pages": 1,
+    "global-state": [
+      {
+        "key": "Zw==",
+        "value": {
+          "bytes": "",
+          "type": 2,
+          "uint": 7
+        }
+      }
+    ],
+    "global-state-schema": {
+      "num-byte-slice": 1,
+      "num-uint": 0
+    },
+    "local-state-schema": {
+      "num-byte-slice": 0,
+      "num-uint": 1
+    }
+  }
+}
