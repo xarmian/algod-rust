@@ -5,6 +5,7 @@
 
 pub mod abi;
 pub mod auth;
+pub mod block_json;
 pub mod box_name;
 pub mod dryrun;
 pub mod error;

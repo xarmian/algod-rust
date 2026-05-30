@@ -1,0 +1,42 @@
+{
+  "block": {
+    "bi": 10000000,
+    "fc": 1000,
+    "fees": "A7NMWS3NT3IUDMLVO26ULGXGIIOUQ3ND2TXSER6EBGRZNOBOUIQXHIBGDE",
+    "gen": "dockernet-v1",
+    "gh": "XZC1y5k2shLzFr0sZW8S2F7UPRsqtk4CxjWc4WVUOK8=",
+    "prev": "blk-ALX6ZB6PESWD5ZC53FCIUQHXJW3U4XKOUBL7GYBOM4H47KHFM5OA",
+    "prev512": "J/FwFHZWPS4oaJlVZfgJvIdIPZp6TeX4ueoFYhRKjnYXNHzI2aaGQNqFJVDmgM8P6ugM9yKYIiq5ZWoRajlQuA==",
+    "proto": "future",
+    "rnd": 1,
+    "rwcalr": 500000,
+    "rwd": "7777777777777777777777777777777777777777777777777774MSJUVU",
+    "seed": "Au/sh88krD7kXdlEikD3TbdOXU6gV/NgLmcPz6jlZ1w=",
+    "spt": {
+      "0": {
+        "n": 512
+      }
+    },
+    "tc": 1001,
+    "ts": 1772655851,
+    "txn": "LvlXyrCn0l/wUckKl2nl81e2xZdjPJ5erxX63OADTZs=",
+    "txn256": "OMcFcAolQoHpVejMBMsGdGkdM8UaLZdgTII5d9ngboQ=",
+    "txn512": "pOJY1RdoZReNKHdsD/jXbMDg/LKl+zPQr5/mNdj7u7T//wtr+xgA0t6cOrw+ny/lMDrteJw94tCfzBDhp36Liw==",
+    "txns": [
+      {
+        "hgi": true,
+        "sig": "JGLM0/DPsUSKlEDvMXRZHtupNYaiFwfKKmsw4AMQRiAUhgrTrKPeTBZo85Y4+MOO/9yXKCCtE5IXam8UzCzjCQ==",
+        "txn": {
+          "amt": 1000000,
+          "fee": 1000,
+          "fv": 1,
+          "lv": 1001,
+          "note": "ZGl2ZXJzZS1wYXk=",
+          "rcv": "3A2T6JEFFL5JYJW7L7LAXMCKUVULYMESXNKM3WQ4H55YZKFZ4ZQ7BA6ETU",
+          "snd": "YOWXUXO2XHIXA6TFY2XP24IOHOT6L6OYIQ73D4XZKHJJPWQGADOSQZLM3U",
+          "type": "pay"
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "block": {
+    "bi": 10000000,
+    "fc": 1000,
+    "fees": "A7NMWS3NT3IUDMLVO26ULGXGIIOUQ3ND2TXSER6EBGRZNOBOUIQXHIBGDE",
+    "gen": "dockernet-v1",
+    "gh": "XZC1y5k2shLzFr0sZW8S2F7UPRsqtk4CxjWc4WVUOK8=",
+    "prev": "blk-GYILTHX3RA23U46E4EA2RYDKIRCASIL6FONJJ3BN4CWH4IE4HNNQ",
+    "prev512": "6ZuQGpkGUBcfZdAi1cA8dvfeCMaAKmwwm64RdwqZxzIi68Y/dDzJTJ4AMA6NIFwjvoEZ7sB1G2si4c0MyYA5DQ==",
+    "proto": "future",
+    "rnd": 2,
+    "rwcalr": 500000,
+    "rwd": "7777777777777777777777777777777777777777777777777774MSJUVU",
+    "seed": "NhC5nvuINbpzxOEBqOBqREQJIX4rmpTsLeCsfiCcO1s=",
+    "spt": {
+      "0": {
+        "n": 512
+      }
+    },
+    "tc": 1002,
+    "ts": 1772655851,
+    "txn": "5qdkjkl9VXz+UHyY9Laf4dOEQL/GYSaOnHYzIVSYv2A=",
+    "txn256": "lbPgnex7lFlAmg1OLpBt/AqJQkggoxG8vo4l4T8kUQQ=",
+    "txn512": "CUz+p2BjpqLt3A4SOKQCCoakaAFkvTIb6WS50urvfWK1hHn2nKYQkq2vWRynTbHTZaexerHflWEvOUad/xzXgw==",
+    "txns": [
+      {
+        "caid": 1002,
+        "sig": "sDqHnmVc6WEast8oEQFwBvkEEElYu/pRYzWeVUS9pT0bV5AhftWe/LgVZJv60yZqOEKb0IfP0G3mRoTy2bLPDQ==",
+        "txn": {
+          "apar": {
+            "an": "TestAsset",
+            "c": "YOWXUXO2XHIXA6TFY2XP24IOHOT6L6OYIQ73D4XZKHJJPWQGADOSQZLM3U",
+            "f": "YOWXUXO2XHIXA6TFY2XP24IOHOT6L6OYIQ73D4XZKHJJPWQGADOSQZLM3U",
+            "m": "YOWXUXO2XHIXA6TFY2XP24IOHOT6L6OYIQ73D4XZKHJJPWQGADOSQZLM3U",
+            "r": "YOWXUXO2XHIXA6TFY2XP24IOHOT6L6OYIQ73D4XZKHJJPWQGADOSQZLM3U",
+            "t": 1000000,
+            "un": "TST"
+          },
+          "fee": 1000,
+          "fv": 1,
+          "lv": 1001,
+          "note": "x70hy3wd16A=",
+          "snd": "YOWXUXO2XHIXA6TFY2XP24IOHOT6L6OYIQ73D4XZKHJJPWQGADOSQZLM3U",
+          "type": "acfg"
+        }
+      }
+    ]
+  }
+}

@@ -42,6 +42,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
+use crate::block_json;
 use crate::error;
 use crate::format::{self, FormatParams};
 use crate::models;
@@ -1145,12 +1146,21 @@ pub async fn get_block<N: NodeInterface>(
         }
     }
 
-    // For JSON full-block: parse and re-encode
-    match node.get_block(round).await {
-        Ok(block) => {
-            let response = models::BlockJsonResponse { block };
-            format::encode_response(&response, resp_format)
-        }
+    // For JSON full-block: re-encode the stored msgpack block as canonical
+    // JSON byte-for-byte compatible with go-algorand's `JSONStrictHandle`
+    // (base32 addresses, base64 byte fields, sorted keys, 2-space indent).
+    // The typed `BlockJsonResponse` serde path renders byte fields as JSON
+    // number arrays, so we transcode the raw msgpack instead.
+    match node.get_block_raw_msgpack(round).await {
+        Ok(raw) => match block_json::encode_block_json(&raw) {
+            Ok(bytes) => (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                bytes,
+            )
+                .into_response(),
+            Err(e) => error::internal_error(e.to_string()),
+        },
         Err(e) => error::ledger_error_response(e),
     }
 }
