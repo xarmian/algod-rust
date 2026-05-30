@@ -19,7 +19,7 @@ pub mod tracer;
 pub use trace::{
     AppInitialState, AvmValueTrace, ExecTraceConfig, InitialStatesAccumulator, OpcodeTraceUnit,
     ProgramTrace, ResourcesInitialStates, ResultEvalOverrides, SimulationResult, StateChange,
-    StateChangeKind, TransactionTrace, TxnGroupResult, TxnPath, TxnResult,
+    StateChangeKind, StateChangeOp, TransactionTrace, TxnGroupResult, TxnPath, TxnResult,
 };
 pub use tracer::SimulationTracer;
 

@@ -76,14 +76,31 @@ pub enum AvmValueTrace {
 pub struct StateChange {
     /// What kind of state was changed.
     pub kind: StateChangeKind,
+    /// Whether the opcode wrote or deleted the state.
+    ///
+    /// Carried explicitly (rather than inferred from `new_value`) because a
+    /// box write whose opcode errors leaves `new_value` empty — go-algorand
+    /// still reports it as a write (`AppStateOp` is fixed in `BeforeOpcode`,
+    /// the value is only filled on success in `AfterOpcode`).
+    pub op: StateChangeOp,
     /// The application ID.
     pub app_id: u64,
     /// The state key.
     pub key: Vec<u8>,
-    /// The new value (None for deletions).
+    /// The new value (None for deletions, or a not-yet-filled box write).
     pub new_value: Option<AvmValueTrace>,
     /// The account address (for local state changes).
     pub account: Option<Address>,
+}
+
+/// Whether a recorded [`StateChange`] wrote or deleted state, mirroring the
+/// write/delete cases of go-algorand's `logic.AppStateOpEnum`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateChangeOp {
+    /// A write (`app_global_put`, `app_local_put`, `box_put`/`box_create`/…).
+    Write,
+    /// A delete (`app_global_del`, `app_local_del`, `box_del`).
+    Delete,
 }
 
 /// The kind of application state that was changed.

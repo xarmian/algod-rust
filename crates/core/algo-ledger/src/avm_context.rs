@@ -853,6 +853,21 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
         }
     }
 
+    /// Attach the *post-write* whole-box content to the box state-change just
+    /// recorded by a successful box write opcode, mirroring go-algorand's
+    /// `AfterOpcode` → `AppStateQuerying` GetBox read (`opcodeExplain.go:314`).
+    /// Read from the store *after* the mutation so partial writes
+    /// (`box_replace`/`box_resize`/`box_splice`) report the full resulting box,
+    /// and a no-longer-existing box yields an empty value. Called only on the
+    /// success path; a no-op when no tracer is attached (consensus apply).
+    fn record_box_new_value(&self, name: &[u8]) {
+        if let Some(p) = self.tracer_ptr {
+            let new_value = self.box_pre_value(name);
+            // SAFETY: identical aliasing invariants to `record_app_state_access`.
+            unsafe { &mut *p }.record_box_new_value(new_value);
+        }
+    }
+
     /// Read the current box contents as a [`TealValue`] for initial-state
     /// capture, bypassing the I/O-budget accounting in `available_box` (which
     /// the caller has already performed for the real operation).
@@ -3090,6 +3105,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             self.store.set_account(&app_addr, acct);
             self.store.set_box(self.app_id, name, value.to_vec());
         }
+        self.record_box_new_value(name);
         Ok(())
     }
 
@@ -3167,6 +3183,9 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             self.store
                 .set_box(self.app_id, name, vec![0u8; size as usize]);
         }
+        // go-algorand records the write state-op even when the box already
+        // existed (a no-op create); the new value is the box's current content.
+        self.record_box_new_value(name);
         // Returns true if newly created.
         Ok(!exists)
     }
@@ -3227,6 +3246,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         let mut new_contents = contents;
         new_contents[start..end].copy_from_slice(value);
         self.store.set_box(self.app_id, name, new_contents);
+        self.record_box_new_value(name);
         Ok(())
     }
 
@@ -3275,6 +3295,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // store's set_box overwrites, which is equivalent since we already
         // updated the account totals).
         self.store.set_box(self.app_id, name, resized);
+        self.record_box_new_value(name);
         Ok(())
     }
 
@@ -3346,6 +3367,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         }
 
         self.store.set_box(self.app_id, name, result);
+        self.record_box_new_value(name);
         Ok(())
     }
 

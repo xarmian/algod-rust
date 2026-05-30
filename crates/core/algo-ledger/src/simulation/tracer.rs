@@ -10,7 +10,7 @@ use algo_types::{Address, TealValue};
 
 use super::trace::{
     AvmValueTrace, ExecTraceConfig, InitialStatesAccumulator, OpcodeTraceUnit, ProgramTrace,
-    StateChange, StateChangeKind, TransactionTrace,
+    StateChange, StateChangeKind, StateChangeOp, TransactionTrace,
 };
 
 /// Converts an AVM machine value to a trace-friendly representation.
@@ -60,8 +60,9 @@ struct ProgramTraceState {
 /// - `enable`: must be `true` for any tracing to occur.
 /// - `stack`: capture stack additions and pop counts per opcode.
 /// - `scratch`: capture scratch space changes per opcode.
-/// - `state`: capture application state changes (not yet implemented at
-///   the tracer level — state changes are captured by the simulation engine).
+/// - `state`: capture initial application state and per-opcode global/local/box
+///   state-changes (reported via `record_app_state_access` /
+///   `record_box_new_value`).
 pub struct SimulationTracer {
     /// Configuration controlling what to capture.
     config: ExecTraceConfig,
@@ -355,8 +356,7 @@ impl EvalTracer for SimulationTracer {
         self.initial_states.record(access);
 
         // Per-opcode state-change capture (go-algorand `appendStateOperations`):
-        // record only write/delete operations, never reads. Box state-changes
-        // are a follow-up task; only global/local are captured here.
+        // record only write/delete operations, never reads.
         let kind = match (access.op, access.state) {
             (AppStateOp::Write | AppStateOp::Delete, AppStateType::Global) => {
                 StateChangeKind::GlobalState
@@ -364,17 +364,44 @@ impl EvalTracer for SimulationTracer {
             (AppStateOp::Write | AppStateOp::Delete, AppStateType::Local) => {
                 StateChangeKind::LocalState
             }
+            (AppStateOp::Write | AppStateOp::Delete, AppStateType::Box) => {
+                StateChangeKind::BoxState
+            }
             _ => return,
+        };
+        let op = match access.op {
+            AppStateOp::Delete => StateChangeOp::Delete,
+            // Reads returned above; only writes reach here.
+            _ => StateChangeOp::Write,
         };
         self.pending_state_changes.push(StateChange {
             kind,
+            op,
             app_id: access.app_id,
             key: access.key.to_vec(),
-            // Delete leaves `new_value` None (serialized as omitted), matching
-            // go-algorand's empty TealValue for deletes.
+            // Global/local writes carry their new value inline. Box writes
+            // record `None` here and have it filled by `record_box_new_value`
+            // once the write succeeds (the resulting box content is only known
+            // post-mutation). Deletes leave `new_value` None (serialized as
+            // omitted), matching go-algorand's empty TealValue.
             new_value: access.new_value.as_ref().map(teal_to_trace_value),
             account: access.account.map(Address),
         });
+    }
+
+    fn record_box_new_value(&mut self, new_value: Option<TealValue>) {
+        if !self.config.state {
+            return;
+        }
+        // Attach the post-write box content to the box state-change just pushed
+        // by `record_app_state_access` (go-algorand `updateNewStateValues`).
+        // The most recent pending change is this opcode's box write; guard on
+        // the kind so a stray call can never corrupt a global/local change.
+        if let Some(last) = self.pending_state_changes.last_mut() {
+            if last.kind == StateChangeKind::BoxState {
+                last.new_value = new_value.as_ref().map(teal_to_trace_value);
+            }
+        }
     }
 
     fn record_created_app(&mut self, app_id: u64) {
