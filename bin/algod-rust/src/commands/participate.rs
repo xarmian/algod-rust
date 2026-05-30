@@ -1821,8 +1821,8 @@ fn parse_genesis_hash(hex_str: &str) -> anyhow::Result<[u8; 32]> {
 }
 
 /// Load the VRF + one-time-signature signing secrets for the participation
-/// key(s) the pseudonode will vote with at `round`, keyed by account address,
-/// for the agreement `Parameters.signing_keys` map.
+/// key(s) the pseudonode will vote with at `vote_round`, keyed by account
+/// address, for the agreement `Parameters.signing_keys` map.
 ///
 /// Without these secrets the `AsyncPseudonode` emits placeholder (zero-filled)
 /// VRF proofs and OTS signatures, which the crypto verifier rejects — so the
@@ -1833,20 +1833,22 @@ fn parse_genesis_hash(hex_str: &str) -> anyhow::Result<[u8; 32]> {
 /// reconstruct them per key via `get_for_round` (VRF from its 32-byte seed, OTS
 /// from its msgpack blob).
 ///
-/// Key selection mirrors the public-record key manager exactly: we enumerate
-/// the keys via `get_for_voting_round` (which applies the
-/// `effectiveFirst/effectiveLast` window in addition to raw validity), then load
-/// each one's secrets by its participation ID. This is critical for
-/// consistency — `get_for_round` alone filters only on raw `firstValid/lastValid`,
-/// so for an account holding a not-yet-effective or deactivated key alongside
-/// the active one it could load the wrong secret and overwrite the active entry,
-/// leaving the pseudonode signing the active public record with a mismatched
-/// secret (invalid proposals/votes). Driving off the effective records means the
-/// secret loaded for an account always matches the record the agreement uses.
+/// Key selection mirrors the public-record key manager *exactly*: we enumerate
+/// keys via `get_for_voting_round(vote_round, keys_round)` — the same call
+/// `AgreementKeyManagerBridge::voting_keys` makes, applying the
+/// `effectiveFirst/effectiveLast` window in addition to raw validity — then load
+/// each one's secrets by its participation ID. `keys_round` must be the same
+/// online-stake lookback round the pseudonode uses (`balance_round(vote_round)`),
+/// so the set of accounts/keys here matches the records the pseudonode will sign
+/// under. Using `get_for_round` alone (raw `firstValid/lastValid` only) or a
+/// different `keys_round` could load a secret for a record the pseudonode won't
+/// use — or the wrong one of several — leaving it signing with mismatched secrets.
 ///
-/// Keys with no loadable secret valid at `round` (a legacy record with no voting
-/// blob) are skipped; a load error for one key is logged and skipped rather than
-/// failing the whole node.
+/// Records are sorted by participation ID before the keep-first step below so the
+/// collapse is deterministic (the underlying SQL has no `ORDER BY`).
+///
+/// Keys with no loadable secret (a legacy record with no voting blob) are skipped;
+/// a load error for one key is logged and skipped rather than failing the node.
 ///
 /// This is a **startup snapshot** for the imminent round, handed to the agreement
 /// service once; it does not refresh as rounds advance, so it does not survive
@@ -1855,23 +1857,22 @@ fn parse_genesis_hash(hex_str: &str) -> anyhow::Result<[u8; 32]> {
 /// is tracked in TASK-272.
 fn load_signing_keys_for_round(
     part_store: &ParticipationStore,
-    round: Round,
+    vote_round: Round,
+    keys_round: Round,
 ) -> HashMap<Address, AccountSigningKeys> {
     let mut signing_keys = HashMap::new();
-    // Select keys with the same effective-window semantics the pseudonode's
-    // key manager uses (`AgreementKeyManagerBridge::voting_keys` →
-    // `get_for_voting_round`), so the secret we load for an account matches the
-    // public participation record the agreement will sign under. `keys_round`
-    // is the same round for this startup snapshot.
-    let records = match part_store.get_for_voting_round(round, round) {
+    let mut records = match part_store.get_for_voting_round(vote_round, keys_round) {
         Ok(records) => records,
         Err(e) => {
             warn!(error = %e, "failed to enumerate participation keys; node will not sign consensus messages");
             return signing_keys;
         }
     };
+    // Deterministic keep-first when an account has multiple effective keys:
+    // `get_for_voting_round`'s SQL has no `ORDER BY`, so sort by participation ID.
+    records.sort_by(|a, b| a.participation_id.0.cmp(&b.participation_id.0));
     for record in &records {
-        match part_store.get_for_round(&record.participation_id, round) {
+        match part_store.get_for_round(&record.participation_id, vote_round) {
             Ok(Some(part)) => {
                 // `part.parent` is the root account the key votes for; the
                 // pseudonode looks up signing keys by that address. The map
@@ -2446,19 +2447,48 @@ pub async fn run(
 
     // Load the actual signing secrets (VRF + OTS) before the store is moved
     // into the key-manager bridge. The bridge only exposes public voting
-    // records; the pseudonode needs the secrets to sign proposals/votes. Load
-    // for the next round to produce (latest + 1), which selects the keyset
-    // valid for the rounds this node will participate in.
-    let signing_keys = load_signing_keys_for_round(&part_store, Round(latest + 1));
+    // records; the pseudonode needs the secrets to sign proposals/votes.
+    //
+    // Select for the next round to produce (`latest + 1`) using the same
+    // online-stake lookback round (`balance_round`) the pseudonode passes to
+    // `voting_keys`, resolved from the protocol governing that round's params
+    // (`params_round`). Matching both rounds means the secrets loaded here line
+    // up exactly with the public records the agreement will sign under.
+    let vote_round = Round(latest + 1);
+    let keys_round = {
+        let params_round = algo_agreement::params_round(vote_round);
+        let proto = {
+            let l = ledger.lock().expect("ledger lock");
+            l.get_block_header_data(params_round.0)
+                .ok()
+                .flatten()
+                .and_then(|bytes| BlockHeader::decode_from_bytes(&bytes).ok())
+                .map(|hdr| hdr.current_protocol)
+        };
+        match proto.and_then(|p| algo_types::consensus::consensus_params_for_version(&p)) {
+            Some(cp) => algo_agreement::balance_round(vote_round, &cp),
+            None => {
+                warn!(
+                    round = params_round.0,
+                    "could not resolve consensus params for the balance-round lookback; \
+                     using the vote round as the keys round"
+                );
+                vote_round
+            }
+        }
+    };
+    let signing_keys = load_signing_keys_for_round(&part_store, vote_round, keys_round);
     if signing_keys.is_empty() {
         warn!(
-            round = latest + 1,
+            vote_round = vote_round.0,
+            keys_round = keys_round.0,
             "no participation signing secrets loaded — node will not produce valid proposals or votes"
         );
     } else {
         info!(
             accounts = signing_keys.len(),
-            round = latest + 1,
+            vote_round = vote_round.0,
+            keys_round = keys_round.0,
             "loaded participation signing secrets for consensus"
         );
     }
@@ -2669,7 +2699,8 @@ mod tests {
 
         // A round inside the validity window loads the secrets, keyed by the
         // parent account, with the VRF keypair reconstructed from its seed.
-        let keys = load_signing_keys_for_round(&store, Round(1));
+        // (Unregistered key → NULL effective window, so any keys_round passes.)
+        let keys = load_signing_keys_for_round(&store, Round(1), Round(1));
         assert_eq!(keys.len(), 1, "exactly one account's secrets loaded");
         let signing = keys.get(&account).expect("secrets for the account");
         assert_eq!(
@@ -2678,14 +2709,14 @@ mod tests {
         );
 
         // A round outside the validity window loads nothing.
-        let none = load_signing_keys_for_round(&store, Round(2_000));
+        let none = load_signing_keys_for_round(&store, Round(2_000), Round(2_000));
         assert!(none.is_empty(), "no secrets outside the validity window");
     }
 
     #[test]
     fn load_signing_keys_empty_store_returns_empty() {
         let store = ParticipationStore::open_in_memory().expect("in-memory part store");
-        assert!(load_signing_keys_for_round(&store, Round(1)).is_empty());
+        assert!(load_signing_keys_for_round(&store, Round(1), Round(1)).is_empty());
     }
 
     #[test]
@@ -2714,11 +2745,13 @@ mod tests {
         let id_b = store.insert(&key_b).expect("insert key B");
 
         // Activate A at round 1, then B at round 500 — registering B deactivates
-        // A (sets A.effectiveLast = 499). At round 600 only B is effective.
+        // A (sets A.effectiveLast = 499). At round 600 only B is effective: A's
+        // effectiveLast (499) is below the vote round, so the effective-window
+        // filter excludes it even though it's still raw-valid over [0, 1000].
         store.register(&id_a, Round(1)).expect("register A");
         store.register(&id_b, Round(500)).expect("register B");
 
-        let keys = load_signing_keys_for_round(&store, Round(600));
+        let keys = load_signing_keys_for_round(&store, Round(600), Round(600));
         let signing = keys.get(&account).expect("the effective key's secrets");
         assert_eq!(
             signing.vrf.pk.0, vrf_b,
@@ -2747,7 +2780,7 @@ mod tests {
         store.insert(&key_a).expect("insert key A");
         store.insert(&key_b).expect("insert key B");
 
-        let keys = load_signing_keys_for_round(&store, Round(1));
+        let keys = load_signing_keys_for_round(&store, Round(1), Round(1));
         assert_eq!(keys.len(), 1, "one secret per address — collapsed");
         let loaded = keys
             .get(&account)
