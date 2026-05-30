@@ -266,3 +266,40 @@ fn sqlite_ledger_feeds_group_tracer_when_enabled() {
         .txn_group_delta_for_id(&Digest([0x99u8; 32]))
         .is_none());
 }
+
+/// Regression: a transaction carrying a nonzero lease must still apply with the
+/// tracer enabled. The scratch capture records the lease in the in-memory lease
+/// table (not covered by the savepoint); without restoring it the authoritative
+/// apply would reject the block as a duplicate lease.
+#[test]
+fn group_tracer_does_not_poison_lease_table() {
+    let a = Address([1u8; 32]);
+    let b = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut ledger = SqliteLedger::open_in_memory().unwrap();
+    ledger.set_account(
+        &a,
+        AccountData {
+            micro_algos: 5_000_000,
+            ..Default::default()
+        },
+    );
+    ledger.set_account(&b, AccountData::default());
+    ledger.set_account(&fee_sink, AccountData::default());
+    ledger.enable_group_delta_tracer(8);
+
+    let mut txn = pay_txn(a, b, 100_000, [0u8; 32]);
+    txn.txn.lease = [0x42u8; 32];
+    let block = minimal_block(fee_sink, 1, vec![txn]);
+
+    // Must not be rejected as a duplicate lease.
+    ledger
+        .apply_block_caching_delta(&block)
+        .expect("block with a lease must apply with the tracer enabled");
+    assert_eq!(
+        ledger.get_account(&a).unwrap().micro_algos,
+        5_000_000 - 100_000 - 1000
+    );
+    assert!(ledger.txn_group_deltas_for_round(1).is_some());
+}

@@ -2654,10 +2654,10 @@ impl SqliteLedger {
             if let Some(mut tracer) = self.group_delta_tracer.take() {
                 // The SQLite SAVEPOINT rolls back account/DB state, but the
                 // apply path also mutates in-memory ledger fields (the round
-                // counter, rewards state, and reward addresses) that the
-                // savepoint does not cover. Save and restore exactly those so
-                // the scratch capture leaves the ledger identical for the
-                // authoritative apply below.
+                // counter, rewards state, reward addresses, txn counter, and
+                // lease table) that the savepoint does not cover. Save and
+                // restore exactly those so the scratch capture leaves the ledger
+                // identical for the authoritative apply below.
                 let saved_round = self.current_round();
                 let saved_level = self.rewards_level();
                 let saved_rate = self.rewards_rate();
@@ -2665,6 +2665,12 @@ impl SqliteLedger {
                 let saved_recalc = self.rewards_recalculation_round();
                 let saved_fee_sink = self.fee_sink();
                 let saved_rewards_pool = self.rewards_pool();
+                let saved_txn_counter = self.txn_counter();
+                // The in-memory lease table is not covered by the savepoint
+                // either; without restoring it the authoritative apply below
+                // sees the scratch apply's leases as duplicates and rejects any
+                // block whose transactions carry a nonzero lease.
+                let saved_leases = self.lease_table.clone();
 
                 let sp = self.snapshot(&[]);
                 let _ = crate::apply::apply_block_capturing_group_deltas(self, block, &mut tracer);
@@ -2677,6 +2683,8 @@ impl SqliteLedger {
                 self.set_rewards_recalculation_round(saved_recalc);
                 self.set_fee_sink(saved_fee_sink);
                 self.set_rewards_pool(saved_rewards_pool);
+                self.set_txn_counter(saved_txn_counter);
+                self.lease_table = saved_leases;
 
                 self.group_delta_tracer = Some(tracer);
             }
