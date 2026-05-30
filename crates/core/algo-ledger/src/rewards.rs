@@ -85,6 +85,102 @@ pub fn apply_rewards(account: &mut AccountData, rewards_level: u64) -> u64 {
     pending
 }
 
+/// The reward-relevant portion of a block header that advances via the rewards
+/// schedule, mirroring the calculation inputs/outputs of go-algorand's
+/// `bookkeeping.RewardsState.NextRewardsState`. `fee_sink`/`rewards_pool` are
+/// carried in the header directly and are not part of this calculation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RewardsState {
+    /// Cumulative rewards per reward unit distributed so far.
+    pub rewards_level: u64,
+    /// MicroAlgos distributed per reward unit per round.
+    pub rewards_rate: u64,
+    /// Leftover microAlgos carried to the next round (sub-unit remainder).
+    pub rewards_residue: u64,
+    /// Round at which the rewards rate is recalculated from the pool balance.
+    pub rewards_recalculation_round: u64,
+}
+
+/// Advance the rewards state for `next_round`, mirroring go-algorand's
+/// `RewardsState.NextRewardsState` (`data/bookkeeping/block.go`).
+///
+/// `incentive_pool_balance` is the rewards-pool account balance and
+/// `total_reward_units` is the network-wide reward-unit count, both read from
+/// the ledger by the caller — exactly as go's evaluator does in
+/// `eval.StartEvaluator`.
+///
+/// Two go consensus flags are not modeled in [`algo_types::ConsensusParams`]:
+/// `PendingResidueRewards` (enabled v18+) and `RewardsCalculationFix` (enabled
+/// v31+). algod-rust targets modern protocols (v41) where both are enabled, so
+/// this applies that behavior unconditionally and documents the divergence —
+/// matching the existing modern-protocol assumptions in `make_genesis_block`.
+///
+/// Overflow semantics mirror go's `OverflowTracker`: an overflow in the level
+/// advance abandons it and keeps the previous level (with any refreshed
+/// rate/recalculation round already applied), rather than panicking.
+pub fn next_rewards_state(
+    prev: RewardsState,
+    next_round: u64,
+    params: &algo_types::ConsensusParams,
+    incentive_pool_balance: u64,
+    total_reward_units: u64,
+) -> RewardsState {
+    let mut res = prev;
+
+    // Time to refresh the rewards rate from the current pool balance.
+    if next_round == res.rewards_recalculation_round {
+        // PendingResidueRewards (modern: enabled): the outstanding residue
+        // counts against what the pool may spend on the next rate.
+        let max_spent_over = match params.min_balance.checked_add(res.rewards_residue) {
+            Some(v) => v,
+            // Overflow (go's OAdd overflowed): spend the whole pool so the new
+            // rate becomes 0.
+            None => incentive_pool_balance,
+        };
+        let new_rate = incentive_pool_balance.saturating_sub(max_spent_over);
+        // RewardsRateRefreshInterval is a positive consensus param; guard a
+        // degenerate 0 to avoid a divide-by-zero.
+        res.rewards_rate = if params.rewards_rate_refresh_interval == 0 {
+            0
+        } else {
+            new_rate / params.rewards_rate_refresh_interval
+        };
+        // go computes `nextRound + Round(interval)` with plain unsigned
+        // (wrapping) arithmetic; use wrapping_add for bit-for-bit parity rather
+        // than saturating (which would clamp at u64::MAX) in this consensus
+        // state transition.
+        res.rewards_recalculation_round =
+            next_round.wrapping_add(params.rewards_rate_refresh_interval);
+    }
+
+    if total_reward_units == 0 {
+        // No reward units in circulation → keep the previous level (the
+        // rate/recalculation round refreshed above still stand).
+        return res;
+    }
+
+    // RewardsCalculationFix (modern: enabled): use the freshly-refreshed rate.
+    let rewards_rate = res.rewards_rate;
+
+    // Mirror go's OverflowTracker: abandon the level advance on overflow.
+    let rewards_with_residue = match rewards_rate.checked_add(res.rewards_residue) {
+        Some(v) => v,
+        None => return res,
+    };
+    let next_reward_level = match res
+        .rewards_level
+        .checked_add(rewards_with_residue / total_reward_units)
+    {
+        Some(v) => v,
+        None => return res,
+    };
+    let next_residue = rewards_with_residue % total_reward_units;
+
+    res.rewards_level = next_reward_level;
+    res.rewards_residue = next_residue;
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +420,117 @@ mod tests {
     fn test_nob_overflow_panics() {
         // u64::MAX rewards_base + any reward_unit > 0 must overflow the checked_add
         normalized_online_balance(AccountStatus::Online, 1_000_000, u64::MAX, 1);
+    }
+
+    // ── next_rewards_state tests (vs go bookkeeping.NextRewardsState) ───
+
+    fn v41() -> algo_types::ConsensusParams {
+        algo_types::consensus::consensus_params_for_version(algo_types::CONSENSUS_V41)
+            .expect("v41 params")
+    }
+
+    #[test]
+    fn test_nrs_zero_rate_keeps_level() {
+        // No recalc this round, rate 0 → level/residue unchanged.
+        let prev = RewardsState {
+            rewards_level: 5,
+            rewards_rate: 0,
+            rewards_residue: 0,
+            rewards_recalculation_round: 1000,
+        };
+        let next = next_rewards_state(prev, 10, &v41(), 10_000_000, 100);
+        assert_eq!(next, prev);
+    }
+
+    #[test]
+    fn test_nrs_rate_advances_level_and_residue() {
+        // rewardsWithResidue = rate + residue = 250 + 30 = 280
+        // level += 280 / 100 = 2 → 102 ; residue = 280 % 100 = 80
+        let prev = RewardsState {
+            rewards_level: 100,
+            rewards_rate: 250,
+            rewards_residue: 30,
+            rewards_recalculation_round: 1000,
+        };
+        let next = next_rewards_state(prev, 10, &v41(), 10_000_000, 100);
+        assert_eq!(
+            next,
+            RewardsState {
+                rewards_level: 102,
+                rewards_rate: 250,
+                rewards_residue: 80,
+                rewards_recalculation_round: 1000,
+            }
+        );
+    }
+
+    #[test]
+    fn test_nrs_zero_reward_units_keeps_level() {
+        // totalRewardUnits == 0 → level/residue unchanged (no recalc here).
+        let prev = RewardsState {
+            rewards_level: 7,
+            rewards_rate: 999,
+            rewards_residue: 5,
+            rewards_recalculation_round: 1000,
+        };
+        let next = next_rewards_state(prev, 10, &v41(), 10_000_000, 0);
+        assert_eq!(next, prev);
+    }
+
+    #[test]
+    fn test_nrs_recalc_round_refreshes_rate() {
+        // At the recalculation round, the rate refreshes to
+        // (pool - (min_balance + residue)) / refresh_interval and the next
+        // recalculation round advances by the refresh interval. Use
+        // total_reward_units = 0 so the level stays put and we isolate the
+        // refresh. (Mirrors go's PendingResidueRewards + recalc path.)
+        let params = v41();
+        let pool = 10_000_000_000u64;
+        let prev = RewardsState {
+            rewards_level: 0,
+            rewards_rate: 1,
+            rewards_residue: 0,
+            rewards_recalculation_round: 5,
+        };
+        let next = next_rewards_state(prev, 5, &params, pool, 0);
+        let expected_rate = (pool - params.min_balance) / params.rewards_rate_refresh_interval;
+        assert_eq!(next.rewards_rate, expected_rate, "rate refreshed from pool");
+        assert_eq!(
+            next.rewards_recalculation_round,
+            5 + params.rewards_rate_refresh_interval,
+            "recalc round advanced by the refresh interval",
+        );
+        assert_eq!(
+            next.rewards_level, 0,
+            "level unchanged when no reward units"
+        );
+    }
+
+    #[test]
+    fn test_nrs_recalc_residue_counts_against_pool() {
+        // PendingResidueRewards: residue is subtracted along with min_balance,
+        // so a larger residue yields a smaller (or equal) refreshed rate.
+        let params = v41();
+        let pool = 10_000_000_000u64;
+        let base = RewardsState {
+            rewards_recalculation_round: 5,
+            ..Default::default()
+        };
+        let no_residue = next_rewards_state(base, 5, &params, pool, 0).rewards_rate;
+        let with_residue = next_rewards_state(
+            RewardsState {
+                rewards_residue: 1_000_000,
+                ..base
+            },
+            5,
+            &params,
+            pool,
+            0,
+        )
+        .rewards_rate;
+        assert!(
+            with_residue <= no_residue,
+            "residue must not increase the refreshed rate ({with_residue} > {no_residue})",
+        );
     }
 }

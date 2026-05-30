@@ -17,7 +17,7 @@ pub use canonical::{
     canonical_encode_unauthenticated_proposal, resource_flags, BaseOnlineAccountData,
     OnlineRoundParamsData, ResourcesData, StateProofVerificationContext,
 };
-pub use digest::{compute_block_digest, compute_txn_id};
+pub use digest::{compute_block_digest, compute_block_header_digest, compute_txn_id};
 
 use algo_error::{AlgoError, Result};
 use algo_types::{Block, BlockResponse};
