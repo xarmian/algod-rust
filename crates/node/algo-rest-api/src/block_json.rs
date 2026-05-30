@@ -176,10 +176,13 @@ fn write_json_string(out: &mut String, bytes: &[u8]) {
                     std::str::from_utf8_unchecked(&bytes[i..i + upto])
                 });
                 i += upto;
-                // Each invalid byte (or incomplete trailing sequence) becomes one
-                // replacement-character escape, matching Go's `utf8.DecodeRune`.
+                // Emit exactly one replacement escape per invalid byte and
+                // re-decode from the next byte. Go's `utf8.DecodeRune` returns
+                // size 1 for every invalid byte, so a multi-byte invalid or
+                // truncated sequence becomes that many `�` (e.g. a trailing
+                // `0xe2 0x82` → `��`), not one.
                 out.push_str("\\ufffd");
-                i += e.error_len().unwrap_or(bytes.len() - i);
+                i += 1;
             }
         }
     }

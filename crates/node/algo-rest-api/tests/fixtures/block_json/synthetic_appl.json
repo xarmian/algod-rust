@@ -79,7 +79,8 @@
           },
           "lg": [
             "log-a",
-            "\u0000\ufffd"
+            "\u0000\ufffd",
+            "x\ufffd\ufffd"
           ]
         },
         "hgi": true,

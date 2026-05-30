@@ -54,7 +54,7 @@ func main() {
 						10: {"lk": {Action: basics.SetUintAction, Uint: 5}},
 						11: {"lk": {Action: basics.SetUintAction, Uint: 6}},
 					},
-					Logs: []string{"log-a", "\x00\xff"},
+					Logs: []string{"log-a", "\x00\xff", "x\xe2\x82"},
 					InnerTxns: []transactions.SignedTxnWithAD{
 						{SignedTxn: transactions.SignedTxn{Txn: transactions.Transaction{
 							Type:             protocol.PaymentTx,
