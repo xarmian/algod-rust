@@ -113,6 +113,11 @@ async fn run_start(
 
     let ledger = Arc::new(Mutex::new(sqlite_ledger));
 
+    // Cancellation token shared with the adapter and the server: cancelling it
+    // on Ctrl-C also unblocks in-flight `wait-for-block-after` handlers promptly
+    // instead of letting them poll to their 60s timeout (mirrors participate).
+    let shutdown_token = CancellationToken::new();
+
     // -----------------------------------------------------------------------
     // 3. Build the read-serving node interface adapter.
     //    (Pool + broadcaster + dev-mode production attach in TASK-264.)
@@ -124,7 +129,9 @@ async fn run_start(
         build_version: BuildVersion::from_build_env(),
         default_protocol: genesis.proto.clone(),
     };
-    let node = Arc::new(AlgodNodeInterface::new(ledger, node_config));
+    let node = Arc::new(
+        AlgodNodeInterface::new(ledger, node_config).with_shutdown_token(shutdown_token.clone()),
+    );
 
     // -----------------------------------------------------------------------
     // 4. Serve the REST API. `ApiServer::serve` writes algod.net /
@@ -142,7 +149,6 @@ async fn run_start(
         api_token: None,
         admin_token: None,
     };
-    let shutdown_token = CancellationToken::new();
     let shutdown_future = {
         let token = shutdown_token.clone();
         async move { token.cancelled().await }
