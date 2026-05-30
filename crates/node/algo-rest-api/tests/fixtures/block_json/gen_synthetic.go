@@ -44,8 +44,9 @@ func main() {
 			ApplyData: transactions.ApplyData{
 				EvalDelta: transactions.EvalDelta{
 					GlobalDelta: basics.StateDelta{
-						"gkey": {Action: basics.SetBytesAction, Bytes: "gval"},
-						"cnt":  {Action: basics.SetUintAction, Uint: 9},
+						"gkey":   {Action: basics.SetBytesAction, Bytes: "gval"},
+						"cnt":    {Action: basics.SetUintAction, Uint: 9},
+						"z\xff": {Action: basics.SetUintAction, Uint: 1},
 					},
 					LocalDeltas: map[uint64]basics.StateDelta{
 						1:  {"lk": {Action: basics.SetUintAction, Uint: 3}},

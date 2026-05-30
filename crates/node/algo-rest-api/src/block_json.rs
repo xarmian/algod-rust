@@ -119,7 +119,23 @@ fn cmp_map_keys(a: &rmpv::Value, b: &rmpv::Value) -> std::cmp::Ordering {
     }
     match (as_i128(a), as_i128(b)) {
         (Some(x), Some(y)) => x.cmp(&y),
-        _ => map_key_to_string(a).cmp(&map_key_to_string(b)),
+        // String keys are compared by their raw bytes (go sorts on the encoded
+        // key, not a lossy rendering), so keys with invalid UTF-8 order the same.
+        _ => match (a, b) {
+            (rmpv::Value::String(x), rmpv::Value::String(y)) => x.as_bytes().cmp(y.as_bytes()),
+            _ => map_key_to_string(a).cmp(&map_key_to_string(b)),
+        },
+    }
+}
+
+/// Write a map key as a JSON string literal, escaping from the key's raw bytes
+/// (so invalid-UTF-8 string keys render `�` exactly as go-codec does).
+fn write_map_key(out: &mut String, key: &rmpv::Value) {
+    match key {
+        rmpv::Value::String(s) => write_json_string(out, s.as_bytes()),
+        // Integer / binary / bool keys render to ASCII, so the lossy rendering
+        // is already exact.
+        other => write_json_string(out, map_key_to_string(other).as_bytes()),
     }
 }
 
@@ -242,25 +258,24 @@ fn write_value(
             }
             // Canonical: sort by the key in its natural order. go-codec sorts
             // integer keys numerically (`"2"` before `"10"`) and string keys
-            // lexically, so compare on the original msgpack key, not its string
-            // form.
-            let mut pairs: Vec<(&rmpv::Value, String, &rmpv::Value)> = entries
-                .iter()
-                .map(|(k, v)| (k, map_key_to_string(k), v))
-                .collect();
-            pairs.sort_by(|a, b| cmp_map_keys(a.0, b.0).then_with(|| a.1.cmp(&b.1)));
+            // lexically (by raw bytes), so compare on the original msgpack key.
+            let mut pairs: Vec<(&rmpv::Value, &rmpv::Value)> =
+                entries.iter().map(|(k, v)| (k, v)).collect();
+            pairs.sort_by(|a, b| cmp_map_keys(a.0, b.0));
             out.push('{');
-            for (idx, (_, k, v)) in pairs.iter().enumerate() {
+            for (idx, (k, v)) in pairs.iter().enumerate() {
                 if idx > 0 {
                     out.push(',');
                 }
                 out.push('\n');
                 push_indent(out, level + 1);
-                write_json_string(out, k.as_bytes());
+                write_map_key(out, k);
                 out.push_str(": ");
                 // The entries of this map have it as their parent; `key` is the
-                // key this map itself sits under.
-                write_value(out, v, Some(k), key, level + 1);
+                // key this map itself sits under. The string-rendered key drives
+                // address-key detection (those keys are always ASCII).
+                let key_ctx = map_key_to_string(k);
+                write_value(out, v, Some(&key_ctx), key, level + 1);
             }
             out.push('\n');
             push_indent(out, level);

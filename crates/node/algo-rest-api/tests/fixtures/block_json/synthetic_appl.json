@@ -34,6 +34,10 @@
             "gkey": {
               "at": 1,
               "bs": "gval"
+            },
+            "z\ufffd": {
+              "at": 2,
+              "ui": 1
             }
           },
           "itx": [
