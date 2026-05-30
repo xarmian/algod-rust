@@ -3,15 +3,22 @@
 use std::collections::HashSet;
 
 use algo_ledger::{
-    apply_block_capturing_group_deltas, apply_block_with_delta, LedgerState, TxnGroupDeltaTracer,
+    apply_block_capturing_group_deltas, apply_block_with_delta, LedgerState, LedgerStore,
+    SqliteLedger, TxnGroupDeltaTracer,
 };
-use algo_types::{Address, Block, Digest, Round, SignedTransaction};
+use algo_types::{AccountData, Address, Block, Digest, Round, SignedTransaction};
 
 fn make_state(balances: &[(Address, u64)], fee_sink: Address) -> LedgerState {
     let mut state = LedgerState::new();
     state.fee_sink = fee_sink;
     for (addr, bal) in balances {
-        state.get_or_default_account(addr).micro_algos = *bal;
+        state.set_account(
+            addr,
+            AccountData {
+                micro_algos: *bal,
+                ..Default::default()
+            },
+        );
     }
     state
 }
@@ -203,4 +210,59 @@ fn per_group_deltas_aggregate_to_round_delta() {
         union, round_addrs,
         "per-group account deltas must aggregate to the round delta's accounts"
     );
+}
+
+/// End-to-end: a SqliteLedger with the tracer enabled feeds per-group deltas
+/// through `apply_block_caching_delta` (scratch-savepoint capture), and the
+/// query methods back the REST endpoints. Disabled by default (→ 501).
+#[test]
+fn sqlite_ledger_feeds_group_tracer_when_enabled() {
+    let a = Address([1u8; 32]);
+    let b = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+
+    let mut ledger = SqliteLedger::open_in_memory().unwrap();
+    ledger.set_account(
+        &a,
+        AccountData {
+            micro_algos: 5_000_000,
+            ..Default::default()
+        },
+    );
+    ledger.set_account(&b, AccountData::default());
+    ledger.set_account(&fee_sink, AccountData::default());
+
+    // Disabled by default — endpoints would report 501.
+    assert!(!ledger.group_delta_tracer_enabled());
+    assert!(ledger.txn_group_deltas_for_round(1).is_none());
+
+    ledger.enable_group_delta_tracer(8);
+    assert!(ledger.group_delta_tracer_enabled());
+
+    let block = minimal_block(fee_sink, 1, vec![pay_txn(a, b, 100_000, [0u8; 32])]);
+    ledger.apply_block_caching_delta(&block).unwrap();
+
+    // The block committed once (a debited amount + fee), not twice — the scratch
+    // capture is rolled back by the savepoint.
+    assert_eq!(
+        ledger.get_account(&a).unwrap().micro_algos,
+        5_000_000 - 100_000 - 1000
+    );
+
+    // Per-group delta is retained and queryable by txn id.
+    let groups = ledger
+        .txn_group_deltas_for_round(1)
+        .expect("round 1 retained");
+    assert_eq!(groups.len(), 1);
+    let id = groups[0].ids[0];
+    assert!(ledger.txn_group_delta_for_id(&id).is_some());
+
+    // The per-round cache is also populated (unchanged behavior).
+    assert!(ledger.get_cached_state_delta(1).is_some());
+
+    // A round outside the window is unavailable (handler → 404).
+    assert!(ledger.txn_group_deltas_for_round(2).is_none());
+    assert!(ledger
+        .txn_group_delta_for_id(&Digest([0x99u8; 32]))
+        .is_none());
 }
