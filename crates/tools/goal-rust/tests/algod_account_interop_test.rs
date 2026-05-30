@@ -11,11 +11,13 @@
 //! MIXED_CLUSTER=1 cargo test -p goal-rust --test algod_account_interop_test
 //! ```
 //!
-//! ## Subset & deliberate omissions
+//! ## Subset & a deliberate omission
 //!
 //! Covered end-to-end against Go's stack: `wallet new` + `account new` (Go
 //! kmd), `account list` (Go kmd open-handle), `account info` + `account
-//! balance` (Go algod read paths).
+//! balance` (Go algod read paths), and `addpartkey` / `listpartkeys` /
+//! `deletepartkey` (Go algod's admin-token-gated `/v2/participation*` —
+//! goal-rust sends the admin token as of TASK-261).
 //!
 //! **`changeonlinestatus` / `marknonparticipating` are NOT in this subset.** A
 //! keyreg status change must be signed by, and pay a fee from, a *funded*
@@ -27,13 +29,6 @@
 //! "spawn algod against genesis"). The keyreg submit/confirm path is covered
 //! against the in-tree algod-rust + kmd-rust in
 //! `account_changeonlinestatus_e2e.rs` (B12).
-//!
-//! **`addpartkey` / `listpartkeys` / `deletepartkey` are NOT in this subset.**
-//! Go's algod gates `/v2/participation*` on the *admin* token
-//! (`algod.admin.token`); goal-rust's client sends only the regular
-//! `algod.token`, so those endpoints return 401 against real Go algod. That
-//! admin-token gap is a goal-rust follow-up; partkey management is covered
-//! against the in-tree algod-rust in `account_partkey_e2e.rs`.
 
 #![cfg(unix)]
 
@@ -362,11 +357,83 @@ fn goal_rust_account_group_against_go_algod_and_kmd() {
          likely `/v2/accounts/{{addr}}.amount` wire drift"
     );
 
-    // NOTE: `addpartkey` / `listpartkeys` / `deletepartkey` are NOT driven here.
-    // Go's algod gates the `/v2/participation*` endpoints on the *admin* token
-    // (`algod.admin.token`), but goal-rust's client currently sends only the
-    // regular `algod.token`, so these return 401 against a real Go algod (the
-    // B10 e2e exercised them against a mock that didn't enforce the token). That
-    // admin-token gap is tracked as a goal-rust follow-up; partkey management is
-    // covered against the in-tree algod-rust in `account_partkey_e2e.rs`.
+    // 6. addpartkey — server-side key generation against Go algod's admin-gated
+    // `/v2/participation/generate`. goal-rust now sends the admin token
+    // (TASK-261), so this no longer 401s.
+    assert_ok(
+        &goal(
+            dd,
+            &[
+                "account",
+                "addpartkey",
+                "-a",
+                &addr,
+                "--roundFirstValid",
+                "1",
+                "--roundLastValid",
+                "1000",
+            ],
+        ),
+        "account addpartkey",
+    );
+
+    // A direct admin-token client to resolve/confirm the partkey id without
+    // depending on `listpartkeys`' table layout.
+    let admin_client = {
+        let net = std::fs::read_to_string(dd.join("algod.net")).unwrap();
+        let tok = std::fs::read_to_string(dd.join("algod.admin.token"))
+            .or_else(|_| std::fs::read_to_string(dd.join("algod.token")))
+            .unwrap();
+        algo_rest_client::AlgodClient::new(format!("http://{}", net.trim()), tok.trim())
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // Generation via `/v2/participation/generate` is asynchronous server-side,
+    // so poll until the new key registers (bounded).
+    let part_id = {
+        let start = Instant::now();
+        loop {
+            let found = rt
+                .block_on(admin_client.list_participation_keys())
+                .expect("list participation keys")
+                .into_iter()
+                .find(|p| p.address == addr)
+                .map(|p| p.id);
+            if let Some(id) = found {
+                break id;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "no participation key registered for {addr} within 30s of addpartkey"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    };
+
+    // 7. listpartkeys — the new key is rendered (also admin-gated).
+    let lpk_out = assert_ok(
+        &goal(dd, &["account", "listpartkeys"]),
+        "account listpartkeys",
+    );
+    // The table truncates the ParticipationID to its first 8 chars + "…", so
+    // match that prefix rather than the full id.
+    assert!(
+        lpk_out.contains(&part_id[..8]),
+        "listpartkeys missing the new partkey {part_id}; got:\n{lpk_out}"
+    );
+
+    // 8. deletepartkey — remove it, then confirm via the admin client.
+    assert_ok(
+        &goal(dd, &["account", "deletepartkey", "--partkeyid", &part_id]),
+        "account deletepartkey",
+    );
+    let after = rt
+        .block_on(admin_client.list_participation_keys())
+        .expect("list participation keys after delete");
+    assert!(
+        !after.iter().any(|p| p.id == part_id),
+        "partkey {part_id} should be gone after deletepartkey"
+    );
 }

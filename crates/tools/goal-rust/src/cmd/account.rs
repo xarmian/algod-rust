@@ -356,18 +356,32 @@ struct AccountRow {
 /// renders with `[n/a]` balances in that case.
 fn build_algod_endpoint(data_dir_path: &Path) -> Option<(String, String)> {
     let net = std::fs::read_to_string(data_dir_path.join("algod.net")).ok()?;
-    let tok = std::fs::read_to_string(data_dir_path.join("algod.token")).ok()?;
     let net = net.trim();
-    let tok = tok.trim();
-    if net.is_empty() || tok.is_empty() {
+    if net.is_empty() {
         return None;
     }
+    // Prefer the admin token, falling back to the regular token. The admin
+    // token is accepted on every endpoint AND is required for the admin-gated
+    // `/v2/participation*` handlers (addpartkey/listpartkeys/deletepartkey) —
+    // the regular token alone gets a 401 from a real Go algod there. Mirrors
+    // go-algorand's libgoal `nc.AlgodClient()`
+    // (nodecontrol/algodControl.go:72) and our own `cmd/node.rs` (TASK-261).
+    let tok = match data_dir::read_algod_admin_token(data_dir_path) {
+        Ok(t) if !t.is_empty() => t,
+        _ => {
+            let t = data_dir::read_algod_token(data_dir_path).ok()?;
+            if t.is_empty() {
+                return None;
+            }
+            t
+        }
+    };
     let base = if net.starts_with("http://") || net.starts_with("https://") {
         net.to_string()
     } else {
         format!("http://{net}")
     };
-    Some((base, tok.to_string()))
+    Some((base, tok))
 }
 
 fn fetch_status_and_amount(
@@ -2940,6 +2954,33 @@ fn format_assetdetails(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_algod_endpoint_prefers_admin_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dd = tmp.path();
+        std::fs::write(dd.join("algod.net"), "127.0.0.1:1234\n").unwrap();
+        std::fs::write(dd.join("algod.token"), "regular\n").unwrap();
+        std::fs::write(dd.join("algod.admin.token"), "admintok\n").unwrap();
+        let (base, tok) = build_algod_endpoint(dd).expect("endpoint");
+        assert_eq!(base, "http://127.0.0.1:1234");
+        assert_eq!(tok, "admintok", "admin token must win when present");
+    }
+
+    #[test]
+    fn build_algod_endpoint_falls_back_to_regular_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dd = tmp.path();
+        std::fs::write(dd.join("algod.net"), "http://host:9\n").unwrap();
+        std::fs::write(dd.join("algod.token"), "regular\n").unwrap();
+        // No admin token file.
+        let (base, tok) = build_algod_endpoint(dd).expect("endpoint");
+        assert_eq!(base, "http://host:9");
+        assert_eq!(tok, "regular");
+        // An empty admin token also falls back.
+        std::fs::write(dd.join("algod.admin.token"), "\n").unwrap();
+        assert_eq!(build_algod_endpoint(dd).unwrap().1, "regular");
+    }
 
     #[test]
     fn compute_validity_defaults_to_current_round_window() {

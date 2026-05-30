@@ -970,14 +970,20 @@ Sequence:
    - `account list --password …` (Go kmd open-handle) → new address
      rendered.
    - `account info` + `account balance` on a genesis-funded `WalletN`
-     address (Go algod read paths).
+     address (Go algod read paths; assertions cross-check the
+     genesis-allocated amount, not just "is a number").
+   - `addpartkey` + `listpartkeys` + `deletepartkey` against Go algod's
+     admin-token-gated `/v2/participation*` (goal-rust sends the admin
+     token — see below).
 4. SIGTERM both daemons, reap.
 
-**Deliberate omissions** (documented in the test header):
+goal-rust resolves the algod token like go-algorand's libgoal: the
+**admin token** (`algod.admin.token`) is preferred and falls back to
+the regular `algod.token`. The admin token is accepted on every
+endpoint and is *required* for the participation handlers, so the
+partkey-management steps above work against a real Go algod.
+
+**Deliberate omission** (documented in the test header):
 `changeonlinestatus`/`marknonparticipating` need a *funded, signable*
 account (devnet genesis ships funded addresses without spending keys),
-covered against in-tree algod-rust in `account_changeonlinestatus_e2e.rs`;
-`addpartkey`/`listpartkeys`/`deletepartkey` hit Go algod's admin-token-gated
-`/v2/participation*` endpoints, which goal-rust doesn't yet authenticate to
-(tracked as a follow-up), covered against in-tree algod-rust in
-`account_partkey_e2e.rs`.
+covered against in-tree algod-rust in `account_changeonlinestatus_e2e.rs`.
