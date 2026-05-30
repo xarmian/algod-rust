@@ -941,3 +941,43 @@ Sequence:
 
 Wire-shape drift on `/v2/status` or `/v2/versions` between the two
 implementations trips the test immediately.
+
+## goal-rust account ↔ Go-algod+kmd MIXED_CLUSTER Interop Test
+
+[`crates/tools/goal-rust/tests/algod_account_interop_test.rs`](../crates/tools/goal-rust/tests/algod_account_interop_test.rs)
+extends the cross-impl gate to the **`account` group**, driving it
+against **both** Go's `algod` and Go's `kmd` — proving wire-compat for
+the wallet/account lifecycle, not just the read-only node endpoints.
+Gated by `MIXED_CLUSTER=1` like the others:
+
+```bash
+# Default run: gated, skips with a friendly note.
+cargo test -p goal-rust --test algod_account_interop_test
+
+# Full cross-impl interop:
+MIXED_CLUSTER=1 cargo test -p goal-rust --test algod_account_interop_test
+```
+
+Sequence:
+
+1. `go build` both `../go-algorand/cmd/algod` and `.../cmd/kmd`
+   into `target/algod-interop/` (cached between runs).
+2. Spawn Go `algod` (devnet genesis, `127.0.0.1:0`) and Go `kmd`
+   (under `<datadir>/kmd-v0.5`, insecure scrypt for speed); poll each
+   for its `*.net` + `*.token` readiness markers.
+3. Drive `goal-rust account` against the pair:
+   - `wallet new` + `account new` (Go kmd) → capture the new address.
+   - `account list --password …` (Go kmd open-handle) → new address
+     rendered.
+   - `account info` + `account balance` on a genesis-funded `WalletN`
+     address (Go algod read paths).
+4. SIGTERM both daemons, reap.
+
+**Deliberate omissions** (documented in the test header):
+`changeonlinestatus`/`marknonparticipating` need a *funded, signable*
+account (devnet genesis ships funded addresses without spending keys),
+covered against in-tree algod-rust in `account_changeonlinestatus_e2e.rs`;
+`addpartkey`/`listpartkeys`/`deletepartkey` hit Go algod's admin-token-gated
+`/v2/participation*` endpoints, which goal-rust doesn't yet authenticate to
+(tracked as a follow-up), covered against in-tree algod-rust in
+`account_partkey_e2e.rs`.
