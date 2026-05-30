@@ -103,6 +103,26 @@ fn binary_to_string(bytes: &[u8], key: &str, parent: Option<&str>) -> String {
     }
 }
 
+/// Compare two msgpack map keys in go-codec's canonical order: integer keys
+/// numerically, string keys lexically. Mixed/other key types fall back to their
+/// string rendering (not expected in the block schema, where each map has a
+/// single key type).
+fn cmp_map_keys(a: &rmpv::Value, b: &rmpv::Value) -> std::cmp::Ordering {
+    fn as_i128(v: &rmpv::Value) -> Option<i128> {
+        match v {
+            rmpv::Value::Integer(i) => i
+                .as_u64()
+                .map(|u| u as i128)
+                .or_else(|| i.as_i64().map(|s| s as i128)),
+            _ => None,
+        }
+    }
+    match (as_i128(a), as_i128(b)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        _ => map_key_to_string(a).cmp(&map_key_to_string(b)),
+    }
+}
+
 /// Render a non-string msgpack map key as a string (go's `MapKeyAsString`).
 fn map_key_to_string(key: &rmpv::Value) -> String {
     match key {
@@ -220,14 +240,17 @@ fn write_value(
                 out.push_str("{}");
                 return;
             }
-            // Canonical: sort by the (string-rendered) key.
-            let mut pairs: Vec<(String, &rmpv::Value)> = entries
+            // Canonical: sort by the key in its natural order. go-codec sorts
+            // integer keys numerically (`"2"` before `"10"`) and string keys
+            // lexically, so compare on the original msgpack key, not its string
+            // form.
+            let mut pairs: Vec<(&rmpv::Value, String, &rmpv::Value)> = entries
                 .iter()
-                .map(|(k, v)| (map_key_to_string(k), v))
+                .map(|(k, v)| (k, map_key_to_string(k), v))
                 .collect();
-            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            pairs.sort_by(|a, b| cmp_map_keys(a.0, b.0).then_with(|| a.1.cmp(&b.1)));
             out.push('{');
-            for (idx, (k, v)) in pairs.iter().enumerate() {
+            for (idx, (_, k, v)) in pairs.iter().enumerate() {
                 if idx > 0 {
                     out.push(',');
                 }

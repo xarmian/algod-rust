@@ -48,7 +48,10 @@ func main() {
 						"cnt":  {Action: basics.SetUintAction, Uint: 9},
 					},
 					LocalDeltas: map[uint64]basics.StateDelta{
-						1: {"lk": {Action: basics.SetUintAction, Uint: 3}},
+						1:  {"lk": {Action: basics.SetUintAction, Uint: 3}},
+						2:  {"lk": {Action: basics.SetUintAction, Uint: 4}},
+						10: {"lk": {Action: basics.SetUintAction, Uint: 5}},
+						11: {"lk": {Action: basics.SetUintAction, Uint: 6}},
 					},
 					Logs: []string{"log-a", "\x00\xff"},
 					InnerTxns: []transactions.SignedTxnWithAD{
