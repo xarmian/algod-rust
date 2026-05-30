@@ -14,7 +14,7 @@ use algo_rest_api::auth::generate_token;
 use algo_rest_api::node::{
     AccountLookup, AppResourceLookup, ApplicationLookup, AssetLookup, AssetResourceLookup,
     AssetResourceWithIDs, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
-    StateProofData, SupplyInfo, TxnWithStatus,
+    StateProofData, SupplyInfo, TxnGroupDeltaWithIds, TxnWithStatus,
 };
 use algo_rest_api::router::{build_router, TokenConfig};
 use algo_types::{
@@ -97,6 +97,10 @@ struct MockNode {
     block_hashes: BTreeMap<u64, Digest>,
     /// Raw msgpack block bytes, keyed by round.
     block_raw_msgpack: BTreeMap<u64, Vec<u8>>,
+    /// Per-transaction-group deltas keyed by round. `None` = tracer disabled
+    /// (endpoints 501); `Some` = enabled (round→deltas, txn/group ids searched
+    /// across all rounds for the by-id endpoint).
+    txn_group_deltas: Option<BTreeMap<u64, Vec<algo_rest_api::node::TxnGroupDeltaWithIds>>>,
     /// State proof transaction results, keyed by round. Returns (first_attested, last_attested).
     state_proof_txns: BTreeMap<u64, (u64, u64)>,
     /// Supply info to return from get_supply().
@@ -180,6 +184,7 @@ impl Clone for MockNode {
             block_headers: self.block_headers.clone(),
             block_hashes: self.block_hashes.clone(),
             block_raw_msgpack: self.block_raw_msgpack.clone(),
+            txn_group_deltas: self.txn_group_deltas.clone(),
             state_proof_txns: self.state_proof_txns.clone(),
             supply_info: self.supply_info.clone(),
             state_proof_data: self.state_proof_data.clone(),
@@ -286,6 +291,7 @@ impl MockNode {
             block_headers: BTreeMap::new(),
             block_hashes: BTreeMap::new(),
             block_raw_msgpack: BTreeMap::new(),
+            txn_group_deltas: None,
             state_proof_txns: BTreeMap::new(),
             supply_info: None,
             state_proof_data: BTreeMap::new(),
@@ -710,6 +716,36 @@ impl NodeInterface for MockNode {
             return Ok(buf);
         }
         Err(NodeError::NotFound("block not found".to_string()))
+    }
+
+    async fn get_txn_group_delta(&self, id: &Digest) -> Result<StateDelta, NodeError> {
+        match &self.txn_group_deltas {
+            None => Err(NodeError::NotImplemented("get_txn_group_delta")),
+            Some(by_round) => {
+                let id_str = id.to_string();
+                for deltas in by_round.values() {
+                    for d in deltas {
+                        if d.ids.contains(&id_str) {
+                            return Ok(d.delta.clone());
+                        }
+                    }
+                }
+                Err(NodeError::NotFound(format!("no delta for {id_str}")))
+            }
+        }
+    }
+
+    async fn get_txn_group_deltas_for_round(
+        &self,
+        round: u64,
+    ) -> Result<Vec<TxnGroupDeltaWithIds>, NodeError> {
+        match &self.txn_group_deltas {
+            None => Err(NodeError::NotImplemented("get_txn_group_deltas_for_round")),
+            Some(by_round) => by_round
+                .get(&round)
+                .cloned()
+                .ok_or_else(|| NodeError::NotFound(format!("round {round} not found"))),
+        }
     }
 
     async fn get_state_proof_transaction_for_round(
@@ -5655,6 +5691,56 @@ async fn get_txn_group_delta_returns_501() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let msg = body["message"].as_str().unwrap();
     assert_eq!(msg, "failed retrieving the expected tracer from ledger");
+}
+
+/// With the tracer enabled, both group-delta endpoints return data (no 501),
+/// and unknown ids/rounds return 404 — matching go-algorand.
+#[tokio::test]
+async fn get_txn_group_delta_endpoints_return_data_when_enabled() {
+    let txn_id = Digest([0x11u8; 32]);
+    let id_str = txn_id.to_string();
+    let group = TxnGroupDeltaWithIds {
+        ids: vec![id_str.clone()],
+        delta: StateDelta::default(),
+    };
+    let mut node = MockNode::synced();
+    let mut by_round = BTreeMap::new();
+    by_round.insert(1u64, vec![group]);
+    node.txn_group_deltas = Some(by_round);
+    let server = TestServer::start(node).await;
+
+    let get = |path: String| {
+        let c = server.client.clone();
+        let url = server.url(&path);
+        let tok = server.api_token.clone();
+        async move {
+            c.get(url)
+                .header("X-Algo-API-Token", &tok)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // by-round → 200 with the `{ "Deltas": [...] }` wrapper.
+    let resp = get("/v2/deltas/1/txn/group".into()).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["Deltas"].as_array().unwrap().len(), 1);
+    assert_eq!(body["Deltas"][0]["Ids"][0].as_str().unwrap(), id_str);
+
+    // by-id → 200.
+    let resp = get(format!("/v2/deltas/txn/group/{id_str}")).await;
+    assert_eq!(resp.status(), 200);
+
+    // Unknown round → 404.
+    let resp = get("/v2/deltas/2/txn/group".into()).await;
+    assert_eq!(resp.status(), 404);
+
+    // Unknown id → 404.
+    let other = Digest([0x99u8; 32]).to_string();
+    let resp = get(format!("/v2/deltas/txn/group/{other}")).await;
+    assert_eq!(resp.status(), 404);
 }
 
 #[tokio::test]

@@ -1910,6 +1910,12 @@ pub struct SqliteLedger {
     /// in-memory only — it does not survive a restart, matching Go.
     /// PLAN-36 TASK-128.
     delta_cache: crate::delta_cache::DeltaCache,
+
+    /// Optional per-transaction-group state-delta tracer backing the
+    /// `GET /v2/deltas/txn/group/...` endpoints (TASK-257). `None` by default,
+    /// matching go-algorand's opt-in `TxnGroupDeltaTracer`; when absent the
+    /// endpoints report 501. Enabled via [`Self::enable_group_delta_tracer`].
+    group_delta_tracer: Option<crate::txn_group_delta_tracer::TxnGroupDeltaTracer>,
 }
 
 /// Whether the current `apply_block_with_delta` builder produces a
@@ -2205,6 +2211,7 @@ impl SqliteLedger {
             pre_mutations: Vec::new(),
             trie_cache_target: None,
             delta_cache: crate::delta_cache::DeltaCache::with_default_window(),
+            group_delta_tracer: None,
         })
     }
 
@@ -2597,16 +2604,106 @@ impl SqliteLedger {
     /// (`bin/algod-rust/src/commands/sync.rs`) calls this instead of the
     /// bare `apply_block` so a node serving REST populates the cache as a
     /// normal side effect of block application.
+    /// Enable per-transaction-group delta tracking with the given lookback
+    /// window, so the `GET /v2/deltas/txn/group/...` endpoints serve data
+    /// instead of 501. Opt-in, matching go-algorand's configured tracer.
+    pub fn enable_group_delta_tracer(&mut self, lookback: u64) {
+        self.group_delta_tracer = Some(crate::txn_group_delta_tracer::TxnGroupDeltaTracer::new(
+            lookback,
+        ));
+    }
+
+    /// Whether the per-group delta tracer is enabled.
+    pub fn group_delta_tracer_enabled(&self) -> bool {
+        self.group_delta_tracer.is_some()
+    }
+
+    /// The per-group delta for a transaction ID or group ID, if retained.
+    pub fn txn_group_delta_for_id(
+        &self,
+        id: &algo_types::Digest,
+    ) -> Option<crate::state_delta::StateDelta> {
+        self.group_delta_tracer
+            .as_ref()
+            .and_then(|t| t.get_delta_for_id(id).cloned())
+    }
+
+    /// All per-group deltas (with their IDs) for a round, if the round is
+    /// retained. Returns `None` when the round is outside the window or
+    /// uncaptured (so the handler can report 404, matching go).
+    pub fn txn_group_deltas_for_round(
+        &self,
+        round: u64,
+    ) -> Option<Vec<crate::txn_group_delta_tracer::TxnGroupDelta>> {
+        self.group_delta_tracer
+            .as_ref()
+            .and_then(|t| t.get_deltas_for_round(round).map(|g| g.to_vec()))
+    }
+
     pub fn apply_block_caching_delta(
         &mut self,
         block: &algo_types::Block,
     ) -> Result<(), AlgoError> {
         if block_state_delta_is_complete(block) {
             let round = block.round.0;
+            // Feed the per-group delta tracer (opt-in) on a scratch SAVEPOINT
+            // that is rolled back, so the authoritative per-round commit below
+            // is unchanged. The Execute-mode group capture and the Replay-mode
+            // per-round delta both commit the block, so they cannot share one
+            // apply; the scratch apply keeps them independent.
+            if let Some(mut tracer) = self.group_delta_tracer.take() {
+                // The SQLite SAVEPOINT rolls back account/DB state, but the
+                // apply path also mutates in-memory ledger fields (the round
+                // counter, rewards state, reward addresses, txn counter, and
+                // lease table) that the savepoint does not cover. Save and
+                // restore exactly those so the scratch capture leaves the ledger
+                // identical for the authoritative apply below.
+                let saved_round = self.current_round();
+                let saved_level = self.rewards_level();
+                let saved_rate = self.rewards_rate();
+                let saved_residue = self.rewards_residue();
+                let saved_recalc = self.rewards_recalculation_round();
+                let saved_fee_sink = self.fee_sink();
+                let saved_rewards_pool = self.rewards_pool();
+                let saved_txn_counter = self.txn_counter();
+                // The in-memory lease table is not covered by the savepoint
+                // either; without restoring it the authoritative apply below
+                // sees the scratch apply's leases as duplicates and rejects any
+                // block whose transactions carry a nonzero lease.
+                let saved_leases = self.lease_table.clone();
+                // Trie-tracking pre-mutations are an append-only in-memory log
+                // (cleared only at commit, which this path does not call), so the
+                // scratch apply's entries must be truncated away or they would be
+                // consumed by the authoritative commit's trie finalization.
+                let saved_pre_mutations_len = self.pre_mutations.len();
+
+                let sp = self.snapshot(&[]);
+                let _ = crate::apply::apply_block_capturing_group_deltas(self, block, &mut tracer);
+                self.restore_snapshot(sp);
+                self.pre_mutations.truncate(saved_pre_mutations_len);
+
+                self.set_current_round(saved_round);
+                self.set_rewards_level(saved_level);
+                self.set_rewards_rate(saved_rate);
+                self.set_rewards_residue(saved_residue);
+                self.set_rewards_recalculation_round(saved_recalc);
+                self.set_fee_sink(saved_fee_sink);
+                self.set_rewards_pool(saved_rewards_pool);
+                self.set_txn_counter(saved_txn_counter);
+                self.lease_table = saved_leases;
+
+                self.group_delta_tracer = Some(tracer);
+            }
             let delta = crate::apply::apply_block_with_delta(self, block)?;
             self.cache_state_delta(round, delta);
             Ok(())
         } else {
+            // Incomplete block: still advance the group window so stale deltas
+            // are evicted on schedule (the round itself stays unretained →
+            // endpoints report it unavailable).
+            if let Some(t) = self.group_delta_tracer.as_mut() {
+                t.advance(block.round.0);
+            }
             // Payset contains a transaction type the builder doesn't yet
             // fully cover. Apply via the bare path and leave the cache
             // empty — the handler will return `NotFound` for this round
@@ -6003,6 +6100,67 @@ mod tests {
         // With 2 accounts in DB, trie should be non-empty.
         assert_ne!(root, [0u8; 32]);
         assert_eq!(trie.len(), 2);
+    }
+
+    /// Regression (TASK-257): enabling the per-group delta tracer must not
+    /// change the committed trie. The scratch capture appends trie
+    /// pre-mutations that the savepoint does not roll back; if they leaked they
+    /// would be consumed by the authoritative commit's `finalize_trie_updates`
+    /// and corrupt the root.
+    #[test]
+    fn group_tracer_does_not_leak_trie_pre_mutations() {
+        use crate::store_trait::LedgerStore;
+        use algo_types::{Block, SignedTransaction};
+
+        let a = Address([1u8; 32]);
+        let b = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let make_block = || {
+            let mut stx = SignedTransaction::default();
+            stx.txn.txn_type = "pay".into();
+            stx.txn.sender = a;
+            stx.txn.receiver = b;
+            stx.txn.amount = 100_000;
+            stx.txn.fee = 1000;
+            stx.txn.last_valid = Round(1000);
+            Block {
+                round: Round(1),
+                fee_sink,
+                current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+                payset: vec![stx],
+                ..Block::default()
+            }
+        };
+
+        let committed_root = |tracer_on: bool| -> [u8; 32] {
+            let mut l = SqliteLedger::open_in_memory().unwrap();
+            l.set_account(
+                &a,
+                AccountData {
+                    micro_algos: 5_000_000,
+                    ..Default::default()
+                },
+            );
+            l.set_account(&b, AccountData::default());
+            l.set_account(&fee_sink, AccountData::default());
+            // Build the trie from the seeded accounts, then apply the block.
+            l.enable_trie();
+            if tracer_on {
+                l.enable_group_delta_tracer(8);
+            }
+            l.begin_block().unwrap();
+            l.apply_block_caching_delta(&make_block()).unwrap();
+            l.finalize_trie_updates();
+            l.commit_block().unwrap();
+            l.trie.as_mut().unwrap().root_hash().unwrap()
+        };
+
+        assert_eq!(
+            committed_root(false),
+            committed_root(true),
+            "enabling the group tracer must not change the committed trie root"
+        );
     }
 
     #[test]

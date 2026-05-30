@@ -281,6 +281,19 @@ pub struct SupplyInfo {
     pub online_money: u64,
 }
 
+/// One transaction group's state delta together with the IDs (each txn ID and
+/// the group ID) that resolve to it. Mirrors go-algorand's
+/// `eval.TxnGroupDeltaWithIds`; serialized as `{ "Ids": [...], "Delta": {...} }`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TxnGroupDeltaWithIds {
+    /// Base32 transaction/group IDs that map to `delta`.
+    #[serde(rename = "Ids")]
+    pub ids: Vec<String>,
+    /// The group's state delta.
+    #[serde(rename = "Delta")]
+    pub delta: StateDelta,
+}
+
 /// State proof data returned by the node.
 ///
 /// Mirrors the fields used to build go-algorand's `model.StateProofResponse`.
@@ -730,17 +743,21 @@ pub trait NodeInterface: Send + Sync + 'static {
         Err(NodeError::NotImplemented("get_state_delta_for_round"))
     }
 
-    /// Return the state delta for a specific transaction group by its ID.
-    ///
-    /// Mirrors go-algorand's tracer-based transaction group delta lookup.
-    async fn get_txn_group_delta(&self, _id: &Digest) -> Result<Vec<u8>, NodeError> {
+    /// Return the state delta for a transaction group identified by a txn ID or
+    /// group ID. `NotImplemented` when the tracer is disabled (501, matching
+    /// go's `GetTracer` type assertion failure); `NotFound` when the ID is
+    /// unknown.
+    async fn get_txn_group_delta(&self, _id: &Digest) -> Result<StateDelta, NodeError> {
         Err(NodeError::NotImplemented("get_txn_group_delta"))
     }
 
-    /// Return all transaction group deltas for a given round.
-    ///
-    /// Mirrors go-algorand's tracer-based round transaction group delta lookup.
-    async fn get_txn_group_deltas_for_round(&self, _round: u64) -> Result<Vec<u8>, NodeError> {
+    /// Return all transaction-group deltas (with their IDs) for a round.
+    /// `NotImplemented` when the tracer is disabled; `NotFound` when the round
+    /// is outside the retained window.
+    async fn get_txn_group_deltas_for_round(
+        &self,
+        _round: u64,
+    ) -> Result<Vec<TxnGroupDeltaWithIds>, NodeError> {
         Err(NodeError::NotImplemented("get_txn_group_deltas_for_round"))
     }
 

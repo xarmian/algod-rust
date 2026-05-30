@@ -41,7 +41,7 @@ use algo_rest_api::models::{
 };
 use algo_rest_api::node::{
     AccountLookup, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
-    TxnWithStatus,
+    TxnGroupDeltaWithIds, TxnWithStatus,
 };
 use algo_types::consensus::consensus_params_for_version;
 use algo_types::{
@@ -698,6 +698,36 @@ impl NodeInterface for AlgodNodeInterface {
         ledger
             .get_cached_state_delta(round)
             .ok_or_else(|| NodeError::NotFound(format!("no state delta for round {round}")))
+    }
+
+    async fn get_txn_group_delta(&self, id: &Digest) -> Result<StateDelta, NodeError> {
+        let ledger = self.lock_ledger("get_txn_group_delta")?;
+        if !ledger.group_delta_tracer_enabled() {
+            return Err(NodeError::NotImplemented("get_txn_group_delta"));
+        }
+        ledger
+            .txn_group_delta_for_id(id)
+            .ok_or_else(|| NodeError::NotFound(format!("no delta for transaction group {id}")))
+    }
+
+    async fn get_txn_group_deltas_for_round(
+        &self,
+        round: u64,
+    ) -> Result<Vec<TxnGroupDeltaWithIds>, NodeError> {
+        let ledger = self.lock_ledger("get_txn_group_deltas_for_round")?;
+        if !ledger.group_delta_tracer_enabled() {
+            return Err(NodeError::NotImplemented("get_txn_group_deltas_for_round"));
+        }
+        let groups = ledger
+            .txn_group_deltas_for_round(round)
+            .ok_or_else(|| NodeError::NotFound(format!("round {round} not found in tracer")))?;
+        Ok(groups
+            .into_iter()
+            .map(|g| TxnGroupDeltaWithIds {
+                ids: g.ids.iter().map(|d| d.to_string()).collect(),
+                delta: g.delta,
+            })
+            .collect())
     }
 
     // ---- Account state ----

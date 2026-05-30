@@ -2915,17 +2915,46 @@ pub async fn get_state_delta<N: NodeInterface>(
 ///
 /// Mirrors go-algorand's `GetLedgerStateDeltaForTransactionGroup` handler.
 pub async fn get_txn_group_delta<N: NodeInterface>(
-    State(_node): State<AppState<N>>,
-    Path(_id): Path<String>,
+    State(node): State<AppState<N>>,
+    Path(id): Path<String>,
     Query(params): Query<format::FormatParams>,
 ) -> Response {
     // Validate format first, matching go-algorand's ordering.
-    if let Err(resp) = format::negotiate_format(&params) {
-        return *resp;
-    }
+    let resp_format = match format::negotiate_format(&params) {
+        Ok(f) => f,
+        Err(resp) => return *resp,
+    };
 
-    // No tracer available — return 501 matching go-algorand.
-    error::not_implemented("failed retrieving the expected tracer from ledger")
+    // Parse the txn/group ID (base32, like go's `crypto.DigestFromString`).
+    let digest = match parse_digest_base32(&id) {
+        Some(d) => d,
+        None => return error::bad_request("the transaction ID could not be parsed"),
+    };
+
+    match node.get_txn_group_delta(&digest).await {
+        Ok(mut delta) => {
+            // go nils Txleases in JSON (it cannot be represented with an object key).
+            if resp_format == format::ResponseFormat::Json {
+                delta.txleases = None;
+            }
+            format::encode_response(&delta, resp_format)
+        }
+        Err(NodeError::NotImplemented(_)) => {
+            error::not_implemented("failed retrieving the expected tracer from ledger")
+        }
+        Err(NodeError::NotFound(msg)) => {
+            error::not_found(format!("failed retrieving State Delta: {msg}"))
+        }
+        Err(e) => error::internal_error(format!("failed retrieving State Delta: {e}")),
+    }
+}
+
+/// Parse a base32 (RFC 4648, no padding) 32-byte digest, matching go's
+/// `crypto.DigestFromString`.
+fn parse_digest_base32(s: &str) -> Option<algo_types::Digest> {
+    let bytes = data_encoding::BASE32_NOPAD.decode(s.as_bytes()).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    Some(algo_types::Digest(arr))
 }
 
 /// Handler for `GET /v2/deltas/{round}/txn/group`.
@@ -2936,17 +2965,40 @@ pub async fn get_txn_group_delta<N: NodeInterface>(
 ///
 /// Mirrors go-algorand's `GetTransactionGroupLedgerStateDeltasForRound` handler.
 pub async fn get_txn_group_deltas_for_round<N: NodeInterface>(
-    State(_node): State<AppState<N>>,
-    Path(_round): Path<u64>,
+    State(node): State<AppState<N>>,
+    Path(round): Path<u64>,
     Query(params): Query<format::FormatParams>,
 ) -> Response {
     // Validate format first, matching go-algorand's ordering.
-    if let Err(resp) = format::negotiate_format(&params) {
-        return *resp;
-    }
+    let resp_format = match format::negotiate_format(&params) {
+        Ok(f) => f,
+        Err(resp) => return *resp,
+    };
 
-    // No tracer available — return 501 matching go-algorand.
-    error::not_implemented("failed retrieving the expected tracer from ledger")
+    match node.get_txn_group_deltas_for_round(round).await {
+        Ok(mut deltas) => {
+            // go nils Txleases in JSON for each group's delta.
+            if resp_format == format::ResponseFormat::Json {
+                for d in &mut deltas {
+                    d.delta.txleases = None;
+                }
+            }
+            // go wraps the list as `{ "Deltas": [...] }`.
+            #[derive(serde::Serialize)]
+            struct DeltasResponse {
+                #[serde(rename = "Deltas")]
+                deltas: Vec<crate::node::TxnGroupDeltaWithIds>,
+            }
+            format::encode_response(&DeltasResponse { deltas }, resp_format)
+        }
+        Err(NodeError::NotImplemented(_)) => {
+            error::not_implemented("failed retrieving the expected tracer from ledger")
+        }
+        Err(NodeError::NotFound(msg)) => {
+            error::not_found(format!("failed retrieving State Delta: {msg}"))
+        }
+        Err(e) => error::internal_error(format!("failed retrieving State Delta: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
