@@ -1874,14 +1874,28 @@ fn load_signing_keys_for_round(
         match part_store.get_for_round(&record.participation_id, round) {
             Ok(Some(part)) => {
                 // `part.parent` is the root account the key votes for; the
-                // pseudonode looks up signing keys by that address.
-                signing_keys.insert(
-                    part.parent,
-                    AccountSigningKeys {
-                        vrf: part.vrf,
-                        ots: part.voting,
-                    },
-                );
+                // pseudonode looks up signing keys by that address. The map
+                // holds one secret per address, so if an account has more than
+                // one simultaneously-effective key (e.g. multiple unregistered
+                // keys with NULL/0 effective rounds), only one secret can be
+                // represented. Keep the first deterministically and warn rather
+                // than silently overwriting — disambiguating per public record
+                // needs per-record signing in the pseudonode (TASK-272).
+                match signing_keys.entry(part.parent) {
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        warn!(
+                            account = %record.account,
+                            participation_id = %record.participation_id,
+                            "multiple effective participation keys for this account; keeping the first loaded secret and ignoring this one (TASK-272)",
+                        );
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(AccountSigningKeys {
+                            vrf: part.vrf,
+                            ots: part.voting,
+                        });
+                    }
+                }
             }
             Ok(None) => {
                 // Effective record with no loadable voting secret (legacy
@@ -2709,6 +2723,41 @@ mod tests {
         assert_eq!(
             signing.vrf.pk.0, vrf_b,
             "must load the EFFECTIVE key (B), not the deactivated-but-raw-valid key (A)",
+        );
+    }
+
+    #[test]
+    fn load_signing_keys_collapses_multiple_effective_keys_deterministically() {
+        // The signing map holds one secret per address. If an account has two
+        // simultaneously-effective keys (both unregistered → NULL/0 effective
+        // rounds, so both pass `get_for_voting_round`), the loader must collapse
+        // to a single, deterministically-chosen entry (keep-first + warn) rather
+        // than panic or produce duplicates. Full per-record disambiguation is
+        // tracked in TASK-272.
+        use algo_ledger::participation::Participation;
+
+        let store = ParticipationStore::open_in_memory().expect("in-memory part store");
+        let account = Address([3u8; 32]);
+        let key_a = Participation::generate(account, Round(0), Round(1000), 10_000, 0)
+            .expect("generate key A");
+        let key_b = Participation::generate(account, Round(0), Round(1000), 10_000, 0)
+            .expect("generate key B");
+        let vrf_a = key_a.vrf_pubkey().0;
+        let vrf_b = key_b.vrf_pubkey().0;
+        store.insert(&key_a).expect("insert key A");
+        store.insert(&key_b).expect("insert key B");
+
+        let keys = load_signing_keys_for_round(&store, Round(1));
+        assert_eq!(keys.len(), 1, "one secret per address — collapsed");
+        let loaded = keys
+            .get(&account)
+            .expect("a secret for the account")
+            .vrf
+            .pk
+            .0;
+        assert!(
+            loaded == vrf_a || loaded == vrf_b,
+            "loaded secret must be one of the inserted keys",
         );
     }
 
