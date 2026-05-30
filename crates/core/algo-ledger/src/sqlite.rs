@@ -2671,10 +2671,16 @@ impl SqliteLedger {
                 // sees the scratch apply's leases as duplicates and rejects any
                 // block whose transactions carry a nonzero lease.
                 let saved_leases = self.lease_table.clone();
+                // Trie-tracking pre-mutations are an append-only in-memory log
+                // (cleared only at commit, which this path does not call), so the
+                // scratch apply's entries must be truncated away or they would be
+                // consumed by the authoritative commit's trie finalization.
+                let saved_pre_mutations_len = self.pre_mutations.len();
 
                 let sp = self.snapshot(&[]);
                 let _ = crate::apply::apply_block_capturing_group_deltas(self, block, &mut tracer);
                 self.restore_snapshot(sp);
+                self.pre_mutations.truncate(saved_pre_mutations_len);
 
                 self.set_current_round(saved_round);
                 self.set_rewards_level(saved_level);
@@ -6094,6 +6100,67 @@ mod tests {
         // With 2 accounts in DB, trie should be non-empty.
         assert_ne!(root, [0u8; 32]);
         assert_eq!(trie.len(), 2);
+    }
+
+    /// Regression (TASK-257): enabling the per-group delta tracer must not
+    /// change the committed trie. The scratch capture appends trie
+    /// pre-mutations that the savepoint does not roll back; if they leaked they
+    /// would be consumed by the authoritative commit's `finalize_trie_updates`
+    /// and corrupt the root.
+    #[test]
+    fn group_tracer_does_not_leak_trie_pre_mutations() {
+        use crate::store_trait::LedgerStore;
+        use algo_types::{Block, SignedTransaction};
+
+        let a = Address([1u8; 32]);
+        let b = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+
+        let make_block = || {
+            let mut stx = SignedTransaction::default();
+            stx.txn.txn_type = "pay".into();
+            stx.txn.sender = a;
+            stx.txn.receiver = b;
+            stx.txn.amount = 100_000;
+            stx.txn.fee = 1000;
+            stx.txn.last_valid = Round(1000);
+            Block {
+                round: Round(1),
+                fee_sink,
+                current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+                payset: vec![stx],
+                ..Block::default()
+            }
+        };
+
+        let committed_root = |tracer_on: bool| -> [u8; 32] {
+            let mut l = SqliteLedger::open_in_memory().unwrap();
+            l.set_account(
+                &a,
+                AccountData {
+                    micro_algos: 5_000_000,
+                    ..Default::default()
+                },
+            );
+            l.set_account(&b, AccountData::default());
+            l.set_account(&fee_sink, AccountData::default());
+            // Build the trie from the seeded accounts, then apply the block.
+            l.enable_trie();
+            if tracer_on {
+                l.enable_group_delta_tracer(8);
+            }
+            l.begin_block().unwrap();
+            l.apply_block_caching_delta(&make_block()).unwrap();
+            l.finalize_trie_updates();
+            l.commit_block().unwrap();
+            l.trie.as_mut().unwrap().root_hash().unwrap()
+        };
+
+        assert_eq!(
+            committed_root(false),
+            committed_root(true),
+            "enabling the group tracer must not change the committed trie root"
+        );
     }
 
     #[test]
