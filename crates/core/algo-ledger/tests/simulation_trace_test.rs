@@ -699,6 +699,19 @@ fn simulation_trace_inner_txn_spawned_inners() {
         &vec![0usize],
         "spawned-inners index must reference inner_traces[0]"
     );
+
+    // app_budget_consumed must roll up the inner app call's cost into the
+    // top-level txn (go-algorand tracer.go:504). Outer program runs 8 cost-1
+    // opcodes (itxn_begin, pushint, itxn_field, pushint, itxn_field,
+    // itxn_submit, pushint, return); inner runs 2 (pushint, return) = 10 total.
+    // A naive shared-pool delta would report 0 here, since the inner app call
+    // adds MaxAppProgramCost (700) back to the pool.
+    let txn_result = &group.txn_results[0];
+    assert_eq!(
+        txn_result.app_budget_consumed, 10,
+        "app budget must include the inner app call's opcode cost"
+    );
+    assert_eq!(group.app_budget_consumed, 10);
 }
 
 // ---------------------------------------------------------------------------

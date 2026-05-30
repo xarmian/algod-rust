@@ -414,14 +414,6 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
             // Use apply_transaction_with_budget for ALL transactions (not just appl)
             // so they all share the group context.
-            //
-            // Per-transaction app budget consumed = the pool delta around this
-            // txn's apply. Inner app calls draw from the same pool (and don't
-            // grow it), so this delta captures the txn's approval/clear-state
-            // programs plus all inners — matching go-algorand's roll-up of each
-            // program's cost into the top-level transaction
-            // (`tracer.go:504`: `Txns[relativeCursor[0]].AppBudgetConsumed += cx.Cost()`).
-            let budget_before = group_budget.remaining();
             let apply_result = apply_transaction_with_budget(
                 self.store,
                 stx,
@@ -431,8 +423,14 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 Some(&gi),
                 Some(&mut tracer),
             );
-            group_result.txn_results[i].app_budget_consumed =
-                (budget_before - group_budget.remaining()).max(0) as u64;
+            // Per-transaction app budget consumed = the sum of every approval /
+            // clear-state program cost under this txn, including inner app calls,
+            // accumulated by the tracer (go-algorand rolls each program's
+            // `cx.Cost()` into the top-level txn — `tracer.go:504`). This is read
+            // from the tracer rather than the shared pool delta because inner app
+            // calls add `MaxAppProgramCost` to the pool and clear-state programs
+            // run on an isolated budget, so the net pool delta under-reports.
+            group_result.txn_results[i].app_budget_consumed = tracer.app_budget_consumed();
             // LogicSig budget consumed for this txn was measured during check().
             group_result.txn_results[i].logicsig_budget_consumed =
                 logicsig_budgets.get(i).copied().unwrap_or(0);
@@ -461,10 +459,19 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         group_result.failure_message = failure_message;
         group_result.failed_at = failed_at;
 
-        // Compute group-level budget metrics.
+        // Compute group-level budget metrics. AppBudgetConsumed is the sum of
+        // the per-transaction figures (each rolled up from its programs +
+        // inners via the tracer), which is correct even when inner app calls
+        // grow the pool or clear-state runs on an isolated budget — unlike the
+        // raw pool delta. AppBudgetAdded keeps the top-level allocation; its
+        // inner-app-call growth is a separate, documented divergence.
         let total_budget = (num_app_calls as i64) * 700 + request.extra_opcode_budget;
         group_result.app_budget_added = total_budget.max(0) as u64;
-        group_result.app_budget_consumed = (total_budget - group_budget.remaining()).max(0) as u64;
+        group_result.app_budget_consumed = group_result
+            .txn_results
+            .iter()
+            .map(|t| t.app_budget_consumed)
+            .sum();
 
         result.txn_groups.push(group_result);
 

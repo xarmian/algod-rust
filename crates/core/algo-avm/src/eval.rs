@@ -314,6 +314,7 @@ pub fn run_approval_program_with_tracer(
             budget.consume(cost_used)?;
 
             tracer.after_program(ProgramType::Approval, pass, None);
+            tracer.record_program_cost(ProgramType::Approval, machine.cost);
 
             let coverage = machine.opcode_coverage();
             let result = AvmResult {
@@ -333,6 +334,7 @@ pub fn run_approval_program_with_tracer(
 
             let msg = e.to_string();
             tracer.after_program(ProgramType::Approval, false, Some(&msg));
+            tracer.record_program_cost(ProgramType::Approval, machine.cost);
 
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
@@ -384,6 +386,7 @@ pub fn run_clear_state_program_with_tracer(
     match machine.run_with_tracer(ctx, tracer) {
         Ok(true) => {
             tracer.after_program(ProgramType::ClearState, true, None);
+            tracer.record_program_cost(ProgramType::ClearState, machine.cost);
             let coverage = machine.opcode_coverage();
             AvmResult {
                 global_delta: ctx.take_global_delta(),
@@ -397,6 +400,7 @@ pub fn run_clear_state_program_with_tracer(
         }
         Ok(false) => {
             tracer.after_program(ProgramType::ClearState, false, None);
+            tracer.record_program_cost(ProgramType::ClearState, machine.cost);
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
             result
@@ -404,6 +408,7 @@ pub fn run_clear_state_program_with_tracer(
         Err(e) => {
             let msg = e.to_string();
             tracer.after_program(ProgramType::ClearState, false, Some(&msg));
+            tracer.record_program_cost(ProgramType::ClearState, machine.cost);
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
             result.error = Some(msg);
@@ -450,6 +455,7 @@ pub fn run_logicsig_program_with_tracer(
             let cost_used = budget_before - machine.budget;
             budget.consume(cost_used)?;
             tracer.after_program(ProgramType::LogicSig, pass, None);
+            tracer.record_program_cost(ProgramType::LogicSig, machine.cost);
             Ok(pass)
         }
         Err(e) => {
@@ -457,6 +463,7 @@ pub fn run_logicsig_program_with_tracer(
             let _ = budget.consume(cost_used);
             let msg = e.to_string();
             tracer.after_program(ProgramType::LogicSig, false, Some(&msg));
+            tracer.record_program_cost(ProgramType::LogicSig, machine.cost);
             Err(e)
         }
     }

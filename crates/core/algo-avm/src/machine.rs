@@ -140,8 +140,15 @@ pub struct AvmMachine {
     pub scratch: Vec<AvmValue>,
     /// Program counter (instruction index, not byte offset).
     pub pc: usize,
-    /// Cost budget remaining.
+    /// Cost budget remaining. Shared/pooled across app calls — inner app calls
+    /// add to and consume from this, so its delta is not this program's own
+    /// cost (use [`AvmMachine::cost`] for that).
     pub budget: i64,
+    /// Total opcode cost charged by *this* program's own opcodes, accumulated
+    /// independently of the shared `budget`. Mirrors go-algorand's `cx.cost`:
+    /// unaffected by inner app calls' budget pooling, so it is the faithful
+    /// per-program cost for budget reporting.
+    pub cost: u64,
     /// Execution mode.
     pub mode: ExecMode,
     /// Integer constant pool (set by intcblock).
@@ -194,6 +201,7 @@ impl AvmMachine {
             scratch,
             pc: 0,
             budget,
+            cost: 0,
             mode,
             int_constants: Vec::new(),
             byte_constants: Vec::new(),
@@ -398,6 +406,9 @@ impl AvmMachine {
 
     /// Deduct cost from the budget. Returns an error if the budget is exceeded.
     pub fn charge_cost(&mut self, cost: u64) -> Result<(), AlgoError> {
+        // Track this program's own cumulative cost independently of the shared
+        // (pooled) budget, mirroring go-algorand's `cx.cost`.
+        self.cost = self.cost.saturating_add(cost);
         self.budget -= cost as i64;
         if self.budget < 0 {
             Err(AlgoError::Avm {
