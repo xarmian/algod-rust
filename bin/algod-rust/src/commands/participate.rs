@@ -1820,9 +1820,9 @@ fn parse_genesis_hash(hex_str: &str) -> anyhow::Result<[u8; 32]> {
     Ok(arr)
 }
 
-/// Load the VRF + one-time-signature signing secrets for every participation
-/// key valid at `round`, keyed by account address, for the agreement
-/// `Parameters.signing_keys` map.
+/// Load the VRF + one-time-signature signing secrets for the participation
+/// key(s) the pseudonode will vote with at `round`, keyed by account address,
+/// for the agreement `Parameters.signing_keys` map.
 ///
 /// Without these secrets the `AsyncPseudonode` emits placeholder (zero-filled)
 /// VRF proofs and OTS signatures, which the crypto verifier rejects — so the
@@ -1833,25 +1833,37 @@ fn parse_genesis_hash(hex_str: &str) -> anyhow::Result<[u8; 32]> {
 /// reconstruct them per key via `get_for_round` (VRF from its 32-byte seed, OTS
 /// from its msgpack blob).
 ///
-/// Keys with no entry valid at `round` (outside their validity window, or a
-/// legacy record with no voting blob) are skipped; a load error for one key is
-/// logged and skipped rather than failing the whole node.
+/// Key selection mirrors the public-record key manager exactly: we enumerate
+/// the keys via `get_for_voting_round` (which applies the
+/// `effectiveFirst/effectiveLast` window in addition to raw validity), then load
+/// each one's secrets by its participation ID. This is critical for
+/// consistency — `get_for_round` alone filters only on raw `firstValid/lastValid`,
+/// so for an account holding a not-yet-effective or deactivated key alongside
+/// the active one it could load the wrong secret and overwrite the active entry,
+/// leaving the pseudonode signing the active public record with a mismatched
+/// secret (invalid proposals/votes). Driving off the effective records means the
+/// secret loaded for an account always matches the record the agreement uses.
 ///
-/// This is a **startup snapshot** for the imminent round: the returned map is
-/// keyed by account address and handed to the agreement service once. It does
-/// not refresh as rounds advance, so it does not survive participation-key
-/// validity-window boundaries — a key that only becomes valid later, or an
-/// account that rotates to a new key mid-run, won't be picked up. Per-round
-/// secret refresh in the pseudonode is tracked in TASK-272. Loading for the
-/// imminent round (rather than every record) is deliberate: it selects the key
-/// valid for the round about to be produced, avoiding an address collision that
-/// would otherwise let a rotated-out key overwrite the active one.
+/// Keys with no loadable secret valid at `round` (a legacy record with no voting
+/// blob) are skipped; a load error for one key is logged and skipped rather than
+/// failing the whole node.
+///
+/// This is a **startup snapshot** for the imminent round, handed to the agreement
+/// service once; it does not refresh as rounds advance, so it does not survive
+/// participation-key validity-window boundaries (a key that becomes effective
+/// only later, or a mid-run rotation). Per-round secret refresh in the pseudonode
+/// is tracked in TASK-272.
 fn load_signing_keys_for_round(
     part_store: &ParticipationStore,
     round: Round,
 ) -> HashMap<Address, AccountSigningKeys> {
     let mut signing_keys = HashMap::new();
-    let records = match part_store.get_all() {
+    // Select keys with the same effective-window semantics the pseudonode's
+    // key manager uses (`AgreementKeyManagerBridge::voting_keys` →
+    // `get_for_voting_round`), so the secret we load for an account matches the
+    // public participation record the agreement will sign under. `keys_round`
+    // is the same round for this startup snapshot.
+    let records = match part_store.get_for_voting_round(round, round) {
         Ok(records) => records,
         Err(e) => {
             warn!(error = %e, "failed to enumerate participation keys; node will not sign consensus messages");
@@ -1872,8 +1884,8 @@ fn load_signing_keys_for_round(
                 );
             }
             Ok(None) => {
-                // No keyset valid for this round, or a legacy record with no
-                // voting secrets — it simply won't contribute signatures.
+                // Effective record with no loadable voting secret (legacy
+                // record / empty blob) — it simply won't contribute signatures.
             }
             Err(e) => {
                 warn!(
@@ -2660,6 +2672,44 @@ mod tests {
     fn load_signing_keys_empty_store_returns_empty() {
         let store = ParticipationStore::open_in_memory().expect("in-memory part store");
         assert!(load_signing_keys_for_round(&store, Round(1)).is_empty());
+    }
+
+    #[test]
+    fn load_signing_keys_uses_effective_window_not_raw_validity() {
+        // Regression: the loader must select keys with the same effective-window
+        // semantics the pseudonode's key manager uses (`get_for_voting_round`),
+        // not raw firstValid/lastValid (`get_for_round` alone). Otherwise an
+        // account holding a deactivated key (still raw-valid) could overwrite the
+        // active key's secret in the address-keyed map, leaving the node signing
+        // the active public record with the wrong secret.
+        use algo_ledger::participation::Participation;
+
+        let store = ParticipationStore::open_in_memory().expect("in-memory part store");
+        let account = Address([9u8; 32]);
+
+        // Two keys for the same account, both raw-valid over [0, 1000] but with
+        // distinct VRF keypairs so we can tell which secret got loaded.
+        let key_a = Participation::generate(account, Round(0), Round(1000), 10_000, 0)
+            .expect("generate key A");
+        let key_b = Participation::generate(account, Round(0), Round(1000), 10_000, 0)
+            .expect("generate key B");
+        let vrf_a = key_a.vrf_pubkey().0;
+        let vrf_b = key_b.vrf_pubkey().0;
+        assert_ne!(vrf_a, vrf_b, "test keys must differ");
+        let id_a = store.insert(&key_a).expect("insert key A");
+        let id_b = store.insert(&key_b).expect("insert key B");
+
+        // Activate A at round 1, then B at round 500 — registering B deactivates
+        // A (sets A.effectiveLast = 499). At round 600 only B is effective.
+        store.register(&id_a, Round(1)).expect("register A");
+        store.register(&id_b, Round(500)).expect("register B");
+
+        let keys = load_signing_keys_for_round(&store, Round(600));
+        let signing = keys.get(&account).expect("the effective key's secrets");
+        assert_eq!(
+            signing.vrf.pk.0, vrf_b,
+            "must load the EFFECTIVE key (B), not the deactivated-but-raw-valid key (A)",
+        );
     }
 
     // ── Helpers: RestOptions / load_genesis_json ────────────────────
