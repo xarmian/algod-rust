@@ -130,6 +130,42 @@ fn captures_per_group_deltas_indexed_by_txn_and_group_id() {
     assert!(tracer.get_delta_for_id(&Digest([0x99u8; 32])).is_none());
 }
 
+/// Blocks whose payset contains a transaction type the diff-based delta cannot
+/// fully reconstruct (anything beyond pay/keyreg) are left unretained, so the
+/// endpoints report the delta as unavailable rather than serving a partial one
+/// (consistent with the per-round delta cache's completeness gate).
+#[test]
+fn incomplete_block_is_not_captured() {
+    let creator = Address([1u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let balances = [(creator, 5_000_000), (fee_sink, 0)];
+
+    // An asset-config create — not pay/keyreg, so the block is delta-incomplete.
+    let mut acfg = SignedTransaction::default();
+    acfg.txn.txn_type = "acfg".into();
+    acfg.txn.sender = creator;
+    acfg.txn.fee = 1000;
+    acfg.txn.last_valid = Round(1000);
+    acfg.txn.config_asset = 0; // create
+    acfg.txn.asset_params = Some(algo_types::AssetParams {
+        total: 1_000_000,
+        ..Default::default()
+    });
+
+    let mut state = make_state(&balances, fee_sink);
+    let block = minimal_block(fee_sink, 1, vec![acfg]);
+
+    let mut tracer = TxnGroupDeltaTracer::new(8);
+    apply_block_capturing_group_deltas(&mut state, &block, &mut tracer).unwrap();
+
+    // The round is not retained → endpoints will report "unavailable".
+    assert!(
+        !tracer.has_round(1),
+        "incomplete block must not be captured"
+    );
+    assert!(tracer.get_deltas_for_round(1).is_none());
+}
+
 #[test]
 fn per_group_deltas_aggregate_to_round_delta() {
     let a = Address([1u8; 32]);

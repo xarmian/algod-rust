@@ -559,9 +559,20 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                 let groups = detect_transaction_groups(&block.payset);
                 let mut global_txn_idx: usize = 0;
 
-                // Per-group state-delta capture (opt-in via `group_deltas`).
-                if let Some(t) = group_deltas.as_deref_mut() {
-                    t.before_block(block.round.0);
+                // Per-group state-delta capture (opt-in via `group_deltas`),
+                // gated on the same completeness check as the per-round delta
+                // cache. The diff-based capture only reconstructs full deltas for
+                // pay/keyreg blocks, because `collect_txn_addresses` does not
+                // enumerate every account touched by app calls, asset ops, or
+                // heartbeats. For incomplete blocks the round is left unretained,
+                // so the endpoints report the delta as unavailable rather than
+                // returning a partial one.
+                let capture_group_deltas =
+                    group_deltas.is_some() && crate::sqlite::block_state_delta_is_complete(block);
+                if capture_group_deltas {
+                    if let Some(t) = group_deltas.as_deref_mut() {
+                        t.before_block(block.round.0);
+                    }
                 }
 
                 for group in &groups {
@@ -582,7 +593,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                     let group_start_idx = global_txn_idx;
                     let group_pre: Option<
                         std::collections::HashMap<Address, Option<algo_types::AccountData>>,
-                    > = if group_deltas.is_some() {
+                    > = if capture_group_deltas {
                         let mut addrs = std::collections::HashSet::new();
                         for stx in group.iter() {
                             collect_txn_addresses(&stx.txn, &mut addrs);

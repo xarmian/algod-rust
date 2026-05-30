@@ -1935,7 +1935,7 @@ pub struct SqliteLedger {
 ///
 /// See `apply_block_caching_delta` for the rest of the contract, including
 /// the per-field gaps that remain even on cached rounds (#190).
-fn block_state_delta_is_complete(block: &algo_types::Block) -> bool {
+pub(crate) fn block_state_delta_is_complete(block: &algo_types::Block) -> bool {
     use algo_types::TxnType;
     block
         .payset
