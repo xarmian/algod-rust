@@ -700,3 +700,114 @@ fn simulation_trace_inner_txn_spawned_inners() {
         "spawned-inners index must reference inner_traces[0]"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Per-transaction budget figures (TASK-250)
+// ---------------------------------------------------------------------------
+
+/// An app call's `app_budget_consumed` must equal the sum of its opcode costs.
+/// Program `[v6, pushint 1, return]` runs two cost-1 opcodes → 2.
+#[test]
+fn simulation_app_budget_consumed_matches_opcode_cost() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 100;
+    let approval = vec![0x06, 0x81, 0x01, 0x43]; // v6: pushint 1, return
+
+    let mut state = setup_state(sender, app_id, approval);
+    let txn = make_appl_txn(sender, app_id);
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("simulation should succeed");
+
+    let group = &result.txn_groups[0];
+    assert!(group.failure_message.is_none());
+    let txn_result = &group.txn_results[0];
+    // pushint (1) + return (1) = 2.
+    assert_eq!(txn_result.app_budget_consumed, 2);
+    assert_eq!(txn_result.logicsig_budget_consumed, 0);
+    // Per-txn consumed must roll up to the group total (single app call here).
+    assert_eq!(group.app_budget_consumed, 2);
+    // Budget is captured even with tracing disabled (it is not a trace field).
+    assert!(txn_result.trace.is_none());
+}
+
+/// A LogicSig-authorized payment's `logicsig_budget_consumed` must equal the
+/// LogicSig program's opcode cost, captured during signature verification.
+/// Program `[v6, pushint 1]` runs one cost-1 opcode → 1. The payment itself
+/// runs no app program, so `app_budget_consumed` is 0.
+#[test]
+fn simulation_logicsig_budget_consumed_populated() {
+    let program = vec![0x06, 0x81, 0x01]; // v6: pushint 1 (approves)
+    let sender = contract_account_address(&program);
+    let fee_sink = Address([0xFE; 32]);
+
+    let mut state = LedgerState::new();
+    state.fee_sink = fee_sink;
+    state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
+    state.set_account(
+        &sender,
+        AccountData {
+            micro_algos: 10_000_000,
+            ..Default::default()
+        },
+    );
+    state.set_account(
+        &fee_sink,
+        AccountData {
+            micro_algos: 0,
+            ..Default::default()
+        },
+    );
+
+    let txn = SignedTransaction {
+        txn: Transaction {
+            txn_type: "pay".into(),
+            sender,
+            fee: 1000,
+            first_valid: 0.into(),
+            last_valid: 1000.into(),
+            receiver: Address([0x20; 32]),
+            amount: 0,
+            ..Default::default()
+        },
+        lsig: Some(LogicSig {
+            logic: serde_bytes::ByteBuf::from(program.clone()),
+            sig: [0u8; 64],
+            msig: None,
+            lmsig: None,
+            args: None,
+        }),
+        ..Default::default()
+    };
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn]],
+        allow_empty_signatures: false,
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("logicsig simulation should succeed");
+
+    let group = &result.txn_groups[0];
+    assert!(
+        group.failure_message.is_none(),
+        "unexpected failure: {:?}",
+        group.failure_message
+    );
+    let txn_result = &group.txn_results[0];
+    // pushint (1) = 1.
+    assert_eq!(txn_result.logicsig_budget_consumed, 1);
+    // A bare payment runs no app program.
+    assert_eq!(txn_result.app_budget_consumed, 0);
+}

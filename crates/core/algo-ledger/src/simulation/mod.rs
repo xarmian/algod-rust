@@ -333,13 +333,13 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // execution. When tracing is enabled, `check` also captures logic-sig
         // opcode traces, since LogicSig programs run during signature
         // verification — before the per-transaction execution tracer exists.
-        let logicsig_traces = match self.check(
+        let (logicsig_traces, logicsig_budgets) = match self.check(
             txn_group,
             request.allow_empty_signatures,
             &consensus,
             &request.trace_config,
         ) {
-            Ok(traces) => traces,
+            Ok(captured) => captured,
             Err(e) => {
                 self.store.restore_snapshot(snapshot);
                 return Err(e);
@@ -414,6 +414,14 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
             // Use apply_transaction_with_budget for ALL transactions (not just appl)
             // so they all share the group context.
+            //
+            // Per-transaction app budget consumed = the pool delta around this
+            // txn's apply. Inner app calls draw from the same pool (and don't
+            // grow it), so this delta captures the txn's approval/clear-state
+            // programs plus all inners — matching go-algorand's roll-up of each
+            // program's cost into the top-level transaction
+            // (`tracer.go:504`: `Txns[relativeCursor[0]].AppBudgetConsumed += cx.Cost()`).
+            let budget_before = group_budget.remaining();
             let apply_result = apply_transaction_with_budget(
                 self.store,
                 stx,
@@ -423,6 +431,11 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 Some(&gi),
                 Some(&mut tracer),
             );
+            group_result.txn_results[i].app_budget_consumed =
+                (budget_before - group_budget.remaining()).max(0) as u64;
+            // LogicSig budget consumed for this txn was measured during check().
+            group_result.txn_results[i].logicsig_budget_consumed =
+                logicsig_budgets.get(i).copied().unwrap_or(0);
 
             match apply_result {
                 Ok(apply_data) => {
@@ -478,13 +491,14 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
     ///    unsigned transactions are proxy-signed with a fixed key so that
     ///    signature verification passes without requiring the caller to
     ///    provide real signatures.
+    #[allow(clippy::type_complexity)]
     fn check(
         &self,
         txn_group: &[SignedTransaction],
         allow_empty_signatures: bool,
         consensus: &ConsensusParams,
         trace_config: &ExecTraceConfig,
-    ) -> Result<Vec<Option<TransactionTrace>>, SimulatorError> {
+    ) -> Result<(Vec<Option<TransactionTrace>>, Vec<u64>), SimulatorError> {
         let spec = SpecialAddresses {
             fee_sink: self.store.fee_sink(),
             rewards_pool: self.store.rewards_pool(),
@@ -594,9 +608,17 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // both in one pass; this engine splits check() from execution, so the
         // logic-sig trace is captured now and merged into the execution trace
         // for the same transaction afterwards).
+        //
+        // The per-transaction LogicSig budget consumed is also measured here,
+        // as the LogicSig opcode-budget pool delta around each transaction's
+        // verification (go-algorand `tracer.go:495`:
+        // `Txns[groupIndex].LogicSigBudgetConsumed = cx.Cost()`). This is
+        // captured for all LogicSig transactions, independent of trace config.
         let mut logicsig_traces: Vec<Option<TransactionTrace>> = vec![None; verify_group.len()];
+        let mut logicsig_budgets: Vec<u64> = vec![0; verify_group.len()];
         let mut budget = GroupBudget::for_logicsig(verify_group.len());
         for (i, stx) in verify_group.iter().enumerate() {
+            let budget_before = budget.remaining();
             let result = if trace_config.is_enabled() && stx.lsig.is_some() {
                 let mut lsig_tracer = SimulationTracer::new(trace_config.clone());
                 let r = verify_transaction_signature_with_tracer(
@@ -612,6 +634,9 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             } else {
                 verify_transaction_signature(stx, &verify_group, i, &mut budget, consensus)
             };
+            // A non-LogicSig transaction consumes no LogicSig budget, leaving
+            // the delta at 0.
+            logicsig_budgets[i] = (budget_before - budget.remaining()).max(0) as u64;
             result.map_err(|e| {
                 SimulatorError::InvalidRequest(InvalidRequestError {
                     message: e.to_string(),
@@ -619,7 +644,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             })?;
         }
 
-        Ok(logicsig_traces)
+        Ok((logicsig_traces, logicsig_budgets))
     }
 }
 
