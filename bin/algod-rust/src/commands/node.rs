@@ -16,6 +16,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use algo_codec::{canonical_encode_block_header_from_block, encode_block};
+use algo_ledger::participation::ParticipationStore;
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{
     make_genesis_block, parse_genesis_json, populate_store, seed_account_totals_from_genesis,
@@ -157,6 +158,20 @@ async fn run_start(
 
     let ledger = Arc::new(Mutex::new(sqlite_ledger));
 
+    // Participation-key registry. Lives at <genesisDir>/partregistry.sqlite,
+    // matching go's `config.ParticipationRegistryFilename`
+    // (../go-algorand/node/node.go:868). Backs the admin-only
+    // /v2/participation* endpoints so `goal account addpartkey/listpartkeys/
+    // deletepartkey` round-trip against the node.
+    let part_registry_path = ledger_dir.join("partregistry.sqlite");
+    let part_store = ParticipationStore::open(&part_registry_path).map_err(|e| {
+        anyhow::anyhow!(
+            "opening participation registry at {}: {e}",
+            part_registry_path.display()
+        )
+    })?;
+    let part_store = Arc::new(Mutex::new(part_store));
+
     // Cancellation token shared with the adapter and the server: cancelling it
     // on Ctrl-C also unblocks in-flight `wait-for-block-after` handlers promptly
     // instead of letting them poll to their 60s timeout (mirrors participate).
@@ -175,7 +190,8 @@ async fn run_start(
         default_protocol: genesis.proto.clone(),
     };
     let mut node_interface = AlgodNodeInterface::new(ledger.clone(), node_config)
-        .with_shutdown_token(shutdown_token.clone());
+        .with_shutdown_token(shutdown_token.clone())
+        .with_participation_store(part_store);
     if dev_mode {
         let pool = Arc::new(TransactionPool::new(
             PoolConfig::default(),

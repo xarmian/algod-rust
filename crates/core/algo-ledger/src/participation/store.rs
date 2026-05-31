@@ -112,6 +112,15 @@ impl ParticipationStore {
     ///
     /// Creates the `Keysets` and `Rolling` tables if they do not exist.
     pub fn new(conn: Connection) -> Result<Self, rusqlite::Error> {
+        // The registry holds raw private key material (VRF seeds, ed25519
+        // voting keys, Falcon state-proof keys). Enable `secure_delete` so that
+        // when a key is removed (`delete` / `delete_expired` /
+        // `delete_state_proof_keys_before`) SQLite zeroes the freed pages
+        // instead of leaving the secrets recoverable in the file's free list.
+        // Mirrors go-algorand's erasable participation accessor
+        // (`secure_delete=ON`, `../go-algorand/util/db/dbutil.go` /
+        // `node.go:868`).
+        conn.execute_batch("PRAGMA secure_delete = ON;")?;
         conn.execute_batch(CREATE_KEYSETS)?;
         conn.execute_batch(CREATE_ROLLING)?;
         conn.execute_batch(CREATE_STATE_PROOF_KEYS)?;
@@ -119,8 +128,35 @@ impl ParticipationStore {
     }
 
     /// Open (or create) a store backed by the given file path.
+    ///
+    /// The database holds raw private key material (VRF seeds, ed25519 voting
+    /// keys, Falcon state-proof keys), so on unix the file is restricted to
+    /// `0600` (owner read/write only) — matching go-algorand, which opens the
+    /// participation registry via an erasable accessor with restricted
+    /// permissions (`../go-algorand/node/node.go:868`). The chmod is best-effort
+    /// idempotent: it runs on every open, tightening a file created under a
+    /// looser umask on a prior run.
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // Only attempt the chmod for a real on-disk file. Failures here are
+            // non-fatal to opening the store but indicate the key DB may be
+            // more permissive than intended, so surface them.
+            if path.exists() {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+                    |e| {
+                        rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                            Some(format!(
+                                "restricting participation registry permissions to 0600: {e}"
+                            )),
+                        )
+                    },
+                )?;
+            }
+        }
         Self::new(conn)
     }
 
@@ -839,6 +875,46 @@ impl ParticipationStore {
 
         tx.commit()?;
         Ok(())
+    }
+
+    /// Append state proof keys carrying explicit rounds (a `(round, signer)`
+    /// slice) to an existing participation key.
+    ///
+    /// Unlike [`append_state_proof_keys`](Self::append_state_proof_keys), which
+    /// recomputes each round from the existing key count, this preserves the
+    /// round attached to each key. It mirrors go-algorand's
+    /// `appendKeysOp.apply` (`data/account/registeryDbOps.go:268`), which
+    /// inserts `(pk, key.Round, encode(key.Key))` verbatim from the
+    /// `StateProofKeys` (`[]KeyRoundPair`) wire body.
+    ///
+    /// Returns `Ok(false)` when no record matches `id` (matches Go's silent
+    /// `sql.ErrNoRows` → "nothing to do" branch); `Ok(true)` once the keys are
+    /// inserted.
+    pub fn append_state_proof_keys_with_rounds(
+        &self,
+        id: &ParticipationID,
+        keys: &[(u64, FalconSigner)],
+    ) -> Result<bool, rusqlite::Error> {
+        if keys.is_empty() {
+            return Ok(false);
+        }
+
+        let pk: Option<i64> = self
+            .conn
+            .query_row(SELECT_PK, params![id.0.as_slice()], |row| row.get(0))
+            .optional()?;
+        let pk = match pk {
+            Some(pk) => pk,
+            None => return Ok(false),
+        };
+
+        let tx = self.conn.unchecked_transaction()?;
+        for (round, key) in keys {
+            let key_blob = key.to_msgpack();
+            tx.execute(INSERT_STATE_PROOF_KEY, params![pk, *round as i64, key_blob])?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     // -- Internal helpers ---------------------------------------------------

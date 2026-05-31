@@ -18,6 +18,7 @@ algo-validate.workspace = true
 algo-bench.workspace = true
 algo-conformance.workspace = true
 algo-ledger.workspace = true
+algo-consensus-crypto.workspace = true
 algo-agreement.workspace = true
 algo-pool.workspace = true
 algo-avm.workspace = true

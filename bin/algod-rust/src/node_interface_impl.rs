@@ -26,6 +26,10 @@ use algo_codec::{
     canonical_encode_block_header, compute_block_digest, compute_txn_id, decode_block,
 };
 use algo_ledger::apply::ApplyData;
+use algo_ledger::erasable_db::ErasableDb;
+use algo_ledger::participation::{
+    restore_participation, Participation, ParticipationID, ParticipationRecord, ParticipationStore,
+};
 use algo_ledger::simulation::{
     AppInitialState, AvmValueTrace, ExecTraceConfig, OpcodeTraceUnit, ProgramTrace,
     ResourcesInitialStates, ResultEvalOverrides, SimulationRequest, SimulationResult, Simulator,
@@ -183,6 +187,15 @@ pub struct AlgodNodeInterface {
     /// asset/app creates; the `eval_delta` plumbing is already in place for when
     /// it does.)
     dev_apply_data: Arc<std::sync::Mutex<std::collections::HashMap<Digest, ApplyData>>>,
+    /// Optional participation-key store backing the `/v2/participation*`
+    /// endpoints (list/get/install/remove/append/generate). Persisted to
+    /// `<genesisDir>/partregistry.sqlite` by `node start`, mirroring go's
+    /// `config.ParticipationRegistryFilename` at
+    /// `../go-algorand/node/node.go:868`. Absent for read-only / test contexts
+    /// — the participation trait methods then report
+    /// [`NodeError::NotImplemented`]. Wrapped in a `Mutex` because the
+    /// underlying rusqlite `Connection` is not `Sync`.
+    part_store: Option<Arc<Mutex<ParticipationStore>>>,
 }
 
 impl AlgodNodeInterface {
@@ -206,7 +219,19 @@ impl AlgodNodeInterface {
             dev_mode: false,
             dev_produce_lock: Arc::new(tokio::sync::Mutex::new(())),
             dev_apply_data: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            part_store: None,
         }
+    }
+
+    /// Attach a participation-key store so the `/v2/participation*` endpoints
+    /// (list/get/install/remove/append/generate) operate against persisted
+    /// keys. Builder-style, matching [`Self::with_pool`]. Without it those
+    /// methods report [`NodeError::NotImplemented`] (mirroring go's behavior
+    /// when no participation registry is configured).
+    #[must_use]
+    pub fn with_participation_store(mut self, store: Arc<Mutex<ParticipationStore>>) -> Self {
+        self.part_store = Some(store);
+        self
     }
 
     /// Enable dev mode: `broadcast_signed_tx_group` ingests directly into the
@@ -344,6 +369,26 @@ impl AlgodNodeInterface {
             }
         }
         Ok(None)
+    }
+
+    /// Lock the attached participation store, surfacing absence as
+    /// [`NodeError::NotImplemented`] and lock poison as
+    /// [`NodeError::Internal`]. Single call site so the error strings stay
+    /// consistent across the participation methods.
+    fn lock_part_store(
+        &self,
+        method: &'static str,
+    ) -> Result<std::sync::MutexGuard<'_, ParticipationStore>, NodeError> {
+        let store = self
+            .part_store
+            .as_ref()
+            .ok_or(NodeError::NotImplemented(method))?;
+        store.lock().map_err(|_| {
+            NodeError::Internal(format!(
+                "{method}: participation store lock poisoned — an earlier operation panicked \
+                 while holding the lock"
+            ))
+        })
     }
 
     /// Return the attached broadcaster (or [`NodeError::NotImplemented`]
@@ -1064,6 +1109,274 @@ impl NodeInterface for AlgodNodeInterface {
                 .map_err(Self::map_simulator_error)?
         };
         Ok(Self::build_simulate_response(result))
+    }
+
+    // ---- Participation key methods (TASK-265) ----
+    //
+    // Backed by the optional [`ParticipationStore`] attached via
+    // [`Self::with_participation_store`]. These mirror go-algorand's
+    // `AlgorandFullNode` participation methods in
+    // `../go-algorand/node/node.go` (ListParticipationKeys:878,
+    // GetParticipationKey:883, RemoveParticipationKey:894,
+    // AppendParticipationKeys:927, InstallParticipationKey:965) and the
+    // `generateKeyHandler` path at
+    // `../go-algorand/daemon/algod/api/server/v2/handlers.go:261`.
+
+    /// List all participation keys. Mirrors `Node.ListParticipationKeys`
+    /// (`../go-algorand/node/node.go:878` → `Registry().GetAll()`).
+    async fn list_participation_keys(&self) -> Result<Vec<ParticipationRecord>, NodeError> {
+        let store = self.lock_part_store("list_participation_keys")?;
+        store
+            .get_all()
+            .map_err(|e| NodeError::Internal(format!("list_participation_keys: {e}")))
+    }
+
+    /// Get a single participation key by ID. Mirrors `Node.GetParticipationKey`
+    /// (`../go-algorand/node/node.go:883`): a zero/absent record surfaces as
+    /// `account.ErrParticipationIDNotFound`. The REST handler maps the
+    /// returned record's `is_zero()` to a 404, but we additionally map a
+    /// genuine miss to [`NodeError::NotFound`] so direct trait callers get the
+    /// same semantics.
+    async fn get_participation_key(
+        &self,
+        id: &ParticipationID,
+    ) -> Result<ParticipationRecord, NodeError> {
+        let store = self.lock_part_store("get_participation_key")?;
+        match store
+            .get(id)
+            .map_err(|e| NodeError::Internal(format!("get_participation_key: {e}")))?
+        {
+            Some(record) => Ok(record),
+            None => Err(NodeError::NotFound("participation id not found".into())),
+        }
+    }
+
+    /// Install a participation key from a raw partkey-DB binary blob. Mirrors
+    /// `Node.InstallParticipationKey` (`../go-algorand/node/node.go:965`):
+    /// write the bytes to a temporary erasable DB, `RestoreParticipation`,
+    /// reject a zero parent, then register it (duplicates rejected). The temp
+    /// file is removed before returning, matching go's `defer os.Remove`.
+    async fn install_participation_key(&self, data: Vec<u8>) -> Result<ParticipationID, NodeError> {
+        // Fail fast with NotImplemented when no store is configured, before
+        // doing the (potentially slow) decode work — matches the behavior of
+        // the other participation methods.
+        if self.part_store.is_none() {
+            return Err(NodeError::NotImplemented("install_participation_key"));
+        }
+
+        // Restore the Participation from the supplied partkey bytes by
+        // round-tripping through a temporary on-disk sqlite DB (the partkey
+        // schema reader operates on a file-backed connection). We do this
+        // before taking the store lock so the (potentially slow) msgpack
+        // decode doesn't serialize against other participation calls.
+        let participation = Self::restore_from_partkey_bytes(&data)?;
+
+        // Reject a missing (zero) parent address, matching go's explicit
+        // check (`node.go:996`).
+        if participation.parent == Address([0u8; 32]) {
+            return Err(NodeError::Internal(
+                "cannot install partkey with missing (zero) parent address".into(),
+            ));
+        }
+
+        let store = self.lock_part_store("install_participation_key")?;
+        store.insert(&participation).map_err(|e| {
+            // The UNIQUE(participationID) constraint surfaces duplicates;
+            // map them to the same message go returns from AddParticipation.
+            if matches!(
+                &e,
+                rusqlite::Error::SqliteFailure(ffi, _)
+                    if ffi.code == rusqlite::ErrorCode::ConstraintViolation
+            ) {
+                NodeError::Internal(
+                    "ParticipationRegistry: cannot register duplicate participation key".into(),
+                )
+            } else {
+                NodeError::Internal(format!("install_participation_key: {e}"))
+            }
+        })
+    }
+
+    /// Remove a participation key by ID. Mirrors `Node.RemoveParticipationKey`
+    /// (`../go-algorand/node/node.go:894`): an unknown ID is
+    /// `ErrParticipationIDNotFound` → [`NodeError::NotFound`]. (algod-rust
+    /// stores keys in the registry DB only — there is no separate partkey file
+    /// to unlink, unlike go's on-disk `.partkey` files.)
+    async fn remove_participation_key(&self, id: &ParticipationID) -> Result<(), NodeError> {
+        let store = self.lock_part_store("remove_participation_key")?;
+        let deleted = store
+            .delete(id)
+            .map_err(|e| NodeError::Internal(format!("remove_participation_key: {e}")))?;
+        if deleted {
+            Ok(())
+        } else {
+            Err(NodeError::NotFound("participation id not found".into()))
+        }
+    }
+
+    /// Append state-proof keys to an existing participation key. Mirrors
+    /// `Node.AppendParticipationKeys` (`../go-algorand/node/node.go:927` →
+    /// `Registry().AppendKeys`). `keys` is the raw `StateProofKeys`
+    /// (`[]merklesignature.KeyRoundPair`) msgpack body POSTed to
+    /// `/v2/participation/{id}`; we decode it and insert each key with its
+    /// explicit round, matching go's `appendKeysOp.apply`
+    /// (`../go-algorand/data/account/registeryDbOps.go:268`). An unknown ID
+    /// returns [`NodeError::NotFound`], matching go's public `Registry.AppendKeys`
+    /// which rejects an id missing from its cache with
+    /// `ErrParticipationIDNotFound` before queuing the DB op
+    /// (`../go-algorand/data/account/participationRegistry.go:560`).
+    async fn append_participation_keys(
+        &self,
+        id: &ParticipationID,
+        keys: Vec<u8>,
+    ) -> Result<(), NodeError> {
+        // A malformed body or an empty key list is a client error (go's
+        // AppendKeys handler `badRequest`s on both — handlers.go:378), so these
+        // surface as 400, not 500.
+        let pairs = algo_consensus_crypto::merklesig::decode_state_proof_keys(&keys)
+            .map_err(|e| NodeError::BadRequest(format!("unable to parse keys from body: {e}")))?;
+        if pairs.is_empty() {
+            return Err(NodeError::BadRequest(
+                "empty request, please attach keys to request body".into(),
+            ));
+        }
+        let store = self.lock_part_store("append_participation_keys")?;
+        let appended = store
+            .append_state_proof_keys_with_rounds(id, &pairs)
+            .map_err(|e| NodeError::Internal(format!("append_participation_keys: {e}")))?;
+        if appended {
+            Ok(())
+        } else {
+            Err(NodeError::NotFound("participation id not found".into()))
+        }
+    }
+
+    /// Generate participation keys server-side and install them. Mirrors go's
+    /// `generateKeyHandler` (`../go-algorand/daemon/algod/api/server/v2/handlers.go:261`),
+    /// which calls `participation.GenParticipationKeysTo` then
+    /// `InstallParticipationKey`. We generate the [`Participation`] directly
+    /// (no intermediate partkey file) and persist it. The REST handler already
+    /// runs this on a background task behind a single-permit semaphore, so it
+    /// returns 200 immediately and logs the resulting id.
+    async fn generate_participation_keys(
+        &self,
+        address: Address,
+        first: u64,
+        last: u64,
+        dilution: Option<u64>,
+    ) -> Result<ParticipationID, NodeError> {
+        // Enforce the consensus `MaxKeyregValidPeriod` bound before generating,
+        // matching go's `FillDBWithParticipationKeys`
+        // (../go-algorand/data/account/participation.go:231), which reads the
+        // limit from the current consensus params and rejects an over-long
+        // validity window. `Participation::generate` only checks `last >= first`,
+        // so without this the endpoint would generate (and persist) keys with
+        // windows go rejects — a large CPU/RAM cost on an untrusted request.
+        if last < first {
+            return Err(NodeError::Internal(format!(
+                "firstValid {first} is after lastValid {last}"
+            )));
+        }
+        let proto = {
+            let ledger = self.lock_ledger("generate_participation_keys")?;
+            self.resolve_protocol(&ledger)
+        };
+        let params = Self::resolve_consensus_params(&proto)?;
+        if params.max_keyreg_valid_period != 0
+            && last.saturating_sub(first) > params.max_keyreg_valid_period
+        {
+            return Err(NodeError::Internal(format!(
+                "the validity period for mss is too large: the limit is {}",
+                params.max_keyreg_valid_period
+            )));
+        }
+
+        // `dilution = 0` defers to the default in `Participation::generate`
+        // (matching go's `nilToZero(params.Dilution)`).
+        let key_dilution = dilution.unwrap_or(0);
+        let participation = Participation::generate(
+            address,
+            Round(first),
+            Round(last),
+            key_dilution,
+            algo_consensus_crypto::merklesig::KEY_LIFETIME_DEFAULT,
+        )
+        .map_err(NodeError::Internal)?;
+
+        let store = self.lock_part_store("generate_participation_keys")?;
+        store
+            .insert(&participation)
+            .map_err(|e| NodeError::Internal(format!("generate_participation_keys: {e}")))
+    }
+}
+
+impl AlgodNodeInterface {
+    /// Decode a partkey-DB binary blob into a [`Participation`] by writing it
+    /// to a temporary on-disk sqlite file and reading it with
+    /// [`restore_participation`]. The temp file is removed before returning.
+    /// Mirrors go's `createTemporaryParticipationKey` then
+    /// `MakeErasableAccessor` then `RestoreParticipationWithSecrets` in
+    /// `../go-algorand/node/node.go:965`.
+    fn restore_from_partkey_bytes(data: &[u8]) -> Result<Participation, NodeError> {
+        if data.is_empty() {
+            return Err(NodeError::Internal("cannot install empty partkey".into()));
+        }
+
+        use std::io::Write as _;
+
+        // Create the temp file securely: on unix 0600 (private-key material),
+        // exclusive creation (`O_CREAT|O_EXCL` — fails rather than following a
+        // pre-placed symlink or clobbering an existing file), and a unique name
+        // combining the pid, a high-resolution timestamp, and a process-global
+        // counter so concurrent installs never collide. Go uses a
+        // random-suffixed name in the genesis dir (node.go:936); we keep the
+        // bytes off any shared path and lock down the mode the same way go's
+        // umask-respecting participation files are expected to be protected.
+        static TEMP_PARTKEY_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = TEMP_PARTKEY_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "algod-rust-partkey.{}.{nonce}.{seq}.bin",
+            std::process::id()
+        ));
+
+        {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            // The 0600 mode is unix-only; on other platforms exclusive creation
+            // in a private temp dir is the available protection.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            let mut file = opts
+                .open(&path)
+                .map_err(|e| NodeError::Internal(format!("creating temp partkey: {e}")))?;
+            file.write_all(data)
+                .and_then(|()| file.flush())
+                .map_err(|e| {
+                    let _ = std::fs::remove_file(&path);
+                    NodeError::Internal(format!("writing temp partkey: {e}"))
+                })?;
+        }
+
+        let result = (|| {
+            let db = ErasableDb::open(&path)
+                .map_err(|e| NodeError::Internal(format!("opening temp partkey db: {e}")))?;
+            restore_participation(&db)
+                .map_err(|e| NodeError::Internal(format!("restoring partkey: {e}")))
+        })();
+
+        // Always remove the temp file, mirroring go's `defer os.Remove`.
+        let _ = std::fs::remove_file(&path);
+
+        result
     }
 }
 
@@ -3121,5 +3434,238 @@ mod tests {
             .expect("get_block_hash ok")
             .expect("hash present for round 5");
         assert_eq!(hash, compute_block_digest(&block));
+    }
+
+    // ---- Participation key methods (TASK-265) ----
+
+    /// Adapter with an in-memory participation store attached.
+    fn adapter_with_part_store() -> AlgodNodeInterface {
+        let store = ParticipationStore::open_in_memory().expect("in-memory part store");
+        make_adapter().with_participation_store(Arc::new(Mutex::new(store)))
+    }
+
+    #[tokio::test]
+    async fn participation_methods_not_implemented_without_store() {
+        let adapter = make_adapter();
+        // No store attached → every method reports NotImplemented (mirroring
+        // go when no participation registry is configured).
+        assert!(matches!(
+            adapter.list_participation_keys().await,
+            Err(NodeError::NotImplemented("list_participation_keys"))
+        ));
+        assert!(matches!(
+            adapter.install_participation_key(vec![1, 2, 3]).await,
+            Err(NodeError::NotImplemented("install_participation_key"))
+        ));
+        assert!(matches!(
+            adapter
+                .generate_participation_keys(Address([1u8; 32]), 1, 100, None)
+                .await,
+            Err(NodeError::NotImplemented("generate_participation_keys"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn generate_list_get_remove_round_trip() {
+        let adapter = adapter_with_part_store();
+        let addr = Address([0x42; 32]);
+
+        // Empty store lists nothing.
+        assert!(adapter
+            .list_participation_keys()
+            .await
+            .expect("list ok")
+            .is_empty());
+
+        // Generate installs a key and returns its id.
+        let id = adapter
+            .generate_participation_keys(addr, 1, 100, Some(10_000))
+            .await
+            .expect("generate ok");
+
+        // List now returns exactly that key.
+        let listed = adapter.list_participation_keys().await.expect("list ok");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].participation_id, id);
+        assert_eq!(listed[0].account, addr);
+
+        // Get by id returns the record.
+        let got = adapter.get_participation_key(&id).await.expect("get ok");
+        assert_eq!(got.participation_id, id);
+
+        // Get on an unknown id is NotFound.
+        let missing = ParticipationID([0xFF; 32]);
+        assert!(matches!(
+            adapter.get_participation_key(&missing).await,
+            Err(NodeError::NotFound(_))
+        ));
+
+        // Remove deletes it; a second remove is NotFound.
+        adapter
+            .remove_participation_key(&id)
+            .await
+            .expect("remove ok");
+        assert!(adapter
+            .list_participation_keys()
+            .await
+            .expect("list ok")
+            .is_empty());
+        assert!(matches!(
+            adapter.remove_participation_key(&id).await,
+            Err(NodeError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn install_from_partkey_bytes_round_trip() {
+        // Build a real partkey DB on disk, read its raw bytes, and install
+        // them through the adapter (exercising the secure temp-file write +
+        // restore_participation path).
+        let addr = Address([0x5a; 32]);
+        let dir = std::env::temp_dir().join(format!(
+            "algod-rust-test-partkey.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut db = algo_ledger::erasable_db::ErasableDb::open(&dir).expect("open partkey db");
+        let part = algo_ledger::participation::fill_db_with_participation_keys(
+            &mut db,
+            addr,
+            Round(1),
+            Round(100),
+            10_000,
+        )
+        .expect("fill partkey db");
+        let expected_id = part.id();
+        db.close().expect("close db");
+        let bytes = std::fs::read(&dir).expect("read partkey bytes");
+        let _ = std::fs::remove_file(&dir);
+
+        let adapter = adapter_with_part_store();
+        let id = adapter
+            .install_participation_key(bytes)
+            .await
+            .expect("install ok");
+        assert_eq!(id, expected_id);
+
+        let listed = adapter.list_participation_keys().await.expect("list ok");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].participation_id, id);
+        assert_eq!(listed[0].account, addr);
+    }
+
+    #[tokio::test]
+    async fn install_empty_partkey_is_rejected() {
+        let adapter = adapter_with_part_store();
+        let err = adapter
+            .install_participation_key(Vec::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NodeError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn generate_rejects_over_long_validity_window() {
+        let adapter = adapter_with_part_store();
+        // v41 MaxKeyregValidPeriod is 256*(1<<16)-1 = 16_777_215. A window
+        // wider than that is rejected before any keygen (matches go's
+        // FillDBWithParticipationKeys validity-period check).
+        let err = adapter
+            .generate_participation_keys(Address([0x09; 32]), 1, 1 + 16_777_216, None)
+            .await
+            .unwrap_err();
+        match err {
+            NodeError::Internal(msg) => assert!(
+                msg.contains("the validity period for mss is too large"),
+                "expected validity-period message, got {msg:?}"
+            ),
+            other => panic!("expected Internal(validity period), got {other:?}"),
+        }
+        // Nothing was persisted.
+        assert!(adapter
+            .list_participation_keys()
+            .await
+            .expect("list ok")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_generate_is_rejected() {
+        let adapter = adapter_with_part_store();
+        let addr = Address([0x07; 32]);
+        let store = adapter.part_store.clone().expect("store attached");
+
+        // Generate one key, then re-insert the *same* participation directly
+        // to force the UNIQUE(participationID) collision (regenerating would
+        // produce fresh random keys with a different id).
+        let part =
+            Participation::generate(addr, Round(1), Round(100), 10_000, 256).expect("generate");
+        let id = store.lock().expect("lock").insert(&part).expect("insert");
+        assert_eq!(
+            adapter
+                .get_participation_key(&id)
+                .await
+                .expect("get")
+                .participation_id,
+            id
+        );
+
+        // Installing a partkey blob whose id already exists maps to the
+        // duplicate-key error. Build a partkey DB for the same Participation.
+        // (Covered indirectly: a second direct insert returns a constraint
+        // error, which install maps to the duplicate message.)
+        let err = store.lock().expect("lock").insert(&part).unwrap_err();
+        assert!(matches!(
+            &err,
+            rusqlite::Error::SqliteFailure(ffi, _)
+                if ffi.code == rusqlite::ErrorCode::ConstraintViolation
+        ));
+    }
+
+    #[tokio::test]
+    async fn append_participation_keys_rejects_empty_body() {
+        let adapter = adapter_with_part_store();
+        let id = ParticipationID([0x11; 32]);
+        // An empty msgpack array (0x90) decodes to zero pairs → BadRequest
+        // (client error → 400), matching go's "empty request" message.
+        let err = adapter
+            .append_participation_keys(&id, vec![0x90])
+            .await
+            .unwrap_err();
+        match err {
+            NodeError::BadRequest(msg) => assert!(
+                msg.contains("empty request"),
+                "expected empty-request message, got {msg:?}"
+            ),
+            other => panic!("expected BadRequest(empty request), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn append_participation_keys_unknown_id_is_not_found() {
+        let adapter = adapter_with_part_store();
+        let id = ParticipationID([0x22; 32]);
+        // One well-formed KeyRoundPair for an id that isn't installed: go's
+        // public Registry.AppendKeys rejects it with ErrParticipationIDNotFound
+        // (participationRegistry.go:560), so we return NotFound → 404.
+        let mut signer = algo_consensus_crypto::merklesig::FalconSigner::default();
+        signer.pk[0] = 0x01;
+        let mut body = Vec::new();
+        body.push(0x91); // fixarray of 1
+        body.push(0x82); // fixmap of 2
+        body.extend_from_slice(&[0xa3, b'k', b'e', b'y']);
+        body.extend_from_slice(&signer.to_msgpack());
+        body.extend_from_slice(&[0xa3, b'r', b'n', b'd']);
+        body.push(0xcd);
+        body.extend_from_slice(&256u16.to_be_bytes());
+
+        let err = adapter
+            .append_participation_keys(&id, body)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NodeError::NotFound(_)));
     }
 }
