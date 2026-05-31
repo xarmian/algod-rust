@@ -125,26 +125,24 @@ pub struct SendArgs {
     /// goal `send` also honors the global no-wait behavior).
     #[arg(short = 'N', long = "no-wait")]
     pub no_wait: bool,
-    /// Wallet name. Go declares `-w/--wallet` as a *persistent* flag on the
-    /// `clerk` group (clerk.go:101), so `goal clerk -w w send ...` works there.
-    /// goal-rust places it on the leaf instead — `clerk send -w w ...` — the
-    /// same documented divergence the `account` group already ships (every
-    /// account leaf re-declares `-w` rather than inheriting a group flag). Pass
-    /// `-w` after `send`.
-    #[arg(short = 'w', long = "wallet")]
-    pub wallet: Option<String>,
     /// Wallet password (skip the prompt). goal-rust convention shared with the
     /// account leaves.
     #[arg(long = "password")]
     pub password: Option<String>,
+    // NOTE: `-w/--wallet` is declared on the `clerk` group (see
+    // `RootCommand::Clerk`) as a `global = true` flag so both Go orderings
+    // parse: `clerk -w w send ...` and `clerk send -w w ...`. It is threaded
+    // into the handler via `run(.., wallet)` rather than living on `SendArgs`.
 }
 
-pub fn run(cmd: ClerkCmd) -> ExitCode {
+/// `wallet` is the group-level `-w` (Go's persistent clerk flag); leaves that
+/// take a wallet thread it in here.
+pub fn run(cmd: ClerkCmd, wallet: Option<String>) -> ExitCode {
     use crate::cli_state::{datadirs, kmddir};
 
     let leaf: &str = match cmd {
         ClerkCmd::Send(args) => {
-            return crate::cmd::clerk::run_send(args, datadirs(), kmddir());
+            return crate::cmd::clerk::run_send(args, wallet, datadirs(), kmddir());
         }
         ClerkCmd::Compile => "compile",
         ClerkCmd::Dryrun => "dryrun",

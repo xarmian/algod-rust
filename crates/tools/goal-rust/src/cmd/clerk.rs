@@ -43,8 +43,13 @@ const ERROR_KMD_UNREACHABLE: &str = "Could not contact kmd; is it running?";
 /// Mirrors Go's `sendCmd` (clerk.go:348-576). LogicSig / program-account
 /// (`--from-program*`, `--logic-sig`, `--argb64`) and `--msig-params` paths are
 /// out of scope and rejected up front (see [`SendArgs`]).
-pub fn run_send(args: SendArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBuf>) -> ExitCode {
-    match run_send_inner(args, cli_d, kmd_dir_flag) {
+pub fn run_send(
+    args: SendArgs,
+    wallet: Option<String>,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    match run_send_inner(args, wallet, cli_d, kmd_dir_flag) {
         Ok(code) => code,
         Err(msg) => {
             eprintln!("{msg}");
@@ -55,6 +60,7 @@ pub fn run_send(args: SendArgs, cli_d: Vec<PathBuf>, kmd_dir_flag: Option<PathBu
 
 fn run_send_inner(
     args: SendArgs,
+    wallet: Option<String>,
     cli_d: Vec<PathBuf>,
     kmd_dir_flag: Option<PathBuf>,
 ) -> Result<ExitCode, String> {
@@ -171,7 +177,7 @@ fn run_send_inner(
                 &rt,
                 kmd,
                 &mut accounts,
-                args.wallet.as_deref(),
+                wallet.as_deref(),
                 args.password.as_deref(),
             )?;
             rt.block_on(pipeline.sign_with_kmd(&handle, &password, &txn))
@@ -202,7 +208,7 @@ fn run_send_inner(
         &rt,
         kmd,
         &mut accounts,
-        args.wallet.as_deref(),
+        wallet.as_deref(),
         args.password.as_deref(),
     )?;
 
