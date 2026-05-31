@@ -245,12 +245,20 @@ where
     participation_keys_round: Round,
     /// The cached participation keys.
     participation_keys: Vec<ParticipationRecord>,
-    /// Per-account signing keys (VRF + OTS secrets), keyed by address.
-    ///
-    /// When an account's signing keys are present in this map, the
-    /// pseudonode produces cryptographically valid VRF proofs and OTS
-    /// signatures. Otherwise, placeholder values are used.
+    /// Statically-registered per-account signing keys (VRF + OTS secrets),
+    /// keyed by address. Used as a fallback when the key manager doesn't supply
+    /// per-round secrets (e.g. tests that inject keys directly). When an
+    /// account's signing keys are present, the pseudonode produces
+    /// cryptographically valid VRF proofs and OTS signatures; otherwise,
+    /// placeholder values are used.
     signing_keys: HashMap<Address, AccountSigningKeys>,
+    /// Per-round signing secrets loaded from the key manager alongside the
+    /// public voting records (keyed by address, rebuilt each round in
+    /// [`Self::load_round_participation_keys`]). Preferred over `signing_keys`
+    /// so secrets track the public records across key validity-window
+    /// boundaries / rotation (TASK-272). Empty when the key manager supplies
+    /// none (then the static `signing_keys` fallback applies).
+    round_signing_keys: HashMap<Address, AccountSigningKeys>,
 }
 
 impl<F, K, L> AsyncPseudonode<F, K, L>
@@ -271,6 +279,7 @@ where
             participation_keys_round: Round(0),
             participation_keys: Vec::new(),
             signing_keys: HashMap::new(),
+            round_signing_keys: HashMap::new(),
         }
     }
 
@@ -311,6 +320,22 @@ where
         self.participation_keys = self.keys.voting_keys(vote_round, balance_round);
         self.participation_keys_round = vote_round;
 
+        // Load per-round signing secrets for the same records, so signing
+        // material tracks the public records across key validity-window
+        // boundaries / rotation. The key manager returns `None` for accounts it
+        // has no secrets for (e.g. test managers), leaving the static
+        // `signing_keys` fallback to apply.
+        let addresses: Vec<Address> = self.participation_keys.iter().map(|r| r.address).collect();
+        self.round_signing_keys.clear();
+        for address in addresses {
+            if let Some(keys) = self
+                .keys
+                .signing_keys_for(&address, vote_round, balance_round)
+            {
+                self.round_signing_keys.insert(address, keys);
+            }
+        }
+
         &self.participation_keys
     }
 
@@ -342,8 +367,13 @@ where
         let mut proposals = Vec::with_capacity(accounts.len());
 
         for acc in accounts {
-            // Look up signing keys for this account.
-            let signing = self.signing_keys.get(&acc.address);
+            // Look up signing keys for this account: prefer the per-round
+            // secrets from the key manager, falling back to statically-
+            // registered keys.
+            let signing = self
+                .round_signing_keys
+                .get(&acc.address)
+                .or_else(|| self.signing_keys.get(&acc.address));
 
             // Create the proposal for this block/account.
             match proposal_for_block(
@@ -407,7 +437,10 @@ where
                 proposal,
             };
 
-            let signing = self.signing_keys.get(&part.address);
+            let signing = self
+                .round_signing_keys
+                .get(&part.address)
+                .or_else(|| self.signing_keys.get(&part.address));
             match make_vote(&rv, part, &self.ledger, signing) {
                 Ok(uv) => votes.push(uv),
                 Err(_) => {

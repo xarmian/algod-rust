@@ -413,6 +413,28 @@ pub trait AgreementKeyManager {
     ///
     /// Mirrors Go's `Record(account, round, participationType)`.
     fn record(&self, account: &Address, round: Round, action: ParticipationAction);
+
+    /// Load the signing secrets (VRF + OTS) for `account`'s participation key
+    /// valid at `voting_round` (selected using `keys_round`'s online state), if
+    /// this key manager has them.
+    ///
+    /// The pseudonode calls this each round it loads voting keys, so the secrets
+    /// track the public records across participation-key validity-window
+    /// boundaries (a key that becomes effective later, or a mid-run rotation) —
+    /// which a one-time statically-registered map cannot. Mirrors go's account
+    /// manager handing per-round `account.Participation` secrets to agreement.
+    ///
+    /// The default returns `None`; the pseudonode then falls back to any keys
+    /// registered via `register_signing_keys`. Implementations backed by a
+    /// participation store (e.g. the node's key-manager bridge) override this.
+    fn signing_keys_for(
+        &self,
+        _account: &Address,
+        _voting_round: Round,
+        _keys_round: Round,
+    ) -> Option<crate::pseudonode::AccountSigningKeys> {
+        None
+    }
 }
 
 /// A participation record for a specific round, containing the address
