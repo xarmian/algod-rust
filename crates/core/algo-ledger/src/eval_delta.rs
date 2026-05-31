@@ -125,6 +125,11 @@ pub fn parse_eval_delta(val: &rmpv::Value) -> Result<EvalDelta, AlgoError> {
 /// deltas are keyed by the account's index in the transaction (sender = 0,
 /// `accounts[i]` = i+1), matching the wire format. Returns `None` when there is
 /// nothing to report (no state changes, logs, or inner transactions).
+///
+/// Inner transactions are serialized as-is. Their *own* nested eval delta
+/// (`itx[*].dt`) is only as complete as the AVM recorded on them — inner app
+/// calls that write state without logging currently carry incomplete nested
+/// deltas (TASK-281); the outer transaction's delta here is complete.
 pub fn encode_eval_delta(
     result: &algo_avm::eval::AvmResult,
     txn: &Transaction,
