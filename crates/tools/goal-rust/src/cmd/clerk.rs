@@ -439,6 +439,14 @@ fn run_sign_inner(
         let mut out = Vec::new();
         for (idx, stxn) in stxns.iter_mut().enumerate() {
             stxn.lsig = Some(lsig.clone());
+            // A LogicSig-authorized txn must carry exactly one signature type.
+            // If the input file already had a top-level ed25519 sig or msig
+            // (e.g. it was re-fed from a signed file), clear them so we don't
+            // emit a dual-signed txn the node rejects with "should only have
+            // one signature". (Go's signCmd assumes an unsigned input here and
+            // leaves these untouched; clearing is the safe superset.)
+            stxn.sig = [0u8; 64];
+            stxn.msig = None;
             if let Some(signer) = signer_addr {
                 if signer == stxn.txn.sender {
                     return Err("AuthAddr cannot be the same as the transaction sender".into());
