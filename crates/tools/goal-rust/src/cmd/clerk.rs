@@ -691,9 +691,560 @@ fn run_tealsign_inner(args: TealsignArgs) -> Result<(), String> {
     Ok(())
 }
 
+// ---- clerk compile --------------------------------------------------------
+
+/// Sentinel filename meaning stdin/stdout in goal (`-`), matching Go's
+/// `stdinFileNameValue` / `stdoutFilenameValue` (common.go:27-28).
+const STDIN_STDOUT: &str = "-";
+
+/// `clerk compile [files...] [-o out] [-n]`.
+///
+/// Mirrors Go's `compileCmd` (clerk.go:1090) output/flag surface. Each input
+/// file's TEAL source is compiled, the raw program bytes are written to
+/// `<file>.tok` (or `-o`/`-`), and the contract address is printed as
+/// `<file>: <address>` unless the output target is stdout.
+///
+/// **Intentional divergence from Go (TASK-291 scope):** Go's `goal clerk
+/// compile` assembles *locally* via `logic.AssembleString` (works offline,
+/// independent of any node), whereas this leaf is specified to compile via the
+/// node's `POST /v2/teal/compile` endpoint. Consequences, by design:
+/// it requires a reachable algod data dir + a running node, and the node must
+/// have `EnableDeveloperAPI=true` (else the endpoint 404s, surfaced here as
+/// `Could not assemble: ...`).
+/// Compiling against the node guarantees the produced bytecode matches the
+/// exact assembler the target node runs; the assembler itself
+/// (`algo_avm::assembler`) is byte-identical to go-algorand's, so for a given
+/// program the result equals Go's local-compile output (verified for parity).
+pub fn run_compile(args: crate::groups::clerk::CompileArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    match run_compile_inner(args, cli_d) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_compile_inner(
+    args: crate::groups::clerk::CompileArgs,
+    cli_d: Vec<PathBuf>,
+) -> Result<(), String> {
+    // With no input files Go's compileCmd iterates an empty list — a no-op that
+    // never contacts a node. Mirror that and skip data-dir/client setup.
+    if args.files.is_empty() {
+        return Ok(());
+    }
+    let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
+    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Error processing command: {e}"))?;
+
+    for fname in &args.files {
+        let fname_str = fname.to_string_lossy().to_string();
+        // Resolve the output target the same way Go does (clerk.go:1100-1108):
+        // -o wins; else stdout for stdin source, else "<file>.tok".
+        let outname = match args.outfile.as_deref() {
+            Some(o) => o.to_string(),
+            None => {
+                if fname_str == STDIN_STDOUT {
+                    STDIN_STDOUT.to_string()
+                } else {
+                    format!("{fname_str}.tok")
+                }
+            }
+        };
+        let should_print_address = outname != STDIN_STDOUT;
+
+        // Read the TEAL source (stdin for "-").
+        let source = if fname_str == STDIN_STDOUT {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("{fname_str}: {e}"))?;
+            buf
+        } else {
+            std::fs::read(fname).map_err(|e| format!("{fname_str}: {e}"))?
+        };
+
+        // Compile via the node. A 404 means the node has the developer API
+        // disabled; surface it like Go's "Could not assemble".
+        let result = rt
+            .block_on(algod.teal_compile(&source))
+            .map_err(|e| format!("Could not assemble: {e}"))?;
+        let program = base64::engine::general_purpose::STANDARD
+            .decode(&result.result)
+            .map_err(|e| format!("{fname_str}: node returned an undecodable program: {e}"))?;
+
+        // Write the binary program unless --no-out (clerk.go:1138-1143).
+        if !args.no_out {
+            if outname == STDIN_STDOUT {
+                use std::io::Write;
+                std::io::stdout()
+                    .write_all(&program)
+                    .map_err(|e| format!("{outname}: {e}"))?;
+            } else {
+                // Go writes the compile output with 0666 perms (clerk.go:1140).
+                std::fs::write(&outname, &program).map_err(|e| format!("{outname}: {e}"))?;
+            }
+        }
+
+        // Print "<file>: <address>" unless writing to stdout (clerk.go:1157-1161).
+        // The node already returns the program hash as an Algorand address.
+        if should_print_address {
+            println!("{fname_str}: {}", result.hash);
+        }
+    }
+    Ok(())
+}
+
+// ---- clerk dryrun (dump) --------------------------------------------------
+
+/// go-algorand's `defaultAppIdx` placeholder used for app-create dryruns, since
+/// app id 0 is not acceptable to the ledger in dryrun/debugger (libgoal.go:1130).
+const DEFAULT_APP_IDX: u64 = 1380011588;
+
+/// `clerk dryrun -t <txfile> -o <out> --dryrun-dump [--dryrun-dump-format json]
+/// [--dryrun-accounts a,b] [-P proto]`.
+///
+/// Mirrors Go's `dryrunCmd` (clerk.go:1167) dump path via
+/// `libgoal.MakeDryrunStateGenerated` (libgoal.go:1163): decode the txns from
+/// the file, gather the referenced app + account state from the node, and write
+/// the resulting `DryrunRequest` as JSON to `-o`. Only the `--dryrun-dump`
+/// (JSON) path is supported (see [`crate::groups::clerk::DryrunArgs`]).
+pub fn run_dryrun(args: crate::groups::clerk::DryrunArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    match run_dryrun_inner(args, cli_d) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_dryrun_inner(
+    args: crate::groups::clerk::DryrunArgs,
+    cli_d: Vec<PathBuf>,
+) -> Result<(), String> {
+    if !args.dryrun_dump {
+        return Err(
+            "goal-rust clerk dryrun only supports the --dryrun-dump path; pass --dryrun-dump to \
+             write a dryrun request object (the local TEAL-eval mode is not ported)"
+                .to_string(),
+        );
+    }
+    if args.dryrun_dump_format != "json" {
+        return Err(format!(
+            "goal-rust clerk dryrun only supports --dryrun-dump-format json (got {})",
+            args.dryrun_dump_format
+        ));
+    }
+
+    let data = std::fs::read(&args.txfile)
+        .map_err(|e| format!("Cannot read file {}: {e}", args.txfile.display()))?;
+    let stxns = decode_signed_txn_stream(&data).map_err(|e| {
+        format!(
+            "Cannot decode transactions from {}: {e}",
+            args.txfile.display()
+        )
+    })?;
+
+    // Resolve extra accounts (Go's util.Map(dumpForDryrunAccts, cliAddress)):
+    // plain Algorand addresses or `app(<id>)` references.
+    let mut other_accts: Vec<[u8; 32]> = Vec::new();
+    for acct in &args.dryrun_accounts {
+        other_accts.push(parse_cli_address(acct)?);
+    }
+
+    let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
+    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Error processing command: {e}"))?;
+
+    // proto: -P wins, else fall back to the node's suggested consensus version
+    // (Go's getProto, clerk.go:760-784).
+    let proto = match args.proto.clone() {
+        Some(p) if !p.is_empty() => p,
+        _ => rt
+            .block_on(algod.suggested_transaction_params())
+            .map(|p| p.consensus_version.clone())
+            .map_err(|e| format!("Could not fetch suggested params for proto: {e}"))?,
+    };
+
+    let dump = rt.block_on(build_dryrun_state(&algod, &stxns, &other_accts, &proto))?;
+    let bytes =
+        serde_json::to_vec(&dump).map_err(|e| format!("Cannot encode dryrun request: {e}"))?;
+    write_file_0600(&args.outfile, &bytes)?;
+    Ok(())
+}
+
+/// Build the JSON dryrun-request object, mirroring
+/// `libgoal.MakeDryrunStateGenerated` (libgoal.go:1163). Each app-call txn pulls
+/// in its referenced apps (created-app params from the txn, foreign apps from
+/// the node), the sender + foreign + app-address accounts, and the round /
+/// timestamp / protocol-version context.
+///
+/// **JSON convention (intentional, vs go-algorand):** the `txns` entries are
+/// encoded with this workspace's serde JSON for `SignedTransaction` — i.e. the
+/// exact value the Rust node's `/v2/teal/dryrun` JSON path decodes via
+/// `serde_json::from_value::<SignedTransaction>` — *not* go-algorand's
+/// `protocol.EncodeJSON`. The two differ on byte/address fields (serde renders
+/// `[]byte`/`Address` as integer arrays; Go's `codecgen` JSON renders base64 /
+/// checksum strings), so a dump produced here targets the Rust node (the node
+/// goal-rust talks to), where it round-trips exactly — verified end-to-end via
+/// `clerk dryrun --dryrun-dump` → `clerk dryrun-remote` against
+/// `algod-rust node start --dev`. It is NOT wire-interchangeable with a
+/// go-algorand algod's dryrun JSON, which reflects the nodes' differing
+/// JSON conventions for these types rather than anything specific to this leaf.
+/// (The accounts/apps entries below are passed through verbatim from the same
+/// Rust node's `/v2/accounts` and `/v2/applications` responses, so they match
+/// the request's typed `AccountResponse`/`ApiApplication` fields by
+/// construction.)
+async fn build_dryrun_state(
+    algod: &algo_rest_client::AlgodClient,
+    stxns: &[SignedTransaction],
+    other_accts: &[[u8; 32]],
+    proto: &str,
+) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+
+    // txns: each SignedTxn JSON-encoded the same way the Rust node decodes them
+    // (serde_json::from_value::<SignedTransaction>), so serde round-trips. See
+    // the JSON-convention note on this fn for why this is not Go's
+    // protocol.EncodeJSON.
+    let mut txns_json = Vec::with_capacity(stxns.len());
+    for stxn in stxns {
+        txns_json.push(
+            serde_json::to_value(stxn)
+                .map_err(|e| format!("Cannot encode transaction for dryrun: {e}"))?,
+        );
+    }
+
+    let mut apps_json: Vec<serde_json::Value> = Vec::new();
+    let mut accounts_json: Vec<serde_json::Value> = Vec::new();
+    let mut has_app_call = false;
+    let mut round = 0u64;
+    let mut latest_timestamp = 0i64;
+
+    for stxn in stxns {
+        let tx = &stxn.txn;
+        if tx.txn_type != algo_types::TxnType::Appl {
+            continue;
+        }
+        has_app_call = true;
+
+        // accounts = txn.Accounts ++ [Sender] ++ otherAccts (libgoal.go:1191).
+        let mut accounts: Vec<[u8; 32]> = Vec::new();
+        if let Some(accts) = tx.accounts.as_ref() {
+            accounts.extend(accts.iter().map(|a| a.0));
+        }
+        accounts.push(tx.sender.0);
+        accounts.extend_from_slice(other_accts);
+
+        // apps = [ApplicationID] ++ ForeignApps (libgoal.go:1196).
+        let mut apps: Vec<u64> = vec![tx.application_id];
+        if let Some(fa) = tx.foreign_apps.as_ref() {
+            apps.extend_from_slice(fa);
+        }
+
+        for app_idx in apps {
+            if app_idx == 0 {
+                // App-create: params come from the txn; id is the placeholder.
+                let params = create_app_params_json(tx);
+                apps_json.push(json!({ "id": DEFAULT_APP_IDX, "params": params }));
+            } else {
+                // Existing app: fetch params from the node, and include the
+                // app's own account (libgoal.go:1210-1219).
+                let app = algod
+                    .get_application_json(app_idx)
+                    .await
+                    .map_err(|e| format!("Could not fetch application {app_idx}: {e}"))?;
+                let params = app
+                    .get("params")
+                    .cloned()
+                    .ok_or_else(|| format!("application {app_idx} response had no params"))?;
+                apps_json.push(json!({ "id": app_idx, "params": params }));
+                accounts.push(app_index_address(app_idx));
+            }
+        }
+
+        // Fetch each referenced account; ignore lookup failures (unfunded app
+        // addresses), matching libgoal.go:1223-1230.
+        for acc in accounts {
+            let addr = algo_types::Address(acc).to_algorand_string();
+            if let Ok(info) = algod.get_account_json(&addr).await {
+                accounts_json.push(info);
+            }
+        }
+
+        // Round + latest timestamp from the node (libgoal.go:1232-1239).
+        round = algod
+            .current_round()
+            .await
+            .map_err(|e| format!("Could not fetch current round: {e}"))?;
+        latest_timestamp = algod
+            .block_timestamp(round)
+            .await
+            .map_err(|e| format!("Could not fetch block {round}: {e}"))?;
+    }
+
+    // Go only assigns proto/round/timestamp inside the app-call loop
+    // (libgoal.go:1232-1239); with no app calls they stay empty/zero and the
+    // node fills its own defaults on dryrun. Preserve that.
+    let proto_field = if has_app_call { proto } else { "" };
+    Ok(json!({
+        "accounts": accounts_json,
+        "apps": apps_json,
+        "latest-timestamp": latest_timestamp,
+        "protocol-version": proto_field,
+        "round": round,
+        "sources": serde_json::Value::Array(Vec::new()),
+        "txns": txns_json,
+    }))
+}
+
+/// Build the `model.ApplicationParams`-shaped JSON for an app-create txn from
+/// its own fields (libgoal.go:1200-1210).
+fn create_app_params_json(tx: &algo_types::Transaction) -> serde_json::Value {
+    use serde_json::json;
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let approval = tx
+        .approval_program
+        .as_deref()
+        .map(|p| &p[..])
+        .unwrap_or(&[]);
+    let clear = tx
+        .clear_state_program
+        .as_deref()
+        .map(|p| &p[..])
+        .unwrap_or(&[]);
+    let gschema = tx.global_state_schema.clone().unwrap_or_default();
+    let lschema = tx.local_state_schema.clone().unwrap_or_default();
+    json!({
+        "approval-program": b64(approval),
+        "clear-state-program": b64(clear),
+        "creator": tx.sender.to_algorand_string(),
+        "global-state-schema": {
+            "num-uint": gschema.num_uint,
+            "num-byte-slice": gschema.num_byte_slice,
+        },
+        "local-state-schema": {
+            "num-uint": lschema.num_uint,
+            "num-byte-slice": lschema.num_byte_slice,
+        },
+    })
+}
+
+/// Parse a `--dryrun-accounts` entry: an Algorand address or an `app(<id>)`
+/// reference (Go's `cliAddress`, application.go:371).
+fn parse_cli_address(acct: &str) -> Result<[u8; 32], String> {
+    if let Some(inner) = acct.strip_prefix("app(").and_then(|s| s.strip_suffix(')')) {
+        let app_id: u64 = inner
+            .parse()
+            .map_err(|e| format!("Cannot parse app id from {acct}: {e}"))?;
+        return Ok(app_index_address(app_id));
+    }
+    Address::from_algorand_string(acct)
+        .map(|a| a.0)
+        .map_err(|e| format!("Cannot parse address {acct}: {e}"))
+}
+
+/// Compute an application's account address: `SHA512/256("appID" || app_id_be)`,
+/// matching go-algorand's `basics.AppIndex.Address()`.
+fn app_index_address(app_id: u64) -> [u8; 32] {
+    use sha2::{Digest as _, Sha512_256};
+    let mut hasher = Sha512_256::new();
+    hasher.update(b"appID");
+    hasher.update(app_id.to_be_bytes());
+    hasher.finalize().into()
+}
+
+// ---- clerk dryrun-remote --------------------------------------------------
+
+/// `clerk dryrun-remote -D <state-file> [-v] [-r]`.
+///
+/// Mirrors Go's `dryrunRemoteCmd` (clerk.go:1230): POST the dryrun request
+/// object to `POST /v2/teal/dryrun` and print the per-transaction messages (and,
+/// with `-v`, the trace), or the raw JSON with `-r`.
+pub fn run_dryrun_remote(
+    args: crate::groups::clerk::DryrunRemoteArgs,
+    cli_d: Vec<PathBuf>,
+) -> ExitCode {
+    match run_dryrun_remote_inner(args, cli_d) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_dryrun_remote_inner(
+    args: crate::groups::clerk::DryrunRemoteArgs,
+    cli_d: Vec<PathBuf>,
+) -> Result<(), String> {
+    let data = std::fs::read(&args.dryrun_state)
+        .map_err(|e| format!("Cannot read file {}: {e}", args.dryrun_state.display()))?;
+
+    let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
+    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Error processing command: {e}"))?;
+
+    let resp = rt
+        .block_on(algod.teal_dryrun(&data))
+        .map_err(|e| format!("dryrun-remote: {e}"))?;
+
+    if args.raw {
+        // Go prints the raw response JSON with no trailing newline.
+        let rendered = serde_json::to_string(&resp).map_err(|e| format!("dryrun-remote: {e}"))?;
+        print!("{rendered}");
+        return Ok(());
+    }
+
+    print_dryrun_response(&resp, args.verbose);
+    Ok(())
+}
+
+/// Print a dryrun response in Go's `dryrun-remote` text format
+/// (clerk.go:1252-1290): per-txn budget lines, app-call-or-logicsig messages,
+/// and (with `-v`) the trace as `<line> (<pc>): <disassembly> [<stack>]`.
+fn print_dryrun_response(resp: &serde_json::Value, verbose: bool) {
+    let txns = match resp.get("txns").and_then(|t| t.as_array()) {
+        Some(t) => t,
+        None => return,
+    };
+    for (i, txn) in txns.iter().enumerate() {
+        // Prefer app-call messages/trace; fall back to logic-sig (clerk.go:1262-1271).
+        let (msgs, trace) = {
+            let app_msgs = txn.get("app-call-messages").and_then(|m| m.as_array());
+            if app_msgs.is_some_and(|m| !m.is_empty()) {
+                (
+                    app_msgs,
+                    txn.get("app-call-trace").and_then(|t| t.as_array()),
+                )
+            } else {
+                (
+                    txn.get("logic-sig-messages").and_then(|m| m.as_array()),
+                    txn.get("logic-sig-trace").and_then(|t| t.as_array()),
+                )
+            }
+        };
+
+        if let Some(b) = txn.get("budget-consumed").and_then(|b| b.as_u64()) {
+            println!("tx[{i}] budget consumed: {b}");
+        }
+        if let Some(b) = txn.get("budget-added").and_then(|b| b.as_u64()) {
+            println!("tx[{i}] budget added: {b}");
+        }
+
+        println!("tx[{i}] messages:");
+        if let Some(msgs) = msgs {
+            for msg in msgs {
+                if let Some(s) = msg.as_str() {
+                    println!("{s}");
+                }
+            }
+        }
+
+        if verbose {
+            if let Some(trace) = trace.filter(|t| !t.is_empty()) {
+                let disassembly = txn.get("disassembly").and_then(|d| d.as_array());
+                println!("tx[{i}] trace:");
+                for item in trace {
+                    let line = item.get("line").and_then(|l| l.as_u64()).unwrap_or(0);
+                    let pc = item.get("pc").and_then(|p| p.as_u64()).unwrap_or(0);
+                    // `disassembly[line - 1]`, verbatim from Go's dryrunRemoteCmd
+                    // (clerk.go:1284: `txnResult.Disassembly[item.Line-1]`). Go's
+                    // dryrun reports a 1-based `line` over the full disassembly
+                    // (the `#pragma` is line 1), so `line - 1` lands on the
+                    // executed opcode. NOTE: the Rust node's dryrun currently
+                    // emits `line = instruction_index + 1` (pragma = line 0),
+                    // which is one less than go-algorand for the same step — so
+                    // against today's Rust node this can render the source line
+                    // shifted by one. That is a node-side `offset_to_line`
+                    // discrepancy (algo-rest-api/dryrun.rs), not a CLI bug:
+                    // matching Go's `line - 1` here keeps goal-rust correct
+                    // against go-algorand and against a node fixed to Go's
+                    // convention. Tracked as a separate (deferred) node concern.
+                    let src = disassembly
+                        .and_then(|d| line.checked_sub(1).and_then(|idx| d.get(idx as usize)))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let stack = item
+                        .get("stack")
+                        .and_then(|s| s.as_array())
+                        .map(|s| stack_to_string(s))
+                        .unwrap_or_default();
+                    println!("{line:4} ({pc:04x}): {src} [{stack}]");
+                }
+            }
+        }
+    }
+}
+
+/// Render a dryrun trace stack the way Go's `stackToString` does
+/// (clerk.go:1244-1255): uints as decimal, byte values heuristically formatted.
+/// In our model bytes arrive base64-encoded; decode before formatting.
+fn stack_to_string(stack: &[serde_json::Value]) -> String {
+    let mut parts = Vec::with_capacity(stack.len());
+    for sv in stack {
+        let ty = sv.get("type").and_then(|t| t.as_u64()).unwrap_or(0);
+        // TealBytesType == 1 in go-algorand's basics.TealType.
+        if ty == 1 {
+            let b64 = sv.get("bytes").and_then(|b| b.as_str()).unwrap_or("");
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap_or_default();
+            parts.push(heuristic_format_str(&raw));
+        } else {
+            let u = sv.get("uint").and_then(|u| u.as_u64()).unwrap_or(0);
+            parts.push(u.to_string());
+        }
+    }
+    parts.join(" ")
+}
+
+/// Mirrors Go's `heuristicFormatStr` (formatting.go:164): printable ASCII (the
+/// htmlSafeSet, excluding `<`, `>`, `&`, `\`) is shown as-is; an otherwise
+/// opaque 32-byte blob renders as an Algorand address; anything else is shown
+/// as a lossy UTF-8 string (Go returns the raw bytes as a Go string).
+fn heuristic_format_str(raw: &[u8]) -> String {
+    if json_printable(raw) {
+        return String::from_utf8_lossy(raw).into_owned();
+    }
+    if raw.len() == 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(raw);
+        return Address(arr).to_algorand_string();
+    }
+    String::from_utf8_lossy(raw).into_owned()
+}
+
+/// True if every byte is in Go's `htmlSafeSet` (formatting.go:34-152): printable
+/// ASCII excluding `<` (0x3c), `>` (0x3e), `&` (0x26), and `\` (0x5c).
+fn json_printable(raw: &[u8]) -> bool {
+    raw.iter().all(|&b| {
+        b.is_ascii() && !b.is_ascii_control() && b != b'<' && b != b'>' && b != b'&' && b != b'\\'
+    })
+}
+
 /// Write `data` to `path` with `0600` perms, mirroring Go's `writeFile(..,
-/// 0600)` used by the signing paths.
+/// 0600)` (commands.go:510) used by the signing + dryrun-dump paths. As in Go,
+/// the path `-` (`stdoutFilenameValue`) writes to stdout instead of a file.
 fn write_file_0600(path: &Path, data: &[u8]) -> Result<(), String> {
+    if path.as_os_str() == STDIN_STDOUT {
+        use std::io::Write;
+        return std::io::stdout()
+            .write_all(data)
+            .map_err(|e| format!("Cannot write to stdout: {e}"));
+    }
     std::fs::write(path, data).map_err(|e| format!("Cannot write file {}: {e}", path.display()))?;
     #[cfg(unix)]
     {
@@ -1522,6 +2073,83 @@ mod tests {
             json["txn"]["apar"]["m"].as_str().unwrap(),
             Address([0x11; 32]).to_algorand_string()
         );
+    }
+
+    #[test]
+    fn app_index_address_matches_known_vector() {
+        // basics.AppIndex(0).Address() = SHA512_256("appID" || 0u64-be), which
+        // is the contract address of an app with id 0. Cross-check against the
+        // well-known constant for app id 1 from go-algorand test vectors:
+        // app id 1 → WCS6TVPJRBSARHLN2326LRU5BYVJZUKI2VJ53CAWKYYHDE455ZGKANWMGM.
+        let addr = Address(app_index_address(1)).to_algorand_string();
+        assert_eq!(
+            addr,
+            "WCS6TVPJRBSARHLN2326LRU5BYVJZUKI2VJ53CAWKYYHDE455ZGKANWMGM"
+        );
+    }
+
+    #[test]
+    fn parse_cli_address_handles_app_and_plain() {
+        // app(<id>) → the app's contract address.
+        let app = parse_cli_address("app(1)").expect("app() parses");
+        assert_eq!(app, app_index_address(1));
+        // A plain address round-trips.
+        let plain = Address([0x42; 32]).to_algorand_string();
+        assert_eq!(parse_cli_address(&plain).expect("addr parses"), [0x42; 32]);
+        // Garbage fails.
+        assert!(parse_cli_address("not-an-address").is_err());
+    }
+
+    #[test]
+    fn heuristic_format_str_matches_go() {
+        // Printable ASCII shown as-is.
+        assert_eq!(heuristic_format_str(b"hello"), "hello");
+        // A 32-byte opaque blob renders as an Algorand address.
+        let blob = [0xABu8; 32];
+        assert_eq!(
+            heuristic_format_str(&blob),
+            Address(blob).to_algorand_string()
+        );
+        // htmlSafeSet excludes '<', '>', '&', '\\' → not "json printable".
+        assert!(!json_printable(b"a<b"));
+        assert!(!json_printable(b"a&b"));
+        assert!(json_printable(b"plain text 123 (ok)"));
+    }
+
+    #[test]
+    fn write_file_0600_dash_goes_to_stdout_not_a_file() {
+        // `-` must write to stdout (Go's writeFile), never create a file named
+        // "-" in the cwd.
+        let cwd = std::env::current_dir().expect("cwd");
+        let dash = cwd.join("-");
+        let pre_existing = dash.exists();
+        write_file_0600(Path::new("-"), b"to-stdout").expect("stdout write ok");
+        // We didn't create a `-` file (unless one already existed before).
+        if !pre_existing {
+            assert!(
+                !dash.exists(),
+                "write_file_0600(\"-\") must not create a file"
+            );
+        }
+        // A real path still writes a file.
+        let tmp = std::env::temp_dir().join(format!("task291-wf-{}.bin", std::process::id()));
+        write_file_0600(&tmp, b"hello").expect("file write ok");
+        assert_eq!(std::fs::read(&tmp).expect("read back"), b"hello");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn stack_to_string_formats_uint_and_bytes() {
+        use base64::Engine as _;
+        let stack = vec![
+            serde_json::json!({ "type": 2, "uint": 42, "bytes": "" }),
+            serde_json::json!({
+                "type": 1,
+                "uint": 0,
+                "bytes": base64::engine::general_purpose::STANDARD.encode(b"hi"),
+            }),
+        ];
+        assert_eq!(stack_to_string(&stack), "42 hi");
     }
 
     #[test]
