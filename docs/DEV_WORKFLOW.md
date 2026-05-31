@@ -98,6 +98,63 @@ docker exec algod-go goal account list -d /algod/data
 docker exec algod-go goal account list -d /algod/data | head -1 | awk '{print $2}'
 ```
 
+## Rust Localnet (Docker)
+
+A drop-in alternative to the `algod-go` localnet that runs the **Rust** node
+(`algod-rust node start --dev`) in docker. Genesis (`devmode: true`) and config
+are baked into the image; dev mode produces one block per submitted transaction
+group, so a fresh `up` is immediately ready for `goal clerk send`.
+
+```bash
+make localnet-rust-up      # Build the image + start the Rust dev node (port 4001)
+make localnet-rust-status  # Query /v2/status
+make localnet-rust-logs    # Tail the node logs
+make localnet-rust-down    # Stop and remove volumes
+```
+
+The node serves the algod v2 REST API on `http://localhost:4001` with the same
+fixed token as the Go localnet
+(`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`), so existing
+tooling and scripts point at it unchanged. The first `make localnet-rust-up`
+build compiles the Rust workspace in release mode and can take 10–20 minutes;
+subsequent builds reuse the docker layer cache.
+
+### Driving it with `goal` / `goal-rust`
+
+`node status` against the mounted data dir works once the container is up:
+
+```bash
+docker exec algod-rust-localnet \
+    algod-rust node start --help    # the running node; or use goal/goal-rust:
+goal-rust -d <mounted-datadir> node status
+```
+
+The data dir inside the container is `/algod/data`. Because `goal` reads
+`algod.net` / `algod.token` from the data dir, point `goal -d` at a copy of the
+container's data dir (the token is the fixed `aaaa…` value above) or talk to the
+REST endpoint directly with `curl`.
+
+### The funded dev account
+
+The baked genesis funds a single dev account so you can sign and submit
+transactions immediately:
+
+- **Address:** `E4A7NFAARAKFG4ZK7KQ7VZBO5XEQIUKBK2U3KNLAFTX6R3HTJBFG75MQZE`
+- **Mnemonic (25 words):**
+  `under this above produce during card issue fire gloom reopen topple rough cat smooth salad put broken decade vocal loud pulp gauge hurdle absorb olympic`
+
+Import it to sign transactions:
+
+```bash
+goal-rust account import -m "under this above produce during card issue fire gloom reopen topple rough cat smooth salad put broken decade vocal loud pulp gauge hurdle absorb olympic"
+# or with the Go toolchain:
+algokey import -m "under this above produce …" -f dev.key
+```
+
+This account is for **local development only** — never fund it on a public
+network. The staged data dir lives at `docker/localnet-rust/data/` and the
+image is built from the `localnet` target in `docker/Dockerfile`.
+
 ## Regenerating Test Fixtures
 
 The easiest way is the all-in-one pipeline:

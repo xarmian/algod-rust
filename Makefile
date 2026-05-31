@@ -1,6 +1,7 @@
 ALGOD_TOKEN := aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ALGOD_URL := http://localhost:4001
 COMPOSE := docker compose -f docker/docker-compose.yml
+COMPOSE_RUST := docker compose -f docker/docker-compose.localnet-rust.yml
 COMPOSE_RELAY := docker compose -f docker/docker-compose.test-relay.yml
 COMPOSE_MIXED := docker compose -f docker/docker-compose.mixed-cluster.yml
 PHASE6_CLUSTER := ops/mixed-cluster
@@ -11,6 +12,7 @@ PHASE6_CLUSTER := ops/mixed-cluster
 .PHONY: bench-rust bench-decode bench-go bench-micro bench-micro-go bench-cluster benchmark
 .PHONY: archival-up archival-down
 .PHONY: localnet-up localnet-down localnet-status localnet-logs algokey-e2e
+.PHONY: localnet-rust-up localnet-rust-down localnet-rust-status localnet-rust-logs
 .PHONY: capture validate validate-only generate-txns fixtures help
 .PHONY: generate-diverse-txns fixtures-diverse
 .PHONY: canonical-extract extract-trackerdb-fixtures
@@ -64,6 +66,31 @@ localnet-status:
 
 localnet-logs:
 	$(COMPOSE) logs -f algod-go
+
+## ── Localnet (Rust, Docker) ───────────────────────────────────
+## Boots the Rust `algod-rust node start --dev` daemon in docker as a drop-in
+## alternative to the `algod-go` localnet. Genesis (devmode + funded dev
+## account) and config are baked into the image; dev mode produces a block per
+## submitted transaction group, so a fresh `up` is ready for `goal clerk send`.
+## See docs/DEV_WORKFLOW.md for the dev-account mnemonic and `goal` workflow.
+
+localnet-rust-up:
+	$(COMPOSE_RUST) up -d --build algod-rust-localnet
+	@echo "Waiting for algod-rust-localnet to be healthy..."
+	@until docker inspect --format='{{.State.Health.Status}}' algod-rust-localnet 2>/dev/null | grep -q healthy; do \
+		sleep 1; \
+	done
+	@echo "algod-rust-localnet is healthy — REST API on http://localhost:4001"
+
+localnet-rust-down:
+	$(COMPOSE_RUST) down -v
+
+localnet-rust-status:
+	@curl -s $(ALGOD_URL)/v2/status \
+		-H "X-Algo-API-Token: $(ALGOD_TOKEN)" | python3 -m json.tool
+
+localnet-rust-logs:
+	$(COMPOSE_RUST) logs -f algod-rust-localnet
 
 ## algokey-rust end-to-end suite against a live algod-go localnet (PLAN-183 Phase D).
 ## Brings the localnet up, runs the smoke + keyreg + compat-matrix tests,
@@ -495,6 +522,12 @@ help:
 	@echo "  make localnet-down    Stop devnet and remove volumes"
 	@echo "  make localnet-status  Query node status"
 	@echo "  make localnet-logs    Tail algod-go logs"
+	@echo ""
+	@echo "Localnet (Rust, Docker):"
+	@echo "  make localnet-rust-up      Start Rust dev node (algod-rust node start --dev)"
+	@echo "  make localnet-rust-down    Stop Rust dev node and remove volumes"
+	@echo "  make localnet-rust-status  Query Rust node status (port 4001)"
+	@echo "  make localnet-rust-logs    Tail algod-rust-localnet logs"
 	@echo ""
 	@echo "algokey-rust E2E:"
 	@echo "  make algokey-e2e      Bring up localnet, run algokey-rust e2e suite (smoke +"

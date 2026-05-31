@@ -45,6 +45,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      target: runtime
     container_name: algod-rust
     depends_on:
       algod-go:
