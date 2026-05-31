@@ -1873,6 +1873,14 @@ pub struct SqliteLedger {
     db_prefix: Option<std::path::PathBuf>,
     /// In-memory lease table (leases are short-lived, no persistence needed).
     lease_table: LeaseTable,
+    /// Snapshot of `lease_table` taken at `begin_block`, restored by
+    /// `rollback_block`. The SQLite/trie rollback does not cover the in-memory
+    /// lease table, so without this a partially-applied-then-rolled-back block
+    /// (e.g. a group whose later transaction fails under Execute mode) would
+    /// leave the earlier transactions' leases recorded, rejecting future
+    /// transactions that reuse them as duplicates until expiry. `None` outside a
+    /// `begin_block`/`commit_block` span.
+    lease_snapshot: Option<LeaseTable>,
     /// Cached chain-level state (loaded from DB, flushed on commit).
     current_round: Round,
     rewards_level: u64,
@@ -2194,6 +2202,7 @@ impl SqliteLedger {
             conn,
             db_prefix,
             lease_table: LeaseTable::new(),
+            lease_snapshot: None,
             current_round,
             rewards_level,
             rewards_rate,
@@ -2506,6 +2515,9 @@ impl SqliteLedger {
             .map_err(|e| AlgoError::Ledger {
                 message: format!("begin block error: {e}"),
             })?;
+        // Snapshot the in-memory lease table so rollback_block can restore it —
+        // the SQLite/trie transaction does not cover it.
+        self.lease_snapshot = Some(self.lease_table.clone());
         self.in_block = true;
         Ok(())
     }
@@ -2783,6 +2795,8 @@ impl SqliteLedger {
             .map_err(|e| AlgoError::Ledger {
                 message: format!("commit block error: {e}"),
             })?;
+        // The committed lease changes stand; discard the rollback snapshot.
+        self.lease_snapshot = None;
         self.in_block = false;
         Ok(())
     }
@@ -2792,6 +2806,13 @@ impl SqliteLedger {
     pub fn rollback_block(&mut self) -> Result<(), AlgoError> {
         // Clear pre-mutation records — they are for the rolled-back block.
         self.pre_mutations.clear();
+
+        // Restore the in-memory lease table to its pre-block state — the SQLite
+        // ROLLBACK below does not cover it, so leases recorded by partially-
+        // applied transactions must be undone or they poison future submissions.
+        if let Some(snapshot) = self.lease_snapshot.take() {
+            self.lease_table = snapshot;
+        }
 
         self.conn
             .execute_batch("ROLLBACK")
@@ -5770,6 +5791,47 @@ mod tests {
         assert!(ledger.check_lease(&sender, &lease, 100).is_err());
         ledger.purge_expired_leases(201);
         assert!(ledger.check_lease(&sender, &lease, 100).is_ok());
+    }
+
+    #[test]
+    fn rollback_block_restores_lease_table() {
+        // A lease recorded during a block that is then rolled back must not
+        // persist — the SQLite ROLLBACK does not cover the in-memory lease
+        // table, so begin_block snapshots it and rollback_block restores it.
+        // Otherwise a partially-applied-then-failed block would wedge future
+        // transactions that reuse the lease (Codex PR #410).
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let sender = Address([7u8; 32]);
+        let lease = [0xAB; 32];
+
+        ledger.begin_block().unwrap();
+        ledger.record_lease(&sender, &lease, 1000);
+        // Within the block the lease is active (a reuse would be rejected).
+        assert!(ledger.check_lease(&sender, &lease, 100).is_err());
+        ledger.rollback_block().unwrap();
+
+        // After rollback the lease is gone — reusable.
+        assert!(
+            ledger.check_lease(&sender, &lease, 100).is_ok(),
+            "rolled-back lease must not persist",
+        );
+    }
+
+    #[test]
+    fn commit_block_keeps_lease_table() {
+        // Committed lease changes stand (the snapshot is discarded, not restored).
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        let sender = Address([8u8; 32]);
+        let lease = [0xCD; 32];
+
+        ledger.begin_block().unwrap();
+        ledger.record_lease(&sender, &lease, 1000);
+        ledger.commit_block().unwrap();
+
+        assert!(
+            ledger.check_lease(&sender, &lease, 100).is_err(),
+            "committed lease must persist",
+        );
     }
 
     #[test]
