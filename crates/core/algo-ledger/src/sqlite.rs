@@ -2966,28 +2966,36 @@ impl SqliteLedger {
     /// The mixed cluster's online-stake composition is static for the
     /// lifetime of a soak (Wallet1/2/3 online, Wallet4 offline, no txns
     /// change this), so a one-time seed from genesis allocations is
-    /// correct for the harness. Reward-unit and rewards-level columns
-    /// are set to zero — they aren't consumed by the verifier path we
-    /// care about. This is intentionally a coarser-grained write than
-    /// the catchpoint importer's version.
+    /// correct for the harness. Per-status reward-unit columns are seeded
+    /// from the caller (go's `AccountTotals.RewardUnits()` feeds the
+    /// per-round rewards-level advance); the rewards-level column is left
+    /// zero (genesis level). This is intentionally a coarser-grained write
+    /// than the catchpoint importer's version.
     ///
     /// Safe to call multiple times; it `INSERT OR REPLACE`s the row.
+    #[allow(clippy::too_many_arguments)]
     pub fn put_account_totals_seed(
         &mut self,
         online_money: u64,
+        online_reward_units: u64,
         offline_money: u64,
+        offline_reward_units: u64,
         not_participating_money: u64,
+        not_participating_reward_units: u64,
     ) -> Result<(), AlgoError> {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO accounttotals(id, online, onlinerewardunits, \
                  offline, offlinerewardunits, notparticipating, \
                  notparticipatingrewardunits, rewardslevel) \
-                 VALUES('', ?1, 0, ?2, 0, ?3, 0, 0)",
+                 VALUES('', ?1, ?2, ?3, ?4, ?5, ?6, 0)",
                 params![
                     online_money as i64,
+                    online_reward_units as i64,
                     offline_money as i64,
+                    offline_reward_units as i64,
                     not_participating_money as i64,
+                    not_participating_reward_units as i64,
                 ],
             )
             .map_err(|e| AlgoError::Ledger {
@@ -4876,8 +4884,8 @@ mod tests {
     #[test]
     fn total_reward_units_sums_online_and_offline() {
         // go's AccountTotals.RewardUnits() = Online.RewardUnits + Offline.RewardUnits
-        // (NotParticipating excluded). Seed the row directly since
-        // put_account_totals_seed zeroes the reward-unit columns.
+        // (NotParticipating excluded). Seed the row directly with distinct
+        // per-status reward-unit counts to isolate the SUM query.
         let ledger = SqliteLedger::open_in_memory().unwrap();
         ledger
             .conn
