@@ -413,7 +413,7 @@ fn inspect_signed_txn_json(stxn: &SignedTransaction) -> serde_json::Value {
         Ok(v) => v,
         Err(_) => return serde_json::Value::Null,
     };
-    msgpack_to_inspect_json(&value, JsonKey::Root)
+    msgpack_to_inspect_json(&value, JsonKey::Root, "")
 }
 
 /// The contextual meaning of the JSON key whose value we're currently
@@ -430,32 +430,44 @@ enum JsonKey {
     Program,
 }
 
-/// Map a (msgpack) field key to the `JsonKey` describing how its *value*'s byte
-/// blobs should be rendered. Keys correspond to the codec tags Go uses for the
-/// `basics.Address` / program-typed fields in `inspectSignedTxn`.
-fn classify_key(key: &str) -> JsonKey {
-    match key {
-        // Transaction address fields (data/transactions/transaction.go) +
-        // SignedTxn.AuthAddr ("sgnr") + msig subsig public key ("pk").
-        //   - apat: account references (array of Address) — elements inherit
-        //     this key, so they render base32.
-        //   - apar's m/r/f/c: AssetParams manager/reserve/freeze/clawback.
-        //   - a: heartbeat address (hb.a) — only matches inside the "hb" map.
-        //   - d: access-list direct address (al[].d) — only matches inside the
-        //     "al" resource-ref maps.
-        // Classifying a key as Address only affects 32-byte *binary* values
-        // (render_bytes), so any non-address field that happens to reuse a
-        // single-letter tag with a non-binary value is unaffected.
-        "snd" | "rcv" | "close" | "asnd" | "arcv" | "aclose" | "fadd" | "rekey" | "sgnr" | "pk"
-        | "apat" | "m" | "r" | "f" | "c" | "a" | "d" => JsonKey::Address,
-        // LogicSig program ("l"). apap/apsu (approval/clear programs) are plain
-        // []byte in Go's inspect view → base64, so they are NOT classified here.
-        "l" => JsonKey::Program,
+/// Classify a `(parent, key)` pair into the `JsonKey` describing how the value's
+/// byte blobs should render. `parent` is the codec tag of the enclosing map (or
+/// array, for array elements) — needed because several single-letter tags
+/// (`a`/`c`/`d`/`f`/`l`/`m`/`r`) mean *address* under one parent but something
+/// else (e.g. a byte digest) under another. Without structural context, e.g.
+/// state-proof `sp.c` (`SigCommit`, a digest) would be mis-rendered as an
+/// address.
+///
+/// Mirrors the `basics.Address` / `inspectProgram`-typed fields of Go's
+/// `inspectSignedTxn` (`cmd/goal/inspect.go`).
+fn classify_key(parent: &str, key: &str) -> JsonKey {
+    match (parent, key) {
+        // AssetParams (apar): manager/reserve/freeze/clawback addresses.
+        ("apar", "m" | "r" | "f" | "c") => JsonKey::Address,
+        // HeartbeatTxnFields (hb): the heartbeat address.
+        ("hb", "a") => JsonKey::Address,
+        // Access-list resource refs (al[] elements): direct address ref ("d").
+        ("al", "d") => JsonKey::Address,
+        // msig subsig public key, wherever the "subsig" array nests it.
+        ("subsig", "pk") => JsonKey::Address,
+        // Top-level (or otherwise unambiguous) address tags. "apat" is an array
+        // of addresses — classifying the field Address makes its (key-less)
+        // array elements inherit the Address value-classification.
+        (
+            _,
+            "snd" | "rcv" | "close" | "asnd" | "arcv" | "aclose" | "fadd" | "rekey" | "sgnr"
+            | "apat",
+        ) => JsonKey::Address,
+        // LogicSig program ("l") at the lsig level. apap/apsu (approval/clear
+        // programs) are plain []byte in Go's inspect view → base64. Other "l"
+        // tags (e.g. ResourceRef.locals, AppLocalState) are maps/ints, not the
+        // program, and are unaffected since Program only formats byte blobs.
+        ("lsig", "l") => JsonKey::Program,
         _ => JsonKey::Root,
     }
 }
 
-fn msgpack_to_inspect_json(value: &rmpv::Value, key: JsonKey) -> serde_json::Value {
+fn msgpack_to_inspect_json(value: &rmpv::Value, key: JsonKey, parent: &str) -> serde_json::Value {
     use rmpv::Value;
     match value {
         Value::Nil => serde_json::Value::Null,
@@ -480,17 +492,23 @@ fn msgpack_to_inspect_json(value: &rmpv::Value, key: JsonKey) -> serde_json::Val
         Value::Array(items) => serde_json::Value::Array(
             items
                 .iter()
-                // Array element context inherits the parent key (e.g. "apat" is
-                // an array of addresses, "arg" an array of byte blobs).
-                .map(|v| msgpack_to_inspect_json(v, key))
+                // Array elements inherit both the value-classification (e.g.
+                // "apat" is an array of addresses) and the parent tag, so a map
+                // element (e.g. an "al" resource-ref) can classify its own keys.
+                .map(|v| msgpack_to_inspect_json(v, key, parent))
                 .collect(),
         ),
         Value::Map(pairs) => {
             let mut map = serde_json::Map::new();
             for (k, v) in pairs {
                 let key_str = k.as_str().unwrap_or("").to_string();
-                let child_key = classify_key(&key_str);
-                map.insert(key_str, msgpack_to_inspect_json(v, child_key));
+                let child_key = classify_key(parent, &key_str);
+                // The child's value becomes the new parent context for its
+                // descendants.
+                map.insert(
+                    key_str.clone(),
+                    msgpack_to_inspect_json(v, child_key, &key_str),
+                );
             }
             serde_json::Value::Object(map)
         }
@@ -1098,6 +1116,68 @@ mod tests {
         assert_eq!(
             apat[1].as_str().unwrap(),
             Address([0x66; 32]).to_algorand_string()
+        );
+    }
+
+    #[test]
+    fn inspect_json_keeps_stateproof_commit_base64() {
+        // sp.c (StateProofBody.sig_commit) is a byte digest, NOT an address —
+        // it must render base64 even at 32 bytes, despite "c" meaning a
+        // (clawback) address under "apar" (Codex round 2 collision finding).
+        use algo_types::StateProofBody;
+        let commit = vec![0x7Au8; 32];
+        let txn = Transaction {
+            txn_type: TxnType::Stpf,
+            sender: Address([1u8; 32]),
+            fee: 1000,
+            first_valid: 1.into(),
+            last_valid: 1001.into(),
+            genesis_hash: [9u8; 32],
+            state_proof_type: 0,
+            state_proof: Some(StateProofBody {
+                sig_commit: commit.clone().into(),
+                signed_weight: 5,
+                ..StateProofBody::default()
+            }),
+            ..Transaction::default()
+        };
+        let json = inspect_signed_txn_json(&unsigned(txn));
+        let c = json["txn"]["sp"]["c"].as_str().expect("sp.c present");
+        assert_eq!(
+            c,
+            base64::engine::general_purpose::STANDARD.encode(&commit),
+            "state-proof commit must stay base64, not an address"
+        );
+    }
+
+    #[test]
+    fn inspect_json_renders_assetparams_addresses_base32() {
+        // apar.m/r/f/c are AssetParams addresses → base32 (context-sensitive:
+        // "c" under "apar" is an address, but under "sp" it's a digest).
+        use algo_types::AssetParams;
+        let txn = Transaction {
+            txn_type: TxnType::Acfg,
+            sender: Address([1u8; 32]),
+            fee: 1000,
+            first_valid: 1.into(),
+            last_valid: 1001.into(),
+            genesis_hash: [9u8; 32],
+            asset_params: Some(AssetParams {
+                total: 100,
+                clawback: Some(Address([0xCC; 32])),
+                manager: Some(Address([0x11; 32])),
+                ..AssetParams::default()
+            }),
+            ..Transaction::default()
+        };
+        let json = inspect_signed_txn_json(&unsigned(txn));
+        assert_eq!(
+            json["txn"]["apar"]["c"].as_str().unwrap(),
+            Address([0xCC; 32]).to_algorand_string()
+        );
+        assert_eq!(
+            json["txn"]["apar"]["m"].as_str().unwrap(),
+            Address([0x11; 32]).to_algorand_string()
         );
     }
 
