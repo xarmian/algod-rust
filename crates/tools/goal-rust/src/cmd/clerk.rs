@@ -160,8 +160,14 @@ fn run_send_inner(
     }
     let mut txn = builder.build().map_err(|e| e.to_string())?;
 
-    // ConstructPayment fills the suggested fee when --fee is unset; an explicit
-    // --fee (even 0) is honored verbatim (clerk.go:441-447).
+    // ConstructPayment fills the suggested fee only when --fee is *unset*. An
+    // explicit `--fee 0` is INTENTIONALLY kept at 0 (not bumped to the
+    // suggested/min fee): Go's sendCmd keys this on `cmd.Flags().Changed("fee")`
+    // and the comment at clerk.go:441-447 spells out that a deliberate
+    // `--fee=0` should be honored verbatim, since zero/low fees make sense in a
+    // group where another txn covers the pooled fee. Matching Go faithfully
+    // here, so a standalone `--fee 0` send may be rejected by min-fee
+    // validation exactly as Go's would.
     if args.fee.is_none() {
         txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
     }
