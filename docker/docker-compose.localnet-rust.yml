@@ -6,10 +6,11 @@
 # port 4001 (same host port as the Go localnet).
 #
 # Dev mode produces one block per submitted transaction group (single-node, no
-# agreement), so a fresh `up` is immediately ready for
-# `goal -d <datadir> clerk send` / `goal-rust`. The ledger is created at runtime
-# by seeding genesis state — the image carries no pre-built database, so every
-# `up` starts from a clean round 0.
+# agreement), so a fresh `up` is immediately ready to accept transactions over
+# REST (e.g. from a host-side `goal` / `goal-rust` pointed at localhost:4001 —
+# the image itself ships only the daemon, not a client). The ledger is created
+# at runtime by seeding genesis state — the image carries no pre-built database,
+# so every `up` starts from a clean round 0.
 #
 # Usage (see the `localnet-rust-*` targets in the Makefile):
 #   docker compose -f docker/docker-compose.localnet-rust.yml up -d --build

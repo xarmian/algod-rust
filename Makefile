@@ -71,8 +71,9 @@ localnet-logs:
 ## Boots the Rust `algod-rust node start --dev` daemon in docker as a drop-in
 ## alternative to the `algod-go` localnet. Genesis (devmode + funded dev
 ## account) and config are baked into the image; dev mode produces a block per
-## submitted transaction group, so a fresh `up` is ready for `goal clerk send`.
-## See docs/DEV_WORKFLOW.md for the dev-account mnemonic and `goal` workflow.
+## submitted transaction group, so a fresh `up` accepts transactions over REST
+## (the image ships only the daemon — drive it from a host-side client on
+## localhost:4001). See docs/DEV_WORKFLOW.md for the dev-account mnemonic.
 
 localnet-rust-up:
 	$(COMPOSE_RUST) up -d --build algod-rust-localnet

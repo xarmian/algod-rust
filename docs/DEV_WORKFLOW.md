@@ -121,20 +121,24 @@ subsequent builds reuse the docker layer cache.
 
 ### Driving it with `goal` / `goal-rust`
 
-The data dir inside the container is `/algod/data`. The node writes `algod.net`
-there with its *container* bind address (`0.0.0.0:8080`), so `goal`/`goal-rust`
-reading a copied data dir on the host would dial the wrong endpoint. Two ways to
-drive it:
+The image ships only the `algod-rust` daemon — there is no `goal` / `goal-rust`
+client inside the container. Drive it from the host against the published REST
+endpoint (`http://localhost:4001`, fixed `aaaa…` token):
 
 ```bash
-# 1. From inside the container, where algod.net is correct:
-docker exec algod-rust-localnet goal-rust -d /algod/data node status
-
-# 2. From the host, talk to the published port directly (skip the data dir):
+# Raw REST:
 curl -s -H "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
     http://localhost:4001/v2/status
-# or copy the data dir out and rewrite algod.net to 127.0.0.1:4001 first.
+
+# Or with a host-installed goal-rust / goal pointed at the endpoint.
 ```
+
+`goal` / `goal-rust` normally read `algod.net` + `algod.token` from a data dir.
+The container's data dir is `/algod/data`, but the node writes `algod.net` with
+its *container* bind address (`0.0.0.0:8080`), so a copied-out data dir would
+dial the wrong endpoint — point your client at `127.0.0.1:4001` instead (e.g.
+rewrite `algod.net`, or use whatever endpoint flag your client exposes). The
+token is the fixed `aaaa…` value above.
 
 The staged `config.json` in the data dir is a go-algorand-format placeholder for
 operator familiarity; the Rust `node start` command does not consume it (it
