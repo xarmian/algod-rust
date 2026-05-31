@@ -526,6 +526,71 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
         "recipient balance should grow by >= {pay_amt} (before={before}, after={after})"
     );
 
+    // 6c. clerk rawsend → write a signed payment to a file with `clerk send
+    //    -o <file> -s`, then submit the raw file with `clerk rawsend -f <file>`
+    //    and confirm it commits (TASK-289, clerk.go:579 rawsendCmd). The
+    //    recipient balance grows again by the sent amount.
+    let raw_before = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (before rawsend)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+
+    let raw_amt: u64 = 1_234_000;
+    let raw_file = dd.join("rawsend.tx");
+    assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                &raw_amt.to_string(),
+                "-f",
+                DEV_ADDR,
+                "-t",
+                FEE_SINK,
+                "-o",
+                raw_file.to_str().unwrap(),
+                "-s",
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
+        ),
+        "clerk send -o (write signed txn)",
+        &node,
+    );
+    assert!(
+        raw_file.exists(),
+        "clerk send -o should have written the signed txn file"
+    );
+    let rawsend_out = assert_cli_ok(
+        &goal_rust(dd, &["clerk", "rawsend", "-f", raw_file.to_str().unwrap()]),
+        "clerk rawsend",
+        &node,
+    );
+    assert!(
+        rawsend_out.contains("Raw transaction ID"),
+        "rawsend should print Go's infoRawTxIssued line; got:\n{rawsend_out}"
+    );
+    assert!(
+        rawsend_out.contains("committed in round"),
+        "rawsend should confirm in a dev-mode round; got:\n{rawsend_out}"
+    );
+    let raw_after = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (after rawsend)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+    assert!(
+        raw_after >= raw_before + raw_amt,
+        "recipient balance should grow by >= {raw_amt} (before={raw_before}, after={raw_after})"
+    );
+
     // 7. addpartkey, then changeonlinestatus --online → status flips back. Going
     //    online needs a participation key registered for the account.
     assert_cli_ok(

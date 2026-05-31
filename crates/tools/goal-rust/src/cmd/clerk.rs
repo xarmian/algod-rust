@@ -1,29 +1,36 @@
 //! `goal-rust clerk` leaf handlers.
 //!
-//! Ports the payment path of `../go-algorand/cmd/goal/clerk.go`:
+//! Ports the payment path + offline txn-file utilities of
+//! `../go-algorand/cmd/goal/clerk.go`:
 //! - `send` → clerk.go:348-576 (`sendCmd`), via `libgoal.ConstructPayment`
 //!   (libgoal.go:571) and `computeValidityRounds` (libgoal.go:525).
+//! - `inspect` → clerk.go:712 (`inspectCmd`) + `inspect.go` (`inspectTxn`).
+//! - `split` → clerk.go:966 (`splitCmd`).
+//! - `group` → clerk.go:914 (`groupCmd`).
+//! - `rawsend` → clerk.go:579 (`rawsendCmd`).
 //!
 //! Signing + submission reuse the same build → sign (kmd) → submit → confirm
 //! pipeline as the account keyreg leaves
 //! ([`algo_txn_pipeline::TxnPipeline`]); the wallet-handle resolution mirrors
 //! `crate::cmd::account` (Go's `getWalletHandleMaybePassword`).
 //!
-//! The rest of the `clerk` group (rawsend / sign / group / split / compile /
-//! dryrun* / simulate / inspect / multisig / tealsign) is still stubbed — see
-//! [`crate::groups::clerk`].
+//! The rest of the `clerk` group (sign / compile / dryrun* / simulate /
+//! multisig / tealsign) is still stubbed — see [`crate::groups::clerk`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use algo_codec::canonical_encode_signed_transaction;
+use algo_codec::{
+    canonical_encode_signed_transaction, compute_group_id, compute_txn_id, decode_signed_txn_stream,
+};
 use algo_kmd_client::{KmdClient, KmdError};
 use algo_types::{Address, SignedTransaction};
 use base64::Engine;
 
 use crate::accounts_list::AccountsList;
 use crate::data_dir;
-use crate::groups::clerk::SendArgs;
+use crate::groups::clerk::{GroupArgs, InspectArgs, RawsendArgs, SendArgs, SplitArgs};
 
 /// Typical protocol `MaxTxnLife` (rounds). The consensus-param table isn't
 /// loaded client-side, so the validity-window default uses this — matching the
@@ -353,6 +360,469 @@ fn compute_validity(
     Ok((first, last))
 }
 
+// ---- clerk inspect --------------------------------------------------------
+
+/// `clerk inspect [files...]` — decode and pretty-print transaction file(s).
+///
+/// Mirrors Go's `inspectCmd` (clerk.go:712): for each file, stream-decode the
+/// `SignedTxn`s and print each as canonical JSON. The JSON view matches Go's
+/// `inspectSignedTxn` (`inspect.go`): addresses render in algorand base32+
+/// checksum form, the LogicSig program is disassembled to TEAL, and other byte
+/// fields are base64.
+pub fn run_inspect(args: InspectArgs) -> ExitCode {
+    for file in &args.files {
+        if let Err(msg) = inspect_one_file(file, args.txid) {
+            eprintln!("{msg}");
+            return ExitCode::from(1);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn inspect_one_file(file: &Path, with_txid: bool) -> Result<(), String> {
+    let data =
+        std::fs::read(file).map_err(|e| format!("Cannot read file {}: {e}", file.display()))?;
+    let stxns = decode_signed_txn_stream(&data)
+        .map_err(|e| format!("Cannot decode transactions from {}: {e}", file.display()))?;
+    for (idx, stxn) in stxns.iter().enumerate() {
+        let json = inspect_signed_txn_json(stxn);
+        let rendered = serde_json::to_string_pretty(&json)
+            .map_err(|e| format!("Cannot decode transactions from {}: {e}", file.display()))?;
+        if with_txid {
+            let txid = compute_txn_id(&stxn.txn).to_string();
+            println!("{}[{idx}] - {txid}\n{rendered}\n", file.display());
+        } else {
+            println!("{}[{idx}]\n{rendered}\n", file.display());
+        }
+    }
+    Ok(())
+}
+
+/// Build the JSON inspect view of a `SignedTransaction`, mirroring Go's
+/// `protocol.EncodeJSON(inspectSignedTxn)` (`inspect.go`).
+///
+/// We start from the canonical msgpack encoding (which already applies Go's
+/// omitempty + canonical field ordering for a `SignedTxn`), decode it to a
+/// generic `rmpv::Value`, and render that to JSON — base32-encoding the fields
+/// Go types as addresses and disassembling the LogicSig program.
+fn inspect_signed_txn_json(stxn: &SignedTransaction) -> serde_json::Value {
+    let encoded = canonical_encode_signed_transaction(stxn);
+    // Decode back to a generic msgpack tree; the canonical encoder produced it,
+    // so this round-trips without error.
+    let value = match rmpv::decode::read_value(&mut &encoded[..]) {
+        Ok(v) => v,
+        Err(_) => return serde_json::Value::Null,
+    };
+    msgpack_to_inspect_json(&value, JsonKey::Root, "")
+}
+
+/// The contextual meaning of the JSON key whose value we're currently
+/// rendering, so byte blobs can be formatted the way Go's `inspectSignedTxn`
+/// types dictate (base32 address vs. disassembled program vs. base64).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonKey {
+    /// Top of the tree (the whole map) or any non-special context: byte blobs
+    /// render as base64.
+    Root,
+    /// `basics.Address` / `crypto.PublicKey` field: base32 + checksum.
+    Address,
+    /// LogicSig program (`inspectProgram`): disassembled to TEAL text.
+    Program,
+}
+
+/// Classify a `(parent, key)` pair into the `JsonKey` describing how the value's
+/// byte blobs should render. `parent` is the codec tag of the enclosing map (or
+/// array, for array elements) — needed because several single-letter tags
+/// (`a`/`c`/`d`/`f`/`l`/`m`/`r`) mean *address* under one parent but something
+/// else (e.g. a byte digest) under another. Without structural context, e.g.
+/// state-proof `sp.c` (`SigCommit`, a digest) would be mis-rendered as an
+/// address.
+///
+/// Mirrors the `basics.Address` / `inspectProgram`-typed fields of Go's
+/// `inspectSignedTxn` (`cmd/goal/inspect.go`).
+fn classify_key(parent: &str, key: &str) -> JsonKey {
+    match (parent, key) {
+        // AssetParams (apar): manager/reserve/freeze/clawback addresses.
+        ("apar", "m" | "r" | "f" | "c") => JsonKey::Address,
+        // HeartbeatTxnFields (hb): the heartbeat address.
+        ("hb", "a") => JsonKey::Address,
+        // Access-list resource refs (al[] elements): direct address ref ("d").
+        ("al", "d") => JsonKey::Address,
+        // msig subsig public key, wherever the "subsig" array nests it.
+        ("subsig", "pk") => JsonKey::Address,
+        // Top-level (or otherwise unambiguous) address tags. "apat" is an array
+        // of addresses — classifying the field Address makes its (key-less)
+        // array elements inherit the Address value-classification.
+        (
+            _,
+            "snd" | "rcv" | "close" | "asnd" | "arcv" | "aclose" | "fadd" | "rekey" | "sgnr"
+            | "apat",
+        ) => JsonKey::Address,
+        // LogicSig program ("l") at the lsig level. apap/apsu (approval/clear
+        // programs) are plain []byte in Go's inspect view → base64. Other "l"
+        // tags (e.g. ResourceRef.locals, AppLocalState) are maps/ints, not the
+        // program, and are unaffected since Program only formats byte blobs.
+        ("lsig", "l") => JsonKey::Program,
+        _ => JsonKey::Root,
+    }
+}
+
+fn msgpack_to_inspect_json(value: &rmpv::Value, key: JsonKey, parent: &str) -> serde_json::Value {
+    use rmpv::Value;
+    match value {
+        Value::Nil => serde_json::Value::Null,
+        Value::Boolean(b) => serde_json::Value::Bool(*b),
+        Value::Integer(i) => {
+            if let Some(u) = i.as_u64() {
+                serde_json::Value::from(u)
+            } else if let Some(s) = i.as_i64() {
+                serde_json::Value::from(s)
+            } else {
+                serde_json::Value::Null
+            }
+        }
+        Value::F32(x) => serde_json::Number::from_f64(*x as f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::F64(x) => serde_json::Number::from_f64(*x)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::String(s) => serde_json::Value::String(s.as_str().unwrap_or("").to_string()),
+        Value::Binary(bytes) => render_bytes(bytes, key),
+        Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                // Array elements inherit both the value-classification (e.g.
+                // "apat" is an array of addresses) and the parent tag, so a map
+                // element (e.g. an "al" resource-ref) can classify its own keys.
+                .map(|v| msgpack_to_inspect_json(v, key, parent))
+                .collect(),
+        ),
+        Value::Map(pairs) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in pairs {
+                let key_str = k.as_str().unwrap_or("").to_string();
+                let child_key = classify_key(parent, &key_str);
+                // The child's value becomes the new parent context for its
+                // descendants.
+                map.insert(
+                    key_str.clone(),
+                    msgpack_to_inspect_json(v, child_key, &key_str),
+                );
+            }
+            serde_json::Value::Object(map)
+        }
+        Value::Ext(_, bytes) => render_bytes(bytes, JsonKey::Root),
+    }
+}
+
+/// Render a byte blob according to its key context: base32+checksum address,
+/// disassembled TEAL program, or base64 (Go's default for `[]byte`).
+fn render_bytes(bytes: &[u8], key: JsonKey) -> serde_json::Value {
+    match key {
+        JsonKey::Address if bytes.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(bytes);
+            serde_json::Value::String(Address(arr).to_algorand_string())
+        }
+        JsonKey::Program => match algo_avm::disassembler::disassemble(bytes) {
+            Ok(text) => serde_json::Value::String(text),
+            // Go's inspectProgram.MarshalText surfaces the disassembly error as
+            // the field's text; mirror that rather than failing the whole print.
+            Err(e) => serde_json::Value::String(e),
+        },
+        _ => serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
+    }
+}
+
+// ---- clerk split ----------------------------------------------------------
+
+/// `clerk split -i <in> -o <out>` — write each transaction in the input file to
+/// its own `<base>-<idx><ext>` file. Mirrors Go's `splitCmd` (clerk.go:966).
+pub fn run_split(args: SplitArgs) -> ExitCode {
+    match run_split_inner(args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_split_inner(args: SplitArgs) -> Result<(), String> {
+    let data = std::fs::read(&args.infile)
+        .map_err(|e| format!("Cannot read file {}: {e}", args.infile.display()))?;
+    let stxns = decode_signed_txn_stream(&data).map_err(|e| {
+        format!(
+            "Cannot decode transactions from {}: {e}",
+            args.infile.display()
+        )
+    })?;
+
+    // Split the output filename into base + extension the same way Go's
+    // filepath.Ext does (extension = final '.'-segment of the last path
+    // component, empty if none).
+    let (base, ext) = split_ext(&args.outfile);
+
+    for (idx, stxn) in stxns.iter().enumerate() {
+        let fname = format!("{base}-{idx}{ext}");
+        let encoded = canonical_encode_signed_transaction(stxn);
+        std::fs::write(&fname, &encoded)
+            .map_err(|e| format!("Cannot write file {}: {e}", args.outfile))?;
+        println!("Wrote transaction {idx} to {fname}");
+    }
+    Ok(())
+}
+
+/// Split a filename into `(base, ext)` where `ext` includes the leading dot,
+/// matching Go's `filepath.Ext` (only the final component's extension counts).
+fn split_ext(name: &str) -> (String, String) {
+    // Find the final path separator so an extension only counts within the last
+    // component (mirrors filepath.Ext scanning back to a separator).
+    let last_component_start = name.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+    match name[last_component_start..].rfind('.') {
+        Some(rel_dot) => {
+            let dot = last_component_start + rel_dot;
+            (name[..dot].to_string(), name[dot..].to_string())
+        }
+        None => (name.to_string(), String::new()),
+    }
+}
+
+// ---- clerk group ----------------------------------------------------------
+
+/// `clerk group -i <in> -o <out>` — assign a computed group ID to the unsigned
+/// transactions in a file. Mirrors Go's `groupCmd` (clerk.go:914).
+pub fn run_group(args: GroupArgs) -> ExitCode {
+    match run_group_inner(args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_group_inner(args: GroupArgs) -> Result<(), String> {
+    let data = std::fs::read(&args.infile)
+        .map_err(|e| format!("Cannot read file {}: {e}", args.infile.display()))?;
+    let mut stxns = decode_signed_txn_stream(&data).map_err(|e| {
+        format!(
+            "Cannot decode transactions from {}: {e}",
+            args.infile.display()
+        )
+    })?;
+
+    // Reject already-grouped or already-signed inputs (clerk.go:933-940). Go
+    // preserves the LogicSig (the group can be verified by a logicsig arg), so
+    // only the ed25519 sig + multisig must be absent.
+    for (idx, stxn) in stxns.iter().enumerate() {
+        if stxn.txn.group != [0u8; 32] {
+            let id = compute_txn_id(&stxn.txn);
+            return Err(format!(
+                "Transaction #{idx} with ID of {id} is already part of a group."
+            ));
+        }
+        if stxn.sig != [0u8; 64] || stxn.msig.is_some() {
+            let id = compute_txn_id(&stxn.txn);
+            return Err(format!(
+                "Transaction #{idx} with ID of {id} is already signed"
+            ));
+        }
+    }
+
+    let txns: Vec<algo_types::Transaction> = stxns.iter().map(|s| s.txn.clone()).collect();
+    let group_hash = compute_group_id(&txns);
+    let mut out = Vec::new();
+    for stxn in &mut stxns {
+        stxn.txn.group = group_hash.0;
+        out.extend_from_slice(&canonical_encode_signed_transaction(stxn));
+    }
+    std::fs::write(&args.outfile, &out)
+        .map_err(|e| format!("Cannot write file {}: {e}", args.outfile.display()))?;
+    Ok(())
+}
+
+// ---- clerk rawsend --------------------------------------------------------
+
+/// `clerk rawsend -f <file> [-r rejects] [-N]` — submit a signed-txn file to
+/// algod, then (unless `-N`) wait for each transaction to commit. Mirrors Go's
+/// `rawsendCmd` (clerk.go:579).
+pub fn run_rawsend(args: RawsendArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    match run_rawsend_inner(args, cli_d) {
+        Ok(code) => code,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_rawsend_inner(args: RawsendArgs, cli_d: Vec<PathBuf>) -> Result<ExitCode, String> {
+    let rejects_filename = args.rejects.clone().unwrap_or_else(|| {
+        let mut p = args.filename.clone().into_os_string();
+        p.push(".rej");
+        PathBuf::from(p)
+    });
+
+    let data = std::fs::read(&args.filename)
+        .map_err(|e| format!("Cannot read file {}: {e}", args.filename.display()))?;
+    let txns = decode_signed_txn_stream(&data).map_err(|e| {
+        format!(
+            "Cannot decode transactions from {}: {e}",
+            args.filename.display()
+        )
+    })?;
+
+    // Duplicate detection by txid (clerk.go:607-613).
+    let mut seen: HashMap<String, ()> = HashMap::new();
+    for stxn in &txns {
+        let txid = compute_txn_id(&stxn.txn).to_string();
+        if seen.insert(txid.clone(), ()).is_some() {
+            return Err(format!(
+                "Duplicate transaction {txid} in {}",
+                args.filename.display()
+            ));
+        }
+    }
+
+    let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
+    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Error processing command: {e}"))?;
+    let pipeline = algo_txn_pipeline::TxnPipeline::new(algod, None);
+
+    // Group the transactions by their group ID, preserving file order, and
+    // broadcast each group together (clerk.go:617-637, SignedTxnsToGroups +
+    // BroadcastTransactionGroup).
+    let groups = signed_txns_to_groups(&txns);
+
+    // txid -> error message, for the rejects file (preserve file order below).
+    let mut txn_errors: HashMap<String, String> = HashMap::new();
+    // txid of every successfully-broadcast txn, to poll for confirmation.
+    let mut pending: Vec<String> = Vec::new();
+
+    rt.block_on(async {
+        for group in &groups {
+            let mut raw = Vec::new();
+            for stxn in group {
+                raw.extend_from_slice(&canonical_encode_signed_transaction(stxn));
+            }
+            match pipeline.submit(&raw).await {
+                Ok(_) => {
+                    for stxn in group {
+                        let txid = compute_txn_id(&stxn.txn).to_string();
+                        // infoRawTxIssued (messages.go:126).
+                        println!("Raw transaction ID {txid} issued");
+                        pending.push(txid);
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    for stxn in group {
+                        txn_errors.insert(compute_txn_id(&stxn.txn).to_string(), msg.clone());
+                    }
+                    // reportWarnf(errorBroadcastingTX) — a warning, not fatal.
+                    eprintln!("Couldn't broadcast tx with algod: {msg}");
+                }
+            }
+        }
+    });
+
+    if args.no_wait {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Poll each pending txn to confirmation. `last_valid == 0` waits until the
+    // node either commits or evicts the txn (mirrors Go's per-round loop, which
+    // has no explicit deadline beyond the node forgetting the txid).
+    rt.block_on(async {
+        for txid in &pending {
+            let tid = algo_rest_client::TxId(txid.clone());
+            match pipeline.wait_for_confirmation(&tid, 0).await {
+                Ok(info) => {
+                    if let Some(round) = info.confirmed_round {
+                        // infoTxCommitted (messages.go:113).
+                        println!("Transaction {txid} committed in round {round}");
+                    }
+                }
+                Err(e) => {
+                    txn_errors.insert(txid.clone(), e.to_string());
+                    eprintln!("Error processing command: {e}");
+                }
+            }
+        }
+    });
+
+    if !txn_errors.is_empty() {
+        println!(
+            "Encountered errors in sending {} transactions:",
+            txn_errors.len()
+        );
+        let mut rejects_data = Vec::new();
+        // Preserve the original file order so groups stay together (clerk.go:684).
+        for stxn in &txns {
+            let txid = compute_txn_id(&stxn.txn).to_string();
+            if let Some(err) = txn_errors.get(&txid) {
+                println!("  {txid}: {err}");
+                rejects_data.extend_from_slice(&canonical_encode_signed_transaction(stxn));
+            }
+        }
+        // O_EXCL: refuse to clobber an existing rejects file (clerk.go:695).
+        write_new_file(&rejects_filename, &rejects_data)?;
+        println!(
+            "Rejected transactions written to {}",
+            rejects_filename.display()
+        );
+        return Ok(ExitCode::from(1));
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Partition signed transactions into groups, preserving first-seen order.
+/// Mirrors `bookkeeping.SignedTxnsToGroups`: contiguous runs sharing a non-zero
+/// group ID form a group; a zero group ID (ungrouped) is its own singleton.
+fn signed_txns_to_groups(txns: &[SignedTransaction]) -> Vec<Vec<SignedTransaction>> {
+    let mut groups: Vec<Vec<SignedTransaction>> = Vec::new();
+    let mut current: Vec<SignedTransaction> = Vec::new();
+    for stxn in txns {
+        if stxn.txn.group == [0u8; 32] {
+            if !current.is_empty() {
+                groups.push(std::mem::take(&mut current));
+            }
+            groups.push(vec![stxn.clone()]);
+            continue;
+        }
+        if let Some(first) = current.first() {
+            if first.txn.group != stxn.txn.group {
+                groups.push(std::mem::take(&mut current));
+            }
+        }
+        current.push(stxn.clone());
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
+/// Write `data` to `path`, failing if the file already exists (Go's
+/// `os.O_WRONLY|O_CREATE|O_EXCL`).
+fn write_new_file(path: &Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("Cannot write file {}: {e}", path.display()))?;
+    f.write_all(data)
+        .map_err(|e| format!("Cannot write file {}: {e}", path.display()))?;
+    Ok(())
+}
+
 // ---- shared client + wallet helpers (mirrors crate::cmd::account) ---------
 
 fn is_valid_api_token(token: &str) -> bool {
@@ -512,5 +982,215 @@ fn kmd_msg(e: &KmdError) -> String {
     match e {
         KmdError::Api { message, .. } => message.clone(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use algo_types::{Transaction, TxnType};
+
+    fn sample_payment(amount: u64, receiver: [u8; 32]) -> Transaction {
+        Transaction {
+            txn_type: TxnType::Pay,
+            sender: Address([1u8; 32]),
+            fee: 1000,
+            first_valid: 1.into(),
+            last_valid: 1001.into(),
+            genesis_hash: [9u8; 32],
+            amount,
+            receiver: Address(receiver),
+            ..Transaction::default()
+        }
+    }
+
+    fn unsigned(txn: Transaction) -> SignedTransaction {
+        SignedTransaction {
+            txn,
+            ..SignedTransaction::default()
+        }
+    }
+
+    #[test]
+    fn split_ext_matches_filepath_ext() {
+        assert_eq!(
+            split_ext("out.txn"),
+            ("out".to_string(), ".txn".to_string())
+        );
+        assert_eq!(split_ext("out"), ("out".to_string(), String::new()));
+        // Only the final path component's extension counts.
+        assert_eq!(
+            split_ext("dir.v2/out"),
+            ("dir.v2/out".to_string(), String::new())
+        );
+        assert_eq!(
+            split_ext("a/b/out.tx"),
+            ("a/b/out".to_string(), ".tx".to_string())
+        );
+        // A leading dot in the final component is still an extension to
+        // filepath.Ext.
+        assert_eq!(split_ext(".rej"), (String::new(), ".rej".to_string()));
+    }
+
+    #[test]
+    fn group_assigns_shared_group_id() {
+        let a = unsigned(sample_payment(1, [2u8; 32]));
+        let b = unsigned(sample_payment(2, [3u8; 32]));
+        let txns = [a.txn.clone(), b.txn.clone()];
+        let gid = compute_group_id(&txns);
+        assert!(!gid.is_zero());
+
+        // Both transactions should carry the same group hash, and recomputing
+        // the group ID over the now-grouped txns (grp zeroed internally) is
+        // stable.
+        let mut grouped: Vec<SignedTransaction> = vec![a, b];
+        for s in &mut grouped {
+            s.txn.group = gid.0;
+        }
+        let regrouped: Vec<Transaction> = grouped.iter().map(|s| s.txn.clone()).collect();
+        assert_eq!(compute_group_id(&regrouped), gid, "group id must be stable");
+        assert_eq!(grouped[0].txn.group, grouped[1].txn.group);
+    }
+
+    #[test]
+    fn signed_txns_to_groups_partitions_by_group_id() {
+        // Two txns sharing a group, then one ungrouped singleton.
+        let mut g1a = unsigned(sample_payment(1, [2u8; 32]));
+        let mut g1b = unsigned(sample_payment(2, [3u8; 32]));
+        g1a.txn.group = [7u8; 32];
+        g1b.txn.group = [7u8; 32];
+        let solo = unsigned(sample_payment(3, [4u8; 32]));
+
+        let groups = signed_txns_to_groups(&[g1a, g1b, solo]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2, "the grouped pair stays together");
+        assert_eq!(groups[1].len(), 1, "the ungrouped txn is its own group");
+    }
+
+    #[test]
+    fn inspect_json_renders_addresses_base32() {
+        let txn = sample_payment(5, [0xAB; 32]);
+        let stxn = unsigned(txn.clone());
+        let json = inspect_signed_txn_json(&stxn);
+        let inner = &json["txn"];
+        // snd/rcv are Address-typed → base32 (matches goal inspect).
+        assert_eq!(
+            inner["snd"].as_str().unwrap(),
+            Address([1u8; 32]).to_algorand_string()
+        );
+        assert_eq!(
+            inner["rcv"].as_str().unwrap(),
+            Address([0xAB; 32]).to_algorand_string()
+        );
+        // gh is a Digest → base64, NOT base32.
+        assert_eq!(
+            inner["gh"].as_str().unwrap(),
+            base64::engine::general_purpose::STANDARD.encode([9u8; 32])
+        );
+        assert_eq!(inner["amt"].as_u64().unwrap(), 5);
+        assert_eq!(inner["type"].as_str().unwrap(), "pay");
+    }
+
+    #[test]
+    fn inspect_json_renders_apat_accounts_base32() {
+        // App-call with an Accounts reference list (apat) — each element is an
+        // Address and must render base32, not base64 (Codex round 1, finding 1).
+        let txn = Transaction {
+            txn_type: TxnType::Appl,
+            sender: Address([1u8; 32]),
+            fee: 1000,
+            first_valid: 1.into(),
+            last_valid: 1001.into(),
+            genesis_hash: [9u8; 32],
+            application_id: 42,
+            accounts: Some(vec![Address([0x55; 32]), Address([0x66; 32])]),
+            ..Transaction::default()
+        };
+        let json = inspect_signed_txn_json(&unsigned(txn));
+        let apat = json["txn"]["apat"].as_array().expect("apat array");
+        assert_eq!(apat.len(), 2);
+        assert_eq!(
+            apat[0].as_str().unwrap(),
+            Address([0x55; 32]).to_algorand_string()
+        );
+        assert_eq!(
+            apat[1].as_str().unwrap(),
+            Address([0x66; 32]).to_algorand_string()
+        );
+    }
+
+    #[test]
+    fn inspect_json_keeps_stateproof_commit_base64() {
+        // sp.c (StateProofBody.sig_commit) is a byte digest, NOT an address —
+        // it must render base64 even at 32 bytes, despite "c" meaning a
+        // (clawback) address under "apar" (Codex round 2 collision finding).
+        use algo_types::StateProofBody;
+        let commit = vec![0x7Au8; 32];
+        let txn = Transaction {
+            txn_type: TxnType::Stpf,
+            sender: Address([1u8; 32]),
+            fee: 1000,
+            first_valid: 1.into(),
+            last_valid: 1001.into(),
+            genesis_hash: [9u8; 32],
+            state_proof_type: 0,
+            state_proof: Some(StateProofBody {
+                sig_commit: commit.clone().into(),
+                signed_weight: 5,
+                ..StateProofBody::default()
+            }),
+            ..Transaction::default()
+        };
+        let json = inspect_signed_txn_json(&unsigned(txn));
+        let c = json["txn"]["sp"]["c"].as_str().expect("sp.c present");
+        assert_eq!(
+            c,
+            base64::engine::general_purpose::STANDARD.encode(&commit),
+            "state-proof commit must stay base64, not an address"
+        );
+    }
+
+    #[test]
+    fn inspect_json_renders_assetparams_addresses_base32() {
+        // apar.m/r/f/c are AssetParams addresses → base32 (context-sensitive:
+        // "c" under "apar" is an address, but under "sp" it's a digest).
+        use algo_types::AssetParams;
+        let txn = Transaction {
+            txn_type: TxnType::Acfg,
+            sender: Address([1u8; 32]),
+            fee: 1000,
+            first_valid: 1.into(),
+            last_valid: 1001.into(),
+            genesis_hash: [9u8; 32],
+            asset_params: Some(AssetParams {
+                total: 100,
+                clawback: Some(Address([0xCC; 32])),
+                manager: Some(Address([0x11; 32])),
+                ..AssetParams::default()
+            }),
+            ..Transaction::default()
+        };
+        let json = inspect_signed_txn_json(&unsigned(txn));
+        assert_eq!(
+            json["txn"]["apar"]["c"].as_str().unwrap(),
+            Address([0xCC; 32]).to_algorand_string()
+        );
+        assert_eq!(
+            json["txn"]["apar"]["m"].as_str().unwrap(),
+            Address([0x11; 32]).to_algorand_string()
+        );
+    }
+
+    #[test]
+    fn stream_round_trips_through_canonical_encode() {
+        let a = unsigned(sample_payment(1, [2u8; 32]));
+        let b = unsigned(sample_payment(2, [3u8; 32]));
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&canonical_encode_signed_transaction(&a));
+        buf.extend_from_slice(&canonical_encode_signed_transaction(&b));
+        let decoded = decode_signed_txn_stream(&buf).expect("decode stream");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].txn.amount, 1);
+        assert_eq!(decoded[1].txn.amount, 2);
     }
 }

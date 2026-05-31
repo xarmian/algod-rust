@@ -19,11 +19,37 @@ pub use canonical::{
 };
 pub use digest::{
     compute_block_digest, compute_block_header_digest, compute_block_header_digest_512,
-    compute_txn_id,
+    compute_group_id, compute_txn_id,
 };
 
 use algo_error::{AlgoError, Result};
-use algo_types::{Block, BlockResponse};
+use algo_types::{Block, BlockResponse, SignedTransaction};
+
+/// Decode a stream of one or more concatenated msgpack `SignedTransaction`s,
+/// as produced by `goal`'s txn-file writers (`protocol.Encode(&stx)` appended
+/// back to back).
+///
+/// Mirrors go-algorand's `protocol.NewMsgpDecoderBytes(data)` loop used by
+/// `clerk inspect` / `group` / `rawsend` / `split` (`cmd/goal/clerk.go`):
+/// decode values until the input is fully consumed. An empty input yields an
+/// empty vector. A trailing partial value (or any decode failure) is an error.
+pub fn decode_signed_txn_stream(mut bytes: &[u8]) -> Result<Vec<SignedTransaction>> {
+    let mut out = Vec::new();
+    while !bytes.is_empty() {
+        let mut cursor = std::io::Cursor::new(bytes);
+        let mut de = rmp_serde::Deserializer::new(&mut cursor);
+        let stxn: SignedTransaction =
+            serde::Deserialize::deserialize(&mut de).map_err(|e| AlgoError::Codec {
+                source: Box::new(e),
+                context: "failed to decode SignedTransaction from msgpack stream".into(),
+            })?;
+        let consumed = cursor.position() as usize;
+        debug_assert!(consumed > 0, "decoder must advance the stream");
+        bytes = &bytes[consumed..];
+        out.push(stxn);
+    }
+    Ok(out)
+}
 
 /// Decode a block response from msgpack bytes (as returned by the REST API).
 pub fn decode_block_response(bytes: &[u8]) -> Result<BlockResponse> {

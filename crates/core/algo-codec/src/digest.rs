@@ -5,11 +5,14 @@ use algo_types::{Block, BlockHeader, Digest, Transaction};
 
 use crate::canonical::{
     canonical_encode_block_header, canonical_encode_block_header_from_block,
-    canonical_encode_transaction,
+    canonical_encode_transaction, canonical_encode_tx_group,
 };
 
 /// Domain separation prefix for transaction hashing.
 const TX_HASH_PREFIX: &[u8] = b"TX";
+
+/// Domain separation prefix for transaction-group-ID hashing.
+const TG_HASH_PREFIX: &[u8] = b"TG";
 
 /// Domain separation prefix for block header hashing.
 const BH_HASH_PREFIX: &[u8] = b"BH";
@@ -18,6 +21,26 @@ const BH_HASH_PREFIX: &[u8] = b"BH";
 pub fn compute_txn_id(tx: &Transaction) -> Digest {
     let canonical = canonical_encode_transaction(tx);
     hash_with_prefix(TX_HASH_PREFIX, &canonical)
+}
+
+/// Compute the group ID for an ordered set of transactions:
+/// `SHA512/256("TG" || canonical_encode(TxGroup{txids}))`, where each `txid` is
+/// [`compute_txn_id`] of the corresponding transaction with its `grp` field
+/// zeroed.
+///
+/// Mirrors go-algorand's `crypto.HashObj(TxGroup)` over `TxGroupHashes`
+/// (`cmd/goal/clerk.go:914` `groupCmd`; `data/transactions/transaction.go:176`).
+pub fn compute_group_id(txns: &[Transaction]) -> Digest {
+    let hashes: Vec<Digest> = txns
+        .iter()
+        .map(|txn| {
+            let mut zeroed = txn.clone();
+            zeroed.group = [0u8; 32];
+            compute_txn_id(&zeroed)
+        })
+        .collect();
+    let encoded = canonical_encode_tx_group(&hashes);
+    hash_with_prefix(TG_HASH_PREFIX, &encoded)
 }
 
 /// Compute the block digest: SHA512/256("BH" || canonical_encode(block_header)).
