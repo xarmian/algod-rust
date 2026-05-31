@@ -22,7 +22,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use algo_codec::{canonical_encode_block_header, compute_block_digest, decode_block};
+use algo_codec::{
+    canonical_encode_block_header, compute_block_digest, compute_txn_id, decode_block,
+};
 use algo_ledger::simulation::{
     AppInitialState, AvmValueTrace, ExecTraceConfig, OpcodeTraceUnit, ProgramTrace,
     ResourcesInitialStates, ResultEvalOverrides, SimulationRequest, SimulationResult, Simulator,
@@ -290,16 +292,13 @@ impl AlgodNodeInterface {
             let block = decode_block(&bytes)
                 .map_err(|e| NodeError::Internal(format!("decode_block({round}): {e}")))?;
             for stx in &block.payset {
-                if crate::dev_producer::block_txn_id(stx, &block) == *txid {
-                    // Return the transaction with its genesis hash restored from
-                    // the block header (STIB strips it), so the response carries
-                    // the same transaction the submitter signed.
-                    let mut stx = stx.clone();
-                    if stx.txn.genesis_hash == [0u8; 32] {
-                        stx.txn.genesis_hash = block.genesis_hash;
-                    }
+                // Restore the genesis fields the block's STIB encoding strips so
+                // the id matches the submitter's and the response carries the
+                // transaction as signed.
+                let restored = crate::dev_producer::restore_block_genesis_fields(stx, &block);
+                if compute_txn_id(&restored.txn) == *txid {
                     return Ok(Some(TxnWithStatus {
-                        txn: stx,
+                        txn: restored,
                         confirmed_round: round,
                         pool_error: String::new(),
                         closing_amount: 0,
@@ -2145,7 +2144,7 @@ mod tests {
     #[tokio::test]
     async fn dev_mode_submit_produces_block_and_confirms() {
         use crate::commands::participate::PoolLedgerAdapter;
-        use algo_codec::{canonical_encode_block_header_from_block, compute_txn_id, encode_block};
+        use algo_codec::{canonical_encode_block_header_from_block, encode_block};
         use algo_ledger::genesis::genesis_hash;
         use algo_ledger::{
             make_genesis_block, parse_genesis_json, populate_store,

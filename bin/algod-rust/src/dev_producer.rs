@@ -22,28 +22,36 @@ use algo_ledger::SqliteLedger;
 use algo_pool::TransactionPool;
 use algo_types::{Block, Digest, SignedTransaction};
 
-/// Compute the canonical transaction id of a transaction *as committed in a
-/// block*, restoring the genesis hash the block's STIB encoding strips.
+/// Restore the genesis fields a block's STIB encoding strips, returning the
+/// transaction in the canonical form the submitter signed and hashed.
 ///
 /// A block stores transactions in `SignedTxnInBlock` form, which omits
-/// `genesis_hash` when it equals the block's (always, under modern protocols
-/// that require it). The decoded `payset` therefore carries a zero
-/// `genesis_hash`, so a naive `compute_txn_id` would differ from the id the
-/// submitter computed (which includes the genesis hash). Restore it before
-/// hashing so committed-id matching and confirmation lookups agree with the
-/// submitter.
-///
-/// Note: a transaction whose `genesis_id` matched the network (and was thus
-/// stripped) cannot be reconstructed from `payset` alone; modern clients set
-/// `genesis_hash` but not `genesis_id`, so this restores only the hash.
-pub fn block_txn_id(stx: &SignedTransaction, block: &Block) -> Digest {
-    if stx.txn.genesis_hash == [0u8; 32] && block.genesis_hash != [0u8; 32] {
-        let mut txn = stx.txn.clone();
-        txn.genesis_hash = block.genesis_hash;
-        compute_txn_id(&txn)
-    } else {
-        compute_txn_id(&stx.txn)
+/// `genesis_id` (when it matched the network, flagged by `has_genesis_id`) and
+/// `genesis_hash` (when it equals the block's — always, under modern protocols
+/// that require it). The decoded `payset` therefore carries the stripped form,
+/// so hashing it directly would differ from the submitter's txid. This mirrors
+/// the evaluator's `restore_genesis_fields`:
+/// - restore `genesis_id` from the block when `has_genesis_id` is set and the
+///   field is empty;
+/// - restore `genesis_hash` from the block when it's zero (a committed block's
+///   genesis hash is non-zero only under protocols that require it, where every
+///   txn's hash matched and was stripped).
+pub fn restore_block_genesis_fields(stx: &SignedTransaction, block: &Block) -> SignedTransaction {
+    let mut out = stx.clone();
+    if out.has_genesis_id && out.txn.genesis_id.is_empty() {
+        out.txn.genesis_id.clone_from(&block.genesis_id);
     }
+    if out.txn.genesis_hash == [0u8; 32] && block.genesis_hash != [0u8; 32] {
+        out.txn.genesis_hash = block.genesis_hash;
+    }
+    out
+}
+
+/// Canonical txid of a transaction *as committed in a block* — the id the
+/// submitter computed, with the block's stripped genesis fields restored (see
+/// [`restore_block_genesis_fields`]).
+pub fn block_txn_id(stx: &SignedTransaction, block: &Block) -> Digest {
+    compute_txn_id(&restore_block_genesis_fields(stx, block).txn)
 }
 
 /// Assemble, finish, commit, and announce one dev-mode block built from the
@@ -111,4 +119,78 @@ pub fn produce_dev_block(
     // and rebuilds the evaluator for the next round.
     pool.on_new_block(&block, &committed_txids);
     Ok(block)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use algo_types::{Round, Transaction, TxnType};
+
+    fn block_with_genesis(id: &str, hash: [u8; 32]) -> Block {
+        Block {
+            round: Round(1),
+            genesis_id: id.to_string(),
+            genesis_hash: hash,
+            ..Block::default()
+        }
+    }
+
+    #[test]
+    fn block_txn_id_matches_submitter_when_both_genesis_fields_stripped() {
+        // The submitter signs/hashes the full transaction.
+        let full = Transaction {
+            txn_type: TxnType::Pay,
+            sender: algo_types::Address([1u8; 32]),
+            genesis_id: "net-x".to_string(),
+            genesis_hash: [7u8; 32],
+            ..Default::default()
+        };
+        let want = compute_txn_id(&full);
+
+        // The block stores the STIB-stripped form: genesis_id/hash removed, flags set.
+        let stripped = SignedTransaction {
+            txn: Transaction {
+                genesis_id: String::new(),
+                genesis_hash: [0u8; 32],
+                ..full.clone()
+            },
+            has_genesis_id: true,
+            has_genesis_hash: true,
+            ..Default::default()
+        };
+        let block = block_with_genesis("net-x", [7u8; 32]);
+
+        assert_eq!(
+            block_txn_id(&stripped, &block),
+            want,
+            "restored txid must match the submitter's full-transaction txid",
+        );
+    }
+
+    #[test]
+    fn restore_leaves_unflagged_genesis_id_empty() {
+        // A transaction that genuinely had no genesis_id (flag unset) must keep
+        // it empty — restoring it would change the txid.
+        let stx = SignedTransaction {
+            txn: Transaction {
+                txn_type: TxnType::Pay,
+                genesis_id: String::new(),
+                genesis_hash: [0u8; 32],
+                ..Default::default()
+            },
+            has_genesis_id: false,
+            has_genesis_hash: true,
+            ..Default::default()
+        };
+        let block = block_with_genesis("net-x", [7u8; 32]);
+        let restored = restore_block_genesis_fields(&stx, &block);
+        assert!(
+            restored.txn.genesis_id.is_empty(),
+            "unflagged genesis_id stays empty"
+        );
+        assert_eq!(
+            restored.txn.genesis_hash, [7u8; 32],
+            "genesis_hash restored"
+        );
+    }
 }
