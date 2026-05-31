@@ -1323,16 +1323,15 @@ impl AlgodNodeInterface {
         }
 
         use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
 
-        // Create the temp file securely: 0600 (private-key material), exclusive
-        // creation (`O_CREAT|O_EXCL` — fails rather than following a pre-placed
-        // symlink or clobbering an existing file), and a unique name combining
-        // the pid, a high-resolution timestamp, and a process-global counter so
-        // concurrent installs never collide. Go uses a random-suffixed name in
-        // the genesis dir (node.go:936); we keep the bytes off any shared path
-        // and lock down the mode the same way go's umask-respecting
-        // participation files are expected to be protected.
+        // Create the temp file securely: on unix 0600 (private-key material),
+        // exclusive creation (`O_CREAT|O_EXCL` — fails rather than following a
+        // pre-placed symlink or clobbering an existing file), and a unique name
+        // combining the pid, a high-resolution timestamp, and a process-global
+        // counter so concurrent installs never collide. Go uses a
+        // random-suffixed name in the genesis dir (node.go:936); we keep the
+        // bytes off any shared path and lock down the mode the same way go's
+        // umask-respecting participation files are expected to be protected.
         static TEMP_PARTKEY_COUNTER: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
         let nonce = std::time::SystemTime::now()
@@ -1347,10 +1346,16 @@ impl AlgodNodeInterface {
         ));
 
         {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            // The 0600 mode is unix-only; on other platforms exclusive creation
+            // in a private temp dir is the available protection.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            let mut file = opts
                 .open(&path)
                 .map_err(|e| NodeError::Internal(format!("creating temp partkey: {e}")))?;
             file.write_all(data)
