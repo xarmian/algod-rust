@@ -1155,6 +1155,19 @@ fn print_dryrun_response(resp: &serde_json::Value, verbose: bool) {
                 for item in trace {
                     let line = item.get("line").and_then(|l| l.as_u64()).unwrap_or(0);
                     let pc = item.get("pc").and_then(|p| p.as_u64()).unwrap_or(0);
+                    // `disassembly[line - 1]`, verbatim from Go's dryrunRemoteCmd
+                    // (clerk.go:1284: `txnResult.Disassembly[item.Line-1]`). Go's
+                    // dryrun reports a 1-based `line` over the full disassembly
+                    // (the `#pragma` is line 1), so `line - 1` lands on the
+                    // executed opcode. NOTE: the Rust node's dryrun currently
+                    // emits `line = instruction_index + 1` (pragma = line 0),
+                    // which is one less than go-algorand for the same step — so
+                    // against today's Rust node this can render the source line
+                    // shifted by one. That is a node-side `offset_to_line`
+                    // discrepancy (algo-rest-api/dryrun.rs), not a CLI bug:
+                    // matching Go's `line - 1` here keeps goal-rust correct
+                    // against go-algorand and against a node fixed to Go's
+                    // convention. Tracked as a separate (deferred) node concern.
                     let src = disassembly
                         .and_then(|d| line.checked_sub(1).and_then(|idx| d.get(idx as usize)))
                         .and_then(|s| s.as_str())
