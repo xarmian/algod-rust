@@ -729,6 +729,11 @@ fn run_compile_inner(
     args: crate::groups::clerk::CompileArgs,
     cli_d: Vec<PathBuf>,
 ) -> Result<(), String> {
+    // With no input files Go's compileCmd iterates an empty list — a no-op that
+    // never contacts a node. Mirror that and skip data-dir/client setup.
+    if args.files.is_empty() {
+        return Ok(());
+    }
     let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
     let algod = build_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
