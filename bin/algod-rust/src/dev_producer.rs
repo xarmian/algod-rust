@@ -12,19 +12,21 @@
 //! all advanced header fields match go's dev-mode `MakeBlock`/`writeDevmodeBlock`,
 //! the produced block digests match a go dev chain.
 //!
-//! **Limitation (TASK-278):** blocks are committed via the pool's
-//! `SimpleBlockEvaluator` (stateless + signature + balance/resource checks, no
-//! AVM execution) and `apply_block` in Replay mode. So an `appl` transaction
-//! whose approval program would reject can still be confirmed, and committed
-//! blocks carry no ApplyData (eval deltas, logs, inner txns, created ids).
-//! Payments and asset transfers confirm correctly; full app/asset execution +
-//! ApplyData in dev mode is tracked in TASK-278.
+//! Blocks are committed in [`ApplyMode::Execute`], which runs the AVM: an `appl`
+//! transaction whose approval (or clear-state) program rejects fails the apply,
+//! so the submission errors and nothing is confirmed — rather than confirming an
+//! invalid app call. (The pool's assembly evaluator only does stateless +
+//! balance/resource checks, so this commit-time execution is what enforces
+//! program correctness in dev mode.) Surfacing the resulting ApplyData
+//! (created ids, eval delta, logs, inner txns) in the confirmed-transaction
+//! response is tracked in TASK-278; today the response carries `confirmed_round`
+//! and the transaction.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use algo_codec::{canonical_encode_block_header_from_block, compute_txn_id, encode_block};
-use algo_ledger::apply::apply_block;
+use algo_ledger::apply::{apply_block_with_mode, ApplyMode};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::SqliteLedger;
 use algo_pool::TransactionPool;
@@ -88,9 +90,11 @@ pub fn block_txn_id(stx: &SignedTransaction, block: &Block) -> Digest {
 ///    same value, so `seed = branch`. The proposer (and thus payout) stay zero,
 ///    matching `writeDevmodeBlock`.
 /// 3. Commit block + state atomically (`begin_block` → `put_block` →
-///    `apply_block` → `commit_block`). No certificate is stored — dev blocks
-///    aren't agreed upon, so `get_block_cert` returns `None` (a valid
-///    `{block}`-only envelope, exactly as for the genesis block).
+///    `apply_block_with_mode(Execute)` → `commit_block`). Execute mode runs the
+///    AVM, so a rejecting app program fails the apply and the whole commit rolls
+///    back (the submission errors; nothing is confirmed). No certificate is
+///    stored — dev blocks aren't agreed upon, so `get_block_cert` returns `None`
+///    (a valid `{block}`-only envelope, exactly as for the genesis block).
 /// 4. `on_new_block` so the pool drops the now-committed transactions and
 ///    rebuilds its evaluator for the next round.
 pub fn produce_dev_block(
@@ -122,7 +126,9 @@ pub fn produce_dev_block(
             .map_err(|e| anyhow::anyhow!("begin_block: {e}"))?;
         let result = (|| -> Result<(), algo_error::AlgoError> {
             l.put_block(block.round.0, &proto, &hdr_data, &blk_data)?;
-            apply_block(&mut *l, &block)?;
+            // Execute mode runs the AVM, rejecting transactions whose programs
+            // fail (rather than confirming an invalid app call as Replay would).
+            apply_block_with_mode(&mut *l, &block, ApplyMode::Execute)?;
             Ok(())
         })();
         if let Err(e) = result {

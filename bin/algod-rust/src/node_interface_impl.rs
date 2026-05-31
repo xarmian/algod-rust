@@ -903,8 +903,17 @@ impl NodeInterface for AlgodNodeInterface {
                 pool.ensure_evaluator_primed();
                 pool.remember(tx_group)
                     .map_err(|e| NodeError::BadRequest(format!("pool rejected group: {e}")))?;
-                crate::dev_producer::produce_dev_block(&pool, &ledger)
-                    .map_err(|e| NodeError::Internal(format!("dev block production: {e}")))?;
+                if let Err(e) = crate::dev_producer::produce_dev_block(&pool, &ledger) {
+                    // The block (including this just-remembered group) failed to
+                    // apply — typically a rejecting app program under Execute
+                    // mode. Drop the pending group so the rejected transaction
+                    // doesn't wedge later blocks; dev submits are serialized and
+                    // each drains the pool, so only this group is pending here.
+                    pool.reset();
+                    return Err(NodeError::BadRequest(format!(
+                        "dev block production rejected the group: {e}"
+                    )));
+                }
                 Ok::<(), NodeError>(())
             })
             .await
@@ -2149,10 +2158,13 @@ mod tests {
         make_adapter().with_pool(pool)
     }
 
-    /// End-to-end dev-mode submit→confirm (TASK-264): a signed payment, when
-    /// broadcast to a dev-mode node, produces a block and is reported confirmed.
-    #[tokio::test]
-    async fn dev_mode_submit_produces_block_and_confirms() {
+    /// Build a dev-mode adapter over an in-memory ledger seeded from a genesis
+    /// that funds `sender` (proto "future"). Returns the adapter, the shared
+    /// ledger, and the genesis hash. Mirrors `node start --dev` wiring.
+    fn seed_dev_adapter(
+        sender: Address,
+        micro_algos: u64,
+    ) -> (AlgodNodeInterface, Arc<Mutex<SqliteLedger>>, [u8; 32]) {
         use crate::commands::participate::PoolLedgerAdapter;
         use algo_codec::{canonical_encode_block_header_from_block, encode_block};
         use algo_ledger::genesis::genesis_hash;
@@ -2160,25 +2172,16 @@ mod tests {
             make_genesis_block, parse_genesis_json, populate_store,
             seed_account_totals_from_genesis,
         };
-        use algo_types::{Round, SignedTransaction, Transaction, TxnType};
-        use ed25519_dalek::{Signer, SigningKey};
 
-        // Sender keypair (we need to sign); receiver is a fresh account.
-        let sender_key = SigningKey::from_bytes(&[0x11u8; 32]);
-        let sender = Address(sender_key.verifying_key().to_bytes());
-        let receiver = Address([0x22u8; 32]);
-
-        // Genesis: sender funded; valid fee-sink / rewards-pool; proto "future".
         let fees = Address([0xFEu8; 32]).to_algorand_string();
         let rwd = Address([0xFDu8; 32]).to_algorand_string();
         let sender_b32 = sender.to_algorand_string();
         let genesis_json = format!(
-            r#"{{"id":"v1","network":"localnet","proto":"future","fees":"{fees}","rwd":"{rwd}","timestamp":0,"alloc":[{{"addr":"{sender_b32}","comment":"w1","state":{{"algo":10000000,"onl":0}}}}]}}"#
+            r#"{{"id":"v1","network":"localnet","proto":"future","fees":"{fees}","rwd":"{rwd}","timestamp":0,"alloc":[{{"addr":"{sender_b32}","comment":"w1","state":{{"algo":{micro_algos},"onl":0}}}}]}}"#
         );
         let genesis = parse_genesis_json(&genesis_json).expect("parse genesis");
         let gh = genesis_hash(&genesis);
 
-        // Seed an in-memory ledger from genesis (mirrors `node start`).
         let mut l = SqliteLedger::open_in_memory().expect("ledger");
         l.begin_block().unwrap();
         populate_store(&mut l, &genesis).unwrap();
@@ -2190,7 +2193,6 @@ mod tests {
         l.commit_block().unwrap();
         let ledger = Arc::new(Mutex::new(l));
 
-        // Dev-mode adapter with a real pool over the seeded ledger.
         let pool = Arc::new(TransactionPool::new(
             algo_pool::PoolConfig::default(),
             Arc::new(PoolLedgerAdapter::new(ledger.clone()))
@@ -2199,12 +2201,40 @@ mod tests {
         let adapter = adapter_with_ledger(ledger.clone())
             .with_pool(pool)
             .with_dev_mode();
+        (adapter, ledger, gh)
+    }
+
+    /// ed25519-sign a transaction (`SHA512/256("TX" || canonical(txn))`).
+    fn sign_txn(
+        txn: &algo_types::Transaction,
+        key: &ed25519_dalek::SigningKey,
+    ) -> SignedTransaction {
+        use ed25519_dalek::Signer;
+        let mut msg = b"TX".to_vec();
+        msg.extend_from_slice(&algo_codec::canonical_encode_transaction(txn));
+        SignedTransaction {
+            txn: txn.clone(),
+            sig: key.sign(&msg).to_bytes(),
+            ..Default::default()
+        }
+    }
+
+    /// End-to-end dev-mode submit→confirm (TASK-264): a signed payment, when
+    /// broadcast to a dev-mode node, produces a block and is reported confirmed.
+    #[tokio::test]
+    async fn dev_mode_submit_produces_block_and_confirms() {
+        use algo_types::{Round, Transaction, TxnType};
+        use ed25519_dalek::SigningKey;
+
+        let sender_key = SigningKey::from_bytes(&[0x11u8; 32]);
+        let sender = Address(sender_key.verifying_key().to_bytes());
+        let (adapter, ledger, gh) = seed_dev_adapter(sender, 10_000_000);
 
         // Signed payment valid from round 1 (the round the dev node will build).
         let txn = Transaction {
             txn_type: TxnType::Pay,
             sender,
-            receiver,
+            receiver: Address([0x22u8; 32]),
             amount: 1_000_000,
             fee: 1000,
             first_valid: Round(1),
@@ -2212,17 +2242,9 @@ mod tests {
             genesis_hash: gh,
             ..Default::default()
         };
-        let mut msg = b"TX".to_vec();
-        msg.extend_from_slice(&algo_codec::canonical_encode_transaction(&txn));
-        let sig = sender_key.sign(&msg).to_bytes();
-        let stx = SignedTransaction {
-            txn: txn.clone(),
-            sig,
-            ..Default::default()
-        };
+        let stx = sign_txn(&txn, &sender_key);
         let txid = compute_txn_id(&txn);
 
-        // Submit → the dev producer assembles, finishes, and commits round 1.
         adapter
             .broadcast_signed_tx_group(vec![stx])
             .await
@@ -2234,13 +2256,70 @@ mod tests {
             "one block should have been produced",
         );
 
-        // The committed transaction is reported confirmed in round 1.
         let status = adapter
             .get_pending_transaction(&txid)
             .await
             .expect("lookup ok")
             .expect("transaction should be found as confirmed");
         assert_eq!(status.confirmed_round, 1, "confirmed in round 1");
+    }
+
+    /// Dev mode commits in Execute mode, so an app-create whose approval program
+    /// rejects must fail the submission — not confirm an invalid app call — and
+    /// must not wedge the pool (TASK-264 / Codex round 5).
+    #[tokio::test]
+    async fn dev_mode_rejects_failing_app_program() {
+        use algo_types::{Round, Transaction, TxnType};
+        use ed25519_dalek::SigningKey;
+        use serde_bytes::ByteBuf;
+
+        let sender_key = SigningKey::from_bytes(&[0x33u8; 32]);
+        let sender = Address(sender_key.verifying_key().to_bytes());
+        let (adapter, ledger, gh) = seed_dev_adapter(sender, 10_000_000);
+
+        // App-create (application_id 0, NoOp) with a rejecting approval program
+        // (`#pragma version 6; pushint 0`) and an approving clear-state program.
+        let txn = Transaction {
+            txn_type: TxnType::Appl,
+            sender,
+            application_id: 0,
+            on_completion: 0,
+            approval_program: Some(ByteBuf::from(vec![0x06u8, 0x81, 0x00])),
+            clear_state_program: Some(ByteBuf::from(vec![0x06u8, 0x81, 0x01])),
+            fee: 1000,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            genesis_hash: gh,
+            ..Default::default()
+        };
+        let stx = sign_txn(&txn, &sender_key);
+        let txid = compute_txn_id(&txn);
+
+        // Execute mode runs the rejecting program → submission errors (4xx).
+        let err = adapter
+            .broadcast_signed_tx_group(vec![stx])
+            .await
+            .expect_err("a rejecting app program must fail the submission");
+        assert!(
+            matches!(err, NodeError::BadRequest(_)),
+            "expected BadRequest, got {err:?}",
+        );
+
+        // No block was produced, and the rejected txn is neither confirmed nor
+        // left wedged in the pool.
+        assert_eq!(
+            ledger.lock().unwrap().current_round().0,
+            0,
+            "no block should be produced when the app program rejects",
+        );
+        assert!(
+            adapter
+                .get_pending_transaction(&txid)
+                .await
+                .expect("lookup ok")
+                .is_none(),
+            "rejected transaction must not be reported confirmed or pending",
+        );
     }
 
     #[tokio::test]
