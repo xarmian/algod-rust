@@ -7,16 +7,19 @@
 //! than `core/` because it depends on async networking — `core/*` crates must
 //! not (see `docs/CRATE_ARCHITECTURE.md`).
 //!
-//! Today it ships the [`KeyregBuilder`] (key registration); Phase C extends the
-//! pipeline with payment / asset-transfer / asset-config / asset-freeze /
-//! application builders, each a small follow-on against this same surface.
+//! Today it ships the [`KeyregBuilder`] (key registration) and
+//! [`PaymentBuilder`] (payments); Phase C extends the pipeline with
+//! asset-transfer / asset-config / asset-freeze / application builders, each a
+//! small follow-on against this same surface.
 
 mod error;
 mod keyreg;
+mod payment;
 mod pipeline;
 
 pub use error::{PipelineError, Result};
 pub use keyreg::KeyregBuilder;
+pub use payment::PaymentBuilder;
 pub use pipeline::{estimate_fee, TxnPipeline};
 
 // Re-export the client-layer types a consumer needs so they don't have to

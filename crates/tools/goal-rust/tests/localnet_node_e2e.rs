@@ -38,20 +38,21 @@
 //!   5. `account changeonlinestatus --offline` → keyreg submit, dev-mode block,
 //!      confirmed; `account list` flips to `[offline]` (Phase C1, needs a
 //!      funded signer).
-//!   6. `account addpartkey` then `changeonlinestatus --online` → status flips
+//!   6. `clerk send` → a real payment, signed via `kmd-rust`, submitted to the
+//!      Rust dev node and confirmed within one dev-mode round; the recipient
+//!      balance increases by the sent amount (TASK-287).
+//!   7. `account addpartkey` then `changeonlinestatus --online` → status flips
 //!      back to `[online]`.
 //!
 //! - **Go-goal direction** (only when `../go-algorand` is present + builds):
-//!   1. Go `goal account info` / `account balance` → read paths.
-//!   2. Go `goal clerk send` → a real payment, signed via `kmd-rust`, submitted
-//!      to the Rust dev node and confirmed within one dev-mode round; the
-//!      recipient balance increases by the sent amount.
+//!   1. Go `goal account info` → read path against the Rust node's
+//!      `/v2/accounts` endpoint.
 //!
-//! `goal-rust clerk send` is still a stub (the whole `clerk` group is
-//! unimplemented in `goal-rust`), so the payment submit/confirm path is covered
-//! via **Go** `goal` here. If `../go-algorand` is absent or `go build` fails,
-//! the Go-goal section is skipped with a note rather than failing — the
-//! goal-rust lifecycle above still runs and asserts.
+//! The payment submit/confirm path is now driven end-to-end by **`goal-rust
+//! clerk send`** (TASK-287 implemented the leaf; before that it ran via Go
+//! `goal clerk send`). The Go-goal section is read-only and is skipped with a
+//! note rather than failing when `../go-algorand` is absent or `go build`
+//! fails — the goal-rust lifecycle above still runs and asserts.
 //!
 //! ## The A11 lesson
 //!
@@ -470,7 +471,62 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
         "status should flip to offline; got:\n{list_off}"
     );
 
-    // 6. addpartkey, then changeonlinestatus --online → status flips back. Going
+    // 6b. clerk send → a real payment driven entirely by goal-rust: build the
+    //    pay txn, sign via kmd-rust, submit to the Rust dev node, confirm within
+    //    one dev-mode round; the recipient balance grows by the sent amount.
+    //    (Migrated from Go `goal clerk send` — TASK-287.)
+    let before = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (before)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+
+    let pay_amt: u64 = 1_000_000;
+    let send_out = assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                &pay_amt.to_string(),
+                "-f",
+                DEV_ADDR,
+                "-t",
+                FEE_SINK,
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
+        ),
+        "clerk send",
+        &node,
+    );
+    assert!(
+        send_out.contains(&format!(
+            "Sent {pay_amt} MicroAlgos from account {DEV_ADDR} to address {FEE_SINK}"
+        )),
+        "clerk send should print Go's infoTxIssued line; got:\n{send_out}"
+    );
+    assert!(
+        send_out.contains("committed in round"),
+        "goal-rust payment should confirm in a dev-mode round; got:\n{send_out}"
+    );
+
+    let after = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (after)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+    assert!(
+        after >= before + pay_amt,
+        "recipient balance should grow by >= {pay_amt} (before={before}, after={after})"
+    );
+
+    // 7. addpartkey, then changeonlinestatus --online → status flips back. Going
     //    online needs a participation key registered for the account.
     assert_cli_ok(
         &goal_rust(
@@ -558,79 +614,5 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
         String::from_utf8_lossy(&go_info.stdout).contains("Minimum Balance:"),
         "Go goal account info missing Minimum Balance; got:\n{}",
         String::from_utf8_lossy(&go_info.stdout)
-    );
-
-    // Payment submit/confirm via Go goal (goal-rust's clerk send is a stub).
-    // Go goal only skips the password prompt for an *unencrypted* wallet, so
-    // create one and re-import the dev account there.
-    assert_cli_ok(
-        &goal_rust(dd, &["wallet", "new", "wu", "-w", "", "--no-display-seed"]),
-        "wallet new (unencrypted)",
-        &node,
-    );
-    assert_cli_ok(
-        &goal_rust(
-            dd,
-            &[
-                "account",
-                "import",
-                "-w",
-                "wu",
-                "--password",
-                "",
-                "--mnemonic",
-                DEV_MNEMONIC,
-            ],
-        ),
-        "account import (unencrypted wallet)",
-        &node,
-    );
-
-    let before = parse_balance(&assert_cli_ok(
-        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
-        "recipient balance (before)",
-        &node,
-    ))
-    .expect("recipient balance is an integer");
-
-    let pay_amt: u64 = 1_000_000;
-    let send = go_goal(
-        &go_goal_bin,
-        dd,
-        &[
-            "clerk",
-            "send",
-            "-a",
-            &pay_amt.to_string(),
-            "-f",
-            DEV_ADDR,
-            "-t",
-            FEE_SINK,
-            "-w",
-            "wu",
-        ],
-    );
-    let send_out = String::from_utf8_lossy(&send.stdout);
-    assert!(
-        send.status.success(),
-        "Go goal clerk send failed: exit={:?}\n  stdout={send_out}\n  stderr={}\n  node log:\n{}",
-        send.status.code(),
-        String::from_utf8_lossy(&send.stderr),
-        node.log_tail(),
-    );
-    assert!(
-        send_out.contains("committed in round"),
-        "Go goal payment should confirm in a dev-mode round; got:\n{send_out}"
-    );
-
-    let after = parse_balance(&assert_cli_ok(
-        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
-        "recipient balance (after)",
-        &node,
-    ))
-    .expect("recipient balance is an integer");
-    assert!(
-        after >= before + pay_amt,
-        "recipient balance should grow by >= {pay_amt} (before={before}, after={after})"
     );
 }

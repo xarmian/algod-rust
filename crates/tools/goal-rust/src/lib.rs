@@ -92,6 +92,12 @@ pub enum RootCommand {
 
     /// Provides the tools to control transactions.
     Clerk {
+        /// Wallet to use for the operation. Mirrors Go's *persistent* `-w`
+        /// flag on the `clerk` group (clerk.go:101). Declared `global = true`
+        /// so both Go orderings parse to the same value: `clerk -w w send ...`
+        /// and `clerk send -w w ...`.
+        #[arg(short = 'w', long = "wallet", global = true)]
+        wallet: Option<String>,
         #[command(subcommand)]
         cmd: Option<groups::clerk::ClerkCmd>,
     },
@@ -191,8 +197,11 @@ pub fn run() -> ExitCode {
         RootCommand::App { cmd: None } => print_group_help(&["app"]),
         RootCommand::Asset { cmd: Some(c) } => groups::asset::run(c),
         RootCommand::Asset { cmd: None } => print_group_help(&["asset"]),
-        RootCommand::Clerk { cmd: Some(c) } => groups::clerk::run(c),
-        RootCommand::Clerk { cmd: None } => print_group_help(&["clerk"]),
+        RootCommand::Clerk {
+            cmd: Some(c),
+            wallet,
+        } => groups::clerk::run(c, wallet),
+        RootCommand::Clerk { cmd: None, .. } => print_group_help(&["clerk"]),
         RootCommand::Completion { cmd: Some(c) } => groups::completion::run(c),
         RootCommand::Completion { cmd: None } => print_group_help(&["completion"]),
         RootCommand::Kmd { cmd: Some(c) } => groups::kmd::run(c),
