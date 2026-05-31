@@ -1385,11 +1385,10 @@ fn execute_inner_appl<L: LedgerStore>(
         });
     }
 
-    // ── Collect logs, inner txns, fee_credit, and txn_counter from child ──
-    // Logs and inner transactions are now captured in the AvmResult (extracted
-    // from the context by run_approval_program/run_clear_state_program).
-    let inner_logs = avm_result.logs.clone();
-    let inner_txns_from_child = avm_result.inner_transactions.clone();
+    // ── Collect fee_credit and txn_counter from child ──
+    // Logs, inner txns, and state deltas are captured in the AvmResult (extracted
+    // from the context by run_approval_program/run_clear_state_program) and
+    // encoded into the inner txn's eval_delta below.
     // Capture fee_credit and txn_counter for propagation back to parent (H5/H6).
     let child_fee_credit = inner_ctx.fee_credit;
     let child_txn_counter = inner_ctx.txn_counter;
@@ -1408,42 +1407,14 @@ fn execute_inner_appl<L: LedgerStore>(
         unnamed_access: inner_ctx.unnamed_access,
     };
 
-    // Store logs and nested inner txns as the eval_delta on the
-    // inner SignedTransaction. We build a minimal eval_delta rmpv::Value map.
-    if !inner_logs.is_empty() || !inner_txns_from_child.is_empty() {
-        let mut dt_map: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-        if !inner_logs.is_empty() {
-            let log_values: Vec<rmpv::Value> = inner_logs
-                .iter()
-                .map(|l| rmpv::Value::Binary(l.clone()))
-                .collect();
-            dt_map.push((
-                rmpv::Value::String("lg".into()),
-                rmpv::Value::Array(log_values),
-            ));
-        }
-
-        // Serialize nested inner transactions under the "itx" key,
-        // matching go-algorand's EvalDelta.InnerTxns field.
-        if !inner_txns_from_child.is_empty() {
-            let itx_values: Vec<rmpv::Value> = inner_txns_from_child
-                .iter()
-                .filter_map(|stxn_child| {
-                    let bytes = rmp_serde::to_vec_named(stxn_child).ok()?;
-                    rmpv::decode::read_value(&mut &bytes[..]).ok()
-                })
-                .collect();
-            if !itx_values.is_empty() {
-                dt_map.push((
-                    rmpv::Value::String("itx".into()),
-                    rmpv::Value::Array(itx_values),
-                ));
-            }
-        }
-
-        stxn.eval_delta = Some(rmpv::Value::Map(dt_map));
-    }
+    // Encode the inner app call's full eval_delta — global/local state deltas,
+    // shared accounts, logs, and nested inner txns — onto the inner
+    // SignedTransaction, matching go-algorand's per-transaction EvalDelta
+    // (eval.go:5751 appends each inner txn with its own ApplyData). Reuses the
+    // same encoder as the outer txn (TASK-280); nested `itx[*].dt` are already
+    // populated on each child stxn, so the recursion composes. (TASK-281)
+    let dt = crate::eval_delta::encode_eval_delta(&avm_result, &stxn.txn);
+    stxn.eval_delta = dt;
 
     // ── Apply OnCompletion side effects (post-program) ──
     // Drop inner_ctx to release the borrow on store before applying on-completion effects.
@@ -5571,6 +5542,72 @@ mod tests {
         let logs = ed.logs.unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0], b"nested");
+    }
+
+    // ---- TASK-281: inner app call global/local state deltas in eval_delta ----
+
+    #[test]
+    fn inner_appl_state_delta_without_logging_in_eval_delta() {
+        // An inner app call that writes global state but emits no logs must
+        // still surface its state changes in the inner txn's eval_delta `gd`.
+        // Before TASK-281 the inner eval_delta only carried `lg`/`itx`, so a
+        // silent state writer produced an empty (None) inner delta.
+        use crate::eval_delta::{parse_eval_delta, DeltaAction};
+
+        let mut store = LedgerState::new();
+        setup_app(&mut store, 42, make_program(6, true), make_program(6, true));
+
+        // App 100: pushbytes "g"; pushint 7; app_global_put; pushint 1; return.
+        // Writes global key "g" = 7 and approves, without logging.
+        let state_program = vec![
+            6u8, // version 6
+            0x80, 0x01, b'g', // pushbytes "g"
+            0x81, 0x07, // pushint 7
+            0x67, // app_global_put
+            0x81, 0x01, // pushint 1
+            0x43, // return
+        ];
+        setup_app(&mut store, 100, state_program, make_program(6, true));
+
+        let app_addr = Address(app_address(42));
+        store.set_account(
+            &app_addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+
+        let sender = [10u8; 32];
+        let txn = make_appl_txn(sender, 42, vec![], vec![100], vec![]);
+        let mut ctx = make_context(&mut store, vec![txn]);
+        ctx.fee_sink = Address([0xFEu8; 32]);
+        ctx.opcode_budget = 2000;
+
+        ctx.itxn_begin().unwrap();
+        ctx.itxn_field(16, TealValue::Uint(6)).unwrap(); // appl
+        ctx.itxn_field(24, TealValue::Uint(100)).unwrap(); // ApplicationID = 100
+        ctx.itxn_submit().unwrap();
+
+        let inner_stxn = &ctx.inner_txns().last().unwrap()[0];
+        let ed = parse_eval_delta(
+            inner_stxn
+                .eval_delta
+                .as_ref()
+                .expect("inner eval_delta should exist for a state-writing inner call"),
+        )
+        .unwrap();
+
+        let gd = ed
+            .global_delta
+            .expect("inner global delta should be present");
+        let vd = gd
+            .get(b"g".as_slice())
+            .expect("global key `g` written by the inner app");
+        assert_eq!(vd.action, DeltaAction::SetUint);
+        assert_eq!(vd.uint, 7);
+        // No logs were emitted, so there should be no `lg` entry.
+        assert!(ed.logs.is_none(), "inner call emitted no logs");
     }
 
     // ---- H2: Asset/app creation IDs are sequential (no gaps/duplicates) ----

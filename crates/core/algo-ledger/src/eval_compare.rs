@@ -77,12 +77,7 @@ pub fn compare_eval_delta(
     recorded: Option<&EvalDelta>,
     stx: &SignedTransaction,
 ) -> CompareResult {
-    let empty_delta = EvalDelta {
-        global_delta: None,
-        local_deltas: None,
-        inner_txns: None,
-        logs: None,
-    };
+    let empty_delta = EvalDelta::default();
     let recorded = recorded.unwrap_or(&empty_delta);
     let mut mismatches = Vec::new();
 
@@ -769,6 +764,7 @@ mod tests {
             local_deltas: None,
             inner_txns: None,
             logs: None,
+            shared_accts: None,
         };
         let stx = make_stx_with_accounts(Address([0u8; 32]), vec![]);
         let cmp = compare_eval_delta(&result, Some(&delta), &stx);
@@ -785,6 +781,7 @@ mod tests {
             local_deltas: None,
             inner_txns: None,
             logs: Some(vec![b"hello".to_vec(), b"world".to_vec()]),
+            shared_accts: None,
         };
         let stx = make_stx_with_accounts(Address([0u8; 32]), vec![]);
         let cmp = compare_eval_delta(&result, Some(&delta), &stx);
@@ -801,6 +798,7 @@ mod tests {
             local_deltas: None,
             inner_txns: None,
             logs: Some(vec![b"hello".to_vec(), b"world".to_vec()]),
+            shared_accts: None,
         };
         let stx = make_stx_with_accounts(Address([0u8; 32]), vec![]);
         let cmp = compare_eval_delta(&result, Some(&delta), &stx);
@@ -830,6 +828,7 @@ mod tests {
             local_deltas: None,
             inner_txns: None,
             logs: None,
+            shared_accts: None,
         };
         let stx = make_stx_with_accounts(Address([0u8; 32]), vec![]);
         let cmp = compare_eval_delta(&result, Some(&delta), &stx);
@@ -857,6 +856,7 @@ mod tests {
             local_deltas: None,
             inner_txns: None,
             logs: None,
+            shared_accts: None,
         };
         let stx = make_stx_with_accounts(Address([0u8; 32]), vec![]);
         let cmp = compare_eval_delta(&result, Some(&delta), &stx);
@@ -876,6 +876,7 @@ mod tests {
             local_deltas: None,
             inner_txns: None,
             logs: None,
+            shared_accts: None,
         };
         let stx = make_stx_with_accounts(Address([0u8; 32]), vec![]);
         let cmp = compare_eval_delta(&result, Some(&delta), &stx);
@@ -908,6 +909,7 @@ mod tests {
             local_deltas: Some(ld),
             inner_txns: None,
             logs: None,
+            shared_accts: None,
         };
         let stx = make_stx_with_accounts(sender, vec![]);
         let cmp = compare_eval_delta(&result, Some(&delta), &stx);
@@ -944,6 +946,7 @@ mod tests {
             local_deltas: None,
             inner_txns: None,
             logs: None,
+            shared_accts: None,
         };
         let stx = make_stx_with_accounts(Address([0u8; 32]), vec![]);
         let cmp = compare_eval_delta(&result, Some(&delta), &stx);
