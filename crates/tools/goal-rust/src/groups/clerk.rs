@@ -1,9 +1,10 @@
 //! `goal clerk` — port of `../go-algorand/cmd/goal/clerk.go` (+ `multisig.go`,
 //! `tealsign.go`).
 //!
-//! `send` is implemented (the core payment path); the remaining leaves
-//! (compile / dryrun* / group / inspect / multisig / rawsend / sign / simulate
-//! / split / tealsign) are still stubbed pending their own follow-ups.
+//! `send` plus the offline txn-file utilities (`inspect` / `split` / `group`)
+//! and `rawsend` are implemented; the remaining leaves (compile / dryrun* /
+//! multisig / sign / simulate / tealsign) are still stubbed pending their own
+//! follow-ups.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -26,16 +27,16 @@ pub enum ClerkCmd {
     #[command(name = "dryrun-remote")]
     DryrunRemote,
     /// Group transactions together.
-    Group,
+    Group(GroupArgs),
     /// Print a transaction file.
-    Inspect,
+    Inspect(InspectArgs),
     /// Provides tools working with multisig transactions.
     Multisig {
         #[command(subcommand)]
         cmd: Option<MultisigCmd>,
     },
     /// Send raw transactions.
-    Rawsend,
+    Rawsend(RawsendArgs),
     /// Send money to an address.
     Send(SendArgs),
     /// Sign a transaction file.
@@ -45,7 +46,7 @@ pub enum ClerkCmd {
     Simulate,
     /// Split a file containing many transactions into one transaction per
     /// file.
-    Split,
+    Split(SplitArgs),
     /// Sign data to be verified in a TEAL program.
     Tealsign,
 }
@@ -135,6 +136,68 @@ pub struct SendArgs {
     // into the handler via `run(.., wallet)` rather than living on `SendArgs`.
 }
 
+/// `clerk inspect [files...]` — pretty-print decoded transaction file(s).
+///
+/// Mirrors Go's `inspectCmd` (clerk.go:712): for each input file, stream-decode
+/// `SignedTxn`s and print each as canonical JSON (`protocol.EncodeJSON` of the
+/// `inspectSignedTxn` view — addresses in algorand base32 format, the LogicSig
+/// program disassembled to TEAL).
+#[derive(Args, Debug)]
+pub struct InspectArgs {
+    /// Transaction files to decode and print. With none, nothing is printed
+    /// (matches Go iterating over zero positional args).
+    #[arg(value_name = "FILE")]
+    pub files: Vec<PathBuf>,
+    /// Display the TxID for each transaction (Go `-t/--txid`).
+    #[arg(short = 't', long = "txid")]
+    pub txid: bool,
+}
+
+/// `clerk split -i <in> -o <out>` — split a multi-txn file into one file per
+/// transaction. Mirrors Go's `splitCmd` (clerk.go:966): outputs are named
+/// `<base>-<idx><ext>` derived from `-o`.
+#[derive(Args, Debug)]
+pub struct SplitArgs {
+    /// File storing transactions to be split (Go `-i/--infile`). Required.
+    #[arg(short = 'i', long = "infile")]
+    pub infile: PathBuf,
+    /// Base filename for the individual transactions; each is written to
+    /// `<base>-<N><ext>` (Go `-o/--outfile`). Required.
+    #[arg(short = 'o', long = "outfile")]
+    pub outfile: String,
+}
+
+/// `clerk group -i <in> -o <out>` — assign a computed group ID to the (unsigned)
+/// transactions in a file. Mirrors Go's `groupCmd` (clerk.go:914).
+#[derive(Args, Debug)]
+pub struct GroupArgs {
+    /// File storing transactions to be grouped (Go `-i/--infile`). Required.
+    #[arg(short = 'i', long = "infile")]
+    pub infile: PathBuf,
+    /// Filename for writing the grouped transactions (Go `-o/--outfile`).
+    /// Required.
+    #[arg(short = 'o', long = "outfile")]
+    pub outfile: PathBuf,
+}
+
+/// `clerk rawsend -f <file> [-r rejects] [-N]` — submit a signed-txn file to
+/// algod and (unless `-N`) wait for confirmation. Mirrors Go's `rawsendCmd`
+/// (clerk.go:579).
+#[derive(Args, Debug)]
+pub struct RawsendArgs {
+    /// Filename of file containing raw (msgpack `SignedTxn`) transactions
+    /// (Go `-f/--filename`). Required.
+    #[arg(short = 'f', long = "filename")]
+    pub filename: PathBuf,
+    /// Filename for writing rejected transactions to (Go `-r/--rejects`;
+    /// default is `<filename>.rej`).
+    #[arg(short = 'r', long = "rejects")]
+    pub rejects: Option<PathBuf>,
+    /// Don't wait for transactions to commit (Go `-N/--no-wait`).
+    #[arg(short = 'N', long = "no-wait")]
+    pub no_wait: bool,
+}
+
 /// `wallet` is the group-level `-w` (Go's persistent clerk flag); leaves that
 /// take a wallet thread it in here.
 pub fn run(cmd: ClerkCmd, wallet: Option<String>) -> ExitCode {
@@ -144,11 +207,21 @@ pub fn run(cmd: ClerkCmd, wallet: Option<String>) -> ExitCode {
         ClerkCmd::Send(args) => {
             return crate::cmd::clerk::run_send(args, wallet, datadirs(), kmddir());
         }
+        ClerkCmd::Inspect(args) => {
+            return crate::cmd::clerk::run_inspect(args);
+        }
+        ClerkCmd::Split(args) => {
+            return crate::cmd::clerk::run_split(args);
+        }
+        ClerkCmd::Group(args) => {
+            return crate::cmd::clerk::run_group(args);
+        }
+        ClerkCmd::Rawsend(args) => {
+            return crate::cmd::clerk::run_rawsend(args, datadirs());
+        }
         ClerkCmd::Compile => "compile",
         ClerkCmd::Dryrun => "dryrun",
         ClerkCmd::DryrunRemote => "dryrun-remote",
-        ClerkCmd::Group => "group",
-        ClerkCmd::Inspect => "inspect",
         ClerkCmd::Multisig { cmd } => {
             let Some(cmd) = cmd else {
                 return crate::print_group_help(&["clerk", "multisig"]);
@@ -160,10 +233,8 @@ pub fn run(cmd: ClerkCmd, wallet: Option<String>) -> ExitCode {
             };
             return unimplemented("clerk multisig", leaf);
         }
-        ClerkCmd::Rawsend => "rawsend",
         ClerkCmd::Sign => "sign",
         ClerkCmd::Simulate => "simulate",
-        ClerkCmd::Split => "split",
         ClerkCmd::Tealsign => "tealsign",
     };
     unimplemented("clerk", leaf)
