@@ -3019,6 +3019,30 @@ impl SqliteLedger {
         Ok(result.unwrap_or(0).max(0) as u64)
     }
 
+    /// Query the total reward units from the `accounttotals` table.
+    ///
+    /// Returns `onlinerewardunits + offlinerewardunits` from the
+    /// `accounttotals` row with `id = ''` — go's `AccountTotals.RewardUnits()`
+    /// (`Online.RewardUnits + Offline.RewardUnits`, excluding NotParticipating).
+    /// This is the divisor in the per-round rewards-level advance.
+    ///
+    /// Returns `Ok(0)` if the table is empty or the row is missing.
+    pub fn total_reward_units(&self) -> Result<u64, AlgoError> {
+        let result: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT onlinerewardunits, offlinerewardunits FROM accounttotals WHERE id = ''",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query accounttotals reward units error: {e}"),
+            })?;
+        let (online, offline) = result.unwrap_or((0, 0));
+        Ok((online.max(0) as u64).saturating_add(offline.max(0) as u64))
+    }
+
     /// Query the online supply for a specific round from the
     /// `onlineroundparamstail` table.
     ///
@@ -4838,6 +4862,36 @@ impl LedgerStore for SqliteLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // total_reward_units (TASK-275)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn total_reward_units_missing_row_is_zero() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        assert_eq!(ledger.total_reward_units().unwrap(), 0);
+    }
+
+    #[test]
+    fn total_reward_units_sums_online_and_offline() {
+        // go's AccountTotals.RewardUnits() = Online.RewardUnits + Offline.RewardUnits
+        // (NotParticipating excluded). Seed the row directly since
+        // put_account_totals_seed zeroes the reward-unit columns.
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO accounttotals(id, online, onlinerewardunits, \
+                 offline, offlinerewardunits, notparticipating, \
+                 notparticipatingrewardunits, rewardslevel) \
+                 VALUES('', 0, 30, 0, 12, 0, 99, 0)",
+                [],
+            )
+            .unwrap();
+        // 30 + 12 = 42; the NotParticipating 99 must be excluded.
+        assert_eq!(ledger.total_reward_units().unwrap(), 42);
+    }
 
     // ---------------------------------------------------------------------
     // ResourceMeta / inspect_resource_blob (TASK-190)
