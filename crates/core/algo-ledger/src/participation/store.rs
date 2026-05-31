@@ -112,6 +112,15 @@ impl ParticipationStore {
     ///
     /// Creates the `Keysets` and `Rolling` tables if they do not exist.
     pub fn new(conn: Connection) -> Result<Self, rusqlite::Error> {
+        // The registry holds raw private key material (VRF seeds, ed25519
+        // voting keys, Falcon state-proof keys). Enable `secure_delete` so that
+        // when a key is removed (`delete` / `delete_expired` /
+        // `delete_state_proof_keys_before`) SQLite zeroes the freed pages
+        // instead of leaving the secrets recoverable in the file's free list.
+        // Mirrors go-algorand's erasable participation accessor
+        // (`secure_delete=ON`, `../go-algorand/util/db/dbutil.go` /
+        // `node.go:868`).
+        conn.execute_batch("PRAGMA secure_delete = ON;")?;
         conn.execute_batch(CREATE_KEYSETS)?;
         conn.execute_batch(CREATE_ROLLING)?;
         conn.execute_batch(CREATE_STATE_PROOF_KEYS)?;
