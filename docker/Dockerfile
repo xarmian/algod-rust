@@ -30,3 +30,8 @@ COPY docker/localnet-rust/data/ /algod/data/
 EXPOSE 8080
 ENTRYPOINT ["algod-rust"]
 CMD ["node", "start", "-d", "/algod/data", "--dev", "-l", "0.0.0.0:8080"]
+
+# Final stage: keep `runtime` (the `follow` default) as the image a plain
+# `docker build -f docker/Dockerfile .` produces. The `localnet` stage is opt-in
+# via `--target localnet` (see docker-compose.localnet-rust.yml).
+FROM runtime AS default

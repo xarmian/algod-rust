@@ -121,18 +121,24 @@ subsequent builds reuse the docker layer cache.
 
 ### Driving it with `goal` / `goal-rust`
 
-`node status` against the mounted data dir works once the container is up:
+The data dir inside the container is `/algod/data`. The node writes `algod.net`
+there with its *container* bind address (`0.0.0.0:8080`), so `goal`/`goal-rust`
+reading a copied data dir on the host would dial the wrong endpoint. Two ways to
+drive it:
 
 ```bash
-docker exec algod-rust-localnet \
-    algod-rust node start --help    # the running node; or use goal/goal-rust:
-goal-rust -d <mounted-datadir> node status
+# 1. From inside the container, where algod.net is correct:
+docker exec algod-rust-localnet goal-rust -d /algod/data node status
+
+# 2. From the host, talk to the published port directly (skip the data dir):
+curl -s -H "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+    http://localhost:4001/v2/status
+# or copy the data dir out and rewrite algod.net to 127.0.0.1:4001 first.
 ```
 
-The data dir inside the container is `/algod/data`. Because `goal` reads
-`algod.net` / `algod.token` from the data dir, point `goal -d` at a copy of the
-container's data dir (the token is the fixed `aaaa…` value above) or talk to the
-REST endpoint directly with `curl`.
+The staged `config.json` in the data dir is a go-algorand-format placeholder for
+operator familiarity; the Rust `node start` command does not consume it (it
+takes its listen address from `-l` and tokens from `algod.token`).
 
 ### The funded dev account
 
