@@ -17,6 +17,7 @@ algo-kmd-client = { workspace = true }
 algo-kmd-api-types = { workspace = true }
 algo-txn-pipeline = { workspace = true }
 algo-consensus-crypto = { workspace = true }
+algo-codec = { workspace = true }
 algo-types = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }

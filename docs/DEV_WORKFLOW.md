@@ -1087,22 +1087,22 @@ Sequence:
    `[online]`); `account info` (assets/apps + nonzero Minimum Balance,
    Phase C2); `account balance`; `changeonlinestatus --offline` →
    keyreg submit + dev-mode block + status flips to `[offline]` (Phase
-   C1, needs the funded signer); `addpartkey` then `changeonlinestatus
-   --online` → status flips back to `[online]`.
+   C1, needs the funded signer); **`clerk send` → a real payment signed
+   via `kmd-rust`, submitted to the Rust dev node, and confirmed within
+   one dev-mode round (recipient balance grows by the sent amount;
+   TASK-287)**; `addpartkey` then `changeonlinestatus --online` →
+   status flips back to `[online]`.
 3. **Go-goal direction** (only when `../go-algorand` builds): Go `goal
-   account info`/`balance` read paths, and Go `goal clerk send` — a real
-   payment signed via `kmd-rust`, submitted to the Rust dev node, and
-   confirmed within one dev-mode round (recipient balance grows by the
-   sent amount). If `../go-algorand` is absent or `go build ./cmd/goal`
+   account info` read path against the Rust node's `/v2/accounts`
+   endpoint. If `../go-algorand` is absent or `go build ./cmd/goal`
    fails, this section skips with a note and the goal-rust lifecycle
    above still runs.
 
-**Gated/omitted paths** (documented in the test header):
+**Notes:**
 
-- The **payment submit path via `goal-rust clerk send` is not
-  exercised** — the whole `clerk` group is still a stub in `goal-rust`.
-  The payment submit/confirm path is covered via **Go** `goal` instead;
-  it can move to goal-rust once `clerk send` is implemented.
-- Go `goal clerk send` only skips the wallet password prompt for an
-  *unencrypted* wallet (`WalletIsUnencrypted`), so the payment uses a
-  second, empty-password wallet with the same dev account re-imported.
+- The **payment submit/confirm path is now driven by `goal-rust clerk
+  send`** (TASK-287). Before TASK-287 the whole `clerk` group was a stub
+  and the leg ran via Go `goal clerk send`; it has been migrated to the
+  Rust CLI. The rest of the `clerk` group (rawsend / sign / group /
+  split / compile / dryrun* / simulate / inspect / multisig / tealsign)
+  remains stubbed.
