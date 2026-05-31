@@ -1026,9 +1026,16 @@ impl NodeInterface for AlgodNodeInterface {
         let last_round = Self::committed_round(&ledger, "lookup_assets")?;
         // Mirrors handlers.go:1138 AccountAssetsInformation /
         // ledger.LookupAssets: list the account's asset *holdings* with
-        // AssetID > asset_id_gt, ascending, capped at `limit`. Each record
-        // carries the creator + params only when this address is the asset's
-        // creator (acctupdates.go:1217 lookupAssetResources).
+        // AssetID > asset_id_gt, ascending, capped at `limit`. For each
+        // holding, Go's `LookupLimitedResources` LEFT JOINs `assetcreators`
+        // and the creator's resource row, so the creator + asset params are
+        // returned for ANY holder of a still-existing asset — not only when
+        // the queried address is itself the creator (the holder's amount /
+        // frozen are merged onto the creator's params). When the asset has no
+        // creator (e.g. deleted), creator stays zero and params are omitted.
+        // Refs: `../go-algorand/ledger/store/trackerdb/sqlitedriver/sql.go:90`
+        // (lookupLimitedResourcesStmt) + `:447` (LookupLimitedResources),
+        // `ledger/acctupdates.go:1217` lookupAssetResources.
         let mut holdings = ledger.asset_holdings_for_addr(addr);
         holdings.sort_unstable_by_key(|(aidx, _)| *aidx);
         let mut records = Vec::new();
@@ -1039,12 +1046,11 @@ impl NodeInterface for AlgodNodeInterface {
             if records.len() as u64 >= limit {
                 break;
             }
-            // Creator/params are populated only when this address created the
-            // asset; otherwise the creator is left as the zero address and the
-            // handler omits the asset params.
+            // Resolve the asset's creator (via the assetcreators table) and
+            // its params, independent of whether `addr` is the creator.
             let (creator, asset_params) = match ledger.get_asset_params(asset_id) {
-                Some(rec) if &rec.creator == addr => (rec.creator, Some(rec.params)),
-                _ => (Address::default(), None),
+                Some(rec) => (rec.creator, Some(rec.params)),
+                None => (Address::default(), None),
             };
             records.push(AssetResourceWithIDs {
                 asset_id,
@@ -4046,9 +4052,11 @@ mod tests {
     async fn lookup_assets_paginates_and_marks_creator() {
         let (adapter, ledger_arc) = adapter_with_seedable_ledger();
         let addr = Address([0x88; 32]);
+        let other_creator = Address([0x99; 32]);
         {
             let mut ledger = ledger_arc.lock().expect("ledger lock");
-            // Opt into assets 10, 20, 30. The account also created asset 20.
+            // Opt into assets 10, 20, 30. The account created asset 20; asset
+            // 30 is created by someone else; asset 10 has no creator (deleted).
             for aid in [10u64, 20, 30] {
                 ledger.set_asset_holding(
                     &addr,
@@ -4066,6 +4074,13 @@ mod tests {
                     creator: addr,
                 },
             );
+            ledger.set_asset_params(
+                30,
+                AssetParamsRecord {
+                    params: asset_params_named("OTH", 30),
+                    creator: other_creator,
+                },
+            );
         }
 
         // Full listing, ascending by asset id.
@@ -4076,10 +4091,19 @@ mod tests {
         assert_eq!(round, 0);
         let ids: Vec<u64> = all.iter().map(|r| r.asset_id).collect();
         assert_eq!(ids, vec![10, 20, 30]);
-        // Only asset 20 (self-created) carries creator + params.
+        // Asset 20 (self-created): creator is self + params present.
         let mid = all.iter().find(|r| r.asset_id == 20).expect("asset 20");
         assert_eq!(mid.creator, addr);
         assert!(mid.asset_params.is_some());
+        // Asset 30 (created by another account): a non-creator holder still
+        // gets the resolved creator + params, matching go's LookupLimitedResources.
+        let other = all.iter().find(|r| r.asset_id == 30).expect("asset 30");
+        assert_eq!(other.creator, other_creator);
+        assert_eq!(
+            other.asset_params.as_ref().expect("params").unit_name,
+            "OTH"
+        );
+        // Asset 10 (no creator / deleted): zero creator, params omitted.
         let first = all.iter().find(|r| r.asset_id == 10).expect("asset 10");
         assert!(first.creator.is_zero());
         assert!(first.asset_params.is_none());
