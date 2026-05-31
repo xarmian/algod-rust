@@ -119,8 +119,35 @@ impl ParticipationStore {
     }
 
     /// Open (or create) a store backed by the given file path.
+    ///
+    /// The database holds raw private key material (VRF seeds, ed25519 voting
+    /// keys, Falcon state-proof keys), so on unix the file is restricted to
+    /// `0600` (owner read/write only) — matching go-algorand, which opens the
+    /// participation registry via an erasable accessor with restricted
+    /// permissions (`../go-algorand/node/node.go:868`). The chmod is best-effort
+    /// idempotent: it runs on every open, tightening a file created under a
+    /// looser umask on a prior run.
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // Only attempt the chmod for a real on-disk file. Failures here are
+            // non-fatal to opening the store but indicate the key DB may be
+            // more permissive than intended, so surface them.
+            if path.exists() {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+                    |e| {
+                        rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                            Some(format!(
+                                "restricting participation registry permissions to 0600: {e}"
+                            )),
+                        )
+                    },
+                )?;
+            }
+        }
         Self::new(conn)
     }
 

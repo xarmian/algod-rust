@@ -1220,9 +1220,11 @@ impl NodeInterface for AlgodNodeInterface {
     /// (`[]merklesignature.KeyRoundPair`) msgpack body POSTed to
     /// `/v2/participation/{id}`; we decode it and insert each key with its
     /// explicit round, matching go's `appendKeysOp.apply`
-    /// (`../go-algorand/data/account/registeryDbOps.go:268`). An unknown ID is
-    /// a silent no-op in go (`sql.ErrNoRows` → "nothing to do"), so we mirror
-    /// that and return `Ok(())`.
+    /// (`../go-algorand/data/account/registeryDbOps.go:268`). An unknown ID
+    /// returns [`NodeError::NotFound`], matching go's public `Registry.AppendKeys`
+    /// which rejects an id missing from its cache with
+    /// `ErrParticipationIDNotFound` before queuing the DB op
+    /// (`../go-algorand/data/account/participationRegistry.go:560`).
     async fn append_participation_keys(
         &self,
         id: &ParticipationID,
@@ -1239,10 +1241,14 @@ impl NodeInterface for AlgodNodeInterface {
             ));
         }
         let store = self.lock_part_store("append_participation_keys")?;
-        store
+        let appended = store
             .append_state_proof_keys_with_rounds(id, &pairs)
             .map_err(|e| NodeError::Internal(format!("append_participation_keys: {e}")))?;
-        Ok(())
+        if appended {
+            Ok(())
+        } else {
+            Err(NodeError::NotFound("participation id not found".into()))
+        }
     }
 
     /// Generate participation keys server-side and install them. Mirrors go's
@@ -3634,11 +3640,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_participation_keys_unknown_id_is_noop() {
+    async fn append_participation_keys_unknown_id_is_not_found() {
         let adapter = adapter_with_part_store();
         let id = ParticipationID([0x22; 32]);
         // One well-formed KeyRoundPair for an id that isn't installed: go's
-        // appendKeysOp silently does nothing (sql.ErrNoRows), so we return Ok.
+        // public Registry.AppendKeys rejects it with ErrParticipationIDNotFound
+        // (participationRegistry.go:560), so we return NotFound → 404.
         let mut signer = algo_consensus_crypto::merklesig::FalconSigner::default();
         signer.pk[0] = 0x01;
         let mut body = Vec::new();
@@ -3650,9 +3657,10 @@ mod tests {
         body.push(0xcd);
         body.extend_from_slice(&256u16.to_be_bytes());
 
-        adapter
+        let err = adapter
             .append_participation_keys(&id, body)
             .await
-            .expect("append on unknown id is a no-op");
+            .unwrap_err();
+        assert!(matches!(err, NodeError::NotFound(_)));
     }
 }
