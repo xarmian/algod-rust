@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use algo_error::AlgoError;
-use algo_types::{AppLocalState, AppParams, SignedTransaction, StateSchema, TealValue};
+use algo_types::{
+    Address, AppLocalState, AppParams, SignedTransaction, StateSchema, TealValue, Transaction,
+};
 
 use crate::apply::{apply_transaction, ApplyContext};
 
@@ -111,6 +113,109 @@ pub fn parse_eval_delta(val: &rmpv::Value) -> Result<EvalDelta, AlgoError> {
         inner_txns,
         logs,
     })
+}
+
+/// Encode an AVM execution result into the `dt` (EvalDelta) wire form
+/// (`rmpv::Value`) that [`parse_eval_delta`] consumes and the REST layer renders
+/// — the inverse of `parse_eval_delta`.
+///
+/// Used in Execute mode (e.g. the dev-mode producer) to surface state changes,
+/// logs, and inner transactions on confirmation, since the AVM produces an
+/// [`algo_avm::eval::AvmResult`] rather than a recorded `dt` field. Local-state
+/// deltas are keyed by the account's index in the transaction (sender = 0,
+/// `accounts[i]` = i+1), matching the wire format. Returns `None` when there is
+/// nothing to report (no state changes, logs, or inner transactions).
+pub fn encode_eval_delta(
+    result: &algo_avm::eval::AvmResult,
+    txn: &Transaction,
+) -> Option<rmpv::Value> {
+    use rmpv::Value;
+
+    // A single key→value change: {at: action, ui|bs: value}.
+    fn value_delta(v: &Option<TealValue>) -> Value {
+        match v {
+            Some(TealValue::Uint(u)) => Value::Map(vec![
+                (Value::from("at"), Value::from(DeltaAction::SetUint as u64)),
+                (Value::from("ui"), Value::from(*u)),
+            ]),
+            Some(TealValue::Bytes(b)) => Value::Map(vec![
+                (Value::from("at"), Value::from(DeltaAction::SetBytes as u64)),
+                (Value::from("bs"), Value::Binary(b.clone())),
+            ]),
+            None => Value::Map(vec![(
+                Value::from("at"),
+                Value::from(DeltaAction::Delete as u64),
+            )]),
+        }
+    }
+
+    // A state-delta map: state-key (binary) → value delta.
+    fn state_delta(m: &HashMap<Vec<u8>, Option<TealValue>>) -> Value {
+        Value::Map(
+            m.iter()
+                .map(|(k, v)| (Value::Binary(k.clone()), value_delta(v)))
+                .collect(),
+        )
+    }
+
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+
+    if !result.global_delta.is_empty() {
+        entries.push((Value::from("gd"), state_delta(&result.global_delta)));
+    }
+
+    if !result.local_deltas.is_empty() {
+        // Resolve each account address to its transaction index (sender = 0,
+        // accounts[i] = i+1) — the wire format keys local deltas by index.
+        let index_of = |addr: &Address| -> Option<u64> {
+            if *addr == txn.sender {
+                return Some(0);
+            }
+            txn.accounts
+                .as_ref()
+                .and_then(|accts| accts.iter().position(|a| a == addr))
+                .map(|i| (i + 1) as u64)
+        };
+        let ld: Vec<(Value, Value)> = result
+            .local_deltas
+            .iter()
+            .filter_map(|(addr, kv)| index_of(addr).map(|idx| (Value::from(idx), state_delta(kv))))
+            .collect();
+        if !ld.is_empty() {
+            entries.push((Value::from("ld"), Value::Map(ld)));
+        }
+    }
+
+    if !result.inner_transactions.is_empty() {
+        // Each inner transaction is an msgpack-encoded SignedTransaction, the
+        // same shape `parse_inner_txns` reads back.
+        let itx: Vec<Value> = result
+            .inner_transactions
+            .iter()
+            .filter_map(|stx| {
+                let bytes = rmp_serde::to_vec_named(stx).ok()?;
+                rmpv::decode::read_value(&mut &bytes[..]).ok()
+            })
+            .collect();
+        if !itx.is_empty() {
+            entries.push((Value::from("itx"), Value::Array(itx)));
+        }
+    }
+
+    if !result.logs.is_empty() {
+        let lg: Vec<Value> = result
+            .logs
+            .iter()
+            .map(|l| Value::Binary(l.clone()))
+            .collect();
+        entries.push((Value::from("lg"), Value::Array(lg)));
+    }
+
+    if entries.is_empty() {
+        None
+    } else {
+        Some(Value::Map(entries))
+    }
 }
 
 /// Maximum inner transaction recursion depth.
@@ -622,5 +727,79 @@ mod tests {
         let vd = gd.get(b"k".as_slice()).unwrap();
         assert_eq!(vd.action, DeltaAction::SetUint);
         assert_eq!(vd.uint, 5);
+    }
+
+    fn avm_result(
+        global_delta: HashMap<Vec<u8>, Option<TealValue>>,
+        local_deltas: HashMap<Address, HashMap<Vec<u8>, Option<TealValue>>>,
+        inner: Vec<SignedTransaction>,
+        logs: Vec<Vec<u8>>,
+    ) -> algo_avm::eval::AvmResult {
+        algo_avm::eval::AvmResult {
+            global_delta,
+            local_deltas,
+            inner_transactions: inner,
+            logs,
+            approved: true,
+            error: None,
+            coverage: algo_avm::machine::OpcodeCoverage::default(),
+        }
+    }
+
+    #[test]
+    fn encode_eval_delta_round_trips_through_parse() {
+        let sender = Address([1u8; 32]);
+        let other = Address([2u8; 32]);
+        let txn = Transaction {
+            sender,
+            accounts: Some(vec![other]), // index 1 (sender is index 0)
+            ..Default::default()
+        };
+
+        let mut global_delta = HashMap::new();
+        global_delta.insert(b"gk".to_vec(), Some(TealValue::Uint(42)));
+        global_delta.insert(b"gdel".to_vec(), None);
+        let mut local = HashMap::new();
+        local.insert(b"lk".to_vec(), Some(TealValue::Bytes(b"v".to_vec())));
+        let mut local_deltas = HashMap::new();
+        local_deltas.insert(other, local);
+
+        let result = avm_result(
+            global_delta,
+            local_deltas,
+            vec![SignedTransaction::default()],
+            vec![b"log1".to_vec()],
+        );
+
+        let encoded = encode_eval_delta(&result, &txn).expect("non-empty delta");
+        let parsed = parse_eval_delta(&encoded).expect("encoded delta round-trips through parse");
+
+        let gd = parsed.global_delta.expect("global delta");
+        assert_eq!(
+            gd.get(b"gk".as_slice()).unwrap().action,
+            DeltaAction::SetUint
+        );
+        assert_eq!(gd.get(b"gk".as_slice()).unwrap().uint, 42);
+        assert_eq!(
+            gd.get(b"gdel".as_slice()).unwrap().action,
+            DeltaAction::Delete
+        );
+
+        let ld = parsed.local_deltas.expect("local deltas");
+        let l = ld.get(&1).expect("account index 1 (accounts[0])");
+        assert_eq!(
+            l.get(b"lk".as_slice()).unwrap().action,
+            DeltaAction::SetBytes
+        );
+        assert_eq!(l.get(b"lk".as_slice()).unwrap().bytes, b"v");
+
+        assert_eq!(parsed.logs.expect("logs"), vec![b"log1".to_vec()]);
+        assert_eq!(parsed.inner_txns.expect("inner txns").len(), 1);
+    }
+
+    #[test]
+    fn encode_eval_delta_empty_is_none() {
+        let result = avm_result(HashMap::new(), HashMap::new(), vec![], vec![]);
+        assert!(encode_eval_delta(&result, &Transaction::default()).is_none());
     }
 }

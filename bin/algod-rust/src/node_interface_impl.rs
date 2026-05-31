@@ -2419,6 +2419,64 @@ mod tests {
         assert_eq!(status.asset_index, None, "not an asset create");
     }
 
+    /// An app whose program writes global state has its eval delta surfaced on
+    /// confirmation (TASK-280 — Execute-mode ApplyData.eval_delta).
+    #[tokio::test]
+    async fn dev_mode_app_call_reports_eval_delta() {
+        use algo_types::{Round, StateSchema, Transaction, TxnType};
+        use ed25519_dalek::SigningKey;
+        use serde_bytes::ByteBuf;
+
+        let sender_key = SigningKey::from_bytes(&[0x55u8; 32]);
+        let sender = Address(sender_key.verifying_key().to_bytes());
+        let (adapter, _ledger, gh) = seed_dev_adapter(sender, 10_000_000);
+
+        // v6 approval program: pushbytes "counter"; pushint 42; app_global_put;
+        // pushint 1; return — writes one global-state entry, then approves.
+        let approval = vec![
+            0x06, 0x80, 0x07, b'c', b'o', b'u', b'n', b't', b'e', b'r', 0x81, 0x2A, 0x67, 0x81,
+            0x01, 0x43,
+        ];
+        let txn = Transaction {
+            txn_type: TxnType::Appl,
+            sender,
+            application_id: 0,
+            on_completion: 0,
+            approval_program: Some(ByteBuf::from(approval)),
+            clear_state_program: Some(ByteBuf::from(vec![0x06u8, 0x81, 0x01])),
+            // Global schema must allow the one uint the program writes.
+            global_state_schema: Some(StateSchema {
+                num_uint: 1,
+                num_byte_slice: 0,
+            }),
+            fee: 1000,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            genesis_hash: gh,
+            ..Default::default()
+        };
+        let stx = sign_txn(&txn, &sender_key);
+        let txid = compute_txn_id(&txn);
+
+        adapter
+            .broadcast_signed_tx_group(vec![stx])
+            .await
+            .expect("state-writing app-create should confirm");
+
+        let status = adapter
+            .get_pending_transaction(&txid)
+            .await
+            .expect("lookup ok")
+            .expect("confirmed");
+        assert_eq!(status.application_index, Some(1001));
+        // The program wrote global state, so the AVM-produced eval delta is
+        // surfaced (it carries the global "counter" change).
+        assert!(
+            status.eval_delta.is_some(),
+            "eval delta from the app execution should be reported on confirmation",
+        );
+    }
+
     #[tokio::test]
     async fn pool_methods_return_not_implemented_without_pool() {
         let adapter = make_adapter();
