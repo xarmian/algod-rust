@@ -21,16 +21,21 @@ if [[ ! -f "$consensus_rs" ]]; then
     exit 1
 fi
 
-# `pub const CONSENSUS_CURRENT_VERSION: &str = CONSENSUS_V41;`
-current_alias="$(grep -oP 'CONSENSUS_CURRENT_VERSION:\s*&str\s*=\s*\K[A-Z0-9_]+' "$consensus_rs")"
+# Resolve the alias `CONSENSUS_CURRENT_VERSION` points at, e.g.
+#   pub const CONSENSUS_CURRENT_VERSION: &str = CONSENSUS_V41;
+# Portable POSIX sed (works under GNU + BSD/macOS) — no `grep -P`/`-oP`.
+current_alias="$(sed -n 's/.*CONSENSUS_CURRENT_VERSION:[[:space:]]*&str[[:space:]]*=[[:space:]]*\([A-Z0-9_]*\);.*/\1/p' "$consensus_rs" | head -n1)"
 if [[ -z "${current_alias:-}" ]]; then
     echo "gen-localnet-genesis: could not resolve CONSENSUS_CURRENT_VERSION alias from $consensus_rs" >&2
     exit 1
 fi
 
-# `pub const CONSENSUS_V41: &str =\n    "https://...";`
-proto_url="$(grep -A1 -P "pub const ${current_alias}:\s*&str\s*=" "$consensus_rs" \
-    | grep -oP '"\K[^"]+(?=")' | head -n1)"
+# Resolve that alias to its spec URL. The const spans two lines:
+#   pub const CONSENSUS_V41: &str =
+#       "https://...";
+# Anchor on the const line, then take the first quoted string that follows.
+proto_url="$(sed -n "/pub const ${current_alias}:[[:space:]]*&str[[:space:]]*=/,/;/p" "$consensus_rs" \
+    | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -n1)"
 if [[ -z "${proto_url:-}" ]]; then
     echo "gen-localnet-genesis: could not resolve $current_alias spec URL from $consensus_rs" >&2
     exit 1
