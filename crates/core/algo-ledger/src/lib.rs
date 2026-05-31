@@ -3,6 +3,7 @@ pub mod agreement_key_manager;
 pub mod apply;
 pub mod avm_context;
 pub mod block_entry;
+pub mod block_header;
 pub mod catchpoint;
 pub mod catchup_service;
 pub mod delta_cache;
@@ -36,6 +37,7 @@ pub use apply::{
     ApplyMode, GroupInfo, InnerApplyData,
 };
 pub use avm_context::{type_enum, LedgerAvmContext};
+pub use block_header::make_next_block_header;
 pub use eval_compare::{
     compare_eval_delta, CompareResult, EvalDeltaMismatchDetail, EvalDeltaStats, FieldMismatch,
     MismatchCategory,
@@ -52,7 +54,8 @@ pub use heartbeat::{
 pub use lease::LeaseTable;
 pub use params::min_balance;
 pub use rewards::{
-    apply_rewards, compute_pending_rewards, normalized_online_balance, REWARD_UNITS,
+    apply_rewards, compute_pending_rewards, next_rewards_state, normalized_online_balance,
+    RewardsState, REWARD_UNITS,
 };
 pub use sqlite::{
     block_path_for_prefix, derive_ledger_prefix, ledger_exists, open_ledger_connection,
