@@ -436,11 +436,18 @@ enum JsonKey {
 fn classify_key(key: &str) -> JsonKey {
     match key {
         // Transaction address fields (data/transactions/transaction.go) +
-        // SignedTxn.AuthAddr ("sgnr") + msig subsig public key ("pk"). apar's
-        // m/r/f/c (AssetParams manager/reserve/freeze/clawback) and apat
-        // (accounts) are also addresses.
+        // SignedTxn.AuthAddr ("sgnr") + msig subsig public key ("pk").
+        //   - apat: account references (array of Address) — elements inherit
+        //     this key, so they render base32.
+        //   - apar's m/r/f/c: AssetParams manager/reserve/freeze/clawback.
+        //   - a: heartbeat address (hb.a) — only matches inside the "hb" map.
+        //   - d: access-list direct address (al[].d) — only matches inside the
+        //     "al" resource-ref maps.
+        // Classifying a key as Address only affects 32-byte *binary* values
+        // (render_bytes), so any non-address field that happens to reuse a
+        // single-letter tag with a non-binary value is unaffected.
         "snd" | "rcv" | "close" | "asnd" | "arcv" | "aclose" | "fadd" | "rekey" | "sgnr" | "pk"
-        | "m" | "r" | "f" | "c" => JsonKey::Address,
+        | "apat" | "m" | "r" | "f" | "c" | "a" | "d" => JsonKey::Address,
         // LogicSig program ("l"). apap/apsu (approval/clear programs) are plain
         // []byte in Go's inspect view → base64, so they are NOT classified here.
         "l" => JsonKey::Program,
@@ -1064,6 +1071,34 @@ mod tests {
         );
         assert_eq!(inner["amt"].as_u64().unwrap(), 5);
         assert_eq!(inner["type"].as_str().unwrap(), "pay");
+    }
+
+    #[test]
+    fn inspect_json_renders_apat_accounts_base32() {
+        // App-call with an Accounts reference list (apat) — each element is an
+        // Address and must render base32, not base64 (Codex round 1, finding 1).
+        let txn = Transaction {
+            txn_type: TxnType::Appl,
+            sender: Address([1u8; 32]),
+            fee: 1000,
+            first_valid: 1.into(),
+            last_valid: 1001.into(),
+            genesis_hash: [9u8; 32],
+            application_id: 42,
+            accounts: Some(vec![Address([0x55; 32]), Address([0x66; 32])]),
+            ..Transaction::default()
+        };
+        let json = inspect_signed_txn_json(&unsigned(txn));
+        let apat = json["txn"]["apat"].as_array().expect("apat array");
+        assert_eq!(apat.len(), 2);
+        assert_eq!(
+            apat[0].as_str().unwrap(),
+            Address([0x55; 32]).to_algorand_string()
+        );
+        assert_eq!(
+            apat[1].as_str().unwrap(),
+            Address([0x66; 32]).to_algorand_string()
+        );
     }
 
     #[test]
