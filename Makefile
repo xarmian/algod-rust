@@ -12,7 +12,7 @@ PHASE6_CLUSTER := ops/mixed-cluster
 .PHONY: bench-rust bench-decode bench-go bench-micro bench-micro-go bench-cluster benchmark
 .PHONY: archival-up archival-down
 .PHONY: localnet-up localnet-down localnet-status localnet-logs algokey-e2e
-.PHONY: localnet-rust-up localnet-rust-down localnet-rust-status localnet-rust-logs
+.PHONY: localnet-rust-up localnet-rust-down localnet-rust-status localnet-rust-logs localnet-rust-genesis
 .PHONY: capture validate validate-only generate-txns fixtures help
 .PHONY: generate-diverse-txns fixtures-diverse
 .PHONY: canonical-extract extract-trackerdb-fixtures
@@ -75,7 +75,13 @@ localnet-logs:
 ## (the image ships only the daemon — drive it from a host-side client on
 ## localhost:4001). See docs/DEV_WORKFLOW.md for the dev-account mnemonic.
 
-localnet-rust-up:
+## Regenerate the baked localnet genesis.json from genesis.json.in, deriving
+## `proto` from the shared `CONSENSUS_CURRENT_VERSION` constant (BT-284) so the
+## dev-only genesis tracks the project's current consensus version automatically.
+localnet-rust-genesis:
+	@bash docker/scripts/gen-localnet-genesis.sh
+
+localnet-rust-up: localnet-rust-genesis
 	$(COMPOSE_RUST) up -d --build algod-rust-localnet
 	@echo "Waiting for algod-rust-localnet to be healthy..."
 	@until docker inspect --format='{{.State.Health.Status}}' algod-rust-localnet 2>/dev/null | grep -q healthy; do \

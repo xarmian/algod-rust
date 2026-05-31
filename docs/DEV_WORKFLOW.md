@@ -165,6 +165,14 @@ This account is for **local development only** — never fund it on a public
 network. The staged data dir lives at `docker/localnet-rust/data/` and the
 image is built from the `localnet` target in `docker/Dockerfile`.
 
+The staged `genesis.json` is generated from `genesis.json.in` by
+`docker/scripts/gen-localnet-genesis.sh`, which derives the `proto` spec-URL
+from the shared `CONSENSUS_CURRENT_VERSION` constant
+(`crates/core/algo-types/src/consensus.rs`) instead of hardcoding it. `make
+localnet-rust-up` regenerates it automatically; after bumping
+`CONSENSUS_CURRENT_VERSION`, run `make localnet-rust-genesis` (or `localnet-rust-up`)
+to refresh the committed file.
+
 ## Regenerating Test Fixtures
 
 The easiest way is the all-in-one pipeline:
