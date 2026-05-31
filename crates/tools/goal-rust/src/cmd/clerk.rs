@@ -882,6 +882,23 @@ fn run_dryrun_inner(
 /// in its referenced apps (created-app params from the txn, foreign apps from
 /// the node), the sender + foreign + app-address accounts, and the round /
 /// timestamp / protocol-version context.
+///
+/// **JSON convention (intentional, vs go-algorand):** the `txns` entries are
+/// encoded with this workspace's serde JSON for `SignedTransaction` — i.e. the
+/// exact value the Rust node's `/v2/teal/dryrun` JSON path decodes via
+/// `serde_json::from_value::<SignedTransaction>` — *not* go-algorand's
+/// `protocol.EncodeJSON`. The two differ on byte/address fields (serde renders
+/// `[]byte`/`Address` as integer arrays; Go's `codecgen` JSON renders base64 /
+/// checksum strings), so a dump produced here targets the Rust node (the node
+/// goal-rust talks to), where it round-trips exactly — verified end-to-end via
+/// `clerk dryrun --dryrun-dump` → `clerk dryrun-remote` against
+/// `algod-rust node start --dev`. It is NOT wire-interchangeable with a
+/// go-algorand algod's dryrun JSON, which reflects the nodes' differing
+/// JSON conventions for these types rather than anything specific to this leaf.
+/// (The accounts/apps entries below are passed through verbatim from the same
+/// Rust node's `/v2/accounts` and `/v2/applications` responses, so they match
+/// the request's typed `AccountResponse`/`ApiApplication` fields by
+/// construction.)
 async fn build_dryrun_state(
     algod: &algo_rest_client::AlgodClient,
     stxns: &[SignedTransaction],
@@ -890,8 +907,10 @@ async fn build_dryrun_state(
 ) -> Result<serde_json::Value, String> {
     use serde_json::json;
 
-    // txns: each SignedTxn JSON-encoded the same way the server decodes them
-    // (serde_json::from_value::<SignedTransaction>), so serde round-trips.
+    // txns: each SignedTxn JSON-encoded the same way the Rust node decodes them
+    // (serde_json::from_value::<SignedTransaction>), so serde round-trips. See
+    // the JSON-convention note on this fn for why this is not Go's
+    // protocol.EncodeJSON.
     let mut txns_json = Vec::with_capacity(stxns.len());
     for stxn in stxns {
         txns_json.push(
