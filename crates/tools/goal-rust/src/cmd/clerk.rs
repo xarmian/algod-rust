@@ -699,11 +699,22 @@ const STDIN_STDOUT: &str = "-";
 
 /// `clerk compile [files...] [-o out] [-n]`.
 ///
-/// Mirrors Go's `compileCmd` (clerk.go:1090). Each input file's TEAL source is
-/// compiled via `POST /v2/teal/compile` (the node gates this on
-/// `EnableDeveloperAPI`); the raw program bytes are written to `<file>.tok` (or
-/// `-o`/`-`) and the contract address is printed as `<file>: <address>` unless
-/// the output target is stdout.
+/// Mirrors Go's `compileCmd` (clerk.go:1090) output/flag surface. Each input
+/// file's TEAL source is compiled, the raw program bytes are written to
+/// `<file>.tok` (or `-o`/`-`), and the contract address is printed as
+/// `<file>: <address>` unless the output target is stdout.
+///
+/// **Intentional divergence from Go (TASK-291 scope):** Go's `goal clerk
+/// compile` assembles *locally* via `logic.AssembleString` (works offline,
+/// independent of any node), whereas this leaf is specified to compile via the
+/// node's `POST /v2/teal/compile` endpoint. Consequences, by design:
+/// it requires a reachable algod data dir + a running node, and the node must
+/// have `EnableDeveloperAPI=true` (else the endpoint 404s, surfaced here as
+/// `Could not assemble: ...`).
+/// Compiling against the node guarantees the produced bytecode matches the
+/// exact assembler the target node runs; the assembler itself
+/// (`algo_avm::assembler`) is byte-identical to go-algorand's, so for a given
+/// program the result equals Go's local-compile output (verified for parity).
 pub fn run_compile(args: crate::groups::clerk::CompileArgs, cli_d: Vec<PathBuf>) -> ExitCode {
     match run_compile_inner(args, cli_d) {
         Ok(()) => ExitCode::SUCCESS,
