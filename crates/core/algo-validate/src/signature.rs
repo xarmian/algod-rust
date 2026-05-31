@@ -211,6 +211,86 @@ fn verify_logicsig_multisig(
     verify_multisig_subsigs(msig, program_msg, "logicsig multisig")
 }
 
+/// Signature-level sanity check for a LogicSig, mirroring go-algorand's
+/// `verify.LogicSigSanityCheck` (`data/transactions/verify/txn.go:360-444`)
+/// **without** executing the program.
+///
+/// Verifies the structural rules (empty program, at-most-one of
+/// sig/msig/lmsig) and the delegation signature itself:
+/// - **no sig/msig/lmsig**: contract account — the txn authorizer (auth_addr
+///   else sender) must equal `SHA512/256("Program" || logic)`;
+/// - **sig**: ed25519 over `"Program" || logic` against the authorizer;
+/// - **msig**: multisig over `"Program" || logic`;
+/// - **lmsig**: multisig over `"MsigProgram" || authorizer || logic`.
+///
+/// This is what `goal clerk sign` runs before writing a LogicSig-signed file
+/// (the node re-runs the full check, including TEAL execution, on submit).
+pub fn logicsig_sanity_check(stx: &SignedTransaction, lsig: &LogicSig) -> Result<(), AlgoError> {
+    if lsig.logic.is_empty() {
+        return Err(AlgoError::Validation {
+            message: "LogicSig.Logic empty".into(),
+        });
+    }
+
+    let has_sig = lsig.sig != [0u8; 64];
+    let has_msig = lsig.msig.is_some();
+    let has_lmsig = lsig.lmsig.is_some();
+    let num_sigs = has_sig as u8 + has_msig as u8 + has_lmsig as u8;
+
+    if num_sigs > 1 {
+        return Err(AlgoError::Validation {
+            message: "LogicSig should only have one of Sig, Msig, or LMsig but has more than one"
+                .into(),
+        });
+    }
+
+    let authorizer = match &stx.auth_addr {
+        Some(addr) => addr,
+        None => &stx.txn.sender,
+    };
+
+    if num_sigs == 0 {
+        let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
+        program_msg.extend_from_slice(PROGRAM_PREFIX);
+        program_msg.extend_from_slice(&lsig.logic);
+        let hash = Sha512_256::digest(&program_msg);
+        let mut expected = [0u8; 32];
+        expected.copy_from_slice(&hash);
+        if *authorizer != Address(expected) {
+            return Err(AlgoError::Validation {
+                message: "logicsig contract account: sender does not match program hash".into(),
+            });
+        }
+    } else if has_sig {
+        let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
+        program_msg.extend_from_slice(PROGRAM_PREFIX);
+        program_msg.extend_from_slice(&lsig.logic);
+        let signature = Signature::from_bytes(&lsig.sig);
+        let verifying_key =
+            VerifyingKey::from_bytes(&authorizer.0).map_err(|e| AlgoError::Validation {
+                message: format!("invalid logicsig delegated public key: {e}"),
+            })?;
+        verifying_key
+            .verify(&program_msg, &signature)
+            .map_err(|e| AlgoError::Validation {
+                message: format!("logicsig delegated signature verification failed: {e}"),
+            })?;
+    } else if let Some(msig) = &lsig.msig {
+        let mut program_msg = Vec::with_capacity(PROGRAM_PREFIX.len() + lsig.logic.len());
+        program_msg.extend_from_slice(PROGRAM_PREFIX);
+        program_msg.extend_from_slice(&lsig.logic);
+        verify_logicsig_multisig(stx, msig, &program_msg)?;
+    } else if let Some(lmsig) = &lsig.lmsig {
+        let mut lmsig_msg = Vec::with_capacity(MSIG_PROGRAM_PREFIX.len() + 32 + lsig.logic.len());
+        lmsig_msg.extend_from_slice(MSIG_PROGRAM_PREFIX);
+        lmsig_msg.extend_from_slice(&authorizer.0);
+        lmsig_msg.extend_from_slice(&lsig.logic);
+        verify_logicsig_multisig(stx, lmsig, &lmsig_msg)?;
+    }
+
+    Ok(())
+}
+
 /// Verify a logic signature on a signed transaction.
 ///
 /// Four modes (exactly one of sig/msig/lmsig must be set, or none for contract account):
@@ -781,6 +861,77 @@ mod tests {
                 .collect(),
         };
         compute_multisig_address(&msig)
+    }
+
+    /// The `int 1` (v2) program and its contract-account address bytes.
+    fn int1_program() -> Vec<u8> {
+        vec![0x02u8, 0x20, 0x01, 0x01, 0x22]
+    }
+
+    #[test]
+    fn logicsig_sanity_check_contract_account_ok_and_mismatch() {
+        let program = int1_program();
+        // authorizer == HashProgram(program) → contract account, OK.
+        let mut msg = Vec::new();
+        msg.extend_from_slice(PROGRAM_PREFIX);
+        msg.extend_from_slice(&program);
+        let hash = Sha512_256::digest(&msg);
+        let mut addr = [0u8; 32];
+        addr.copy_from_slice(&hash);
+
+        let lsig = LogicSig {
+            logic: ByteBuf::from(program.clone()),
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(Address(addr)),
+            lsig: Some(lsig.clone()),
+            ..Default::default()
+        };
+        assert!(logicsig_sanity_check(&stx, &lsig).is_ok());
+
+        // authorizer != program hash, no delegated sig → rejected.
+        let bad = SignedTransaction {
+            txn: minimal_pay_txn(Address([0u8; 32])),
+            lsig: Some(lsig.clone()),
+            ..Default::default()
+        };
+        assert!(logicsig_sanity_check(&bad, &lsig).is_err());
+    }
+
+    #[test]
+    fn logicsig_sanity_check_delegated_sig_verifies() {
+        let key = test_signing_key();
+        let signer = Address(key.verifying_key().to_bytes());
+        let program = int1_program();
+        let good_sig = sign_program(&key, &program);
+
+        // Delegated (sig present) signed by the sender → OK.
+        let lsig = LogicSig {
+            logic: ByteBuf::from(program.clone()),
+            sig: good_sig,
+            ..LogicSig::default()
+        };
+        let stx = SignedTransaction {
+            txn: minimal_pay_txn(signer),
+            lsig: Some(lsig.clone()),
+            ..Default::default()
+        };
+        assert!(logicsig_sanity_check(&stx, &lsig).is_ok());
+
+        // A garbage delegated sig must be rejected (the Codex round-3 fix:
+        // `clerk sign -L bad.lsig` must not write an unverified delegation).
+        let bad_lsig = LogicSig {
+            logic: ByteBuf::from(program),
+            sig: [0x11u8; 64],
+            ..LogicSig::default()
+        };
+        let bad = SignedTransaction {
+            txn: minimal_pay_txn(signer),
+            lsig: Some(bad_lsig.clone()),
+            ..Default::default()
+        };
+        assert!(logicsig_sanity_check(&bad, &bad_lsig).is_err());
     }
 
     #[test]

@@ -591,6 +591,183 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
         "recipient balance should grow by >= {raw_amt} (before={raw_before}, after={raw_after})"
     );
 
+    // 6d. clerk sign (wallet) → write an UNSIGNED payment with `clerk send -o`
+    //     (no -s), sign it with `clerk sign -i ... -o ... -w w`, then rawsend it.
+    //     Proves the wallet (kmd) signing path of `clerk sign` produces a valid
+    //     SignedTxn that the node accepts (TASK-290, clerk.go:787 signCmd).
+    let ws_before = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (before wallet-sign)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+    let ws_amt: u64 = 777_000;
+    let ws_unsigned = dd.join("walletsign-unsigned.tx");
+    let ws_signed = dd.join("walletsign-signed.tx");
+    assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                &ws_amt.to_string(),
+                "-f",
+                DEV_ADDR,
+                "-t",
+                FEE_SINK,
+                "-o",
+                ws_unsigned.to_str().unwrap(),
+            ],
+        ),
+        "clerk send -o (unsigned)",
+        &node,
+    );
+    assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "sign",
+                "-i",
+                ws_unsigned.to_str().unwrap(),
+                "-o",
+                ws_signed.to_str().unwrap(),
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
+        ),
+        "clerk sign (wallet)",
+        &node,
+    );
+    let ws_rawsend = assert_cli_ok(
+        &goal_rust(dd, &["clerk", "rawsend", "-f", ws_signed.to_str().unwrap()]),
+        "clerk rawsend (wallet-signed)",
+        &node,
+    );
+    assert!(
+        ws_rawsend.contains("committed in round"),
+        "wallet-signed txn should confirm; got:\n{ws_rawsend}"
+    );
+    let ws_after = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (after wallet-sign)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+    assert!(
+        ws_after >= ws_before + ws_amt,
+        "recipient balance should grow by >= {ws_amt} (before={ws_before}, after={ws_after})"
+    );
+
+    // 6e. clerk sign (LogicSig) → fund a contract account (escrow) whose logic
+    //     is `#pragma version 2; int 1` (always approves), write an unsigned
+    //     spend FROM the escrow, attach the LogicSig with `clerk sign --program`,
+    //     and rawsend it. Proves the LogicSig attach path produces a valid
+    //     escrow spend the node accepts (clerk.go:804-903).
+    //
+    //     The escrow address is the program hash of the assembled `int 1`
+    //     program (computed via go-algorand `logic.HashProgram`).
+    const ESCROW_ADDR: &str = "YOE6C22GHCTKAN3HU4SE5PGIPN5UKXAJTXCQUPJ3KKF5HOAH646MKKCPDA";
+    let escrow_teal = dd.join("escrow.teal");
+    std::fs::write(&escrow_teal, "#pragma version 2\nint 1\n").unwrap();
+
+    // Fund the escrow generously (cover min-balance + the spend + fees).
+    let fund_amt: u64 = 5_000_000;
+    let fund_out = assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                &fund_amt.to_string(),
+                "-f",
+                DEV_ADDR,
+                "-t",
+                ESCROW_ADDR,
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
+        ),
+        "fund escrow",
+        &node,
+    );
+    assert!(
+        fund_out.contains("committed in round"),
+        "escrow funding should confirm; got:\n{fund_out}"
+    );
+
+    let ls_before = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (before logicsig)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+
+    let ls_amt: u64 = 1_000_000;
+    let ls_unsigned = dd.join("logicsig-unsigned.tx");
+    let ls_signed = dd.join("logicsig-signed.tx");
+    assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                &ls_amt.to_string(),
+                "-f",
+                ESCROW_ADDR,
+                "-t",
+                FEE_SINK,
+                "-o",
+                ls_unsigned.to_str().unwrap(),
+            ],
+        ),
+        "clerk send -o from escrow (unsigned)",
+        &node,
+    );
+    assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "sign",
+                "-i",
+                ls_unsigned.to_str().unwrap(),
+                "-o",
+                ls_signed.to_str().unwrap(),
+                "--program",
+                escrow_teal.to_str().unwrap(),
+            ],
+        ),
+        "clerk sign --program (logicsig)",
+        &node,
+    );
+    let ls_rawsend = assert_cli_ok(
+        &goal_rust(dd, &["clerk", "rawsend", "-f", ls_signed.to_str().unwrap()]),
+        "clerk rawsend (logicsig-signed)",
+        &node,
+    );
+    assert!(
+        ls_rawsend.contains("committed in round"),
+        "logicsig-signed escrow spend should confirm; got:\n{ls_rawsend}"
+    );
+    let ls_after = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (after logicsig)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+    assert!(
+        ls_after >= ls_before + ls_amt,
+        "recipient balance should grow by >= {ls_amt} via logicsig escrow (before={ls_before}, after={ls_after})"
+    );
+
     // 7. addpartkey, then changeonlinestatus --online → status flips back. Going
     //    online needs a participation key registered for the account.
     assert_cli_ok(

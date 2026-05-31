@@ -16,6 +16,7 @@ pub use rules::{
     MAX_TXN_BYTES_PER_BLOCK_V33, MAX_TXN_LIFE, MIN_TXN_FEE,
 };
 pub use signature::{
-    verify_auth_addr_sender_diff, verify_group_logicsig_size, verify_heartbeat_proof,
-    verify_single_sig, verify_transaction_signature, verify_transaction_signature_with_tracer,
+    logicsig_sanity_check, verify_auth_addr_sender_diff, verify_group_logicsig_size,
+    verify_heartbeat_proof, verify_single_sig, verify_transaction_signature,
+    verify_transaction_signature_with_tracer,
 };
