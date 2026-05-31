@@ -48,7 +48,8 @@ use algo_rest_api::models::{
     SimulationTransactionExecTrace,
 };
 use algo_rest_api::node::{
-    AccountLookup, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
+    AccountLookup, AppResourceLookup, ApplicationLookup, AssetLookup, AssetResourceLookup,
+    AssetResourceWithIDs, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
     TxnGroupDeltaWithIds, TxnWithStatus,
 };
 use algo_types::consensus::consensus_params_for_version;
@@ -492,6 +493,18 @@ impl AlgodNodeInterface {
         Ok((last_round, account_data))
     }
 
+    /// Return the last committed round for a lookup performed under an already
+    /// held ledger lock, mapping the SQLite error into a `NodeError::Internal`
+    /// tagged with the calling method. Returns `0` for an empty ledger
+    /// (`last_committed_round` is `None`), matching `ledger.Latest()` on a
+    /// freshly initialised ledger.
+    fn committed_round(ledger: &SqliteLedger, method: &str) -> Result<u64, NodeError> {
+        Ok(ledger
+            .last_committed_round()
+            .map_err(|e| NodeError::Internal(format!("{method}: last_committed_round: {e}")))?
+            .unwrap_or(0))
+    }
+
     /// Compute the block digest (SHA512/256 of `"BH" || canonical(header)`)
     /// directly from a header. Mirrors `algo_codec::compute_block_digest` but
     /// accepts a `BlockHeader` so callers can serve `/v2/blocks/{round}/hash`
@@ -904,6 +917,196 @@ impl NodeInterface for AlgodNodeInterface {
             account_data,
             last_round,
         })
+    }
+
+    // ---- Asset / app / box resource lookups (TASK-266) ----
+    //
+    // These back `goal account info` (held/created assets + apps + boxes) and
+    // the `asset` / `app` command groups against the SqliteLedger. They mirror
+    // go-algorand's resource lookups in
+    // `../go-algorand/daemon/algod/api/server/v2/handlers.go` @ `v4.5.1-stable`:
+    // AccountAssetInformation, AccountApplicationInformation, GetAssetByID,
+    // GetApplicationByID, AccountAssetsInformation, GetApplicationBoxByName,
+    // GetApplicationBoxes. State is read from the live ledger via the
+    // `LedgerStore` accessors (`get_asset_holding`, `get_asset_params`,
+    // `get_app_local_state`, `get_app_params`, `get_box`, `box_keys_for_app`,
+    // `asset_holdings_for_addr`), which already resolve creators through the
+    // `assetcreators` table.
+
+    async fn lookup_asset_resource(
+        &self,
+        addr: &Address,
+        asset_id: u64,
+    ) -> Result<AssetResourceLookup, NodeError> {
+        let ledger = self.lock_ledger("lookup_asset_resource")?;
+        let last_round = Self::committed_round(&ledger, "lookup_asset_resource")?;
+        // Holding is present iff the address has opted in; params are present
+        // only when this address is the asset's creator (mirrors
+        // handlers.go:557 AccountAssetInformation, which fills AssetHolding from
+        // the holding and CreatedAsset from params keyed on the creator).
+        let asset_holding = ledger.get_asset_holding(addr, asset_id);
+        let asset_params = ledger
+            .get_asset_params(asset_id)
+            .filter(|rec| &rec.creator == addr)
+            .map(|rec| rec.params);
+        Ok(AssetResourceLookup {
+            asset_holding,
+            asset_params,
+            last_round,
+        })
+    }
+
+    async fn lookup_app_resource(
+        &self,
+        addr: &Address,
+        app_id: u64,
+    ) -> Result<AppResourceLookup, NodeError> {
+        let ledger = self.lock_ledger("lookup_app_resource")?;
+        let last_round = Self::committed_round(&ledger, "lookup_app_resource")?;
+        // Local state is present iff opted in; params are present only when
+        // this address created the app (handlers.go:605
+        // AccountApplicationInformation). `get_app_params` carries the creator
+        // in `AppParams.creator`, resolved via the assetcreators table.
+        let app_local_state = ledger.get_app_local_state(addr, app_id);
+        let app_params = ledger
+            .get_app_params(app_id)
+            .filter(|params| &params.creator == addr);
+        Ok(AppResourceLookup {
+            app_local_state,
+            app_params,
+            last_round,
+        })
+    }
+
+    async fn lookup_application(&self, app_id: u64) -> Result<ApplicationLookup, NodeError> {
+        let ledger = self.lock_ledger("lookup_application")?;
+        let last_round = Self::committed_round(&ledger, "lookup_application")?;
+        // Mirrors handlers.go:1690 GetApplicationByID: resolve the creator,
+        // then look up AppParams. `get_app_params` returns `None` (→
+        // `app_params: None`, the handler maps that to 404) when the app does
+        // not exist; otherwise it carries the resolved creator.
+        let (app_params, creator) = match ledger.get_app_params(app_id) {
+            Some(params) => {
+                let creator = params.creator;
+                (Some(params), creator)
+            }
+            None => (None, Address::default()),
+        };
+        Ok(ApplicationLookup {
+            app_params,
+            creator,
+            last_round,
+        })
+    }
+
+    async fn lookup_asset_by_id(&self, asset_id: u64) -> Result<AssetLookup, NodeError> {
+        let ledger = self.lock_ledger("lookup_asset_by_id")?;
+        let last_round = Self::committed_round(&ledger, "lookup_asset_by_id")?;
+        // Mirrors handlers.go:1808 GetAssetByID: resolve the creator, then look
+        // up AssetParams. `get_asset_params` returns `None` (→ 404 at the
+        // handler) when the asset does not exist.
+        let (asset_params, creator) = match ledger.get_asset_params(asset_id) {
+            Some(rec) => (Some(rec.params), rec.creator),
+            None => (None, Address::default()),
+        };
+        Ok(AssetLookup {
+            asset_params,
+            creator,
+            last_round,
+        })
+    }
+
+    async fn lookup_assets(
+        &self,
+        addr: &Address,
+        asset_id_gt: u64,
+        limit: u64,
+    ) -> Result<(Vec<AssetResourceWithIDs>, u64), NodeError> {
+        let ledger = self.lock_ledger("lookup_assets")?;
+        let last_round = Self::committed_round(&ledger, "lookup_assets")?;
+        // Mirrors handlers.go:1138 AccountAssetsInformation /
+        // ledger.LookupAssets: list the account's asset *holdings* with
+        // AssetID > asset_id_gt, ascending, capped at `limit`. For each
+        // holding, Go's `LookupLimitedResources` LEFT JOINs `assetcreators`
+        // and the creator's resource row, so the creator + asset params are
+        // returned for ANY holder of a still-existing asset — not only when
+        // the queried address is itself the creator (the holder's amount /
+        // frozen are merged onto the creator's params). When the asset has no
+        // creator (e.g. deleted), creator stays zero and params are omitted.
+        // Refs: `../go-algorand/ledger/store/trackerdb/sqlitedriver/sql.go:90`
+        // (lookupLimitedResourcesStmt) + `:447` (LookupLimitedResources),
+        // `ledger/acctupdates.go:1217` lookupAssetResources.
+        let mut holdings = ledger.asset_holdings_for_addr(addr);
+        holdings.sort_unstable_by_key(|(aidx, _)| *aidx);
+        let mut records = Vec::new();
+        for (asset_id, holding) in holdings {
+            if asset_id <= asset_id_gt {
+                continue;
+            }
+            if records.len() as u64 >= limit {
+                break;
+            }
+            // Resolve the asset's creator (via the assetcreators table) and
+            // its params, independent of whether `addr` is the creator.
+            let (creator, asset_params) = match ledger.get_asset_params(asset_id) {
+                Some(rec) => (rec.creator, Some(rec.params)),
+                None => (Address::default(), None),
+            };
+            records.push(AssetResourceWithIDs {
+                asset_id,
+                asset_holding: Some(holding),
+                creator,
+                asset_params,
+            });
+        }
+        Ok((records, last_round))
+    }
+
+    async fn lookup_kv(
+        &self,
+        app_id: u64,
+        key: &[u8],
+    ) -> Result<(Option<Vec<u8>>, u64), NodeError> {
+        let ledger = self.lock_ledger("lookup_kv")?;
+        let last_round = Self::committed_round(&ledger, "lookup_kv")?;
+        // `get_box` constructs the full `bx:`-prefixed KV key internally
+        // (sqlite.rs make_box_key), matching ledger.LookupKv + apps.MakeBoxKey
+        // (handlers.go:1790 GetApplicationBoxByName). `key` is the raw box name.
+        let value = ledger.get_box(app_id, key);
+        Ok((value, last_round))
+    }
+
+    async fn lookup_keys_by_prefix(
+        &self,
+        app_id: u64,
+        prefix: &[u8],
+    ) -> Result<(Vec<Vec<u8>>, u64), NodeError> {
+        let ledger = self.lock_ledger("lookup_keys_by_prefix")?;
+        let last_round = Self::committed_round(&ledger, "lookup_keys_by_prefix")?;
+        // `box_keys_for_app` returns box names already stripped of the KV
+        // prefix (sqlite.rs:4409). The handler passes an empty prefix to list
+        // all boxes (handlers.go:1733 GetApplicationBoxes); filter here for the
+        // general LookupKeysByPrefix contract.
+        let mut keys = ledger.box_keys_for_app(app_id);
+        if !prefix.is_empty() {
+            keys.retain(|k| k.starts_with(prefix));
+        }
+        Ok((keys, last_round))
+    }
+
+    async fn total_boxes(&self, app_id: u64) -> Result<(u64, u64), NodeError> {
+        let ledger = self.lock_ledger("total_boxes")?;
+        let last_round = Self::committed_round(&ledger, "total_boxes")?;
+        // Boxes are owned by the application *account* (its escrow address),
+        // not the creator — the count lives on that account's record
+        // (handlers.go:1742 looks up `applicationID.Address()` and reads
+        // `record.TotalBoxes`). O(1) account-record read, no key scan.
+        let app_addr = Address(algo_ledger::avm_context::app_address(app_id));
+        let total = ledger
+            .get_account(&app_addr)
+            .map(|acct| acct.total_boxes)
+            .unwrap_or(0);
+        Ok((total, last_round))
     }
 
     async fn consensus_params(&self) -> Result<ConsensusParams, NodeError> {
@@ -3667,5 +3870,313 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, NodeError::NotFound(_)));
+    }
+
+    // ---- Asset / app / box resource lookups (TASK-266) ----
+
+    use algo_types::{
+        AppLocalState, AppParams, AssetHolding, AssetParams, AssetParamsRecord, StateSchema,
+    };
+
+    /// Build an adapter over an in-memory ledger and hand back the shared
+    /// ledger handle for direct state seeding via the `LedgerStore` setters.
+    ///
+    /// State is written through the store setters without driving a full
+    /// apply/commit, so `acctrounds.acctbase` is never advanced and the
+    /// lookups observe `last_round == 0` (the `unwrap_or(0)` empty-ledger
+    /// path, mirroring `ledger.Latest()` on a freshly initialised ledger).
+    /// The round plumbing through committed blocks is covered separately by
+    /// the status/account-lookup tests.
+    fn adapter_with_seedable_ledger() -> (AlgodNodeInterface, Arc<Mutex<SqliteLedger>>) {
+        let ledger_arc = Arc::new(Mutex::new(
+            SqliteLedger::open_in_memory().expect("in-memory ledger"),
+        ));
+        (adapter_with_ledger(Arc::clone(&ledger_arc)), ledger_arc)
+    }
+
+    fn asset_params_named(name: &str, total: u64) -> AssetParams {
+        AssetParams {
+            total,
+            unit_name: name.to_string(),
+            ..AssetParams::default()
+        }
+    }
+
+    fn app_params(creator: Address) -> AppParams {
+        AppParams {
+            creator,
+            approval_program: vec![0x06],
+            clear_state_program: vec![0x06],
+            global_state: Default::default(),
+            local_state_schema: StateSchema::default(),
+            global_state_schema: StateSchema::default(),
+            extra_program_pages: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_asset_resource_reports_holding_and_creator_params() {
+        let (adapter, ledger_arc) = adapter_with_seedable_ledger();
+        let creator = Address([0x11; 32]);
+        let holder = Address([0x22; 32]);
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            ledger.set_asset_params(
+                7,
+                AssetParamsRecord {
+                    params: asset_params_named("AST", 1_000),
+                    creator,
+                },
+            );
+            // Creator opted into their own asset; a separate holder opted in too.
+            ledger.set_asset_holding(
+                &creator,
+                7,
+                AssetHolding {
+                    amount: 400,
+                    frozen: false,
+                },
+            );
+            ledger.set_asset_holding(
+                &holder,
+                7,
+                AssetHolding {
+                    amount: 600,
+                    frozen: true,
+                },
+            );
+        }
+
+        // Creator: holding + params present.
+        let c = adapter
+            .lookup_asset_resource(&creator, 7)
+            .await
+            .expect("creator lookup");
+        assert_eq!(c.last_round, 0);
+        assert_eq!(c.asset_holding.expect("holding").amount, 400);
+        assert_eq!(c.asset_params.expect("params").total, 1_000);
+
+        // Non-creator holder: holding present, params omitted.
+        let h = adapter
+            .lookup_asset_resource(&holder, 7)
+            .await
+            .expect("holder lookup");
+        assert_eq!(h.asset_holding.expect("holding").amount, 600);
+        assert!(h.asset_params.is_none());
+
+        // Address with no holding: both None.
+        let none = adapter
+            .lookup_asset_resource(&Address([0x33; 32]), 7)
+            .await
+            .expect("absent lookup");
+        assert!(none.asset_holding.is_none());
+        assert!(none.asset_params.is_none());
+    }
+
+    #[tokio::test]
+    async fn lookup_app_resource_reports_local_state_and_creator_params() {
+        let (adapter, ledger_arc) = adapter_with_seedable_ledger();
+        let creator = Address([0x44; 32]);
+        let user = Address([0x55; 32]);
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            ledger.set_app_params(99, app_params(creator));
+            ledger.set_app_local_state(
+                &user,
+                99,
+                AppLocalState {
+                    schema: StateSchema::default(),
+                    key_value: Default::default(),
+                },
+            );
+        }
+
+        // Creator: params present, no local state (didn't opt in).
+        let c = adapter
+            .lookup_app_resource(&creator, 99)
+            .await
+            .expect("creator lookup");
+        assert_eq!(c.last_round, 0);
+        assert!(c.app_params.is_some());
+        assert!(c.app_local_state.is_none());
+
+        // Opted-in user: local state present, params omitted.
+        let u = adapter
+            .lookup_app_resource(&user, 99)
+            .await
+            .expect("user lookup");
+        assert!(u.app_local_state.is_some());
+        assert!(u.app_params.is_none());
+    }
+
+    #[tokio::test]
+    async fn lookup_application_and_asset_by_id_resolve_creator() {
+        let (adapter, ledger_arc) = adapter_with_seedable_ledger();
+        let app_creator = Address([0x66; 32]);
+        let asset_creator = Address([0x77; 32]);
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            ledger.set_app_params(123, app_params(app_creator));
+            ledger.set_asset_params(
+                456,
+                AssetParamsRecord {
+                    params: asset_params_named("ZZZ", 42),
+                    creator: asset_creator,
+                },
+            );
+        }
+
+        let app = adapter.lookup_application(123).await.expect("app lookup");
+        assert_eq!(app.creator, app_creator);
+        assert!(app.app_params.is_some());
+        assert_eq!(app.last_round, 0);
+
+        let asset = adapter.lookup_asset_by_id(456).await.expect("asset lookup");
+        assert_eq!(asset.creator, asset_creator);
+        assert_eq!(asset.asset_params.expect("params").unit_name, "ZZZ");
+
+        // Missing app/asset → None params and zero-address creator (handler
+        // maps that to 404).
+        let missing_app = adapter.lookup_application(999).await.expect("missing app");
+        assert!(missing_app.app_params.is_none());
+        assert!(missing_app.creator.is_zero());
+        let missing_asset = adapter
+            .lookup_asset_by_id(999)
+            .await
+            .expect("missing asset");
+        assert!(missing_asset.asset_params.is_none());
+        assert!(missing_asset.creator.is_zero());
+    }
+
+    #[tokio::test]
+    async fn lookup_assets_paginates_and_marks_creator() {
+        let (adapter, ledger_arc) = adapter_with_seedable_ledger();
+        let addr = Address([0x88; 32]);
+        let other_creator = Address([0x99; 32]);
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            // Opt into assets 10, 20, 30. The account created asset 20; asset
+            // 30 is created by someone else; asset 10 has no creator (deleted).
+            for aid in [10u64, 20, 30] {
+                ledger.set_asset_holding(
+                    &addr,
+                    aid,
+                    AssetHolding {
+                        amount: aid,
+                        frozen: false,
+                    },
+                );
+            }
+            ledger.set_asset_params(
+                20,
+                AssetParamsRecord {
+                    params: asset_params_named("MID", 20),
+                    creator: addr,
+                },
+            );
+            ledger.set_asset_params(
+                30,
+                AssetParamsRecord {
+                    params: asset_params_named("OTH", 30),
+                    creator: other_creator,
+                },
+            );
+        }
+
+        // Full listing, ascending by asset id.
+        let (all, round) = adapter
+            .lookup_assets(&addr, 0, 100)
+            .await
+            .expect("all assets");
+        assert_eq!(round, 0);
+        let ids: Vec<u64> = all.iter().map(|r| r.asset_id).collect();
+        assert_eq!(ids, vec![10, 20, 30]);
+        // Asset 20 (self-created): creator is self + params present.
+        let mid = all.iter().find(|r| r.asset_id == 20).expect("asset 20");
+        assert_eq!(mid.creator, addr);
+        assert!(mid.asset_params.is_some());
+        // Asset 30 (created by another account): a non-creator holder still
+        // gets the resolved creator + params, matching go's LookupLimitedResources.
+        let other = all.iter().find(|r| r.asset_id == 30).expect("asset 30");
+        assert_eq!(other.creator, other_creator);
+        assert_eq!(
+            other.asset_params.as_ref().expect("params").unit_name,
+            "OTH"
+        );
+        // Asset 10 (no creator / deleted): zero creator, params omitted.
+        let first = all.iter().find(|r| r.asset_id == 10).expect("asset 10");
+        assert!(first.creator.is_zero());
+        assert!(first.asset_params.is_none());
+
+        // asset_id_gt filter: only ids strictly greater than 10.
+        let (gt, _) = adapter.lookup_assets(&addr, 10, 100).await.expect("gt 10");
+        assert_eq!(
+            gt.iter().map(|r| r.asset_id).collect::<Vec<_>>(),
+            vec![20, 30]
+        );
+
+        // limit cap: request 2 (handler asks for limit+1 to detect more).
+        let (capped, _) = adapter.lookup_assets(&addr, 0, 2).await.expect("limit 2");
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[0].asset_id, 10);
+        assert_eq!(capped[1].asset_id, 20);
+    }
+
+    #[tokio::test]
+    async fn box_lookups_round_trip_through_kvstore() {
+        let (adapter, ledger_arc) = adapter_with_seedable_ledger();
+        let app_id = 555u64;
+        let app_addr = Address(algo_ledger::avm_context::app_address(app_id));
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            ledger.set_box(app_id, b"alpha", b"one".to_vec());
+            ledger.set_box(app_id, b"beta", b"two".to_vec());
+            ledger.set_box(app_id, b"alpine", b"three".to_vec());
+            // total_boxes reads the app account's record.
+            ledger.set_account(
+                &app_addr,
+                AccountData {
+                    total_boxes: 3,
+                    ..AccountData::default()
+                },
+            );
+        }
+
+        // Single box by raw name.
+        let (value, round) = adapter.lookup_kv(app_id, b"alpha").await.expect("kv alpha");
+        assert_eq!(round, 0);
+        assert_eq!(value.expect("alpha value"), b"one");
+        let (missing, _) = adapter
+            .lookup_kv(app_id, b"missing")
+            .await
+            .expect("kv missing");
+        assert!(missing.is_none());
+
+        // All box names (empty prefix), stripped of the KV prefix.
+        let (mut all, _) = adapter
+            .lookup_keys_by_prefix(app_id, &[])
+            .await
+            .expect("all keys");
+        all.sort();
+        assert_eq!(
+            all,
+            vec![b"alpha".to_vec(), b"alpine".to_vec(), b"beta".to_vec()]
+        );
+
+        // Prefix filter.
+        let (mut alp, _) = adapter
+            .lookup_keys_by_prefix(app_id, b"alp")
+            .await
+            .expect("alp keys");
+        alp.sort();
+        assert_eq!(alp, vec![b"alpha".to_vec(), b"alpine".to_vec()]);
+
+        // total_boxes from the app account record.
+        let (total, round) = adapter.total_boxes(app_id).await.expect("total boxes");
+        assert_eq!(total, 3);
+        assert_eq!(round, 0);
+        // Unknown app → zero, not an error.
+        let (zero, _) = adapter.total_boxes(777).await.expect("total boxes empty");
+        assert_eq!(zero, 0);
     }
 }
