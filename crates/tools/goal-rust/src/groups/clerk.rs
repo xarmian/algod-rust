@@ -125,7 +125,12 @@ pub struct SendArgs {
     /// goal `send` also honors the global no-wait behavior).
     #[arg(short = 'N', long = "no-wait")]
     pub no_wait: bool,
-    /// Wallet name (Go persistent `-w/--wallet` on the clerk group).
+    /// Wallet name. Go declares `-w/--wallet` as a *persistent* flag on the
+    /// `clerk` group (clerk.go:101), so `goal clerk -w w send ...` works there.
+    /// goal-rust places it on the leaf instead — `clerk send -w w ...` — the
+    /// same documented divergence the `account` group already ships (every
+    /// account leaf re-declares `-w` rather than inheriting a group flag). Pass
+    /// `-w` after `send`.
     #[arg(short = 'w', long = "wallet")]
     pub wallet: Option<String>,
     /// Wallet password (skip the prompt). goal-rust convention shared with the
