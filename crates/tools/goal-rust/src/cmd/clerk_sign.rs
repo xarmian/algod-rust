@@ -221,7 +221,17 @@ pub fn logicsig_sanity_check(lsig: &LogicSig, authorizer: &[u8; 32]) -> Result<(
         return Err("LogicSig.Logic empty".to_string());
     }
     let parsed = algo_avm::parse(&program).map_err(|e| format!("{e}"))?;
-    algo_avm::check_program(&parsed, algo_avm::Mode::LogicSig, program.len(), 0)
+    // Go's size check counts the whole LogicSig: `LogicSig.Len()` =
+    // len(Logic) + sum(len(Args)) (data/transactions/logic.go) against
+    // `LogicSigMaxSize`, so an oversized `--argb64` is caught here too. Pass the
+    // pooled length as `program_len`.
+    let lsig_len = program.len()
+        + lsig
+            .args
+            .as_ref()
+            .map(|a| a.iter().map(|arg| arg.len()).sum::<usize>())
+            .unwrap_or(0);
+    algo_avm::check_program(&parsed, algo_avm::Mode::LogicSig, lsig_len, 0)
         .map_err(|e| format!("{e}"))?;
 
     let has_sig = lsig.sig != [0u8; 64];
