@@ -27,6 +27,11 @@ pub const MERKLE_SIGNATURE_SCHEME_ROOT_SIZE: usize = 64;
 /// Default key lifetime in rounds.
 pub const KEY_LIFETIME_DEFAULT: u64 = 256;
 
+/// Maximum number of `KeyRoundPair`s accepted when decoding a `StateProofKeys`
+/// wire body. Mirrors go's `//msgp:allocbound StateProofKeys 1000`
+/// (`../go-algorand/data/account/participationRegistry.go:89`).
+pub const STATE_PROOF_KEYS_ALLOCBOUND: usize = 1000;
+
 /// Identifies the cryptographic primitives used: subset-sum hash + falcon.
 pub const CRYPTO_PRIMITIVES_ID: u16 = 0;
 
@@ -179,9 +184,21 @@ impl FalconSigner {
 /// Unknown map fields are skipped (forward-compat with go's canonical encoder,
 /// which omits empty fields). A missing `key` yields a default (all-zero)
 /// signer for that pair.
+///
+/// The element count is rejected if it exceeds [`STATE_PROOF_KEYS_ALLOCBOUND`]
+/// *before* allocating, matching go's generated msgp decoder (`//msgp:allocbound
+/// StateProofKeys 1000` at `data/account/participationRegistry.go:89`). This
+/// prevents a tiny `array32` header advertising a huge count from forcing an
+/// enormous up-front allocation on an untrusted (admin-tier) request body.
 pub fn decode_state_proof_keys(data: &[u8]) -> Result<Vec<(u64, FalconSigner)>, String> {
     let (count, mut cur) =
         read_array_header(data).map_err(|e| format!("StateProofKeys array header: {e}"))?;
+
+    if count as usize > STATE_PROOF_KEYS_ALLOCBOUND {
+        return Err(format!(
+            "StateProofKeys array len {count} exceeds allocbound {STATE_PROOF_KEYS_ALLOCBOUND}"
+        ));
+    }
 
     let mut out = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -1594,6 +1611,13 @@ mod tests {
 
         // garbage body is rejected, not silently accepted.
         assert!(decode_state_proof_keys(&[0xc0]).is_err());
+
+        // An array32 header advertising a count above the allocbound is
+        // rejected before allocating (matches go's msgp allocbound 1000).
+        let mut huge = vec![0xdd]; // array32
+        huge.extend_from_slice(&u32::MAX.to_be_bytes());
+        let err = decode_state_proof_keys(&huge).unwrap_err();
+        assert!(err.contains("allocbound"), "{err}");
     }
 
     #[test]

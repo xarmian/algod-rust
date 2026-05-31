@@ -1256,6 +1256,32 @@ impl NodeInterface for AlgodNodeInterface {
         last: u64,
         dilution: Option<u64>,
     ) -> Result<ParticipationID, NodeError> {
+        // Enforce the consensus `MaxKeyregValidPeriod` bound before generating,
+        // matching go's `FillDBWithParticipationKeys`
+        // (../go-algorand/data/account/participation.go:231), which reads the
+        // limit from the current consensus params and rejects an over-long
+        // validity window. `Participation::generate` only checks `last >= first`,
+        // so without this the endpoint would generate (and persist) keys with
+        // windows go rejects — a large CPU/RAM cost on an untrusted request.
+        if last < first {
+            return Err(NodeError::Internal(format!(
+                "firstValid {first} is after lastValid {last}"
+            )));
+        }
+        let proto = {
+            let ledger = self.lock_ledger("generate_participation_keys")?;
+            self.resolve_protocol(&ledger)
+        };
+        let params = Self::resolve_consensus_params(&proto)?;
+        if params.max_keyreg_valid_period != 0
+            && last.saturating_sub(first) > params.max_keyreg_valid_period
+        {
+            return Err(NodeError::Internal(format!(
+                "the validity period for mss is too large: the limit is {}",
+                params.max_keyreg_valid_period
+            )));
+        }
+
         // `dilution = 0` defers to the default in `Participation::generate`
         // (matching go's `nilToZero(params.Dilution)`).
         let key_dilution = dilution.unwrap_or(0);
@@ -3451,6 +3477,31 @@ mod tests {
             adapter.remove_participation_key(&id).await,
             Err(NodeError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn generate_rejects_over_long_validity_window() {
+        let adapter = adapter_with_part_store();
+        // v41 MaxKeyregValidPeriod is 256*(1<<16)-1 = 16_777_215. A window
+        // wider than that is rejected before any keygen (matches go's
+        // FillDBWithParticipationKeys validity-period check).
+        let err = adapter
+            .generate_participation_keys(Address([0x09; 32]), 1, 1 + 16_777_216, None)
+            .await
+            .unwrap_err();
+        match err {
+            NodeError::Internal(msg) => assert!(
+                msg.contains("the validity period for mss is too large"),
+                "expected validity-period message, got {msg:?}"
+            ),
+            other => panic!("expected Internal(validity period), got {other:?}"),
+        }
+        // Nothing was persisted.
+        assert!(adapter
+            .list_participation_keys()
+            .await
+            .expect("list ok")
+            .is_empty());
     }
 
     #[tokio::test]
