@@ -170,24 +170,39 @@ pub fn encode_eval_delta(
     }
 
     if !result.local_deltas.is_empty() {
-        // Resolve each account address to its transaction index (sender = 0,
-        // accounts[i] = i+1) — the wire format keys local deltas by index.
-        let index_of = |addr: &Address| -> Option<u64> {
-            if *addr == txn.sender {
-                return Some(0);
-            }
-            txn.accounts
-                .as_ref()
-                .and_then(|accts| accts.iter().position(|a| a == addr))
-                .map(|i| (i + 1) as u64)
-        };
-        let ld: Vec<(Value, Value)> = result
-            .local_deltas
-            .iter()
-            .filter_map(|(addr, kv)| index_of(addr).map(|idx| (Value::from(idx), state_delta(kv))))
-            .collect();
-        if !ld.is_empty() {
-            entries.push((Value::from("ld"), Value::Map(ld)));
+        // Local deltas are keyed by the account's position in the wire layout
+        // [sender, accounts..., shared_accts...] (go's teal.go): sender = 0,
+        // accounts[i] = i+1, and any account addressed by raw value (not in the
+        // Accounts array) goes into the `sa` shared-accounts list, indexed after
+        // accounts. Iterate in a deterministic order since HashMap order is
+        // unspecified.
+        let accounts: &[Address] = txn.accounts.as_deref().unwrap_or(&[]);
+        let mut items: Vec<_> = result.local_deltas.iter().collect();
+        items.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+
+        let mut shared: Vec<Address> = Vec::new();
+        let mut ld: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+        for (addr, kv) in items {
+            let index = if *addr == txn.sender {
+                0u64
+            } else if let Some(i) = accounts.iter().position(|a| a == addr) {
+                (i + 1) as u64
+            } else {
+                let pos = shared.iter().position(|a| a == addr).unwrap_or_else(|| {
+                    shared.push(*addr);
+                    shared.len() - 1
+                });
+                (1 + accounts.len() + pos) as u64
+            };
+            ld.push((Value::from(index), state_delta(kv)));
+        }
+        entries.push((Value::from("ld"), Value::Map(ld)));
+        if !shared.is_empty() {
+            // `sa`: addresses for the local deltas that index beyond `accounts`.
+            entries.push((
+                Value::from("sa"),
+                Value::Array(shared.iter().map(|a| Value::Binary(a.0.to_vec())).collect()),
+            ));
         }
     }
 
@@ -806,5 +821,65 @@ mod tests {
     fn encode_eval_delta_empty_is_none() {
         let result = avm_result(HashMap::new(), HashMap::new(), vec![], vec![]);
         assert!(encode_eval_delta(&result, &Transaction::default()).is_none());
+    }
+
+    /// Extract the `sa` (shared accounts) entries from an encoded eval delta.
+    fn shared_accts(encoded: &rmpv::Value) -> Vec<Vec<u8>> {
+        let rmpv::Value::Map(m) = encoded else {
+            return vec![];
+        };
+        for (k, v) in m {
+            if matches!(k, rmpv::Value::String(s) if s.as_str() == Some("sa")) {
+                if let rmpv::Value::Array(a) = v {
+                    return a
+                        .iter()
+                        .filter_map(|x| match x {
+                            rmpv::Value::Binary(b) => Some(b.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                }
+            }
+        }
+        vec![]
+    }
+
+    #[test]
+    fn encode_eval_delta_routes_raw_account_to_shared_accts() {
+        // A local delta for an account that's neither the sender nor in the
+        // Accounts array must be recorded under `sa` and indexed after accounts
+        // (sender=0, accounts[0]=1, shared[0]=2), not silently dropped.
+        let sender = Address([1u8; 32]);
+        let acct = Address([2u8; 32]); // in accounts → index 1
+        let raw = Address([9u8; 32]); // not in accounts → shared → index 2
+        let txn = Transaction {
+            sender,
+            accounts: Some(vec![acct]),
+            ..Default::default()
+        };
+        let mut local_deltas = HashMap::new();
+        for a in [sender, acct, raw] {
+            let mut kv = HashMap::new();
+            kv.insert(b"k".to_vec(), Some(TealValue::Uint(1)));
+            local_deltas.insert(a, kv);
+        }
+
+        let encoded = encode_eval_delta(
+            &avm_result(HashMap::new(), local_deltas, vec![], vec![]),
+            &txn,
+        )
+        .expect("delta");
+
+        let ld = parse_eval_delta(&encoded).unwrap().local_deltas.unwrap();
+        assert!(
+            ld.contains_key(&0) && ld.contains_key(&1) && ld.contains_key(&2),
+            "expected indices 0/1/2 (sender/accounts[0]/shared[0]), got {:?}",
+            ld.keys().collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            shared_accts(&encoded),
+            vec![raw.0.to_vec()],
+            "raw-address account must appear in the shared-accounts list",
+        );
     }
 }
