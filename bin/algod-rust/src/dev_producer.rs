@@ -11,6 +11,14 @@
 //! unset, and the block is committed with no certificate. Because the seed and
 //! all advanced header fields match go's dev-mode `MakeBlock`/`writeDevmodeBlock`,
 //! the produced block digests match a go dev chain.
+//!
+//! **Limitation (TASK-278):** blocks are committed via the pool's
+//! `SimpleBlockEvaluator` (stateless + signature + balance/resource checks, no
+//! AVM execution) and `apply_block` in Replay mode. So an `appl` transaction
+//! whose approval program would reject can still be confirmed, and committed
+//! blocks carry no ApplyData (eval deltas, logs, inner txns, created ids).
+//! Payments and asset transfers confirm correctly; full app/asset execution +
+//! ApplyData in dev mode is tracked in TASK-278.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
