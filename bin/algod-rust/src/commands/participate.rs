@@ -1761,6 +1761,11 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
         _payset_hint: usize,
         max_txn_bytes_per_block: usize,
     ) -> Result<Box<dyn algo_pool::traits::BlockEvaluator>, algo_error::AlgoError> {
+        // `hdr` is the PREVIOUS (committed) block header. The consensus params
+        // for the round we're about to build are the previous protocol's unless
+        // a protocol switch occurs — and block production never crosses an
+        // upgrade (see make_next_block_header), so the previous protocol's
+        // params govern.
         let consensus_params = algo_types::consensus::consensus_params_for_version(
             &hdr.current_protocol,
         )
@@ -1775,9 +1780,55 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
             }
         })?;
 
-        // Snapshot the ledger state at evaluator creation time.
-        // This briefly acquires the mutex, captures lease state, then releases.
-        let snapshot = LedgerSnapshot::from_ledger(&self.ledger, hdr.round.0);
+        // Snapshot the committed state at the previous round — evaluation reads
+        // balances as of the block we build on. This briefly acquires the mutex,
+        // captures lease state, then releases.
+        let mut snapshot = LedgerSnapshot::from_ledger(&self.ledger, hdr.round.0);
+
+        // Advance the header to the next round, mirroring go's
+        // eval.StartEvaluator: read the rewards-pool balance (with pending
+        // rewards applied at the previous level) and the total reward units,
+        // advance the rewards state, then build the next-round header skeleton.
+        // Without this the evaluator would carry the previous header verbatim
+        // (wrong round/branch and a stale rewards level).
+        let next_round = hdr.round.0 + 1;
+        let pool_balance = snapshot
+            .get_account(&hdr.rewards_pool, &self.ledger)
+            .map(|acct| {
+                algo_ledger::compute_pending_rewards(&acct, hdr.rewards_level)
+                    .saturating_add(acct.micro_algos)
+            })
+            .unwrap_or(0);
+        let total_reward_units = {
+            let l = self
+                .ledger
+                .lock()
+                .map_err(|e| algo_error::AlgoError::Ledger {
+                    message: format!("ledger lock poisoned: {e}"),
+                })?;
+            l.total_reward_units()?
+        };
+        let prev_rewards = algo_ledger::RewardsState {
+            rewards_level: hdr.rewards_level,
+            rewards_rate: hdr.rewards_rate,
+            rewards_residue: hdr.rewards_residue,
+            rewards_recalculation_round: hdr.rewards_recalculation_round.0,
+        };
+        let rewards = algo_ledger::next_rewards_state(
+            prev_rewards,
+            next_round,
+            &consensus_params,
+            pool_balance,
+            total_reward_units,
+        );
+        // Proposer wall-clock time (clamped inside make_next_block_header),
+        // matching go's MakeBlock `time.Now()`. Falls back to the previous
+        // timestamp if the system clock is before the Unix epoch.
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(hdr.timestamp);
+        let next_hdr = algo_ledger::make_next_block_header(&hdr, timestamp, rewards)?;
 
         // Use the caller-provided byte limit, or the consensus protocol
         // default if the caller passed 0. Take the minimum of the two when
@@ -1790,7 +1841,7 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
         };
 
         Ok(Box::new(SimpleBlockEvaluator {
-            hdr,
+            hdr: next_hdr,
             consensus_params,
             included_txns: Vec::new(),
             txn_bytes: 0,
@@ -2680,6 +2731,56 @@ mod tests {
         Arc::new(Mutex::new(
             SqliteLedger::open_in_memory().expect("in-memory ledger"),
         ))
+    }
+
+    // ── start_evaluator advances the header ─────────────────────────
+
+    #[test]
+    fn start_evaluator_advances_round_and_branch() {
+        use algo_pool::traits::PoolLedger;
+
+        // Empty in-memory ledger: no accounts, no totals seeded. The evaluator
+        // must still advance the header off the supplied previous header.
+        let adapter = PoolLedgerAdapter {
+            ledger: test_ledger(),
+        };
+
+        let prev = BlockHeader {
+            round: Round(5),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            fee_sink: Address([1u8; 32]),
+            rewards_pool: Address([2u8; 32]),
+            genesis_id: "net-x".to_string(),
+            timestamp: 1000,
+            ..BlockHeader::default()
+        };
+
+        let mut eval = adapter
+            .start_evaluator(prev.clone(), 0, 0)
+            .expect("start_evaluator");
+        let block = eval.generate_block(&[]).expect("generate_block");
+
+        assert_eq!(
+            block.round,
+            Round(6),
+            "evaluator advances to prev round + 1"
+        );
+        assert_eq!(
+            block.branch,
+            algo_codec::compute_block_header_digest(&prev).0,
+            "branch = previous header digest (go's prev.Hash())",
+        );
+        assert_eq!(block.fee_sink, prev.fee_sink, "fee sink carried");
+        assert_eq!(
+            block.rewards_pool, prev.rewards_pool,
+            "rewards pool carried"
+        );
+        // No reward units seeded (empty ledger) → rewards level carries unchanged.
+        assert_eq!(block.rewards_level, prev.rewards_level);
+        assert_eq!(
+            block.seed, [0u8; 32],
+            "seed left for the producer/agreement"
+        );
     }
 
     // ── load_signing_keys_for_round ─────────────────────────────────
