@@ -424,22 +424,14 @@ fn run_sign_inner(
 
     let out_data = if let Some(lsig) = lsig {
         // --- LogicSig path: attach lsig (+ AuthAddr) to every txn. ---
-        // Go runs verify.LogicSigSanityCheck per group; we run a lightweight
-        // program structure check (size/version/branch targets) — the byte
-        // assembly + arg attachment is the load-bearing part for producing a
-        // valid signed file, and the node re-verifies on submit.
-        let program: Vec<u8> = lsig.logic.to_vec();
-        algo_avm::check_program(
-            &algo_avm::parse(&program)
-                .map_err(|e| format!("{}: txn error {e}", args.infile.display()))?,
-            algo_avm::Mode::LogicSig,
-            program.len(),
-            0,
-        )
-        .map_err(|e| format!("{}: txn error {e}", args.infile.display()))?;
-
+        // Go runs verify.LogicSigSanityCheck per txn (it depends on the txn's
+        // authorizer); `clerk_sign::logicsig_sanity_check` mirrors the
+        // consensus-independent core — program structure, the single-signature
+        // rule, and (for an unsigned lsig) the contract-account authorizer ==
+        // HashProgram check. Delegated sig/msig/lmsig are re-verified by the
+        // node on submit.
         let mut out = Vec::new();
-        for stxn in &mut stxns {
+        for (idx, stxn) in stxns.iter_mut().enumerate() {
             stxn.lsig = Some(lsig.clone());
             if let Some(signer) = signer_addr {
                 if signer == stxn.txn.sender {
@@ -447,6 +439,10 @@ fn run_sign_inner(
                 }
                 stxn.auth_addr = Some(signer);
             }
+            // Authorizer = auth_addr if set, else sender (Go's txn.Authorizer()).
+            let authorizer = stxn.auth_addr.map(|a| a.0).unwrap_or(stxn.txn.sender.0);
+            clerk_sign::logicsig_sanity_check(&lsig, &authorizer)
+                .map_err(|e| format!("{}: txn[{idx}] error {e}", args.infile.display()))?;
             out.extend_from_slice(&canonical_encode_signed_transaction(stxn));
         }
         out
@@ -477,6 +473,27 @@ fn run_sign_inner(
             let signed = rt
                 .block_on(kmd.sign_transaction(&handle, &password, encoded, signer_pk))
                 .map_err(|e| format!("Couldn't sign tx with kmd: {}", kmd_msg(&e)))?;
+            // Go's `Transaction.Sign` (transaction.go:271-274) sets AuthAddr
+            // whenever the signing key differs from the sender (the rekey
+            // case). The kmd-rust server signs with the requested key but
+            // leaves `sgnr` unset (TASK-216), so set it here when `--signer`
+            // differs from the sender — otherwise the emitted txn would carry
+            // a signature checked against the wrong (sender) key and fail
+            // verification.
+            if let Some(signer) = signer_addr {
+                if signer != stxn.txn.sender {
+                    let mut signed_txn = decode_signed_txn_stream(&signed.signed_transaction)
+                        .map_err(|e| {
+                            format!("kmd returned an undecodable signed transaction: {e}")
+                        })?;
+                    let mut s = signed_txn
+                        .pop()
+                        .ok_or("kmd returned an empty signed transaction for a single-txn sign")?;
+                    s.auth_addr = Some(signer);
+                    out.extend_from_slice(&canonical_encode_signed_transaction(&s));
+                    continue;
+                }
+            }
             out.extend_from_slice(&signed.signed_transaction);
         }
         out
