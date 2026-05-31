@@ -33,9 +33,19 @@ use algo_types::{Block, Digest, SignedTransaction};
 /// the evaluator's `restore_genesis_fields`:
 /// - restore `genesis_id` from the block when `has_genesis_id` is set and the
 ///   field is empty;
-/// - restore `genesis_hash` from the block when it's zero (a committed block's
-///   genesis hash is non-zero only under protocols that require it, where every
-///   txn's hash matched and was stripped).
+/// - restore `genesis_hash` from the block when the field is zero and the block
+///   carries one.
+///
+/// `genesis_id` is gated on the `has_genesis_id` flag because an empty
+/// `genesis_id` is a legal, common state (the flag distinguishes "stripped
+/// because it matched the network" from "genuinely empty"). `genesis_hash` is
+/// gated only on zero-ness, not the flag: the block encoder here does not
+/// reliably set `has_genesis_hash` when it strips the hash, and dev-mode block
+/// production runs on modern protocols (`require_genesis_hash`) where every
+/// committed transaction carries a genesis hash equal to the block's — so a zero
+/// hash in a committed block unambiguously means it was stripped. (On legacy
+/// protocols where the hash is optional this would be ambiguous, but dev mode
+/// never runs there.)
 pub fn restore_block_genesis_fields(stx: &SignedTransaction, block: &Block) -> SignedTransaction {
     let mut out = stx.clone();
     if out.has_genesis_id && out.txn.genesis_id.is_empty() {

@@ -167,6 +167,10 @@ pub struct AlgodNodeInterface {
     /// dev mode. Requires a pool; no broadcaster/gossip is used. See
     /// [`crate::dev_producer`].
     dev_mode: bool,
+    /// Serializes dev-mode production so concurrent submissions don't assemble
+    /// against the same round before each other's `on_new_block` drains the
+    /// pool. Mirrors go's `node.mu.Lock()` in dev-mode `BroadcastSignedTxGroup`.
+    dev_produce_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AlgodNodeInterface {
@@ -188,6 +192,7 @@ impl AlgodNodeInterface {
             build_version: config.build_version,
             default_protocol: config.default_protocol,
             dev_mode: false,
+            dev_produce_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -887,6 +892,11 @@ impl NodeInterface for AlgodNodeInterface {
                 .clone()
                 .ok_or(NodeError::NotImplemented("broadcast_signed_tx_group (dev)"))?;
             let ledger = self.ledger.clone();
+            // Serialize production so concurrent submissions don't assemble
+            // against the same round before each other's on_new_block drains the
+            // pool (go holds node.mu across Remember + writeDevmodeBlock). Held
+            // across the spawn_blocking below.
+            let _produce_guard = self.dev_produce_lock.lock().await;
             return tokio::task::spawn_blocking(move || {
                 // Prime the evaluator before the first ingest (a fresh pool has
                 // none until the first block); idempotent thereafter.
