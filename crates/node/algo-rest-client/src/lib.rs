@@ -14,5 +14,6 @@ pub use parallel_fetch::{ParallelBlockFetcher, DEFAULT_CONCURRENCY};
 pub use traits::BlockSource;
 pub use types::{
     AccountInfo, AccountParticipation, AlgodVersions, NodeStatus, ParticipationKey,
-    ParticipationKeyAdded, PendingTxnInfo, PostTransactionResponse, SuggestedParams, TxId,
+    ParticipationKeyAdded, PendingTxnInfo, PostTransactionResponse, SuggestedParams,
+    TealCompileResult, TxId,
 };

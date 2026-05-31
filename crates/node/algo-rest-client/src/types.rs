@@ -377,3 +377,17 @@ mod digest_base64 {
         Ok(Digest(out))
     }
 }
+
+/// Response from `POST /v2/teal/compile`.
+///
+/// Matches go-algorand's `model.CompileResponse` (the `sourcemap` field is
+/// only present when `sourcemap=true` is requested, which goal's `clerk
+/// compile` never sets). Used by goal-rust's `clerk compile`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TealCompileResult {
+    /// Hash of the compiled program, rendered as an Algorand address string.
+    pub hash: String,
+
+    /// Base64-encoded compiled program bytes.
+    pub result: String,
+}

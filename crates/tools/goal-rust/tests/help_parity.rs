@@ -232,7 +232,9 @@ fn unimplemented_leaf_exits_with_code_two_and_message() {
         // Every `account` leaf is implemented (through TASK-244 / B12:
         // changeonlinestatus, marknonparticipating); spot-check still-stubbed
         // leaves in other groups.
-        (&["clerk", "dryrun-remote"], "clerk dryrun-remote"),
+        // clerk compile/dryrun/dryrun-remote are implemented (TASK-291); spot-
+        // check `clerk simulate`, still stubbed pending T4.
+        (&["clerk", "simulate"], "clerk simulate"),
         (&["node", "generate-p2pid"], "node generate-p2pid"),
         // All `wallet` leaves are implemented (TASK-226/227/228);
         // use a still-stubbed `node` leaf as the spot check.

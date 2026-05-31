@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use crate::{
     AccountInfo, AlgodVersions, BlockSource, NodeStatus, ParticipationKey, ParticipationKeyAdded,
-    PendingTxnInfo, PostTransactionResponse, SuggestedParams, TxId,
+    PendingTxnInfo, PostTransactionResponse, SuggestedParams, TealCompileResult, TxId,
 };
 
 /// Configuration for the REST client.
@@ -471,6 +471,107 @@ impl AlgodClient {
             source: Box::new(e),
             context: format!("reading POST {path} response body"),
         })
+    }
+}
+
+// ---- TEAL tooling surface (TASK-291 / CLERK T3) ----
+//
+// Mirrors `../go-algorand/daemon/algod/api/server/v2/handlers.go` TealCompile
+// (`/v2/teal/compile`) and TealDryrun (`/v2/teal/dryrun`), plus the raw
+// account/application/round/block reads `libgoal.MakeDryrunStateGenerated`
+// (libgoal.go:1163) performs while assembling a dryrun dump. Used by
+// goal-rust's `clerk compile` / `dryrun` / `dryrun-remote` leaves.
+
+impl AlgodClient {
+    /// `POST /v2/teal/compile` — assemble TEAL source text to bytecode.
+    ///
+    /// Returns `(program_hash_address, compiled_program_bytes)`. The body is the
+    /// raw source text (Content-Type `text/plain`, matching go-algorand's
+    /// handler which reads the body as source). A 404 means the node has
+    /// `EnableDeveloperAPI=false`; a 400 carries the assembler error text.
+    ///
+    /// Ported reference:
+    /// `../go-algorand/daemon/algod/api/server/v2/handlers.go` (`TealCompile`).
+    pub async fn teal_compile(&self, source: &[u8]) -> Result<TealCompileResult> {
+        let resp = self
+            .post_no_retry("/v2/teal/compile", "text/plain", source.to_vec())
+            .await?;
+        resp.json::<TealCompileResult>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: "parsing POST /v2/teal/compile response".into(),
+            })
+    }
+
+    /// `POST /v2/teal/dryrun` — execute a dryrun request and return the raw
+    /// response JSON value. The body is the JSON-encoded dryrun request (the
+    /// dump produced by `clerk dryrun --dryrun-dump`); the node accepts either
+    /// JSON or msgpack, and we always send JSON. A 404 means the node has
+    /// `EnableDeveloperAPI=false`.
+    ///
+    /// Ported reference:
+    /// `../go-algorand/daemon/algod/api/server/v2/handlers.go` (`TealDryrun`)
+    /// and `libgoal.(*Client).Dryrun` (libgoal.go:1252).
+    pub async fn teal_dryrun(&self, request_json: &[u8]) -> Result<serde_json::Value> {
+        let resp = self
+            .post_no_retry("/v2/teal/dryrun", "application/json", request_json.to_vec())
+            .await?;
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: "parsing POST /v2/teal/dryrun response".into(),
+            })
+    }
+
+    /// `GET /v2/accounts/{addr}` — fetch account info as a raw JSON value, the
+    /// `model.Account` shape the dryrun request's `accounts` field expects.
+    ///
+    /// Mirrors the `client.AccountInformation` call in
+    /// `MakeDryrunStateGenerated` (libgoal.go:1232).
+    pub async fn get_account_json(&self, addr: &str) -> Result<serde_json::Value> {
+        let path = format!("/v2/accounts/{addr}");
+        let resp = self.get_with_retry(&path, &self.http).await?;
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("parsing GET /v2/accounts/{addr} response"),
+            })
+    }
+
+    /// `GET /v2/applications/{id}` — fetch application info as a raw JSON value,
+    /// the `model.Application` shape the dryrun request's `apps` field expects.
+    ///
+    /// Mirrors the `client.ApplicationInformation` call in
+    /// `MakeDryrunStateGenerated` (libgoal.go:1218).
+    pub async fn get_application_json(&self, app_id: u64) -> Result<serde_json::Value> {
+        let path = format!("/v2/applications/{app_id}");
+        let resp = self.get_with_retry(&path, &self.http).await?;
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: format!("parsing GET /v2/applications/{app_id} response"),
+            })
+    }
+
+    /// `GET /v2/status` — current last committed round.
+    ///
+    /// Mirrors `client.CurrentRound` in `MakeDryrunStateGenerated`.
+    pub async fn current_round(&self) -> Result<u64> {
+        let status = <Self as BlockSource>::get_status(self).await?;
+        Ok(status.last_round)
+    }
+
+    /// Fetch the block header timestamp for `round` via `GET /v2/blocks/{round}`.
+    ///
+    /// Mirrors `client.BookkeepingBlock(round).BlockHeader.TimeStamp` in
+    /// `MakeDryrunStateGenerated`.
+    pub async fn block_timestamp(&self, round: u64) -> Result<i64> {
+        let block = <Self as BlockSource>::get_block(self, Round(round)).await?;
+        Ok(block.block.timestamp)
     }
 }
 
