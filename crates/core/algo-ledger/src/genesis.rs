@@ -478,19 +478,49 @@ pub fn seed_account_totals_from_genesis(
         };
         per_addr.insert(alloc.addr.clone(), (status, alloc.state.algo));
     }
+    // Reward units per account are floor(microAlgos / RewardUnit), summed by
+    // status — go's `AccountTotals` (`AlgoCount.RewardUnits`). The per-account
+    // floor means the sum differs from total_money / RewardUnit, so it must be
+    // accumulated per account, not derived from the status totals. These feed
+    // the per-round rewards-level advance (`next_rewards_state`).
+    //
+    // RewardUnit is a fixed 1e6 microAlgos across every consensus version (go
+    // documents it must never change), so use the crate constant rather than a
+    // protocol lookup — consistent with `compute_pending_rewards`, and it avoids
+    // erroring on the placeholder protocols used in some genesis fixtures.
+    let reward_unit = crate::rewards::REWARD_UNITS;
+
     let mut online: u64 = 0;
     let mut offline: u64 = 0;
     let mut not_participating: u64 = 0;
+    let mut online_ru: u64 = 0;
+    let mut offline_ru: u64 = 0;
+    let mut not_participating_ru: u64 = 0;
     for (_, (status, algo)) in per_addr {
+        let ru = algo / reward_unit;
         match status {
-            AccountStatus::Online => online = online.saturating_add(algo),
-            AccountStatus::Offline => offline = offline.saturating_add(algo),
+            AccountStatus::Online => {
+                online = online.saturating_add(algo);
+                online_ru = online_ru.saturating_add(ru);
+            }
+            AccountStatus::Offline => {
+                offline = offline.saturating_add(algo);
+                offline_ru = offline_ru.saturating_add(ru);
+            }
             AccountStatus::NotParticipating => {
                 not_participating = not_participating.saturating_add(algo);
+                not_participating_ru = not_participating_ru.saturating_add(ru);
             }
         }
     }
-    ledger.put_account_totals_seed(online, offline, not_participating)
+    ledger.put_account_totals_seed(
+        online,
+        online_ru,
+        offline,
+        offline_ru,
+        not_participating,
+        not_participating_ru,
+    )
 }
 
 impl LedgerState {
@@ -681,6 +711,47 @@ mod tests {
         seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
         // Total online = 33 + 33 = 66; online_stake reads that column.
         assert_eq!(ledger.online_stake().unwrap(), 66);
+    }
+
+    #[test]
+    fn seed_account_totals_from_genesis_seeds_reward_units() {
+        // TASK-276: per-status reward units = sum of per-account
+        // floor(microAlgos / RewardUnit). total_reward_units() returns
+        // online + offline (NotParticipating excluded), feeding the rewards
+        // advance. The per-account floor is why 2.5 RU contributes 2, not the
+        // status total / RewardUnit.
+        let ru = algo_types::consensus::consensus_params_for_version("future")
+            .unwrap()
+            .reward_unit;
+        assert!(ru > 0);
+        let json = format!(
+            r#"{{
+            "network": "phase6net",
+            "id": "v1",
+            "proto": "future",
+            "alloc": [
+                {{"addr": "A2UDRUOIEWEYDTE5DJLC4EH2HWFKQMZOPUKGNOWDOJOLJFPOPZ4EVXAAJY",
+                 "comment": "online-5ru", "state": {{"algo": {}, "onl": 1}}}},
+                {{"addr": "GBMUQUM7E3QW75GCVLQFMCS2Y7V5XTOJUBRVBXWOLS3EENBZP4AIGPHM6A",
+                 "comment": "online-2ru", "state": {{"algo": {}, "onl": 1}}}},
+                {{"addr": "ALGORANDSCOLLECTSFEES7777777777777777777777777777777746MSJUVU",
+                 "comment": "offline-3ru", "state": {{"algo": {}, "onl": 0}}}},
+                {{"addr": "B2UDRUOIEWEYDTE5DJLC4EH2HWFKQMZOPUKGNOWDOJOLJFPOPZ4EVXAAJY",
+                 "comment": "notpart-9ru", "state": {{"algo": {}, "onl": 2}}}}
+            ],
+            "fees": "7777777777777777777777777777777777777777777777777774MSJUVU",
+            "rwd":  "7777777777777777777777777777777777777777777777777774MSJUVU"
+        }}"#,
+            5 * ru,
+            2 * ru + ru / 2, // floors to 2 reward units
+            3 * ru,
+            9 * ru,
+        );
+        let genesis = parse_genesis_json(&json).unwrap();
+        let mut ledger = crate::sqlite::SqliteLedger::open_in_memory().unwrap();
+        seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
+        // online (5 + 2) + offline (3) = 10; not-participating (9) excluded.
+        assert_eq!(ledger.total_reward_units().unwrap(), 10);
     }
 
     #[test]
