@@ -508,6 +508,7 @@ dependencies = [
  "algo-bench",
  "algo-codec",
  "algo-conformance",
+ "algo-consensus-crypto",
  "algo-error",
  "algo-fixtures",
  "algo-ledger",

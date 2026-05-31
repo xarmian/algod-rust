@@ -841,6 +841,46 @@ impl ParticipationStore {
         Ok(())
     }
 
+    /// Append state proof keys carrying explicit rounds (a `(round, signer)`
+    /// slice) to an existing participation key.
+    ///
+    /// Unlike [`append_state_proof_keys`](Self::append_state_proof_keys), which
+    /// recomputes each round from the existing key count, this preserves the
+    /// round attached to each key. It mirrors go-algorand's
+    /// `appendKeysOp.apply` (`data/account/registeryDbOps.go:268`), which
+    /// inserts `(pk, key.Round, encode(key.Key))` verbatim from the
+    /// `StateProofKeys` (`[]KeyRoundPair`) wire body.
+    ///
+    /// Returns `Ok(false)` when no record matches `id` (matches Go's silent
+    /// `sql.ErrNoRows` → "nothing to do" branch); `Ok(true)` once the keys are
+    /// inserted.
+    pub fn append_state_proof_keys_with_rounds(
+        &self,
+        id: &ParticipationID,
+        keys: &[(u64, FalconSigner)],
+    ) -> Result<bool, rusqlite::Error> {
+        if keys.is_empty() {
+            return Ok(false);
+        }
+
+        let pk: Option<i64> = self
+            .conn
+            .query_row(SELECT_PK, params![id.0.as_slice()], |row| row.get(0))
+            .optional()?;
+        let pk = match pk {
+            Some(pk) => pk,
+            None => return Ok(false),
+        };
+
+        let tx = self.conn.unchecked_transaction()?;
+        for (round, key) in keys {
+            let key_blob = key.to_msgpack();
+            tx.execute(INSERT_STATE_PROOF_KEY, params![pk, *round as i64, key_blob])?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     // -- Internal helpers ---------------------------------------------------
 
     /// Scan a single row from the joined `Keysets`/`Rolling` query into a

@@ -166,6 +166,59 @@ impl FalconSigner {
     }
 }
 
+/// Decode a `StateProofKeys` wire body (`[]KeyRoundPair`) into a vector of
+/// `(round, FalconSigner)` pairs.
+///
+/// Matches go-algorand's `account.StateProofKeys` = `[]merklesignature.KeyRoundPair`
+/// where each pair is `{rnd: uint64, key: *crypto.FalconSigner}`
+/// (`crypto/merklesignature/merkleSignatureScheme.go:88`). This is the body
+/// POSTed to `/v2/participation/{id}` (AppendKeys); the algod handler decodes
+/// it with `protocol.NewDecoder(...).Decode(&keys)`
+/// (`daemon/algod/api/server/v2/handlers.go:378`).
+///
+/// Unknown map fields are skipped (forward-compat with go's canonical encoder,
+/// which omits empty fields). A missing `key` yields a default (all-zero)
+/// signer for that pair.
+pub fn decode_state_proof_keys(data: &[u8]) -> Result<Vec<(u64, FalconSigner)>, String> {
+    let (count, mut cur) =
+        read_array_header(data).map_err(|e| format!("StateProofKeys array header: {e}"))?;
+
+    let mut out = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let (map_len, rest) =
+            read_map_header(cur).map_err(|e| format!("KeyRoundPair map header: {e}"))?;
+        cur = rest;
+
+        let mut round: u64 = 0;
+        let mut key = FalconSigner::default();
+        for _ in 0..map_len {
+            let (field, rest) =
+                read_str(cur).map_err(|e| format!("KeyRoundPair field key: {e}"))?;
+            cur = rest;
+            match field {
+                "rnd" => {
+                    let (r, rest) =
+                        read_uint64(cur).map_err(|e| format!("KeyRoundPair rnd: {e}"))?;
+                    round = r;
+                    cur = rest;
+                }
+                "key" => {
+                    let (signer, rest) = FalconSigner::from_msgpack(cur)
+                        .map_err(|e| format!("KeyRoundPair key: {e}"))?;
+                    key = signer;
+                    cur = rest;
+                }
+                _ => {
+                    cur = skip_msgpack_value(cur)
+                        .map_err(|e| format!("KeyRoundPair skip '{field}': {e}"))?;
+                }
+            }
+        }
+        out.push((round, key));
+    }
+    Ok(out)
+}
+
 // ── FalconVerifier ─────────────────────────────────────────────────────────
 
 /// Wrapper around a Falcon-1024 public key for verification and serialization.
@@ -1136,6 +1189,31 @@ fn read_map_header(data: &[u8]) -> Result<(u32, &[u8]), String> {
     }
 }
 
+/// Read a msgpack array header, returning (element_count, remaining_bytes).
+fn read_array_header(data: &[u8]) -> Result<(u32, &[u8]), String> {
+    if data.is_empty() {
+        return Err("unexpected end of input".to_string());
+    }
+    let b = data[0];
+    if b & 0xf0 == 0x90 {
+        Ok(((b & 0x0f) as u32, &data[1..]))
+    } else if b == 0xdc {
+        if data.len() < 3 {
+            return Err("array16: unexpected end".to_string());
+        }
+        let len = u16::from_be_bytes([data[1], data[2]]) as u32;
+        Ok((len, &data[3..]))
+    } else if b == 0xdd {
+        if data.len() < 5 {
+            return Err("array32: unexpected end".to_string());
+        }
+        let len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+        Ok((len, &data[5..]))
+    } else {
+        Err(format!("expected array header, got 0x{b:02x}"))
+    }
+}
+
 /// Read a msgpack string, returning (&str, remaining_bytes).
 fn read_str(data: &[u8]) -> Result<(&str, &[u8]), String> {
     if data.is_empty() {
@@ -1478,6 +1556,45 @@ mod tests {
     use super::*;
 
     // ── Round arithmetic tests ─────────────────────────────────────────
+
+    #[test]
+    fn decode_state_proof_keys_roundtrip() {
+        // Build a `[]KeyRoundPair` body the way go's canonical encoder would:
+        // a 2-element array of `{rnd, key}` fixmaps. Field order matches go's
+        // alphabetical codec ("key" before "rnd").
+        let mut signer = FalconSigner::default();
+        signer.pk[0] = 0x11;
+        signer.sk[0] = 0x22;
+
+        let mut body = Vec::new();
+        body.push(0x92); // fixarray of 2
+        for (round, r_byte) in [(256u64, 0x33u8), (512u64, 0x44u8)] {
+            let mut s = FalconSigner::default();
+            s.pk[0] = r_byte;
+            s.sk[0] = r_byte;
+            body.push(0x82); // fixmap of 2
+            write_fixstr(&mut body, "key");
+            body.extend_from_slice(&s.to_msgpack());
+            write_fixstr(&mut body, "rnd");
+            // round is > 0x7f, so encode as uint16 (0xcd) for 256 / 512.
+            body.push(0xcd);
+            body.extend_from_slice(&(round as u16).to_be_bytes());
+        }
+
+        let decoded = decode_state_proof_keys(&body).expect("decode");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].0, 256);
+        assert_eq!(decoded[0].1.pk[0], 0x33);
+        assert_eq!(decoded[0].1.sk[0], 0x33);
+        assert_eq!(decoded[1].0, 512);
+        assert_eq!(decoded[1].1.pk[0], 0x44);
+
+        // empty array decodes to empty vec.
+        assert!(decode_state_proof_keys(&[0x90]).expect("empty").is_empty());
+
+        // garbage body is rejected, not silently accepted.
+        assert!(decode_state_proof_keys(&[0xc0]).is_err());
+    }
 
     #[test]
     fn test_round_to_index_basic() {
