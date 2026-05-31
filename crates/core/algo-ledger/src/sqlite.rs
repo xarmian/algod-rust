@@ -3048,6 +3048,30 @@ impl SqliteLedger {
         Ok(result.unwrap_or(0).max(0) as u64)
     }
 
+    /// Query the total *participating* money from the `accounttotals` table.
+    ///
+    /// Returns `online + offline` (microAlgos) from the `accounttotals` row with
+    /// `id = ''` — go's `AccountTotals.Participating()` (`Online.Money +
+    /// Offline.Money`, excluding NotParticipating). This is the `total_money`
+    /// value reported by the `/v2/ledger/supply` endpoint.
+    ///
+    /// Returns `Ok(0)` if the table is empty or the row is missing.
+    pub fn participating_money(&self) -> Result<u64, AlgoError> {
+        let result: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT online, offline FROM accounttotals WHERE id = ''",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query accounttotals participating money error: {e}"),
+            })?;
+        let (online, offline) = result.unwrap_or((0, 0));
+        Ok((online.max(0) as u64).saturating_add(offline.max(0) as u64))
+    }
+
     /// Query the total reward units from the `accounttotals` table.
     ///
     /// Returns `onlinerewardunits + offlinerewardunits` from the

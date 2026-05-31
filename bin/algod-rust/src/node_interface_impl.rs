@@ -50,7 +50,7 @@ use algo_rest_api::models::{
 use algo_rest_api::node::{
     AccountLookup, AppResourceLookup, ApplicationLookup, AssetLookup, AssetResourceLookup,
     AssetResourceWithIDs, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
-    TxnGroupDeltaWithIds, TxnWithStatus,
+    SupplyInfo, TxnGroupDeltaWithIds, TxnWithStatus,
 };
 use algo_types::consensus::consensus_params_for_version;
 use algo_types::{
@@ -197,6 +197,22 @@ pub struct AlgodNodeInterface {
     /// [`NodeError::NotImplemented`]. Wrapped in a `Mutex` because the
     /// underlying rusqlite `Connection` is not `Sync`.
     part_store: Option<Arc<Mutex<ParticipationStore>>>,
+    /// Dev-mode block-timestamp offset (`/v2/devmode/blocks/offset`). `None`
+    /// until set; when `Some(offset)` each dev block's timestamp is fixed at
+    /// `prev.timestamp + offset` instead of the proposer wall clock. Shared with
+    /// the dev-production path. Get/set are dev-mode only (the trait methods
+    /// error when `dev_mode` is false), mirroring go's
+    /// `AlgorandFullNode.timestampOffset` at
+    /// `../go-algorand/node/node.go:137,1505-1521`.
+    timestamp_offset: Arc<Mutex<Option<i64>>>,
+    /// Debug profiling rates `(mutex_rate, block_rate)` backing
+    /// `GET/PUT /debug/settings/pprof`. go stores these as live runtime values
+    /// via `runtime.SetMutexProfileFraction` / `SetBlockProfileRate`; the Rust
+    /// node has no equivalent runtime profiler, so they are held here as plain
+    /// settings so the round-trip the SDK/`goal` exercises (set, then get
+    /// returns the same values) still works. See
+    /// `../go-algorand/daemon/algod/api/server/v2/handlers.go:2109-2151`.
+    debug_settings_prof: Arc<Mutex<(u64, u64)>>,
 }
 
 impl AlgodNodeInterface {
@@ -221,6 +237,8 @@ impl AlgodNodeInterface {
             dev_produce_lock: Arc::new(tokio::sync::Mutex::new(())),
             dev_apply_data: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             part_store: None,
+            timestamp_offset: Arc::new(Mutex::new(None)),
+            debug_settings_prof: Arc::new(Mutex::new((0, 0))),
         }
     }
 
@@ -1164,6 +1182,12 @@ impl NodeInterface for AlgodNodeInterface {
                 .ok_or(NodeError::NotImplemented("broadcast_signed_tx_group (dev)"))?;
             let ledger = self.ledger.clone();
             let apply_data_cache = self.dev_apply_data.clone();
+            // Snapshot the configured dev-mode timestamp offset for this block.
+            let timestamp_offset: Option<i64> = *self.timestamp_offset.lock().map_err(|_| {
+                NodeError::Internal(
+                    "broadcast_signed_tx_group (dev): timestamp offset lock poisoned".into(),
+                )
+            })?;
             // Serialize production so concurrent submissions don't assemble
             // against the same round before each other's on_new_block drains the
             // pool (go holds node.mu across Remember + writeDevmodeBlock). Held
@@ -1175,7 +1199,7 @@ impl NodeInterface for AlgodNodeInterface {
                 pool.ensure_evaluator_primed();
                 pool.remember(tx_group)
                     .map_err(|e| NodeError::BadRequest(format!("pool rejected group: {e}")))?;
-                match crate::dev_producer::produce_dev_block(&pool, &ledger) {
+                match crate::dev_producer::produce_dev_block(&pool, &ledger, timestamp_offset) {
                     Ok((block, apply_data)) => {
                         // Cache per-txn ApplyData (created ids / eval delta) for
                         // get_pending_transaction to report on confirmation.
@@ -1510,6 +1534,136 @@ impl NodeInterface for AlgodNodeInterface {
         store
             .insert(&participation)
             .map_err(|e| NodeError::Internal(format!("generate_participation_keys: {e}")))
+    }
+
+    // ---- Operational getters (TASK-267) ----
+
+    /// Supply information: current round, total *participating* money, and
+    /// online money. Mirrors go's `GetSupply` →
+    /// `LedgerForAPI().LatestTotals()`: `total_money = totals.Participating()`
+    /// (`Online.Money + Offline.Money`) and `online_money = totals.Online.Money`.
+    /// Reference: `../go-algorand/daemon/algod/api/server/v2/handlers.go:937-953`
+    /// and `ledger/ledgercore/totals.go:117-123` @ v4.5.1-stable.
+    async fn get_supply(&self) -> Result<SupplyInfo, NodeError> {
+        let ledger = self.lock_ledger("get_supply")?;
+        let round = ledger.current_round().0;
+        let total_money = ledger
+            .participating_money()
+            .map_err(|e| NodeError::Internal(format!("get_supply: {e}")))?;
+        let online_money = ledger
+            .online_stake()
+            .map_err(|e| NodeError::Internal(format!("get_supply: {e}")))?;
+        Ok(SupplyInfo {
+            round,
+            total_money,
+            online_money,
+        })
+    }
+
+    /// Whether the node is running in dev mode. Gates the timestamp-offset
+    /// get/set endpoints (`/v2/devmode/blocks/offset`).
+    fn is_dev_mode(&self) -> bool {
+        self.dev_mode
+    }
+
+    /// Get the dev-mode block-timestamp offset. Returns `Err` (mapped by the
+    /// handler to 400) when not in dev mode, `Ok(None)` when never set, and
+    /// `Ok(Some(offset))` otherwise — matching go's
+    /// `GetBlockTimeStampOffset` (`../go-algorand/node/node.go:1515-1521`),
+    /// where the handler turns a nil pointer into a 404 and the not-dev-mode
+    /// error into a 400. The trait exposes the offset as a `u64`; the stored
+    /// value is always non-negative because `set_block_timestamp_offset` only
+    /// accepts `offset >= 0` (the handler rejects values above `i64::MAX`).
+    async fn get_block_timestamp_offset(&self) -> Result<Option<u64>, NodeError> {
+        if !self.is_dev_mode() {
+            return Err(NodeError::NotImplemented("get_block_timestamp_offset"));
+        }
+        let offset = *self.timestamp_offset.lock().map_err(|_| {
+            NodeError::Internal("get_block_timestamp_offset: timestamp offset lock poisoned".into())
+        })?;
+        Ok(offset.map(|v| v.max(0) as u64))
+    }
+
+    /// Set the dev-mode block-timestamp offset. Returns `Err` (mapped to 400)
+    /// when not in dev mode, mirroring go's `SetBlockTimeStampOffset`
+    /// (`../go-algorand/node/node.go:1505-1513`). The handler has already
+    /// validated `0 <= offset <= i64::MAX` before calling. Once set, each
+    /// dev block's timestamp is fixed at `prev.timestamp + offset` (see
+    /// [`crate::dev_producer::produce_dev_block`]).
+    async fn set_block_timestamp_offset(&self, offset: i64) -> Result<(), NodeError> {
+        if !self.is_dev_mode() {
+            return Err(NodeError::NotImplemented("set_block_timestamp_offset"));
+        }
+        let mut slot = self.timestamp_offset.lock().map_err(|_| {
+            NodeError::Internal("set_block_timestamp_offset: timestamp offset lock poisoned".into())
+        })?;
+        *slot = Some(offset);
+        Ok(())
+    }
+
+    /// Return the node's effective configuration as JSON. Minimal until PLAN-43
+    /// lands the full `config.Local` layer: go returns `v2.Node.Config()` (the
+    /// merged defaults+overrides struct), but the Rust node does not model that
+    /// struct yet. We expose the operationally-meaningful flags the node
+    /// actually carries so `goal`/SDK clients that read this endpoint get a
+    /// well-formed, truthful object. Reference:
+    /// `../go-algorand/daemon/algod/api/server/v2/handlers.go:2123-2125`.
+    async fn get_config_json(&self) -> Result<serde_json::Value, NodeError> {
+        Ok(serde_json::json!({
+            "Version": self.build_version.major,
+            "GenesisID": self.genesis_id,
+            "DevMode": self.dev_mode,
+            "EnableDeveloperAPI": self.enable_developer_api(),
+            "EnableExperimentalAPI": self.enable_experimental_api(),
+        }))
+    }
+
+    /// Get debug profiling settings as `(mutex_rate, block_rate)`. The Rust node
+    /// has no live runtime profiler (go reads `runtime.SetMutexProfileFraction`
+    /// / a saved blocking rate), so these are held as plain settings: a fresh
+    /// node reports `(0, 0)` and a prior `set_debug_settings_prof` round-trips.
+    /// Reference: `../go-algorand/daemon/algod/api/server/v2/handlers.go:2109-2120`.
+    async fn get_debug_settings_prof(&self) -> Result<(u64, u64), NodeError> {
+        let settings = self.debug_settings_prof.lock().map_err(|_| {
+            NodeError::Internal("get_debug_settings_prof: debug settings lock poisoned".into())
+        })?;
+        Ok(*settings)
+    }
+
+    /// Set debug profiling settings, returning the *old* values for whichever
+    /// rates were provided (and `None` for the others), matching go's
+    /// `PutDebugSettingsProf`
+    /// (`../go-algorand/daemon/algod/api/server/v2/handlers.go:2127-2170`),
+    /// which only reports the previous value of a rate it actually changed. The
+    /// handler has already validated each provided rate is `<= i32::MAX`.
+    async fn set_debug_settings_prof(
+        &self,
+        mutex_rate: Option<u64>,
+        block_rate: Option<u64>,
+    ) -> Result<(Option<u64>, Option<u64>), NodeError> {
+        let mut settings = self.debug_settings_prof.lock().map_err(|_| {
+            NodeError::Internal("set_debug_settings_prof: debug settings lock poisoned".into())
+        })?;
+        let (old_mutex, old_block) = *settings;
+        let mut response = (None, None);
+        if let Some(rate) = mutex_rate {
+            response.0 = Some(old_mutex);
+            settings.0 = rate;
+        }
+        if let Some(rate) = block_rate {
+            response.1 = Some(old_block);
+            settings.1 = rate;
+        }
+        Ok(response)
+    }
+
+    /// Latest committed round, used by the catchup handler's `min_rounds`
+    /// admission check. (Catchup itself remains stubbed — TASK-267 leaves
+    /// `start_catchup`/`abort_catchup` to a separate plan — but exposing the
+    /// real latest round here keeps the admission arithmetic honest if catchup
+    /// is wired later.) Falls back to 0 on a poisoned lock.
+    fn latest_round_for_catchup(&self) -> u64 {
+        self.ledger.lock().map(|l| l.current_round().0).unwrap_or(0)
     }
 }
 
@@ -4178,5 +4332,177 @@ mod tests {
         // Unknown app → zero, not an error.
         let (zero, _) = adapter.total_boxes(777).await.expect("total boxes empty");
         assert_eq!(zero, 0);
+    }
+
+    // ---- Operational getters (TASK-267) ----
+
+    /// `get_supply` reports the genesis-seeded participating and online totals at
+    /// the current round. The dev genesis funds the sender offline, so
+    /// `total_money` is the funded amount and `online_money` is 0.
+    #[tokio::test]
+    async fn get_supply_reports_seeded_totals() {
+        use ed25519_dalek::SigningKey;
+
+        let sender_key = SigningKey::from_bytes(&[0x44u8; 32]);
+        let sender = Address(sender_key.verifying_key().to_bytes());
+        let (adapter, _ledger, _gh) = seed_dev_adapter(sender, 7_500_000);
+
+        let supply = adapter.get_supply().await.expect("supply ok");
+        assert_eq!(supply.round, 0, "no blocks beyond genesis produced yet");
+        assert_eq!(
+            supply.total_money, 7_500_000,
+            "participating money = online + offline (offline-funded sender)",
+        );
+        assert_eq!(supply.online_money, 0, "no online stake in genesis alloc");
+    }
+
+    /// `get_supply` on an unseeded ledger returns zeros rather than erroring —
+    /// matching the ledger getters' `Ok(0)` for a missing totals row.
+    #[tokio::test]
+    async fn get_supply_zero_for_unseeded_ledger() {
+        let adapter = make_adapter();
+        let supply = adapter.get_supply().await.expect("supply ok");
+        assert_eq!(supply.round, 0);
+        assert_eq!(supply.total_money, 0);
+        assert_eq!(supply.online_money, 0);
+    }
+
+    /// Outside dev mode the timestamp-offset get/set both error (the handler maps
+    /// these to 400/404), matching go's "not in dev mode" guard.
+    #[tokio::test]
+    async fn timestamp_offset_requires_dev_mode() {
+        let adapter = make_adapter();
+        assert!(!adapter.is_dev_mode());
+        assert!(matches!(
+            adapter.get_block_timestamp_offset().await,
+            Err(NodeError::NotImplemented(_)),
+        ));
+        assert!(matches!(
+            adapter.set_block_timestamp_offset(5).await,
+            Err(NodeError::NotImplemented(_)),
+        ));
+    }
+
+    /// In dev mode the offset is `None` until set, then round-trips.
+    #[tokio::test]
+    async fn timestamp_offset_get_set_round_trip() {
+        let adapter = adapter_with_pool().with_dev_mode();
+        assert!(adapter.is_dev_mode());
+        // Never set → Ok(None) (the handler turns this into a 404).
+        assert_eq!(adapter.get_block_timestamp_offset().await.unwrap(), None);
+        adapter
+            .set_block_timestamp_offset(60)
+            .await
+            .expect("set offset");
+        assert_eq!(
+            adapter.get_block_timestamp_offset().await.unwrap(),
+            Some(60)
+        );
+        // Overwrite.
+        adapter
+            .set_block_timestamp_offset(0)
+            .await
+            .expect("reset offset");
+        assert_eq!(adapter.get_block_timestamp_offset().await.unwrap(), Some(0));
+    }
+
+    /// With a timestamp offset set, a produced dev block carries
+    /// `prev.timestamp + offset` instead of the wall clock — go's
+    /// `writeDevmodeBlock` behavior.
+    #[tokio::test]
+    async fn dev_block_uses_timestamp_offset() {
+        use algo_types::{Round, Transaction, TxnType};
+        use ed25519_dalek::SigningKey;
+
+        let sender_key = SigningKey::from_bytes(&[0x55u8; 32]);
+        let sender = Address(sender_key.verifying_key().to_bytes());
+        let (adapter, ledger, gh) = seed_dev_adapter(sender, 10_000_000);
+
+        // Genesis timestamp is 0 (see seed_dev_adapter's genesis), so the
+        // produced block's timestamp should equal the offset exactly.
+        adapter
+            .set_block_timestamp_offset(123)
+            .await
+            .expect("set offset");
+
+        let txn = Transaction {
+            txn_type: TxnType::Pay,
+            sender,
+            receiver: Address([0x66u8; 32]),
+            amount: 1_000_000,
+            fee: 1000,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            genesis_hash: gh,
+            ..Default::default()
+        };
+        let stx = sign_txn(&txn, &sender_key);
+        adapter
+            .broadcast_signed_tx_group(vec![stx])
+            .await
+            .expect("dev broadcast");
+
+        let bytes = ledger
+            .lock()
+            .unwrap()
+            .get_block_data(1)
+            .expect("read block")
+            .expect("block present");
+        let block = algo_codec::decode_block(&bytes).expect("decode block");
+        assert_eq!(
+            block.timestamp, 123,
+            "dev block timestamp = prev(genesis=0) + offset(123)",
+        );
+    }
+
+    /// Debug profiling settings start at `(0, 0)` and round-trip per provided
+    /// rate, returning the previous value only for rates that were set — matching
+    /// go's `PutDebugSettingsProf`.
+    #[tokio::test]
+    async fn debug_settings_prof_round_trip() {
+        let adapter = make_adapter();
+        assert_eq!(adapter.get_debug_settings_prof().await.unwrap(), (0, 0));
+
+        // Set only the mutex rate: old mutex returned, block untouched/None.
+        let (old_mutex, old_block) = adapter
+            .set_debug_settings_prof(Some(7), None)
+            .await
+            .unwrap();
+        assert_eq!(old_mutex, Some(0));
+        assert_eq!(old_block, None);
+        assert_eq!(adapter.get_debug_settings_prof().await.unwrap(), (7, 0));
+
+        // Set both: previous values returned.
+        let (old_mutex, old_block) = adapter
+            .set_debug_settings_prof(Some(9), Some(3))
+            .await
+            .unwrap();
+        assert_eq!(old_mutex, Some(7));
+        assert_eq!(old_block, Some(0));
+        assert_eq!(adapter.get_debug_settings_prof().await.unwrap(), (9, 3));
+    }
+
+    /// `get_config_json` returns a well-formed object carrying the node's
+    /// effective flags (minimal until PLAN-43).
+    #[tokio::test]
+    async fn get_config_json_reports_effective_flags() {
+        let adapter = adapter_with_pool().with_dev_mode();
+        let cfg = adapter.get_config_json().await.expect("config ok");
+        assert_eq!(cfg["DevMode"], serde_json::json!(true));
+        assert_eq!(cfg["GenesisID"], serde_json::json!("testnet-v1.0"));
+        assert_eq!(cfg["EnableDeveloperAPI"], serde_json::json!(false));
+        assert!(cfg.get("Version").is_some());
+    }
+
+    /// `latest_round_for_catchup` tracks the ledger's current round.
+    #[tokio::test]
+    async fn latest_round_for_catchup_tracks_ledger() {
+        use ed25519_dalek::SigningKey;
+
+        let sender_key = SigningKey::from_bytes(&[0x77u8; 32]);
+        let sender = Address(sender_key.verifying_key().to_bytes());
+        let (adapter, _ledger, _gh) = seed_dev_adapter(sender, 10_000_000);
+        // Genesis committed at round 0.
+        assert_eq!(adapter.latest_round_for_catchup(), 0);
     }
 }
