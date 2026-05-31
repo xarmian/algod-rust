@@ -3,5 +3,6 @@
 
 pub mod account;
 pub mod clerk;
+pub mod clerk_sign;
 pub mod node;
 pub mod wallet;

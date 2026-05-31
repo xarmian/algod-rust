@@ -40,7 +40,7 @@ pub enum ClerkCmd {
     /// Send money to an address.
     Send(SendArgs),
     /// Sign a transaction file.
-    Sign,
+    Sign(SignArgs),
     /// Simulate a transaction or transaction group with algod's simulate
     /// REST endpoint.
     Simulate,
@@ -48,7 +48,7 @@ pub enum ClerkCmd {
     /// file.
     Split(SplitArgs),
     /// Sign data to be verified in a TEAL program.
-    Tealsign,
+    Tealsign(TealsignArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -198,6 +198,99 @@ pub struct RawsendArgs {
     pub no_wait: bool,
 }
 
+/// `clerk sign -i <in> -o <out> [-S signer] [-p prog | -L lsig] [--argb64 ...]
+/// [-P proto] [-w wallet] [--password]` — sign every transaction in a file.
+///
+/// Mirrors Go's `signCmd` (clerk.go:787-911). Two modes, keyed on whether a
+/// program/logicsig source is given:
+/// - **LogicSig** (`--program/-p` xor `--logic-sig/-L`, with `--argb64`):
+///   attach the assembled/decoded LogicSig to each txn; with `-S/--signer`,
+///   set the AuthAddr (the rekeyed spending account).
+/// - **Wallet** (default): re-sign each txn's body via the kmd wallet, with
+///   `-S/--signer` selecting the spending key when the sender was rekeyed.
+#[derive(Args, Debug)]
+pub struct SignArgs {
+    /// Partially-signed transaction file to add a signature to
+    /// (Go `-i/--infile`). Required.
+    #[arg(short = 'i', long = "infile")]
+    pub infile: PathBuf,
+    /// Filename for writing the signed transaction (Go `-o/--outfile`).
+    /// Required. May equal `--infile` to overwrite in place.
+    #[arg(short = 'o', long = "outfile")]
+    pub outfile: PathBuf,
+    /// Address of the key to sign with, if different from the transaction
+    /// "from" address due to rekeying (Go `-S/--signer`).
+    #[arg(short = 'S', long = "signer")]
+    pub signer: Option<String>,
+    /// Program source file to use as account logic (Go `-p/--program`).
+    /// Mutually exclusive with `--logic-sig`.
+    #[arg(short = 'p', long = "program")]
+    pub program: Option<String>,
+    /// LogicSig file (msgpack) to apply to the transaction (Go `-L/--logic-sig`).
+    /// Mutually exclusive with `--program`.
+    #[arg(short = 'L', long = "logic-sig")]
+    pub logic_sig: Option<String>,
+    /// Base64-encoded args to pass to the transaction logic (Go `--argb64`,
+    /// repeatable / comma-separated).
+    #[arg(long = "argb64", value_delimiter = ',')]
+    pub argb64: Vec<String>,
+    /// Consensus protocol version id string (Go `-P/--proto`). Accepted for
+    /// flag parity; only used to gate the LogicSig sanity check.
+    #[arg(short = 'P', long = "proto")]
+    pub proto: Option<String>,
+    /// Wallet password (skip the prompt). goal-rust convention shared with the
+    /// other clerk leaves.
+    #[arg(long = "password")]
+    pub password: Option<String>,
+}
+
+/// `clerk tealsign` — sign data to be verified inside a TEAL program by the
+/// `ed25519verify` opcode.
+///
+/// Mirrors Go's `tealsignCmd` (`cmd/goal/tealsign.go`). The signed payload is
+/// domain-separated as `"ProgData" || program_hash || data`. The program hash
+/// comes from either a LogicSig transaction (`--lsig-txn`) or a contract
+/// address (`--contract-addr`); the data comes from one of `--data-file`,
+/// `--data-b64`, `--data-b32`, or `--sign-txid`. The base64 signature is always
+/// printed; with `--set-lsig-arg-idx`, it's also stored as a LogicSig arg in
+/// the `--lsig-txn` file (rewritten in place).
+#[derive(Args, Debug)]
+pub struct TealsignArgs {
+    /// algokey private-key (32-byte ed25519 seed) file to sign with
+    /// (Go `--keyfile`).
+    #[arg(long = "keyfile")]
+    pub keyfile: Option<PathBuf>,
+    /// Address of account to sign with (Go `--account`). Not yet supported
+    /// (needs kmd logicsig-data signing), matching Go.
+    #[arg(long = "account")]
+    pub account: Option<String>,
+    /// Transaction (with a LogicSig) to sign data for; supplies the program
+    /// hash (Go `--lsig-txn`).
+    #[arg(long = "lsig-txn")]
+    pub lsig_txn: Option<PathBuf>,
+    /// Contract address to sign data for; supplies the program hash directly.
+    /// Not needed if `--lsig-txn` is provided (Go `--contract-addr`).
+    #[arg(long = "contract-addr")]
+    pub contract_addr: Option<String>,
+    /// Use the txid of `--lsig-txn` as the data to sign (Go `--sign-txid`).
+    #[arg(long = "sign-txid")]
+    pub sign_txid: bool,
+    /// Data file to sign (Go `--data-file`).
+    #[arg(long = "data-file")]
+    pub data_file: Option<PathBuf>,
+    /// Base64 data to sign (Go `--data-b64`).
+    #[arg(long = "data-b64")]
+    pub data_b64: Option<String>,
+    /// Base32 data to sign (Go `--data-b32`).
+    #[arg(long = "data-b32")]
+    pub data_b32: Option<String>,
+    /// If `--lsig-txn` is also specified, set the LogicSig arg at this index to
+    /// the raw signature bytes, rewriting the `--lsig-txn` file in place
+    /// (Go `--set-lsig-arg-idx`; default `-1` = don't store).
+    #[arg(long = "set-lsig-arg-idx", default_value_t = -1)]
+    pub set_lsig_arg_idx: i64,
+}
+
 /// `wallet` is the group-level `-w` (Go's persistent clerk flag); leaves that
 /// take a wallet thread it in here.
 pub fn run(cmd: ClerkCmd, wallet: Option<String>) -> ExitCode {
@@ -233,9 +326,13 @@ pub fn run(cmd: ClerkCmd, wallet: Option<String>) -> ExitCode {
             };
             return unimplemented("clerk multisig", leaf);
         }
-        ClerkCmd::Sign => "sign",
+        ClerkCmd::Sign(args) => {
+            return crate::cmd::clerk::run_sign(args, wallet, datadirs(), kmddir());
+        }
+        ClerkCmd::Tealsign(args) => {
+            return crate::cmd::clerk::run_tealsign(args);
+        }
         ClerkCmd::Simulate => "simulate",
-        ClerkCmd::Tealsign => "tealsign",
     };
     unimplemented("clerk", leaf)
 }

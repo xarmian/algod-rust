@@ -23,7 +23,17 @@ pub use digest::{
 };
 
 use algo_error::{AlgoError, Result};
-use algo_types::{Block, BlockResponse, SignedTransaction};
+use algo_types::{Block, BlockResponse, LogicSig, SignedTransaction};
+
+/// Decode a single msgpack-encoded `LogicSig`, as produced by `goal clerk
+/// compile -s` (a `protocol.Encode(&LogicSig)` blob). Mirrors `lsigFromArgs`'s
+/// `protocol.Decode(lsigBytes, lsig)` (`cmd/goal/clerk.go:753`).
+pub fn decode_logicsig(bytes: &[u8]) -> Result<LogicSig> {
+    rmp_serde::from_slice(bytes).map_err(|e| AlgoError::Codec {
+        source: Box::new(e),
+        context: "failed to decode LogicSig from msgpack".into(),
+    })
+}
 
 /// Decode a stream of one or more concatenated msgpack `SignedTransaction`s,
 /// as produced by `goal`'s txn-file writers (`protocol.Encode(&stx)` appended

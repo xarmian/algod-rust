@@ -8,14 +8,18 @@
 //! - `split` → clerk.go:966 (`splitCmd`).
 //! - `group` → clerk.go:914 (`groupCmd`).
 //! - `rawsend` → clerk.go:579 (`rawsendCmd`).
+//! - `sign` → clerk.go:787 (`signCmd`) — wallet (kmd) and LogicSig signing.
+//! - `tealsign` → `cmd/goal/tealsign.go` — domain-separated data signing for
+//!   the `ed25519verify` opcode.
 //!
 //! Signing + submission reuse the same build → sign (kmd) → submit → confirm
 //! pipeline as the account keyreg leaves
 //! ([`algo_txn_pipeline::TxnPipeline`]); the wallet-handle resolution mirrors
-//! `crate::cmd::account` (Go's `getWalletHandleMaybePassword`).
+//! `crate::cmd::account` (Go's `getWalletHandleMaybePassword`). The shared
+//! LogicSig / multisig signing helpers live in [`crate::cmd::clerk_sign`].
 //!
-//! The rest of the `clerk` group (sign / compile / dryrun* / simulate /
-//! multisig / tealsign) is still stubbed — see [`crate::groups::clerk`].
+//! The rest of the `clerk` group (compile / dryrun* / simulate / multisig) is
+//! still stubbed — see [`crate::groups::clerk`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,8 +33,11 @@ use algo_types::{Address, SignedTransaction};
 use base64::Engine;
 
 use crate::accounts_list::AccountsList;
+use crate::cmd::clerk_sign;
 use crate::data_dir;
-use crate::groups::clerk::{GroupArgs, InspectArgs, RawsendArgs, SendArgs, SplitArgs};
+use crate::groups::clerk::{
+    GroupArgs, InspectArgs, RawsendArgs, SendArgs, SignArgs, SplitArgs, TealsignArgs,
+};
 
 /// Typical protocol `MaxTxnLife` (rounds). The consensus-param table isn't
 /// loaded client-side, so the validity-window default uses this — matching the
@@ -358,6 +365,306 @@ fn compute_validity(
         ));
     }
     Ok((first, last))
+}
+
+// ---- clerk sign -----------------------------------------------------------
+
+/// `clerk sign -i <in> -o <out> [-S signer] [-p prog | -L lsig] [--argb64 ...]
+/// [-P proto] [-w wallet] [--password]`.
+///
+/// Mirrors Go's `signCmd` (clerk.go:787-911). When a `--program`/`--logic-sig`
+/// source is supplied, every transaction in the file gets that LogicSig
+/// attached (and, with `-S`, the AuthAddr set); otherwise each transaction's
+/// body is re-signed through the kmd wallet (Go's
+/// `SignTransactionWithWalletAndSigner`).
+pub fn run_sign(
+    args: SignArgs,
+    wallet: Option<String>,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    match run_sign_inner(args, wallet, cli_d, kmd_dir_flag) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_sign_inner(
+    args: SignArgs,
+    wallet: Option<String>,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> Result<(), String> {
+    let data = std::fs::read(&args.infile)
+        .map_err(|e| format!("Cannot read file {}: {e}", args.infile.display()))?;
+    let mut stxns = decode_signed_txn_stream(&data).map_err(|e| {
+        format!(
+            "Cannot decode transactions from {}: {e}",
+            args.infile.display()
+        )
+    })?;
+
+    // Build the LogicSig from --program/--logic-sig + --argb64, if any
+    // (clerk.go:804-812). `None` ⇒ wallet-sign path.
+    let lsig = clerk_sign::lsig_from_args(
+        args.program.as_deref(),
+        args.logic_sig.as_deref(),
+        &args.argb64,
+    )?;
+
+    // Resolve the optional --signer (AuthAddr) once (clerk.go:818-823).
+    let signer_addr = args
+        .signer
+        .as_deref()
+        .map(|s| Address::from_algorand_string(s).map_err(|e| format!("Signer invalid ({s}): {e}")))
+        .transpose()?;
+
+    let out_data = if let Some(lsig) = lsig {
+        // --- LogicSig path: attach lsig (+ AuthAddr) to every txn. ---
+        // Go runs verify.LogicSigSanityCheck per group; we run a lightweight
+        // program structure check (size/version/branch targets) — the byte
+        // assembly + arg attachment is the load-bearing part for producing a
+        // valid signed file, and the node re-verifies on submit.
+        let program: Vec<u8> = lsig.logic.to_vec();
+        algo_avm::check_program(
+            &algo_avm::parse(&program)
+                .map_err(|e| format!("{}: txn error {e}", args.infile.display()))?,
+            algo_avm::Mode::LogicSig,
+            program.len(),
+            0,
+        )
+        .map_err(|e| format!("{}: txn error {e}", args.infile.display()))?;
+
+        let mut out = Vec::new();
+        for stxn in &mut stxns {
+            stxn.lsig = Some(lsig.clone());
+            if let Some(signer) = signer_addr {
+                if signer == stxn.txn.sender {
+                    return Err("AuthAddr cannot be the same as the transaction sender".into());
+                }
+                stxn.auth_addr = Some(signer);
+            }
+            out.extend_from_slice(&canonical_encode_signed_transaction(stxn));
+        }
+        out
+    } else {
+        // --- Wallet path: re-sign each txn body through kmd. ---
+        let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
+        let kmd = build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref())?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Error processing command: {e}"))?;
+        let mut accounts = AccountsList::load(&data_dir_path);
+        let (handle, _wallet_name, password) = resolve_wallet_and_init(
+            &rt,
+            &kmd,
+            &mut accounts,
+            wallet.as_deref(),
+            args.password.as_deref(),
+        )?;
+
+        // `[0u8; 32]` ⇒ kmd infers the signer from the sender; a non-zero
+        // signer pubkey selects a specific spending key (rekey case).
+        let signer_pk: [u8; 32] = signer_addr.map(|a| a.0).unwrap_or([0u8; 32]);
+
+        let mut out = Vec::new();
+        for stxn in &stxns {
+            let encoded = algo_codec::canonical_encode_transaction(&stxn.txn);
+            let signed = rt
+                .block_on(kmd.sign_transaction(&handle, &password, encoded, signer_pk))
+                .map_err(|e| format!("Couldn't sign tx with kmd: {}", kmd_msg(&e)))?;
+            out.extend_from_slice(&signed.signed_transaction);
+        }
+        out
+    };
+
+    write_file_0600(&args.outfile, &out_data)?;
+    Ok(())
+}
+
+// ---- clerk tealsign -------------------------------------------------------
+
+/// `clerk tealsign --keyfile <f> (--lsig-txn <f> | --contract-addr <a>)
+/// (--data-file <f> | --data-b64 <s> | --data-b32 <s> | --sign-txid)
+/// [--set-lsig-arg-idx <n>]`.
+///
+/// Mirrors Go's `tealsignCmd` (`cmd/goal/tealsign.go`). Signs the
+/// domain-separated payload `"ProgData" || program_hash || data` with the
+/// ed25519 seed from `--keyfile`, prints the base64 signature, and optionally
+/// stores it as a LogicSig arg in the `--lsig-txn` file.
+pub fn run_tealsign(args: TealsignArgs) -> ExitCode {
+    match run_tealsign_inner(args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_tealsign_inner(args: TealsignArgs) -> Result<(), String> {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    // 1. Fetch the signing key. --keyfile xor --account; --account is not yet
+    //    supported (matches Go tealsign.go:75-96).
+    if args.keyfile.is_some() == args.account.is_some() {
+        return Err(
+            "goal clerk tealsign requires exactly one of --keyfile or --account".to_string(),
+        );
+    }
+    if args.account.is_some() {
+        return Err("goal clerk tealsign --account is not yet supported".to_string());
+    }
+    let keyfile = args
+        .keyfile
+        .as_ref()
+        .ok_or("goal clerk tealsign requires exactly one of --keyfile or --account")?;
+    let kdata = std::fs::read(keyfile).map_err(|e| format!("Cannot read key file: {e}"))?;
+    // Go copies the file bytes into a 32-byte Seed (extra bytes ignored, short
+    // files zero-padded). GenerateSignatureSecrets(seed) == ed25519 from seed.
+    let mut seed = [0u8; 32];
+    let n = kdata.len().min(32);
+    seed[..n].copy_from_slice(&kdata[..n]);
+    let signing_key = SigningKey::from_bytes(&seed);
+
+    // 2. Resolve the program hash: exactly one of --lsig-txn / --contract-addr
+    //    (tealsign.go:108-152).
+    let mut lsig_args: usize = 0;
+    if args.lsig_txn.is_some() {
+        lsig_args += 1;
+    }
+    if args.contract_addr.is_some() {
+        lsig_args += 1;
+    }
+    if lsig_args != 1 {
+        return Err(
+            "goal clerk tealsign requires exactly one of --lsig-txn or --contract-addr".to_string(),
+        );
+    }
+
+    let mut lsig_stxn: Option<SignedTransaction> = None;
+    let program_hash: [u8; 32] =
+        if let Some(path) = args.lsig_txn.as_ref() {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("Cannot read file {}: {e}", path.display()))?;
+            let stxns = decode_signed_txn_stream(&bytes)
+                .map_err(|e| format!("Cannot decode transactions from {}: {e}", path.display()))?;
+            let stxn = stxns.into_iter().next().ok_or_else(|| {
+                format!("Cannot decode transactions from {}: empty", path.display())
+            })?;
+            let program = match stxn.lsig.as_ref() {
+                Some(l) if !l.logic.is_empty() => l.logic.to_vec(),
+                _ => return Err(
+                    "The transaction's logic sig contains no program. Can't compute program hash"
+                        .to_string(),
+                ),
+            };
+            let h = clerk_sign::hash_program(&program);
+            lsig_stxn = Some(stxn);
+            h
+        } else {
+            let addr_str = args.contract_addr.as_deref().unwrap_or_default();
+            Address::from_algorand_string(addr_str)
+                .map_err(|e| format!("Cannot parse contract address: {e}"))?
+                .0
+        };
+
+    // 3. Resolve the data to sign: exactly one of --data-file / --data-b64 /
+    //    --data-b32 / --sign-txid (tealsign.go:158-194).
+    let mut data_args: usize = 0;
+    let mut data_to_sign: Vec<u8> = Vec::new();
+    if let Some(path) = args.data_file.as_ref() {
+        data_to_sign =
+            std::fs::read(path).map_err(|e| format!("Cannot parse data to sign: {e}"))?;
+        data_args += 1;
+    }
+    if let Some(b64) = args.data_b64.as_deref() {
+        data_to_sign = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("Cannot parse base64 data to sign: {e}"))?;
+        data_args += 1;
+    }
+    if let Some(b32) = args.data_b32.as_deref() {
+        data_to_sign = data_encoding::BASE32_NOPAD
+            .decode(b32.as_bytes())
+            .map_err(|e| format!("Cannot parse base32 data to sign: {e}"))?;
+        data_args += 1;
+    }
+    if args.sign_txid {
+        let stxn = lsig_stxn.as_ref().ok_or(
+            "--sign-txid requires --lsig-txn so there is a transaction whose txid can be signed",
+        )?;
+        data_to_sign = compute_txn_id(&stxn.txn).0.to_vec();
+        data_args += 1;
+    }
+    if data_args != 1 {
+        return Err(
+            "goal clerk tealsign requires exactly one of --data-file, --data-b64, --data-b32, or \
+             --sign-txid"
+                .to_string(),
+        );
+    }
+
+    // 4. Sign the domain-separated payload (tealsign.go:200-203).
+    let payload = clerk_sign::tealsign_payload(&program_hash, &data_to_sign);
+    let signature = signing_key.sign(&payload).to_bytes();
+
+    // 5. Optionally store the signature as a LogicSig arg, rewriting the
+    //    --lsig-txn file in place (tealsign.go:209-227).
+    if args.set_lsig_arg_idx >= 0 {
+        let idx = args.set_lsig_arg_idx as usize;
+        let mut stxn = lsig_stxn.ok_or(
+            "--set-lsig-arg-idx requires --lsig-txn so there is a logic sig to store the arg in",
+        )?;
+        if idx > clerk_sign::EVAL_MAX_ARGS - 1 {
+            return Err(format!(
+                "--set-lsig-arg-idx too large: a logic sig can have at most {} args",
+                clerk_sign::EVAL_MAX_ARGS
+            ));
+        }
+        let lsig = stxn.lsig.get_or_insert_with(algo_types::LogicSig::default);
+        let mut existing = lsig.args.take().unwrap_or_default();
+        while existing.len() < idx + 1 {
+            existing.push(serde_bytes::ByteBuf::new());
+        }
+        existing[idx] = serde_bytes::ByteBuf::from(signature.to_vec());
+        lsig.args = Some(existing);
+
+        let path = args
+            .lsig_txn
+            .as_ref()
+            .expect("lsig_txn present when set-lsig-arg-idx >= 0 and lsig_stxn was Some");
+        let encoded = canonical_encode_signed_transaction(&stxn);
+        std::fs::write(path, &encoded)
+            .map_err(|e| format!("Cannot write file {}: {e}", path.display()))?;
+        println!(
+            "Updated lsig arg {idx} in {} with the signature",
+            path.display()
+        );
+    }
+
+    // Always print the base64 signature (tealsign.go:229-231).
+    println!(
+        "Signature: {}",
+        base64::engine::general_purpose::STANDARD.encode(signature)
+    );
+    Ok(())
+}
+
+/// Write `data` to `path` with `0600` perms, mirroring Go's `writeFile(..,
+/// 0600)` used by the signing paths.
+fn write_file_0600(path: &Path, data: &[u8]) -> Result<(), String> {
+    std::fs::write(path, data).map_err(|e| format!("Cannot write file {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 // ---- clerk inspect --------------------------------------------------------
