@@ -1054,3 +1054,55 @@ partkey-management steps above work against a real Go algod.
 `changeonlinestatus`/`marknonparticipating` need a *funded, signable*
 account (devnet genesis ships funded addresses without spending keys),
 covered against in-tree algod-rust in `account_changeonlinestatus_e2e.rs`.
+
+## Localnet e2e: drive goal-rust AND Go goal against the Rust node
+
+[`crates/tools/goal-rust/tests/localnet_node_e2e.rs`](../crates/tools/goal-rust/tests/localnet_node_e2e.rs)
+is the inverse of the interop test above: the **daemon under test is
+the in-tree Rust node** (`algod-rust node start --dev`), and both
+`goal-rust` and Go's `goal` are pointed at it to prove the localnet
+REST/submit surface is usable like go-algorand for the dev-account
+lifecycle (TASK-269 / Phase D2). Gated by `MIXED_CLUSTER=1`:
+
+```bash
+# Default run: gated, skips with a friendly note.
+cargo test -p goal-rust --test localnet_node_e2e
+
+# Full localnet e2e against the Rust node:
+MIXED_CLUSTER=1 cargo test -p goal-rust --test localnet_node_e2e
+```
+
+Sequence:
+
+1. Stage a data dir from the localnet-rust dev genesis
+   ([`docker/localnet-rust/data/genesis.json`](../docker/localnet-rust/data/genesis.json)),
+   which funds the published dev account, then spawn `algod-rust node
+   start --dev` (bound to `127.0.0.1:0`) and `kmd-rust serve` (under
+   `<datadir>/kmd-v0.5`), each polled for its `*.net`/`*.token`
+   readiness markers. Both daemons' stdout+stderr are redirected to
+   `node.log`/`kmd.log`, surfaced in the panic message on any failure
+   (the A11 lesson).
+2. **goal-rust direction** (always under the gate): `wallet new` +
+   `account import -m <dev mnemonic>`; `account list` (renders
+   `[online]`); `account info` (assets/apps + nonzero Minimum Balance,
+   Phase C2); `account balance`; `changeonlinestatus --offline` →
+   keyreg submit + dev-mode block + status flips to `[offline]` (Phase
+   C1, needs the funded signer); `addpartkey` then `changeonlinestatus
+   --online` → status flips back to `[online]`.
+3. **Go-goal direction** (only when `../go-algorand` builds): Go `goal
+   account info`/`balance` read paths, and Go `goal clerk send` — a real
+   payment signed via `kmd-rust`, submitted to the Rust dev node, and
+   confirmed within one dev-mode round (recipient balance grows by the
+   sent amount). If `../go-algorand` is absent or `go build ./cmd/goal`
+   fails, this section skips with a note and the goal-rust lifecycle
+   above still runs.
+
+**Gated/omitted paths** (documented in the test header):
+
+- The **payment submit path via `goal-rust clerk send` is not
+  exercised** — the whole `clerk` group is still a stub in `goal-rust`.
+  The payment submit/confirm path is covered via **Go** `goal` instead;
+  it can move to goal-rust once `clerk send` is implemented.
+- Go `goal clerk send` only skips the wallet password prompt for an
+  *unencrypted* wallet (`WalletIsUnencrypted`), so the payment uses a
+  second, empty-password wallet with the same dev account re-imported.
