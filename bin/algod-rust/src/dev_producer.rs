@@ -105,16 +105,56 @@ pub fn block_txn_id(stx: &SignedTransaction, block: &Block) -> Digest {
 /// 4. `on_new_block` so the pool drops the now-committed transactions and
 ///    rebuilds its evaluator for the next round.
 ///
+/// Read the timestamp of a committed block header from the ledger. Used by the
+/// dev-mode timestamp-offset path to compute `prev.timestamp + offset`. The
+/// genesis round (0) has no stored header timestamp in some bootstraps, so a
+/// missing header yields `0` (matching go, where genesis `prev.TimeStamp` is 0).
+fn read_block_timestamp(ledger: &Arc<Mutex<SqliteLedger>>, round: u64) -> anyhow::Result<i64> {
+    let l = ledger
+        .lock()
+        .map_err(|e| anyhow::anyhow!("ledger lock poisoned: {e}"))?;
+    let Some(hdr_data) = l
+        .get_block_header_data(round)
+        .map_err(|e| anyhow::anyhow!("read prev block header ({round}): {e}"))?
+    else {
+        return Ok(0);
+    };
+    let hdr = algo_types::BlockHeader::decode_from_bytes(&hdr_data)
+        .map_err(|e| anyhow::anyhow!("decode prev block header ({round}): {e}"))?;
+    Ok(hdr.timestamp)
+}
+
+/// When `timestamp_offset` is `Some(offset)`, the block's wall-clock timestamp is
+/// overridden with `prev.timestamp + offset` — go's dev-mode timestamp control
+/// (`/v2/devmode/blocks/offset`). This lets SDK test harnesses produce blocks with
+/// deterministic, monotonically-advanced timestamps. Matches
+/// `../go-algorand/node/node.go:563-565` @ v4.5.1-stable, including the
+/// `offset < MaxInt64 - prev.TimeStamp` overflow guard (the override is skipped
+/// otherwise, leaving the assembled wall-clock timestamp in place).
+///
 /// Returns the committed block plus the per-transaction [`ApplyData`] from the
 /// Execute apply (payset order), so the caller can surface created asset/app ids
 /// and eval deltas on confirmation (TASK-278).
 pub fn produce_dev_block(
     pool: &Arc<TransactionPool>,
     ledger: &Arc<Mutex<SqliteLedger>>,
+    timestamp_offset: Option<i64>,
 ) -> anyhow::Result<(Block, Vec<ApplyData>)> {
     let mut block = pool
         .assemble_dev_mode_block()
         .map_err(|e| anyhow::anyhow!("assemble dev-mode block: {e}"))?;
+
+    // Dev-mode timestamp control: when an offset is configured, set the block
+    // timestamp to `prev.timestamp + offset` rather than the proposer wall clock,
+    // mirroring go's `writeDevmodeBlock`. Skipped (keeping the assembled
+    // timestamp) when the addition would overflow i64, exactly as go does.
+    if let Some(offset) = timestamp_offset {
+        let prev_round = block.round.0.saturating_sub(1);
+        let prev_timestamp = read_block_timestamp(ledger, prev_round)?;
+        if offset < i64::MAX - prev_timestamp {
+            block.timestamp = prev_timestamp + offset;
+        }
+    }
 
     // Deterministic dev finality seed (see step 2 above).
     block.seed = block.branch;
