@@ -1530,7 +1530,8 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                 // Capture the app ID that will be created (txn_counter + 1)
                 // before apply_appl runs, in case we need it for ApplyData.
                 let pre_apply_counter = ctx.txn_counter.get();
-                apply_appl(store, stx, ctx, depth, group_budget, group_info, tracer_ref)?;
+                let executed_eval_delta =
+                    apply_appl(store, stx, ctx, depth, group_budget, group_info, tracer_ref)?;
                 // For appl creates, capture the created application ID.
                 if txn.application_id == 0 {
                     apply_data.application_id = if stx.apply_data_application_id != 0 {
@@ -1538,6 +1539,12 @@ fn apply_transaction_inner_body<L: crate::store_trait::LedgerStore>(
                     } else {
                         pre_apply_counter + 1 // Execute: derived from txn_counter
                     };
+                }
+                // In Execute mode, record the AVM-produced eval delta (state
+                // changes / logs / inner txns). Replay mode records the block's
+                // recorded delta below.
+                if ctx.mode == ApplyMode::Execute {
+                    apply_data.eval_delta = executed_eval_delta;
                 }
             }
             "keyreg" => {
@@ -2458,8 +2465,13 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
     group_budget: Option<&mut GroupBudget>,
     group_info: Option<&GroupInfo<'_>>,
     mut tracer: Option<&mut dyn EvalTracer>,
-) -> Result<(), AlgoError> {
+) -> Result<Option<rmpv::Value>, AlgoError> {
     let txn = &stx.txn;
+
+    // EvalDelta (state changes / logs / inner txns) encoded from the AVM result
+    // in Execute mode, for the caller to record in ApplyData. `None` in Replay
+    // mode (the caller uses the block's recorded delta instead).
+    let mut captured_eval_delta: Option<rmpv::Value> = None;
 
     // Debit fee first.
     apply_fee(store, &txn.sender, txn.fee, &ctx.fee_sink)?;
@@ -2613,6 +2625,9 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                         // program made during execution. The on-completion branch
                         // below will still clear local state regardless.
                         store.restore_snapshot(cs_snapshot);
+                    } else {
+                        // Report the clear-state program's state changes / logs.
+                        captured_eval_delta = crate::eval_delta::encode_eval_delta(&result, txn);
                     }
                 }
             } else {
@@ -2698,6 +2713,8 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                         ),
                     });
                 }
+                // Report the approval program's state changes / logs / inner txns.
+                captured_eval_delta = crate::eval_delta::encode_eval_delta(&result, txn);
             }
         }
     }
@@ -2746,7 +2763,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
     // ON_COMPLETION_OPT_IN is a no-op in the shared helper (handled above).
     apply_appl_on_completion(store, txn, app_id, ApplErrorContext::Outer)?;
 
-    Ok(())
+    Ok(captured_eval_delta)
 }
 
 /// Apply a key registration transaction (core state mutation only).

@@ -18,17 +18,16 @@
 //! invalid app call. (The pool's assembly evaluator only does stateless +
 //! balance/resource checks, so this commit-time execution is what enforces
 //! program correctness in dev mode.) [`produce_dev_block`] returns the
-//! per-transaction `ApplyData` from the Execute apply so the node can surface
-//! created asset/app ids on confirmation (TASK-278). Dev blocks don't carry that
+//! per-transaction `ApplyData` from the Execute apply so the node can surface it
+//! on confirmation: created asset/app ids (TASK-278) and the eval delta — global
+//! and local state changes and logs (TASK-280). Dev blocks don't carry that
 //! ApplyData in their payset (the assembly evaluator doesn't run the AVM, so the
 //! txn commitment is over the apply-data-free payset), so it's reported from a
 //! node-side cache rather than from the stored block.
 //!
-//! Note: `ApplyData.eval_delta` (logs, state changes, inner txns) is not yet
-//! populated in Execute mode — `apply_appl` discards the AVM result for ApplyData
-//! purposes and there's no `AvmResult → eval_delta` encoder — so only created ids
-//! are surfaced today. The cache and response already plumb `eval_delta` through,
-//! so it surfaces automatically once Execute-mode population lands (TASK-280).
+//! Inner transactions are surfaced too, but an inner app call's *own* nested
+//! state delta can be incomplete (an AVM-layer gap tracked in TASK-281); the
+//! outer transaction's eval delta is complete.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
