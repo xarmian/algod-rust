@@ -43,17 +43,24 @@ pub struct ValueDelta {
 }
 
 /// Typed representation of an EvalDelta (ApplyData.dt field).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EvalDelta {
     /// Global state changes keyed by state key.
     pub global_delta: Option<HashMap<Vec<u8>, ValueDelta>>,
-    /// Per-account local state changes. Outer key is the account index
-    /// (offset into the transaction's Accounts array), inner key is state key.
+    /// Per-account local state changes. Outer key is the account index into the
+    /// wire layout `[sender, accounts..., shared_accts...]`, inner key is state
+    /// key. Indices past the transaction's Accounts array address into
+    /// [`shared_accts`](Self::shared_accts).
     pub local_deltas: Option<HashMap<u64, HashMap<Vec<u8>, ValueDelta>>>,
     /// Inner transactions (each with their own ApplyData/EvalDelta).
     pub inner_txns: Option<Vec<SignedTransaction>>,
     /// Log messages emitted by the application.
     pub logs: Option<Vec<Vec<u8>>>,
+    /// Shared accounts (`sa`): addresses for local-delta indices that fall past
+    /// the transaction's Accounts array (cross-transaction resource sharing).
+    /// Indexed after `accounts`: wire index `1 + accounts.len() + i` resolves to
+    /// `shared_accts[i]`. Matches go-algorand `EvalDelta.SharedAccts`.
+    pub shared_accts: Option<Vec<Address>>,
 }
 
 /// Parse an EvalDelta from an rmpv::Value (the `dt` field on SignedTransaction).
@@ -63,6 +70,8 @@ pub struct EvalDelta {
 /// - "ld": local deltas (map of uint index -> map of string key -> ValueDelta map)
 /// - "itx": inner transactions (array of msgpack-encoded SignedTransaction)
 /// - "lg": logs (array of binary/string values)
+/// - "sa": shared accounts (array of 32-byte addresses) for local-delta indices
+///   that fall past the transaction's Accounts array
 pub fn parse_eval_delta(val: &rmpv::Value) -> Result<EvalDelta, AlgoError> {
     let map = match val {
         rmpv::Value::Map(m) => m,
@@ -77,6 +86,7 @@ pub fn parse_eval_delta(val: &rmpv::Value) -> Result<EvalDelta, AlgoError> {
     let mut local_deltas = None;
     let mut inner_txns = None;
     let mut logs = None;
+    let mut shared_accts = None;
 
     for (k, v) in map {
         let key = value_as_str(k)?;
@@ -101,6 +111,11 @@ pub fn parse_eval_delta(val: &rmpv::Value) -> Result<EvalDelta, AlgoError> {
                     logs = Some(parse_logs(v)?);
                 }
             }
+            "sa" => {
+                if !is_empty_value(v) {
+                    shared_accts = Some(parse_shared_accts(v)?);
+                }
+            }
             _ => {
                 // Ignore unknown fields for forward compatibility.
             }
@@ -112,6 +127,7 @@ pub fn parse_eval_delta(val: &rmpv::Value) -> Result<EvalDelta, AlgoError> {
         local_deltas,
         inner_txns,
         logs,
+        shared_accts,
     })
 }
 
@@ -126,10 +142,11 @@ pub fn parse_eval_delta(val: &rmpv::Value) -> Result<EvalDelta, AlgoError> {
 /// `accounts[i]` = i+1), matching the wire format. Returns `None` when there is
 /// nothing to report (no state changes, logs, or inner transactions).
 ///
-/// Inner transactions are serialized as-is. Their *own* nested eval delta
-/// (`itx[*].dt`) is only as complete as the AVM recorded on them — inner app
-/// calls that write state without logging currently carry incomplete nested
-/// deltas (TASK-281); the outer transaction's delta here is complete.
+/// Also used to build each inner app call's `dt` field during inner-transaction
+/// execution (see `execute_inner_appl`), so nested `itx[*].dt` carry complete
+/// global/local state deltas, logs, and their own nested inner transactions —
+/// the recursion composes because each inner `SignedTransaction` already has its
+/// delta encoded before the parent serializes it under `itx`.
 pub fn encode_eval_delta(
     result: &algo_avm::eval::AvmResult,
     txn: &Transaction,
@@ -299,24 +316,31 @@ pub fn apply_eval_delta<L: crate::store_trait::LedgerStore>(
     if let Some(ref ld) = delta.local_deltas {
         if app_id != 0 {
             for (&account_index, kv_deltas) in ld {
-                // Resolve account address: index 0 = sender, index N = accounts[N-1].
+                // Resolve account address against the wire layout
+                // [sender, accounts..., shared_accts...]: index 0 = sender,
+                // 1..=accounts.len() = accounts[index-1], and indices past that
+                // address into the `sa` shared-accounts list (cross-transaction
+                // resource sharing). Mirrors go-algorand `edIndexToAddress`.
                 let addr = if account_index == 0 {
                     txn.sender
                 } else {
-                    let accounts = txn.accounts.as_ref().ok_or_else(|| AlgoError::Ledger {
-                        message: format!(
-                            "eval_delta local: account index {} but no accounts array on txn",
-                            account_index
-                        ),
-                    })?;
+                    let accounts = txn.accounts.as_deref().unwrap_or(&[]);
                     let idx = (account_index - 1) as usize;
-                    *accounts.get(idx).ok_or_else(|| AlgoError::Ledger {
-                        message: format!(
-                            "eval_delta local: account index {} out of bounds (accounts len {})",
-                            account_index,
-                            accounts.len()
-                        ),
-                    })?
+                    if idx < accounts.len() {
+                        accounts[idx]
+                    } else {
+                        let shared = delta.shared_accts.as_deref().unwrap_or(&[]);
+                        let shared_idx = idx - accounts.len();
+                        *shared.get(shared_idx).ok_or_else(|| AlgoError::Ledger {
+                            message: format!(
+                                "eval_delta local: account index {} out of bounds \
+                                 (accounts len {}, shared len {})",
+                                account_index,
+                                accounts.len(),
+                                shared.len()
+                            ),
+                        })?
+                    }
                 };
 
                 // Get or create local state entry. For recorded block replay,
@@ -484,6 +508,35 @@ fn parse_inner_txns(val: &rmpv::Value) -> Result<Vec<SignedTransaction>, AlgoErr
         txns.push(stx);
     }
     Ok(txns)
+}
+
+/// Parse shared accounts: array of 32-byte addresses (the `sa` key).
+fn parse_shared_accts(val: &rmpv::Value) -> Result<Vec<Address>, AlgoError> {
+    let arr = match val {
+        rmpv::Value::Array(a) => a,
+        _ => {
+            return Err(AlgoError::Ledger {
+                message: format!("shared_accts: expected array, got {:?}", val),
+            });
+        }
+    };
+
+    let mut result = Vec::with_capacity(arr.len());
+    for item in arr {
+        let bytes = value_as_bytes(item)?;
+        if bytes.len() != 32 {
+            return Err(AlgoError::Ledger {
+                message: format!(
+                    "shared_accts: expected 32-byte address, got {}",
+                    bytes.len()
+                ),
+            });
+        }
+        let mut addr = [0u8; 32];
+        addr.copy_from_slice(&bytes);
+        result.push(Address(addr));
+    }
+    Ok(result)
 }
 
 /// Parse logs array.
@@ -870,7 +923,8 @@ mod tests {
         )
         .expect("delta");
 
-        let ld = parse_eval_delta(&encoded).unwrap().local_deltas.unwrap();
+        let parsed = parse_eval_delta(&encoded).unwrap();
+        let ld = parsed.local_deltas.unwrap();
         assert!(
             ld.contains_key(&0) && ld.contains_key(&1) && ld.contains_key(&2),
             "expected indices 0/1/2 (sender/accounts[0]/shared[0]), got {:?}",
@@ -881,5 +935,100 @@ mod tests {
             vec![raw.0.to_vec()],
             "raw-address account must appear in the shared-accounts list",
         );
+        // parse_eval_delta must now surface `sa` as typed addresses.
+        assert_eq!(
+            parsed.shared_accts,
+            Some(vec![raw]),
+            "parse_eval_delta should decode the `sa` shared-accounts list",
+        );
+    }
+
+    #[test]
+    fn parse_eval_delta_decodes_shared_accts() {
+        let raw = Address([7u8; 32]);
+        let val = Value::Map(vec![(
+            Value::String("sa".into()),
+            Value::Array(vec![Value::Binary(raw.0.to_vec())]),
+        )]);
+        let ed = parse_eval_delta(&val).unwrap();
+        assert_eq!(ed.shared_accts, Some(vec![raw]));
+    }
+
+    #[test]
+    fn parse_eval_delta_rejects_malformed_shared_acct() {
+        // A non-32-byte entry in `sa` is a hard error, not silently dropped.
+        let val = Value::Map(vec![(
+            Value::String("sa".into()),
+            Value::Array(vec![Value::Binary(vec![1, 2, 3])]),
+        )]);
+        assert!(parse_eval_delta(&val).is_err());
+    }
+
+    #[test]
+    fn apply_eval_delta_resolves_shared_account_local_delta() {
+        // A local delta indexed past the Accounts array must resolve to the
+        // matching `sa` shared account and write that account's local state —
+        // not error with "out of bounds" (the pre-TASK-281 behavior).
+        use crate::apply::ApplyContext;
+        use crate::state::LedgerState;
+        use crate::store_trait::LedgerStore;
+
+        let sender = Address([1u8; 32]);
+        let in_accounts = Address([2u8; 32]); // index 1
+        let shared = Address([9u8; 32]); // index 2 (shared[0])
+        let app_id = 555u64;
+
+        let mut store = LedgerState::new();
+        store.set_app_params(
+            app_id,
+            AppParams {
+                creator: sender,
+                approval_program: Vec::new(),
+                clear_state_program: Vec::new(),
+                global_state: std::collections::BTreeMap::new(),
+                local_state_schema: StateSchema::default(),
+                global_state_schema: StateSchema::default(),
+                extra_program_pages: 0,
+            },
+        );
+
+        // Local delta for index 2 → shared[0] → `shared`, setting key "k" = 3.
+        let mut kv = HashMap::new();
+        kv.insert(
+            b"k".to_vec(),
+            ValueDelta {
+                action: DeltaAction::SetUint,
+                uint: 3,
+                bytes: Vec::new(),
+            },
+        );
+        let mut local_deltas = HashMap::new();
+        local_deltas.insert(2u64, kv);
+
+        let delta = EvalDelta {
+            local_deltas: Some(local_deltas),
+            shared_accts: Some(vec![shared]),
+            ..Default::default()
+        };
+
+        let stx = SignedTransaction {
+            txn: Transaction {
+                txn_type: algo_types::TxnType::Appl,
+                sender,
+                application_id: app_id,
+                accounts: Some(vec![in_accounts]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let ctx = ApplyContext::new_replay(0, Address::ZERO, 1);
+        apply_eval_delta(&stx, &delta, &mut store, &ctx, 0)
+            .expect("shared-account local delta should apply cleanly");
+
+        let ls = store
+            .get_app_local_state(&shared, app_id)
+            .expect("shared account should have local state written");
+        assert_eq!(ls.key_value.get(b"k".as_slice()), Some(&TealValue::Uint(3)));
     }
 }
