@@ -117,6 +117,13 @@ async fn run_start(
         sqlite_ledger
             .put_block(0, &genesis_block.current_protocol, &hdr_data, &blk_data)
             .map_err(|e| anyhow::anyhow!("put_block(0) for genesis: {e}"))?;
+        // Seed the running txn-counter state from the genesis block (1000 under
+        // modern protocols). The block-0 header carries it, but only block
+        // *apply* advances the counter and we don't apply block 0 — so without
+        // this the first produced block's id generation would start from 0
+        // (first created asset/app id 1 instead of 1001), diverging from go and
+        // from the block header's own txn_counter. TASK-279.
+        sqlite_ledger.set_txn_counter(genesis_block.txn_counter);
         // No certificate for the genesis block — it isn't agreed upon. Leaving
         // certdata NULL makes `get_block_cert(0)` return None, so the
         // `/v2/blocks/0` envelope is a valid `{block}` map (an empty-bytes cert

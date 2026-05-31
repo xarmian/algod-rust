@@ -2234,6 +2234,9 @@ mod tests {
         let hdr = canonical_encode_block_header_from_block(&gblk);
         let blk = encode_block(&gblk).unwrap();
         l.put_block(0, &gblk.current_protocol, &hdr, &blk).unwrap();
+        // Seed the running txn-counter from the genesis block (TASK-279) so
+        // produced blocks generate ids from 1001, as `node start` does.
+        l.set_txn_counter(gblk.txn_counter);
         l.commit_block().unwrap();
         let ledger = Arc::new(Mutex::new(l));
 
@@ -2406,14 +2409,12 @@ mod tests {
             .expect("lookup ok")
             .expect("confirmed");
         assert_eq!(status.confirmed_round, 1, "confirmed in round 1");
-        // The created application id is surfaced from the captured ApplyData.
-        // (Its absolute value depends on the ledger's running txn_counter, which
-        // isn't yet seeded from the genesis block's 1000 — TASK-279 — so we
-        // assert a real id was reported rather than a specific number.)
-        assert!(
-            matches!(status.application_index, Some(id) if id > 0),
-            "created application id reported from ApplyData, got {:?}",
+        // First created app id is 1001: genesis seeds the running txn_counter at
+        // 1000 (TASK-279), matching go's AppForbidLowResources convention.
+        assert_eq!(
             status.application_index,
+            Some(1001),
+            "created application id reported from ApplyData",
         );
         assert_eq!(status.asset_index, None, "not an asset create");
     }
