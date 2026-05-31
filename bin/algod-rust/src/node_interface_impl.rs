@@ -178,7 +178,10 @@ pub struct AlgodNodeInterface {
     /// payset (the assembly evaluator doesn't run the AVM, so the txn commitment
     /// is over the apply-data-free payset), so it's surfaced from this in-memory
     /// side cache instead. Only entries with a created id or eval delta are
-    /// stored, so it stays small. Dev-mode only.
+    /// stored, so it stays small. Dev-mode only. (Execute mode doesn't yet
+    /// populate `eval_delta` — TASK-280 — so in practice this currently caches
+    /// asset/app creates; the `eval_delta` plumbing is already in place for when
+    /// it does.)
     dev_apply_data: Arc<std::sync::Mutex<std::collections::HashMap<Digest, ApplyData>>>,
 }
 
