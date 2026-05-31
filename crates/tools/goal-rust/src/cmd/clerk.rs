@@ -425,11 +425,17 @@ fn run_sign_inner(
     let out_data = if let Some(lsig) = lsig {
         // --- LogicSig path: attach lsig (+ AuthAddr) to every txn. ---
         // Go runs verify.LogicSigSanityCheck per txn (it depends on the txn's
-        // authorizer); `clerk_sign::logicsig_sanity_check` mirrors the
-        // consensus-independent core — program structure, the single-signature
-        // rule, and (for an unsigned lsig) the contract-account authorizer ==
-        // HashProgram check. Delegated sig/msig/lmsig are re-verified by the
-        // node on submit.
+        // authorizer). We mirror it in two steps that together match Go without
+        // needing the consensus-param table loaded client-side:
+        //   1. `clerk_sign::logicsig_program_check` — program structure +
+        //      pooled-size (len(logic) + sum(args)) check;
+        //   2. `algo_validate::logicsig_sanity_check` — the at-most-one-sig rule
+        //      and the actual delegation-signature verification (sig / msig /
+        //      lmsig over "Program"||logic, or the contract-account
+        //      authorizer == HashProgram check). This is the load-bearing
+        //      security check: it rejects an invalid/unsigned delegated lsig
+        //      before we write the file. The node re-runs the full check
+        //      (including TEAL execution) on submit.
         let mut out = Vec::new();
         for (idx, stxn) in stxns.iter_mut().enumerate() {
             stxn.lsig = Some(lsig.clone());
@@ -439,9 +445,9 @@ fn run_sign_inner(
                 }
                 stxn.auth_addr = Some(signer);
             }
-            // Authorizer = auth_addr if set, else sender (Go's txn.Authorizer()).
-            let authorizer = stxn.auth_addr.map(|a| a.0).unwrap_or(stxn.txn.sender.0);
-            clerk_sign::logicsig_sanity_check(&lsig, &authorizer)
+            clerk_sign::logicsig_program_check(&lsig)
+                .map_err(|e| format!("{}: txn[{idx}] error {e}", args.infile.display()))?;
+            algo_validate::logicsig_sanity_check(stxn, &lsig)
                 .map_err(|e| format!("{}: txn[{idx}] error {e}", args.infile.display()))?;
             out.extend_from_slice(&canonical_encode_signed_transaction(stxn));
         }

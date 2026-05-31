@@ -197,34 +197,28 @@ pub fn tealsign_payload(program_hash: &[u8; 32], data: &[u8]) -> Vec<u8> {
     payload
 }
 
-/// Sanity-check a LogicSig that has just been attached to a transaction,
-/// mirroring the consensus-independent core of `verify.LogicSigSanityCheck`
-/// (`data/transactions/verify/txn.go:372-444`):
+/// Structural + size check for a LogicSig program, the consensus-independent
+/// part of `verify.LogicSigSanityCheck` (`data/transactions/verify/txn.go`):
 ///
-/// - the program assembles and passes the structural [`check_program`] checks
-///   (size/version/branch targets);
-/// - at most one of the delegated `sig` / `msig` / `lmsig` fields is set;
-/// - if **none** is set, the LogicSig is only valid as a contract account — the
-///   transaction's authorizer (`auth_addr` if present, else `sender`) must
-///   equal `HashProgram(logic)`.
+/// - the program is non-empty and passes the structural [`check_program`]
+///   checks (AVM version, opcode mode, branch targets, stack depth);
+/// - the pooled LogicSig length `len(logic) + sum(len(args))` is within the
+///   LogicSig size limit (so an oversized `--argb64` is rejected, matching
+///   Go's `LogicSig.Len()` vs `LogicSigMaxSize`).
 ///
-/// We do **not** cryptographically verify a delegated `sig`/`msig`/`lmsig`
-/// here: that requires the full group context, and the node re-verifies on
-/// submit. The contract-account check is the one that catches the common
-/// `clerk sign --program` mistake (attaching an unsigned LogicSig to a normal
-/// account), which Go rejects with "not signed and not a Logic-only account".
-///
-/// `authorizer` is the already-resolved 32-byte authorizer for the txn.
-pub fn logicsig_sanity_check(lsig: &LogicSig, authorizer: &[u8; 32]) -> Result<(), String> {
+/// The delegation-signature verification (sig / msig / lmsig over
+/// `"Program" || logic`, or the contract-account `authorizer == HashProgram`
+/// check) is performed by [`algo_validate::logicsig_sanity_check`], which
+/// reuses the tested signature/multisig verification in `algo-validate`.
+pub fn logicsig_program_check(lsig: &LogicSig) -> Result<(), String> {
     let program: Vec<u8> = lsig.logic.to_vec();
     if program.is_empty() {
         return Err("LogicSig.Logic empty".to_string());
     }
     let parsed = algo_avm::parse(&program).map_err(|e| format!("{e}"))?;
     // Go's size check counts the whole LogicSig: `LogicSig.Len()` =
-    // len(Logic) + sum(len(Args)) (data/transactions/logic.go) against
-    // `LogicSigMaxSize`, so an oversized `--argb64` is caught here too. Pass the
-    // pooled length as `program_len`.
+    // len(Logic) + sum(len(Args)) against `LogicSigMaxSize`. Pass the pooled
+    // length as `program_len`.
     let lsig_len = program.len()
         + lsig
             .args
@@ -233,34 +227,7 @@ pub fn logicsig_sanity_check(lsig: &LogicSig, authorizer: &[u8; 32]) -> Result<(
             .unwrap_or(0);
     algo_avm::check_program(&parsed, algo_avm::Mode::LogicSig, lsig_len, 0)
         .map_err(|e| format!("{e}"))?;
-
-    let has_sig = lsig.sig != [0u8; 64];
-    let has_msig = lsig.msig.as_ref().is_some_and(|m| !multisig_blank(m));
-    let has_lmsig = lsig.lmsig.as_ref().is_some_and(|m| !multisig_blank(m));
-    let num_sigs = has_sig as u8 + has_msig as u8 + has_lmsig as u8;
-
-    if num_sigs == 0 {
-        if &hash_program(&program) == authorizer {
-            return Ok(());
-        }
-        return Err("LogicNot signed and not a Logic-only account".to_string());
-    }
-    if num_sigs > 1 {
-        return Err(
-            "LogicSig should only have one of Sig, Msig, or LMsig but has more than one"
-                .to_string(),
-        );
-    }
-    // A single delegated sig/msig/lmsig: the node verifies it on submit (full
-    // group context required), so we accept it here.
     Ok(())
-}
-
-/// A `MultisigSig` is "blank" when it carries no populated subsignatures
-/// (matches Go's `MultisigSig.Blank`: version/threshold zero or every subsig
-/// signature empty). We treat any non-blank-signature subsig as present.
-fn multisig_blank(msig: &MultisigSig) -> bool {
-    msig.subsigs.iter().all(|s| s.signature == [0u8; 64])
 }
 
 #[cfg(test)]
@@ -357,41 +324,32 @@ mod tests {
     }
 
     #[test]
-    fn logicsig_sanity_check_contract_account() {
-        // `int 1` (v2): 0x0220010122. Authorizer == program hash → OK.
-        let program = vec![0x02u8, 0x20, 0x01, 0x01, 0x22];
+    fn logicsig_program_check_accepts_valid_program() {
+        // `int 1` (v2): 0x0220010122.
         let lsig = LogicSig {
-            logic: ByteBuf::from(program.clone()),
+            logic: ByteBuf::from(vec![0x02u8, 0x20, 0x01, 0x01, 0x22]),
             ..LogicSig::default()
         };
-        let prog_hash = hash_program(&program);
-        assert!(logicsig_sanity_check(&lsig, &prog_hash).is_ok());
-
-        // Authorizer != program hash, no delegated sig → rejected. Go's literal
-        // (typo'd) message is "LogicNot signed and not a Logic-only account".
-        let err = logicsig_sanity_check(&lsig, &[0u8; 32]).unwrap_err();
-        assert!(err.contains("not a Logic-only account"), "got: {err}");
+        assert!(logicsig_program_check(&lsig).is_ok());
     }
 
     #[test]
-    fn logicsig_sanity_check_accepts_delegated_sig() {
-        // A non-blank delegated sig is accepted (node re-verifies on submit),
-        // regardless of authorizer.
-        let program = vec![0x02u8, 0x20, 0x01, 0x01, 0x22];
-        let lsig = LogicSig {
-            logic: ByteBuf::from(program),
-            sig: [7u8; 64],
-            ..LogicSig::default()
-        };
-        assert!(logicsig_sanity_check(&lsig, &[0u8; 32]).is_ok());
-    }
-
-    #[test]
-    fn logicsig_sanity_check_rejects_empty_program() {
+    fn logicsig_program_check_rejects_empty_program() {
         let lsig = LogicSig::default();
-        assert!(logicsig_sanity_check(&lsig, &[0u8; 32])
-            .unwrap_err()
-            .contains("empty"));
+        assert!(logicsig_program_check(&lsig).unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn logicsig_program_check_counts_args_toward_size() {
+        // A tiny program with a single arg larger than the LogicSig size limit
+        // (1000 bytes for v1-3) must be rejected on the pooled-size check.
+        let lsig = LogicSig {
+            logic: ByteBuf::from(vec![0x02u8, 0x20, 0x01, 0x01, 0x22]),
+            args: Some(vec![ByteBuf::from(vec![0u8; 4096])]),
+            ..LogicSig::default()
+        };
+        let err = logicsig_program_check(&lsig).unwrap_err();
+        assert!(err.contains("size"), "got: {err}");
     }
 
     #[test]

@@ -1805,6 +1805,7 @@ dependencies = [
  "algo-rest-client",
  "algo-txn-pipeline",
  "algo-types",
+ "algo-validate",
  "base64",
  "clap",
  "data-encoding",
