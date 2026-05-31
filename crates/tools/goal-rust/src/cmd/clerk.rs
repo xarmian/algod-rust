@@ -1231,8 +1231,15 @@ fn json_printable(raw: &[u8]) -> bool {
 }
 
 /// Write `data` to `path` with `0600` perms, mirroring Go's `writeFile(..,
-/// 0600)` used by the signing paths.
+/// 0600)` (commands.go:510) used by the signing + dryrun-dump paths. As in Go,
+/// the path `-` (`stdoutFilenameValue`) writes to stdout instead of a file.
 fn write_file_0600(path: &Path, data: &[u8]) -> Result<(), String> {
+    if path.as_os_str() == STDIN_STDOUT {
+        use std::io::Write;
+        return std::io::stdout()
+            .write_all(data)
+            .map_err(|e| format!("Cannot write to stdout: {e}"));
+    }
     std::fs::write(path, data).map_err(|e| format!("Cannot write file {}: {e}", path.display()))?;
     #[cfg(unix)]
     {
@@ -2102,6 +2109,28 @@ mod tests {
         assert!(!json_printable(b"a<b"));
         assert!(!json_printable(b"a&b"));
         assert!(json_printable(b"plain text 123 (ok)"));
+    }
+
+    #[test]
+    fn write_file_0600_dash_goes_to_stdout_not_a_file() {
+        // `-` must write to stdout (Go's writeFile), never create a file named
+        // "-" in the cwd.
+        let cwd = std::env::current_dir().expect("cwd");
+        let dash = cwd.join("-");
+        let pre_existing = dash.exists();
+        write_file_0600(Path::new("-"), b"to-stdout").expect("stdout write ok");
+        // We didn't create a `-` file (unless one already existed before).
+        if !pre_existing {
+            assert!(
+                !dash.exists(),
+                "write_file_0600(\"-\") must not create a file"
+            );
+        }
+        // A real path still writes a file.
+        let tmp = std::env::temp_dir().join(format!("task291-wf-{}.bin", std::process::id()));
+        write_file_0600(&tmp, b"hello").expect("file write ok");
+        assert_eq!(std::fs::read(&tmp).expect("read back"), b"hello");
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
