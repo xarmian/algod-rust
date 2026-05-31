@@ -519,6 +519,13 @@ pub enum NodeCommands {
         /// Path to `genesis.json` (default `<data-dir>/genesis.json`).
         #[arg(long, short = 'g')]
         genesis: Option<PathBuf>,
+
+        /// Run in dev mode: each submitted transaction group immediately
+        /// produces a block (single-node, no agreement), giving instant
+        /// submit→confirm. Also enabled automatically when `genesis.json` sets
+        /// `"devmode": true`.
+        #[arg(long)]
+        dev: bool,
     },
 }
 

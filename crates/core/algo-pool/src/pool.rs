@@ -936,6 +936,21 @@ impl TransactionPool {
                 .unwrap_or(started)
     }
 
+    /// Ensure the pool has a block evaluator, building one for the next round if
+    /// none exists. Idempotent — a no-op once primed.
+    ///
+    /// A freshly-constructed pool has no evaluator until the first
+    /// `on_new_block`; go primes it via the ledger's `OnNewBlock` notification
+    /// at startup. Until primed, `remember`/`ingest` fails with
+    /// `NoPendingBlockEvaluator`. Dev mode calls this before the first ingest
+    /// (subsequent rounds stay primed via `on_new_block`).
+    pub fn ensure_evaluator_primed(&self) {
+        let mut inner = self.mu.lock();
+        if inner.evaluator.is_none() {
+            self.recompute_block_evaluator(&mut inner, &HashSet::new());
+        }
+    }
+
     /// Assemble a block in dev mode: recompute the evaluator and immediately
     /// assemble a block from current pending transactions.
     ///

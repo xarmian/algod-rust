@@ -6,10 +6,10 @@
 //! initializes a fresh one) and serves the REST API, following the data-dir
 //! layout Go uses so `goal -d <datadir> …` works unchanged.
 //!
-//! Scope of this task is a **read-serving** node: status, blocks, account, and
-//! genesis endpoints. Transaction submission + confirmation (the pool +
-//! broadcaster + dev-mode block-production loop) land in TASK-264; until then
-//! `POST /v2/transactions` reports not-implemented.
+//! By default this is a **read-serving** node: status, blocks, account, and
+//! genesis endpoints. With `--dev` (or a `"devmode": true` genesis), it also
+//! attaches a transaction pool and produces one block per submitted group
+//! (single-node, no agreement) — giving instant submit→confirm (TASK-264).
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -21,6 +21,7 @@ use algo_ledger::{
     make_genesis_block, parse_genesis_json, populate_store, seed_account_totals_from_genesis,
     SqliteLedger,
 };
+use algo_pool::{PoolConfig, TransactionPool};
 use algo_rest_api::node::BuildVersion;
 use algo_rest_api::server::{ApiServer, ApiServerConfig};
 use algo_types::Digest;
@@ -29,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::cli::NodeCommands;
+use crate::commands::participate::PoolLedgerAdapter;
 use crate::node_interface_impl::{AlgodNodeInterface, NodeInterfaceConfig};
 
 /// Default REST bind address when `--listen` is not provided. Matches
@@ -41,7 +43,8 @@ pub async fn run(cmd: NodeCommands) -> anyhow::Result<()> {
             data_dir,
             listen,
             genesis,
-        } => run_start(&data_dir, listen.as_deref(), genesis.as_deref()).await,
+            dev,
+        } => run_start(&data_dir, listen.as_deref(), genesis.as_deref(), dev).await,
     }
 }
 
@@ -49,6 +52,7 @@ async fn run_start(
     data_dir: &Path,
     listen: Option<&str>,
     genesis_path_arg: Option<&Path>,
+    dev_flag: bool,
 ) -> anyhow::Result<()> {
     // -----------------------------------------------------------------------
     // 1. Resolve + parse genesis.json.
@@ -122,11 +126,26 @@ async fn run_start(
             .map_err(|e| anyhow::anyhow!("commit_block during genesis seed: {e}"))?;
     }
 
-    if genesis.devmode {
-        warn!(
-            "genesis declares devmode but block production is not wired yet (TASK-264); \
-             serving reads only — submitted transactions will not confirm"
-        );
+    // Dev mode is enabled by the `--dev` flag or a `"devmode": true` genesis.
+    let dev_mode = dev_flag || genesis.devmode;
+
+    // Dev-mode block production restores the genesis hash stripped from committed
+    // transactions by treating a zero hash as "stripped" (see
+    // `dev_producer::restore_block_genesis_fields`). That is only unambiguous
+    // under protocols that require a genesis hash, so refuse dev mode on legacy
+    // optional-genesis-hash protocols rather than risk mis-derived txids.
+    if dev_mode {
+        let params = algo_types::consensus::consensus_params_for_version(&genesis.proto)
+            .ok_or_else(|| {
+                anyhow::anyhow!("dev mode: unknown genesis protocol '{}'", genesis.proto)
+            })?;
+        if !params.require_genesis_hash {
+            anyhow::bail!(
+                "dev mode requires a protocol that mandates a genesis hash (modern protocols); \
+                 genesis protocol '{}' does not — refusing to start in dev mode",
+                genesis.proto
+            );
+        }
     }
 
     let ledger = Arc::new(Mutex::new(sqlite_ledger));
@@ -137,8 +156,9 @@ async fn run_start(
     let shutdown_token = CancellationToken::new();
 
     // -----------------------------------------------------------------------
-    // 3. Build the read-serving node interface adapter.
-    //    (Pool + broadcaster + dev-mode production attach in TASK-264.)
+    // 3. Build the node interface adapter. In dev mode it also gets a
+    //    transaction pool and produces a block on each submitted group
+    //    (single-node, no agreement); otherwise it stays read-serving.
     // -----------------------------------------------------------------------
     let node_config = NodeInterfaceConfig {
         genesis_id: genesis_id.clone(),
@@ -147,9 +167,18 @@ async fn run_start(
         build_version: BuildVersion::from_build_env(),
         default_protocol: genesis.proto.clone(),
     };
-    let node = Arc::new(
-        AlgodNodeInterface::new(ledger, node_config).with_shutdown_token(shutdown_token.clone()),
-    );
+    let mut node_interface = AlgodNodeInterface::new(ledger.clone(), node_config)
+        .with_shutdown_token(shutdown_token.clone());
+    if dev_mode {
+        let pool = Arc::new(TransactionPool::new(
+            PoolConfig::default(),
+            Arc::new(PoolLedgerAdapter::new(ledger.clone()))
+                as Arc<dyn algo_pool::traits::PoolLedger>,
+        ));
+        node_interface = node_interface.with_pool(pool).with_dev_mode();
+        info!("dev mode enabled — each submitted transaction group produces a block");
+    }
+    let node = Arc::new(node_interface);
 
     // -----------------------------------------------------------------------
     // 4. Serve the REST API. `ApiServer::serve` writes algod.net /
