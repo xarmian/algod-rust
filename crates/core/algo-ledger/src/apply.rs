@@ -131,7 +131,7 @@ pub fn apply_block<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<(), AlgoError> {
-    apply_block_impl(store, block, ApplyMode::Replay, false, None, None)
+    apply_block_impl(store, block, ApplyMode::Replay, false, None, None, None)
 }
 
 /// Apply a full block to the ledger state with the specified mode.
@@ -142,7 +142,7 @@ pub fn apply_block_with_mode<L: crate::store_trait::LedgerStore>(
     block: &Block,
     mode: ApplyMode,
 ) -> Result<(), AlgoError> {
-    apply_block_impl(store, block, mode, false, None, None)
+    apply_block_impl(store, block, mode, false, None, None, None)
 }
 
 /// Apply a full block to the ledger state with validation enabled.
@@ -154,7 +154,7 @@ pub fn apply_block_validating<L: crate::store_trait::LedgerStore>(
     store: &mut L,
     block: &Block,
 ) -> Result<(), AlgoError> {
-    apply_block_impl(store, block, ApplyMode::Replay, true, None, None)
+    apply_block_impl(store, block, ApplyMode::Replay, true, None, None, None)
 }
 
 /// Apply a full block (Execute mode) while capturing per-transaction-group
@@ -174,7 +174,25 @@ pub fn apply_block_capturing_group_deltas<L: crate::store_trait::LedgerStore>(
         false,
         None,
         Some(group_deltas),
+        None,
     )
+}
+
+/// Apply `block` in `mode`, returning the per-transaction [`ApplyData`] in
+/// payset order (created asset/app ids, eval delta, rewards, closing amounts).
+///
+/// Used by the dev-mode producer to backfill the committed block's
+/// `SignedTxnInBlock` apply-data fields so `/v2/transactions/pending/{txid}` can
+/// report created ids and eval deltas. `Execute` mode runs the AVM (the deltas
+/// reflect real execution); `Replay` mode returns the trusted-block apply data.
+pub fn apply_block_capturing_apply_data<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+    mode: ApplyMode,
+) -> Result<Vec<ApplyData>, AlgoError> {
+    let mut out = Vec::with_capacity(block.payset.len());
+    apply_block_impl(store, block, mode, false, None, None, Some(&mut out))?;
+    Ok(out)
 }
 
 /// Build a `StateDelta` balance record from an account's post-state, matching
@@ -274,7 +292,7 @@ pub fn apply_block_with_delta<L: crate::store_trait::LedgerStore>(
     let prev_timestamp = 0i64;
 
     // ── 3. Apply the block ────────────────────────────────────────
-    apply_block_impl(store, block, ApplyMode::Replay, false, None, None)?;
+    apply_block_impl(store, block, ApplyMode::Replay, false, None, None, None)?;
 
     // ── 4. Build the StateDelta by diffing pre vs post state ──────
     let mut accts = Vec::new();
@@ -480,6 +498,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     validate: bool,
     mut tracer: Option<&mut dyn EvalTracer>,
     mut group_deltas: Option<&mut crate::txn_group_delta_tracer::TxnGroupDeltaTracer>,
+    mut apply_data_out: Option<&mut Vec<ApplyData>>,
 ) -> Result<(), AlgoError> {
     // Validate round monotonicity.
     let expected = Round(store.current_round().0 + 1);
@@ -548,8 +567,13 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
             ApplyMode::Replay => {
                 // Replay mode: process transactions individually (no AVM execution).
                 for stx in &block.payset {
-                    if let Err(e) = apply_transaction(store, stx, &ctx, 0) {
-                        break 'block Err(e);
+                    match apply_transaction(store, stx, &ctx, 0) {
+                        Ok(ad) => {
+                            if let Some(out) = apply_data_out.as_deref_mut() {
+                                out.push(ad);
+                            }
+                        }
+                        Err(e) => break 'block Err(e),
                     }
                 }
             }
@@ -634,7 +658,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                                 Some(ref mut t) => Some(&mut **t),
                                 None => None,
                             };
-                            if let Err(e) = apply_transaction_with_budget(
+                            match apply_transaction_with_budget(
                                 store,
                                 stx,
                                 &ctx,
@@ -643,10 +667,22 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                                 Some(&gi),
                                 tracer_ref,
                             ) {
-                                break 'block Err(e);
+                                Ok(ad) => {
+                                    if let Some(out) = apply_data_out.as_deref_mut() {
+                                        out.push(ad);
+                                    }
+                                }
+                                Err(e) => break 'block Err(e),
                             }
-                        } else if let Err(e) = apply_transaction(store, stx, &ctx, 0) {
-                            break 'block Err(e);
+                        } else {
+                            match apply_transaction(store, stx, &ctx, 0) {
+                                Ok(ad) => {
+                                    if let Some(out) = apply_data_out.as_deref_mut() {
+                                        out.push(ad);
+                                    }
+                                }
+                                Err(e) => break 'block Err(e),
+                            }
                         }
                         global_txn_idx += 1;
                     }

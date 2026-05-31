@@ -25,6 +25,7 @@ use std::time::Duration;
 use algo_codec::{
     canonical_encode_block_header, compute_block_digest, compute_txn_id, decode_block,
 };
+use algo_ledger::apply::ApplyData;
 use algo_ledger::simulation::{
     AppInitialState, AvmValueTrace, ExecTraceConfig, OpcodeTraceUnit, ProgramTrace,
     ResourcesInitialStates, ResultEvalOverrides, SimulationRequest, SimulationResult, Simulator,
@@ -171,6 +172,14 @@ pub struct AlgodNodeInterface {
     /// against the same round before each other's `on_new_block` drains the
     /// pool. Mirrors go's `node.mu.Lock()` in dev-mode `BroadcastSignedTxGroup`.
     dev_produce_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-transaction ApplyData (created asset/app ids, eval delta) captured
+    /// from dev-mode commits, keyed by txid, so `get_pending_transaction` can
+    /// report it on confirmation. Dev blocks don't carry ApplyData in their
+    /// payset (the assembly evaluator doesn't run the AVM, so the txn commitment
+    /// is over the apply-data-free payset), so it's surfaced from this in-memory
+    /// side cache instead. Only entries with a created id or eval delta are
+    /// stored, so it stays small. Dev-mode only.
+    dev_apply_data: Arc<std::sync::Mutex<std::collections::HashMap<Digest, ApplyData>>>,
 }
 
 impl AlgodNodeInterface {
@@ -193,6 +202,7 @@ impl AlgodNodeInterface {
             default_protocol: config.default_protocol,
             dev_mode: false,
             dev_produce_lock: Arc::new(tokio::sync::Mutex::new(())),
+            dev_apply_data: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -302,18 +312,28 @@ impl AlgodNodeInterface {
                 // transaction as signed.
                 let restored = crate::dev_producer::restore_block_genesis_fields(stx, &block);
                 if compute_txn_id(&restored.txn) == *txid {
+                    // Surface ApplyData (created asset/app id, eval delta) from
+                    // the dev-mode side cache, if captured at commit time.
+                    let ad = self
+                        .dev_apply_data
+                        .lock()
+                        .ok()
+                        .and_then(|cache| cache.get(txid).cloned());
                     return Ok(Some(TxnWithStatus {
                         txn: restored,
                         confirmed_round: round,
                         pool_error: String::new(),
-                        closing_amount: 0,
-                        asset_closing_amount: 0,
-                        sender_rewards: 0,
-                        receiver_rewards: 0,
-                        close_rewards: 0,
-                        asset_index: None,
-                        application_index: None,
-                        eval_delta: None,
+                        closing_amount: ad.as_ref().map_or(0, |a| a.closing_amount),
+                        asset_closing_amount: ad.as_ref().map_or(0, |a| a.asset_closing_amount),
+                        sender_rewards: ad.as_ref().map_or(0, |a| a.sender_rewards),
+                        receiver_rewards: ad.as_ref().map_or(0, |a| a.receiver_rewards),
+                        close_rewards: ad.as_ref().map_or(0, |a| a.close_rewards),
+                        asset_index: ad.as_ref().map(|a| a.config_asset).filter(|id| *id != 0),
+                        application_index: ad
+                            .as_ref()
+                            .map(|a| a.application_id)
+                            .filter(|id| *id != 0),
+                        eval_delta: ad.and_then(|a| a.eval_delta),
                         logs: None,
                         inner_txns: None,
                     }));
@@ -892,6 +912,7 @@ impl NodeInterface for AlgodNodeInterface {
                 .clone()
                 .ok_or(NodeError::NotImplemented("broadcast_signed_tx_group (dev)"))?;
             let ledger = self.ledger.clone();
+            let apply_data_cache = self.dev_apply_data.clone();
             // Serialize production so concurrent submissions don't assemble
             // against the same round before each other's on_new_block drains the
             // pool (go holds node.mu across Remember + writeDevmodeBlock). Held
@@ -903,18 +924,38 @@ impl NodeInterface for AlgodNodeInterface {
                 pool.ensure_evaluator_primed();
                 pool.remember(tx_group)
                     .map_err(|e| NodeError::BadRequest(format!("pool rejected group: {e}")))?;
-                if let Err(e) = crate::dev_producer::produce_dev_block(&pool, &ledger) {
-                    // The block (including this just-remembered group) failed to
-                    // apply — typically a rejecting app program under Execute
-                    // mode. Drop the pending group so the rejected transaction
-                    // doesn't wedge later blocks; dev submits are serialized and
-                    // each drains the pool, so only this group is pending here.
-                    pool.reset();
-                    return Err(NodeError::BadRequest(format!(
-                        "dev block production rejected the group: {e}"
-                    )));
+                match crate::dev_producer::produce_dev_block(&pool, &ledger) {
+                    Ok((block, apply_data)) => {
+                        // Cache per-txn ApplyData (created ids / eval delta) for
+                        // get_pending_transaction to report on confirmation.
+                        if let Ok(mut cache) = apply_data_cache.lock() {
+                            for (stx, ad) in block.payset.iter().zip(apply_data.iter()) {
+                                if ad.config_asset != 0
+                                    || ad.application_id != 0
+                                    || ad.eval_delta.is_some()
+                                {
+                                    cache.insert(
+                                        crate::dev_producer::block_txn_id(stx, &block),
+                                        ad.clone(),
+                                    );
+                                }
+                            }
+                        }
+                        Ok::<(), NodeError>(())
+                    }
+                    Err(e) => {
+                        // The block (including this just-remembered group) failed
+                        // to apply — typically a rejecting app program under
+                        // Execute mode. Drop the pending group so the rejected
+                        // transaction doesn't wedge later blocks; dev submits are
+                        // serialized and each drains the pool, so only this group
+                        // is pending here.
+                        pool.reset();
+                        Err(NodeError::BadRequest(format!(
+                            "dev block production rejected the group: {e}"
+                        )))
+                    }
                 }
-                Ok::<(), NodeError>(())
             })
             .await
             .map_err(|e| NodeError::Internal(format!("dev broadcast task join failed: {e}")))?;
@@ -2320,6 +2361,58 @@ mod tests {
                 .is_none(),
             "rejected transaction must not be reported confirmed or pending",
         );
+    }
+
+    /// A passing app-create confirms and reports its created application id in
+    /// the pending-transaction response (TASK-278 ApplyData surfacing).
+    #[tokio::test]
+    async fn dev_mode_app_create_reports_application_id() {
+        use algo_types::{Round, Transaction, TxnType};
+        use ed25519_dalek::SigningKey;
+        use serde_bytes::ByteBuf;
+
+        let sender_key = SigningKey::from_bytes(&[0x44u8; 32]);
+        let sender = Address(sender_key.verifying_key().to_bytes());
+        let (adapter, _ledger, gh) = seed_dev_adapter(sender, 10_000_000);
+
+        // App-create with an APPROVING program (`#pragma version 6; pushint 1`).
+        let txn = Transaction {
+            txn_type: TxnType::Appl,
+            sender,
+            application_id: 0,
+            on_completion: 0,
+            approval_program: Some(ByteBuf::from(vec![0x06u8, 0x81, 0x01])),
+            clear_state_program: Some(ByteBuf::from(vec![0x06u8, 0x81, 0x01])),
+            fee: 1000,
+            first_valid: Round(1),
+            last_valid: Round(1000),
+            genesis_hash: gh,
+            ..Default::default()
+        };
+        let stx = sign_txn(&txn, &sender_key);
+        let txid = compute_txn_id(&txn);
+
+        adapter
+            .broadcast_signed_tx_group(vec![stx])
+            .await
+            .expect("approving app-create should confirm");
+
+        let status = adapter
+            .get_pending_transaction(&txid)
+            .await
+            .expect("lookup ok")
+            .expect("confirmed");
+        assert_eq!(status.confirmed_round, 1, "confirmed in round 1");
+        // The created application id is surfaced from the captured ApplyData.
+        // (Its absolute value depends on the ledger's running txn_counter, which
+        // isn't yet seeded from the genesis block's 1000 — TASK-279 — so we
+        // assert a real id was reported rather than a specific number.)
+        assert!(
+            matches!(status.application_index, Some(id) if id > 0),
+            "created application id reported from ApplyData, got {:?}",
+            status.application_index,
+        );
+        assert_eq!(status.asset_index, None, "not an asset create");
     }
 
     #[tokio::test]
