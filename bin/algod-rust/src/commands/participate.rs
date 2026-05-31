@@ -1707,9 +1707,18 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
 ///
 /// The `TransactionPool` requires an `Arc<dyn PoolLedger>`, so we provide
 /// this thin adapter that delegates to the same SQLite ledger used by the
-/// agreement bridges.
-struct PoolLedgerAdapter {
+/// agreement bridges. Reused by `node start --dev` (TASK-264) so its
+/// consensus-critical `start_evaluator` (next-round header advance) is not
+/// duplicated.
+pub(crate) struct PoolLedgerAdapter {
     ledger: Arc<Mutex<SqliteLedger>>,
+}
+
+impl PoolLedgerAdapter {
+    /// Wrap a shared ledger as a pool ledger.
+    pub(crate) fn new(ledger: Arc<Mutex<SqliteLedger>>) -> Self {
+        Self { ledger }
+    }
 }
 
 impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {

@@ -1,6 +1,7 @@
 mod cli;
 mod commands;
 mod config;
+mod dev_producer;
 mod node_interface_impl;
 
 use clap::Parser;
