@@ -582,6 +582,11 @@ fn run_tealsign_inner(args: TealsignArgs) -> Result<(), String> {
         if let Some(path) = args.lsig_txn.as_ref() {
             let bytes = std::fs::read(path)
                 .map_err(|e| format!("Cannot read file {}: {e}", path.display()))?;
+            // Go's tealsign reads `--lsig-txn` as a SINGLE SignedTxn via
+            // `protocol.Decode` (tealsign.go:131) — trailing txns in the file
+            // are ignored, and `--set-lsig-arg-idx` rewrites only that first
+            // txn (`protocol.Encode(&stxn)`, tealsign.go:222). We mirror that:
+            // decode the stream and take the first txn.
             let stxns = decode_signed_txn_stream(&bytes)
                 .map_err(|e| format!("Cannot decode transactions from {}: {e}", path.display()))?;
             let stxn = stxns.into_iter().next().ok_or_else(|| {
