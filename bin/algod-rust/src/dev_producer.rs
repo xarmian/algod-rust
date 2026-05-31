@@ -33,25 +33,28 @@ use algo_types::{Block, Digest, SignedTransaction};
 /// the evaluator's `restore_genesis_fields`:
 /// - restore `genesis_id` from the block when `has_genesis_id` is set and the
 ///   field is empty;
-/// - restore `genesis_hash` from the block when the field is zero and the block
-///   carries one.
+/// - restore `genesis_hash` from the block when the field is zero and the hash
+///   was stripped — i.e. the block's protocol requires a genesis hash (so every
+///   committed txn carries one) or the `has_genesis_hash` flag is set.
 ///
-/// `genesis_id` is gated on the `has_genesis_id` flag because an empty
-/// `genesis_id` is a legal, common state (the flag distinguishes "stripped
-/// because it matched the network" from "genuinely empty"). `genesis_hash` is
-/// gated only on zero-ness, not the flag: the block encoder here does not
-/// reliably set `has_genesis_hash` when it strips the hash, and dev-mode block
-/// production runs on modern protocols (`require_genesis_hash`) where every
-/// committed transaction carries a genesis hash equal to the block's — so a zero
-/// hash in a committed block unambiguously means it was stripped. (On legacy
-/// protocols where the hash is optional this would be ambiguous, but dev mode
-/// never runs there.)
+/// This mirrors the evaluator's `restore_genesis_fields` (`require_genesis_hash
+/// || has_genesis_hash`) and is protocol-aware via the block's `current_protocol`
+/// — so a transaction that genuinely omitted its genesis hash on a legacy
+/// optional-genesis-hash protocol is left untouched, keeping its txid stable.
+/// `genesis_id` is flag-gated because an empty `genesis_id` is a legal, common
+/// state the flag distinguishes from "stripped because it matched the network".
 pub fn restore_block_genesis_fields(stx: &SignedTransaction, block: &Block) -> SignedTransaction {
     let mut out = stx.clone();
     if out.has_genesis_id && out.txn.genesis_id.is_empty() {
         out.txn.genesis_id.clone_from(&block.genesis_id);
     }
-    if out.txn.genesis_hash == [0u8; 32] && block.genesis_hash != [0u8; 32] {
+    let requires_genesis_hash =
+        algo_types::consensus::consensus_params_for_version(&block.current_protocol)
+            .is_some_and(|p| p.require_genesis_hash);
+    if out.txn.genesis_hash == [0u8; 32]
+        && block.genesis_hash != [0u8; 32]
+        && (requires_genesis_hash || out.has_genesis_hash)
+    {
         out.txn.genesis_hash = block.genesis_hash;
     }
     out
@@ -134,11 +137,12 @@ pub fn produce_dev_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use algo_types::{Round, Transaction, TxnType};
+    use algo_types::{Round, Transaction, TxnType, CONSENSUS_V41};
 
-    fn block_with_genesis(id: &str, hash: [u8; 32]) -> Block {
+    fn block_with_genesis(proto: &str, id: &str, hash: [u8; 32]) -> Block {
         Block {
             round: Round(1),
+            current_protocol: proto.to_string(),
             genesis_id: id.to_string(),
             genesis_hash: hash,
             ..Block::default()
@@ -146,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    fn block_txn_id_matches_submitter_when_both_genesis_fields_stripped() {
+    fn block_txn_id_matches_submitter_on_modern_protocol() {
         // The submitter signs/hashes the full transaction.
         let full = Transaction {
             txn_type: TxnType::Pay,
@@ -157,7 +161,9 @@ mod tests {
         };
         let want = compute_txn_id(&full);
 
-        // The block stores the STIB-stripped form: genesis_id/hash removed, flags set.
+        // The block stores the STIB-stripped form. genesis_id is flag-gated;
+        // genesis_hash is restored because the protocol (v41) requires it, even
+        // though the encoder left has_genesis_hash unset.
         let stripped = SignedTransaction {
             txn: Transaction {
                 genesis_id: String::new(),
@@ -165,10 +171,10 @@ mod tests {
                 ..full.clone()
             },
             has_genesis_id: true,
-            has_genesis_hash: true,
+            has_genesis_hash: false,
             ..Default::default()
         };
-        let block = block_with_genesis("net-x", [7u8; 32]);
+        let block = block_with_genesis(CONSENSUS_V41, "net-x", [7u8; 32]);
 
         assert_eq!(
             block_txn_id(&stripped, &block),
@@ -192,15 +198,38 @@ mod tests {
             has_genesis_hash: true,
             ..Default::default()
         };
-        let block = block_with_genesis("net-x", [7u8; 32]);
+        let block = block_with_genesis(CONSENSUS_V41, "net-x", [7u8; 32]);
         let restored = restore_block_genesis_fields(&stx, &block);
         assert!(
             restored.txn.genesis_id.is_empty(),
             "unflagged genesis_id stays empty"
         );
+        // has_genesis_hash set → genesis_hash restored.
         assert_eq!(
             restored.txn.genesis_hash, [7u8; 32],
-            "genesis_hash restored"
+            "flagged genesis_hash restored"
+        );
+    }
+
+    #[test]
+    fn restore_skips_genesis_hash_when_optional_and_unflagged() {
+        // Protocol does not require a genesis hash and the flag is unset → a
+        // genuinely-omitted hash stays zero (restoring would change the txid).
+        let stx = SignedTransaction {
+            txn: Transaction {
+                txn_type: TxnType::Pay,
+                genesis_hash: [0u8; 32],
+                ..Default::default()
+            },
+            has_genesis_hash: false,
+            ..Default::default()
+        };
+        // Unknown protocol → require_genesis_hash treated as false.
+        let block = block_with_genesis("legacy-optional-gh", "net-x", [7u8; 32]);
+        let restored = restore_block_genesis_fields(&stx, &block);
+        assert_eq!(
+            restored.txn.genesis_hash, [0u8; 32],
+            "optional + unflagged genesis_hash must stay zero",
         );
     }
 }
