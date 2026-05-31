@@ -17,16 +17,24 @@
 //! so the submission errors and nothing is confirmed — rather than confirming an
 //! invalid app call. (The pool's assembly evaluator only does stateless +
 //! balance/resource checks, so this commit-time execution is what enforces
-//! program correctness in dev mode.) Surfacing the resulting ApplyData
-//! (created ids, eval delta, logs, inner txns) in the confirmed-transaction
-//! response is tracked in TASK-278; today the response carries `confirmed_round`
-//! and the transaction.
+//! program correctness in dev mode.) [`produce_dev_block`] returns the
+//! per-transaction `ApplyData` from the Execute apply so the node can surface
+//! created asset/app ids on confirmation (TASK-278). Dev blocks don't carry that
+//! ApplyData in their payset (the assembly evaluator doesn't run the AVM, so the
+//! txn commitment is over the apply-data-free payset), so it's reported from a
+//! node-side cache rather than from the stored block.
+//!
+//! Note: `ApplyData.eval_delta` (logs, state changes, inner txns) is not yet
+//! populated in Execute mode — `apply_appl` discards the AVM result for ApplyData
+//! purposes and there's no `AvmResult → eval_delta` encoder — so only created ids
+//! are surfaced today. The cache and response already plumb `eval_delta` through,
+//! so it surfaces automatically once Execute-mode population lands (TASK-280).
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use algo_codec::{canonical_encode_block_header_from_block, compute_txn_id, encode_block};
-use algo_ledger::apply::{apply_block_with_mode, ApplyMode};
+use algo_ledger::apply::{apply_block_capturing_apply_data, ApplyData, ApplyMode};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::SqliteLedger;
 use algo_pool::TransactionPool;
@@ -97,10 +105,14 @@ pub fn block_txn_id(stx: &SignedTransaction, block: &Block) -> Digest {
 ///    (a valid `{block}`-only envelope, exactly as for the genesis block).
 /// 4. `on_new_block` so the pool drops the now-committed transactions and
 ///    rebuilds its evaluator for the next round.
+///
+/// Returns the committed block plus the per-transaction [`ApplyData`] from the
+/// Execute apply (payset order), so the caller can surface created asset/app ids
+/// and eval deltas on confirmation (TASK-278).
 pub fn produce_dev_block(
     pool: &Arc<TransactionPool>,
     ledger: &Arc<Mutex<SqliteLedger>>,
-) -> anyhow::Result<Block> {
+) -> anyhow::Result<(Block, Vec<ApplyData>)> {
     let mut block = pool
         .assemble_dev_mode_block()
         .map_err(|e| anyhow::anyhow!("assemble dev-mode block: {e}"))?;
@@ -118,34 +130,39 @@ pub fn produce_dev_block(
         .map(|stx| block_txn_id(stx, &block))
         .collect();
 
-    {
+    let apply_data = {
         let mut l = ledger
             .lock()
             .map_err(|e| anyhow::anyhow!("ledger lock poisoned: {e}"))?;
         l.begin_block()
             .map_err(|e| anyhow::anyhow!("begin_block: {e}"))?;
-        let result = (|| -> Result<(), algo_error::AlgoError> {
+        let result = (|| -> Result<Vec<ApplyData>, algo_error::AlgoError> {
             l.put_block(block.round.0, &proto, &hdr_data, &blk_data)?;
             // Execute mode runs the AVM, rejecting transactions whose programs
-            // fail (rather than confirming an invalid app call as Replay would).
-            apply_block_with_mode(&mut *l, &block, ApplyMode::Execute)?;
-            Ok(())
+            // fail (rather than confirming an invalid app call as Replay would),
+            // and returns the per-transaction ApplyData.
+            apply_block_capturing_apply_data(&mut *l, &block, ApplyMode::Execute)
         })();
-        if let Err(e) = result {
-            let _ = l.rollback_block();
-            return Err(anyhow::anyhow!(
-                "commit dev-mode block {}: {e}",
-                block.round.0
-            ));
+        match result {
+            Ok(apply_data) => {
+                l.commit_block()
+                    .map_err(|e| anyhow::anyhow!("commit_block: {e}"))?;
+                apply_data
+            }
+            Err(e) => {
+                let _ = l.rollback_block();
+                return Err(anyhow::anyhow!(
+                    "commit dev-mode block {}: {e}",
+                    block.round.0
+                ));
+            }
         }
-        l.commit_block()
-            .map_err(|e| anyhow::anyhow!("commit_block: {e}"))?;
-    }
+    };
 
     // Advance the pool past the committed block: drops confirmed transactions
     // and rebuilds the evaluator for the next round.
     pool.on_new_block(&block, &committed_txids);
-    Ok(block)
+    Ok((block, apply_data))
 }
 
 #[cfg(test)]
