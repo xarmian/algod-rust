@@ -1,5 +1,5 @@
 use sha2::Digest as Sha2Digest;
-use sha2::Sha512_256;
+use sha2::{Sha512, Sha512_256};
 
 use algo_types::{Block, BlockHeader, Digest, Transaction};
 
@@ -37,6 +37,21 @@ pub fn compute_block_digest(block: &Block) -> Digest {
 pub fn compute_block_header_digest(header: &BlockHeader) -> Digest {
     let canonical = canonical_encode_block_header(header);
     hash_with_prefix(BH_HASH_PREFIX, &canonical)
+}
+
+/// Compute a block's full SHA-512 header digest:
+/// `SHA-512("BH" || canonical_encode(header))`.
+///
+/// This is go's `BlockHeader.Hash512()` — the same "BH"-prefixed header
+/// encoding as [`compute_block_header_digest`], hashed with SHA-512 instead of
+/// SHA-512/256. It is the value stored as the next block's `prev512`
+/// (`Branch512`) under protocols with `EnableSha512BlockHash` (v41+).
+pub fn compute_block_header_digest_512(header: &BlockHeader) -> [u8; 64] {
+    let canonical = canonical_encode_block_header(header);
+    let mut hasher = Sha512::new();
+    hasher.update(BH_HASH_PREFIX);
+    hasher.update(&canonical);
+    hasher.finalize().into()
 }
 
 fn hash_with_prefix(prefix: &[u8], data: &[u8]) -> Digest {
@@ -87,6 +102,25 @@ mod tests {
             compute_block_header_digest(&header),
             compute_block_digest(&block),
             "header-only digest must equal the block digest for equivalent header fields",
+        );
+    }
+
+    #[test]
+    fn block_header_digest_512_is_deterministic_and_distinct() {
+        let header = BlockHeader {
+            round: Round(9),
+            branch: [4u8; 32],
+            ..BlockHeader::default()
+        };
+        let a = compute_block_header_digest_512(&header);
+        let b = compute_block_header_digest_512(&header);
+        assert_eq!(a, b, "512 header digest must be deterministic");
+        // The 64-byte SHA-512 digest must not be the 32-byte SHA-512/256 digest
+        // zero-extended — its first 32 bytes differ (different hash function).
+        assert_ne!(
+            &a[..32],
+            compute_block_header_digest(&header).0.as_slice(),
+            "SHA-512 prefix must differ from the SHA-512/256 digest",
         );
     }
 
