@@ -116,7 +116,15 @@ fn fill_rejects_validity_period_exceeding_consensus_limit() {
         msg.contains("the validity period for mss is too large"),
         "actual: {msg}"
     );
-    assert!(matches!(err, FillError::ValidityPeriodTooLarge { .. }));
+    // The reported limit must be V41's MaxKeyregValidPeriod (16,777,215),
+    // proving the guard resolved the live consensus bound rather than the
+    // zero default that would silently disable the check (BT-283).
+    match err {
+        FillError::ValidityPeriodTooLarge { limit } => {
+            assert_eq!(limit, 256 * (1 << 16) - 1, "limit must be V41's bound");
+        }
+        other => panic!("expected ValidityPeriodTooLarge, got {other:?}"),
+    }
 
     drop(db);
     let _ = std::fs::remove_file(&path);

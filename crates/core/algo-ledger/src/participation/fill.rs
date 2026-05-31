@@ -9,7 +9,7 @@
 use algo_consensus_crypto::{
     merklesig, one_time_id_for_round, OneTimeSignatureSecrets, VrfKeypair,
 };
-use algo_types::consensus::ConsensusParams;
+use algo_types::consensus::{consensus_params_for_version, CONSENSUS_CURRENT_VERSION};
 use algo_types::{Address, Round};
 use thiserror::Error;
 
@@ -73,10 +73,19 @@ pub fn fill_db_with_participation_keys(
         });
     }
 
-    // MaxKeyregValidPeriod: current consensus only.
-    let consensus = ConsensusParams::default();
-    let max_valid_period = consensus.max_keyreg_valid_period;
-    if max_valid_period != 0 && (last_valid.0 - first_valid.0) > max_valid_period {
+    // Enforce `MaxKeyregValidPeriod` from the *current* consensus version,
+    // matching go's `FillDBWithParticipationKeys`, which reads
+    // `config.Consensus[protocol.ConsensusCurrentVersion].MaxKeyregValidPeriod`
+    // (../go-algorand/data/account/participation.go:231). We resolve the params
+    // explicitly from `CONSENSUS_CURRENT_VERSION` (V41) rather than relying on
+    // `ConsensusParams::default()` — the bound is consensus-critical, so the
+    // version it comes from must be unambiguous, not an implementation detail of
+    // `Default`. Mirrors the live-params resolution in the server path's
+    // `generate_participation_keys` (node_interface_impl.rs).
+    let max_valid_period = consensus_params_for_version(CONSENSUS_CURRENT_VERSION)
+        .map(|p| p.max_keyreg_valid_period)
+        .unwrap_or(0);
+    if max_valid_period != 0 && last_valid.0.saturating_sub(first_valid.0) > max_valid_period {
         return Err(FillError::ValidityPeriodTooLarge {
             limit: max_valid_period,
         });
