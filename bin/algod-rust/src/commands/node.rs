@@ -129,6 +129,25 @@ async fn run_start(
     // Dev mode is enabled by the `--dev` flag or a `"devmode": true` genesis.
     let dev_mode = dev_flag || genesis.devmode;
 
+    // Dev-mode block production restores the genesis hash stripped from committed
+    // transactions by treating a zero hash as "stripped" (see
+    // `dev_producer::restore_block_genesis_fields`). That is only unambiguous
+    // under protocols that require a genesis hash, so refuse dev mode on legacy
+    // optional-genesis-hash protocols rather than risk mis-derived txids.
+    if dev_mode {
+        let params = algo_types::consensus::consensus_params_for_version(&genesis.proto)
+            .ok_or_else(|| {
+                anyhow::anyhow!("dev mode: unknown genesis protocol '{}'", genesis.proto)
+            })?;
+        if !params.require_genesis_hash {
+            anyhow::bail!(
+                "dev mode requires a protocol that mandates a genesis hash (modern protocols); \
+                 genesis protocol '{}' does not — refusing to start in dev mode",
+                genesis.proto
+            );
+        }
+    }
+
     let ledger = Arc::new(Mutex::new(sqlite_ledger));
 
     // Cancellation token shared with the adapter and the server: cancelling it
