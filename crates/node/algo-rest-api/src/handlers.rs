@@ -3565,6 +3565,10 @@ pub async fn append_keys<N: NodeInterface>(
     match node.append_participation_keys(&decoded_id, data).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(NodeError::NotFound(msg)) => error::not_found(msg),
+        // Malformed / empty request bodies are client errors → 400, matching
+        // go-algorand's AppendKeys handler which `badRequest`s on a decode
+        // failure or an empty key list (handlers.go:378).
+        Err(NodeError::BadRequest(msg)) => error::bad_request(msg),
         Err(e) => error::internal_error(e.to_string()),
     }
 }

@@ -1228,10 +1228,13 @@ impl NodeInterface for AlgodNodeInterface {
         id: &ParticipationID,
         keys: Vec<u8>,
     ) -> Result<(), NodeError> {
+        // A malformed body or an empty key list is a client error (go's
+        // AppendKeys handler `badRequest`s on both — handlers.go:378), so these
+        // surface as 400, not 500.
         let pairs = algo_consensus_crypto::merklesig::decode_state_proof_keys(&keys)
-            .map_err(|e| NodeError::Internal(format!("unable to parse keys from body: {e}")))?;
+            .map_err(|e| NodeError::BadRequest(format!("unable to parse keys from body: {e}")))?;
         if pairs.is_empty() {
-            return Err(NodeError::Internal(
+            return Err(NodeError::BadRequest(
                 "empty request, please attach keys to request body".into(),
             ));
         }
@@ -1313,21 +1316,44 @@ impl AlgodNodeInterface {
             return Err(NodeError::Internal("cannot install empty partkey".into()));
         }
 
-        // Unique temp path so concurrent installs don't collide (go uses a
-        // random uint64 suffix); a process-unique counter + pid is sufficient
-        // here and avoids pulling in an RNG dependency.
-        let mut path = std::env::temp_dir();
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        // Create the temp file securely: 0600 (private-key material), exclusive
+        // creation (`O_CREAT|O_EXCL` — fails rather than following a pre-placed
+        // symlink or clobbering an existing file), and a unique name combining
+        // the pid, a high-resolution timestamp, and a process-global counter so
+        // concurrent installs never collide. Go uses a random-suffixed name in
+        // the genesis dir (node.go:936); we keep the bytes off any shared path
+        // and lock down the mode the same way go's umask-respecting
+        // participation files are expected to be protected.
+        static TEMP_PARTKEY_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
+        let seq = TEMP_PARTKEY_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
         path.push(format!(
-            "algod-rust-partkey.{}.{nonce}.bin",
+            "algod-rust-partkey.{}.{nonce}.{seq}.bin",
             std::process::id()
         ));
 
-        std::fs::write(&path, data)
-            .map_err(|e| NodeError::Internal(format!("writing temp partkey: {e}")))?;
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .map_err(|e| NodeError::Internal(format!("creating temp partkey: {e}")))?;
+            file.write_all(data)
+                .and_then(|()| file.flush())
+                .map_err(|e| {
+                    let _ = std::fs::remove_file(&path);
+                    NodeError::Internal(format!("writing temp partkey: {e}"))
+                })?;
+        }
 
         let result = (|| {
             let db = ErasableDb::open(&path)
@@ -3480,6 +3506,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn install_from_partkey_bytes_round_trip() {
+        // Build a real partkey DB on disk, read its raw bytes, and install
+        // them through the adapter (exercising the secure temp-file write +
+        // restore_participation path).
+        let addr = Address([0x5a; 32]);
+        let dir = std::env::temp_dir().join(format!(
+            "algod-rust-test-partkey.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut db = algo_ledger::erasable_db::ErasableDb::open(&dir).expect("open partkey db");
+        let part = algo_ledger::participation::fill_db_with_participation_keys(
+            &mut db,
+            addr,
+            Round(1),
+            Round(100),
+            10_000,
+        )
+        .expect("fill partkey db");
+        let expected_id = part.id();
+        db.close().expect("close db");
+        let bytes = std::fs::read(&dir).expect("read partkey bytes");
+        let _ = std::fs::remove_file(&dir);
+
+        let adapter = adapter_with_part_store();
+        let id = adapter
+            .install_participation_key(bytes)
+            .await
+            .expect("install ok");
+        assert_eq!(id, expected_id);
+
+        let listed = adapter.list_participation_keys().await.expect("list ok");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].participation_id, id);
+        assert_eq!(listed[0].account, addr);
+    }
+
+    #[tokio::test]
+    async fn install_empty_partkey_is_rejected() {
+        let adapter = adapter_with_part_store();
+        let err = adapter
+            .install_participation_key(Vec::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NodeError::Internal(_)));
+    }
+
+    #[tokio::test]
     async fn generate_rejects_over_long_validity_window() {
         let adapter = adapter_with_part_store();
         // v41 MaxKeyregValidPeriod is 256*(1<<16)-1 = 16_777_215. A window
@@ -3541,18 +3618,18 @@ mod tests {
     async fn append_participation_keys_rejects_empty_body() {
         let adapter = adapter_with_part_store();
         let id = ParticipationID([0x11; 32]);
-        // An empty msgpack array (0x90) decodes to zero pairs → bad-request-ish
-        // Internal error matching go's "empty request" message.
+        // An empty msgpack array (0x90) decodes to zero pairs → BadRequest
+        // (client error → 400), matching go's "empty request" message.
         let err = adapter
             .append_participation_keys(&id, vec![0x90])
             .await
             .unwrap_err();
         match err {
-            NodeError::Internal(msg) => assert!(
+            NodeError::BadRequest(msg) => assert!(
                 msg.contains("empty request"),
                 "expected empty-request message, got {msg:?}"
             ),
-            other => panic!("expected Internal(empty request), got {other:?}"),
+            other => panic!("expected BadRequest(empty request), got {other:?}"),
         }
     }
 
