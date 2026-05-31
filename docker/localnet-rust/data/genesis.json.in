@@ -1,0 +1,35 @@
+{
+  "id": "v1",
+  "network": "localnet-rust",
+  "proto": "@CONSENSUS_CURRENT_VERSION@",
+  "devmode": true,
+  "timestamp": 0,
+  "fees": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
+  "rwd": "TJD47PJE4JPJV6W2RNS47KXA2IID52Y2S5OPUSXKJZLWSEWMNJ4R2GIOFM",
+  "alloc": [
+    {
+      "addr": "E4A7NFAARAKFG4ZK7KQ7VZBO5XEQIUKBK2U3KNLAFTX6R3HTJBFG75MQZE",
+      "comment": "DevWallet",
+      "state": {
+        "algo": 4000000000000000,
+        "onl": 1
+      }
+    },
+    {
+      "addr": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
+      "comment": "FeeSink",
+      "state": {
+        "algo": 100000,
+        "onl": 0
+      }
+    },
+    {
+      "addr": "TJD47PJE4JPJV6W2RNS47KXA2IID52Y2S5OPUSXKJZLWSEWMNJ4R2GIOFM",
+      "comment": "RewardsPool",
+      "state": {
+        "algo": 0,
+        "onl": 0
+      }
+    }
+  ]
+}
