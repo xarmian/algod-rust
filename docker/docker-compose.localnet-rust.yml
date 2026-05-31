@@ -1,0 +1,47 @@
+# Rust Localnet — single-node dev-mode network (TASK-268 / PLAN-262)
+#
+# A drop-in alternative to the `algod-go` localnet (docker-compose.yml): boots
+# the Rust `algod-rust node start --dev` daemon from a baked-in genesis.json
+# (devmode:true) with a funded dev account, and serves the algod v2 REST API on
+# port 4001 (same host port as the Go localnet).
+#
+# Dev mode produces one block per submitted transaction group (single-node, no
+# agreement), so a fresh `up` is immediately ready to accept transactions over
+# REST (e.g. from a host-side `goal` / `goal-rust` pointed at localhost:4001 —
+# the image itself ships only the daemon, not a client). The ledger is created
+# at runtime by seeding genesis state — the image carries no pre-built database,
+# so every `up` starts from a clean round 0.
+#
+# Usage (see the `localnet-rust-*` targets in the Makefile):
+#   docker compose -f docker/docker-compose.localnet-rust.yml up -d --build
+#   docker compose -f docker/docker-compose.localnet-rust.yml down -v
+#
+# The funded dev account address is
+#   E4A7NFAARAKFG4ZK7KQ7VZBO5XEQIUKBK2U3KNLAFTX6R3HTJBFG75MQZE
+# and its 25-word mnemonic is documented in docs/DEV_WORKFLOW.md so an operator
+# can import it (`goal account import` / `algokey import`) and sign txns.
+
+services:
+  algod-rust-localnet:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: localnet
+    image: algod-rust-localnet:latest
+    container_name: algod-rust-localnet
+    ports:
+      - "4001:8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "-H",
+          "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "http://localhost:8080/v2/status",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped

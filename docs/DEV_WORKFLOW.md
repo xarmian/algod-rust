@@ -98,6 +98,73 @@ docker exec algod-go goal account list -d /algod/data
 docker exec algod-go goal account list -d /algod/data | head -1 | awk '{print $2}'
 ```
 
+## Rust Localnet (Docker)
+
+A drop-in alternative to the `algod-go` localnet that runs the **Rust** node
+(`algod-rust node start --dev`) in docker. Genesis (`devmode: true`) and config
+are baked into the image; dev mode produces one block per submitted transaction
+group, so a fresh `up` is immediately ready for `goal clerk send`.
+
+```bash
+make localnet-rust-up      # Build the image + start the Rust dev node (port 4001)
+make localnet-rust-status  # Query /v2/status
+make localnet-rust-logs    # Tail the node logs
+make localnet-rust-down    # Stop and remove volumes
+```
+
+The node serves the algod v2 REST API on `http://localhost:4001` with the same
+fixed token as the Go localnet
+(`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`), so existing
+tooling and scripts point at it unchanged. The first `make localnet-rust-up`
+build compiles the Rust workspace in release mode and can take 10–20 minutes;
+subsequent builds reuse the docker layer cache.
+
+### Driving it with `goal` / `goal-rust`
+
+The image ships only the `algod-rust` daemon — there is no `goal` / `goal-rust`
+client inside the container. Drive it from the host against the published REST
+endpoint (`http://localhost:4001`, fixed `aaaa…` token):
+
+```bash
+# Raw REST:
+curl -s -H "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+    http://localhost:4001/v2/status
+
+# Or with a host-installed goal-rust / goal pointed at the endpoint.
+```
+
+`goal` / `goal-rust` normally read `algod.net` + `algod.token` from a data dir.
+The container's data dir is `/algod/data`, but the node writes `algod.net` with
+its *container* bind address (`0.0.0.0:8080`), so a copied-out data dir would
+dial the wrong endpoint — point your client at `127.0.0.1:4001` instead (e.g.
+rewrite `algod.net`, or use whatever endpoint flag your client exposes). The
+token is the fixed `aaaa…` value above.
+
+The staged `config.json` in the data dir is a go-algorand-format placeholder for
+operator familiarity; the Rust `node start` command does not consume it (it
+takes its listen address from `-l` and tokens from `algod.token`).
+
+### The funded dev account
+
+The baked genesis funds a single dev account so you can sign and submit
+transactions immediately:
+
+- **Address:** `E4A7NFAARAKFG4ZK7KQ7VZBO5XEQIUKBK2U3KNLAFTX6R3HTJBFG75MQZE`
+- **Mnemonic (25 words):**
+  `under this above produce during card issue fire gloom reopen topple rough cat smooth salad put broken decade vocal loud pulp gauge hurdle absorb olympic`
+
+Import it to sign transactions:
+
+```bash
+goal-rust account import -m "under this above produce during card issue fire gloom reopen topple rough cat smooth salad put broken decade vocal loud pulp gauge hurdle absorb olympic"
+# or with the Go toolchain:
+algokey import -m "under this above produce …" -f dev.key
+```
+
+This account is for **local development only** — never fund it on a public
+network. The staged data dir lives at `docker/localnet-rust/data/` and the
+image is built from the `localnet` target in `docker/Dockerfile`.
+
 ## Regenerating Test Fixtures
 
 The easiest way is the all-in-one pipeline:
