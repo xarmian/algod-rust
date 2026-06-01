@@ -1566,6 +1566,20 @@ impl NodeInterface for AlgodNodeInterface {
         self.dev_mode
     }
 
+    /// Whether the Developer API (`/v2/teal/compile`, `/v2/teal/disassemble`,
+    /// `/v2/teal/dryrun`, `/v2/transactions/async`) is enabled. Default-on in
+    /// dev mode so `goal`/SDK clients can compile and dry-run TEAL against a
+    /// localnet/`--dev` node out of the box. This mirrors go-algorand's devmode
+    /// networks, which ship `EnableDeveloperAPI: true` in the node's
+    /// `config.json` (the config default is `false`, see
+    /// `../go-algorand/config/local_defaults.go:70`); the standalone Rust node
+    /// has no config-file layer yet (PLAN-43), so dev mode carries the flag
+    /// directly. Non-dev nodes keep the trait default (`false`) until that
+    /// config layer lands.
+    fn enable_developer_api(&self) -> bool {
+        self.dev_mode
+    }
+
     /// Get the dev-mode block-timestamp offset. Returns `Err` (mapped by the
     /// handler to 400) when not in dev mode, `Ok(None)` when never set, and
     /// `Ok(Some(offset))` otherwise — matching go's
@@ -4490,8 +4504,20 @@ mod tests {
         let cfg = adapter.get_config_json().await.expect("config ok");
         assert_eq!(cfg["DevMode"], serde_json::json!(true));
         assert_eq!(cfg["GenesisID"], serde_json::json!("testnet-v1.0"));
-        assert_eq!(cfg["EnableDeveloperAPI"], serde_json::json!(false));
+        // Dev mode enables the developer API (teal/compile, dryrun), mirroring
+        // go-algorand's devmode networks shipping `EnableDeveloperAPI: true`.
+        assert_eq!(cfg["EnableDeveloperAPI"], serde_json::json!(true));
         assert!(cfg.get("Version").is_some());
+    }
+
+    /// A non-dev node keeps the developer API disabled (config default is
+    /// `false`; the config-file layer that could flip it is PLAN-43).
+    #[tokio::test]
+    async fn get_config_json_dev_api_off_without_dev_mode() {
+        let adapter = adapter_with_pool();
+        let cfg = adapter.get_config_json().await.expect("config ok");
+        assert_eq!(cfg["DevMode"], serde_json::json!(false));
+        assert_eq!(cfg["EnableDeveloperAPI"], serde_json::json!(false));
     }
 
     /// `latest_round_for_catchup` tracks the ledger's current round.
