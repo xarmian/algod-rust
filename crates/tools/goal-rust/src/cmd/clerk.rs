@@ -263,8 +263,16 @@ fn run_send_inner(
         }
         s
     } else if want_wallet_sign {
-        // Wallet path: kmd-sign the txn body. `sign_with_kmd` returns the
-        // msgpack-encoded SignedTxn, so decode it back to apply --msig-params.
+        // Wallet path: kmd-sign the txn body, then decode the returned SignedTxn
+        // so we can (a) apply the rekey AuthAddr and (b) attach --msig-params.
+        //
+        // With `-S/--signer` (the rekey case) kmd must sign with the *signer's*
+        // key, not the sender's, so pass `signer.0` as the requested key —
+        // mirroring Go's `SignTransactionWithWalletAndSigner` (clerk.go:244) and
+        // the same call `run_sign_inner` makes. Using `sign_with_kmd` here would
+        // force kmd to infer the sender key (`[0u8; 32]`), which for a rekeyed
+        // account either fails (sender key not in the wallet) or emits a
+        // signature by the *old* sender that won't verify against the AuthAddr.
         let kmd = pipeline.kmd().ok_or("no kmd client configured")?;
         let mut accounts = AccountsList::load(&data_dir_path);
         let (handle, _wallet_name, password) = resolve_wallet_and_init(
@@ -274,21 +282,26 @@ fn run_send_inner(
             wallet.as_deref(),
             args.password.as_deref(),
         )?;
-        let encoded = rt
-            .block_on(pipeline.sign_with_kmd(&handle, &password, &txn))
+        let signer_pk: [u8; 32] = auth_addr.map(|a| a.0).unwrap_or([0u8; 32]);
+        let encoded = algo_codec::canonical_encode_transaction(&txn);
+        let signed = rt
+            .block_on(kmd.sign_transaction(&handle, &password, encoded, signer_pk))
             .map_err(|e| {
                 format!(
-                    "Couldn't sign tx with kmd: {e} (for multisig accounts, write tx to file and \
-                     sign manually)"
+                    "Couldn't sign tx with kmd: {} (for multisig accounts, write tx to file and \
+                     sign manually)",
+                    kmd_msg(&e)
                 )
             })?;
-        let mut decoded = decode_signed_txn_stream(&encoded)
+        let mut decoded = decode_signed_txn_stream(&signed.signed_transaction)
             .map_err(|e| format!("kmd returned an undecodable signed transaction: {e}"))?;
         let mut s = decoded
             .pop()
             .ok_or("kmd returned an empty signed transaction")?;
-        // Apply the rekey signer AuthAddr if kmd signed with a different key
-        // (mirrors `createSignedTransaction(.., authAddr)`, clerk.go:498).
+        // The kmd-rust server signs with the requested key but leaves `sgnr`
+        // unset (TASK-216), so set the AuthAddr here when `--signer` differs
+        // from the sender (mirrors `createSignedTransaction(.., authAddr)`,
+        // clerk.go:498, and `Transaction.Sign`, transaction.go:271-274).
         if auth_addr.is_some() {
             s.auth_addr = auth_addr;
         }

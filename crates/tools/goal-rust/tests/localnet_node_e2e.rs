@@ -1237,6 +1237,116 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
         "recipient balance should grow by >= {mp_amt} via clerk send --msig-params (before={mp_before}, after={mp_after})"
     );
 
+    // 6i. clerk send -S/--signer → the rekeyed-to-single-key sender path
+    //     (TASK-295, clerk.go:450-461,498). Create two fresh wallet accounts
+    //     (sender + signer), fund the sender, rekey the sender to the signer's
+    //     key, then broadcast a spend with `clerk send -f <sender> -S <signer>`:
+    //     kmd must sign with the *signer's* key (not the sender's) and the txn
+    //     must carry AuthAddr=<signer>. The node accepting + committing the spend
+    //     proves the signer-aware kmd call signs with the right key (a plain
+    //     sender-key signature would fail verification against the rekeyed
+    //     authorizer).
+    let rk2_sender = mk_acct("signer-sender");
+    let rk2_signer = mk_acct("signer-key");
+    let rk2_fund = assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                "3000000",
+                "-f",
+                DEV_ADDR,
+                "-t",
+                &rk2_sender,
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
+        ),
+        "fund rekey-to-key sender",
+        &node,
+    );
+    assert!(
+        rk2_fund.contains("committed in round"),
+        "rekey-to-key sender funding should confirm; got:\n{rk2_fund}"
+    );
+    // Rekey the sender to the signer's spending key.
+    let rk2_out = assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                "0",
+                "-f",
+                &rk2_sender,
+                "-t",
+                &rk2_sender,
+                "--rekey-to",
+                &rk2_signer,
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
+        ),
+        "rekey sender to signer key",
+        &node,
+    );
+    assert!(
+        rk2_out.contains("committed in round"),
+        "rekey-to-key should confirm; got:\n{rk2_out}"
+    );
+    let sgn_before = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (before -S spend)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+    // Spend FROM the rekeyed sender, signed by the new signer key via -S.
+    let sgn_amt: u64 = 400_000;
+    let sgn_out = assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                &sgn_amt.to_string(),
+                "-f",
+                &rk2_sender,
+                "-t",
+                FEE_SINK,
+                "-S",
+                &rk2_signer,
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
+        ),
+        "clerk send -S (rekeyed sender, signer key)",
+        &node,
+    );
+    assert!(
+        sgn_out.contains("committed in round"),
+        "clerk send -S rekeyed spend should confirm; got:\n{sgn_out}"
+    );
+    let sgn_after = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (after -S spend)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+    assert!(
+        sgn_after >= sgn_before + sgn_amt,
+        "recipient balance should grow by >= {sgn_amt} via clerk send -S (before={sgn_before}, after={sgn_after})"
+    );
+
     // 7. addpartkey, then changeonlinestatus --online → status flips back. Going
     //    online needs a participation key registered for the account.
     assert_cli_ok(
