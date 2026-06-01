@@ -1483,7 +1483,10 @@ fn run_multisig_sign_inner(
     for stxn in stxns.iter_mut() {
         let new_msig = if args.no_sig {
             // Populate a blank multisig preimage looked up from the wallet's
-            // multisig account (LookupMultisigAccount → msigInfoToMsig).
+            // multisig account by the txn SENDER (Go's `addSigCmd`:
+            // `LookupMultisigAccount(wh, stxn.Txn.Sender.String())` →
+            // msigInfoToMsig, multisig.go:113-119). Go looks up by sender, not
+            // AuthAddr, even for a rekeyed sender — we match that verbatim.
             let sender = stxn.txn.sender.to_algorand_string();
             let exp = rt
                 .block_on(kmd.export_multisig(&handle, &sender))
@@ -1499,7 +1502,14 @@ fn run_multisig_sign_inner(
             let partial = to_kmd_msig(stxn.msig.as_ref());
             // AuthAddr: zero when unset (Go passes stxn.AuthAddr.GetUserAddress()
             // only when non-zero; the kmd-rust client takes a 32-byte key with
-            // all-zero meaning "none").
+            // all-zero meaning "none"). This is the rekey signer override Go
+            // forwards via `MultisigSignTransactionWithWalletAndSigner`
+            // (multisig.go:124). NOTE: like go-algorand's kmd, the *fresh*
+            // (no partial) sign path looks up the preimage by the txn sender,
+            // not AuthAddr (sqlite.go:1188) — so first-signing a rekeyed-to-
+            // multisig txn requires the txn to already carry the blank msig
+            // preimage (e.g. via a prior `multisig sign --no-sig`). This
+            // matches `goal multisig sign`; it is not a goal-rust-only limit.
             let auth_addr = stxn.auth_addr.map(|a| a.0).unwrap_or([0u8; 32]);
             let resp = rt
                 .block_on(kmd.multisig_sign_transaction(
