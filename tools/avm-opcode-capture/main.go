@@ -58,8 +58,6 @@ package main
 
 import (
 	"bufio"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
@@ -321,17 +319,21 @@ func generate() []Vector {
 	// data must be sha512_256(message) (32 bytes). Mirrors crypto_test.go.
 	// =======================================================================
 	{
-		dr := newDetRand(0x736563703235366b) // "secp256k"
-		key, err := ecdsa.GenerateKey(secp256k1.S256(), dr)
-		if err != nil {
-			panic(fmt.Sprintf("secp256k1 keygen: %v", err))
-		}
-		x := key.PublicKey.X.FillBytes(make([]byte, 32))
-		y := key.PublicKey.Y.FillBytes(make([]byte, 32))
-		sk := key.D.FillBytes(make([]byte, 32))
+		// Fixed 32-byte private scalar -> deterministic key + RFC6979
+		// signature. We do NOT use ecdsa.GenerateKey here: modern Go's
+		// GenerateKey mixes in crypto/rand for blinding even when handed a
+		// deterministic reader, so it is not reproducible. Deriving the
+		// pubkey via ScalarBaseMult and signing via secp256k1.Sign (RFC6979,
+		// deterministic) keeps the captured vector byte-stable run to run.
+		var sk [32]byte
+		copy(sk[:], []byte("avm-opcode-capture/secp256k1-key"))
+		curve := secp256k1.S256()
+		px, py := curve.ScalarBaseMult(sk[:])
+		x := px.FillBytes(make([]byte, 32))
+		y := py.FillBytes(make([]byte, 32))
 
 		msg := sha512.Sum512_256([]byte("testdata"))
-		sign, err := secp256k1.Sign(msg[:], sk)
+		sign, err := secp256k1.Sign(msg[:], sk[:])
 		if err != nil {
 			panic(fmt.Sprintf("secp256k1 sign: %v", err))
 		}
@@ -370,21 +372,28 @@ func generate() []Vector {
 	// ecdsa_verify Secp256r1 (0x05, curve 1, v7+). Stack: data, R, S, X, Y.
 	// =======================================================================
 	{
-		dr := newDetRand(0x736563703235367201 & 0x7fffffffffffffff) // secp256r1 seed
-		key, err := ecdsa.GenerateKey(elliptic.P256(), dr)
-		if err != nil {
-			panic(fmt.Sprintf("secp256r1 keygen: %v", err))
-		}
-		x := key.PublicKey.X.FillBytes(make([]byte, 32))
-		y := key.PublicKey.Y.FillBytes(make([]byte, 32))
-
-		msg := sha512.Sum512_256([]byte("testdata"))
-		ri, si, err := ecdsa.Sign(dr, key, msg[:])
-		if err != nil {
-			panic(fmt.Sprintf("secp256r1 sign: %v", err))
-		}
-		r := ri.FillBytes(make([]byte, 32))
-		s := si.FillBytes(make([]byte, 32))
+		// Modern Go's ecdsa.GenerateKey/Sign are intentionally
+		// non-deterministic (they mix in crypto/rand for blinding even with a
+		// deterministic reader), so we cannot regenerate a P-256 key+signature
+		// reproducibly at runtime. Instead we embed an authentic,
+		// go-produced (X, Y, R, S) over sha512_256("testdata"), captured once
+		// from `crypto/ecdsa` using a fixed private scalar
+		// ("avm-opcode-capture/secp256r1-key" reduced mod N). The runtime
+		// eval below RE-VERIFIES this signature through go's opEcdsaVerify, so
+		// a stale/incorrect constant would surface as pass=false here and a
+		// replay mismatch — i.e. the constants are checked, not trusted.
+		xHex := "4862227ae813aba1b5eb1481b08fa0b3f8d3fec9a35e31f997397d4f87dd45df"
+		yHex := "a2681e878625fa1e9375f7a90ea70171939ff4660a56426c6401319fd5df28e5"
+		rHexC := "af68083e4d09ed721b67db3c2823942559c1a29b1178dbbcf148f3647408915a"
+		sHexC := "b6463ea21b152286c5dcaec9672f2a747efadb911289038aeb18e0a4451c9bd2"
+		xb, _ := hex.DecodeString(xHex)
+		yb, _ := hex.DecodeString(yHex)
+		rb, _ := hex.DecodeString(rHexC)
+		sb, _ := hex.DecodeString(sHexC)
+		x := xb
+		y := yb
+		r := rb
+		s := sb
 
 		source := func(dataStr, rHex string) string {
 			return fmt.Sprintf("byte \"%s\"; sha512_256; byte 0x%s; byte 0x%s; byte 0x%s; byte 0x%s; ecdsa_verify Secp256r1",
@@ -513,16 +522,69 @@ func enforcePin(allowUnpinned bool) error {
 	if err != nil {
 		return err
 	}
+	// 1. Tag pin.
 	cmd := exec.Command("git", "-C", dir, "describe", "--tags", "--exact-match")
 	tagOut, tagErr := cmd.Output()
-	if tagErr == nil {
-		tag := strings.TrimSpace(string(tagOut))
-		if tag != expectedGoAlgorandPin {
-			return fmt.Errorf("go-algorand at %s is on tag %q, expected %q (use --allow-unpinned to override)", dir, tag, expectedGoAlgorandPin)
-		}
-		return nil
+	if tagErr != nil {
+		return fmt.Errorf("go-algorand at %s is not on tag %q (git describe --exact-match failed: %v); use --allow-unpinned to override", dir, expectedGoAlgorandPin, tagErr)
 	}
-	return fmt.Errorf("go-algorand at %s is not on tag %q (git describe --exact-match failed: %v); use --allow-unpinned to override", dir, expectedGoAlgorandPin, tagErr)
+	if tag := strings.TrimSpace(string(tagOut)); tag != expectedGoAlgorandPin {
+		return fmt.Errorf("go-algorand at %s is on tag %q, expected %q (use --allow-unpinned to override)", dir, tag, expectedGoAlgorandPin)
+	}
+
+	// 2. Clean working tree under the paths whose contents determine the
+	//    captured vectors. Local edits to logic eval / crypto / consensus
+	//    params would change generated output while still passing the tag
+	//    pin, silently breaking the deterministic ground-truth guarantee.
+	statusOut, err := exec.Command("git", "-C", dir, "status", "--porcelain").Output()
+	if err != nil {
+		return fmt.Errorf("checking %s working tree: %w", dir, err)
+	}
+	guarded := []string{
+		"data/transactions/logic/",
+		"crypto/",
+		"config/",
+		"protocol/",
+	}
+	if dirty := dirtyGuardedPaths(string(statusOut), guarded); len(dirty) > 0 {
+		return fmt.Errorf(
+			"go-algorand at %s has uncommitted changes touching paths that determine "+
+				"captured vectors:\n%s\nClean the tree or pass --allow-unpinned.",
+			dir, strings.Join(dirty, "\n"),
+		)
+	}
+	return nil
+}
+
+// dirtyGuardedPaths returns the `git status --porcelain` lines whose source
+// or destination path lies under any guarded prefix. Renames/copies are
+// emitted as `XY <old> -> <new>`, so both sides are inspected: a file moved
+// into a guarded directory changes that tree just as an in-place edit does.
+// The leading two status columns are stripped (offset 3) without trimming the
+// whole line first — porcelain v1 can begin with a literal space.
+func dirtyGuardedPaths(porcelain string, prefixes []string) []string {
+	var dirty []string
+	for _, line := range strings.Split(strings.TrimRight(porcelain, "\n"), "\n") {
+		if len(line) < 4 {
+			continue
+		}
+		body := strings.TrimSpace(line[3:])
+		candidates := []string{body}
+		if idx := strings.Index(body, " -> "); idx >= 0 {
+			candidates = []string{strings.TrimSpace(body[:idx]), strings.TrimSpace(body[idx+4:])}
+		}
+	candidateLoop:
+		for _, c := range candidates {
+			p := strings.Trim(c, "\"")
+			for _, pre := range prefixes {
+				if strings.HasPrefix(p, pre) {
+					dirty = append(dirty, line)
+					break candidateLoop
+				}
+			}
+		}
+	}
+	return dirty
 }
 
 func main() {
