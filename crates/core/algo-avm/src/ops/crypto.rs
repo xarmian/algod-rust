@@ -471,7 +471,12 @@ pub fn op_json_ref(machine: &mut AvmMachine, instruction: &Instruction) -> Resul
 // ---------------------------------------------------------------------------
 
 /// `ed25519verify` (0x04): pop pubkey (32 bytes), signature (64 bytes), data (bytes).
-/// Domain separation: verify `SHA-512/256("ProgData" || program_hash || data)`.
+/// Domain separation: ed25519-verify over the raw bytes `"ProgData" || program_hash || data`.
+/// This matches go-algorand `opEd25519Verify` (`data/transactions/logic/crypto.go:192`) →
+/// `SignatureVerifier.Verify` (`crypto/curve25519.go:240`) → `ed25519Verify(pk, HashRep(msg), sig)`,
+/// where `HashRep` (`crypto/util.go:38`) only CONCATENATES `hashid || data` (no extra hash); the
+/// `Msg.ToBeHashed` hashid is `"ProgData"` and the data is `program_hash || data`
+/// (`crypto.go:163-164`). Only ed25519's own internal SHA-512 applies.
 /// Push 1 if verified, 0 otherwise. Cost: 1900 (static, charged by dispatch).
 pub fn op_ed25519verify(
     machine: &mut AvmMachine,
@@ -489,15 +494,15 @@ pub fn op_ed25519verify(
         return Err(avm_err("invalid signature"));
     }
 
-    // Domain separation: SHA-512/256("ProgData" || program_hash || data)
+    // Domain separation: ed25519-verify over the RAW bytes "ProgData" || program_hash || data
+    // (HashRep concatenation only; no SHA-512/256 prehash — go-algorand crypto/util.go:38).
     let program_hash = ctx.program_hash();
     let mut msg_bytes = Vec::with_capacity(8 + 32 + data.len());
     msg_bytes.extend_from_slice(b"ProgData");
     msg_bytes.extend_from_slice(&program_hash);
     msg_bytes.extend_from_slice(&data);
-    let msg_hash: [u8; 32] = Sha512_256::digest(&msg_bytes).into();
 
-    let result = ed25519_verify_raw(&pubkey_bytes, &sig_bytes, &msg_hash);
+    let result = ed25519_verify_raw(&pubkey_bytes, &sig_bytes, &msg_bytes);
     machine.push(AvmValue::Uint64(if result { 1 } else { 0 }))
 }
 
@@ -1701,6 +1706,17 @@ mod tests {
     // ed25519verify tests (with domain separation)
     // -----------------------------------------------------------------------
 
+    /// go-faithful payload: ed25519 verifies over the RAW bytes
+    /// "ProgData" || program_hash || data (HashRep concatenation, no prehash).
+    /// Matches go-algorand crypto.go:163-164 (Msg.ToBeHashed) + util.go:38 (HashRep).
+    fn ed25519_progdata_msg(program_hash: &[u8; 32], data: &[u8]) -> Vec<u8> {
+        let mut msg_bytes = Vec::new();
+        msg_bytes.extend_from_slice(b"ProgData");
+        msg_bytes.extend_from_slice(program_hash);
+        msg_bytes.extend_from_slice(data);
+        msg_bytes
+    }
+
     #[test]
     fn test_ed25519verify_valid() {
         use ed25519_dalek::{Signer, SigningKey};
@@ -1708,17 +1724,14 @@ mod tests {
         // The program hash that our context will return.
         let program_hash = [7u8; 32];
 
-        // Build the domain-separated message: SHA-512/256("ProgData" || program_hash || data)
+        // Sign the RAW go-style payload "ProgData" || program_hash || data
+        // (NOT a SHA-512/256 prehash of it). This is what go-algorand verifies.
         let data = b"hello ed25519verify";
-        let mut msg_bytes = Vec::new();
-        msg_bytes.extend_from_slice(b"ProgData");
-        msg_bytes.extend_from_slice(&program_hash);
-        msg_bytes.extend_from_slice(data);
-        let msg_hash: [u8; 32] = Sha512_256::digest(&msg_bytes).into();
+        let msg_bytes = ed25519_progdata_msg(&program_hash, data);
 
         let sk = SigningKey::from_bytes(&[99u8; 32]);
         let pk = sk.verifying_key();
-        let sig = sk.sign(&msg_hash);
+        let sig = sk.sign(&msg_bytes);
 
         let mut code = Vec::new();
         pushbytes(&mut code, data);
@@ -1732,7 +1745,7 @@ mod tests {
         let m = run_prog_with_ctx(3, &code, &mut ctx).unwrap();
         assert!(
             m.pass,
-            "ed25519verify should pass for valid domain-separated signature"
+            "ed25519verify should pass for valid go-faithful raw-payload signature"
         );
     }
 
@@ -1745,15 +1758,11 @@ mod tests {
         let wrong_hash = [8u8; 32];
 
         let data = b"test data";
-        let mut msg_bytes = Vec::new();
-        msg_bytes.extend_from_slice(b"ProgData");
-        msg_bytes.extend_from_slice(&wrong_hash); // use wrong hash
-        msg_bytes.extend_from_slice(data);
-        let msg_hash: [u8; 32] = Sha512_256::digest(&msg_bytes).into();
+        let msg_bytes = ed25519_progdata_msg(&wrong_hash, data);
 
         let sk = SigningKey::from_bytes(&[99u8; 32]);
         let pk = sk.verifying_key();
-        let sig = sk.sign(&msg_hash);
+        let sig = sk.sign(&msg_bytes);
 
         let mut code = Vec::new();
         pushbytes(&mut code, data);
@@ -1769,6 +1778,78 @@ mod tests {
         assert!(
             !m.pass,
             "ed25519verify should reject when program hash doesn't match"
+        );
+    }
+
+    #[test]
+    fn test_ed25519verify_wrong_key_rejects() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let program_hash = [7u8; 32];
+        let data = b"hello ed25519verify";
+        let msg_bytes = ed25519_progdata_msg(&program_hash, data);
+
+        // Sign with one key, present a different (valid) pubkey on the stack.
+        let signing_key = SigningKey::from_bytes(&[99u8; 32]);
+        let other_pk = SigningKey::from_bytes(&[42u8; 32]).verifying_key();
+        let sig = signing_key.sign(&msg_bytes);
+
+        let mut code = Vec::new();
+        pushbytes(&mut code, data);
+        pushbytes(&mut code, &sig.to_bytes());
+        pushbytes(&mut code, other_pk.as_bytes());
+        code.push(0x04);
+        code.push(0x43);
+
+        let mut ctx = Ed25519TestContext { program_hash };
+        let m = run_prog_with_ctx(3, &code, &mut ctx).unwrap();
+        assert!(
+            !m.pass,
+            "ed25519verify should reject a signature from a different key"
+        );
+    }
+
+    /// Go-parity regression: a signature produced over the SHA-512/256 prehash of the
+    /// ProgData payload (the OLD, buggy behavior) MUST now be REJECTED, while a signature
+    /// over the RAW ProgData payload (the go-faithful behavior) MUST be ACCEPTED. This pins
+    /// the BT-294 fix and prevents reintroducing the extra prehash. The raw payload here is
+    /// byte-identical to go-algorand's HashRep(logic.Msg{ProgramHash, Data}) — the same bytes
+    /// that crypto.SignatureSecrets.Sign signs over (curve25519.go:240, util.go:38).
+    #[test]
+    fn test_ed25519verify_go_parity_raw_not_prehashed() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let program_hash = [7u8; 32];
+        let data = b"go-parity payload";
+        let raw_msg = ed25519_progdata_msg(&program_hash, data);
+        let prehashed: [u8; 32] = Sha512_256::digest(&raw_msg).into();
+
+        let sk = SigningKey::from_bytes(&[123u8; 32]);
+        let pk = sk.verifying_key();
+        let sig_raw = sk.sign(&raw_msg);
+        let sig_prehashed = sk.sign(&prehashed);
+
+        let build = |sig: &[u8]| {
+            let mut code = Vec::new();
+            pushbytes(&mut code, data);
+            pushbytes(&mut code, sig);
+            pushbytes(&mut code, pk.as_bytes());
+            code.push(0x04);
+            code.push(0x43);
+            code
+        };
+
+        // Go-faithful raw-payload signature is accepted.
+        let mut ctx = Ed25519TestContext { program_hash };
+        let m = run_prog_with_ctx(3, &build(&sig_raw.to_bytes()), &mut ctx).unwrap();
+        assert!(m.pass, "raw ProgData-payload signature must be accepted");
+
+        // Old prehash-based signature is now rejected.
+        let mut ctx = Ed25519TestContext { program_hash };
+        let m = run_prog_with_ctx(3, &build(&sig_prehashed.to_bytes()), &mut ctx).unwrap();
+        assert!(
+            !m.pass,
+            "SHA-512/256-prehashed signature (old buggy behavior) must be rejected"
         );
     }
 
