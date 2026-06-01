@@ -4612,9 +4612,28 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn restore_snapshot(&mut self, snapshot: String) {
+        // `ROLLBACK TO SAVEPOINT` reverts the changes made since the savepoint
+        // but does NOT remove the savepoint from the transaction stack — the
+        // savepoint (and, when it is the outermost one with no enclosing
+        // BEGIN, the implicit transaction SQLite opened for it) stays active.
+        // We must also `RELEASE` it. For the outermost savepoint the RELEASE
+        // commits the now-empty (already rolled-back) implicit transaction and
+        // closes it; for a savepoint nested inside an explicit BEGIN (the
+        // block-apply path) the RELEASE merely pops it off the stack, leaving
+        // the enclosing transaction open and the rolled-back state intact.
+        //
+        // Without the RELEASE the simulate path (which calls `snapshot`
+        // directly, with no surrounding BEGIN) leaves a lingering open
+        // transaction, so the next write fails with "cannot start a
+        // transaction within a transaction" (BT-298). go-algorand's simulator
+        // (ledger/simulation/simulator.go) evaluates against an eval snapshot
+        // and never mutates the real ledger; this keeps the SQLite ledger
+        // exactly as simulate found it, with no open transaction left behind.
         self.conn
-            .execute_batch(&format!("ROLLBACK TO SAVEPOINT {snapshot}"))
-            .expect("rollback to savepoint");
+            .execute_batch(&format!(
+                "ROLLBACK TO SAVEPOINT {snapshot}; RELEASE SAVEPOINT {snapshot};"
+            ))
+            .expect("rollback to and release savepoint");
     }
 
     // ---- Min balance ----
@@ -5801,6 +5820,48 @@ mod tests {
         ledger.restore_snapshot(sp);
         assert_eq!(ledger.get_account(&addr).unwrap().micro_algos, 1000);
 
+        ledger.commit_block().unwrap();
+    }
+
+    #[test]
+    fn simulate_snapshot_does_not_leak_open_txn() {
+        // BT-298 regression: the simulate path takes a `snapshot` directly on
+        // the ledger (with NO enclosing `begin_block`), evaluates, then
+        // `restore_snapshot`s. A top-level SAVEPOINT opens an implicit SQLite
+        // transaction; `ROLLBACK TO SAVEPOINT` alone leaves it open, so the
+        // NEXT write (`begin_block` → `BEGIN IMMEDIATE`) failed with "cannot
+        // start a transaction within a transaction". `restore_snapshot` must
+        // also RELEASE the savepoint so the implicit transaction closes.
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+
+        let addr = Address([3u8; 32]);
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 2000,
+                ..Default::default()
+            },
+        );
+
+        // Simulate-style snapshot/restore with no surrounding block txn.
+        let sp = ledger.snapshot(&[addr]);
+        ledger.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 1,
+                ..Default::default()
+            },
+        );
+        ledger.restore_snapshot(sp);
+
+        // State was rolled back...
+        assert_eq!(ledger.get_account(&addr).unwrap().micro_algos, 2000);
+
+        // ...and no open transaction lingers, so a subsequent write (the
+        // "submit") succeeds rather than erroring with a nested-transaction.
+        ledger
+            .begin_block()
+            .expect("begin_block after simulate must succeed (no lingering txn)");
         ledger.commit_block().unwrap();
     }
 
