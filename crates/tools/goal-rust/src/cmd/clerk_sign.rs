@@ -122,7 +122,7 @@ pub fn lsig_from_args(
 
 /// Render assembler errors the way `assembleFileImpl` surfaces them
 /// (clerk.go:998-1001): the file name followed by the joined error messages.
-fn format_assembly_errors(fname: &str, errs: &[algo_avm::assembler::AssemblyError]) -> String {
+pub fn format_assembly_errors(fname: &str, errs: &[algo_avm::assembler::AssemblyError]) -> String {
     let joined = errs
         .iter()
         .map(|e| e.to_string())

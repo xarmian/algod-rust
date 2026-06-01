@@ -1,17 +1,15 @@
 //! `goal clerk` — port of `../go-algorand/cmd/goal/clerk.go` (+ `multisig.go`,
 //! `tealsign.go`).
 //!
-//! `send` plus the offline txn-file utilities (`inspect` / `split` / `group`)
-//! and `rawsend` are implemented; the remaining leaves (compile / dryrun* /
-//! multisig / sign / simulate / tealsign) are still stubbed pending their own
-//! follow-ups.
+//! The full `clerk` group is implemented: `send`, the offline txn-file
+//! utilities (`inspect` / `split` / `group`), `rawsend`, `sign`, `tealsign`,
+//! `compile`, `dryrun` / `dryrun-remote`, `simulate`, and the `multisig`
+//! subcommands (`sign` / `signprogram` / `merge`).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
-
-use crate::unimplemented;
 
 #[derive(Subcommand, Debug)]
 // `Send` carries the full payment flag surface (many `Option<String>` fields);
@@ -43,7 +41,7 @@ pub enum ClerkCmd {
     Sign(SignArgs),
     /// Simulate a transaction or transaction group with algod's simulate
     /// REST endpoint.
-    Simulate,
+    Simulate(SimulateArgs),
     /// Split a file containing many transactions into one transaction per
     /// file.
     Split(SplitArgs),
@@ -54,11 +52,101 @@ pub enum ClerkCmd {
 #[derive(Subcommand, Debug)]
 pub enum MultisigCmd {
     /// Merge multisig signatures on transactions.
-    Merge,
+    Merge(MultisigMergeArgs),
     /// Add a signature to a multisig transaction.
-    Sign,
+    Sign(MultisigSignArgs),
     /// Add a signature to a multisig LogicSig.
-    Signprogram,
+    Signprogram(MultisigSignProgramArgs),
+}
+
+/// `clerk multisig sign -t <txfile> [-a addr | -n] [-w wallet] [--password]`.
+///
+/// Mirrors Go's `addSigCmd` (multisig.go:75): start or extend a multisig on
+/// every transaction in `--tx`, rewriting the file in place. With `-a/--address`
+/// the kmd wallet signs with that key (auto-detecting the spending key when the
+/// sender was rekeyed); with `-n/--no-sig` it only populates the blank multisig
+/// preimage looked up from the wallet's multisig account (no signature).
+/// `--address` and `--no-sig` are mutually exclusive (one is required).
+#[derive(Args, Debug)]
+pub struct MultisigSignArgs {
+    /// Partially-signed transaction file to add a signature to
+    /// (Go `-t/--tx`). Required; rewritten in place.
+    #[arg(short = 't', long = "tx")]
+    pub tx: PathBuf,
+    /// Address of the key to sign with (Go `-a/--address`). Mutually exclusive
+    /// with `--no-sig`.
+    #[arg(short = 'a', long = "address")]
+    pub address: Option<String>,
+    /// Fill in the multisig field with public keys and threshold information,
+    /// but don't produce a signature (Go `-n/--no-sig`). Mutually exclusive
+    /// with `--address`.
+    #[arg(short = 'n', long = "no-sig")]
+    pub no_sig: bool,
+    /// Wallet password (skip the prompt). goal-rust convention shared with the
+    /// other clerk leaves.
+    #[arg(long = "password")]
+    pub password: Option<String>,
+}
+
+/// `clerk multisig signprogram -a <addr> [-p prog | -P progbytes | -L lsig]
+/// [-A msig-addr] [-o lsig-out] [--legacy-msig] [-w wallet] [--password]`.
+///
+/// Mirrors Go's `signProgramCmd` (multisig.go:144): start or extend a multisig
+/// on a LogicSig program and write the (partial) LogicSig blob. The program
+/// comes from a TEAL source (`-p/--program`), raw bytes (`-P/--program-bytes`),
+/// or a partial LogicSig file (`-L/--lsig`); the partial multisig comes from the
+/// LogicSig file (when `-L`) or is looked up from `-A/--msig-address`.
+#[derive(Args, Debug)]
+pub struct MultisigSignProgramArgs {
+    /// Program source to be compiled and signed (Go `-p/--program`). Mutually
+    /// exclusive with `--program-bytes`/`--lsig`.
+    #[arg(short = 'p', long = "program")]
+    pub program: Option<String>,
+    /// Program binary to be signed (Go `-P/--program-bytes`). Mutually
+    /// exclusive with `--program`/`--lsig`.
+    #[arg(short = 'P', long = "program-bytes")]
+    pub program_bytes: Option<String>,
+    /// Partial LogicSig file (msgpack) to add a signature to (Go `-L/--lsig`).
+    /// Mutually exclusive with `--program`/`--program-bytes`.
+    #[arg(short = 'L', long = "lsig")]
+    pub lsig: Option<String>,
+    /// Address of the key to sign with (Go `-a/--address`). Required.
+    #[arg(short = 'a', long = "address")]
+    pub address: String,
+    /// Multisig address that the signing address is part of
+    /// (Go `-A/--msig-address`). Required when a partial LogicSig isn't
+    /// available (i.e. when not using `-L`).
+    #[arg(short = 'A', long = "msig-address")]
+    pub msig_address: Option<String>,
+    /// File to write the partial LogicSig to (Go `-o/--lsig-out`). Defaults to
+    /// `<program>.lsig` for source/bytes input, or the `-L` file itself.
+    #[arg(short = 'o', long = "lsig-out")]
+    pub lsig_out: Option<String>,
+    /// Use legacy multisig (`Msig`) rather than the LogicSig multisig field
+    /// (`LMsig`). When unset, auto-detected from the node's consensus params
+    /// (Go `--legacy-msig`).
+    #[arg(long = "legacy-msig")]
+    pub legacy_msig: bool,
+    /// Wallet password (skip the prompt). goal-rust convention shared with the
+    /// other clerk leaves.
+    #[arg(long = "password")]
+    pub password: Option<String>,
+}
+
+/// `clerk multisig merge -o <out> <file1> <file2> ...`.
+///
+/// Mirrors Go's `mergeSigCmd` (multisig.go:259): combine multiple
+/// partially-signed multisig transaction files (same txn IDs, same order) into
+/// one file with merged multisig signatures.
+#[derive(Args, Debug)]
+pub struct MultisigMergeArgs {
+    /// Output file for the merged transactions (Go `-o/--out`). Required.
+    #[arg(short = 'o', long = "out")]
+    pub out: PathBuf,
+    /// Input transaction files to merge (Go's positional args). At least one
+    /// required.
+    #[arg(value_name = "FILE")]
+    pub files: Vec<PathBuf>,
 }
 
 /// `clerk send` — send money from one account to another.
@@ -196,6 +284,78 @@ pub struct RawsendArgs {
     /// Don't wait for transactions to commit (Go `-N/--no-wait`).
     #[arg(short = 'N', long = "no-wait")]
     pub no_wait: bool,
+}
+
+/// `clerk simulate (-t <txfile> | --request <file>) [--request-only-out <file>
+/// | -o <file>] [--round N] [--allow-empty-signatures] [--allow-more-logging]
+/// [--allow-more-opcode-budget | --extra-opcode-budget N]
+/// [--allow-unnamed-resources] [--trace | --full-trace] [--stack] [--scratch]
+/// [--state]`.
+///
+/// Mirrors Go's `simulateCmd` (clerk.go:1300). Builds a `SimulateRequest` from
+/// a transaction-group file (`--txfile`) or an already-built request file
+/// (`--request`) and POSTs it to `/v2/transactions/simulate`, pretty-printing
+/// the JSON response (or writing it to `-o`). With `--request-only-out` it only
+/// writes the constructed request and exits without simulating.
+#[derive(Args, Debug)]
+pub struct SimulateArgs {
+    /// Transaction or transaction-group file to simulate (Go `-t/--txfile`).
+    /// Mutually exclusive with `--request`; exactly one is required.
+    #[arg(short = 't', long = "txfile")]
+    pub txfile: Option<PathBuf>,
+    /// Pre-built simulate request object (JSON) to run (Go `--request`).
+    /// Mutually exclusive with `--txfile`; exactly one is required.
+    #[arg(long = "request")]
+    pub request: Option<PathBuf>,
+    /// Write the constructed simulate request to this file and exit without
+    /// simulating (Go `--request-only-out`). Mutually exclusive with
+    /// `--request` and `-o/--result-out`.
+    #[arg(long = "request-only-out")]
+    pub request_only_out: Option<PathBuf>,
+    /// Filename for writing the simulation result; defaults to stdout
+    /// (Go `-o/--result-out`). Mutually exclusive with `--request-only-out`.
+    #[arg(short = 'o', long = "result-out")]
+    pub result_out: Option<PathBuf>,
+    /// Round after which the simulation takes place; latest round if unset
+    /// (Go `--round`).
+    #[arg(long = "round")]
+    pub round: Option<u64>,
+    /// Allow transactions without signatures to be simulated as if correctly
+    /// signed (Go `--allow-empty-signatures`).
+    #[arg(long = "allow-empty-signatures")]
+    pub allow_empty_signatures: bool,
+    /// Lift the limits on the `log` opcode during simulation
+    /// (Go `--allow-more-logging`).
+    #[arg(long = "allow-more-logging")]
+    pub allow_more_logging: bool,
+    /// Apply the maximum extra opcode budget per group (Go
+    /// `--allow-more-opcode-budget`). Mutually exclusive with
+    /// `--extra-opcode-budget`.
+    #[arg(long = "allow-more-opcode-budget")]
+    pub allow_more_opcode_budget: bool,
+    /// Apply this extra opcode budget per group (Go `--extra-opcode-budget`).
+    /// Mutually exclusive with `--allow-more-opcode-budget`.
+    #[arg(long = "extra-opcode-budget")]
+    pub extra_opcode_budget: Option<i64>,
+    /// Allow access to unnamed resources during simulation
+    /// (Go `--allow-unnamed-resources`).
+    #[arg(long = "allow-unnamed-resources")]
+    pub allow_unnamed_resources: bool,
+    /// Enable all execution-trace options (Go `--full-trace`).
+    #[arg(long = "full-trace")]
+    pub full_trace: bool,
+    /// Enable an execution trace of app calls (Go `--trace`).
+    #[arg(long = "trace")]
+    pub trace: bool,
+    /// Report stack changes during simulation (Go `--stack`).
+    #[arg(long = "stack")]
+    pub stack: bool,
+    /// Report scratch changes during simulation (Go `--scratch`).
+    #[arg(long = "scratch")]
+    pub scratch: bool,
+    /// Report application state changes during simulation (Go `--state`).
+    #[arg(long = "state")]
+    pub state: bool,
 }
 
 /// `clerk sign -i <in> -o <out> [-S signer] [-p prog | -L lsig] [--argb64 ...]
@@ -393,49 +553,31 @@ pub struct DryrunRemoteArgs {
 pub fn run(cmd: ClerkCmd, wallet: Option<String>) -> ExitCode {
     use crate::cli_state::{datadirs, kmddir};
 
-    let leaf: &str = match cmd {
-        ClerkCmd::Send(args) => {
-            return crate::cmd::clerk::run_send(args, wallet, datadirs(), kmddir());
-        }
-        ClerkCmd::Inspect(args) => {
-            return crate::cmd::clerk::run_inspect(args);
-        }
-        ClerkCmd::Split(args) => {
-            return crate::cmd::clerk::run_split(args);
-        }
-        ClerkCmd::Group(args) => {
-            return crate::cmd::clerk::run_group(args);
-        }
-        ClerkCmd::Rawsend(args) => {
-            return crate::cmd::clerk::run_rawsend(args, datadirs());
-        }
-        ClerkCmd::Compile(args) => {
-            return crate::cmd::clerk::run_compile(args, datadirs());
-        }
-        ClerkCmd::Dryrun(args) => {
-            return crate::cmd::clerk::run_dryrun(args, datadirs());
-        }
-        ClerkCmd::DryrunRemote(args) => {
-            return crate::cmd::clerk::run_dryrun_remote(args, datadirs());
-        }
+    match cmd {
+        ClerkCmd::Send(args) => crate::cmd::clerk::run_send(args, wallet, datadirs(), kmddir()),
+        ClerkCmd::Inspect(args) => crate::cmd::clerk::run_inspect(args),
+        ClerkCmd::Split(args) => crate::cmd::clerk::run_split(args),
+        ClerkCmd::Group(args) => crate::cmd::clerk::run_group(args),
+        ClerkCmd::Rawsend(args) => crate::cmd::clerk::run_rawsend(args, datadirs()),
+        ClerkCmd::Compile(args) => crate::cmd::clerk::run_compile(args, datadirs()),
+        ClerkCmd::Dryrun(args) => crate::cmd::clerk::run_dryrun(args, datadirs()),
+        ClerkCmd::DryrunRemote(args) => crate::cmd::clerk::run_dryrun_remote(args, datadirs()),
         ClerkCmd::Multisig { cmd } => {
             let Some(cmd) = cmd else {
                 return crate::print_group_help(&["clerk", "multisig"]);
             };
-            let leaf = match cmd {
-                MultisigCmd::Merge => "merge",
-                MultisigCmd::Sign => "sign",
-                MultisigCmd::Signprogram => "signprogram",
-            };
-            return unimplemented("clerk multisig", leaf);
+            match cmd {
+                MultisigCmd::Sign(args) => {
+                    crate::cmd::clerk::run_multisig_sign(args, wallet, datadirs(), kmddir())
+                }
+                MultisigCmd::Signprogram(args) => {
+                    crate::cmd::clerk::run_multisig_signprogram(args, wallet, datadirs(), kmddir())
+                }
+                MultisigCmd::Merge(args) => crate::cmd::clerk::run_multisig_merge(args),
+            }
         }
-        ClerkCmd::Sign(args) => {
-            return crate::cmd::clerk::run_sign(args, wallet, datadirs(), kmddir());
-        }
-        ClerkCmd::Tealsign(args) => {
-            return crate::cmd::clerk::run_tealsign(args);
-        }
-        ClerkCmd::Simulate => "simulate",
-    };
-    unimplemented("clerk", leaf)
+        ClerkCmd::Sign(args) => crate::cmd::clerk::run_sign(args, wallet, datadirs(), kmddir()),
+        ClerkCmd::Tealsign(args) => crate::cmd::clerk::run_tealsign(args),
+        ClerkCmd::Simulate(args) => crate::cmd::clerk::run_simulate(args, datadirs()),
+    }
 }

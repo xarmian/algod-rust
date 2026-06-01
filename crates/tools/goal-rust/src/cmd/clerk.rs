@@ -36,7 +36,8 @@ use crate::accounts_list::AccountsList;
 use crate::cmd::clerk_sign;
 use crate::data_dir;
 use crate::groups::clerk::{
-    GroupArgs, InspectArgs, RawsendArgs, SendArgs, SignArgs, SplitArgs, TealsignArgs,
+    GroupArgs, InspectArgs, MultisigMergeArgs, MultisigSignArgs, MultisigSignProgramArgs,
+    RawsendArgs, SendArgs, SignArgs, SimulateArgs, SplitArgs, TealsignArgs,
 };
 
 /// Typical protocol `MaxTxnLife` (rounds). The consensus-param table isn't
@@ -1235,6 +1236,549 @@ fn json_printable(raw: &[u8]) -> bool {
     })
 }
 
+// ---- clerk simulate -------------------------------------------------------
+
+/// `clerk simulate (-t <txfile> | --request <file>) [--request-only-out <file>
+/// | -o <file>] [flags]`.
+///
+/// Mirrors Go's `simulateCmd` (clerk.go:1300). Builds a `SimulateRequest` from a
+/// transaction-group file (`--txfile`) or runs a pre-built request file
+/// (`--request`), POSTs it to `POST /v2/transactions/simulate`, and prints the
+/// pretty-printed JSON response (or writes it to `-o`). `--request-only-out`
+/// writes the constructed request JSON and exits without simulating.
+///
+/// **Note vs Go:** Go encodes the request as msgpack and round-trips the
+/// response through `protocol.EncodeJSON`. goal-rust sends JSON (the Rust node
+/// decodes either; JSON avoids msgpack-roundtrip quirks for embedded txn bytes)
+/// and pretty-prints the JSON the node returns. The `--request` path therefore
+/// expects a JSON request file (the same JSON `--request-only-out` writes),
+/// rather than Go's msgpack request blob.
+pub fn run_simulate(args: SimulateArgs, cli_d: Vec<PathBuf>) -> ExitCode {
+    match run_simulate_inner(args, cli_d) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_simulate_inner(args: SimulateArgs, cli_d: Vec<PathBuf>) -> Result<(), String> {
+    // Exactly one of --txfile / --request (clerk.go:1306-1309).
+    let tx_provided = args.txfile.is_some();
+    let request_provided = args.request.is_some();
+    if tx_provided == request_provided {
+        return Err("exactly one of --txfile or --request must be provided".into());
+    }
+
+    // --allow-more-opcode-budget and --extra-opcode-budget are mutually
+    // exclusive (clerk.go:1311-1314).
+    if args.allow_more_opcode_budget && args.extra_opcode_budget.is_some() {
+        return Err(
+            "--allow-extra-opcode-budget and --extra-opcode-budget are mutually exclusive".into(),
+        );
+    }
+    // Go's `simulation.MaxExtraOpcodeBudget` (320000).
+    const MAX_EXTRA_OPCODE_BUDGET: i64 = 320_000;
+    let extra_opcode_budget = if args.allow_more_opcode_budget {
+        Some(MAX_EXTRA_OPCODE_BUDGET)
+    } else {
+        args.extra_opcode_budget
+    };
+
+    // --request-only-out and --result-out are mutually exclusive
+    // (clerk.go:1320-1323).
+    if args.request_only_out.is_some() && args.result_out.is_some() {
+        return Err("--request-only-out and --result-out are mutually exclusive".into());
+    }
+
+    // --request-only-out: build a request from --txfile and write it, no
+    // simulation (clerk.go:1325-1351).
+    if let Some(out) = args.request_only_out.as_ref() {
+        if request_provided {
+            return Err("--request-only-out and --request are mutually exclusive".into());
+        }
+        let txfile = args
+            .txfile
+            .as_ref()
+            .ok_or("--request-only-out requires --txfile")?;
+        let request = build_simulate_request(txfile, &args, extra_opcode_budget)?;
+        let json = serde_json::to_vec(&request)
+            .map_err(|e| format!("could not encode simulate request: {e}"))?;
+        write_file_0600(out, &json)?;
+        return Ok(());
+    }
+
+    let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
+    let algod = build_algod_client_for_dir(&data_dir_path)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Error processing command: {e}"))?;
+
+    // Request body: build from --txfile, or read the pre-built --request JSON.
+    let request_json = if let Some(txfile) = args.txfile.as_ref() {
+        let request = build_simulate_request(txfile, &args, extra_opcode_budget)?;
+        serde_json::to_vec(&request)
+            .map_err(|e| format!("could not encode simulate request: {e}"))?
+    } else {
+        let path = args.request.as_ref().expect("request set");
+        std::fs::read(path).map_err(|e| format!("Cannot read file {}: {e}", path.display()))?
+    };
+
+    let resp = rt
+        .block_on(algod.simulate_transactions(&request_json))
+        .map_err(|e| format!("simulation error: {e}"))?;
+
+    // Go prints `protocol.EncodeJSON(&simulateResponse)` (compact, no trailing
+    // newline) to stdout, or writes it to -o. We pretty-print to stdout for
+    // readability and write compact JSON to -o.
+    if let Some(out) = args.result_out.as_ref() {
+        let encoded =
+            serde_json::to_vec(&resp).map_err(|e| format!("could not encode result: {e}"))?;
+        write_file_0600(out, &encoded)?;
+    } else {
+        let pretty = serde_json::to_string_pretty(&resp)
+            .map_err(|e| format!("could not encode result: {e}"))?;
+        println!("{pretty}");
+    }
+    Ok(())
+}
+
+/// Build the JSON `SimulateRequest` body from a transaction-group file plus the
+/// command flags. Mirrors Go's `PreEncodedSimulateRequest` construction
+/// (clerk.go:1333-1371): one group containing the file's `SignedTxn`s, with the
+/// request-level flags. Each txn is JSON-encoded the way the Rust node decodes
+/// them (`serde_json::from_value::<SignedTransaction>`), the same convention the
+/// dryrun-dump path uses.
+fn build_simulate_request(
+    txfile: &Path,
+    args: &SimulateArgs,
+    extra_opcode_budget: Option<i64>,
+) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+
+    let data =
+        std::fs::read(txfile).map_err(|e| format!("Cannot read file {}: {e}", txfile.display()))?;
+    let stxns = decode_signed_txn_stream(&data)
+        .map_err(|e| format!("Cannot decode transactions from {}: {e}", txfile.display()))?;
+
+    let mut txns_json = Vec::with_capacity(stxns.len());
+    for stxn in &stxns {
+        txns_json.push(
+            serde_json::to_value(stxn)
+                .map_err(|e| format!("Cannot encode transaction for simulate: {e}"))?,
+        );
+    }
+
+    // exec-trace-config (traceCmdOptionToSimulateTraceConfigModel, clerk.go:1417):
+    // --full-trace turns everything on; --trace/--stack/--scratch/--state OR in.
+    let enable = args.full_trace || args.trace;
+    let stack = args.full_trace || args.stack;
+    let scratch = args.full_trace || args.scratch;
+    let state = args.full_trace || args.state;
+    let mut trace_config = serde_json::Map::new();
+    if enable {
+        trace_config.insert("enable".into(), json!(true));
+    }
+    if stack {
+        trace_config.insert("stack-change".into(), json!(true));
+    }
+    if scratch {
+        trace_config.insert("scratch-change".into(), json!(true));
+    }
+    if state {
+        trace_config.insert("state-change".into(), json!(true));
+    }
+
+    let mut request = serde_json::Map::new();
+    request.insert(
+        "txn-groups".into(),
+        json!([{ "txns": serde_json::Value::Array(txns_json) }]),
+    );
+    if let Some(round) = args.round {
+        request.insert("round".into(), json!(round));
+    }
+    if args.allow_empty_signatures {
+        request.insert("allow-empty-signatures".into(), json!(true));
+    }
+    if args.allow_more_logging {
+        request.insert("allow-more-logging".into(), json!(true));
+    }
+    if args.allow_unnamed_resources {
+        request.insert("allow-unnamed-resources".into(), json!(true));
+    }
+    if let Some(budget) = extra_opcode_budget {
+        request.insert("extra-opcode-budget".into(), json!(budget));
+    }
+    if !trace_config.is_empty() {
+        request.insert(
+            "exec-trace-config".into(),
+            serde_json::Value::Object(trace_config),
+        );
+    }
+
+    Ok(serde_json::Value::Object(request))
+}
+
+// ---- clerk multisig sign --------------------------------------------------
+
+/// `clerk multisig sign -t <txfile> [-a addr | -n] [-w wallet] [--password]`.
+///
+/// Mirrors Go's `addSigCmd` (multisig.go:75): for each `SignedTxn` in `--tx`,
+/// start or extend its multisig (rewriting the file in place). With `-n/--no-sig`
+/// it only populates the blank multisig preimage looked up from the wallet's
+/// multisig account; otherwise it signs with the `-a/--address` key via kmd
+/// (passing the txn's AuthAddr when the sender was rekeyed).
+pub fn run_multisig_sign(
+    args: MultisigSignArgs,
+    wallet: Option<String>,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    match run_multisig_sign_inner(args, wallet, cli_d, kmd_dir_flag) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_multisig_sign_inner(
+    args: MultisigSignArgs,
+    wallet: Option<String>,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> Result<(), String> {
+    let data = std::fs::read(&args.tx)
+        .map_err(|e| format!("Cannot read file {}: {e}", args.tx.display()))?;
+    let mut stxns = decode_signed_txn_stream(&data)
+        .map_err(|e| format!("Cannot decode transactions from {}: {e}", args.tx.display()))?;
+
+    // --address and --no-sig are mutually exclusive; exactly one is required
+    // (multisig.go:88-93, `addrNoSigError`).
+    let addr_msg = "must specify exactly one of --address or --no-sig";
+    match (args.address.as_deref(), args.no_sig) {
+        (None, false) | (Some(_), true) => return Err(addr_msg.into()),
+        _ => {}
+    }
+
+    let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
+    let kmd = build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref())?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Error processing command: {e}"))?;
+    let mut accounts = AccountsList::load(&data_dir_path);
+    let (handle, _wallet_name, password) = resolve_wallet_and_init(
+        &rt,
+        &kmd,
+        &mut accounts,
+        wallet.as_deref(),
+        args.password.as_deref(),
+    )?;
+
+    let mut out_data = Vec::new();
+    for stxn in stxns.iter_mut() {
+        let new_msig = if args.no_sig {
+            // Populate a blank multisig preimage looked up from the wallet's
+            // multisig account (LookupMultisigAccount → msigInfoToMsig).
+            let sender = stxn.txn.sender.to_algorand_string();
+            let exp = rt
+                .block_on(kmd.export_multisig(&handle, &sender))
+                .map_err(|e| format!("multisig lookup error: {}", kmd_msg(&e)))?;
+            algo_consensus_crypto::multisig_preimage_from_pks(exp.version, exp.threshold, &exp.pks)
+        } else {
+            // Sign with the -a/--address key via kmd.
+            let addr_str = args.address.as_deref().expect("address set");
+            let signer = Address::from_algorand_string(addr_str)
+                .map_err(|e| format!("Cannot decode address {addr_str}: {e}"))?;
+            let encoded = algo_codec::canonical_encode_transaction(&stxn.txn);
+            // Partial multisig already on the txn (blank if first signer).
+            let partial = to_kmd_msig(stxn.msig.as_ref());
+            // AuthAddr: zero when unset (Go passes stxn.AuthAddr.GetUserAddress()
+            // only when non-zero; the kmd-rust client takes a 32-byte key with
+            // all-zero meaning "none").
+            let auth_addr = stxn.auth_addr.map(|a| a.0).unwrap_or([0u8; 32]);
+            let resp = rt
+                .block_on(kmd.multisig_sign_transaction(
+                    &handle, &password, encoded, signer.0, partial, auth_addr,
+                ))
+                .map_err(|e| format!("Couldn't sign tx with kmd: {}", kmd_msg(&e)))?;
+            algo_codec::decode_multisig(&resp.multisig)
+                .map_err(|e| format!("kmd returned an undecodable multisig: {e}"))?
+        };
+
+        stxn.msig = Some(new_msig);
+        out_data.extend_from_slice(&canonical_encode_signed_transaction(stxn));
+    }
+
+    write_file_0600(&args.tx, &out_data)?;
+    Ok(())
+}
+
+// ---- clerk multisig signprogram -------------------------------------------
+
+/// `clerk multisig signprogram -a <addr> [-p prog | -P progbytes | -L lsig]
+/// [-A msig-addr] [-o lsig-out] [--legacy-msig] [-w wallet] [--password]`.
+///
+/// Mirrors Go's `signProgramCmd` (multisig.go:144): start or extend a multisig
+/// on a LogicSig program and write the (partial) LogicSig blob. The partial
+/// multisig comes from the `-L` LogicSig file (its `Msig`/`LMsig`) or is looked
+/// up from `-A/--msig-address`. Whether the signature lands in `Msig` (legacy)
+/// or `LMsig` is `--legacy-msig`, auto-detected from the node's consensus
+/// params (`LogicSigLMsig`) when the flag is unset.
+pub fn run_multisig_signprogram(
+    args: MultisigSignProgramArgs,
+    wallet: Option<String>,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> ExitCode {
+    match run_multisig_signprogram_inner(args, wallet, cli_d, kmd_dir_flag) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_multisig_signprogram_inner(
+    args: MultisigSignProgramArgs,
+    wallet: Option<String>,
+    cli_d: Vec<PathBuf>,
+    kmd_dir_flag: Option<PathBuf>,
+) -> Result<(), String> {
+    use algo_types::LogicSig;
+
+    let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
+    let kmd = build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref())?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Error processing command: {e}"))?;
+    let mut accounts = AccountsList::load(&data_dir_path);
+    let (handle, _wallet_name, password) = resolve_wallet_and_init(
+        &rt,
+        &kmd,
+        &mut accounts,
+        wallet.as_deref(),
+        args.password.as_deref(),
+    )?;
+
+    // Resolve the program + base LogicSig from -p / -P / -L (multisig.go:151-217).
+    let collision = "goal multisig signprogram should have at most one of --program/-p, \
+                     --program-bytes/-P, or --lsig/-L";
+    let mut lsig = LogicSig::default();
+    let mut out_name = args.lsig_out.clone();
+    let mut got_partial = false;
+    let program: Vec<u8>;
+
+    if let Some(src) = args.program.as_deref() {
+        if args.lsig.is_some() || args.program_bytes.is_some() {
+            return Err(collision.into());
+        }
+        let text = std::fs::read_to_string(src).map_err(|e| format!("{src}: {e}"))?;
+        let ops = algo_avm::assembler::assemble_string(&text)
+            .map_err(|errs| clerk_sign::format_assembly_errors(src, &errs))?;
+        program = ops.program;
+        lsig.logic = serde_bytes::ByteBuf::from(program.clone());
+        if out_name.is_none() {
+            out_name = Some(format!("{src}.lsig"));
+        }
+    } else if let Some(file) = args.lsig.as_deref() {
+        if args.program_bytes.is_some() {
+            return Err(collision.into());
+        }
+        let bytes = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
+        lsig = algo_codec::decode_logicsig(&bytes).map_err(|e| format!("{file}: {e}"))?;
+        program = lsig.logic.to_vec();
+        if out_name.is_none() {
+            out_name = Some(file.to_string());
+        }
+        got_partial = true;
+    } else if let Some(file) = args.program_bytes.as_deref() {
+        let bytes = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
+        program = bytes;
+        lsig.logic = serde_bytes::ByteBuf::from(program.clone());
+        if out_name.is_none() {
+            out_name = Some(format!("{file}.lsig"));
+        }
+    } else {
+        return Err("one of --program/-p, --program-bytes/-P, or --lsig/-L is required".into());
+    }
+
+    // Auto-detect useLegacyMsig from the node's consensus params when the flag
+    // wasn't set (multisig.go:219-226). When set, take it verbatim.
+    // clap can't tell "flag absent" from "--legacy-msig=false", so we mirror
+    // Go's default (auto-detect) whenever the value is the false default.
+    // Go auto-detects from SuggestedParams' consensus params (`LogicSigLMsig`)
+    // when `--legacy-msig` is unset. The Rust node's suggested-params response
+    // does not currently surface `LogicSigLMsig`, so goal-rust defaults to the
+    // modern LMsig path (useLegacyMsig=false), which matches current consensus
+    // (v >= the LMsig-enabling version). Pass `--legacy-msig` to force the
+    // legacy `Msig` field.
+    let use_legacy_msig = args.legacy_msig;
+
+    // Get or create the partial multisig (multisig.go:228-251).
+    let partial: algo_types::MultisigSig = if got_partial {
+        if use_legacy_msig {
+            if lsig.lmsig.as_ref().is_some_and(|m| !m.subsigs.is_empty()) {
+                return Err(
+                    "LogicSig file contains LMsig field, but --legacy-msig=true is set, \
+                            which uses Msig. Specify --legacy-msig=false to use LMsig, or provide \
+                            a LogicSig file with Msig field"
+                        .into(),
+                );
+            }
+            lsig.msig.clone().unwrap_or_default()
+        } else {
+            if lsig.msig.as_ref().is_some_and(|m| !m.subsigs.is_empty()) {
+                return Err(
+                    "LogicSig file contains Msig field, but --legacy-msig=false is set, \
+                            which uses LMsig. Specify --legacy-msig=true to use Msig, or provide \
+                            a LogicSig file with LMsig field"
+                        .into(),
+                );
+            }
+            lsig.lmsig.clone().unwrap_or_default()
+        }
+    } else {
+        let msig_addr = args
+            .msig_address
+            .as_deref()
+            .ok_or("--msig-address/-A required when partial LogicSig not available")?;
+        let exp = rt
+            .block_on(kmd.export_multisig(&handle, msig_addr))
+            .map_err(|e| format!("multisig lookup error: {}", kmd_msg(&e)))?;
+        algo_consensus_crypto::multisig_preimage_from_pks(exp.version, exp.threshold, &exp.pks)
+    };
+
+    // Sign the program via kmd (multisig.go:253-256).
+    let signer = Address::from_algorand_string(&args.address)
+        .map_err(|e| format!("Cannot decode address {}: {e}", args.address))?;
+    let resp = rt
+        .block_on(kmd.multisig_sign_program(
+            &handle,
+            &password,
+            &args.address,
+            signer.0,
+            to_kmd_msig(Some(&partial)),
+            program,
+            use_legacy_msig,
+        ))
+        .map_err(|e| format!("Couldn't sign program with kmd: {}", kmd_msg(&e)))?;
+    let msig = algo_codec::decode_multisig(&resp.multisig)
+        .map_err(|e| format!("kmd returned an undecodable multisig: {e}"))?;
+
+    if use_legacy_msig {
+        lsig.msig = Some(msig);
+        lsig.lmsig = None;
+    } else {
+        lsig.msig = None;
+        lsig.lmsig = Some(msig);
+    }
+
+    let out_name = out_name.expect("out_name set by one of the program branches");
+    let blob = algo_codec::canonical_encode_logicsig(&lsig);
+    write_file_0600(Path::new(&out_name), &blob)?;
+    Ok(())
+}
+
+// ---- clerk multisig merge -------------------------------------------------
+
+/// `clerk multisig merge -o <out> <file1> <file2> ...`.
+///
+/// Mirrors Go's `mergeSigCmd` (multisig.go:259): combine partially-signed
+/// multisig transaction files (same txn IDs in the same order) into one file
+/// with merged multisig signatures.
+pub fn run_multisig_merge(args: MultisigMergeArgs) -> ExitCode {
+    match run_multisig_merge_inner(args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_multisig_merge_inner(args: MultisigMergeArgs) -> Result<(), String> {
+    if args.files.is_empty() {
+        return Err("must specify at least one transaction file to merge".into());
+    }
+
+    // Decode each input file into its list of SignedTxns (multisig.go:264-289).
+    let mut txn_lists: Vec<Vec<SignedTransaction>> = Vec::with_capacity(args.files.len());
+    for file in &args.files {
+        let data =
+            std::fs::read(file).map_err(|e| format!("Cannot read file {}: {e}", file.display()))?;
+        let txns = decode_signed_txn_stream(&data)
+            .map_err(|e| format!("Cannot decode transactions from {}: {e}", file.display()))?;
+        txn_lists.push(txns);
+    }
+
+    // All lists must be the same length (multisig.go:291-296).
+    let len0 = txn_lists[0].len();
+    for list in &txn_lists {
+        if list.len() != len0 {
+            return Err("transaction files do not have the same number of transactions".into());
+        }
+    }
+
+    // For each txn position, merge the multisigs across all files
+    // (multisig.go:298-318). Equality is by TxID.
+    let mut merged_data = Vec::new();
+    for i in 0..len0 {
+        let base_id = compute_txn_id(&txn_lists[0][i].txn);
+        // Collect the partial msig from each file's i-th txn.
+        let mut partials: Vec<algo_types::MultisigSig> = Vec::with_capacity(txn_lists.len());
+        for list in &txn_lists {
+            if compute_txn_id(&list[i].txn) != base_id {
+                return Err("transactions don't match up; cannot merge".into());
+            }
+            partials.push(list[i].msig.clone().unwrap_or_default());
+        }
+
+        // multisig_assemble requires >= 2 partials; a single input file
+        // self-merges (matching Go's tx0-with-tx0 first iteration).
+        if partials.len() == 1 {
+            partials.push(partials[0].clone());
+        }
+        let merged = algo_consensus_crypto::multisig_assemble(&partials)
+            .map_err(|e| format!("Cannot merge multisig signatures: {e}"))?;
+
+        let mut tx = txn_lists[0][i].clone();
+        tx.msig = Some(merged);
+        merged_data.extend_from_slice(&canonical_encode_signed_transaction(&tx));
+    }
+
+    write_file_0600(&args.out, &merged_data)?;
+    Ok(())
+}
+
+/// Convert an `algo_types::MultisigSig` (txn/codec model) into the kmd client's
+/// `MultisigSig` request type. A `None`/blank input yields kmd's default
+/// (`MultisigSig::default()`), which kmd treats as "no partial multisig yet".
+fn to_kmd_msig(msig: Option<&algo_types::MultisigSig>) -> algo_kmd_api_types::common::MultisigSig {
+    use algo_kmd_api_types::common::{MultisigSig as KmdMsig, MultisigSubsig as KmdSubsig};
+    match msig {
+        None => KmdMsig::default(),
+        Some(m) => KmdMsig {
+            version: m.version,
+            threshold: m.threshold,
+            subsigs: m
+                .subsigs
+                .iter()
+                .map(|s| KmdSubsig {
+                    public_key: s.public_key,
+                    signature: s.signature,
+                })
+                .collect(),
+        },
+    }
+}
+
 /// Write `data` to `path` with `0600` perms, mirroring Go's `writeFile(..,
 /// 0600)` (commands.go:510) used by the signing + dryrun-dump paths. As in Go,
 /// the path `-` (`stdoutFilenameValue`) writes to stdout instead of a file.
@@ -2163,5 +2707,108 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].txn.amount, 1);
         assert_eq!(decoded[1].txn.amount, 2);
+    }
+
+    fn simulate_args() -> SimulateArgs {
+        SimulateArgs {
+            txfile: None,
+            request: None,
+            request_only_out: None,
+            result_out: None,
+            round: None,
+            allow_empty_signatures: false,
+            allow_more_logging: false,
+            allow_more_opcode_budget: false,
+            extra_opcode_budget: None,
+            allow_unnamed_resources: false,
+            full_trace: false,
+            trace: false,
+            stack: false,
+            scratch: false,
+            state: false,
+        }
+    }
+
+    #[test]
+    fn build_simulate_request_wraps_txns_in_one_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let txfile = dir.path().join("group.txn");
+        let a = unsigned(sample_payment(1, [2u8; 32]));
+        let b = unsigned(sample_payment(2, [3u8; 32]));
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&canonical_encode_signed_transaction(&a));
+        buf.extend_from_slice(&canonical_encode_signed_transaction(&b));
+        std::fs::write(&txfile, &buf).unwrap();
+
+        let args = simulate_args();
+        let req = build_simulate_request(&txfile, &args, None).expect("build request");
+        let groups = req["txn-groups"].as_array().expect("txn-groups array");
+        assert_eq!(groups.len(), 1);
+        let txns = groups[0]["txns"].as_array().expect("txns array");
+        assert_eq!(txns.len(), 2);
+        // No optional flags ⇒ those keys are omitted (matches Go's omitempty).
+        assert!(req.get("round").is_none());
+        assert!(req.get("allow-empty-signatures").is_none());
+        assert!(req.get("exec-trace-config").is_none());
+    }
+
+    #[test]
+    fn build_simulate_request_sets_flags_and_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let txfile = dir.path().join("one.txn");
+        std::fs::write(
+            &txfile,
+            canonical_encode_signed_transaction(&unsigned(sample_payment(1, [2u8; 32]))),
+        )
+        .unwrap();
+
+        let mut args = simulate_args();
+        args.round = Some(7);
+        args.allow_empty_signatures = true;
+        args.allow_more_logging = true;
+        args.allow_unnamed_resources = true;
+        // --full-trace turns on enable + stack + scratch + state.
+        args.full_trace = true;
+
+        let req = build_simulate_request(&txfile, &args, Some(123)).expect("build request");
+        assert_eq!(req["round"], 7);
+        assert_eq!(req["allow-empty-signatures"], true);
+        assert_eq!(req["allow-more-logging"], true);
+        assert_eq!(req["allow-unnamed-resources"], true);
+        assert_eq!(req["extra-opcode-budget"], 123);
+        let trace = &req["exec-trace-config"];
+        assert_eq!(trace["enable"], true);
+        assert_eq!(trace["stack-change"], true);
+        assert_eq!(trace["scratch-change"], true);
+        assert_eq!(trace["state-change"], true);
+    }
+
+    #[test]
+    fn to_kmd_msig_maps_fields_and_handles_blank() {
+        assert_eq!(
+            to_kmd_msig(None),
+            algo_kmd_api_types::common::MultisigSig::default()
+        );
+
+        let msig = algo_types::MultisigSig {
+            version: 1,
+            threshold: 2,
+            subsigs: vec![
+                algo_types::MultisigSubsig {
+                    public_key: [7u8; 32],
+                    signature: [0u8; 64],
+                },
+                algo_types::MultisigSubsig {
+                    public_key: [8u8; 32],
+                    signature: [9u8; 64],
+                },
+            ],
+        };
+        let kmd = to_kmd_msig(Some(&msig));
+        assert_eq!(kmd.version, 1);
+        assert_eq!(kmd.threshold, 2);
+        assert_eq!(kmd.subsigs.len(), 2);
+        assert_eq!(kmd.subsigs[0].public_key, [7u8; 32]);
+        assert_eq!(kmd.subsigs[1].signature, [9u8; 64]);
     }
 }

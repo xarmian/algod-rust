@@ -23,7 +23,7 @@ pub use digest::{
 };
 
 use algo_error::{AlgoError, Result};
-use algo_types::{Block, BlockResponse, LogicSig, SignedTransaction};
+use algo_types::{Block, BlockResponse, LogicSig, MultisigSig, SignedTransaction};
 
 /// Decode a single msgpack-encoded `LogicSig`, as produced by `goal clerk
 /// compile -s` (a `protocol.Encode(&LogicSig)` blob). Mirrors `lsigFromArgs`'s
@@ -32,6 +32,16 @@ pub fn decode_logicsig(bytes: &[u8]) -> Result<LogicSig> {
     rmp_serde::from_slice(bytes).map_err(|e| AlgoError::Codec {
         source: Box::new(e),
         context: "failed to decode LogicSig from msgpack".into(),
+    })
+}
+
+/// Decode a single msgpack-encoded `MultisigSig`, as returned by kmd's
+/// `multisig/sign` and `multisig/signprogram` endpoints (a `protocol.Encode`d
+/// `crypto.MultisigSig` blob). Mirrors `protocol.Decode(blob, &msig)`.
+pub fn decode_multisig(bytes: &[u8]) -> Result<MultisigSig> {
+    rmp_serde::from_slice(bytes).map_err(|e| AlgoError::Codec {
+        source: Box::new(e),
+        context: "failed to decode MultisigSig from msgpack".into(),
     })
 }
 
