@@ -2845,6 +2845,131 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // TASK-299: BT-294 prehash-bug-class regression guards.
+    //
+    // BT-294 found ed25519verify applied an extra SHA-512/256 prehash that
+    // go-algorand does not. This audited the sibling crypto verify opcodes
+    // (ecdsa secp256k1/secp256r1, vrf_verify) for the same class and confirmed
+    // each feeds the RAW program-supplied bytes to the verify primitive (the
+    // primitive's own internal hashing is the only hashing applied), matching
+    // go byte-for-byte:
+    //
+    //   - secp256k1: data/transactions/logic/crypto.go:273-274 calls
+    //     secp256k1.VerifySignature(pubkey, msg, signature); that primitive
+    //     (crypto/secp256k1/secp256.go:132) feeds msg straight to
+    //     secp256k1_ext_ecdsa_verify as the 32-byte digest (no extra hash).
+    //   - secp256r1: data/transactions/logic/crypto.go:284 calls
+    //     ecdsa.Verify(&pubkey, msg, r, s); Go's stdlib ecdsa.Verify treats
+    //     msg as the already-computed digest (no extra hash).
+    //   - vrf_verify: data/transactions/logic/crypto.go:406,431 calls
+    //     pubkey.Verify(proof, rawMessage(data)); rawMessage.ToBeHashed()
+    //     (crypto.go:397-399) returns hashid "" + data, so HashRep
+    //     (crypto/util.go:38-41) is the raw data, fed unchanged to
+    //     crypto_vrf_verify (crypto/vrf.go:129,142-144). The ECVRF's internal
+    //     Elligator2/SHA-512 hashing is the only hashing.
+    //
+    // The existing _valid tests above already prove a signature/proof over the
+    // RAW bytes verifies. These tests add the missing half: a signature/proof
+    // over a SHA-512/256-PREHASHED copy of the bytes must NOT verify, which is
+    // exactly what would regress if a BT-294-style application-level prehash
+    // were (re)introduced.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ecdsa_verify_secp256k1_rejects_app_prehash() {
+        use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+
+        let sk = SigningKey::from_bytes(&[7u8; 32].into()).unwrap();
+        let vk = sk.verifying_key();
+        let data = [0xa1u8; 32];
+
+        let encoded = vk.to_encoded_point(false);
+        let x = encoded.x().unwrap();
+        let y = encoded.y().unwrap();
+
+        // Sanity: a signature over the RAW 32-byte data verifies.
+        let (sig_raw, _) = sk.sign_prehash(&data).unwrap();
+        let raw_bytes = sig_raw.to_bytes();
+        assert!(
+            ecdsa_verify_secp256k1(&data, &raw_bytes[..32], &raw_bytes[32..], x, y),
+            "secp256k1 must verify a signature made over the raw 32-byte data"
+        );
+
+        // A signature over SHA-512/256(data) must NOT verify, because the impl
+        // feeds the raw data (not a prehash of it) to the verify primitive.
+        let prehashed: [u8; 32] = Sha512_256::digest(data).into();
+        let (sig_ph, _) = sk.sign_prehash(&prehashed).unwrap();
+        let ph_bytes = sig_ph.to_bytes();
+        assert!(
+            !ecdsa_verify_secp256k1(&data, &ph_bytes[..32], &ph_bytes[32..], x, y),
+            "secp256k1 must NOT verify a signature made over SHA-512/256(data) \
+             (would indicate an erroneous application-level prehash; BT-294 class)"
+        );
+    }
+
+    #[test]
+    fn test_ecdsa_verify_secp256r1_rejects_app_prehash() {
+        use p256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+
+        let sk = SigningKey::from_bytes(&[7u8; 32].into()).unwrap();
+        let vk = sk.verifying_key();
+        let data = [0xb2u8; 32];
+
+        let encoded = vk.to_encoded_point(false);
+        let x = encoded.x().unwrap();
+        let y = encoded.y().unwrap();
+
+        let (sig_raw, _) = sk.sign_prehash(&data).unwrap();
+        let raw_bytes = sig_raw.to_bytes();
+        assert!(
+            ecdsa_verify_secp256r1(&data, &raw_bytes[..32], &raw_bytes[32..], x, y),
+            "secp256r1 must verify a signature made over the raw 32-byte data"
+        );
+
+        let prehashed: [u8; 32] = Sha512_256::digest(data).into();
+        let (sig_ph, _) = sk.sign_prehash(&prehashed).unwrap();
+        let ph_bytes = sig_ph.to_bytes();
+        assert!(
+            !ecdsa_verify_secp256r1(&data, &ph_bytes[..32], &ph_bytes[32..], x, y),
+            "secp256r1 must NOT verify a signature made over SHA-512/256(data) \
+             (would indicate an erroneous application-level prehash; BT-294 class)"
+        );
+    }
+
+    #[test]
+    fn test_vrf_verify_rejects_app_prehash() {
+        // draft-irtf-cfrg-vrf-03 TV2 (also go-algorand crypto/vrf_test.go):
+        // the proof was generated over the RAW message alpha = 0x72.
+        let pk: [u8; 32] =
+            hex_to_vec("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c")
+                .try_into()
+                .unwrap();
+        let pi: [u8; 80] = hex_to_vec(
+            "ae5b66bdf04b4c010bfe32b2fc126ead2107b697634f6f7337b9bff8785ee111\
+             200095ece87dde4dbe87343f6df3b107d91798c8a7eb1245d3bb9c5aafb093358\
+             c13e6ae1111a55717e895fd15f99f07",
+        )
+        .try_into()
+        .unwrap();
+        let raw_alpha: &[u8] = &[0x72];
+
+        // Raw message verifies against the proof.
+        assert!(
+            super::super::vrf::vrf_verify(&pk, &pi, raw_alpha).is_some(),
+            "vrf_verify must succeed against the raw alpha (0x72)"
+        );
+
+        // SHA-512/256(alpha) must NOT verify against the same proof — the
+        // message is consumed raw (no application-level prehash).
+        let prehashed_alpha: [u8; 32] = Sha512_256::digest(raw_alpha).into();
+        assert!(
+            super::super::vrf::vrf_verify(&pk, &pi, &prehashed_alpha).is_none(),
+            "vrf_verify must NOT succeed against SHA-512/256(alpha) \
+             (would indicate an erroneous application-level prehash; BT-294 class)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // FIX 5: JSON edge-case tests
     // -----------------------------------------------------------------------
 
