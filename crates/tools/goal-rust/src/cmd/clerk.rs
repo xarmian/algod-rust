@@ -1527,8 +1527,13 @@ fn run_multisig_sign_inner(
 /// on a LogicSig program and write the (partial) LogicSig blob. The partial
 /// multisig comes from the `-L` LogicSig file (its `Msig`/`LMsig`) or is looked
 /// up from `-A/--msig-address`. Whether the signature lands in `Msig` (legacy)
-/// or `LMsig` is `--legacy-msig`, auto-detected from the node's consensus
-/// params (`LogicSigLMsig`) when the flag is unset.
+/// or `LMsig` is keyed on `--legacy-msig`.
+///
+/// NOTE vs Go: Go auto-detects `useLegacyMsig` from the node's consensus params
+/// (`!LogicSigLMsig`) when the flag is unset. goal-rust does NOT — the Rust
+/// consensus-param table doesn't model the `LogicSigLMsig` gate — so it defaults
+/// to the modern `LMsig` field; pass `--legacy-msig` for the legacy `Msig`
+/// field (see [`MultisigSignProgramArgs::legacy_msig`]).
 pub fn run_multisig_signprogram(
     args: MultisigSignProgramArgs,
     wallet: Option<String>,
@@ -1609,16 +1614,13 @@ fn run_multisig_signprogram_inner(
         return Err("one of --program/-p, --program-bytes/-P, or --lsig/-L is required".into());
     }
 
-    // Auto-detect useLegacyMsig from the node's consensus params when the flag
-    // wasn't set (multisig.go:219-226). When set, take it verbatim.
-    // clap can't tell "flag absent" from "--legacy-msig=false", so we mirror
-    // Go's default (auto-detect) whenever the value is the false default.
-    // Go auto-detects from SuggestedParams' consensus params (`LogicSigLMsig`)
-    // when `--legacy-msig` is unset. The Rust node's suggested-params response
-    // does not currently surface `LogicSigLMsig`, so goal-rust defaults to the
-    // modern LMsig path (useLegacyMsig=false), which matches current consensus
-    // (v >= the LMsig-enabling version). Pass `--legacy-msig` to force the
-    // legacy `Msig` field.
+    // Go auto-detects `useLegacyMsig` from the node's consensus params
+    // (`!LogicSigLMsig`) when `--legacy-msig` is omitted (multisig.go:219-226).
+    // goal-rust does NOT: the Rust consensus-param table
+    // (`algo_types::ConsensusParams`) doesn't model the `LogicSigLMsig` gate, so
+    // there is nothing to detect client-side. We default to the modern `LMsig`
+    // field (useLegacyMsig=false); `--legacy-msig` forces the legacy `Msig`
+    // field. See the flag's doc-comment for the full rationale.
     let use_legacy_msig = args.legacy_msig;
 
     // Get or create the partial multisig (multisig.go:228-251).

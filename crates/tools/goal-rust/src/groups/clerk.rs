@@ -123,8 +123,15 @@ pub struct MultisigSignProgramArgs {
     #[arg(short = 'o', long = "lsig-out")]
     pub lsig_out: Option<String>,
     /// Use legacy multisig (`Msig`) rather than the LogicSig multisig field
-    /// (`LMsig`). When unset, auto-detected from the node's consensus params
-    /// (Go `--legacy-msig`).
+    /// (`LMsig`) (Go `--legacy-msig`).
+    ///
+    /// NOTE vs Go: Go auto-detects this from the node's consensus params
+    /// (`!LogicSigLMsig`) when the flag is omitted. goal-rust does NOT — the
+    /// Rust consensus-param table (`algo_types::ConsensusParams`) doesn't model
+    /// the `LogicSigLMsig` gate, so there's nothing to detect client-side.
+    /// goal-rust therefore defaults to the modern `LMsig` field; pass
+    /// `--legacy-msig` to force the legacy `Msig` field (required on protocols
+    /// before LMsig was enabled).
     #[arg(long = "legacy-msig")]
     pub legacy_msig: bool,
     /// Wallet password (skip the prompt). goal-rust convention shared with the
