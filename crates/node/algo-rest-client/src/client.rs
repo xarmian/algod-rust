@@ -525,6 +525,35 @@ impl AlgodClient {
             })
     }
 
+    /// `POST /v2/transactions/simulate` — simulate a transaction group and
+    /// return the raw response JSON value. The body is the JSON-encoded
+    /// `model.SimulateRequest` (`txn-groups[].txns` are JSON `SignedTransaction`
+    /// values, which the Rust node decodes via `serde_json::from_value`); we
+    /// always request the JSON response so the CLI can pretty-print it directly.
+    /// A 404 means the node has `EnableDeveloperAPI=false`.
+    ///
+    /// Ported reference:
+    /// `../go-algorand/daemon/algod/api/server/v2/handlers.go`
+    /// (`SimulateTransaction`) and `libgoal.(*Client).SimulateTransactions`
+    /// (libgoal.go:1281). Go encodes the request as msgpack; the Rust node
+    /// accepts either, and JSON keeps the client free of msgpack-roundtrip
+    /// quirks for embedded txn bytes.
+    pub async fn simulate_transactions(&self, request_json: &[u8]) -> Result<serde_json::Value> {
+        let resp = self
+            .post_no_retry(
+                "/v2/transactions/simulate?format=json",
+                "application/json",
+                request_json.to_vec(),
+            )
+            .await?;
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| AlgoError::RestClient {
+                source: Box::new(e),
+                context: "parsing POST /v2/transactions/simulate response".into(),
+            })
+    }
+
     /// `GET /v2/accounts/{addr}` — fetch account info as a raw JSON value, the
     /// `model.Account` shape the dryrun request's `accounts` field expects.
     ///
