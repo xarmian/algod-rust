@@ -310,11 +310,23 @@ fn run_send_inner(
     // --msig-params: the sender was rekeyed to a multisig account. Attach the
     // blank multisig preimage and set the AuthAddr to the derived multisig
     // address (clerk.go:507-543). The output-file guard above ensures `-o` is set.
+    //
+    // The msig preimage *is* the authorization: the multisig signers fill it in
+    // later (`clerk multisig sign`). Any signature attached by the branches above
+    // is meaningless here, so clear it. Go's normal flow is `-o` without `-s`,
+    // where the wallet branch already produced a blank-sig SignedTxn so there is
+    // nothing to clear; this only diverges from Go's *literal* behavior for the
+    // pathological `-o -s --msig-params` combination, where Go leaves the
+    // wallet's top-level `Sig` set alongside `Msig` and emits an unsubmittable
+    // dual-signed txn ("should only have one signature"). Clearing it keeps every
+    // `--msig-params` output a valid single-authorization txn.
     if let Some(params_str) = args.msig_params.as_deref() {
         let pre = clerk_sign::parse_msig_params(params_str)?;
         if pre.address == txn.sender {
             return Err("AuthAddr cannot be the same as the transaction sender".to_string());
         }
+        stx.sig = [0u8; 64];
+        stx.lsig = None;
         stx.msig = Some(pre.msig);
         stx.auth_addr = Some(pre.address);
     }
