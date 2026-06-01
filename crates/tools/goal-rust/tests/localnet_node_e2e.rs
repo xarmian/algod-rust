@@ -918,6 +918,142 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
         "recipient balance should grow by >= {msig_amt} via multisig (before={msig_before}, after={msig_after})"
     );
 
+    // 6g. clerk multisig signprogram → delegate a LogicSig from the 2-of-3
+    //     multisig account: sign the program `int 1` with alice (via
+    //     -A <msig>, producing a partial .lsig) then bob (via -L <partial>,
+    //     reaching threshold). Attach the resulting delegated LogicSig to an
+    //     unsigned spend FROM the msig address with `clerk sign -L`, and rawsend
+    //     to confirm the node accepts the multisig-delegated logicsig
+    //     (TASK-292, multisig.go:144 signProgramCmd). Exercises the msig-address-
+    //     derived kmd signing path.
+    let prog_teal = dd.join("msig-prog.teal");
+    std::fs::write(&prog_teal, "#pragma version 2\nint 1\n").unwrap();
+    let lsig_file = dd.join("msig-prog.lsig");
+
+    // First signer (alice): start the multisig LogicSig from the program source,
+    // looking up the preimage via -A <msig>.
+    assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "multisig",
+                "signprogram",
+                "-p",
+                prog_teal.to_str().unwrap(),
+                "-a",
+                &alice,
+                "-A",
+                &msig_addr,
+                "-o",
+                lsig_file.to_str().unwrap(),
+                // Use the legacy `Msig` delegation field (broadly enabled);
+                // exercises the msig-address-derived kmd signing path.
+                "--legacy-msig",
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
+        ),
+        "clerk multisig signprogram (alice)",
+        &node,
+    );
+    // Second signer (bob): extend the partial LogicSig in place.
+    assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "multisig",
+                "signprogram",
+                "-L",
+                lsig_file.to_str().unwrap(),
+                "-a",
+                &bob,
+                "-o",
+                lsig_file.to_str().unwrap(),
+                "--legacy-msig",
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
+        ),
+        "clerk multisig signprogram (bob)",
+        &node,
+    );
+
+    // Build an unsigned spend FROM the msig (delegating) account, attach the
+    // delegated LogicSig with `clerk sign -L`, and rawsend.
+    let prog_before = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (before logicsig-msig spend)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+    let prog_amt: u64 = 650_000;
+    let prog_unsigned = dd.join("msig-prog-unsigned.tx");
+    let prog_signed = dd.join("msig-prog-signed.tx");
+    assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                &prog_amt.to_string(),
+                "-f",
+                &msig_addr,
+                "-t",
+                FEE_SINK,
+                "-o",
+                prog_unsigned.to_str().unwrap(),
+            ],
+        ),
+        "clerk send -o from msig (unsigned, for logicsig)",
+        &node,
+    );
+    assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "sign",
+                "-i",
+                prog_unsigned.to_str().unwrap(),
+                "-o",
+                prog_signed.to_str().unwrap(),
+                "-L",
+                lsig_file.to_str().unwrap(),
+            ],
+        ),
+        "clerk sign -L (delegated multisig logicsig)",
+        &node,
+    );
+    let prog_rawsend = assert_cli_ok(
+        &goal_rust(
+            dd,
+            &["clerk", "rawsend", "-f", prog_signed.to_str().unwrap()],
+        ),
+        "clerk rawsend (delegated multisig logicsig)",
+        &node,
+    );
+    assert!(
+        prog_rawsend.contains("committed in round"),
+        "delegated multisig logicsig spend should confirm; got:\n{prog_rawsend}"
+    );
+    let prog_after = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (after logicsig-msig spend)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+    assert!(
+        prog_after >= prog_before + prog_amt,
+        "recipient balance should grow by >= {prog_amt} via delegated multisig logicsig (before={prog_before}, after={prog_after})"
+    );
+
     // 7. addpartkey, then changeonlinestatus --online → status flips back. Going
     //    online needs a participation key registered for the account.
     assert_cli_ok(

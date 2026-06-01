@@ -1655,14 +1655,25 @@ fn run_multisig_signprogram_inner(
         algo_consensus_crypto::multisig_preimage_from_pks(exp.version, exp.threshold, &exp.pks)
     };
 
-    // Sign the program via kmd (multisig.go:253-256).
+    // Sign the program via kmd. The kmd `address` is the *multisig* address
+    // (derived from the partial), NOT the signer key — it scopes the preimage
+    // lookup and the modern `"MsigProgram" || addr || program` signing domain.
+    // The signer key is passed only as `public_key`. Mirrors Go's
+    // `MultisigSignProgramWithWallet` (libgoal/transactions.go:152-156:
+    // `MultisigAddrGenWithSubsigs(partial...)` → kmd `address`; signerAddr →
+    // `public_key`).
     let signer = Address::from_algorand_string(&args.address)
         .map_err(|e| format!("Cannot decode address {}: {e}", args.address))?;
+    let pks: Vec<[u8; 32]> = partial.subsigs.iter().map(|s| s.public_key).collect();
+    let msig_address =
+        algo_consensus_crypto::multisig_addr_gen(partial.version, partial.threshold, &pks)
+            .map_err(|e| format!("Cannot derive multisig address from partial: {e}"))?
+            .to_algorand_string();
     let resp = rt
         .block_on(kmd.multisig_sign_program(
             &handle,
             &password,
-            &args.address,
+            &msig_address,
             signer.0,
             to_kmd_msig(Some(&partial)),
             program,
