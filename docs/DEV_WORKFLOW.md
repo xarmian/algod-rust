@@ -372,6 +372,73 @@ semantics — otherwise treat the committed fixtures as golden.
 - go-algorand `data/transactions/logic/crypto.go:128` — `opSHA512`
 - go-algorand `data/transactions/logic/opcodes.go:657-658` — opcode specs
 
+## AVM Opcode Vector Regeneration
+
+Opcode-level conformance vectors for the AVM/TEAL interpreter (TASK-301).
+These exist because the byte-level conformance harness was block-decode /
+state-compare oriented and had **zero** opcode coverage — which is exactly why
+the consensus-critical `ed25519verify` divergence **BT-294** (the Rust op
+SHA-512/256-prehashed the `"ProgData"||H(Program)||data` payload that go does
+not prehash) shipped undetected.
+
+Each vector is a TEAL program + LogicSig args evaluated by go-algorand's
+authoritative `logic.EvalSignatureFull` (the path a node takes to validate a
+LogicSig txn). The Rust replay
+(`crates/tools/algo-conformance/tests/avm_opcode_conformance.rs`) runs the same
+program + args through the Rust AVM and asserts the (errored, pass, final
+stack) result matches go.
+
+### Fixture location
+
+- `crates/tools/algo-conformance/tests/fixtures/avm/vectors.jsonl` — one JSON
+  object per line. Schema + coverage are documented in the sibling
+  `fixtures/avm/README.md`.
+
+Coverage centres on the **crypto-verify** opcodes (where BT-294 lived):
+`ed25519verify`, `ed25519verify_bare`, `ecdsa_verify` (Secp256k1 + Secp256r1),
+`vrf_verify` — each with both a passing and a failing case. The
+`ed25519verify/valid` vector is the BT-294 guard: a go-produced signature over
+the raw `"ProgData"||H||data` payload that the pre-fix Rust op would have
+rejected (verified by temporarily reintroducing the prehash and observing the
+replay fail).
+
+### Regenerating
+
+The capture tool is a standalone Go module at `tools/avm-opcode-capture/`. It
+imports go-algorand's `data/transactions/logic` and `crypto` packages directly
+and generates all signature/key material with a fixed RNG seed, so output is
+deterministic.
+
+```bash
+cd tools/avm-opcode-capture
+go run .
+```
+
+The tool enforces the go-algorand pin (`v4.5.1-stable`) at runtime; override
+with `--allow-unpinned` only for an intentional capture against a different
+checkout. Do not edit `vectors.jsonl` by hand — it is a build artifact.
+
+### Running the replay
+
+```bash
+cargo test -p algo-conformance --test avm_opcode_conformance
+```
+
+### When to regenerate
+
+- go-algorand pin bump touching `data/transactions/logic/crypto.go`,
+  `eval.go`, or `crypto/`.
+- Adding new vectors in `tools/avm-opcode-capture/main.go` — append, don't
+  renumber, so existing `name` identifiers stay stable.
+
+### References
+
+- go-algorand `data/transactions/logic/eval.go:1228` — `EvalSignatureFull`
+- go-algorand `data/transactions/logic/crypto.go:175` — `opEd25519Verify` (BT-294 site)
+- go-algorand `data/transactions/logic/crypto.go:162` — `Msg.ToBeHashed` (`"ProgData"||H||data`)
+- go-algorand `data/transactions/logic/crypto.go:237` — `opEcdsaVerify`
+- go-algorand `data/transactions/logic/crypto.go:401` — `opVrfVerify`
+
 ## VRF Vector Regeneration
 
 Byte-exact VRF parity is the foundation of Phase 6 — Rust's pure-Rust ECVRF

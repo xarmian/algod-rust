@@ -20,3 +20,5 @@ serde_bytes.workspace = true
 
 [dev-dependencies]
 rmp-serde.workspace = true
+algo-avm.workspace = true
+serde.workspace = true
