@@ -80,6 +80,21 @@ pub struct DryrunDebugReceiver {
     pub final_scratch: Option<Vec<AvmValue>>,
 }
 
+/// Returns true if a disassembly line is a label definition (e.g. `label1:`).
+///
+/// The disassembler emits these standalone lines ahead of branch targets, and
+/// go-algorand's line numbering counts them (`disassembleInstrumented` writes
+/// the label line before the opcode's `pcOffset` is recorded — see
+/// `data/transactions/logic/assembler.go`), so they must be skipped when
+/// mapping an instruction index to its source line.
+fn is_label_line(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    // A label line is a single token ending in ':' with no embedded whitespace
+    // (instruction operands always introduce a space before any ':', and no
+    // TEAL opcode mnemonic ends in ':').
+    trimmed.ends_with(':') && !trimmed.contains(char::is_whitespace)
+}
+
 impl DryrunDebugReceiver {
     pub fn new() -> Self {
         Self::default()
@@ -111,22 +126,37 @@ impl DryrunDebugReceiver {
         0
     }
 
-    /// Map a byte offset to a line number in the disassembly.
-    /// Go's dryrun uses the line index from the disassembly, which includes
-    /// the `#pragma version N` line at index 0.
-    fn offset_to_line(&self, offset: usize) -> usize {
-        // The disassembly lines are: "#pragma version N", then one line per
-        // instruction. Line 0 is the pragma, line 1 is the first instruction
-        // (offset = version_byte_size, typically 2 for version >= 2).
-        // We find the instruction index in the program that has this offset
-        // and add 1 for the pragma line.
-        if let Some(ref prog) = self.program {
-            for (i, instr) in prog.instructions.iter().enumerate() {
-                if instr.offset == offset {
-                    // Line = i + 1 (pragma line is 0)
-                    return i + 1;
-                }
+    /// Map an instruction index to a line number in the disassembly.
+    ///
+    /// Mirrors go-algorand's `DebugState.PCToLine`
+    /// (`data/transactions/logic/debugger.go`), which returns
+    /// `len(strings.Split(Disassembly[:offset], "\n")) - 1` where `offset` is
+    /// the character position in the disassembly text at which the instruction's
+    /// disassembled text begins (recorded in `PCOffset` by
+    /// `disassembleInstrumented`). That value is exactly the 0-based index of the
+    /// disassembly line that holds the instruction.
+    ///
+    /// The disassembly is `#pragma version N` (line 0) followed by one line per
+    /// instruction, but branch targets also emit standalone label lines
+    /// (`label1:`) ahead of the instruction they mark. Go's `PCOffset` is
+    /// recorded *after* the label line is written, so those label lines shift
+    /// every subsequent instruction's line number. We therefore walk the
+    /// disassembly and skip the pragma and label lines rather than assume
+    /// `instruction_index + 1`.
+    fn instruction_to_line(&self, instruction_index: usize) -> usize {
+        let mut instr_seen = 0usize;
+        for (line_idx, line) in self.disassembly.iter().enumerate() {
+            if line_idx == 0 {
+                // `#pragma version N`
+                continue;
             }
+            if is_label_line(line) {
+                continue;
+            }
+            if instr_seen == instruction_index {
+                return line_idx;
+            }
+            instr_seen += 1;
         }
         0
     }
@@ -166,8 +196,12 @@ impl EvalTracer for DryrunDebugReceiver {
         scratch: &[AvmValue],
         error: Option<&str>,
     ) {
+        // `pc` here is the instruction index (the AVM `after_opcode` callback
+        // reports instruction-index PCs). The trace's `pc` field carries the
+        // byte offset (matching go's `DebugState.PC = cx.pc`), while the line is
+        // derived from the disassembly so label lines are accounted for.
         let byte_offset = self.instruction_to_offset(pc);
-        let line = self.offset_to_line(byte_offset);
+        let line = self.instruction_to_line(pc);
 
         let stack_vals: Vec<DryrunTealValue> = stack.iter().map(avm_value_to_dryrun).collect();
         let scratch_vals = Self::trim_scratch(scratch);
@@ -2342,6 +2376,79 @@ mod tests {
         let scratch: Vec<AvmValue> = vec![];
         let result = DryrunDebugReceiver::trim_scratch(&scratch);
         assert!(result.is_none(), "empty scratch should return None");
+    }
+
+    #[test]
+    fn test_is_label_line() {
+        assert!(is_label_line("label1:"));
+        assert!(is_label_line("done:"));
+        assert!(is_label_line("main_l3:\n"));
+        // Instructions, the pragma, and operand-bearing lines are not labels.
+        assert!(!is_label_line("#pragma version 10"));
+        assert!(!is_label_line("int 1"));
+        assert!(!is_label_line("bnz done"));
+        assert!(!is_label_line("pop"));
+    }
+
+    #[test]
+    fn test_instruction_to_line_no_labels() {
+        // No branch labels: line == instruction_index + 1 (line 0 is the pragma).
+        let program = assemble_string("#pragma version 10\nint 1\nint 2\npop")
+            .expect("should assemble")
+            .program;
+        let mut tracer = DryrunDebugReceiver::new();
+        tracer.init_program(&program);
+        // Disassembly: ["#pragma version 10", "pushint 1", "pushint 2", "pop"]
+        assert_eq!(tracer.instruction_to_line(0), 1, "pushint 1 -> line 1");
+        assert_eq!(tracer.instruction_to_line(1), 2, "pushint 2 -> line 2");
+        assert_eq!(tracer.instruction_to_line(2), 3, "pop -> line 3");
+    }
+
+    #[test]
+    fn test_instruction_to_line_with_label() {
+        // A branch target emits a standalone `label:` line that shifts the line
+        // numbers of every instruction after it. This pins go-algorand's
+        // `PCToLine` behavior (data/transactions/logic/debugger.go): the line is
+        // the disassembly line index where the instruction's text sits, NOT
+        // simply `instruction_index + 1`.
+        let program = assemble_string("#pragma version 10\nint 1\nbnz done\nint 0\ndone:\nint 1")
+            .expect("should assemble")
+            .program;
+        let mut tracer = DryrunDebugReceiver::new();
+        tracer.init_program(&program);
+
+        // Confirm the disassembly really contains a label line, otherwise the
+        // test would not exercise the off-by-one path.
+        let lines = tracer.disassembly_lines();
+        assert!(
+            lines.iter().any(|l| is_label_line(l)),
+            "disassembly should contain a label line: {lines:?}"
+        );
+
+        // The assembler/disassembler emits the same intcblock-optimized form as
+        // go-algorand (verified against `disassembleInstrumented`), so the
+        // disassembly is:
+        //   0: #pragma version 10
+        //   1: intcblock 1   (instr 0)
+        //   2: intc_0 // 1   (instr 1)
+        //   3: bnz label1    (instr 2)
+        //   4: pushint 0     (instr 3)
+        //   5: label1:       (label line — counts toward go's numbering)
+        //   6: intc_0 // 1   (instr 4)
+        //
+        // These line numbers were pinned against go's `DebugState.PCToLine`:
+        //   pc=1 -> 1, pc=4 -> 2, pc=5 -> 3, pc=8 -> 4, pc=10 -> 6.
+        assert_eq!(tracer.instruction_to_line(0), 1, "intcblock -> line 1");
+        assert_eq!(tracer.instruction_to_line(1), 2, "intc_0 -> line 2");
+        assert_eq!(tracer.instruction_to_line(2), 3, "bnz -> line 3");
+        assert_eq!(tracer.instruction_to_line(3), 4, "pushint 0 -> line 4");
+        // The instruction after the label is line 6 (label line is line 5),
+        // NOT line 5 as the old `instruction_index + 1` mapping produced.
+        assert_eq!(
+            tracer.instruction_to_line(4),
+            6,
+            "post-label intc_0 -> line 6 (label line shifts it)"
+        );
     }
 
     #[test]
