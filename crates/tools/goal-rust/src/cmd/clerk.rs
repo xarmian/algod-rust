@@ -1753,6 +1753,15 @@ fn run_multisig_merge_inner(args: MultisigMergeArgs) -> Result<(), String> {
             partials.push(list[i].msig.clone().unwrap_or_default());
         }
 
+        // Go's `crypto.MultisigMerge` (crypto/multisig.go:328) rejects
+        // CONFLICTING non-blank signatures for the same subsig position
+        // (`errInvalidDuplicates`); the shared `multisig_assemble` primitive
+        // instead silently last-writer-wins. Match Go by detecting conflicts
+        // here before assembling. (Differing subsig counts / keys / threshold /
+        // version are caught by `multisig_assemble` itself, mirroring Go's
+        // `errKeysNotMatch` / `errInvalidThreshold`.)
+        detect_conflicting_subsigs(&partials)?;
+
         // multisig_assemble requires >= 2 partials; a single input file
         // self-merges (matching Go's tx0-with-tx0 first iteration).
         if partials.len() == 1 {
@@ -1767,6 +1776,40 @@ fn run_multisig_merge_inner(args: MultisigMergeArgs) -> Result<(), String> {
     }
 
     write_file_0600(&args.out, &merged_data)?;
+    Ok(())
+}
+
+/// Reject conflicting non-blank signatures for the same subsig position across
+/// the multisig partials being merged. Mirrors `crypto.MultisigMerge`'s
+/// `errInvalidDuplicates` (crypto/multisig.go): two partials carrying *different*
+/// non-blank signatures at the same index is an error (the shared
+/// `multisig_assemble` primitive would otherwise silently keep the last one).
+fn detect_conflicting_subsigs(partials: &[algo_types::MultisigSig]) -> Result<(), String> {
+    let Some(width) = partials.iter().map(|p| p.subsigs.len()).max() else {
+        return Ok(());
+    };
+    for j in 0..width {
+        let mut seen: Option<[u8; 64]> = None;
+        for p in partials {
+            let Some(sub) = p.subsigs.get(j) else {
+                continue;
+            };
+            if sub.signature == [0u8; 64] {
+                continue;
+            }
+            match seen {
+                None => seen = Some(sub.signature),
+                Some(prev) if prev != sub.signature => {
+                    return Err(
+                        "Cannot merge multisig signatures: invalid duplicates (conflicting \
+                         signatures for the same key)"
+                            .into(),
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2823,5 +2866,42 @@ mod tests {
         assert_eq!(kmd.subsigs.len(), 2);
         assert_eq!(kmd.subsigs[0].public_key, [7u8; 32]);
         assert_eq!(kmd.subsigs[1].signature, [9u8; 64]);
+    }
+
+    fn msig_with_sigs(sigs: &[[u8; 64]]) -> algo_types::MultisigSig {
+        algo_types::MultisigSig {
+            version: 1,
+            threshold: 2,
+            subsigs: sigs
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| algo_types::MultisigSubsig {
+                    public_key: [i as u8 + 1; 32],
+                    signature: s,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn detect_conflicting_subsigs_accepts_disjoint_and_agreeing() {
+        // alice signs slot 0, bob signs slot 1 — disjoint, no conflict.
+        let a = msig_with_sigs(&[[1u8; 64], [0u8; 64], [0u8; 64]]);
+        let b = msig_with_sigs(&[[0u8; 64], [2u8; 64], [0u8; 64]]);
+        assert!(detect_conflicting_subsigs(&[a.clone(), b]).is_ok());
+        // The same partial twice (self-merge / identical re-sign) agrees.
+        assert!(detect_conflicting_subsigs(&[a.clone(), a]).is_ok());
+        // Empty input is a no-op.
+        assert!(detect_conflicting_subsigs(&[]).is_ok());
+    }
+
+    #[test]
+    fn detect_conflicting_subsigs_rejects_conflicts() {
+        // Two partials carry DIFFERENT non-blank sigs at slot 0 — Go's
+        // errInvalidDuplicates.
+        let a = msig_with_sigs(&[[1u8; 64], [0u8; 64]]);
+        let b = msig_with_sigs(&[[9u8; 64], [0u8; 64]]);
+        let err = detect_conflicting_subsigs(&[a, b]).unwrap_err();
+        assert!(err.contains("invalid duplicates"), "got: {err}");
     }
 }
