@@ -53,11 +53,13 @@ const ERROR_KMD_UNREACHABLE: &str = "Could not contact kmd; is it running?";
 
 /// `clerk send -a <amt> -f <from> -t <to> [-c close] [--rekey-to] [--fee]
 /// [--firstvalid/--lastvalid/--validrounds] [--note/--noteb64] [--lease]
-/// [-N] [-o out [-s]] [-w wallet] [--password]`.
+/// [-F prog | -P progbytes | -L lsig] [--argb64 ...] [--msig-params ...]
+/// [-S signer] [-N] [-o out [-s]] [-w wallet] [--password]`.
 ///
-/// Mirrors Go's `sendCmd` (clerk.go:348-576). LogicSig / program-account
-/// (`--from-program*`, `--logic-sig`, `--argb64`) and `--msig-params` paths are
-/// out of scope and rejected up front (see [`SendArgs`]).
+/// Mirrors Go's `sendCmd` (clerk.go:348-576), including the LogicSig /
+/// program-account (`--from-program/-F`, `--from-program-bytes/-P`,
+/// `--logic-sig/-L`, `--argb64`) and `--msig-params` paths, which reuse the
+/// shared signing helpers in [`crate::cmd::clerk_sign`].
 pub fn run_send(
     args: SendArgs,
     wallet: Option<String>,
@@ -84,6 +86,11 @@ fn run_send_inner(
         return Err("-s is not meaningful without -o".to_string());
     }
 
+    // --msig-params is invalid without -o (clerk.go:359-362, noOutputFileError).
+    if args.out.is_none() && args.msig_params.is_some() {
+        return Err("--msig-params must be specified with an output file name (-o)".to_string());
+    }
+
     // Validity-period flag guards (commands.go:543-551).
     if args.valid_rounds.is_some() && args.last_valid.is_some() {
         return Err("Only one of [--validrounds] or [--lastvalid] can be specified".to_string());
@@ -95,17 +102,39 @@ fn run_send_inner(
     let data_dir_path = data_dir::ensure_single_data_dir(&cli_d).map_err(|e| e.to_string())?;
     let accounts = AccountsList::load(&data_dir_path);
 
+    // Resolve the program/LogicSig source (clerk.go:370-396). Exactly one of
+    // `-P/--from-program-bytes` (raw bytes), `-F/--from-program` (TEAL source),
+    // or `-L/--logic-sig` (msgpack LogicSig file) may be set; `--argb64` supplies
+    // the program args (overriding any args in a `-L` file). The `program_account`
+    // variant (`-F`/`-P`) makes the sender default to the program's escrow
+    // address and attaches the LogicSig with the resolved AuthAddr, while the
+    // `delegated` variant (`-L`) runs the LogicSig sanity check and attaches the
+    // LogicSig verbatim — matching Go's two distinct branches.
+    let resolved_lsig = resolve_send_lsig(
+        args.from_program.as_deref(),
+        args.from_program_bytes.as_deref(),
+        args.logic_sig.as_deref(),
+        &args.argb64,
+    )?;
+
     // Resolve from (default account if unset) + to via the accountList name map
-    // (clerk.go:397-403). Go falls back to the default account when -f is empty.
+    // (clerk.go:388-403). With a `-F`/`-P` program account and no `-f`, the
+    // sender defaults to the program's escrow address (clerk.go:388-396);
+    // otherwise Go falls back to the default account when `-f` is empty.
     let from_name = match args.from {
         Some(f) => f,
-        None => {
-            let def = accounts.default_account.clone();
-            if def.is_empty() {
-                return Err("no default account set; specify the sender with -f/--from".to_string());
+        None => match resolved_lsig.as_ref() {
+            Some(r) if r.is_program_account => r.escrow_address.to_algorand_string(),
+            _ => {
+                let def = accounts.default_account.clone();
+                if def.is_empty() {
+                    return Err(
+                        "no default account set; specify the sender with -f/--from".to_string()
+                    );
+                }
+                def
             }
-            def
-        }
+        },
     };
     let from_resolved = accounts.address_for(&from_name);
     let to_resolved = accounts.address_for(&args.to);
@@ -134,15 +163,31 @@ fn run_send_inner(
         .map(|r| Address::from_algorand_string(r).map_err(|e| format!("rekey-to invalid: {e}")))
         .transpose()?;
 
+    // Resolve --signer/-S into an AuthAddr; it must differ from the sender
+    // (clerk.go:271-277). Applied on the program-account and wallet paths.
+    let auth_addr = args
+        .signer
+        .as_deref()
+        .map(|s| Address::from_algorand_string(s).map_err(|e| format!("Signer invalid ({s}): {e}")))
+        .transpose()?;
+    if let Some(signer) = auth_addr {
+        if signer == from_addr {
+            return Err("AuthAddr cannot be the same as the transaction sender".to_string());
+        }
+    }
+
     let algod = build_algod_client_for_dir(&data_dir_path)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("Request failed: {e}"))?;
 
-    // The output-only path never needs kmd unless we're also asked to sign.
-    let want_signature = args.out.is_none() || args.sign;
-    let kmd = if want_signature {
+    // The wallet (kmd) is only needed when no LogicSig source was supplied AND we
+    // intend to sign: `signTx := sign || (out == "")` (clerk.go:495). With a
+    // LogicSig (`-F`/`-P`/`-L`) the txn is self-authorized, so kmd is never
+    // contacted, even when broadcasting (clerk.go:464-490).
+    let want_wallet_signature = resolved_lsig.is_none() && (args.out.is_none() || args.sign);
+    let kmd = if want_wallet_signature {
         Some(build_kmd_client(&data_dir_path, kmd_dir_flag.as_deref())?)
     } else {
         None
@@ -187,65 +232,132 @@ fn run_send_inner(
         txn.fee = algo_txn_pipeline::estimate_fee(&txn, params.fee, params.min_fee);
     }
 
-    // --out: write the (optionally signed) transaction to a file instead of
-    // broadcasting (clerk.go:565-573). `signTx := sign || (outFilename == "")`.
-    if let Some(out_path) = args.out {
-        let encoded = if want_signature {
-            // kmd returns the already-msgpack-encoded SignedTxn bytes.
-            let kmd = pipeline.kmd().ok_or("no kmd client configured")?;
-            let mut accounts = AccountsList::load(&data_dir_path);
-            let (handle, _wallet_name, password) = resolve_wallet_and_init(
-                &rt,
-                kmd,
-                &mut accounts,
-                wallet.as_deref(),
-                args.password.as_deref(),
-            )?;
-            rt.block_on(pipeline.sign_with_kmd(&handle, &password, &txn))
-                .map_err(|e| {
-                    format!(
-                        "Couldn't sign tx with kmd: {e} (for multisig accounts, write tx to file \
-                         and sign manually)"
-                    )
-                })?
-        } else {
-            // Blank-sig SignedTxn so msgpack still encodes the txn type, matching
-            // Go's `AssembleSignedTxn(tx, Signature{}, MultisigSig{})`.
-            let stx = SignedTransaction {
-                txn: txn.clone(),
-                ..SignedTransaction::default()
-            };
-            canonical_encode_signed_transaction(&stx)
+    let last_valid = txn.last_valid.0;
+
+    // Assemble the SignedTxn (`stx`) per the active path (clerk.go:464-505):
+    //  - delegated LogicSig (`-L`): run the LogicSig sanity check and attach the
+    //    LogicSig verbatim (no AuthAddr override) — clerk.go:464-481;
+    //  - program account (`-F`/`-P`): attach the LogicSig with the resolved
+    //    AuthAddr (no sanity check) — clerk.go:482-489;
+    //  - wallet: kmd-sign the body when `signTx` (sign || out==""), else emit a
+    //    blank-sig SignedTxn — clerk.go:490-505.
+    let want_wallet_sign = args.out.is_none() || args.sign;
+    let mut stx = if let Some(resolved) = resolved_lsig.as_ref() {
+        let mut s = SignedTransaction {
+            txn: txn.clone(),
+            lsig: Some(resolved.lsig.clone()),
+            ..SignedTransaction::default()
         };
+        if resolved.is_program_account {
+            // Program-account path: set the AuthAddr (clerk.go:484-488). Go runs
+            // no sanity check here; the node verifies on submit.
+            s.auth_addr = auth_addr;
+        } else {
+            // Delegated LogicSig path: structural + delegation sanity check
+            // before broadcast (clerk.go:465-481, verify.LogicSigSanityCheck),
+            // split the same way `clerk sign` does (see run_sign_inner).
+            clerk_sign::logicsig_program_check(&resolved.lsig)
+                .map_err(|e| format!("{}: txn error {e}", out_label(args.out.as_deref())))?;
+            algo_validate::logicsig_sanity_check(&s, &resolved.lsig)
+                .map_err(|e| format!("{}: txn error {e}", out_label(args.out.as_deref())))?;
+        }
+        s
+    } else if want_wallet_sign {
+        // Wallet path: kmd-sign the txn body, then decode the returned SignedTxn
+        // so we can (a) apply the rekey AuthAddr and (b) attach --msig-params.
+        //
+        // With `-S/--signer` (the rekey case) kmd must sign with the *signer's*
+        // key, not the sender's, so pass `signer.0` as the requested key —
+        // mirroring Go's `SignTransactionWithWalletAndSigner` (clerk.go:244) and
+        // the same call `run_sign_inner` makes. Using `sign_with_kmd` here would
+        // force kmd to infer the sender key (`[0u8; 32]`), which for a rekeyed
+        // account either fails (sender key not in the wallet) or emits a
+        // signature by the *old* sender that won't verify against the AuthAddr.
+        let kmd = pipeline.kmd().ok_or("no kmd client configured")?;
+        let mut accounts = AccountsList::load(&data_dir_path);
+        let (handle, _wallet_name, password) = resolve_wallet_and_init(
+            &rt,
+            kmd,
+            &mut accounts,
+            wallet.as_deref(),
+            args.password.as_deref(),
+        )?;
+        let signer_pk: [u8; 32] = auth_addr.map(|a| a.0).unwrap_or([0u8; 32]);
+        let encoded = algo_codec::canonical_encode_transaction(&txn);
+        let signed = rt
+            .block_on(kmd.sign_transaction(&handle, &password, encoded, signer_pk))
+            .map_err(|e| {
+                format!(
+                    "Couldn't sign tx with kmd: {} (for multisig accounts, write tx to file and \
+                     sign manually)",
+                    kmd_msg(&e)
+                )
+            })?;
+        let mut decoded = decode_signed_txn_stream(&signed.signed_transaction)
+            .map_err(|e| format!("kmd returned an undecodable signed transaction: {e}"))?;
+        let mut s = decoded
+            .pop()
+            .ok_or("kmd returned an empty signed transaction")?;
+        // The kmd-rust server signs with the requested key but leaves `sgnr`
+        // unset (TASK-216), so set the AuthAddr here when `--signer` differs
+        // from the sender (mirrors `createSignedTransaction(.., authAddr)`,
+        // clerk.go:498, and `Transaction.Sign`, transaction.go:271-274).
+        if auth_addr.is_some() {
+            s.auth_addr = auth_addr;
+        }
+        s
+    } else {
+        // -o without -s and no LogicSig: a blank-sig SignedTxn so msgpack still
+        // encodes the txn type, matching Go's `AssembleSignedTxn(tx, Signature{},
+        // MultisigSig{})`. A --signer here would never be honored, matching Go's
+        // "Signer specified when txn won't be signed" guard (clerk.go:491-494).
+        if auth_addr.is_some() {
+            return Err("Signer specified when txn won't be signed".to_string());
+        }
+        SignedTransaction {
+            txn: txn.clone(),
+            ..SignedTransaction::default()
+        }
+    };
+
+    // --msig-params: the sender was rekeyed to a multisig account. Attach the
+    // blank multisig preimage and set the AuthAddr to the derived multisig
+    // address (clerk.go:507-543). The output-file guard above ensures `-o` is set.
+    //
+    // The msig preimage *is* the authorization: the multisig signers fill it in
+    // later (`clerk multisig sign`). Any signature attached by the branches above
+    // is meaningless here, so clear it. Go's normal flow is `-o` without `-s`,
+    // where the wallet branch already produced a blank-sig SignedTxn so there is
+    // nothing to clear; this only diverges from Go's *literal* behavior for the
+    // pathological `-o -s --msig-params` combination, where Go leaves the
+    // wallet's top-level `Sig` set alongside `Msig` and emits an unsubmittable
+    // dual-signed txn ("should only have one signature"). Clearing it keeps every
+    // `--msig-params` output a valid single-authorization txn.
+    if let Some(params_str) = args.msig_params.as_deref() {
+        let pre = clerk_sign::parse_msig_params(params_str)?;
+        if pre.address == txn.sender {
+            return Err("AuthAddr cannot be the same as the transaction sender".to_string());
+        }
+        stx.sig = [0u8; 64];
+        stx.lsig = None;
+        stx.msig = Some(pre.msig);
+        stx.auth_addr = Some(pre.address);
+    }
+
+    // --out: write the SignedTxn to a file instead of broadcasting
+    // (clerk.go:565-573).
+    if let Some(out_path) = args.out {
+        let encoded = canonical_encode_signed_transaction(&stx);
         std::fs::write(&out_path, &encoded)
             .map_err(|e| format!("Cannot write file {}: {e}", out_path.display()))?;
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Broadcast path: sign via kmd, submit, report, optionally wait.
-    let mut accounts = AccountsList::load(&data_dir_path);
-    let kmd = pipeline.kmd().ok_or("no kmd client configured")?;
-    let (handle, _wallet_name, password) = resolve_wallet_and_init(
-        &rt,
-        kmd,
-        &mut accounts,
-        wallet.as_deref(),
-        args.password.as_deref(),
-    )?;
-
-    let last_valid = txn.last_valid.0;
+    // Broadcast path: submit the assembled SignedTxn, report, optionally wait.
+    let encoded_stx = canonical_encode_signed_transaction(&stx);
     let result = rt.block_on(async {
-        let signed = pipeline
-            .sign_with_kmd(&handle, &password, &txn)
-            .await
-            .map_err(|e| {
-                format!(
-                    "Couldn't sign tx with kmd: {e} (for multisig accounts, write tx to file \
-                     and sign manually)"
-                )
-            })?;
         let txid = pipeline
-            .submit(&signed)
+            .submit(&encoded_stx)
             .await
             .map_err(|e| format!("Couldn't broadcast tx with algod: {e}"))?;
 
@@ -270,6 +382,95 @@ fn run_send_inner(
     });
     result?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The label Go uses in LogicSig sanity-check errors: the output filename, or an
+/// empty string when broadcasting (Go's `outFilename`, clerk.go:478). Matches
+/// Go's `"%s: txn error %s"` formatting for both the `-o` and broadcast cases.
+fn out_label(out: Option<&Path>) -> String {
+    out.map(|p| p.display().to_string()).unwrap_or_default()
+}
+
+/// A LogicSig resolved from `clerk send`'s `-F`/`-P`/`-L` flags, plus whether it
+/// is a *program account* (`-F`/`-P`, which drives the sender-default + AuthAddr
+/// behavior) vs a *delegated* LogicSig (`-L`).
+#[derive(Debug)]
+struct ResolvedSendLsig {
+    lsig: algo_types::LogicSig,
+    /// `-F`/`-P`: the program acts as the account (sender defaults to its escrow
+    /// address; AuthAddr from `--signer` is attached). `-L` is a delegated
+    /// LogicSig (`false`).
+    is_program_account: bool,
+    /// The program's escrow address (`HashProgram`), used as the default sender
+    /// for a program account. Only meaningful when `is_program_account`.
+    escrow_address: Address,
+}
+
+/// Resolve `clerk send`'s LogicSig source flags, mirroring Go's `sendCmd`
+/// (clerk.go:370-396). At most one of `-P/--from-program-bytes` (raw program
+/// bytes), `-F/--from-program` (TEAL source), or `-L/--logic-sig` (msgpack
+/// LogicSig file) may be set. `-F`/`-L` reuse [`clerk_sign::lsig_from_args`];
+/// `-P` builds the LogicSig from the raw bytes directly. `--argb64` supplies the
+/// program args in all cases. Returns `Ok(None)` when no source flag is set.
+fn resolve_send_lsig(
+    from_program: Option<&str>,
+    from_program_bytes: Option<&str>,
+    logic_sig_file: Option<&str>,
+    arg_b64: &[String],
+) -> Result<Option<ResolvedSendLsig>, String> {
+    const COLLISION: &str = "should use at most one of --from-program/-F or \
+                             --from-program-bytes/-P --logic-sig/-L";
+    match (from_program_bytes, from_program, logic_sig_file) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
+            Err(COLLISION.into())
+        }
+        (Some(file), None, None) => {
+            // `-P`: raw program bytes; build the LogicSig with --argb64 args.
+            let program = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
+            let args = clerk_sign::parse_arg_b64(arg_b64)?;
+            let args_field = if args.is_empty() {
+                None
+            } else {
+                Some(args.into_iter().map(serde_bytes::ByteBuf::from).collect())
+            };
+            let escrow_address = clerk_sign::program_address(&program);
+            Ok(Some(ResolvedSendLsig {
+                lsig: algo_types::LogicSig {
+                    logic: serde_bytes::ByteBuf::from(program),
+                    args: args_field,
+                    ..algo_types::LogicSig::default()
+                },
+                is_program_account: true,
+                escrow_address,
+            }))
+        }
+        (None, Some(_), None) => {
+            // `-F`: TEAL source → assemble (program account).
+            let lsig = match clerk_sign::lsig_from_args(from_program, None, arg_b64)? {
+                Some(l) => l,
+                None => return Ok(None),
+            };
+            let escrow_address = clerk_sign::program_address(&lsig.logic);
+            Ok(Some(ResolvedSendLsig {
+                lsig,
+                is_program_account: true,
+                escrow_address,
+            }))
+        }
+        (None, None, Some(_)) => {
+            // `-L`: msgpack LogicSig file (delegated).
+            let lsig = match clerk_sign::lsig_from_args(None, logic_sig_file, arg_b64)? {
+                Some(l) => l,
+                None => return Ok(None),
+            };
+            Ok(Some(ResolvedSendLsig {
+                lsig,
+                is_program_account: false,
+                escrow_address: Address::default(),
+            }))
+        }
+        (None, None, None) => Ok(None),
+    }
 }
 
 /// Resolve the note field: `--noteb64` (base64) wins, then `--note` text,
@@ -2913,5 +3114,68 @@ mod tests {
         let b = msig_with_sigs(&[[9u8; 64], [0u8; 64]]);
         let err = detect_conflicting_subsigs(&[a, b]).unwrap_err();
         assert!(err.contains("invalid duplicates"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_send_lsig_none_without_source() {
+        assert!(resolve_send_lsig(None, None, None, &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_send_lsig_rejects_multiple_sources() {
+        // Any pair of the three program-source flags collides (clerk.go:374-385).
+        let err = resolve_send_lsig(Some("a.teal"), None, Some("b.lsig"), &[]).unwrap_err();
+        assert!(err.contains("at most one of"), "got: {err}");
+        let err = resolve_send_lsig(None, Some("p.bin"), Some("b.lsig"), &[]).unwrap_err();
+        assert!(err.contains("at most one of"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_send_lsig_from_program_bytes_is_program_account() {
+        // `-P`: raw program bytes act as the account; the sender default is the
+        // program's escrow address (HashProgram).
+        let dir = tempfile::tempdir().unwrap();
+        let prog = dir.path().join("prog.bin");
+        // `int 1` assembled for v2: 0x0220010122.
+        let bytes = [0x02u8, 0x20, 0x01, 0x01, 0x22];
+        std::fs::write(&prog, bytes).unwrap();
+        let resolved = resolve_send_lsig(None, Some(prog.to_str().unwrap()), None, &[])
+            .unwrap()
+            .expect("resolved lsig");
+        assert!(resolved.is_program_account);
+        assert_eq!(resolved.lsig.logic.as_ref(), &bytes);
+        assert_eq!(resolved.escrow_address, clerk_sign::program_address(&bytes));
+    }
+
+    #[test]
+    fn resolve_send_lsig_from_program_source_assembles() {
+        // `-F`: TEAL source assembled into a program account, with --argb64 args.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("prog.teal");
+        std::fs::write(&src, "#pragma version 2\nint 1\n").unwrap();
+        let resolved = resolve_send_lsig(
+            Some(src.to_str().unwrap()),
+            None,
+            None,
+            &["AQ==".to_string()],
+        )
+        .unwrap()
+        .expect("resolved lsig");
+        assert!(resolved.is_program_account);
+        assert!(!resolved.lsig.logic.is_empty());
+        let args = resolved.lsig.args.expect("args present");
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].as_ref(), &[1u8]);
+        // Escrow address is HashProgram of the assembled bytes.
+        assert_eq!(
+            resolved.escrow_address,
+            clerk_sign::program_address(&resolved.lsig.logic)
+        );
+    }
+
+    #[test]
+    fn out_label_renders_path_or_empty() {
+        assert_eq!(out_label(None), "");
+        assert_eq!(out_label(Some(Path::new("out.tx"))), "out.tx");
     }
 }

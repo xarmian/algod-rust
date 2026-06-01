@@ -768,6 +768,50 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
         "recipient balance should grow by >= {ls_amt} via logicsig escrow (before={ls_before}, after={ls_after})"
     );
 
+    // 6e-bis. clerk send --from-program → broadcast a LogicSig escrow spend
+    //     directly (no intermediate sign/rawsend), reusing the same `int 1`
+    //     escrow. Proves `clerk send`'s program-account path (TASK-295,
+    //     clerk.go:381-396,482-489): the sender defaults to the program's escrow
+    //     address, the assembled LogicSig is attached, and the node accepts and
+    //     commits the spend.
+    let fsend_amt: u64 = 750_000;
+    let fsend_out = assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                &fsend_amt.to_string(),
+                // No -f: sender defaults to the program's escrow address.
+                "-t",
+                FEE_SINK,
+                "-F",
+                escrow_teal.to_str().unwrap(),
+            ],
+        ),
+        "clerk send --from-program (direct logicsig broadcast)",
+        &node,
+    );
+    assert!(
+        fsend_out.contains(&format!("from account {ESCROW_ADDR}")),
+        "clerk send -F should report the escrow as the sender; got:\n{fsend_out}"
+    );
+    assert!(
+        fsend_out.contains("committed in round"),
+        "clerk send -F logicsig spend should confirm; got:\n{fsend_out}"
+    );
+    let fsend_after = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (after clerk send -F)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+    assert!(
+        fsend_after >= ls_after + fsend_amt,
+        "recipient balance should grow by >= {fsend_amt} via clerk send -F (before={ls_after}, after={fsend_after})"
+    );
+
     // 6f. clerk multisig round-trip → create a 2-of-3 multisig (alice/bob/carol),
     //     fund it from the dev account, build an UNSIGNED spend FROM the msig
     //     address, then `clerk multisig sign` with alice and bob (reaching the
@@ -1052,6 +1096,255 @@ fn localnet_dev_node_drives_goal_rust_and_go_goal() {
     assert!(
         prog_after >= prog_before + prog_amt,
         "recipient balance should grow by >= {prog_amt} via delegated multisig logicsig (before={prog_before}, after={prog_after})"
+    );
+
+    // 6h. clerk send --msig-params → the rekeyed-to-multisig sender path
+    //     (TASK-295, clerk.go:507-543). Create a fresh wallet account, fund it,
+    //     rekey it to the 2-of-3 multisig (alice/bob/carol), then build the spend
+    //     with `clerk send --msig-params "2 <alice> <bob> <carol>" -o <file>`:
+    //     this attaches the blank multisig preimage and sets AuthAddr to the
+    //     derived multisig address. Reaching the threshold with `clerk multisig
+    //     sign` (alice + bob) and rawsending confirms the node accepts a
+    //     multisig-authorized spend assembled by `clerk send --msig-params`.
+    let rekeyed = mk_acct("msig-params-sender");
+    let rk_fund = assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                "3000000",
+                "-f",
+                DEV_ADDR,
+                "-t",
+                &rekeyed,
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
+        ),
+        "fund rekey-to-msig sender",
+        &node,
+    );
+    assert!(
+        rk_fund.contains("committed in round"),
+        "rekey-to-msig sender funding should confirm; got:\n{rk_fund}"
+    );
+    // Rekey the fresh account to the multisig address (its spending authority
+    // now requires the 2-of-3 multisig).
+    let rk_out = assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                "0",
+                "-f",
+                &rekeyed,
+                "-t",
+                &rekeyed,
+                "--rekey-to",
+                &msig_addr,
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
+        ),
+        "rekey sender to multisig",
+        &node,
+    );
+    assert!(
+        rk_out.contains("committed in round"),
+        "rekey-to-msig should confirm; got:\n{rk_out}"
+    );
+
+    let mp_before = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (before msig-params spend)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+
+    // Build the spend with --msig-params: attaches the blank preimage + AuthAddr.
+    let mp_amt: u64 = 500_000;
+    let mp_tx = dd.join("msig-params-spend.tx");
+    let msig_params = format!("2 {alice} {bob} {carol}");
+    assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                &mp_amt.to_string(),
+                "-f",
+                &rekeyed,
+                "-t",
+                FEE_SINK,
+                "--msig-params",
+                &msig_params,
+                "-o",
+                mp_tx.to_str().unwrap(),
+            ],
+        ),
+        "clerk send --msig-params (rekeyed sender)",
+        &node,
+    );
+    // Reach the 2-of-3 threshold (alice + bob); the file is rewritten in place.
+    for signer in [&alice, &bob] {
+        assert_cli_ok(
+            &goal_rust(
+                dd,
+                &[
+                    "clerk",
+                    "multisig",
+                    "sign",
+                    "-t",
+                    mp_tx.to_str().unwrap(),
+                    "-a",
+                    signer,
+                    "-w",
+                    "w",
+                    "--password",
+                    "pw",
+                ],
+            ),
+            "clerk multisig sign (msig-params spend)",
+            &node,
+        );
+    }
+    let mp_rawsend = assert_cli_ok(
+        &goal_rust(dd, &["clerk", "rawsend", "-f", mp_tx.to_str().unwrap()]),
+        "clerk rawsend (msig-params spend)",
+        &node,
+    );
+    assert!(
+        mp_rawsend.contains("committed in round"),
+        "rekeyed-to-msig spend via clerk send --msig-params should confirm; got:\n{mp_rawsend}"
+    );
+    let mp_after = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (after msig-params spend)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+    assert!(
+        mp_after >= mp_before + mp_amt,
+        "recipient balance should grow by >= {mp_amt} via clerk send --msig-params (before={mp_before}, after={mp_after})"
+    );
+
+    // 6i. clerk send -S/--signer → the rekeyed-to-single-key sender path
+    //     (TASK-295, clerk.go:450-461,498). Create two fresh wallet accounts
+    //     (sender + signer), fund the sender, rekey the sender to the signer's
+    //     key, then broadcast a spend with `clerk send -f <sender> -S <signer>`:
+    //     kmd must sign with the *signer's* key (not the sender's) and the txn
+    //     must carry AuthAddr=<signer>. The node accepting + committing the spend
+    //     proves the signer-aware kmd call signs with the right key (a plain
+    //     sender-key signature would fail verification against the rekeyed
+    //     authorizer).
+    let rk2_sender = mk_acct("signer-sender");
+    let rk2_signer = mk_acct("signer-key");
+    let rk2_fund = assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                "3000000",
+                "-f",
+                DEV_ADDR,
+                "-t",
+                &rk2_sender,
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
+        ),
+        "fund rekey-to-key sender",
+        &node,
+    );
+    assert!(
+        rk2_fund.contains("committed in round"),
+        "rekey-to-key sender funding should confirm; got:\n{rk2_fund}"
+    );
+    // Rekey the sender to the signer's spending key.
+    let rk2_out = assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                "0",
+                "-f",
+                &rk2_sender,
+                "-t",
+                &rk2_sender,
+                "--rekey-to",
+                &rk2_signer,
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
+        ),
+        "rekey sender to signer key",
+        &node,
+    );
+    assert!(
+        rk2_out.contains("committed in round"),
+        "rekey-to-key should confirm; got:\n{rk2_out}"
+    );
+    let sgn_before = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (before -S spend)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+    // Spend FROM the rekeyed sender, signed by the new signer key via -S.
+    let sgn_amt: u64 = 400_000;
+    let sgn_out = assert_cli_ok(
+        &goal_rust(
+            dd,
+            &[
+                "clerk",
+                "send",
+                "-a",
+                &sgn_amt.to_string(),
+                "-f",
+                &rk2_sender,
+                "-t",
+                FEE_SINK,
+                "-S",
+                &rk2_signer,
+                "-w",
+                "w",
+                "--password",
+                "pw",
+            ],
+        ),
+        "clerk send -S (rekeyed sender, signer key)",
+        &node,
+    );
+    assert!(
+        sgn_out.contains("committed in round"),
+        "clerk send -S rekeyed spend should confirm; got:\n{sgn_out}"
+    );
+    let sgn_after = parse_balance(&assert_cli_ok(
+        &goal_rust(dd, &["account", "balance", "-a", FEE_SINK]),
+        "recipient balance (after -S spend)",
+        &node,
+    ))
+    .expect("recipient balance is an integer");
+    assert!(
+        sgn_after >= sgn_before + sgn_amt,
+        "recipient balance should grow by >= {sgn_amt} via clerk send -S (before={sgn_before}, after={sgn_after})"
     );
 
     // 7. addpartkey, then changeonlinestatus --online → status flips back. Going
