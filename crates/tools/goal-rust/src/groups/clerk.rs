@@ -163,11 +163,10 @@ pub struct MultisigMergeArgs {
 /// `-f/--from` defaults to the accountList default account; fee/validity follow
 /// `addTxnFlags` (common.go:57-66).
 ///
-/// **Out of scope (documented):** LogicSig / program-account sending
-/// (`--from-program/-F`, `--from-program-bytes/-P`, `--logic-sig/-L`,
-/// `--argb64`) and `--msig-params` (rekeyed-to-multisig signing) are not
-/// implemented — those leaves remain a follow-up. They're omitted from the
-/// flag set so `clerk send` only advertises what it can do.
+/// LogicSig / program-account sending (`--from-program/-F`,
+/// `--from-program-bytes/-P`, `--logic-sig/-L`, `--argb64`, with `--signer/-S`)
+/// and `--msig-params` (rekeyed-to-multisig signing) are wired through the
+/// shared [`crate::cmd::clerk_sign`] helpers (TASK-295).
 #[derive(Args, Debug)]
 pub struct SendArgs {
     /// Amount to transfer, in microAlgos. Required (Go `-a/--amount`).
@@ -187,6 +186,37 @@ pub struct SendArgs {
     /// Rekey the sender to this spending key/address (Go `--rekey-to`).
     #[arg(long = "rekey-to")]
     pub rekey_to: Option<String>,
+    /// Program source file to use as account logic (Go `-F/--from-program`).
+    /// Assembled and attached as a contract-account LogicSig; the sender
+    /// defaults to the program's escrow address when `-f/--from` is unset.
+    /// Mutually exclusive with `--from-program-bytes`/`--logic-sig`.
+    #[arg(short = 'F', long = "from-program")]
+    pub from_program: Option<String>,
+    /// Program binary file to use as account logic (Go `-P/--from-program-bytes`).
+    /// Attached verbatim as a contract-account LogicSig. Mutually exclusive with
+    /// `--from-program`/`--logic-sig`.
+    #[arg(short = 'P', long = "from-program-bytes")]
+    pub from_program_bytes: Option<String>,
+    /// LogicSig file (msgpack) to apply to the transaction (Go `-L/--logic-sig`).
+    /// Mutually exclusive with `--from-program`/`--from-program-bytes`.
+    #[arg(short = 'L', long = "logic-sig")]
+    pub logic_sig: Option<String>,
+    /// Base64-encoded args to pass to the transaction logic (Go `--argb64`,
+    /// repeatable / comma-separated). Overrides any args already in a `-L`
+    /// LogicSig file, matching Go's `lsig.Args = getProgramArgs()`.
+    #[arg(long = "argb64", value_delimiter = ',')]
+    pub argb64: Vec<String>,
+    /// Multisig preimage parameters `"[threshold] [Address 1] [Address 2] ..."`
+    /// (Go `--msig-params`). Used when the sender account was rekeyed to a
+    /// multisig account: attaches the blank multisig preimage and sets the
+    /// AuthAddr to the derived multisig address. Must be used with `-o/--out`.
+    #[arg(long = "msig-params")]
+    pub msig_params: Option<String>,
+    /// Address of the key to sign with, if different from the transaction "from"
+    /// address due to rekeying (Go `-S/--signer`, from `addTxnFlags`). Applied
+    /// as the AuthAddr on the program-account and wallet signing paths.
+    #[arg(short = 'S', long = "signer")]
+    pub signer: Option<String>,
     /// Transaction fee in microAlgos (Go `--fee`; suggested when unset).
     #[arg(long = "fee")]
     pub fee: Option<u64>,

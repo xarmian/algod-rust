@@ -70,6 +70,11 @@ pub struct Cli {
 /// Order and naming mirror `commands.go:56-91` (`rootCmd.AddCommand(...)`):
 /// version, license, report, protocols, account, wallet, clerk, asset,
 /// node, kmd, network, ledger, completion, app.
+// The `Clerk` variant inlines the full `clerk send` flag surface (`SendArgs`),
+// which is intentionally larger than the unit/`Option<subcommand>` siblings;
+// `ClerkCmd` already opts into the same size disparity (see its `#[allow]`).
+// Boxing buys nothing for a short-lived CLI parse, so allow it here too.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum RootCommand {
     /// Control and manage Algorand accounts.
