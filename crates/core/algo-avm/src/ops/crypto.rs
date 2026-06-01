@@ -915,8 +915,12 @@ pub fn op_vrf_verify(machine: &mut AvmMachine, instruction: &Instruction) -> Res
         )));
     }
 
-    let pk: [u8; 32] = pubkey_bytes.try_into().unwrap();
-    let pi: [u8; 80] = proof_bytes.try_into().unwrap();
+    let pk: [u8; 32] = pubkey_bytes
+        .try_into()
+        .map_err(|_| avm_err("vrf pubkey wrong size != 32"))?;
+    let pi: [u8; 80] = proof_bytes
+        .try_into()
+        .map_err(|_| avm_err("vrf proof wrong size != 80"))?;
 
     let (output, verified) = match super::vrf::vrf_verify(&pk, &pi, &data) {
         Some(output) => (output.to_vec(), 1u64),
