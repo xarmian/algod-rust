@@ -2,10 +2,8 @@
 // Conformance review (#34): version-aware consensus params, zero-sender /
 // rewards-pool-sender checks, heartbeat fee exemption.
 
-use algo_codec::{canonical_encode_transaction, canonical_encode_tx_group};
 use algo_error::AlgoError;
 use algo_types::{Address, Digest, SignedTransaction, Transaction};
-use sha2::{Digest as _, Sha512_256};
 
 // Re-export the comprehensive ConsensusParams and lookup function from algo-types.
 pub use algo_types::consensus::ConsensusParams;
@@ -364,42 +362,16 @@ pub fn is_free_heartbeat(txn: &Transaction, params: &ConsensusParams) -> bool {
         && params.enable_heartbeat
 }
 
-/// Domain separation prefix for transaction ID hashing.
-const TX_PREFIX: &[u8] = b"TX";
-
-/// Domain separation prefix for group ID hashing.
-const TG_PREFIX: &[u8] = b"TG";
-
 /// Compute the group ID for a set of transactions.
 ///
-/// For each transaction, zeros the `grp` field, computes its txn ID
-/// (`SHA512/256("TX" || canonical_encode(txn))`), then encodes the list
-/// of txn IDs via `canonical_encode_tx_group` and hashes with the "TG" prefix.
+/// Delegates to [`algo_codec::compute_group_id`] — the single source of truth
+/// for the `SHA512/256("TG" || canonical_encode(TxGroup{txids}))` hash, where
+/// each `txid` is `SHA512/256("TX" || canonical_encode(txn))` of the
+/// corresponding transaction with its `grp` field zeroed. Mirrors
+/// go-algorand's `TxGroup.ComputeGroupID` / `crypto.HashObj(TxGroup)`
+/// (`data/transactions/transaction.go`, `protocol` "TG"/"TX" tags).
 pub fn compute_group_id(txns: &[Transaction]) -> Digest {
-    let hashes: Vec<Digest> = txns
-        .iter()
-        .map(|txn| {
-            let mut zeroed = txn.clone();
-            zeroed.group = [0u8; 32];
-            let canonical = canonical_encode_transaction(&zeroed);
-            let mut msg = Vec::with_capacity(TX_PREFIX.len() + canonical.len());
-            msg.extend_from_slice(TX_PREFIX);
-            msg.extend_from_slice(&canonical);
-            let hash = Sha512_256::digest(&msg);
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&hash);
-            Digest(out)
-        })
-        .collect();
-
-    let encoded = canonical_encode_tx_group(&hashes);
-    let mut msg = Vec::with_capacity(TG_PREFIX.len() + encoded.len());
-    msg.extend_from_slice(TG_PREFIX);
-    msg.extend_from_slice(&encoded);
-    let hash = Sha512_256::digest(&msg);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&hash);
-    Digest(out)
+    algo_codec::compute_group_id(txns)
 }
 
 /// Collect transactions by group ID across the entire payset, then invoke the
