@@ -4,7 +4,7 @@
 //! the internal simulation result structure. They are separate from the REST
 //! API model types; conversion to REST types happens in the API layer.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use algo_avm::tracer::{AppStateAccess, AppStateOp, AppStateType};
 use algo_types::{Address, Round, SignedTransaction, TealValue};
@@ -185,7 +185,73 @@ pub struct TxnGroupResult {
     pub app_budget_added: u64,
     /// Total application budget consumed by this group.
     pub app_budget_consumed: u64,
+    /// Unnamed resources accessed by the group, populated when the request
+    /// set `allow_unnamed_resources` and any were accessed. Always reported
+    /// at the group level (go-algorand additionally reports per-transaction
+    /// for pre-resource-sharing program versions; this engine does not).
+    pub unnamed_resources_accessed: Option<UnnamedResourcesAccessed>,
 }
+
+/// Unnamed resources accessed during simulation, in deterministic order.
+///
+/// Mirrors go-algorand's `simulation.ResourceTracker` public fields
+/// (`ledger/simulation/resources.go`) as surfaced in the REST
+/// `SimulateUnnamedResourcesAccessed` model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnnamedResourcesAccessed {
+    /// Accounts accessed outside the group's named accounts.
+    pub accounts: BTreeSet<Address>,
+    /// Asset IDs accessed outside the group's foreign-asset arrays.
+    pub assets: BTreeSet<u64>,
+    /// App IDs accessed outside the group's foreign-app arrays.
+    pub apps: BTreeSet<u64>,
+    /// Boxes `(app_id, name)` accessed without a matching box reference.
+    pub boxes: BTreeSet<(u64, Vec<u8>)>,
+    /// Asset holdings `(account, asset)` whose halves are named but never by
+    /// the same transaction.
+    pub asset_holdings: BTreeSet<(Address, u64)>,
+    /// App local states `(account, app)` whose halves are named but never by
+    /// the same transaction.
+    pub app_locals: BTreeSet<(Address, u64)>,
+}
+
+impl UnnamedResourcesAccessed {
+    /// Whether any unnamed resource was recorded (go-algorand's
+    /// `HasResources`).
+    pub fn has_resources(&self) -> bool {
+        !(self.accounts.is_empty()
+            && self.assets.is_empty()
+            && self.apps.is_empty()
+            && self.boxes.is_empty()
+            && self.asset_holdings.is_empty()
+            && self.app_locals.is_empty())
+    }
+
+    /// Merge another set of accesses into this one.
+    pub fn merge(&mut self, other: UnnamedResourcesAccessed) {
+        self.accounts.extend(other.accounts);
+        self.assets.extend(other.assets);
+        self.apps.extend(other.apps);
+        self.boxes.extend(other.boxes);
+        self.asset_holdings.extend(other.asset_holdings);
+        self.app_locals.extend(other.app_locals);
+    }
+}
+
+/// Hard limit on how many bytes a transaction may log during simulation when
+/// `allow_more_logging` is enabled. Mirrors go-algorand's
+/// `simulation.LogBytesLimit`.
+pub const LOG_BYTES_LIMIT: u64 = 65536;
+
+/// The raised `log`-call limit applied when `allow_more_logging` is enabled.
+/// Mirrors go-algorand's `bounds.MaxLogCalls` (the maximum
+/// `MaxAppProgramLen` across consensus versions, 2048).
+pub const SIMULATION_MAX_LOG_CALLS: u64 = 2048;
+
+/// Hard limit on how much extra opcode budget a simulation request may add
+/// to one transaction group. Mirrors go-algorand's
+/// `simulation.MaxExtraOpcodeBudget` (`20000 * 16`).
+pub const MAX_EXTRA_OPCODE_BUDGET: i64 = 20_000 * 16;
 
 /// Evaluation overrides that were applied during simulation.
 ///

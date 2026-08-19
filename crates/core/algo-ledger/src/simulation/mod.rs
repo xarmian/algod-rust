@@ -20,11 +20,14 @@ pub use trace::{
     AppInitialState, AvmValueTrace, ExecTraceConfig, InitialStatesAccumulator, OpcodeTraceUnit,
     ProgramTrace, ResourcesInitialStates, ResultEvalOverrides, SimulationResult, StateChange,
     StateChangeKind, StateChangeOp, TransactionTrace, TxnGroupResult, TxnPath, TxnResult,
+    UnnamedResourcesAccessed, LOG_BYTES_LIMIT, MAX_EXTRA_OPCODE_BUDGET, SIMULATION_MAX_LOG_CALLS,
 };
 pub use tracer::SimulationTracer;
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use algo_avm::group::GroupBudget;
 use algo_codec::canonical_encode_transaction;
@@ -38,8 +41,10 @@ use algo_validate::{
 use ed25519_dalek::{Signer, SigningKey};
 
 use crate::apply::{
-    apply_transaction_with_budget, compute_group_fee_credit, ApplyContext, ApplyMode, GroupInfo,
+    apply_transaction_with_budget, compute_group_fee_credit, ApplyContext, ApplyMode,
+    AvmEvalOverrides, GroupInfo,
 };
+use crate::avm_context::NamedGroupResources;
 use crate::store_trait::LedgerStore;
 
 /// Fixed proxy signing key seed (first 32 bytes of go-algorand's `proxySigner`).
@@ -263,8 +268,12 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             allow_unnamed_resources: request.allow_unnamed_resources,
             extra_opcode_budget: request.extra_opcode_budget,
             fix_signers: request.fix_signers,
-            max_log_calls: None,
-            max_log_size: None,
+            // AllowMoreLogging raises the AVM log limits (go-algorand
+            // `ResultEvalOverrides.AllowMoreLogging`).
+            max_log_calls: request
+                .allow_more_logging
+                .then_some(SIMULATION_MAX_LOG_CALLS),
+            max_log_size: request.allow_more_logging.then_some(LOG_BYTES_LIMIT),
         };
 
         // --- Snapshot the store before simulation ---
@@ -355,6 +364,19 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             self.store.snapshot_with_ids(&addrs, &asset_ids, &app_ids)
         };
 
+        // --- FixSigners: pre-evaluation signer correction ---
+
+        // Working copy of the group used for verification and evaluation.
+        // With `fix_signers`, unsigned transactions get their `auth_addr`
+        // corrected here (and again after each app call, since apps can
+        // rekey); the original `txn_group` is kept for the response and the
+        // post-evaluation `fixed_signer` comparison — mirroring go-algorand's
+        // `simulateWithTracer` (`ledger/simulation/simulator.go:219-260`).
+        let mut eval_group: Vec<SignedTransaction> = txn_group.clone();
+        if request.fix_signers {
+            fix_unsigned_signers_pre_eval(&*self.store, &mut eval_group);
+        }
+
         // --- Build apply context ---
 
         // Fetch block header for consensus params and timestamp
@@ -373,7 +395,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // opcode traces, since LogicSig programs run during signature
         // verification — before the per-transaction execution tracer exists.
         let (logicsig_traces, logicsig_budgets) = match self.check(
-            txn_group,
+            &eval_group,
             request.allow_empty_signatures,
             &consensus,
             &request.trace_config,
@@ -385,10 +407,26 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             }
         };
 
+        // Validate the extra opcode budget against the simulation limit.
+        // Runs after `check()` so verification errors take precedence,
+        // matching go-algorand's `simulateWithTracer` ordering; the message
+        // matches go byte-for-byte.
+        if request.extra_opcode_budget > MAX_EXTRA_OPCODE_BUDGET {
+            self.store.restore_snapshot(snapshot);
+            return Err(SimulatorError::InvalidRequest(InvalidRequestError {
+                message: format!(
+                    "extra budget {} > simulation extra budget limit {}",
+                    request.extra_opcode_budget, MAX_EXTRA_OPCODE_BUDGET
+                ),
+            }));
+        }
+
         // Compute group fee credit so inner transactions can draw from
         // overpayment by outer transactions (matches go-algorand's feeCredit).
-        let group_refs: Vec<&SignedTransaction> = txn_group.iter().collect();
-        let fee_credit = compute_group_fee_credit(&group_refs, consensus.min_txn_fee);
+        let fee_credit = {
+            let group_refs: Vec<&SignedTransaction> = eval_group.iter().collect();
+            compute_group_fee_credit(&group_refs, consensus.min_txn_fee)
+        };
 
         let apply_ctx = ApplyContext {
             rewards_level: self.store.rewards_level(),
@@ -402,6 +440,16 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             fee_credit: Cell::new(fee_credit),
             txn_index: Cell::new(0),
             consensus,
+            // Simulation-only AVM overrides: raised log limits
+            // (`allow_more_logging`) and unnamed-resource tracking
+            // (`allow_unnamed_resources`).
+            avm_overrides: AvmEvalOverrides {
+                max_log_calls: result.eval_overrides.max_log_calls,
+                max_log_size: result.eval_overrides.max_log_size,
+                unnamed_tracking: request
+                    .allow_unnamed_resources
+                    .then(|| Arc::new(NamedGroupResources::from_group(&eval_group))),
+            },
         };
 
         // --- Execute the transaction group ---
@@ -434,8 +482,12 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // first-touch-wins semantics so the earliest-seen pre-value persists.
         let mut initial_states = InitialStatesAccumulator::default();
 
+        // Unnamed resources accessed across the whole group (populated only
+        // when `allow_unnamed_resources` is requested).
+        let mut group_unnamed = UnnamedResourcesAccessed::default();
+
         // Count app calls for group budget
-        let num_app_calls = txn_group
+        let num_app_calls = eval_group
             .iter()
             .filter(|stx| stx.txn.txn_type == "appl")
             .count();
@@ -445,13 +497,8 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             group_budget.add(request.extra_opcode_budget);
         }
 
-        for (i, stx) in txn_group.iter().enumerate() {
+        for i in 0..eval_group.len() {
             apply_ctx.txn_index.set(i);
-
-            let gi = GroupInfo {
-                txns: &group_refs,
-                index: i,
-            };
 
             // Create a per-transaction tracer to capture execution details.
             // Seed it with apps created by earlier transactions in the group so
@@ -461,16 +508,25 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             tracer.seed_created_apps(&initial_states.created_app_ids());
 
             // Use apply_transaction_with_budget for ALL transactions (not just appl)
-            // so they all share the group context.
-            let apply_result = apply_transaction_with_budget(
-                self.store,
-                stx,
-                &apply_ctx,
-                0,
-                Some(&mut group_budget),
-                Some(&gi),
-                Some(&mut tracer),
-            );
+            // so they all share the group context. The group refs are rebuilt
+            // per iteration because `fix_signers` may mutate later
+            // transactions' `auth_addr` between iterations.
+            let apply_result = {
+                let group_refs: Vec<&SignedTransaction> = eval_group.iter().collect();
+                let gi = GroupInfo {
+                    txns: &group_refs,
+                    index: i,
+                };
+                apply_transaction_with_budget(
+                    self.store,
+                    &eval_group[i],
+                    &apply_ctx,
+                    0,
+                    Some(&mut group_budget),
+                    Some(&gi),
+                    Some(&mut tracer),
+                )
+            };
             // Per-transaction app budget consumed = the sum of every approval /
             // clear-state program cost under this txn, including inner app calls,
             // accumulated by the tracer (go-algorand rolls each program's
@@ -485,8 +541,18 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 Ok(apply_data) => {
                     group_result.txn_results[i].apply_data = Some(apply_data);
                     initial_states.merge(tracer.take_initial_states());
+                    group_unnamed.merge(tracer.take_unnamed_resources());
                     group_result.txn_results[i].trace =
                         merge_logicsig_trace(tracer.into_transaction_trace(), &logicsig_traces, i);
+
+                    // FixSigners: an app call can rekey accounts (via inner
+                    // transactions), so re-correct the auth addrs of the
+                    // remaining unsigned transactions from the mutated ledger,
+                    // up to and including the next app call — go-algorand's
+                    // `AfterProgram` fix pass (`ledger/simulation/tracer.go`).
+                    if request.fix_signers && eval_group[i].txn.txn_type == "appl" {
+                        fix_unsigned_signers_after_app(&*self.store, &mut eval_group, i);
+                    }
                 }
                 Err(e) => {
                     // Record failure. Collect any partial trace data before
@@ -495,6 +561,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     failure_message = Some(e.to_string());
                     failed_at = Some(vec![i]);
                     initial_states.merge(tracer.take_initial_states());
+                    group_unnamed.merge(tracer.take_unnamed_resources());
                     group_result.txn_results[i].trace =
                         merge_logicsig_trace(tracer.into_transaction_trace(), &logicsig_traces, i);
                     break;
@@ -504,6 +571,24 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
         group_result.failure_message = failure_message;
         group_result.failed_at = failed_at;
+
+        // Report unnamed resources accessed by the group (go-algorand drops
+        // the field entirely when nothing was recorded).
+        if request.allow_unnamed_resources && group_unnamed.has_resources() {
+            group_result.unnamed_resources_accessed = Some(group_unnamed);
+        }
+
+        // FixSigners: report the corrected signer for each transaction whose
+        // effective signer differs from the one supplied in the request
+        // (go-algorand's post-evaluation `FixedSigner` pass).
+        for i in 0..group_result.txn_results.len() {
+            let sender = txn_group[i].txn.sender;
+            let input_signer = txn_group[i].auth_addr.unwrap_or(sender);
+            let actual_signer = eval_group[i].auth_addr.unwrap_or(sender);
+            if input_signer != actual_signer {
+                group_result.txn_results[i].fixed_signer = Some(actual_signer);
+            }
+        }
 
         // Compute group-level budget metrics. AppBudgetConsumed is the sum of
         // the per-transaction figures (each rolled up from its programs +
@@ -698,6 +783,98 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         }
 
         Ok((logicsig_traces, logicsig_budgets))
+    }
+}
+
+/// Whether a signed transaction carries no signature of any kind
+/// (go-algorand's `txnHasNoSignature`).
+fn txn_has_no_signature(stx: &SignedTransaction) -> bool {
+    stx.sig == [0u8; 64] && stx.msig.is_none() && stx.lsig.is_none()
+}
+
+/// The sender's current auth addr in the ledger, or the zero address when the
+/// account is not rekeyed (go-algorand `AccountData.AuthAddr`).
+fn ledger_auth_addr<L: LedgerStore>(store: &L, sender: &Address) -> Address {
+    store
+        .get_account(sender)
+        .and_then(|a| a.auth_addr)
+        .unwrap_or(Address::ZERO)
+}
+
+/// Set an unsigned transaction's `auth_addr` to the given authorizer,
+/// normalising "authorizer == sender" to `None` (a zero auth addr means the
+/// sender signs for itself).
+fn set_fixed_auth_addr(stx: &mut SignedTransaction, auth: Address) {
+    stx.auth_addr = if auth.is_zero() || auth == stx.txn.sender {
+        None
+    } else {
+        Some(auth)
+    };
+}
+
+/// FixSigners pre-evaluation pass: correct the `auth_addr` of unsigned
+/// transactions from static rekeys within the group or the ledger, stopping
+/// at the first app call (later transactions are corrected by
+/// [`fix_unsigned_signers_after_app`] once each app call completes, since
+/// apps can rekey accounts). Mirrors go-algorand's `simulateWithTracer`
+/// (`ledger/simulation/simulator.go:219-260`).
+fn fix_unsigned_signers_pre_eval<L: LedgerStore>(store: &L, group: &mut [SignedTransaction]) {
+    let mut static_rekeys: HashMap<Address, Address> = HashMap::new();
+    for stx in group.iter_mut() {
+        let sender = stx.txn.sender;
+        if txn_has_no_signature(stx) {
+            let auth = match static_rekeys.get(&sender) {
+                Some(a) => *a,
+                None => ledger_auth_addr(store, &sender),
+            };
+            set_fixed_auth_addr(stx, auth);
+        }
+
+        // Stop at the first app call: auth-addr correction for the rest is
+        // done after each app program runs.
+        if stx.txn.txn_type == "appl" {
+            break;
+        }
+
+        if let Some(rekey) = stx.txn.rekey_to {
+            if !rekey.is_zero() {
+                static_rekeys.insert(sender, rekey);
+            }
+        }
+    }
+}
+
+/// FixSigners post-app-call pass: after the app call at `app_index`
+/// completes, re-correct the `auth_addr` of the remaining unsigned
+/// transactions from the (possibly rekeyed) ledger state and static rekeys,
+/// up to and including the next app call. Mirrors go-algorand's
+/// `evalTracer.AfterProgram` fix pass (`ledger/simulation/tracer.go`).
+fn fix_unsigned_signers_after_app<L: LedgerStore>(
+    store: &L,
+    group: &mut [SignedTransaction],
+    app_index: usize,
+) {
+    let mut known_auth_addrs: HashMap<Address, Address> = HashMap::new();
+    for stx in group.iter_mut().skip(app_index + 1) {
+        let sender = stx.txn.sender;
+        let auth = *known_auth_addrs
+            .entry(sender)
+            .or_insert_with(|| ledger_auth_addr(store, &sender));
+
+        if txn_has_no_signature(stx) {
+            set_fixed_auth_addr(stx, auth);
+        }
+
+        // The next app call's own AfterProgram pass handles the rest.
+        if stx.txn.txn_type == "appl" {
+            break;
+        }
+
+        if let Some(rekey) = stx.txn.rekey_to {
+            if !rekey.is_zero() {
+                known_auth_addrs.insert(sender, rekey);
+            }
+        }
     }
 }
 

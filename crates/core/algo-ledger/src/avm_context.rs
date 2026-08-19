@@ -5,11 +5,12 @@
 //! the AVM can read/write chain state through the `AvmContext` trait defined
 //! in `algo-avm`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use algo_avm::context::AvmContext;
 use algo_avm::eval::AvmResult;
-use algo_avm::tracer::{AppStateAccess, AppStateOp, AppStateType};
+use algo_avm::tracer::{AppStateAccess, AppStateOp, AppStateType, UnnamedResourceAccess};
 use algo_avm::txn_fields;
 use algo_error::AlgoError;
 use algo_types::consensus::ConsensusParams;
@@ -746,6 +747,172 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// `self.store` and the tracer need to be accessed during `itxn_submit`.
     /// SAFETY: the tracer outlives the context (guaranteed by the call stack).
     pub tracer_ptr: Option<*mut (dyn algo_avm::tracer::EvalTracer + 'a)>,
+
+    /// Maximum number of `log` calls per program execution. Defaults to
+    /// go-algorand's `logic.maxLogCalls` (32); simulation raises it when
+    /// `allow_more_logging` is requested.
+    pub max_log_calls: u64,
+
+    /// Maximum total bytes logged per program execution. Defaults to
+    /// go-algorand's `logic.maxLogSize` (1024); simulation raises it when
+    /// `allow_more_logging` is requested.
+    pub max_log_size: u64,
+
+    /// Running total of bytes logged so far (go-algorand's `cx.logSize`).
+    log_size: u64,
+
+    /// When `Some`, unnamed-resource tracking is enabled (the simulation
+    /// request set `allow_unnamed_resources`): resource accesses outside the
+    /// group's named reference arrays are reported to the tracer instead of
+    /// being restricted, and unnamed box accesses are permitted. Holds the
+    /// resources named by the top-level transaction group.
+    unnamed_tracking: Option<Arc<NamedGroupResources>>,
+}
+
+/// Base AVM limit on the number of `log` calls per program execution.
+/// Mirrors go-algorand's `logic.maxLogCalls`.
+pub const MAX_LOG_CALLS: u64 = 32;
+
+/// Base AVM limit on the total bytes logged per program execution.
+/// Mirrors go-algorand's `logic.maxLogSize` (`bounds.MaxEvalDeltaTotalLogSize`).
+pub const MAX_LOG_SIZE: u64 = 1024;
+
+/// Resources named by a top-level transaction group's reference arrays,
+/// precomputed for unnamed-resource tracking (`allow_unnamed_resources`).
+///
+/// Mirrors the "named" side of go-algorand's simulation `ResourceTracker`
+/// (`ledger/simulation/resources.go`): an access is *unnamed* when the
+/// resource does not appear here (and was not created during execution).
+/// Cross-products (asset holdings / app locals) are named only when both
+/// halves are named by the *same* transaction, matching go-algorand's
+/// per-transaction cross-product availability.
+#[derive(Debug, Default)]
+pub struct NamedGroupResources {
+    /// Union of all accounts named anywhere in the group.
+    accounts: HashSet<[u8; 32]>,
+    /// Union of all asset IDs named anywhere in the group.
+    assets: HashSet<u64>,
+    /// Union of all app IDs named anywhere in the group.
+    apps: HashSet<u64>,
+    /// Boxes named by box references: `(app_id, name)`.
+    boxes: HashSet<(u64, Vec<u8>)>,
+    /// Per-transaction named sets, for cross-product (holding/local) checks.
+    per_txn: Vec<TxnNamedResources>,
+}
+
+/// Resources named by a single transaction's fields and reference arrays.
+#[derive(Debug, Default)]
+struct TxnNamedResources {
+    accounts: HashSet<[u8; 32]>,
+    assets: HashSet<u64>,
+    apps: HashSet<u64>,
+}
+
+impl NamedGroupResources {
+    /// Compute the named resources for a top-level transaction group.
+    pub fn from_group(group: &[SignedTransaction]) -> Self {
+        let mut named = NamedGroupResources::default();
+
+        for stxn in group {
+            let txn = &stxn.txn;
+            let mut tn = TxnNamedResources::default();
+
+            // Accounts named by transaction fields.
+            tn.accounts.insert(txn.sender.0);
+            for addr in [
+                Some(txn.receiver),
+                Some(txn.close_remainder_to),
+                txn.asset_receiver,
+                txn.asset_sender,
+                txn.asset_close_to,
+                txn.freeze_account,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !addr.is_zero() {
+                    tn.accounts.insert(addr.0);
+                }
+            }
+            if let Some(ref accounts) = txn.accounts {
+                for a in accounts {
+                    tn.accounts.insert(a.0);
+                }
+            }
+
+            // Assets named by transaction fields and the foreign-assets array.
+            for id in [txn.xaid, txn.config_asset, txn.freeze_asset] {
+                if id != 0 {
+                    tn.assets.insert(id);
+                }
+            }
+            if let Some(ref assets) = txn.foreign_assets {
+                tn.assets.extend(assets.iter().copied());
+            }
+
+            // Apps named by the called app and the foreign-apps array. Named
+            // apps also make their application accounts available
+            // (go-algorand `appAddressAvailableVersion`).
+            if txn.application_id != 0 {
+                tn.apps.insert(txn.application_id);
+                tn.accounts.insert(app_address(txn.application_id));
+            }
+            if let Some(ref apps) = txn.foreign_apps {
+                for &id in apps {
+                    tn.apps.insert(id);
+                    tn.accounts.insert(app_address(id));
+                }
+            }
+
+            // Boxes named by box references (same resolution as
+            // `ensure_boxes_initialized`: index 0 = the called app, index > 0
+            // is 1-based into foreign apps; empty refs name nothing).
+            if let Some(ref box_refs) = txn.boxes {
+                for br in box_refs {
+                    let name = match &br.name {
+                        Some(n) if !n.is_empty() => n.clone(),
+                        _ => continue,
+                    };
+                    let app_id = if br.index == 0 {
+                        txn.application_id
+                    } else {
+                        match txn
+                            .foreign_apps
+                            .as_ref()
+                            .and_then(|apps| apps.get((br.index - 1) as usize))
+                        {
+                            Some(&id) => id,
+                            None => continue,
+                        }
+                    };
+                    named.boxes.insert((app_id, name.to_vec()));
+                }
+            }
+
+            named.accounts.extend(tn.accounts.iter().copied());
+            named.assets.extend(tn.assets.iter().copied());
+            named.apps.extend(tn.apps.iter().copied());
+            named.per_txn.push(tn);
+        }
+
+        named
+    }
+
+    /// Whether some single transaction names both the account and the asset,
+    /// making the holding cross-product available.
+    fn has_holding(&self, account: &[u8; 32], asset_id: u64) -> bool {
+        self.per_txn
+            .iter()
+            .any(|t| t.accounts.contains(account) && t.assets.contains(&asset_id))
+    }
+
+    /// Whether some single transaction names both the account and the app,
+    /// making the local-state cross-product available.
+    fn has_local(&self, account: &[u8; 32], app_id: u64) -> bool {
+        self.per_txn
+            .iter()
+            .any(|t| t.accounts.contains(account) && t.apps.contains(&app_id))
+    }
 }
 
 // Helper to create a default scratch row (256 zero-uint slots).
@@ -808,7 +975,29 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             global_delta_tracker: HashMap::new(),
             local_delta_tracker: HashMap::new(),
             tracer_ptr: None,
+            max_log_calls: MAX_LOG_CALLS,
+            max_log_size: MAX_LOG_SIZE,
+            log_size: 0,
+            unnamed_tracking: None,
         }
+    }
+
+    /// Override the per-program log limits (simulation `allow_more_logging`).
+    pub fn set_log_limits(&mut self, max_log_calls: u64, max_log_size: u64) {
+        self.max_log_calls = max_log_calls;
+        self.max_log_size = max_log_size;
+    }
+
+    /// Enable unnamed-resource tracking (simulation `allow_unnamed_resources`)
+    /// with the given precomputed group-named resources.
+    pub fn enable_unnamed_resource_tracking(&mut self, named: Arc<NamedGroupResources>) {
+        self.unnamed_tracking = Some(named);
+    }
+
+    /// The active unnamed-tracking named-resource set, for propagation to
+    /// inner-transaction contexts.
+    pub fn unnamed_tracking(&self) -> Option<Arc<NamedGroupResources>> {
+        self.unnamed_tracking.clone()
     }
 
     /// Set LogicSig arguments (for LogicSig mode).
@@ -850,6 +1039,116 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             // tracer is distinct memory from `self.store`, so this does not
             // alias any other borrow held by the caller.
             unsafe { &mut *p }.record_app_state_access(&access);
+        }
+    }
+
+    /// Report an unnamed-resource access to the attached tracer. A no-op when
+    /// unnamed-resource tracking is disabled or no tracer is attached.
+    fn record_unnamed(&self, access: UnnamedResourceAccess) {
+        if let Some(p) = self.tracer_ptr {
+            // SAFETY: identical aliasing invariants to `record_app_state_access`.
+            unsafe { &mut *p }.record_unnamed_resource(&access);
+        }
+    }
+
+    /// Whether `account` is named by the group, is an application account of a
+    /// named or created app, or belongs to the currently-executing app.
+    fn is_named_account(&self, named: &NamedGroupResources, account: &[u8; 32]) -> bool {
+        if named.accounts.contains(account) {
+            return true;
+        }
+        if *account == app_address(self.app_id) {
+            return true;
+        }
+        self.created_apps
+            .iter()
+            .any(|&id| app_address(id) == *account)
+    }
+
+    /// Whether `asset_id` is named by the group or was created during
+    /// execution.
+    fn is_named_asset(&self, named: &NamedGroupResources, asset_id: u64) -> bool {
+        named.assets.contains(&asset_id) || self.created_assets.contains(&asset_id)
+    }
+
+    /// Whether `app_id` is named by the group, is the currently-executing app,
+    /// or was created during execution.
+    fn is_named_app(&self, named: &NamedGroupResources, app_id: u64) -> bool {
+        app_id == self.app_id || named.apps.contains(&app_id) || self.created_apps.contains(&app_id)
+    }
+
+    /// Track an account access when unnamed-resource tracking is enabled.
+    fn note_account_access(&self, account: &[u8; 32]) {
+        if let Some(named) = &self.unnamed_tracking {
+            if !self.is_named_account(named, account) {
+                self.record_unnamed(UnnamedResourceAccess::Account(*account));
+            }
+        }
+    }
+
+    /// Track an asset access when unnamed-resource tracking is enabled.
+    fn note_asset_access(&self, asset_id: u64) {
+        if let Some(named) = &self.unnamed_tracking {
+            if asset_id != 0 && !self.is_named_asset(named, asset_id) {
+                self.record_unnamed(UnnamedResourceAccess::Asset(asset_id));
+            }
+        }
+    }
+
+    /// Track an app access when unnamed-resource tracking is enabled.
+    fn note_app_access(&self, app_id: u64) {
+        if let Some(named) = &self.unnamed_tracking {
+            if app_id != 0 && !self.is_named_app(named, app_id) {
+                self.record_unnamed(UnnamedResourceAccess::App(app_id));
+            }
+        }
+    }
+
+    /// Track an asset-holding access. Records the unnamed halves, or — when
+    /// both halves are named but no single transaction names them together —
+    /// the holding cross-product itself (go-algorand `AllowsHolding`).
+    fn note_holding_access(&self, account: &[u8; 32], asset_id: u64) {
+        if let Some(named) = &self.unnamed_tracking {
+            let acct_named = self.is_named_account(named, account);
+            let asset_named = asset_id == 0 || self.is_named_asset(named, asset_id);
+            if !acct_named {
+                self.record_unnamed(UnnamedResourceAccess::Account(*account));
+            }
+            if !asset_named {
+                self.record_unnamed(UnnamedResourceAccess::Asset(asset_id));
+            }
+            if acct_named
+                && asset_named
+                && asset_id != 0
+                && !self.created_assets.contains(&asset_id)
+                && !named.has_holding(account, asset_id)
+            {
+                self.record_unnamed(UnnamedResourceAccess::AssetHolding(*account, asset_id));
+            }
+        }
+    }
+
+    /// Track an app-local access. Records the unnamed halves, or — when both
+    /// halves are named but no single transaction names them together — the
+    /// local cross-product itself (go-algorand `AllowsLocal`).
+    fn note_local_access(&self, account: &[u8; 32], app_id: u64) {
+        if let Some(named) = &self.unnamed_tracking {
+            let acct_named = self.is_named_account(named, account);
+            let app_named = app_id == 0 || self.is_named_app(named, app_id);
+            if !acct_named {
+                self.record_unnamed(UnnamedResourceAccess::Account(*account));
+            }
+            if !app_named {
+                self.record_unnamed(UnnamedResourceAccess::App(app_id));
+            }
+            if acct_named
+                && app_named
+                && app_id != 0
+                && !self.created_apps.contains(&app_id)
+                && !named.has_local(account, app_id)
+            {
+                self.record_unnamed(UnnamedResourceAccess::AppLocal(*account, app_id));
+            }
         }
     }
 
@@ -1037,6 +1336,21 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             // for creates/writes and added to available_boxes
         }
 
+        // Unnamed-resource relaxation (simulation `allow_unnamed_resources`):
+        // permit access to a box without a matching box ref, report it to the
+        // tracer, and grow the I/O budget as if one more box reference had
+        // been supplied (go-algorand raises the budget to
+        // `maxPossibleBoxIOBudget` instead; see the divergence note on
+        // `NamedGroupResources`).
+        if !ok && self.unnamed_tracking.is_some() {
+            ok = true;
+            self.record_unnamed(UnnamedResourceAccess::Box(self.app_id, name.to_vec()));
+            self.io_budget = self
+                .io_budget
+                .saturating_add(self.consensus.bytes_per_box_reference);
+            self.available_boxes.entry(key.clone()).or_insert(false);
+        }
+
         if !ok {
             return Err(AlgoError::Avm {
                 message: format!("invalid Box reference {:?}", name),
@@ -1222,6 +1536,8 @@ fn execute_inner_appl<L: LedgerStore>(
     created_apps_snapshot: Vec<u64>,
     consensus: ConsensusParams,
     mut tracer: Option<&mut dyn algo_avm::tracer::EvalTracer>,
+    log_limits: (u64, u64),
+    unnamed_tracking: Option<Arc<NamedGroupResources>>,
 ) -> Result<crate::apply::InnerApplyData, AlgoError> {
     use algo_avm::eval::{
         run_approval_program, run_approval_program_with_tracer, run_clear_state_program,
@@ -1339,6 +1655,12 @@ fn execute_inner_appl<L: LedgerStore>(
     inner_ctx.unnamed_access = box_state.unnamed_access;
     // Inherit created_apps so newAppAccess fallback works for apps created earlier.
     inner_ctx.created_apps = created_apps_snapshot;
+
+    // Inherit simulation eval overrides: log limits and unnamed-resource
+    // tracking apply at every inner-call depth.
+    inner_ctx.max_log_calls = log_limits.0;
+    inner_ctx.max_log_size = log_limits.1;
+    inner_ctx.unnamed_tracking = unnamed_tracking;
 
     // Propagate tracer to inner context for recursive inner tracing.
     // SAFETY: tracer_ptr derived from the mutable reference in `tracer`, which
@@ -1641,6 +1963,26 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
     fn resolve_asset(&self, index: u64) -> Result<u64, AlgoError> {
         let txn = &self.current_txn().txn;
+        // Direct reference (go-algorand `asaReference`, AVM v4+): a value that
+        // names an *available* asset is the asset ID itself, checked before
+        // slot interpretation. With unnamed-resource tracking enabled
+        // (simulation `allow_unnamed_resources`), every asset is available and
+        // the access is recorded at the querying opcode.
+        if index != 0 {
+            let in_foreign = txn
+                .foreign_assets
+                .as_deref()
+                .is_some_and(|assets| assets.contains(&index));
+            if in_foreign
+                || txn.xaid == index
+                || txn.config_asset == index
+                || txn.freeze_asset == index
+                || self.created_assets.contains(&index)
+                || self.unnamed_tracking.is_some()
+            {
+                return Ok(index);
+            }
+        }
         if index == 0 {
             // Index 0 = the "implied" asset: xfer_asset, config_asset, or freeze_asset
             let id = if txn.xaid != 0 {
@@ -1677,6 +2019,24 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             return Ok(self.app_id);
         }
         let txn = &self.current_txn().txn;
+        // Direct reference (go-algorand `appReference`, AVM v4+): a value that
+        // names an *available* app is the app ID itself, checked before slot
+        // interpretation. With unnamed-resource tracking enabled, every app is
+        // available and the access is recorded at the querying opcode.
+        {
+            let in_foreign = txn
+                .foreign_apps
+                .as_deref()
+                .is_some_and(|apps| apps.contains(&index));
+            if in_foreign
+                || index == self.app_id
+                || txn.application_id == index
+                || self.created_apps.contains(&index)
+                || self.unnamed_tracking.is_some()
+            {
+                return Ok(index);
+            }
+        }
         let apps = txn.foreign_apps.as_deref().unwrap_or(&[]);
         let i = (index - 1) as usize;
         if i < apps.len() {
@@ -1695,6 +2055,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     // ---- State reads ----
 
     fn app_opted_in(&self, account: &[u8; 32], app_id: u64) -> Result<bool, AlgoError> {
+        self.note_local_access(account, app_id);
         let addr = Address(*account);
         Ok(self.store.has_app_local_state(&addr, app_id))
     }
@@ -1705,6 +2066,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         app_id: u64,
         key: &[u8],
     ) -> Result<Option<TealValue>, AlgoError> {
+        self.note_local_access(account, app_id);
         let addr = Address(*account);
         let value = match self.store.get_app_local_state(&addr, app_id) {
             Some(local) => local.key_value.get(key).cloned(),
@@ -1723,6 +2085,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     }
 
     fn app_global_get(&self, app_id: u64, key: &[u8]) -> Result<Option<TealValue>, AlgoError> {
+        self.note_app_access(app_id);
         let value = match self.store.get_app_params(app_id) {
             Some(params) => params.global_state.get(key).cloned(),
             None => None,
@@ -1868,6 +2231,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     // ---- Account / asset / app parameter queries ----
 
     fn balance(&self, account: &[u8; 32]) -> Result<u64, AlgoError> {
+        self.note_account_access(account);
         let addr = Address(*account);
         Ok(self
             .store
@@ -1877,6 +2241,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     }
 
     fn min_balance(&self, account: &[u8; 32]) -> Result<u64, AlgoError> {
+        self.note_account_access(account);
         let addr = Address(*account);
         let acct = self.store.get_or_default_account(&addr);
         Ok(self.store.min_balance_with_state(&addr, &acct))
@@ -1888,6 +2253,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         asset_id: u64,
         field: u8,
     ) -> Result<(TealValue, bool), AlgoError> {
+        self.note_holding_access(account, asset_id);
         let addr = Address(*account);
         match self.store.get_asset_holding(&addr, asset_id) {
             Some(holding) => {
@@ -1909,6 +2275,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     }
 
     fn asset_params_get(&self, asset_id: u64, field: u8) -> Result<(TealValue, bool), AlgoError> {
+        self.note_asset_access(asset_id);
         match self.store.get_asset_params(asset_id) {
             Some(record) => {
                 let p = &record.params;
@@ -1975,6 +2342,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     }
 
     fn app_params_get(&self, app_id: u64, field: u8) -> Result<(TealValue, bool), AlgoError> {
+        self.note_app_access(app_id);
         match self.store.get_app_params(app_id) {
             Some(p) => {
                 let val = match field {
@@ -2013,6 +2381,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         account: &[u8; 32],
         field: u8,
     ) -> Result<(TealValue, bool), AlgoError> {
+        self.note_account_access(account);
         let addr = Address(*account);
         match self.store.get_account(&addr) {
             Some(acct) => {
@@ -2067,6 +2436,26 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
     // ---- Logging ----
 
     fn log(&mut self, data: Vec<u8>) -> Result<(), AlgoError> {
+        // Enforce the per-program log limits (go-algorand `opLog`,
+        // `data/transactions/logic/eval.go`). Error strings match go
+        // byte-for-byte so simulation failure messages are identical.
+        if self.logs.len() as u64 >= self.max_log_calls {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "too many log calls in program. up to {} is allowed",
+                    self.max_log_calls
+                ),
+            });
+        }
+        self.log_size += data.len() as u64;
+        if self.log_size > self.max_log_size {
+            return Err(AlgoError::Avm {
+                message: format!(
+                    "program logs too large. {} bytes >  {} bytes limit",
+                    self.log_size, self.max_log_size
+                ),
+            });
+        }
         self.logs.push(data);
         Ok(())
     }
@@ -2677,6 +3066,8 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     self.created_apps.clone(),
                     self.consensus.clone(),
                     tracer_ref,
+                    (self.max_log_calls, self.max_log_size),
+                    self.unnamed_tracking.clone(),
                 );
                 match result {
                     Ok(ad) => {

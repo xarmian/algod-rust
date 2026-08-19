@@ -101,6 +101,25 @@ pub struct ApplyContext {
     pub txn_index: Cell<usize>,
     /// Consensus parameters for the current protocol version.
     pub consensus: ConsensusParams,
+    /// Simulation-only AVM evaluation overrides (log limits,
+    /// unnamed-resource tracking). Defaults leave consensus behaviour
+    /// unchanged.
+    pub avm_overrides: AvmEvalOverrides,
+}
+
+/// AVM evaluation overrides applied by the simulation engine.
+///
+/// Mirrors the effect of go-algorand's `ResultEvalOverrides.LogicEvalConstants()`
+/// and the `UnnamedResources` policy on `logic.EvalParams`.
+#[derive(Debug, Clone, Default)]
+pub struct AvmEvalOverrides {
+    /// Raised `log` call limit (simulation `allow_more_logging`).
+    pub max_log_calls: Option<u64>,
+    /// Raised total log size limit (simulation `allow_more_logging`).
+    pub max_log_size: Option<u64>,
+    /// Enable unnamed-resource tracking (simulation `allow_unnamed_resources`).
+    /// Holds the group's named resources, shared across all transactions.
+    pub unnamed_tracking: Option<std::sync::Arc<crate::avm_context::NamedGroupResources>>,
 }
 
 impl ApplyContext {
@@ -119,6 +138,28 @@ impl ApplyContext {
             fee_credit: Cell::new(0),
             txn_index: Cell::new(0),
             consensus: ConsensusParams::default(),
+            avm_overrides: AvmEvalOverrides::default(),
+        }
+    }
+
+    /// Apply this context's simulation AVM overrides to a freshly created
+    /// `LedgerAvmContext`. A no-op for the default (consensus) overrides.
+    pub(crate) fn configure_avm_ctx<L: crate::store_trait::LedgerStore>(
+        &self,
+        avm_ctx: &mut crate::avm_context::LedgerAvmContext<'_, L>,
+    ) {
+        if self.avm_overrides.max_log_calls.is_some() || self.avm_overrides.max_log_size.is_some() {
+            avm_ctx.set_log_limits(
+                self.avm_overrides
+                    .max_log_calls
+                    .unwrap_or(crate::avm_context::MAX_LOG_CALLS),
+                self.avm_overrides
+                    .max_log_size
+                    .unwrap_or(crate::avm_context::MAX_LOG_SIZE),
+            );
+        }
+        if let Some(named) = &self.avm_overrides.unnamed_tracking {
+            avm_ctx.enable_unnamed_resource_tracking(named.clone());
         }
     }
 }
@@ -551,6 +592,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
         fee_credit: Cell::new(0),
         txn_index: Cell::new(0),
         consensus: consensus.clone(),
+        avm_overrides: Default::default(),
     };
 
     // Re-borrow the tracer per iteration with `Option::as_deref_mut` so
@@ -2596,6 +2638,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                     avm_ctx.fee_sink = ctx.fee_sink;
                     avm_ctx.txn_counter = ctx.txn_counter.get();
                     avm_ctx.fee_credit = ctx.fee_credit.get();
+                    ctx.configure_avm_ctx(&mut avm_ctx);
                     if let Some(ref mut t) = tracer {
                         avm_ctx.tracer_ptr = Some(*t as *mut dyn EvalTracer);
                     }
@@ -2680,6 +2723,7 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 avm_ctx.fee_sink = ctx.fee_sink;
                 avm_ctx.txn_counter = ctx.txn_counter.get();
                 avm_ctx.fee_credit = ctx.fee_credit.get();
+                ctx.configure_avm_ctx(&mut avm_ctx);
                 if let Some(ref mut t) = tracer {
                     avm_ctx.tracer_ptr = Some(*t as *mut dyn EvalTracer);
                 }
@@ -5103,6 +5147,7 @@ mod tests {
             fee_credit: Cell::new(0),
             txn_index: Cell::new(0),
             consensus,
+            avm_overrides: Default::default(),
         }
     }
 
@@ -5802,6 +5847,7 @@ mod tests {
             fee_credit: Cell::new(0),
             txn_index: Cell::new(0),
             consensus,
+            avm_overrides: Default::default(),
         };
         let stx = heartbeat_txn(sender, target, vote_id, 10, 1_000);
         let result = apply_transaction(&mut state, &stx, &ctx, 0);
@@ -5981,6 +6027,7 @@ mod tests {
             fee_credit: Cell::new(0),
             txn_index: Cell::new(0),
             consensus,
+            avm_overrides: Default::default(),
         }
     }
 
@@ -6823,6 +6870,7 @@ mod tests {
             fee_credit: Cell::new(0),
             txn_index: Cell::new(0),
             consensus,
+            avm_overrides: Default::default(),
         };
 
         apply_transaction(&mut state, &stx, &ctx, 0).unwrap();

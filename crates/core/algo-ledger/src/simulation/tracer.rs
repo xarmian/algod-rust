@@ -5,12 +5,14 @@
 //! [`TransactionTrace`] structures for the simulation result.
 
 use algo_avm::machine::AvmValue;
-use algo_avm::tracer::{AppStateAccess, AppStateOp, AppStateType, EvalTracer, ProgramType};
+use algo_avm::tracer::{
+    AppStateAccess, AppStateOp, AppStateType, EvalTracer, ProgramType, UnnamedResourceAccess,
+};
 use algo_types::{Address, TealValue};
 
 use super::trace::{
     AvmValueTrace, ExecTraceConfig, InitialStatesAccumulator, OpcodeTraceUnit, ProgramTrace,
-    StateChange, StateChangeKind, StateChangeOp, TransactionTrace,
+    StateChange, StateChangeKind, StateChangeOp, TransactionTrace, UnnamedResourcesAccessed,
 };
 
 /// Converts an AVM machine value to a trace-friendly representation.
@@ -92,6 +94,10 @@ pub struct SimulationTracer {
     /// (`tracer.go:504`). Accumulated even when opcode tracing is disabled,
     /// since per-transaction budget is a standard simulate response field.
     app_cost_consumed: u64,
+    /// Unnamed resources reported by the AVM context when the request set
+    /// `allow_unnamed_resources`. The simulation engine drains this after
+    /// each transaction and merges it into the group-level set.
+    unnamed_resources: UnnamedResourcesAccessed,
 }
 
 impl SimulationTracer {
@@ -106,7 +112,14 @@ impl SimulationTracer {
             initial_states: InitialStatesAccumulator::default(),
             pending_state_changes: Vec::new(),
             app_cost_consumed: 0,
+            unnamed_resources: UnnamedResourcesAccessed::default(),
         }
+    }
+
+    /// Take the unnamed resources recorded during this transaction, leaving
+    /// an empty set behind.
+    pub fn take_unnamed_resources(&mut self) -> UnnamedResourcesAccessed {
+        std::mem::take(&mut self.unnamed_resources)
     }
 
     /// Total app opcode cost consumed by this transaction (approval +
@@ -422,6 +435,36 @@ impl EvalTracer for SimulationTracer {
                 self.app_cost_consumed = self.app_cost_consumed.saturating_add(cost);
             }
             ProgramType::LogicSig => {}
+        }
+    }
+
+    fn record_unnamed_resource(&mut self, access: &UnnamedResourceAccess) {
+        // Not gated on trace config: the AVM context only reports these when
+        // the request enabled `allow_unnamed_resources`, and the response
+        // field is independent of exec tracing.
+        match access {
+            UnnamedResourceAccess::Account(addr) => {
+                self.unnamed_resources.accounts.insert(Address(*addr));
+            }
+            UnnamedResourceAccess::Asset(id) => {
+                self.unnamed_resources.assets.insert(*id);
+            }
+            UnnamedResourceAccess::App(id) => {
+                self.unnamed_resources.apps.insert(*id);
+            }
+            UnnamedResourceAccess::Box(app_id, name) => {
+                self.unnamed_resources.boxes.insert((*app_id, name.clone()));
+            }
+            UnnamedResourceAccess::AssetHolding(addr, id) => {
+                self.unnamed_resources
+                    .asset_holdings
+                    .insert((Address(*addr), *id));
+            }
+            UnnamedResourceAccess::AppLocal(addr, id) => {
+                self.unnamed_resources
+                    .app_locals
+                    .insert((Address(*addr), *id));
+            }
         }
     }
 }

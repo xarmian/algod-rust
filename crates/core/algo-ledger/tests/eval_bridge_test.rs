@@ -86,6 +86,7 @@ fn execute_ctx(fee_sink: Address, round: u64) -> ApplyContext {
         fee_credit: Cell::new(0),
         txn_index: Cell::new(0),
         consensus: algo_types::ConsensusParams::default(),
+        avm_overrides: Default::default(),
     }
 }
 
@@ -930,6 +931,7 @@ fn two_app_calls_produce_distinct_inner_asset_ids() {
         fee_credit: Cell::new(0),
         txn_index: Cell::new(0),
         consensus: algo_types::ConsensusParams::default(),
+        avm_overrides: Default::default(),
     };
 
     // First app call: fee=1000 (no overpayment).
@@ -1082,6 +1084,7 @@ fn fee_credit_from_outer_overpayment_enables_inner_zero_fee() {
         fee_credit: Cell::new(2_000 - 1_000), // overpayment
         txn_index: Cell::new(0),
         consensus: algo_types::ConsensusParams::default(),
+        avm_overrides: Default::default(),
     };
 
     let result = apply_transaction(&mut state, &stx, &ctx, 0);
@@ -1150,6 +1153,7 @@ fn inner_zero_fee_fails_without_fee_credit() {
         fee_credit: Cell::new(0), // no fee credit
         txn_index: Cell::new(0),
         consensus: algo_types::ConsensusParams::default(),
+        avm_overrides: Default::default(),
     };
 
     let result = apply_transaction(&mut state, &stx, &ctx, 0);
