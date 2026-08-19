@@ -2795,6 +2795,13 @@ pub async fn simulate_transaction<N: NodeInterface>(
         return error::service_unavailable("operation not available during catchup");
     }
 
+    // Enforce go-algorand's request body size limit: the Go handler wraps
+    // the body in `http.MaxBytesReader(nil, body, MaxTealDryrunBytes)` and
+    // returns 400 when the read overflows (handlers.go SimulateTransaction).
+    if body.len() > MAX_TEAL_DRYRUN_BYTES {
+        return error::bad_request("request body too large");
+    }
+
     // Decode request body: try msgpack first, then JSON.
     // Track the input format so we can decode individual transactions
     // correctly (msgpack binary data cannot round-trip through serde_json::Value).

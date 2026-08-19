@@ -4,8 +4,11 @@
 //! This is the acceptance test for TASK-217 (B9): end-to-end through
 //! the same binary `goal kmd` would talk to.
 
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::time::Duration;
 
 #[cfg(unix)]

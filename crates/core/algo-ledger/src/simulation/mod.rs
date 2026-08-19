@@ -175,6 +175,43 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         }
     }
 
+    /// Validate the trace configuration against the node configuration.
+    ///
+    /// Mirrors go-algorand's `validateSimulateRequest`
+    /// (`ledger/simulation/trace.go`): requesting an execution trace
+    /// requires the developer API to be enabled, and the `stack`,
+    /// `scratch`, and `state` sub-options require the basic trace
+    /// (`enable`) to be on. Error messages match go byte-for-byte so REST
+    /// clients see identical 400 bodies.
+    fn validate_trace_config(&self, cfg: &ExecTraceConfig) -> Result<(), SimulatorError> {
+        if !self.developer_api && cfg.enable {
+            return Err(SimulatorError::InvalidRequest(InvalidRequestError {
+                message: "the local configuration of the node has `EnableDeveloperAPI` turned off, while requesting for execution trace".to_string(),
+            }));
+        }
+        if !cfg.enable {
+            if cfg.stack {
+                return Err(SimulatorError::InvalidRequest(InvalidRequestError {
+                    message: "basic trace must be enabled when enabling stack tracing".to_string(),
+                }));
+            }
+            if cfg.scratch {
+                return Err(SimulatorError::InvalidRequest(InvalidRequestError {
+                    message:
+                        "basic trace must be enabled when enabling scratch slot change tracing"
+                            .to_string(),
+                }));
+            }
+            if cfg.state {
+                return Err(SimulatorError::InvalidRequest(InvalidRequestError {
+                    message: "basic trace must be enabled when enabling app state change tracing"
+                        .to_string(),
+                }));
+            }
+        }
+        Ok(())
+    }
+
     /// Simulate the given request and return results.
     ///
     /// The ledger store is left unchanged after simulation completes
@@ -210,6 +247,8 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 message: "transaction group must contain at least one transaction".to_string(),
             }));
         }
+
+        self.validate_trace_config(&request.trace_config)?;
 
         // --- Determine simulation round ---
 
@@ -266,7 +305,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             }
         }
         // Deduplicate addresses.
-        addrs.sort_by(|a, b| a.0.cmp(&b.0));
+        addrs.sort_by_key(|a| a.0);
         addrs.dedup();
 
         // Collect app/asset IDs that may be created or modified during
@@ -275,8 +314,10 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // derived ID from the running txn_counter.
         let mut asset_ids: Vec<u64> = Vec::new();
         let mut app_ids: Vec<u64> = Vec::new();
-        let mut sim_counter = self.store.txn_counter();
-        for stx in txn_group {
+        let base_counter = self.store.txn_counter();
+        for (i, stx) in txn_group.iter().enumerate() {
+            // Each top-level txn increments the counter.
+            let sim_counter = base_counter + i as u64;
             match stx.txn.txn_type.as_str() {
                 "acfg" => {
                     if stx.txn.config_asset != 0 {
@@ -306,8 +347,6 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                 }
                 _ => {}
             }
-            // Each top-level txn increments the counter
-            sim_counter += 1;
         }
 
         let snapshot = if asset_ids.is_empty() && app_ids.is_empty() {

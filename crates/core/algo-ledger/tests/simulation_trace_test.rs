@@ -106,7 +106,7 @@ fn simulation_trace_captures_approval_opcodes() {
         ..Default::default()
     };
 
-    let mut simulator = Simulator::new(&mut state);
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
     let result = simulator
         .simulate(request)
         .expect("simulation should succeed");
@@ -214,7 +214,7 @@ fn simulation_trace_with_stack() {
         ..Default::default()
     };
 
-    let mut simulator = Simulator::new(&mut state);
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
     let result = simulator
         .simulate(request)
         .expect("simulation should succeed");
@@ -270,7 +270,7 @@ fn simulation_captures_state_change_on_global_write() {
         ..Default::default()
     };
 
-    let mut simulator = Simulator::new(&mut state);
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
     let result = simulator
         .simulate(request)
         .expect("simulation should succeed");
@@ -387,7 +387,7 @@ fn simulation_captures_initial_global_state() {
         ..Default::default()
     };
 
-    let mut simulator = Simulator::new(&mut state);
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
     let result = simulator
         .simulate(request)
         .expect("simulation should succeed");
@@ -441,7 +441,7 @@ fn simulation_no_initial_states_without_state_config() {
         ..Default::default()
     };
 
-    let mut simulator = Simulator::new(&mut state);
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
     let result = simulator
         .simulate(request)
         .expect("simulation should succeed");
@@ -530,7 +530,7 @@ fn simulation_trace_captures_logicsig_program() {
         ..Default::default()
     };
 
-    let mut simulator = Simulator::new(&mut state);
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
     let result = simulator
         .simulate(request)
         .expect("logicsig simulation should succeed");
@@ -655,7 +655,7 @@ fn simulation_trace_inner_txn_spawned_inners() {
         ..Default::default()
     };
 
-    let mut simulator = Simulator::new(&mut state);
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
     let result = simulator
         .simulate(request)
         .expect("inner-txn simulation should succeed");
@@ -991,7 +991,7 @@ fn simulation_captures_box_state_changes_with_post_write_values() {
         ..Default::default()
     };
 
-    let mut simulator = Simulator::new(&mut state);
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
     let result = simulator
         .simulate(request)
         .expect("simulation should succeed");
@@ -1056,4 +1056,180 @@ fn simulation_captures_box_state_changes_with_post_write_values() {
     // box_del "b1" -> no new value.
     assert_eq!(changes[3].key, b"b1");
     assert!(changes[3].new_value.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Trace config validation (issue #217)
+//
+// Mirrors go-algorand's `validateSimulateRequest`
+// (`ledger/simulation/trace.go`): requesting an execution trace requires
+// the developer API, and the stack/scratch/state sub-options require the
+// basic trace to be enabled.
+// ---------------------------------------------------------------------------
+
+/// Build a request with one valid app-call group and the given trace config.
+fn trace_request(sender: Address, app_id: u64, trace_config: ExecTraceConfig) -> SimulationRequest {
+    SimulationRequest {
+        txn_groups: vec![vec![make_appl_txn(sender, app_id)]],
+        allow_empty_signatures: true,
+        trace_config,
+        ..Default::default()
+    }
+}
+
+/// Extract the invalid-request message or panic.
+fn expect_invalid_request(
+    result: Result<algo_ledger::simulation::SimulationResult, SimulatorError>,
+) -> String {
+    match result {
+        Err(SimulatorError::InvalidRequest(e)) => e.to_string(),
+        other => panic!("expected InvalidRequest error, got {other:?}"),
+    }
+}
+
+#[test]
+fn simulation_trace_requires_developer_api() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 100;
+    let mut state = setup_state(sender, app_id, vec![0x06, 0x81, 0x01, 0x43]);
+
+    let request = trace_request(
+        sender,
+        app_id,
+        ExecTraceConfig {
+            enable: true,
+            ..Default::default()
+        },
+    );
+
+    // `Simulator::new` leaves the developer API off.
+    let mut simulator = Simulator::new(&mut state);
+    let msg = expect_invalid_request(simulator.simulate(request));
+    assert_eq!(
+        msg,
+        "the local configuration of the node has `EnableDeveloperAPI` turned off, while requesting for execution trace"
+    );
+}
+
+#[test]
+fn simulation_trace_allowed_with_developer_api() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 100;
+    let mut state = setup_state(sender, app_id, vec![0x06, 0x81, 0x01, 0x43]);
+
+    let request = trace_request(
+        sender,
+        app_id,
+        ExecTraceConfig {
+            enable: true,
+            stack: true,
+            scratch: true,
+            state: true,
+        },
+    );
+
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("trace request with developer API should succeed");
+    assert!(result.txn_groups[0].failure_message.is_none());
+}
+
+#[test]
+fn simulation_stack_trace_requires_basic_trace() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 100;
+    let mut state = setup_state(sender, app_id, vec![0x06, 0x81, 0x01, 0x43]);
+
+    let request = trace_request(
+        sender,
+        app_id,
+        ExecTraceConfig {
+            enable: false,
+            stack: true,
+            ..Default::default()
+        },
+    );
+
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
+    let msg = expect_invalid_request(simulator.simulate(request));
+    assert_eq!(
+        msg,
+        "basic trace must be enabled when enabling stack tracing"
+    );
+}
+
+#[test]
+fn simulation_scratch_trace_requires_basic_trace() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 100;
+    let mut state = setup_state(sender, app_id, vec![0x06, 0x81, 0x01, 0x43]);
+
+    let request = trace_request(
+        sender,
+        app_id,
+        ExecTraceConfig {
+            enable: false,
+            scratch: true,
+            ..Default::default()
+        },
+    );
+
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
+    let msg = expect_invalid_request(simulator.simulate(request));
+    assert_eq!(
+        msg,
+        "basic trace must be enabled when enabling scratch slot change tracing"
+    );
+}
+
+#[test]
+fn simulation_state_trace_requires_basic_trace() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 100;
+    let mut state = setup_state(sender, app_id, vec![0x06, 0x81, 0x01, 0x43]);
+
+    let request = trace_request(
+        sender,
+        app_id,
+        ExecTraceConfig {
+            enable: false,
+            state: true,
+            ..Default::default()
+        },
+    );
+
+    let mut simulator = Simulator::new_with_developer_api(&mut state);
+    let msg = expect_invalid_request(simulator.simulate(request));
+    assert_eq!(
+        msg,
+        "basic trace must be enabled when enabling app state change tracing"
+    );
+}
+
+/// The developer-API gate fires before the sub-option consistency checks,
+/// matching go-algorand's check ordering in `validateSimulateRequest`.
+#[test]
+fn simulation_developer_api_gate_checked_before_sub_options() {
+    let sender = Address([0xAA; 32]);
+    let app_id = 100;
+    let mut state = setup_state(sender, app_id, vec![0x06, 0x81, 0x01, 0x43]);
+
+    let request = trace_request(
+        sender,
+        app_id,
+        ExecTraceConfig {
+            enable: true,
+            stack: true,
+            scratch: true,
+            state: true,
+        },
+    );
+
+    let mut simulator = Simulator::new(&mut state);
+    let msg = expect_invalid_request(simulator.simulate(request));
+    assert!(
+        msg.contains("EnableDeveloperAPI"),
+        "expected developer-API error, got {msg:?}"
+    );
 }

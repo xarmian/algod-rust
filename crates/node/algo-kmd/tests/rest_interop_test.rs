@@ -20,10 +20,14 @@
 //! Requires `go` on PATH and `../go-algorand` checked out at the
 //! same level as the algod-rust workspace root.
 
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use tempfile::TempDir;
 
 fn mixed_cluster_enabled() -> bool {
@@ -31,6 +35,7 @@ fn mixed_cluster_enabled() -> bool {
 }
 
 /// Workspace root — `crates/node/algo-kmd/../../..`.
+#[cfg(unix)]
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
@@ -38,6 +43,7 @@ fn workspace_root() -> PathBuf {
         .expect("workspace root resolves")
 }
 
+#[cfg(unix)]
 fn kmd_rust_binary() -> PathBuf {
     // `cargo test -p algo-kmd --test rest_interop_test` builds the
     // crate's test binary, but kmd-rust lives in a separate package.
@@ -61,6 +67,7 @@ fn kmd_rust_binary() -> PathBuf {
     panic!("kmd-rust binary not found under {}/target", root.display());
 }
 
+#[cfg(unix)]
 fn write_minimal_config(data_dir: &Path) {
     // Insecure scrypt so the interop test isn't dominated by KDF
     // cost.  Matches the params other algo-kmd integration tests use.
@@ -85,6 +92,7 @@ fn write_minimal_config(data_dir: &Path) {
     .unwrap();
 }
 
+#[cfg(unix)]
 fn poll_for_listening(data_dir: &Path, timeout: Duration) -> Result<(), String> {
     let net_path = data_dir.join("kmd.net");
     let start = Instant::now();

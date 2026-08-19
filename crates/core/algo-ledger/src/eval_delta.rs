@@ -111,10 +111,8 @@ pub fn parse_eval_delta(val: &rmpv::Value) -> Result<EvalDelta, AlgoError> {
                     logs = Some(parse_logs(v)?);
                 }
             }
-            "sa" => {
-                if !is_empty_value(v) {
-                    shared_accts = Some(parse_shared_accts(v)?);
-                }
+            "sa" if !is_empty_value(v) => {
+                shared_accts = Some(parse_shared_accts(v)?);
             }
             _ => {
                 // Ignore unknown fields for forward compatibility.
@@ -195,7 +193,7 @@ pub fn encode_eval_delta(
         // unspecified.
         let accounts: &[Address] = txn.accounts.as_deref().unwrap_or(&[]);
         let mut items: Vec<_> = result.local_deltas.iter().collect();
-        items.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        items.sort_by_key(|(addr, _)| addr.0);
 
         let mut shared: Vec<Address> = Vec::new();
         let mut ld: Vec<(Value, Value)> = Vec::with_capacity(items.len());

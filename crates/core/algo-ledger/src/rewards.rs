@@ -140,11 +140,9 @@ pub fn next_rewards_state(
         let new_rate = incentive_pool_balance.saturating_sub(max_spent_over);
         // RewardsRateRefreshInterval is a positive consensus param; guard a
         // degenerate 0 to avoid a divide-by-zero.
-        res.rewards_rate = if params.rewards_rate_refresh_interval == 0 {
-            0
-        } else {
-            new_rate / params.rewards_rate_refresh_interval
-        };
+        res.rewards_rate = new_rate
+            .checked_div(params.rewards_rate_refresh_interval)
+            .unwrap_or_default();
         // go computes `nextRound + Round(interval)` with plain unsigned
         // (wrapping) arithmetic; use wrapping_add for bit-for-bit parity rather
         // than saturating (which would clamp at u64::MAX) in this consensus
