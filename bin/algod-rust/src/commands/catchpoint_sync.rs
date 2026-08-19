@@ -185,6 +185,7 @@ pub enum BlockSourcePolicy {
 /// This ensures batch fetches route through the same HTTP block fetcher that
 /// single-block fetches use, rather than constructing ad-hoc `AlgodClient`
 /// instances.
+#[allow(dead_code)] // wired up when catchup batch-fetch routes through BlockSource
 struct HttpBlockFetcherSource {
     fetcher: HttpBlockFetcher,
 }
@@ -236,6 +237,7 @@ impl BlockSource for HttpBlockFetcherSource {
 ///
 /// The HTTP fallback uses [`HttpBlockFetcherSource`] to ensure consistency
 /// with the single-block fetch path (which routes through `HttpBlockFetcher`).
+#[allow(dead_code)] // wired up when catchup batch-fetch routes through BlockSource
 struct FallbackBlockSource {
     gossip: Arc<GossipBlockSource>,
     http: HttpBlockFetcherSource,

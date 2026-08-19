@@ -4,7 +4,6 @@
 //! — error wording, file permissions, and exit codes match Go so operator
 //! tooling (CI, scripts) sees the same surface.
 
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
@@ -60,6 +59,7 @@ pub fn write_public_key(pubkeyfile: &Path, checksummed: &str) -> std::io::Result
 fn write_with_mode(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
+        use std::fs::OpenOptions;
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = OpenOptions::new()
             .write(true)

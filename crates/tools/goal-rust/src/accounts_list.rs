@@ -224,7 +224,7 @@ impl AccountsList {
 
     /// `rename(old, new)`. Mirrors Go.
     pub fn rename(&mut self, old_name: &str, new_name: &str) -> Result<(), AccountsListError> {
-        for (_addr, name) in self.accounts.iter_mut() {
+        for name in self.accounts.values_mut() {
             if name == old_name {
                 *name = new_name.to_string();
                 break;
