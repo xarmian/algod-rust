@@ -5609,6 +5609,44 @@ async fn simulate_invalid_format_returns_400() {
     assert_eq!(resp.status(), 400);
 }
 
+/// The simulate endpoint enforces go-algorand's 1MB request body limit
+/// (`MaxTealDryrunBytes`): an otherwise-valid request padded past the limit
+/// must be rejected with 400 before decoding.
+#[tokio::test]
+async fn simulate_body_too_large_returns_400() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    // A structurally valid JSON request padded with trailing whitespace
+    // (still valid JSON) so only the size check can reject it.
+    let stx_val = serde_json::to_value(SignedTransaction::default()).unwrap();
+    let request_json = serde_json::json!({
+        "txn-groups": [{
+            "txns": [stx_val]
+        }]
+    });
+    let mut body = serde_json::to_vec(&request_json).unwrap();
+    body.resize(1_000_001, b' ');
+
+    let resp = server
+        .client
+        .post(server.url("/v2/transactions/simulate"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("request body too large"),
+        "expected body-too-large message, got {json}"
+    );
+}
+
 // ===========================================================================
 // Ledger state delta endpoint tests
 // ===========================================================================

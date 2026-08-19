@@ -1330,7 +1330,14 @@ impl NodeInterface for AlgodNodeInterface {
         // the simulation-response fidelity work.
         let result = {
             let mut ledger = self.lock_ledger("simulate")?;
-            let mut simulator = Simulator::new(&mut *ledger);
+            // Honor the node's developer-API setting so trace-enabled
+            // requests are gated exactly like go-algorand's
+            // `MakeSimulator(ledger, developerAPI)`.
+            let mut simulator = if self.enable_developer_api() {
+                Simulator::new_with_developer_api(&mut *ledger)
+            } else {
+                Simulator::new(&mut *ledger)
+            };
             simulator
                 .simulate(sim_req)
                 .map_err(Self::map_simulator_error)?
@@ -3760,6 +3767,63 @@ mod tests {
                 );
             }
             other => panic!("expected BadRequest(invalid request), got {other:?}"),
+        }
+    }
+
+    /// Build a simulate request with one dummy transaction and an
+    /// exec-trace config asking for the basic trace.
+    fn trace_simulate_request() -> SimulateRequest {
+        SimulateRequest {
+            allow_empty_signatures: Some(true),
+            allow_more_logging: None,
+            allow_unnamed_resources: None,
+            exec_trace_config: Some(SimulateTraceConfig {
+                enable: Some(true),
+                stack_change: None,
+                scratch_change: None,
+                state_change: None,
+            }),
+            extra_opcode_budget: None,
+            fix_signers: None,
+            round: None,
+            txn_groups: Vec::new(),
+            decoded_txn_groups: vec![vec![algo_types::SignedTransaction::default()]],
+        }
+    }
+
+    #[tokio::test]
+    async fn simulate_trace_requires_developer_api() {
+        // Without dev mode, `enable_developer_api()` is false, so the
+        // simulator must reject a trace-enabled request with go's
+        // `validateSimulateRequest` error, surfaced as a 400 by the
+        // handler via `NodeError::BadRequest`.
+        let adapter = make_adapter();
+        match adapter.simulate(trace_simulate_request()).await {
+            Err(NodeError::BadRequest(msg)) => {
+                assert!(
+                    msg.contains("EnableDeveloperAPI"),
+                    "expected developer-API gating error, got {msg:?}"
+                );
+            }
+            other => panic!("expected BadRequest(EnableDeveloperAPI ...), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn simulate_trace_allowed_in_dev_mode() {
+        // With dev mode on, `enable_developer_api()` is true and the
+        // trace-enabled request must pass the developer-API gate. The
+        // dummy transaction may still fail evaluation, but it must not
+        // be rejected by the trace-config validation.
+        let adapter = make_adapter().with_dev_mode();
+        match adapter.simulate(trace_simulate_request()).await {
+            Err(NodeError::BadRequest(msg)) => {
+                assert!(
+                    !msg.contains("EnableDeveloperAPI"),
+                    "developer-API gate should be open in dev mode, got {msg:?}"
+                );
+            }
+            _ => {}
         }
     }
 
