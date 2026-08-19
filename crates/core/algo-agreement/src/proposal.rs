@@ -565,7 +565,7 @@ mod tests {
         };
         let encoded = prop.to_be_hashed();
         // The encoded bytes should contain "sdpf" as a field key
-        let has_sdpf = encoded.windows(4).any(|w| w == [b's', b'd', b'p', b'f']);
+        let has_sdpf = encoded.windows(4).any(|w| w == b"sdpf");
         assert!(has_sdpf, "encoding must contain 'sdpf' field");
     }
 
@@ -578,7 +578,7 @@ mod tests {
             original_proposer: Address([0; 32]),
         };
         let encoded = prop.to_be_hashed();
-        let has_oper = encoded.windows(4).any(|w| w == [b'o', b'p', b'e', b'r']);
+        let has_oper = encoded.windows(4).any(|w| w == b"oper");
         assert!(has_oper, "encoding must contain 'oper' field");
     }
 
@@ -591,9 +591,7 @@ mod tests {
             original_proposer: Address([0x11; 32]),
         };
         let encoded = prop.to_be_hashed();
-        let has_oprop = encoded
-            .windows(5)
-            .any(|w| w == [b'o', b'p', b'r', b'o', b'p']);
+        let has_oprop = encoded.windows(5).any(|w| w == b"oprop");
         assert!(has_oprop, "encoding must contain 'oprop' field");
     }
 

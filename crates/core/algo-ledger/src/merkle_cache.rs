@@ -1105,8 +1105,8 @@ impl MerkleTrieCache {
         old_nodes.sort_by_key(|(id, _)| *id);
         self.next_node_id += count as u64;
 
-        let mut cur_id = next_id_start;
-        for (old_id, node) in old_nodes {
+        for (i, (old_id, node)) in old_nodes.into_iter().enumerate() {
+            let cur_id = next_id_start + i as u64;
             reallocation_map.insert(old_id, cur_id);
             let cur_page = cur_id / self.nodes_per_page;
             // Note: cached_node_count is conserved across moves — we're
@@ -1114,7 +1114,6 @@ impl MerkleTrieCache {
             self.pages.entry(cur_page).or_default().insert(cur_id, node);
             reallocated_pages.insert(cur_page);
             self.prioritize_front(cur_page);
-            cur_id += 1;
         }
 
         // Old page is now empty; drop from LRU + reallocated set.

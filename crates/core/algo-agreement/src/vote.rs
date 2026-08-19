@@ -441,10 +441,8 @@ impl UnauthenticatedVote {
                     return Err(VoteError::BottomNotAllowed { step: rv.step });
                 }
             }
-            SOFT | CERT => {
-                if rv.proposal.is_bottom() {
-                    return Err(VoteError::BottomNotAllowed { step: rv.step });
-                }
+            SOFT | CERT if rv.proposal.is_bottom() => {
+                return Err(VoteError::BottomNotAllowed { step: rv.step });
             }
             _ => {}
         }

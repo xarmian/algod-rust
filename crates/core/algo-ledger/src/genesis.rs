@@ -286,11 +286,10 @@ pub fn make_genesis_block(genesis: &GenesisJson) -> Result<algo_types::Block, Al
         .find(|a| a.addr == genesis.rwd)
         .map(|a| a.state.algo)
         .unwrap_or(0);
-    let rewards_rate = if refresh == 0 {
-        0
-    } else {
-        rewards_pool_balance.saturating_sub(params.min_balance) / refresh
-    };
+    let rewards_rate = rewards_pool_balance
+        .saturating_sub(params.min_balance)
+        .checked_div(refresh)
+        .unwrap_or_default();
 
     Ok(algo_types::Block {
         round: algo_types::Round(0),

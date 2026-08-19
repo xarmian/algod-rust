@@ -778,13 +778,11 @@ fn make_vote(
                 )));
             }
         }
-        step if step == crate::step::DOWN => {
-            if !rv.proposal.is_bottom() {
-                return Err(PseudonodeError::VoteFailed(format!(
-                    "votes from step {} must validate bottom",
-                    rv.step
-                )));
-            }
+        step if step == crate::step::DOWN && !rv.proposal.is_bottom() => {
+            return Err(PseudonodeError::VoteFailed(format!(
+                "votes from step {} must validate bottom",
+                rv.step
+            )));
         }
         _ => {}
     }

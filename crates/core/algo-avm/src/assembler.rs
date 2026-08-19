@@ -350,7 +350,7 @@ impl OpStream {
 
         // Process refs from last to first position to avoid invalidating earlier positions
         let mut sorted_refs = self.intc_refs.clone();
-        sorted_refs.sort_by(|a, b| b.position.cmp(&a.position));
+        sorted_refs.sort_by_key(|r| std::cmp::Reverse(r.position));
 
         for r in &sorted_refs {
             let (new_index, singleton) = freqs
@@ -440,7 +440,7 @@ impl OpStream {
         freqs.sort_by(|a, b| b.freq.cmp(&a.freq).then(a.first_seen.cmp(&b.first_seen)));
 
         let mut sorted_refs = self.bytec_refs.clone();
-        sorted_refs.sort_by(|a, b| b.position.cmp(&a.position));
+        sorted_refs.sort_by_key(|r| std::cmp::Reverse(r.position));
 
         for r in &sorted_refs {
             let (new_index, singleton) = freqs
@@ -501,7 +501,7 @@ impl OpStream {
                 r.position = (r.position as isize + delta) as usize;
             }
         }
-        for (_, pos) in self.labels.iter_mut() {
+        for pos in self.labels.values_mut() {
             if *pos > position {
                 *pos = (*pos as isize + delta) as usize;
             }

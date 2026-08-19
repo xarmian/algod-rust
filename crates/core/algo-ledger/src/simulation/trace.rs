@@ -458,7 +458,7 @@ impl InitialStatesAccumulator {
 
                 let mut local_accounts: Vec<(Address, BTreeMap<Vec<u8>, TealValue>)> =
                     app.locals.into_iter().collect();
-                local_accounts.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+                local_accounts.sort_by_key(|(addr, _)| addr.0);
                 let local_states = local_accounts
                     .into_iter()
                     .map(|(addr, kvs)| {
