@@ -98,6 +98,16 @@ pub struct SimulationTracer {
     /// `allow_unnamed_resources`. The simulation engine drains this after
     /// each transaction and merges it into the group-level set.
     unnamed_resources: UnnamedResourcesAccessed,
+    /// Number of inner transaction groups submitted under this transaction
+    /// (i.e. `itxn_submit` calls, including from nested inner app calls).
+    /// The production `before_txn_group` call site
+    /// (`avm_context.rs::submit_inner_group`) only fires for inner groups, so
+    /// every call here counts one `MaxAppProgramCost` unit toward the group's
+    /// `AppBudgetAdded` — mirroring go-algorand's `BeforeTxnGroup`, which adds
+    /// `ep.Proto.MaxAppProgramCost` whenever `ep.GetCaller() != nil`
+    /// (`tracer.go:156`). Accumulated even when opcode tracing is disabled,
+    /// since group budget is a standard simulate response field.
+    inner_txn_group_count: u64,
 }
 
 impl SimulationTracer {
@@ -113,6 +123,7 @@ impl SimulationTracer {
             pending_state_changes: Vec::new(),
             app_cost_consumed: 0,
             unnamed_resources: UnnamedResourcesAccessed::default(),
+            inner_txn_group_count: 0,
         }
     }
 
@@ -127,6 +138,13 @@ impl SimulationTracer {
     /// per-transaction `AppBudgetConsumed` figure for the simulate response.
     pub fn app_budget_consumed(&self) -> u64 {
         self.app_cost_consumed
+    }
+
+    /// Number of inner transaction groups submitted under this transaction
+    /// (including nested inner app calls). Each unit contributes one
+    /// `MaxAppProgramCost` to the group's `AppBudgetAdded` figure.
+    pub fn inner_txn_group_count(&self) -> u64 {
+        self.inner_txn_group_count
     }
 
     /// Take the initial-state snapshot captured during this transaction,
@@ -174,6 +192,16 @@ impl SimulationTracer {
 }
 
 impl EvalTracer for SimulationTracer {
+    fn before_txn_group(&mut self, _group_size: usize) {
+        // The only production call site (avm_context.rs, inner-txn
+        // submission) fires this exclusively for inner groups, so every call
+        // counts one MaxAppProgramCost unit — see `inner_txn_group_count`
+        // doc comment. Counted unconditionally (not gated on
+        // `config.is_enabled()`), matching `app_cost_consumed`: group budget
+        // is a standard simulate response field, not a trace-capture detail.
+        self.inner_txn_group_count += 1;
+    }
+
     fn before_program(&mut self, program_type: ProgramType, program_hash: [u8; 32]) {
         if !self.config.is_enabled() {
             return;

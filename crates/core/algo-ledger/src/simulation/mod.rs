@@ -487,6 +487,13 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // when `allow_unnamed_resources` is requested).
         let mut group_unnamed = UnnamedResourcesAccessed::default();
 
+        // Inner transaction groups submitted across the whole group (summed
+        // from each top-level transaction's tracer). Each unit adds one
+        // `MaxAppProgramCost` to `AppBudgetAdded`, mirroring go-algorand's
+        // `BeforeTxnGroup` (`tracer.go:156`), which grows the group budget
+        // for every inner-txn submission, not just top-level app calls.
+        let mut inner_txn_groups: u64 = 0;
+
         // Count app calls for group budget
         let num_app_calls = eval_group
             .iter()
@@ -537,6 +544,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
             // run on an isolated budget, so the net pool delta under-reports.
             group_result.txn_results[i].app_budget_consumed = tracer.app_budget_consumed();
             // (logicsig_budget_consumed was pre-seeded for the whole group above.)
+            inner_txn_groups += tracer.inner_txn_group_count();
 
             match apply_result {
                 Ok(apply_data) => {
@@ -613,9 +621,16 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
         // the per-transaction figures (each rolled up from its programs +
         // inners via the tracer), which is correct even when inner app calls
         // grow the pool or clear-state runs on an isolated budget — unlike the
-        // raw pool delta. AppBudgetAdded keeps the top-level allocation; its
-        // inner-app-call growth is a separate, documented divergence.
-        let total_budget = (num_app_calls as i64) * 700 + request.extra_opcode_budget;
+        // raw pool delta. AppBudgetAdded is the top-level allocation
+        // (`MaxAppProgramCost` per top-level app call) plus one
+        // `MaxAppProgramCost` unit for every inner transaction group
+        // submitted anywhere in the group, matching go-algorand's
+        // `BeforeTxnGroup` (`tracer.go:156`, `AppBudgetAdded += MaxAppProgramCost`
+        // whenever `ep.GetCaller() != nil`) — issue #215.
+        let max_app_program_cost = apply_ctx.consensus.max_app_program_cost as i64;
+        let total_budget = (num_app_calls as i64) * max_app_program_cost
+            + (inner_txn_groups as i64) * max_app_program_cost
+            + request.extra_opcode_budget;
         group_result.app_budget_added = total_budget.max(0) as u64;
         group_result.app_budget_consumed = group_result
             .txn_results
