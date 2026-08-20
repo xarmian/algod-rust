@@ -19,6 +19,31 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
   - `ledger/simulation/simulator.go` — simulation engine (Simulator, check, evaluate)
   - `daemon/algod/api/server/v2/handlers.go` — REST API handlers
 
+## CI Workflows (.github/workflows)
+
+- **Building go-algorand binaries in CI requires the vendored libsodium fork.**
+  go-algorand's `crypto` package links `crypto/libs/<os>/<arch>/lib/libsodium.a`
+  via cgo. A plain `go build ./cmd/<tool>` fails with
+  `sodium.h: No such file or directory`. Always run `make libsodium` in the
+  go-algorand checkout first (needs `autoconf automake libtool build-essential`
+  on the runner) before building any go-algorand command.
+- **Path-filtered workflows fire on any commit touching their paths**, including
+  unrelated lint/fmt sweeps. A red check on a PR may come from a workflow the
+  feature never touched — read the failing job's logs before assuming the
+  feature implementation is at fault, and fix the workflow itself if that is
+  the actual failure.
+- When adding a CI step, prefer the reference repo's own build entry points
+  (Makefile targets, scripts/) over ad-hoc `go build`/`go test` invocations —
+  they encode required native-dependency setup.
+
+## Golden Fixtures
+
+- Fixture files under `crates/**/fixtures/` are compared byte-for-byte against
+  go-algorand output. `.gitattributes` pins them to LF checkout; on Windows
+  checkouts made before that file existed, golden tests (e.g.
+  `block_json_test`) fail on CRLF only — re-checkout the fixtures rather than
+  "fixing" the encoder. Never let editors or autocrlf rewrite fixture bytes.
+
 ## Bash Tool Constraints
 
 - Do NOT chain test runs hoping for different results. If a test fails, diagnose the issue first.

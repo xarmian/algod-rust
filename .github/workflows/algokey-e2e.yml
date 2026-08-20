@@ -55,7 +55,9 @@ jobs:
   e2e:
     name: algokey-rust e2e against live algod-go localnet
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Includes the go-algorand libsodium-fork autotools build (~2-3 min)
+    # on top of the localnet + cargo test cost.
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -79,6 +81,15 @@ jobs:
       - name: Build pinned `algokey` from go-algorand
         run: |
           set -euo pipefail
+          # go-algorand's crypto package links a vendored libsodium fork via
+          # cgo (crypto/curve25519.go includes sodium.h from
+          # crypto/libs/<os>/<arch>/include). That fork must be built with
+          # `make libsodium` before any `go build` touching the crypto
+          # package, otherwise cgo fails with
+          # "sodium.h: No such file or directory".
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool build-essential
           # `go build -o <path>` needs the parent directory to exist.
           mkdir -p "$HOME/.local/bin"
           mkdir -p "$RUNNER_TEMP/go-algorand-src"
@@ -86,6 +97,7 @@ jobs:
             https://github.com/algorand/go-algorand.git \
             "$RUNNER_TEMP/go-algorand-src"
           cd "$RUNNER_TEMP/go-algorand-src"
+          make libsodium
           go build -o "$HOME/.local/bin/algokey" ./cmd/algokey
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/algokey" -v | head -3
