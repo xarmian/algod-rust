@@ -6,7 +6,7 @@ COMPOSE_RELAY := docker compose -f docker/docker-compose.test-relay.yml
 COMPOSE_MIXED := docker compose -f docker/docker-compose.mixed-cluster.yml
 PHASE6_CLUSTER := ops/mixed-cluster
 
-.PHONY: build test fmt fmt-check clippy lint deny ci clean
+.PHONY: build test fmt fmt-check clippy lint deny ci clean coverage coverage-lcov
 .PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful replay-mainnet-1k
 .PHONY: avm-replay avm-replay-mainnet
 .PHONY: bench-rust bench-decode bench-go bench-micro bench-micro-go bench-cluster benchmark
@@ -43,6 +43,17 @@ deny:
 	cargo deny check
 
 ci: lint test
+
+## Test/bench source files are excluded from coverage reports — they are
+## scaffolding, not shipped code. Matches .github/workflows/coverage.yml and
+## docs/COVERAGE.md. Requires cargo-llvm-cov (cargo install cargo-llvm-cov).
+COVERAGE_IGNORE := (^|[/\\])(tests|benches)[/\\]
+
+coverage:
+	cargo llvm-cov --workspace --ignore-filename-regex '$(COVERAGE_IGNORE)' --open
+
+coverage-lcov:
+	cargo llvm-cov --workspace --ignore-filename-regex '$(COVERAGE_IGNORE)' --lcov --output-path lcov.info
 
 clean:
 	cargo clean
@@ -523,6 +534,8 @@ help:
 	@echo "  make test             Run all tests (needs fixtures)"
 	@echo "  make lint             Run fmt-check + clippy"
 	@echo "  make ci               Run lint + test"
+	@echo "  make coverage         Workspace coverage, HTML report (cargo-llvm-cov)"
+	@echo "  make coverage-lcov    Workspace coverage, lcov.info for editors/CI"
 	@echo ""
 	@echo "Localnet (Docker):"
 	@echo "  make localnet-up      Start devnet (algod-go + txn-generator)"
