@@ -715,6 +715,114 @@ fn simulation_trace_inner_txn_spawned_inners() {
     assert_eq!(group.app_budget_consumed, 10);
 }
 
+/// `app_budget_added` must grow by `MaxAppProgramCost` for every inner
+/// transaction group submitted during simulation, not just for top-level
+/// application calls (go-algorand's `BeforeTxnGroup`, `tracer.go:156`, adds
+/// `ep.Proto.MaxAppProgramCost` whenever `ep.GetCaller() != nil`, i.e. once
+/// per `itxn_submit`). Reuses the single-inner-call fixture above: one
+/// top-level app call (700) plus one inner-txn group submission (700) = 1400.
+/// Issue #215.
+#[test]
+fn simulation_app_budget_added_includes_inner_app_calls() {
+    let sender = Address([0xAA; 32]);
+    let outer_app_id = 100;
+    let inner_app_id = 200;
+
+    let inner_approval = vec![0x06, 0x81, 0x01, 0x43]; // v6: pushint 1, return
+
+    // Outer app (v6): itxn_begin; pushint 6 (appl); itxn_field TypeEnum(16);
+    // pushint 200; itxn_field ApplicationID(24); itxn_submit; pushint 1; return.
+    let outer_approval = vec![
+        0x06, // version 6
+        0xb1, // itxn_begin
+        0x81, 0x06, // pushint 6 (appl)
+        0xb2, 0x10, // itxn_field TypeEnum (field 16)
+        0x81, 0xC8, 0x01, // pushint 200
+        0xb2, 0x18, // itxn_field ApplicationID (field 24)
+        0xb3, // itxn_submit
+        0x81, 0x01, // pushint 1
+        0x43, // return
+    ];
+
+    let fee_sink = Address([0xFE; 32]);
+    let mut state = LedgerState::new();
+    state.fee_sink = fee_sink;
+    state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
+    state.set_account(
+        &sender,
+        AccountData {
+            micro_algos: 10_000_000,
+            total_created_apps: 2,
+            ..Default::default()
+        },
+    );
+    state.set_account(
+        &fee_sink,
+        AccountData {
+            micro_algos: 0,
+            ..Default::default()
+        },
+    );
+    state.set_app_params(
+        outer_app_id,
+        AppParams {
+            creator: sender,
+            approval_program: outer_approval,
+            clear_state_program: vec![0x06, 0x81, 0x01, 0x43],
+            global_state: BTreeMap::new(),
+            local_state_schema: StateSchema::default(),
+            global_state_schema: StateSchema::default(),
+            extra_program_pages: 0,
+        },
+    );
+    state.set_app_params(
+        inner_app_id,
+        AppParams {
+            creator: sender,
+            approval_program: inner_approval,
+            clear_state_program: vec![0x06, 0x81, 0x01, 0x43],
+            global_state: BTreeMap::new(),
+            local_state_schema: StateSchema::default(),
+            global_state_schema: StateSchema::default(),
+            extra_program_pages: 0,
+        },
+    );
+    let outer_app_addr = Address(algo_ledger::avm_context::app_address(outer_app_id));
+    state.set_account(
+        &outer_app_addr,
+        AccountData {
+            micro_algos: 10_000_000,
+            ..Default::default()
+        },
+    );
+
+    let mut txn = make_appl_txn(sender, outer_app_id);
+    txn.txn.foreign_apps = Some(vec![inner_app_id]);
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("inner-txn simulation should succeed");
+
+    let group = &result.txn_groups[0];
+    assert!(
+        group.failure_message.is_none(),
+        "unexpected failure: {:?}",
+        group.failure_message
+    );
+    assert_eq!(
+        group.app_budget_added, 1400,
+        "app_budget_added must include MaxAppProgramCost (700) for the \
+         top-level app call plus MaxAppProgramCost (700) for the one inner \
+         transaction group submitted via itxn_submit"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Per-transaction budget figures (TASK-250)
 // ---------------------------------------------------------------------------
