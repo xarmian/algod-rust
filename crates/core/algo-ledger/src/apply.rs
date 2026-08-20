@@ -105,6 +105,24 @@ pub struct ApplyContext {
     /// unnamed-resource tracking). Defaults leave consensus behaviour
     /// unchanged.
     pub avm_overrides: AvmEvalOverrides,
+    /// Side channel for the partial EvalDelta of a top-level `appl` call that
+    /// was rejected or errored during execution.
+    ///
+    /// `apply_appl` sets this immediately before returning `Err` for a
+    /// rejected/erroring approval program, carrying whatever global/local
+    /// state, logs, and inner transactions the AVM had already accumulated
+    /// (see `algo_avm::eval::run_approval_program`'s error-preservation, and
+    /// go-algorand's `evalTracer.saveEvalDelta` — `tracer.go:263`). The
+    /// transaction still fails and its state changes are rolled back
+    /// (nothing here is ever applied to the ledger); this exists purely so
+    /// callers that need failure visibility (the simulation engine) can
+    /// surface the partial delta in `TxnResult.apply_data` instead of `None`.
+    ///
+    /// Uses `Cell` for the same reason as `fee_credit`/`txn_counter`: the
+    /// context is shared via `&` across the call chain. Consumed with
+    /// `.take()` by the caller so a stale value never leaks into an
+    /// unrelated later transaction.
+    pub failed_eval_delta: Cell<Option<rmpv::Value>>,
 }
 
 /// AVM evaluation overrides applied by the simulation engine.
@@ -139,6 +157,7 @@ impl ApplyContext {
             txn_index: Cell::new(0),
             consensus: ConsensusParams::default(),
             avm_overrides: AvmEvalOverrides::default(),
+            failed_eval_delta: Cell::new(None),
         }
     }
 
@@ -593,6 +612,7 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
         txn_index: Cell::new(0),
         consensus: consensus.clone(),
         avm_overrides: Default::default(),
+        failed_eval_delta: Cell::new(None),
     };
 
     // Re-borrow the tracer per iteration with `Option::as_deref_mut` so
@@ -2745,6 +2765,17 @@ fn apply_appl<L: crate::store_trait::LedgerStore>(
                 record_eval_delta_comparison(stx, &result, ctx.round, ctx.txn_index.get(), app_id);
 
                 if !result.approved {
+                    // Surface whatever global/local state, logs, and inner
+                    // transactions accumulated before the program rejected or
+                    // errored (algo_avm::eval preserves these rather than
+                    // discarding them — see the error-preservation comments
+                    // there). The transaction still fails and none of this is
+                    // applied to the ledger; it exists purely so callers that
+                    // need failure visibility (the simulation engine) can
+                    // report the partial delta instead of `None`. Mirrors
+                    // go-algorand's `evalTracer.saveEvalDelta`.
+                    ctx.failed_eval_delta
+                        .set(crate::eval_delta::encode_eval_delta(&result, txn));
                     return Err(AlgoError::Ledger {
                         message: format!(
                             "appl execute: app {} approval program rejected transaction{}",
@@ -5148,6 +5179,7 @@ mod tests {
             txn_index: Cell::new(0),
             consensus,
             avm_overrides: Default::default(),
+            failed_eval_delta: Cell::new(None),
         }
     }
 
@@ -5848,6 +5880,7 @@ mod tests {
             txn_index: Cell::new(0),
             consensus,
             avm_overrides: Default::default(),
+            failed_eval_delta: Cell::new(None),
         };
         let stx = heartbeat_txn(sender, target, vote_id, 10, 1_000);
         let result = apply_transaction(&mut state, &stx, &ctx, 0);
@@ -6028,6 +6061,7 @@ mod tests {
             txn_index: Cell::new(0),
             consensus,
             avm_overrides: Default::default(),
+            failed_eval_delta: Cell::new(None),
         }
     }
 
@@ -6871,6 +6905,7 @@ mod tests {
             txn_index: Cell::new(0),
             consensus,
             avm_overrides: Default::default(),
+            failed_eval_delta: Cell::new(None),
         };
 
         apply_transaction(&mut state, &stx, &ctx, 0).unwrap();

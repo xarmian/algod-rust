@@ -142,10 +142,22 @@ pub fn run_approval_program(
             // Ignore consume error here -- we already have the real error.
             let _ = budget.consume(cost_used);
 
-            let mut result = AvmResult::empty();
-            result.coverage = machine.opcode_coverage();
-            result.approved = false;
-            result.error = Some(e.to_string());
+            // Preserve whatever global/local state, logs, and inner
+            // transactions accumulated before the failing opcode, matching
+            // go-algorand's per-opcode `saveEvalDelta` (tracer.go): the
+            // ledger never applies a rejected/erroring app call, but the
+            // caller (notably simulation) still needs visibility into the
+            // partial EvalDelta observed up to the point of failure.
+            let coverage = machine.opcode_coverage();
+            let result = AvmResult {
+                global_delta: ctx.take_global_delta(),
+                local_deltas: ctx.take_local_deltas(),
+                inner_transactions: ctx.take_inner_transactions(),
+                logs: ctx.take_logs(),
+                approved: false,
+                error: Some(e.to_string()),
+                coverage,
+            };
             Ok(result)
         }
     }
@@ -211,6 +223,16 @@ pub fn run_clear_state_program(
         Err(e) => {
             // Program errored: return empty result but capture the error
             // message for debugging/conformance reporting.
+            //
+            // Unlike `run_approval_program`, this does NOT preserve partial
+            // state on error: go-algorand's ClearState handling swallows
+            // in-program `logic.EvalError`s entirely (`ledger/apply/
+            // application.go`: `if _, ok := evalErr.(logic.EvalError); !ok {
+            // return evalErr }`) and never fails the outer transaction for
+            // them, so it never hits the tracer's per-opcode EvalDelta
+            // substitution — a clear-state failure's `ApplyData.EvalDelta`
+            // is empty in go-algorand's simulate response too, both for a
+            // clean reject and a runtime error.
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
             result.error = Some(e.to_string());
@@ -336,10 +358,18 @@ pub fn run_approval_program_with_tracer(
             tracer.after_program(ProgramType::Approval, false, Some(&msg));
             tracer.record_program_cost(ProgramType::Approval, machine.cost);
 
-            let mut result = AvmResult::empty();
-            result.coverage = machine.opcode_coverage();
-            result.approved = false;
-            result.error = Some(msg);
+            // Preserve partial state accumulated before the failing opcode
+            // (see the matching comment in the non-tracer variant above).
+            let coverage = machine.opcode_coverage();
+            let result = AvmResult {
+                global_delta: ctx.take_global_delta(),
+                local_deltas: ctx.take_local_deltas(),
+                inner_transactions: ctx.take_inner_transactions(),
+                logs: ctx.take_logs(),
+                approved: false,
+                error: Some(msg),
+                coverage,
+            };
             Ok(result)
         }
     }
@@ -409,6 +439,10 @@ pub fn run_clear_state_program_with_tracer(
             let msg = e.to_string();
             tracer.after_program(ProgramType::ClearState, false, Some(&msg));
             tracer.record_program_cost(ProgramType::ClearState, machine.cost);
+            // Does NOT preserve partial state on error — see the matching
+            // comment in the non-tracer variant above (go-algorand never
+            // fails the outer transaction for a ClearState program error, so
+            // it never substitutes a partial EvalDelta for this case).
             let mut result = AvmResult::empty();
             result.coverage = machine.opcode_coverage();
             result.error = Some(msg);
@@ -483,6 +517,26 @@ mod tests {
         let mut p = vec![version];
         p.extend_from_slice(code);
         p
+    }
+
+    /// A minimal stateful context that records `log` calls, for testing that
+    /// state accumulated before a runtime error is preserved rather than
+    /// discarded (issue #215: "EvalDelta preserved on error", mirroring
+    /// go-algorand's per-opcode `saveEvalDelta`).
+    #[derive(Default)]
+    struct LoggingContext {
+        logs: Vec<Vec<u8>>,
+    }
+
+    impl crate::context::AvmContext for LoggingContext {
+        fn log(&mut self, data: Vec<u8>) -> Result<(), AlgoError> {
+            self.logs.push(data);
+            Ok(())
+        }
+
+        fn take_logs(&mut self) -> Vec<Vec<u8>> {
+            std::mem::take(&mut self.logs)
+        }
     }
 
     #[test]
@@ -586,6 +640,38 @@ mod tests {
     }
 
     #[test]
+    fn test_approval_program_runtime_error_preserves_partial_state() {
+        // pushbytes "hi"; log; err -- the log call succeeds before the
+        // program hits the unconditional runtime error. go-algorand's
+        // tracer preserves whatever EvalDelta/logs accumulated up to the
+        // failing opcode (tracer.go: saveEvalDelta is called before every
+        // opcode); the result should carry that partial state rather than
+        // discarding it via AvmResult::empty().
+        let raw = prog(6, &[0x80, 0x02, b'h', b'i', 0xb0, 0x00]);
+        let mut ctx = LoggingContext::default();
+        let mut budget = GroupBudget::new(1);
+
+        let result = run_approval_program(&raw, &mut ctx, &mut budget).unwrap();
+        assert!(!result.approved);
+        assert!(result.error.is_some());
+        assert_eq!(result.logs, vec![b"hi".to_vec()]);
+    }
+
+    #[test]
+    fn test_approval_program_with_tracer_runtime_error_preserves_partial_state() {
+        let raw = prog(6, &[0x80, 0x02, b'h', b'i', 0xb0, 0x00]);
+        let mut ctx = LoggingContext::default();
+        let mut budget = GroupBudget::new(1);
+        let mut tracer = crate::tracer::NullTracer;
+
+        let result =
+            run_approval_program_with_tracer(&raw, &mut ctx, &mut budget, &mut tracer).unwrap();
+        assert!(!result.approved);
+        assert!(result.error.is_some());
+        assert_eq!(result.logs, vec![b"hi".to_vec()]);
+    }
+
+    #[test]
     fn test_approval_program_parse_error() {
         // Empty program bytes should fail to parse
         let result = run_approval_program(&[], &mut NullContext, &mut GroupBudget::new(1));
@@ -656,15 +742,40 @@ mod tests {
 
     #[test]
     fn test_clear_state_program_error_returns_empty() {
-        // err opcode (0x00) -- runtime error, should return empty result
-        let raw = prog(1, &[0x00]);
-        let mut ctx = NullContext;
+        // pushbytes "hi"; log; err -- the log call succeeds before the
+        // unconditional runtime error, but the result must still be empty.
+        // Unlike approval programs, go-algorand swallows a ClearState
+        // program's runtime `logic.EvalError` entirely (`ledger/apply/
+        // application.go`) rather than failing the transaction, so it never
+        // substitutes a partial EvalDelta for the (always-empty) real one —
+        // both a clean reject and a runtime error report nothing.
+        let raw = prog(6, &[0x80, 0x02, b'h', b'i', 0xb0, 0x00]);
+        let mut ctx = LoggingContext::default();
 
         let result = run_clear_state_program(&raw, &mut ctx, &ConsensusParams::default());
         assert!(!result.approved);
+        assert!(result.error.is_some());
         assert!(result.global_delta.is_empty());
         assert!(result.local_deltas.is_empty());
         assert!(result.inner_transactions.is_empty());
+        assert!(result.logs.is_empty());
+    }
+
+    #[test]
+    fn test_clear_state_program_with_tracer_error_returns_empty() {
+        let raw = prog(6, &[0x80, 0x02, b'h', b'i', 0xb0, 0x00]);
+        let mut ctx = LoggingContext::default();
+        let mut tracer = crate::tracer::NullTracer;
+
+        let result = run_clear_state_program_with_tracer(
+            &raw,
+            &mut ctx,
+            &ConsensusParams::default(),
+            &mut tracer,
+        );
+        assert!(!result.approved);
+        assert!(result.error.is_some());
+        assert!(result.global_delta.is_empty());
         assert!(result.logs.is_empty());
     }
 

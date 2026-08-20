@@ -44,6 +44,21 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
   `block_json_test`) fail on CRLF only — re-checkout the fixtures rather than
   "fixing" the encoder. Never let editors or autocrlf rewrite fixture bytes.
 
+## Simulation EvalDelta-on-Error Semantics
+
+- go-algorand's simulate endpoint reports a **partial** EvalDelta for a
+  transaction that rejects/errors only when that failure genuinely fails the
+  outer transaction (approval program reject/error → `evalError != nil` at
+  `AfterTxn` → the tracer's `saveEvalDelta`/`omitEvalDelta` substitutes the
+  per-opcode-saved delta for the real, empty `ApplyData.EvalDelta`).
+- **ClearState is the exception**: go-algorand swallows a ClearState
+  program's `logic.EvalError` and never fails the outer transaction for it
+  (`ledger/apply/application.go`) — clearing out is always allowed — so a
+  rejected/erroring ClearState program's `ApplyData.EvalDelta` stays empty in
+  the real ledger *and* in simulate, unlike approval programs. Don't
+  "fix" `run_clear_state_program`'s empty-on-error result by analogy with
+  `run_approval_program` — it's already correct.
+
 ## Bash Tool Constraints
 
 - Do NOT chain test runs hoping for different results. If a test fails, diagnose the issue first.

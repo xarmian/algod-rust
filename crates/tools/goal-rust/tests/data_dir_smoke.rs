@@ -37,10 +37,14 @@ fn group_help_works_with_algorand_data_set_to_garbage() {
         .expect("run goal-rust node --help");
     assert!(out.status.success(), "exit={:?}", out.status.code());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("Usage: goal-rust node"),
-        "no Usage line: {stdout:?}"
-    );
+    // clap renders the subcommand's usage line from the running
+    // executable's file name, which is `goal-rust.exe` on Windows vs
+    // `goal-rust` elsewhere — check for the binary name as a prefix
+    // rather than an exact literal so this passes on both.
+    let has_usage_line = stdout
+        .lines()
+        .any(|l| l.starts_with("Usage: goal-rust") && l.contains(" node "));
+    assert!(has_usage_line, "no Usage line: {stdout:?}");
 }
 
 #[test]

@@ -112,6 +112,26 @@ pub struct WalletServer {
     lock_file: std::fs::File,
 }
 
+/// `ERROR_LOCK_VIOLATION` — the Win32 code `LockFileEx` returns when the
+/// requested region is already locked by another handle. The standard
+/// library doesn't map this to `io::ErrorKind::WouldBlock` (unlike Unix's
+/// `flock`/`EWOULDBLOCK`), so [`WalletServer::bind`] checks the raw OS error
+/// directly to recognize a lock conflict on Windows.
+#[cfg(windows)]
+const ERROR_LOCK_VIOLATION: i32 = 33;
+
+/// Whether `e` is Windows' lock-conflict error. Always `false` on
+/// non-Windows targets, where `WouldBlock` alone is sufficient.
+#[cfg(windows)]
+fn is_windows_lock_violation(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(ERROR_LOCK_VIOLATION)
+}
+
+#[cfg(not(windows))]
+fn is_windows_lock_violation(_e: &std::io::Error) -> bool {
+    false
+}
+
 impl WalletServer {
     /// Validate the config, acquire the file lock, bind a TCP
     /// listener, and write `kmd.net` / `kmd.pid`.  Mirrors
@@ -144,10 +164,14 @@ impl WalletServer {
             .open(&lock_path)
             .map_err(Error::Io)?;
         if let Err(e) = lock_file.try_lock_exclusive() {
-            // fs2 returns `WouldBlock` when another process holds the
-            // lock; surface that as `AlreadyRunning` so the caller
-            // gets the same Go-side `ErrAlreadyRunning` message.
-            if e.kind() == std::io::ErrorKind::WouldBlock {
+            // fs2 returns `WouldBlock` on Unix (`flock` maps `EWOULDBLOCK`
+            // cleanly) when another process holds the lock; surface that as
+            // `AlreadyRunning` so the caller gets the same Go-side
+            // `ErrAlreadyRunning` message. On Windows, `LockFileEx`'s
+            // conflict error (`ERROR_LOCK_VIOLATION`, raw code 33) isn't
+            // mapped to `WouldBlock` by the standard library, so check the
+            // raw OS error too.
+            if e.kind() == std::io::ErrorKind::WouldBlock || is_windows_lock_violation(&e) {
                 return Err(Error::AlreadyRunning);
             }
             return Err(Error::Io(e));
@@ -814,9 +838,21 @@ mod tests {
             return;
         }
         let upstream_bytes = std::fs::read(&upstream).expect("read upstream swagger.json");
+        // Normalize CRLF -> LF on both sides before comparing: this checks
+        // for *content* drift against the sibling go-algorand checkout, and
+        // that checkout's own line endings depend on how it was cloned
+        // (e.g. Windows with `core.autocrlf=true`) — not something this
+        // repo's `.gitattributes` controls. Content drift is what matters;
+        // a `\n` vs `\r\n` difference from the reference clone's local
+        // checkout config is not a real divergence.
+        let normalize = |b: &[u8]| -> Vec<u8> {
+            String::from_utf8_lossy(b)
+                .replace("\r\n", "\n")
+                .into_bytes()
+        };
         assert_eq!(
-            SWAGGER_JSON.as_bytes(),
-            upstream_bytes.as_slice(),
+            normalize(SWAGGER_JSON.as_bytes()),
+            normalize(&upstream_bytes),
             "vendored swagger.json drifted from go-algorand v4.5.1-stable; re-copy from {}",
             upstream.display()
         );
