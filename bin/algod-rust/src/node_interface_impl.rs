@@ -41,10 +41,11 @@ use algo_ledger::{SqliteLedger, StateDelta};
 use algo_network::local_tx_broadcast::{LocalTxBroadcaster, LocalTxError};
 use algo_pool::TransactionPool;
 use algo_rest_api::models::{
-    ApplicationInitialStates, ApplicationKVStorage, ApplicationStateOperation, AvmKeyValue,
-    AvmValue, PreEncodedTxInfo, ScratchChange, SimulateInitialStates, SimulateRequest,
-    SimulateResponse, SimulateTraceConfig, SimulateTransactionGroupResult,
-    SimulateTransactionResult, SimulationEvalOverrides, SimulationOpcodeTraceUnit,
+    ApplicationInitialStates, ApplicationKVStorage, ApplicationLocalReference,
+    ApplicationStateOperation, AssetHoldingReference, AvmKeyValue, AvmValue, BoxReference,
+    PreEncodedTxInfo, ScratchChange, SimulateInitialStates, SimulateRequest, SimulateResponse,
+    SimulateTraceConfig, SimulateTransactionGroupResult, SimulateTransactionResult,
+    SimulateUnnamedResourcesAccessed, SimulationEvalOverrides, SimulationOpcodeTraceUnit,
     SimulationTransactionExecTrace,
 };
 use algo_rest_api::node::{
@@ -1787,15 +1788,6 @@ impl AlgodNodeInterface {
     /// [`SimulateRequest`]. Uses the handler-populated
     /// `decoded_txn_groups` field — callers that bypass the handler must
     /// populate it before calling this method.
-    ///
-    /// Note: `allow_more_logging` is plumbed through for forward
-    /// compatibility but is currently a no-op inside
-    /// [`algo_ledger::simulation::Simulator::simulate`], which does not
-    /// yet raise the AVM `max_log_calls` / `max_log_size` limits. The
-    /// simulator-side wiring lands with the rest of the
-    /// simulation-response fidelity work in PLAN-34. Callers that rely
-    /// on relaxed log limits should not expect this flag to take effect
-    /// until then.
     fn build_simulation_request(request: SimulateRequest) -> SimulationRequest {
         SimulationRequest {
             round: request.round.map(Round),
@@ -1864,6 +1856,57 @@ impl AlgodNodeInterface {
         }
     }
 
+    /// Convert the group-level unnamed-resources set into the REST shape.
+    /// Every collection is omitted when empty, mirroring go-algorand's
+    /// `convertUnnamedResourcesAccessed` omit-empty semantics.
+    fn unnamed_resources_to_model(
+        unnamed: &algo_ledger::simulation::UnnamedResourcesAccessed,
+    ) -> SimulateUnnamedResourcesAccessed {
+        fn non_empty<T>(v: Vec<T>) -> Option<Vec<T>> {
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        }
+        SimulateUnnamedResourcesAccessed {
+            accounts: non_empty(unnamed.accounts.iter().map(|a| a.to_string()).collect()),
+            app_locals: non_empty(
+                unnamed
+                    .app_locals
+                    .iter()
+                    .map(|(addr, app)| ApplicationLocalReference {
+                        account: addr.to_string(),
+                        app: *app,
+                    })
+                    .collect(),
+            ),
+            apps: non_empty(unnamed.apps.iter().copied().collect()),
+            asset_holdings: non_empty(
+                unnamed
+                    .asset_holdings
+                    .iter()
+                    .map(|(addr, asset)| AssetHoldingReference {
+                        account: addr.to_string(),
+                        asset: *asset,
+                    })
+                    .collect(),
+            ),
+            assets: non_empty(unnamed.assets.iter().copied().collect()),
+            boxes: non_empty(
+                unnamed
+                    .boxes
+                    .iter()
+                    .map(|(app, name)| BoxReference {
+                        app: *app,
+                        name: name.clone(),
+                    })
+                    .collect(),
+            ),
+            extra_box_refs: None,
+        }
+    }
+
     /// Convert a simulation [`TxnGroupResult`] into the REST shape.
     fn txn_group_result_to_model(group: TxnGroupResult) -> SimulateTransactionGroupResult {
         SimulateTransactionGroupResult {
@@ -1878,7 +1921,10 @@ impl AlgodNodeInterface {
                 .into_iter()
                 .map(Self::txn_result_to_model)
                 .collect(),
-            unnamed_resources_accessed: None,
+            unnamed_resources_accessed: group
+                .unnamed_resources_accessed
+                .as_ref()
+                .map(Self::unnamed_resources_to_model),
         }
     }
 
@@ -2357,6 +2403,50 @@ mod tests {
         assert_eq!(model.extra_opcode_budget, Some(200));
         assert_eq!(model.max_log_calls, Some(40));
         assert_eq!(model.max_log_size, None);
+    }
+
+    #[test]
+    fn unnamed_resources_to_model_maps_and_omits_empty_collections() {
+        use algo_ledger::simulation::UnnamedResourcesAccessed;
+
+        let mut unnamed = UnnamedResourcesAccessed::default();
+        let addr = algo_types::Address([0x11; 32]);
+        unnamed.accounts.insert(addr);
+        unnamed.assets.insert(77);
+        unnamed.boxes.insert((5, b"bx".to_vec()));
+        unnamed.app_locals.insert((addr, 9));
+
+        let model = AlgodNodeInterface::unnamed_resources_to_model(&unnamed);
+        assert_eq!(model.accounts, Some(vec![addr.to_string()]));
+        assert_eq!(model.assets, Some(vec![77]));
+        // Empty collections are omitted entirely.
+        assert!(model.apps.is_none());
+        assert!(model.asset_holdings.is_none());
+        assert!(model.extra_box_refs.is_none());
+        let boxes = model.boxes.expect("boxes present");
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].app, 5);
+        assert_eq!(boxes[0].name, b"bx".to_vec());
+        let locals = model.app_locals.expect("app locals present");
+        assert_eq!(locals[0].account, addr.to_string());
+        assert_eq!(locals[0].app, 9);
+    }
+
+    #[test]
+    fn txn_group_result_to_model_carries_unnamed_resources() {
+        use algo_ledger::simulation::UnnamedResourcesAccessed;
+
+        let mut unnamed = UnnamedResourcesAccessed::default();
+        unnamed.assets.insert(300);
+        let group = TxnGroupResult {
+            unnamed_resources_accessed: Some(unnamed),
+            ..Default::default()
+        };
+        let model = AlgodNodeInterface::txn_group_result_to_model(group);
+        let ur = model
+            .unnamed_resources_accessed
+            .expect("unnamed resources surfaced on the group");
+        assert_eq!(ur.assets, Some(vec![300]));
     }
 
     #[test]
@@ -3541,6 +3631,7 @@ mod tests {
             failed_at: None,
             app_budget_added: 700,
             app_budget_consumed: 100,
+            unnamed_resources_accessed: None,
         };
         let result = SimulationResult {
             version: 2,
@@ -3588,6 +3679,7 @@ mod tests {
                 failed_at: Some(vec![0, 1]),
                 app_budget_added: 0,
                 app_budget_consumed: 0,
+                unnamed_resources_accessed: None,
             }],
             eval_overrides: Default::default(),
             trace_config: Default::default(),
@@ -3816,14 +3908,11 @@ mod tests {
         // dummy transaction may still fail evaluation, but it must not
         // be rejected by the trace-config validation.
         let adapter = make_adapter().with_dev_mode();
-        match adapter.simulate(trace_simulate_request()).await {
-            Err(NodeError::BadRequest(msg)) => {
-                assert!(
-                    !msg.contains("EnableDeveloperAPI"),
-                    "developer-API gate should be open in dev mode, got {msg:?}"
-                );
-            }
-            _ => {}
+        if let Err(NodeError::BadRequest(msg)) = adapter.simulate(trace_simulate_request()).await {
+            assert!(
+                !msg.contains("EnableDeveloperAPI"),
+                "developer-API gate should be open in dev mode, got {msg:?}"
+            );
         }
     }
 

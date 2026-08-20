@@ -70,7 +70,7 @@ pub fn compare_round(by_node: &DigestByNode) -> RoundVerdict {
     } else {
         let mut clusters: Vec<(Digest, Vec<String>)> = groups.into_iter().collect();
         // Stable ordering for deterministic output.
-        clusters.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        clusters.sort_by_key(|c| c.0 .0);
         for (_, nodes) in clusters.iter_mut() {
             nodes.sort();
         }

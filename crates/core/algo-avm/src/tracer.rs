@@ -180,6 +180,39 @@ pub trait EvalTracer {
     /// go-algorand's `ResourcesInitialStates.CreatedApp` population in
     /// `ledger/simulation/tracer.go`.
     fn record_created_app(&mut self, _app_id: u64) {}
+
+    /// Report an access to a resource that was not named in the transaction
+    /// group's reference arrays (accounts / foreign assets / foreign apps /
+    /// box refs).
+    ///
+    /// Called by the ledger AVM context only when the simulation request has
+    /// `allow_unnamed_resources` enabled; the consensus apply path never
+    /// reports these. Mirrors go-algorand's `resourcePolicy` recording into
+    /// the group `ResourceTracker` (`ledger/simulation/resources.go`). The
+    /// default is a no-op.
+    fn record_unnamed_resource(&mut self, _access: &UnnamedResourceAccess) {}
+}
+
+/// A single unnamed-resource access reported to an [`EvalTracer`].
+///
+/// Mirrors the resource categories tracked by go-algorand's simulation
+/// `ResourceTracker` (`ledger/simulation/resources.go`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnnamedResourceAccess {
+    /// An account address accessed outside the group's named accounts.
+    Account([u8; 32]),
+    /// An asset ID accessed outside the group's foreign-asset arrays.
+    Asset(u64),
+    /// An app ID accessed outside the group's foreign-app arrays.
+    App(u64),
+    /// A box `(app_id, name)` accessed without a matching box reference.
+    Box(u64, Vec<u8>),
+    /// An asset holding `(account, asset)` where both the account and the
+    /// asset are named but the pairing is not.
+    AssetHolding([u8; 32], u64),
+    /// An app local state `(account, app)` where both the account and the
+    /// app are named but the pairing is not.
+    AppLocal([u8; 32], u64),
 }
 
 /// A no-op tracer that discards all events.

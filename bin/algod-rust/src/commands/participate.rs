@@ -1930,7 +1930,7 @@ fn load_signing_keys_for_round(
     };
     // Deterministic keep-first when an account has multiple effective keys:
     // `get_for_voting_round`'s SQL has no `ORDER BY`, so sort by participation ID.
-    records.sort_by(|a, b| a.participation_id.0.cmp(&b.participation_id.0));
+    records.sort_by_key(|a| a.participation_id.0);
     for record in &records {
         match part_store.get_for_round(&record.participation_id, vote_round) {
             Ok(Some(part)) => {

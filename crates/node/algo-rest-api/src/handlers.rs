@@ -2288,13 +2288,9 @@ fn parse_value_delta(val: &rmpv::Value) -> Option<models::ApiEvalDelta> {
         }
     }
 
-    let bytes = bytes_val.map(|b| BASE64_STANDARD.encode(&b)).and_then(|s| {
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
-    });
+    let bytes = bytes_val
+        .map(|b| BASE64_STANDARD.encode(&b))
+        .filter(|s| !s.is_empty());
     let uint = if uint_val == 0 { None } else { Some(uint_val) };
 
     Some(models::ApiEvalDelta {

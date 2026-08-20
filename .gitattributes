@@ -1,0 +1,16 @@
+# Fixture files are compared byte-for-byte against go-algorand reference
+# output (include_str!/include_bytes! golden tests, conformance corpora).
+# They must reach the working tree with their exact committed bytes on
+# every platform: Windows checkouts with core.autocrlf=true would
+# otherwise rewrite LF to CRLF and break the golden tests
+# (e.g. algo-rest-api block_json_test).
+crates/**/fixtures/** text=auto eol=lf
+
+# Binary fixture formats: exempt from all text/eol handling.
+*.msgpack binary
+*.keyfile binary
+*.tx binary
+*.db binary
+*.sqlite binary
+*.sqlite-shm binary
+*.sqlite-wal binary

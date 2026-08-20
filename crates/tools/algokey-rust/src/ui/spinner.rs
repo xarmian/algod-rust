@@ -46,7 +46,7 @@ where
     F: FnOnce() -> T + Send,
     T: Send,
 {
-    const CURSOR: [u8; 4] = [b'\\', b'|', b'/', b'-'];
+    const CURSOR: [u8; 4] = *b"\\|/-";
     let (done_tx, done_rx) = mpsc::channel::<()>();
 
     let result = thread::scope(|scope| {
