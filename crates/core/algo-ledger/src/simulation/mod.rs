@@ -450,6 +450,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     .allow_unnamed_resources
                     .then(|| Arc::new(NamedGroupResources::from_group(&eval_group))),
             },
+            failed_eval_delta: Cell::new(None),
         };
 
         // --- Execute the transaction group ---
@@ -539,6 +540,11 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
 
             match apply_result {
                 Ok(apply_data) => {
+                    // Defensively drain `failed_eval_delta` even on success:
+                    // nothing sets it on this path today, but a future change
+                    // must not let a stale value from an earlier iteration
+                    // silently attach to this (unrelated, successful) txn.
+                    apply_ctx.failed_eval_delta.take();
                     group_result.txn_results[i].apply_data = Some(apply_data);
                     initial_states.merge(tracer.take_initial_states());
                     group_unnamed.merge(tracer.take_unnamed_resources());
@@ -564,6 +570,19 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     group_unnamed.merge(tracer.take_unnamed_resources());
                     group_result.txn_results[i].trace =
                         merge_logicsig_trace(tracer.into_transaction_trace(), &logicsig_traces, i);
+                    // A rejected/erroring `appl` call leaves its partial
+                    // EvalDelta on `apply_ctx` (set by `apply_appl` right
+                    // before returning this error — see the field's doc
+                    // comment). Surface it so callers can see what the
+                    // program computed up to the point of failure, matching
+                    // go-algorand's `evalTracer.saveEvalDelta`. `None` for
+                    // any other failure (e.g. insufficient balance).
+                    if let Some(dt) = apply_ctx.failed_eval_delta.take() {
+                        group_result.txn_results[i].apply_data = Some(crate::apply::ApplyData {
+                            eval_delta: Some(dt),
+                            ..Default::default()
+                        });
+                    }
                     break;
                 }
             }
