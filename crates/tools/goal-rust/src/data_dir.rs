@@ -394,6 +394,21 @@ mod tests {
         tempfile::tempdir().expect("tempdir")
     }
 
+    /// Turn a Unix-style absolute path literal (e.g. `"/tmp/x"`) into one
+    /// that `Path::is_absolute()` recognizes on the current platform.
+    /// `absolutize()` deliberately mirrors Go's platform-aware
+    /// `filepath.Abs` (a bare `/tmp/x` is NOT absolute on Windows, which
+    /// requires a drive prefix), so tests asserting exact `absolutize()`
+    /// output need a literal that's genuinely absolute everywhere.
+    #[cfg(windows)]
+    fn plat_abs(unix_path: &str) -> PathBuf {
+        PathBuf::from(format!("C:{}", unix_path.replace('/', "\\")))
+    }
+    #[cfg(not(windows))]
+    fn plat_abs(unix_path: &str) -> PathBuf {
+        PathBuf::from(unix_path)
+    }
+
     #[test]
     fn no_d_no_env_returns_error_with_go_exact_message() {
         let err = resolve_data_dirs_with_env(&[], None).unwrap_err();
@@ -510,7 +525,7 @@ mod tests {
     #[test]
     fn kmd_dir_flag_wins() {
         let d = tmp();
-        let flag = PathBuf::from("/tmp/explicit-kmd");
+        let flag = plat_abs("/tmp/explicit-kmd");
         let got = resolve_kmd_data_dir_with(
             Some(&flag),
             Some(OsStr::new("/env/should/lose")),
@@ -519,21 +534,22 @@ mod tests {
             Path::new("/global/should/lose"),
         )
         .unwrap();
-        assert_eq!(got, PathBuf::from("/tmp/explicit-kmd"));
+        assert_eq!(got, plat_abs("/tmp/explicit-kmd"));
     }
 
     #[test]
     fn kmd_env_wins_when_no_flag() {
         let d = tmp();
+        let env_kmd = plat_abs("/tmp/env-kmd");
         let got = resolve_kmd_data_dir_with(
             None,
-            Some(OsStr::new("/tmp/env-kmd")),
+            Some(env_kmd.as_os_str()),
             d.path(),
             None,
             Path::new("/global/should/lose"),
         )
         .unwrap();
-        assert_eq!(got, PathBuf::from("/tmp/env-kmd"));
+        assert_eq!(got, plat_abs("/tmp/env-kmd"));
     }
 
     #[test]

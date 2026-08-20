@@ -6,6 +6,19 @@
 # (e.g. algo-rest-api block_json_test).
 crates/**/fixtures/** text=auto eol=lf
 
+# BIP-39 wordlist: parsed by index and compared against known checksums
+# (see algo_consensus_crypto::passphrase::wordlist). Not under a
+# `fixtures/` directory but has the same byte-exactness requirement.
+crates/core/algo-consensus-crypto/src/passphrase/wordlist.txt text eol=lf
+
+# Other `include_str!`/`include_bytes!` resources outside `fixtures/`
+# that are embedded verbatim into the binary (schema text compared
+# byte-for-byte against go-algorand, or served as-is over HTTP) and so
+# have the same byte-exactness requirement as fixtures.
+crates/node/algo-kmd/src/wallet_schema.sql text eol=lf
+crates/node/algo-kmd/swagger.json text eol=lf
+crates/node/algo-rest-api/resources/algod.oas2.json text eol=lf
+
 # Binary fixture formats: exempt from all text/eol handling.
 *.msgpack binary
 *.keyfile binary

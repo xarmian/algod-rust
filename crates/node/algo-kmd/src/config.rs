@@ -339,6 +339,15 @@ mod tests {
 
     #[test]
     fn validate_rejects_relative_wallets_dir() {
+        // `Path::is_absolute()` requires a drive letter (or UNC prefix) on
+        // Windows, so a Unix-style "/abs/path" literal is NOT absolute
+        // there; use a path literal that's actually absolute on the
+        // platform running the test.
+        #[cfg(windows)]
+        let abs_path = "C:\\abs\\path";
+        #[cfg(not(windows))]
+        let abs_path = "/abs/path";
+
         let mut cfg = KMDConfig::defaults("/tmp/x");
         cfg.driver_config.sqlite.wallets_dir = "relative/path".into();
         assert!(matches!(
@@ -346,7 +355,7 @@ mod tests {
             Err(Error::SQLiteWalletNotAbsolute)
         ));
 
-        cfg.driver_config.sqlite.wallets_dir = "/abs/path".into();
+        cfg.driver_config.sqlite.wallets_dir = abs_path.into();
         assert!(cfg.validate().is_ok());
 
         cfg.driver_config.sqlite.wallets_dir = String::new();

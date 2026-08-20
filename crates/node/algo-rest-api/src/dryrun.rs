@@ -2144,6 +2144,55 @@ mod tests {
         assert_eq!(entry.value.uint, Some(42), "uint should be 42");
     }
 
+    /// A program that writes global state and then hits a runtime error
+    /// (not a clean reject) must still surface that write in the dryrun
+    /// response. go-algorand's `dryrun.go` does this unconditionally on
+    /// `!pass` for both approval and clear-state programs — it reads the
+    /// live `ep.TxnGroup[ti].EvalDelta`, which opcodes mutate in place as
+    /// they execute (`data/transactions/logic/eval.go`), rather than the
+    /// value `StatefulEval` returns (which is empty on any non-pass
+    /// outcome). `run_approval_program_with_tracer`'s error branch mirrors
+    /// this by draining the AVM context's accumulated deltas instead of
+    /// discarding them (issue #215).
+    #[test]
+    fn test_dryrun_global_delta_preserved_on_runtime_error() {
+        let sender = test_sender();
+        let creator_str = test_sender_str();
+        let teal =
+            "#pragma version 10\nbyte \"key\"\nint 42\napp_global_put\nint 0\nint 0\n/\npop\nint 1";
+        let app = make_app(100, &creator_str, teal, "#pragma version 10\nint 1");
+        let account = make_simple_account(&creator_str, 1_000_000);
+        let txn = make_app_call_txn_json(&sender, 100, 0);
+
+        let req = DryrunRequest {
+            accounts: vec![account],
+            apps: vec![app],
+            latest_timestamp: 0,
+            protocol_version: String::new(),
+            round: 1,
+            sources: vec![],
+            txns: vec![txn],
+        };
+
+        let resp = run_dryrun(req);
+        assert!(resp.error.is_empty(), "unexpected error: {}", resp.error);
+        assert_eq!(resp.txns.len(), 1);
+        let msgs = resp.txns[0].app_call_messages.as_ref().unwrap();
+        assert!(
+            msgs.contains(&"REJECT".to_string()),
+            "division by zero must not PASS: {:?}",
+            msgs
+        );
+
+        let delta = resp.txns[0]
+            .global_delta
+            .as_ref()
+            .expect("global_delta must be preserved despite the runtime error");
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].key, BASE64.encode(b"key"));
+        assert_eq!(delta[0].value.uint, Some(42));
+    }
+
     #[test]
     fn test_dryrun_local_delta() {
         let sender = test_sender();
