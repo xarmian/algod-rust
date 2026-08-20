@@ -1,0 +1,75 @@
+# Codecov configuration — see docs/COVERAGE.md for the rationale behind the
+# thresholds and the consensus-critical / tooling split (issue #440).
+#
+# Gating applies to consensus-critical and node code (crates/core, crates/node,
+# bin). Tooling (crates/tools) is reported but informational-only: fixture
+# capture and bench harnesses should not block a protocol fix.
+
+coverage:
+  round: down
+  precision: 2
+
+  status:
+    project:
+      default:
+        # Overall coverage of gated paths may not drop by more than 0.5%.
+        paths:
+          - "crates/core"
+          - "crates/node"
+          - "bin"
+        target: auto
+        threshold: 0.5%
+      tooling:
+        paths:
+          - "crates/tools"
+        informational: true
+    patch:
+      default:
+        # New/changed lines in gated paths must be >= 80% covered.
+        paths:
+          - "crates/core"
+          - "crates/node"
+          - "bin"
+        target: 80%
+      tooling:
+        paths:
+          - "crates/tools"
+        informational: true
+
+# Component breakdown shown in the PR comment and Codecov UI.
+component_management:
+  individual_components:
+    - component_id: core
+      name: core (consensus-critical)
+      paths:
+        - "crates/core/**"
+    - component_id: node
+      name: node (REST API, networking, pool pipeline)
+      paths:
+        - "crates/node/**"
+    - component_id: bin
+      name: binaries (algod-rust, kmd-rust)
+      paths:
+        - "bin/**"
+    - component_id: tools
+      name: tools (fixtures, conformance, bench)
+      paths:
+        - "crates/tools/**"
+
+# Non-Rust / non-shipping code and test code itself are excluded from reports.
+ignore:
+  - "crates/**/tests/**"
+  - "crates/**/benches/**"
+  - "benchmarks"
+  - "docker"
+  - "docs"
+  - "fuzz"
+  - "ops"
+  - "scripts"
+  - "tests"
+  - "tools"
+
+comment:
+  layout: "condensed_header, diff, components, condensed_files"
+  behavior: default
+  require_changes: true

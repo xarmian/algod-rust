@@ -1,0 +1,98 @@
+name: Coverage
+
+# Workspace test coverage via cargo-llvm-cov (source-based LLVM instrumentation:
+# accurate region/branch data across unit, integration, and doc tests).
+# Runs on every PR and push to main; uploads LCOV to Codecov, which posts the
+# per-PR coverage-diff comment and enforces the patch/project thresholds
+# configured in codecov.yml. An HTML report is attached as a workflow artifact
+# so coverage is inspectable even without the Codecov UI.
+#
+# Scope: default `cargo test --workspace` targets only. Docker-backed e2e
+# suites (localnet, mixed-cluster, relay) are feature/env-gated and stay out
+# of coverage, so this job needs neither go-algorand binaries nor libsodium.
+#
+# See docs/COVERAGE.md for local usage, thresholds, and best practices.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  coverage:
+    name: Workspace Coverage (cargo-llvm-cov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Instrumented release build: source-based LLVM coverage keeps accurate
+      # region counters under optimization, and release runtime keeps the
+      # heavier integration/proptest suites inside the job budget.
+      - name: Run workspace tests with coverage
+        run: >-
+          cargo llvm-cov --workspace --release
+          --ignore-filename-regex '(^|[/\\])(tests|benches)[/\\]'
+          --lcov --output-path lcov.info
+
+      # Reuses the profraw data from the run above — no second test pass.
+      - name: Generate HTML report
+        run: >-
+          cargo llvm-cov report --release
+          --ignore-filename-regex '(^|[/\\])(tests|benches)[/\\]'
+          --html --output-dir coverage-html
+
+      - name: Upload HTML report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage-html
+          retention-days: 14
+
+      - name: Upload LCOV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+          retention-days: 14
+
+      # Requires the CODECOV_TOKEN repository secret (Codecov requires a token
+      # for non-fork uploads). fail_ci_if_error stays false so a Codecov
+      # outage or missing token degrades to artifact-only reporting instead of
+      # failing the build — the lcov/HTML artifacts above are always available.
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false
+          verbose: true
