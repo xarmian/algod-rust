@@ -218,7 +218,7 @@ async fn get_block_msgpack_envelope_matches() {
     // zero digest rather than go's real empty-payset commitment — see
     // `algo-ledger/src/genesis.rs`'s `make_genesis_block` doc comment).
     // That's a block-storage/genesis-construction fix, not a REST
-    // format-negotiation one — tracked separately so it gets the scrutiny
+    // format-negotiation one — tracked separately as issue #453 so it gets the scrutiny
     // consensus-adjacent code deserves rather than a rushed fix here.
     //
     // This test instead locks in what issue #448 *did* fix: the envelope
