@@ -73,7 +73,9 @@ pub async fn compare_accounts(
         let rust_status = match rust_acct.status {
             AccountStatus::Offline => "Offline",
             AccountStatus::Online => "Online",
-            AccountStatus::NotParticipating => "NotParticipating",
+            // Matches go's `Status.String()` (`data/basics/userBalance.go`)
+            // -- note the space (issue #129).
+            AccountStatus::NotParticipating => "Not Participating",
         };
         if go_status != rust_status {
             mismatches.push(BalanceMismatch {

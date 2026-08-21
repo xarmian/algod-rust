@@ -418,8 +418,11 @@ fn fetch_status_and_amount(
             Some("Online") => "online",
             Some("Offline") => "offline",
             // Go renders NotParticipating as `[excluded]`
-            // (accountsList.go:226). Match for parity.
-            Some("NotParticipating") => "excluded",
+            // (accountsList.go:217-218, matching `basics.NotParticipating
+            // .String()` == "Not Participating", with a space). Match for
+            // parity -- verified live against go-algorand v4.5.1-stable
+            // (issue #129) that this is the actual wire value.
+            Some("Not Participating") => "excluded",
             Some(other) => {
                 // Pass through anything algod returns we don't model;
                 // matches the spirit of Go's switch+default-panic by

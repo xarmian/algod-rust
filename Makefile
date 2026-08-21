@@ -4,9 +4,11 @@ COMPOSE := docker compose -f docker/docker-compose.yml
 COMPOSE_RUST := docker compose -f docker/docker-compose.localnet-rust.yml
 COMPOSE_RELAY := docker compose -f docker/docker-compose.test-relay.yml
 COMPOSE_MIXED := docker compose -f docker/docker-compose.mixed-cluster.yml
+COMPOSE_VALIDATE_API := docker compose -f docker/docker-compose.validate-api.yml
 PHASE6_CLUSTER := ops/mixed-cluster
 
 .PHONY: build test fmt fmt-check clippy lint deny ci clean coverage coverage-lcov
+.PHONY: validate-api-up validate-api-down validate-api-status validate-api-logs validate-api
 .PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful replay-mainnet-1k
 .PHONY: avm-replay avm-replay-mainnet
 .PHONY: bench-rust bench-decode bench-go bench-micro bench-micro-go bench-cluster benchmark
@@ -127,6 +129,50 @@ algokey-e2e:
 	@cargo test -p algokey-rust --features e2e -- --test-threads=1; \
 	  STATUS=$$?; \
 	  $(MAKE) localnet-down; \
+	  exit $$STATUS
+
+## ── Dual-node REST conformance harness (issue #129) ──────────
+## Boots a real go-algorand v4.5.1-stable node and a real algod-rust node
+## from the *same* baked genesis (docker/localnet-rust/data/) on distinct
+## ports (go: 4001, rust: 4002), so live requests can be compared
+## byte-for-byte, not just structurally. See
+## docker/docker-compose.validate-api.yml's header comment for why this
+## needs a real `algod` invocation rather than the plain algod-go localnet's
+## auto-generated (randomized) genesis.
+
+validate-api-up:
+	$(COMPOSE_VALIDATE_API) up -d --build
+	@echo "Waiting for algod-go-shared to be healthy..."
+	@until docker inspect --format='{{.State.Health.Status}}' algod-go-shared 2>/dev/null | grep -q healthy; do \
+		sleep 1; \
+	done
+	@echo "Waiting for algod-rust-shared to be healthy..."
+	@until docker inspect --format='{{.State.Health.Status}}' algod-rust-shared 2>/dev/null | grep -q healthy; do \
+		sleep 1; \
+	done
+	@echo "Both nodes healthy — go on http://localhost:4001, rust on http://localhost:4002"
+
+validate-api-down:
+	$(COMPOSE_VALIDATE_API) down -v
+
+validate-api-status:
+	@echo "== go ==" && curl -s http://localhost:4001/v2/status \
+		-H "X-Algo-API-Token: $(ALGOD_TOKEN)" | python3 -m json.tool
+	@echo "== rust ==" && curl -s http://localhost:4002/v2/status \
+		-H "X-Algo-API-Token: $(ALGOD_TOKEN)" | python3 -m json.tool
+
+validate-api-logs:
+	$(COMPOSE_VALIDATE_API) logs -f
+
+## Bring up the dual-node harness, run the live parity suite
+## (bin/algod-rust/tests/live_go_parity.rs), and tear down even if the
+## suite fails — matching algokey-e2e's pattern.
+validate-api:
+	$(MAKE) validate-api-up
+	@echo "==> Running live dual-node parity suite..."
+	@cargo test --release -p algod-rust --test live_go_parity -- --ignored --nocapture; \
+	  STATUS=$$?; \
+	  $(MAKE) validate-api-down; \
 	  exit $$STATUS
 
 ## ── Transaction Generation ───────────────────────────────────
@@ -554,6 +600,13 @@ help:
 	@echo "                        keyreg + Go↔Rust compat matrix), tear down. Requires"
 	@echo '                        go-algorand@v4.5.1-stable `algokey` on PATH for the'
 	@echo "                        compat matrix (else skipped). PLAN-183."
+	@echo ""
+	@echo "Dual-Node REST Conformance (issue #129):"
+	@echo "  make validate-api        Bring up go+rust on a shared genesis, run the"
+	@echo "                           live parity suite, tear down (even on failure)"
+	@echo "  make validate-api-up     Start both nodes (go:4001, rust:4002)"
+	@echo "  make validate-api-down   Stop both nodes and remove volumes"
+	@echo "  make validate-api-status Query /v2/status on both nodes"
 	@echo ""
 	@echo "Transaction Generation:"
 	@echo "  make generate-txns          Send N payment transactions (default N=6)"
