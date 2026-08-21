@@ -6890,6 +6890,73 @@ async fn unset_sync_round_success() {
     assert_eq!(resp.status(), 200);
 }
 
+/// `/v2/ledger/sync` must reject unauthenticated requests exactly like any
+/// other authenticated v2 route — there is no separate "data API" token to
+/// omit here, go-algorand wires the sync routes with the same public
+/// middleware used everywhere else (`data.RegisterHandlers(e, &v2Handler,
+/// publicMiddleware...)`, `router.go:150`). Issue #206.
+#[tokio::test]
+async fn sync_endpoints_return_401_without_token() {
+    let mut node = MockNode::synced();
+    node.is_follower_mode = true;
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/ledger/sync"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    let resp = server
+        .client
+        .post(server.url("/v2/ledger/sync/100"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    let resp = server
+        .client
+        .delete(server.url("/v2/ledger/sync"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+/// The admin token must also grant access to `/v2/ledger/sync`, proving these
+/// endpoints sit on the same public tier (`[adminToken, apiToken]`,
+/// `router.go:96`) as ordinary authenticated routes rather than requiring a
+/// distinct "data API" credential. go-algorand has no separate data-API
+/// token: `generated/data/routes.go`'s "data" grouping is an OpenAPI-spec
+/// route category, not an auth tier — its handlers are registered with the
+/// exact same `publicMiddleware` as `/v2/status`, `/v2/accounts/...`, etc.
+/// (`router.go:150`). Issue #206.
+#[tokio::test]
+async fn admin_token_works_on_sync_endpoints() {
+    let mut node = MockNode::synced();
+    node.is_follower_mode = true;
+    node.sync_round = 500;
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/ledger/sync"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "admin token must be accepted on the sync endpoints (go router.go:96)"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["round"], 500);
+}
+
 // ===========================================================================
 // Min-rounds catchup check test
 // ===========================================================================
