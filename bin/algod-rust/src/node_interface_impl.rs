@@ -37,7 +37,7 @@ use algo_ledger::simulation::{
     TxnResult,
 };
 use algo_ledger::store_trait::LedgerStore;
-use algo_ledger::{SqliteLedger, StateDelta};
+use algo_ledger::{SqliteLedger, StateDelta, StateDeltaSubset};
 use algo_network::local_tx_broadcast::{LocalTxBroadcaster, LocalTxError};
 use algo_pool::TransactionPool;
 use algo_rest_api::models::{
@@ -875,7 +875,7 @@ impl NodeInterface for AlgodNodeInterface {
             .ok_or_else(|| NodeError::NotFound(format!("no state delta for round {round}")))
     }
 
-    async fn get_txn_group_delta(&self, id: &Digest) -> Result<StateDelta, NodeError> {
+    async fn get_txn_group_delta(&self, id: &Digest) -> Result<StateDeltaSubset, NodeError> {
         let ledger = self.lock_ledger("get_txn_group_delta")?;
         if !ledger.group_delta_tracer_enabled() {
             return Err(NodeError::NotImplemented("get_txn_group_delta"));

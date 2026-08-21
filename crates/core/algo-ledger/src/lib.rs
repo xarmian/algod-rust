@@ -77,5 +77,5 @@ pub use state_delta::{
     AccountBaseData, AccountDeltas, AccountTotals, AlgoCount, AppLocalStateDelta, AppParamsDelta,
     AppResourceRecord, AssetHoldingDelta, AssetParamsDelta, AssetResourceRecord, BalanceRecord,
     IncludedTransactions, KvValueDelta, LedgercoreAccountData, ModifiedCreatable, StateDelta,
-    Txlease, VotingData,
+    StateDeltaSubset, Txlease, VotingData,
 };
