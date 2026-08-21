@@ -16,3 +16,7 @@ docker/data/
 .env
 wire_fixtures/
 benchmarks/go-decode/go.sum
+# Dual-node REST conformance harness scratch state (issue #129).
+/.validate-api-rust-data/
+/.validate-api-rust-data.log
+/.validate-api-rust.pid

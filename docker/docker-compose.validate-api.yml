@@ -1,10 +1,11 @@
 # Dual-node REST conformance harness (issue #129).
 #
-# Boots a *real* go-algorand v4.5.1-stable node and a real algod-rust node
-# from the **same genesis.json** — the funded-dev-account genesis already
-# baked into `docker/localnet-rust/data/` (TASK-268) — on distinct host
-# ports, so a live client can send identical requests to both and compare
-# responses byte-for-byte at round 0 and beyond.
+# Boots a *real* go-algorand v4.5.1-stable node from the **same genesis.json**
+# — the funded-dev-account genesis already baked into
+# `docker/localnet-rust/data/` (TASK-268) — so a live client can send
+# identical requests to it and to a natively-run algod-rust process (see the
+# `validate-api-*` targets in the Makefile) and compare responses
+# byte-for-byte at round 0 and beyond.
 #
 # Why the same genesis matters: go-algorand's own DEV_MODE bootstrap
 # (`docker-compose.yml`'s `algod-go` service) auto-generates a fresh,
@@ -19,8 +20,16 @@
 # mnemonic in docs/DEV_WORKFLOW.md), making state-dependent response
 # comparison meaningful, not just structural.
 #
+# algod-rust deliberately runs natively (`cargo build --release --bin
+# algod-rust` + a plain background process), not as a second Docker service:
+# building it via `docker compose up --build` and then separately building
+# it again for `cargo test --release --test live_go_parity` performs two
+# full, uncached release compiles of the same binary, which blew CI's
+# 20-minute timeout on the very first run. Running it natively means both
+# the harness process and the test binary share one `target/release` build.
+#
 # Usage (see the `validate-api-*` targets in the Makefile):
-#   docker compose -f docker/docker-compose.validate-api.yml up -d --build
+#   docker compose -f docker/docker-compose.validate-api.yml up -d
 #   docker compose -f docker/docker-compose.validate-api.yml down -v
 
 services:
@@ -67,33 +76,10 @@ services:
       retries: 15
     restart: unless-stopped
 
-  # algod-rust, from the same `localnet` image used by
-  # docker-compose.localnet-rust.yml (genesis baked in at build time —
-  # identical file to what algod-go-shared is fed above). Remapped to
-  # host port 4002 so both nodes can run simultaneously.
-  algod-rust-shared:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-      target: localnet
-    image: algod-rust-localnet:latest
-    container_name: algod-rust-shared
-    ports:
-      - "4002:8080"
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "curl",
-          "-f",
-          "-H",
-          "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "http://localhost:8080/v2/status",
-        ]
-      interval: 5s
-      timeout: 3s
-      retries: 15
-    restart: unless-stopped
+# algod-rust itself is run natively on the host (see `validate-api-up` /
+# `validate-api-down` in the Makefile), on port 4002 against a scratch copy
+# of the same `docker/localnet-rust/data/` genesis — not as a compose
+# service. See the header comment above for why.
 
 volumes:
   algod-go-shared-data:

@@ -7,9 +7,12 @@ name: Dual-Node REST Conformance
 # HTTP responses byte-for-byte where a shared genesis makes that meaningful.
 #
 # Runs only when paths the suite actually exercises change, so most PRs
-# don't pay the Docker-build + dual-node-boot cost. No go-algorand-from-source
-# build is needed here (unlike algokey-e2e.yml) -- the go side uses the
-# prebuilt `algorand/algod` image directly.
+# don't pay the dual-node-boot cost. No go-algorand-from-source build is
+# needed here (unlike algokey-e2e.yml) -- the go side uses the prebuilt
+# `algorand/algod` image directly, and algod-rust runs natively (a single
+# `cargo build --release`, reused by the test binary) rather than as a
+# second Docker image -- see docker-compose.validate-api.yml's header
+# comment for why building it twice blew the original timeout.
 
 on:
   pull_request:
@@ -50,7 +53,7 @@ jobs:
   validate-api:
     name: Live parity vs go-algorand (shared genesis)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
