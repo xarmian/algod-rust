@@ -11,6 +11,7 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use crate::auth;
+use crate::error_envelope::{json_envelope_layer, unmatched_route_fallback};
 use crate::handlers;
 use crate::node::NodeInterface;
 
@@ -241,6 +242,21 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             ));
         router = router.merge(experimental);
     }
+
+    // Set explicitly on the fully-merged router so an unmatched path is
+    // reached without passing through any sub-router's auth layer (each of
+    // which was itself `.layer()`-wrapped before merging, so an implicit
+    // fallback inherited from any one of them would otherwise gate a
+    // genuinely-unmatched path behind that tier's specific token) — matching
+    // go-algorand, where routing determines there is no match (and therefore
+    // no middleware chain to run) before any auth check (issue #129).
+    router = router.fallback(unmatched_route_fallback);
+
+    // Outermost layer: guarantees every error response — including axum's
+    // default extractor-rejection bodies, which never reach a handler — is
+    // go-algorand's JSON `{"message": "..."}"` envelope. See
+    // `error_envelope` for the full rationale.
+    router = router.layer(middleware::from_fn(json_envelope_layer));
 
     router.with_state(node)
 }

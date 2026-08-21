@@ -84,6 +84,15 @@ pub fn service_unavailable(msg: impl Into<String>) -> Response {
     error_response(StatusCode::SERVICE_UNAVAILABLE, msg)
 }
 
+/// Build a JSON error response for an arbitrary status code and message.
+///
+/// Used by [`crate::error_envelope`] to rewrite non-JSON error responses
+/// (e.g. axum's default extractor-rejection bodies) into go-algorand's
+/// envelope while preserving the original status code.
+pub fn error_response_for_status(status: StatusCode, msg: impl Into<String>) -> Response {
+    error_response(status, msg)
+}
+
 /// Build a JSON error response with the given status code and message.
 fn error_response(status: StatusCode, msg: impl Into<String>) -> Response {
     let body = ErrorResponse::new(msg);

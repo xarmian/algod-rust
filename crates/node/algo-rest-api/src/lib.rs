@@ -9,6 +9,7 @@ pub mod block_json;
 pub mod box_name;
 pub mod dryrun;
 pub mod error;
+pub mod error_envelope;
 pub mod format;
 pub mod handlers;
 pub mod models;
