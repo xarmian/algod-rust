@@ -173,6 +173,7 @@ validate-api-up:
 	@rm -rf $(VALIDATE_API_RUST_DATA)
 	@mkdir -p $(VALIDATE_API_RUST_DATA)
 	@cp -r docker/localnet-rust/data/. $(VALIDATE_API_RUST_DATA)/
+	@printf '%s' "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" > $(VALIDATE_API_RUST_DATA)/algod.admin.token
 	@./target/release/algod-rust node start -d $(VALIDATE_API_RUST_DATA) --dev -l 0.0.0.0:4002 \
 		>$(VALIDATE_API_RUST_DATA).log 2>&1 & echo $$! > $(VALIDATE_API_RUST_PID)
 	@echo "Waiting for algod-rust to be healthy..."
