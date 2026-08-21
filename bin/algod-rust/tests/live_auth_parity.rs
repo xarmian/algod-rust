@@ -30,19 +30,23 @@
 //! `/health`, `/ready`, `/versions`, `/genesis`, `/swagger.json` carry no
 //! auth middleware at all.
 
-/// `docker/localnet-rust/data/algod.token` AND `algod.admin.token` --
-/// this harness's dev fixtures deliberately share one token value across
-/// both files (as does every other dev/test harness in this repo,
-/// `Makefile`'s `ALGOD_TOKEN`, `docker-compose.*.yml`, etc.), so there is
-/// no distinctly-different "admin token" to exercise here. That means the
-/// live-testable subset of the tier matrix is: no-token, garbage-token,
-/// and this-shared-token -- not "a genuinely different admin token accepted
-/// where a genuinely different public token is rejected". Bumping
-/// `algod.admin.token` to a distinct value to close that gap would touch
-/// shared dev infrastructure well beyond this harness (every docker-compose
-/// file listed above reads the same `ALGOD_TOKEN`), so it's left as a
-/// documented harness limitation rather than changed here.
+/// `docker/localnet-rust/data/algod.token` -- the public API token, shared
+/// with every other dev/test harness in this repo (`Makefile`'s
+/// `ALGOD_TOKEN`, `docker-compose.*.yml`, etc.).
 const DEV_TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+/// A distinct admin token, scoped to *this* harness only (issue #458).
+/// `docker/docker-compose.validate-api.yml`'s init script and
+/// `Makefile`'s `validate-api-up` target both override
+/// `algod.admin.token` to this value on top of the shared genesis data
+/// dir, rather than changing the shared `algod.admin.token` file every
+/// other harness reads (which still equals [`DEV_TOKEN`], for developer
+/// convenience elsewhere). This lets the tests below exercise the case
+/// the tier model actually exists for: a genuinely public-only token
+/// rejected on an admin-tier route, and a genuinely different admin
+/// token accepted there.
+const ADMIN_TOKEN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
 const GARBAGE_TOKEN: &str = "0000000000000000000000000000000000000000000000000000000000000";
 
 fn go_url() -> String {
@@ -201,9 +205,7 @@ async fn public_tier_accepts_the_shared_token() {
 async fn admin_tier_rejects_missing_and_garbage_tokens() {
     let c = client();
     // `/v2/participation` (GET) is admin-tier on both nodes and side-effect
-    // free -- avoid `/v2/shutdown` per the issue's own guidance. Note: a
-    // "public-but-not-admin token" case is deliberately not asserted here
-    // -- this harness has no such token (see DEV_TOKEN's doc comment).
+    // free -- avoid `/v2/shutdown` per the issue's own guidance.
     let path = "/v2/participation";
     assert_auth_parity(&c, reqwest::Method::GET, path, AuthHeaders::none(), 401).await;
     assert_auth_parity(
@@ -218,13 +220,30 @@ async fn admin_tier_rejects_missing_and_garbage_tokens() {
 
 #[tokio::test]
 #[ignore = "requires `make validate-api-up`; see module docs"]
-async fn admin_tier_accepts_the_shared_token() {
+async fn admin_tier_rejects_a_genuinely_public_only_token() {
+    // Issue #458: with a harness-scoped distinct ADMIN_TOKEN, DEV_TOKEN is
+    // now a genuinely public-only token on this harness -- the case the
+    // tier model exists for and that couldn't be exercised before.
     let c = client();
     assert_auth_parity(
         &c,
         reqwest::Method::GET,
         "/v2/participation",
         AuthHeaders::token(DEV_TOKEN),
+        401,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires `make validate-api-up`; see module docs"]
+async fn admin_tier_accepts_the_distinct_admin_token() {
+    let c = client();
+    assert_auth_parity(
+        &c,
+        reqwest::Method::GET,
+        "/v2/participation",
+        AuthHeaders::token(ADMIN_TOKEN),
         200,
     )
     .await;
