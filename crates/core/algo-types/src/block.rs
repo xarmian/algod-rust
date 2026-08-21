@@ -13,7 +13,10 @@ use crate::{rmp_decode, Address, Round, SignedTransaction};
 pub struct Block {
     // ── Header fields ─────────────────────────────────────────
     /// Round number.
-    #[serde(rename = "rnd")]
+    ///
+    /// `#[serde(default)]` because canonically/omitempty-encoded blocks
+    /// omit "rnd" entirely at round 0 (e.g. the genesis block).
+    #[serde(rename = "rnd", default)]
     pub round: Round,
 
     /// Previous block hash (crypto.Digest = [32]byte in Go).
@@ -276,7 +279,6 @@ impl Block {
     pub fn decode_from_reader(rd: &mut &[u8]) -> DecodeResult<Self> {
         let len = rmp_decode::read_map_len(rd)?;
         let mut b = Self::default();
-        let mut has_rnd = false;
         for _ in 0..len {
             let key = rmp_decode::read_key_bytes(rd)?;
             match (key.len(), key.first().copied().unwrap_or(0)) {
@@ -296,10 +298,12 @@ impl Block {
                 (3, b'g') if key == b"gen" => b.genesis_id = rmp_decode::read_string(rd)?,
                 (3, b'p') if key == b"prp" => b.proposer = rmp_decode::read_address(rd)?,
                 (3, b'r') => match key {
-                    b"rnd" => {
-                        b.round = Round(rmp_decode::read_u64(rd)?);
-                        has_rnd = true;
-                    }
+                    // Canonically/omitempty-encoded blocks omit "rnd"
+                    // entirely at round 0 (e.g. the genesis block, since
+                    // #453) -- `b.round` is already `Round(0)` via
+                    // `Self::default()`, so there is no missing-field case
+                    // to reject here.
+                    b"rnd" => b.round = Round(rmp_decode::read_u64(rd)?),
                     b"rwd" => b.rewards_pool = rmp_decode::read_address(rd)?,
                     _ => rmp_decode::skip_value(rd)?,
                 },
@@ -373,13 +377,6 @@ impl Block {
                 // Unknown fields are skipped
                 _ => rmp_decode::skip_value(rd)?,
             }
-        }
-        // The serde path requires `rnd` (no #[serde(default)]), so validate here.
-        if !has_rnd {
-            return Err(algo_error::AlgoError::Codec {
-                source: "Block: missing required 'rnd' field".into(),
-                context: "rmp_decode".into(),
-            });
         }
         Ok(b)
     }
