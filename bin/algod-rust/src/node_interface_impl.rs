@@ -391,6 +391,51 @@ impl AlgodNodeInterface {
         Ok(None)
     }
 
+    /// Search recent committed blocks (the same [`CONFIRM_LOOKBACK_ROUNDS`]
+    /// window [`Self::lookup_confirmed_txn`] uses) for `txid`, returning
+    /// whether it has already been confirmed.
+    ///
+    /// Takes the ledger handle directly (rather than `&self`) so it can run
+    /// from inside `broadcast_signed_tx_group`'s `spawn_blocking` closure,
+    /// which only has the cloned `Arc<Mutex<SqliteLedger>>` in scope, not
+    /// `self`. Used to reject resubmission of an already-confirmed
+    /// transaction — matching go-algorand's `ledgercore.TransactionInLedgerError`
+    /// (`"transaction already in ledger: %v"`, `ledger/ledgercore/error.go`),
+    /// raised inside its block evaluator via `TxTail.checkDup`. algod-rust had
+    /// no equivalent check at all before this: dev-mode's pool only tracks
+    /// *pending* duplicates (`Pool::check_duplicate`), so once a transaction
+    /// is confirmed and cleared from the pool, resubmitting the identical
+    /// signed bytes was silently accepted and re-applied a second time — a
+    /// real replay gap, found live against go-algorand v4.5.1-stable
+    /// (issue #449).
+    fn txn_confirmed_in_ledger(
+        ledger: &Mutex<SqliteLedger>,
+        txid: Digest,
+    ) -> Result<bool, NodeError> {
+        let ledger = ledger.lock().map_err(|_| {
+            NodeError::Internal("txn_confirmed_in_ledger: ledger lock poisoned".into())
+        })?;
+        let current = ledger.current_round().0;
+        let lo = current.saturating_sub(CONFIRM_LOOKBACK_ROUNDS).max(1);
+        for round in (lo..=current).rev() {
+            let Some(bytes) = ledger
+                .get_block_data(round)
+                .map_err(|e| NodeError::Internal(format!("get_block_data({round}): {e}")))?
+            else {
+                continue;
+            };
+            let block = decode_block(&bytes)
+                .map_err(|e| NodeError::Internal(format!("decode_block({round}): {e}")))?;
+            for stx in &block.payset {
+                let restored = crate::dev_producer::restore_block_genesis_fields(stx, &block);
+                if compute_txn_id(&restored.txn) == txid {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Lock the attached participation store, surfacing absence as
     /// [`NodeError::NotImplemented`] and lock poison as
     /// [`NodeError::Internal`]. Single call site so the error strings stay
@@ -1203,6 +1248,19 @@ impl NodeInterface for AlgodNodeInterface {
             // across the spawn_blocking below.
             let _produce_guard = self.dev_produce_lock.lock().await;
             return tokio::task::spawn_blocking(move || {
+                // Reject resubmission of an already-confirmed transaction --
+                // matching go's `TransactionInLedgerError` (issue #449). Must
+                // run before `pool.remember`: the pending-pool duplicate check
+                // alone can't catch this, since a confirmed txn has already
+                // been cleared out of the pool by the time it's resubmitted.
+                for stx in &tx_group {
+                    let txid = compute_txn_id(&stx.txn);
+                    if Self::txn_confirmed_in_ledger(&ledger, txid)? {
+                        return Err(NodeError::BadRequest(format!(
+                            "transaction already in ledger: {txid}"
+                        )));
+                    }
+                }
                 // Prime the evaluator before the first ingest (a fresh pool has
                 // none until the first block); idempotent thereafter.
                 pool.ensure_evaluator_primed();

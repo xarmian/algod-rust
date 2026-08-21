@@ -27,7 +27,7 @@
       "addr": "TJD47PJE4JPJV6W2RNS47KXA2IID52Y2S5OPUSXKJZLWSEWMNJ4R2GIOFM",
       "comment": "RewardsPool",
       "state": {
-        "algo": 0,
+        "algo": 125000000000000,
         "onl": 0
       }
     }

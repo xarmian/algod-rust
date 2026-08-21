@@ -78,24 +78,29 @@ pub struct GenesisAccountState {
 
 /// Resolve the account status a genesis allocation entry should actually get.
 ///
-/// Verified live against go-algorand v4.5.1-stable (issue #129): the fee
-/// sink and rewards pool addresses are *always* reported as
-/// `NotParticipating`, regardless of what the genesis file's own `"onl"`
-/// field declares for them — feeding the identical genesis.json (with
-/// `"onl": 0` for both) to a real `algod` and to algod-rust produced
-/// `"status": "Not Participating"` from go and `"status": "Offline"` from
-/// algod-rust for the same fee-sink address. This also affects
-/// `/v2/ledger/supply`: go's `TotalMoney` is `Online.Money + Offline.Money`
-/// (`ledgercore.AccountTotals.Participating()`), which excludes
-/// `NotParticipating` accounts, so an un-overridden fee sink balance was
-/// incorrectly inflating algod-rust's reported total supply.
+/// Only the **fee sink** is unconditionally forced to `NotParticipating`
+/// regardless of the genesis file's declared `onl` value; the rewards pool
+/// honors its declared status like any other account. Verified live
+/// against go-algorand v4.5.1-stable with a *nonzero* rewards-pool balance
+/// (issue #449) -- `GET /v2/accounts/{rewardsPool}` reports `"Offline"`
+/// (matching this localnet genesis's `"onl": 0`), not `"Not Participating"`.
+///
+/// A prior version of this function also forced the rewards pool to
+/// `NotParticipating`, based on an earlier live comparison that used a
+/// **zero**-balance rewards pool (PR #446) -- with a zero balance, "Offline"
+/// and "NotParticipating" are observationally identical in every
+/// balance-aggregate response (`/v2/ledger/supply`'s `total-money`), so
+/// that comparison could not actually distinguish the two hypotheses. Once
+/// the rewards pool carries a real balance (needed to unblock go's
+/// dev-mode block production at all -- see
+/// `docker/localnet-rust/data/genesis.json`), the distinction becomes
+/// observable and the original claim doesn't hold.
 fn effective_genesis_status(
     addr: &str,
     state: &GenesisAccountState,
     fee_sink: &str,
-    rewards_pool: &str,
 ) -> AccountStatus {
-    if addr == fee_sink || addr == rewards_pool {
+    if addr == fee_sink {
         return AccountStatus::NotParticipating;
     }
     match state.onl {
@@ -139,8 +144,7 @@ pub fn populate_store<L: crate::store_trait::LedgerStore>(
             message: format!("invalid allocation address '{}': {e}", alloc.addr),
         })?;
 
-        let status =
-            effective_genesis_status(&alloc.addr, &alloc.state, &genesis.fees, &genesis.rwd);
+        let status = effective_genesis_status(&alloc.addr, &alloc.state, &genesis.fees);
 
         let vote_id = decode_key_32(&alloc.state.vote, "vote")?;
         let selection_id = decode_key_32(&alloc.state.sel, "sel")?;
@@ -497,8 +501,7 @@ pub fn seed_account_totals_from_genesis(
     // sharing the reserve address) hit this in practice.
     let mut per_addr: HashMap<String, (AccountStatus, u64)> = HashMap::new();
     for alloc in &genesis.alloc {
-        let status =
-            effective_genesis_status(&alloc.addr, &alloc.state, &genesis.fees, &genesis.rwd);
+        let status = effective_genesis_status(&alloc.addr, &alloc.state, &genesis.fees);
         per_addr.insert(alloc.addr.clone(), (status, alloc.state.algo));
     }
     // Reward units per account are floor(microAlgos / RewardUnit), summed by
@@ -702,16 +705,24 @@ mod tests {
 
     /// Live-verified against go-algorand v4.5.1-stable (issue #129): the fee
     /// sink is always reported `NotParticipating`, even when the genesis
-    /// file's own `"onl"` field for it says `0` (Offline). Directly asserted
-    /// on `populate_store`'s output (the account status
+    /// file's own `"onl"` field for it says `0` (Offline) -- but the
+    /// **rewards pool** honors its declared status like any other account.
+    /// Directly asserted on `populate_store`'s output (the account status
     /// `/v2/accounts/{address}` reports) here; the corresponding
-    /// `/v2/ledger/supply` effect (a NotParticipating fee sink balance must
-    /// not inflate `total-money`) is covered by
+    /// `/v2/ledger/supply` effect is covered by
     /// `seed_account_totals_from_genesis_sums_by_status` and the
-    /// dedicated `seed_account_totals_excludes_fee_sink_and_rewards_pool`
-    /// test below.
+    /// dedicated `seed_account_totals_excludes_fee_sink_only` test below.
+    ///
+    /// See [`effective_genesis_status`]'s doc comment for why an earlier
+    /// version of this test (and the code it covers) also forced the
+    /// rewards pool to `NotParticipating`: that claim came from a
+    /// zero-balance rewards pool, which made "Offline" and
+    /// "NotParticipating" observationally identical. This test now uses a
+    /// nonzero rewards-pool balance specifically so the two are
+    /// distinguishable, matching the live-verified go-algorand v4.5.1-stable
+    /// behavior (issue #449).
     #[test]
-    fn fee_sink_and_rewards_pool_are_always_not_participating() {
+    fn fee_sink_forced_not_participating_rewards_pool_honors_declared_status() {
         let json = r#"{
             "network": "devnet",
             "id": "v1.0",
@@ -725,7 +736,7 @@ mod tests {
                 {
                     "addr": "TJD47PJE4JPJV6W2RNS47KXA2IID52Y2S5OPUSXKJZLWSEWMNJ4R2GIOFM",
                     "comment": "RewardsPool",
-                    "state": { "algo": 0, "onl": 0 }
+                    "state": { "algo": 125000000000000, "onl": 0 }
                 }
             ],
             "fees": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
@@ -748,8 +759,8 @@ mod tests {
         );
         assert_eq!(
             state.get_account(&rewards_pool_addr).unwrap().status,
-            AccountStatus::NotParticipating,
-            "rewards pool must be NotParticipating regardless of the genesis file's onl:0"
+            AccountStatus::Offline,
+            "rewards pool must honor the genesis file's declared onl:0 (Offline), not be force-overridden"
         );
     }
 
@@ -758,9 +769,11 @@ mod tests {
     /// (`participating_money` / go's `AccountTotals.Participating()`,
     /// `Online.Money + Offline.Money`) even though its own `"onl"` field
     /// says Offline — matching the `total-money` mismatch found live
-    /// against go-algorand (issue #129).
+    /// against go-algorand (issue #129). The rewards pool, by contrast,
+    /// *does* count (issue #449 -- see `effective_genesis_status`'s doc
+    /// comment).
     #[test]
-    fn seed_account_totals_excludes_fee_sink_and_rewards_pool() {
+    fn seed_account_totals_excludes_fee_sink_only() {
         let json = r#"{
             "network": "devnet",
             "id": "v1.0",
@@ -775,6 +788,11 @@ mod tests {
                     "addr": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
                     "comment": "FeeSink",
                     "state": { "algo": 100000, "onl": 0 }
+                },
+                {
+                    "addr": "TJD47PJE4JPJV6W2RNS47KXA2IID52Y2S5OPUSXKJZLWSEWMNJ4R2GIOFM",
+                    "comment": "RewardsPool",
+                    "state": { "algo": 500, "onl": 0 }
                 }
             ],
             "fees": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
@@ -783,9 +801,10 @@ mod tests {
         let genesis = parse_genesis_json(json).unwrap();
         let mut ledger = crate::sqlite::SqliteLedger::open_in_memory().unwrap();
         seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
-        // Only the 1000-microAlgo dev account is participating (Offline);
-        // the fee sink's 100000 must be excluded.
-        assert_eq!(ledger.participating_money().unwrap(), 1000);
+        // The 1000-microAlgo dev account and the 500-microAlgo rewards pool
+        // (both Offline) are participating; the fee sink's 100000 is
+        // excluded.
+        assert_eq!(ledger.participating_money().unwrap(), 1500);
     }
 
     #[test]
