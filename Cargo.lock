@@ -522,6 +522,7 @@ dependencies = [
  "algo-validate",
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "clap",
  "ed25519-dalek",

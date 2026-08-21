@@ -144,7 +144,7 @@ algokey-e2e:
 ## the native process is free to write its ledger/tracker DBs into; it is
 ## rebuilt fresh on every `validate-api-up` and is not tracked by git.
 ##
-## `validate-api-up` also pre-builds the live_go_parity test binary
+## `validate-api-up` also pre-builds the live parity test binaries
 ## (--no-run) before starting the native algod-rust process: `cargo test`
 ## always uplifts every bin target of the package under test (so
 ## CARGO_BIN_EXE_* env vars are populated even if unused), which would
@@ -161,9 +161,11 @@ validate-api-up:
 	@until docker inspect --format='{{.State.Health.Status}}' algod-go-shared 2>/dev/null | grep -q healthy; do \
 		sleep 1; \
 	done
-	@echo "==> Building algod-rust (release) and the live parity test binary..."
+	@echo "==> Building algod-rust (release) and the live parity test binaries..."
 	@cargo build --release --bin algod-rust
 	@cargo test --release -p algod-rust --test live_go_parity --no-run
+	@cargo test --release -p algod-rust --test live_msgpack_parity --no-run
+	@cargo test --release -p algod-rust --test live_txn_cross_verification --no-run
 	@echo "==> Starting algod-rust natively on :4002..."
 	@rm -rf $(VALIDATE_API_RUST_DATA)
 	@mkdir -p $(VALIDATE_API_RUST_DATA)
@@ -194,15 +196,24 @@ validate-api-status:
 validate-api-logs:
 	$(COMPOSE_VALIDATE_API) logs -f
 
-## Bring up the dual-node harness, run the live parity suite
-## (bin/algod-rust/tests/live_go_parity.rs), and tear down even if the
-## suite fails — matching algokey-e2e's pattern. Reuses the same
-## `target/release` build that validate-api-up already produced, so the
-## harness process and the test binary are never compiled twice.
+## Bring up the dual-node harness, run every live parity suite
+## (bin/algod-rust/tests/live_go_parity.rs, live_msgpack_parity.rs,
+## live_txn_cross_verification.rs), and tear down even if a suite fails —
+## matching algokey-e2e's pattern. Reuses the same `target/release` build
+## that validate-api-up already produced, so the harness process and the
+## test binaries are never compiled twice.
+##
+## Order matters: live_go_parity and live_msgpack_parity assume genesis-only
+## state (round 0), so they run first, before live_txn_cross_verification
+## submits any transactions and advances both nodes' rounds.
+## live_txn_cross_verification also needs --test-threads=1 (see its module
+## docs) since its tests mutate the shared dev account's on-chain state.
 validate-api:
 	$(MAKE) validate-api-up
-	@echo "==> Running live dual-node parity suite..."
-	@cargo test --release -p algod-rust --test live_go_parity -- --ignored --nocapture; \
+	@echo "==> Running live dual-node parity suites..."
+	@cargo test --release -p algod-rust --test live_go_parity -- --ignored --nocapture && \
+	 cargo test --release -p algod-rust --test live_msgpack_parity -- --ignored --nocapture && \
+	 cargo test --release -p algod-rust --test live_txn_cross_verification -- --ignored --nocapture --test-threads=1; \
 	  STATUS=$$?; \
 	  $(MAKE) validate-api-down; \
 	  exit $$STATUS
