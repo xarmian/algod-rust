@@ -530,11 +530,14 @@ pub async fn wait_for_block<N: NodeInterface>(
     State(node): State<AppState<N>>,
     Path(round): Path<u64>,
 ) -> Response {
-    // 0. Guard against round+1 overflow
-    let next_round = match round.checked_add(1) {
-        Some(r) => r,
-        None => return error::bad_request("round overflow"),
-    };
+    // 0. go's `round basics.Round` (a `uint64`) computes `round+1` with
+    // plain unsigned-integer wraparound, no overflow check at all --
+    // verified live against go-algorand v4.5.1-stable (issue #450):
+    // `wait-for-block-after/{u64::MAX}` returns 200 immediately, because
+    // `round+1` wraps to 0, and round 0 is always already committed. An
+    // explicit "round overflow" 400 here (as this code previously did) is
+    // itself the conformance bug -- match go's wraparound instead.
+    let next_round = round.wrapping_add(1);
 
     // 1. Get current status
     let status = match node.status().await {
