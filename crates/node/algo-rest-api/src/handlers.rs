@@ -1804,6 +1804,19 @@ pub async fn get_light_block_header_proof<N: NodeInterface>(
         match node.get_state_proof_transaction_for_round(round).await {
             Ok(range) => range,
             Err(NodeError::NotFound(msg)) => return error::not_found(msg),
+            // State proof tracking isn't implemented yet (issue #462), so
+            // the default `NodeInterface::get_state_proof_transaction_for_round`
+            // always returns `NotImplemented`. From this endpoint's
+            // perspective that's indistinguishable from go's own "no state
+            // proof covers this round" 404 (the only case currently
+            // verifiable — no state proofs exist yet on a fresh localnet
+            // either way) -- surfacing a 500 here would be a real,
+            // avoidable conformance mismatch. Once state proof tracking is
+            // implemented, `NotImplemented` will simply stop being
+            // returned and this arm becomes unreachable in practice.
+            Err(NodeError::NotImplemented(_)) => {
+                return error::not_found("no state proof covers the given round")
+            }
             Err(e) => return error::internal_error(e.to_string()),
         };
 
@@ -2173,6 +2186,12 @@ pub async fn get_state_proof<N: NodeInterface>(
         Ok(Err(e)) => match e {
             NodeError::NotFound(msg) => error::not_found(msg),
             NodeError::Timeout(msg) => error::timeout(msg),
+            // State proof tracking isn't implemented yet (issue #462), so
+            // the default `NodeInterface::get_state_proof_for_round` always
+            // returns `NotImplemented`. Matches go's `ErrNoStateProofForRound`
+            // 404 for conformance -- see `get_light_block_header_proof`'s
+            // identical reasoning for the sibling state-proof endpoint.
+            NodeError::NotImplemented(_) => error::not_found("no state proof for that round"),
             e => error::internal_error(e.to_string()),
         },
         Err(_elapsed) => error::timeout("operation timed out"),
@@ -3515,7 +3534,15 @@ pub async fn get_participation_key_by_id<N: NodeInterface>(
                 Err(e) => error::internal_error(format!("failed to encode response: {e}")),
             }
         }
-        Err(NodeError::NotFound(msg)) => error::not_found(msg),
+        // go's `Node.GetParticipationKey` (`node/node.go`) always returns
+        // `account.ErrParticipationIDNotFound` as an *error* for an unknown
+        // ID -- never the zero-record/nil-error case its own handler
+        // (`GetParticipationKeyByID`, `handlers.go`) has a dedicated 404
+        // branch for. Its generic `err != nil` branch runs instead, which
+        // maps to 500, not 404 -- a confirmed live quirk (issue #447), not
+        // a deliberate "unknown ID" contract. Matched here for conformance:
+        // the message is byte-identical to go's `ErrParticipationIDNotFound`.
+        Err(NodeError::NotFound(_)) => error::internal_error("the participation ID was not found"),
         Err(e) => error::internal_error(e.to_string()),
     }
 }
