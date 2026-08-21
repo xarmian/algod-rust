@@ -55,6 +55,7 @@ services:
         tr -d '\r' < /genesis-src/genesis.json > /algod/data/genesis.json
         tr -d '\r' < /genesis-src/algod.token > /algod/data/algod.token
         tr -d '\r' < /genesis-src/algod.admin.token > /algod/data/algod.admin.token
+        tr -d '\r' < /genesis-src/config.json > /algod/data/config.json
         exec algod -d /algod/data -g /algod/data/genesis.json -l 0.0.0.0:8080 -o
     volumes:
       - ./localnet-rust/data:/genesis-src:ro

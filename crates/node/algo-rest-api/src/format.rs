@@ -164,6 +164,62 @@ pub async fn json_trailing_newline_layer(request: Request, next: Next) -> Respon
     response
 }
 
+/// Ensures every response carries a `Vary: Accept-Encoding` entry (go's
+/// exact casing), regardless of whether this response was actually
+/// compressed.
+///
+/// Two real, live-verified (issue #452) mismatches against go-algorand
+/// v4.5.1-stable, both fixed here:
+/// - `tower_http::CompressionLayer` emits an all-lowercase
+///   `Vary: accept-encoding` value; go emits `Vary: Accept-Encoding`. HTTP
+///   header *values* are technically opaque strings, so this is a real
+///   byte-level mismatch, not just cosmetic.
+/// - `CompressionLayer` only sets `Vary: Accept-Encoding` when it actually
+///   compresses the response, skipping it below its own size threshold
+///   (e.g. `/health`'s tiny body, or a short 404 error envelope). go's Echo
+///   `middleware.Gzip()` sets it unconditionally on every response it
+///   wraps, since the response is *negotiable* on Accept-Encoding
+///   regardless of whether this particular reply happened to compress.
+///
+/// Applied as the outermost layer (after `CompressionLayer`, which is
+/// otherwise the outermost middleware in `router.rs`) so it runs on the
+/// final response the client sees.
+pub async fn normalize_vary_header_casing(request: Request, next: Next) -> Response {
+    // OPTIONS preflight responses are fully handled by `cors::cors_layer`,
+    // which already builds go's exact preflight `Vary` set (`Origin`,
+    // `Access-Control-Request-Method`, `Access-Control-Request-Headers` --
+    // no `Accept-Encoding`, since go's gzip middleware never wraps a
+    // preflight's empty 204 body). Leave it untouched.
+    let is_options = request.method() == axum::http::Method::OPTIONS;
+    let mut response = next.run(request).await;
+    if is_options {
+        return response;
+    }
+    let headers = response.headers_mut();
+    let mut values: Vec<axum::http::HeaderValue> = headers
+        .get_all(axum::http::header::VARY)
+        .iter()
+        .map(|v| {
+            if v.as_bytes().eq_ignore_ascii_case(b"accept-encoding") {
+                axum::http::HeaderValue::from_static("Accept-Encoding")
+            } else {
+                v.clone()
+            }
+        })
+        .collect();
+    if !values
+        .iter()
+        .any(|v| v.as_bytes().eq_ignore_ascii_case(b"accept-encoding"))
+    {
+        values.push(axum::http::HeaderValue::from_static("Accept-Encoding"));
+    }
+    headers.remove(axum::http::header::VARY);
+    for v in values {
+        headers.append(axum::http::header::VARY, v);
+    }
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
