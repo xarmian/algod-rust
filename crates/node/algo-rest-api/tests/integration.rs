@@ -1635,6 +1635,123 @@ async fn malformed_numeric_path_param_returns_json_error_envelope() {
 }
 
 // ===========================================================================
+// CORS conformance (issue #129)
+//
+// Verified live against go-algorand v4.5.1-stable: `middlewares.MakeCORS`
+// (`daemon/algod/api/server/lib/middlewares/cors.go`) configures Echo's CORS
+// middleware with `AllowOrigins: ["*"]`, `AllowHeaders: [TokenHeader,
+// "Content-Type"]`, `AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]`, applied
+// globally to every route (including `/health` and friends) before auth.
+//
+// Before this fix, algod-rust had no CORS support at all: a simple GET with
+// an `Origin` header carried no `Access-Control-*` headers, and — more
+// seriously — an OPTIONS preflight request returned axum's default
+// `405 Method Not Allowed` (no route registers OPTIONS explicitly) instead of
+// go's `204 No Content` with the preflight headers a browser requires to
+// proceed. That failure mode silently breaks every browser-based dApp/wallet
+// calling algod-rust directly for any request needing a preflight (a custom
+// header like `X-Algo-API-Token`, or a non-simple method) — the actual
+// request is never sent because the preflight itself fails.
+// ===========================================================================
+
+#[tokio::test]
+async fn simple_request_with_origin_carries_cors_headers() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/transactions/params"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Origin", "https://example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("*"),
+        "must match go's AllowOrigins: [\"*\"] (cors.go)"
+    );
+}
+
+#[tokio::test]
+async fn options_preflight_returns_204_with_cors_headers() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .request(
+            reqwest::Method::OPTIONS,
+            server.url("/v2/transactions/params"),
+        )
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "GET")
+        .header("Access-Control-Request-Headers", "X-Algo-API-Token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        204,
+        "preflight must succeed without any auth token (go: CORS runs before auth)"
+    );
+
+    let headers = resp.headers();
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("*")
+    );
+
+    let allow_headers = headers
+        .get("access-control-allow-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    assert!(
+        allow_headers.contains("x-algo-api-token"),
+        "must allow the token header for preflight, got {allow_headers:?}"
+    );
+    assert!(
+        allow_headers.contains("content-type"),
+        "must allow Content-Type for preflight, got {allow_headers:?}"
+    );
+
+    let allow_methods = headers
+        .get("access-control-allow-methods")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    for m in ["GET", "POST", "PUT", "DELETE", "OPTIONS"] {
+        assert!(
+            allow_methods.contains(m),
+            "AllowMethods must include {m} (cors.go), got {allow_methods:?}"
+        );
+    }
+}
+
+/// Preflight must never require an auth token — go-algorand's CORS
+/// middleware runs before the auth middleware chain, and a real browser
+/// preflight never sends `X-Algo-API-Token`.
+#[tokio::test]
+async fn options_preflight_requires_no_auth_even_on_admin_routes() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .request(reqwest::Method::OPTIONS, server.url("/v2/participation"))
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+}
+
+// ===========================================================================
 // Transaction params always returns JSON (no format negotiation)
 // ===========================================================================
 

@@ -11,6 +11,7 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use crate::auth;
+use crate::cors::cors_layer;
 use crate::error_envelope::{json_envelope_layer, unmatched_route_fallback};
 use crate::handlers;
 use crate::node::NodeInterface;
@@ -257,6 +258,19 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
     // go-algorand's JSON `{"message": "..."}"` envelope. See
     // `error_envelope` for the full rationale.
     router = router.layer(middleware::from_fn(json_envelope_layer));
+
+    // CORS, applied outermost so it wraps every route (including `/health`
+    // and friends) and, critically, intercepts `OPTIONS` preflight requests
+    // *before* any route/auth dispatch — matching go-algorand's
+    // `middlewares.MakeCORS`, which Echo applies via a global `e.Use(...)`
+    // ahead of any per-route middleware (`router.go:98`,
+    // `lib/middlewares/cors.go`). Without this, no route registers `OPTIONS`
+    // explicitly, so axum's own dispatch would 405 every preflight — quietly
+    // breaking any browser-based client (a preflight failure means the
+    // browser never sends the real request at all). See `crate::cors` for
+    // why this is a hand-written middleware rather than
+    // `tower_http::cors::CorsLayer`.
+    router = router.layer(middleware::from_fn(cors_layer));
 
     router.with_state(node)
 }
