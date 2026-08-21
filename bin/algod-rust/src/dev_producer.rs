@@ -32,7 +32,9 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use algo_codec::{canonical_encode_block_header_from_block, compute_txn_id, encode_block};
+use algo_codec::{
+    canonical_encode_block, canonical_encode_block_header_from_block, compute_txn_id,
+};
 use algo_ledger::apply::{apply_block_capturing_apply_data, ApplyData, ApplyMode};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::SqliteLedger;
@@ -124,6 +126,24 @@ fn read_block_timestamp(ledger: &Arc<Mutex<SqliteLedger>>, round: u64) -> anyhow
     Ok(hdr.timestamp)
 }
 
+/// Canonically encode go's dev-mode `agreement.Certificate{Round: round}`
+/// (`../go-algorand/node/node.go`'s `writeDevmodeBlock`, which calls
+/// `AddValidatedBlock` with a certificate carrying only `Round` set — every
+/// other `Certificate`/`unauthenticatedBundle` field stays zero-valued).
+/// Canonical/omitempty msgpack encoding of that leaves a single `"rnd"` key
+/// (codec tag on `unauthenticatedBundle.Round`), or the empty map for round
+/// 0 (never produced through this dev-mode path in practice).
+fn canonical_encode_dev_mode_certificate(round: u64) -> Vec<u8> {
+    if round == 0 {
+        return vec![0x80]; // fixmap(0)
+    }
+    let mut buf = Vec::with_capacity(8);
+    rmp::encode::write_map_len(&mut buf, 1).unwrap();
+    rmp::encode::write_str(&mut buf, "rnd").unwrap();
+    rmp::encode::write_uint(&mut buf, round).unwrap();
+    buf
+}
+
 /// When `timestamp_offset` is `Some(offset)`, the block's wall-clock timestamp is
 /// overridden with `prev.timestamp + offset` — go's dev-mode timestamp control
 /// (`/v2/devmode/blocks/offset`). This lets SDK test harnesses produce blocks with
@@ -161,8 +181,15 @@ pub fn produce_dev_block(
 
     let proto = block.current_protocol.clone();
     let hdr_data = canonical_encode_block_header_from_block(&block);
-    let blk_data =
-        encode_block(&block).map_err(|e| anyhow::anyhow!("encode dev-mode block: {e}"))?;
+    let blk_data = canonical_encode_block(&block);
+    // go's dev-mode block sealer stores `agreement.Certificate{Round:
+    // vb2.Block().Round()}` (`../go-algorand/node/node.go`'s
+    // `writeDevmodeBlock`) — every other Certificate field stays
+    // zero-valued, so canonical/omitempty encoding leaves only "rnd".
+    // Round 0 (genesis) never goes through this path, so `cert_data` is
+    // never the empty map here — `get_block_raw_msgpack` already supplies
+    // that fallback for rounds with no stored certificate.
+    let cert_data = canonical_encode_dev_mode_certificate(block.round.0);
     let committed_txids: HashSet<Digest> = block
         .payset
         .iter()
@@ -177,6 +204,7 @@ pub fn produce_dev_block(
             .map_err(|e| anyhow::anyhow!("begin_block: {e}"))?;
         let result = (|| -> Result<Vec<ApplyData>, algo_error::AlgoError> {
             l.put_block(block.round.0, &proto, &hdr_data, &blk_data)?;
+            l.put_block_cert(block.round.0, &cert_data)?;
             // Execute mode runs the AVM, rejecting transactions whose programs
             // fail (rather than confirming an invalid app call as Replay would),
             // and returns the per-transaction ApplyData.

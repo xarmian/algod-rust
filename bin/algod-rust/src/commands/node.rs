@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use algo_codec::{canonical_encode_block_header_from_block, encode_block};
+use algo_codec::{canonical_encode_block, canonical_encode_block_header_from_block};
 use algo_ledger::participation::ParticipationStore;
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{
@@ -112,8 +112,7 @@ async fn run_start(
         // round-0 handling).
         let genesis_block = make_genesis_block(&genesis)
             .map_err(|e| anyhow::anyhow!("building genesis block: {e}"))?;
-        let blk_data = encode_block(&genesis_block)
-            .map_err(|e| anyhow::anyhow!("encoding genesis block: {e}"))?;
+        let blk_data = canonical_encode_block(&genesis_block);
         let hdr_data = canonical_encode_block_header_from_block(&genesis_block);
         sqlite_ledger
             .put_block(0, &genesis_block.current_protocol, &hdr_data, &blk_data)

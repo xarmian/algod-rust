@@ -221,7 +221,7 @@ validate-api:
 	$(MAKE) validate-api-up
 	@echo "==> Running live dual-node parity suites..."
 	@cargo test --release -p algod-rust --test live_go_parity -- --ignored --nocapture && \
-	 cargo test --release -p algod-rust --test live_msgpack_parity -- --ignored --nocapture && \
+	 cargo test --release -p algod-rust --test live_msgpack_parity -- --ignored --nocapture --test-threads=1 && \
 	 cargo test --release -p algod-rust --test live_auth_parity -- --ignored --nocapture && \
 	 cargo test --release -p algod-rust --test live_headers_parity -- --ignored --nocapture && \
 	 cargo test --release -p algod-rust --test live_txn_cross_verification -- --ignored --nocapture --test-threads=1 && \

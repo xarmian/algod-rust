@@ -291,9 +291,9 @@ pub fn genesis_hash(genesis: &GenesisJson) -> [u8; 32] {
 ///   starts at 1000, so the first created asset/app gets id 1001 like a real
 ///   network.
 ///
-/// `txn_commitment` is left as algo-rust's empty-payset commitment (zero);
-/// go's genesis commits to an empty *non-nil* payset (`Payset::CommitGenesis`),
-/// a value that differs but is never cross-validated on an isolated localnet.
+/// `txn_commitment` is set to go's real empty-*non-nil*-payset commitment
+/// (see [`GENESIS_EMPTY_PAYSET_COMMITMENT`]), matching
+/// `bookkeeping.Payset{}.CommitGenesis()` in `../go-algorand`.
 pub fn make_genesis_block(genesis: &GenesisJson) -> Result<algo_types::Block, AlgoError> {
     let params =
         algo_types::consensus::consensus_params_for_version(&genesis.proto).ok_or_else(|| {
@@ -341,9 +341,23 @@ pub fn make_genesis_block(genesis: &GenesisJson) -> Result<algo_types::Block, Al
         current_protocol: genesis.proto.clone(),
         // Modern-protocol AppForbidLowResources behavior (see doc comment).
         txn_counter: 1000,
+        txn_commitment: GENESIS_EMPTY_PAYSET_COMMITMENT,
         ..Default::default()
     })
 }
+
+/// go's real commitment to an empty *non-nil* payset at genesis:
+/// `SHA512_256("PF" ++ msgpack([]))` == `bookkeeping.Payset{}.CommitGenesis()`
+/// (`../go-algorand/data/transactions/payset.go` @ v4.5.1-stable). The
+/// genesis block is the only block that commits to an empty-but-non-nil
+/// payset — every other empty block commits to the nil-payset digest
+/// instead (go's `commit(genesis bool)` treats the two paysets
+/// differently only at genesis). Verified against go's own test fixture
+/// `emptyFlatPaysetHash` in `payset_test.go`.
+const GENESIS_EMPTY_PAYSET_COMMITMENT: [u8; 32] = [
+    0x27, 0x78, 0x62, 0xb1, 0xb2, 0xd2, 0xd1, 0x27, 0x9b, 0xb5, 0xa1, 0x9d, 0x0d, 0x87, 0x51, 0x8f,
+    0xe7, 0x15, 0x00, 0xf1, 0x26, 0xb8, 0xba, 0x33, 0x67, 0x75, 0xbd, 0x34, 0x9a, 0x1e, 0x7b, 0x73,
+];
 
 /// Encode a single `GenesisAllocation` as a msgpack map.
 ///
