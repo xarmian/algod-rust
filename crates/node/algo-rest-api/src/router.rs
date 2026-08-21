@@ -299,5 +299,13 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             .quality(CompressionLevel::Default),
     );
 
+    // Outermost of all: `tower_http::CompressionLayer` emits a lowercase
+    // `Vary: accept-encoding` value; go emits `Vary: Accept-Encoding`. A
+    // live comparison (issue #452) found this as a real byte-level header
+    // mismatch, so normalize the casing after compression has already run.
+    router = router.layer(middleware::from_fn(
+        crate::format::normalize_vary_header_casing,
+    ));
+
     router.with_state(node)
 }

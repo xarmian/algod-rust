@@ -39,17 +39,32 @@ const ALLOW_METHODS: &str = "GET,POST,PUT,DELETE,OPTIONS";
 /// - `OPTIONS` requests are answered directly with go's exact preflight
 ///   shape (`204 No Content` plus the `Access-Control-Allow-*` headers) and
 ///   never reach routing/auth.
-/// - Every other response gets `Access-Control-Allow-Origin: *` and
-///   `Vary: Origin` added, matching go's simple-request CORS headers.
+/// - A non-OPTIONS request that carries an `Origin` header gets
+///   `Access-Control-Allow-Origin: *` and `Vary: Origin` added to the
+///   response, matching go's simple-request CORS headers.
+/// - A request with **no** `Origin` header gets neither — go's
+///   `middleware.CORSWithConfig` checks for the header's presence before
+///   adding anything at all (it isn't a CORS request otherwise), and an
+///   earlier version of this middleware added the headers unconditionally.
+///   That was a real, live-verified mismatch (issue #452): every plain
+///   same-origin response (no browser, no `Origin` header — the vast
+///   majority of algod's actual traffic) incorrectly carried
+///   `Access-Control-Allow-Origin: *`/`Vary: Origin` on algod-rust but not
+///   on go, and the stray `Vary: Origin` entry could shadow a
+///   gzip-negotiated response's `Vary: Accept-Encoding` as the first
+///   (client-visible-first) value.
 pub async fn cors_layer(request: Request, next: Next) -> Response {
     if request.method() == Method::OPTIONS {
         return preflight_response();
     }
 
+    let has_origin = request.headers().contains_key(axum::http::header::ORIGIN);
     let mut response = next.run(request).await;
-    let headers = response.headers_mut();
-    headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, wildcard());
-    headers.append(VARY, HeaderValue::from_static("Origin"));
+    if has_origin {
+        let headers = response.headers_mut();
+        headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, wildcard());
+        headers.append(VARY, HeaderValue::from_static("Origin"));
+    }
     response
 }
 
@@ -214,5 +229,26 @@ mod tests {
             "*"
         );
         assert_eq!(resp.headers().get(VARY).unwrap(), "Origin");
+    }
+
+    #[tokio::test]
+    async fn simple_get_without_origin_carries_no_cors_headers() {
+        // go's middleware.CORSWithConfig checks for the Origin header's
+        // presence before adding anything -- a plain same-origin request
+        // (no browser, no Origin header at all) must not gain
+        // Access-Control-Allow-Origin/Vary: Origin (issue #452).
+        let resp = test_router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        assert!(resp.headers().get(VARY).is_none());
     }
 }
