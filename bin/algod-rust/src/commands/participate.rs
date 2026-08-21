@@ -1764,6 +1764,37 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
         )
     }
 
+    fn contains_confirmed_txid(&self, txid: algo_types::Digest) -> bool {
+        // Mirrors go's ledger txtail duplicate check (`ledger/txtail.go`'s
+        // `checkDup`): scan the recent-history window for a matching txid,
+        // rather than requiring a full evaluator round-trip. Bounded to the
+        // last `CONFIRM_LOOKBACK_ROUNDS` rounds (go's `MaxTxnLife` window) —
+        // a transaction older than that can never be a live duplicate
+        // (its own `last_valid` would already have expired).
+        const CONFIRM_LOOKBACK_ROUNDS: u64 = 1000;
+        let Ok(ledger) = self.ledger.lock() else {
+            return false;
+        };
+        let current = ledger.current_round().0;
+        let lo = current.saturating_sub(CONFIRM_LOOKBACK_ROUNDS).max(1);
+        for round in (lo..=current).rev() {
+            let Ok(Some(bytes)) = ledger.get_txtail(round) else {
+                continue;
+            };
+            let Ok(tail) = rmp_serde::from_slice::<algo_types::TxTailRound>(&bytes) else {
+                continue;
+            };
+            if tail
+                .txn_ids
+                .iter()
+                .any(|id| id.as_ref() == txid.as_bytes().as_slice())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     fn start_evaluator(
         &self,
         hdr: algo_types::BlockHeader,

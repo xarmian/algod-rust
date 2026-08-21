@@ -308,6 +308,14 @@ impl TransactionPool {
             if pending.txids.contains_key(&txid) || inner.remembered_txids.contains_key(&txid) {
                 return Err(PoolError::DuplicateTxn(txid));
             }
+            // A transaction that already confirmed and cleared the pending
+            // pool wouldn't be caught by the check above — go's evaluator
+            // catches this via the ledger's txtail duplicate check
+            // (`ledgercore.TransactionInLedgerError`); we don't route
+            // through a real evaluator here, so ask the ledger directly.
+            if self.ledger.contains_confirmed_txid(txid) {
+                return Err(PoolError::AlreadyInLedger(txid));
+            }
         }
         Ok(())
     }

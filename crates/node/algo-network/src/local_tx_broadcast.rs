@@ -199,15 +199,11 @@ impl LocalTxBroadcaster {
         //    resubmitted after the user fixes the issue, and we don't
         //    want the cache to suppress the retry.
         //
-        // NOTE: `self.ingest` only rejects *pending*-pool duplicates (see
-        // `algo_pool::Pool::check_duplicate`) -- it has no check against
-        // already-*confirmed* transactions the way go's block evaluator
-        // does (`ledgercore.TransactionInLedgerError`). `AlgodNodeInterface`'s
-        // dev-mode broadcast path (`bin/algod-rust/src/node_interface_impl.rs`,
-        // `txn_confirmed_in_ledger`) has this check because issue #449's live
-        // harness exercises dev-mode specifically; this non-dev-mode path
-        // (relay/participate) hasn't been live-verified and likely has the
-        // same gap -- follow-up work, not fixed here.
+        // `self.ingest` (backed by `PoolIngestAdapter` -> `TransactionPool::remember`)
+        // rejects both *pending*-pool duplicates and already-*confirmed*
+        // transactions -- the latter via `PoolLedger::contains_confirmed_txid`,
+        // which `PoolLedgerAdapter` (the production impl, shared with the
+        // dev-mode path) backs with a txtail scan. See issue #456.
         if let Err(e) = self.ingest.ingest(group).await {
             warn!(error = %e, "LocalTxBroadcaster: pool rejected local group");
             return Err(LocalTxError::Pool(e));
