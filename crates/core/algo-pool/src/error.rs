@@ -52,6 +52,15 @@ pub enum PoolError {
     #[error("transaction already in the pool: {0}")]
     DuplicateTxn(Digest),
 
+    /// A transaction with the same ID is already confirmed in a
+    /// recently-committed block. Mirrors go's
+    /// `ledgercore.TransactionInLedgerError` ("transaction already in
+    /// ledger: %v"), raised by the evaluator's `TestTransactionGroup` via
+    /// the ledger's txtail duplicate check (`ledger/txtail.go`'s
+    /// `checkDup`).
+    #[error("transaction already in ledger: {0}")]
+    AlreadyInLedger(Digest),
+
     /// Wraps an inner error from the block evaluator.
     #[error("TransactionPool.ingest: {0}")]
     Evaluator(String),
@@ -174,6 +183,7 @@ pub fn classify_pool_error(err: &PoolError) -> PoolErrorTag {
         PoolError::StaleBlockAssemblyRequest => PoolErrorTag::EvalGeneric,
         PoolError::PoolShutdown => PoolErrorTag::EvalGeneric,
         PoolError::DuplicateTxn(_) => PoolErrorTag::TxId,
+        PoolError::AlreadyInLedger(_) => PoolErrorTag::TxId,
         PoolError::Evaluator(_) => PoolErrorTag::EvalGeneric,
         PoolError::Remember(inner) => classify_pool_error(inner),
     }

@@ -5,7 +5,7 @@
 //! only the methods the pool actually calls are included.
 
 use algo_error::AlgoError;
-use algo_types::{Address, Block, BlockHeader, ConsensusParams, Round, SignedTransaction};
+use algo_types::{Address, Block, BlockHeader, ConsensusParams, Digest, Round, SignedTransaction};
 
 // ── BlockEvaluator ───────────────────────────────────────────────
 
@@ -77,4 +77,20 @@ pub trait PoolLedger: Send + Sync {
         payset_hint: usize,
         max_txn_bytes_per_block: usize,
     ) -> Result<Box<dyn BlockEvaluator>, AlgoError>;
+
+    /// Whether `txid` is already confirmed in a recently-committed block.
+    ///
+    /// Mirrors go's block evaluator rejecting a resubmission of an
+    /// already-confirmed transaction via `ledgercore.TransactionInLedgerError`
+    /// (`ledger/txtail.go`'s `checkDup`, called from `eval.go`'s
+    /// `TestTransactionGroup`). The pool itself only tracks *pending*-pool
+    /// duplicates (see `TransactionPool::check_duplicate`), so without this
+    /// check a transaction that already confirmed and cleared the pool could
+    /// be silently resubmitted and re-applied.
+    ///
+    /// Default implementation returns `false` (no ledger-confirmed dedup) —
+    /// test doubles that don't model committed history can ignore this.
+    fn contains_confirmed_txid(&self, _txid: Digest) -> bool {
+        false
+    }
 }

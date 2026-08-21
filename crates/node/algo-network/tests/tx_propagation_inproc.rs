@@ -38,8 +38,14 @@ use algo_types::{Address, Block, BlockHeader, ConsensusParams, Digest, Round, Si
 /// Minimal stub ledger. Claims to be at `Round(1)` and hands out
 /// `StubEvaluator`s anchored at `Round(2)` so `pool.remember` passes
 /// the wait-for-OnNewBlock gate.
+///
+/// `confirmed` models the ledger's committed-transaction history (what a
+/// real `PoolLedgerAdapter` derives from the txtail, per issue #456) so
+/// tests can simulate a transaction confirming and clearing the pending
+/// pool, then assert a resubmission of the identical bytes is rejected.
 struct StubLedger {
     round: Round,
+    confirmed: std::sync::Mutex<HashSet<Digest>>,
 }
 
 impl PoolLedger for StubLedger {
@@ -61,6 +67,12 @@ impl PoolLedger for StubLedger {
         Ok(Box::new(StubEvaluator {
             round: self.round.next(),
         }))
+    }
+    fn contains_confirmed_txid(&self, txid: Digest) -> bool {
+        self.confirmed
+            .lock()
+            .map(|c| c.contains(&txid))
+            .unwrap_or(false)
     }
 }
 
@@ -100,20 +112,27 @@ fn init_tracing() {
 }
 
 /// Build a pool seeded with a stub evaluator so `remember` can proceed.
-fn make_pool() -> Arc<TransactionPool> {
-    let ledger: Arc<dyn PoolLedger> = Arc::new(StubLedger { round: Round(1) });
+/// Returns the pool plus the concrete `StubLedger` (via its `Arc`, cloned
+/// before the trait-object upcast) so tests can mark txids confirmed.
+fn make_pool() -> (Arc<TransactionPool>, Arc<StubLedger>) {
+    let stub = Arc::new(StubLedger {
+        round: Round(1),
+        confirmed: std::sync::Mutex::new(HashSet::new()),
+    });
+    let ledger: Arc<dyn PoolLedger> = stub.clone();
     let pool = Arc::new(TransactionPool::new(PoolConfig::default(), ledger));
     // Install the evaluator via the public `on_new_block` path — the
     // pool's private `mu` field is not reachable from an integration
     // test crate.
     pool.on_new_block(&Block::default(), &HashSet::new());
-    pool
+    (pool, stub)
 }
 
 /// Node state: all the pieces needed to submit locally and receive over
 /// gossip on a single loopback node.
 struct InProcNode {
     pool: Arc<TransactionPool>,
+    ledger: Arc<StubLedger>,
     broadcaster: Arc<LocalTxBroadcaster>,
     /// Retained for the lifetime of the test — dropping the shared seen
     /// cache would break the TxTagHandler's dedup.
@@ -145,7 +164,7 @@ fn build_node(genesis: &str, relay: bool) -> Arc<WebsocketNetwork> {
 /// Wire pool + TxTagHandler + LocalTxBroadcaster onto a network that
 /// has already been constructed (but not started).
 fn wire_node(net: &Arc<WebsocketNetwork>) -> InProcNode {
-    let pool = make_pool();
+    let (pool, ledger) = make_pool();
     let seen = Arc::new(SeenTxCache::new(1024));
 
     net.multiplexer()
@@ -162,6 +181,7 @@ fn wire_node(net: &Arc<WebsocketNetwork>) -> InProcNode {
 
     InProcNode {
         pool,
+        ledger,
         broadcaster,
         _seen: seen,
     }
@@ -275,5 +295,76 @@ async fn txn_propagates_from_a_to_b_via_gossip() {
 
     // Clean shutdown.
     net_b.stop().await;
+    net_a.stop().await;
+}
+
+/// Issue #456: `LocalTxBroadcaster::submit_group` (the non-dev-mode
+/// relay/participate broadcast path) must reject resubmission of an
+/// already-confirmed transaction, mirroring go's
+/// `ledgercore.TransactionInLedgerError`. Confirmation is simulated by
+/// (1) telling the pool the block committed via `on_new_block` — clearing
+/// the pending-pool duplicate check's only line of defense — and (2)
+/// marking the txid confirmed on the `StubLedger`, exactly as a real
+/// `PoolLedgerAdapter` would report via its txtail scan (see
+/// `algo_pool::traits::PoolLedger::contains_confirmed_txid`).
+#[tokio::test]
+async fn resubmitting_a_confirmed_txn_is_rejected() {
+    init_tracing();
+
+    let net_a = build_node("test-v1.0", true);
+    let node_a = wire_node(&net_a);
+    net_a.start_arc().await.expect("node A start");
+
+    let tx = make_tx(0x99);
+    let txid = compute_txn_id(&tx.txn);
+
+    // First submission succeeds and lands in the pending pool.
+    node_a
+        .broadcaster
+        .submit_group(vec![tx.clone()])
+        .await
+        .expect("first submission should succeed");
+    assert!(node_a.pool.pending_tx_ids().contains(&txid));
+
+    // Simulate the transaction confirming into a block: the pool drops it
+    // from pending (on_new_block), and the ledger now reports it as
+    // confirmed (what a real txtail scan would find).
+    let mut committed = HashSet::new();
+    committed.insert(txid);
+    // `make_pool`'s initial `on_new_block` advances the stub evaluator to
+    // round 2 (`StubLedger { round: Round(1) }`'s `start_evaluator` hands
+    // out `round.next()`); `on_new_block` only recomputes the evaluator
+    // (which is what clears committed txids from pending) when the new
+    // block's round is `>= eval.round()`, so this simulated "confirmation"
+    // block must itself be at round 2 or later.
+    let confirmed_block = Block {
+        round: Round(2),
+        ..Default::default()
+    };
+    node_a.pool.on_new_block(&confirmed_block, &committed);
+    node_a
+        .ledger
+        .confirmed
+        .lock()
+        .expect("stub ledger lock")
+        .insert(txid);
+    assert!(
+        !node_a.pool.pending_tx_ids().contains(&txid),
+        "txid should have cleared the pending pool after on_new_block"
+    );
+
+    // Resubmitting the identical signed bytes must now be rejected, not
+    // silently re-accepted and re-broadcast.
+    let result = node_a.broadcaster.submit_group(vec![tx]).await;
+    assert!(
+        result.is_err(),
+        "resubmitting an already-confirmed txn should be rejected, got {result:?}"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("already in ledger"),
+        "error should surface go's ledgercore.TransactionInLedgerError-style message, got: {err}"
+    );
+
     net_a.stop().await;
 }
