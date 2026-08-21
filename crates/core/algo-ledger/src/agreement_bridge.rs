@@ -460,16 +460,7 @@ impl LedgerWriter for AgreementLedgerBridge {
         // Pre-encode the block and header outside the retry loop — these are
         // deterministic and will not change between attempts. Encoding failure
         // is permanent and not retryable.
-        let blk_data = match algo_codec::encode_block(block) {
-            Ok(data) => data,
-            Err(e) => {
-                warn!(
-                    "ensure_block: failed to encode block for round {}: {e}",
-                    block.round
-                );
-                return;
-            }
-        };
+        let blk_data = algo_codec::canonical_encode_block(block);
         let hdr_data = algo_codec::canonical_encode_block_header_from_block(block);
         let proto = &block.current_protocol;
 

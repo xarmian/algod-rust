@@ -864,16 +864,10 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
     // fail block application (matches go-algorand's tracker persistence pattern).
     // TODO(Epic 25b): Wire up `forget_before` to prune old blocks/txtail entries.
     let hdrdata = algo_codec::canonical_encode_block_header_from_block(block);
-    match algo_codec::encode_block(block) {
-        Ok(blkdata) => {
-            let proto = &block.current_protocol;
-            if let Err(e) = store.put_block(block.round.0, proto, &hdrdata, &blkdata) {
-                tracing::warn!("put_block failed for round {}: {e}", block.round.0);
-            }
-        }
-        Err(e) => {
-            tracing::warn!("encode_block failed for round {}: {e}", block.round.0);
-        }
+    let blkdata = algo_codec::canonical_encode_block(block);
+    let proto = &block.current_protocol;
+    if let Err(e) = store.put_block(block.round.0, proto, &hdrdata, &blkdata) {
+        tracing::warn!("put_block failed for round {}: {e}", block.round.0);
     }
 
     let txtail = algo_codec::build_txtail_from_block(block);

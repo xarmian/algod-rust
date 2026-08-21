@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use algo_codec::{canonical_encode_block_header_from_block, decode_block_response, encode_block};
+use algo_codec::{
+    canonical_encode_block, canonical_encode_block_header_from_block, decode_block_response,
+};
 use algo_error::AlgoError;
 use algo_ledger::sync::{SyncBackend, SyncConfig, SyncOrchestrator};
 use algo_rest_client::{
@@ -80,7 +82,7 @@ impl SyncBackend for AlgodSyncBackend {
                 //           validation and block digest computation)
                 // blkdata = full block msgpack encoding (for block replay)
                 let hdrdata = canonical_encode_block_header_from_block(&br.block);
-                let blkdata = encode_block(&br.block)?;
+                let blkdata = canonical_encode_block(&br.block);
                 Ok((proto, hdrdata, blkdata))
             })
         })
@@ -423,7 +425,7 @@ impl GossipSyncBackend {
         let block = self.fetch_block_with_policy(round).await?;
         let proto = block.current_protocol.clone();
         let hdrdata = canonical_encode_block_header_from_block(&block);
-        let blkdata = encode_block(&block)?;
+        let blkdata = canonical_encode_block(&block);
         Ok((proto, hdrdata, blkdata))
     }
 }

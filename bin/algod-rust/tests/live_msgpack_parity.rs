@@ -11,9 +11,20 @@
 //!
 //! ```text
 //! make validate-api-up
-//! cargo test --package algod-rust --test live_msgpack_parity -- --ignored --nocapture
+//! cargo test --package algod-rust --test live_msgpack_parity -- --ignored --nocapture --test-threads=1
 //! make validate-api-down
 //! ```
+//!
+//! # Serialization requirement
+//!
+//! `get_produced_block_msgpack_matches` (issue #453) submits and confirms a
+//! real transaction on each node to exercise the normal block-sealing path,
+//! which permanently advances both nodes' round and the shared genesis fee
+//! sink's collected-fees balance. Every other test in this file assumes
+//! genesis-only (round 0) state. Run with `--test-threads=1` so the
+//! state-mutating test fully completes (and both nodes converge on the same
+//! post-fee balance) before any other test in this file observes state —
+//! same pattern as `live_txn_cross_verification.rs`.
 //!
 //! # Scope
 //!
@@ -208,47 +219,206 @@ async fn account_application_information_msgpack_404_matches() {
 #[tokio::test]
 #[ignore = "requires `make validate-api-up`; see module docs"]
 async fn get_block_msgpack_envelope_matches() {
-    // Full byte/field parity of the *block body* is blocked on a deeper,
-    // pre-existing gap this test discovered: algod-rust's stored block
-    // bytes are not run through the canonical/omitempty msgpack encoder
-    // go-algorand's `codec` struct tags apply (e.g. go omits zero-valued
-    // `rnd`/`ts`/`nextbefore`/`nextswitch` at genesis; algod-rust's stored
-    // bytes include them explicitly, and is separately missing `txn` since
-    // `make_genesis_block` intentionally leaves `txn_commitment` as a
-    // zero digest rather than go's real empty-payset commitment — see
-    // `algo-ledger/src/genesis.rs`'s `make_genesis_block` doc comment).
-    // That's a block-storage/genesis-construction fix, not a REST
-    // format-negotiation one — tracked separately as issue #453 so it gets the scrutiny
-    // consensus-adjacent code deserves rather than a rushed fix here.
+    // Full field-for-field parity of round 0 (genesis), now that issue #453
+    // fixed both the envelope shape (issue #448: go's `rpcs.EncodedBlockCert`
+    // always carries "block" and "cert", no `omitempty` on either) and the
+    // underlying gap: stored block bytes now go through
+    // `algo_codec::canonical_encode_block` (omitempty/canonical, matching
+    // go's `codec` struct tags) instead of plain `rmp_serde::to_vec_named`,
+    // and `make_genesis_block` sets `txn_commitment` to go's real empty-payset
+    // commitment (`Payset{}.CommitGenesis()`) instead of a zero placeholder.
+    assert_msgpack_parity("/v2/blocks/0?format=msgpack").await;
+}
+
+#[tokio::test]
+#[ignore = "requires `make validate-api-up`; run with --test-threads=1; see module docs"]
+async fn get_produced_block_msgpack_matches() {
+    // Round 0 (genesis) is a special-cased, never-applied block on both
+    // implementations (see issue #453's investigation: go's own
+    // `MakeGenesisBlock` always uses the flat `CommitGenesis` commitment,
+    // bypassing the merkle-payset path modern protocols otherwise use).
+    // Verify the canonical-encoding fix also holds for a normally-sealed
+    // block (round > 0, non-empty payset, going through the standard
+    // `apply_block`/`put_block` path in `algo-ledger/src/apply.rs`), not
+    // just the genesis special case.
     //
-    // This test instead locks in what issue #448 *did* fix: the envelope
-    // shape. go's `rpcs.EncodedBlockCert` always carries both "block" and
-    // "cert" keys (no `omitempty` on either field) — previously algod-rust
-    // omitted "cert" entirely when no certificate was stored (true for
-    // round 0's synthetic genesis block on every fresh node). Both nodes
-    // must now agree on that envelope shape and on the Content-Type.
+    // Both nodes must confirm the *identical* signed transaction bytes (not
+    // just "a" payment each) so the payset content — and therefore every
+    // payset-derived commitment field — is directly comparable, following
+    // `live_txn_cross_verification.rs`'s cross-node identical-input pattern.
+    // Each node still runs its own independent dev-mode chain, so the
+    // confirmed round number itself can differ between them; only the block
+    // *contents* at each node's own confirmed round are compared.
     let c = client();
-    let (go_status, go_val) = get_msgpack(&c, &go_url(), "/v2/blocks/0?format=msgpack").await;
-    let (rust_status, rust_val) = get_msgpack(&c, &rust_url(), "/v2/blocks/0?format=msgpack").await;
+    let (go_round, rust_round) = submit_identical_payment_and_get_confirmed_rounds(&c).await;
+
+    let (go_status, go_val) = get_msgpack(
+        &c,
+        &go_url(),
+        &format!("/v2/blocks/{go_round}?format=msgpack"),
+    )
+    .await;
+    let (rust_status, rust_val) = get_msgpack(
+        &c,
+        &rust_url(),
+        &format!("/v2/blocks/{rust_round}?format=msgpack"),
+    )
+    .await;
     assert_eq!(go_status, 200);
     assert_eq!(rust_status, 200);
 
-    for (label, val) in [("go", &go_val), ("rust", &rust_val)] {
-        let map = val.as_map().unwrap_or_else(|| {
-            panic!("{label}: /v2/blocks/0?format=msgpack body must decode as a map")
-        });
-        let keys: Vec<String> = map
+    let mut mismatches = Vec::new();
+    diff_msgpack("", &go_val, &rust_val, &mut mismatches);
+    // "block"."rnd" legitimately differs: each node's own dev-mode chain
+    // reaches this transaction at its own round number (see doc comment
+    // above). "block"."bi" (proposer bonus payout) and "block"."spt" (state
+    // proof tracking) are separately-tracked, out-of-scope feature gaps —
+    // algod-rust doesn't yet implement incentive bonus payouts or state
+    // proof tracking initialization (Phase 6 consensus-participation work,
+    // unrelated to this issue's canonical-*encoding* fix) — filed as
+    // follow-up issue #462 rather than silently ignored here.
+    let allowed_prefixes = ["\"block\".\"rnd\"", "\"block\".\"bi\"", "\"block\".\"spt\""];
+    mismatches.retain(|m| {
+        !allowed_prefixes
             .iter()
-            .filter_map(|(k, _)| k.as_str().map(String::from))
-            .collect();
-        assert!(
-            keys.contains(&"block".to_string()),
-            "{label}: envelope must carry a \"block\" key, got {keys:?}"
-        );
-        assert!(
-            keys.contains(&"cert".to_string()),
-            "{label}: envelope must carry a \"cert\" key even with no stored certificate (issue #448), got {keys:?}"
-        );
+            .any(|p| m.starts_with(&format!("{p}:")))
+    });
+    assert!(
+        mismatches.is_empty(),
+        "GET /v2/blocks/{{round}} field mismatches (go round {go_round}, rust round {rust_round}):\n{}",
+        mismatches.join("\n")
+    );
+}
+
+/// Signs one payment transaction and submits the *identical* signed bytes
+/// to both nodes (so payset content, and every payset-derived commitment
+/// field, is directly comparable — see [`get_produced_block_msgpack_matches`]),
+/// waits for confirmation on each, and returns `(go_round, rust_round)`.
+async fn submit_identical_payment_and_get_confirmed_rounds(client: &reqwest::Client) -> (u64, u64) {
+    use algo_codec::{canonical_encode_transaction, compute_txn_id};
+    use algo_types::{Round, SignedTransaction, TxnType};
+    use ed25519_dalek::Signer;
+
+    const DEV_MNEMONIC: &str = "under this above produce during card issue fire gloom reopen topple rough cat smooth salad put broken decade vocal loud pulp gauge hurdle absorb olympic";
+    let seed = algo_consensus_crypto::passphrase::mnemonic_to_key(DEV_MNEMONIC)
+        .expect("dev mnemonic must decode to a valid key");
+    let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let addr = algo_types::Address(sk.verifying_key().to_bytes());
+
+    // Both nodes boot from the byte-identical shared genesis
+    // (`docker/localnet-rust/data/genesis.json`), so genesis-hash/id are the
+    // same on both; a fixed first/last-valid window (matching
+    // `tx_propagation_two_binary.rs`'s pattern) keeps the txn bytes
+    // identical without needing to query per-node suggested params.
+    let mut genesis_hash = [0u8; 32];
+    {
+        let go_params: serde_json::Value = client
+            .get(format!("{}/v2/transactions/params", go_url()))
+            .header("X-Algo-API-Token", DEV_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        let bytes = STANDARD
+            .decode(go_params["genesis-hash"].as_str().unwrap())
+            .expect("valid base64");
+        genesis_hash.copy_from_slice(&bytes);
+    }
+
+    let mut txn = algo_types::Transaction {
+        sender: addr,
+        fee: 1000,
+        first_valid: Round(1),
+        last_valid: Round(1000),
+        genesis_id: "localnet-rust-v1".to_string(),
+        genesis_hash,
+        txn_type: TxnType::Pay,
+        receiver: addr,
+        amount: 0,
+        note: format!(
+            "live_msgpack_parity:issue-453:{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+        .into_bytes()
+        .into(),
+        ..Default::default()
+    };
+    let mut msg = Vec::with_capacity(2 + 256);
+    msg.extend_from_slice(b"TX");
+    msg.extend_from_slice(&canonical_encode_transaction(&txn));
+    let sig = sk.sign(&msg).to_bytes();
+    let stx = SignedTransaction {
+        txn: std::mem::take(&mut txn),
+        sig,
+        ..Default::default()
+    };
+    let txid = compute_txn_id(&stx.txn).to_string();
+    let body = rmp_serde::to_vec_named(&stx).expect("encode signed txn");
+
+    let go_round = submit_and_wait_for_confirmation(client, &go_url(), &txid, &body).await;
+    let rust_round = submit_and_wait_for_confirmation(client, &rust_url(), &txid, &body).await;
+    (go_round, rust_round)
+}
+
+async fn submit_and_wait_for_confirmation(
+    client: &reqwest::Client,
+    base: &str,
+    txid: &str,
+    body: &[u8],
+) -> u64 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = client
+            .post(format!("{base}/v2/transactions"))
+            .header("X-Algo-API-Token", DEV_TOKEN)
+            .header("Content-Type", "application/x-binary")
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        if status == 200 {
+            break;
+        }
+        let text = resp.text().await.unwrap_or_default();
+        if status == 400
+            && text.contains("no pending block evaluator")
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!("POST {base}/v2/transactions failed: {status} {text}");
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = client
+            .get(format!("{base}/v2/transactions/pending/{txid}"))
+            .header("X-Algo-API-Token", DEV_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        if status == 200 {
+            if let Some(r) = body["confirmed-round"].as_u64() {
+                if r > 0 {
+                    return r;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("txid {txid} on {base} did not confirm before deadline (last body {body})");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
