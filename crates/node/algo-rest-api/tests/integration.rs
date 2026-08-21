@@ -2345,8 +2345,15 @@ async fn wait_for_block_returns_500_when_wait_for_round_errors() {
     );
 }
 
+/// go's `round basics.Round` (`uint64`) computes `round+1` with plain
+/// unsigned wraparound and no overflow check at all -- verified live
+/// against go-algorand v4.5.1-stable (issue #450):
+/// `wait-for-block-after/{u64::MAX}` returns 200 immediately, since
+/// `round+1` wraps to 0 and round 0 is always already committed. A prior
+/// version of this test asserted an explicit 400 "round overflow" here,
+/// which was itself the conformance bug.
 #[tokio::test]
-async fn wait_for_block_returns_400_on_round_overflow() {
+async fn wait_for_block_round_overflow_wraps_and_returns_200() {
     let server = TestServer::start(MockNode::synced()).await;
 
     let resp = server
@@ -2356,10 +2363,7 @@ async fn wait_for_block_returns_400_on_round_overflow() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400);
-
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["message"].as_str().unwrap(), "round overflow");
+    assert_eq!(resp.status(), 200);
 }
 
 // ===========================================================================
