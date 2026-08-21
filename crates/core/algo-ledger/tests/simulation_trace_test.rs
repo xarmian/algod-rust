@@ -76,6 +76,24 @@ fn make_appl_txn(sender: Address, app_id: u64) -> SignedTransaction {
     }
 }
 
+/// Create a zero-amount payment `SignedTransaction` from `sender` to
+/// `receiver`, defaulting to `MinTxnFee` (1000).
+fn pay_txn(sender: Address, receiver: Address) -> SignedTransaction {
+    SignedTransaction {
+        txn: Transaction {
+            txn_type: "pay".into(),
+            sender,
+            fee: 1000,
+            first_valid: 0.into(),
+            last_valid: 1000.into(),
+            receiver,
+            amount: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -331,6 +349,105 @@ fn simulation_rejects_underpaid_group() {
                 e.message.contains("fees"),
                 "expected a group-fee error, got: {}",
                 e.message
+            );
+        }
+        other => panic!("expected InvalidRequest fee error, got {other:?}"),
+    }
+}
+
+/// Two-transaction group where the pooled total meets `MinTxnFee * count`
+/// even though one transaction pays zero: `check()` must accept it (matching
+/// go-algorand's `verify.TxnGroup`, `txn.go:253-270`, which sums fees across
+/// the whole group rather than enforcing a per-transaction minimum once fee
+/// pooling is enabled). Issue #213.
+#[test]
+fn simulation_group_pooled_fees_cover_underpaid_transaction() {
+    let sender_a = Address([0xAA; 32]);
+    let sender_b = Address([0xBB; 32]);
+    let receiver = Address([0x20; 32]);
+    let fee_sink = Address([0xFE; 32]);
+
+    let mut state = LedgerState::new();
+    state.fee_sink = fee_sink;
+    state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
+    for addr in [sender_a, sender_b, fee_sink] {
+        state.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+    }
+
+    let mut txn_a = pay_txn(sender_a, receiver);
+    txn_a.txn.fee = 0; // Underpaid on its own.
+    let mut txn_b = pay_txn(sender_b, receiver);
+    txn_b.txn.fee = 2000; // Covers both transactions' MinTxnFee (1000 each).
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn_a, txn_b]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new(&mut state);
+    let result = simulator
+        .simulate(request)
+        .expect("pooled fees should satisfy the group minimum");
+
+    let group = &result.txn_groups[0];
+    assert!(
+        group.failure_message.is_none(),
+        "unexpected failure: {:?}",
+        group.failure_message
+    );
+}
+
+/// Two-transaction group whose pooled total is still short of
+/// `MinTxnFee * count`: `check()` must reject it with go-algorand's exact
+/// error format (`txgroup had %d in fees, which is less than the minimum
+/// %d * %d`, `txn.go:262`), proving the group-level check aggregates across
+/// multiple transactions rather than only catching a single zero-fee
+/// transaction. Issue #213.
+#[test]
+fn simulation_group_pooled_fees_reject_insufficient_total() {
+    let sender_a = Address([0xAA; 32]);
+    let sender_b = Address([0xBB; 32]);
+    let receiver = Address([0x20; 32]);
+    let fee_sink = Address([0xFE; 32]);
+
+    let mut state = LedgerState::new();
+    state.fee_sink = fee_sink;
+    state.protocol = algo_types::consensus::CONSENSUS_V41.to_string();
+    for addr in [sender_a, sender_b, fee_sink] {
+        state.set_account(
+            &addr,
+            AccountData {
+                micro_algos: 10_000_000,
+                ..Default::default()
+            },
+        );
+    }
+
+    let mut txn_a = pay_txn(sender_a, receiver);
+    txn_a.txn.fee = 500;
+    let mut txn_b = pay_txn(sender_b, receiver);
+    txn_b.txn.fee = 500;
+    // Pooled total: 1000, needed: 2 * MinTxnFee (1000) = 2000.
+
+    let request = SimulationRequest {
+        txn_groups: vec![vec![txn_a, txn_b]],
+        allow_empty_signatures: true,
+        ..Default::default()
+    };
+
+    let mut simulator = Simulator::new(&mut state);
+    match simulator.simulate(request) {
+        Err(SimulatorError::InvalidRequest(e)) => {
+            assert_eq!(
+                e.message, "txgroup had 1000 in fees, which is less than the minimum 2 * 1000",
+                "error message must match go-algorand's verify.TxnGroup format byte-for-byte"
             );
         }
         other => panic!("expected InvalidRequest fee error, got {other:?}"),
