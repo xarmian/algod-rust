@@ -76,6 +76,34 @@ pub struct GenesisAccountState {
     pub stprf: Option<String>,
 }
 
+/// Resolve the account status a genesis allocation entry should actually get.
+///
+/// Verified live against go-algorand v4.5.1-stable (issue #129): the fee
+/// sink and rewards pool addresses are *always* reported as
+/// `NotParticipating`, regardless of what the genesis file's own `"onl"`
+/// field declares for them — feeding the identical genesis.json (with
+/// `"onl": 0` for both) to a real `algod` and to algod-rust produced
+/// `"status": "Not Participating"` from go and `"status": "Offline"` from
+/// algod-rust for the same fee-sink address. This also affects
+/// `/v2/ledger/supply`: go's `TotalMoney` is `Online.Money + Offline.Money`
+/// (`ledgercore.AccountTotals.Participating()`), which excludes
+/// `NotParticipating` accounts, so an un-overridden fee sink balance was
+/// incorrectly inflating algod-rust's reported total supply.
+fn effective_genesis_status(
+    addr: &str,
+    state: &GenesisAccountState,
+    fee_sink: &str,
+    rewards_pool: &str,
+) -> AccountStatus {
+    if addr == fee_sink || addr == rewards_pool {
+        return AccountStatus::NotParticipating;
+    }
+    match state.onl {
+        Some(v) => AccountStatus::from(v),
+        None => AccountStatus::Offline,
+    }
+}
+
 /// Populate any `LedgerStore` backend from parsed genesis data.
 ///
 /// Sets fee_sink, rewards_pool, genesis_id, protocol, genesis_hash,
@@ -111,10 +139,8 @@ pub fn populate_store<L: crate::store_trait::LedgerStore>(
             message: format!("invalid allocation address '{}': {e}", alloc.addr),
         })?;
 
-        let status = match alloc.state.onl {
-            Some(v) => AccountStatus::from(v),
-            None => AccountStatus::Offline,
-        };
+        let status =
+            effective_genesis_status(&alloc.addr, &alloc.state, &genesis.fees, &genesis.rwd);
 
         let vote_id = decode_key_32(&alloc.state.vote, "vote")?;
         let selection_id = decode_key_32(&alloc.state.sel, "sel")?;
@@ -471,10 +497,8 @@ pub fn seed_account_totals_from_genesis(
     // sharing the reserve address) hit this in practice.
     let mut per_addr: HashMap<String, (AccountStatus, u64)> = HashMap::new();
     for alloc in &genesis.alloc {
-        let status = match alloc.state.onl {
-            Some(v) => AccountStatus::from(v),
-            None => AccountStatus::Offline,
-        };
+        let status =
+            effective_genesis_status(&alloc.addr, &alloc.state, &genesis.fees, &genesis.rwd);
         per_addr.insert(alloc.addr.clone(), (status, alloc.state.algo));
     }
     // Reward units per account are floor(microAlgos / RewardUnit), summed by
@@ -656,8 +680,8 @@ mod tests {
                     }
                 }
             ],
-            "fees": "7777777777777777777777777777777777777777777777777774MSJUVU",
-            "rwd": "7777777777777777777777777777777777777777777777777774MSJUVU"
+            "fees": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
+            "rwd": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU"
         }"#;
 
         let state = LedgerState::from_genesis_json(json).unwrap();
@@ -666,11 +690,102 @@ mod tests {
         )
         .unwrap();
         let account = state.get_account(&addr).unwrap();
+        // The allocation address is distinct from the fee sink / rewards
+        // pool placeholder above, so `effective_genesis_status` doesn't force
+        // it to NotParticipating — the declared `"onl": 1` applies as-is.
         assert_eq!(account.status, AccountStatus::Online);
         assert_eq!(account.micro_algos, 1_000_000);
         assert_eq!(account.vote_first_valid, 1);
         assert_eq!(account.vote_last_valid, 3_000_000);
         assert_eq!(account.vote_key_dilution, 10_000);
+    }
+
+    /// Live-verified against go-algorand v4.5.1-stable (issue #129): the fee
+    /// sink is always reported `NotParticipating`, even when the genesis
+    /// file's own `"onl"` field for it says `0` (Offline). Directly asserted
+    /// on `populate_store`'s output (the account status
+    /// `/v2/accounts/{address}` reports) here; the corresponding
+    /// `/v2/ledger/supply` effect (a NotParticipating fee sink balance must
+    /// not inflate `total-money`) is covered by
+    /// `seed_account_totals_from_genesis_sums_by_status` and the
+    /// dedicated `seed_account_totals_excludes_fee_sink_and_rewards_pool`
+    /// test below.
+    #[test]
+    fn fee_sink_and_rewards_pool_are_always_not_participating() {
+        let json = r#"{
+            "network": "devnet",
+            "id": "v1.0",
+            "proto": "test-proto",
+            "alloc": [
+                {
+                    "addr": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
+                    "comment": "FeeSink",
+                    "state": { "algo": 100000, "onl": 0 }
+                },
+                {
+                    "addr": "TJD47PJE4JPJV6W2RNS47KXA2IID52Y2S5OPUSXKJZLWSEWMNJ4R2GIOFM",
+                    "comment": "RewardsPool",
+                    "state": { "algo": 0, "onl": 0 }
+                }
+            ],
+            "fees": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
+            "rwd": "TJD47PJE4JPJV6W2RNS47KXA2IID52Y2S5OPUSXKJZLWSEWMNJ4R2GIOFM"
+        }"#;
+
+        let state = LedgerState::from_genesis_json(json).unwrap();
+        let fee_sink_addr = Address::from_algorand_string(
+            "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
+        )
+        .unwrap();
+        let rewards_pool_addr = Address::from_algorand_string(
+            "TJD47PJE4JPJV6W2RNS47KXA2IID52Y2S5OPUSXKJZLWSEWMNJ4R2GIOFM",
+        )
+        .unwrap();
+        assert_eq!(
+            state.get_account(&fee_sink_addr).unwrap().status,
+            AccountStatus::NotParticipating,
+            "fee sink must be NotParticipating regardless of the genesis file's onl:0"
+        );
+        assert_eq!(
+            state.get_account(&rewards_pool_addr).unwrap().status,
+            AccountStatus::NotParticipating,
+            "rewards pool must be NotParticipating regardless of the genesis file's onl:0"
+        );
+    }
+
+    /// The `/v2/ledger/supply` companion to the test above: a fee sink
+    /// funded in genesis must not count toward `total-money`
+    /// (`participating_money` / go's `AccountTotals.Participating()`,
+    /// `Online.Money + Offline.Money`) even though its own `"onl"` field
+    /// says Offline — matching the `total-money` mismatch found live
+    /// against go-algorand (issue #129).
+    #[test]
+    fn seed_account_totals_excludes_fee_sink_and_rewards_pool() {
+        let json = r#"{
+            "network": "devnet",
+            "id": "v1.0",
+            "proto": "test-proto",
+            "alloc": [
+                {
+                    "addr": "GBMUQUM7E3QW75GCVLQFMCS2Y7V5XTOJUBRVBXWOLS3EENBZP4AIGPHM6A",
+                    "comment": "dev account",
+                    "state": { "algo": 1000, "onl": 0 }
+                },
+                {
+                    "addr": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
+                    "comment": "FeeSink",
+                    "state": { "algo": 100000, "onl": 0 }
+                }
+            ],
+            "fees": "AOVDCP4FEMVDRM6XDX6ERJDHLY6TDW42MRKCVLX2PAZZQZICS7M2EZWWAU",
+            "rwd": "TJD47PJE4JPJV6W2RNS47KXA2IID52Y2S5OPUSXKJZLWSEWMNJ4R2GIOFM"
+        }"#;
+        let genesis = parse_genesis_json(json).unwrap();
+        let mut ledger = crate::sqlite::SqliteLedger::open_in_memory().unwrap();
+        seed_account_totals_from_genesis(&mut ledger, &genesis).unwrap();
+        // Only the 1000-microAlgo dev account is participating (Offline);
+        // the fee sink's 100000 must be excluded.
+        assert_eq!(ledger.participating_money().unwrap(), 1000);
     }
 
     #[test]
@@ -814,8 +929,8 @@ mod tests {
             r#"{"network":"n","id":"v","proto":"p","alloc":[
                 {"addr":"7777777777777777777777777777777777777777777777777774MSJUVU",
                  "state":{"algo":10,"onl":1}}
-            ],"fees":"7777777777777777777777777777777777777777777777777774MSJUVU",
-              "rwd":"7777777777777777777777777777777777777777777777777774MSJUVU"}"#,
+            ],"fees":"GBMUQUM7E3QW75GCVLQFMCS2Y7V5XTOJUBRVBXWOLS3EENBZP4AIGPHM6A",
+              "rwd":"GBMUQUM7E3QW75GCVLQFMCS2Y7V5XTOJUBRVBXWOLS3EENBZP4AIGPHM6A"}"#,
         )
         .unwrap();
         let mut ledger = crate::sqlite::SqliteLedger::open_in_memory().unwrap();

@@ -1,0 +1,81 @@
+name: Dual-Node REST Conformance
+
+# Live conformance check for issue #129: boots a real go-algorand
+# v4.5.1-stable node and a real algod-rust node from the *same* baked
+# genesis (docker/localnet-rust/data/, see
+# docker/docker-compose.validate-api.yml's header comment), and diffs live
+# HTTP responses byte-for-byte where a shared genesis makes that meaningful.
+#
+# Runs only when paths the suite actually exercises change, so most PRs
+# don't pay the dual-node-boot cost. No go-algorand-from-source build is
+# needed here (unlike algokey-e2e.yml) -- the go side uses the prebuilt
+# `algorand/algod` image directly, and algod-rust runs natively (a single
+# `cargo build --release`, reused by the test binary) rather than as a
+# second Docker image -- see docker-compose.validate-api.yml's header
+# comment for why building it twice blew the original timeout.
+
+on:
+  pull_request:
+    paths:
+      - "crates/node/algo-rest-api/**"
+      - "crates/core/algo-ledger/src/genesis.rs"
+      - "crates/core/algo-types/src/account.rs"
+      - "bin/algod-rust/**"
+      - "docker/docker-compose.validate-api.yml"
+      - "docker/localnet-rust/**"
+      - "docker/Dockerfile"
+      - "Makefile"
+      - ".github/workflows/validate-api.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/node/algo-rest-api/**"
+      - "crates/core/algo-ledger/src/genesis.rs"
+      - "crates/core/algo-types/src/account.rs"
+      - "bin/algod-rust/**"
+      - "docker/docker-compose.validate-api.yml"
+      - "docker/localnet-rust/**"
+      - "docker/Dockerfile"
+      - "Makefile"
+      - ".github/workflows/validate-api.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: validate-api-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  validate-api:
+    name: Live parity vs go-algorand (shared genesis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: validate-api
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run dual-node parity suite
+        run: make validate-api
+
+      - name: Dump node logs on failure
+        if: failure()
+        run: |
+          docker compose -f docker/docker-compose.validate-api.yml logs --tail=200 || true
+
+      - name: Tear down (safety net)
+        if: always()
+        run: make validate-api-down || true

@@ -1514,6 +1514,312 @@ async fn admin_token_works_on_public_routes_but_api_token_does_not_work_on_admin
 }
 
 // ===========================================================================
+// JSON error envelope conformance (issue #129)
+//
+// Verified live against go-algorand v4.5.1-stable: a request to an unmatched
+// route returns `{"message":"Not Found"}` (Echo's default JSON error
+// handler), and a malformed path parameter (e.g. a non-numeric round) returns
+// a 400 with `{"message": "Invalid format for parameter ...: ..."}`. Every
+// go-algorand error response, with no exception, is a JSON object carrying a
+// `message` key (`returnError`, `daemon/algod/api/server/v2/utils.go`).
+//
+// Before this fix, axum's default extractor-rejection and no-route-matched
+// responses bypassed the JSON envelope entirely: an unmatched route returned
+// an empty body, and a malformed numeric path segment (e.g.
+// `/v2/blocks/notanumber`) returned axum's plain-text rejection message
+// ("Invalid URL: Cannot parse ...") with no `message` key at all -- silently
+// breaking any client that unconditionally reads `response.json()["message"]`
+// on a 4xx/5xx response, as go-algorand's OpenAPI error schema promises.
+// ===========================================================================
+
+#[tokio::test]
+async fn unmatched_route_returns_json_not_found_envelope() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/this-route-does-not-exist"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("application/json"),
+        "unmatched-route 404 must be JSON, got content-type {content_type:?}"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"], "Not Found",
+        "must match go-algorand's Echo default 404 body"
+    );
+}
+
+/// go-algorand's router returns 404 for an unmatched path *before* any
+/// per-route auth middleware runs — Echo's routing determines there is no
+/// matching handler (and therefore no middleware chain to invoke) prior to
+/// dispatch. Verified live against go-algorand v4.5.1-stable: a completely
+/// unauthenticated request to a bogus path still returns
+/// `404 {"message":"Not Found"}`, never `401`.
+///
+/// Before this fix, an unmatched route in algod-rust was accidentally
+/// funneled through whichever sub-router's auth layer happened to be merged
+/// last (the admin-only tier), so an unauthenticated (or public-token-only)
+/// request to a bogus path incorrectly returned `401 Invalid API Token`
+/// instead of `404 Not Found` — a materially misleading error that could send
+/// a client chasing an auth problem that doesn't exist. Issue #129.
+#[tokio::test]
+async fn unmatched_route_requires_no_auth() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    // No token at all.
+    let resp = server
+        .client
+        .get(server.url("/v2/this-route-does-not-exist"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "unmatched route must 404 without requiring any auth token"
+    );
+
+    // The plain public token (not the admin token) must also reach the same
+    // 404 — regression coverage for the admin-tier-fallback bug specifically.
+    let resp = server
+        .client
+        .get(server.url("/v2/this-route-does-not-exist"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn malformed_numeric_path_param_returns_json_error_envelope() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/blocks/notanumber"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("application/json"),
+        "extractor-rejection response must be JSON, got content-type {content_type:?}"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["message"].is_string() && !body["message"].as_str().unwrap().is_empty(),
+        "response must carry a non-empty message field: {body:?}"
+    );
+}
+
+// ===========================================================================
+// CORS conformance (issue #129)
+//
+// Verified live against go-algorand v4.5.1-stable: `middlewares.MakeCORS`
+// (`daemon/algod/api/server/lib/middlewares/cors.go`) configures Echo's CORS
+// middleware with `AllowOrigins: ["*"]`, `AllowHeaders: [TokenHeader,
+// "Content-Type"]`, `AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]`, applied
+// globally to every route (including `/health` and friends) before auth.
+//
+// Before this fix, algod-rust had no CORS support at all: a simple GET with
+// an `Origin` header carried no `Access-Control-*` headers, and — more
+// seriously — an OPTIONS preflight request returned axum's default
+// `405 Method Not Allowed` (no route registers OPTIONS explicitly) instead of
+// go's `204 No Content` with the preflight headers a browser requires to
+// proceed. That failure mode silently breaks every browser-based dApp/wallet
+// calling algod-rust directly for any request needing a preflight (a custom
+// header like `X-Algo-API-Token`, or a non-simple method) — the actual
+// request is never sent because the preflight itself fails.
+// ===========================================================================
+
+#[tokio::test]
+async fn simple_request_with_origin_carries_cors_headers() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/transactions/params"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Origin", "https://example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("*"),
+        "must match go's AllowOrigins: [\"*\"] (cors.go)"
+    );
+}
+
+#[tokio::test]
+async fn options_preflight_returns_204_with_cors_headers() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .request(
+            reqwest::Method::OPTIONS,
+            server.url("/v2/transactions/params"),
+        )
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "GET")
+        .header("Access-Control-Request-Headers", "X-Algo-API-Token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        204,
+        "preflight must succeed without any auth token (go: CORS runs before auth)"
+    );
+
+    let headers = resp.headers();
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("*")
+    );
+
+    let allow_headers = headers
+        .get("access-control-allow-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    assert!(
+        allow_headers.contains("x-algo-api-token"),
+        "must allow the token header for preflight, got {allow_headers:?}"
+    );
+    assert!(
+        allow_headers.contains("content-type"),
+        "must allow Content-Type for preflight, got {allow_headers:?}"
+    );
+
+    let allow_methods = headers
+        .get("access-control-allow-methods")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    for m in ["GET", "POST", "PUT", "DELETE", "OPTIONS"] {
+        assert!(
+            allow_methods.contains(m),
+            "AllowMethods must include {m} (cors.go), got {allow_methods:?}"
+        );
+    }
+}
+
+/// Preflight must never require an auth token — go-algorand's CORS
+/// middleware runs before the auth middleware chain, and a real browser
+/// preflight never sends `X-Algo-API-Token`.
+#[tokio::test]
+async fn options_preflight_requires_no_auth_even_on_admin_routes() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .request(reqwest::Method::OPTIONS, server.url("/v2/participation"))
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+}
+
+// ===========================================================================
+// Response compression (issue #129)
+//
+// go-algorand applies Echo's `middleware.Gzip()` globally (`router.go:110`),
+// compressing any response when the client sends `Accept-Encoding: gzip` and
+// adding `Vary: Accept-Encoding`. algod-rust had no compression support at
+// all before this fix.
+// ===========================================================================
+
+#[tokio::test]
+async fn gzip_accepted_response_is_compressed_and_round_trips() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/transactions/params"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "response must be gzip-compressed when the client accepts it"
+    );
+    assert!(
+        resp.headers()
+            .get_all("vary")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.eq_ignore_ascii_case("accept-encoding")),
+        "must advertise Vary: Accept-Encoding (go: middleware.Gzip)"
+    );
+
+    let compressed = resp.bytes().await.unwrap();
+    use std::io::Read;
+    let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
+    let mut decompressed = String::new();
+    decoder.read_to_string(&mut decompressed).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&decompressed).unwrap();
+    assert!(body.get("min-fee").is_some());
+}
+
+#[tokio::test]
+async fn response_uncompressed_without_accept_encoding() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/transactions/params"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "must not compress when the client didn't send Accept-Encoding"
+    );
+    // Body is still valid, plain JSON.
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body.get("min-fee").is_some());
+}
+
+// ===========================================================================
 // Transaction params always returns JSON (no format negotiation)
 // ===========================================================================
 

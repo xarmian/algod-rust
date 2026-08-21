@@ -9,8 +9,12 @@ use std::sync::Arc;
 use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
+use tower_http::compression::CompressionLayer;
+use tower_http::CompressionLevel;
 
 use crate::auth;
+use crate::cors::cors_layer;
+use crate::error_envelope::{json_envelope_layer, unmatched_route_fallback};
 use crate::handlers;
 use crate::node::NodeInterface;
 
@@ -241,6 +245,59 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             ));
         router = router.merge(experimental);
     }
+
+    // Set explicitly on the fully-merged router so an unmatched path is
+    // reached without passing through any sub-router's auth layer (each of
+    // which was itself `.layer()`-wrapped before merging, so an implicit
+    // fallback inherited from any one of them would otherwise gate a
+    // genuinely-unmatched path behind that tier's specific token) — matching
+    // go-algorand, where routing determines there is no match (and therefore
+    // no middleware chain to run) before any auth check (issue #129).
+    router = router.fallback(unmatched_route_fallback);
+
+    // Outermost layer: guarantees every error response — including axum's
+    // default extractor-rejection bodies, which never reach a handler — is
+    // go-algorand's JSON `{"message": "..."}"` envelope. See
+    // `error_envelope` for the full rationale.
+    router = router.layer(middleware::from_fn(json_envelope_layer));
+
+    // Every JSON response (success or error) must carry go's trailing `\n`
+    // byte (`encoding/json`'s `Encoder.Encode`, which Echo's `ctx.JSON` uses
+    // — unlike `json.Marshal`, it always appends a newline after the value).
+    // Verified live against go-algorand v4.5.1-stable: this is a systemic,
+    // one-byte gap present on effectively every JSON endpoint, not something
+    // specific to any one handler — see `format::json_trailing_newline_layer`.
+    // Applied after `json_envelope_layer` so a rewritten error body also
+    // gains the trailing newline.
+    router = router.layer(middleware::from_fn(
+        crate::format::json_trailing_newline_layer,
+    ));
+
+    // CORS, applied outermost so it wraps every route (including `/health`
+    // and friends) and, critically, intercepts `OPTIONS` preflight requests
+    // *before* any route/auth dispatch — matching go-algorand's
+    // `middlewares.MakeCORS`, which Echo applies via a global `e.Use(...)`
+    // ahead of any per-route middleware (`router.go:98`,
+    // `lib/middlewares/cors.go`). Without this, no route registers `OPTIONS`
+    // explicitly, so axum's own dispatch would 405 every preflight — quietly
+    // breaking any browser-based client (a preflight failure means the
+    // browser never sends the real request at all). See `crate::cors` for
+    // why this is a hand-written middleware rather than
+    // `tower_http::cors::CorsLayer`.
+    router = router.layer(middleware::from_fn(cors_layer));
+
+    // Response compression, outermost of all — matches go-algorand's
+    // middleware order, where `middleware.Gzip()` is registered before CORS
+    // (`router.go:110`, ahead of the CORS registration at `router.go:98`+),
+    // so gzip wraps (and therefore compresses the final bytes of) every
+    // other middleware's output. Only gzip: go's Echo `middleware.Gzip()`
+    // never negotiates brotli/deflate/zstd, so restricting to gzip keeps the
+    // `Content-Encoding` values a client can see identical to go's.
+    router = router.layer(
+        CompressionLayer::new()
+            .gzip(true)
+            .quality(CompressionLevel::Default),
+    );
 
     router.with_state(node)
 }

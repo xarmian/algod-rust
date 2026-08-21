@@ -3034,11 +3034,10 @@ pub async fn teal_compile<N: NodeInterface>(
 ) -> Response {
     // Check if developer API is enabled
     if !node.enable_developer_api() {
-        return (
+        return crate::error_envelope::plain_text_response(
             StatusCode::NOT_FOUND,
             "/teal/compile was not enabled in the configuration file by setting the EnableDeveloperAPI to true",
-        )
-            .into_response();
+        );
     }
 
     // Enforce body size limit
@@ -3123,11 +3122,10 @@ pub async fn teal_disassemble<N: NodeInterface>(
 ) -> Response {
     // Check if developer API is enabled
     if !node.enable_developer_api() {
-        return (
+        return crate::error_envelope::plain_text_response(
             StatusCode::NOT_FOUND,
             "/teal/disassemble was not enabled in the configuration file by setting the EnableDeveloperAPI to true",
-        )
-            .into_response();
+        );
     }
 
     // Enforce body size limit
@@ -3204,11 +3202,10 @@ pub async fn teal_dryrun<N: NodeInterface>(
 ) -> Response {
     // Check if developer API is enabled
     if !node.enable_developer_api() {
-        return (
+        return crate::error_envelope::plain_text_response(
             StatusCode::NOT_FOUND,
             "/teal/dryrun was not enabled in the configuration file by setting the EnableDeveloperAPI to true",
-        )
-            .into_response();
+        );
     }
 
     // Enforce body size limit
@@ -3710,9 +3707,15 @@ pub async fn abort_catchup<N: NodeInterface>(
 /// Shutdown the node.
 ///
 /// Matches go-algorand's `Handlers.ShutdownNode` which returns 501
-/// "Endpoint not implemented."
+/// "Endpoint not implemented." as plain text via `ctx.String(...)`
+/// (`handlers.go:407`) rather than the JSON error envelope every other
+/// handler uses — `SkipEnvelopeRewrite` opts this response out of the
+/// router's JSON-envelope rewrite so it stays byte-for-byte conformant.
 pub async fn shutdown_node<N: NodeInterface>(State(_node): State<AppState<N>>) -> Response {
-    (StatusCode::NOT_IMPLEMENTED, "Endpoint not implemented.").into_response()
+    crate::error_envelope::plain_text_response(
+        StatusCode::NOT_IMPLEMENTED,
+        "Endpoint not implemented.",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3975,11 +3978,10 @@ pub async fn account_assets_information<N: NodeInterface>(
     Query(params): Query<AccountAssetsInformationParams>,
 ) -> Response {
     if !node.enable_experimental_api() {
-        return (
+        return crate::error_envelope::plain_text_response(
             StatusCode::NOT_FOUND,
             "/v2/accounts/{address}/assets was not enabled in the configuration file by setting the EnableExperimentalAPI to true",
-        )
-            .into_response();
+        );
     }
 
     // Parse address
@@ -4097,18 +4099,16 @@ pub async fn raw_transaction_async<N: NodeInterface>(
     body: axum::body::Bytes,
 ) -> Response {
     if !node.enable_experimental_api() {
-        return (
+        return crate::error_envelope::plain_text_response(
             StatusCode::NOT_FOUND,
             "/transactions/async was not enabled in the configuration file by setting the EnableExperimentalAPI to true",
-        )
-            .into_response();
+        );
     }
     if !node.enable_developer_api() {
-        return (
+        return crate::error_envelope::plain_text_response(
             StatusCode::NOT_FOUND,
             "/transactions/async was not enabled in the configuration file by setting the EnableDeveloperAPI to true",
-        )
-            .into_response();
+        );
     }
 
     let max_group_size = node.max_tx_group_size();

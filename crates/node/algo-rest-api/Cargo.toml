@@ -36,6 +36,7 @@ serde_bytes.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 reqwest = { workspace = true }
+flate2 = { workspace = true }
 rmp-serde = { workspace = true }
 async-trait = { workspace = true }
 algo-types = { workspace = true }

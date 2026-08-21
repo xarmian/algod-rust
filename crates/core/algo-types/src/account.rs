@@ -18,7 +18,11 @@ impl fmt::Display for AccountStatus {
         match self {
             AccountStatus::Offline => write!(f, "Offline"),
             AccountStatus::Online => write!(f, "Online"),
-            AccountStatus::NotParticipating => write!(f, "NotParticipating"),
+            // Matches go's `Status.String()` exactly (`data/basics/userBalance.go`)
+            // — note the space, unlike the enum variant's own Rust name.
+            // Live-verified against go-algorand v4.5.1-stable (issue #129):
+            // `GET /v2/accounts/{fee-sink}` reports `"status": "Not Participating"`.
+            AccountStatus::NotParticipating => write!(f, "Not Participating"),
         }
     }
 }
