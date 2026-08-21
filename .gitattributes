@@ -19,6 +19,20 @@ crates/node/algo-kmd/src/wallet_schema.sql text eol=lf
 crates/node/algo-kmd/swagger.json text eol=lf
 crates/node/algo-rest-api/resources/algod.oas2.json text eol=lf
 
+# Baked localnet-rust data dir (TASK-268): genesis.json is COPYed verbatim
+# into the Docker image and served byte-for-byte by the live `/genesis` REST
+# endpoint (`node.genesis_json()`), and algod.token/algod.admin.token are
+# compared byte-exact by go-algorand's own token validation when the same
+# files seed a shared-genesis go node (issue #129's dual-node harness). A
+# Windows checkout with core.autocrlf=true would otherwise inject CRLF into
+# both, corrupting the live REST response and breaking go's strict token
+# comparison — pin all four to LF.
+docker/localnet-rust/data/genesis.json text eol=lf
+docker/localnet-rust/data/genesis.json.in text eol=lf
+docker/localnet-rust/data/config.json text eol=lf
+docker/localnet-rust/data/algod.token text eol=lf
+docker/localnet-rust/data/algod.admin.token text eol=lf
+
 # Binary fixture formats: exempt from all text/eol handling.
 *.msgpack binary
 *.keyfile binary

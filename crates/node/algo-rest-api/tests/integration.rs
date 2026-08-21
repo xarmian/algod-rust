@@ -1752,6 +1752,74 @@ async fn options_preflight_requires_no_auth_even_on_admin_routes() {
 }
 
 // ===========================================================================
+// Response compression (issue #129)
+//
+// go-algorand applies Echo's `middleware.Gzip()` globally (`router.go:110`),
+// compressing any response when the client sends `Accept-Encoding: gzip` and
+// adding `Vary: Accept-Encoding`. algod-rust had no compression support at
+// all before this fix.
+// ===========================================================================
+
+#[tokio::test]
+async fn gzip_accepted_response_is_compressed_and_round_trips() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/transactions/params"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "response must be gzip-compressed when the client accepts it"
+    );
+    assert!(
+        resp.headers()
+            .get_all("vary")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.eq_ignore_ascii_case("accept-encoding")),
+        "must advertise Vary: Accept-Encoding (go: middleware.Gzip)"
+    );
+
+    let compressed = resp.bytes().await.unwrap();
+    use std::io::Read;
+    let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
+    let mut decompressed = String::new();
+    decoder.read_to_string(&mut decompressed).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&decompressed).unwrap();
+    assert!(body.get("min-fee").is_some());
+}
+
+#[tokio::test]
+async fn response_uncompressed_without_accept_encoding() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/transactions/params"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "must not compress when the client didn't send Accept-Encoding"
+    );
+    // Body is still valid, plain JSON.
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body.get("min-fee").is_some());
+}
+
+// ===========================================================================
 // Transaction params always returns JSON (no format negotiation)
 // ===========================================================================
 

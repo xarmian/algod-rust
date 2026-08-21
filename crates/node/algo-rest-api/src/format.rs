@@ -3,7 +3,11 @@
 //! go-algorand supports `?format=json` (default) and `?format=msgpack` (or `msgp`).
 //! Invalid format values return 400 Bad Request.
 
+use axum::body::to_bytes;
+use axum::extract::Request;
+use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
@@ -97,10 +101,64 @@ pub fn encode_protocol_codec_response(bytes: Vec<u8>) -> Response {
         .into_response()
 }
 
+/// Maximum body size to buffer for the trailing-newline check. JSON API
+/// responses here are small (status/account/block metadata); this is a
+/// generous defensive ceiling, not a realistic expected size.
+const MAX_JSON_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Middleware ensuring every `application/json` response body ends with a
+/// trailing `\n`, matching go-algorand's wire format byte-for-byte.
+///
+/// go's Echo `ctx.JSON(...)` writes via `json.NewEncoder(w).Encode(v)`
+/// (`encoding/json`), which — unlike `json.Marshal` — always appends a `\n`
+/// after the encoded value. This is a real, systemic difference: verified
+/// live against go-algorand v4.5.1-stable, every JSON response (`/v2/status`,
+/// `/v2/ledger/supply`, `/genesis`, `/versions`, ...) carries this trailing
+/// byte; algod-rust's `serde_json`-based responses did not, a one-byte
+/// mismatch present on effectively every JSON endpoint. Applied as an
+/// outermost router layer (like [`crate::error_envelope::json_envelope_layer`])
+/// rather than patched into each call site, since the gap is systemic rather
+/// than handler-specific.
+///
+/// Msgpack responses are untouched — go's msgpack codec has no equivalent
+/// trailing-byte convention.
+pub async fn json_trailing_newline_layer(request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+
+    let is_json = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("application/json"))
+        .unwrap_or(false);
+    if !is_json {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let bytes = match to_bytes(body, MAX_JSON_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => return Response::from_parts(parts, axum::body::Body::empty()),
+    };
+    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    }
+
+    let mut out = bytes.to_vec();
+    out.push(b'\n');
+    let mut response = Response::from_parts(parts, axum::body::Body::from(out));
+    // Content-Length must track the now-longer body, or clients that trust
+    // the header over the actual byte stream will truncate the trailing
+    // newline right back off.
+    response
+        .headers_mut()
+        .remove(axum::http::header::CONTENT_LENGTH);
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
     use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize)]
@@ -166,5 +224,100 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let decoded: TestData = rmp_serde::from_slice(&body).unwrap();
         assert_eq!(decoded.value, 42);
+    }
+
+    #[tokio::test]
+    async fn trailing_newline_layer_appends_newline_to_json() {
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        async fn handler() -> Response {
+            encode_response(&TestData { value: 1 }, ResponseFormat::Json)
+        }
+        let router = Router::new()
+            .route("/x", get(handler))
+            .layer(axum::middleware::from_fn(json_trailing_newline_layer));
+
+        let resp = router
+            .oneshot(
+                axum::http::Request::get("/x")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert!(
+            body.ends_with(b"\n"),
+            "body must end with newline: {body:?}"
+        );
+        // The rest of the body is still valid JSON once the newline is trimmed.
+        let trimmed = &body[..body.len() - 1];
+        let parsed: serde_json::Value = serde_json::from_slice(trimmed).unwrap();
+        assert_eq!(parsed["value"], 1);
+    }
+
+    #[tokio::test]
+    async fn trailing_newline_layer_is_idempotent() {
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        async fn handler() -> Response {
+            let mut resp = encode_response(&TestData { value: 1 }, ResponseFormat::Json);
+            let body = to_bytes(std::mem::take(resp.body_mut()), 1024)
+                .await
+                .unwrap();
+            let mut with_newline = body.to_vec();
+            with_newline.push(b'\n');
+            *resp.body_mut() = axum::body::Body::from(with_newline);
+            resp
+        }
+        let router = Router::new()
+            .route("/x", get(handler))
+            .layer(axum::middleware::from_fn(json_trailing_newline_layer));
+
+        let resp = router
+            .oneshot(
+                axum::http::Request::get("/x")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert!(!body.ends_with(b"\n\n"), "must not double the newline");
+        assert!(body.ends_with(b"\n"));
+    }
+
+    #[tokio::test]
+    async fn trailing_newline_layer_ignores_msgpack() {
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        async fn handler() -> Response {
+            encode_response(&TestData { value: 1 }, ResponseFormat::Msgpack)
+        }
+        let router = Router::new()
+            .route("/x", get(handler))
+            .layer(axum::middleware::from_fn(json_trailing_newline_layer));
+
+        let resp = router
+            .oneshot(
+                axum::http::Request::get("/x")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let decoded: TestData = rmp_serde::from_slice(&body).unwrap();
+        assert_eq!(decoded.value, 1);
+        assert!(
+            !body.ends_with(b"\n"),
+            "msgpack must not gain a trailing newline"
+        );
     }
 }

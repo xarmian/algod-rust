@@ -50,7 +50,7 @@ rmpv = { version = "1", features = ["with-serde"] }
 axum = { version = "0.7", features = ["ws"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
 hyper = { version = "1", features = ["server", "http1"] }
 subtle = "2"
 

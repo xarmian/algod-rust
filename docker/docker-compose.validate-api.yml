@@ -1,0 +1,99 @@
+# Dual-node REST conformance harness (issue #129).
+#
+# Boots a *real* go-algorand v4.5.1-stable node and a real algod-rust node
+# from the **same genesis.json** — the funded-dev-account genesis already
+# baked into `docker/localnet-rust/data/` (TASK-268) — on distinct host
+# ports, so a live client can send identical requests to both and compare
+# responses byte-for-byte at round 0 and beyond.
+#
+# Why the same genesis matters: go-algorand's own DEV_MODE bootstrap
+# (`docker-compose.yml`'s `algod-go` service) auto-generates a fresh,
+# randomized genesis (random dev-account keys, a fixed `future` consensus
+# label) on every `up`, which can never byte-match algod-rust's baked
+# genesis. `algod-go-shared` here instead launches the real `algod` binary
+# directly (bypassing the image's `run.sh` network-templating entrypoint,
+# which only supports templated/random genesis generation for private
+# networks) against the *identical* genesis.json algod-rust uses — so both
+# nodes start with the same genesis ID, genesis hash, consensus version, and
+# funded dev account (address `E4A7NFAARAKFG4ZK7KQ7VZBO5XEQIUKBK2U3KNLAFTX6R3HTJBFG75MQZE`,
+# mnemonic in docs/DEV_WORKFLOW.md), making state-dependent response
+# comparison meaningful, not just structural.
+#
+# Usage (see the `validate-api-*` targets in the Makefile):
+#   docker compose -f docker/docker-compose.validate-api.yml up -d --build
+#   docker compose -f docker/docker-compose.validate-api.yml down -v
+
+services:
+  # Real go-algorand v4.5.1-stable, launched directly with our shared
+  # genesis (see header comment). The genesis directory is bind-mounted
+  # read-only at /genesis-src; an init copy step seeds the writable
+  # /algod/data volume from it before exec'ing algod, since `algod` needs
+  # write access to its data directory (ledger, tracker DBs, algod.net,
+  # etc.) that a read-only bind mount can't provide.
+  algod-go-shared:
+    image: algorand/algod:4.5.1-stable
+    container_name: algod-go-shared
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mkdir -p /algod/data
+        # `tr -d '\r'` strips any CRLF line endings a Windows checkout of the
+        # git-tracked source files may carry (`docker/localnet-rust/data/`
+        # isn't LF-pinned in .gitattributes) — go's token comparison is
+        # byte-exact, so a stray trailing \r silently turns every request
+        # into a 401 even though the token "looks" identical when printed.
+        tr -d '\r' < /genesis-src/genesis.json > /algod/data/genesis.json
+        tr -d '\r' < /genesis-src/algod.token > /algod/data/algod.token
+        tr -d '\r' < /genesis-src/algod.admin.token > /algod/data/algod.admin.token
+        exec algod -d /algod/data -g /algod/data/genesis.json -l 0.0.0.0:8080 -o
+    volumes:
+      - ./localnet-rust/data:/genesis-src:ro
+      - algod-go-shared-data:/algod/data
+    ports:
+      - "4001:8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "-H",
+          "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "http://localhost:8080/v2/status",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  # algod-rust, from the same `localnet` image used by
+  # docker-compose.localnet-rust.yml (genesis baked in at build time —
+  # identical file to what algod-go-shared is fed above). Remapped to
+  # host port 4002 so both nodes can run simultaneously.
+  algod-rust-shared:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: localnet
+    image: algod-rust-localnet:latest
+    container_name: algod-rust-shared
+    ports:
+      - "4002:8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "-H",
+          "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "http://localhost:8080/v2/status",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+volumes:
+  algod-go-shared-data:

@@ -9,6 +9,8 @@ use std::sync::Arc;
 use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
+use tower_http::compression::CompressionLayer;
+use tower_http::CompressionLevel;
 
 use crate::auth;
 use crate::cors::cors_layer;
@@ -259,6 +261,18 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
     // `error_envelope` for the full rationale.
     router = router.layer(middleware::from_fn(json_envelope_layer));
 
+    // Every JSON response (success or error) must carry go's trailing `\n`
+    // byte (`encoding/json`'s `Encoder.Encode`, which Echo's `ctx.JSON` uses
+    // — unlike `json.Marshal`, it always appends a newline after the value).
+    // Verified live against go-algorand v4.5.1-stable: this is a systemic,
+    // one-byte gap present on effectively every JSON endpoint, not something
+    // specific to any one handler — see `format::json_trailing_newline_layer`.
+    // Applied after `json_envelope_layer` so a rewritten error body also
+    // gains the trailing newline.
+    router = router.layer(middleware::from_fn(
+        crate::format::json_trailing_newline_layer,
+    ));
+
     // CORS, applied outermost so it wraps every route (including `/health`
     // and friends) and, critically, intercepts `OPTIONS` preflight requests
     // *before* any route/auth dispatch — matching go-algorand's
@@ -271,6 +285,19 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
     // why this is a hand-written middleware rather than
     // `tower_http::cors::CorsLayer`.
     router = router.layer(middleware::from_fn(cors_layer));
+
+    // Response compression, outermost of all — matches go-algorand's
+    // middleware order, where `middleware.Gzip()` is registered before CORS
+    // (`router.go:110`, ahead of the CORS registration at `router.go:98`+),
+    // so gzip wraps (and therefore compresses the final bytes of) every
+    // other middleware's output. Only gzip: go's Echo `middleware.Gzip()`
+    // never negotiates brotli/deflate/zstd, so restricting to gzip keeps the
+    // `Content-Encoding` values a client can see identical to go's.
+    router = router.layer(
+        CompressionLayer::new()
+            .gzip(true)
+            .quality(CompressionLevel::Default),
+    );
 
     router.with_state(node)
 }
