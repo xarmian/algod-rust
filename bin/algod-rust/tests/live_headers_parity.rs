@@ -294,31 +294,31 @@ async fn gzip_not_negotiated_with_identity_only() {
 #[tokio::test]
 #[ignore = "requires `make validate-api-up`; see module docs"]
 async fn gzip_ignores_quality_value_matching_go() {
-    // Confirmed live: go's Echo Gzip middleware does *not* parse
-    // Accept-Encoding quality values at all -- it compresses whenever the
-    // string "gzip" appears anywhere in the header, "q=0" included. This is
-    // arguably a bug in go's middleware (RFC 7231 ss5.3.4 says q=0 means
-    // "not acceptable"), but conformance means matching it. algod-rust's
-    // `tower_http::CompressionLayer` does spec-compliant quality-value
-    // negotiation, which is a real, documented gap left open rather than
-    // rushed -- see issue tracking (filed alongside issue #452) -- since
-    // closing it means bypassing a well-tested library's correct behavior
-    // in favor of replicating go's non-standard one. This test locks in
-    // *go's* actual behavior so the gap stays visible rather than silently
-    // assumed away, and only asserts on go's side.
+    // go's Echo Gzip middleware does *not* parse Accept-Encoding quality
+    // values at all -- it compresses whenever the string "gzip" appears
+    // anywhere in the header, "q=0" included. This is arguably a bug in
+    // go's middleware (RFC 7231 ss5.3.4 says q=0 means "not acceptable"),
+    // but conformance means matching it: issue #460 added
+    // `normalize_accept_encoding_for_gzip_substring_match`, a request
+    // middleware that rewrites any Accept-Encoding value containing the
+    // substring "gzip" to a bare "gzip" before `tower_http::CompressionLayer`
+    // (which does correct, spec-compliant negotiation on its own) ever sees
+    // it -- so both nodes now compress this request identically.
     let c = client();
-    let go = c
-        .get(format!("{}/v2/status", go_url()))
-        .header("X-Algo-API-Token", DEV_TOKEN)
-        .header("Accept-Encoding", "gzip;q=0, identity")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        header_value(&go, "content-encoding"),
-        Some("gzip"),
-        "go: Accept-Encoding: gzip;q=0 is still compressed (quality values are not parsed)"
-    );
+    for (base, label) in [(go_url(), "go"), (rust_url(), "rust")] {
+        let resp = c
+            .get(format!("{base}/v2/status"))
+            .header("X-Algo-API-Token", DEV_TOKEN)
+            .header("Accept-Encoding", "gzip;q=0, identity")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            header_value(&resp, "content-encoding"),
+            Some("gzip"),
+            "{label}: Accept-Encoding: gzip;q=0 must still be compressed (quality values are not parsed)"
+        );
+    }
 }
 
 #[tokio::test]

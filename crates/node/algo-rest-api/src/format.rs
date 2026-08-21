@@ -164,6 +164,43 @@ pub async fn json_trailing_newline_layer(request: Request, next: Next) -> Respon
     response
 }
 
+/// Rewrites an incoming `Accept-Encoding` header so `tower_http`'s
+/// spec-compliant (RFC 7231 §5.3.4) quality-value negotiation matches
+/// go's Echo `middleware.Gzip()`, which never parses quality values at
+/// all — it compresses whenever the literal substring `"gzip"` appears
+/// anywhere in the header, `q=0` included (issue #460, live-verified
+/// against go-algorand v4.5.1-stable: `Accept-Encoding: gzip;q=0,
+/// identity` still gets a gzip-compressed response).
+///
+/// If the raw header value contains `"gzip"` as a substring, it's
+/// replaced with the bare token `gzip` — an unconditional accept that
+/// `CompressionLayer` will always negotiate — before `CompressionLayer`
+/// ever sees it. Otherwise the header (any other codings, `identity`, or
+/// absence) passes through untouched, preserving spec-compliant
+/// negotiation for everything go's own middleware doesn't special-case
+/// (`unknown_encodings_not_negotiated`, `gzip_not_negotiated_with_identity_only`).
+///
+/// This is a deliberate divergence from otherwise-more-correct behavior
+/// in order to match go's actual (arguably buggy) wire behavior —
+/// conformance means matching what go does, not what RFC 7231 says it
+/// should do.
+pub async fn normalize_accept_encoding_for_gzip_substring_match(
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if let Some(existing) = request.headers().get(axum::http::header::ACCEPT_ENCODING) {
+        if let Ok(s) = existing.to_str() {
+            if s.contains("gzip") {
+                request.headers_mut().insert(
+                    axum::http::header::ACCEPT_ENCODING,
+                    axum::http::HeaderValue::from_static("gzip"),
+                );
+            }
+        }
+    }
+    next.run(request).await
+}
+
 /// Ensures every response carries a `Vary: Accept-Encoding` entry (go's
 /// exact casing), regardless of whether this response was actually
 /// compressed.

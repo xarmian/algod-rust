@@ -299,6 +299,17 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             .quality(CompressionLevel::Default),
     );
 
+    // Rewrite Accept-Encoding before CompressionLayer negotiates, so a
+    // request like `gzip;q=0` is seen as an unconditional `gzip` — matching
+    // go's Echo Gzip middleware, which never parses quality values (issue
+    // #460). Registered *after* (thus outer to, seeing the request first)
+    // `CompressionLayer` — axum layers wrap outermost-last, so the most
+    // recently added `.layer()` call sees the request before any layer
+    // added earlier.
+    router = router.layer(middleware::from_fn(
+        crate::format::normalize_accept_encoding_for_gzip_substring_match,
+    ));
+
     // Outermost of all: `tower_http::CompressionLayer` emits a lowercase
     // `Vary: accept-encoding` value; go emits `Vary: Accept-Encoding`. A
     // live comparison (issue #452) found this as a real byte-level header
