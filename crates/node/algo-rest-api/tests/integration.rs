@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use algo_ledger::participation::{ParticipationID, ParticipationRecord};
-use algo_ledger::StateDelta;
+use algo_ledger::{StateDelta, StateDeltaSubset};
 use algo_rest_api::auth::generate_token;
 use algo_rest_api::node::{
     AccountLookup, AppResourceLookup, ApplicationLookup, AssetLookup, AssetResourceLookup,
@@ -718,7 +718,7 @@ impl NodeInterface for MockNode {
         Err(NodeError::NotFound("block not found".to_string()))
     }
 
-    async fn get_txn_group_delta(&self, id: &Digest) -> Result<StateDelta, NodeError> {
+    async fn get_txn_group_delta(&self, id: &Digest) -> Result<StateDeltaSubset, NodeError> {
         match &self.txn_group_deltas {
             None => Err(NodeError::NotImplemented("get_txn_group_delta")),
             Some(by_round) => {
@@ -5758,7 +5758,7 @@ async fn get_txn_group_delta_endpoints_return_data_when_enabled() {
     let id_str = txn_id.to_string();
     let group = TxnGroupDeltaWithIds {
         ids: vec![id_str.clone()],
-        delta: StateDelta::default(),
+        delta: StateDeltaSubset::default(),
     };
     let mut node = MockNode::synced();
     let mut by_round = BTreeMap::new();
@@ -5786,9 +5786,27 @@ async fn get_txn_group_delta_endpoints_return_data_when_enabled() {
     assert_eq!(body["Deltas"].as_array().unwrap().len(), 1);
     assert_eq!(body["Deltas"][0]["Ids"][0].as_str().unwrap(), id_str);
 
-    // by-id → 200.
+    // by-id → 200. The response must never carry a "Totals" key: go-algorand's
+    // group-delta endpoints return `eval.StateDeltaSubset`, which has no
+    // Totals/StateProofNext/PrevTimestamp fields at all (unlike the
+    // round-level `GET /v2/deltas/{round}` response). Issue #191.
     let resp = get(format!("/v2/deltas/txn/group/{id_str}")).await;
     assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let obj = body.as_object().expect("response is a JSON object");
+    assert!(
+        !obj.contains_key("Totals"),
+        "group-delta response must not include Totals (go's StateDeltaSubset \
+         has no such field): {obj:?}"
+    );
+    assert!(
+        !obj.contains_key("StateProofNext"),
+        "group-delta response must not include StateProofNext: {obj:?}"
+    );
+    assert!(
+        !obj.contains_key("PrevTimestamp"),
+        "group-delta response must not include PrevTimestamp: {obj:?}"
+    );
 
     // Unknown round → 404.
     let resp = get("/v2/deltas/2/txn/group".into()).await;

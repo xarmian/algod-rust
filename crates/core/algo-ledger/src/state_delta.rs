@@ -689,3 +689,123 @@ pub struct StateDelta {
     #[serde(rename = "Totals", default)]
     pub totals: AccountTotals,
 }
+
+// ---------------------------------------------------------------------------
+// StateDeltaSubset
+// ---------------------------------------------------------------------------
+
+/// A sparse subset of [`StateDelta`]'s fields, scoped to a single transaction
+/// group rather than a whole round.
+///
+/// Mirrors go-algorand's `ledger/eval.StateDeltaSubset`
+/// (`ledger/eval/txntracer.go`), which the reference node uses for its
+/// `GET /v2/deltas/txn/group/{id}` and `GET /v2/deltas/{round}/txn/group`
+/// responses. It deliberately omits [`StateDelta`]'s round-only fields —
+/// `StateProofNext`, `PrevTimestamp`, and `Totals` — which are meaningless
+/// for a single group and which go-algorand's `StateDeltaSubset` type does
+/// not declare at all, so they never appear in its wire encoding. Using the
+/// full [`StateDelta`] for these two endpoints would instead always emit a
+/// `Totals` key (its sub-fields have no `skip_serializing_if`), a byte-level
+/// conformance mismatch — see issue #191.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StateDeltaSubset {
+    /// Account deltas (balance + resource changes).
+    #[serde(rename = "Accts", default)]
+    pub accts: AccountDeltas,
+
+    /// Key-value (box) modifications, keyed by box key string.
+    #[serde(rename = "KvMods", default, skip_serializing_if = "HashMap::is_empty")]
+    pub kv_mods: HashMap<String, KvValueDelta>,
+
+    /// Transaction IDs included in the group.
+    #[serde(rename = "Txids", default, skip_serializing_if = "HashMap::is_empty")]
+    pub txids: HashMap<Digest, IncludedTransactions>,
+
+    /// Transaction leases. See [`StateDelta::txleases`] for representation
+    /// notes.
+    #[serde(rename = "Txleases", default, skip_serializing_if = "Option::is_none")]
+    pub txleases: Option<Vec<(Txlease, Round)>>,
+
+    /// Created/deleted assets and applications.
+    #[serde(
+        rename = "Creatables",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub creatables: HashMap<u64, ModifiedCreatable>,
+
+    /// Block header (None when not set).
+    #[serde(rename = "Hdr", default, skip_serializing_if = "Option::is_none")]
+    pub hdr: Option<BlockHeader>,
+}
+
+impl From<StateDelta> for StateDeltaSubset {
+    /// Extract the group-scoped subset, dropping `StateProofNext`,
+    /// `PrevTimestamp`, and `Totals` — mirrors go's `convertStateDelta`
+    /// (`ledger/eval/txntracer.go`).
+    fn from(delta: StateDelta) -> Self {
+        StateDeltaSubset {
+            accts: delta.accts,
+            kv_mods: delta.kv_mods,
+            txids: delta.txids,
+            txleases: delta.txleases,
+            creatables: delta.creatables,
+            hdr: delta.hdr,
+        }
+    }
+}
+
+#[cfg(test)]
+mod state_delta_subset_tests {
+    use super::*;
+
+    /// go-algorand's `StateDeltaSubset` has no `Totals`/`StateProofNext`/
+    /// `PrevTimestamp` fields at all, so its JSON encoding never contains
+    /// those keys — regardless of what the source round's full `StateDelta`
+    /// carried. Issue #191.
+    #[test]
+    fn json_encoding_omits_round_scoped_fields_even_when_source_delta_has_them() {
+        let full = StateDelta {
+            state_proof_next: Round(42),
+            prev_timestamp: 1_700_000_000,
+            totals: AccountTotals {
+                online: AlgoCount {
+                    money: 5_000_000,
+                    reward_units: 10,
+                },
+                ..Default::default()
+            },
+            accts: AccountDeltas {
+                accts: vec![BalanceRecord {
+                    addr: Address([0xAA; 32]),
+                    account_data: LedgercoreAccountData::default(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let subset: StateDeltaSubset = full.into();
+        let json = serde_json::to_value(&subset).expect("subset must serialize");
+        let obj = json.as_object().expect("subset encodes as a JSON object");
+
+        assert!(
+            !obj.contains_key("Totals"),
+            "StateDeltaSubset must never emit a Totals key (go-algorand's \
+             type has no such field): {obj:?}"
+        );
+        assert!(
+            !obj.contains_key("StateProofNext"),
+            "StateDeltaSubset must never emit a StateProofNext key: {obj:?}"
+        );
+        assert!(
+            !obj.contains_key("PrevTimestamp"),
+            "StateDeltaSubset must never emit a PrevTimestamp key: {obj:?}"
+        );
+        // Fields StateDeltaSubset does carry must still round-trip.
+        assert!(
+            obj.contains_key("Accts"),
+            "Accts must still be present: {obj:?}"
+        );
+    }
+}

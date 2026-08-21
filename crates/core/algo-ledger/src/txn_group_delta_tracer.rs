@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use algo_types::Digest;
 
-use crate::state_delta::StateDelta;
+use crate::state_delta::{StateDelta, StateDeltaSubset};
 
 /// A single group's state delta together with all IDs (txn IDs + group ID)
 /// that resolve to it. Mirrors go's `TxnGroupDeltaWithIds`.
@@ -27,8 +27,10 @@ pub struct TxnGroupDelta {
     /// All identifiers (each transaction's ID, plus the group ID when set)
     /// that map to this delta.
     pub ids: Vec<Digest>,
-    /// The state delta produced by applying this group.
-    pub delta: StateDelta,
+    /// The state delta produced by applying this group, narrowed to the
+    /// group-scoped subset of fields go-algorand's `StateDeltaSubset` wire
+    /// format declares (see [`StateDeltaSubset`] and issue #191).
+    pub delta: StateDeltaSubset,
 }
 
 #[derive(Debug, Default)]
@@ -80,7 +82,11 @@ impl TxnGroupDeltaTracer {
     }
 
     /// Record a group's `delta`, indexed by every `id` (each transaction's ID
-    /// and the group ID when set). Mirrors go's `AfterTxnGroup`.
+    /// and the group ID when set). Mirrors go's `AfterTxnGroup`, which
+    /// snapshots the group's delta through `convertStateDelta` at capture
+    /// time; narrowing to [`StateDeltaSubset`] here (rather than at read
+    /// time) means the round-scoped fields never exist in a stored group
+    /// delta at all.
     pub fn record_group(&mut self, ids: Vec<Digest>, delta: StateDelta) {
         let round = self.latest_round;
         let entry = self.rounds.entry(round).or_default();
@@ -88,12 +94,15 @@ impl TxnGroupDeltaTracer {
         for id in &ids {
             entry.by_id.insert(*id, idx);
         }
-        entry.groups.push(TxnGroupDelta { ids, delta });
+        entry.groups.push(TxnGroupDelta {
+            ids,
+            delta: delta.into(),
+        });
     }
 
     /// Look up the delta for a transaction ID or group ID across all retained
     /// rounds. Mirrors go's `GetDeltaForID`.
-    pub fn get_delta_for_id(&self, id: &Digest) -> Option<&StateDelta> {
+    pub fn get_delta_for_id(&self, id: &Digest) -> Option<&StateDeltaSubset> {
         self.rounds
             .values()
             .find_map(|rd| rd.by_id.get(id).map(|&i| &rd.groups[i].delta))

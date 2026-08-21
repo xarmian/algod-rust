@@ -74,8 +74,10 @@ fn minimal_block(fee_sink: Address, round: u64, payset: Vec<SignedTransaction>) 
 }
 
 /// Collect the set of addresses appearing in a delta's account records.
-fn delta_addrs(delta: &algo_ledger::state_delta::StateDelta) -> HashSet<Address> {
-    delta.accts.accts.iter().map(|r| r.addr).collect()
+/// Takes `AccountDeltas` directly so it works for both `StateDelta` (round
+/// deltas) and `StateDeltaSubset` (group deltas), which share this field.
+fn delta_addrs(accts: &algo_ledger::state_delta::AccountDeltas) -> HashSet<Address> {
+    accts.accts.iter().map(|r| r.addr).collect()
 }
 
 #[test]
@@ -123,9 +125,9 @@ fn captures_per_group_deltas_indexed_by_txn_and_group_id() {
     );
     for id in &atomic.ids {
         let d = tracer.get_delta_for_id(id).expect("id resolves to a delta");
-        assert_eq!(delta_addrs(d), delta_addrs(&atomic.delta));
+        assert_eq!(delta_addrs(&d.accts), delta_addrs(&atomic.delta.accts));
     }
-    let atomic_addrs = delta_addrs(&atomic.delta);
+    let atomic_addrs = delta_addrs(&atomic.delta.accts);
     assert!(atomic_addrs.contains(&a) && atomic_addrs.contains(&b) && atomic_addrs.contains(&c));
 
     // The standalone group has a single txn id and no group id.
@@ -196,7 +198,7 @@ fn per_group_deltas_aggregate_to_round_delta() {
 
     let mut union: HashSet<Address> = HashSet::new();
     for g in tracer.get_deltas_for_round(1).unwrap() {
-        union.extend(delta_addrs(&g.delta));
+        union.extend(delta_addrs(&g.delta.accts));
     }
 
     // Whole-round delta (independent apply).

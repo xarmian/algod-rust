@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use algo_ledger::participation::{ParticipationID, ParticipationRecord};
-use algo_ledger::StateDelta;
+use algo_ledger::{StateDelta, StateDeltaSubset};
 use algo_types::{
     AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParams, Block, BlockHeader,
     ConsensusParams, Digest, SignedTransaction,
@@ -289,9 +289,11 @@ pub struct TxnGroupDeltaWithIds {
     /// Base32 transaction/group IDs that map to `delta`.
     #[serde(rename = "Ids")]
     pub ids: Vec<String>,
-    /// The group's state delta.
+    /// The group's state delta, narrowed to go-algorand's `StateDeltaSubset`
+    /// wire shape (no `Totals`/`StateProofNext`/`PrevTimestamp` — those are
+    /// round-scoped fields that don't apply to a single group).
     #[serde(rename = "Delta")]
-    pub delta: StateDelta,
+    pub delta: StateDeltaSubset,
 }
 
 /// State proof data returned by the node.
@@ -747,7 +749,12 @@ pub trait NodeInterface: Send + Sync + 'static {
     /// group ID. `NotImplemented` when the tracer is disabled (501, matching
     /// go's `GetTracer` type assertion failure); `NotFound` when the ID is
     /// unknown.
-    async fn get_txn_group_delta(&self, _id: &Digest) -> Result<StateDelta, NodeError> {
+    ///
+    /// Returns [`StateDeltaSubset`] (not the full [`StateDelta`]), matching
+    /// go-algorand's `GetLedgerStateDeltaForTransactionGroup`, which returns
+    /// `eval.StateDeltaSubset` — a type with no `Totals`/`StateProofNext`/
+    /// `PrevTimestamp` fields, unlike the full round-level delta.
+    async fn get_txn_group_delta(&self, _id: &Digest) -> Result<StateDeltaSubset, NodeError> {
         Err(NodeError::NotImplemented("get_txn_group_delta"))
     }
 

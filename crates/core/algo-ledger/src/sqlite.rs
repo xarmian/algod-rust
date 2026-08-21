@@ -2634,7 +2634,7 @@ impl SqliteLedger {
     pub fn txn_group_delta_for_id(
         &self,
         id: &algo_types::Digest,
-    ) -> Option<crate::state_delta::StateDelta> {
+    ) -> Option<crate::state_delta::StateDeltaSubset> {
         self.group_delta_tracer
             .as_ref()
             .and_then(|t| t.get_delta_for_id(id).cloned())
