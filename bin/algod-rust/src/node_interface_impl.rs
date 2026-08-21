@@ -853,12 +853,10 @@ impl NodeInterface for AlgodNodeInterface {
         buf.extend_from_slice(b"block");
         buf.extend_from_slice(&block_bytes);
 
-        {
-            // "cert" key (fixstr, length 4) + raw or empty-map cert bytes.
-            buf.push(0xa4);
-            buf.extend_from_slice(b"cert");
-            buf.extend_from_slice(cert_bytes);
-        }
+        // "cert" key (fixstr, length 4) + raw or empty-map cert bytes.
+        buf.push(0xa4);
+        buf.extend_from_slice(b"cert");
+        buf.extend_from_slice(cert_bytes);
 
         Ok(buf)
     }
