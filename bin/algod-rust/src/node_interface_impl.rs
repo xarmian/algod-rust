@@ -832,23 +832,31 @@ impl NodeInterface for AlgodNodeInterface {
             (blk, cert)
         };
 
-        let entry_count: u8 = if cert_bytes_opt.is_some() { 2 } else { 1 };
-        let mut buf = Vec::with_capacity(block_bytes.len() + 32);
+        // go's `rpcs.EncodedBlockCert` (`Block bookkeeping.Block "codec:\"block\""`,
+        // `Certificate agreement.Certificate "codec:\"cert\""`) carries no
+        // `omitempty` on either field, so the `cert` key is *always* present
+        // — even for a round with no stored certificate (e.g. round 0's
+        // synthetic genesis block), where a zero-valued `Certificate`
+        // canonically encodes to an empty map. Verified live against
+        // go-algorand v4.5.1-stable (issue #448): omitting the key
+        // entirely (as opposed to encoding it as `{}`) is a structural
+        // mismatch a msgpack-consuming client would trip over.
+        const EMPTY_MSGPACK_MAP: &[u8] = &[0x80];
+        let cert_bytes: &[u8] = cert_bytes_opt.as_deref().unwrap_or(EMPTY_MSGPACK_MAP);
+        let mut buf = Vec::with_capacity(block_bytes.len() + cert_bytes.len() + 32);
 
-        // fixmap(N) — N <= 15 here (we only ever emit 1 or 2 entries).
-        buf.push(0x80 | entry_count);
+        // fixmap(2) — always "block" + "cert".
+        buf.push(0x82);
 
         // "block" key (fixstr, length 5) + raw block bytes (already msgpack).
         buf.push(0xa5);
         buf.extend_from_slice(b"block");
         buf.extend_from_slice(&block_bytes);
 
-        if let Some(cert_bytes) = cert_bytes_opt {
-            // "cert" key (fixstr, length 4) + raw cert bytes.
-            buf.push(0xa4);
-            buf.extend_from_slice(b"cert");
-            buf.extend_from_slice(&cert_bytes);
-        }
+        // "cert" key (fixstr, length 4) + raw or empty-map cert bytes.
+        buf.push(0xa4);
+        buf.extend_from_slice(b"cert");
+        buf.extend_from_slice(cert_bytes);
 
         Ok(buf)
     }
@@ -2864,7 +2872,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_block_raw_msgpack_omits_cert_when_missing() {
+    async fn get_block_raw_msgpack_uses_empty_map_cert_when_missing() {
+        // go's `rpcs.EncodedBlockCert` has no `omitempty` on `Certificate`,
+        // so the "cert" key is always present -- a zero-valued Certificate
+        // canonically encodes to an empty map, not an omitted key (verified
+        // live against go-algorand v4.5.1-stable, issue #448).
         let ledger_arc = Arc::new(Mutex::new(
             SqliteLedger::open_in_memory().expect("in-memory ledger"),
         ));
@@ -2875,7 +2887,8 @@ mod tests {
                 .put_block(2, CONSENSUS_V41, &stored_block, &stored_block)
                 .expect("put_block ok");
             // Intentionally no put_block_cert — mirrors catchpoint-backfilled
-            // blocks that arrive without their original certificate.
+            // blocks that arrive without their original certificate, and
+            // round 0's synthetic genesis block.
         }
         let adapter = adapter_with_ledger(ledger_arc);
         let raw = adapter
@@ -2883,10 +2896,13 @@ mod tests {
             .await
             .expect("raw msgpack ok");
 
-        // Expected: fixmap(1) + "block" + raw bytes — no "cert" key.
-        let mut expected = vec![0x81, 0xa5];
+        // Expected: fixmap(2) + "block" + raw bytes + "cert" + empty map.
+        let mut expected = vec![0x82, 0xa5];
         expected.extend_from_slice(b"block");
         expected.extend_from_slice(&stored_block);
+        expected.push(0xa4);
+        expected.extend_from_slice(b"cert");
+        expected.push(0x80); // empty fixmap
         assert_eq!(raw, expected);
     }
 

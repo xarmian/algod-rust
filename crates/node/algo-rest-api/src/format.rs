@@ -44,13 +44,21 @@ impl ResponseFormat {
 /// Parse a `FormatParams` into a `ResponseFormat`.
 ///
 /// Returns `Err(Response)` with a 400 status if the format value is invalid.
+///
+/// Matches go-algorand's `getCodecHandle`
+/// (`daemon/algod/api/server/v2/utils.go`): the format value is compared
+/// case-insensitively (`strings.ToLower`), and on failure the response body
+/// carries the fixed external message `"failed to parse the format option"`
+/// (`errFailedParsingFormatOption`) rather than echoing the invalid value —
+/// verified live against go-algorand v4.5.1-stable (issue #448).
 pub fn negotiate_format(params: &FormatParams) -> Result<ResponseFormat, Box<Response>> {
-    match params.format.as_deref() {
-        None | Some("json") => Ok(ResponseFormat::Json),
-        Some("msgpack") | Some("msgp") => Ok(ResponseFormat::Msgpack),
-        Some(other) => Err(Box::new(error::bad_request(format!(
-            "invalid format: {other}"
-        )))),
+    match params.format.as_deref().map(|f| f.to_ascii_lowercase()) {
+        None => Ok(ResponseFormat::Json),
+        Some(f) if f == "json" => Ok(ResponseFormat::Json),
+        Some(f) if f == "msgpack" || f == "msgp" => Ok(ResponseFormat::Msgpack),
+        Some(_) => Err(Box::new(error::bad_request(
+            "failed to parse the format option",
+        ))),
     }
 }
 
@@ -202,6 +210,38 @@ mod tests {
             format: Some("xml".into()),
         };
         assert!(negotiate_format(&params).is_err());
+    }
+
+    #[test]
+    fn negotiate_msgpack_uppercase_matches_go_case_insensitivity() {
+        // go's getCodecHandle lowercases the format value before matching
+        // (`strings.ToLower`), so "MSGPACK" must be accepted too.
+        let params = FormatParams {
+            format: Some("MSGPACK".into()),
+        };
+        assert_eq!(negotiate_format(&params).unwrap(), ResponseFormat::Msgpack);
+    }
+
+    #[test]
+    fn negotiate_json_mixed_case_accepted() {
+        let params = FormatParams {
+            format: Some("Json".into()),
+        };
+        assert_eq!(negotiate_format(&params).unwrap(), ResponseFormat::Json);
+    }
+
+    #[tokio::test]
+    async fn negotiate_invalid_error_message_matches_go() {
+        // go's errFailedParsingFormatOption body text, not an echo of the
+        // invalid value (verified live against go-algorand v4.5.1-stable).
+        let params = FormatParams {
+            format: Some("xml".into()),
+        };
+        let err_response = *negotiate_format(&params).unwrap_err();
+        assert_eq!(err_response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(err_response.into_body(), 1024).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["message"], "failed to parse the format option");
     }
 
     #[tokio::test]
