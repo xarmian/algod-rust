@@ -2186,6 +2186,12 @@ pub async fn get_state_proof<N: NodeInterface>(
         Ok(Err(e)) => match e {
             NodeError::NotFound(msg) => error::not_found(msg),
             NodeError::Timeout(msg) => error::timeout(msg),
+            // State proof tracking isn't implemented yet (issue #462), so
+            // the default `NodeInterface::get_state_proof_for_round` always
+            // returns `NotImplemented`. Matches go's `ErrNoStateProofForRound`
+            // 404 for conformance -- see `get_light_block_header_proof`'s
+            // identical reasoning for the sibling state-proof endpoint.
+            NodeError::NotImplemented(_) => error::not_found("no state proof for that round"),
             e => error::internal_error(e.to_string()),
         },
         Err(_elapsed) => error::timeout("operation timed out"),

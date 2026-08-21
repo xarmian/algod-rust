@@ -382,7 +382,14 @@ async fn devmode_blocks_offset_get_matches() {
 #[tokio::test]
 #[ignore = "requires `make validate-api-up`; see module docs"]
 async fn stateproofs_404_matches() {
-    assert_json_parity("/v2/stateproofs/1", DEV_TOKEN).await;
+    // Round 0, not round 1: `?round=1` sits right at the boundary of each
+    // node's own "requested round is beyond the latest round" pre-check
+    // (go: `ledger.Latest() < round`; rust: `round > status.last_round`),
+    // and the two nodes' `last_round` at the moment of the request isn't
+    // guaranteed to be identical to the millisecond -- round 0 is always
+    // `<=` both nodes' `last_round`, so this only ever exercises the "no
+    // state proof found" 404 path both sides actually intend to test.
+    assert_json_parity("/v2/stateproofs/0", DEV_TOKEN).await;
 }
 
 // ---------------------------------------------------------------------------
