@@ -3,7 +3,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use algo_ledger::catchpoint::{
-    import_catchpoint_file, parse_catchpoint_label, validate_post_import, verify_catchpoint,
+    export_catchpoint_file, import_catchpoint_file, parse_catchpoint_label, validate_post_import,
+    verify_catchpoint, ExportOptions,
 };
 use algo_ledger::open_ledger_connection;
 use algo_rest_client::{CatchpointDownloader, DownloadProgress};
@@ -339,6 +340,113 @@ pub async fn run_verify(db_path: &Path, file_path: Option<&Path>) -> anyhow::Res
     }
 
     Ok(())
+}
+
+/// Run the catchpoint export subcommand.
+///
+/// Writes a go-algorand-format catchpoint file from the local ledger's
+/// tracker tables. See `algo_ledger::catchpoint::writer` and
+/// `../go-algorand/ledger/catchpointfilewriter.go`.
+pub async fn run_export(
+    db_path: &Path,
+    output: &Path,
+    round: Option<u64>,
+    blocks_round: Option<u64>,
+    block_digest: Option<&str>,
+    no_online_data: bool,
+    no_gzip: bool,
+) -> anyhow::Result<()> {
+    let conn = open_ledger_connection(db_path).map_err(|e| anyhow::anyhow!("open db: {e}"))?;
+
+    // Default the snapshot round to whatever the tracker DB is committed at.
+    let balances_round = match round {
+        Some(r) => r,
+        None => {
+            let r: i64 = conn
+                .query_row(
+                    "SELECT rnd FROM acctrounds WHERE id = 'acctbase'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("could not read acctrounds('acctbase'); pass --round: {e}")
+                })?;
+            r as u64
+        }
+    };
+    let blocks_round = blocks_round.unwrap_or(balances_round);
+
+    let block_header_digest = match block_digest {
+        Some(hex) => parse_hex32(hex)?,
+        None => block_header_digest_at(&conn, blocks_round)?,
+    };
+
+    println!("=== Catchpoint Export ===");
+    println!("Database:       {}", db_path.display());
+    println!("Output:         {}", output.display());
+    println!("Balances round: {balances_round}");
+    println!("Blocks round:   {blocks_round}");
+
+    let opts = ExportOptions {
+        balances_round,
+        blocks_round,
+        block_header_digest,
+        include_online_data: !no_online_data,
+        gzip: !no_gzip,
+        ..Default::default()
+    };
+
+    let timer = Instant::now();
+    let result = export_catchpoint_file(&conn, output, &opts)
+        .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
+    let elapsed = timer.elapsed();
+
+    println!("Export complete ({:.1}s)", elapsed.as_secs_f64());
+    println!("  Label:               {}", result.label);
+    println!("  Accounts:            {}", result.total_accounts);
+    println!("  Chunks:              {}", result.total_chunks);
+    println!("  KVs:                 {}", result.total_kvs);
+    println!("  Online accounts:     {}", result.total_online_accounts);
+    println!(
+        "  Online round params: {}",
+        result.total_online_round_params
+    );
+    println!("  File size:           {} bytes", result.file_size);
+    info!(label = %result.label, size = result.file_size, "catchpoint exported");
+
+    Ok(())
+}
+
+/// Parse a 64-character hex string into a 32-byte digest.
+fn parse_hex32(s: &str) -> anyhow::Result<[u8; 32]> {
+    let s = s.trim().trim_start_matches("0x");
+    if s.len() != 64 {
+        anyhow::bail!("block digest must be 64 hex characters, got {}", s.len());
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .map_err(|e| anyhow::anyhow!("invalid hex in block digest: {e}"))?;
+    }
+    Ok(out)
+}
+
+/// Compute the block header digest of `round` from the attached block DB.
+fn block_header_digest_at(conn: &rusqlite::Connection, round: u64) -> anyhow::Result<[u8; 32]> {
+    let hdrdata: Vec<u8> = conn
+        .query_row(
+            "SELECT hdrdata FROM blockdb.blocks WHERE rnd = ?1",
+            rusqlite::params![round as i64],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "block {round} not found in the block DB; pass --block-digest instead: {e}"
+            )
+        })?;
+    let header: algo_types::BlockHeader = rmp_serde::from_slice(&hdrdata)
+        .map_err(|e| anyhow::anyhow!("decode block {round} header: {e}"))?;
+    Ok(algo_codec::compute_block_header_digest(&header).0)
 }
 
 /// Run the catchpoint download subcommand.
