@@ -61,6 +61,7 @@ use crate::request_response::{
 };
 use crate::tag::Tag;
 use crate::topics::{Topic, Topics};
+use crate::NetworkError;
 
 // ---------------------------------------------------------------------------
 // Constants (matching go-algorand)
@@ -653,13 +654,43 @@ impl PeerHandle {
                         match msg {
                             Some(Ok(axum::extract::ws::Message::Binary(data))) => {
                                 if let Ok((tag, payload)) = crate::framing::decode_frame(&data) {
+                                    // go-algorand compresses every proposal
+                                    // broadcast unconditionally at wsnet 2.2
+                                    // (`msgBroadcaster.preparePeerData`,
+                                    // network/wsNetwork.go:1471) and decides
+                                    // decompression purely on the zstd magic
+                                    // (network/msgCompressor.go:206).  Inbound
+                                    // peers therefore *must* decompress PP here
+                                    // too, or every Go-sourced proposal reaches
+                                    // agreement as raw zstd and gets the peer
+                                    // disconnected — issue #478.
+                                    let payload = if tag == Tag::ProposalPayload
+                                        && is_zstd_compressed(payload)
+                                    {
+                                        match zstd_decompress(
+                                            payload,
+                                            MAX_DECOMPRESSED_MESSAGE_SIZE,
+                                        ) {
+                                            Ok(d) => d,
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    addr = %read_addr,
+                                                    error = %e,
+                                                    "inbound read loop: PP decompression failed"
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        payload.to_vec()
+                                    };
                                     let now_ns = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_nanos() as i64;
                                     let incoming = IncomingMessage {
                                         tag,
-                                        data: payload.to_vec(),
+                                        data: payload,
                                         sender: read_addr.clone(),
                                         received_at: now_ns,
                                         peer: None,
@@ -700,7 +731,7 @@ impl PeerHandle {
                     cmd = send_high_prio_rx.recv() => {
                         match cmd {
                             Some(WriteCommand::Data(sm)) => {
-                                let frame = match encode_frame(&sm.msg.tag, &sm.msg.payload) {
+                                let frame = match encode_inbound_frame(&sm.msg) {
                                     Ok(f) => f,
                                     Err(_) => continue,
                                 };
@@ -720,7 +751,7 @@ impl PeerHandle {
                     cmd = send_bulk_rx.recv() => {
                         match cmd {
                             Some(WriteCommand::Data(sm)) => {
-                                let frame = match encode_frame(&sm.msg.tag, &sm.msg.payload) {
+                                let frame = match encode_inbound_frame(&sm.msg) {
                                     Ok(f) => f,
                                     Err(_) => continue,
                                 };
@@ -765,6 +796,39 @@ impl PeerHandle {
             _keepalive_handle: keepalive_handle,
         }
     }
+}
+
+/// Encode an outgoing message for an inbound (server-side) peer connection.
+///
+/// Mirrors the parts of the outbound `write_loop` that matter on the wire:
+///
+/// * a message carrying `topics` (e.g. a `TopicMsgResp` answering a
+///   `UniEnsBlockReq`) is serialized from its topics, not from the empty
+///   `payload` field — without this, inbound peers could never be answered
+///   with a block, so a Go node that dialed a Rust relay could not catch up
+///   from it;
+/// * `PP` payloads are zstd-compressed, matching go-algorand's
+///   `msgBroadcaster.preparePeerData` (`network/wsNetwork.go:1471`), which
+///   compresses every proposal unconditionally at wsnet 2.2.
+fn encode_inbound_frame(msg: &OutgoingMessage) -> Result<Vec<u8>, NetworkError> {
+    let topics_serialized;
+    let payload: &[u8] = if let Some(ref topics) = msg.topics {
+        topics_serialized = topics.marshal();
+        &topics_serialized
+    } else {
+        &msg.payload
+    };
+
+    if msg.tag == Tag::ProposalPayload && !payload.is_empty() {
+        if let Ok(compressed) = zstd_compress(payload) {
+            let mut frame = Vec::with_capacity(2 + compressed.len());
+            frame.extend_from_slice(&msg.tag.as_bytes());
+            frame.extend_from_slice(&compressed);
+            return Ok(frame);
+        }
+    }
+
+    encode_frame(&msg.tag, payload)
 }
 
 impl Drop for PeerHandle {
@@ -1020,7 +1084,9 @@ async fn read_loop<St>(
     last_packet_time: Arc<RwLock<Instant>>,
     closing: CancellationToken,
     remote_addr: String,
-    features: PeerFeatureFlags,
+    // Retained for symmetry with Go's `wsPeer`; the PP decompression path
+    // below deliberately no longer consults it (see issue #478).
+    _features: PeerFeatureFlags,
     multiplexer: Option<Arc<Multiplexer>>,
     incoming_filter: Option<Arc<MessageFilter>>,
     outgoing_filter: Option<Arc<MessageFilter>>,
@@ -1088,11 +1154,29 @@ async fn read_loop<St>(
                     }
                 };
 
-                // Decompress if needed (PP tag with ppzstd feature).
-                let payload = if tag == Tag::ProposalPayload
-                    && features.contains(PeerFeatureFlags::COMPRESSED_PROPOSAL)
-                    && is_zstd_compressed(payload)
-                {
+                // Decompress PP payloads that carry the zstd frame magic.
+                //
+                // This deliberately does NOT consult the negotiated
+                // `ppzstd` peer feature.  go-algorand compresses *every*
+                // proposal broadcast unconditionally once the wsnet
+                // protocol version is 2.2 —
+                // `network/wsNetwork.go:1471` ("Compress proposals -- all
+                // proposals are compressed as of wsnet 2.2") runs in
+                // `msgBroadcaster.preparePeerData`, before any per-peer
+                // feature check, and the per-peer codec explicitly does
+                // not implement outgoing PP compression
+                // (`network/msgCompressor.go:94`).  Correspondingly Go's
+                // receive path always installs the PP decompressor
+                // (`c.ppdec = zstdProposalDecompressor{}` at
+                // `network/msgCompressor.go:281`) and decides purely on
+                // the magic bytes (`decompress`, msgCompressor.go:206).
+                //
+                // Gating this on the feature flag meant every proposal
+                // from a Go peer that dialed us (inbound connections never
+                // negotiate features) arrived as raw zstd, failed the
+                // msgpack decode in `agreement::demux`, and got the peer
+                // disconnected — issue #478.
+                let payload = if tag == Tag::ProposalPayload && is_zstd_compressed(payload) {
                     match zstd_decompress(payload, MAX_DECOMPRESSED_MESSAGE_SIZE) {
                         Ok(decompressed) => decompressed,
                         Err(e) => {

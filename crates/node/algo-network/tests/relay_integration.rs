@@ -547,3 +547,96 @@ async fn relay_forwards_messages() {
 
     net.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Test 7: inbound_zstd_proposal_is_decompressed (regression: issue #478)
+// ---------------------------------------------------------------------------
+
+/// go-algorand compresses **every** `PP` broadcast with zstd once the wsnet
+/// protocol version is 2.2 — `msgBroadcaster.preparePeerData`
+/// (`network/wsNetwork.go:1471`) does it before any per-peer feature check,
+/// and the per-peer codec explicitly does not implement outgoing PP
+/// compression (`network/msgCompressor.go:94`). Its receive path
+/// correspondingly always installs the PP decompressor and decides purely on
+/// the zstd frame magic (`network/msgCompressor.go:206,281`).
+///
+/// The Rust inbound-peer read loop used to skip decompression entirely, and
+/// the outbound one gated it on the negotiated `ppzstd` feature. A Go relay
+/// that dialed a Rust node therefore delivered raw zstd bytes to
+/// `agreement::demux`, which failed to msgpack-decode them and disconnected
+/// the peer — the Rust node never accepted a single proposal and never left
+/// round 0 (issue #478).
+///
+/// This test drives the real inbound path: a client connects to a relay-mode
+/// `WebsocketNetwork` without advertising any peer features, sends a
+/// zstd-compressed `PP` frame, and the registered handler must observe the
+/// *decompressed* payload.
+#[tokio::test]
+async fn inbound_zstd_proposal_is_decompressed() {
+    use algo_network::compression::zstd_compress;
+    use algo_network::forwarding_policy::ForwardingPolicy;
+    use algo_network::handler::{MessageHandler, TaggedMessageHandler};
+    use algo_network::message::{IncomingMessage, OutgoingMessage};
+    use tokio::sync::mpsc;
+
+    init_tracing();
+
+    struct Capture {
+        tx: mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageHandler for Capture {
+        async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+            let _ = self.tx.send(msg.data);
+            OutgoingMessage {
+                action: ForwardingPolicy::Ignore,
+                tag: Tag::ProposalPayload,
+                payload: Vec::new(),
+                topics: None,
+            }
+        }
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let net = build_relay_network("test-v1.0", 100);
+    net.register_handlers(vec![TaggedMessageHandler {
+        tag: Tag::ProposalPayload,
+        handler: Arc::new(Capture { tx }),
+    }]);
+    net.start_arc().await.expect("relay should start");
+
+    let hp = relay_host_port(&net);
+    let request = gossip_request(&hp, "test-v1.0", "zstd_pp_peer");
+    let (ws, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("peer should connect");
+    let (mut write, _read) = ws.split();
+
+    // A payload that is unambiguously not a zstd frame itself, and big
+    // enough that zstd actually produces a frame header.
+    let plain: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+    let compressed = zstd_compress(&plain).expect("compression should succeed");
+    assert_ne!(compressed, plain, "payload must actually be compressed");
+
+    let mut frame = Vec::with_capacity(2 + compressed.len());
+    frame.extend_from_slice(&Tag::ProposalPayload.as_bytes());
+    frame.extend_from_slice(&compressed);
+    write
+        .send(tungstenite::Message::Binary(frame))
+        .await
+        .expect("peer should be able to send");
+
+    let received = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("handler should be invoked before the timeout")
+        .expect("handler channel should stay open");
+
+    assert_eq!(
+        received, plain,
+        "inbound PP must reach the handler decompressed, regardless of \
+         whether the peer negotiated the ppzstd feature"
+    );
+
+    net.stop().await;
+}

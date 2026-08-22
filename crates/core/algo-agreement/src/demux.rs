@@ -601,7 +601,12 @@ impl Demux {
                 consensus_version,
             )),
             Err(e) => {
-                warn!("error decoding proposal message: {}", e);
+                warn!(
+                    len = msg.data.len(),
+                    prefix = %hex_prefix(&msg.data, 96),
+                    "error decoding proposal message: {}",
+                    e
+                );
                 // Disconnect the peer that sent the malformed message.
                 if let Some(ref net) = self.network {
                     net.disconnect(&msg.handle);
@@ -643,11 +648,24 @@ impl Demux {
     }
 
     /// Handle a verified vote result from the crypto verifier.
+    ///
+    /// Go forwards only `r.message` into the `voteVerified` event
+    /// (`agreement/demux.go:345`) and relies on the verifier having already
+    /// stored the authenticated vote on it
+    /// (`asyncVoteVerifier.go:107`: `req.message.Vote = v`). Downstream —
+    /// `proposalManager`, `proposalStore`, `proposalTracker` — all read
+    /// `input.vote` unconditionally, so a result whose message lost the
+    /// vote makes the whole proposal pipeline fail (issue #478). Restore it
+    /// here if a verifier implementation did not.
     fn handle_verified_vote(&self, r: CryptoVoteVerifyResult) -> ExternalEvent {
+        let mut input = r.message;
+        if input.vote.is_none() {
+            input.vote = r.vote;
+        }
         ExternalEvent {
             event: Event::Message(MessageEvent {
                 t: EventType::VoteVerified,
-                input: r.message,
+                input,
                 task_index: r.task_index,
                 err: r.err,
                 cancelled: r.cancelled,
@@ -843,6 +861,21 @@ pub fn make_round_interruption_event(round: Round) -> ExternalEvent {
     }
 }
 
+/// Hex-encode the first `n` bytes of `data`, for diagnostics on a wire
+/// message this node could not decode.
+fn hex_prefix(data: &[u8], n: usize) -> String {
+    use std::fmt::Write as _;
+    let take = std::cmp::min(n, data.len());
+    let mut s = String::with_capacity(take * 2 + 3);
+    for b in &data[..take] {
+        let _ = write!(s, "{b:02x}");
+    }
+    if data.len() > take {
+        s.push_str("...");
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -887,6 +920,46 @@ mod tests {
         (
             demux, av_tx, pp_tx, vb_tx, vv_tx, vp_tx, vb_res_tx, lr_tx, quit_tx,
         )
+    }
+
+    /// Regression test for issue #478.
+    ///
+    /// The demux forwards only `r.message` into the `voteVerified` event, so
+    /// the authenticated vote has to be on the message. Whether the verifier
+    /// put it there or only on `r.vote`, the emitted event must carry it —
+    /// `proposalManager`/`proposalStore`/`proposalTracker` all read
+    /// `input.vote` unconditionally, and before this fix the field was
+    /// always `None`, which took the agreement thread down on the first
+    /// successfully-verified proposal-vote from a Go peer.
+    #[test]
+    fn verified_vote_event_carries_the_authenticated_vote() {
+        use crate::step::{Period, Step};
+        use crate::test_support::vote_maker::VoteMakerHelper;
+
+        let (demux, ..) = make_test_demux();
+
+        let mut helper = VoteMakerHelper::new();
+        let prop = helper.make_random_proposal_value();
+        let vote = helper.make_verified_vote(0, Round(1), Period(0), Step(1), prop);
+
+        let result = CryptoVoteVerifyResult {
+            vote: Some(vote),
+            // A message that does NOT already carry the vote.
+            message: InternalMessage::default(),
+            task_index: 7,
+            err: None,
+            cancelled: false,
+        };
+
+        let ev = demux.handle_verified_vote(result);
+        let Event::Message(me) = ev.event else {
+            panic!("expected a message event");
+        };
+        assert_eq!(me.t, EventType::VoteVerified);
+        assert!(
+            me.input.vote.is_some(),
+            "voteVerified must carry the authenticated vote"
+        );
     }
 
     fn default_signals() -> ExternalDemuxSignals {

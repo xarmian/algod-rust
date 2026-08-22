@@ -593,13 +593,27 @@ fn verify_vote_impl<L: LedgerReader>(
     };
 
     match uv.verify(&params) {
-        Ok(vote) => CryptoVoteVerifyResult {
-            vote: Some(vote),
-            message: request.message.clone(),
-            task_index: request.task_index,
-            err: None,
-            cancelled: false,
-        },
+        Ok(vote) => {
+            // Go stores the authenticated vote *on the message* before
+            // handing the response back —
+            // `req.message.Vote = v` in
+            // `AsyncVoteVerifier.executeVoteVerification`
+            // (agreement/asyncVoteVerifier.go:107) — because the demux
+            // forwards only `r.message` into the `voteVerified` event
+            // (`agreement/demux.go:345`).  Without this the
+            // `proposalManager` sees a `VoteVerified` event whose
+            // `input.vote` is `None` and panics on the very first
+            // successfully-verified proposal-vote (issue #478).
+            let mut message = request.message.clone();
+            message.vote = Some(vote.clone());
+            CryptoVoteVerifyResult {
+                vote: Some(vote),
+                message,
+                task_index: request.task_index,
+                err: None,
+                cancelled: false,
+            }
+        }
         Err(e) => CryptoVoteVerifyResult {
             vote: None,
             message: request.message.clone(),

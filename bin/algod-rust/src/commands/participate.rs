@@ -9,18 +9,21 @@ use algo_agreement::{
     EventsProcessingMonitor, NetworkAdvancer, Parameters, RandomSource, Service, SystemClock,
 };
 use algo_avm::group::GroupBudget;
-use algo_codec::{canonical_encode_signed_txn_in_block, canonical_encode_transaction};
+use algo_codec::{
+    canonical_encode_block, canonical_encode_block_header_from_block,
+    canonical_encode_signed_txn_in_block, canonical_encode_transaction,
+};
 use algo_ledger::participation::{restore_participation, ParticipationStore};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{
-    parse_genesis_json, populate_store, seed_account_totals_from_genesis,
+    make_genesis_block, parse_genesis_json, populate_store, seed_account_totals_from_genesis,
     AgreementKeyManagerBridge, AgreementLedgerBridge, BlockFetcher, CatchupService, FetchError,
     FetchedBlockCert, SqliteLedger,
 };
 use algo_network::local_tx_broadcast::{LocalTxBroadcaster, PoolIngestAdapter};
 use algo_network::{
-    AgreementNetworkBridge, GossipNode, Phonebook, WebsocketNetwork, WebsocketNetworkConfig,
-    RELAY_ROLE,
+    AgreementNetworkBridge, BlockService, BlockServiceError, GossipNode, LedgerForBlockService,
+    Phonebook, WebsocketNetwork, WebsocketNetworkConfig, RELAY_ROLE,
 };
 use algo_pool::{PoolConfig, TransactionPool};
 use algo_rest_api::node::BuildVersion;
@@ -1711,6 +1714,77 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
 /// agreement bridges. Reused by `node start --dev` (TASK-264) so its
 /// consensus-critical `start_evaluator` (next-round header advance) is not
 /// duplicated.
+/// Adapter exposing the participation node's ledger to the gossip
+/// [`BlockService`], so a Rust node that listens for inbound gossip can serve
+/// `/v{n}/{genesisID}/block/{round}` and `UniEnsBlockReq` like a Go relay.
+///
+/// Before issue #478 only `algod-rust relay` registered a block service, so a
+/// Rust node started with `participate --listen-address ... --relay-messages`
+/// (the relay role in the #100 stress topology) answered every block request
+/// with a 404 / request timeout: Go peers could not catch up from it, and
+/// neither could other Rust nodes.
+struct ParticipateBlockService {
+    ledger: Arc<Mutex<SqliteLedger>>,
+}
+
+impl LedgerForBlockService for ParticipateBlockService {
+    fn encoded_block_cert(&self, round: u64) -> Result<(Vec<u8>, Vec<u8>), BlockServiceError> {
+        let ledger = self
+            .ledger
+            .lock()
+            .map_err(|_| BlockServiceError::BlockNotAvailable {
+                round,
+                latest_round: None,
+            })?;
+        let latest = ledger.current_round().0;
+
+        let block_data = ledger
+            .get_block_data(round)
+            .map_err(|_| BlockServiceError::BlockNotAvailable {
+                round,
+                latest_round: Some(latest),
+            })?
+            .ok_or(BlockServiceError::BlockNotAvailable {
+                round,
+                latest_round: Some(latest),
+            })?;
+
+        let cert_data = ledger
+            .get_block_cert(round)
+            .map_err(|_| BlockServiceError::BlockNotAvailable {
+                round,
+                latest_round: Some(latest),
+            })?
+            .unwrap_or_default();
+
+        Ok((block_data, cert_data))
+    }
+
+    fn latest_round(&self) -> u64 {
+        self.ledger.lock().map(|l| l.current_round().0).unwrap_or(0)
+    }
+}
+
+/// Serves `UniEnsBlockReq` gossip messages from the local ledger.
+///
+/// Mirrors `relay.rs`'s `BlockRequestHandler`.
+struct ParticipateBlockRequestHandler {
+    block_service: Arc<BlockService>,
+}
+
+#[async_trait::async_trait]
+impl algo_network::MessageHandler for ParticipateBlockRequestHandler {
+    async fn handle(&self, msg: algo_network::IncomingMessage) -> algo_network::OutgoingMessage {
+        let (response_topics, _guard) = self.block_service.handle_ws_block_request(&msg.data);
+        algo_network::OutgoingMessage {
+            action: algo_network::ForwardingPolicy::Respond,
+            tag: algo_network::Tag::TopicMsgResp,
+            payload: Vec::new(),
+            topics: Some(response_topics),
+        }
+    }
+}
+
 pub(crate) struct PoolLedgerAdapter {
     ledger: Arc<Mutex<SqliteLedger>>,
 }
@@ -2507,6 +2581,25 @@ fn seed_ledger_from_genesis(
         .map_err(|e| anyhow::anyhow!("populate_store from genesis: {}", e))?;
     seed_account_totals_from_genesis(ledger, &genesis)
         .map_err(|e| anyhow::anyhow!("seed_account_totals_from_genesis: {}", e))?;
+    // Store the round-0 genesis block, exactly as `algod-rust node` does.
+    //
+    // Without it the ledger has account state but no block-0 *header*, and
+    // the block header is where the committee seed lives. Agreement's
+    // `LedgerReader::seed(0)` (the lookback seed for round 1) then fails
+    // with "seed not found in header for round 0", so the node cannot run
+    // sortition for its own keys, cannot verify anybody else's round-1
+    // votes, and cannot authenticate a fetched round-1 certificate during
+    // catchup — it can never leave round 1. Issue #478.
+    let genesis_block = make_genesis_block(&genesis)
+        .map_err(|e| anyhow::anyhow!("building genesis block: {}", e))?;
+    let blk_data = canonical_encode_block(&genesis_block);
+    let hdr_data = canonical_encode_block_header_from_block(&genesis_block);
+    ledger
+        .put_block(0, &genesis_block.current_protocol, &hdr_data, &blk_data)
+        .map_err(|e| anyhow::anyhow!("put_block(0) for genesis: {}", e))?;
+    // Seed the running txn-counter from the genesis block header (1000 under
+    // modern protocols); block 0 is never applied, so nothing else would.
+    ledger.set_txn_counter(genesis_block.txn_counter);
     ledger
         .commit_block()
         .map_err(|e| anyhow::anyhow!("commit_block during genesis seed: {}", e))?;
@@ -2514,7 +2607,7 @@ fn seed_ledger_from_genesis(
         genesis_path = %genesis_path.display(),
         allocations = genesis.alloc.len(),
         online_stake = ledger.online_stake().unwrap_or(0),
-        "seeded ledger from genesis (accountbase + accounttotals)"
+        "seeded ledger from genesis (accountbase + accounttotals + block 0)"
     );
     Ok(())
 }
@@ -2725,6 +2818,20 @@ pub async fn run(
     let tx_seen_cache = Arc::new(algo_network::SeenTxCache::new(
         algo_network::TxSyncerConfig::default().seen_cache_size,
     ));
+    // Serve blocks to peers, both over HTTP (`/v1/{genesisID}/block/{round}`)
+    // and over gossip (`UniEnsBlockReq`). Registered before `start_arc()` so
+    // the routes exist the moment the listener accepts its first connection.
+    // Issue #478: without this a Rust node acting as a relay answered every
+    // block request with 404 / timeout, so nothing could catch up from it.
+    let block_service = Arc::new(BlockService::new(
+        Arc::new(ParticipateBlockService {
+            ledger: ledger.clone(),
+        }) as Arc<dyn LedgerForBlockService>,
+        resolved_genesis_id.clone(),
+        0,
+    ));
+    gossip_node.register_http_handler("/", block_service.http_router());
+
     gossip_node.multiplexer().register_handlers(vec![
         algo_network::handler::TaggedMessageHandler {
             tag: algo_network::Tag::Transaction,
@@ -2732,6 +2839,12 @@ pub async fn run(
                 pool.clone(),
                 tx_seen_cache.clone(),
             )),
+        },
+        algo_network::handler::TaggedMessageHandler {
+            tag: algo_network::Tag::UniEnsBlockReq,
+            handler: Arc::new(ParticipateBlockRequestHandler {
+                block_service: Arc::clone(&block_service),
+            }),
         },
     ]);
 
@@ -3030,6 +3143,74 @@ pub async fn run(
     info!("catchup service started");
 
     // -----------------------------------------------------------------------
+    // Pool block follower.
+    //
+    // go-algorand drives `pool.OnNewBlock` from a ledger block listener that
+    // fires for *every* committed round (`node.go`'s `blockListener` /
+    // `ledger.Wait`). Here it was only ever called once, at startup, to prime
+    // the evaluator — so the pool's evaluator stayed pinned at the node's
+    // starting round forever. Every user-submitted transaction was then
+    // rejected with "transaction round window [N, N+1000] does not cover
+    // block round <startup round>", and committed transactions were never
+    // dropped from the pool (issue #478).
+    let pool_follower_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pool_follower = {
+        let pool = pool.clone();
+        let ledger = ledger.clone();
+        let stop = Arc::clone(&pool_follower_stop);
+        let mut last_seen = {
+            let l = ledger.lock().expect("ledger lock poisoned");
+            l.current_round().0
+        };
+        std::thread::Builder::new()
+            .name("pool-block-follower".to_string())
+            .spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(200));
+                    let latest = match ledger.lock() {
+                        Ok(l) => l.current_round().0,
+                        Err(_) => break,
+                    };
+                    while last_seen < latest {
+                        let round = last_seen + 1;
+                        let block = {
+                            let l = match ledger.lock() {
+                                Ok(l) => l,
+                                Err(_) => return,
+                            };
+                            match l.get_block_data(round) {
+                                Ok(Some(bytes)) => {
+                                    match algo_types::Block::decode_from_bytes(&bytes) {
+                                        Ok(b) => Some(b),
+                                        Err(e) => {
+                                            warn!(
+                                                round,
+                                                error = %e,
+                                                "pool follower: could not decode committed block"
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                                _ => None,
+                            }
+                        };
+                        if let Some(block) = block {
+                            let committed_txids: HashSet<algo_types::Digest> = block
+                                .payset
+                                .iter()
+                                .map(|stx| crate::dev_producer::block_txn_id(stx, &block))
+                                .collect();
+                            pool.on_new_block(&block, &committed_txids);
+                        }
+                        last_seen = round;
+                    }
+                }
+            })
+            .expect("failed to spawn pool-block-follower thread")
+    };
+
+    // -----------------------------------------------------------------------
     // 6. Build and start the agreement Service.
     // -----------------------------------------------------------------------
     let params = Parameters {
@@ -3075,6 +3256,8 @@ pub async fn run(
     // catchup service shuts down).
     handle.shutdown();
     catchup_service.stop();
+    pool_follower_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = pool_follower.join();
     gossip_node.stop().await;
 
     // Await the REST server last — its graceful shutdown depends on
