@@ -106,3 +106,84 @@ fn rust_node_passes_positive_consensus_conformance() {
         status.code()
     );
 }
+
+/// Issue #471 (Epic 42d) — restart / rejoin conformance.
+///
+/// Drives `ops/mixed-cluster/scripts/restart-rejoin.sh`, which takes the
+/// Rust node down *while rounds are being produced* and asserts it comes
+/// back correctly:
+///
+/// * **graceful** — `docker restart` (SIGTERM).
+/// * **kill** — `docker kill -s KILL`, so recovery actually runs against
+///   whatever the async persistence loop had committed to `crash.sqlite`
+///   at the instant the process died.
+/// * **proposer** — the SIGKILL is timed into a round the node holds a
+///   proposer credential for (detected from its own `assembled N proposal
+///   message(s) at (round, period)` log line).
+///
+/// Each scenario asserts: rejoin to lockstep within a round budget,
+/// resumed attesting, no Go-quorum stall, no fork across all four nodes,
+/// and — the safety-critical one — **no equivocation**, checked from both
+/// the Rust node's own vote log and go-algorand's
+/// `voteTracker: observed an equivocator` detector.
+///
+/// ## Running
+///
+/// ```bash
+/// # Against an already-running cluster (make consensus-cluster-up first):
+/// MIXED_CLUSTER=1 cargo test -p algo-network --test consensus_conformance \
+///     restart -- --ignored --nocapture
+///
+/// # Just one scenario:
+/// MIXED_CLUSTER=1 RESTART_MODE=kill cargo test -p algo-network \
+///     --test consensus_conformance restart -- --ignored --nocapture
+/// ```
+///
+/// ## Prerequisites
+///
+/// The 4-node cluster must already be **up and in lockstep** — this test
+/// does not manage cluster lifetime, so a failed run leaves the cluster
+/// available for inspection. `algo-fork-detector` must be built into
+/// `target/debug`.
+#[test]
+#[ignore = "requires MIXED_CLUSTER=1 + a running mixed cluster"]
+fn rust_node_rejoins_consensus_after_restart() {
+    if !mixed_cluster_enabled() {
+        eprintln!(
+            "SKIPPED: rust_node_rejoins_consensus_after_restart requires \
+             MIXED_CLUSTER=1 and a running cluster. Run with:\n  \
+             make consensus-cluster-up\n  \
+             MIXED_CLUSTER=1 cargo test -p algo-network --test consensus_conformance \
+             restart -- --ignored --nocapture"
+        );
+        return;
+    }
+
+    let root = repo_root();
+    let script = root
+        .join("ops")
+        .join("mixed-cluster")
+        .join("scripts")
+        .join("restart-rejoin.sh");
+    assert!(
+        script.exists(),
+        "expected orchestration script at {}",
+        script.display()
+    );
+
+    let status = Command::new("bash")
+        .arg(&script)
+        .arg("--mode")
+        .arg(std::env::var("RESTART_MODE").unwrap_or_else(|_| "all".to_string()))
+        .current_dir(&root)
+        .status()
+        .expect("failed to spawn restart-rejoin.sh");
+
+    assert!(
+        status.success(),
+        "restart-rejoin.sh exited with {:?} — read the printed check list and the \
+         restart-summary.json it names. A `no_equivocation_*` failure is a \
+         consensus-safety bug, not a flake: treat it as such.",
+        status.code()
+    );
+}

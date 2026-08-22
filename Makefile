@@ -22,7 +22,7 @@ PHASE6_CLUSTER := ops/mixed-cluster
 .PHONY: relay-up relay-down relay-test
 .PHONY: mixed-cluster-up mixed-cluster-down mixed-cluster-smoke mixed-cluster-test mixed-cluster-conformance
 .PHONY: consensus-cluster-up consensus-cluster-down consensus-cluster-status consensus-cluster-smoke
-.PHONY: consensus-cluster-test consensus-analyzer-test
+.PHONY: consensus-cluster-test consensus-analyzer-test consensus-cluster-restart
 .PHONY: phase6-cluster-up phase6-cluster-down phase6-cluster-status
 
 ## ── Build & Test ──────────────────────────────────────────────
@@ -600,9 +600,25 @@ consensus-cluster-smoke: ## Run the #469 participation smoke test (up + 30 round
 ## directions, proposer share, vote steps, cadence) -> down, with a
 ## machine-readable summary JSON. Override the round count with
 ## `make consensus-cluster-test ROUNDS=500`.
+##
+## Issue #471 (Epic 42d) adds an OPT-IN restart/rejoin stage to the same
+## run — graceful restart, SIGKILL, and a restart timed into a round the
+## Rust node is proposing in, each asserting rejoin-within-budget, no
+## stall, no fork, and no equivocation across the restart boundary:
+##
+##   make consensus-cluster-test RESTART_SCENARIOS=1
+##   make consensus-cluster-restart          # restart stage only, on an
+##                                           # already-running cluster
 consensus-cluster-test: consensus-analyzer-test ## Run the #470 conformance suite (up + soak + verify + down)
 	cargo build -p algo-fork-detector -p algo-cert-crossverify
-	ROUNDS=$(or $(ROUNDS),200) $(PHASE6_CLUSTER)/scripts/consensus-conformance.sh
+	ROUNDS=$(or $(ROUNDS),200) \
+	RESTART_SCENARIOS=$(or $(RESTART_SCENARIOS),0) \
+	RESTART_MODE=$(or $(RESTART_MODE),all) \
+		$(PHASE6_CLUSTER)/scripts/consensus-conformance.sh
+
+consensus-cluster-restart: ## Run the #471 restart/rejoin scenarios against a RUNNING cluster
+	cargo build -p algo-fork-detector
+	MODE=$(or $(RESTART_MODE),all) $(PHASE6_CLUSTER)/scripts/restart-rejoin.sh
 
 consensus-analyzer-test: ## Unit-test the #470 soak-analyzer logic (no Docker needed)
 	python3 $(PHASE6_CLUSTER)/scripts/analyze_test.py
@@ -765,6 +781,7 @@ help:
 	@echo "  make consensus-cluster-down    Tear down (append PURGE=1 to wipe netroot/)"
 	@echo "  make consensus-cluster-smoke   Up + 30 rounds + lockstep/rejection asserts + down"
 	@echo "  make consensus-cluster-test    #470 conformance suite (up + 200-round soak + verify + down)"
+	@echo "  make consensus-cluster-restart #471 restart/rejoin scenarios against a running cluster"
 	@echo "  make consensus-analyzer-test   Unit-test the #470 soak analyzer (no Docker)"
 	@echo "  (phase6-cluster-up/-status/-down are deprecated aliases)"
 	@echo ""

@@ -151,6 +151,29 @@ detector, both cert-verification directions, and the Go nodes'
 consensus-analyzer-test`), including the negative cases from the
 non-participating topology.
 
+### Issue #471 additions (opt-in restart / rejoin stage)
+
+`RESTART_SCENARIOS=1` adds a restart stage after the soak (or run it
+standalone with `make consensus-cluster-restart` against an already-up
+cluster). It takes the Rust node down mid-round — gracefully, with
+SIGKILL, and with a SIGKILL timed into a round the node is proposing in
+— and adds these acceptance criteria per scenario:
+
+| Check | Adds to acceptance |
+| --- | --- |
+| `rejoin` | back within `LAG_TOLERANCE` of the Go quorum inside `REJOIN_ROUND_BUDGET` Go rounds |
+| `resumed_voting` | at least one attest for a round at/after the restart |
+| `no_stall` | the Go quorum never pauses longer than `MAX_STALL_SECONDS` |
+| `no_fork` | `algo-fork-detector` agrees across all four nodes over the window |
+| `no_equivocation_rust` | no `(round, period, step)` in the node's own vote log carries two different values |
+| `no_equivocation_go` | go-algorand never reports the Rust account via `voteTracker: observed an equivocator` / `EquivocatedVote` |
+
+The equivocation detector (`scripts/equivocation.py`) is unit-tested by
+`scripts/equivocation_test.py` and self-tested at the start of every
+restart run, because a "no equivocation" verdict from a detector that
+never matches anything is worthless. `attests_scanned > 0` is a separate
+precondition for the same reason.
+
 **Explicitly out of scope for TASK-87** (i.e., NOT part of acceptance):
 
 - **Fork detection / cert cross-verify.** TASK-88. This harness'

@@ -52,6 +52,11 @@
 #   PAUSE_SECONDS         how long to pause it              (default 25)
 #   REQUIRE_NEXT_STEP     1 = fail if no period > 0 vote
 #                         was observed                      (default 0)
+#   RESTART_SCENARIOS     1 = also run the issue #471 restart/rejoin
+#                         stage after the soak (graceful restart,
+#                         SIGKILL, restart-as-proposer)      (default 0)
+#   RESTART_MODE          which restart scenarios to run:
+#                         graceful|kill|proposer|all       (default all)
 #   SKIP_START=1          use an already-running cluster
 #   KEEP_CLUSTER=1        leave the cluster up on exit
 #   OUT_DIR               artifact directory (default: a timestamped
@@ -457,6 +462,37 @@ if [ "$REQUIRE_NEXT_STEP" = "1" ]; then
     else
         record "period_advancement_required" fail \
             "no period > 0 vote from the Rust node (REQUIRE_NEXT_STEP=1)"
+    fi
+fi
+
+# -- 7b. (opt-in) restart / rejoin scenarios — issue #471 ---------------
+# Off by default: each scenario takes the Rust node down and waits for it
+# to catch back up, which adds minutes and is a *different* property from
+# the steady-state conformance the rest of this script asserts. Turn on
+# with RESTART_SCENARIOS=1 (make consensus-cluster-test RESTART_SCENARIOS=1).
+if [ "${RESTART_SCENARIOS:-0}" = "1" ]; then
+    echo "==> restart / rejoin scenarios (issue #471, mode=${RESTART_MODE:-all})"
+    restart_rc=0
+    MODE="${RESTART_MODE:-all}" \
+    OUT_DIR="$OUT_DIR/restart" \
+    TOOLS_DIR="$TOOLS_DIR" \
+    LAG_TOLERANCE="$LAG_TOLERANCE" \
+        "$HERE/restart-rejoin.sh" > "$OUT_DIR/restart.log" 2>&1 || restart_rc=$?
+    tail -30 "$OUT_DIR/restart.log" || true
+    if [ -s "$OUT_DIR/restart/restart-summary.json" ]; then
+        while IFS=$'\t' read -r name status detail; do
+            [ -n "$name" ] && record "$name" "$status" "$detail"
+        done < <(python3 -c "
+import json, sys
+s = json.load(open(sys.argv[1]))
+for c in s['checks']:
+    status = c['status'] if c['status'] in ('pass', 'fail') else 'pass'
+    print('restart_{}_{}\t{}\t{}'.format(
+        c['scenario'].replace('-', '_'), c['name'], status, c['detail']))
+" "$OUT_DIR/restart/restart-summary.json")
+    else
+        record "restart_rejoin" fail \
+            "restart-rejoin.sh exited $restart_rc with no summary — see $OUT_DIR/restart.log"
     fi
 fi
 

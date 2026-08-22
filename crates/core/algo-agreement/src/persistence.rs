@@ -198,6 +198,47 @@ impl From<rusqlite::Error> for PersistenceError {
 ///
 /// Mirrors Go's `encode()` in persistence.go. Filters the router to only keep
 /// rounds >= player.Round, matching Go's pre-persistence GC.
+///
+/// ## Why named (map) encoding — issue #471
+///
+/// Every sub-object is encoded with [`rmp_serde::to_vec_named`], which
+/// emits structs as msgpack **maps** with field names, rather than
+/// `to_vec`, which emits them as positional **arrays**.
+///
+/// This is not a style choice; array encoding is silently wrong here.
+/// The persisted graph reaches `algo_types::Block` (via
+/// `RootRouter -> RoundRouter -> ProposalStore -> BlockAssembler ->
+/// UnauthenticatedProposal -> Block`), and `Block` is a
+/// canonical-msgpack type: every field carries
+/// `#[serde(rename = "...", default, skip_serializing_if = "...")]`
+/// because go-algorand's codec omits empty fields. Under array encoding
+/// each omitted field simply disappears from the array and shifts every
+/// later field left, so decoding reads the wrong element for every field
+/// after the first omission. In practice this made the crash state of a
+/// *live* participating node undecodable 100% of the time, with errors
+/// like `invalid type: integer 1787410431, expected 32 bytes` — the
+/// block's `ts` (a unix timestamp in seconds) landing where a 32-byte
+/// digest was expected. `restore_crash_state` then discarded the state
+/// and the node bootstrapped fresh on every restart, making agreement
+/// crash recovery inert. Unit-shaped state (default routers, empty
+/// proposal stores) round-trips fine either way, which is why the bug
+/// survived a large existing test suite; see
+/// `encode_decode_router_holding_a_real_block_proposal`.
+///
+/// Named encoding is also the go-algorand-parity choice: Go persists
+/// with `protocol.Encode`, i.e. canonical msgpack with field names and
+/// omitempty, so a map with omitted-empty keys is exactly Go's shape.
+///
+/// [`decode`] uses `rmp_serde::from_slice`, which accepts both map and
+/// array encodings, so it reads named payloads without further change.
+///
+/// ## Format compatibility
+///
+/// This changes the on-disk `crash.sqlite` payload. Pre-fix blobs fail
+/// to decode — which is exactly the state they were already in — and
+/// `Service::start`'s `restore_crash_state` resets the row and
+/// bootstraps fresh, so the upgrade is a one-time loss of in-flight
+/// crash state and nothing more.
 pub fn encode(
     router: &RootRouter,
     player: &Player,
@@ -210,19 +251,19 @@ pub fn encode(
         .children
         .retain(|&round, _| round.0 >= player.round.0);
 
-    let router_bytes =
-        rmp_serde::to_vec(&filtered_router).map_err(|e| PersistenceError::Encode(e.to_string()))?;
+    let router_bytes = rmp_serde::to_vec_named(&filtered_router)
+        .map_err(|e| PersistenceError::Encode(e.to_string()))?;
     let player_bytes =
-        rmp_serde::to_vec(player).map_err(|e| PersistenceError::Encode(e.to_string()))?;
+        rmp_serde::to_vec_named(player).map_err(|e| PersistenceError::Encode(e.to_string()))?;
     let clock_bytes =
-        rmp_serde::to_vec(clock).map_err(|e| PersistenceError::Encode(e.to_string()))?;
+        rmp_serde::to_vec_named(clock).map_err(|e| PersistenceError::Encode(e.to_string()))?;
 
     let mut action_types = Vec::with_capacity(actions.len());
     let mut encoded_actions = Vec::with_capacity(actions.len());
     for action in actions {
         action_types.push(action.action_type());
         let action_bytes =
-            rmp_serde::to_vec(action).map_err(|e| PersistenceError::Encode(e.to_string()))?;
+            rmp_serde::to_vec_named(action).map_err(|e| PersistenceError::Encode(e.to_string()))?;
         encoded_actions.push(action_bytes);
     }
 
@@ -234,7 +275,7 @@ pub fn encode(
         actions: encoded_actions,
     };
 
-    rmp_serde::to_vec(&disk_state).map_err(|e| PersistenceError::Encode(e.to_string()))
+    rmp_serde::to_vec_named(&disk_state).map_err(|e| PersistenceError::Encode(e.to_string()))
 }
 
 /// Decode persisted agreement state.
@@ -1858,6 +1899,234 @@ mod tests {
         .expect("encode big round");
         let (_, dec_big, _, _) = decode(&raw_big).expect("decode big round");
         assert_eq!(dec_big.round, Round(u64::MAX - 1));
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #471 — the crash state a *live* node writes must decode.
+    //
+    // Every other test in this module builds state out of default /
+    // empty sub-objects, which round-trips no matter how it is encoded.
+    // Real agreement state does not: `RootRouter` transitively holds a
+    // `BlockAssembler`, which holds an `UnauthenticatedProposal`, which
+    // holds a `Block`.
+    //
+    // `Block`/`BlockHeader` are canonical-msgpack types: every field
+    // carries `#[serde(rename = "...", default, skip_serializing_if =
+    // "...")]` because go-algorand's codec omits empty fields from the
+    // *map*. Encoding such a type with `rmp_serde::to_vec` — which emits
+    // structs as positional ARRAYS with no field names — makes each
+    // skipped field vanish from the array and shifts every later field
+    // left. Deserialization then reads the wrong element for each field
+    // and fails, typically as `invalid type: integer <block timestamp>,
+    // expected 32 bytes` where the `ts` field lands on a digest.
+    //
+    // Consequence before the fix: a live node's crash state NEVER
+    // decoded, so `restore_crash_state` always fell back to a fresh
+    // bootstrap and the crash-recovery feature was inert. Observed on
+    // every restart of the mixed-cluster Rust node:
+    //
+    //   WARN failed to decode persisted agreement state: persistence
+    //   corrupt state: invalid type: integer `1787410431`, expected 32
+    //   bytes
+    //
+    // (1787410431 is a unix timestamp in seconds — the block's `ts`.)
+    //
+    // The fix is to encode named, which is also what Go does:
+    // `protocol.Encode` is canonical msgpack with field names and
+    // omitempty, so named encoding is the parity-correct form.
+    // -----------------------------------------------------------------
+
+    /// Build a router shaped like one a participating node actually
+    /// persists: a period holding a proposal payload with a real block.
+    fn router_with_a_real_proposal(round: Round) -> (RootRouter, ProposalValue) {
+        use crate::proposal_store::BlockAssembler;
+        use crate::UnauthenticatedProposal;
+        use algo_types::Block;
+
+        let block = Block {
+            round,
+            // A real, non-zero timestamp — this is the field whose value
+            // showed up in the decode error under array encoding.
+            timestamp: 1_787_410_431,
+            branch: [0x11; 32],
+            seed: [0x22; 32],
+            genesis_id: "phase6net-v1".to_string(),
+            genesis_hash: [0x33; 32],
+            // Deliberately leave several digests zero so
+            // `skip_serializing_if` actually fires.
+            ..Block::default()
+        };
+
+        let pv = ProposalValue {
+            original_period: Period(0),
+            original_proposer: Address([0x44; 32]),
+            block_digest: Digest([0x55; 32]),
+            encoding_digest: Digest([0x66; 32]),
+        };
+
+        let assembler = BlockAssembler {
+            pipeline: UnauthenticatedProposal {
+                block,
+                seed_proof: [0x77; crate::VRF_PROOF_SIZE],
+                original_period: Period(0),
+                original_proposer: Address([0x44; 32]),
+            },
+            filled: true,
+            ..BlockAssembler::default()
+        };
+
+        let mut round_router = RoundRouter::default();
+        round_router.proposal_store.assemblers.insert(pv, assembler);
+        let mut period_router = PeriodRouter::default();
+        period_router.proposal_tracker.staging = pv;
+        round_router.children.insert(Period(0), period_router);
+
+        let mut router = RootRouter::default();
+        router.children.insert(round, round_router);
+        (router, pv)
+    }
+
+    #[test]
+    fn encode_decode_router_holding_a_real_block_proposal() {
+        let (router, pv) = router_with_a_real_proposal(Round(1581));
+        let player = Player {
+            round: Round(1581),
+            ..Player::default()
+        };
+
+        let raw = encode(&router, &player, &ClockState::default(), &[]).expect("encode");
+        let (dec_router, _, _, _) = decode(&raw).expect(
+            "a router holding a real block proposal must round-trip — this is \
+             the shape a participating node actually persists",
+        );
+
+        let rr = &dec_router.children[&Round(1581)];
+        let asm = rr
+            .proposal_store
+            .assemblers
+            .get(&pv)
+            .expect("assembler must survive the round-trip");
+        assert_eq!(asm.pipeline.block.round, Round(1581));
+        assert_eq!(asm.pipeline.block.timestamp, 1_787_410_431);
+        assert_eq!(asm.pipeline.block.branch, [0x11; 32]);
+        assert_eq!(asm.pipeline.block.seed, [0x22; 32]);
+        assert_eq!(asm.pipeline.block.genesis_id, "phase6net-v1");
+        assert_eq!(asm.pipeline.block.genesis_hash, [0x33; 32]);
+        assert_eq!(asm.pipeline.seed_proof, [0x77; crate::VRF_PROOF_SIZE]);
+        assert!(asm.filled);
+    }
+
+    #[test]
+    fn full_persist_restore_cycle_with_a_real_block_proposal() {
+        let conn = mem_db();
+        let (router, _pv) = router_with_a_real_proposal(Round(900));
+        let player = Player {
+            round: Round(900),
+            period: Period(1),
+            step: Step(2),
+            ..Player::default()
+        };
+        let actions = vec![Action::Pseudonode(PseudonodeAction {
+            t: ActionType::Attest,
+            round: Round(900),
+            period: Period(1),
+            step: Step(2),
+            proposal: test_proposal(0x9A),
+        })];
+
+        let raw = encode(&router, &player, &ClockState::default(), &actions).expect("encode");
+        persist(&conn, &raw).expect("persist");
+        let back = restore(&conn).expect("restore").expect("data");
+        let (dec_router, dec_player, _, dec_actions) = decode(&back).expect(
+            "the full persist -> restore -> decode cycle must work for the state \
+             a live node writes",
+        );
+
+        assert_eq!(dec_player.round, Round(900));
+        assert_eq!(dec_player.period, Period(1));
+        assert_eq!(dec_player.step, Step(2));
+        assert_eq!(dec_actions.len(), 1);
+        assert_eq!(
+            dec_router.children[&Round(900)]
+                .proposal_store
+                .assemblers
+                .len(),
+            1
+        );
+    }
+
+    /// Diagnostic: decode a real `crash.sqlite` produced by a live node.
+    ///
+    /// Ignored by default (it needs a file from a real run). Point it at
+    /// one — e.g. `docker cp phase6-rust-node-4:/app/crash.sqlite .` from
+    /// the mixed cluster — to find out *which* sub-object of a
+    /// production-shaped checkpoint fails to decode:
+    ///
+    /// ```bash
+    /// ALGOD_CRASH_DB=/path/to/crash.sqlite cargo test -p algo-agreement \
+    ///     decode_real_crash_db -- --ignored --nocapture
+    /// ```
+    ///
+    /// This exists because unit-test-shaped state (empty routers, default
+    /// players) round-trips cleanly while real state — routers holding
+    /// actual proposals and vote trackers — did not; see issue #471.
+    #[test]
+    #[ignore = "needs ALGOD_CRASH_DB pointing at a real crash.sqlite"]
+    fn decode_real_crash_db() {
+        let Ok(path) = std::env::var("ALGOD_CRASH_DB") else {
+            eprintln!("SKIPPED: set ALGOD_CRASH_DB=/path/to/crash.sqlite");
+            return;
+        };
+        let conn = rusqlite::Connection::open(&path).expect("open crash db");
+        let raw: Vec<u8> = conn
+            .query_row("SELECT data FROM Service WHERE rowid = 1", [], |r| r.get(0))
+            .expect("read Service row");
+        eprintln!("blob: {} bytes", raw.len());
+
+        match decode(&raw) {
+            Ok((r, p, _c, a)) => eprintln!(
+                "decode(): OK — player {}/{}/{}, {} router rounds, {} actions",
+                p.round,
+                p.period,
+                p.step,
+                r.children.len(),
+                a.len()
+            ),
+            Err(e) => eprintln!("decode(): FAILED — {e}"),
+        }
+
+        // Narrow the failure down to a single sub-object.
+        let ds: DiskState = match rmp_serde::from_slice(&raw) {
+            Ok(d) => d,
+            Err(e) => {
+                panic!("DiskState itself failed to decode: {e}");
+            }
+        };
+        eprintln!(
+            "  DiskState: OK (router {} B, player {} B, clock {} B, {} actions)",
+            ds.router.len(),
+            ds.player.len(),
+            ds.clock.len(),
+            ds.actions.len()
+        );
+        match rmp_serde::from_slice::<Player>(&ds.player) {
+            Ok(p) => eprintln!("  player: OK {}/{}/{}", p.round, p.period, p.step),
+            Err(e) => eprintln!("  player: FAILED {e}"),
+        }
+        match rmp_serde::from_slice::<RootRouter>(&ds.router) {
+            Ok(r) => eprintln!("  router: OK ({} rounds)", r.children.len()),
+            Err(e) => eprintln!("  router: FAILED {e}"),
+        }
+        match rmp_serde::from_slice::<ClockState>(&ds.clock) {
+            Ok(_) => eprintln!("  clock: OK"),
+            Err(e) => eprintln!("  clock: FAILED {e}"),
+        }
+        for (i, bytes) in ds.actions.iter().enumerate() {
+            match rmp_serde::from_slice::<Action>(bytes) {
+                Ok(_) => eprintln!("  action[{i}] {:?}: OK", ds.action_types[i]),
+                Err(e) => eprintln!("  action[{i}] {:?}: FAILED {e}", ds.action_types[i]),
+            }
+        }
     }
 
     // -- Test: decode single random byte ------------------------------------

@@ -24,3 +24,7 @@ scripts/__pycache__/
 
 # Rendered template handed to `goal network create` (transient).
 .template.rendered.json
+
+# Issue #471 restart/rejoin artifact directories (per-scenario node logs,
+# fork-detector JSONL, restart-summary.json). Same rationale as above.
+restart-*/
