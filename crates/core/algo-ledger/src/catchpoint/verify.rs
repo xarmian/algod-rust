@@ -86,7 +86,7 @@ fn encode_algo_count(ac: &AlgoCount) -> Vec<u8> {
 ///
 /// Top-level keys (sorted): `"notpart"`, `"offline"`, `"online"`, `"rwdlvl"`.
 /// Struct-valued fields are omitted when all-zero; uint fields omitted when zero.
-fn encode_account_totals(totals: &AccountTotals) -> Vec<u8> {
+pub(crate) fn encode_account_totals(totals: &AccountTotals) -> Vec<u8> {
     // Build entries. For struct fields, encode them as sub-maps and only include
     // if non-zero. For u64 fields, only include if non-zero.
     // Sorted order: "notpart", "offline", "online", "rwdlvl"
@@ -126,7 +126,7 @@ fn encode_string_uint_map(entries: &[(&str, u64)]) -> Vec<u8> {
 }
 
 /// Encode a msgpack map with string keys and pre-encoded msgpack values.
-fn encode_mixed_map(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+pub(crate) fn encode_mixed_map(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
     let mut buf = Vec::new();
     let len = entries.len();
 
@@ -164,7 +164,7 @@ fn encode_mixed_map(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
 }
 
 /// Encode a u64 as msgpack using the most compact representation.
-fn encode_msgpack_uint(v: u64) -> Vec<u8> {
+pub(crate) fn encode_msgpack_uint(v: u64) -> Vec<u8> {
     let mut buf = Vec::new();
     if v <= 0x7F {
         buf.push(v as u8); // positive fixint
@@ -275,7 +275,7 @@ fn encode_msgpack_str(s: &str) -> Vec<u8> {
 }
 
 /// Encode a byte slice as msgpack binary format.
-fn encode_msgpack_bin(b: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_msgpack_bin(b: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
     rmp::encode::write_bin(&mut buf, b).expect("write_bin to Vec never fails");
     buf
@@ -359,6 +359,42 @@ fn encode_sp_verification_wrapper(contexts: &[SpVerificationCtxFull]) -> Vec<u8>
 ///
 /// Reference: `go-algorand/ledger/catchupaccessor.go` -- `GetVerifyData`
 pub fn calculate_sp_verification_hash(conn: &Connection) -> Result<[u8; 32], CatchpointError> {
+    let blob = build_sp_verification_blob(conn)?;
+    Ok(hash_sp_verification_blob(&blob))
+}
+
+/// Hash an already-encoded SP verification wrapper blob.
+///
+/// `SHA512_256("spv" || blob)`, matching Go's `crypto.HashObj` over
+/// `catchpointStateProofVerificationContext` (`protocol.StateProofVerCtx`
+/// hash ID is the ASCII prefix `"spv"`).
+pub fn hash_sp_verification_blob(blob: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha512_256::new();
+    hasher.update(b"spv");
+    hasher.update(blob);
+    let result = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
+}
+
+/// Build the canonical msgpack blob written to the catchpoint file's
+/// `stateProofVerificationContext.msgpack` entry.
+///
+/// This is the exact byte string Go hashes to obtain the SP verification
+/// component of the catchpoint label (`catchpointTracker.getSPVerificationData`
+/// in `../go-algorand/ledger/catchpointtracker.go`), so the writer and the
+/// label computation are guaranteed to agree.
+pub fn build_sp_verification_blob(conn: &Connection) -> Result<Vec<u8>, CatchpointError> {
+    let contexts = read_sp_verification_contexts(conn)?;
+    Ok(encode_sp_verification_wrapper(&contexts))
+}
+
+/// Read and decode every row of the `stateproofverification` table, ordered
+/// by `lastattestedround` (matching Go's iteration order).
+fn read_sp_verification_contexts(
+    conn: &Connection,
+) -> Result<Vec<SpVerificationCtxFull>, CatchpointError> {
     let mut stmt = conn
         .prepare(
             "SELECT verificationContext FROM stateproofverification \
@@ -390,16 +426,7 @@ pub fn calculate_sp_verification_hash(conn: &Connection) -> Result<[u8; 32], Cat
         contexts.push(ctx);
     }
 
-    let encoded_wrapper = encode_sp_verification_wrapper(&contexts);
-
-    // Hash: SHA512_256("spv" || encoded_wrapper)
-    let mut hasher = Sha512_256::new();
-    hasher.update(b"spv");
-    hasher.update(&encoded_wrapper);
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    Ok(hash)
+    Ok(contexts)
 }
 
 /// Canonically encode an `OnlineAccountRecordV6` as msgpack.
@@ -411,7 +438,7 @@ pub fn calculate_sp_verification_hash(conn: &Connection) -> Result<[u8; 32], Cat
 /// - `data`: Go `msgp.Raw` -- raw msgpack bytes injected directly (not bin-wrapped).
 /// - `update_round`, `vote_last_valid`: Go `basics.Round` (u64), omitted when zero.
 /// - `normalized_balance`: u64, omitted when zero.
-fn encode_online_account_record(
+pub(crate) fn encode_online_account_record(
     address: &[u8],
     update_round: u64,
     normalized_balance: u64,
@@ -505,7 +532,7 @@ pub fn calculate_online_accounts_hash(conn: &Connection) -> Result<[u8; 32], Cat
 /// Keys (sorted): `"data"`, `"rnd"`.
 /// Uses omitempty: zero fields and empty bytes are omitted.
 /// The `data` field is `msgp.Raw` in Go -- raw msgpack bytes injected directly.
-fn encode_online_round_params_record(round: u64, data: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_online_round_params_record(round: u64, data: &[u8]) -> Vec<u8> {
     // Sorted key order: data < rnd
     let mut entries: Vec<(&str, Vec<u8>)> = Vec::new();
     if !data.is_empty() {
@@ -1015,7 +1042,7 @@ fn read_acctrounds(conn: &Connection, key: &str) -> Result<i64, CatchpointError>
 }
 
 /// Read the `accounttotals` row from the database.
-fn read_account_totals(conn: &Connection) -> Result<AccountTotals, CatchpointError> {
+pub(crate) fn read_account_totals(conn: &Connection) -> Result<AccountTotals, CatchpointError> {
     let (online, online_ru, offline, offline_ru, nopart, nopart_ru, rwdlvl): (
         i64,
         i64,
@@ -1064,7 +1091,7 @@ fn read_account_totals(conn: &Connection) -> Result<AccountTotals, CatchpointErr
 }
 
 /// Count rows in the `accountbase` table.
-fn count_accounts(conn: &Connection) -> Result<u64, CatchpointError> {
+pub(crate) fn count_accounts(conn: &Connection) -> Result<u64, CatchpointError> {
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM accountbase", [], |row| row.get(0))
         .map_err(|e| {

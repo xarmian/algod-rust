@@ -7,6 +7,82 @@ use thiserror::Error;
 use algo_types::AccountData;
 
 // ---------------------------------------------------------------------------
+// Go `msgp.Raw` field support
+// ---------------------------------------------------------------------------
+//
+// Several catchpoint record fields are typed `msgp.Raw` in go-algorand
+// (`../go-algorand/ledger/encoded/recordsV6.go`): `BalanceRecordV6.AccountData`
+// (`"b"`), the values of `BalanceRecordV6.Resources` (`"c"`),
+// `OnlineAccountRecordV6.Data` and `OnlineRoundParamsRecordV6.Data`
+// (both `"data"`). Go writes a `msgp.Raw` by splicing the already-encoded
+// bytes straight into the stream, so in a real go-algorand catchpoint file
+// these fields appear as an *embedded msgpack map*, not as a msgpack `bin`
+// blob.
+//
+// The Rust model keeps them as `ByteBuf` (the raw blob is stored verbatim in
+// SQLite and hashed as-is), so decoding needs to accept both shapes:
+//
+//   * `bin`  — produced by `rmp_serde::to_vec_named` on these types (used by
+//     this crate's own test fixtures and by any writer that round-trips the
+//     serde impls);
+//   * anything else (in practice a `map`) — produced by go-algorand and by
+//     [`crate::catchpoint::writer`], which mirrors Go's canonical encoding.
+//
+// [`deserialize_msgp_raw`] and [`deserialize_msgp_raw_map`] normalize both
+// into the raw blob bytes. Serialization is unchanged (`ByteBuf` -> `bin`);
+// the go-canonical writer hand-rolls its encoding rather than going through
+// serde, exactly as `verify.rs` does for hash-critical paths.
+
+/// Re-encode a decoded msgpack value back into its raw byte form.
+///
+/// `Value::Binary` is treated as an already-unwrapped raw blob (the `bin`
+/// shape described above); every other value is re-encoded. `rmpv` preserves
+/// map entry order and the str/bin distinction, and writes integers in their
+/// shortest form.
+///
+/// **Caveat:** the embedded-map path is byte-exact only for *canonically*
+/// encoded input — i.e. integers already in shortest form. go-codec (and this
+/// workspace's `algo_codec::canonical_encode_*`) always emit shortest-form
+/// integers, so every blob produced by go-algorand or by algod-rust survives
+/// verbatim; a hand-crafted blob with an over-wide integer would be rewritten
+/// (and would therefore hash differently). The `bin` path is always
+/// byte-exact.
+fn msgp_raw_bytes<E: serde::de::Error>(value: rmpv::Value) -> Result<Vec<u8>, E> {
+    match value {
+        rmpv::Value::Binary(b) => Ok(b),
+        rmpv::Value::Nil => Ok(Vec::new()),
+        other => {
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, &other)
+                .map_err(|e| E::custom(format!("re-encode msgp.Raw field: {e}")))?;
+            Ok(buf)
+        }
+    }
+}
+
+/// `serde` adapter for a Go `msgp.Raw` field.
+fn deserialize_msgp_raw<'de, D>(deserializer: D) -> Result<ByteBuf, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = rmpv::Value::deserialize(deserializer)?;
+    Ok(ByteBuf::from(msgp_raw_bytes::<D::Error>(value)?))
+}
+
+/// `serde` adapter for a `map[uint64]msgp.Raw` field.
+fn deserialize_msgp_raw_map<'de, D>(deserializer: D) -> Result<HashMap<u64, ByteBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: HashMap<u64, rmpv::Value> = HashMap::deserialize(deserializer)?;
+    let mut out = HashMap::with_capacity(raw.len());
+    for (k, v) in raw {
+        out.insert(k, ByteBuf::from(msgp_raw_bytes::<D::Error>(v)?));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Catchpoint file format version constants
 // From go-algorand/ledger/catchpointtracker.go
 // These are Go octal literals: 0200 = 128, 0201 = 129, 0202 = 130, 0203 = 131
@@ -201,11 +277,11 @@ pub struct BalanceRecordV6 {
     pub address: ByteBuf,
 
     /// Raw msgp-encoded `baseAccountData` blob (decoded separately in Wave 2).
-    #[serde(rename = "b", default)]
+    #[serde(rename = "b", default, deserialize_with = "deserialize_msgp_raw")]
     pub account_data: ByteBuf,
 
     /// Map of creatable index -> raw msgp-encoded `resourcesData`.
-    #[serde(rename = "c", default)]
+    #[serde(rename = "c", default, deserialize_with = "deserialize_msgp_raw_map")]
     pub resources: HashMap<u64, ByteBuf>,
 
     /// Flag indicating whether there are more records for the same account.
@@ -253,7 +329,7 @@ pub struct OnlineAccountRecordV6 {
     pub vote_last_valid: u64,
 
     /// Raw msgp-encoded `BaseOnlineAccountData`.
-    #[serde(rename = "data", default)]
+    #[serde(rename = "data", default, deserialize_with = "deserialize_msgp_raw")]
     pub data: ByteBuf,
 }
 
@@ -269,7 +345,7 @@ pub struct OnlineRoundParamsRecordV6 {
     pub round: u64,
 
     /// Raw msgp-encoded `OnlineRoundParamsData`.
-    #[serde(rename = "data", default)]
+    #[serde(rename = "data", default, deserialize_with = "deserialize_msgp_raw")]
     pub data: ByteBuf,
 }
 

@@ -243,7 +243,7 @@ pub enum Commands {
         relay_addr: Vec<String>,
     },
 
-    /// Catchpoint operations: import, verify, and download catchpoint files.
+    /// Catchpoint operations: import, verify, export, and download catchpoint files.
     Catchpoint {
         #[command(subcommand)]
         action: CatchpointAction,
@@ -563,6 +563,39 @@ pub enum CatchpointAction {
         /// Path to the catchpoint file (required for block header digest).
         #[arg(long)]
         file: Option<PathBuf>,
+    },
+
+    /// Export a catchpoint file from a local ledger database.
+    Export {
+        /// Ledger path (prefix, or a `.sqlite` / `.tracker.sqlite` path).
+        #[arg(long, default_value = "./ledger.sqlite")]
+        db: PathBuf,
+
+        /// Output catchpoint file path.
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Round of the account snapshot. Defaults to `acctrounds('acctbase')`.
+        #[arg(long)]
+        round: Option<u64>,
+
+        /// Block round anchoring the label. Defaults to `--round`.
+        #[arg(long)]
+        blocks_round: Option<u64>,
+
+        /// Hex-encoded 32-byte block header digest for `--blocks-round`.
+        /// Defaults to the digest of that block in the ledger's block DB.
+        #[arg(long)]
+        block_digest: Option<String>,
+
+        /// Skip the onlineaccounts / onlineroundparamstail tables
+        /// (pre-consensus-v40 catchpoint contents).
+        #[arg(long)]
+        no_online_data: bool,
+
+        /// Write an uncompressed tar instead of tar.gz.
+        #[arg(long)]
+        no_gzip: bool,
     },
 
     /// Download a catchpoint file from an algod node.

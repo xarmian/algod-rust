@@ -183,6 +183,26 @@ async fn main() -> anyhow::Result<()> {
             CatchpointAction::Verify { db, file } => {
                 commands::catchpoint::run_verify(&db, file.as_deref()).await?;
             }
+            CatchpointAction::Export {
+                db,
+                output,
+                round,
+                blocks_round,
+                block_digest,
+                no_online_data,
+                no_gzip,
+            } => {
+                commands::catchpoint::run_export(
+                    &db,
+                    &output,
+                    round,
+                    blocks_round,
+                    block_digest.as_deref(),
+                    no_online_data,
+                    no_gzip,
+                )
+                .await?;
+            }
             CatchpointAction::Download {
                 url,
                 token,
