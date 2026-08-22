@@ -281,6 +281,76 @@ and caches both in named Docker volumes (first run ~3-5 min, later runs
 seconds). That is also the only supported path on Windows, where the
 host checkout's line endings break autotools.
 
+## Restart / rejoin conformance (issue #471, Epic 42d)
+
+`scripts/restart-rejoin.sh` takes the Rust node down **while rounds are
+being produced** and asserts it comes back correctly. It does not manage
+cluster lifetime — bring the cluster up first, and a failing run leaves
+it up for inspection.
+
+```bash
+make consensus-cluster-up
+cargo build -p algo-fork-detector
+
+# All three scenarios (graceful, SIGKILL, restart-as-proposer):
+make consensus-cluster-restart
+
+# One scenario:
+RESTART_MODE=kill make consensus-cluster-restart
+bash ops/mixed-cluster/scripts/restart-rejoin.sh --mode graceful
+
+# As an opt-in stage of the #470 suite (it will start/stop the cluster):
+make consensus-cluster-test RESTART_SCENARIOS=1
+
+# Through cargo, gated like the other cluster tests:
+MIXED_CLUSTER=1 cargo test -p algo-network --test consensus_conformance \
+    restart -- --ignored --nocapture
+```
+
+### Scenarios
+
+| mode | how the node goes down | what it exercises |
+| --- | --- | --- |
+| `graceful` | `docker restart` (SIGTERM) | clean shutdown + rejoin |
+| `kill` | `docker kill -s KILL` | real crash recovery — the node comes back off whatever the async persistence loop had committed to `crash.sqlite` at the instant it died |
+| `proposer` | SIGKILL timed into a round the node is proposing in | period advancement around a lost proposer |
+
+The proposer window is driven off the node's own log: the agreement
+service emits `assembled N proposal message(s) at (round, period)`
+only when sortition handed it a proposer credential, so the script waits
+for that line and kills `PROPOSER_KILL_DELAY` seconds later. At the
+harness's 10% stake this lands within a handful of rounds without
+needing the stake split changed.
+
+### Assertions
+
+Per scenario:
+
+* **rejoin** — back to within `LAG_TOLERANCE` of the Go quorum inside
+  `REJOIN_ROUND_BUDGET` Go rounds and `REJOIN_TIMEOUT` seconds.
+* **resumed_voting** — at least one attest for a round at/after the
+  restart, so a replayed pre-crash checkpoint cannot be mistaken for
+  fresh participation.
+* **no_stall** — the Go quorum never goes `MAX_STALL_SECONDS` without
+  advancing, during or after the outage.
+* **no_fork** — `algo-fork-detector` over **all four** nodes across the
+  restart window.
+* **no_equivocation_rust** — `scripts/equivocation.py` groups every
+  `attested to ... at (round, period, step)` line in the container's
+  whole log (which spans the restart, since `docker restart`/`docker
+  kill` keep the same container) by coordinate and fails if any
+  coordinate carries two *different* values. Replaying the same vote is
+  fine and expected; a second, different value is a double vote.
+* **no_equivocation_go** — go-algorand's own detector:
+  `voteTracker: observed an equivocator` / `EquivocatedVote`
+  (`agreement/voteTracker.go:134,178`) naming the Rust account.
+
+`equivocation.py` is unit-tested by `equivocation_test.py`, which the
+script runs as a **self-test before the scenarios** — a green
+"no equivocation" verdict is only meaningful if the detector provably
+catches a synthetic double vote, and `attests_scanned > 0` is separately
+required so an empty scan can never pass.
+
 ## Phase B writer-side acceptance (TASK-127)
 
 The `handoff-rust-to-go.sh` script is PLAN-36's end-to-end acceptance

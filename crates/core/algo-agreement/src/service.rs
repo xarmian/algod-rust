@@ -223,36 +223,7 @@ where
         // Try to restore persisted state BEFORE creating the persistence loop
         // (which takes ownership of the connection). We need a separate
         // connection for restore, or we do restore first with the same one.
-        let restored_state = if let Some(ref conn) = crash_db {
-            match persistence::restore(conn) {
-                Ok(Some(raw)) => match persistence::decode(&raw) {
-                    Ok((router, player, clock, actions)) => {
-                        info!(
-                            "restored persisted agreement state at round {}, period {}, step {}",
-                            player.round, player.period, player.step
-                        );
-                        Some((router, player, clock, actions))
-                    }
-                    Err(e) => {
-                        warn!(
-                            "failed to decode persisted agreement state: {}; starting fresh",
-                            e
-                        );
-                        None
-                    }
-                },
-                Ok(None) => {
-                    debug!("no persisted agreement state found; starting fresh");
-                    None
-                }
-                Err(e) => {
-                    warn!("failed to restore agreement state: {}; starting fresh", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let restored_state = crash_db.as_ref().and_then(restore_crash_state);
 
         // Create the persistence loop if crash_db is available.
         let persistence_loop = crash_db.map(|conn| {
@@ -455,31 +426,8 @@ fn main_loop<L, K, BF, R>(
     // assignment in `agreement/service.go:252` so timeouts continue to
     // fire on their original schedule rather than being reset by the
     // restart (DOC-21 §3.8).
-    let (mut router, mut player, mut actions) = if let Some((
-        r_router,
-        mut r_player,
-        r_clock,
-        r_actions,
-    )) = restored_state
-    {
-        // Use restored state only if it is still relevant (round >= ledger's next round).
-        if r_player.round.0 >= next_round.0 {
-            info!(
-                "using restored agreement state at round {} (ledger next round {})",
-                r_player.round, next_round
-            );
-            resume_from_clock_zero(&mut r_player, &r_clock, SystemTime::now());
-            (r_router, r_player, r_actions)
-        } else {
-            info!(
-                    "restored agreement state at round {} is stale (ledger next round {}); bootstrapping fresh",
-                    r_player.round, next_round
-                );
-            bootstrap_fresh(next_round, &cparams)
-        }
-    } else {
-        bootstrap_fresh(next_round, &cparams)
-    };
+    let (mut router, mut player, mut actions) =
+        initial_state(restored_state, next_round, &cparams, SystemTime::now());
 
     // Create the pseudonode for local proposal/vote generation.
     // We share ledger via a clone of the Arc, but AsyncPseudonode wants
@@ -698,6 +646,23 @@ fn execute_pseudonode_action(
         ActionType::Assemble => {
             match pseudonode.make_proposals(pa.round, pa.period) {
                 Ok(message_events) => {
+                    // Sortition only hands back proposal messages when this
+                    // node actually holds a proposer credential for
+                    // (round, period), so a non-empty result is the moment
+                    // the node becomes a candidate proposer. Logged at INFO
+                    // because it is the only externally visible signal of
+                    // that fact — issue #471's restart-during-own-proposal
+                    // scenario keys its restart off this line, and it makes
+                    // "did we propose this round?" answerable from the node's
+                    // own log instead of only from the committed block.
+                    if !message_events.is_empty() {
+                        info!(
+                            "assembled {} proposal message(s) at ({}, {})",
+                            message_events.len(),
+                            pa.round,
+                            pa.period
+                        );
+                    }
                     let ext_events: Vec<ExternalEvent> = message_events
                         .into_iter()
                         .map(|me| ExternalEvent {
@@ -905,6 +870,134 @@ fn resume_from_clock_zero(player: &mut Player, clock: &ClockState, now: SystemTi
             info!("restored agreement state has no clock zero; starting fresh clock epoch");
             now
         }
+    }
+}
+
+/// The restored agreement state read back out of the crash-recovery
+/// database: `(router, player, clock, pending actions)`.
+pub(crate) type RestoredState = (RootRouter, Player, ClockState, Vec<Action>);
+
+/// Read and decode crash-recovery state, mirroring go-algorand
+/// v4.5.1-stable `agreement/service.go:mainLoop` lines 220-232.
+///
+/// Returns `None` when there is nothing usable to restore, in which case
+/// the caller bootstraps a fresh player.
+///
+/// ## Go parity: reset on undecodable state
+///
+/// Go's `mainLoop` does:
+///
+/// ```text
+/// raw, err := restore(...)
+/// if err == nil {
+///     clock, router, status, a, err = decode(raw, ...)
+///     if err != nil {
+///         reset(s.log, s.Accessor)   // <-- wipe the undecodable blob
+///     }
+/// }
+/// ```
+///
+/// The `reset` is load-bearing for crash recovery: without it an
+/// undecodable blob stays in the `Service` table across every subsequent
+/// restart, so each boot re-reads and re-fails on the same bytes, and
+/// (worse) any later code that treats "a row exists" as "we have crash
+/// state" sees stale, unusable state. Go throws it away immediately and
+/// starts clean. This port previously logged the decode error and moved
+/// on without clearing the row; `reset` is now called to match.
+///
+/// A failure of `restore` itself (an I/O/SQL-level error) is NOT reset —
+/// Go doesn't either, because the database is not known to be readable
+/// or writable at that point.
+pub(crate) fn restore_crash_state(conn: &rusqlite::Connection) -> Option<RestoredState> {
+    match persistence::restore(conn) {
+        Ok(Some(raw)) => match persistence::decode(&raw) {
+            Ok((router, player, clock, actions)) => {
+                info!(
+                    "restored persisted agreement state at round {}, period {}, step {}",
+                    player.round, player.period, player.step
+                );
+                Some((router, player, clock, actions))
+            }
+            Err(e) => {
+                warn!(
+                    "failed to decode persisted agreement state: {}; \
+                     resetting crash state and starting fresh",
+                    e
+                );
+                if let Err(reset_err) = persistence::reset(conn) {
+                    warn!("failed to reset crash state after decode failure: {reset_err}");
+                }
+                None
+            }
+        },
+        Ok(None) => {
+            debug!("no persisted agreement state found; starting fresh");
+            None
+        }
+        Err(e) => {
+            warn!("failed to restore agreement state: {}; starting fresh", e);
+            None
+        }
+    }
+}
+
+/// Decide the state the main loop starts from: the crash-recovered state
+/// when it is still relevant, otherwise a fresh bootstrap at the ledger's
+/// next round.
+///
+/// Mirrors go-algorand v4.5.1-stable `agreement/service.go:232-252`:
+///
+/// ```text
+/// if err != nil || status.Round < s.Ledger.NextRound() {
+///     ... fresh player at NextRound, actions = [assemble, rezero] ...
+/// } else {
+///     s.Clock = clock
+/// }
+/// ```
+///
+/// Restored state whose round has *already been committed* by the ledger
+/// (`player.round < ledger.next_round`) is stale — the network moved on
+/// while we were down and replaying it would re-drive a decided round —
+/// so it is discarded. Restored state at or ahead of the ledger's next
+/// round is adopted verbatim, together with its pending actions.
+///
+/// ## Why this is the equivocation guard
+///
+/// The pending-action list persisted alongside the player is written
+/// *before* the corresponding `Attest` is broadcast (see the
+/// `ActionType::Attest` arm above), so any vote that reached the wire had
+/// its `(round, period, step, proposal)` durably recorded first. Adopting
+/// the restored player verbatim therefore restarts the state machine at
+/// the same `(round, period, step)` it crashed at, with the same staged
+/// proposal — so a replayed attest re-signs the *identical* value rather
+/// than a second, different one at the same step. Rewinding to an earlier
+/// step (or bootstrapping fresh at a round already voted in) is what would
+/// permit a double vote, and neither branch here does that.
+fn initial_state(
+    restored_state: Option<RestoredState>,
+    next_round: Round,
+    cparams: &algo_types::ConsensusParams,
+    now: SystemTime,
+) -> (RootRouter, Player, Vec<Action>) {
+    let Some((r_router, mut r_player, r_clock, r_actions)) = restored_state else {
+        return bootstrap_fresh(next_round, cparams);
+    };
+
+    // Use restored state only if it is still relevant (round >= ledger's next round).
+    if r_player.round.0 >= next_round.0 {
+        info!(
+            "using restored agreement state at round {} (ledger next round {})",
+            r_player.round, next_round
+        );
+        resume_from_clock_zero(&mut r_player, &r_clock, now);
+        (r_router, r_player, r_actions)
+    } else {
+        info!(
+            "restored agreement state at round {} is stale (ledger next round {}); \
+             bootstrapping fresh",
+            r_player.round, next_round
+        );
+        bootstrap_fresh(next_round, cparams)
     }
 }
 
@@ -1938,5 +2031,513 @@ mod tests {
 
         assert_eq!(reader_ref.next_round(), Round(42));
         assert!(reader_ref.consensus_params(Round(1)).is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #471 — restart / rejoin crash-recovery semantics.
+    //
+    // These exercise the two functions the agreement service uses to
+    // decide what state it wakes up in after a restart:
+    //
+    //   * `restore_crash_state` — read + decode the crash DB, mirroring
+    //     go-algorand `agreement/service.go:220-231` (including the
+    //     `reset()` on an undecodable blob).
+    //   * `initial_state`       — adopt vs. discard the restored state,
+    //     mirroring `agreement/service.go:232-252`.
+    //
+    // The safety property under test is *no equivocation*: a restart
+    // must never put the player back at a `(round, period, step)` it has
+    // already voted in with a different value, and must never rewind to
+    // an earlier step within a round it already voted in.
+    // -----------------------------------------------------------------
+
+    use crate::actions::{NoopAction, PseudonodeAction};
+    use crate::persistence::{encode, persist};
+    use crate::router::{PeriodRouter, RoundRouter};
+    use crate::step::{CERT, NEXT, PROPOSE};
+    use crate::vote::{ProposalValue, BOTTOM};
+    use algo_types::Digest;
+
+    fn crash_db() -> rusqlite::Connection {
+        rusqlite::Connection::open_in_memory().expect("in-memory crash db")
+    }
+
+    fn proposal(seed: u8) -> ProposalValue {
+        ProposalValue {
+            original_period: Period(0),
+            original_proposer: Address([seed; 32]),
+            block_digest: Digest([seed; 32]),
+            encoding_digest: Digest([seed.wrapping_add(0x10); 32]),
+        }
+    }
+
+    /// Build the state a node would have persisted at the checkpoint just
+    /// before broadcasting a vote for `value` at `(round, period, step)`:
+    /// a player parked at that coordinate, a router with `value` staged in
+    /// that period, and the pending `Attest` action itself.
+    ///
+    /// This mirrors the `ActionType::Attest` arm of `do_pseudonode_action`,
+    /// which encodes `persist_router` / `persist_player` / `persist_actions`
+    /// and waits for the write to land *before* the vote reaches the wire.
+    fn checkpoint_before_vote(
+        round: Round,
+        period: Period,
+        step: Step,
+        value: ProposalValue,
+    ) -> (RootRouter, Player, Vec<Action>) {
+        let player = Player {
+            round,
+            period,
+            step,
+            deadline: Deadline {
+                duration: Duration::from_secs(4),
+                timeout_type: TimeoutType::Deadline,
+            },
+            ..Player::default()
+        };
+
+        let mut period_router = PeriodRouter::default();
+        period_router.proposal_tracker.staging = value;
+        let mut round_router = RoundRouter::default();
+        round_router.children.insert(period, period_router);
+        let mut router = RootRouter::default();
+        router.children.insert(round, round_router);
+
+        let actions = vec![Action::Pseudonode(PseudonodeAction {
+            t: ActionType::Attest,
+            round,
+            period,
+            step,
+            proposal: value,
+        })];
+
+        (router, player, actions)
+    }
+
+    /// Write a checkpoint into `conn` exactly as the persistence loop would.
+    fn write_checkpoint(
+        conn: &rusqlite::Connection,
+        router: &RootRouter,
+        player: &Player,
+        actions: &[Action],
+        zero: SystemTime,
+    ) {
+        let raw = encode(router, player, &ClockState::with_zero(zero), actions).expect("encode");
+        persist(conn, &raw).expect("persist");
+    }
+
+    // -- restore_crash_state ------------------------------------------
+
+    #[test]
+    fn restore_crash_state_returns_none_on_empty_db() {
+        let conn = crash_db();
+        assert!(
+            restore_crash_state(&conn).is_none(),
+            "an empty crash DB must yield a fresh bootstrap, not a restore"
+        );
+    }
+
+    #[test]
+    fn restore_crash_state_round_trips_a_checkpoint() {
+        let conn = crash_db();
+        let value = proposal(0x7A);
+        let (router, player, actions) = checkpoint_before_vote(Round(880), Period(3), SOFT, value);
+        write_checkpoint(&conn, &router, &player, &actions, SystemTime::now());
+
+        let (dec_router, dec_player, _clock, dec_actions) =
+            restore_crash_state(&conn).expect("checkpoint must be restorable");
+
+        assert_eq!(dec_player.round, Round(880));
+        assert_eq!(dec_player.period, Period(3));
+        assert_eq!(dec_player.step, SOFT);
+        assert_eq!(
+            dec_router.children[&Round(880)].children[&Period(3)]
+                .proposal_tracker
+                .staging,
+            value,
+            "the staged proposal must survive the restart"
+        );
+        assert_eq!(dec_actions.len(), 1);
+        match &dec_actions[0] {
+            Action::Pseudonode(pa) => {
+                assert_eq!(pa.t, ActionType::Attest);
+                assert_eq!(
+                    (pa.round, pa.period, pa.step),
+                    (Round(880), Period(3), SOFT)
+                );
+                assert_eq!(pa.proposal, value);
+            }
+            other => panic!("expected a pending Attest action, got {other:?}"),
+        }
+    }
+
+    /// go-algorand wipes the `Service` row when `decode` fails
+    /// (`agreement/service.go:225-227`, `reset(s.log, s.Accessor)`), so a
+    /// corrupt blob never survives to be re-read on the next boot. This
+    /// port previously only logged and left the row in place.
+    #[test]
+    fn restore_crash_state_resets_the_db_on_a_corrupt_blob() {
+        let conn = crash_db();
+        persist(&conn, &[0xDE, 0xAD, 0xBE, 0xEF]).expect("persist garbage");
+
+        assert!(
+            restore_crash_state(&conn).is_none(),
+            "a corrupt blob must not be adopted as agreement state"
+        );
+        assert!(
+            crate::persistence::restore(&conn)
+                .expect("restore")
+                .is_none(),
+            "go-algorand resets the crash DB after a decode failure; \
+             the undecodable row must be gone"
+        );
+    }
+
+    /// A truncated blob is the realistic SIGKILL failure mode (the write
+    /// was in flight when the process died). Same handling as garbage.
+    #[test]
+    fn restore_crash_state_resets_the_db_on_a_truncated_blob() {
+        let conn = crash_db();
+        let (router, player, actions) =
+            checkpoint_before_vote(Round(12), Period(0), SOFT, proposal(1));
+        let raw = encode(
+            &router,
+            &player,
+            &ClockState::with_zero(SystemTime::now()),
+            &actions,
+        )
+        .expect("encode");
+        persist(&conn, &raw[..raw.len() / 2]).expect("persist truncated");
+
+        assert!(restore_crash_state(&conn).is_none());
+        assert!(crate::persistence::restore(&conn)
+            .expect("restore")
+            .is_none());
+    }
+
+    // -- initial_state: adopt vs. discard ------------------------------
+
+    /// Restart mid-period: the ledger has NOT moved past the crashed
+    /// round, so the restored player is adopted verbatim — same round,
+    /// same period, same step, same pending attest. Go:
+    /// `status.Round >= s.Ledger.NextRound()` takes the `else` branch and
+    /// keeps the decoded player.
+    #[test]
+    fn initial_state_adopts_restored_state_mid_period() {
+        let value = proposal(0x33);
+        let (router, player, actions) = checkpoint_before_vote(Round(500), Period(4), NEXT, value);
+        let now = SystemTime::now();
+        let restored = Some((router, player, ClockState::with_zero(now), actions));
+
+        let (out_router, out_player, out_actions) =
+            initial_state(restored, Round(500), &v41_params(), now);
+
+        assert_eq!(out_player.round, Round(500));
+        assert_eq!(
+            out_player.period,
+            Period(4),
+            "a restart must not rewind the period — re-voting in an earlier \
+             period is exactly how a node equivocates"
+        );
+        assert_eq!(
+            out_player.step, NEXT,
+            "a restart must not rewind the step within the period"
+        );
+        assert_eq!(
+            out_router.children[&Round(500)].children[&Period(4)]
+                .proposal_tracker
+                .staging,
+            value
+        );
+        assert_eq!(out_actions.len(), 1);
+    }
+
+    /// Restart with a pending proposal to re-broadcast: the whole action
+    /// list is replayed, unchanged, so the replayed vote carries the same
+    /// value the pre-crash vote did.
+    #[test]
+    fn initial_state_replays_the_pending_attest_unchanged() {
+        let value = proposal(0x91);
+        let (router, player, actions) = checkpoint_before_vote(Round(77), Period(0), SOFT, value);
+        let now = SystemTime::now();
+        let restored = Some((router, player, ClockState::with_zero(now), actions.clone()));
+
+        let (_r, _p, out_actions) = initial_state(restored, Round(77), &v41_params(), now);
+
+        assert_eq!(out_actions.len(), actions.len());
+        for (replayed, original) in out_actions.iter().zip(actions.iter()) {
+            let (Action::Pseudonode(a), Action::Pseudonode(b)) = (replayed, original) else {
+                panic!("expected pseudonode actions");
+            };
+            assert_eq!(
+                (a.t, a.round, a.period, a.step, a.proposal),
+                (b.t, b.round, b.period, b.step, b.proposal),
+                "the replayed attest must be byte-for-byte the vote that was \
+                 already signed — a *different* value at the same coordinate \
+                 would be an equivocation"
+            );
+        }
+    }
+
+    /// Stale restored state (the network committed the crashed round while
+    /// we were down) is discarded in favour of a fresh bootstrap at the
+    /// ledger's next round. Go: `status.Round < s.Ledger.NextRound()`.
+    #[test]
+    fn initial_state_discards_stale_restored_state() {
+        let (router, player, actions) =
+            checkpoint_before_vote(Round(100), Period(2), CERT, proposal(0x44));
+        let now = SystemTime::now();
+        let restored = Some((router, player, ClockState::with_zero(now), actions));
+
+        let (out_router, out_player, out_actions) =
+            initial_state(restored, Round(104), &v41_params(), now);
+
+        assert_eq!(
+            out_player.round,
+            Round(104),
+            "must jump to the ledger round"
+        );
+        assert_eq!(out_player.period, Period(0));
+        assert_eq!(out_player.step, SOFT);
+        assert!(
+            !out_router.children.contains_key(&Round(100)),
+            "stale router state must not be carried into the fresh bootstrap"
+        );
+        // Fresh bootstrap actions: [Assemble(next_round), Rezero(next_round)].
+        assert_eq!(out_actions.len(), 2);
+        match (&out_actions[0], &out_actions[1]) {
+            (Action::Pseudonode(a), Action::Rezero(r)) => {
+                assert_eq!(a.t, ActionType::Assemble);
+                assert_eq!(a.round, Round(104));
+                assert_eq!(a.proposal, BOTTOM);
+                assert_eq!(r.round, Round(104));
+            }
+            other => panic!("unexpected bootstrap actions: {other:?}"),
+        }
+        assert!(
+            !crate::persistence::persistent(&out_actions),
+            "a fresh bootstrap must not carry a pending attest — it would \
+             be a vote at a coordinate this node never reached"
+        );
+    }
+
+    /// Boundary: restored round == ledger next round is *not* stale. Go
+    /// uses a strict `<` for the stale test, so the equal case is adopted.
+    /// Getting this wrong by one would throw away the state for exactly
+    /// the round the node was mid-vote in — the equivocation-critical one.
+    #[test]
+    fn initial_state_boundary_equal_round_is_adopted() {
+        let (router, player, actions) =
+            checkpoint_before_vote(Round(300), Period(1), CERT, proposal(0x55));
+        let now = SystemTime::now();
+        let restored = Some((router, player, ClockState::with_zero(now), actions));
+
+        let (_r, out_player, out_actions) = initial_state(restored, Round(300), &v41_params(), now);
+
+        assert_eq!(out_player.round, Round(300));
+        assert_eq!(out_player.period, Period(1));
+        assert_eq!(out_player.step, CERT);
+        assert!(crate::persistence::persistent(&out_actions));
+    }
+
+    /// Restored state *ahead* of the ledger (the node voted in round R+1
+    /// before the ledger finished committing R) is also adopted.
+    #[test]
+    fn initial_state_adopts_future_restored_round() {
+        let (router, player, actions) =
+            checkpoint_before_vote(Round(301), Period(0), SOFT, proposal(0x66));
+        let now = SystemTime::now();
+        let restored = Some((router, player, ClockState::with_zero(now), actions));
+
+        let (_r, out_player, _a) = initial_state(restored, Round(300), &v41_params(), now);
+
+        assert_eq!(out_player.round, Round(301));
+    }
+
+    /// No crash DB / nothing persisted → fresh bootstrap.
+    #[test]
+    fn initial_state_bootstraps_when_nothing_was_restored() {
+        let (_router, player, actions) =
+            initial_state(None, Round(9), &v41_params(), SystemTime::now());
+        assert_eq!(player.round, Round(9));
+        assert_eq!(player.step, SOFT);
+        assert_eq!(actions.len(), 2);
+    }
+
+    // -- end-to-end: crash DB -> restart, at every step ----------------
+
+    /// The scope-1 sweep: for each step a node can be parked at when it
+    /// crashes, drive the *full* production path — checkpoint written by
+    /// the persistence encoder, process dies, `restore_crash_state` +
+    /// `initial_state` on the way back up — and assert the node resumes at
+    /// the identical `(round, period, step)` with the identical staged
+    /// value and pending vote.
+    #[test]
+    fn restart_at_every_step_resumes_at_the_same_coordinate() {
+        for (i, step) in [PROPOSE, SOFT, CERT, NEXT, Step(4), Step(9)]
+            .into_iter()
+            .enumerate()
+        {
+            for period in [Period(0), Period(1), Period(5)] {
+                let conn = crash_db();
+                let value = proposal(0xA0 + i as u8);
+                let round = Round(1_000 + i as u64);
+                let (router, player, actions) = checkpoint_before_vote(round, period, step, value);
+                let zero = SystemTime::now();
+                write_checkpoint(&conn, &router, &player, &actions, zero);
+
+                // ---- process dies here; everything above is on disk ----
+
+                let restored = restore_crash_state(&conn).expect("restorable");
+                let (out_router, out_player, out_actions) =
+                    initial_state(Some(restored), round, &v41_params(), zero);
+
+                assert_eq!(
+                    (out_player.round, out_player.period, out_player.step),
+                    (round, period, step),
+                    "restart at step {step} period {period} must resume at the \
+                     same coordinate"
+                );
+                assert_eq!(
+                    out_router.children[&round].children[&period]
+                        .proposal_tracker
+                        .staging,
+                    value,
+                    "restart at step {step} must resume with the same staged value"
+                );
+                let Action::Pseudonode(pa) = &out_actions[0] else {
+                    panic!("expected replayed attest");
+                };
+                assert_eq!(
+                    (pa.round, pa.period, pa.step, pa.proposal),
+                    (round, period, step, value),
+                    "restart at step {step} must replay the identical vote, \
+                     never a second value at the same coordinate"
+                );
+            }
+        }
+    }
+
+    /// The explicit no-equivocation assertion for the soft-vote case named
+    /// in issue #471: a node that already soft-voted for value X in
+    /// `(R, P)` and then crashed comes back staged on X — the restart can
+    /// only ever reproduce that vote, never manufacture a vote for a
+    /// different value at `(R, P, soft)`.
+    #[test]
+    fn restart_after_a_soft_vote_cannot_produce_a_second_soft_value() {
+        let conn = crash_db();
+        let voted_for = proposal(0xC1);
+        let other = proposal(0xC2);
+        assert_ne!(voted_for, other);
+
+        let (router, player, actions) =
+            checkpoint_before_vote(Round(4_242), Period(2), SOFT, voted_for);
+        let zero = SystemTime::now();
+        write_checkpoint(&conn, &router, &player, &actions, zero);
+
+        let restored = restore_crash_state(&conn).expect("restorable");
+        let (out_router, out_player, out_actions) =
+            initial_state(Some(restored), Round(4_242), &v41_params(), zero);
+
+        assert_eq!(
+            (out_player.round, out_player.period, out_player.step),
+            (Round(4_242), Period(2), SOFT)
+        );
+
+        // Every attest the restart is about to replay is for `voted_for`.
+        let replayed: Vec<_> = out_actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Pseudonode(pa) if pa.t == ActionType::Attest => Some(pa.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].proposal, voted_for);
+        assert_ne!(replayed[0].proposal, other);
+
+        // And the staged value the state machine will keep voting for in
+        // this period is the same one, so a later step in the same period
+        // cannot diverge onto `other` either.
+        assert_eq!(
+            out_router.children[&Round(4_242)].children[&Period(2)]
+                .proposal_tracker
+                .staging,
+            voted_for
+        );
+    }
+
+    /// A crash checkpoint with no persistent action (e.g. only a `Noop`)
+    /// still restores, and still must not be treated as a pending vote.
+    #[test]
+    fn restart_with_a_non_persistent_action_list_replays_no_vote() {
+        let conn = crash_db();
+        let player = Player {
+            round: Round(60),
+            period: Period(1),
+            step: CERT,
+            ..Player::default()
+        };
+        write_checkpoint(
+            &conn,
+            &RootRouter::default(),
+            &player,
+            &[Action::Noop(NoopAction)],
+            SystemTime::now(),
+        );
+
+        let restored = restore_crash_state(&conn).expect("restorable");
+        let (_r, out_player, out_actions) =
+            initial_state(Some(restored), Round(60), &v41_params(), SystemTime::now());
+
+        assert_eq!(
+            (out_player.round, out_player.period, out_player.step),
+            (Round(60), Period(1), CERT)
+        );
+        assert!(!crate::persistence::persistent(&out_actions));
+    }
+
+    /// A corrupt crash DB degrades to a fresh bootstrap at the ledger's
+    /// round — never to a half-decoded player at some arbitrary step.
+    #[test]
+    fn corrupt_crash_db_bootstraps_fresh_rather_than_half_restoring() {
+        let conn = crash_db();
+        persist(&conn, b"not-msgpack-at-all").expect("persist garbage");
+
+        let restored = restore_crash_state(&conn);
+        assert!(restored.is_none());
+
+        let (_r, player, actions) =
+            initial_state(restored, Round(7), &v41_params(), SystemTime::now());
+        assert_eq!(player.round, Round(7));
+        assert_eq!(player.period, Period(0));
+        assert_eq!(player.step, SOFT);
+        assert!(!crate::persistence::persistent(&actions));
+    }
+
+    /// The restart clock clamp and the coordinate restore compose: after a
+    /// 2s outage the player is at the same step with 2s less deadline.
+    #[test]
+    fn restart_clamps_deadlines_without_moving_the_coordinate() {
+        let conn = crash_db();
+        let (router, player, actions) =
+            checkpoint_before_vote(Round(21), Period(1), CERT, proposal(0x0E));
+        assert_eq!(player.deadline.duration, Duration::from_secs(4));
+        let zero = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        write_checkpoint(&conn, &router, &player, &actions, zero);
+
+        let restored = restore_crash_state(&conn).expect("restorable");
+        let (_r, out_player, _a) = initial_state(
+            Some(restored),
+            Round(21),
+            &v41_params(),
+            zero + Duration::from_secs(2),
+        );
+
+        assert_eq!(
+            (out_player.round, out_player.period, out_player.step),
+            (Round(21), Period(1), CERT)
+        );
+        assert_eq!(out_player.deadline.duration, Duration::from_secs(2));
     }
 }
