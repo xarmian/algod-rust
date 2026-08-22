@@ -24,7 +24,10 @@ algo-pool.workspace = true
 algo-avm.workspace = true
 algo-fixtures.workspace = true
 algo-rest-api.workspace = true
+algo-txn-pipeline.workspace = true
 async-trait.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -44,7 +47,6 @@ rand.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
-ed25519-dalek.workspace = true
 serde_bytes = "0.11"
 tempfile = "3"
 base64.workspace = true

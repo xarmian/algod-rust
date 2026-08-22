@@ -10,9 +10,10 @@ use algo_agreement::{
 };
 use algo_avm::group::GroupBudget;
 use algo_codec::{canonical_encode_signed_txn_in_block, canonical_encode_transaction};
-use algo_ledger::participation::ParticipationStore;
+use algo_ledger::participation::{restore_participation, ParticipationStore};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::{
+    parse_genesis_json, populate_store, seed_account_totals_from_genesis,
     AgreementKeyManagerBridge, AgreementLedgerBridge, BlockFetcher, CatchupService, FetchError,
     FetchedBlockCert, SqliteLedger,
 };
@@ -2202,6 +2203,184 @@ fn synthesize_genesis_json(genesis_id: &str, network: &str, proto: &str) -> Stri
     serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Read a go-algorand `.partkey` file into a [`Participation`].
+///
+/// SQLite always opens a database read-write, and even a pure `SELECT` wants
+/// to be able to create the journal/WAL sidecar next to the file. Partkeys
+/// legitimately live on read-only media — in the stress-test compose the whole
+/// `goal network create` tree is bind-mounted `:ro` so no container can
+/// corrupt another's key material — so copy the bytes to a private temp file
+/// and open *that*. This mirrors how
+/// `AlgodNodeInterface::install_participation_key` handles the REST upload
+/// path, which has the same constraint for a different reason (it starts from
+/// bytes, not a path).
+fn restore_partkey_file(path: &Path) -> anyhow::Result<algo_ledger::participation::Participation> {
+    use std::io::Write as _;
+
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("reading partkey file {}: {}", path.display(), e))?;
+    if bytes.is_empty() {
+        anyhow::bail!("partkey file {} is empty", path.display());
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!(
+        "algod-rust-import-partkey.{}.{nonce}.sqlite",
+        std::process::id()
+    ));
+
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        // Private-key material: 0600 where the platform supports it,
+        // exclusive creation everywhere (never follow a pre-placed symlink).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .map_err(|e| anyhow::anyhow!("creating temp partkey copy: {e}"))?;
+        f.write_all(&bytes)
+            .and_then(|()| f.flush())
+            .map_err(|e| anyhow::anyhow!("writing temp partkey copy: {e}"))?;
+    }
+
+    let result = (|| {
+        let db = algo_ledger::erasable_db::ErasableDb::open(&tmp)
+            .map_err(|e| anyhow::anyhow!("opening partkey copy of {}: {}", path.display(), e))?;
+        restore_participation(&db)
+            .map_err(|e| anyhow::anyhow!("restoring partkey {}: {}", path.display(), e))
+    })();
+
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// Import go-algorand `.partkey` files (the single-account
+/// `ParticipationAccount` schema written by `goal network create` /
+/// `algokey part generate`) into the multi-key participation *registry*
+/// that [`ParticipationStore`] — and therefore `--partkey-path` — reads.
+///
+/// The two schemas are not interchangeable: `restore_participation` reads
+/// shape (1), `ParticipationStore::insert` writes shape (2). Without this
+/// bridge the only way to get a Go-generated key into a Rust participation
+/// node is the REST admin `POST /v2/participation` endpoint, which
+/// `participate` does not expose (it never calls
+/// `.with_participation_store()`).
+///
+/// Re-importing an already-present key is a no-op rather than an error, so
+/// a container that restarts against a persistent volume converges instead
+/// of crash-looping on the `UNIQUE(participationID)` constraint.
+///
+/// Returns the number of keys newly inserted.
+fn import_go_partkeys(store: &ParticipationStore, paths: &[PathBuf]) -> anyhow::Result<usize> {
+    let mut inserted = 0usize;
+    for path in paths {
+        let participation = restore_partkey_file(path)?;
+        if participation.parent == Address([0u8; 32]) {
+            anyhow::bail!(
+                "partkey {} has a missing (zero) parent address",
+                path.display()
+            );
+        }
+        match store.insert(&participation) {
+            Ok(id) => {
+                inserted += 1;
+                info!(
+                    path = %path.display(),
+                    account = %participation.parent,
+                    participation_id = %id,
+                    first_valid = participation.first_valid.0,
+                    last_valid = participation.last_valid.0,
+                    "imported go-algorand participation key"
+                );
+            }
+            Err(rusqlite::Error::SqliteFailure(ffi, _))
+                if ffi.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                info!(
+                    path = %path.display(),
+                    account = %participation.parent,
+                    "participation key already present in registry; skipping"
+                );
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "inserting partkey {} into registry: {}",
+                    path.display(),
+                    e
+                ));
+            }
+        }
+    }
+    Ok(inserted)
+}
+
+/// Seed `accountbase` + `accounttotals` from a `genesis.json` when the ledger
+/// is brand new.
+///
+/// This is the same bootstrap `relay --genesis-json` performs (see
+/// `commands/relay.rs`, PLAN-32 / TASK-95). A participation node needs it for
+/// a *stricter* reason than a relay does: without genesis balances the node
+/// has no online stake table, so it can neither run sortition for its own
+/// keys nor validate anybody else's proposals — it would sit at round 0
+/// forever on a fresh private network.
+///
+/// "Already seeded" is `accounttotals` row presence, not `online_stake > 0`,
+/// so a restart against a populated volume is a no-op.
+fn seed_ledger_from_genesis(
+    ledger: &mut SqliteLedger,
+    genesis_path: &Path,
+    latest: u64,
+) -> anyhow::Result<()> {
+    let already_seeded = ledger.has_account_totals().unwrap_or(false);
+    if already_seeded {
+        info!(
+            latest_round = latest,
+            "ledger already seeded (accounttotals row present); skipping genesis bootstrap"
+        );
+        return Ok(());
+    }
+    if latest > 0 {
+        anyhow::bail!(
+            "ledger at round {latest} has blocks but no accounttotals row — refusing to \
+             re-seed genesis over accumulated history. Delete the ledger DB pair and restart."
+        );
+    }
+    let genesis_str = std::fs::read_to_string(genesis_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read genesis.json at {}: {}",
+            genesis_path.display(),
+            e
+        )
+    })?;
+    let genesis = parse_genesis_json(&genesis_str)
+        .map_err(|e| anyhow::anyhow!("failed to parse genesis.json: {}", e))?;
+    ledger
+        .begin_block()
+        .map_err(|e| anyhow::anyhow!("begin_block during genesis seed: {}", e))?;
+    populate_store(ledger, &genesis)
+        .map_err(|e| anyhow::anyhow!("populate_store from genesis: {}", e))?;
+    seed_account_totals_from_genesis(ledger, &genesis)
+        .map_err(|e| anyhow::anyhow!("seed_account_totals_from_genesis: {}", e))?;
+    ledger
+        .commit_block()
+        .map_err(|e| anyhow::anyhow!("commit_block during genesis seed: {}", e))?;
+    info!(
+        genesis_path = %genesis_path.display(),
+        allocations = genesis.alloc.len(),
+        online_stake = ledger.online_stake().unwrap_or(0),
+        "seeded ledger from genesis (accountbase + accounttotals)"
+    );
+    Ok(())
+}
+
 /// Run the participate command: start the agreement protocol and participate
 /// in consensus using the provided participation keys.
 #[allow(clippy::too_many_arguments)]
@@ -2211,6 +2390,8 @@ pub async fn run(
     network: &str,
     peers: &[String],
     partkey_path: &Path,
+    import_partkeys: &[PathBuf],
+    genesis_json_path: Option<&Path>,
     listen_address: Option<&str>,
     relay_messages: bool,
     genesis_hash_hex: Option<&str>,
@@ -2248,7 +2429,7 @@ pub async fn run(
     // -----------------------------------------------------------------------
     // 1. Open the SQLite ledger (shared between agreement and pool bridges).
     // -----------------------------------------------------------------------
-    let sqlite_ledger = SqliteLedger::open(ledger_path).map_err(|e| {
+    let mut sqlite_ledger = SqliteLedger::open(ledger_path).map_err(|e| {
         anyhow::anyhow!("failed to open ledger at {}: {}", ledger_path.display(), e)
     })?;
 
@@ -2281,6 +2462,13 @@ pub async fn run(
     let latest = sqlite_ledger.current_round().0;
     info!(path = %ledger_path.display(), latest_round = latest, "opened ledger database");
 
+    // Optional: bootstrap genesis state when the ledger is fresh. Mirrors
+    // `relay --genesis-json`; see `seed_ledger_from_genesis` for why a
+    // participation node needs it even more than a relay does.
+    if let Some(genesis_path) = genesis_json_path {
+        seed_ledger_from_genesis(&mut sqlite_ledger, genesis_path, latest)?;
+    }
+
     let ledger = Arc::new(Mutex::new(sqlite_ledger));
 
     // Open the agreement crash recovery database alongside the ledger.
@@ -2299,6 +2487,19 @@ pub async fn run(
             e
         )
     })?;
+
+    // Bridge go-algorand `.partkey` files into the registry schema before
+    // counting keys, so a node whose only key material comes from a
+    // `goal network create` netroot still boots with live keys.
+    if !import_partkeys.is_empty() {
+        let n = import_go_partkeys(&part_store, import_partkeys)?;
+        info!(
+            requested = import_partkeys.len(),
+            inserted = n,
+            "imported go-algorand participation keys into the registry"
+        );
+    }
+
     let key_count = part_store.get_all().map(|v| v.len()).unwrap_or(0);
     info!(
         path = %partkey_path.display(),
