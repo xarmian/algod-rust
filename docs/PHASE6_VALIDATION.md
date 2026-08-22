@@ -408,7 +408,7 @@ autotools.
 
 | Limitation | Notes |
 |---|---|
-| **Not in CI** | The harness is not run by any GitHub Actions workflow. Container build + Rust release build + a 200-round soak is far too slow for per-PR CI; see `docs/MIXED_CLUSTER_HARNESS.md` §3 and the follow-up issue filed there. All Layer-9 cluster tests are `#[ignore]`d and gated on `MIXED_CLUSTER=1`, so `cargo test --workspace` never touches Docker. |
+| **Nightly in CI, never per-PR** | Since #488 the harness runs in `.github/workflows/consensus-cluster.yml` (`schedule` 02:41 UTC + `workflow_dispatch` only): Tier 1 is the #469 participation smoke, Tier 2 the full `consensus-cluster-test RESTART_SCENARIOS=1 NEGATIVE_CASES=1` suite, with `summary.json` / `soak.jsonl` / verifier reports uploaded for 30 days. Container build + Rust release build + a 200-round soak remain far too slow for per-PR CI, so there is no `pull_request`/`push` trigger, and all Layer-9 cluster tests stay `#[ignore]`d behind `MIXED_CLUSTER=1` — `cargo test --workspace` never touches Docker. See `docs/MIXED_CLUSTER_HARNESS.md` §3. |
 | One Rust node, not three | The proposal's 6-node topology (3 Go + 3 Rust) and 1000+ round soak are explicitly **deferred to Phase 7** by #107. |
 | Rust cert votes not inside certificates | Structural consequence of `makeBundle` + the 30/30/30/10 split, not a defect — see criterion 7. This is the one Epic #107 acceptance item left open; Phase 7's 3 Go + 3 Rust topology puts the Rust stake at 50%, where the votes become quorum-necessary and `MIN_RUST_VOTE_ROUNDS` can be raised above 0 to gate on it. |
 | Negative suite injects at one node | Only `go-node-1`'s gossip port is published, deliberately: an injection can never reach the other two, which carry the quorum. |

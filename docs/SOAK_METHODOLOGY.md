@@ -179,9 +179,12 @@ precondition for the same reason.
 - **Fork detection / cert cross-verify.** TASK-88. This harness'
   output feeds it but the detector itself isn't shipped here.
 - **Adversarial soak (fuzzer on live cluster).** Future work.
-- **CI integration.** Deliberately deferred — a full 200-round soak
-  takes 15-20 minutes, too expensive for per-PR CI. A shorter (e.g. 30-
-  round) version is a reasonable first CI gate; tracked as a follow-up.
+- **CI integration.** Was deferred here; shipped later as #488. A full
+  200-round soak takes 15-20 minutes — still far too expensive for
+  per-PR CI — so it runs *nightly* instead, in
+  `.github/workflows/consensus-cluster.yml` (`schedule` +
+  `workflow_dispatch` only, no PR/push trigger), with the shorter
+  30-round participation smoke as that job's Tier 1 gate.
 
 ## Running a soak
 

@@ -1,0 +1,267 @@
+name: Nightly Consensus Cluster
+
+# Issue #488 — run the Epic 42 mixed-cluster consensus harness
+# (ops/mixed-cluster/, 3 go-algorand v4.5.1-stable relays + 1
+# `algod-rust participate` node, 30/30/30/10 ONLINE stake) in CI.
+#
+# ## Why this is NOT on the PR path
+#
+# One run means: a release build of algod-rust in Docker, an
+# `algorand/algod:4.5.1-stable` pull, a 4-node BFT cluster boot, a
+# multi-hundred-round soak at ~3 s block time, restart/rejoin scenarios,
+# a malformed-message injection suite, and (for `certs_authenticate_go`)
+# building go-algorand's vendored libsodium fork inside
+# `tools/cert-authenticate/run-in-docker.sh`. That is tens of minutes —
+# far too much per PR. So the triggers below are `schedule` +
+# `workflow_dispatch` ONLY: no `pull_request`, no `push`. Per-PR CI wall
+# time is unchanged by this file. Every cluster test also stays
+# `#[ignore]`d behind MIXED_CLUSTER=1, so `cargo test --workspace` never
+# touches Docker either.
+#
+# ## Tiers
+#
+#   Tier 1 (always) — `consensus-cluster-up` -> `-status` -> `-smoke`
+#     -> `-down`. Fails on lockstep loss, a non-advancing Rust node, or
+#     any Go-side agreement rejection (participation-smoke.sh, #469).
+#   Tier 2 (nightly / dispatch with tier=full) —
+#     `consensus-cluster-test RESTART_SCENARIOS=1 NEGATIVE_CASES=1`
+#     (#470 + #471 + #472), uploading summary.json, soak.jsonl,
+#     analyze.summary.json and the fork/cert verifier output.
+#
+# ## Caching
+#
+#   * `algod-rust-phase6:local` is pre-built here with a buildx
+#     `type=gha` layer cache and consumed by start.sh via
+#     PHASE6_SKIP_BUILD=1, so the release compile is paid once per
+#     Dockerfile/source change rather than on every `up` (twice per run,
+#     once per tier).
+#   * The Docker volume holding `tools/cert-authenticate`'s
+#     in-container go-algorand clone AND its built libsodium is tarred
+#     into actions/cache, so the 3-5 minute autotools build is not
+#     repeated nightly. Per CLAUDE.md the build itself is still
+#     go-algorand's own `make libsodium`, invoked by run-in-docker.sh —
+#     nothing is re-implemented here.
+
+on:
+  schedule:
+    # 02:41 UTC daily — off-peak, and offset from nightly-fuzz.yml's
+    # 03:17 so the two don't contend for runners.
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "Which tier to run"
+        type: choice
+        options: [full, smoke]
+        default: full
+      rounds:
+        description: "Tier-2 soak length in rounds"
+        default: "200"
+        required: false
+
+concurrency:
+  # Never run two clusters at once: they'd collide on host ports
+  # 4001-4004/4161 if they ever land on the same runner, and a nightly
+  # queueing behind the previous nightly is the correct behaviour.
+  group: consensus-cluster
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Same pin as the rest of the repo (see CLAUDE.md, algokey-e2e.yml).
+  GO_ALGORAND_REV: "v4.5.1-stable"
+  # start.sh: reuse the image built by the buildx step below.
+  PHASE6_SKIP_BUILD: "1"
+  # Named volume run-in-docker.sh keeps its go-algorand clone + libsodium
+  # build in (must match SRC_VOLUME's default there).
+  CERT_AUTH_VOLUME: algod-rust-goalgo-src
+
+jobs:
+  consensus-cluster:
+    name: Mixed-cluster consensus conformance (3 Go + 1 Rust)
+    runs-on: ubuntu-latest
+    # Tier 1 is ~10 min warm; Tier 2's 200-round soak plus the restart
+    # and negative stages is the bulk of the rest. 120 min is a hard
+    # stop so a wedged cluster can't hold a runner all day.
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Host-side tools the suite shells out to: algo-fork-detector,
+      # algo-cert-crossverify, algo-agreement-fuzz (built debug by the
+      # consensus-cluster-test / -negative make targets).
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: consensus-cluster
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Pull algorand/algod:4.5.1-stable
+        run: docker pull algorand/algod:4.5.1-stable
+
+      # Deterministic tag declared by ops/mixed-cluster/docker-compose.yml's
+      # `rust-node-4.image`. With PHASE6_SKIP_BUILD=1 start.sh runs
+      # `docker compose up -d rust-node-4` (no --build) and picks this up.
+      - name: Build algod-rust node image (layer-cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime
+          tags: algod-rust-phase6:local
+          load: true
+          cache-from: type=gha,scope=consensus-cluster
+          cache-to: type=gha,mode=max,scope=consensus-cluster
+
+      # ── Tier 1 — participation smoke ──────────────────────────────
+      #
+      # SKIP_START=1 / KEEP_CLUSTER=1 make the smoke run against the
+      # cluster `consensus-cluster-up` just started rather than cycling
+      # it a second time; the explicit `-down` below is the issue's
+      # up -> status -> smoke -> down sequence.
+      - name: Tier 1 — cluster up
+        run: make consensus-cluster-up
+
+      # status.sh is a lockstep gate (it fails when any node lags more
+      # than LAG_TOLERANCE=5 rounds behind the max), and `up` returns as
+      # soon as the Rust container is started — before it has replayed
+      # the handful of rounds the Go relays produced while start.sh was
+      # reading the genesis hash off go-node-1. Retry for up to 5 min so
+      # the gate measures steady-state lockstep and not boot ordering;
+      # the last invocation is the one that decides the step.
+      - name: Tier 1 — cluster status (lockstep gate)
+        run: |
+          for _ in $(seq 1 29); do
+            if make consensus-cluster-status; then exit 0; fi
+            sleep 10
+          done
+          make consensus-cluster-status
+
+      - name: Tier 1 — participation smoke (#469)
+        env:
+          SKIP_START: "1"
+          KEEP_CLUSTER: "1"
+          SMOKE_ROUNDS: "30"
+        run: make consensus-cluster-smoke
+
+      - name: Tier 1 — cluster down
+        run: make consensus-cluster-down
+
+      # ── Tier 2 prerequisites — go-algorand + libsodium caches ─────
+      # run-in-docker.sh needs a real go-algorand git checkout to clone
+      # from (it defaults to a sibling ../go-algorand, which a runner
+      # does not have). This clone is only the *source* of that
+      # in-container clone; the expensive part — the clone plus the
+      # `make libsodium` autotools build — lives in the Docker volume
+      # cached below, and on a cache hit /src is never read at all.
+      - name: Clone pinned go-algorand
+        if: github.event.inputs.tier != 'smoke'
+        env:
+          GO_ALGORAND_DIR: ${{ runner.temp }}/go-algorand-src
+        run: |
+          set -euo pipefail
+          # NOT shallow: run-in-docker.sh does `git clone --shared` from
+          # this checkout inside the builder container and then checks
+          # out the tag there, which a depth-1 clone cannot serve.
+          rm -rf "$GO_ALGORAND_DIR"
+          git clone --branch "$GO_ALGORAND_REV" \
+            https://github.com/algorand/go-algorand.git "$GO_ALGORAND_DIR"
+
+      - name: Restore cert-authenticate libsodium volume
+        id: certauth-vol
+        if: github.event.inputs.tier != 'smoke'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/certauth-volume
+          key: certauth-libsodium-${{ env.GO_ALGORAND_REV }}-${{ hashFiles('tools/cert-authenticate/run-in-docker.sh') }}
+
+      - name: Load cert-authenticate volume from cache
+        if: github.event.inputs.tier != 'smoke'
+        run: |
+          set -euo pipefail
+          docker volume create "$CERT_AUTH_VOLUME" >/dev/null
+          if [ -f "$RUNNER_TEMP/certauth-volume/work.tar" ]; then
+            echo "==> restoring cached go-algorand clone + libsodium build"
+            docker run --rm \
+              -v "$CERT_AUTH_VOLUME:/work" \
+              -v "$RUNNER_TEMP/certauth-volume:/backup:ro" \
+              alpine tar -xf /backup/work.tar -C /work
+          else
+            echo "==> no cached volume; run-in-docker.sh will run 'make libsodium' (3-5 min)"
+          fi
+
+      # ── Tier 2 — full conformance suite ───────────────────────────
+      #
+      # OUT_DIR is read straight from the environment by
+      # consensus-conformance.sh (make exports its own environment to
+      # recipe shells), pinning the otherwise timestamped artifact
+      # directory to a path the upload step can name.
+      - name: Tier 2 — full conformance suite (#470 + #471 + #472)
+        if: github.event.inputs.tier != 'smoke'
+        env:
+          OUT_DIR: ${{ github.workspace }}/consensus-artifacts
+          ROUNDS: ${{ github.event.inputs.rounds || '200' }}
+          GO_ALGORAND_DIR: ${{ runner.temp }}/go-algorand-src
+        run: make consensus-cluster-test RESTART_SCENARIOS=1 NEGATIVE_CASES=1
+
+      # ── Diagnostics + artifacts ───────────────────────────────────
+      - name: Collect container logs on failure
+        if: failure()
+        run: |
+          set +e
+          mkdir -p "$GITHUB_WORKSPACE/consensus-artifacts/container-logs"
+          for c in phase6-go-node-1 phase6-go-node-2 phase6-go-node-3 phase6-rust-node-4; do
+            docker logs --tail 2000 "$c" \
+              > "$GITHUB_WORKSPACE/consensus-artifacts/container-logs/$c.log" 2>&1
+          done
+          docker ps -a > "$GITHUB_WORKSPACE/consensus-artifacts/container-logs/docker-ps.txt" 2>&1
+          exit 0
+
+      - name: Upload conformance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # summary.json, soak.jsonl, analyze.summary.json, verify.log +
+          # verify-go-report-*.json (the go-algorand cert verifier),
+          # cert-crossverify JSONL, restart/ and negative/ sub-summaries,
+          # and the per-node logs the analyzers read.
+          name: consensus-cluster-${{ github.run_id }}
+          path: consensus-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Export cert-authenticate volume for the cache
+        if: always() && github.event.inputs.tier != 'smoke' && steps.certauth-vol.outputs.cache-hit != 'true'
+        run: |
+          set +e
+          # Only cache a volume that actually holds a built libsodium —
+          # otherwise a job that failed before the verifier ran would
+          # poison this cache key with an empty tarball.
+          docker run --rm -v "$CERT_AUTH_VOLUME:/work:ro" alpine \
+            test -f /work/go-algorand/crypto/libs/linux/amd64/lib/libsodium.a
+          if [ $? -ne 0 ]; then
+            echo "==> volume has no libsodium build — not caching"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/certauth-volume"
+          docker run --rm \
+            -v "$CERT_AUTH_VOLUME:/work:ro" \
+            -v "$RUNNER_TEMP/certauth-volume:/backup" \
+            alpine tar -cf /backup/work.tar -C /work .
+          exit 0
+
+      - name: Tear down (safety net)
+        if: always()
+        run: make consensus-cluster-down PURGE=1 || true
