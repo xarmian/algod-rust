@@ -253,11 +253,12 @@ fi
 #    hard evidence that Go accepts Rust consensus messages, which is the
 #    positive half of criterion (c) above.
 #  * PROPOSING — the count of committed blocks whose `prp` header field
-#    is the Rust node's account. This is currently expected to be ZERO:
-#    the Rust node cannot assemble a block because agreement asks the
-#    pool for round N before the ledger has written block N-1
-#    ("cannot get prev header for N-1"), so it votes but never proposes.
-#    Tracked as a follow-up; see ops/mixed-cluster/README.md.
+#    is the Rust node's account. Expected to track its 10% stake share
+#    since issue #482 (assemble/ensure ordering) was fixed; before that
+#    it was always ZERO because agreement asked the pool for round N
+#    before the ledger had written block N-1 ("cannot get prev header
+#    for N-1"). It is reported, not asserted: over a 30-round default
+#    window a 10% proposer routinely wins anywhere from 0 to 7 rounds.
 # `tracing`'s pretty formatter wraps field names in ANSI escapes, so
 # "account=" is not literally present in `docker logs` output — strip the
 # escapes first, then take the 58-character base32 account.
@@ -291,7 +292,7 @@ for r in range(max(lo, 1), hi + 1):
         pass
 print(n)
 " "$ALGOD_TOKEN" "$RUST_ACCOUNT" "$BASE_MAX" "$MAX" | tr -d '\r')"
-    echo "    blocks proposed in rounds $BASE_MAX..$MAX: $PROPOSED (expected 0 today)"
+    echo "    blocks proposed in rounds $BASE_MAX..$MAX: $PROPOSED (expected ≈10% of the window)"
 fi
 
 echo ""

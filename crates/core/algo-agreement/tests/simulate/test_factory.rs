@@ -145,6 +145,64 @@ impl UnfinishedBlock for AutoUnfinishedBlock {
 }
 
 // ---------------------------------------------------------------------------
+// PrevRoundGuardBlockFactory
+// ---------------------------------------------------------------------------
+
+/// `BlockFactory` that enforces the ordering guarantee production block
+/// assembly depends on: assembling round `N` reads round `N-1`'s block
+/// header out of the ledger (`TransactionPool::assemble_empty_block`), so
+/// round `N-1` MUST already be committed when the `Assemble` action runs.
+///
+/// Regression guard for issue #482: the agreement main loop used to execute
+/// the batch's `Pseudonode(Assemble N)` action *before* handing the same
+/// batch's `Ensure(block N-1)` to the demux thread, so the ledger's latest
+/// committed round was still `N-2` and every proposal attempt failed with
+/// `cannot get prev header for N-1`. Any factory failure recorded here means
+/// the ordering has regressed.
+pub struct PrevRoundGuardBlockFactory {
+    /// Reads the ledger's next (i.e. first uncommitted) round.
+    next_round: Box<dyn Fn() -> Round + Send + Sync>,
+    /// `(requested round, ledger next_round)` for each rejected assembly.
+    failures: Arc<Mutex<Vec<(Round, Round)>>>,
+}
+
+impl PrevRoundGuardBlockFactory {
+    /// Build a factory reading committed progress through `next_round`.
+    pub fn new(next_round: impl Fn() -> Round + Send + Sync + 'static) -> Self {
+        Self {
+            next_round: Box::new(next_round),
+            failures: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Handle to the recorded failures, readable after the run finishes.
+    pub fn failures(&self) -> Arc<Mutex<Vec<(Round, Round)>>> {
+        Arc::clone(&self.failures)
+    }
+}
+
+impl BlockFactory for PrevRoundGuardBlockFactory {
+    fn assemble_block(
+        &self,
+        round: Round,
+        addresses: &[Address],
+    ) -> Result<Box<dyn UnfinishedBlock>, AgreementError> {
+        let next = (self.next_round)();
+        if next.0 < round.0 {
+            // Round `round - 1` is not committed yet — exactly the
+            // production failure mode from issue #482.
+            self.failures.lock().unwrap().push((round, next));
+            return Err(AgreementError::Other(format!(
+                "assembleEmptyBlock: cannot get prev header for {}: ledger is only at round {}",
+                Round(round.0.saturating_sub(1)),
+                next.0.saturating_sub(1),
+            )));
+        }
+        AutoBlockFactory.assemble_block(round, addresses)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SigningKeyMap helper
 // ---------------------------------------------------------------------------
 

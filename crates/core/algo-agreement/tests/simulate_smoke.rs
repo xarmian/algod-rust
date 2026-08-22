@@ -129,10 +129,11 @@ fn simulate_one_round_completes_clock_handshake() {
 /// this:
 ///
 /// 1. **Bootstrap pseudonode dispatch.** The main loop now executes
-///    `Action::Pseudonode` actions inline before sending the batch to the
-///    demux; previously the bootstrap `Pseudonode(Assemble)` was sent
-///    straight to the demux's no-op arm and dropped, so `make_proposals`
-///    never ran and the player never saw a proposal.
+///    `Action::Pseudonode` actions itself (since issue #482, right after
+///    the demux thread acknowledges the rest of the same batch);
+///    previously the bootstrap `Pseudonode(Assemble)` was sent straight
+///    to the demux's no-op arm and dropped, so `make_proposals` never ran
+///    and the player never saw a proposal.
 /// 2. **Canonical `ProposalMachinePeriod` routing.** `RootRouter::dispatch`
 ///    now routes `ProposalMachinePeriod` queries (`ProposalFrozen`,
 ///    `ReadStaging`, `ReadLowestVote`) through `ProposalManager.stores[r]
@@ -261,6 +262,112 @@ fn simulate_three_rounds_commits_three_blocks() {
         "expected ≥1 round to elect a Rust-generated proposer; participation log: {:?}",
         log.entries,
     );
+}
+
+/// Regression test for issue #482: `Assemble` for round N must never run
+/// before `Ensure` has committed block N-1.
+///
+/// Production block assembly (`TransactionPool::assemble_empty_block`) reads
+/// round N-1's block header out of the ledger, so a proposal for round N can
+/// only be built once round N-1 is committed. The agreement main loop used to
+/// execute a batch's `Pseudonode(Assemble N)` action *before* sending the same
+/// batch — which begins with `Ensure(block N-1)` — to the demux thread that
+/// actually performs it. The result in a live mixed Go/Rust cluster: every
+/// proposal attempt failed with
+/// `TransactionPool.assembleEmptyBlock: cannot get prev header for N-1`, so
+/// the Rust node voted normally but proposed 0 of 287 blocks.
+///
+/// [`PrevRoundGuardBlockFactory`] reproduces that ledger dependency
+/// deterministically: it refuses to assemble round N unless the ledger's
+/// `next_round()` has already reached N (i.e. N-1 is committed) and records
+/// every refusal. With the ordering bug present, the very first round records
+/// a failure and — because a blackhole network means the only proposals are
+/// the ones this node assembles — no round ever commits, so the driver hits
+/// its join deadline.
+#[test]
+fn assemble_never_runs_before_previous_round_is_committed() {
+    use crate::simulate::test_account::generate_n_accounts;
+    use crate::simulate::test_factory::{
+        signing_keys_from_accounts, PrevRoundGuardBlockFactory, TestKeyManager,
+    };
+    use crate::simulate::test_ledger::TestLedger;
+
+    let params = v41_params();
+    let key_dilution = params.default_key_dilution;
+    let target_round = Round(3);
+
+    let accounts = generate_n_accounts(
+        4,
+        Round(0),
+        Round(target_round.0 + 10),
+        key_dilution,
+        0xa9_3e,
+    );
+
+    let key_manager = TestKeyManager::new(&accounts);
+    let ledger = TestLedger::new(
+        &accounts,
+        100_000,
+        params.clone(),
+        algo_types::CONSENSUS_V41.to_string(),
+    );
+    let ledger_handle = ledger.clone();
+
+    let (signing_keys, _addrs) = signing_keys_from_accounts(accounts);
+
+    // The factory reads committed progress through its own ledger handle,
+    // exactly as the production pool reads the shared `SqliteLedger`.
+    let ledger_for_factory = ledger_handle.clone();
+    let block_factory = PrevRoundGuardBlockFactory::new(move || ledger_for_factory.next_round());
+    let failures = block_factory.failures();
+
+    let clock = InstantClock::new();
+    let monitor = clock.make_monitor();
+    let agreement_params = Parameters {
+        network: BlackholeNetwork::new(),
+        ledger,
+        key_manager,
+        block_factory,
+        block_validator: StubBlockValidator::accepting(),
+        random_source: StubRandomSource::constant(0),
+        monitor,
+        crypto: StubCryptoVerifier::new(),
+        clock: Arc::clone(&clock) as Arc<dyn algo_agreement::Clock>,
+        crash_db: None,
+        signing_keys,
+    };
+
+    let ledger_for_driver = ledger_handle.clone();
+    let handle = thread::Builder::new()
+        .name("simulate-assemble-ordering-driver".into())
+        .spawn(move || {
+            simulate_until_committed(agreement_params, clock, target_round, move || {
+                ledger_for_driver.next_round()
+            })
+        })
+        .expect("spawn simulate thread");
+
+    join_with_timeout(handle, Duration::from_secs(30)).expect(
+        "simulate did not complete within 30s — with the assemble/ensure ordering \
+         broken no proposal can be built, so no round ever commits",
+    );
+
+    let failures = failures.lock().unwrap();
+    assert!(
+        failures.is_empty(),
+        "Assemble ran before the previous round was committed (issue #482); \
+         (requested round, ledger next_round) pairs: {:?}",
+        failures,
+    );
+
+    // Sanity: the rounds really did commit (so the assertion above is not
+    // vacuously true because assembly was never attempted).
+    for r in 1..=target_round.0 {
+        assert!(
+            ledger_handle.block(Round(r)).is_some(),
+            "round {r} block not committed",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
