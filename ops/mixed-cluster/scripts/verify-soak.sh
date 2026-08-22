@@ -19,22 +19,36 @@
 #                  [--cert-ledger PATH] [--skip-preflight]
 #
 # Exit codes:
+#   3. (issue #470 §2) `tools/cert-authenticate` — the inverse
+#      direction. `algo-cert-crossverify --export-go-input` dumps the
+#      raw (block, cert) bytes plus the ledger facts Go's verifier
+#      needs, and the Go helper re-authenticates each certificate with
+#      go-algorand v4.5.1-stable's own
+#      `agreement.Certificate.Authenticate`. Combined with step 2, every
+#      sampled certificate is proven to authenticate under BOTH
+#      implementations. Enabled by passing `--rust-account`.
+#
+# Usage:
+#   verify-soak.sh [--from-round N] [--to-round M] [--stride S]
+#                  [--tools-dir PATH] [--no-cert-crossverify]
+#                  [--cert-ledger PATH] [--skip-preflight]
+#                  [--rust-account ADDR] [--min-rust-vote-rounds N]
+#                  [--no-go-authenticate]
+#
+# Exit codes:
 #   0 — every tool that ran reported clean
 #   1 — the fork detector exited with its degraded-coverage code
 #       (insufficient or fetch errors without `--allow-degraded`)
 #   2 — the fork detector detected a real fork (bubbled up verbatim)
 #       OR the cert cross-verify tool failed authentication
+#       OR the Go-side authenticator rejected a certificate
 #   3 — preflight failed (cluster not healthy, no token file, etc.)
 #   4 — extracting the Rust ledger failed
 #
-# When both tools run and both fail, the larger exit code (most severe)
-# wins.
+# When several tools run and more than one fails, the larger exit code
+# (most severe) wins.
 #
 # Notes:
-# - Rust → Go cert verification (the inverse direction) is out of scope
-#   until the Rust node runs online participation keys (PLAN-35). This
-#   script only exercises Go-produced cert verification under the Rust
-#   verifier.
 # - The script does not start or stop the cluster. Run start.sh / stop.sh
 #   around it.
 
@@ -56,6 +70,10 @@ OUT_DIR="${OUT_DIR:-$ROOT}"
 # an externally-prepared SQLite instead of the relay container's.
 RUN_CERT=1
 CERT_LEDGER_OVERRIDE=""
+# issue #470 §2 — Rust → Go direction.
+RUST_ACCOUNT="${RUST_ACCOUNT:-}"
+MIN_RUST_VOTE_ROUNDS="${MIN_RUST_VOTE_ROUNDS:-1}"
+RUN_GO_AUTH=1
 
 usage() {
     cat <<EOF
@@ -86,11 +104,22 @@ Options:
                          phase6-rust-node-4:/app/ledger.sqlite. The
                          ledger must be caught up past --to-round.
   --skip-preflight       Skip the status.sh health check.
+  --rust-account ADDR    (#470 §2) Address of the Rust participant.
+                         Enables the vote-in-certificate assertion and
+                         the Go-side re-authentication step.
+  --min-rust-vote-rounds N
+                         Fail unless at least N sampled certificates
+                         contain a vote from --rust-account (default 1).
+  --no-go-authenticate   Skip the go-algorand-side authentication even
+                         when --rust-account is given (e.g. no Docker,
+                         or you only want the Rust-side assertions).
   -h, --help             Show this help.
 
 Artifacts written:
   \$OUT_DIR/verify-fork-<ts>.jsonl
   \$OUT_DIR/verify-cert-<ts>.jsonl (unless --no-cert-crossverify)
+  \$OUT_DIR/verify-go-input-<ts>.json  (with --rust-account)
+  \$OUT_DIR/verify-go-report-<ts>.json (with --rust-account)
 EOF
 }
 
@@ -112,6 +141,9 @@ while [ $# -gt 0 ]; do
         --tools-dir)              need_arg "$@"; TOOLS_DIR="$2"; shift 2 ;;
         --out-dir)                need_arg "$@"; OUT_DIR="$2"; shift 2 ;;
         --cert-ledger)            need_arg "$@"; CERT_LEDGER_OVERRIDE="$2"; shift 2 ;;
+        --rust-account)           need_arg "$@"; RUST_ACCOUNT="$2"; shift 2 ;;
+        --min-rust-vote-rounds)   need_arg "$@"; MIN_RUST_VOTE_ROUNDS="$2"; shift 2 ;;
+        --no-go-authenticate)     RUN_GO_AUTH=0; shift ;;
         --no-cert-crossverify)    RUN_CERT=0; shift ;;
         --skip-preflight)         SKIP_PREFLIGHT=1; shift ;;
         -h|--help)                usage; exit 0 ;;
@@ -314,6 +346,17 @@ if [ "$RUN_CERT" = "1" ]; then
         fi
         echo "    ledger size: tracker=$(du -h "$TRACKER_PATH" | awk '{print $1}') block=$(du -h "$BLOCK_PATH" | awk '{print $1}')"
     fi
+    # (#470 §2) When a Rust participant address is supplied, additionally
+    # assert its votes are present in the sampled certs and dump the
+    # bundle the go-algorand-side authenticator consumes.
+    CERT_EXTRA_ARGS=()
+    if [ -n "$RUST_ACCOUNT" ]; then
+        GO_INPUT="$OUT_DIR/verify-go-input-$(date +%s).json"
+        CERT_EXTRA_ARGS+=(--rust-account "$RUST_ACCOUNT")
+        CERT_EXTRA_ARGS+=(--min-rust-vote-rounds "$MIN_RUST_VOTE_ROUNDS")
+        CERT_EXTRA_ARGS+=(--export-go-input "$GO_INPUT")
+        echo "    rust participant: $RUST_ACCOUNT (>= $MIN_RUST_VOTE_ROUNDS cert(s) must carry its vote)"
+    fi
     set +e
     "$CERT_BIN" \
         --node http://127.0.0.1:4001 \
@@ -322,7 +365,8 @@ if [ "$RUN_CERT" = "1" ]; then
         --from-round "$FROM_ROUND" \
         --to-round "$TO_ROUND" \
         --stride "$STRIDE" \
-        --jsonl-out "$CERT_OUT"
+        --jsonl-out "$CERT_OUT" \
+        "${CERT_EXTRA_ARGS[@]+"${CERT_EXTRA_ARGS[@]}"}"
     cert_rc=$?
     set -e
     echo "    cert-crossverify exit: $cert_rc (output: $CERT_OUT)"
@@ -330,10 +374,35 @@ else
     echo "==> cert cross-verify: SKIPPED (--no-cert-crossverify)"
 fi
 
+# -- 3. Go-side certificate authentication (Rust → Go, issue #470 §2) ------
+go_auth_rc=0
+if [ -n "$RUST_ACCOUNT" ] && [ "$RUN_CERT" = "1" ] && [ "$RUN_GO_AUTH" = "1" ]; then
+    GO_REPORT="$OUT_DIR/verify-go-report-$(date +%s).json"
+    echo "==> go-algorand cert authentication (Rust-participating certs -> Go verifier)"
+    if [ ! -s "${GO_INPUT:-/nonexistent}" ]; then
+        echo "error: cert-crossverify did not write a go-verify bundle at ${GO_INPUT:-<unset>}" >&2
+        go_auth_rc=2
+    else
+        set +e
+        bash "$REPO_ROOT/tools/cert-authenticate/run-in-docker.sh" \
+            --input "$GO_INPUT" \
+            --out "$GO_REPORT" \
+            --require-rust-votes "$MIN_RUST_VOTE_ROUNDS"
+        go_auth_rc=$?
+        set -e
+        echo "    cert-authenticate exit: $go_auth_rc (report: $GO_REPORT)"
+    fi
+elif [ -n "$RUST_ACCOUNT" ] && [ "$RUN_GO_AUTH" = "0" ]; then
+    echo "==> go-algorand cert authentication: SKIPPED (--no-go-authenticate)"
+fi
+
 # -- Summary ----------------------------------------------------------------
 echo ""
-if [ "$fork_rc" -eq 0 ] && [ "$cert_rc" -eq 0 ]; then
-    if [ "$RUN_CERT" = "1" ]; then
+if [ "$fork_rc" -eq 0 ] && [ "$cert_rc" -eq 0 ] && [ "$go_auth_rc" -eq 0 ]; then
+    if [ "$RUN_CERT" = "1" ] && [ -n "$RUST_ACCOUNT" ] && [ "$RUN_GO_AUTH" = "1" ]; then
+        echo "verify-soak: CLEAN — fork detector + Go→Rust cert cross-verify +"
+        echo "             Rust→Go cert authentication all passed."
+    elif [ "$RUN_CERT" = "1" ]; then
         echo "verify-soak: CLEAN — fork detector + Go→Rust cert cross-verify both passed."
     else
         echo "verify-soak: fork-clean (cert cross-verify skipped via --no-cert-crossverify)."
@@ -351,5 +420,8 @@ fi
 if [ "$cert_rc" -gt "$worst" ]; then
     worst=$cert_rc
 fi
-echo "verify-soak: FAILED — fork_rc=$fork_rc cert_rc=$cert_rc (exit=$worst)" >&2
+if [ "$go_auth_rc" -gt "$worst" ]; then
+    worst=$go_auth_rc
+fi
+echo "verify-soak: FAILED — fork_rc=$fork_rc cert_rc=$cert_rc go_auth_rc=$go_auth_rc (exit=$worst)" >&2
 exit "$worst"

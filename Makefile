@@ -22,6 +22,7 @@ PHASE6_CLUSTER := ops/mixed-cluster
 .PHONY: relay-up relay-down relay-test
 .PHONY: mixed-cluster-up mixed-cluster-down mixed-cluster-smoke mixed-cluster-test mixed-cluster-conformance
 .PHONY: consensus-cluster-up consensus-cluster-down consensus-cluster-status consensus-cluster-smoke
+.PHONY: consensus-cluster-test consensus-analyzer-test
 .PHONY: phase6-cluster-up phase6-cluster-down phase6-cluster-status
 
 ## ── Build & Test ──────────────────────────────────────────────
@@ -594,6 +595,18 @@ consensus-cluster-down: ## Tear down the consensus cluster (pass PURGE=1 to wipe
 consensus-cluster-smoke: ## Run the #469 participation smoke test (up + 30 rounds + assertions + down)
 	SMOKE_ROUNDS=$(or $(SMOKE_ROUNDS),30) $(PHASE6_CLUSTER)/scripts/participation-smoke.sh
 
+## Issue #470 (Epic 42c) — the full positive Layer-9 conformance suite:
+## up -> forced period advancement -> soak -> verify (forks, certs both
+## directions, proposer share, vote steps, cadence) -> down, with a
+## machine-readable summary JSON. Override the round count with
+## `make consensus-cluster-test ROUNDS=500`.
+consensus-cluster-test: consensus-analyzer-test ## Run the #470 conformance suite (up + soak + verify + down)
+	cargo build -p algo-fork-detector -p algo-cert-crossverify
+	ROUNDS=$(or $(ROUNDS),200) $(PHASE6_CLUSTER)/scripts/consensus-conformance.sh
+
+consensus-analyzer-test: ## Unit-test the #470 soak-analyzer logic (no Docker needed)
+	python3 $(PHASE6_CLUSTER)/scripts/analyze_test.py
+
 ## Deprecated aliases — `phase6-cluster-*` was the TASK-86 name for the
 ## same harness back when the Rust node was a non-participating relay.
 ## Kept so existing docs/muscle memory keep working; prefer the
@@ -751,6 +764,8 @@ help:
 	@echo "  make consensus-cluster-status  Per-node round snapshot (all 4 via REST)"
 	@echo "  make consensus-cluster-down    Tear down (append PURGE=1 to wipe netroot/)"
 	@echo "  make consensus-cluster-smoke   Up + 30 rounds + lockstep/rejection asserts + down"
+	@echo "  make consensus-cluster-test    #470 conformance suite (up + 200-round soak + verify + down)"
+	@echo "  make consensus-analyzer-test   Unit-test the #470 soak analyzer (no Docker)"
 	@echo "  (phase6-cluster-up/-status/-down are deprecated aliases)"
 	@echo ""
 	@echo "Benchmarks (fair comparison):"

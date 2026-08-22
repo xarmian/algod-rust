@@ -117,10 +117,12 @@ version = "0.1.0"
 dependencies = [
  "algo-agreement",
  "algo-codec",
+ "algo-consensus-crypto",
  "algo-ledger",
  "algo-rest-client",
  "algo-types",
  "anyhow",
+ "base64",
  "clap",
  "hex",
  "rmp-serde",

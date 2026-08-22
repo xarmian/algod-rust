@@ -125,13 +125,34 @@ A soak run is **clean** if `analyze.py` reports "all criteria satisfied"
    collector-side anomalies, so a clean run should have none.
 4. Every captured block has a `block_ts_unix` and a `proposer`.
 
+### Issue #470 additions (opt-in)
+
+`analyze.py` gained flags that turn the Rust node's own participation
+into acceptance criteria. They are all opt-in, so historical
+observer-topology reports are unchanged:
+
+| Flag | Adds to acceptance |
+| --- | --- |
+| `--rust-account ADDR` | the account must appear as proposer, never zero, within a two-sided binomial bound |
+| `--rust-stake-fraction F` | the `p` in `Binomial(N, p)` (default 0.10) |
+| `--proposer-sigma S` | the bound, in standard deviations (default 3.0) |
+| `--rust-log PATH` | the node must have cast both `soft` and `cert` votes |
+| `--require-steps a,b` | which steps `--rust-log` must show (default `soft,cert`) |
+| `--max-mean-block-time S`, `--max-p95-block-time S` | cadence bounds (0 = off) |
+
+The sidecar JSON gains `rust_proposer_share`, `rust_participation_log`,
+`rust_step_coverage`, `cadence`, and a top-level `acceptance_ok`.
+
+`ops/mixed-cluster/scripts/consensus-conformance.sh` (`make
+consensus-cluster-test`) wires all of it together with the fork
+detector, both cert-verification directions, and the Go nodes'
+`VoteAccepted` telemetry. The verifier logic itself is unit-tested by
+`ops/mixed-cluster/scripts/analyze_test.py` (`make
+consensus-analyzer-test`), including the negative cases from the
+non-participating topology.
+
 **Explicitly out of scope for TASK-87** (i.e., NOT part of acceptance):
 
-- **Rust node proposer share.** `Wallet4` is now `Online: true` with
-  10% of stake (issue #469) and the Rust node votes with keys Go
-  accepts, but it still contributes 0% of proposals — see
-  §Known limitations for the block-assembly ordering bug behind that.
-  A proposer-share assertion stays out of scope until it is fixed.
 - **Fork detection / cert cross-verify.** TASK-88. This harness'
   output feeds it but the detector itself isn't shipped here.
 - **Adversarial soak (fuzzer on live cluster).** Future work.
@@ -277,10 +298,25 @@ ledger (copied out of the container by `verify-soak.sh` at verify
 time) is a valid input for `Certificate::authenticate`. Verified
 live on a 90-round soak: 11/11 sampled rounds authenticated cleanly.
 
-Rust-produced cert verification (the inverse Rust → Go direction) still
-needs the Rust node to actively propose; its keys are online and its
-votes are accepted, but block assembly is blocked (see
-§Known limitations).
+The inverse **Rust → Go** direction shipped with issue #470. Pass
+`--rust-account ADDR` to `verify-soak.sh` and it additionally
+
+1. records, per sampled round, whether the Rust participant's vote is
+   inside the committed certificate (`--min-rust-vote-rounds N` turns
+   that into a gate), and
+2. hands the raw `(block, cert)` bytes plus the ledger facts read from
+   the **Rust** ledger to `tools/cert-authenticate`, which
+   re-authenticates each certificate with go-algorand
+   v4.5.1-stable's own `agreement.Certificate.Authenticate` inside a
+   `golang:1.25-bookworm` container (it builds the vendored libsodium
+   fork there — see `tools/cert-authenticate/run-in-docker.sh`).
+
+Note on (1): `agreement.makeBundle` stops packing votes at quorum, and
+in the 30/30/30/10 split the three Go accounts alone clear the cert
+threshold, so the Rust vote is normally absent from the bundle. Vote
+*acceptance* is therefore asserted from the Go nodes' `VoteAccepted`
+telemetry instead, and `--min-rust-vote-rounds` defaults to 0. See
+`ops/mixed-cluster/README.md` for the arithmetic and the measurement.
 
 ## Follow-ups (out of TASK-87 scope)
 
@@ -290,6 +326,8 @@ votes are accepted, but block assembly is blocked (see
   `ops/mixed-cluster/baselines/`.
 - Extend `metrics.py` to sample `/v2/metrics` (Prometheus) for peer
   counts, memory, and txnpool stats when `EnableDeveloperAPI` is on.
-- Fix the agreement/pool round-advance ordering so the Rust node can
+- ~~Fix the agreement/pool round-advance ordering so the Rust node can
   assemble and propose blocks; then re-enable the proposer-share
-  acceptance criterion (~10% at the current 30/30/30/10 split).
+  acceptance criterion (~10% at the current 30/30/30/10 split).~~
+  Done: issue #482 fixed the ordering and issue #470 shipped the
+  proposer-share criterion (`analyze.py --rust-account`).

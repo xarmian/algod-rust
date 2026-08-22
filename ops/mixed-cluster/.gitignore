@@ -11,6 +11,12 @@ soak-*.jsonl.summary.json
 # Same rationale as soak output.
 verify-fork-*.jsonl
 verify-cert-*.jsonl
+verify-go-input-*.json
+verify-go-report-*.json
+
+# Issue #470 conformance-suite artifact directories (soak JSONL, node
+# logs, analyzer + verifier output, summary.json). Same rationale.
+conformance-*/
 
 # Python bytecode from `python3 -c py_compile` or direct script runs.
 scripts/__pycache__/

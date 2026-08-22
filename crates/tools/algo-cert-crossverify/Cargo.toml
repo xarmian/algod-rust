@@ -12,11 +12,11 @@ rust-version.workspace = true
 # sqlite snapshot must already be caught up to the target round (in the
 # TASK-86 mixed cluster, this comes from the Rust relay's own ledger).
 #
-# Rust-produced cert verification (the inverse direction) is deferred
-# to PLAN-35 — it requires the Rust node to be running with online
-# participation keys, which is gated on participation-key format
-# interop with go-algorand's netgoal output. See
-# `docs/MIXED_CLUSTER_HARNESS.md` §Open questions.
+# Issue #470 §2 adds the inverse direction: with the Rust node online
+# and voting (#469), `--rust-account` asserts its votes are present in
+# the committed certificates, and `--export-go-input` writes a bundle
+# that `tools/cert-authenticate` replays through go-algorand's own
+# `agreement.Certificate.Authenticate`.
 
 [[bin]]
 name = "algo-cert-crossverify"
@@ -25,10 +25,12 @@ path = "src/main.rs"
 [dependencies]
 algo-agreement.workspace = true
 algo-codec.workspace = true
+algo-consensus-crypto.workspace = true
 algo-ledger.workspace = true
 algo-rest-client.workspace = true
 algo-types.workspace = true
 anyhow.workspace = true
+base64.workspace = true
 clap.workspace = true
 hex.workspace = true
 rmp-serde.workspace = true
