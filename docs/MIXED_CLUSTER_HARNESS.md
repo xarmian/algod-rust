@@ -81,27 +81,48 @@ rewrite each Node's `config.json` with:
 
 ### 1. Rust consensus participation
 
-Today the Rust node runs `algod-rust relay --peers=...` and
-`--genesis-id=...` but does NOT participate. Making it propose
-requires, at minimum:
+Today the Rust node in this compose file runs `algod-rust relay
+--peers=... --genesis-id=...` and does NOT participate. The
+prerequisites for switching it to `algod-rust participate` are now
+verified rather than open (issue #468):
 
-- **Participation-key format interop.** `goal network create` emits
-  `*.partkey` files in Go's SQLite schema. `algod-rust participate`'s
-  `--partkey-path` expects a participation key database; whether those
-  formats are compatible today is unverified. Related work lives in
-  PLAN-35 (DB Interchange — Phase A: Reader) which is the canonical
-  place to close this gap.
-- **Genesis interop.** The Rust node must accept the `goal`-generated
-  `genesis.json` byte-for-byte, including the `ConsensusProtocol:
-  "future"` pin the template sets. Needs verification.
-- **Online-stake awareness.** Wallet4 is offline in the current
-  template; flipping it online will require the Rust node to respond
-  to sortition and propose. Gated on the two points above.
+- **Participation-key format interop — verified.** `goal network
+  create` emits `*.partkey` files in Go's single-account SQLite schema.
+  A partkey captured from a real `goal network create` run over
+  `template.json` (v4.5.1-stable) is committed at
+  `crates/core/algo-ledger/tests/fixtures/partkey/goal-network-create/`
+  and proven end to end by
+  `crates/core/algo-ledger/tests/goal_network_create_test.rs`: it
+  restores, and its VRF / OTS / state-proof public keys match the
+  values `goal` independently wrote into `genesis.json`.
+- **Provisioning — no conversion step needed.** `--partkey-path` opens
+  the multi-key *registry* schema, which is not the same database, so
+  `participate` bridges the two at startup. Point `--data-dir` at a
+  `goal`-generated node directory and it scans that node's genesis
+  subdirectory (`<data-dir>/<genesis-id>/`, e.g.
+  `netroot/Node4Rust/phase6net-v1/`) for `<account>.<first>.<last>.partkey`
+  files and registers them — the same discovery
+  `AlgorandFullNode.loadParticipationKeys` performs
+  (`../go-algorand/node/node.go`). `--partkey-dir` scans an arbitrary
+  directory and `--import-partkey` names individual files, for layouts
+  that don't follow Go's convention.
+- **Genesis interop — verified.** `participate --genesis-json` seeds
+  `accountbase` + `accounttotals` from the `goal`-generated
+  `genesis.json` (including the `ConsensusProtocol: "future"` pin the
+  template sets). `genesis_seed_matches_go_ledger_supply` asserts the
+  resulting online / participating totals against the values a live
+  `algorand/algod:4.5.1-stable` node serves from `/v2/ledger/supply` at
+  round 0 on the same netroot.
+- **Online-stake awareness.** Wallet4 is `"Online": false` in the
+  template, so `goal` generates no partkey for it; that account needs a
+  keyreg to join consensus. Both paths are covered by
+  `goal_network_create_test.rs` — the keyreg-online transition for the
+  offline account, and the "genesis already carries the keys, no keyreg
+  needed" case for the online wallets.
 
-This is captured at the PR level rather than as its own TASK item
-because it's really a rollup of PLAN-35 prerequisites — the right place
-to reconsider the Rust participation story is once reader-side
-interchange lands.
+What remains is the live end-to-end run: flipping the compose file's
+Rust node over to `participate` and confirming it proposes alongside the
+Go nodes. That is the rest of Epic 42 (#107), not a format question.
 
 ### 2. REST surface on the Rust relay
 
