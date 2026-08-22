@@ -6,8 +6,13 @@
 * ``<sample-dir>/<node>.csv`` — one row per 2s tick:
   ``timestamp,mem_usage,cpu_pct,round``, straight out of ``docker stats`` and
   ``GET /v2/status``.
-* ``<sample-dir>/<node>.{final-round,proposals,votes,errors}`` — end-of-run
-  scalars, the latter three grepped out of the Rust nodes' logs.
+* ``<sample-dir>/<node>.{final-round,errors,warns,restarts}`` — end-of-run
+  scalars: the round, log-line counts for the Rust nodes, and Docker's own
+  restart/exit/OOM state for every node.
+* ``<sample-dir>/<node>.partstatus.{before,after}.json`` — the real
+  participation counters from ``GET /v2/participation/status`` (issue #473),
+  snapshotted either side of the measured load window. Absent/empty for the Go
+  nodes, which have no such endpoint.
 * ``<results-dir>/stress-loadgen-*.json`` — the generator's own reports.
 
 This script turns them into the report shape the issue specifies, adds the
@@ -222,6 +227,69 @@ def scan_blocks(base_url: str, token: str, first: int, last: int) -> dict:
     }
 
 
+_PART_COUNTERS = (
+    "blocks_committed",
+    "proposals_made",
+    "proposals_accepted",
+    "proposals_rejected",
+    "proposal_rounds",
+)
+
+
+def participation(sample_dir: str, node: str) -> dict | None:
+    """Fold a node's before/after ``/v2/participation/status`` pair into one dict.
+
+    Returns ``None`` for a node that has no such endpoint (the Go nodes) or
+    that answered 404 (a non-participating process), which is what lets the
+    report say "not participating" rather than "participating, zero votes".
+
+    The cumulative ``after`` totals are reported alongside a ``during_load``
+    delta, because the counters run from process start and therefore include
+    warmup and any pre-load idle rounds.
+    """
+    before = read_json(os.path.join(sample_dir, f"{node}.partstatus.before.json"))
+    after = read_json(os.path.join(sample_dir, f"{node}.partstatus.after.json"))
+    if not isinstance(after, dict):
+        return None
+    out = {k: after.get(k, 0) for k in _PART_COUNTERS}
+    out["current_round"] = after.get("current_round")
+    out["last_committed_round"] = after.get("last_committed_round")
+    if isinstance(before, dict):
+        out["during_load"] = {
+            k: (after.get(k, 0) or 0) - (before.get(k, 0) or 0) for k in _PART_COUNTERS
+        }
+    # `recent_rounds` is a bounded ring of per-round timings; summarise the
+    # timings rather than copying the whole ring into every report.
+    ring = after.get("recent_rounds") or []
+    commits = [r["start_to_commit_ms"] for r in ring if r.get("start_to_commit_ms") is not None]
+    props = [r["start_to_proposal_ms"] for r in ring if r.get("start_to_proposal_ms") is not None]
+    out["recent_rounds_sampled"] = len(ring)
+    out["votes_cast_recent"] = sum(r.get("votes_cast", 0) or 0 for r in ring)
+    out["start_to_commit_ms_avg"] = int(statistics.fmean(commits)) if commits else 0
+    out["start_to_commit_ms_p95"] = int(pct([float(c) for c in commits], 95.0))
+    out["start_to_proposal_ms_avg"] = int(statistics.fmean(props)) if props else 0
+    return out
+
+
+def restarts(sample_dir: str, node: str) -> dict:
+    """Docker's restart/exit/OOM state, the only unambiguous crash evidence.
+
+    Every node runs under ``restart: unless-stopped``, so a crash heals itself
+    within a couple of seconds and leaves almost no trace in the round samples.
+    """
+    path = os.path.join(sample_dir, f"{node}.restarts")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            count, exit_code, oom = (fh.read().strip() + ",,").split(",")[:3]
+        return {
+            "restart_count": int(count or 0),
+            "last_exit_code": int(exit_code or 0),
+            "oom_killed": oom.strip().lower() == "true",
+        }
+    except (OSError, ValueError):
+        return {"restart_count": 0, "last_exit_code": 0, "oom_killed": False}
+
+
 def mean_of(metrics: list[dict], key: str) -> float:
     vals = [m[key] for m in metrics if m.get(key)]
     return statistics.fmean(vals) if vals else 0.0
@@ -259,12 +327,15 @@ def main() -> None:
             "implementation": "Rust" if n in rust_nodes else "Go",
             "role": "relay" if n.endswith("relay") else "participation",
             "metrics": node_metrics(per_node_rows[n]),
+            "stability": restarts(args.sample_dir, n),
         }
+        part = participation(args.sample_dir, n)
+        if part is not None:
+            entry["participation"] = part
         if n in rust_nodes:
             entry["log_evidence"] = {
-                "proposal_log_lines": read_scalar(os.path.join(args.sample_dir, f"{n}.proposals")),
-                "vote_log_lines": read_scalar(os.path.join(args.sample_dir, f"{n}.votes")),
                 "error_log_lines": read_scalar(os.path.join(args.sample_dir, f"{n}.errors")),
+                "warn_log_lines": read_scalar(os.path.join(args.sample_dir, f"{n}.warns")),
             }
         node_report[n] = entry
 
@@ -335,6 +406,24 @@ def main() -> None:
     # finding to report, not a reason to fail the harness.
     ratio_cpu = report["comparison"]["cpu_ratio_rust_over_go"]
     ratio_mem = report["comparison"]["memory_ratio_rust_over_go"]
+
+    # The generator ramps linearly from 0 to the target over `ramp_secs` and
+    # only then holds the target, so its *mean* rate over the whole
+    # ramp+sustained window can never reach the target. Comparing the mean
+    # against the target marked a perfectly on-target run as a miss; compare it
+    # against the mean the schedule can actually deliver instead.
+    ramp = max(0.0, args.ramp_secs)
+    sustained = max(0.0, args.sustained_secs)
+    window = ramp + sustained
+    schedulable_tps = (
+        args.target_tps * (0.5 * ramp + sustained) / window if window > 0 else args.target_tps
+    )
+    report["config"]["schedulable_mean_tps"] = rnd(schedulable_tps)
+
+    crashes = sum(node_report[n]["stability"]["restart_count"] for n in nodes)
+    ooms = sum(1 for n in nodes if node_report[n]["stability"]["oom_killed"])
+    report["stability"] = {"total_restarts": crashes, "oom_killed_nodes": ooms}
+
     report["acceptance"] = {
         "all_nodes_reported_rounds": all(
             node_report[n]["metrics"]["final_round"] is not None for n in nodes
@@ -344,9 +433,10 @@ def main() -> None:
         "no_submission_failures": submission.get("failed_groups", 0) == 0,
         "rust_cpu_at_most_1_5x_go": (ratio_cpu is not None and ratio_cpu <= 1.5),
         "rust_memory_at_most_0_5x_go": (ratio_mem is not None and ratio_mem <= 0.5),
+        "no_crashes_or_oom": crashes == 0 and ooms == 0,
         "achieved_target_tps": (
-            args.target_tps > 0
-            and float(submission.get("achieved_submit_tps") or 0) >= 0.9 * args.target_tps
+            schedulable_tps > 0
+            and float(submission.get("achieved_submit_tps") or 0) >= 0.9 * schedulable_tps
         ),
     }
 
@@ -367,6 +457,26 @@ def main() -> None:
             f"{m['avg_cpu_pct']:>10.1f}{rss_mb:>10.1f}MB{str(m['final_round']):>11}"
         )
     print("")
+    print("participation counters (/v2/participation/status, delta over load window):")
+    any_part = False
+    for n in nodes:
+        part = node_report[n].get("participation")
+        if not part:
+            continue
+        any_part = True
+        d = part.get("during_load", part)
+        print(
+            f"  {n:<14} committed={d.get('blocks_committed', 0):<6} "
+            f"proposed={d.get('proposals_made', 0):<6} "
+            f"accepted={d.get('proposals_accepted', 0):<6} "
+            f"rejected={d.get('proposals_rejected', 0):<6} "
+            f"commit_p95={part.get('start_to_commit_ms_p95', 0)}ms"
+        )
+    if not any_part:
+        print("  (none reported — no node exposed /v2/participation/status)")
+    print("")
+    print(f"restarts / OOM kills:       {report['stability']['total_restarts']} / "
+          f"{report['stability']['oom_killed_nodes']}")
     print(f"round spread (max/avg):     {report['sync']['max_round_spread']} / "
           f"{report['sync']['avg_round_spread']}")
     print(f"txns confirmed (scanned):   {blocks.get('total_txns_confirmed', 0)} "
@@ -374,7 +484,7 @@ def main() -> None:
     print(f"txns/block avg | p95 | max: {blocks.get('txns_per_block_avg', 0)} | "
           f"{blocks.get('txns_per_block_p95', 0)} | {blocks.get('txns_per_block_max', 0)}")
     print(f"submit TPS achieved:        {submission.get('achieved_submit_tps', 0)} "
-          f"(target {args.target_tps})")
+          f"(target {args.target_tps}, schedulable mean {rnd(schedulable_tps)})")
     print(f"confirmed TPS:              {rnd(confirmed_tps)}")
     print(f"confirmation p95:           {confirmation.get('p95_ms', 0)} ms "
           f"({confirmation.get('samples', 0)} samples, "
