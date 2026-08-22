@@ -17,6 +17,12 @@ ledger apply, transaction/block validation, and the REST API v2. Phase 6
 [docs/PROJECT_SCOPE.md](docs/PROJECT_SCOPE.md) for the full scope and
 [docs/PHASE6_PROPOSAL.md](docs/PHASE6_PROPOSAL.md) for the current phase.
 
+The Rust node votes and proposes blocks alongside go-algorand
+v4.5.1-stable nodes in a mixed 4-node cluster
+(`make consensus-cluster-test`);
+[docs/PHASE6_VALIDATION.md](docs/PHASE6_VALIDATION.md) maps each Phase 6
+success criterion to the test or tool that verifies it.
+
 ## Quick start
 
 ```bash

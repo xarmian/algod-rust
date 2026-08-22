@@ -1,5 +1,11 @@
 # Mixed-Cluster Consensus Harness — Design (PLAN-32 / TASK-86)
 
+> **Status: shipped and complete.** This file records the *design
+> rationale* behind the harness. For what it proves and which test
+> backs each claim, read `docs/PHASE6_VALIDATION.md`; for how to drive
+> it, read `ops/mixed-cluster/README.md`. Both are kept current; this
+> document is not a task list.
+
 ## Why
 
 Phase 6 acceptance (see PLAN-32) requires running the Rust node alongside
@@ -9,6 +15,12 @@ docker-compose topology where we can bring up a 4-node (3 Go + 1 Rust)
 private network reliably enough to hang soak tests (TASK-87) and fork-
 detection tooling (TASK-88) on top.
 
+Epic 42 (#107) then turned that foundation into the full Layer-9 suite:
+the Rust node became an online participant (#469), and the harness grew
+positive (#470), restart/rejoin (#471) and negative (#472) conformance
+gates plus participation metrics (#473). The canonical entry points are
+the `consensus-cluster-*` make targets.
+
 ## Relation to the existing `docker/docker-compose.mixed-cluster.yml`
 
 The repo already has a mixed-cluster compose under `docker/`
@@ -17,7 +29,7 @@ The repo already has a mixed-cluster compose under `docker/`
 | File | Purpose | Topology |
 |---|---|---|
 | `docker/docker-compose.mixed-cluster.yml` | Gossip + catchup interop — can the Rust observer read Go blocks? Can a Go non-relay sync from a Rust relay? | 1 Go relay (block producer) + 1 Rust observer + 1 Rust relay + 1 Go non-relay |
-| `ops/mixed-cluster/docker-compose.yml` (this PR) | **Consensus agreement** — can the Rust node live on a network where 3 Go peers are running real agreement, without disrupting them? | 3 Go relay+proposers + 1 Rust relay peer (not yet proposing) |
+| `ops/mixed-cluster/docker-compose.yml` | **Consensus agreement** — does the Rust node vote and propose on a network of 3 Go peers running real agreement, and does Go accept it? | 3 Go relay+proposers (30% stake each) + 1 `algod-rust participate` node (10%), all four online |
 
 These intentionally coexist. A future refactor could unify them but
 that's not in this task's scope. The `ops/` location is net-new and
@@ -26,27 +38,36 @@ scenario-specific compose files.
 
 ## Topology decisions
 
-### 3 proposers, 1 non-participating peer
+### 3 Go proposers + 1 Rust participant, 30/30/30/10
 
-`template.json` gives each Go node 33% stake (online, proposing) and the
-Rust node 1% stake (**offline** → no participation keys actually used
-for consensus). Consensus quorum (>2/3 of online stake) is met by any
-2 of the 3 Go nodes; the Rust node joins as a peer and syncs blocks
-via gossip.
+`template.json` gives each Go node 30% of stake and the Rust node 10%,
+**all four online and participating** (this was 33/33/33/1-offline in
+the TASK-86 original; #469 flipped Wallet4 online).
 
 Why this stake split:
 
-- A 4-way 25/25/25/25 split with all 4 online would make the Rust
-  node's 25% count toward the online-stake denominator. If it doesn't
-  propose, cert threshold (>2/3 of online = >66.7%) requires all 3 Go
-  nodes in quorum — which is brittle because Algorand's sortition is
-  stochastic and any single Go node occasionally missing would stall
-  blocks. With Rust offline, the denominator is 99% and quorum only
-  needs ~2/3 × 99% ≈ 66% ≈ 2 Go nodes, which is robust.
-- An alternative (skip the Rust wallet entirely) would mean the Rust
-  node connects with no account on the network. We keep Wallet4 in the
-  genesis as a placeholder so a future Rust-participation iteration can
-  flip it `Online: true` with zero template churn.
+- **The Rust node must never be able to halt the chain.** The three Go
+  nodes hold 90% of online stake, an expected 1350 of the
+  `CertCommitteeSize = 1500` cert votes against a `1112` (74.1%)
+  threshold — roughly 13 sigma clear. They certify rounds with or
+  without the Rust node, so a Rust bug shows up as a failed *assertion*,
+  not as a dead cluster with nothing to read.
+- **But its participation must still be statistically observable.**
+  Under ConsensusFuture's `NumProposers = 20`, a 10% share gives an
+  expected proposer-committee size of 2, so the Rust node holds at least
+  one proposer credential in ~86% of rounds and wins ~10% of them. Over
+  a 200-round soak that is a mean of 20 wins with sd 4.24 — a wide
+  enough margin for `analyze.py`'s two-sided binomial gate to
+  distinguish "healthy" from "never proposes" (see
+  `ops/mixed-cluster/README.md` §"The proposer-share bound").
+- A 25/25/25/25 split would have been worse on the first count: the
+  cert threshold (>2/3 of online) would then need all three Go nodes in
+  quorum, which stochastic sortition makes brittle.
+- The flip side of the 10% share is that Rust's cert vote is not
+  *needed* for quorum, so `agreement.makeBundle` drops it from the
+  certificate. Vote acceptance is therefore asserted from Go's own
+  `VoteAccepted` telemetry instead — see `docs/PHASE6_VALIDATION.md`
+  criterion 7 for the full reasoning.
 
 ### One container per node (not `goal network start` in one container)
 
@@ -71,20 +92,38 @@ which is fine for single-host `goal network start` but useless across
 docker containers. `start.sh` runs `algocfg` inside the algod image to
 rewrite each Node's `config.json` with:
 
-- `NetAddress = 0.0.0.0:4161` — listen on all interfaces inside the
-  container
+- `NetAddress = 0.0.0.0:4161` on the three Go relays — listen on all
+  interfaces inside the container. `Node4Rust` gets `NetAddress = ""`:
+  the Rust node is a participation node that dials out to the relays,
+  matching the Go participation topology.
 - `EndpointAddress = 0.0.0.0:8080` — same for REST
 - `DNSBootstrapID = ""` — so private-net nodes don't try to reach
   mainnet/testnet relays and fill the logs with resolver errors
 
-## Open questions (follow-ups)
+## Follow-ups (§1 and §2 resolved; §3 deferred)
 
-### 1. Rust consensus participation
+### 1. Rust consensus participation — RESOLVED (#468, #469, #470–#473)
 
-Today the Rust node in this compose file runs `algod-rust relay
---peers=... --genesis-id=...` and does NOT participate. The
-prerequisites for switching it to `algod-rust participate` are now
-verified rather than open (issue #468):
+The Rust node in this compose file runs `algod-rust participate` and is
+an **online voter and proposer**, holding 10% of online stake against
+the three Go relays' 30% each. `template.json` marks all four wallets
+`"Online": true`. Entry points: `make consensus-cluster-smoke` (30
+rounds), `make consensus-cluster-test` (200-round positive suite),
+`make consensus-cluster-restart`, `make consensus-cluster-negative`.
+`docs/PHASE6_VALIDATION.md` maps each Phase 6 success criterion to the
+test that verifies it.
+
+Getting there took two real fixes that only a live cluster could
+surface: a VRF **seed-proof** bug (#469) and an agreement
+action-ordering bug (#482) that let the Rust node vote but never
+propose — its `Pseudonode(Assemble N)` action ran before the demux had
+executed the same batch's `Ensure(block N−1)`, so block assembly always
+ran two rounds behind. Both are fixed and regression-locked
+(`crates/core/algo-agreement/tests/simulate_smoke.rs`,
+`assemble_never_runs_before_previous_round_is_committed`).
+
+The key-format prerequisites that made this section an open question in
+the first place were closed by issue #468:
 
 - **Participation-key format interop — verified.** `goal network
   create` emits `*.partkey` files in Go's single-account SQLite schema.
@@ -113,16 +152,11 @@ verified rather than open (issue #468):
   resulting online / participating totals against the values a live
   `algorand/algod:4.5.1-stable` node serves from `/v2/ledger/supply` at
   round 0 on the same netroot.
-- **Online-stake awareness.** Wallet4 is `"Online": false` in the
-  template, so `goal` generates no partkey for it; that account needs a
-  keyreg to join consensus. Both paths are covered by
-  `goal_network_create_test.rs` — the keyreg-online transition for the
-  offline account, and the "genesis already carries the keys, no keyreg
-  needed" case for the online wallets.
-
-What remains is the live end-to-end run: flipping the compose file's
-Rust node over to `participate` and confirming it proposes alongside the
-Go nodes. That is the rest of Epic 42 (#107), not a format question.
+- **Online-stake awareness — done.** `template.json` now marks Wallet4
+  `"Online": true`, so `goal network create` generates its partkey
+  directly and no keyreg is needed to join the harness. The keyreg path
+  remains covered by `keyreg_online_brings_offline_genesis_account_online`
+  for the general case.
 
 ### 2. REST surface on the Rust relay — RESOLVED (#469, #473)
 
@@ -156,13 +190,25 @@ records; `scripts/analyze.py` summarizes them and can gate on them with
 `algod-rust relay` still has no REST listener; that remains open, but the
 cluster no longer needs it.
 
-### 3. CI integration
+### 3. CI integration — DEFERRED, tracked as #488
 
-This harness is excluded from CI in the current PR. The build requires
-docker-in-docker (or a preloaded algorand/algod image) and a Rust
-release build — both slow. A follow-up can add a nightly / merge-to-
-main job that runs `start.sh` → wait 2 min → `status.sh`, then tears
-down, keeping per-PR CI fast.
+This harness is **not** run by any GitHub Actions workflow, and Epic 42
+(#107) deliberately did not add one. The cost is prohibitive per PR: a
+release build of `algod-rust` in Docker, an `algorand/algod:4.5.1-stable`
+pull, a 200-round soak at ~3 s block time (10-15 minutes), and — for
+the `certs_authenticate_go` check — building go-algorand's vendored
+libsodium fork inside `tools/cert-authenticate/run-in-docker.sh`.
+
+Every cluster test is `#[ignore]`d and gated on `MIXED_CLUSTER=1`, so
+`cargo test --workspace` never touches Docker and per-PR CI is
+unaffected. Layer 9 is validated by running the harness locally; the
+evidence is recorded in `docs/PHASE6_VALIDATION.md`.
+
+Issue **#488** tracks the follow-up: a scheduled (nightly) job running
+at least `consensus-cluster-up` → `-status` → `-smoke` → `-down`, with a
+nightly tier for the full `consensus-cluster-test
+RESTART_SCENARIOS=1 NEGATIVE_CASES=1` suite and artifact retention.
+Update this section when that lands.
 
 ## Verification against TASK-86 acceptance
 
@@ -171,12 +217,23 @@ down, keeping per-PR CI fast.
 | `docker compose up -d` starts all 4 nodes | `start.sh` wraps it; compose file has 4 services |
 | All 4 see each other as peers within 60s | Each Go node's `config.json` has the other 3 as peers via `NetAddress` + peer config; Rust node has `--peers=go-node-1,go-node-2,go-node-3` |
 | Genesis hash matches | Single `goal network create` invocation produces one `genesis.json` distributed via `netroot/NodeN/` subdirs |
-| 3 Go + 1 Rust advance to round ≥ 10 within 2 min | Validated by `status.sh`; 3 Go nodes hold 99% of online stake, sufficient for quorum |
+| 3 Go + 1 Rust advance to round ≥ 10 within 2 min | Validated by `status.sh` (`make consensus-cluster-status`), which fails if any node lags more than `LAG_TOLERANCE` behind the max; the 3 Go nodes hold 90% of online stake, comfortably above the 74.1% cert threshold |
 | `stop.sh` cleans up volumes + networks | `docker compose down -v --remove-orphans`; `--purge` flag wipes netroot/ too |
 | Runbook | `ops/mixed-cluster/README.md` |
 | Design doc | This file |
 
 The "Rust node proposes at least once every N rounds" criterion from
-TASK-87 is explicitly **not** claimed by this PR — that's why Wallet4
-is offline and why PLAN-35 remains the dependency for Rust-side
-participation.
+TASK-87 was out of scope for TASK-86 itself. It is now shipped and
+gated: `analyze.py`'s `proposer_share_check` requires the Rust account
+to appear in the committed-proposer histogram inside a two-sided
+binomial bound and **always** fails on zero. See
+`docs/PHASE6_VALIDATION.md` criterion 3.
+
+## Where to go next
+
+| Question | Read |
+|---|---|
+| What does the harness prove, and which test proves it? | `docs/PHASE6_VALIDATION.md` |
+| How do I run it? | `ops/mixed-cluster/README.md`, `make help` |
+| How does Layer 9 fit the overall conformance plan? | `docs/CONFORMANCE_STRATEGY.md` §11 |
+| What does the soak measure and what are its thresholds? | `docs/SOAK_METHODOLOGY.md` |

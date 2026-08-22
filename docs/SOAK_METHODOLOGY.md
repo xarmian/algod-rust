@@ -148,7 +148,7 @@ consensus-cluster-test`) wires all of it together with the fork
 detector, both cert-verification directions, and the Go nodes'
 `VoteAccepted` telemetry. The verifier logic itself is unit-tested by
 `ops/mixed-cluster/scripts/analyze_test.py` (`make
-consensus-analyzer-test`), including the negative cases from the
+consensus-cluster-analyzer`), including the negative cases from the
 non-participating topology.
 
 ### Issue #471 additions (opt-in restart / rejoin stage)
