@@ -10,6 +10,15 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
+# See start.sh — Git Bash mangles both sides of `docker run -v`.
+host_path() {
+    if [ -n "${MSYSTEM:-}" ]; then
+        (cd "$1" 2>/dev/null && pwd -W) || echo "$1"
+    else
+        echo "$1"
+    fi
+}
+
 PURGE=0
 for arg in "$@"; do
     case "$arg" in
@@ -48,8 +57,8 @@ if [ "$PURGE" = "1" ]; then
         # pull will fail — fall back to a best-effort host-side rm so we
         # don't leave a half-cleaned netroot/ behind. A partial purge is
         # still preferable to `set -e` aborting mid-cleanup.
-        if ! docker run --rm \
-                -v "$ROOT/netroot:/netroot" \
+        if ! MSYS_NO_PATHCONV=1 docker run --rm \
+                -v "$(host_path "$ROOT/netroot"):/netroot" \
                 --entrypoint sh \
                 algorand/algod:4.5.1-stable \
                 -c 'rm -rf /netroot/* /netroot/.[!.]* 2>/dev/null || true'; then

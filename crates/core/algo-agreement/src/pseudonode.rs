@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tracing::{debug, warn};
+
 use algo_consensus_crypto::vrf::VrfKeypair;
 use algo_consensus_crypto::OneTimeSignatureSecrets;
 use algo_types::{Address, Round};
@@ -357,8 +359,12 @@ where
         let unfinished_block = match self.factory.assemble_block(round, &addresses) {
             Ok(b) => b,
             Err(e) => {
-                // If the round is stale, this is normal operation; otherwise log error.
-                let _ = e; // In Go, errors other than ErrAssembleBlockRoundStale are logged.
+                // Go logs everything but ErrAssembleBlockRoundStale as an
+                // error; a stale round is normal operation. Keep both
+                // visible at debug so "the node never proposes" is
+                // diagnosable without a source rebuild.
+                debug!(round = round.0, period = period.0, error = %e,
+                    "block assembly failed; not proposing this round");
                 return (Vec::new(), Vec::new());
             }
         };
@@ -399,14 +405,25 @@ where
                             proposals.push(proposal);
                             votes.push(uv);
                         }
-                        Err(_) => {
-                            // In Go, this is logged as a warning and we continue.
+                        Err(e) => {
+                            // Go logs this as a warning and continues. The
+                            // overwhelmingly common cause is "this account
+                            // was not selected as a proposer this round".
+                            debug!(round = round.0, period = period.0,
+                                account = ?acc.address, error = %e,
+                                "no proposal vote for account");
                             continue;
                         }
                     }
                 }
-                Err(_) => {
-                    // In Go, this is logged as an error and we continue.
+                Err(e) => {
+                    // Go logs this as an error and continues. Unlike the
+                    // make_vote path this is never routine — it means the
+                    // ledger could not supply the seed / consensus params
+                    // needed to build a proposal at all.
+                    warn!(round = round.0, period = period.0,
+                        account = ?acc.address, error = %e,
+                        "could not build a proposal for account");
                     continue;
                 }
             }
@@ -650,6 +667,41 @@ struct ProposalData {
 // Helper functions
 // ---------------------------------------------------------------------------
 
+/// The optional `History` term folded into `seedInput` when the round
+/// falls in a seed re-randomization window.
+///
+/// Mirrors the shared tail of Go's `deriveNewSeed` and `verifyProposer`
+/// (`../go-algorand/agreement/proposal.go`):
+///
+/// ```go
+/// rerand := rnd % basics.Round(cparams.SeedLookback*cparams.SeedRefreshInterval)
+/// if rerand < basics.Round(cparams.SeedLookback) {
+///     digrnd := rnd.SubSaturate(basics.Round(cparams.SeedLookback * cparams.SeedRefreshInterval))
+///     input.History, err = ledger.LookupDigest(digrnd)
+/// }
+/// ```
+///
+/// Returns `None` outside those windows, which is the overwhelming
+/// majority of rounds (8 in every 640 under ConsensusFuture).
+fn seed_history(
+    rnd: Round,
+    cparams: &algo_types::ConsensusParams,
+    ledger: &dyn LedgerReader,
+) -> Result<Option<algo_types::Digest>, PseudonodeError> {
+    let interval = cparams.seed_lookback * cparams.seed_refresh_interval;
+    if interval == 0 || rnd.0 % interval >= cparams.seed_lookback {
+        return Ok(None);
+    }
+    let digrnd = rnd.sub_saturate(interval);
+    let digest = ledger.lookup_digest(digrnd).map_err(|e| {
+        PseudonodeError::LedgerError(format!(
+            "could not lookup old entry digest (for seed) from round {}: {e}",
+            digrnd.0
+        ))
+    })?;
+    Ok(Some(digest))
+}
+
 /// Create a proposal for a block using the given account's VRF key.
 ///
 /// Mirrors Go's `proposalForBlock` in agreement/proposal.go.
@@ -676,34 +728,40 @@ fn proposal_for_block(
         .seed(seed_rnd)
         .map_err(|e| PseudonodeError::LedgerError(e.to_string()))?;
 
+    // Every `SeedRefreshInterval * SeedLookback` rounds the seed is
+    // re-randomized with an old block digest. Go's `deriveNewSeed` folds
+    // that `History` term into `seedInput` and `verifyProposer` recomputes
+    // it the same way, so a proposer that always passes `None` produces a
+    // block whose seed the network rejects on those rounds.
+    let history = seed_history(rnd, &cparams, ledger)?;
+
     // Derive new seed and VRF proof.
     let (new_seed, seed_proof) = if period == Period(0) {
         if let Some(keys) = signing_keys {
-            // Real VRF: build the selector message and produce a proof.
-            //
-            // In Go, deriveNewSeed calls VRF.Prove(hashRep(selector)) where
-            // selector = {seed: prevSeed, round: rnd, period: 0, step: propose}.
-            // The VRF output (64 bytes) is used to derive the new seed.
-            let selector = crate::selector::Selector {
-                seed: prev_seed,
-                round: rnd,
-                period: Period(0),
-                step: PROPOSE,
-            };
-            let vrf_message = hash_rep(&selector);
+            // Real VRF. Go's `deriveNewSeed` proves over the PREVIOUS
+            // SEED itself — `vrf.SK.Prove(prevSeed)`, i.e. the VRF alpha
+            // is `hashRep(prevSeed)` = "SD" || prevSeed — and
+            // `verifyProposer` checks it with
+            // `proposerRecord.SelectionID.Verify(p.SeedProof, prevSeed)`
+            // (../go-algorand/agreement/proposal.go). Proving over the
+            // sortition `Selector` instead makes every proposal we emit
+            // fail Go's check with "seed proof malformed", which is
+            // exactly what the 3-Go + 1-Rust cluster observed before
+            // issue #469.
+            let vrf_message = hash_rep(&prev_seed);
             let (proof, output) = keys.vrf.sk.prove(&vrf_message);
 
-            let seed = crate::seed::derive_seed_period_zero(address, output.as_bytes(), None);
+            let seed = crate::seed::derive_seed_period_zero(address, output.as_bytes(), history);
             (seed, *proof.as_bytes())
         } else {
             // Placeholder VRF: derive deterministically from seed + address.
             let vrf_out = derive_placeholder_vrf_output(&prev_seed, address);
-            let seed = crate::seed::derive_seed_period_zero(address, &vrf_out, None);
+            let seed = crate::seed::derive_seed_period_zero(address, &vrf_out, history);
             (seed, [0u8; 80])
         }
     } else {
         // Period > 0: seed is derived from previous seed, no VRF needed.
-        let seed = crate::seed::derive_seed_period_nonzero(&prev_seed, None);
+        let seed = crate::seed::derive_seed_period_nonzero(&prev_seed, history);
         (seed, [0u8; 80])
     };
 
@@ -1383,4 +1441,139 @@ mod tests {
     // brings the same infrastructure in for the broader state-machine
     // test matrix. See the top-of-block "Scenarios intentionally NOT
     // ported" list — this entry is captured there.
+
+    // -- Seed derivation / seed proof (issue #469) ----------------------
+    //
+    // Regression tests for the bug the 3-Go + 1-Rust mixed cluster
+    // surfaced: every Rust-proposed block was rejected by all three Go
+    // nodes with `rejected block for (R, 0): ... seed proof malformed`,
+    // because `proposal_for_block` proved the seed VRF over the sortition
+    // `Selector` instead of over the previous seed. Go's `verifyProposer`
+    // checks `SelectionID.Verify(p.SeedProof, prevSeed)`
+    // (../go-algorand/agreement/proposal.go), so the two never matched.
+
+    fn seeded_ledger(prev_seed: Seed, rnd: Round) -> crate::stubs::StubLedger {
+        let cparams = v41_params();
+        let mut ledger = crate::stubs::StubLedger::new(cparams.clone(), Round(rnd.0 + 1));
+        ledger
+            .seeds
+            .insert(crate::lookback::seed_round(rnd, &cparams), prev_seed);
+        ledger
+    }
+
+    /// The proof a proposer emits must verify under Go's rule: the VRF
+    /// alpha is `hashRep(prevSeed)`, not the sortition selector.
+    #[test]
+    fn proposal_seed_proof_verifies_against_previous_seed() {
+        let rnd = Round(100);
+        let prev_seed = Seed([0x5a; 32]);
+        let ledger = seeded_ledger(prev_seed, rnd);
+        let address = Address([0x11; 32]);
+        let keys = AccountSigningKeys {
+            vrf: VrfKeypair::from_seed([7u8; 32]),
+            ots: OneTimeSignatureSecrets::generate(0, 4),
+        };
+        let ub = crate::stubs::StubUnfinishedBlock::new(algo_types::Block::default(), rnd);
+
+        let (data, _pv) = proposal_for_block(
+            &address,
+            keys.vrf.pk.as_bytes(),
+            &ub,
+            Period(0),
+            &ledger,
+            Some(&keys),
+        )
+        .expect("proposal_for_block");
+
+        // Go: verifier.Verify(p.SeedProof, prevSeed)
+        let proof = algo_consensus_crypto::vrf::VrfProof(data.unauthenticated_proposal.seed_proof);
+        let vrf_out = keys
+            .vrf
+            .pk
+            .verify(&proof, &hash_rep(&prev_seed))
+            .expect("seed proof must verify over hash_rep(prev_seed)");
+
+        // ... and the seed handed to finish_block must be the one derived
+        // from that same proof's output.
+        let finish_args = *ub.finish_args.borrow();
+        let (seed, proposer, _eligible) = finish_args.expect("finish_block was called");
+        assert_eq!(proposer, address);
+        assert_eq!(
+            seed,
+            crate::seed::derive_seed_period_zero(&address, &vrf_out.0, None)
+        );
+    }
+
+    /// Proving over the sortition selector — the pre-#469 behaviour — must
+    /// NOT verify, so this test fails if the old input is reintroduced.
+    #[test]
+    fn selector_derived_seed_proof_does_not_verify() {
+        let rnd = Round(100);
+        let prev_seed = Seed([0x5a; 32]);
+        let keys = AccountSigningKeys {
+            vrf: VrfKeypair::from_seed([7u8; 32]),
+            ots: OneTimeSignatureSecrets::generate(0, 4),
+        };
+        let selector = crate::selector::Selector {
+            seed: prev_seed,
+            round: rnd,
+            period: Period(0),
+            step: PROPOSE,
+        };
+        let (proof, _) = keys.vrf.sk.prove(&hash_rep(&selector));
+        assert!(
+            keys.vrf.pk.verify(&proof, &hash_rep(&prev_seed)).is_none(),
+            "a selector-derived proof must not satisfy Go's prevSeed check"
+        );
+    }
+
+    /// Outside a re-randomization window there is no History term, and the
+    /// ledger is never consulted for an old digest.
+    #[test]
+    fn seed_history_is_none_outside_rerand_window() {
+        let cparams = v41_params();
+        let interval = cparams.seed_lookback * cparams.seed_refresh_interval;
+        // An empty StubLedger errors on every lookup_digest, so a None
+        // result also proves no lookup was attempted.
+        let ledger = crate::stubs::StubLedger::new(cparams.clone(), Round(1));
+        let rnd = Round(interval + cparams.seed_lookback);
+        assert_eq!(seed_history(rnd, &cparams, &ledger).unwrap(), None);
+    }
+
+    /// Inside the window the History term is the digest of the round
+    /// exactly one full interval back.
+    #[test]
+    fn seed_history_reads_old_digest_inside_rerand_window() {
+        let cparams = v41_params();
+        let interval = cparams.seed_lookback * cparams.seed_refresh_interval;
+        let rnd = Round(2 * interval + 1);
+        let digrnd = Round(interval + 1);
+        let mut ledger = crate::stubs::StubLedger::new(cparams.clone(), Round(rnd.0 + 1));
+        ledger.digests.insert(digrnd, Digest([0xc3; 32]));
+        assert_eq!(
+            seed_history(rnd, &cparams, &ledger).unwrap(),
+            Some(Digest([0xc3; 32]))
+        );
+    }
+
+    /// Error path: inside the window with no digest on file, the proposer
+    /// must surface a ledger error rather than silently dropping History
+    /// and proposing a block the network will reject.
+    #[test]
+    fn seed_history_propagates_missing_digest_error() {
+        let cparams = v41_params();
+        let interval = cparams.seed_lookback * cparams.seed_refresh_interval;
+        let rnd = Round(2 * interval + 1);
+        let ledger = crate::stubs::StubLedger::new(cparams.clone(), Round(rnd.0 + 1));
+        let err = seed_history(rnd, &cparams, &ledger).unwrap_err();
+        match err {
+            PseudonodeError::LedgerError(msg) => {
+                assert!(
+                    msg.contains("old entry digest"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected LedgerError, got {other:?}"),
+        }
+    }
 }

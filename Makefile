@@ -21,6 +21,7 @@ PHASE6_CLUSTER := ops/mixed-cluster
 .PHONY: canonical-extract extract-trackerdb-fixtures
 .PHONY: relay-up relay-down relay-test
 .PHONY: mixed-cluster-up mixed-cluster-down mixed-cluster-smoke mixed-cluster-test mixed-cluster-conformance
+.PHONY: consensus-cluster-up consensus-cluster-down consensus-cluster-status consensus-cluster-smoke
 .PHONY: phase6-cluster-up phase6-cluster-down phase6-cluster-status
 
 ## ── Build & Test ──────────────────────────────────────────────
@@ -572,19 +573,42 @@ mixed-cluster-conformance: mixed-cluster-up ## Run long-running conformance test
 	@echo "==> Mixed cluster conformance test complete."
 	$(MAKE) mixed-cluster-down
 
-## ── Phase 6 mixed-cluster consensus harness (TASK-86) ──────────
-phase6-cluster-up: ## Bring up the PLAN-32 4-node (3 Go + 1 Rust) consensus harness
+## ── Mixed-cluster consensus harness (issue #469, Epic 42b) ─────
+##
+## 3 go-algorand relays (30% of online stake each) + 1 `algod-rust
+## participate` node (10%), all four voting. See
+## ops/mixed-cluster/README.md for the sortition math.
+consensus-cluster-up: ## Bring up the 4-node (3 Go + 1 Rust participant) consensus cluster
 	$(PHASE6_CLUSTER)/scripts/start.sh
 
-phase6-cluster-status: ## Per-node round + peer-count snapshot for the phase6 cluster
+consensus-cluster-status: ## Per-node round snapshot for the consensus cluster (all 4 via REST)
 	$(PHASE6_CLUSTER)/scripts/status.sh
 
-phase6-cluster-down: ## Tear down the phase6 cluster (pass PURGE=1 to wipe netroot/)
+consensus-cluster-down: ## Tear down the consensus cluster (pass PURGE=1 to wipe netroot/)
 	@if [ "$(PURGE)" = "1" ]; then \
 		$(PHASE6_CLUSTER)/scripts/stop.sh --purge; \
 	else \
 		$(PHASE6_CLUSTER)/scripts/stop.sh; \
 	fi
+
+consensus-cluster-smoke: ## Run the #469 participation smoke test (up + 30 rounds + assertions + down)
+	SMOKE_ROUNDS=$(or $(SMOKE_ROUNDS),30) $(PHASE6_CLUSTER)/scripts/participation-smoke.sh
+
+## Deprecated aliases — `phase6-cluster-*` was the TASK-86 name for the
+## same harness back when the Rust node was a non-participating relay.
+## Kept so existing docs/muscle memory keep working; prefer the
+## `consensus-cluster-*` names above.
+phase6-cluster-up: ## DEPRECATED alias for consensus-cluster-up
+	@echo "note: phase6-cluster-up is deprecated — use 'make consensus-cluster-up'" >&2
+	@$(MAKE) consensus-cluster-up
+
+phase6-cluster-status: ## DEPRECATED alias for consensus-cluster-status
+	@echo "note: phase6-cluster-status is deprecated — use 'make consensus-cluster-status'" >&2
+	@$(MAKE) consensus-cluster-status
+
+phase6-cluster-down: ## DEPRECATED alias for consensus-cluster-down
+	@echo "note: phase6-cluster-down is deprecated — use 'make consensus-cluster-down'" >&2
+	@$(MAKE) consensus-cluster-down PURGE=$(PURGE)
 
 ## ── Benchmarks ─────────────────────────────────────────────
 BENCH_START  ?= 40000000
@@ -722,10 +746,12 @@ help:
 	@echo "  make mixed-cluster-smoke  Quick connectivity check"
 	@echo "  make mixed-cluster-test   Full conformance test (up + smoke + logs + down)"
 	@echo ""
-	@echo "Phase 6 Mixed-Cluster Consensus (TASK-86):"
-	@echo "  make phase6-cluster-up      Bring up 4-node cluster (3 Go + 1 Rust)"
-	@echo "  make phase6-cluster-status  Per-node round + liveness snapshot"
-	@echo "  make phase6-cluster-down    Tear down (append PURGE=1 to wipe netroot/)"
+	@echo "Mixed-Cluster Consensus (3 Go + 1 Rust, all four participating):"
+	@echo "  make consensus-cluster-up      Bring up the 4-node consensus cluster"
+	@echo "  make consensus-cluster-status  Per-node round snapshot (all 4 via REST)"
+	@echo "  make consensus-cluster-down    Tear down (append PURGE=1 to wipe netroot/)"
+	@echo "  make consensus-cluster-smoke   Up + 30 rounds + lockstep/rejection asserts + down"
+	@echo "  (phase6-cluster-up/-status/-down are deprecated aliases)"
 	@echo ""
 	@echo "Benchmarks (fair comparison):"
 	@echo "  make bench-micro      Run Rust criterion microbenchmarks (fixture-based)"

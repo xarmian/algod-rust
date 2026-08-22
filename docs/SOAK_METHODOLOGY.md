@@ -55,9 +55,11 @@ Every 5 s:
   `log_round` scrape (no stable structured round log exists today;
   null is normal)
 
-The Rust node has no REST endpoint today and is `Online: false` in the
-genesis template, so we cannot — and do not — record it as a proposer
-or source of block data. See §Known limitations.
+Since issue #469 the Rust node holds 10% of ONLINE stake and serves the
+algod v2 REST API on host port 4004, so it is sampled exactly like a Go
+node. It is a fully accepted voter — Go logs `VoteAccepted` for its
+votes — but it does not yet appear in the proposer histogram; see
+§Known limitations.
 
 ## Output format
 
@@ -125,14 +127,11 @@ A soak run is **clean** if `analyze.py` reports "all criteria satisfied"
 
 **Explicitly out of scope for TASK-87** (i.e., NOT part of acceptance):
 
-- **Rust node proposer share.** The task description originally asked
-  for "Rust proposes ≥ ~25% with ε tolerance", but that requires the
-  Rust node to run on-network participation keys — which needs
-  participation-key format interop with go-algorand's netgoal output.
-  That work is tracked under PLAN-35 (Rust consensus participation) and
-  is a strict prerequisite for flipping `Wallet4` to `Online: true` in
-  `template.json`. Until then the proposer histogram will show only
-  go-node-{1,2,3}.
+- **Rust node proposer share.** `Wallet4` is now `Online: true` with
+  10% of stake (issue #469) and the Rust node votes with keys Go
+  accepts, but it still contributes 0% of proposals — see
+  §Known limitations for the block-assembly ordering bug behind that.
+  A proposer-share assertion stays out of scope until it is fixed.
 - **Fork detection / cert cross-verify.** TASK-88. This harness'
   output feeds it but the detector itself isn't shipped here.
 - **Adversarial soak (fuzzer on live cluster).** Future work.
@@ -205,11 +204,17 @@ change in proposer distribution beyond noise is worth investigating.
 
 ## Known limitations
 
-- **Rust node not proposing.** See above. Tracked under PLAN-35.
-- **Rust node has no REST.** We observe it via `docker inspect` /
-  `docker logs`. The log scraping regex is best-effort and may return
-  `null` for `log_round`; the state sample is the authoritative
-  liveness signal.
+- **Rust node not proposing.** The Rust node votes (Go logs
+  `VoteAccepted` with `Weight` ~150/1500, matching its 10% stake) but
+  never proposes a block. Agreement issues its `Assemble` action for
+  round N before the ledger has written block N-1, so the pool's
+  `assemble_empty_block` fallback fails every round with
+  `cannot get prev header for N-1`. Reproduce with
+  `PHASE6_RUST_LOG=info,algo_agreement=debug`. Tracked as a follow-up;
+  the proposer histogram therefore still shows only go-node-{1,2,3}.
+- **`metrics.py` still samples the Rust node by container state.** Its
+  REST endpoint exists now (port 4004) and `status.sh` uses it;
+  extending `metrics.py` to do the same is a small follow-up.
 - **Single-machine docker.** Network latency and scheduling jitter on
   one host bias the `commit_spread_ms` distribution low relative to a
   geo-distributed production network. Use the numbers as a relative
@@ -269,9 +274,10 @@ ledger (copied out of the container by `verify-soak.sh` at verify
 time) is a valid input for `Certificate::authenticate`. Verified
 live on a 90-round soak: 11/11 sampled rounds authenticated cleanly.
 
-Rust-produced cert verification (the inverse Rust → Go direction)
-is **not** in this PR's scope — it needs the Rust node to actively
-propose with online participation keys, which is gated on PLAN-35.
+Rust-produced cert verification (the inverse Rust → Go direction) still
+needs the Rust node to actively propose; its keys are online and its
+votes are accepted, but block assembly is blocked (see
+§Known limitations).
 
 ## Follow-ups (out of TASK-87 scope)
 
@@ -281,6 +287,6 @@ propose with online participation keys, which is gated on PLAN-35.
   `ops/mixed-cluster/baselines/`.
 - Extend `metrics.py` to sample `/v2/metrics` (Prometheus) for peer
   counts, memory, and txnpool stats when `EnableDeveloperAPI` is on.
-- Rust-node REST server (gated on node wiring work) + participation
-  key interop (PLAN-35) → flip `Wallet4` online → acceptance-criterion
-  #2 from the original task can then be satisfied.
+- Fix the agreement/pool round-advance ordering so the Rust node can
+  assemble and propose blocks; then re-enable the proposer-share
+  acceptance criterion (~10% at the current 30/30/30/10 split).

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Per-node round + liveness snapshot for the PLAN-32 / TASK-86 mixed
-# cluster. Exits non-zero if any node is unreachable / not running /
-# more than LAG_TOLERANCE rounds behind the max.
+# Per-node round + liveness snapshot for the 4-node mixed cluster (3 Go
+# + 1 Rust, all four consensus participants). Exits non-zero if any node
+# is unreachable / not running / more than LAG_TOLERANCE rounds behind
+# the max.
 
 set -euo pipefail
 
@@ -10,13 +11,15 @@ ALGOD_TOKEN="${ALGOD_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 # Exit non-zero if any node's round lags > LAG_TOLERANCE behind the max.
 LAG_TOLERANCE="${LAG_TOLERANCE:-5}"
 
-# Name → (container, host_port). The Rust node has no container-facing
-# REST today, so we fall back to a container-state check for it.
+# Name → (container, host_port). Since issue #469 the Rust node runs
+# `participate --rest-listen 0.0.0.0:8080`, so its round comes from the
+# same algod v2 `/v2/status` endpoint as the Go nodes' — no log-scrape
+# or container-state-only fallback.
 declare -a ROWS=(
     "go-node-1|phase6-go-node-1|4001"
     "go-node-2|phase6-go-node-2|4002"
     "go-node-3|phase6-go-node-3|4003"
-    "rust-node-4|phase6-rust-node-4|4160"
+    "rust-node-4|phase6-rust-node-4|4004"
 )
 
 # ------------------------------------------------------------------ helpers
@@ -30,14 +33,17 @@ fetch_round() {
         echo "unreachable"
         return
     fi
+    # Pass the body as argv rather than interpolating it into the source:
+    # a body containing a stray quote would otherwise be a syntax error,
+    # and the native-Windows python3 on Git Bash chokes on MSYS paths.
     python3 -c "
 import json, sys
 try:
-    s = json.loads('''$body''')
+    s = json.loads(sys.argv[1])
     print(s.get('last-round', 'unknown'))
 except Exception as e:
-    print(f'parse-error: {e}')
-"
+    print('parse-error: {}'.format(e))
+" "$body" | tr -d '\r'
 }
 
 # Returns the container's Docker state string ('running' / 'exited' /
@@ -75,15 +81,6 @@ for row in "${ROWS[@]}"; do
     if [ "$state" != "running" ]; then
         printf "%-14s %-10s %-6s %s\n" "$name" "$state" "$port" "-"
         any_fail=1
-        continue
-    fi
-
-    # Running containers that don't serve REST (today: only the Rust
-    # relay) report state only; we still consider them healthy as long
-    # as the container is up. TASK-87 will scrape gossip logs for a
-    # stronger signal.
-    if [ "$port" -ge 4160 ]; then
-        printf "%-14s %-10s %-6s %s\n" "$name" "$state" "$port" "n/a (no REST)"
         continue
     fi
 
