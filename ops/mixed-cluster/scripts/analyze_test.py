@@ -5,7 +5,7 @@ Run directly (no pytest dependency):
 
     python3 ops/mixed-cluster/scripts/analyze_test.py
     # or
-    make consensus-analyzer-test
+    make consensus-cluster-analyzer
 
 The TDD requirement in issue #470 is "each new verifier assertion first
 demonstrated failing against a recorded soak from the *non*-participating

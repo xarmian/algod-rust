@@ -318,30 +318,46 @@ Ensure Rust consensus decisions match Go nodes.
 
 Testing environment:
 
-Mixed testnet cluster.
+A private mixed Go/Rust cluster under `ops/mixed-cluster/`
+(`docker-compose.yml` + `template.json`, bootstrapped by
+`scripts/start.sh`):
 
 ```
-Cluster:
+Cluster (shipped, Phase 6):
 
-3 Go nodes
-3 Rust nodes
-1 relay node
+3 x algorand/algod:4.5.1-stable   relay + proposer, 30% online stake each
+1 x algod-rust participate        10% online stake, voting + proposing
+
+Deferred to Phase 7: 3 Go + 3 Rust, 1000+ round soaks.
 ```
 
-Validation checks:
+Validation checks and where each one lives:
 
-- block proposals
-- voting participation
-- fork resolution
-- final block agreement
+| Check | Harness entry point | Tooling |
+|---|---|---|
+| Committee selection (VRF + sortition) matches Go | `cargo test -p algo-consensus-crypto` | `crates/core/algo-consensus-crypto/tests/vrf_parity.rs`, `tests/sortition_parity.rs`, `crates/core/algo-agreement/tests/lookback_boundary.rs` |
+| Go accepts Rust's votes | `make consensus-cluster-smoke`, `make consensus-cluster-test` | `scripts/participation-smoke.sh`, `scripts/consensus-conformance.sh` checks `go_accepts_rust_votes` + `no_go_side_rejections` (read off the Go nodes' own `VoteAccepted` telemetry) |
+| Block proposals accepted | `make consensus-cluster-test` | `scripts/analyze.py::proposer_share_check` — Rust account's share of committed proposers inside a two-sided binomial bound, never zero; the gate itself is unit-tested by `scripts/analyze_test.py` (`make consensus-cluster-analyzer`) |
+| Rust verifies Go's certificates | `make consensus-cluster-test` | `crates/tools/algo-cert-crossverify` via `scripts/verify-soak.sh` (check `certs_authenticate_rust`) |
+| Go verifies certificates from a Rust-participating chain | `make consensus-cluster-test` | `tools/cert-authenticate/` — a real go-algorand v4.5.1-stable binary running `agreement.Certificate.Authenticate` over ledger facts exported from the **Rust** ledger (check `certs_authenticate_go`) |
+| Fork resolution / final block agreement | `make consensus-cluster-test` | `crates/tools/algo-fork-detector` over every round (check `fork_free`); `scripts/analyze.py::cadence_check` for block cadence; `scripts/status.sh` for per-node lockstep |
+| Period advancement | `make consensus-cluster-test` | `consensus-conformance.sh` pauses a Go relay to force period > 0, then requires a return to lockstep (`period_advancement_recovery`) |
+| Restart / rejoin mid-round, no equivocation | `make consensus-cluster-restart` | `scripts/restart-rejoin.sh` (graceful / SIGKILL / killed-as-proposer) + `scripts/equivocation.py`, cross-checked against Go's own `voteTracker` equivocation detector |
+| Malformed messages rejected | `make consensus-cluster-negative` | `crates/tools/algo-agreement-fuzz` + `scripts/negative-conformance.sh` — bad VRF proof, zero committee weight, wrong OTS domain, corrupted proposal payload |
+| Participation observability | `make consensus-cluster-status` | `GET /v2/participation/status` and `GET /metrics` on the Rust node (`crates/core/algo-agreement/src/metrics.rs`), scraped by `scripts/metrics.py` |
 
-Implemented by the mixed-cluster harness under `ops/mixed-cluster/`
-(3 Go relays + 1 `algod-rust participate` node). The positive-path
-gate is `make consensus-cluster-test` — see
-`ops/mixed-cluster/README.md` §"Positive consensus conformance
-(issue #470, Epic 42c)" for what it asserts, the binomial bound used
-for proposer share, and how certificates are authenticated under both
-implementations.
+`docs/PHASE6_VALIDATION.md` is the full evidence map: it walks each of
+`docs/PHASE6_PROPOSAL.md`'s seven success criteria to the specific test
+or tool that verifies it, records the four consensus bugs this layer
+found, and states the honest scope limits (notably why the Rust node's
+cert vote does not appear *inside* certificates at a 30/30/30/10 stake
+split). `ops/mixed-cluster/README.md` is the operational runbook.
+
+Layer 9 is **not** run in CI: a container build plus a Rust release
+build plus a 200-round soak is far too slow for per-PR CI. Every
+cluster test is `#[ignore]`d and gated on `MIXED_CLUSTER=1`, so
+`cargo test --workspace` never touches Docker. See
+`docs/MIXED_CLUSTER_HARNESS.md` §3.
 
 ---
 

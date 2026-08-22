@@ -38,7 +38,7 @@
 #
 # Usage:
 #   bash ops/mixed-cluster/scripts/negative-conformance.sh
-#   make consensus-negative-test
+#   make consensus-cluster-negative
 #
 # Env:
 #   CASES              space-separated subset to run (default: all four)
@@ -179,7 +179,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 done
 [[ "$(go_max_round)" =~ ^[0-9]+$ ]] || { echo "cluster never reported a round" >&2; exit 1; }
 
-# The injector binary. `make consensus-negative-test` builds it first; when the
+# The injector binary. `make consensus-cluster-negative` builds it first; when the
 # script is run directly we build it here, but only if cargo is actually on
 # PATH (it is not, under Git Bash on the Windows dev boxes this harness also
 # targets — see CLAUDE.md).

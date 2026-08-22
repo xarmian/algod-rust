@@ -4,11 +4,15 @@ A 4-node docker-compose harness that runs 3 go-algorand v4.5.1-stable
 nodes + 1 algod-rust node on a private network. **All four nodes hold
 online stake and participate in consensus** (issue #469); the Rust node
 runs `algod-rust participate`, votes, and serves the algod v2 REST API.
-Foundation for:
+Foundation for (all shipped):
 
-- TASK-87 — 200-round soak test with metrics collection (shipped — see
-  "Running a soak" below and `docs/SOAK_METHODOLOGY.md`)
-- TASK-88 — fork detector / cert cross-verify (needs the same harness)
+- TASK-87 — 200-round soak test with metrics collection (see "Running a
+  soak" below and `docs/SOAK_METHODOLOGY.md`)
+- TASK-88 / TASK-95 — fork detector + cert cross-verify (see "Verifying
+  a soak")
+- Epic 42 (#107) — the full Layer-9 conformance suite: positive (#470),
+  restart/rejoin (#471), negative (#472), metrics (#473). Evidence map:
+  `docs/PHASE6_VALIDATION.md`.
 
 ## Topology
 
@@ -120,7 +124,24 @@ make consensus-cluster-status
 make consensus-cluster-down          # append PURGE=1 to wipe netroot/
 ```
 
-`phase6-cluster-up` / `-status` / `-down` remain as deprecated aliases.
+Everything that drives this harness lives under one `consensus-cluster-*`
+prefix:
+
+| Target | What it does |
+|---|---|
+| `consensus-cluster-up` | bring the 4 nodes up (bootstraps `netroot/` on first run) |
+| `consensus-cluster-status` | per-node round snapshot; non-zero exit if any node lags |
+| `consensus-cluster-down` | tear down (`PURGE=1` also wipes `netroot/`) |
+| `consensus-cluster-smoke` | #469 participation smoke test (`SMOKE_ROUNDS`, default 30) |
+| `consensus-cluster-test` | #470 positive suite (`ROUNDS`, `RESTART_SCENARIOS`, `NEGATIVE_CASES`) |
+| `consensus-cluster-restart` | #471 restart/rejoin scenarios (`RESTART_MODE`) |
+| `consensus-cluster-negative` | #472 negative suite (`CASES`, `SKIP_START`, `KEEP_CLUSTER`) |
+| `consensus-cluster-analyzer` | unit-test the soak analyzer — no Docker needed |
+
+Deprecated aliases, kept working but printing a notice:
+`phase6-cluster-up` / `-status` / `-down` (the TASK-86 names),
+`consensus-analyzer-test` → `consensus-cluster-analyzer`, and
+`consensus-negative-test` → `consensus-cluster-negative`.
 
 ## Participation smoke test (issue #469)
 
@@ -210,7 +231,7 @@ cluster-down and writes a machine-readable `summary.json`:
 make consensus-cluster-test                 # or ROUNDS=500 make …
 
 # Just the analyzer's unit tests (no Docker).
-make consensus-analyzer-test
+make consensus-cluster-analyzer
 
 # Through cargo, gated the same way as the #469 smoke test.
 MIXED_CLUSTER=1 cargo test -p algo-network --test consensus_conformance \
@@ -368,7 +389,7 @@ gossip connection to `go-node-1` (its `4161` is published to
 
 ```bash
 # Full suite (brings the cluster up and tears it down).
-make consensus-negative-test
+make consensus-cluster-negative
 
 # One case, against an already-running cluster, keeping it up.
 cargo build -p algo-agreement-fuzz
@@ -515,12 +536,20 @@ is Phase C / PLAN-37 territory.
 
 ## Host ports
 
-| Service       | Host port | Container port | Purpose                |
-|---------------|-----------|----------------|------------------------|
-| go-node-1     | `4001`    | `8080`         | REST API (token auth)  |
-| go-node-2     | `4002`    | `8080`         | REST API               |
-| go-node-3     | `4003`    | `8080`         | REST API               |
-| rust-node-4   | `4160`    | `4160`         | Gossip (no REST today) |
+All bindings are on `127.0.0.1` — the harness never listens on a
+routable interface, even though the committed API token is the trivial
+`aaaa…` value.
+
+| Service       | Host port | Container port | Purpose                                        |
+|---------------|-----------|----------------|------------------------------------------------|
+| go-node-1     | `4001`    | `8080`         | REST API (token auth)                          |
+| go-node-1     | `4161`    | `4161`         | Gossip — published **only** for this node, so the #472 injector can reach exactly one Go peer |
+| go-node-2     | `4002`    | `8080`         | REST API                                       |
+| go-node-3     | `4003`    | `8080`         | REST API                                       |
+| rust-node-4   | `4004`    | `8080`         | REST API — `/v2/status`, `/v2/participation/status`, `/metrics` |
+
+go-node-2/3's gossip ports and the Rust node's outbound-only gossip are
+deliberately not published.
 
 Hit the Go nodes with:
 
@@ -529,8 +558,16 @@ curl -sf -H "X-Algo-API-Token: $(cat netroot/Node1/algod.token)" \
     http://localhost:4001/v2/status | jq .
 ```
 
-The Rust node's `relay` subcommand does not yet expose REST — see the
-design doc for the follow-up. `status.sh` reports `n/a` for it.
+and the Rust node the same way on `4004`:
+
+```
+curl -sf -H "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+    http://localhost:4004/v2/participation/status | jq .
+curl -sf http://localhost:4004/metrics          # Prometheus text, no auth
+```
+
+(`algod-rust relay` still has no REST listener; `participate`, which is
+what this harness runs, does.)
 
 ## What's in `netroot/`
 
@@ -609,23 +646,27 @@ netroot/` manually.
   to 4001/4002/4003/4160. Edit the compose file's `ports:` section to
   remap.
 
-## Scope (TASK-86)
+## Scope
 
-This PR delivers the harness plus local-run scripts. It explicitly does
-NOT:
+Everything TASK-86 originally deferred has since shipped:
 
-- Run a long soak — TASK-87 builds on this with a metrics collector.
-- Detect forks or cross-verify certificates — TASK-88.
-- Exercise Rust consensus participation — gated on participation-key
-  interop with Go's netgoal output (see the follow-up in the design
-  doc).
-- Integrate into CI — left as a follow-up so CI doesn't take a
-  container-build hit on every PR.
+| Originally deferred | Status |
+|---|---|
+| Long soak with a metrics collector (TASK-87) | Shipped — `scripts/soak.sh` + `scripts/metrics.py` + `scripts/analyze.py` |
+| Fork detection / cert cross-verify (TASK-88, TASK-95) | Shipped — `algo-fork-detector`, `algo-cert-crossverify`, `tools/cert-authenticate` via `scripts/verify-soak.sh` |
+| Rust consensus participation | Shipped — issue #468 (key interop) + #469 (online participant); the Rust node votes and proposes |
+| **CI integration** | **Still deferred**, tracked as issue **#488** — a container build + release build + 200-round soak is too slow for per-PR CI. All cluster tests are `#[ignore]`d and gated on `MIXED_CLUSTER=1`. |
 
-## Design doc
+## Related docs
 
-See `docs/MIXED_CLUSTER_HARNESS.md` for the rationale behind the
-topology choices, the open questions on Rust-side participation, and the
-relationship to the existing `docker/docker-compose.mixed-cluster.yml`
-harness (which serves a different purpose — gossip / catchup interop
-testing, not consensus agreement).
+| Question | Read |
+|---|---|
+| What does this harness prove, and which test proves it? | `docs/PHASE6_VALIDATION.md` |
+| Why is the topology shaped this way? | `docs/MIXED_CLUSTER_HARNESS.md` |
+| How does Layer 9 fit the overall conformance plan? | `docs/CONFORMANCE_STRATEGY.md` §11 |
+| What does the soak measure, with what thresholds? | `docs/SOAK_METHODOLOGY.md` |
+| All the make targets | `make help` |
+
+Note that `docker/docker-compose.mixed-cluster.yml` is a *different*
+harness serving a different purpose — gossip / catchup interop testing
+(`make mixed-cluster-*`), not consensus agreement.

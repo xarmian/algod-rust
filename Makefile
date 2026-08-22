@@ -22,8 +22,10 @@ PHASE6_CLUSTER := ops/mixed-cluster
 .PHONY: relay-up relay-down relay-test
 .PHONY: mixed-cluster-up mixed-cluster-down mixed-cluster-smoke mixed-cluster-test mixed-cluster-conformance
 .PHONY: consensus-cluster-up consensus-cluster-down consensus-cluster-status consensus-cluster-smoke
-.PHONY: consensus-cluster-test consensus-analyzer-test consensus-cluster-restart
+.PHONY: consensus-cluster-test consensus-cluster-restart consensus-cluster-negative
+.PHONY: consensus-cluster-analyzer
 .PHONY: phase6-cluster-up phase6-cluster-down phase6-cluster-status
+.PHONY: consensus-analyzer-test consensus-negative-test
 
 ## ── Build & Test ──────────────────────────────────────────────
 
@@ -574,11 +576,28 @@ mixed-cluster-conformance: mixed-cluster-up ## Run long-running conformance test
 	@echo "==> Mixed cluster conformance test complete."
 	$(MAKE) mixed-cluster-down
 
-## ── Mixed-cluster consensus harness (issue #469, Epic 42b) ─────
+## ── Mixed-cluster consensus harness (Epic 42, issue #107) ──────
 ##
 ## 3 go-algorand relays (30% of online stake each) + 1 `algod-rust
 ## participate` node (10%), all four voting. See
-## ops/mixed-cluster/README.md for the sortition math.
+## ops/mixed-cluster/README.md for the sortition math and
+## docs/PHASE6_VALIDATION.md for what each target proves.
+##
+## Canonical target family — everything that drives the
+## ops/mixed-cluster harness is `consensus-cluster-*`:
+##
+##   consensus-cluster-up        bring the 4 nodes up
+##   consensus-cluster-status    per-node round snapshot
+##   consensus-cluster-down      tear down (PURGE=1 wipes netroot/)
+##   consensus-cluster-smoke     #469 participation smoke test
+##   consensus-cluster-test      #470 positive conformance suite
+##   consensus-cluster-restart   #471 restart/rejoin scenarios
+##   consensus-cluster-negative  #472 negative conformance suite
+##   consensus-cluster-analyzer  soak-analyzer unit tests (no Docker)
+##
+## `phase6-cluster-*`, `consensus-analyzer-test` and
+## `consensus-negative-test` remain as deprecated aliases at the bottom
+## of this section.
 consensus-cluster-up: ## Bring up the 4-node (3 Go + 1 Rust participant) consensus cluster
 	$(PHASE6_CLUSTER)/scripts/start.sh
 
@@ -613,7 +632,7 @@ consensus-cluster-smoke: ## Run the #469 participation smoke test (up + 30 round
 ## NEGATIVE_CASES=1 additionally runs the #472 negative suite (one malformed
 ## agreement message per case injected into go-node-1, asserting Go rejects
 ## each one and the cluster stays healthy) against the same running cluster.
-consensus-cluster-test: consensus-analyzer-test ## Run the #470 conformance suite (up + soak + verify + down)
+consensus-cluster-test: consensus-cluster-analyzer ## Run the #470 conformance suite (up + soak + verify + down)
 	cargo build -p algo-fork-detector -p algo-cert-crossverify -p algo-agreement-fuzz
 	ROUNDS=$(or $(ROUNDS),200) \
 	RESTART_SCENARIOS=$(or $(RESTART_SCENARIOS),0) \
@@ -625,20 +644,32 @@ consensus-cluster-restart: ## Run the #471 restart/rejoin scenarios against a RU
 	cargo build -p algo-fork-detector
 	MODE=$(or $(RESTART_MODE),all) $(PHASE6_CLUSTER)/scripts/restart-rejoin.sh
 
-consensus-negative-test: ## Run the #472 negative conformance suite (up + inject 4 bad messages + down)
+consensus-cluster-negative: ## Run the #472 negative conformance suite (up + inject 4 bad messages + down)
 	cargo build -p algo-agreement-fuzz
 	CASES=$(or $(CASES),bad-vrf-proof wrong-committee-weight wrong-ots-domain malformed-proposal) \
 	SKIP_START=$(or $(SKIP_START),0) \
 	KEEP_CLUSTER=$(or $(KEEP_CLUSTER),0) \
 		$(PHASE6_CLUSTER)/scripts/negative-conformance.sh
 
-consensus-analyzer-test: ## Unit-test the #470 soak-analyzer logic (no Docker needed)
+consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker needed)
 	python3 $(PHASE6_CLUSTER)/scripts/analyze_test.py
 
-## Deprecated aliases — `phase6-cluster-*` was the TASK-86 name for the
-## same harness back when the Rust node was a non-participating relay.
-## Kept so existing docs/muscle memory keep working; prefer the
-## `consensus-cluster-*` names above.
+## Deprecated aliases.
+##
+## `phase6-cluster-*` was the TASK-86 name for the same harness back when
+## the Rust node was a non-participating relay. `consensus-analyzer-test`
+## and `consensus-negative-test` were introduced by #470/#472 before the
+## family settled on the `consensus-cluster-*` prefix the epic (#107)
+## names. All are kept so existing docs/muscle memory keep working;
+## prefer the canonical names above.
+consensus-analyzer-test: ## DEPRECATED alias for consensus-cluster-analyzer
+	@echo "note: consensus-analyzer-test is deprecated — use 'make consensus-cluster-analyzer'" >&2
+	@$(MAKE) consensus-cluster-analyzer
+
+consensus-negative-test: ## DEPRECATED alias for consensus-cluster-negative
+	@echo "note: consensus-negative-test is deprecated — use 'make consensus-cluster-negative'" >&2
+	@$(MAKE) consensus-cluster-negative CASES="$(CASES)" SKIP_START=$(SKIP_START) KEEP_CLUSTER=$(KEEP_CLUSTER)
+
 phase6-cluster-up: ## DEPRECATED alias for consensus-cluster-up
 	@echo "note: phase6-cluster-up is deprecated — use 'make consensus-cluster-up'" >&2
 	@$(MAKE) consensus-cluster-up
@@ -787,15 +818,19 @@ help:
 	@echo "  make mixed-cluster-smoke  Quick connectivity check"
 	@echo "  make mixed-cluster-test   Full conformance test (up + smoke + logs + down)"
 	@echo ""
-	@echo "Mixed-Cluster Consensus (3 Go + 1 Rust, all four participating):"
-	@echo "  make consensus-cluster-up      Bring up the 4-node consensus cluster"
-	@echo "  make consensus-cluster-status  Per-node round snapshot (all 4 via REST)"
-	@echo "  make consensus-cluster-down    Tear down (append PURGE=1 to wipe netroot/)"
-	@echo "  make consensus-cluster-smoke   Up + 30 rounds + lockstep/rejection asserts + down"
-	@echo "  make consensus-cluster-test    #470 conformance suite (up + 200-round soak + verify + down)"
-	@echo "  make consensus-cluster-restart #471 restart/rejoin scenarios against a running cluster"
-	@echo "  make consensus-analyzer-test   Unit-test the #470 soak analyzer (no Docker)"
-	@echo "  (phase6-cluster-up/-status/-down are deprecated aliases)"
+	@echo "Mixed-Cluster Consensus (3 Go + 1 Rust, all four participating — Epic 42/#107):"
+	@echo "  make consensus-cluster-up       Bring up the 4-node consensus cluster"
+	@echo "  make consensus-cluster-status   Per-node round snapshot (all 4 via REST)"
+	@echo "  make consensus-cluster-down     Tear down (append PURGE=1 to wipe netroot/)"
+	@echo "  make consensus-cluster-smoke    #469 up + 30 rounds + lockstep/rejection asserts + down"
+	@echo "  make consensus-cluster-test     #470 positive suite (up + 200-round soak + verify + down)"
+	@echo "                                  ROUNDS=N, RESTART_SCENARIOS=1, NEGATIVE_CASES=1"
+	@echo "  make consensus-cluster-restart  #471 restart/rejoin scenarios against a running cluster"
+	@echo "  make consensus-cluster-negative #472 negative suite (inject 4 faulted messages, assert reject)"
+	@echo "  make consensus-cluster-analyzer Unit-test the #470/#473 soak analyzer (no Docker)"
+	@echo "  Evidence map: docs/PHASE6_VALIDATION.md; runbook: ops/mixed-cluster/README.md"
+	@echo "  Deprecated aliases: phase6-cluster-up/-status/-down,"
+	@echo "                      consensus-analyzer-test, consensus-negative-test"
 	@echo ""
 	@echo "Benchmarks (fair comparison):"
 	@echo "  make bench-micro      Run Rust criterion microbenchmarks (fixture-based)"
