@@ -151,6 +151,10 @@ struct MockNode {
     latest_round_for_catchup: u64,
     /// Set sync round result: None = success, Some(msg) = error.
     set_sync_round_result: Option<String>,
+    /// Consensus-participation metrics JSON (None = not participating).
+    participation_status: Option<serde_json::Value>,
+    /// Prometheus exposition text (None = not participating).
+    metrics_exposition: Option<String>,
 }
 
 impl Clone for MockNode {
@@ -210,6 +214,8 @@ impl Clone for MockNode {
             debug_prof_rates: self.debug_prof_rates,
             latest_round_for_catchup: self.latest_round_for_catchup,
             set_sync_round_result: self.set_sync_round_result.clone(),
+            participation_status: self.participation_status.clone(),
+            metrics_exposition: self.metrics_exposition.clone(),
         }
     }
 }
@@ -317,6 +323,10 @@ impl MockNode {
             debug_prof_rates: (0, 0),
             latest_round_for_catchup: 0,
             set_sync_round_result: None,
+            // Default mock is a non-participating node, so both #473
+            // endpoints answer 404 unless a test opts in.
+            participation_status: None,
+            metrics_exposition: None,
         }
     }
 
@@ -944,6 +954,14 @@ impl NodeInterface for MockNode {
 
     fn is_follower_mode(&self) -> bool {
         self.is_follower_mode
+    }
+
+    fn participation_status(&self) -> Option<serde_json::Value> {
+        self.participation_status.clone()
+    }
+
+    fn metrics_exposition(&self) -> Option<String> {
+        self.metrics_exposition.clone()
     }
 
     async fn get_block_timestamp_offset(&self) -> Result<Option<u64>, NodeError> {
@@ -7640,4 +7658,170 @@ async fn raw_transaction_async_empty_body_returns_400() {
         body.contains("empty txgroup"),
         "error should mention empty txgroup: {body}"
     );
+}
+
+// ===========================================================================
+// Consensus participation metrics (issue #473)
+// ===========================================================================
+
+/// A mock node instrumented as if it had been participating for a while.
+fn mock_participating() -> MockNode {
+    let mut node = MockNode::synced();
+    node.participation_status = Some(serde_json::json!({
+        "votes_cast_total": 42,
+        "votes_cast_by_step": {"soft": 21, "cert": 21},
+        "proposals_made": 3,
+        "last_committed_round": 1000,
+        "recent_rounds": [{"round": 1000, "start_to_commit_ms": 2800}],
+    }));
+    node.metrics_exposition = Some(
+        "# HELP algod_rust_agreement_votes_total Total agreement votes cast by this node.\n\
+         # TYPE algod_rust_agreement_votes_total counter\n\
+         algod_rust_agreement_votes_total 42\n"
+            .to_string(),
+    );
+    node
+}
+
+#[tokio::test]
+async fn participation_status_returns_metrics_json() {
+    let server = TestServer::start(mock_participating()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/participation/status"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("application/json"));
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["votes_cast_total"], 42);
+    assert_eq!(body["votes_cast_by_step"]["soft"], 21);
+    assert_eq!(body["last_committed_round"], 1000);
+}
+
+#[tokio::test]
+async fn participation_status_requires_a_token() {
+    let server = TestServer::start(mock_participating()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/participation/status"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn participation_status_accepts_the_admin_token() {
+    let server = TestServer::start(mock_participating()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/participation/status"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+/// The endpoint-not-configured case: a node that is not participating must
+/// 404 rather than report a zeroed document, so a scraper can tell the two
+/// apart.
+#[tokio::test]
+async fn participation_status_404s_when_not_participating() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/participation/status"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("not participating in consensus"),
+        "unexpected body: {body}"
+    );
+}
+
+/// `/v2/participation/status` must not be swallowed by the admin group's
+/// `/v2/participation/:participation-id` route.
+#[tokio::test]
+async fn participation_status_route_does_not_shadow_key_lookup() {
+    let server = TestServer::start(mock_participating()).await;
+
+    // A real participation ID still reaches the admin key-lookup handler
+    // (which 404s for an unknown id) rather than the metrics handler.
+    let resp = server
+        .client
+        .get(server.url("/v2/participation/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"))
+        .header("X-Algo-API-Token", &server.admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body = resp.text().await.unwrap();
+    assert!(
+        !body.contains("not participating in consensus"),
+        "id lookup must not hit the metrics handler: {body}"
+    );
+}
+
+#[tokio::test]
+async fn metrics_endpoint_returns_prometheus_text_without_auth() {
+    let server = TestServer::start(mock_participating()).await;
+
+    // No token header at all: `/metrics` is public, like go-algorand's.
+    let resp = server
+        .client
+        .get(server.url("/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/plain"),
+        "unexpected content-type: {content_type}"
+    );
+
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("algod_rust_agreement_votes_total 42"),
+        "{body}"
+    );
+    assert!(body.contains("# TYPE algod_rust_agreement_votes_total counter"));
+}
+
+#[tokio::test]
+async fn metrics_endpoint_404s_when_not_participating() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
 }

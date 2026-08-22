@@ -33,6 +33,7 @@ use crate::codec;
 use crate::demux::{Demux, ExternalDemuxSignals, ExternalEvent};
 use crate::events::ConsensusVersionView;
 use crate::ledger_reader::LedgerReader;
+use crate::metrics::ParticipationMetrics;
 use crate::persistence::{self, AsyncPersistenceLoop, ClockState, PersistentRequest};
 use crate::player::Player;
 use crate::pseudonode::{AccountSigningKeys, AsyncPseudonode, Pseudonode};
@@ -170,6 +171,16 @@ where
     C: CryptoVerifier + Send + 'static,
 {
     params: Parameters<N, L, K, BF, BV, R, M, C>,
+    /// Consensus-participation counters and round timings (issue #473).
+    ///
+    /// Deliberately *not* a `Parameters` field: every existing construction
+    /// site builds `Parameters` with a struct literal, and metrics are
+    /// observability, not a protocol input. `Service::new` always creates one
+    /// so the counters exist unconditionally; a caller that wants to scrape
+    /// them (the `participate` command, which must hand the same handle to
+    /// the REST adapter it starts *before* agreement) injects its own via
+    /// [`Service::with_metrics`] or takes a handle with [`Service::metrics`].
+    metrics: Arc<ParticipationMetrics>,
 }
 
 impl<N, L, K, BF, BV, R, M, C> Service<N, L, K, BF, BV, R, M, C>
@@ -187,7 +198,25 @@ where
     ///
     /// Mirrors Go's `MakeService`.
     pub fn new(params: Parameters<N, L, K, BF, BV, R, M, C>) -> Self {
-        Self { params }
+        Self {
+            params,
+            metrics: Arc::new(ParticipationMetrics::new()),
+        }
+    }
+
+    /// Use a caller-supplied metrics collector instead of the one
+    /// `Service::new` created.
+    ///
+    /// Lets the node share one collector between the agreement service and a
+    /// REST server that was already started (see `participate`).
+    pub fn with_metrics(mut self, metrics: Arc<ParticipationMetrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// A handle to this service's participation metrics.
+    pub fn metrics(&self) -> Arc<ParticipationMetrics> {
+        self.metrics.clone()
     }
 
     /// Start executing the agreement protocol.
@@ -201,6 +230,7 @@ where
     /// Mirrors Go's `Service.Start()`.
     pub fn start(self) -> ServiceHandle {
         let quit = Arc::new(AtomicBool::new(false));
+        let metrics = self.metrics.clone();
 
         // Signal the network that the agreement service is ready.
         self.params.network.start();
@@ -302,6 +332,8 @@ where
         let ledger_demux = ledger.clone();
         let network_demux = network.clone();
         let monitor_demux = monitor.clone();
+        let metrics_main = metrics.clone();
+        let metrics_demux = metrics.clone();
 
         // Spawn main loop thread.
         let main_handle = thread::Builder::new()
@@ -321,6 +353,7 @@ where
                     persistence_loop,
                     restored_state,
                     signing_keys,
+                    metrics_main,
                 );
             })
             .expect("failed to spawn agreement main loop thread");
@@ -350,6 +383,7 @@ where
                     monitor_demux,
                     vote_verifier,
                     clock_for_actions,
+                    metrics_demux,
                 );
             })
             .expect("failed to spawn agreement demux loop thread");
@@ -390,6 +424,7 @@ fn main_loop<L, K, BF, R>(
     mut persistence_loop: Option<AsyncPersistenceLoop>,
     restored_state: Option<(RootRouter, Player, ClockState, Vec<Action>)>,
     signing_keys: HashMap<Address, AccountSigningKeys>,
+    metrics: Arc<ParticipationMetrics>,
 ) where
     L: LedgerReader + LedgerWriter + Send + Sync + 'static,
     K: AgreementKeyManager + Send + 'static,
@@ -449,7 +484,12 @@ fn main_loop<L, K, BF, R>(
     let mut persist_player: Option<Player> = None;
     let mut persist_actions: Option<Vec<Action>> = None;
 
-    info!("agreement service started at round {}", next_round);
+    info!(
+        event = "service_started",
+        round = next_round.0,
+        "agreement service started at round {}",
+        next_round
+    );
 
     loop {
         if quit.load(Ordering::SeqCst) {
@@ -523,6 +563,7 @@ fn main_loop<L, K, BF, R>(
                 &persist_router,
                 &persist_player,
                 &persist_actions,
+                &metrics,
             );
         }
         // Persistence snapshots are consumed by the attest above; reset so
@@ -641,6 +682,7 @@ fn execute_pseudonode_action(
     persist_router: &Option<RootRouter>,
     persist_player: &Option<Player>,
     persist_actions: &Option<Vec<Action>>,
+    metrics: &ParticipationMetrics,
 ) {
     match pa.t {
         ActionType::Assemble => {
@@ -656,12 +698,33 @@ fn execute_pseudonode_action(
                     // "did we propose this round?" answerable from the node's
                     // own log instead of only from the committed block.
                     if !message_events.is_empty() {
+                        // The digests of the blocks we just proposed. Recorded
+                        // so a later `Ensure` can tell whether *our* proposal
+                        // is the one that won the round.
+                        let digests: Vec<algo_types::Digest> = message_events
+                            .iter()
+                            .filter_map(|me| {
+                                me.input
+                                    .vote
+                                    .as_ref()
+                                    .map(|v| v.raw_vote.proposal.block_digest)
+                            })
+                            .collect();
+                        // Structured fields first-class; the human message is
+                        // byte-identical to the pre-#473 line because
+                        // `ops/mixed-cluster/scripts/restart-rejoin.sh` greps
+                        // for it verbatim.
                         info!(
+                            event = "proposal_made",
+                            round = pa.round.0,
+                            period = pa.period.0,
+                            count = message_events.len(),
                             "assembled {} proposal message(s) at ({}, {})",
                             message_events.len(),
                             pa.round,
                             pa.period
                         );
+                        metrics.record_proposal_made(pa.round, pa.period, &digests);
                     }
                     let ext_events: Vec<ExternalEvent> = message_events
                         .into_iter()
@@ -681,11 +744,26 @@ fn execute_pseudonode_action(
         }
         ActionType::Repropose => {
             info!(
+                event = "reproposal_made",
+                round = pa.round.0,
+                period = pa.period.0,
+                step = %PROPOSE,
+                block_digest = %pa.proposal.block_digest,
                 "repropose to {:?} at ({}, {}, {})",
-                pa.proposal, pa.round, pa.period, PROPOSE
+                pa.proposal,
+                pa.round,
+                pa.period,
+                PROPOSE
             );
+            metrics.record_reproposal(pa.round, pa.period);
             match pseudonode.make_votes(pa.round, pa.period, PROPOSE, pa.proposal, None) {
                 Ok(message_events) => {
+                    metrics.record_votes_cast(
+                        pa.round,
+                        pa.period,
+                        PROPOSE,
+                        message_events.len() as u64,
+                    );
                     let ext_events: Vec<ExternalEvent> = message_events
                         .into_iter()
                         .map(|me| ExternalEvent {
@@ -706,9 +784,23 @@ fn execute_pseudonode_action(
             }
         }
         ActionType::Attest => {
+            // Structured fields are additive: the human message keeps the
+            // exact `attested to <ProposalValue> at (r, p, step)` shape that
+            // `ops/mixed-cluster/scripts/{analyze,equivocation}.py` and
+            // `restart-rejoin.sh` match on. tracing's default text formatter
+            // prints `message` ahead of the other fields, so both consumers
+            // — regex and key=value — see what they expect.
             info!(
+                event = "attest",
+                round = pa.round.0,
+                period = pa.period.0,
+                step = %pa.step,
+                block_digest = %pa.proposal.block_digest,
                 "attested to {:?} at ({}, {}, {})",
-                pa.proposal, pa.round, pa.period, pa.step
+                pa.proposal,
+                pa.round,
+                pa.period,
+                pa.step
             );
 
             // If persistence is available and we have saved state, persist
@@ -798,6 +890,31 @@ fn execute_pseudonode_action(
             if persistence_ok {
                 match pseudonode.make_votes(pa.round, pa.period, pa.step, pa.proposal, None) {
                     Ok(message_events) => {
+                        // One message event per vote actually produced — i.e.
+                        // per local account that won sortition at this step.
+                        // Counting here (rather than at the log line above)
+                        // means the counter reflects votes that exist, not
+                        // attest actions that were attempted.
+                        if !message_events.is_empty() {
+                            info!(
+                                event = "vote_cast",
+                                round = pa.round.0,
+                                period = pa.period.0,
+                                step = %pa.step,
+                                count = message_events.len(),
+                                "cast {} vote(s) at ({}, {}, {})",
+                                message_events.len(),
+                                pa.round,
+                                pa.period,
+                                pa.step
+                            );
+                        }
+                        metrics.record_votes_cast(
+                            pa.round,
+                            pa.period,
+                            pa.step,
+                            message_events.len() as u64,
+                        );
                         let ext_events: Vec<ExternalEvent> = message_events
                             .into_iter()
                             .map(|me| ExternalEvent {
@@ -1068,6 +1185,7 @@ fn demux_loop<N, L, BV, C, M>(
     monitor: Arc<Mutex<M>>,
     vote_verifier: Arc<AsyncVoteVerifier>,
     clock: Arc<dyn Clock>,
+    metrics: Arc<ParticipationMetrics>,
 ) where
     N: AgreementNetwork + Send + Sync + 'static,
     L: LedgerReader + LedgerWriter + Send + Sync + 'static,
@@ -1099,6 +1217,7 @@ fn demux_loop<N, L, BV, C, M>(
             &crypto,
             &vote_verifier,
             &clock,
+            &metrics,
         );
 
         // Actions consumed — report queue drained.
@@ -1196,6 +1315,7 @@ fn do_actions<N, L, BV, C>(
     crypto: &C,
     vote_verifier: &AsyncVoteVerifier,
     clock: &Arc<dyn Clock>,
+    metrics: &ParticipationMetrics,
 ) where
     N: AgreementNetwork,
     L: LedgerReader + LedgerWriter,
@@ -1212,6 +1332,7 @@ fn do_actions<N, L, BV, C>(
             crypto,
             vote_verifier,
             clock,
+            metrics,
         );
     }
 }
@@ -1229,6 +1350,7 @@ fn do_action<N, L, BV, C>(
     crypto: &C,
     vote_verifier: &AsyncVoteVerifier,
     clock: &Arc<dyn Clock>,
+    metrics: &ParticipationMetrics,
 ) where
     N: AgreementNetwork,
     L: LedgerReader + LedgerWriter,
@@ -1239,7 +1361,7 @@ fn do_action<N, L, BV, C>(
         Action::Noop(_) => {}
 
         Action::Network(ref na) => {
-            do_network_action(na, network);
+            do_network_action(na, network, metrics);
         }
 
         Action::Crypto(ref ca) => {
@@ -1247,7 +1369,7 @@ fn do_action<N, L, BV, C>(
         }
 
         Action::Ensure(ref ea) => {
-            do_ensure_action(ea, ledger, block_validator);
+            do_ensure_action(ea, ledger, block_validator, metrics);
         }
 
         Action::StageDigest(ref sda) => {
@@ -1255,6 +1377,13 @@ fn do_action<N, L, BV, C>(
         }
 
         Action::Rezero(ref ra) => {
+            // `Rezero` is the agreement service's own definition of "a new
+            // round starts now" — it is the action that resets the deadline
+            // clock the state machine measures every timeout against. Every
+            // timing in `ParticipationMetrics` is anchored here so
+            // round-start → vote / proposal / commit intervals are measured
+            // against the same instant the protocol itself uses.
+            metrics.record_round_started(ra.round);
             do_rezero_action(ra, historical_clocks, clock);
         }
 
@@ -1266,7 +1395,16 @@ fn do_action<N, L, BV, C>(
         }
 
         Action::Checkpoint(ref ca) => {
-            info!("checkpoint at ({}, {}, {})", ca.round, ca.period, ca.step);
+            info!(
+                event = "checkpoint",
+                round = ca.round.0,
+                period = ca.period.0,
+                step = %ca.step,
+                "checkpoint at ({}, {}, {})",
+                ca.round,
+                ca.period,
+                ca.step
+            );
         }
     }
 }
@@ -1274,14 +1412,27 @@ fn do_action<N, L, BV, C>(
 /// Execute a network action (broadcast, relay, disconnect, ignore).
 ///
 /// Mirrors Go's `networkAction.do`.
-fn do_network_action<N: AgreementNetwork>(na: &NetworkAction, network: &N) {
+fn do_network_action<N: AgreementNetwork>(
+    na: &NetworkAction,
+    network: &N,
+    metrics: &ParticipationMetrics,
+) {
     match na.t {
         ActionType::BroadcastVotes => {
             let tag = Tag(AGREEMENT_VOTE_TAG);
             for uv in &na.unauthenticated_votes {
                 let data = codec::encode_vote(uv);
                 if let Err(e) = network.broadcast(&tag, &data) {
-                    warn!("failed to broadcast vote: {}", e);
+                    metrics.record_vote_broadcast_failure();
+                    warn!(
+                        event = "vote_broadcast_failed",
+                        round = uv.raw_vote.round.0,
+                        period = uv.raw_vote.period.0,
+                        step = %uv.raw_vote.step,
+                        err = %e,
+                        "failed to broadcast vote: {}",
+                        e
+                    );
                     break;
                 }
             }
@@ -1393,19 +1544,35 @@ fn do_ensure_action<L: LedgerWriter, BV: BlockValidator>(
     ea: &EnsureAction,
     ledger: &L,
     block_validator: &BV,
+    metrics: &ParticipationMetrics,
 ) {
     let block = &ea.payload.unauthenticated_proposal.block;
 
+    // Recorded before the (blocking) ledger write so the round's measured
+    // duration is agreement's own decision latency, not the ledger's commit
+    // cost — the former is what "keeps pace with the Go nodes" is about.
+    metrics.record_round_committed(ea.certificate.round, ea.certificate.proposal.block_digest);
+
     if let Some(ref vb) = ea.payload.validated_block {
         info!(
+            event = "round_committed",
+            round = ea.certificate.round.0,
+            block_digest = %ea.certificate.proposal.block_digest,
+            pre_validated = true,
             "committed round {} with pre-validated block {:?}",
-            ea.certificate.round, ea.certificate.proposal.block_digest,
+            ea.certificate.round,
+            ea.certificate.proposal.block_digest,
         );
         ledger.ensure_validated_block(vb.as_ref(), &ea.certificate);
     } else {
         info!(
+            event = "round_committed",
+            round = ea.certificate.round.0,
+            block_digest = %ea.certificate.proposal.block_digest,
+            pre_validated = false,
             "committed round {} with block {:?}",
-            ea.certificate.round, ea.certificate.proposal.block_digest,
+            ea.certificate.round,
+            ea.certificate.proposal.block_digest,
         );
         ledger.ensure_block(block, &ea.certificate);
     }
@@ -1848,11 +2015,122 @@ mod tests {
         };
 
         let validator = StubBlockValidator::accepting();
-        do_ensure_action(&ea, &ledger, &validator);
+        do_ensure_action(&ea, &ledger, &validator, &ParticipationMetrics::new());
 
         let written = ledger.get_written_blocks();
         assert_eq!(written.len(), 1);
         assert_eq!(written[0].cert.round, Round(100));
+    }
+
+    /// The ensure action is the wiring point for the commit counters and the
+    /// round-duration timing (issue #473): committing a round the node
+    /// proposed must credit `proposals_accepted`, and the measured duration
+    /// must be anchored at the `Rezero` for that round.
+    #[test]
+    fn do_ensure_action_records_participation_metrics() {
+        use crate::metrics::ManualMetricsClock;
+
+        let clock = Arc::new(ManualMetricsClock::new());
+        let metrics = ParticipationMetrics::with_clock(clock.clone());
+        let own_digest = algo_types::Digest([0xaa; 32]);
+
+        // Round start, then our own proposal, then the commit.
+        metrics.record_round_started(Round(100));
+        clock.advance_ms(250);
+        metrics.record_proposal_made(Round(100), Period(0), &[own_digest]);
+        clock.advance_ms(1750);
+
+        let ledger = StubLedger::new(v41_params(), Round(100));
+        let cert = Certificate {
+            round: Round(100),
+            period: Period(0),
+            proposal: crate::vote::ProposalValue {
+                original_period: Period(0),
+                original_proposer: Address([0x01; 32]),
+                block_digest: own_digest,
+                encoding_digest: algo_types::Digest([0xbb; 32]),
+            },
+            votes: vec![],
+        };
+        let ea = EnsureAction {
+            payload: crate::events::Proposal::default(),
+            certificate: cert,
+            vote_validated_at: Duration::ZERO,
+            dynamic_filter_timeout: Duration::ZERO,
+        };
+
+        do_ensure_action(&ea, &ledger, &StubBlockValidator::accepting(), &metrics);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.blocks_committed, 1);
+        assert_eq!(snap.last_committed_round, 100);
+        assert_eq!(snap.proposals_accepted, 1);
+        assert_eq!(snap.proposals_rejected, 0);
+        assert_eq!(snap.round_duration.last_ms, 2000);
+        assert_eq!(snap.round_start_to_proposal.last_ms, 250);
+    }
+
+    /// A round committed with someone else's block, while this node also
+    /// proposed, must count as a rejection rather than an acceptance.
+    #[test]
+    fn do_ensure_action_records_rejected_own_proposal() {
+        let metrics = ParticipationMetrics::new();
+        metrics.record_round_started(Round(100));
+        metrics.record_proposal_made(Round(100), Period(0), &[algo_types::Digest([0x11; 32])]);
+
+        let ledger = StubLedger::new(v41_params(), Round(100));
+        let ea = EnsureAction {
+            payload: crate::events::Proposal::default(),
+            certificate: Certificate {
+                round: Round(100),
+                period: Period(0),
+                proposal: crate::vote::ProposalValue {
+                    original_period: Period(0),
+                    original_proposer: Address([0x02; 32]),
+                    block_digest: algo_types::Digest([0x99; 32]),
+                    encoding_digest: algo_types::Digest([0xbb; 32]),
+                },
+                votes: vec![],
+            },
+            vote_validated_at: Duration::ZERO,
+            dynamic_filter_timeout: Duration::ZERO,
+        };
+
+        do_ensure_action(&ea, &ledger, &StubBlockValidator::accepting(), &metrics);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.proposals_accepted, 0);
+        assert_eq!(snap.proposals_rejected, 1);
+    }
+
+    /// `Action::Rezero` is what stamps "round start"; dispatching it through
+    /// `do_action` must move the metrics' current round.
+    #[test]
+    fn do_action_rezero_starts_a_metrics_round() {
+        let metrics = ParticipationMetrics::new();
+        let network = StubNetwork::new();
+        let ledger = StubLedger::new(v41_params(), Round(7));
+        let validator = StubBlockValidator::accepting();
+        let crypto = StubCryptoVerifier::new();
+        let verifier = AsyncVoteVerifier::new();
+        let clock: Arc<dyn Clock> = crate::system_clock::SystemClock::new();
+        let mut historical = HashMap::new();
+
+        do_action(
+            &Action::Rezero(RezeroAction { round: Round(7) }),
+            &network,
+            &ledger,
+            &validator,
+            &mut historical,
+            &crypto,
+            &verifier,
+            &clock,
+            &metrics,
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.rounds_started, 1);
+        assert_eq!(snap.current_round, 7);
     }
 
     /// When the proposal has `validated_block: None`, the ensure action must
@@ -1883,7 +2161,7 @@ mod tests {
         };
 
         let validator = StubBlockValidator::accepting();
-        do_ensure_action(&ea, &ledger, &validator);
+        do_ensure_action(&ea, &ledger, &validator, &ParticipationMetrics::new());
 
         let written = ledger.get_written_blocks();
         assert_eq!(written.len(), 1);
@@ -1932,7 +2210,7 @@ mod tests {
         };
 
         let validator = StubBlockValidator::accepting();
-        do_ensure_action(&ea, &ledger, &validator);
+        do_ensure_action(&ea, &ledger, &validator, &ParticipationMetrics::new());
 
         let written = ledger.get_written_blocks();
         assert_eq!(written.len(), 1);
@@ -1971,7 +2249,7 @@ mod tests {
             ..NetworkAction::default()
         };
 
-        do_network_action(&na, &network);
+        do_network_action(&na, &network, &ParticipationMetrics::new());
 
         // Ignore should not send anything.
         assert!(network.get_sent().is_empty());
@@ -1986,7 +2264,7 @@ mod tests {
             ..NetworkAction::default()
         };
 
-        do_network_action(&na, &network);
+        do_network_action(&na, &network, &ParticipationMetrics::new());
 
         let sent = network.get_sent();
         assert_eq!(sent.len(), 1);
@@ -2002,7 +2280,7 @@ mod tests {
             ..NetworkAction::default()
         };
 
-        do_network_action(&na, &network);
+        do_network_action(&na, &network, &ParticipationMetrics::new());
 
         let sent = network.get_sent();
         assert_eq!(sent.len(), 1);
@@ -2017,7 +2295,7 @@ mod tests {
             ..NetworkAction::default()
         };
 
-        do_network_action(&na, &network);
+        do_network_action(&na, &network, &ParticipationMetrics::new());
 
         // Should have recorded a disconnect.
         let disc = network.disconnected.lock().unwrap();

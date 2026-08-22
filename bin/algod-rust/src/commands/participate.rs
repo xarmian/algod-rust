@@ -2916,6 +2916,13 @@ pub async fn run(
     // below).
     // -----------------------------------------------------------------------
     let shutdown_token = CancellationToken::new();
+
+    // Consensus-participation metrics (issue #473). Created here, ahead of
+    // both the REST server and the agreement service, because the REST
+    // adapter is built first and must share the very same collector the
+    // agreement service will later write to (`Service::with_metrics` below).
+    let participation_metrics = Arc::new(algo_agreement::ParticipationMetrics::new());
+
     let default_data_dir = ledger_path.parent().map(Path::to_path_buf);
     let rest_cfg = rest_opts.resolve(default_data_dir.as_deref())?;
     let rest_server_handle = if let Some(cfg) = rest_cfg {
@@ -2938,7 +2945,8 @@ pub async fn run(
         let mut adapter = AlgodNodeInterface::new(ledger.clone(), node_config)
             .with_pool(pool.clone())
             .with_broadcaster(broadcaster.clone())
-            .with_shutdown_token(shutdown_token.clone());
+            .with_shutdown_token(shutdown_token.clone())
+            .with_participation_metrics(participation_metrics.clone());
         if let Some(capacity) = cfg.async_backlog_size {
             adapter = adapter.with_async_backlog_capacity(capacity);
         }
@@ -3227,7 +3235,7 @@ pub async fn run(
         signing_keys,
     };
 
-    let service = Service::new(params);
+    let service = Service::new(params).with_metrics(participation_metrics.clone());
     let handle = service.start();
 
     info!(

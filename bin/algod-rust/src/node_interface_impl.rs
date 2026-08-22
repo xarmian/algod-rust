@@ -22,6 +22,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use algo_agreement::metrics::ParticipationMetrics;
 use algo_codec::{
     canonical_encode_block_header, compute_block_digest, compute_txn_id, decode_block,
 };
@@ -214,6 +215,13 @@ pub struct AlgodNodeInterface {
     /// returns the same values) still works. See
     /// `../go-algorand/daemon/algod/api/server/v2/handlers.go:2109-2151`.
     debug_settings_prof: Arc<Mutex<(u64, u64)>>,
+    /// Consensus-participation counters shared with the agreement service
+    /// (issue #473). `Some` only for the `participate` command, which creates
+    /// the collector before starting the REST server and hands the same handle
+    /// to `Service::with_metrics`. `None` everywhere else (`serve`, dev mode,
+    /// read-only inspection), which is what makes `/metrics` and
+    /// `/v2/participation/status` answer 404 on a non-participating node.
+    participation_metrics: Option<Arc<ParticipationMetrics>>,
 }
 
 impl AlgodNodeInterface {
@@ -240,7 +248,17 @@ impl AlgodNodeInterface {
             part_store: None,
             timestamp_offset: Arc::new(Mutex::new(None)),
             debug_settings_prof: Arc::new(Mutex::new((0, 0))),
+            participation_metrics: None,
         }
+    }
+
+    /// Attach the agreement service's participation metrics so
+    /// `GET /metrics` and `GET /v2/participation/status` report real counts
+    /// (issue #473). Builder-style, matching the other collaborators.
+    #[must_use]
+    pub fn with_participation_metrics(mut self, metrics: Arc<ParticipationMetrics>) -> Self {
+        self.participation_metrics = Some(metrics);
+        self
     }
 
     /// Attach a participation-key store so the `/v2/participation*` endpoints
@@ -1640,6 +1658,25 @@ impl NodeInterface for AlgodNodeInterface {
         self.dev_mode
     }
 
+    /// Consensus-participation counters as JSON (issue #473).
+    ///
+    /// `None` — hence a 404 from `/v2/participation/status` — whenever no
+    /// agreement service is attached, so a caller can distinguish a node that
+    /// is not participating from one that is participating and has simply not
+    /// voted yet (which reports 200 with zeroed counters).
+    fn participation_status(&self) -> Option<serde_json::Value> {
+        let metrics = self.participation_metrics.as_ref()?;
+        serde_json::to_value(metrics.snapshot()).ok()
+    }
+
+    /// The same counters in Prometheus text exposition format, served by
+    /// `GET /metrics`. Rendered by `algo-agreement` so no `prometheus` crate
+    /// dependency enters the workspace.
+    fn metrics_exposition(&self) -> Option<String> {
+        let metrics = self.participation_metrics.as_ref()?;
+        Some(metrics.snapshot().to_prometheus_text())
+    }
+
     /// Whether the Developer API (`/v2/teal/compile`, `/v2/teal/disassemble`,
     /// `/v2/teal/dryrun`, `/v2/transactions/async`) is enabled. Default-on in
     /// dev mode so `goal`/SDK clients can compile and dry-run TEAL against a
@@ -2716,6 +2753,58 @@ mod tests {
                 default_protocol: CONSENSUS_V41.into(),
             },
         )
+    }
+
+    // ── Participation metrics (issue #473) ──────────────────────────
+
+    /// Without an attached collector both #473 endpoints must report
+    /// "unavailable", which is what makes them 404 on a non-participating
+    /// node (`serve`, dev mode, read-only inspection).
+    #[test]
+    fn participation_metrics_absent_reports_nothing() {
+        let adapter = make_adapter();
+        assert!(adapter.participation_status().is_none());
+        assert!(adapter.metrics_exposition().is_none());
+    }
+
+    /// An attached but never-updated collector must still answer — with
+    /// zeroed counters — so a scraper can tell "participating, no votes yet"
+    /// apart from "not participating".
+    #[test]
+    fn participation_metrics_attached_but_idle_reports_zeroes() {
+        let metrics = Arc::new(algo_agreement::ParticipationMetrics::new());
+        let adapter = make_adapter().with_participation_metrics(metrics);
+
+        let status = adapter.participation_status().expect("status available");
+        assert_eq!(status["votes_cast_total"], 0);
+        assert_eq!(status["blocks_committed"], 0);
+
+        let text = adapter.metrics_exposition().expect("exposition available");
+        assert!(text.contains("algod_rust_agreement_votes_total 0"));
+    }
+
+    /// The adapter must surface live counts from the *same* collector the
+    /// agreement service writes to — this is the shared-handle contract that
+    /// `participate` relies on.
+    #[test]
+    fn participation_metrics_reflect_live_agreement_events() {
+        use algo_agreement::{Period, SOFT};
+
+        let metrics = Arc::new(algo_agreement::ParticipationMetrics::new());
+        let adapter = make_adapter().with_participation_metrics(metrics.clone());
+
+        metrics.record_round_started(Round(11));
+        metrics.record_votes_cast(Round(11), Period(0), SOFT, 2);
+        metrics.record_round_committed(Round(11), Digest([0x7; 32]));
+
+        let status = adapter.participation_status().expect("status available");
+        assert_eq!(status["votes_cast_total"], 2);
+        assert_eq!(status["votes_cast_by_step"]["soft"], 2);
+        assert_eq!(status["last_committed_round"], 11);
+
+        let text = adapter.metrics_exposition().expect("exposition available");
+        assert!(text.contains("algod_rust_agreement_votes_cast_total{step=\"soft\"} 2"));
+        assert!(text.contains("algod_rust_agreement_last_committed_round 11"));
     }
 
     #[test]

@@ -46,6 +46,46 @@ except Exception as e:
 " "$body" | tr -d '\r'
 }
 
+# Consensus-participation summary for a node, from the #473
+# `/v2/participation/status` endpoint. Only the Rust node implements it;
+# go-algorand has no equivalent, so a Go node prints "n/a (go)" — that is
+# a statement about the endpoint, not about the node's participation.
+#
+# Output is a single compact field: "votes=N prop=N/N rnd=Nms" where
+# prop is proposals made/accepted and rnd is the last round's
+# start-to-commit time.
+fetch_participation() {
+    local port="$1"
+    local body code
+    # -w writes the status code after the body so a 404 (node not
+    # participating) is distinguishable from an unreachable listener.
+    body="$(curl -s -w '\n%{http_code}' -H "X-Algo-API-Token: $ALGOD_TOKEN" \
+        "http://127.0.0.1:$port/v2/participation/status" 2>/dev/null || true)"
+    code="$(printf '%s' "$body" | tail -n1 | tr -d '\r')"
+    body="$(printf '%s' "$body" | sed '$d')"
+    case "$code" in
+        200) ;;
+        404) echo "not-participating"; return ;;
+        "")  echo "unreachable"; return ;;
+        *)   echo "http-$code"; return ;;
+    esac
+    python3 -c "
+import json, sys
+try:
+    s = json.loads(sys.argv[1])
+except Exception as e:
+    print('parse-error: {}'.format(e))
+    raise SystemExit(0)
+dur = s.get('round_duration') or {}
+print('votes={} prop={}/{} rnd={}ms'.format(
+    s.get('votes_cast_total', '?'),
+    s.get('proposals_made', '?'),
+    s.get('proposals_accepted', '?'),
+    dur.get('last_ms', '?'),
+))
+" "$body" | tr -d '\r'
+}
+
 # Returns the container's Docker state string ('running' / 'exited' /
 # 'notfound') so we can surface a failure for nodes that don't expose
 # REST. Safe to use on any node.
@@ -64,8 +104,8 @@ container_state() {
 
 max_round=-1
 any_fail=0
-printf "%-14s %-10s %-6s %s\n" "node" "state" "port" "round"
-printf "%-14s %-10s %-6s %s\n" "----" "-----" "----" "-----"
+printf "%-14s %-10s %-6s %-8s %s\n" "node" "state" "port" "round" "participation"
+printf "%-14s %-10s %-6s %-8s %s\n" "----" "-----" "----" "-----" "-------------"
 
 declare -A NODE_ROUND
 for row in "${ROWS[@]}"; do
@@ -79,13 +119,19 @@ for row in "${ROWS[@]}"; do
     # Container liveness is the first gate — if it's not running, the
     # node is unhealthy regardless of whether REST answers.
     if [ "$state" != "running" ]; then
-        printf "%-14s %-10s %-6s %s\n" "$name" "$state" "$port" "-"
+        printf "%-14s %-10s %-6s %-8s %s\n" "$name" "$state" "$port" "-" "-"
         any_fail=1
         continue
     fi
 
     round="$(fetch_round "$port")"
-    printf "%-14s %-10s %-6s %s\n" "$name" "$state" "$port" "$round"
+    # Only the Rust node serves the #473 endpoint; asking a Go node for it
+    # would just 404 on every invocation, so don't.
+    case "$name" in
+        rust-*) participation="$(fetch_participation "$port")" ;;
+        *)      participation="n/a (go)" ;;
+    esac
+    printf "%-14s %-10s %-6s %-8s %s\n" "$name" "$state" "$port" "$round" "$participation"
     NODE_ROUND[$name]="$round"
     if [[ "$round" =~ ^[0-9]+$ ]]; then
         if [ "$round" -gt "$max_round" ]; then max_round="$round"; fi

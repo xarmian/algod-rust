@@ -30,6 +30,8 @@
 //! - `GET /v2/deltas/:round` -- ledger state delta for a round
 //! - `GET /v2/deltas/txn/group/:id` -- state delta for a transaction group (501)
 //! - `GET /v2/deltas/:round/txn/group` -- transaction group deltas for a round (501)
+//! - `GET /v2/participation/status` -- consensus-participation counters (issue #473)
+//! - `GET /metrics` -- the same counters in Prometheus text format (unauthenticated)
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -3364,6 +3366,67 @@ fn convert_participation_record(record: &ParticipationRecord) -> models::Partici
         last_vote: omit_empty_round(record.last_vote),
         last_block_proposal: omit_empty_round(record.last_block_proposal),
         last_state_proof: omit_empty_round(record.last_state_proof),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/participation/status  —  consensus participation metrics (issue #473)
+// ---------------------------------------------------------------------------
+
+/// Return this node's consensus-participation counters and round timings.
+///
+/// This endpoint has no go-algorand counterpart: go exposes the equivalent
+/// information through its `metrics/` package on a separate, unauthenticated
+/// port. It is an algod-rust extension for the mixed-cluster harness
+/// (`ops/mixed-cluster/scripts/{metrics,analyze}.py`, `status.sh`), which
+/// previously had to `docker logs | grep` the Rust node to find out whether it
+/// was voting at all.
+///
+/// Returns 404 when the node is not participating in consensus (e.g. a plain
+/// `serve`/relay process), so a caller can tell "not participating" apart from
+/// "participating, zero votes so far" — the latter is a 200 with zeroed
+/// counters.
+pub async fn get_participation_status<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+) -> Response {
+    match node.participation_status() {
+        Some(value) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            serde_json::to_string(&value)
+                .unwrap_or_else(|_| r#"{"message":"internal error"}"#.to_string()),
+        )
+            .into_response(),
+        None => error::not_found("this node is not participating in consensus"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /metrics  —  Prometheus text exposition (issue #473)
+// ---------------------------------------------------------------------------
+
+/// Serve the node's participation counters in Prometheus text exposition
+/// format.
+///
+/// Unauthenticated, matching go-algorand's `/metrics` (served by
+/// `network.RegisterMetrics` without token middleware) and the expectations of
+/// every off-the-shelf Prometheus scraper. The payload is counters only — no
+/// account, key, or transaction data.
+///
+/// Returns 404 when the node is not participating in consensus, which is how
+/// a scraper distinguishes an un-instrumented process from a zeroed one.
+pub async fn metrics<N: NodeInterface>(State(node): State<AppState<N>>) -> Response {
+    match node.metrics_exposition() {
+        Some(text) => (
+            StatusCode::OK,
+            // `version=0.0.4` is the Prometheus text exposition content type;
+            // scrapers accept `text/plain` without it, but naming the version
+            // is what the exposition spec asks for.
+            [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+            text,
+        )
+            .into_response(),
+        None => error::not_found("metrics are not available on this node"),
     }
 }
 

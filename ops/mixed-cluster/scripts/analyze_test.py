@@ -317,6 +317,36 @@ class EndToEndCliTest(unittest.TestCase):
             bad = self._run(path, ["--max-mean-block-time", "2"])
             self.assertEqual(bad.returncode, 1, bad.stdout)
 
+    def test_cli_participation_endpoint_gate(self):
+        """#473 — the endpoint gate is opt-in and actually gates."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.jsonl")
+            self._write_soak(path, rust_proposals=4)
+            # Append #473 participation records to the same soak file.
+            with open(path, "a") as f:
+                for rec in participation_records():
+                    f.write(json.dumps(rec) + "\n")
+
+            ok = self._run(path, ["--require-participation-endpoint"])
+            self.assertEqual(ok.returncode, 0, ok.stdout)
+            self.assertIn("Rust participation endpoint", ok.stdout)
+
+            slow = self._run(path, [
+                "--require-participation-endpoint",
+                "--max-round-duration-ms", "500",
+            ])
+            self.assertEqual(slow.returncode, 1, slow.stdout)
+            self.assertIn("not keeping pace", slow.stdout)
+
+    def test_cli_participation_gate_fails_when_endpoint_absent(self):
+        """A soak with no participation records must fail the opt-in gate."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.jsonl")
+            self._write_soak(path, rust_proposals=4)
+            res = self._run(path, ["--require-participation-endpoint"])
+            self.assertEqual(res.returncode, 1, res.stdout)
+            self.assertIn("never answered", res.stdout)
+
     def test_cli_missing_rust_log_reports_cleanly(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "s.jsonl")
@@ -324,6 +354,143 @@ class EndToEndCliTest(unittest.TestCase):
             res = self._run(path, ["--rust-log", os.path.join(d, "nope.log")])
             self.assertEqual(res.returncode, 2)
             self.assertIn("cannot read --rust-log", res.stderr)
+
+
+
+# ---------------------------------------------------------------------------
+# Issue #473 — participation-endpoint records
+# ---------------------------------------------------------------------------
+
+
+def participation_records(votes_soft=100, votes_cert=100, proposals=4,
+                          durations=(2800, 2900, 3100)):
+    """A `participation` tick plus the terminal `participation_final`."""
+    snapshot = {
+        "votes_cast_total": votes_soft + votes_cert,
+        "votes_cast_by_step": {"soft": votes_soft, "cert": votes_cert},
+        "proposals_made": proposals,
+        "proposal_rounds": proposals,
+        "proposals_accepted": proposals,
+        "proposals_rejected": 0,
+        "reproposals": 0,
+        "blocks_committed": 100,
+        "vote_broadcast_failures": 0,
+        "rounds_started": 100,
+        "current_round": 101,
+        "last_committed_round": 100,
+        "round_duration": {
+            "count": len(durations),
+            "last_ms": durations[-1] if durations else 0,
+            "min_ms": min(durations) if durations else 0,
+            "max_ms": max(durations) if durations else 0,
+            "mean_ms": sum(durations) // len(durations) if durations else 0,
+            "sum_ms": sum(durations),
+        },
+        "round_start_to_first_vote": {
+            "count": len(durations), "last_ms": 400, "min_ms": 380,
+            "max_ms": 450, "mean_ms": 400, "sum_ms": 1200,
+        },
+        "round_start_to_proposal": {
+            "count": proposals, "last_ms": 120, "min_ms": 100,
+            "max_ms": 150, "mean_ms": 120, "sum_ms": 480,
+        },
+        "recent_rounds": [
+            {
+                "round": 98 + i,
+                "start_to_first_vote_ms": 400,
+                "start_to_commit_ms": d,
+                "proposed": False,
+                "proposal_accepted": False,
+                "votes_cast": 2,
+            }
+            for i, d in enumerate(durations)
+        ],
+        "uptime_ms": 300000,
+    }
+    tick = {"kind": "participation", "node": "rust-node-4", "available": True,
+            "votes_cast_total": snapshot["votes_cast_total"],
+            "votes_cast_by_step": snapshot["votes_cast_by_step"]}
+    final = {"kind": "participation_final", "node": "rust-node-4",
+             "available": True, "snapshot": snapshot}
+    return [tick, final]
+
+
+class ParticipationEndpointTest(unittest.TestCase):
+    """#473 — the endpoint replaces log-scraping as the participation proof."""
+
+    def test_pre_473_soak_has_no_participation_section(self):
+        """Negative/compat case: an old soak file must analyze unchanged."""
+        summary = analyze.summarize([{"kind": "run_meta", "phase": "start"}], 5)
+        self.assertIsNone(summary["rust_participation"])
+
+    def test_summarizes_counters_and_timing(self):
+        summary = analyze.summarize(participation_records(), 5)
+        part = summary["rust_participation"]
+        self.assertTrue(part["endpoint_ever_available"])
+        self.assertEqual(part["votes_cast_total"], 200)
+        self.assertEqual(part["votes_cast_by_step"]["soft"], 100)
+        self.assertEqual(part["proposals_made"], 4)
+        self.assertEqual(part["round_duration_ms"]["mean"], 2933)
+        self.assertEqual(part["recent_round_duration_ms"]["n"], 3)
+        self.assertEqual(part["recent_round_duration_ms"]["max"], 3100)
+
+    def test_unavailable_endpoint_fails_the_check(self):
+        """Negative case: the node never answered — pre-#469/#473 topology."""
+        recs = [{"kind": "participation", "node": "rust-node-4",
+                 "available": False, "reason": "not_participating"}]
+        summary = analyze.summarize(recs, 5)
+        part = summary["rust_participation"]
+        self.assertFalse(part["endpoint_ever_available"])
+        self.assertEqual(part["unavailable_reasons"], {"not_participating": 1})
+
+        res = analyze.participation_endpoint_check(part, ["soft", "cert"])
+        self.assertFalse(res["ok"])
+        self.assertIn("never answered", res["failures"][0])
+
+    def test_zero_votes_fails_the_check(self):
+        summary = analyze.summarize(
+            participation_records(votes_soft=0, votes_cert=0), 5
+        )
+        res = analyze.participation_endpoint_check(
+            summary["rust_participation"], ["soft", "cert"]
+        )
+        self.assertFalse(res["ok"])
+        self.assertIn("zero votes", res["failures"][0])
+
+    def test_missing_step_fails_the_check(self):
+        summary = analyze.summarize(participation_records(votes_cert=0), 5)
+        # votes_cast_by_step still lists cert:0 — the check must key off the
+        # required step actually being present with votes, not merely listed.
+        part = summary["rust_participation"]
+        part["votes_cast_by_step"] = {"soft": 100}
+        res = analyze.participation_endpoint_check(part, ["soft", "cert"])
+        self.assertFalse(res["ok"])
+        self.assertIn("cert", res["failures"][0])
+
+    def test_next_plus_n_satisfies_a_next_requirement(self):
+        summary = analyze.summarize(participation_records(), 5)
+        part = summary["rust_participation"]
+        part["votes_cast_by_step"] = {"soft": 10, "cert": 10, "next+2": 3}
+        res = analyze.participation_endpoint_check(part, ["soft", "cert", "next"])
+        self.assertTrue(res["ok"], res["failures"])
+
+    def test_round_duration_gate(self):
+        summary = analyze.summarize(participation_records(), 5)
+        part = summary["rust_participation"]
+        ok = analyze.participation_endpoint_check(part, ["soft", "cert"], 5000)
+        self.assertTrue(ok["ok"], ok["failures"])
+        bad = analyze.participation_endpoint_check(part, ["soft", "cert"], 1000)
+        self.assertFalse(bad["ok"])
+        self.assertIn("not keeping pace", bad["failures"][0])
+
+    def test_healthy_run_passes(self):
+        summary = analyze.summarize(participation_records(), 5)
+        res = analyze.participation_endpoint_check(
+            summary["rust_participation"], ["soft", "cert"], 5000
+        )
+        self.assertTrue(res["ok"], res["failures"])
+        self.assertEqual(res["missing_steps"], [])
+
 
 
 if __name__ == "__main__":

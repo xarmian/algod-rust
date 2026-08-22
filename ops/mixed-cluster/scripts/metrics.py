@@ -7,18 +7,22 @@
 # capture block-level metadata (proposer, block timestamp, txn count,
 # block hash).
 #
-# The Rust node (phase6-rust-node-4) has no REST API today (see
-# docs/MIXED_CLUSTER_HARNESS.md §Open questions), so we probe it via
-# `docker inspect` for liveness and `docker logs` for a best-effort
-# round observation. Rust participation is gated on PLAN-35 (participation
-# key interop) — tracked separately.
+# Since issue #469 the Rust node (phase6-rust-node-4) runs
+# `participate --rest-listen`, and since issue #473 it also serves
+# `GET /v2/participation/status` with its own consensus-participation
+# counters and per-round timings. We therefore scrape it like any other
+# node and additionally poll that endpoint, instead of inferring
+# participation from `docker logs`. The `docker inspect` container sample
+# is kept as a liveness signal (and as the fallback that still produces a
+# record when the endpoint is unreachable).
 #
 # Output: one JSONL record per event to --out. Records have a 'kind':
-#   - "run_meta":   start / baseline / end markers for the run
-#   - "node_round": a REST node observed round r at wall time t
-#   - "block":      block r's metadata (proposer, ts, hash, txn_count)
-#   - "container":  a state sample for a non-REST node (rust-node-4)
-#   - "warning":    a soft issue (stale baseline, parse failure, lag)
+#   - "run_meta":      start / baseline / end markers for the run
+#   - "node_round":    a REST node observed round r at wall time t
+#   - "block":         block r's metadata (proposer, ts, hash, txn_count)
+#   - "container":     a state sample for the Rust node's container
+#   - "participation": a /v2/participation/status snapshot (#473)
+#   - "warning":       a soft issue (stale baseline, parse failure, lag)
 #
 # Stop conditions (in priority order):
 #   1. Target round reached (cluster max >= start_max + --rounds)
@@ -62,6 +66,14 @@ NODES_REST = [
 
 NODES_NOREST = [
     {"name": "rust-node-4", "container": "phase6-rust-node-4"},
+]
+
+# Nodes exposing `GET /v2/participation/status` (issue #473). Only the Rust
+# node implements it — go-algorand has no equivalent endpoint — so this list
+# is what makes the Rust node's participation machine-readable instead of
+# log-scraped.
+NODES_PARTICIPATION = [
+    {"name": "rust-node-4", "host": "127.0.0.1", "port": 4004},
 ]
 
 # Best-effort log regex for the Rust node. The Rust relay today does not
@@ -121,6 +133,66 @@ def rust_latest_round_from_logs(container: str):
             except ValueError:
                 continue
     return None
+
+
+def participation_snapshot(host: str, port: int):
+    """Fetch `/v2/participation/status` (issue #473).
+
+    Returns `(snapshot_dict, None)` on success, `(None, reason)` otherwise.
+    A 404 is a meaningful, non-error answer: the node is up but is not
+    participating in consensus, which is exactly what the endpoint promises
+    to distinguish from "participating with zero votes".
+    """
+    url = f"http://{host}:{port}/v2/participation/status"
+    try:
+        return http_get_json(url, timeout=3), None
+    except HTTPError as e:
+        if e.code == 404:
+            return None, "not_participating"
+        return None, f"http_{e.code}"
+    except Exception as e:  # URLError, timeouts, malformed JSON
+        return None, f"unreachable: {e!s}"
+
+
+def summarize_participation(snap: dict) -> dict:
+    """Flatten the parts of a participation snapshot we record per sample.
+
+    The full snapshot carries a `recent_rounds` array that would dominate the
+    JSONL if written on every tick, so it is summarized here; the terminal
+    sample (see `main`) writes the whole document once.
+    """
+    if not isinstance(snap, dict):
+        return {}
+    out = {
+        "votes_cast_total": snap.get("votes_cast_total"),
+        "votes_cast_by_step": snap.get("votes_cast_by_step"),
+        "proposals_made": snap.get("proposals_made"),
+        "proposal_rounds": snap.get("proposal_rounds"),
+        "proposals_accepted": snap.get("proposals_accepted"),
+        "proposals_rejected": snap.get("proposals_rejected"),
+        "reproposals": snap.get("reproposals"),
+        "blocks_committed": snap.get("blocks_committed"),
+        "vote_broadcast_failures": snap.get("vote_broadcast_failures"),
+        "rounds_started": snap.get("rounds_started"),
+        "current_round": snap.get("current_round"),
+        "last_committed_round": snap.get("last_committed_round"),
+        "uptime_ms": snap.get("uptime_ms"),
+    }
+    for key, field in (
+        ("round_duration", "round_duration"),
+        ("round_start_to_first_vote", "round_start_to_first_vote"),
+        ("round_start_to_proposal", "round_start_to_proposal"),
+    ):
+        stats = snap.get(field)
+        if isinstance(stats, dict):
+            out[key + "_ms"] = {
+                "count": stats.get("count"),
+                "last": stats.get("last_ms"),
+                "min": stats.get("min_ms"),
+                "max": stats.get("max_ms"),
+                "mean": stats.get("mean_ms"),
+            }
+    return out
 
 
 def write_record(fp, record: dict) -> None:
@@ -232,6 +304,7 @@ def main() -> int:
         "overall_timeout_s": args.overall_timeout,
         "nodes_rest": [n["name"] for n in NODES_REST],
         "nodes_norest": [n["name"] for n in NODES_NOREST],
+        "nodes_participation": [n["name"] for n in NODES_PARTICIPATION],
     })
 
     # Establish a baseline from /v2/status so we only record NEW transitions.
@@ -265,6 +338,9 @@ def main() -> int:
     seen_blocks: set = set()
     last_advance_wall = start_wall
     last_rust_sample = 0.0
+    # Most recent full participation snapshot per node, written out once at
+    # end-of-run (the per-tick records carry only the summary).
+    last_participation: dict = {}
     final_phase = "target_reached"
     try:
         while True:
@@ -401,6 +477,26 @@ def main() -> int:
                         "state": state,
                         "log_round": rr,
                     })
+                # Participation counters straight from the node (#473) —
+                # authoritative where the log scrape above is best-effort.
+                for n in NODES_PARTICIPATION:
+                    snap, reason = participation_snapshot(n["host"], n["port"])
+                    if snap is None:
+                        write_record(fp, {
+                            "kind": "participation",
+                            "node": n["name"],
+                            "available": False,
+                            "reason": reason,
+                        })
+                        continue
+                    last_participation[n["name"]] = snap
+                    record = {
+                        "kind": "participation",
+                        "node": n["name"],
+                        "available": True,
+                    }
+                    record.update(summarize_participation(snap))
+                    write_record(fp, record)
                 last_rust_sample = tick
 
             if any_advance:
@@ -425,6 +521,28 @@ def main() -> int:
     except Interrupted:
         final_phase = "interrupted"
         write_record(fp, {"kind": "warning", "msg": "interrupted by signal"})
+
+    # Terminal participation sample: take a fresh one (so the run's last few
+    # rounds are included) and write the FULL snapshot, `recent_rounds` and
+    # all, for analyze.py's timing distribution.
+    for n in NODES_PARTICIPATION:
+        snap, reason = participation_snapshot(n["host"], n["port"])
+        if snap is None:
+            snap = last_participation.get(n["name"])
+        if snap is None:
+            write_record(fp, {
+                "kind": "participation_final",
+                "node": n["name"],
+                "available": False,
+                "reason": reason,
+            })
+            continue
+        write_record(fp, {
+            "kind": "participation_final",
+            "node": n["name"],
+            "available": True,
+            "snapshot": snap,
+        })
 
     write_record(fp, {
         "kind": "run_meta",
