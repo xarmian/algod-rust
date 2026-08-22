@@ -273,12 +273,46 @@ pub struct LoadgenConfig {
     pub group_size: usize,
     /// Concurrent submitter tasks per endpoint.
     pub concurrency: usize,
+    /// Multiplier applied to the congestion-adjusted fee (see [`effective_fee`]).
+    pub fee_multiplier: f64,
     /// Poll confirmation latency for every Nth submission (0 disables).
     pub confirm_sample: u64,
     /// Give up on a confirmation poll after this long.
     pub confirm_timeout_secs: u64,
     /// Where to write the JSON report.
     pub output: Option<PathBuf>,
+}
+
+/// Assumed signed-transaction size, in bytes, for fee estimation.
+///
+/// The generator only ever builds one shape of transaction: a 0-amount payment
+/// with a 24-byte note and an ed25519 signature, which encodes to ~263 bytes.
+/// Rounding up gives a little headroom without needing to encode the
+/// transaction twice (once to measure, once to sign) on the hot path.
+const EST_SIGNED_TXN_BYTES: u64 = 300;
+
+/// The fee to put on each generated transaction, in microAlgos.
+///
+/// `/v2/transactions/params` reports two different things and using the wrong
+/// one is the difference between a benchmark that saturates the network and
+/// one that stalls: `min_fee` is the *static protocol* minimum (1000), while
+/// `fee` is the pool's current **per-byte** congestion price, which rises above
+/// the protocol floor exactly when the run gets interesting. Paying `min_fee`
+/// therefore works until the pool backs up and then fails every submission with
+/// `fee {1000} below threshold N`, capping measured throughput at the point
+/// where the network first became congested — the one number a stress test must
+/// not be capped by.
+///
+/// So: charge go-algorand's own rule, `max(fee_per_byte * size, min_fee)`, and
+/// scale it by `multiplier` for headroom against the params poll being a few
+/// seconds stale.
+fn effective_fee(min_fee: u64, fee_per_byte: u64, multiplier: f64) -> u64 {
+    let congestion = fee_per_byte.saturating_mul(EST_SIGNED_TXN_BYTES);
+    let base = congestion.max(min_fee);
+    let scaled = (base as f64) * multiplier.max(1.0);
+    // Cap at a value that cannot overflow u64 or drain a funded account in one
+    // transaction; 1 Algo per txn is already absurd for a benchmark network.
+    (scaled.min(1_000_000.0)) as u64
 }
 
 /// Per-endpoint submission tallies.
@@ -592,6 +626,7 @@ fn build_report(shared: &Shared, wall_secs: f64) -> LoadgenReport {
             "group_size": cfg.group_size,
             "concurrency": cfg.concurrency,
             "accounts": shared.accounts.len(),
+            "fee_multiplier": cfg.fee_multiplier,
             "confirm_sample": cfg.confirm_sample,
         }),
         submission: serde_json::json!({
@@ -622,6 +657,7 @@ async fn submit_once(shared: &Arc<Shared>, widx: usize) {
     let endpoint = &shared.endpoint_names[endpoint_idx];
 
     let params = shared.params.lock().expect("params mutex").clone();
+    let fee = effective_fee(params.min_fee, params.fee, cfg.fee_multiplier);
     let seq = shared.submit_seq.fetch_add(1, Ordering::Relaxed);
 
     let mut txns = Vec::with_capacity(cfg.group_size);
@@ -643,7 +679,7 @@ async fn submit_once(shared: &Arc<Shared>, widx: usize) {
         note.extend_from_slice(&(i as u32).to_be_bytes());
         note.extend_from_slice(&rand::random::<u32>().to_be_bytes());
         let built = PaymentBuilder::new(sender.address, receiver.address, 0)
-            .fee(params.min_fee)
+            .fee(fee)
             .validity(params.last_round, params.last_round + 1000)
             .genesis_hash(params.genesis_hash.0)
             .genesis_id(params.genesis_id.clone())
@@ -891,5 +927,36 @@ mod tests {
         let mut forged = b.clone();
         forged.sig = a.sig;
         assert!(verify_single(&forged).is_err());
+    }
+
+    #[test]
+    fn effective_fee_uses_protocol_minimum_on_an_idle_network() {
+        // Idle pool: go-algorand suggests 1 µAlgo/byte, which is far below the
+        // protocol floor for a ~300-byte payment, so the floor must win.
+        assert_eq!(effective_fee(1000, 1, 1.0), 1000);
+    }
+
+    #[test]
+    fn effective_fee_tracks_the_congestion_price() {
+        // The exact case that broke the 1000 TPS run: the pool raised its floor
+        // to 4 µAlgo/byte and every 1000 µAlgo submission was rejected with
+        // "fee {1000} below threshold 1052".
+        assert_eq!(effective_fee(1000, 4, 1.0), 1200);
+        assert!(effective_fee(1000, 4, 1.0) > 1052);
+    }
+
+    #[test]
+    fn effective_fee_multiplier_only_ever_adds_headroom() {
+        // A multiplier below 1.0 would underpay and reintroduce the very
+        // rejection this function exists to avoid, so it is clamped.
+        assert_eq!(effective_fee(1000, 4, 0.1), 1200);
+        assert_eq!(effective_fee(1000, 4, 2.0), 2400);
+    }
+
+    #[test]
+    fn effective_fee_is_capped_and_overflow_safe() {
+        // A malfunctioning or hostile endpoint reporting an absurd per-byte
+        // price must not overflow or empty a generator account in one txn.
+        assert_eq!(effective_fee(1000, u64::MAX, 1_000.0), 1_000_000);
     }
 }

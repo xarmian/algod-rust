@@ -589,6 +589,15 @@ pub enum LoadgenCommands {
         #[arg(long, default_value_t = 8)]
         concurrency: usize,
 
+        /// Multiplier applied to the congestion-adjusted fee. Under sustained
+        /// load a node's pool raises its fee floor above the protocol minimum,
+        /// and `/v2/transactions/params` is only polled every few seconds, so
+        /// paying exactly the last-seen suggested fee loses a race with the
+        /// rising floor and the submission is rejected. Values above 1.0 buy
+        /// headroom; the extra fee is irrelevant in a benchmark network.
+        #[arg(long, default_value_t = 1.0)]
+        fee_multiplier: f64,
+
         /// Sample confirmation latency for every Nth submission (0 disables).
         #[arg(long, default_value_t = 200)]
         confirm_sample: u64,

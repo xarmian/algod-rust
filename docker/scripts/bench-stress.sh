@@ -23,27 +23,24 @@
 # Defaults are a short smoke-sized run so the harness is usable on a laptop;
 # the issue's aspirational numbers are --target-tps 1000 --sustained-secs 300.
 #
-# ── Known limitation as of the first run of this harness ───────────────
+# ── History: the round-0 limitation is fixed ───────────────────────────
 #
-# The three Rust nodes come up healthy, seed their ledger from genesis, import
-# their go-generated participation key, and connect to both relays — but they
-# do not leave round 0. Their agreement player sits at (round 1, period 0)
-# escalating through `next`, `next+1`, … attesting to the bottom proposal,
-# which means it never receives (or never accepts) a proposal from the Go
-# proposers; and the catchup service, though started, logs no block fetch at
-# all, so it does not recover by pulling the chain from the Go relay either.
+# The first run of this harness (issue #100, before #478/#469/#482) found the
+# three Rust nodes stuck at round 0: they never accepted a Go proposal and
+# never recovered via catchup, so every transaction aimed at a Rust endpoint
+# was rejected with "transaction round window [N, N+1000] does not cover block
+# round 1" and the achieved TPS came entirely from the Go half of the
+# round-robin. That is no longer the case — all six nodes advance in lockstep
+# and all six REST endpoints accept submissions — so the CPU/RSS comparison is
+# now like-for-like (every node is validating and committing the same chain).
 #
-# Two consequences the report will show rather than hide:
-#   * `sync.max_round_spread` is the whole chain length, not ≤2.
-#   * every transaction aimed at a Rust endpoint is rejected with
-#     "transaction round window [N, N+1000] does not cover block round 1",
-#     so `per_endpoint` shows 100% failure on the three Rust URLs and the
-#     achieved TPS is bounded by the Go half of the round-robin.
+# ── Participation evidence ─────────────────────────────────────────────
 #
-# The CPU/RSS comparison is still meaningful (both stacks are running the same
-# gossip + REST + pool workload), but the Rust nodes are not doing block
-# validation work, so treat their numbers as a floor, not a like-for-like
-# result. Fixing round advancement is Phase 6 work, not harness work.
+# Whether the Rust nodes propose and vote used to be inferred by grepping
+# their logs for message text, which silently reported zero once the log
+# strings changed. It now comes from the real counters that issue #473 added:
+# `GET /v2/participation/status` on any `participate` node. The raw JSON is
+# saved per node into the sample dir and folded into the report.
 
 set -euo pipefail
 
@@ -62,6 +59,10 @@ GROUP_SIZE="${GROUP_SIZE:-1}"
 ACCOUNTS="${ACCOUNTS:-16}"
 FUND_MICROALGOS="${FUND_MICROALGOS:-1000000000}"
 CONCURRENCY="${CONCURRENCY:-8}"
+# >1 by default: under sustained load the pool's fee floor climbs above the
+# protocol minimum between params polls, and a stale-by-one-poll fee is
+# rejected outright. See `effective_fee` in bin/algod-rust/src/commands/loadgen.rs.
+FEE_MULTIPLIER="${FEE_MULTIPLIER:-4}"
 OUTPUT="${OUTPUT:-bench-results/bench-stress.json}"
 SAMPLE_INTERVAL=2
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-240}"
@@ -102,6 +103,7 @@ while [[ $# -gt 0 ]]; do
         --group-size)     GROUP_SIZE="$2";     shift 2 ;;
         --accounts)       ACCOUNTS="$2";       shift 2 ;;
         --concurrency)    CONCURRENCY="$2";    shift 2 ;;
+        --fee-multiplier) FEE_MULTIPLIER="$2"; shift 2 ;;
         --output)         OUTPUT="$2";         shift 2 ;;
         --keep-up)        KEEP_UP=1;           shift   ;;
         --no-purge)       PURGE=0;             shift   ;;
@@ -118,6 +120,7 @@ Usage: bench-stress.sh [options]
   --group-size N       Txns per atomic group, 1-16            (default 1)
   --accounts N         Pre-funded generator accounts          (default 16)
   --concurrency N      Submitter tasks per endpoint           (default 8)
+  --fee-multiplier N   Headroom over the congestion fee       (default 4)
   --output PATH        JSON report path    (default bench-results/bench-stress.json)
   --keep-up            Leave the cluster running after the report
   --no-purge           Reuse an existing docker/stress-netroot tree
@@ -147,6 +150,7 @@ echo "   ramp:            ${RAMP_SECS}s"
 echo "   sustained:       ${SUSTAINED_SECS}s"
 echo "   cooldown:        ${COOLDOWN_SECS}s"
 echo "   group size:      ${GROUP_SIZE}"
+echo "   fee multiplier:  ${FEE_MULTIPLIER}"
 echo "   gen accounts:    ${ACCOUNTS}"
 echo "   output:          ${OUTPUT}"
 echo "=========================================="
@@ -387,13 +391,23 @@ sample_loop() {
         local ts stats
         ts="$(now_secs)"
         stats="$(docker stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.CPUPerc}}' 2>/dev/null || true)"
+        # Poll every node's round concurrently. Rounds advance every ~2.5s
+        # under load and six sequential curl+python round-trips take a
+        # comparable amount of time, so a sequential sample manufactures an
+        # apparent one-to-two-round gap between the first node polled and the
+        # last — an artefact exactly the size of the ≤2-round sync criterion it
+        # would be used to judge.
+        for n in ${NODE_NAMES}; do
+            node_round "${n}" > "${SAMPLE_DIR}/.round.${n}" &
+        done
+        wait
         for n in ${NODE_NAMES}; do
             local c line mem cpu rnd
             c="$(container_for "${n}")"
             line="$(echo "${stats}" | grep -E "^${c} " | head -1)"
             mem="$(echo "${line}" | awk '{print $2}')"
             cpu="$(echo "${line}" | awk '{print $NF}' | tr -d '%')"
-            rnd="$(node_round "${n}")"
+            rnd="$(tr -d '\r\n' < "${SAMPLE_DIR}/.round.${n}" 2>/dev/null || true)"
             echo "${ts},${mem:-},${cpu:-},${rnd:-}" >> "${SAMPLE_DIR}/${n}.csv"
         done
         sleep "${SAMPLE_INTERVAL}"
@@ -404,6 +418,21 @@ SAMPLER_PID=$!
 
 record_phase() {
     echo "$1,$(now_secs),$(node_round go-relay)" >> "${SAMPLE_DIR}/phases.csv"
+}
+
+# Snapshot every node's `/v2/participation/status` counters (issue #473). Go
+# nodes and any non-participating process answer 404, which curl -f turns into
+# an empty body — the report treats "no file / empty file" as "no counters",
+# which is exactly right for the Go half of the cluster.
+#
+# Taken twice (before the load starts and after cooldown) because the counters
+# are cumulative from process start: the delta is what the measured window
+# actually did, while the raw end-of-run totals also include warmup.
+capture_partstatus() {
+    local label="$1" n
+    for n in ${NODE_NAMES}; do
+        api "${n}" /v2/participation/status > "${SAMPLE_DIR}/${n}.partstatus.${label}.json" || true
+    done
 }
 
 # ══════════════════════════════════════════════════════════════════════
@@ -427,6 +456,7 @@ run_loadgen() {
         --ramp-secs "$3" \
         --group-size "${GROUP_SIZE}" \
         --concurrency "${CONCURRENCY}" \
+        --fee-multiplier "${FEE_MULTIPLIER}" \
         --output "/out/$4" >/dev/null 2>&1 \
         || echo "WARNING: loadgen phase '$4' exited non-zero" >&2
 }
@@ -452,6 +482,7 @@ echo ""
 echo "### PHASE 3/6: ramp — ${RAMP_SECS}s to ${TARGET_TPS} TPS"
 echo "### PHASE 4/6: sustained — ${SUSTAINED_SECS}s @ ${TARGET_TPS} TPS"
 record_phase load_start
+capture_partstatus before
 run_loadgen "${TARGET_TPS}" "$((RAMP_SECS + SUSTAINED_SECS))" "${RAMP_SECS}" stress-loadgen-main.json
 record_phase load_end
 
@@ -472,20 +503,28 @@ echo "### PHASE 6/6: report"
 kill "${SAMPLER_PID}" 2>/dev/null || true
 SAMPLER_PID=""
 
-# Per-node final round + participation evidence scraped from the Rust logs.
+# Per-node final round, real participation counters, and crash/restart counts.
 for n in ${NODE_NAMES}; do
     node_round "${n}" > "${SAMPLE_DIR}/${n}.final-round" || true
 done
+capture_partstatus after
+
+# `restart: unless-stopped` means an OOM-killed or panicking node comes back
+# silently and the round samples barely notice. Docker's own RestartCount and
+# the last exit code are the only unambiguous evidence, so record them for
+# every node — this is the "no OOM crashes" acceptance criterion.
+for n in ${NODE_NAMES}; do
+    docker inspect --format '{{.RestartCount}},{{.State.ExitCode}},{{.State.OOMKilled}}' \
+        "$(container_for "${n}")" > "${SAMPLE_DIR}/${n}.restarts" 2>/dev/null \
+        || echo "0,0,false" > "${SAMPLE_DIR}/${n}.restarts"
+done
 for n in ${RUST_NODES}; do
-    docker logs "$(container_for "${n}")" 2>&1 \
-        | grep -ciE 'proposal (assembled|generated)|assembled block|proposing' \
-        > "${SAMPLE_DIR}/${n}.proposals" || echo 0 > "${SAMPLE_DIR}/${n}.proposals"
-    docker logs "$(container_for "${n}")" 2>&1 \
-        | grep -ciE 'broadcast(ing)? vote|cast vote|sending vote' \
-        > "${SAMPLE_DIR}/${n}.votes" || echo 0 > "${SAMPLE_DIR}/${n}.votes"
     docker logs "$(container_for "${n}")" 2>&1 \
         | grep -ciE '\bERROR\b|panicked' \
         > "${SAMPLE_DIR}/${n}.errors" || echo 0 > "${SAMPLE_DIR}/${n}.errors"
+    docker logs "$(container_for "${n}")" 2>&1 \
+        | grep -ciE '\bWARN\b' \
+        > "${SAMPLE_DIR}/${n}.warns" || echo 0 > "${SAMPLE_DIR}/${n}.warns"
 done
 
 # Block-level aggregates come from go-relay, which has the full chain.
