@@ -351,6 +351,100 @@ script runs as a **self-test before the scenarios** — a green
 catches a synthetic double vote, and `attests_scanned > 0` is separately
 required so an empty scan can never pass.
 
+## Negative conformance (issue #472, Epic 42e)
+
+The suites above prove a Go quorum **accepts** algod-rust's valid
+agreement messages. `scripts/negative-conformance.sh` proves the
+converse: go-algorand **rejects** a Rust-constructed agreement message
+carrying exactly one injected fault, stays up, and keeps making rounds.
+
+Messages are built by `crates/tools/algo-agreement-fuzz` from the real
+`Wallet4.partkey` and real ledger parameters, through the production
+encoders in `algo_agreement::codec` and the production crypto in
+`algo_consensus_crypto` — so the only thing wrong with an injected
+message is the named fault. `algo-agreement-fuzz` then opens a normal
+gossip connection to `go-node-1` (its `4161` is published to
+`127.0.0.1` for exactly this reason) and sends **one** message.
+
+```bash
+# Full suite (brings the cluster up and tears it down).
+make consensus-negative-test
+
+# One case, against an already-running cluster, keeping it up.
+cargo build -p algo-agreement-fuzz
+CASES=bad-vrf-proof SKIP_START=1 KEEP_CLUSTER=1 \
+    bash ops/mixed-cluster/scripts/negative-conformance.sh
+
+# As an opt-in stage of the #470 suite.
+make consensus-cluster-test NEGATIVE_CASES=1
+
+# Through cargo, gated like the other cluster tests.
+MIXED_CLUSTER=1 cargo test -p algo-network --test negative_conformance \
+    -- --ignored --nocapture
+
+# Build a message without a cluster (unit-tested path, no Docker):
+cargo test -p algo-agreement-fuzz
+algo-agreement-fuzz --case bad-vrf-proof --dry-run ...
+```
+
+### Cases and what go-algorand actually says
+
+| case | injected fault | Go's rejection |
+| --- | --- | --- |
+| `bad-vrf-proof` | one bit flipped in the 80-byte VRF proof (**1 byte** differs from the honest message) | `malformed vote for (r, 0, 255): unauthenticatedVote.verify: got a vote, but sender was not selected: UnauthenticatedCredential.Verify: could not verify VRF Proof` + `Peer … disconnected: BadData` |
+| `wrong-committee-weight` | nothing on the wire — an entirely honest vote for a `(round, 0, propose)` where the account wins **zero** seats (**0 bytes** differ) | `malformed proposal for (r, 0): … UnauthenticatedCredential.Verify: credential has weight 0` + `BadData` |
+| `wrong-ots-domain` | the correct one-time key signs the correct body under the `"PL"` domain instead of `"VO"` | `malformed vote for (r, 0, 255): unauthenticatedVote.verify: could not verify FS signature on vote by …` + `BadData` |
+| `malformed-proposal` | a genuine `PP` captured off the wire with one block field corrupted | `rejected block for (r, 0): proposalStore: no accepting blockAssembler found on payloadPresent`, and the corrupted block is never committed |
+
+Each vote case is answered with `disconnectAction`
+(`agreement/player.go`, `voteMalformed`) → `disconnectBadData`
+(`network/wsPeer.go:141`), so the injector's socket closes within a few
+milliseconds. A closed socket alone is **not** attribution — an
+undecodable payload would also close it — so the script additionally
+requires the case-specific error text from `agreement/trace.go`.
+
+### Two findings worth recording
+
+**A claimed committee weight is not representable on the wire.** The
+issue asked for "a credential claiming a stake weight inconsistent with
+the account's online balance". No such message exists:
+`committee.UnauthenticatedCredential` (`data/committee/credential.go`)
+carries only the VRF proof (`codec:"pf"`); `Weight` lives on the
+*verified* `committee.Credential`, which is never transmitted. The
+verifier always recomputes the weight from `sortition.Select`. The
+reachable weight rejection is therefore weight-zero, which is what
+`wrong-committee-weight` produces — and note its wire bytes are
+byte-identical to an honest vote, so the rejection comes purely from the
+ledger.
+
+**A single-field payload corruption cannot reach the block validator.**
+`unauthenticatedProposal.value()` binds the payload to the proposal-vote
+through `EncodingDigest = HashObj(payload)` over the *entire* payload,
+so corrupting any one field breaks the binding and the payload is
+dropped by `proposalStore` before `ledger` validation is attempted.
+Reaching the block validator would additionally require forging the
+proposal-vote for the corrupted value, i.e. the original proposer's
+one-time key. `malformed-proposal` therefore asserts the property that
+is actually observable and actually matters: the corrupted block is
+never committed, and the node logs `rejected block for` carrying our
+exact payload digest.
+
+### Safety
+
+The injected identity is Wallet4 — the algod-rust node's own account —
+but every injected vote is **invalid**, so go-algorand discards it
+inside `unauthenticatedVote.verify` before it can reach the vote
+tracker, and it can never be recorded as an equivocating vote. The
+harness never injects a valid vote. The two non-payload cases use step
+`down` (255), which an honest node emits only in fast partition
+recovery, so an injection cannot collide with a real vote from the same
+account. Only `go-node-1`'s gossip port is reachable from the host.
+
+The `malformed-proposal` case briefly raises `go-node-1`'s
+`BaseLoggerDebugLevel` (payload rejections are logged at DEBUG,
+`agreement/trace.go:327`) and restarts it, restoring the level
+afterwards; the other two Go nodes carry the quorum meanwhile.
+
 ## Phase B writer-side acceptance (TASK-127)
 
 The `handoff-rust-to-go.sh` script is PLAN-36's end-to-end acceptance
