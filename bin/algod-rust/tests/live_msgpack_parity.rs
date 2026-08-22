@@ -272,12 +272,11 @@ async fn get_produced_block_msgpack_matches() {
     // "block"."rnd" legitimately differs: each node's own dev-mode chain
     // reaches this transaction at its own round number (see doc comment
     // above). "block"."bi" (proposer bonus payout) and "block"."spt" (state
-    // proof tracking) are separately-tracked, out-of-scope feature gaps —
-    // algod-rust doesn't yet implement incentive bonus payouts or state
-    // proof tracking initialization (Phase 6 consensus-participation work,
-    // unrelated to this issue's canonical-*encoding* fix) — filed as
-    // follow-up issue #462 rather than silently ignored here.
-    let allowed_prefixes = ["\"block\".\"rnd\"", "\"block\".\"bi\"", "\"block\".\"spt\""];
+    // proof tracking) used to be allowlisted here as unimplemented feature
+    // gaps; issue #462 implemented both (`algo_ledger::block_header`'s
+    // `next_bonus` / `next_state_proof_tracking`, ports of go's
+    // `bookkeeping.NextBonus` and `eval.endOfBlock`), so they are now asserted.
+    let allowed_prefixes = ["\"block\".\"rnd\""];
     mismatches.retain(|m| {
         !allowed_prefixes
             .iter()
