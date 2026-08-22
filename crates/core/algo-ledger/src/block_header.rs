@@ -86,6 +86,178 @@ fn next_upgrade_state(prev: &BlockHeader, next_round: u64) -> Result<NextUpgrade
     })
 }
 
+/// Compute the proposer bonus ("bi") for the round after `prev`.
+///
+/// Direct port of go-algorand `data/bookkeeping/block.go`'s `NextBonus` /
+/// `computeBonus` (v4.5.1-stable, lines 579–604), driven by the `BonusPlan`
+/// consensus params (`config/consensus.go`, `BonusPlan` at line 653, values set
+/// for v40 at lines 1422–1424):
+///
+/// ```text
+/// if curPlan.BaseAmount != 0 {
+///     upgrading := curPlan != prevPlan || current == 1
+///     if current == curPlan.BaseRound || (upgrading && current > curPlan.BaseRound) {
+///         return curPlan.BaseAmount
+///     }
+/// }
+/// if curPlan.DecayInterval != 0 && current%curPlan.DecayInterval == 0 {
+///     return NewPercent(99).DivvyAlgos(prevBonus)   // floor(prev * 99 / 100)
+/// }
+/// return prevBonus
+/// ```
+///
+/// `params` are the params for the round being built (post upgrade switch-over)
+/// and `prev_params` those of `prev.current_protocol` — matching go's
+/// `NextBonus`, which looks up `config.Consensus[prev.CurrentProtocol]`.
+pub fn next_bonus(
+    prev: &BlockHeader,
+    params: &ConsensusParams,
+    prev_params: &ConsensusParams,
+) -> u64 {
+    let current = prev.round.0.saturating_add(1);
+    compute_bonus(
+        current,
+        prev.bonus,
+        (
+            params.bonus_base_round,
+            params.bonus_base_amount,
+            params.bonus_decay_interval,
+        ),
+        (
+            prev_params.bonus_base_round,
+            prev_params.bonus_base_amount,
+            prev_params.bonus_decay_interval,
+        ),
+    )
+}
+
+/// Guts of [`next_bonus`], taking the two `BonusPlan`s as
+/// `(base_round, base_amount, decay_interval)` tuples so it can be unit tested
+/// directly (go's `computeBonus`).
+fn compute_bonus(
+    current: u64,
+    prev_bonus: u64,
+    cur_plan: (u64, u64, u64),
+    prev_plan: (u64, u64, u64),
+) -> u64 {
+    let (base_round, base_amount, decay_interval) = cur_plan;
+
+    // Set the amount if it's non-zero...
+    if base_amount != 0 {
+        let upgrading = cur_plan != prev_plan || current == 1;
+        // The time has come if the baseRound arrives, or at upgrade time if
+        // baseRound has already passed.
+        if current == base_round || (upgrading && current > base_round) {
+            return base_amount;
+        }
+    }
+
+    if decay_interval != 0 && current % decay_interval == 0 {
+        // Decay by 1%: go's `basics.NewPercent(99).DivvyAlgos(prevBonus)`,
+        // i.e. floor(prevBonus * 99 / 100) (`data/basics/fraction.go`).
+        return ((prev_bonus as u128 * 99) / 100) as u64;
+    }
+
+    prev_bonus
+}
+
+/// Read `StateProofTracking[StateProofBasic].StateProofNextRound` (the `"n"`
+/// field under map key `0`) out of an encoded `"spt"` value, defaulting to 0
+/// when absent — mirroring go's zero-value map lookup at
+/// `ledger/eval/eval.go:770`.
+fn state_proof_next_round(tracking: &Option<rmpv::Value>) -> u64 {
+    let Some(rmpv::Value::Map(types)) = tracking.as_ref() else {
+        return 0;
+    };
+    let basic = types
+        .iter()
+        .find(|(k, _)| k.as_u64() == Some(STATE_PROOF_BASIC))
+        .map(|(_, v)| v);
+    let Some(rmpv::Value::Map(fields)) = basic else {
+        return 0;
+    };
+    fields
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("n"))
+        .and_then(|(_, v)| v.as_u64())
+        .unwrap_or(0)
+}
+
+/// `protocol.StateProofBasic` — the only state-proof type
+/// (`protocol/stateproof.go`: `StateProofBasic StateProofType = 0`,
+/// `NumStateProofTypes = 1`).
+const STATE_PROOF_BASIC: u64 = 0;
+
+/// Build the `"spt"` (state-proof tracking) map for the round after `prev`.
+///
+/// Ports the two halves of go's tracking maintenance:
+///
+/// - `ledger/eval/eval.go:770–782` (`startEvaluator`): the next-state-proof
+///   round is inherited from the previous header's tracking entry; when it is
+///   still zero (state proofs just enabled / fresh chain) it is *initialized* to
+///   `roundUp(round + StateProofVotersLookback, StateProofInterval) + StateProofInterval`.
+/// - `ledger/eval/eval.go:1391–1400` (`endOfBlock`): the produced block carries
+///   a one-entry map keyed by `protocol.StateProofBasic` holding the voters
+///   commitment (`"v"`), the online total weight (`"t"`) and that next round
+///   (`"n"`).
+///
+/// On a fresh v41 localnet (interval 256, lookback 16) round 1 therefore gets
+/// `{0: {"n": 512}}` — `"v"`/`"t"` are zero (and omitted by the canonical
+/// encoder) because go's `stateProofVotersAndTotal`
+/// (`ledger/eval/eval.go:1333–1349`) returns zeroes for every round that is not
+/// a multiple of `StateProofInterval`.
+///
+/// # Known gap
+///
+/// `"v"`/`"t"` are always left zero here. On rounds that *are* a multiple of
+/// `StateProofInterval` go fills them from `VotersForStateProof`, i.e. the root
+/// of a vector commitment over the online participants' state-proof keys — a
+/// voters tracker and Merkle-tree machinery algod-rust does not have. Blocks
+/// produced by algod-rust at round % 256 == 0 will therefore omit `"v"`/`"t"`
+/// where go-algorand would set them.
+fn next_state_proof_tracking(
+    prev: &BlockHeader,
+    next_round: u64,
+    params: &ConsensusParams,
+) -> Option<rmpv::Value> {
+    // go: `if eval.proto.StateProofInterval > 0` (eval.go:1390).
+    let interval = params.state_proof_interval;
+    if interval == 0 {
+        return None;
+    }
+
+    let mut next = state_proof_next_round(&prev.state_proof_tracking);
+    if next == 0 {
+        // First block after state proofs are enabled: the first block carrying
+        // a vector commitment to the voters is the next multiple of the
+        // interval at or after `round + lookback`; the first state proof itself
+        // lands one interval after that (eval.go:773–782).
+        let voters_round = round_up_to_multiple_of(
+            next_round.saturating_add(params.state_proof_voters_lookback),
+            interval,
+        );
+        next = voters_round.saturating_add(interval);
+    }
+
+    // One entry, keyed by StateProofBasic. Zero-valued fields ("v" voters
+    // commitment, "t" online total weight) are omitted, matching go's
+    // `codec:",omitempty"` on StateProofTrackingData.
+    let mut fields = Vec::new();
+    if next != 0 {
+        fields.push((rmpv::Value::from("n"), rmpv::Value::from(next)));
+    }
+    Some(rmpv::Value::Map(vec![(
+        rmpv::Value::from(STATE_PROOF_BASIC),
+        rmpv::Value::Map(fields),
+    )]))
+}
+
+/// go `basics.Round.RoundUpToMultipleOf` (`data/basics/units.go:161`):
+/// `(round + n - 1) / n * n`.
+fn round_up_to_multiple_of(round: u64, n: u64) -> u64 {
+    round.saturating_add(n - 1) / n * n
+}
+
 /// Clamp `timestamp` to go's `MakeBlock` rule: never earlier than the previous
 /// block, never more than `MaxTimestampIncrement` ahead of it. A non-positive
 /// previous timestamp (genesis) imposes no clamp.
@@ -111,7 +283,11 @@ fn clamp_timestamp(timestamp: i64, prev_timestamp: i64, params: &ConsensusParams
 /// - `timestamp` is the proposer's wall-clock time, clamped per [`clamp_timestamp`].
 /// - `rewards` is the advanced [`RewardsState`] the caller computed via
 ///   `next_rewards_state` from ledger reads (mirroring go's evaluator).
-/// - genesis id/hash, fee sink, rewards pool, and bonus are carried from `prev`.
+/// - genesis id/hash, fee sink and rewards pool are carried from `prev`.
+/// - `bonus` is recomputed by [`next_bonus`] (go's `NextBonus`) and
+///   `state_proof_tracking` by `next_state_proof_tracking` (go's `endOfBlock`
+///   StateProofTracking map) — see those for the ported formulas and the one
+///   known gap (voters commitment / total weight).
 /// - `txn_counter` carries `prev`'s value; the evaluator adds the assembled
 ///   transaction count when it fills the payset.
 /// - seed, proposer, payset, and txn commitments are left zero/empty for later
@@ -120,11 +296,6 @@ fn clamp_timestamp(timestamp: i64, prev_timestamp: i64, params: &ConsensusParams
 /// The protocol governing the new block (and hence the params used for the
 /// timestamp clamp and the 512-hash gate) is the resolved protocol *after* any
 /// switch-over — matching go, which looks up params for `upgradeState.CurrentProtocol`.
-///
-/// `bonus` is carried forward unchanged: `ConsensusParams` does not model the
-/// `BonusPlan` (base-amount onset / decay), so the onset/decay transitions are
-/// not applied — consistent with the modern-protocol simplifications documented
-/// on `make_genesis_block`. For a fresh localnet (genesis bonus 0) this is exact.
 ///
 /// Returns an error if the resolved protocol is unknown or an in-flight upgrade
 /// vote would need the unmodeled `UpgradeThreshold` to resolve (see
@@ -147,6 +318,13 @@ pub fn make_next_block_header(
             ),
         }
     })?;
+
+    // Params of the protocol `prev` ran under, needed by go's `NextBonus` to
+    // detect a plan change (upgrade) between the two rounds.
+    let prev_params =
+        consensus_params_for_version(&prev.current_protocol).unwrap_or_else(|| params.clone());
+    let bonus = next_bonus(prev, &params, &prev_params);
+    let state_proof_tracking = next_state_proof_tracking(prev, next_round, &params);
 
     let branch = compute_block_header_digest(prev).0;
     let prev512 = if params.enable_sha512_block_hash {
@@ -182,12 +360,12 @@ pub fn make_next_block_header(
         upgrade_propose: String::new(),
         upgrade_delay: 0,
         upgrade_approve: false,
-        // Bonus carried forward (BonusPlan onset/decay not modeled — see above).
-        bonus: prev.bonus,
+        // Proposer bonus per the BonusPlan (go `NextBonus`).
+        bonus,
         // The evaluator adds the assembled transaction count.
         txn_counter: prev.txn_counter,
-        // State-proof tracking carries forward (algod-rust produces no state proofs).
-        state_proof_tracking: prev.state_proof_tracking.clone(),
+        // State-proof tracking (go `endOfBlock`'s StateProofTracking map).
+        state_proof_tracking,
         // Filled by the evaluator when it assembles the payset.
         txn_commitment: [0u8; 32],
         txn256: [0u8; 32],
@@ -369,6 +547,157 @@ mod tests {
             ..BlockHeader::default()
         };
         assert!(make_next_block_header(&prev, 0, rewards()).is_err());
+    }
+
+    // ── Bonus payout ("bi") ─────────────────────────────────────
+    // go: data/bookkeeping/block.go `computeBonus`; plan values from
+    // config/consensus.go v40 (BaseAmount 10_000_000, DecayInterval 1_000_000).
+
+    const V40_PLAN: (u64, u64, u64) = (0, 10_000_000, 1_000_000);
+
+    #[test]
+    fn bonus_starts_at_base_amount_on_first_round() {
+        // current == 1 counts as "upgrading", so the base amount applies even
+        // though the plan did not change.
+        assert_eq!(compute_bonus(1, 0, V40_PLAN, V40_PLAN), 10_000_000);
+    }
+
+    #[test]
+    fn bonus_applies_base_amount_at_upgrade() {
+        // Plan differs from the previous round's plan → upgrade, and the base
+        // round (0) has already passed → set the base amount.
+        assert_eq!(compute_bonus(500, 7, V40_PLAN, (0, 0, 0)), 10_000_000);
+    }
+
+    #[test]
+    fn bonus_applies_base_amount_exactly_at_base_round() {
+        let plan = (900, 10_000_000, 1_000_000);
+        assert_eq!(compute_bonus(900, 7, plan, plan), 10_000_000);
+        // Before the base round, with no plan change, nothing happens.
+        assert_eq!(compute_bonus(899, 7, plan, plan), 7);
+    }
+
+    #[test]
+    fn bonus_carries_forward_between_decays() {
+        assert_eq!(compute_bonus(2, 10_000_000, V40_PLAN, V40_PLAN), 10_000_000);
+        assert_eq!(
+            compute_bonus(999_999, 10_000_000, V40_PLAN, V40_PLAN),
+            10_000_000
+        );
+    }
+
+    #[test]
+    fn bonus_decays_one_percent_on_interval() {
+        // floor(prev * 99 / 100), go's NewPercent(99).DivvyAlgos.
+        assert_eq!(
+            compute_bonus(1_000_000, 10_000_000, V40_PLAN, V40_PLAN),
+            9_900_000
+        );
+        assert_eq!(compute_bonus(2_000_000, 101, V40_PLAN, V40_PLAN), 99);
+        // No decay configured → carry forward.
+        assert_eq!(compute_bonus(1_000_000, 101, (0, 0, 0), (0, 0, 0)), 101);
+    }
+
+    #[test]
+    fn first_produced_block_gets_ten_algo_bonus() {
+        // Fresh localnet: genesis (round 0, bonus 0) → round 1 carries 10 Algos,
+        // matching go's live value on a v41 dev-mode chain (issue #462).
+        let genesis = BlockHeader {
+            round: Round(0),
+            current_protocol: CONSENSUS_V41.to_string(),
+            bonus: 0,
+            ..BlockHeader::default()
+        };
+        let hdr = make_next_block_header(&genesis, 1, rewards()).unwrap();
+        assert_eq!(hdr.bonus, 10_000_000);
+        // And the next round carries it forward unchanged.
+        let hdr2 = make_next_block_header(&hdr, 2, rewards()).unwrap();
+        assert_eq!(hdr2.bonus, 10_000_000);
+    }
+
+    // ── State proof tracking ("spt") ────────────────────────────
+
+    fn spt_next_round(hdr: &BlockHeader) -> u64 {
+        state_proof_next_round(&hdr.state_proof_tracking)
+    }
+
+    #[test]
+    fn rounds_up_to_multiple() {
+        assert_eq!(round_up_to_multiple_of(17, 256), 256);
+        assert_eq!(round_up_to_multiple_of(256, 256), 256);
+        assert_eq!(round_up_to_multiple_of(257, 256), 512);
+        assert_eq!(round_up_to_multiple_of(0, 256), 0);
+    }
+
+    #[test]
+    fn initializes_state_proof_tracking_on_first_block() {
+        // v41: interval 256, lookback 16 → votersRound = roundUp(1+16, 256) =
+        // 256, first state proof at 256+256 = 512. go's live localnet value is
+        // `{0: {"n": 512}}` (issue #462).
+        let genesis = BlockHeader {
+            round: Round(0),
+            current_protocol: CONSENSUS_V41.to_string(),
+            ..BlockHeader::default()
+        };
+        let hdr = make_next_block_header(&genesis, 1, rewards()).unwrap();
+        assert_eq!(
+            hdr.state_proof_tracking,
+            Some(rmpv::Value::Map(vec![(
+                rmpv::Value::from(0u64),
+                rmpv::Value::Map(vec![(rmpv::Value::from("n"), rmpv::Value::from(512u64))]),
+            )])),
+            "one StateProofBasic entry carrying only the next round",
+        );
+        assert_eq!(spt_next_round(&hdr), 512);
+    }
+
+    #[test]
+    fn carries_state_proof_next_round_forward() {
+        let genesis = BlockHeader {
+            round: Round(0),
+            current_protocol: CONSENSUS_V41.to_string(),
+            ..BlockHeader::default()
+        };
+        let mut hdr = make_next_block_header(&genesis, 1, rewards()).unwrap();
+        for _ in 0..5 {
+            hdr = make_next_block_header(&hdr, 1, rewards()).unwrap();
+            assert_eq!(
+                spt_next_round(&hdr),
+                512,
+                "next state proof round stays put until a state proof lands",
+            );
+        }
+    }
+
+    #[test]
+    fn omits_state_proof_tracking_before_v34() {
+        // v33 has StateProofInterval == 0 → go never builds the map.
+        let prev = BlockHeader {
+            round: Round(5),
+            current_protocol: algo_types::consensus::CONSENSUS_V33.to_string(),
+            ..BlockHeader::default()
+        };
+        let hdr = make_next_block_header(&prev, 0, rewards()).unwrap();
+        assert_eq!(hdr.state_proof_tracking, None);
+    }
+
+    #[test]
+    fn reads_missing_or_malformed_tracking_as_zero() {
+        assert_eq!(state_proof_next_round(&None), 0);
+        assert_eq!(state_proof_next_round(&Some(rmpv::Value::Nil)), 0);
+        assert_eq!(
+            state_proof_next_round(&Some(rmpv::Value::Map(vec![]))),
+            0,
+            "no StateProofBasic entry",
+        );
+        assert_eq!(
+            state_proof_next_round(&Some(rmpv::Value::Map(vec![(
+                rmpv::Value::from(0u64),
+                rmpv::Value::Map(vec![]),
+            )]))),
+            0,
+            "entry present but \"n\" omitted (zero value)",
+        );
     }
 
     #[test]

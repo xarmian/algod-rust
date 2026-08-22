@@ -331,6 +331,9 @@ pub struct ConsensusParams {
     /// Frequency of state proofs in rounds (Go: `StateProofInterval`, v34+).
     /// 0 means state proofs are disabled.
     pub state_proof_interval: u64,
+    /// How many rounds back the state-proof voters are drawn from
+    /// (Go: `StateProofVotersLookback`, v34+).
+    pub state_proof_voters_lookback: u64,
     /// Whether the light block header includes the block hash instead of the seed
     /// (Go: `StateProofBlockHashInLightHeader`, v39+).
     pub state_proof_block_hash_in_light_header: bool,
@@ -374,6 +377,18 @@ pub struct ConsensusParams {
     /// Number of leading address bits that must match for a challenge
     /// (Go: `Payouts.ChallengeBits`, v40+).
     pub payouts_challenge_bits: u32,
+
+    // ── Proposer bonus plan (v40+) ──────────────────────────────
+    // Go: `config.BonusPlan` (`config/consensus.go`), consulted by
+    // `bookkeeping.NextBonus` / `computeBonus` (`data/bookkeeping/block.go`).
+    /// Earliest round this bonus plan can apply (Go: `Bonus.BaseRound`).
+    pub bonus_base_round: u64,
+    /// Bonus paid when this plan first applies; 0 means "don't change the
+    /// amount, only the decay rate" (Go: `Bonus.BaseAmount`).
+    pub bonus_base_amount: u64,
+    /// Rounds between successive 1% decays of the bonus; 0 disables decay
+    /// (Go: `Bonus.DecayInterval`).
+    pub bonus_decay_interval: u64,
 
     // ── Misc ────────────────────────────────────────────────────
     /// Support non-participating transactions (Go: `SupportBecomeNonParticipatingTransactions`, v18+).
@@ -535,6 +550,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         enable_keyreg_coherency_check: false,
         enable_state_proof_keyreg_check: false,
         state_proof_interval: 0,
+        state_proof_voters_lookback: 0,
         state_proof_block_hash_in_light_header: false,
         isolate_clear_state: false,
         max_asset_url_bytes: 0,
@@ -550,6 +566,9 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         payouts_challenge_interval: 0,
         payouts_challenge_grace_period: 0,
         payouts_challenge_bits: 0,
+        bonus_base_round: 0,
+        bonus_base_amount: 0,
+        bonus_decay_interval: 0,
         support_become_non_participating_transactions: false,
         enable_app_versioning: false,
         // Agreement / committee
@@ -850,6 +869,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v34.min_inner_appl_version = 4;
     v34.enable_sha256_txn_commitment_header = true;
     v34.state_proof_interval = 256;
+    v34.state_proof_voters_lookback = 16;
     v34.agreement_filter_timeout_period0 = Duration::from_millis(3400);
     if version == CONSENSUS_V34 {
         return Some(v34);
@@ -913,6 +933,11 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     v40.payouts_challenge_interval = 1_000;
     v40.payouts_challenge_grace_period = 200;
     v40.payouts_challenge_bits = 5;
+    // go: config/consensus.go — `v40.Bonus.BaseAmount = 10_000_000` (10 Algos)
+    // and `v40.Bonus.DecayInterval = 1_000_000` (~1% decay per 1M rounds).
+    // `BaseRound` is left at its zero value, so the plan applies at upgrade time.
+    v40.bonus_base_amount = 10_000_000;
+    v40.bonus_decay_interval = 1_000_000;
     if version == CONSENSUS_V40 {
         return Some(v40);
     }
