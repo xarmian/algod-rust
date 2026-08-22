@@ -335,6 +335,14 @@ Validation checks:
 - fork resolution
 - final block agreement
 
+Implemented by the mixed-cluster harness under `ops/mixed-cluster/`
+(3 Go relays + 1 `algod-rust participate` node). The positive-path
+gate is `make consensus-cluster-test` — see
+`ops/mixed-cluster/README.md` §"Positive consensus conformance
+(issue #470, Epic 42c)" for what it asserts, the binomial bound used
+for proposer share, and how certificates are authenticated under both
+implementations.
+
 ---
 
 # 12. Fixture Infrastructure

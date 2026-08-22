@@ -16,22 +16,39 @@
 //!
 //! The binary exits non-zero on any authentication failure.
 //!
-//! Rust → Go verification (the inverse direction) requires the Rust
-//! node to actively produce certs, which is gated on participation-key
-//! interop with go-algorand (PLAN-35). Until that ships, this tool only
-//! exercises Go → Rust.
+//! ## Rust → Go (issue #470 §2)
+//!
+//! Now that the Rust node participates for real (#469), two extra
+//! assertions are available:
+//!
+//!   * `--rust-account ADDR` records, per round, whether that account's
+//!     vote is present in the committed certificate, and
+//!     `--min-rust-vote-rounds N` fails the run when fewer than N of the
+//!     sampled rounds carry one. A Rust vote inside a certificate the
+//!     **Go** nodes assembled and committed is direct evidence that Go
+//!     accepted and counted it.
+//!   * `--export-go-input PATH` writes a JSON bundle (raw `(block,
+//!     cert)` msgpack + the ledger facts `agreement.LedgerReader` needs)
+//!     for `tools/cert-authenticate`, which replays each certificate
+//!     through go-algorand's own `agreement.Certificate.Authenticate`.
+//!     Running both gives the "authenticates under BOTH implementations"
+//!     property the issue asks for.
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use algo_agreement::LedgerReader;
-use algo_cert_crossverify::{pair_from_response, VerifiablePair};
+use algo_cert_crossverify::{
+    build_go_verify_round, cert_contains_sender, pair_from_response, GoVerifyInput, GoVerifyRound,
+    VerifiablePair,
+};
 use algo_ledger::{agreement_bridge::AgreementLedgerBridge, sqlite::SqliteLedger};
 use algo_rest_client::{AlgodClient, BlockSource, ClientConfig};
-use algo_types::Round;
+use algo_types::{Address, Round};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use serde::Serialize;
@@ -87,6 +104,22 @@ struct Cli {
     /// Tracing log level (default: info).
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// (#470 §2) Address of the Rust participant. When set, each round
+    /// records whether that account's vote is present in the cert.
+    #[arg(long)]
+    rust_account: Option<String>,
+
+    /// (#470 §2) Fail unless at least this many of the sampled rounds
+    /// carry a vote from --rust-account. 0 disables the gate; 1 is the
+    /// "the Rust node is participating at all" assertion.
+    #[arg(long, default_value_t = 0, requires = "rust_account")]
+    min_rust_vote_rounds: usize,
+
+    /// (#470 §2) Write a JSON bundle for `tools/cert-authenticate` (the
+    /// go-algorand-side authenticator) to this path.
+    #[arg(long)]
+    export_go_input: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -100,6 +133,9 @@ enum JsonlRecord {
         block_digest_hex: String,
         votes: usize,
         error: Option<String>,
+        /// (#470 §2) `Some(true)`/`Some(false)` when --rust-account is
+        /// configured; `None` when it isn't.
+        rust_vote_present: Option<bool>,
     },
     Summary {
         from_round: u64,
@@ -111,6 +147,15 @@ enum JsonlRecord {
         rounds_skipped_fetch: usize,
         node: String,
         ledger_sqlite: String,
+        /// (#470 §2) Rust participant address, when configured.
+        rust_account: Option<String>,
+        /// (#470 §2) How many sampled rounds carried a Rust vote.
+        rust_vote_rounds: usize,
+        /// (#470 §2) The rounds themselves (bounded to the first 64 for
+        /// readability; the per-round records carry the full picture).
+        rust_vote_round_sample: Vec<u64>,
+        /// (#470 §2) The gate that was applied, if any.
+        min_rust_vote_rounds: usize,
     },
 }
 
@@ -228,6 +273,14 @@ async fn run(cli: Cli) -> Result<i32> {
         bail!("--stride must be >= 1");
     }
 
+    let rust_account = match &cli.rust_account {
+        Some(s) => Some(
+            Address::from_str(s.trim())
+                .map_err(|e| anyhow!("--rust-account {s:?} is not a valid address: {e:?}"))?,
+        ),
+        None => None,
+    };
+
     let token = load_token(&cli)?;
     let client_config = ClientConfig {
         timeout: Duration::from_secs(cli.timeout_s),
@@ -294,12 +347,17 @@ async fn run(cli: Cli) -> Result<i32> {
     let mut rounds_ok = 0usize;
     let mut rounds_failed = 0usize;
     let mut rounds_skipped_fetch = 0usize;
+    let mut rust_vote_rounds: Vec<u64> = Vec::new();
+    let mut go_verify_rounds: Vec<GoVerifyRound> = Vec::new();
     let total_rounds = rounds.len();
 
     for round in rounds {
         let algo_round = Round(round);
-        let resp = match client.get_block(algo_round).await {
-            Ok(r) => r,
+        // Fetch the raw msgpack once: the Rust verifier decodes it, and
+        // (when exporting) the very same bytes go to the Go helper so
+        // both implementations authenticate byte-identical input.
+        let raw = match client.get_block_raw(algo_round).await {
+            Ok(b) => b,
             Err(e) => {
                 warn!(round = round, error = %e, "block fetch failed — skipping");
                 rounds_skipped_fetch += 1;
@@ -314,6 +372,30 @@ async fn run(cli: Cli) -> Result<i32> {
                             block_digest_hex: String::new(),
                             votes: 0,
                             error: Some(e.to_string()),
+                            rust_vote_present: None,
+                        },
+                    )?;
+                }
+                continue;
+            }
+        };
+        let resp = match algo_codec::decode_block_response(&raw) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(round = round, error = %e, "block decode failed — skipping");
+                rounds_skipped_fetch += 1;
+                if let Some(w) = jsonl_writer.as_mut() {
+                    write_jsonl(
+                        w,
+                        &JsonlRecord::Round {
+                            round,
+                            outcome: "skipped_fetch",
+                            cert_round: 0,
+                            cert_period: 0,
+                            block_digest_hex: String::new(),
+                            votes: 0,
+                            error: Some(e.to_string()),
+                            rust_vote_present: None,
                         },
                     )?;
                 }
@@ -337,12 +419,43 @@ async fn run(cli: Cli) -> Result<i32> {
                             block_digest_hex: String::new(),
                             votes: 0,
                             error: Some(e.to_string()),
+                            rust_vote_present: None,
                         },
                     )?;
                 }
                 continue;
             }
         };
+
+        // (#470 §2) Is the Rust participant's vote in this certificate?
+        let rust_vote_present = rust_account
+            .as_ref()
+            .map(|a| cert_contains_sender(&pair.certificate, a));
+        if rust_vote_present == Some(true) {
+            rust_vote_rounds.push(round);
+        }
+
+        // (#470 §2) Export the ledger facts Go's verifier will need.
+        // A lookup failure here is reported but not fatal on its own —
+        // the Rust-side authentication below is the primary gate, and
+        // the Go helper reports a short export as missing coverage.
+        if cli.export_go_input.is_some() {
+            match build_go_verify_round(
+                round,
+                &raw,
+                &pair,
+                &bridge as &dyn LedgerReader,
+                rust_account.as_ref(),
+            ) {
+                Ok(rec) => go_verify_rounds.push(rec),
+                Err(e) => warn!(
+                    round = round,
+                    error = %e,
+                    "could not build the go-verify export record for this round"
+                ),
+            }
+        }
+
         let VerifiablePair {
             block,
             block_digest,
@@ -379,6 +492,7 @@ async fn run(cli: Cli) -> Result<i32> {
                     block_digest_hex: hex::encode(block_digest.as_bytes()),
                     votes: certificate.votes.len(),
                     error: outcome_err.as_ref().map(|e| e.to_string()),
+                    rust_vote_present,
                 },
             )?;
         }
@@ -407,8 +521,34 @@ async fn run(cli: Cli) -> Result<i32> {
                 rounds_skipped_fetch,
                 node: cli.node.clone(),
                 ledger_sqlite: cli.ledger_sqlite.display().to_string(),
+                rust_account: cli.rust_account.clone(),
+                rust_vote_rounds: rust_vote_rounds.len(),
+                rust_vote_round_sample: rust_vote_rounds.iter().copied().take(64).collect(),
+                min_rust_vote_rounds: cli.min_rust_vote_rounds,
             },
         )?;
+    }
+
+    // (#470 §2) Write the go-algorand-side verification bundle.
+    if let Some(path) = &cli.export_go_input {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+        }
+        let exported = go_verify_rounds.len();
+        let input = GoVerifyInput {
+            rust_account: cli.rust_account.clone(),
+            rounds: go_verify_rounds,
+        };
+        let f = fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+        serde_json::to_writer_pretty(std::io::BufWriter::new(f), &input)
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!(
+            "cert-crossverify: wrote go-verify input for {exported} round(s) to {}",
+            path.display()
+        );
     }
 
     println!(
@@ -421,7 +561,27 @@ async fn run(cli: Cli) -> Result<i32> {
         rounds_skipped_fetch,
     );
 
-    if rounds_failed > 0 {
+    let mut rust_vote_gate_failed = false;
+    if let Some(account) = &cli.rust_account {
+        println!(
+            "cert-crossverify: rust_account={account} vote present in {}/{} sampled certs \
+             (gate: >= {})",
+            rust_vote_rounds.len(),
+            total_rounds - rounds_skipped_fetch,
+            cli.min_rust_vote_rounds,
+        );
+        if rust_vote_rounds.len() < cli.min_rust_vote_rounds {
+            rust_vote_gate_failed = true;
+            println!(
+                "FAIL: only {} of the sampled certificates contain a vote from {account}; \
+                 wanted at least {}. The Rust node is following, not voting.",
+                rust_vote_rounds.len(),
+                cli.min_rust_vote_rounds
+            );
+        }
+    }
+
+    if rounds_failed > 0 || rust_vote_gate_failed {
         Ok(2)
     } else if rounds_ok == 0 {
         // No successful verifications — something went wrong upstream.

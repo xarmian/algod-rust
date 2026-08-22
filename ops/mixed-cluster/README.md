@@ -198,6 +198,89 @@ next to the soak output (both gitignored). The underlying binaries
 `algo-fork-detector` and `algo-cert-crossverify` are standalone and
 scriptable outside the shell wrapper.
 
+## Positive consensus conformance (issue #470, Epic 42c)
+
+`scripts/consensus-conformance.sh` is the one-command acceptance gate
+for the Rust node's *own* participation. It runs
+cluster-up → (optional) forced period advancement → soak → verify →
+cluster-down and writes a machine-readable `summary.json`:
+
+```bash
+# 200 rounds, full suite, teardown at the end.
+make consensus-cluster-test                 # or ROUNDS=500 make …
+
+# Just the analyzer's unit tests (no Docker).
+make consensus-analyzer-test
+
+# Through cargo, gated the same way as the #469 smoke test.
+MIXED_CLUSTER=1 cargo test -p algo-network --test consensus_conformance \
+    -- --ignored --nocapture
+```
+
+What it asserts:
+
+| Check | Source |
+| --- | --- |
+| `proposer_share` | `analyze.py --rust-account` — the Rust account must appear as block proposer, never zero, within a two-sided binomial bound |
+| `vote_step_coverage` | `analyze.py --rust-log` — the Rust node cast BOTH `soft` and `cert` votes |
+| `period_advancement_recovery` | a Go relay is paused for `PAUSE_SECONDS`, forcing period advancement; the cluster must return to lockstep |
+| `fork_free` | `algo-fork-detector` over every round |
+| `certs_authenticate_rust` | `algo-cert-crossverify` — Go-produced certs under Rust's verifier |
+| `certs_authenticate_go` | `tools/cert-authenticate` — the same certs under go-algorand's own `agreement.Certificate.Authenticate` |
+| `go_accepts_rust_votes` | Go's `VoteAccepted` telemetry with the Rust account as `Sender`, broken down per step |
+| `no_go_side_rejections` | zero WARN-level agreement rejections in the Go logs |
+| `block_cadence`, `node_lockstep` | `analyze.py` block-time and lag bounds |
+
+### The proposer-share bound
+
+Proposer selection over N rounds is Binomial(N, p) with p the account's
+share of ONLINE stake (0.10 here). The gate accepts
+`|k - Np| <= sigma * sqrt(Np(1-p))` with `sigma = 3` by default, and
+**always** fails on `k = 0`.
+
+3 sigma rather than something tighter because the real 200-round run
+recorded on issue #482 saw 13/200 (mu = 20, sd = 4.24, z = -1.65) — a
+2-sigma gate would have been ~0.35 sigma from failing a healthy run. At
+N = 200 the 3-sigma window is k ∈ [7, 32], still nowhere near the
+regression it is meant to catch (k = 0, z = -4.71). Override with
+`PROPOSER_SIGMA` / `RUST_STAKE_FRACTION`.
+
+### Why Rust votes are not required *inside* certificates
+
+`agreement.makeBundle` (go-algorand `agreement/bundle.go`) stops packing
+votes as soon as the running weight reaches the step's quorum, so a
+certificate carries only the votes that were needed. With the 30/30/30/10
+split the three Go accounts hold ~90% of the cert committee against a
+~74% threshold, so the three Go votes alone always suffice and the Rust
+node's cert vote — one relay hop later — is dropped from the bundle.
+Measured on a healthy participating run: **0 of 301 consecutive
+certificates** (checked on all three Go nodes) contained it, while the Go
+nodes' own `VoteAccepted` telemetry showed the Rust votes being counted
+at the propose, soft and cert steps.
+
+So `MIN_RUST_VOTE_ROUNDS` defaults to `0` (recorded, not gated), and
+vote *acceptance* is asserted from the Go side instead. Raise it on a
+topology where the Rust stake exceeds ~26% and is therefore required for
+quorum.
+
+### The go-algorand-side authenticator
+
+`tools/cert-authenticate` is a small Go program that re-authenticates the
+exported certificates with go-algorand v4.5.1-stable's own verifier.
+`algo-cert-crossverify --export-go-input` writes it the raw `(block,
+cert)` msgpack plus the `agreement.LedgerReader` facts (seed,
+circulation, per-voter online account data) read out of the **Rust**
+ledger, so a divergence in Rust's view of stake or seed shows up as a
+Go-side authentication failure. Go recomputes the block digest itself
+and reports a mismatch distinctly.
+
+Building it needs go-algorand's vendored libsodium fork, so
+`tools/cert-authenticate/run-in-docker.sh` clones the pinned checkout
+inside a `golang:1.25-bookworm` container, runs `make libsodium` there,
+and caches both in named Docker volumes (first run ~3-5 min, later runs
+seconds). That is also the only supported path on Windows, where the
+host checkout's line endings break autotools.
+
 ## Phase B writer-side acceptance (TASK-127)
 
 The `handoff-rust-to-go.sh` script is PLAN-36's end-to-end acceptance

@@ -22,11 +22,34 @@
 #     log-round observation (best-effort)
 #   - Warning digest: count per unique warning message prefix
 #
+# Issue #470 (Epic 42c) additions — assertions about the RUST node's own
+# consensus participation, all opt-in via CLI flags so the historical
+# observer-topology reports keep working unchanged:
+#
+#   --rust-account ADDR        Assert this address appears as a block
+#                              proposer, with a share statistically
+#                              consistent with --rust-stake-fraction.
+#   --rust-stake-fraction F    Its share of ONLINE stake (default 0.10,
+#                              the 30/30/30/10 split in template.json).
+#   --proposer-sigma S         Two-sided bound in standard deviations
+#                              (default 3.0). See `proposer_share_check`.
+#   --rust-log PATH            A `docker logs phase6-rust-node-4` capture.
+#                              Asserts the node cast BOTH soft and cert
+#                              votes, and reports any period > 0
+#                              (next-step / period-advancement) activity.
+#   --require-steps a,b        Steps that must appear in --rust-log
+#                              (default "soft,cert").
+#   --max-mean-block-time S    Cadence gate: fail if the mean inter-block
+#                              time exceeds S seconds (0 = disabled).
+#   --max-p95-block-time S     Same, on the p95 (0 = disabled).
+#
 # Acceptance-criteria hints (printed at the bottom):
 #   - Any stall / interrupt / timeout phase in run_meta
 #   - Any lag > --lag-tolerance
 #   - Any warning records
 #   - Any blocks missing block_ts / proposer
+#   - (#470) zero Rust proposals, an out-of-bound Rust proposer share,
+#     a missing vote step, or a cadence threshold breach
 # Exit code is 0 iff every acceptance hint is clean. The full criteria
 # from TASK-87 live in docs/SOAK_METHODOLOGY.md.
 #
@@ -37,10 +60,35 @@ import argparse
 import json
 import math
 import os
+import re
 import statistics
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime
+
+# ── #470: Rust participation parsing ────────────────────────────────────
+#
+# `algo_agreement::service` logs one line per Attest action:
+#
+#   INFO algo_agreement::service: attested to ProposalValue { ... } at (357, 0, cert)
+#
+# The trailing triple is (round, period, step); `Step`'s Display renders
+# 0..3 as propose/soft/cert/next and anything above 3 as "next+N"
+# (see crates/core/algo-agreement/src/step.rs).
+ATTEST_RE = re.compile(
+    r"attested to .* at \((?P<round>\d+), (?P<period>\d+), (?P<step>[a-z]+(?:\+\d+)?)\)"
+)
+
+# Same file logs reproposals at the propose step.
+REPROPOSE_RE = re.compile(
+    r"repropose to .* at \((?P<round>\d+), (?P<period>\d+), (?P<step>[a-z]+(?:\+\d+)?)\)"
+)
+
+# `tracing`'s pretty formatter wraps field names in ANSI escapes, which
+# survive `docker logs` redirection into a file.
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+DEFAULT_REQUIRED_STEPS = ("soft", "cert")
 
 
 def percentile(values, pct: float):
@@ -94,6 +142,215 @@ def describe(values, unit=""):
         f"p99={percentile(values, 99):.3f}{unit} "
         f"min={min(values):.3f}{unit} max={max(values):.3f}{unit}"
     )
+
+
+def proposer_share_check(
+    proposers: dict,
+    account: str,
+    stake_fraction: float,
+    sigma: float,
+):
+    """Issue #470 §1 — is `account`'s proposer share consistent with its stake?
+
+    Model
+    -----
+    Under go-algorand's sortition, block-proposer selection over N
+    independent rounds is Binomial(N, p) where p is the account's share
+    of ONLINE stake (`stake_fraction`). We accept the run when the
+    observed count k lies inside a two-sided normal-approximation
+    interval:
+
+        mu    = N * p
+        sd    = sqrt(N * p * (1 - p))
+        |k - mu| <= `sigma_bound` * sd
+
+    `sigma_bound` defaults to 3.0. Why 3 sigma and not something tighter: the
+    real 200-round run recorded on issue #482 saw 13/200 proposals for a
+    p = 0.10 account (mu = 20, sd = 4.243, z = -1.65). A 2-sigma gate would
+    have been within ~0.35 sigma of failing that perfectly healthy run, so
+    2 sigma is too tight for a CI gate at N = 200. 3 sigma accepts k in [7, 32]
+    at N = 200 — still far from a genuine regression, which produces
+    k = 0 (z = -4.71, rejected on BOTH the sigma test and the explicit
+    zero gate below).
+
+    Zero proposals is ALWAYS a failure regardless of the sigma bound:
+    a node that never proposes is exactly the #482 regression, and at
+    small N the normal interval can otherwise reach down to 0.
+
+    The normal approximation degrades when mu < 10; we still apply it
+    (the alternative, an exact binomial tail, needs scipy) but flag it
+    in the result as `normal_approx_weak` so a reader knows the interval
+    is indicative rather than exact.
+    """
+    total = sum(proposers.values())
+    count = int(proposers.get(account, 0))
+    result = {
+        "account": account,
+        "stake_fraction": stake_fraction,
+        "sigma_bound": sigma,
+        "blocks_with_proposer": total,
+        "rust_proposals": count,
+        "observed_fraction": (count / total) if total else None,
+        "expected": None,
+        "sd": None,
+        "z": None,
+        "lower_bound": None,
+        "upper_bound": None,
+        "normal_approx_weak": None,
+        "ok": False,
+        "failures": [],
+    }
+
+    if total <= 0:
+        result["failures"].append(
+            "no blocks with a proposer were captured — cannot assess "
+            "the Rust proposer share"
+        )
+        return result
+    if not 0.0 < stake_fraction < 1.0:
+        result["failures"].append(
+            f"--rust-stake-fraction must be in (0, 1); got {stake_fraction}"
+        )
+        return result
+
+    mu = total * stake_fraction
+    sd = math.sqrt(total * stake_fraction * (1.0 - stake_fraction))
+    result["expected"] = mu
+    result["sd"] = sd
+    result["normal_approx_weak"] = mu < 10.0
+    result["z"] = ((count - mu) / sd) if sd > 0 else None
+    result["lower_bound"] = mu - sigma * sd
+    result["upper_bound"] = mu + sigma * sd
+
+    if count == 0:
+        result["failures"].append(
+            f"Rust account {account[:8]}… proposed ZERO of {total} blocks "
+            f"(expected ~{mu:.1f}) - the node is following, not proposing"
+        )
+    elif sd > 0 and abs(count - mu) > sigma * sd:
+        result["failures"].append(
+            f"Rust proposer share out of bound: {count}/{total} "
+            f"(z={result['z']:+.2f}, |z| > {sigma:.1f}); expected "
+            f"{mu:.1f} +/- {sigma * sd:.1f}"
+        )
+
+    result["ok"] = not result["failures"]
+    return result
+
+
+def parse_rust_participation_log(text: str):
+    """Issue #470 §3 — extract vote-step coverage from the Rust node log.
+
+    Returns a dict with per-step attest counts, the set of rounds the
+    node attested in, and any period > 0 observations (a period > 0
+    attest is exactly the `next`-step / period-advancement case the
+    issue asks us to exercise).
+
+    Robust against: ANSI escapes from `tracing`'s pretty formatter,
+    interleaved unrelated lines, and truncated/binary junk.
+    """
+    steps = Counter()
+    periods = Counter()
+    rounds = set()
+    period_advanced_rounds = set()
+    repropose_rounds = set()
+    lines_scanned = 0
+
+    for raw in text.splitlines():
+        lines_scanned += 1
+        line = ANSI_RE.sub("", raw)
+        m = ATTEST_RE.search(line)
+        if m:
+            rnd = int(m.group("round"))
+            period = int(m.group("period"))
+            step = m.group("step")
+            steps[step] += 1
+            periods[period] += 1
+            rounds.add(rnd)
+            if period > 0:
+                period_advanced_rounds.add(rnd)
+            continue
+        m = REPROPOSE_RE.search(line)
+        if m:
+            repropose_rounds.add(int(m.group("round")))
+            if int(m.group("period")) > 0:
+                period_advanced_rounds.add(int(m.group("round")))
+
+    return {
+        "lines_scanned": lines_scanned,
+        "attests_total": sum(steps.values()),
+        "steps": dict(steps),
+        "periods": dict(periods),
+        "rounds_attested": len(rounds),
+        "first_round": min(rounds) if rounds else None,
+        "last_round": max(rounds) if rounds else None,
+        "period_advanced_rounds": sorted(period_advanced_rounds),
+        "reproposals": len(repropose_rounds),
+    }
+
+
+def step_coverage_check(parsed: dict, required_steps):
+    """Fail when a required vote step never appears in the Rust log."""
+    seen = set(parsed.get("steps", {}))
+    # "next+N" (period advancement beyond the first next step) satisfies
+    # a "next" requirement — Step's Display renders 4, 5, … that way.
+    normalized = set(seen)
+    if any(s.startswith("next+") for s in seen):
+        normalized.add("next")
+    missing = [s for s in required_steps if s not in normalized]
+    failures = []
+    if parsed.get("attests_total", 0) == 0:
+        failures.append(
+            "the Rust log contains no 'attested to …' lines at all — "
+            "the node cast no votes (wrong log file, or no partkeys?)"
+        )
+    elif missing:
+        failures.append(
+            "Rust node never cast these vote step(s): "
+            + ", ".join(missing)
+            + f" (saw: {', '.join(sorted(seen)) or 'none'})"
+        )
+    return {
+        "required_steps": list(required_steps),
+        "steps_seen": sorted(seen),
+        "missing_steps": missing,
+        "period_advancement_observed": bool(parsed.get("period_advanced_rounds")),
+        "ok": not failures,
+        "failures": failures,
+    }
+
+
+def cadence_check(block_time_summary: dict, max_mean: float, max_p95: float):
+    """Fail when block production is slower than the configured bound.
+
+    Both bounds are opt-in (0 disables). `analyze.py` historically only
+    *reported* the block-time distribution; issue #470 §4 wants a real
+    gate, but the acceptable value depends on the harness (a 4-node
+    docker cluster on a laptop is slower than CI), so the caller picks.
+    """
+    failures = []
+    if block_time_summary.get("n"):
+        if max_mean > 0 and block_time_summary["mean"] > max_mean:
+            failures.append(
+                f"mean block time {block_time_summary['mean']:.2f}s > "
+                f"{max_mean:.2f}s"
+            )
+        if max_p95 > 0 and block_time_summary["p95"] > max_p95:
+            failures.append(
+                f"p95 block time {block_time_summary['p95']:.2f}s > "
+                f"{max_p95:.2f}s"
+            )
+    elif max_mean > 0 or max_p95 > 0:
+        failures.append(
+            "cadence bound requested but no consecutive block pairs were "
+            "captured"
+        )
+    return {
+        "max_mean_block_time_s": max_mean,
+        "max_p95_block_time_s": max_p95,
+        "ok": not failures,
+        "failures": failures,
+    }
 
 
 def summarize(records, lag_tolerance: int):
@@ -309,7 +566,7 @@ def summarize(records, lag_tolerance: int):
     }
 
 
-def print_report(summary, source_paths):
+def print_report(summary, source_paths):  # noqa: C901 — one linear report
     end = summary["run_meta"]["end"] or {}
     baseline = summary["run_meta"]["baseline"] or {}
     phase = end.get("phase", "(no end record)")
@@ -378,6 +635,71 @@ def print_report(summary, source_paths):
         print("  no proposer data captured.")
     print()
 
+    # ── #470 §1: Rust proposer share ────────────────────────────────────
+    ps = summary.get("rust_proposer_share")
+    if ps:
+        short = ps["account"][:8] + "…"
+        print("Rust proposer share (issue #470 §1):")
+        print(
+            f"  account={short} proposals={ps['rust_proposals']}"
+            f"/{ps['blocks_with_proposer']}"
+            + (
+                f" ({100.0 * ps['observed_fraction']:.1f}%)"
+                if ps["observed_fraction"] is not None
+                else ""
+            )
+        )
+        if ps["expected"] is not None:
+            print(
+                f"  binomial(N={ps['blocks_with_proposer']}, "
+                f"p={ps['stake_fraction']:.3f}): expected={ps['expected']:.1f} "
+                f"sd={ps['sd']:.2f} z={ps['z']:+.2f} "
+                f"accept=[{max(0.0, ps['lower_bound']):.1f}, "
+                f"{ps['upper_bound']:.1f}] at {ps['sigma_bound']:.1f} sigma"
+            )
+        if ps.get("normal_approx_weak"):
+            print(
+                "  note: expected count < 10 — the normal approximation is "
+                "indicative only; the zero-proposal gate still applies."
+            )
+        print("  " + ("OK" if ps["ok"] else "FAIL"))
+        print()
+
+    # ── #470 §3: vote-step coverage ─────────────────────────────────────
+    sc = summary.get("rust_step_coverage")
+    if sc:
+        parsed = summary.get("rust_participation_log", {})
+        print("Rust vote-step coverage (issue #470 §3):")
+        print(
+            f"  attests={parsed.get('attests_total', 0)} "
+            f"rounds={parsed.get('rounds_attested', 0)} "
+            f"steps={parsed.get('steps', {})}"
+        )
+        print(
+            f"  required={','.join(sc['required_steps'])} "
+            f"seen={','.join(sc['steps_seen']) or 'none'}"
+        )
+        adv = parsed.get("period_advanced_rounds") or []
+        if adv:
+            print(
+                f"  period advancement (next step) observed in "
+                f"{len(adv)} round(s): {adv[:10]}"
+                + (" …" if len(adv) > 10 else "")
+            )
+        else:
+            print("  period advancement: none observed (period 0 throughout)")
+        print("  " + ("OK" if sc["ok"] else "FAIL"))
+        print()
+
+    cad = summary.get("cadence")
+    if cad and (cad["max_mean_block_time_s"] or cad["max_p95_block_time_s"]):
+        print(
+            f"Cadence gate: max_mean={cad['max_mean_block_time_s']}s "
+            f"max_p95={cad['max_p95_block_time_s']}s — "
+            + ("OK" if cad["ok"] else "FAIL")
+        )
+        print()
+
     rs = summary["rust_summary"]
     print(f"Rust node (phase6-rust-node-4): samples={rs['samples']} "
           f"states={rs['state_counts']} "
@@ -409,6 +731,10 @@ def print_report(summary, source_paths):
         hints.append(
             f"{len(r['blocks_missing_proposer'])} block(s) missing proposer"
         )
+    for key in ("rust_proposer_share", "rust_step_coverage", "cadence"):
+        section = summary.get(key)
+        if section:
+            hints.extend(section.get("failures", []))
 
     if hints:
         print("Acceptance hints (see docs/SOAK_METHODOLOGY.md §Acceptance):")
@@ -434,6 +760,26 @@ def main() -> int:
                         help="Max allowed per-node round delta at end of run (default 5).")
     parser.add_argument("--json-out", default=None,
                         help="Path to write the full summary JSON (default: <input>.summary.json).")
+    # ── issue #470 (Epic 42c) participation assertions ──────────────────
+    parser.add_argument("--rust-account", default=None,
+                        help="Rust participant address; assert it proposed blocks "
+                             "with a share consistent with --rust-stake-fraction.")
+    parser.add_argument("--rust-stake-fraction", type=float, default=0.10,
+                        help="Rust account's share of ONLINE stake (default 0.10).")
+    parser.add_argument("--proposer-sigma", type=float, default=3.0,
+                        help="Two-sided binomial bound in sigmas (default 3.0).")
+    parser.add_argument("--rust-log", default=None,
+                        help="Path to a `docker logs phase6-rust-node-4` capture; "
+                             "asserts vote-step coverage.")
+    parser.add_argument("--require-steps", default=",".join(DEFAULT_REQUIRED_STEPS),
+                        help="Comma-separated vote steps that must appear in "
+                             "--rust-log (default: soft,cert).")
+    parser.add_argument("--max-mean-block-time", type=float, default=0.0,
+                        help="Fail if mean inter-block time exceeds this many "
+                             "seconds (0 = disabled).")
+    parser.add_argument("--max-p95-block-time", type=float, default=0.0,
+                        help="Fail if p95 inter-block time exceeds this many "
+                             "seconds (0 = disabled).")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
@@ -446,11 +792,39 @@ def main() -> int:
         return 2
 
     summary = summarize(records, args.lag_tolerance)
+
+    # ── issue #470 assertions, layered on top of the base summary ───────
+    if args.rust_account:
+        summary["rust_proposer_share"] = proposer_share_check(
+            summary["proposers"],
+            args.rust_account,
+            args.rust_stake_fraction,
+            args.proposer_sigma,
+        )
+    if args.rust_log:
+        try:
+            with open(args.rust_log, encoding="utf-8", errors="replace") as f:
+                log_text = f.read()
+        except OSError as e:
+            print(f"error: cannot read --rust-log {args.rust_log}: {e}",
+                  file=sys.stderr)
+            return 2
+        parsed = parse_rust_participation_log(log_text)
+        required = [s.strip() for s in args.require_steps.split(",") if s.strip()]
+        summary["rust_participation_log"] = parsed
+        summary["rust_step_coverage"] = step_coverage_check(parsed, required)
+    summary["cadence"] = cadence_check(
+        summary["block_time_s"],
+        args.max_mean_block_time,
+        args.max_p95_block_time,
+    )
+
     clean = print_report(summary, [args.input])
 
     # Strip _samples from the sidecar to keep it compact (and also emit a
     # separate _samples file if the caller wants raw arrays).
     out_path = args.json_out or (args.input + ".summary.json")
+    summary["acceptance_ok"] = bool(clean)
     serializable = {k: v for k, v in summary.items() if k != "_samples"}
     with open(out_path, "w") as f:
         json.dump(serializable, f, indent=2, default=str)
