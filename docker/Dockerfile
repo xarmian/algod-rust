@@ -11,6 +11,13 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/algod-rust /usr/local/bin/algod-rust
+# glibc creates up to 8*ncores malloc arenas under multithreaded load
+# (tokio workers + blocking pool); freed memory is retained per-arena, so
+# RSS grows monotonically under sustained transaction load (issue #100
+# measured ~10 MB/round on participation nodes, peaking ~1 GB where Go
+# stays ~450 MB). Capping the arena count returns the node to Go-like
+# resident behavior; it does not affect node semantics.
+ENV MALLOC_ARENA_MAX=2
 WORKDIR /app
 ENTRYPOINT ["algod-rust"]
 CMD ["follow", "--algod-url", "http://algod-go:8080"]
