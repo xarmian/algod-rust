@@ -69,6 +69,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "algo-agreement-fuzz"
+version = "0.1.0"
+dependencies = [
+ "algo-agreement",
+ "algo-codec",
+ "algo-consensus-crypto",
+ "algo-ledger",
+ "algo-network",
+ "algo-types",
+ "anyhow",
+ "base64",
+ "clap",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.5",
+ "reqwest",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "algo-avm"
 version = "0.1.0"
 dependencies = [

@@ -609,16 +609,28 @@ consensus-cluster-smoke: ## Run the #469 participation smoke test (up + 30 round
 ##   make consensus-cluster-test RESTART_SCENARIOS=1
 ##   make consensus-cluster-restart          # restart stage only, on an
 ##                                           # already-running cluster
+##
+## NEGATIVE_CASES=1 additionally runs the #472 negative suite (one malformed
+## agreement message per case injected into go-node-1, asserting Go rejects
+## each one and the cluster stays healthy) against the same running cluster.
 consensus-cluster-test: consensus-analyzer-test ## Run the #470 conformance suite (up + soak + verify + down)
-	cargo build -p algo-fork-detector -p algo-cert-crossverify
+	cargo build -p algo-fork-detector -p algo-cert-crossverify -p algo-agreement-fuzz
 	ROUNDS=$(or $(ROUNDS),200) \
 	RESTART_SCENARIOS=$(or $(RESTART_SCENARIOS),0) \
 	RESTART_MODE=$(or $(RESTART_MODE),all) \
+	NEGATIVE_CASES=$(or $(NEGATIVE_CASES),0) \
 		$(PHASE6_CLUSTER)/scripts/consensus-conformance.sh
 
 consensus-cluster-restart: ## Run the #471 restart/rejoin scenarios against a RUNNING cluster
 	cargo build -p algo-fork-detector
 	MODE=$(or $(RESTART_MODE),all) $(PHASE6_CLUSTER)/scripts/restart-rejoin.sh
+
+consensus-negative-test: ## Run the #472 negative conformance suite (up + inject 4 bad messages + down)
+	cargo build -p algo-agreement-fuzz
+	CASES=$(or $(CASES),bad-vrf-proof wrong-committee-weight wrong-ots-domain malformed-proposal) \
+	SKIP_START=$(or $(SKIP_START),0) \
+	KEEP_CLUSTER=$(or $(KEEP_CLUSTER),0) \
+		$(PHASE6_CLUSTER)/scripts/negative-conformance.sh
 
 consensus-analyzer-test: ## Unit-test the #470 soak-analyzer logic (no Docker needed)
 	python3 $(PHASE6_CLUSTER)/scripts/analyze_test.py

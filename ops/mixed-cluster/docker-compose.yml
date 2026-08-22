@@ -58,6 +58,12 @@ services:
       # though the committed token is the trivial "aaaa..." value. Use
       # `docker compose exec` or edit the binding for off-host access.
       - "127.0.0.1:4001:8080"
+      # Gossip listener, published for go-node-1 only so the issue-#472
+      # negative-conformance injector (`algo-agreement-fuzz`) can open a
+      # normal gossip connection from the host and send a single malformed
+      # agreement message. The other two Go nodes keep their gossip ports
+      # unpublished, so an injection can only ever reach this one node.
+      - "127.0.0.1:4161:4161"
     volumes:
       # Each Go node mounts ONLY its own netroot subdirectory as
       # /algod/data. The parent /algod directory is left unmounted so the

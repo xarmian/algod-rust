@@ -57,6 +57,9 @@
 #                         SIGKILL, restart-as-proposer)      (default 0)
 #   RESTART_MODE          which restart scenarios to run:
 #                         graceful|kill|proposer|all       (default all)
+#   NEGATIVE_CASES        1 = also run the issue #472 negative stage
+#                         (inject one malformed agreement message per
+#                         case and assert Go rejects it)    (default 0)
 #   SKIP_START=1          use an already-running cluster
 #   KEEP_CLUSTER=1        leave the cluster up on exit
 #   OUT_DIR               artifact directory (default: a timestamped
@@ -493,6 +496,38 @@ for c in s['checks']:
     else
         record "restart_rejoin" fail \
             "restart-rejoin.sh exited $restart_rc with no summary — see $OUT_DIR/restart.log"
+    fi
+fi
+
+# -- 7c. (opt-in) negative conformance — issue #472 --------------------
+# Off by default: it injects four deliberately malformed agreement messages
+# into go-node-1 and asserts each is rejected. That is a different property
+# from the steady-state conformance above, and it briefly restarts
+# go-node-1 to raise its log level for the payload case.
+if [ "${NEGATIVE_CASES:-0}" = "1" ]; then
+    echo "==> negative conformance (issue #472)"
+    negative_rc=0
+    SKIP_START=1 \
+    KEEP_CLUSTER=1 \
+    OUT_DIR="$OUT_DIR/negative" \
+    TOOLS_DIR="$TOOLS_DIR" \
+    ALGOD_TOKEN="$ALGOD_TOKEN" \
+        "$HERE/negative-conformance.sh" > "$OUT_DIR/negative.log" 2>&1 || negative_rc=$?
+    tail -40 "$OUT_DIR/negative.log" || true
+    if [ -s "$OUT_DIR/negative/negative-summary.json" ]; then
+        while IFS=$'\t' read -r name status detail; do
+            [ -n "$name" ] && record "$name" "$status" "$detail"
+        done < <(python3 -c "
+import json, sys
+s = json.load(sys.stdin)
+for c in s['checks']:
+    status = c['status'] if c['status'] in ('pass', 'fail') else 'pass'
+    print('negative_{}_{}\t{}\t{}'.format(
+        c['case'].replace('-', '_'), c['name'].replace('-', '_'), status, c['detail']))
+" < "$OUT_DIR/negative/negative-summary.json")
+    else
+        record "negative_conformance" fail \
+            "negative-conformance.sh exited $negative_rc with no summary — see $OUT_DIR/negative.log"
     fi
 fi
 
