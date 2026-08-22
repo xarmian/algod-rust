@@ -31,6 +31,16 @@ members = [
 ]
 exclude = ["fuzz"]
 
+# The stress-benchmark binary (docker/Dockerfile builds `--release`) is
+# compared head-to-head against go-algorand's optimized builds (issue #100).
+# Cargo's release defaults (no LTO, 16 codegen units) leave measurable CPU
+# on the table for a consensus node; thin LTO + a single codegen unit are
+# the standard settings for a performance-sensitive release binary and do
+# not change behavior.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [workspace.package]
 edition = "2021"
 rust-version = "1.75"
