@@ -59,7 +59,7 @@ Foundation for:
   halt the chain, and the Rust node's expected 150 votes are far below
   quorum on their own.
 
-### Current status: votes yes, proposals not yet
+### Current status: votes and proposals both accepted
 
 Go **accepts the Rust node's votes**: `go-node-1`'s agreement log shows
 `VoteAccepted` entries whose `Sender` is the Rust node's account, with
@@ -67,20 +67,28 @@ Go **accepts the Rust node's votes**: `go-node-1`'s agreement log shows
 run the Go nodes log **zero** agreement-level rejections
 (`malformed proposal|malformed vote|rejected block|bundle malformed`).
 
-The Rust node does **not** yet propose blocks, and the reason is *not*
-key interop or header conformance — both work. Agreement issues its
-`Assemble` action for round N before the ledger has written block N-1,
-so `TransactionPool::assemble_block` falls through to
-`assemble_empty_block`, which fails with
+Go also **commits the Rust node's proposals**: the proposer histogram
+over a 200-round soak puts the Rust account at roughly its 10% stake
+share, alongside the three Go accounts at ~30% each.
+
+Until issue #482 was fixed, that share was **0%**. The agreement main
+loop executed a batch's `Pseudonode(Assemble N)` action *before* handing
+the same batch — which begins with `Ensure(block N-1)` — to the demux
+thread that performs it, so `TransactionPool::assemble_block` always ran
+against a ledger two rounds behind and fell through to
+`assemble_empty_block`, which failed with
 
 ```
 cannot get prev header for N-1: ledger error: no block header data for round N-1
 ```
 
-every round. Run with `PHASE6_RUST_LOG=info,algo_agreement=debug` to see
-it. Fixing the round-advance/assembly ordering is tracked separately;
-until then the proposer histogram over this cluster shows only the three
-Go accounts.
+every round. The main loop now blocks on the demux thread's
+acknowledgement that the batch has been executed before running that
+batch's pseudonode actions, matching Go's in-order `Service.do(actions)`.
+`PHASE6_RUST_LOG=info,algo_agreement=debug` still surfaces
+`block assembly failed; not proposing this round`, but now only with
+`error=requested round N for AssembleBlock is stale` during catchup,
+which is normal operation.
 
 ## Prerequisites
 
@@ -121,7 +129,9 @@ make consensus-cluster-down          # append PURGE=1 to wipe netroot/
 in lockstep, that the Rust node's own REST `/v2/status` progresses, and
 that no Go node logged an agreement-level rejection. It also reports how
 many Rust votes Go accepted and how many blocks the Rust node proposed
-(expected 0 today — see "Current status" above).
+(expected ≈10% of the rounds observed — see "Current status" above;
+over a 30-round window the sortition variance is wide, so the count is
+reported rather than asserted).
 
 ```bash
 make consensus-cluster-smoke                       # 30 rounds, tears down after

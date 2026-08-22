@@ -204,14 +204,17 @@ change in proposer distribution beyond noise is worth investigating.
 
 ## Known limitations
 
-- **Rust node not proposing.** The Rust node votes (Go logs
-  `VoteAccepted` with `Weight` ~150/1500, matching its 10% stake) but
-  never proposes a block. Agreement issues its `Assemble` action for
-  round N before the ledger has written block N-1, so the pool's
-  `assemble_empty_block` fallback fails every round with
-  `cannot get prev header for N-1`. Reproduce with
-  `PHASE6_RUST_LOG=info,algo_agreement=debug`. Tracked as a follow-up;
-  the proposer histogram therefore still shows only go-node-{1,2,3}.
+- **Proposer-share variance.** The Rust node both votes (Go logs
+  `VoteAccepted` with `Weight` ~150/1500, matching its 10% stake) and
+  proposes blocks Go commits, so all four accounts appear in the
+  proposer histogram. Its share is a binomial draw around 10%, so a
+  200-round soak still has a standard deviation of ~2 percentage
+  points — compare shares against that band, not against exact 10%.
+  (Before issue #482 was fixed the share was a hard 0%: the agreement
+  main loop ran a batch's `Pseudonode(Assemble N)` before the demux
+  thread executed the same batch's `Ensure(block N-1)`, so the pool's
+  `assemble_empty_block` fallback failed every round with
+  `cannot get prev header for N-1`.)
 - **`metrics.py` still samples the Rust node by container state.** Its
   REST endpoint exists now (port 4004) and `status.sh` uses it;
   extending `metrics.py` to do the same is a small follow-up.

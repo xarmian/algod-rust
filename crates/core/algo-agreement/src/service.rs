@@ -312,6 +312,11 @@ where
         let (output_tx, output_rx) = mpsc::channel::<Vec<Action>>();
         let (ready_tx, ready_rx) = mpsc::channel::<ExternalDemuxSignals>();
 
+        // Acknowledgement channel: the demux loop signals here once it has
+        // finished executing an action batch, so the main loop can run that
+        // batch's pseudonode actions strictly afterwards (issue #482).
+        let (actions_done_tx, actions_done_rx) = mpsc::channel::<()>();
+
         // Channel for pseudonode events from the main loop to the demux loop.
         // In Go, pseudonode actions are executed in the demux goroutine and
         // results are prioritized via `s.demux.prioritize()`. Since the
@@ -339,6 +344,7 @@ where
                     quit_main,
                     input_rx,
                     output_tx,
+                    actions_done_rx,
                     ready_tx,
                     pseudo_tx,
                     persistence_loop,
@@ -364,6 +370,7 @@ where
                     quit_demux,
                     input_tx,
                     output_rx,
+                    actions_done_tx,
                     ready_rx,
                     pseudo_rx,
                     demux,
@@ -406,6 +413,7 @@ fn main_loop<L, K, BF, R>(
     quit: Arc<AtomicBool>,
     input: mpsc::Receiver<Option<ExternalEvent>>,
     output: mpsc::Sender<Vec<Action>>,
+    actions_done: mpsc::Receiver<()>,
     ready: mpsc::Sender<ExternalDemuxSignals>,
     pseudo_events: mpsc::Sender<Vec<ExternalEvent>>,
     mut persistence_loop: Option<AsyncPersistenceLoop>,
@@ -500,34 +508,74 @@ fn main_loop<L, K, BF, R>(
             break;
         }
 
-        // Step 1: Execute pseudonode actions inline and forward resulting
-        // events to the demux's prioritize queue.
+        // Step 1: Hand the demux loop every action it owns and *wait* for it
+        // to finish executing them, then run this batch's pseudonode actions.
         //
         // Mirrors go-algorand's demux dispatch path (`agreement/service.go:195`
         // → `pseudonodeAction.do` in `agreement/actions.go:387`). In Go the
-        // demux loop calls `s.do(ctx, a)` on every action batch, which routes
-        // pseudonode actions to `s.loopback.MakeProposals/MakeVotes` and
-        // prioritizes the resulting events back into the demux. The Rust
-        // port owns the pseudonode in the main loop (because it captures
-        // BlockFactory/KeyManager by value), so we run that step here —
-        // critically, *before* sending the remainder of the batch to the
-        // demux. Doing it at the top of the iteration ensures the bootstrap
-        // batch's `Pseudonode(Assemble)` actually invokes `make_proposals`
-        // (so round 1's first proposal reaches the player) instead of being
-        // silently dropped by the demux's no-op `Action::Pseudonode` arm.
+        // demux loop calls `s.do(ctx, a)` on every action batch, executing the
+        // actions **in slice order**; pseudonode actions are routed to
+        // `s.loopback.MakeProposals/MakeVotes` and the resulting events are
+        // prioritized back into the demux. The Rust port owns the pseudonode
+        // in the main loop (because it captures BlockFactory/KeyManager by
+        // value), so pseudonode actions run here while everything else runs on
+        // the demux thread.
+        //
+        // That split makes the ordering explicit and consensus-critical: a
+        // round-advancing batch is `[Ensure(block N-1), Rezero(N),
+        // Pseudonode(Assemble N), ...]`, so `Ensure` — which commits block
+        // N-1 to the ledger — MUST complete before `Assemble` asks the block
+        // factory to build a proposal for round N (assembling round N needs
+        // round N-1's header). Running the pseudonode first (as this loop used
+        // to) meant `assemble_block(N)` always ran against a ledger whose
+        // latest committed round was still N-2, and every proposal attempt
+        // failed with
+        // `TransactionPool.assembleEmptyBlock: cannot get prev header for N-1`
+        // — the node voted normally but never proposed a block (issue #482).
+        //
+        // The `actions_done` handshake below restores Go's ordering: the batch
+        // is sent first, the demux thread acknowledges after `do_actions`
+        // returns, and only then do the pseudonode actions run. The resulting
+        // events are still delivered to the demux before its next `next()`
+        // call (the demux drains `pseudo_rx` after receiving `ready` signals,
+        // which this loop sends after the pseudonode step), so the bootstrap
+        // batch's `Pseudonode(Assemble)` still produces round 1's first
+        // proposal.
+        //
+        // The demux's `do_action` arm for `Action::Pseudonode` is a no-op, so
+        // strip pseudonode actions out of the batch it receives; its monitor
+        // queue counts then reflect only the actions it actually handles.
+        let pseudonode_actions: Vec<PseudonodeAction> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Pseudonode(pa) => Some(pa.clone()),
+                _ => None,
+            })
+            .collect();
+        actions.retain(|a| !matches!(a, Action::Pseudonode(_)));
+
+        if output.send(actions).is_err() {
+            break;
+        }
+        // Block until the demux thread has executed the batch (in particular
+        // any `Ensure`, which commits the previous round's block).
+        if actions_done.recv().is_err() {
+            break;
+        }
+
+        // Step 2: Execute this batch's pseudonode actions and forward the
+        // resulting events to the demux's prioritize queue.
         let mut pseudonode_events = Vec::new();
-        for action in &actions {
-            if let Action::Pseudonode(ref pa) = action {
-                execute_pseudonode_action(
-                    pa,
-                    &mut *pseudonode,
-                    &mut pseudonode_events,
-                    &persistence_loop,
-                    &persist_router,
-                    &persist_player,
-                    &persist_actions,
-                );
-            }
+        for pa in &pseudonode_actions {
+            execute_pseudonode_action(
+                pa,
+                &mut *pseudonode,
+                &mut pseudonode_events,
+                &persistence_loop,
+                &persist_router,
+                &persist_player,
+                &persist_actions,
+            );
         }
         // Persistence snapshots are consumed by the attest above; reset so
         // the next attest batch captures a fresh snapshot from its own
@@ -536,16 +584,6 @@ fn main_loop<L, K, BF, R>(
         persist_player = None;
         persist_actions = None;
         if !pseudonode_events.is_empty() && pseudo_events.send(pseudonode_events).is_err() {
-            break;
-        }
-        // The demux's `do_action` arm for `Action::Pseudonode` is a no-op
-        // (we executed them above); strip them so the demux's monitor
-        // queue counts and any future per-action work see only the actions
-        // it actually handles.
-        actions.retain(|a| !matches!(a, Action::Pseudonode(_)));
-
-        // Step 2: Send (filtered) actions to demux loop.
-        if output.send(actions).is_err() {
             break;
         }
 
@@ -928,6 +966,7 @@ fn demux_loop<N, L, BV, C, M>(
     quit: Arc<AtomicBool>,
     input: mpsc::Sender<Option<ExternalEvent>>,
     output: mpsc::Receiver<Vec<Action>>,
+    actions_done: mpsc::Sender<()>,
     ready: mpsc::Receiver<ExternalDemuxSignals>,
     pseudo_rx: mpsc::Receiver<Vec<ExternalEvent>>,
     mut demux: Demux,
@@ -949,19 +988,6 @@ fn demux_loop<N, L, BV, C, M>(
     for action_batch in output.iter() {
         if quit.load(Ordering::SeqCst) {
             break;
-        }
-
-        // Drain any pseudonode events that the main loop produced and
-        // prioritize them in the demux so they are returned first.
-        let mut pseudo_count = 0usize;
-        while let Ok(events) = pseudo_rx.try_recv() {
-            pseudo_count += events.len();
-            demux.prioritize(events);
-        }
-        if pseudo_count > 0 {
-            if let Ok(m) = monitor.lock() {
-                m.update_events_queue(crate::demux::EVENT_QUEUE_PSEUDONODE, pseudo_count);
-            }
         }
 
         // Report the action batch size before executing.
@@ -987,11 +1013,36 @@ fn demux_loop<N, L, BV, C, M>(
             m.update_events_queue(crate::demux::EVENT_QUEUE_DEMUX, 0);
         }
 
+        // Acknowledge that the batch has been fully executed. The main loop
+        // blocks on this before running the same batch's pseudonode actions,
+        // which is what keeps Go's action ordering: `Ensure` (commit block
+        // N-1) always completes before `Assemble` (build a proposal for round
+        // N) runs. See the comment in `main_loop` (issue #482).
+        if actions_done.send(()).is_err() {
+            break;
+        }
+
         // Get the signals from the main loop.
         let signals = match ready.recv() {
             Ok(s) => s,
             Err(_) => break,
         };
+
+        // Drain any pseudonode events that the main loop produced and
+        // prioritize them in the demux so they are returned first. The main
+        // loop runs its pseudonode actions between the acknowledgement above
+        // and the `ready` send received here, so by this point every event
+        // from this batch's pseudonode actions is already queued.
+        let mut pseudo_count = 0usize;
+        while let Ok(events) = pseudo_rx.try_recv() {
+            pseudo_count += events.len();
+            demux.prioritize(events);
+        }
+        if pseudo_count > 0 {
+            if let Ok(m) = monitor.lock() {
+                m.update_events_queue(crate::demux::EVENT_QUEUE_PSEUDONODE, pseudo_count);
+            }
+        }
 
         // Refresh the ledger round notification channel before each select,
         // matching Go's `ledgerNextRoundCh := s.Ledger.Wait(nextRound)` which
