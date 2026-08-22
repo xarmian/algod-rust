@@ -413,6 +413,26 @@ pub enum Commands {
         #[arg(long)]
         partkey_path: PathBuf,
 
+        /// Import one or more go-algorand `.partkey` files into the
+        /// `--partkey-path` registry at startup, then participate with them.
+        ///
+        /// `goal network create` / `algokey part generate` write the
+        /// single-account `ParticipationAccount` schema, which is *not* the
+        /// multi-key registry schema `--partkey-path` reads. Repeat this flag
+        /// (or comma-separate) to bridge them. Re-importing an
+        /// already-registered key is a no-op, so restarts against a persistent
+        /// volume are safe.
+        #[arg(long, value_delimiter = ',')]
+        import_partkey: Vec<PathBuf>,
+
+        /// Path to `genesis.json` used to seed `accountbase` +
+        /// `accounttotals` when the ledger is brand new. Without it a node
+        /// joining a fresh private network has no online-stake table and can
+        /// neither run sortition nor validate proposals. Mirrors
+        /// `relay --genesis-json`; a no-op once the ledger is seeded.
+        #[arg(long)]
+        genesis_json: Option<PathBuf>,
+
         /// Address to bind for incoming connections (e.g. "0.0.0.0:4160").
         #[arg(long, short = 'b')]
         listen_address: Option<String>,
@@ -495,6 +515,76 @@ pub enum Commands {
     Node {
         #[command(subcommand)]
         cmd: NodeCommands,
+    },
+
+    /// Sustained-rate transaction load generator for cluster stress tests.
+    Loadgen {
+        #[command(subcommand)]
+        cmd: LoadgenCommands,
+    },
+}
+
+/// Subcommands for `algod-rust loadgen`.
+#[derive(Subcommand)]
+pub enum LoadgenCommands {
+    /// Generate throwaway generator accounts and write them to a JSON key
+    /// file. Fund the printed addresses before running `loadgen run`.
+    GenAccounts {
+        /// How many accounts to generate.
+        #[arg(long, default_value_t = 16)]
+        count: usize,
+
+        /// Where to write the key file (contains private keys; 0600 on unix).
+        #[arg(long, short = 'o')]
+        out: PathBuf,
+    },
+
+    /// Drive a cluster at a fixed transaction rate and emit a JSON report.
+    Run {
+        /// Comma-separated node REST base URLs to round-robin submissions
+        /// across (e.g. `http://a:8080,http://b:8080`).
+        #[arg(long, value_delimiter = ',')]
+        algod_urls: Vec<String>,
+
+        /// API token sent as `X-Algo-API-Token` to every endpoint.
+        #[arg(long, default_value = DEFAULT_TOKEN)]
+        token: String,
+
+        /// Key file written by `loadgen gen-accounts`.
+        #[arg(long)]
+        keys: PathBuf,
+
+        /// Steady-state transactions per second.
+        #[arg(long, default_value_t = 100.0)]
+        target_tps: f64,
+
+        /// Total run length in seconds, ramp included.
+        #[arg(long, default_value_t = 60.0)]
+        duration_secs: f64,
+
+        /// Linear ramp-up length in seconds at the start of the run.
+        #[arg(long, default_value_t = 0.0)]
+        ramp_secs: f64,
+
+        /// Transactions per atomic group (1 = singleton payments, max 16).
+        #[arg(long, default_value_t = 1)]
+        group_size: usize,
+
+        /// Concurrent submitter tasks per endpoint.
+        #[arg(long, default_value_t = 8)]
+        concurrency: usize,
+
+        /// Sample confirmation latency for every Nth submission (0 disables).
+        #[arg(long, default_value_t = 200)]
+        confirm_sample: u64,
+
+        /// Give up on a confirmation poll after this many seconds.
+        #[arg(long, default_value_t = 30)]
+        confirm_timeout_secs: u64,
+
+        /// Write the JSON report here (also printed to stdout).
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
 }
 

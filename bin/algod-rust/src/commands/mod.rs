@@ -5,6 +5,7 @@ pub mod capture_wire;
 pub mod catchpoint;
 pub mod catchpoint_sync;
 pub mod follow;
+pub mod loadgen;
 pub mod network_common;
 pub mod node;
 pub mod observe;

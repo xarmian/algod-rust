@@ -335,6 +335,8 @@ async fn main() -> anyhow::Result<()> {
             network,
             peers,
             partkey_path,
+            import_partkey,
+            genesis_json,
             listen_address,
             relay_messages,
             genesis_hash,
@@ -356,6 +358,8 @@ async fn main() -> anyhow::Result<()> {
                 &network,
                 &peers,
                 &partkey_path,
+                &import_partkey,
+                genesis_json.as_deref(),
                 listen_address.as_deref(),
                 relay_messages,
                 genesis_hash.as_deref(),
@@ -373,6 +377,39 @@ async fn main() -> anyhow::Result<()> {
         Commands::Node { cmd } => {
             commands::node::run(cmd).await?;
         }
+        Commands::Loadgen { cmd } => match cmd {
+            cli::LoadgenCommands::GenAccounts { count, out } => {
+                commands::loadgen::gen_accounts(count, &out)?;
+            }
+            cli::LoadgenCommands::Run {
+                algod_urls,
+                token,
+                keys,
+                target_tps,
+                duration_secs,
+                ramp_secs,
+                group_size,
+                concurrency,
+                confirm_sample,
+                confirm_timeout_secs,
+                output,
+            } => {
+                commands::loadgen::run(commands::loadgen::LoadgenConfig {
+                    endpoints: algod_urls,
+                    token,
+                    keys,
+                    target_tps,
+                    duration_secs,
+                    ramp_secs,
+                    group_size,
+                    concurrency,
+                    confirm_sample,
+                    confirm_timeout_secs,
+                    output,
+                })
+                .await?;
+            }
+        },
     }
 
     Ok(())

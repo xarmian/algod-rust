@@ -1,0 +1,50 @@
+{
+    "Genesis": {
+        "NetworkName": "stressnet",
+        "FirstPartKeyRound": 0,
+        "LastPartKeyRound": NUM_ROUNDS,
+        "ConsensusProtocol": "future",
+        "Wallets": [
+            { "Name": "WalletGo1",   "Stake": 40, "Online": true },
+            { "Name": "WalletGo2",   "Stake": 40, "Online": true },
+            { "Name": "WalletRust1", "Stake": 10, "Online": true },
+            { "Name": "WalletRust2", "Stake": 10, "Online": true }
+        ]
+    },
+    "Nodes": [
+        {
+            "Name": "GoRelay",
+            "IsRelay": true,
+            "Wallets": []
+        },
+        {
+            "Name": "RustRelay",
+            "IsRelay": true,
+            "Wallets": []
+        },
+        {
+            "Name": "GoPart1",
+            "Wallets": [
+                { "Name": "WalletGo1", "ParticipationOnly": false }
+            ]
+        },
+        {
+            "Name": "GoPart2",
+            "Wallets": [
+                { "Name": "WalletGo2", "ParticipationOnly": false }
+            ]
+        },
+        {
+            "Name": "RustPart1",
+            "Wallets": [
+                { "Name": "WalletRust1", "ParticipationOnly": false }
+            ]
+        },
+        {
+            "Name": "RustPart2",
+            "Wallets": [
+                { "Name": "WalletRust2", "ParticipationOnly": false }
+            ]
+        }
+    ]
+}

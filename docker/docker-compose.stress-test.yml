@@ -1,0 +1,297 @@
+# Issue #100 — 6-node mixed-cluster stress-test topology.
+#
+#         go-relay  ←──gossip──→  rust-relay
+#          ↕     ↕                 ↕      ↕
+#   go-part-1  go-part-2   rust-part-1  rust-part-2
+#
+# Two relays, fully meshed with each other; four participation nodes, each
+# dialing BOTH relays. All four participation nodes hold online participation
+# keys and vote in agreement.
+#
+# This is deliberately a different topology from
+# `docker-compose.mixed-cluster.yml` (gossip/catchup interop: 1 go relay +
+# rust observer + rust relay + go non-relay, no participation nodes) and from
+# `ops/mixed-cluster/docker-compose.yml` (3 Go proposers + 1 non-proposing
+# Rust peer). Here every node is a full participant and the point is sustained
+# transaction throughput, not connectivity.
+#
+# ── Stake split ────────────────────────────────────────────────────────
+# WalletGo1/WalletGo2 hold 40% each and WalletRust1/WalletRust2 10% each
+# (see `config/stress-template.json`), all four ONLINE. Certificate quorum is
+# >2/3 of online stake = >66.7%, so the two Go nodes alone (80%) can carry the
+# chain. That is intentional: the benchmark must still produce a chain — and
+# therefore still produce comparable CPU/memory/latency numbers — if the Rust
+# participation nodes turn out not to propose or vote. Whether they *do* is a
+# measured result of the run (bench-stress.sh greps proposal/vote counts out of
+# their logs), not a precondition for getting a report.
+#
+# ── Bootstrap ──────────────────────────────────────────────────────────
+# `docker/scripts/stress-bootstrap.sh` runs `goal network create` once into
+# `docker/stress-netroot/`, then overlays each node's config.json with
+# container-friendly listen addresses and the issue's pool/queue tuning.
+# The Go nodes each mount their own netroot subdirectory as /algod/data; the
+# Rust nodes mount the whole tree read-only at /netroot and import their
+# Go-generated `.partkey` into a Rust participation registry at startup via
+# `participate --import-partkey`.
+#
+# Usage: `make bench-stress` (or `bash docker/scripts/bench-stress.sh`).
+
+x-go-env: &go-env
+  ALGORAND_DATA: /algod/data
+  ALGOD_PORT: "8080"
+  GOSSIP_PORT: "4161"
+  TOKEN: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  ADMIN_TOKEN: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+x-go-health: &go-health
+  test:
+    - CMD
+    - curl
+    - -f
+    - -H
+    - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    - http://localhost:8080/v2/status
+  interval: 5s
+  timeout: 3s
+  retries: 30
+
+x-rust-health: &rust-health
+  test:
+    - CMD
+    - curl
+    - -f
+    - -H
+    - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    - http://localhost:8080/v2/status
+  interval: 5s
+  timeout: 3s
+  retries: 60
+  start_period: 20s
+
+services:
+  # ── Relays ────────────────────────────────────────────────────────────
+  go-relay:
+    image: algorand/algod:4.5.1-stable
+    container_name: stress-go-relay
+    environment:
+      <<: *go-env
+      # Semicolon-separated; consumed by the image entrypoint's
+      # `start_public_network` path as `algod -p`.
+      PEER_ADDRESS: rust-relay:4160
+    ports:
+      - "127.0.0.1:4101:8080"
+    volumes:
+      - ./stress-netroot/GoRelay:/algod/data
+    healthcheck: *go-health
+    restart: unless-stopped
+    networks: [stressnet]
+
+  # The Rust relay runs `participate` rather than `relay` for two reasons:
+  # `participate` is the only subcommand that exposes the v2 REST API
+  # (`--rest-listen`), which the benchmark needs both to poll its round and to
+  # aim transaction load at it; and `--relay-messages` + `--listen-address`
+  # together give it exactly the Go `isRelay = NetAddress != "" && Relay`
+  # behaviour. It is handed an empty participation registry, so it holds no
+  # keys and never proposes — a pure relay.
+  rust-relay:
+    image: algod-rust:stress
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime
+    container_name: stress-rust-relay
+    depends_on:
+      go-relay:
+        condition: service_healthy
+    environment:
+      RUST_LOG: "info,algod_rust=info,algo_network=info,algo_agreement=info"
+    entrypoint:
+      - algod-rust
+      - participate
+      - --ledger-path=/app/ledger
+      - --partkey-path=/app/partkeys.sqlite
+      - --genesis-json=/netroot/genesis.json
+      - --genesis-path=/netroot/genesis.json
+      - --genesis-id=${STRESS_GENESIS_ID:-stressnet-v1}
+      # bench-stress.sh reads this off go-relay's /v2/transactions/params once
+      # the Go relay is healthy, then brings the Rust nodes up with it — the
+      # genesis hash is a digest over the canonical-msgpack Genesis struct, so
+      # there is no way to derive it in shell ahead of a running node. A `:-`
+      # default (rather than `:?`) is required because the very first compose
+      # command starts go-relay alone, before the value can exist; the script
+      # asserts it is non-empty before starting any Rust node.
+      - --genesis-hash=${STRESS_GENESIS_HASH:-}
+      - --network=stressnet
+      - --peers=go-relay:4161
+      - --listen-address=0.0.0.0:4160
+      - --relay-messages
+      - --rest-listen=0.0.0.0:8080
+      - --data-dir=/data
+    ports:
+      - "127.0.0.1:4102:8080"
+    volumes:
+      - rust-relay-ledger:/app
+      - ./stress-netroot:/netroot:ro
+      - ./stress-netroot/rust-relay-data:/data
+    healthcheck: *rust-health
+    restart: unless-stopped
+    networks: [stressnet]
+
+  # ── Go participation nodes ────────────────────────────────────────────
+  # START_KMD=1 so `bench-stress.sh` can drive `goal clerk send` from
+  # go-part-1's wallet to fund the load-generator accounts during warmup.
+  go-part-1:
+    image: algorand/algod:4.5.1-stable
+    container_name: stress-go-part-1
+    depends_on:
+      go-relay:
+        condition: service_healthy
+    environment:
+      <<: *go-env
+      START_KMD: "1"
+      PEER_ADDRESS: go-relay:4161;rust-relay:4160
+    ports:
+      - "127.0.0.1:4103:8080"
+    volumes:
+      - ./stress-netroot/GoPart1:/algod/data
+    healthcheck: *go-health
+    restart: unless-stopped
+    networks: [stressnet]
+
+  go-part-2:
+    image: algorand/algod:4.5.1-stable
+    container_name: stress-go-part-2
+    depends_on:
+      go-relay:
+        condition: service_healthy
+    environment:
+      <<: *go-env
+      PEER_ADDRESS: go-relay:4161;rust-relay:4160
+    ports:
+      - "127.0.0.1:4104:8080"
+    volumes:
+      - ./stress-netroot/GoPart2:/algod/data
+    healthcheck: *go-health
+    restart: unless-stopped
+    networks: [stressnet]
+
+  # ── Rust participation nodes ──────────────────────────────────────────
+  # `--import-partkey` bridges the go-algorand single-account `.partkey`
+  # schema that `goal network create` wrote into the multi-key participation
+  # registry `--partkey-path` reads. The import is idempotent, so a container
+  # restart against the persistent ledger volume is a no-op.
+  #
+  # `--genesis-json` seeds accountbase + accounttotals on a fresh ledger.
+  # Without it the node has no online-stake table and can neither run
+  # sortition for its own keys nor validate anyone else's proposals.
+  rust-part-1:
+    image: algod-rust:stress
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime
+    container_name: stress-rust-part-1
+    depends_on:
+      go-relay:
+        condition: service_healthy
+    environment:
+      RUST_LOG: "info,algod_rust=info,algo_network=info,algo_agreement=info"
+    entrypoint:
+      - algod-rust
+      - participate
+      - --ledger-path=/app/ledger
+      - --partkey-path=/app/partkeys.sqlite
+      - --import-partkey=/netroot/${STRESS_RUST1_PARTKEY:?run via docker/scripts/bench-stress.sh}
+      - --genesis-json=/netroot/genesis.json
+      - --genesis-path=/netroot/genesis.json
+      - --genesis-id=${STRESS_GENESIS_ID:-stressnet-v1}
+      # bench-stress.sh reads this off go-relay's /v2/transactions/params once
+      # the Go relay is healthy, then brings the Rust nodes up with it — the
+      # genesis hash is a digest over the canonical-msgpack Genesis struct, so
+      # there is no way to derive it in shell ahead of a running node. A `:-`
+      # default (rather than `:?`) is required because the very first compose
+      # command starts go-relay alone, before the value can exist; the script
+      # asserts it is non-empty before starting any Rust node.
+      - --genesis-hash=${STRESS_GENESIS_HASH:-}
+      - --network=stressnet
+      - --peers=go-relay:4161,rust-relay:4160
+      - --rest-listen=0.0.0.0:8080
+      - --data-dir=/data
+    ports:
+      - "127.0.0.1:4105:8080"
+    volumes:
+      - rust-part-1-ledger:/app
+      - ./stress-netroot:/netroot:ro
+      - ./stress-netroot/rust-part-1-data:/data
+    healthcheck: *rust-health
+    restart: unless-stopped
+    networks: [stressnet]
+
+  rust-part-2:
+    image: algod-rust:stress
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime
+    container_name: stress-rust-part-2
+    depends_on:
+      go-relay:
+        condition: service_healthy
+    environment:
+      RUST_LOG: "info,algod_rust=info,algo_network=info,algo_agreement=info"
+    entrypoint:
+      - algod-rust
+      - participate
+      - --ledger-path=/app/ledger
+      - --partkey-path=/app/partkeys.sqlite
+      - --import-partkey=/netroot/${STRESS_RUST2_PARTKEY:?run via docker/scripts/bench-stress.sh}
+      - --genesis-json=/netroot/genesis.json
+      - --genesis-path=/netroot/genesis.json
+      - --genesis-id=${STRESS_GENESIS_ID:-stressnet-v1}
+      # bench-stress.sh reads this off go-relay's /v2/transactions/params once
+      # the Go relay is healthy, then brings the Rust nodes up with it — the
+      # genesis hash is a digest over the canonical-msgpack Genesis struct, so
+      # there is no way to derive it in shell ahead of a running node. A `:-`
+      # default (rather than `:?`) is required because the very first compose
+      # command starts go-relay alone, before the value can exist; the script
+      # asserts it is non-empty before starting any Rust node.
+      - --genesis-hash=${STRESS_GENESIS_HASH:-}
+      - --network=stressnet
+      - --peers=go-relay:4161,rust-relay:4160
+      - --rest-listen=0.0.0.0:8080
+      - --data-dir=/data
+    ports:
+      - "127.0.0.1:4106:8080"
+    volumes:
+      - rust-part-2-ledger:/app
+      - ./stress-netroot:/netroot:ro
+      - ./stress-netroot/rust-part-2-data:/data
+    healthcheck: *rust-health
+    restart: unless-stopped
+    networks: [stressnet]
+
+  # ── Load generator ────────────────────────────────────────────────────
+  # Not started by `up -d` (it sits behind a profile). `bench-stress.sh`
+  # invokes it with `docker compose run --rm loadgen ...`, once per phase, so
+  # each phase gets its own TPS target, duration, and JSON report.
+  loadgen:
+    image: algod-rust:stress
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime
+    profiles: ["loadgen"]
+    environment:
+      RUST_LOG: "info,algod_rust=info"
+    volumes:
+      - ../bench-results:/out
+    networks: [stressnet]
+
+volumes:
+  rust-relay-ledger:
+  rust-part-1-ledger:
+  rust-part-2-ledger:
+
+networks:
+  stressnet:
+    driver: bridge

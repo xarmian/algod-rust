@@ -12,6 +12,7 @@ PHASE6_CLUSTER := ops/mixed-cluster
 .PHONY: replay-mainnet replay-testnet replay-stateful replay-mainnet-stateful replay-mainnet-1k
 .PHONY: avm-replay avm-replay-mainnet
 .PHONY: bench-rust bench-decode bench-go bench-micro bench-micro-go bench-cluster benchmark
+.PHONY: bench-stress bench-stress-down
 .PHONY: archival-up archival-down
 .PHONY: localnet-up localnet-down localnet-status localnet-logs algokey-e2e
 .PHONY: localnet-rust-up localnet-rust-down localnet-rust-status localnet-rust-logs localnet-rust-genesis
@@ -617,6 +618,19 @@ bench-micro-go: ## Run Go decode microbenchmarks (same fixture files as Rust cri
 bench-cluster: ## Run mixed-cluster Go vs Rust comparison (requires Docker)
 	bash docker/scripts/bench-cluster.sh
 
+## Issue #100: 6-node mixed cluster (1 Go relay + 1 Rust relay, 2 Go + 2 Rust
+## participation nodes) driven at a sustained TPS target by `algod-rust
+## loadgen`. Defaults are a laptop-sized smoke run; override on the command
+## line for the issue's aspirational load, e.g.
+##   make bench-stress STRESS_ARGS="--target-tps 1000 --sustained-secs 300"
+STRESS_ARGS ?=
+
+bench-stress: ## Run the 6-node mixed-cluster stress benchmark (requires Docker)
+	bash docker/scripts/bench-stress.sh $(STRESS_ARGS)
+
+bench-stress-down: ## Tear down a cluster left running by `bench-stress --keep-up`
+	docker compose -f docker/docker-compose.stress-test.yml down -v --remove-orphans
+
 benchmark: bench-micro bench-micro-go ## Run all microbenchmarks (Rust + Go)
 	@echo "Benchmark complete. For cluster comparison: make bench-cluster"
 
@@ -717,6 +731,7 @@ help:
 	@echo "  make bench-micro      Run Rust criterion microbenchmarks (fixture-based)"
 	@echo "  make bench-micro-go   Run Go decode microbenchmarks (same fixture files)"
 	@echo "  make bench-cluster    Run mixed-cluster Go vs Rust comparison (Docker)"
+	@echo "  make bench-stress     Run the 6-node mixed-cluster stress benchmark (Docker)"
 	@echo "  make benchmark        Run all microbenchmarks (Rust + Go)"
 	@echo ""
 	@echo "Benchmarks (single-implementation profiling):"
