@@ -204,12 +204,22 @@ impl ProposalManager {
                     });
                 }
 
-                let v = e
-                    .message_event
-                    .input
-                    .vote
-                    .as_ref()
-                    .expect("proposalManager: VoteVerified must have vote");
+                // A `VoteVerified` event with no error must carry the
+                // authenticated vote (the crypto verifier attaches it, as
+                // Go does in `asyncVoteVerifier.go:107`). Drop the event
+                // rather than panicking if it somehow does not: this is
+                // network-sourced input on a consensus-critical thread,
+                // and a panic here takes the whole agreement service — and
+                // with it the catchup service — down (issue #478).
+                let Some(v) = e.message_event.input.vote.as_ref() else {
+                    return Event::Filtered(FilteredEvent {
+                        t: EventType::VoteMalformed,
+                        err: Some(SerializableError::new(
+                            "proposalManager: VoteVerified without a vote".to_string(),
+                        )),
+                        ..FilteredEvent::default()
+                    });
+                };
                 let uv = v.to_unauthenticated();
 
                 let err = crate::types::proposal_fresh(&e.freshness_data, &uv);
@@ -521,6 +531,34 @@ mod tests {
         };
         let result = mgr.handle(Round(1), Period(0), Event::FilterableMessage(fme));
         assert_eq!(result.event_type(), EventType::VoteFiltered);
+    }
+
+    /// Regression test for issue #478.
+    ///
+    /// A successful `VoteVerified` must carry the authenticated vote; the
+    /// crypto verifier attaches it to the message exactly as Go does in
+    /// `asyncVoteVerifier.go:107` (`req.message.Vote = v`). Before that fix
+    /// `input.vote` was always `None`, and this arm's `expect` panicked on
+    /// the very first successfully-verified proposal-vote — killing the
+    /// agreement thread (and, through the dropped certificate channel, the
+    /// catchup service with it).
+    ///
+    /// Whatever the cause, network-sourced input must never panic a
+    /// consensus thread: it has to be filtered.
+    #[test]
+    fn proposal_manager_vote_verified_without_vote_is_filtered_not_panic() {
+        let mut mgr = ProposalManager::default();
+        let fd = make_freshness_data(Round(1), Period(0));
+        let fme = FilterableMessageEvent {
+            message_event: MessageEvent {
+                t: EventType::VoteVerified,
+                // No error, not cancelled, but `input.vote` is `None`.
+                ..MessageEvent::default()
+            },
+            freshness_data: fd,
+        };
+        let result = mgr.handle(Round(1), Period(0), Event::FilterableMessage(fme));
+        assert_eq!(result.event_type(), EventType::VoteMalformed);
     }
 
     #[test]

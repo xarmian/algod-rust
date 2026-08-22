@@ -346,7 +346,54 @@ impl LedgerReader for AgreementLedgerBridge {
     }
 
     fn consensus_version(&self, round: Round) -> Result<String, LedgerError> {
-        self.protocol_for_round(round)
+        if let Ok(proto) = self.protocol_for_round(round) {
+            return Ok(proto);
+        }
+
+        // Go's `Ledger.ConsensusVersion` (data/ledger.go:267) does not give
+        // up when the requested round has no block header yet: for a
+        // *future* round it deduces the version from the latest committed
+        // header, because absent a scheduled upgrade the protocol cannot
+        // change before `NextProtocolSwitchOn`. Agreement relies on this —
+        // it asks for `NextRound()`'s version at startup and on every round
+        // interruption, and that round is by definition not committed.
+        //
+        // Without the deduction the agreement service logged
+        // "unable to retrieve consensus version for round N, defaulting to
+        // the binary consensus version" every round and ran the whole
+        // player on the binary's built-in params rather than the network's
+        // (issue #478).
+        let ledger = self
+            .ledger
+            .lock()
+            .map_err(|e| LedgerError::Other(format!("ledger lock poisoned: {e}")))?;
+        let latest = ledger.current_round();
+        if round.0 < latest.0 {
+            // An older round we genuinely do not have: unknowable.
+            return Err(LedgerError::RoundNotAvailable(round));
+        }
+        let latest_proto = if latest.0 == 0 {
+            ledger.protocol().to_string()
+        } else {
+            ledger
+                .get_block_proto(latest.0)
+                .map_err(|e| LedgerError::Other(format!("get_block_proto: {e}")))?
+                .ok_or(LedgerError::RoundNotAvailable(latest))?
+        };
+        let hdr = ledger
+            .get_block_header(latest.0)
+            .map_err(|e| LedgerError::Other(format!("get_block_header: {e}")))?
+            .ok_or(LedgerError::RoundNotAvailable(latest))?;
+        // No upgrade pending, or the requested round is still before the
+        // switch-on round: the protocol is unchanged. Otherwise report the
+        // upgrade target, matching Go.
+        if hdr.next_protocol_switch_on.0 == 0 || round.0 < hdr.next_protocol_switch_on.0 {
+            Ok(latest_proto)
+        } else if !hdr.next_protocol.is_empty() {
+            Ok(hdr.next_protocol.clone())
+        } else {
+            Err(LedgerError::RoundNotAvailable(round))
+        }
     }
 
     fn wait_for_round(&self, round: Round) -> Result<(), LedgerError> {
@@ -633,6 +680,20 @@ impl crate::catchup_service::CatchupLedger for AgreementLedgerBridge {
     fn ensure_block(&self, block: &algo_types::Block, cert: &Certificate) {
         // Delegate to the LedgerWriter implementation.
         <Self as LedgerWriter>::ensure_block(self, block, cert);
+    }
+
+    fn authenticate_block(
+        &self,
+        block: &algo_types::Block,
+        cert: &Certificate,
+    ) -> Result<(), String> {
+        // Mirrors Go's `catchup.Service.fetchAndWrite` calling
+        // `s.auth.Authenticate(block, cert)`: check that the certificate
+        // claims this exact block *and* that its votes form a quorum
+        // against the online stake this ledger knows about.
+        let digest = algo_codec::compute_block_digest(block);
+        cert.authenticate(block.round, digest, self)
+            .map_err(|e| e.to_string())
     }
 }
 

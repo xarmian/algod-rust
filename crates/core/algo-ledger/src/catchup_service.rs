@@ -86,6 +86,26 @@ pub trait CatchupLedger: Send + Sync {
     fn round_is_not_supported(&self, _round: Round) -> bool {
         false
     }
+
+    /// Authenticate a block fetched by the *periodic* catchup path against
+    /// the certificate the serving peer supplied.
+    ///
+    /// The certificate-driven path ([`CatchupService::sync_cert`]) already
+    /// holds a certificate its own agreement service verified, so it only
+    /// needs a digest comparison. The periodic path has no such anchor: the
+    /// block and the certificate both come from an untrusted peer, so the
+    /// certificate's quorum has to be checked before the block is committed.
+    ///
+    /// Mirrors Go's `s.auth.Authenticate(block, cert)` in
+    /// `catchup/service.go`'s `fetchAndWrite`.
+    ///
+    /// The default implementation refuses everything, so an implementation
+    /// that cannot authenticate never silently accepts unverified blocks;
+    /// [`crate::AgreementLedgerBridge`] overrides it with a real quorum
+    /// check.
+    fn authenticate_block(&self, _block: &Block, _cert: &Certificate) -> Result<(), String> {
+        Err("this ledger cannot authenticate certificates".to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,15 +266,59 @@ impl CatchupService {
     ) {
         info!("catchup service started");
 
+        // Mirrors Go's `periodicSync`, which runs one `sync()` immediately
+        // on startup before entering its select loop
+        // (`catchup/service.go:611-619`).
+        Self::sync_pass(&ledger, &fetcher, &shutdown_rx);
+
+        let mut last_round = ledger.next_round();
+
+        // Once the certificate channel closes we still want the periodic
+        // path to keep the ledger following the network, so the closed
+        // receiver is swapped for one that never fires rather than ending
+        // the service (Go's `periodicSync` likewise only exits on
+        // `ctx.Done()`).
+        let never = crossbeam_channel::never::<PendingUnmatchedCertificate>();
+        let mut cert_rx = cert_rx;
+
         loop {
             let mut sel = Select::new();
             let cert_idx = sel.recv(&cert_rx);
             let shutdown_idx = sel.recv(&shutdown_rx);
 
-            let oper = sel.select();
+            let oper = match sel.select_timeout(Self::PERIODIC_SYNC_INTERVAL) {
+                Ok(oper) => oper,
+                Err(_) => {
+                    // Timed out: the ledger has not been advanced by
+                    // agreement recently, so try to pull whatever the
+                    // network already has.  This is Go's
+                    // `case <-time.After(sleepDuration): ... s.sync()`
+                    // branch (catchup/service.go:641-662) and it is the
+                    // only thing that lets a node which started *behind*
+                    // the network tip ever join: agreement will not emit
+                    // an unmatched certificate for a round it is not
+                    // playing, so the certificate-driven path below never
+                    // fires in that situation (issue #478).
+                    let now = ledger.next_round();
+                    if now != last_round {
+                        // Agreement is making progress on its own.
+                        last_round = now;
+                        continue;
+                    }
+                    Self::sync_pass(&ledger, &fetcher, &shutdown_rx);
+                    last_round = ledger.next_round();
+                    continue;
+                }
+            };
+
+            let mut certs_closed = false;
             match oper.index() {
                 i if i == shutdown_idx => {
                     // Shutdown signal received (or sender dropped).
+                    // `SelectedOperation` must be completed before it is
+                    // dropped, or crossbeam panics — so consume it even
+                    // though the value is irrelevant.
+                    let _ = oper.recv(&shutdown_rx);
                     debug!("catchup service received shutdown signal");
                     break;
                 }
@@ -262,20 +326,169 @@ impl CatchupService {
                     match oper.recv(&cert_rx) {
                         Ok(pending) => {
                             Self::sync_cert(&pending, &ledger, &fetcher, &shutdown_rx, &fork_count);
+                            last_round = ledger.next_round();
                         }
                         Err(_) => {
-                            // Certificate channel closed — the agreement service
-                            // has shut down. Exit the loop.
-                            info!("catchup service: certificate channel closed, exiting");
-                            break;
+                            // Certificate channel closed — the agreement
+                            // service has shut down (or never had a sender).
+                            // Keep running the periodic path so the node
+                            // still follows the chain; only `stop()` ends
+                            // the service.
+                            info!(
+                                "catchup service: certificate channel closed, \
+                                 continuing with periodic sync only"
+                            );
+                            certs_closed = true;
                         }
                     }
                 }
                 _ => unreachable!(),
             }
+            drop(sel);
+            if certs_closed {
+                cert_rx = never.clone();
+            }
         }
 
         info!("catchup service exiting");
+    }
+
+    /// How long the ledger may stand still before the periodic path tries
+    /// to fetch from the network. Go derives this from
+    /// `agreement.DeadlineTimeout()` (`roundTimeEstimate`); 4s is that
+    /// value for the default filter timeout.
+    const PERIODIC_SYNC_INTERVAL: Duration = Duration::from_secs(4);
+
+    /// Upper bound on the number of blocks fetched in a single periodic
+    /// pass, so the worker returns to its select loop (and can observe
+    /// shutdown / certificates) even while far behind.
+    const MAX_BLOCKS_PER_SYNC_PASS: u64 = 256;
+
+    /// Pull consecutive blocks from the network starting at the ledger's
+    /// next round, until a fetch fails or the batch limit is reached.
+    ///
+    /// Mirrors Go's `Service.sync()` / `pipelinedFetch` (serially, rather
+    /// than with Go's `CatchupParallelBlocks` worker pool).
+    ///
+    /// Every block committed here is authenticated against the certificate
+    /// the serving peer returned — see
+    /// [`CatchupLedger::authenticate_block`]. A peer that cannot supply a
+    /// certificate, or supplies one that does not carry a quorum for the
+    /// block, is not trusted and the pass stops.
+    fn sync_pass(
+        ledger: &Arc<dyn CatchupLedger>,
+        fetcher: &Arc<dyn BlockFetcher>,
+        shutdown_rx: &Receiver<()>,
+    ) {
+        let start_round = ledger.next_round();
+        let mut fetched = 0u64;
+
+        while fetched < Self::MAX_BLOCKS_PER_SYNC_PASS {
+            if shutdown_rx.try_recv().is_ok() {
+                debug!("catchup service: shutdown received during periodic sync");
+                return;
+            }
+
+            let round = ledger.next_round();
+            if ledger.round_is_not_supported(round) {
+                info!(
+                    round = %round,
+                    "catchup service: periodic sync stopping, round requires \
+                     an unsupported protocol version"
+                );
+                break;
+            }
+
+            let fetched_block = match fetcher.fetch_block(round) {
+                Ok(f) => f,
+                Err(e) => {
+                    // Reaching the network tip is the normal exit from this
+                    // loop, so only report at debug level.
+                    debug!(
+                        round = %round,
+                        error = %e,
+                        "catchup service: periodic sync stopping"
+                    );
+                    break;
+                }
+            };
+
+            let block = fetched_block.block;
+            if block.round != round {
+                warn!(
+                    expected_round = %round,
+                    fetched_round = %block.round,
+                    "catchup service: periodic sync got wrong round, stopping"
+                );
+                break;
+            }
+
+            let Some(cert) = fetched_block.cert else {
+                warn!(
+                    round = %round,
+                    "catchup service: periodic sync got a block with no \
+                     certificate, refusing to commit it"
+                );
+                break;
+            };
+
+            if let Err(reason) = ledger.authenticate_block(&block, &cert) {
+                warn!(
+                    round = %round,
+                    reason = %reason,
+                    "catchup service: periodic sync could not authenticate \
+                     the fetched block, stopping"
+                );
+                break;
+            }
+
+            match algo_validate::contents_match_header(
+                &block,
+                fetched_block.raw_payset_blobs.as_deref(),
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        round = %round,
+                        "catchup service: periodic sync block contents do not \
+                         match header commitments, stopping"
+                    );
+                    break;
+                }
+                Err(reason) => {
+                    warn!(
+                        round = %round,
+                        error = %reason,
+                        "catchup service: periodic sync cannot verify block \
+                         contents, stopping"
+                    );
+                    break;
+                }
+            }
+
+            ledger.ensure_block(&block, &cert);
+            fetched += 1;
+
+            // `ensure_block` is best-effort; if the ledger did not actually
+            // advance there is no point spinning on the same round.
+            if ledger.next_round().0 <= round.0 {
+                warn!(
+                    round = %round,
+                    "catchup service: periodic sync committed a block but the \
+                     ledger did not advance, stopping"
+                );
+                break;
+            }
+        }
+
+        if fetched > 0 {
+            info!(
+                from = %start_round,
+                to = %ledger.next_round(),
+                blocks = fetched,
+                "catchup service: periodic sync advanced the ledger"
+            );
+        }
     }
 
     /// Base delay between retry attempts (doubles with each attempt,
@@ -732,6 +945,127 @@ mod tests {
         block
     }
 
+    // -- Mocks for the periodic (certificate-less) sync path --
+
+    /// A ledger that authenticates any certificate, so periodic-sync tests
+    /// can focus on the fetch/commit loop rather than on quorum crypto.
+    struct PermissiveCatchupLedger {
+        inner: MockCatchupLedger,
+    }
+
+    impl CatchupLedger for PermissiveCatchupLedger {
+        fn next_round(&self) -> Round {
+            self.inner.next_round()
+        }
+        fn ensure_block(&self, block: &Block, cert: &Certificate) {
+            self.inner.ensure_block(block, cert)
+        }
+        fn authenticate_block(&self, _block: &Block, _cert: &Certificate) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Serves rounds `1..=up_to`, each with a certificate, and reports
+    /// `NoBlockForRound` beyond that — i.e. behaves like a peer that is
+    /// itself at round `up_to`.
+    struct BoundedBlockFetcher {
+        up_to: u64,
+        calls: AtomicU64,
+    }
+
+    impl BlockFetcher for BoundedBlockFetcher {
+        fn fetch_block(&self, round: Round) -> Result<FetchedBlockCert, FetchError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if round.0 > self.up_to {
+                return Err(FetchError::NoBlockForRound { round });
+            }
+            let block = make_valid_empty_block(round.0);
+            Ok(FetchedBlockCert {
+                block,
+                cert: Some(make_cert(round.0)),
+                raw_payset_blobs: None,
+            })
+        }
+    }
+
+    /// Regression test for issue #478.
+    ///
+    /// A Rust node that joins an already-running network starts its
+    /// agreement service at `ledger_round + 1` while the network is far
+    /// ahead. Agreement never emits an unmatched certificate for a round it
+    /// is not playing, so the certificate-driven path alone can never close
+    /// that gap: the node sat at round 1 escalating periods forever. Go
+    /// closes it with `periodicSync`'s `time.After` branch calling `sync()`
+    /// (`catchup/service.go:641-662`), which this mirrors.
+    ///
+    /// No certificate is ever sent on `cert_rx` here — the ledger must still
+    /// catch up.
+    #[test]
+    fn periodic_sync_catches_up_without_any_certificate() {
+        let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let ledger = Arc::new(PermissiveCatchupLedger {
+            inner: MockCatchupLedger::new(Round(0)),
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+            up_to: 5,
+            calls: AtomicU64::new(0),
+        });
+
+        let mut svc = CatchupService::start(rx, ledger_dyn, fetcher);
+
+        poll_until(
+            || ledger.next_round() == Round(6),
+            Duration::from_millis(20),
+            Duration::from_secs(10),
+            "periodic sync should have pulled rounds 1..=5 with no certificate from agreement",
+        );
+
+        svc.stop();
+    }
+
+    /// A block offered without a certificate must not be committed: the
+    /// periodic path has no agreement-verified certificate to fall back on,
+    /// so an unauthenticated block would be trusted purely on a peer's word.
+    #[test]
+    fn periodic_sync_refuses_a_block_with_no_certificate() {
+        let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let ledger = Arc::new(PermissiveCatchupLedger {
+            inner: MockCatchupLedger::new(Round(0)),
+        });
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        // `MockBlockFetcher` always returns `cert: None`.
+        let fetcher: Arc<dyn BlockFetcher> =
+            Arc::new(MockBlockFetcher::new(Some(make_valid_empty_block(1))));
+
+        let mut svc = CatchupService::start(rx, ledger_dyn, fetcher);
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            ledger.next_round(),
+            Round(1),
+            "a certificate-less block must not be committed by the periodic path"
+        );
+        svc.stop();
+    }
+
+    /// The default `authenticate_block` refuses, so a ledger that has not
+    /// opted in cannot have unverified blocks written under it.
+    #[test]
+    fn periodic_sync_refuses_when_ledger_cannot_authenticate() {
+        let (_tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
+        let ledger = Arc::new(MockCatchupLedger::new(Round(0)));
+        let ledger_dyn: Arc<dyn CatchupLedger> = ledger.clone();
+        let fetcher: Arc<dyn BlockFetcher> = Arc::new(BoundedBlockFetcher {
+            up_to: 5,
+            calls: AtomicU64::new(0),
+        });
+
+        let mut svc = CatchupService::start(rx, ledger_dyn, fetcher);
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(ledger.next_round(), Round(1));
+        svc.stop();
+    }
+
     // -- Tests --
 
     #[test]
@@ -757,8 +1091,10 @@ mod tests {
     }
 
     #[test]
-    fn cert_channel_closed_exits_cleanly() {
-        // When the cert channel sender is dropped, the service should exit.
+    fn cert_channel_closed_stops_cleanly() {
+        // Closing the cert channel must NOT end the service (the periodic
+        // path keeps the ledger following the network); `stop()` must still
+        // shut it down cleanly.
         let (tx, rx) = crossbeam_channel::bounded::<PendingUnmatchedCertificate>(1);
         let ledger: Arc<dyn CatchupLedger> = Arc::new(MockCatchupLedger::new(Round(0)));
         let fetcher: Arc<dyn BlockFetcher> = Arc::new(MockBlockFetcher::new(None));
@@ -841,12 +1177,15 @@ mod tests {
             "sentinel cert for round 11 should have been fetched",
         );
 
-        // The fetcher should have been called exactly once (only for the
-        // sentinel round 11, not for the skipped round 5).
-        assert_eq!(
-            fetcher.fetch_count(),
-            1,
-            "fetcher should be called only for the sentinel, not for the skipped round"
+        // At most two fetches: the one startup periodic probe the service
+        // makes for `next_round()` (Go's `periodicSync` does the same,
+        // catchup/service.go:611-619) plus exactly one certificate-driven
+        // fetch for the sentinel. Crucially, the already-committed round 5
+        // must not add one.
+        assert!(
+            fetcher.fetch_count() <= 2,
+            "fetcher should be called only for the startup probe and the              sentinel, not for the skipped round (got {})",
+            fetcher.fetch_count()
         );
 
         svc.stop();
@@ -938,11 +1277,12 @@ mod tests {
             "fetcher should be called for a valid block",
         );
 
-        // The fetcher should have been called exactly once (no retries needed).
-        assert_eq!(
-            fetcher.fetch_count(),
-            1,
-            "fetcher should be called exactly once for a valid block"
+        // At most two fetches: the startup periodic probe plus one
+        // certificate-driven fetch. No retries for a valid block.
+        assert!(
+            fetcher.fetch_count() <= 2,
+            "a valid block should need no retries (got {} fetches)",
+            fetcher.fetch_count()
         );
 
         // The block should have been committed to the ledger.

@@ -582,7 +582,17 @@ fn main_loop<L, K, BF, R>(
         };
 
         // Step 5: Look up consensus params for this event's round.
-        let event_round = event.consensus_round();
+        //
+        // Go looks these up at `ParamsRound(e.ConsensusRound())`, i.e. two
+        // rounds back (`agreement/demux.go:200`), never at the event's own
+        // round — the event's round is by definition the one still being
+        // agreed, so its block header does not exist yet and the lookup
+        // would always fail. Using the raw round here meant every event
+        // fell back to the binary's built-in consensus version and params
+        // instead of the network's, and logged
+        // "failed to read valid protocol version" once per round
+        // (issue #478).
+        let event_round = crate::lookback::params_round(event.consensus_round());
         let params = ledger
             .consensus_params(event_round)
             .unwrap_or_else(|_| cparams.clone());

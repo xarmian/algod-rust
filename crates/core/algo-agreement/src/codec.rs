@@ -1697,15 +1697,40 @@ fn decode_block_allowing_missing_rnd(bytes: &[u8]) -> Result<Block, CodecError> 
             // `rnd` key. Other failures (malformed bytes, other
             // missing required fields) propagate unchanged.
             if !is_missing_rnd_error(&first_err) {
-                return Err(CodecError::Decode(format!("block decode: {first_err}")));
+                return Err(CodecError::Decode(format!(
+                    "block decode: {}",
+                    format_error_chain(&first_err)
+                )));
             }
-            let patched = inject_rnd_zero(bytes)
-                .map_err(|_| CodecError::Decode(format!("block decode: {first_err}")))?;
+            let patched = inject_rnd_zero(bytes).map_err(|_| {
+                CodecError::Decode(format!("block decode: {}", format_error_chain(&first_err)))
+            })?;
             Block::decode_from_bytes(&patched).map_err(|retry_err| {
-                CodecError::Decode(format!("block decode (rnd synthesized): {retry_err}"))
+                CodecError::Decode(format!(
+                    "block decode (rnd synthesized): {}",
+                    format_error_chain(&retry_err)
+                ))
             })
         }
     }
+}
+
+/// Render an error together with its full `source()` chain.
+///
+/// `algo_error::AlgoError::Codec`'s `Display` prints only its `context`
+/// string (literally `"codec error: rmp_decode"`), which hides the actual
+/// diagnostic. Every decode failure on the agreement ingest path would
+/// otherwise be reported identically, making wire-format mismatches with
+/// go-algorand effectively undebuggable from logs (see issue #478).
+fn format_error_chain<E: std::error::Error + 'static>(err: &E) -> String {
+    let mut out = err.to_string();
+    let mut cur: &(dyn std::error::Error + 'static) = err;
+    while let Some(next) = cur.source() {
+        out.push_str(": ");
+        out.push_str(&next.to_string());
+        cur = next;
+    }
+    out
 }
 
 /// Returns `true` if `err` is the specific error emitted by
