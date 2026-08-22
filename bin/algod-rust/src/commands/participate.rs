@@ -1969,6 +1969,142 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pool block follower.
+// ---------------------------------------------------------------------------
+
+/// Minimal read view over committed blocks, used by [`run_pool_block_follower`]
+/// so its catch-up logic can be unit tested without a full `SqliteLedger` +
+/// genesis setup.
+///
+/// `None` from either method means "not available right now" (block not yet
+/// readable, or the underlying store is gone) — the follower must retry
+/// rather than treat it as "nothing to do".
+trait CommittedBlockSource: Send + Sync {
+    /// The highest committed round, or `None` if the source is unavailable
+    /// (e.g. a poisoned lock), in which case the follower should stop.
+    fn current_round(&self) -> Option<u64>;
+
+    /// The full block committed at `round`, or `None` if it isn't readable
+    /// yet (including transient errors) — the caller must not advance past
+    /// this round on `None`.
+    fn get_block(&self, round: u64) -> Option<algo_types::Block>;
+}
+
+impl CommittedBlockSource for Arc<Mutex<SqliteLedger>> {
+    fn current_round(&self) -> Option<u64> {
+        self.lock().ok().map(|l| l.current_round().0)
+    }
+
+    fn get_block(&self, round: u64) -> Option<algo_types::Block> {
+        let l = self.lock().ok()?;
+        let bytes = match l.get_block_data(round) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return None,
+            Err(e) => {
+                warn!(round, error = %e, "pool follower: could not read committed block");
+                return None;
+            }
+        };
+        drop(l);
+        match algo_types::Block::decode_from_bytes(&bytes) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                warn!(round, error = %e, "pool follower: could not decode committed block");
+                None
+            }
+        }
+    }
+}
+
+/// Drive `pool.on_new_block()` for every block committed to the ledger.
+///
+/// Mirrors go-algorand's ledger block listener (`node.go`'s `blockListener`),
+/// which `ledger.go`'s tracker-commit path invokes synchronously for *every*
+/// committed round. Here the trigger is `round_advanced`, the same `Condvar`
+/// that `AgreementLedgerBridge::ensure_block` notifies immediately after a
+/// block commits (see `algo_ledger::agreement_bridge`) — so the pool's
+/// pending-block evaluator is rebuilt right after each commit instead of
+/// being discovered on a fixed polling cadence.
+///
+/// Issue #492: the original implementation unconditionally slept for the
+/// full `poll_interval` at the *top* of every loop iteration before ever
+/// checking the ledger. Under sustained load, round-commit cadence can run
+/// faster than `poll_interval`, so by the time the sleep elapsed several
+/// rounds had already committed; the drain loop below did catch all of them
+/// up, but the *next* sleep started the same fixed-delay race over again
+/// against an even busier ledger — so the gap between "ledger round" and
+/// "evaluator round" never shrank back to its steady state, it grew with
+/// throughput. Waiting on `round_advanced` instead (keeping `poll_interval`
+/// only as a bounded fallback for missed/lost notifications, since
+/// `ensure_block` notifies *after* releasing its lock) lets this thread
+/// react within one wakeup of the commit, independent of round-commit rate.
+///
+/// This also fixes a silent round-skip in the original loop: it advanced
+/// `last_seen` even when the block for that round could not be read back
+/// (e.g. a transient decode error), permanently losing that round's
+/// `on_new_block` call and leaving the evaluator stuck one round further
+/// behind than it needed to be. Now a failed read stops the drain for this
+/// tick without advancing `last_seen`, so the same round is retried on the
+/// next wakeup.
+///
+/// `initial_round` (the last round already accounted for, typically the
+/// round the pool's evaluator was primed against) is supplied by the
+/// caller rather than read from `ledger` here: this function runs inside
+/// the follower's own thread, which the OS may not schedule until some
+/// arbitrary time after `std::thread::spawn` returns, so deriving it here
+/// would race real commits made in that gap and silently treat them as
+/// "already seen" without ever calling `on_new_block` for them.
+fn run_pool_block_follower<S: CommittedBlockSource>(
+    pool: &TransactionPool,
+    ledger: &S,
+    round_advanced: &std::sync::Condvar,
+    stop: &std::sync::atomic::AtomicBool,
+    poll_interval: Duration,
+    initial_round: u64,
+) {
+    use std::sync::atomic::Ordering;
+
+    // Paired only with `round_advanced` for `wait_timeout`'s API — it does
+    // not, and need not, guard any shared state (see doc comment above on
+    // why `ensure_block` can't hand us a mutex whose state transition is
+    // safe to rendezvous on).
+    let wait_gate = Mutex::new(());
+
+    let mut last_seen = initial_round;
+
+    while !stop.load(Ordering::Relaxed) {
+        let latest = match ledger.current_round() {
+            Some(r) => r,
+            None => break,
+        };
+
+        while last_seen < latest {
+            let round = last_seen + 1;
+            let Some(block) = ledger.get_block(round) else {
+                // Not readable yet (or a transient error) — stop draining
+                // this tick; we'll retry `round` on the next wakeup instead
+                // of silently skipping it.
+                break;
+            };
+            let committed_txids: HashSet<algo_types::Digest> = block
+                .payset
+                .iter()
+                .map(|stx| crate::dev_producer::block_txn_id(stx, &block))
+                .collect();
+            pool.on_new_block(&block, &committed_txids);
+            last_seen = round;
+        }
+
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let guard = wait_gate.lock().expect("wait_gate mutex poisoned");
+        let _ = round_advanced.wait_timeout(guard, poll_interval);
+    }
+}
+
 /// Parse a hex-encoded genesis hash into a 32-byte array.
 fn parse_genesis_hash(hex_str: &str) -> anyhow::Result<[u8; 32]> {
     let hex_str = hex_str.trim();
@@ -3161,59 +3297,37 @@ pub async fn run(
     // rejected with "transaction round window [N, N+1000] does not cover
     // block round <startup round>", and committed transactions were never
     // dropped from the pool (issue #478).
+    //
+    // The follower is woken by `agreement_ledger`'s `round_advanced` condvar
+    // (the same one `AgreementLedgerBridge::ensure_block` notifies right
+    // after committing a block) rather than a fixed sleep — see
+    // `run_pool_block_follower`'s doc comment for why the original
+    // sleep-then-check polling fell behind under sustained load (issue #492).
     let pool_follower_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pool_follower_round_advanced = agreement_ledger.round_advanced_condvar();
     let pool_follower = {
         let pool = pool.clone();
         let ledger = ledger.clone();
         let stop = Arc::clone(&pool_follower_stop);
-        let mut last_seen = {
+        let round_advanced = Arc::clone(&pool_follower_round_advanced);
+        // Read the starting round here, in the spawning thread, not inside
+        // the closure -- see `run_pool_block_follower`'s doc comment on
+        // `initial_round` for why that distinction matters.
+        let initial_round = {
             let l = ledger.lock().expect("ledger lock poisoned");
             l.current_round().0
         };
         std::thread::Builder::new()
             .name("pool-block-follower".to_string())
             .spawn(move || {
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(200));
-                    let latest = match ledger.lock() {
-                        Ok(l) => l.current_round().0,
-                        Err(_) => break,
-                    };
-                    while last_seen < latest {
-                        let round = last_seen + 1;
-                        let block = {
-                            let l = match ledger.lock() {
-                                Ok(l) => l,
-                                Err(_) => return,
-                            };
-                            match l.get_block_data(round) {
-                                Ok(Some(bytes)) => {
-                                    match algo_types::Block::decode_from_bytes(&bytes) {
-                                        Ok(b) => Some(b),
-                                        Err(e) => {
-                                            warn!(
-                                                round,
-                                                error = %e,
-                                                "pool follower: could not decode committed block"
-                                            );
-                                            None
-                                        }
-                                    }
-                                }
-                                _ => None,
-                            }
-                        };
-                        if let Some(block) = block {
-                            let committed_txids: HashSet<algo_types::Digest> = block
-                                .payset
-                                .iter()
-                                .map(|stx| crate::dev_producer::block_txn_id(stx, &block))
-                                .collect();
-                            pool.on_new_block(&block, &committed_txids);
-                        }
-                        last_seen = round;
-                    }
-                }
+                run_pool_block_follower(
+                    &pool,
+                    &ledger,
+                    &round_advanced,
+                    &stop,
+                    Duration::from_millis(200),
+                    initial_round,
+                );
             })
             .expect("failed to spawn pool-block-follower thread")
     };
@@ -3302,6 +3416,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use serde_bytes::ByteBuf;
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     // ── Helper: create an in-memory ledger ──────────────────────────
     fn test_ledger() -> Arc<Mutex<SqliteLedger>> {
@@ -3357,6 +3472,355 @@ mod tests {
         assert_eq!(
             block.seed, [0u8; 32],
             "seed left for the producer/agreement"
+        );
+    }
+
+    // ── pool block follower (issue #492) ────────────────────────────
+
+    /// Commit a block to `ledger` outside of full state application --
+    /// mirrors the minimal round-0 commit `seed_ledger_from_genesis` does
+    /// for the genesis block, without the accompanying account totals
+    /// (unneeded: `start_evaluator_advances_round_and_branch` already shows
+    /// the evaluator only needs a header to build off of).
+    fn commit_block_for_test(ledger: &Arc<Mutex<SqliteLedger>>, block: &algo_types::Block) {
+        let hdr_data = canonical_encode_block_header_from_block(block);
+        let blk_data = canonical_encode_block(block);
+        let mut l = ledger.lock().expect("ledger lock");
+        l.begin_block().expect("begin_block");
+        l.put_block(block.round.0, &block.current_protocol, &hdr_data, &blk_data)
+            .expect("put_block");
+        l.set_current_round(block.round);
+        l.commit_block().expect("commit_block");
+    }
+
+    /// Evaluate and commit the next block on top of `prev_hdr`, returning
+    /// the newly committed header (for chaining into the next call).
+    fn commit_next_block_for_test(
+        ledger: &Arc<Mutex<SqliteLedger>>,
+        prev_hdr: BlockHeader,
+    ) -> BlockHeader {
+        use algo_pool::traits::PoolLedger;
+
+        let adapter = PoolLedgerAdapter {
+            ledger: ledger.clone(),
+        };
+        let mut eval = adapter
+            .start_evaluator(prev_hdr, 0, 0)
+            .expect("start_evaluator");
+        let block = eval.generate_block(&[]).expect("generate_block");
+        commit_block_for_test(ledger, &block);
+        BlockHeader::decode_from_bytes(&canonical_encode_block_header_from_block(&block))
+            .expect("decode committed header")
+    }
+
+    /// The fixed keypair used by [`window_pinned_txn`]'s probe transactions.
+    fn probe_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    /// Genesis hash shared by the test ledger's genesis header and every
+    /// probe transaction -- `require_genesis_hash` is on for V41, so probe
+    /// txns need a hash matching the block header's, not just a non-zero one.
+    const PROBE_GENESIS_HASH: [u8; 32] = [0xAA; 32];
+
+    /// Fund the probe sender directly via `set_account`, bypassing full
+    /// genesis population -- this test only needs the sender to be able to
+    /// pay its own txn fee, not a fully seeded ledger.
+    fn fund_probe_sender(ledger: &Arc<Mutex<SqliteLedger>>) {
+        let sender = Address(probe_signing_key().verifying_key().to_bytes());
+        let mut l = ledger.lock().expect("ledger lock");
+        l.set_account(
+            &sender,
+            AccountData {
+                micro_algos: 1_000_000_000,
+                ..AccountData::default()
+            },
+        );
+    }
+
+    /// Build a minimal signed payment transaction whose round window is
+    /// exactly `[round, round]`, matching the round-window check in
+    /// `validate_group_stateless_inner` (~line 821) that surfaces the
+    /// pending-evaluator's round to callers.
+    fn window_pinned_txn(round: Round, genesis_id: &str) -> SignedTransaction {
+        let signing_key = probe_signing_key();
+        let sender = Address(signing_key.verifying_key().to_bytes());
+        let txn = Transaction {
+            txn_type: TxnType::Pay,
+            sender,
+            receiver: sender,
+            fee: 1_000,
+            first_valid: round,
+            last_valid: round,
+            genesis_id: genesis_id.to_string(),
+            genesis_hash: PROBE_GENESIS_HASH,
+            ..Transaction::default()
+        };
+        let canonical = canonical_encode_transaction(&txn);
+        let mut msg = Vec::with_capacity(2 + canonical.len());
+        msg.extend_from_slice(b"TX");
+        msg.extend_from_slice(&canonical);
+        let sig = signing_key.sign(&msg).to_bytes();
+        SignedTransaction {
+            txn,
+            sig,
+            ..SignedTransaction::default()
+        }
+    }
+
+    /// Repeatedly try `pool.remember_one(txn)` until it succeeds or
+    /// `deadline` passes. Returns `true` on success.
+    ///
+    /// The pending-block evaluator's round check (issue #492's symptom) is
+    /// exactly what makes this fail while the evaluator lags: a txn with
+    /// `first_valid == last_valid == round` is only accepted once the
+    /// evaluator has caught up to that round.
+    /// `round_advanced` is re-notified on every retry so the test doesn't
+    /// depend on the follower thread having already reached its
+    /// `wait_timeout` call by the time the burst below finishes committing.
+    /// A plain `Condvar` has no memory of a notify sent while nobody was
+    /// waiting, and under parallel `cargo test` CPU contention the follower
+    /// thread's actual start can be delayed by an unpredictable amount --
+    /// so a single post-burst notify is not reliable. Re-notifying every
+    /// 5ms guarantees one lands soon after the follower does start waiting,
+    /// without depending on precise timing.
+    fn wait_for_acceptance(
+        pool: &TransactionPool,
+        txn: &SignedTransaction,
+        round_advanced: &std::sync::Condvar,
+        deadline: Instant,
+    ) -> bool {
+        loop {
+            if pool.remember_one(txn.clone()).is_ok() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            round_advanced.notify_all();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Reproduces issue #492: with a burst of rounds committed back-to-back
+    /// (as happens under sustained load) and `round_advanced` notified right
+    /// after each commit -- exactly like
+    /// `AgreementLedgerBridge::ensure_block` -- the follower must catch the
+    /// pending-block evaluator up promptly, not only after `poll_interval`
+    /// elapses.
+    ///
+    /// `poll_interval` is set to a full 5 seconds specifically so this test
+    /// cannot pass "by accident" via the fallback poll: the old
+    /// sleep-then-check implementation unconditionally blocked for the
+    /// *entire* `poll_interval` before ever looking at the ledger, so it
+    /// would fail this test deterministically (a >=5s wait against a <2s
+    /// deadline). The fixed, condvar-driven implementation wakes on notify
+    /// regardless of `poll_interval` and passes in well under a second.
+    #[test]
+    fn pool_block_follower_catches_up_on_notify_not_poll_interval() {
+        let ledger = test_ledger();
+
+        let genesis_hdr = BlockHeader {
+            round: Round(0),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            fee_sink: Address([1u8; 32]),
+            rewards_pool: Address([2u8; 32]),
+            genesis_id: "net-x".to_string(),
+            genesis_hash: PROBE_GENESIS_HASH,
+            timestamp: 1_000,
+            ..BlockHeader::default()
+        };
+        let genesis_block = algo_types::Block {
+            round: genesis_hdr.round,
+            current_protocol: genesis_hdr.current_protocol.clone(),
+            fee_sink: genesis_hdr.fee_sink,
+            rewards_pool: genesis_hdr.rewards_pool,
+            genesis_id: genesis_hdr.genesis_id.clone(),
+            genesis_hash: genesis_hdr.genesis_hash,
+            timestamp: genesis_hdr.timestamp,
+            ..algo_types::Block::default()
+        };
+        commit_block_for_test(&ledger, &genesis_block);
+        fund_probe_sender(&ledger);
+
+        let pool_ledger_adapter = Arc::new(PoolLedgerAdapter {
+            ledger: ledger.clone(),
+        });
+        let pool = Arc::new(TransactionPool::new(
+            PoolConfig::default(),
+            pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
+        ));
+        pool.ensure_evaluator_primed();
+
+        let round_advanced = Arc::new(std::sync::Condvar::new());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let initial_round = ledger.lock().unwrap().current_round().0;
+        let follower = {
+            let pool = pool.clone();
+            let ledger = ledger.clone();
+            let round_advanced = round_advanced.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                run_pool_block_follower(
+                    &pool,
+                    &ledger,
+                    &round_advanced,
+                    &stop,
+                    Duration::from_secs(5),
+                    initial_round,
+                );
+            })
+        };
+
+        // Give the follower a moment to reach its `wait_timeout` call before
+        // starting the burst below -- in production it's spawned once at
+        // node startup and is already parked waiting long before real load
+        // hits, so a notify is never lost; a plain `Condvar` has no memory
+        // of notifications sent while nobody was waiting, so without this
+        // the test itself (not the fix) could race the burst ahead of the
+        // follower's first wait and spuriously fail on the 5s poll fallback.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Commit a burst of rounds back-to-back, notifying after each --
+        // mirrors several rounds committing faster than a fixed poll
+        // interval under sustained load.
+        const ROUNDS: u64 = 5;
+        let mut prev_hdr = genesis_hdr.clone();
+        for _ in 0..ROUNDS {
+            prev_hdr = commit_next_block_for_test(&ledger, prev_hdr);
+            round_advanced.notify_all();
+        }
+
+        // The evaluator's natural target after `ROUNDS` commits is
+        // `ROUNDS + 1` (the next round to build on top of the committed
+        // chain) -- pin the probe txn's window there so acceptance proves
+        // the evaluator actually reached the tip, not merely "some round".
+        let txn = window_pinned_txn(Round(ROUNDS + 1), &genesis_hdr.genesis_id);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let accepted = wait_for_acceptance(&pool, &txn, &round_advanced, deadline);
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        round_advanced.notify_all();
+        follower.join().expect("follower thread panicked");
+
+        assert!(
+            accepted,
+            "pending-block evaluator did not catch up to round {ROUNDS} within 2s of \
+             notify-driven commits -- it must be woken by round_advanced, not stuck \
+             waiting out poll_interval"
+        );
+    }
+
+    /// A block source that reports a transient read failure for one round
+    /// exactly once, then serves it normally. Verifies the follower retries
+    /// rather than silently skipping past a round it couldn't read.
+    struct FlakyOnceBlockSource {
+        inner: Arc<Mutex<SqliteLedger>>,
+        fail_round: u64,
+        already_failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl CommittedBlockSource for FlakyOnceBlockSource {
+        fn current_round(&self) -> Option<u64> {
+            self.inner.current_round()
+        }
+
+        fn get_block(&self, round: u64) -> Option<algo_types::Block> {
+            if round == self.fail_round
+                && !self
+                    .already_failed
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return None;
+            }
+            self.inner.get_block(round)
+        }
+    }
+
+    #[test]
+    fn pool_block_follower_retries_round_after_transient_read_failure() {
+        let ledger = test_ledger();
+
+        let genesis_hdr = BlockHeader {
+            round: Round(0),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            fee_sink: Address([1u8; 32]),
+            rewards_pool: Address([2u8; 32]),
+            genesis_id: "net-x".to_string(),
+            genesis_hash: PROBE_GENESIS_HASH,
+            timestamp: 1_000,
+            ..BlockHeader::default()
+        };
+        let genesis_block = algo_types::Block {
+            round: genesis_hdr.round,
+            current_protocol: genesis_hdr.current_protocol.clone(),
+            fee_sink: genesis_hdr.fee_sink,
+            rewards_pool: genesis_hdr.rewards_pool,
+            genesis_id: genesis_hdr.genesis_id.clone(),
+            genesis_hash: genesis_hdr.genesis_hash,
+            timestamp: genesis_hdr.timestamp,
+            ..algo_types::Block::default()
+        };
+        commit_block_for_test(&ledger, &genesis_block);
+        fund_probe_sender(&ledger);
+
+        let pool_ledger_adapter = Arc::new(PoolLedgerAdapter {
+            ledger: ledger.clone(),
+        });
+        let pool = Arc::new(TransactionPool::new(
+            PoolConfig::default(),
+            pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
+        ));
+        pool.ensure_evaluator_primed();
+
+        let round_advanced = Arc::new(std::sync::Condvar::new());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Round 1 fails to read exactly once; a short poll_interval lets
+        // the follower's fallback retry it promptly.
+        let flaky_source = Arc::new(FlakyOnceBlockSource {
+            inner: ledger.clone(),
+            fail_round: 1,
+            already_failed: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        let initial_round = ledger.lock().unwrap().current_round().0;
+        let follower = {
+            let pool = pool.clone();
+            let flaky_source = flaky_source.clone();
+            let round_advanced = round_advanced.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                run_pool_block_follower(
+                    &pool,
+                    &*flaky_source,
+                    &round_advanced,
+                    &stop,
+                    Duration::from_millis(20),
+                    initial_round,
+                );
+            })
+        };
+
+        let new_hdr = commit_next_block_for_test(&ledger, genesis_hdr.clone());
+        round_advanced.notify_all();
+
+        // The evaluator's target after this one commit is `new_hdr.round + 1`
+        // (the next round to build on top of it).
+        let txn = window_pinned_txn(new_hdr.round.next(), &genesis_hdr.genesis_id);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let accepted = wait_for_acceptance(&pool, &txn, &round_advanced, deadline);
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        round_advanced.notify_all();
+        follower.join().expect("follower thread panicked");
+
+        assert!(
+            accepted,
+            "pool must retry round {} after a transient read failure instead of \
+             silently skipping past it",
+            new_hdr.round.0
         );
     }
 
