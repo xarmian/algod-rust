@@ -28,6 +28,7 @@ pub mod store_trait;
 pub mod sync;
 pub mod trie_hash;
 pub mod txn_group_delta_tracer;
+pub mod txtail_cache;
 
 pub use apply::{
     apply_acfg, apply_afrz, apply_axfer, apply_block, apply_block_capturing_apply_data,

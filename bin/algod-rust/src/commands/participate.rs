@@ -1787,12 +1787,26 @@ impl algo_network::MessageHandler for ParticipateBlockRequestHandler {
 
 pub(crate) struct PoolLedgerAdapter {
     ledger: Arc<Mutex<SqliteLedger>>,
+    /// In-memory mirror of the recent txtail for duplicate checks —
+    /// go-algorand keeps the whole tail in memory (`ledger/txtail.go`)
+    /// and never re-reads it from SQLite per submission. See
+    /// [`algo_ledger::txtail_cache::TxTailDupCache`].
+    dup_cache: Mutex<algo_ledger::txtail_cache::TxTailDupCache>,
+    /// Single-entry header cache: `block_hdr`/`consensus_params` are
+    /// called for the latest round on every pool ingest; a committed
+    /// round's header is immutable, so caching the last one read is
+    /// trivially coherent.
+    hdr_cache: Mutex<Option<(u64, BlockHeader)>>,
 }
 
 impl PoolLedgerAdapter {
     /// Wrap a shared ledger as a pool ledger.
     pub(crate) fn new(ledger: Arc<Mutex<SqliteLedger>>) -> Self {
-        Self { ledger }
+        Self {
+            ledger,
+            dup_cache: Mutex::new(algo_ledger::txtail_cache::TxTailDupCache::new()),
+            hdr_cache: Mutex::new(None),
+        }
     }
 }
 
@@ -1805,6 +1819,18 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
     }
 
     fn block_hdr(&self, round: Round) -> Result<algo_types::BlockHeader, algo_error::AlgoError> {
+        // Fast path: a committed round's header never changes, so the
+        // last header read can be reused without touching SQLite. Mirrors
+        // go's in-memory block-header caching in its ledger trackers
+        // (`ledger/txtail.go` keeps `blockHeaderData` in memory for the
+        // recent window and serves `BlockHdr` from it).
+        if let Ok(cache) = self.hdr_cache.lock() {
+            if let Some((cached_round, hdr)) = cache.as_ref() {
+                if *cached_round == round.0 {
+                    return Ok(hdr.clone());
+                }
+            }
+        }
         let ledger = self
             .ledger
             .lock()
@@ -1819,9 +1845,15 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
             .ok_or_else(|| algo_error::AlgoError::Ledger {
                 message: format!("no block header data for round {}", round.0),
             })?;
-        BlockHeader::decode_from_bytes(&hdr_data).map_err(|e| algo_error::AlgoError::Ledger {
-            message: format!("block_hdr({}) decode error: {e}", round.0),
-        })
+        let hdr = BlockHeader::decode_from_bytes(&hdr_data).map_err(|e| {
+            algo_error::AlgoError::Ledger {
+                message: format!("block_hdr({}) decode error: {e}", round.0),
+            }
+        })?;
+        if let Ok(mut cache) = self.hdr_cache.lock() {
+            *cache = Some((round.0, hdr.clone()));
+        }
+        Ok(hdr)
     }
 
     fn consensus_params(
@@ -1841,33 +1873,28 @@ impl algo_pool::traits::PoolLedger for PoolLedgerAdapter {
 
     fn contains_confirmed_txid(&self, txid: algo_types::Digest) -> bool {
         // Mirrors go's ledger txtail duplicate check (`ledger/txtail.go`'s
-        // `checkDup`): scan the recent-history window for a matching txid,
-        // rather than requiring a full evaluator round-trip. Bounded to the
-        // last `CONFIRM_LOOKBACK_ROUNDS` rounds (go's `MaxTxnLife` window) —
-        // a transaction older than that can never be a live duplicate
-        // (its own `last_valid` would already have expired).
-        const CONFIRM_LOOKBACK_ROUNDS: u64 = 1000;
+        // `checkDup`): consult the recent-history window (go's `MaxTxnLife`,
+        // 1000 rounds) — a transaction older than that can never be a live
+        // duplicate (its own `last_valid` would already have expired).
+        //
+        // Like go's `txTail` tracker, the window lives in memory
+        // (`TxTailDupCache`), loaded from the ledger's txtail rows once and
+        // advanced incrementally as blocks commit. The pre-cache
+        // implementation re-read and decoded every txtail blob in the
+        // window from SQLite on every submission (~1.9 ms/call at 100
+        // rounds × 420 txns, measured) — the dominant CPU/allocation sink
+        // in the issue #100 stress bench. The cache answers identically
+        // (same rows, same window) in O(1).
         let Ok(ledger) = self.ledger.lock() else {
             return false;
         };
+        let Ok(mut cache) = self.dup_cache.lock() else {
+            return false;
+        };
         let current = ledger.current_round().0;
-        let lo = current.saturating_sub(CONFIRM_LOOKBACK_ROUNDS).max(1);
-        for round in (lo..=current).rev() {
-            let Ok(Some(bytes)) = ledger.get_txtail(round) else {
-                continue;
-            };
-            let Ok(tail) = rmp_serde::from_slice::<algo_types::TxTailRound>(&bytes) else {
-                continue;
-            };
-            if tail
-                .txn_ids
-                .iter()
-                .any(|id| id.as_ref() == txid.as_bytes().as_slice())
-            {
-                return true;
-            }
-        }
-        false
+        cache.sync(current, |round| ledger.get_txtail(round).ok().flatten());
+        drop(ledger);
+        cache.contains(&txid)
     }
 
     fn start_evaluator(
@@ -2944,9 +2971,7 @@ pub async fn run(
     // The `SeenTxCache` is created here so it can be shared with the
     // TxSyncer when TASK-70 lands.
     // -------------------------------------------------------------------
-    let pool_ledger_adapter = Arc::new(PoolLedgerAdapter {
-        ledger: ledger.clone(),
-    });
+    let pool_ledger_adapter = Arc::new(PoolLedgerAdapter::new(ledger.clone()));
     let pool = Arc::new(TransactionPool::new(
         PoolConfig::default(),
         pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
@@ -3433,9 +3458,7 @@ mod tests {
 
         // Empty in-memory ledger: no accounts, no totals seeded. The evaluator
         // must still advance the header off the supplied previous header.
-        let adapter = PoolLedgerAdapter {
-            ledger: test_ledger(),
-        };
+        let adapter = PoolLedgerAdapter::new(test_ledger());
 
         let prev = BlockHeader {
             round: Round(5),
@@ -3501,9 +3524,7 @@ mod tests {
     ) -> BlockHeader {
         use algo_pool::traits::PoolLedger;
 
-        let adapter = PoolLedgerAdapter {
-            ledger: ledger.clone(),
-        };
+        let adapter = PoolLedgerAdapter::new(ledger.clone());
         let mut eval = adapter
             .start_evaluator(prev_hdr, 0, 0)
             .expect("start_evaluator");
@@ -3643,9 +3664,7 @@ mod tests {
         commit_block_for_test(&ledger, &genesis_block);
         fund_probe_sender(&ledger);
 
-        let pool_ledger_adapter = Arc::new(PoolLedgerAdapter {
-            ledger: ledger.clone(),
-        });
+        let pool_ledger_adapter = Arc::new(PoolLedgerAdapter::new(ledger.clone()));
         let pool = Arc::new(TransactionPool::new(
             PoolConfig::default(),
             pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
@@ -3765,9 +3784,7 @@ mod tests {
         commit_block_for_test(&ledger, &genesis_block);
         fund_probe_sender(&ledger);
 
-        let pool_ledger_adapter = Arc::new(PoolLedgerAdapter {
-            ledger: ledger.clone(),
-        });
+        let pool_ledger_adapter = Arc::new(PoolLedgerAdapter::new(ledger.clone()));
         let pool = Arc::new(TransactionPool::new(
             PoolConfig::default(),
             pool_ledger_adapter as Arc<dyn algo_pool::traits::PoolLedger>,
@@ -4555,6 +4572,81 @@ mod tests {
             sig,
             ..Default::default()
         }
+    }
+
+    // ── PoolLedgerAdapter duplicate detection ───────────────────────
+
+    /// Serialize a TxTailRound holding the given txids for `round`.
+    fn adapter_tail_bytes(round: u64, txids: &[[u8; 32]]) -> Vec<u8> {
+        let tail = algo_types::TxTailRound {
+            txn_ids: txids
+                .iter()
+                .map(|id| serde_bytes::ByteBuf::from(id.to_vec()))
+                .collect(),
+            last_valid: txids.iter().map(|_| round + 1000).collect(),
+            leases: Vec::new(),
+            hdr: BlockHeader {
+                round: Round(round),
+                ..BlockHeader::default()
+            },
+        };
+        algo_codec::canonical_encode_txtail_round(&tail)
+    }
+
+    /// Pins the behavior of `contains_confirmed_txid` across the in-memory
+    /// txtail cache: hits within the 1000-round window, misses outside it,
+    /// and visibility of rounds committed *after* earlier queries (the
+    /// incremental-sync path). Written against the pre-cache SQLite-scan
+    /// semantics; the cached implementation must answer identically.
+    #[test]
+    fn adapter_contains_confirmed_txid_tracks_committed_rounds() {
+        use algo_ledger::store_trait::LedgerStore;
+        use algo_pool::traits::PoolLedger;
+
+        let ledger = test_ledger();
+        let confirmed_r1 = [0x11u8; 32];
+        let confirmed_r2 = [0x22u8; 32];
+        let never_confirmed = [0x33u8; 32];
+
+        {
+            let mut l = ledger.lock().unwrap();
+            l.put_txtail(1, &adapter_tail_bytes(1, &[confirmed_r1]))
+                .unwrap();
+            l.set_current_round(Round(1));
+        }
+
+        let adapter = PoolLedgerAdapter::new(ledger.clone());
+        assert!(adapter.contains_confirmed_txid(Digest(confirmed_r1)));
+        assert!(!adapter.contains_confirmed_txid(Digest(never_confirmed)));
+        // Not yet committed — must not be reported as confirmed.
+        assert!(!adapter.contains_confirmed_txid(Digest(confirmed_r2)));
+
+        // Commit round 2 through the same shared ledger handle (as the
+        // participation loop does) — the adapter must pick it up.
+        {
+            let mut l = ledger.lock().unwrap();
+            l.put_txtail(2, &adapter_tail_bytes(2, &[confirmed_r2]))
+                .unwrap();
+            l.set_current_round(Round(2));
+        }
+        assert!(adapter.contains_confirmed_txid(Digest(confirmed_r2)));
+        assert!(adapter.contains_confirmed_txid(Digest(confirmed_r1)));
+
+        // Advance beyond the 1000-round lookback window: round 1's txid
+        // ages out (its own last_valid would have expired — go's
+        // MaxTxnLife bound, ledger/txtail.go).
+        {
+            let mut l = ledger.lock().unwrap();
+            l.set_current_round(Round(1002));
+        }
+        assert!(
+            !adapter.contains_confirmed_txid(Digest(confirmed_r1)),
+            "txid confirmed at round 1 must age out at round 1002"
+        );
+        assert!(
+            adapter.contains_confirmed_txid(Digest(confirmed_r2)),
+            "round 2 is still inside the window at round 1002"
+        );
     }
 
     // ====================================================================
