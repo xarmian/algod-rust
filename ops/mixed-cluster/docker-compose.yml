@@ -173,6 +173,11 @@ services:
       context: ../..
       dockerfile: docker/Dockerfile
       target: runtime
+    # Deterministic tag (instead of compose's implicit
+    # `<project>-rust-node-4`) so CI can pre-build the image out of band —
+    # `docker buildx build -t algod-rust-phase6:local` with a layer cache —
+    # and have `start.sh PHASE6_SKIP_BUILD=1` pick it up without a rebuild.
+    image: algod-rust-phase6:local
     container_name: phase6-rust-node-4
     depends_on:
       go-node-1:

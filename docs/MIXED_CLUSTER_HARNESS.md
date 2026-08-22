@@ -190,25 +190,45 @@ records; `scripts/analyze.py` summarizes them and can gate on them with
 `algod-rust relay` still has no REST listener; that remains open, but the
 cluster no longer needs it.
 
-### 3. CI integration — DEFERRED, tracked as #488
+### 3. CI integration — SHIPPED as `.github/workflows/consensus-cluster.yml` (#488)
 
-This harness is **not** run by any GitHub Actions workflow, and Epic 42
-(#107) deliberately did not add one. The cost is prohibitive per PR: a
-release build of `algod-rust` in Docker, an `algorand/algod:4.5.1-stable`
-pull, a 200-round soak at ~3 s block time (10-15 minutes), and — for
-the `certs_authenticate_go` check — building go-algorand's vendored
-libsodium fork inside `tools/cert-authenticate/run-in-docker.sh`.
+The harness runs nightly in GitHub Actions. The workflow is
+**`Nightly Consensus Cluster`** (`.github/workflows/consensus-cluster.yml`),
+triggered by `schedule` (02:41 UTC daily) and `workflow_dispatch` only —
+there is deliberately **no `pull_request` and no `push` trigger**, so
+per-PR CI wall time is untouched. Every cluster test also remains
+`#[ignore]`d behind `MIXED_CLUSTER=1`, so `cargo test --workspace` still
+never touches Docker.
 
-Every cluster test is `#[ignore]`d and gated on `MIXED_CLUSTER=1`, so
-`cargo test --workspace` never touches Docker and per-PR CI is
-unaffected. Layer 9 is validated by running the harness locally; the
-evidence is recorded in `docs/PHASE6_VALIDATION.md`.
+| Tier | When | What it runs | Red gate |
+|---|---|---|---|
+| **1 — smoke** | every run | `make consensus-cluster-up` → `-status` (retried up to 5 min, so the gate measures steady state rather than boot ordering) → `SKIP_START=1 KEEP_CLUSTER=1 make consensus-cluster-smoke` (`SMOKE_ROUNDS=30`) → `make consensus-cluster-down` | lockstep loss (spread > `LAG_TOLERANCE`), a Rust node that does not advance 30 rounds, or any WARN-level Go-side agreement rejection (#469) |
+| **2 — full suite** | nightly, or `workflow_dispatch` with `tier=full` (the default) | `make consensus-cluster-test RESTART_SCENARIOS=1 NEGATIVE_CASES=1` with `ROUNDS` (default 200) and a pinned `OUT_DIR` | any failed check in `summary.json` — proposer share, vote-step coverage, cadence, fork freedom, certs under Rust *and* under go-algorand's own verifier, Go-side `VoteAccepted`, restart/rejoin (#471) and negative-injection (#472) sub-checks |
 
-Issue **#488** tracks the follow-up: a scheduled (nightly) job running
-at least `consensus-cluster-up` → `-status` → `-smoke` → `-down`, with a
-nightly tier for the full `consensus-cluster-test
-RESTART_SCENARIOS=1 NEGATIVE_CASES=1` suite and artifact retention.
-Update this section when that lands.
+Artifacts are uploaded as `consensus-cluster-<run_id>` with 30-day
+retention: `summary.json`, `soak.jsonl`, `analyze.summary.json`, the
+cert-crossverify JSONL and `verify-go-report-*.json` (the
+`tools/cert-authenticate` output), `restart/restart-summary.json`,
+`negative/negative-summary.json`, the per-node logs the analyzers read,
+and — on failure — a `container-logs/` dump of all four nodes.
+
+Cold-build cost is kept off the critical path two ways:
+
+* the `algod-rust` node image is pre-built by `docker/build-push-action`
+  with a `type=gha` buildx layer cache and tagged
+  `algod-rust-phase6:local` (the tag `docker-compose.yml` now declares
+  for `rust-node-4`); `start.sh` honours `PHASE6_SKIP_BUILD=1` and reuses
+  it instead of running `docker compose up --build` once per tier;
+* the Docker volume holding `tools/cert-authenticate`'s in-container
+  go-algorand clone **and its built libsodium** is tarred into
+  `actions/cache` (keyed on the pin plus `run-in-docker.sh`), so
+  `run-in-docker.sh`'s 3-5 minute first run is paid once. Per CLAUDE.md
+  the build itself is still go-algorand's own `make libsodium`, invoked
+  by `run-in-docker.sh` — the workflow re-implements none of it.
+
+Layer 9 evidence is recorded in `docs/PHASE6_VALIDATION.md`; the nightly
+run is now the standing source of that evidence, with local runs still
+available for iteration.
 
 ## Verification against TASK-86 acceptance
 

@@ -18,7 +18,8 @@
 #      the genesis HASH off its REST API — it is a digest over the
 #      canonical-msgpack Genesis struct, so there is no way to derive it
 #      in shell. The Rust node needs it to validate blocks.
-#   5. docker compose up -d --build rust-node-4.
+#   5. docker compose up -d --build rust-node-4 (or, with
+#      PHASE6_SKIP_BUILD=1, reuse a pre-built algod-rust-phase6:local).
 
 set -euo pipefail
 
@@ -217,8 +218,18 @@ PHASE6_GENESIS_ID=$GENESIS_ID
 PHASE6_GENESIS_HASH=$GENESIS_HASH
 EOF
 
-echo "==> docker compose up -d --build rust-node-4"
-docker compose up -d --build rust-node-4
+# PHASE6_SKIP_BUILD=1 uses whatever `algod-rust-phase6:local` already
+# exists instead of rebuilding it. The nightly CI job
+# (.github/workflows/consensus-cluster.yml) pre-builds that tag with a
+# buildx GitHub-Actions layer cache, so the release compile is not
+# repeated on every `up`. Locally the default (build) is what you want.
+if [ "${PHASE6_SKIP_BUILD:-0}" = "1" ]; then
+    echo "==> docker compose up -d rust-node-4 (PHASE6_SKIP_BUILD=1, using algod-rust-phase6:local)"
+    docker compose up -d rust-node-4
+else
+    echo "==> docker compose up -d --build rust-node-4"
+    docker compose up -d --build rust-node-4
+fi
 
 echo ""
 echo "cluster started. peek at rounds with:"

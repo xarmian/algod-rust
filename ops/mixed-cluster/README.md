@@ -655,7 +655,7 @@ Everything TASK-86 originally deferred has since shipped:
 | Long soak with a metrics collector (TASK-87) | Shipped — `scripts/soak.sh` + `scripts/metrics.py` + `scripts/analyze.py` |
 | Fork detection / cert cross-verify (TASK-88, TASK-95) | Shipped — `algo-fork-detector`, `algo-cert-crossverify`, `tools/cert-authenticate` via `scripts/verify-soak.sh` |
 | Rust consensus participation | Shipped — issue #468 (key interop) + #469 (online participant); the Rust node votes and proposes |
-| **CI integration** | **Still deferred**, tracked as issue **#488** — a container build + release build + 200-round soak is too slow for per-PR CI. All cluster tests are `#[ignore]`d and gated on `MIXED_CLUSTER=1`. |
+| CI integration | Shipped — issue **#488**: `.github/workflows/consensus-cluster.yml` runs Tier 1 (`up` → `status` → `smoke` → `down`) and Tier 2 (`consensus-cluster-test RESTART_SCENARIOS=1 NEGATIVE_CASES=1`) nightly at 02:41 UTC, plus on `workflow_dispatch`. **Never per-PR** — a container build + release build + 200-round soak is far too slow for that, so there is no `pull_request`/`push` trigger and all cluster tests stay `#[ignore]`d behind `MIXED_CLUSTER=1`. Artifacts (`summary.json`, `soak.jsonl`, `analyze.summary.json`, verifier reports) are kept 30 days. See `docs/MIXED_CLUSTER_HARNESS.md` §3. |
 
 ## Related docs
 
