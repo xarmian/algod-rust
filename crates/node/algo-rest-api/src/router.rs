@@ -63,7 +63,11 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
         .route("/ready", get(handlers::ready::<N>))
         .route("/versions", get(handlers::versions::<N>))
         .route("/genesis", get(handlers::genesis::<N>))
-        .route("/swagger.json", get(handlers::swagger_json));
+        .route("/swagger.json", get(handlers::swagger_json))
+        // Prometheus text exposition (issue #473). Public, like
+        // go-algorand's `/metrics`: it carries counters only, and every
+        // off-the-shelf scraper expects an unauthenticated endpoint.
+        .route("/metrics", get(handlers::metrics::<N>));
 
     // Authenticated routes (public API token required)
     let authenticated = Router::new()
@@ -153,6 +157,15 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             post(handlers::teal_disassemble::<N>),
         )
         .route("/v2/teal/dryrun", post(handlers::teal_dryrun::<N>))
+        // Consensus-participation metrics as JSON (issue #473). Guarded by
+        // the public token like the rest of `/v2`; the static `status`
+        // segment takes priority over the admin group's
+        // `/v2/participation/:participation-id`, which only matches
+        // participation IDs.
+        .route(
+            "/v2/participation/status",
+            get(handlers::get_participation_status::<N>),
+        )
         .route(
             "/v2/devmode/blocks/offset",
             get(handlers::get_block_timestamp_offset::<N>),

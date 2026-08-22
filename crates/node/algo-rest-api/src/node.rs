@@ -859,6 +859,33 @@ pub trait NodeInterface: Send + Sync + 'static {
         false
     }
 
+    /// Consensus-participation metrics as a JSON document, or `None` when this
+    /// node is not participating in consensus (issue #473).
+    ///
+    /// Returned as an opaque `serde_json::Value` on purpose: the counters live
+    /// in `algo-agreement`, and this crate deliberately does not depend on the
+    /// agreement stack (it would drag the pool, validator, and AVM into every
+    /// REST build). The node adapter — which already depends on both — does
+    /// the conversion, and this trait only carries the payload.
+    ///
+    /// `None` is the "endpoint not configured" case: `GET
+    /// /v2/participation/status` answers 404 rather than an empty document, so
+    /// a scraper can distinguish "node isn't participating" from "node is
+    /// participating and has cast zero votes so far".
+    fn participation_status(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// The same counters rendered as Prometheus text exposition, or `None`
+    /// when this node is not participating in consensus.
+    ///
+    /// Served by `GET /metrics`. Rendering happens in `algo-agreement` (see
+    /// `ParticipationSnapshot::to_prometheus_text`) so the workspace needs no
+    /// `prometheus` crate dependency.
+    fn metrics_exposition(&self) -> Option<String> {
+        None
+    }
+
     /// Get the block timestamp offset (dev mode only).
     ///
     /// Returns `Err` if not in dev mode, `Ok(None)` if never set,

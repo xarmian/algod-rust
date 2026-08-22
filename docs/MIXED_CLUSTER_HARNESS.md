@@ -124,17 +124,37 @@ What remains is the live end-to-end run: flipping the compose file's
 Rust node over to `participate` and confirming it proposes alongside the
 Go nodes. That is the rest of Epic 42 (#107), not a format question.
 
-### 2. REST surface on the Rust relay
+### 2. REST surface on the Rust relay — RESOLVED (#469, #473)
 
-The current `algod-rust relay` subcommand doesn't expose `/v2/status`
-(TASK-79 wired REST into `participate`, not `relay`). `status.sh`
-therefore reports `n/a` for the Rust node. Short-term workaround: point
-`status.sh` at the Rust node's gossip port instead, or have TASK-87's
-soak harness scrape container logs.
+The cluster's Rust node runs `algod-rust participate --rest-listen
+0.0.0.0:8080` (host port 4004) since issue #469, so `status.sh` and
+`metrics.py` read its round from the same `/v2/status` endpoint as the Go
+nodes'. Issue #473 added two participation-observability endpoints on top:
 
-Longer-term fix: a future task can add `--rest-listen` to the `relay`
-subcommand, reusing the NodeInterface adapter already built in TASK-79
-(`bin/algod-rust/src/node_interface_impl.rs`).
+| Endpoint | Auth | Payload |
+|---|---|---|
+| `GET /v2/participation/status` | public API token | JSON snapshot: vote counts by step, proposals made/accepted/rejected, reproposals, blocks committed, broadcast failures, and round-timing stats (round start → first vote / proposal / commit) including a rolling per-round sample array |
+| `GET /metrics` | none | The same counters in Prometheus text exposition format |
+
+Both answer **404 when the process is not participating in consensus**
+(`serve`, dev mode, read-only inspection) so a scraper can distinguish
+"not participating" from "participating, zero votes so far" — the latter
+is a 200 with zeroed counters.
+
+Neither is a go-algorand conformance surface: go has no
+`/v2/participation/status`, and its `/metrics` is served by a different
+subsystem with a different metric set. These are algod-rust extensions
+for this harness, deliberately implemented with **no new workspace
+dependency** — the exposition text is rendered by hand in
+`crates/core/algo-agreement/src/metrics.rs`.
+
+`scripts/status.sh` prints a participation column from the JSON endpoint;
+`scripts/metrics.py` writes `participation` / `participation_final` JSONL
+records; `scripts/analyze.py` summarizes them and can gate on them with
+`--require-participation-endpoint` / `--max-round-duration-ms`.
+
+`algod-rust relay` still has no REST listener; that remains open, but the
+cluster no longer needs it.
 
 ### 3. CI integration
 

@@ -43,6 +43,22 @@
 #                              time exceeds S seconds (0 = disabled).
 #   --max-p95-block-time S     Same, on the p95 (0 = disabled).
 #
+# Issue #473 (Epic 42f) additions — the Rust node now serves
+# `GET /v2/participation/status`, and metrics.py records it as
+# "participation" / "participation_final" JSONL records. These are always
+# summarized when present (older soak files are unaffected) and can be
+# gated:
+#
+#   --require-participation-endpoint   Fail unless the endpoint reported
+#                                      real votes at every required step.
+#   --max-round-duration-ms MS         With the above: fail if the node's
+#                                      p95 round-start-to-commit exceeds MS.
+#
+# The endpoint supersedes --rust-log as *evidence*: the log says a line was
+# printed, the endpoint reports what the agreement state machine counted,
+# plus per-round timings the log never carried. --rust-log is still
+# supported (and still the only source for equivocation-shaped checks).
+#
 # Acceptance-criteria hints (printed at the bottom):
 #   - Any stall / interrupt / timeout phase in run_meta
 #   - Any lag > --lag-tolerance
@@ -286,6 +302,161 @@ def parse_rust_participation_log(text: str):
         "last_round": max(rounds) if rounds else None,
         "period_advanced_rounds": sorted(period_advanced_rounds),
         "reproposals": len(repropose_rounds),
+    }
+
+
+def summarize_participation_records(records):
+    """Issue #473 — fold `participation` / `participation_final` records.
+
+    metrics.py polls the Rust node's `GET /v2/participation/status`, which
+    reports counters straight out of the agreement service. That is strictly
+    better evidence than the log scrape above: the log tells us a line was
+    printed, the endpoint tells us what the node's own state machine counted,
+    including timings the log never carried.
+
+    Returns `None` when the run predates #473 (no such records), so older
+    soak outputs analyze exactly as before.
+    """
+    samples = [r for r in records if r.get("kind") == "participation"]
+    finals = [r for r in records if r.get("kind") == "participation_final"]
+    if not samples and not finals:
+        return None
+
+    final = next(
+        (r for r in reversed(finals) if r.get("available") and r.get("snapshot")),
+        None,
+    )
+    snapshot = final.get("snapshot") if final else None
+    if snapshot is None:
+        # Fall back to the last available per-tick summary, which carries the
+        # counters but not `recent_rounds`.
+        snapshot = next(
+            (r for r in reversed(samples) if r.get("available")),
+            None,
+        )
+
+    unavailable = [r for r in samples if not r.get("available")]
+    out = {
+        "samples": len(samples),
+        "unavailable_samples": len(unavailable),
+        "unavailable_reasons": dict(
+            Counter(r.get("reason", "unknown") for r in unavailable)
+        ),
+        "endpoint_ever_available": bool(snapshot),
+    }
+    if not snapshot:
+        return out
+
+    # The per-tick summary uses `*_ms` sub-dicts with short keys; the full
+    # snapshot uses the raw field names. Read both shapes.
+    def stats(name):
+        raw = snapshot.get(name)
+        if isinstance(raw, dict) and "last_ms" in raw:
+            return {
+                "count": raw.get("count"),
+                "last": raw.get("last_ms"),
+                "min": raw.get("min_ms"),
+                "max": raw.get("max_ms"),
+                "mean": raw.get("mean_ms"),
+            }
+        return snapshot.get(name + "_ms")
+
+    out.update({
+        "votes_cast_total": snapshot.get("votes_cast_total"),
+        "votes_cast_by_step": snapshot.get("votes_cast_by_step") or {},
+        "proposals_made": snapshot.get("proposals_made"),
+        "proposal_rounds": snapshot.get("proposal_rounds"),
+        "proposals_accepted": snapshot.get("proposals_accepted"),
+        "proposals_rejected": snapshot.get("proposals_rejected"),
+        "reproposals": snapshot.get("reproposals"),
+        "blocks_committed": snapshot.get("blocks_committed"),
+        "vote_broadcast_failures": snapshot.get("vote_broadcast_failures"),
+        "rounds_started": snapshot.get("rounds_started"),
+        "last_committed_round": snapshot.get("last_committed_round"),
+        "round_duration_ms": stats("round_duration"),
+        "round_start_to_first_vote_ms": stats("round_start_to_first_vote"),
+        "round_start_to_proposal_ms": stats("round_start_to_proposal"),
+    })
+
+    # Per-round timing distribution, available only from the full snapshot.
+    recent = snapshot.get("recent_rounds")
+    if isinstance(recent, list) and recent:
+        commits = [
+            s["start_to_commit_ms"] for s in recent
+            if isinstance(s, dict) and isinstance(s.get("start_to_commit_ms"), (int, float))
+        ]
+        votes = [
+            s["start_to_first_vote_ms"] for s in recent
+            if isinstance(s, dict)
+            and isinstance(s.get("start_to_first_vote_ms"), (int, float))
+        ]
+        out["recent_rounds_count"] = len(recent)
+        out["recent_round_duration_ms"] = {
+            "n": len(commits),
+            "p50": percentile(commits, 50),
+            "p95": percentile(commits, 95),
+            "max": max(commits) if commits else None,
+        }
+        out["recent_first_vote_ms"] = {
+            "n": len(votes),
+            "p50": percentile(votes, 50),
+            "p95": percentile(votes, 95),
+            "max": max(votes) if votes else None,
+        }
+    return out
+
+
+def participation_endpoint_check(part: dict, required_steps, max_round_ms: float = 0.0):
+    """Issue #473 — assert the endpoint proves real participation.
+
+    Distinct from `step_coverage_check`, which reads the same facts out of
+    the log: this one reads the node's own counters, and additionally gates
+    round-progression timing (`--max-round-duration-ms`), which is what makes
+    "the Rust node keeps pace with the Go nodes" a measurement rather than an
+    inference from block cadence.
+    """
+    failures = []
+    if not part or not part.get("endpoint_ever_available"):
+        failures.append(
+            "the Rust node's /v2/participation/status never answered — "
+            "is it running `participate --rest-listen` (issues #469/#473)?"
+        )
+        return {"ok": False, "failures": failures, "required_steps": list(required_steps)}
+
+    by_step = part.get("votes_cast_by_step") or {}
+    seen = set(by_step)
+    normalized = set(seen)
+    if any(s.startswith("next+") for s in seen):
+        normalized.add("next")
+    missing = [s for s in required_steps if s not in normalized]
+
+    if not part.get("votes_cast_total"):
+        failures.append(
+            "the participation endpoint reports zero votes cast — the node "
+            "is running but not voting"
+        )
+    elif missing:
+        failures.append(
+            "participation endpoint shows no votes at step(s): "
+            + ", ".join(missing)
+            + f" (saw: {', '.join(sorted(seen)) or 'none'})"
+        )
+
+    duration = part.get("recent_round_duration_ms") or {}
+    p95 = duration.get("p95")
+    if max_round_ms > 0 and isinstance(p95, (int, float)) and p95 > max_round_ms:
+        failures.append(
+            f"p95 round duration {p95:.0f}ms > --max-round-duration-ms "
+            f"{max_round_ms:.0f} — the Rust node is not keeping pace"
+        )
+
+    return {
+        "required_steps": list(required_steps),
+        "steps_seen": sorted(seen),
+        "missing_steps": missing,
+        "max_round_duration_ms": max_round_ms,
+        "ok": not failures,
+        "failures": failures,
     }
 
 
@@ -553,6 +724,8 @@ def summarize(records, lag_tolerance: int):
         "lag_violation": lag_violation,
         "lag_tolerance": lag_tolerance,
         "rust_summary": rust_summary,
+        # None on pre-#473 soak outputs (no participation records present).
+        "rust_participation": summarize_participation_records(records),
         "warnings": {
             "count": len(warnings),
             "digest": dict(warning_digest),
@@ -700,6 +873,46 @@ def print_report(summary, source_paths):  # noqa: C901 — one linear report
         )
         print()
 
+    # ── #473: participation endpoint ────────────────────────────────────
+    part = summary.get("rust_participation")
+    if part:
+        print("Rust participation endpoint (issue #473, /v2/participation/status):")
+        if not part.get("endpoint_ever_available"):
+            print(f"  UNAVAILABLE — samples={part['samples']} "
+                  f"reasons={part.get('unavailable_reasons')}")
+        else:
+            print(
+                f"  votes={part.get('votes_cast_total')} "
+                f"by_step={part.get('votes_cast_by_step')} "
+                f"proposals={part.get('proposals_made')} "
+                f"(accepted={part.get('proposals_accepted')}, "
+                f"rejected={part.get('proposals_rejected')}) "
+                f"reproposals={part.get('reproposals')}"
+            )
+            print(
+                f"  rounds_started={part.get('rounds_started')} "
+                f"blocks_committed={part.get('blocks_committed')} "
+                f"last_committed_round={part.get('last_committed_round')} "
+                f"broadcast_failures={part.get('vote_broadcast_failures')}"
+            )
+            for label, key in (
+                ("round duration", "recent_round_duration_ms"),
+                ("round start to first vote", "recent_first_vote_ms"),
+            ):
+                d = part.get(key)
+                if d and d.get("n"):
+                    print(
+                        f"  {label} (ms, last {d['n']} rounds): "
+                        f"p50={d['p50']:.0f} p95={d['p95']:.0f} max={d['max']:.0f}"
+                    )
+            if part.get("unavailable_samples"):
+                print(f"  note: {part['unavailable_samples']} sample(s) could not "
+                      f"reach the endpoint: {part.get('unavailable_reasons')}")
+        pc = summary.get("rust_participation_check")
+        if pc:
+            print("  " + ("OK" if pc["ok"] else "FAIL"))
+        print()
+
     rs = summary["rust_summary"]
     print(f"Rust node (phase6-rust-node-4): samples={rs['samples']} "
           f"states={rs['state_counts']} "
@@ -731,7 +944,12 @@ def print_report(summary, source_paths):  # noqa: C901 — one linear report
         hints.append(
             f"{len(r['blocks_missing_proposer'])} block(s) missing proposer"
         )
-    for key in ("rust_proposer_share", "rust_step_coverage", "cadence"):
+    for key in (
+        "rust_proposer_share",
+        "rust_step_coverage",
+        "rust_participation_check",
+        "cadence",
+    ):
         section = summary.get(key)
         if section:
             hints.extend(section.get("failures", []))
@@ -774,6 +992,16 @@ def main() -> int:
     parser.add_argument("--require-steps", default=",".join(DEFAULT_REQUIRED_STEPS),
                         help="Comma-separated vote steps that must appear in "
                              "--rust-log (default: soft,cert).")
+    # ── issue #473 (Epic 42f) participation-endpoint assertions ─────────
+    parser.add_argument("--require-participation-endpoint", action="store_true",
+                        help="Assert the Rust node's /v2/participation/status "
+                             "reported real votes (issue #473). Without this "
+                             "flag the endpoint data is reported but not gated, "
+                             "so pre-#473 soak outputs still analyze cleanly.")
+    parser.add_argument("--max-round-duration-ms", type=float, default=0.0,
+                        help="With --require-participation-endpoint: fail if the "
+                             "Rust node's p95 round-start-to-commit time exceeds "
+                             "this many ms (0 = disabled).")
     parser.add_argument("--max-mean-block-time", type=float, default=0.0,
                         help="Fail if mean inter-block time exceeds this many "
                              "seconds (0 = disabled).")
@@ -813,6 +1041,13 @@ def main() -> int:
         required = [s.strip() for s in args.require_steps.split(",") if s.strip()]
         summary["rust_participation_log"] = parsed
         summary["rust_step_coverage"] = step_coverage_check(parsed, required)
+    if args.require_participation_endpoint:
+        required = [s.strip() for s in args.require_steps.split(",") if s.strip()]
+        summary["rust_participation_check"] = participation_endpoint_check(
+            summary.get("rust_participation"),
+            required,
+            args.max_round_duration_ms,
+        )
     summary["cadence"] = cadence_check(
         summary["block_time_s"],
         args.max_mean_block_time,

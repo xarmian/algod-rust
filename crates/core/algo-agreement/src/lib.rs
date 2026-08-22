@@ -19,6 +19,7 @@ mod golden_vectors;
 mod hashable;
 mod ledger_reader;
 mod lookback;
+pub mod metrics;
 pub mod persistence;
 pub mod player;
 mod proposal;
@@ -131,6 +132,12 @@ pub use crypto_verifier::{AsyncCryptoVerifier, NoOpValidator};
 
 // Re-exports from service module
 pub use service::{Parameters, Service, ServiceHandle};
+
+// Re-exports from the participation-metrics module (issue #473)
+pub use metrics::{
+    ManualMetricsClock, MetricsClock, ParticipationMetrics, ParticipationSnapshot,
+    RoundTimingSample, SystemMetricsClock, TimingStats, RECENT_ROUND_CAPACITY,
+};
 
 // Re-exports from clock module
 pub use clock::Clock;
