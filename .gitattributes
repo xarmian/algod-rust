@@ -41,3 +41,11 @@ docker/localnet-rust/data/algod.admin.token text eol=lf
 *.sqlite binary
 *.sqlite-shm binary
 *.sqlite-wal binary
+
+# Go-produced SQLite artifacts (participation key databases captured from
+# `goal network create` / `algokey part generate`). `text=auto` above would
+# normally detect these as binary via their NUL bytes, but say so
+# explicitly: a single byte rewritten by a misconfigured checkout turns a
+# format-parity fixture into a corrupt database.
+crates/**/fixtures/**/*.partkey binary
+crates/**/fixtures/**/*.sqlite binary

@@ -2322,6 +2322,144 @@ fn import_go_partkeys(store: &ParticipationStore, paths: &[PathBuf]) -> anyhow::
     Ok(inserted)
 }
 
+/// Rust port of go-algorand's `config.IsPartKeyFilename`
+/// (`../go-algorand/config/keyfile.go:86-91` @ v4.5.1-stable).
+///
+/// Go builds partkey names with `fmt.Sprintf("%s.%d.%d.partkey", account,
+/// firstValid, lastValid)` and recognises a name by *round-tripping* it:
+/// `extractPartValidInterval` pulls the two numeric components, then the
+/// name is accepted only if re-formatting them reproduces the original
+/// string. That round-trip is why `Wallet1.01.1500.partkey` and
+/// `Wallet1.+0.1500.partkey` are rejected even though both parse — and it
+/// is the behaviour this port has to reproduce, because a name Go skips
+/// must be skipped here too (otherwise a mixed cluster disagrees about
+/// which files are key material).
+///
+/// It also means the SQLite sidecars `algod` leaves next to a live partkey
+/// (`*.partkey-wal`, `*.partkey-shm`) fall out for free: their final
+/// dot-component is not `partkey`.
+fn is_partkey_filename(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('.').collect();
+    let np = parts.len();
+    // Go requires at least `<name>.<first>.<last>.partkey`.
+    if np < 4 || parts[np - 1] != "partkey" {
+        return false;
+    }
+    let (first_str, last_str) = (parts[np - 3], parts[np - 2]);
+    let (Ok(first), Ok(last)) = (first_str.parse::<u64>(), last_str.parse::<u64>()) else {
+        return false;
+    };
+    if first > last {
+        return false;
+    }
+    // The `%d` round-trip: rejects leading zeros, `+` signs, and any other
+    // spelling that wouldn't have been produced by `PartKeyFilename`.
+    first_str == first.to_string() && last_str == last.to_string()
+}
+
+/// Discover go-algorand `.partkey` files in `dir`, mirroring
+/// `AlgorandFullNode.loadParticipationKeys`
+/// (`../go-algorand/node/node.go:1020-1088` @ v4.5.1-stable), which reads
+/// the node's genesis directory and considers every entry whose name
+/// satisfies `config.IsPartKeyFilename`.
+///
+/// Parity notes:
+/// - An unreadable directory is a hard error, exactly as in Go
+///   (`could not read directory %v`). A *missing* directory is the
+///   caller's business — `run` only calls this for paths it has already
+///   established exist, so a read failure here really is a broken node.
+/// - Names that don't match are skipped silently, as in Go.
+/// - Results are sorted so import order (and therefore the log
+///   transcript) is deterministic; Go inherits `os.ReadDir`'s sort.
+fn discover_partkey_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        anyhow::anyhow!(
+            "could not read participation key directory {}: {}",
+            dir.display(),
+            e
+        )
+    })?;
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            anyhow::anyhow!(
+                "could not read an entry of participation key directory {}: {}",
+                dir.display(),
+                e
+            )
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_partkey_filename(name) {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        found.push(path);
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Resolve the full set of `.partkey` files to bridge into the registry at
+/// startup: the explicit `--import-partkey` paths, plus everything
+/// auto-discovered under `--partkey-dir` and under the Go-style genesis
+/// directory `<data_dir>/<genesis_id>`.
+///
+/// The genesis-directory scan is the parity path: it is where
+/// `goal network create` drops each node's key
+/// (`netroot/Node1/phase6net-v1/Wallet1.0.1500.partkey`) and where Go's
+/// `loadParticipationKeys` looks. Pointing `--data-dir` at a
+/// goal-generated node directory therefore needs no conversion step at
+/// all, which is the acceptance bar for issue #468.
+///
+/// Duplicates are collapsed so a path named explicitly *and* found by a
+/// scan is only imported once; `import_go_partkeys` tolerates re-imports
+/// anyway, but a deduplicated list keeps the startup log honest.
+fn resolve_partkey_imports(
+    explicit: &[PathBuf],
+    partkey_dirs: &[PathBuf],
+    data_dir: Option<&Path>,
+    genesis_id: &str,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut dirs: Vec<PathBuf> = partkey_dirs.to_vec();
+    // Go parity: algod always scans its genesis dir, no flag required.
+    if let Some(data_dir) = data_dir {
+        let genesis_dir = data_dir.join(genesis_id);
+        if genesis_dir.is_dir() && !dirs.iter().any(|d| d == &genesis_dir) {
+            info!(
+                dir = %genesis_dir.display(),
+                "scanning the genesis directory for participation keys (go-algorand parity)"
+            );
+            dirs.push(genesis_dir);
+        }
+    }
+
+    let mut out: Vec<PathBuf> = Vec::new();
+    let push_unique = |p: PathBuf, out: &mut Vec<PathBuf>| {
+        if !out.iter().any(|existing| existing == &p) {
+            out.push(p);
+        }
+    };
+    for p in explicit {
+        push_unique(p.clone(), &mut out);
+    }
+    for dir in &dirs {
+        for path in discover_partkey_files(dir)? {
+            info!(
+                path = %path.display(),
+                "discovered go-algorand participation key file"
+            );
+            push_unique(path, &mut out);
+        }
+    }
+    Ok(out)
+}
+
 /// Seed `accountbase` + `accounttotals` from a `genesis.json` when the ledger
 /// is brand new.
 ///
@@ -2391,6 +2529,7 @@ pub async fn run(
     peers: &[String],
     partkey_path: &Path,
     import_partkeys: &[PathBuf],
+    partkey_dirs: &[PathBuf],
     genesis_json_path: Option<&Path>,
     listen_address: Option<&str>,
     relay_messages: bool,
@@ -2491,10 +2630,16 @@ pub async fn run(
     // Bridge go-algorand `.partkey` files into the registry schema before
     // counting keys, so a node whose only key material comes from a
     // `goal network create` netroot still boots with live keys.
-    if !import_partkeys.is_empty() {
-        let n = import_go_partkeys(&part_store, import_partkeys)?;
+    let to_import = resolve_partkey_imports(
+        import_partkeys,
+        partkey_dirs,
+        rest_opts.data_dir.as_deref(),
+        &resolved_genesis_id,
+    )?;
+    if !to_import.is_empty() {
+        let n = import_go_partkeys(&part_store, &to_import)?;
         info!(
-            requested = import_partkeys.len(),
+            requested = to_import.len(),
             inserted = n,
             "imported go-algorand participation keys into the registry"
         );
@@ -3369,6 +3514,282 @@ mod tests {
         let json = synthesize_genesis_json("foo-bar-baz", "mainnet", "proto");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["id"], "foo-bar-baz");
+    }
+
+    // ── Partkey auto-discovery (issue #468) ─────────────────────────
+    //
+    // The accept/reject table below is Go's, not ours: every case is
+    // what `config.IsPartKeyFilename` returns at v4.5.1-stable. A name
+    // Go skips must be skipped here, or a mixed cluster disagrees about
+    // what counts as key material.
+
+    #[test]
+    fn is_partkey_filename_accepts_goal_network_create_names() {
+        // Exactly what `goal network create` writes.
+        assert!(is_partkey_filename("Wallet1.0.1500.partkey"));
+        assert!(is_partkey_filename("Wallet4.0.30000.partkey"));
+        // Account names may themselves contain dots — Go takes the
+        // numeric fields from the *end* of the name.
+        assert!(is_partkey_filename("my.wallet.name.1.100.partkey"));
+        // first == last is a legal single-round window.
+        assert!(is_partkey_filename("W.7.7.partkey"));
+    }
+
+    #[test]
+    fn is_partkey_filename_rejects_non_partkey_names() {
+        assert!(!is_partkey_filename("Wallet1.rootkey"));
+        assert!(!is_partkey_filename("genesis.json"));
+        assert!(!is_partkey_filename("partkey"));
+        // Too few components: Go requires >= 4.
+        assert!(!is_partkey_filename("0.1500.partkey"));
+        // The SQLite sidecars a running node leaves behind. Importing a
+        // `-wal` as if it were a database would be a hard error at open
+        // time, so this exclusion is load-bearing.
+        assert!(!is_partkey_filename("Wallet1.0.1500.partkey-wal"));
+        assert!(!is_partkey_filename("Wallet1.0.1500.partkey-shm"));
+        // Go renames unsupported-schema keys to `*.old` and must not
+        // pick them back up on the next boot.
+        assert!(!is_partkey_filename("Wallet1.0.1500.partkey.old"));
+    }
+
+    #[test]
+    fn is_partkey_filename_rejects_non_roundtripping_numbers() {
+        // `%d` never emits leading zeros, so Go's round-trip check
+        // rejects these even though they parse fine.
+        assert!(!is_partkey_filename("W.01.1500.partkey"));
+        assert!(!is_partkey_filename("W.0.01500.partkey"));
+        assert!(!is_partkey_filename("W.+0.1500.partkey"));
+        assert!(!is_partkey_filename("W.-1.1500.partkey"));
+        assert!(!is_partkey_filename("W.a.b.partkey"));
+        // first > last is incoherent and rejected by
+        // `extractPartValidInterval`.
+        assert!(!is_partkey_filename("W.1500.0.partkey"));
+    }
+
+    #[test]
+    fn discover_partkey_files_finds_only_partkeys_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "Wallet2.0.1500.partkey",
+            "Wallet1.0.1500.partkey",
+            "Wallet1.rootkey",
+            "genesis.json",
+            "Wallet1.0.1500.partkey-wal",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        // A directory whose *name* looks like a partkey must not be
+        // returned — Go opens files, not directories.
+        std::fs::create_dir(dir.path().join("Wallet9.0.1.partkey")).unwrap();
+
+        let found = discover_partkey_files(dir.path()).expect("discover");
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Wallet1.0.1500.partkey", "Wallet2.0.1500.partkey"],
+            "discovery must return only partkey files, in a deterministic order"
+        );
+    }
+
+    #[test]
+    fn discover_partkey_files_on_empty_dir_returns_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(discover_partkey_files(dir.path())
+            .expect("discover")
+            .is_empty());
+    }
+
+    #[test]
+    fn discover_partkey_files_errors_on_unreadable_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let err = discover_partkey_files(&missing).expect_err("missing dir must error");
+        assert!(
+            err.to_string()
+                .contains("could not read participation key directory"),
+            "error should name the unreadable directory, got: {err}"
+        );
+    }
+
+    /// The Go-parity path: `--data-dir <node>` alone must find the key
+    /// `goal network create` wrote to `<node>/<genesis-id>/`, with no
+    /// `--import-partkey` and no `--partkey-dir`.
+    #[test]
+    fn resolve_partkey_imports_scans_the_genesis_dir_like_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let genesis_dir = dir.path().join("phase6net-v1");
+        std::fs::create_dir(&genesis_dir).unwrap();
+        std::fs::write(genesis_dir.join("Wallet1.0.1500.partkey"), b"x").unwrap();
+        std::fs::write(genesis_dir.join("Wallet1.rootkey"), b"x").unwrap();
+
+        let got =
+            resolve_partkey_imports(&[], &[], Some(dir.path()), "phase6net-v1").expect("resolve");
+        assert_eq!(got, vec![genesis_dir.join("Wallet1.0.1500.partkey")]);
+    }
+
+    /// A data dir with no genesis subdirectory (a plain Rust-only node)
+    /// must not error — the scan is opportunistic.
+    #[test]
+    fn resolve_partkey_imports_tolerates_missing_genesis_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let got =
+            resolve_partkey_imports(&[], &[], Some(dir.path()), "phase6net-v1").expect("resolve");
+        assert!(got.is_empty());
+    }
+
+    /// Explicit paths come first and survive; a path that is both named
+    /// explicitly and found by a scan appears once.
+    #[test]
+    fn resolve_partkey_imports_dedupes_explicit_and_discovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let genesis_dir = dir.path().join("phase6net-v1");
+        std::fs::create_dir(&genesis_dir).unwrap();
+        let shared = genesis_dir.join("Wallet1.0.1500.partkey");
+        std::fs::write(&shared, b"x").unwrap();
+
+        let scan_dir = dir.path().join("extra");
+        std::fs::create_dir(&scan_dir).unwrap();
+        let extra = scan_dir.join("Wallet2.0.1500.partkey");
+        std::fs::write(&extra, b"x").unwrap();
+
+        let got = resolve_partkey_imports(
+            std::slice::from_ref(&shared),
+            std::slice::from_ref(&scan_dir),
+            Some(dir.path()),
+            "phase6net-v1",
+        )
+        .expect("resolve");
+        assert_eq!(
+            got,
+            vec![shared, extra],
+            "explicit paths lead, discovered paths follow, no duplicates"
+        );
+    }
+
+    /// Without a data dir there is no genesis directory to guess at, so
+    /// only what the operator named is imported.
+    #[test]
+    fn resolve_partkey_imports_without_data_dir_uses_explicit_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("Wallet1.0.1500.partkey");
+        std::fs::write(&p, b"x").unwrap();
+        let got = resolve_partkey_imports(std::slice::from_ref(&p), &[], None, "phase6net-v1")
+            .expect("resolve");
+        assert_eq!(got, vec![p]);
+    }
+
+    /// An explicitly requested `--partkey-dir` that doesn't exist is a
+    /// configuration error and must fail loudly, unlike the
+    /// opportunistic genesis-dir scan.
+    #[test]
+    fn resolve_partkey_imports_propagates_partkey_dir_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope");
+        let err = resolve_partkey_imports(&[], &[missing], None, "phase6net-v1")
+            .expect_err("missing --partkey-dir must error");
+        assert!(err
+            .to_string()
+            .contains("could not read participation key directory"));
+    }
+
+    /// End-to-end for issue #468 criterion 3, using the real
+    /// `goal network create` artifact committed under
+    /// `crates/core/algo-ledger/tests/fixtures/partkey/goal-network-create/`
+    /// (capture procedure documented in
+    /// `crates/core/algo-ledger/tests/goal_network_create_test.rs`).
+    ///
+    /// Lay the fixture out the way `goal` does — `<data-dir>/<genesis-id>/`
+    /// — and drive the whole startup path: discover, restore, insert into
+    /// the registry `--partkey-path` reads. No conversion step, no flags
+    /// beyond `--data-dir`.
+    #[test]
+    fn goal_network_create_key_is_discovered_and_registered() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/core/algo-ledger/tests/fixtures/partkey/goal-network-create")
+            .join("Wallet1.0.1500.partkey");
+        assert!(
+            fixture.exists(),
+            "goal-network-create fixture missing at {}",
+            fixture.display()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let genesis_dir = dir.path().join("phase6net-v1");
+        std::fs::create_dir(&genesis_dir).unwrap();
+        let staged = genesis_dir.join("Wallet1.0.1500.partkey");
+        std::fs::copy(&fixture, &staged).unwrap();
+        // Sidecars and the root key sit next to it in a real netroot.
+        std::fs::write(genesis_dir.join("Wallet1.rootkey"), b"not a partkey").unwrap();
+
+        let to_import = resolve_partkey_imports(&[], &[], Some(dir.path()), "phase6net-v1")
+            .expect("resolve imports");
+        assert_eq!(to_import, vec![staged]);
+
+        let store = ParticipationStore::open_in_memory().expect("registry");
+        let inserted = import_go_partkeys(&store, &to_import).expect("import");
+        assert_eq!(inserted, 1);
+
+        let records = store.get_all().expect("get_all");
+        assert_eq!(records.len(), 1);
+        let rec = &records[0];
+        assert_eq!(
+            rec.account.to_string(),
+            "TO2V5UP4UGHPVJPY4BBIAVNDF2SYGHCSL6DH5VNLSVCUBZ42BJFJZFKXCE",
+            "registered account must be the Wallet1 address from goal's genesis.json"
+        );
+        assert_eq!(rec.first_valid.0, 0);
+        assert_eq!(rec.last_valid.0, 1500);
+        assert_eq!(rec.key_dilution, 10_000);
+        assert!(
+            rec.vote_id.is_some() && rec.vrf_public_key.is_some(),
+            "a key missing vote_id or the VRF key is filtered out of consensus"
+        );
+
+        // Restarting against the same registry volume must converge, not
+        // crash on the UNIQUE(participationID) constraint.
+        let again = import_go_partkeys(&store, &to_import).expect("re-import is a no-op");
+        assert_eq!(again, 0);
+        assert_eq!(store.get_all().expect("get_all").len(), 1);
+    }
+
+    /// Negative path: a truncated/garbage file whose *name* passes the
+    /// discovery filter must fail the import with a message naming the
+    /// file, not silently register nothing.
+    #[test]
+    fn import_go_partkeys_rejects_a_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir.path().join("Wallet1.0.1500.partkey");
+        std::fs::write(&bogus, b"this is not a sqlite database").unwrap();
+
+        let store = ParticipationStore::open_in_memory().expect("registry");
+        let err = import_go_partkeys(&store, std::slice::from_ref(&bogus))
+            .expect_err("corrupt file must fail");
+        assert!(
+            err.to_string().contains("Wallet1.0.1500.partkey"),
+            "error should name the offending file, got: {err}"
+        );
+        assert!(store.get_all().expect("get_all").is_empty());
+    }
+
+    /// An empty file is a distinct failure mode (an interrupted copy);
+    /// SQLite would happily open it as a blank database, so
+    /// `restore_partkey_file` short-circuits on zero length.
+    #[test]
+    fn restore_partkey_file_rejects_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("Wallet1.0.1500.partkey");
+        std::fs::write(&empty, b"").unwrap();
+        let err = match restore_partkey_file(&empty) {
+            Ok(_) => panic!("an empty partkey file must not restore"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("is empty"),
+            "error should say the file is empty, got: {err}"
+        );
     }
 
     // ── Helper: V41 consensus params ────────────────────────────────

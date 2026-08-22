@@ -1,0 +1,71 @@
+{
+  "alloc": [
+    {
+      "addr": "7777777777777777777777777777777777777777777777777774MSJUVU",
+      "comment": "RewardsPool",
+      "state": {
+        "algo": 125000000000000,
+        "onl": 2
+      }
+    },
+    {
+      "addr": "A7NMWS3NT3IUDMLVO26ULGXGIIOUQ3ND2TXSER6EBGRZNOBOUIQXHIBGDE",
+      "comment": "FeeSink",
+      "state": {
+        "algo": 100000,
+        "onl": 2
+      }
+    },
+    {
+      "addr": "TO2V5UP4UGHPVJPY4BBIAVNDF2SYGHCSL6DH5VNLSVCUBZ42BJFJZFKXCE",
+      "comment": "Wallet1",
+      "state": {
+        "algo": 3300000000000000,
+        "onl": 1,
+        "sel": "UNw/jukd5gsZUKHtnZlGO49TaGZhMVeeYVNbe7o46jw=",
+        "stprf": "0IffoBIHLqZJpoRCemHR0bYCDloyoVV4rtBuyJ+h17fOuw0RoV9KXCdObXnh+N9Bv8S248M+jm+r5BghhkyzOA==",
+        "vote": "NckDdHw8unbXsSTmFAXzoYF8qBNOsTVx7IU0E5iHS2A=",
+        "voteKD": 10000,
+        "voteLst": 1500
+      }
+    },
+    {
+      "addr": "OVA3FUVJNZZMSCW67K2F5MCVVCFRLLEP3ZGN2EYMLSELAIUSNEI3AKTZ4Y",
+      "comment": "Wallet2",
+      "state": {
+        "algo": 3300000000000000,
+        "onl": 1,
+        "sel": "pNJF6wHcyIbeF+C8YQ6tG2s9b4azNohc4/VB0St34ls=",
+        "stprf": "BQERZaDLMpjjtqQVZj3+EUPdhI/qeVgp4xy3fOgoswYLxBeC+5RoYFSw8y/xOUyXxJ+ULXvEknSsueUeCYp+9A==",
+        "vote": "CoBRw4pMxYePFsRiumpvc56/Yn2k7p/+o2clgvMPoFc=",
+        "voteKD": 10000,
+        "voteLst": 1500
+      }
+    },
+    {
+      "addr": "RAEVSBMYU3C5H4RPEHJHSLHCJMW4NIEFL7B7OJQZURYNMPH4GJCPEVQTT4",
+      "comment": "Wallet3",
+      "state": {
+        "algo": 3300000000000000,
+        "onl": 1,
+        "sel": "gZYPj+DnzpoehRp7akJ0xS7uRfG8qQKm5bgQu1xPmDQ=",
+        "stprf": "o1rGKrc4WmANMuiimiwluB65RiRwe/MHVhzHC0xnWwO+J1lHXdGm/14TdN23wvls0NWnq03I40CG/wB9qIOTdg==",
+        "vote": "+LG72IqqYxErBH6ofDWA4DDWyjwOLXeeexyt7JPuqVI=",
+        "voteKD": 10000,
+        "voteLst": 1500
+      }
+    },
+    {
+      "addr": "Q7FTH4YCVX7WF5P7DSQ5GYMZHPZEYMZUZEJWGDQX5W3KJG4JFGSDTWX5TI",
+      "comment": "Wallet4",
+      "state": {
+        "algo": 100000000000000
+      }
+    }
+  ],
+  "fees": "A7NMWS3NT3IUDMLVO26ULGXGIIOUQ3ND2TXSER6EBGRZNOBOUIQXHIBGDE",
+  "id": "v1",
+  "network": "phase6net",
+  "proto": "future",
+  "rwd": "7777777777777777777777777777777777777777777777777774MSJUVU"
+}

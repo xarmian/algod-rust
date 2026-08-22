@@ -425,6 +425,21 @@ pub enum Commands {
         #[arg(long, value_delimiter = ',')]
         import_partkey: Vec<PathBuf>,
 
+        /// Directory to scan for go-algorand `.partkey` files at startup.
+        /// Every entry whose name matches Go's
+        /// `<account>.<firstValid>.<lastValid>.partkey` convention is
+        /// imported into the `--partkey-path` registry, exactly as
+        /// `AlgorandFullNode.loadParticipationKeys` does
+        /// (`../go-algorand/node/node.go`).
+        ///
+        /// Repeat (or comma-separate) for several directories. This is
+        /// rarely needed: when `--data-dir` points at a
+        /// `goal network create` node directory, its genesis
+        /// subdirectory `<data-dir>/<genesis-id>` — where `goal` actually
+        /// writes the keys — is scanned automatically.
+        #[arg(long, value_delimiter = ',')]
+        partkey_dir: Vec<PathBuf>,
+
         /// Path to `genesis.json` used to seed `accountbase` +
         /// `accounttotals` when the ledger is brand new. Without it a node
         /// joining a fresh private network has no online-stake table and can

@@ -1,2 +1,4 @@
 *.sqlite-shm
 *.sqlite-wal
+*.partkey-shm
+*.partkey-wal
