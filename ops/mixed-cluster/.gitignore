@@ -15,3 +15,6 @@ verify-cert-*.jsonl
 # Python bytecode from `python3 -c py_compile` or direct script runs.
 scripts/__pycache__/
 
+
+# Rendered template handed to `goal network create` (transient).
+.template.rendered.json

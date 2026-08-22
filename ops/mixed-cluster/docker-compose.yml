@@ -7,22 +7,39 @@
 # (see ./template.json).
 #
 # The 4 nodes talk to each other via the `phase6net` bridge network using
-# container-DNS hostnames. Each Go node's REST API is exposed on a
-# distinct host port (4001-4003) for off-cluster inspection; the Rust
-# node exposes its gossip port on 4160.
+# container-DNS hostnames. Every node's REST API is exposed on a distinct
+# host port (4001-4003 for Go, 4004 for Rust) for off-cluster inspection.
 #
-# Scope for TASK-86:
+# Scope (issue #469 — Epic 42b):
 #   - All 4 nodes start, see each other as peers, share one genesis.
-#   - 3 Go nodes actively participate (each holds ~33% of stake).
-#   - The Rust node is a relay peer that syncs blocks via gossip; it is
-#     NOT yet expected to propose — participation-key interop with the
-#     Go-generated netroot format is tracked as a follow-up (see
-#     `docs/MIXED_CLUSTER_HARNESS.md`).
+#   - ALL FOUR nodes actively participate in consensus. The Rust node runs
+#     `algod-rust participate` with the `.partkey` that `goal network
+#     create` generated for Wallet4, imported through the #468
+#     auto-discovery path (`--partkey-dir`).
+#
+# ── Stake split & sortition math ───────────────────────────────────────
+# `template.json` gives Wallet1..3 (Go) 30 units each and Wallet4 (Rust)
+# 10 units, ALL ONLINE — so the Rust node holds 10% of online stake.
+#
+#   * Block proposal (ConsensusFuture, NumProposers = 20): each account
+#     runs sortition with expected committee size 20 * stake_fraction, so
+#     the Rust node expects 20 * 0.10 = 2 proposer credentials per round
+#     and has a ~1 - e^-2 = 86% chance of holding at least one. The round
+#     is won by the lowest credential across all selected proposers, and
+#     that is proportional to stake: **~10% of blocks are expected to be
+#     Rust-proposed** (≈3 blocks in a 30-round smoke run).
+#   * Certification (CertCommitteeSize 1500, threshold 1112 = 74.1%):
+#     the three Go nodes hold 90% of stake — an expected 1350 of 1500
+#     cert votes, ~13 sigma above the 74.1% threshold — so they can
+#     certify rounds without the Rust node and a Rust bug can never halt
+#     the chain. Conversely the Rust node's expected 150 votes are far
+#     below quorum, so it cannot certify anything on its own either.
 #
 # Usage:
 #   ops/mixed-cluster/scripts/start.sh     # generate netroot + start
 #   ops/mixed-cluster/scripts/status.sh    # per-node round snapshot
 #   ops/mixed-cluster/scripts/stop.sh      # tear down + cleanup
+#   make consensus-cluster-up / -status / -down
 
 services:
   go-node-1:
@@ -118,11 +135,33 @@ services:
     networks:
       - phase6net
 
-  # The Rust node runs as a relay peer pointed at the 3 Go relays via
-  # gossip. It syncs blocks as they're produced and serves them back
-  # through the gossip port on 4160. Full consensus participation
-  # requires porting the Go participation-key format — see
-  # MIXED_CLUSTER_HARNESS.md for the follow-up plan.
+  # The Rust node is a full consensus participant (issue #469). It dials
+  # the 3 Go relays over gossip, proposes and votes with Wallet4's
+  # participation key, and serves the algod v2 REST API on 8080 so
+  # status.sh can read its round the same way it reads a Go node's.
+  #
+  # Flags worth explaining:
+  #   --partkey-path   the Rust multi-key participation registry (created
+  #                    on first boot inside the persistent /app volume).
+  #   --partkey-dir    #468's go-algorand key auto-discovery: scan the
+  #                    genesis subdirectory that `goal network create`
+  #                    wrote Wallet4's `<account>.<first>.<last>.partkey`
+  #                    into and import it into the registry. Idempotent,
+  #                    so a container restart is a no-op.
+  #   --genesis-json   seeds accountbase + accounttotals on a fresh
+  #                    ledger. Without an online-stake table the node can
+  #                    neither run sortition for its own key nor validate
+  #                    anyone else's proposals.
+  #   --genesis-hash   start.sh reads this off go-node-1's
+  #                    /v2/transactions/params once that node is healthy;
+  #                    the hash is a digest over the canonical-msgpack
+  #                    Genesis struct, so shell cannot derive it offline.
+  #   --data-dir       writable dir for algod.token / algod.admin.token /
+  #                    algod.net (the netroot bind mount is read-only).
+  #
+  # No --listen-address / --relay-messages: this is a participation node
+  # that dials out, mirroring the Go participation topology. Blocks and
+  # consensus messages flow over the outbound connections to the relays.
   rust-node-4:
     build:
       context: ../..
@@ -137,32 +176,52 @@ services:
       go-node-3:
         condition: service_healthy
     environment:
-      - RUST_LOG=info,algod_rust=debug,algo_network=debug,algo_agreement=info
-    # The genesis-id is sourced from PHASE6_GENESIS_ID which start.sh
-    # captures from the goal-generated genesis.json at bootstrap time.
-    # Fallback default matches the template's NetworkName+id on a clean
-    # run; override if you customize the template or rerun on a stale
-    # netroot/ tree.
-    # --genesis-json tells the relay to bootstrap accountbase +
-    # accounttotals from genesis on first startup (PLAN-32 / TASK-95).
-    # Without this the ledger is an archive-only block store and the
-    # TASK-88 cert cross-verify tool can't authenticate certs against
-    # it. The netroot/ tree is bind-mounted read-only at /netroot
-    # (start.sh owns the host-side copy), so the file is available to
-    # the container without shipping it inside the image.
+      # Overridable so a debugging run can turn agreement up to debug
+      # without editing this file:
+      #   PHASE6_RUST_LOG=info,algo_agreement=debug docker compose up -d rust-node-4
+      - RUST_LOG=${PHASE6_RUST_LOG:-info,algod_rust=debug,algo_network=debug,algo_agreement=info}
+    # PHASE6_GENESIS_ID / PHASE6_GENESIS_HASH are exported by start.sh:
+    # the id comes out of the goal-generated genesis.json at bootstrap,
+    # the hash off go-node-1's REST once it is healthy. The `:-` defaults
+    # exist only so `docker compose down`/`config` work without them; a
+    # `docker compose up rust-node-4` outside start.sh will produce a node
+    # with a zero genesis hash that no Go peer accepts.
+    #
+    # --ledger-path=/app/ledger keeps the on-disk pair at
+    # /app/ledger.tracker.sqlite + /app/ledger.block.sqlite, which is what
+    # scripts/verify-soak.sh copies out of this container.
     entrypoint:
       - algod-rust
-      - relay
-      - --bind-address=0.0.0.0:4160
-      - --genesis-id=${PHASE6_GENESIS_ID:-phase6net-v1}
-      - --ledger-path=/app/ledger.sqlite
-      - --peers=go-node-1:4161,go-node-2:4161,go-node-3:4161
+      - participate
+      - --ledger-path=/app/ledger
+      - --partkey-path=/app/partkeys.sqlite
+      - --partkey-dir=/netroot/Node4Rust/${PHASE6_GENESIS_ID:-phase6net-v1}
       - --genesis-json=/netroot/genesis.json
+      - --genesis-path=/netroot/genesis.json
+      - --genesis-id=${PHASE6_GENESIS_ID:-phase6net-v1}
+      - --genesis-hash=${PHASE6_GENESIS_HASH:-}
+      - --network=phase6net
+      - --peers=go-node-1:4161,go-node-2:4161,go-node-3:4161
+      - --rest-listen=0.0.0.0:8080
+      - --data-dir=/data
     ports:
-      - "127.0.0.1:4160:4160"
+      - "127.0.0.1:4004:8080"
     volumes:
       - rust-node-4-data:/app
       - ./netroot:/netroot:ro
+      - ./netroot/rust-node-4-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - -H
+        - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        - http://localhost:8080/v2/status
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 20s
     restart: unless-stopped
     networks:
       - phase6net

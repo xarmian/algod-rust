@@ -1,7 +1,10 @@
-# Mixed-Cluster Consensus Harness (TASK-86 / TASK-87 / TASK-88 / TASK-95)
+# Mixed-Cluster Consensus Harness
 
 A 4-node docker-compose harness that runs 3 go-algorand v4.5.1-stable
-nodes + 1 algod-rust node on a private network. Foundation for:
+nodes + 1 algod-rust node on a private network. **All four nodes hold
+online stake and participate in consensus** (issue #469); the Rust node
+runs `algod-rust participate`, votes, and serves the algod v2 REST API.
+Foundation for:
 
 - TASK-87 — 200-round soak test with metrics collection (shipped — see
   "Running a soak" below and `docs/SOAK_METHODOLOGY.md`)
@@ -22,33 +25,67 @@ nodes + 1 algod-rust node on a private network. Foundation for:
                 └──────┬─────┘
                        │
                        ▼
-                ┌─────────────┐
-                │ rust-node-4 │
-                │ relay only  │
-                └─────────────┘
+                ┌──────────────────┐
+                │   rust-node-4    │
+                │ participate+vote │
+                └──────────────────┘
 ```
 
-- **go-node-1/2/3**: algorand/algod:4.5.1-stable images with 33% stake
-  each, all online, all proposing. These form the consensus quorum.
-- **rust-node-4**: a built-from-source algod-rust running as a relay
-  peer pointed at the 3 Go nodes. Holds a tiny (1 unit) stake that is
-  marked offline, so it does not participate in consensus. As of
-  TASK-95 the relay also seeds accountbase + accounttotals from the
-  bind-mounted `netroot/genesis.json` on fresh startup and applies
-  each imported block, so its SQLite ledger is complete enough for
-  `algo-cert-crossverify` to authenticate Go-produced certificates
-  end-to-end. Pass `--genesis-json` to get the same behavior on
-  `algod-rust relay` outside this compose file.
+- **go-node-1/2/3**: algorand/algod:4.5.1-stable relays with **30%** of
+  online stake each, all online, all proposing.
+- **rust-node-4**: a built-from-source `algod-rust participate` node
+  holding **10%** of online stake, dialing the 3 Go relays over gossip.
+  It imports the `.partkey` that `goal network create` generated for
+  Wallet4 straight out of `netroot/Node4Rust/<genesis-id>/` via
+  `--partkey-dir` (issue #468's go-algorand key auto-discovery — no
+  conversion step), seeds accountbase + accounttotals from the
+  bind-mounted `netroot/genesis.json`, and serves the algod v2 REST API
+  on host port **4004** so `status.sh` reads its round the same way it
+  reads a Go node's.
 
-Full Rust consensus participation (the Rust node actually proposing
-blocks) requires participation-key format interop with Go's netgoal
-output — tracked as a follow-up (see `docs/MIXED_CLUSTER_HARNESS.md`
-§Open questions).
+### Stake split and sortition math
+
+`template.json` allocates 30/30/30/10, all four wallets ONLINE.
+
+- **Proposal** (ConsensusFuture, `NumProposers = 20`): the Rust node's
+  expected proposer-committee size is `20 * 0.10 = 2`, so it holds at
+  least one proposer credential in ~86% of rounds, and — because the
+  round is won by the lowest credential among all selected proposers —
+  it is expected to win **~10% of rounds**.
+- **Certification** (`CertCommitteeSize = 1500`, threshold `1112` =
+  74.1%): the three Go nodes hold 90% of stake, an expected 1350 of
+  1500 cert votes and ~13 sigma clear of the threshold, so they certify
+  rounds with or without the Rust node. A Rust bug therefore cannot
+  halt the chain, and the Rust node's expected 150 votes are far below
+  quorum on their own.
+
+### Current status: votes yes, proposals not yet
+
+Go **accepts the Rust node's votes**: `go-node-1`'s agreement log shows
+`VoteAccepted` entries whose `Sender` is the Rust node's account, with
+`Weight` around 150 of 1500 — exactly its 10% share. Over a 30+ round
+run the Go nodes log **zero** agreement-level rejections
+(`malformed proposal|malformed vote|rejected block|bundle malformed`).
+
+The Rust node does **not** yet propose blocks, and the reason is *not*
+key interop or header conformance — both work. Agreement issues its
+`Assemble` action for round N before the ledger has written block N-1,
+so `TransactionPool::assemble_block` falls through to
+`assemble_empty_block`, which fails with
+
+```
+cannot get prev header for N-1: ledger error: no block header data for round N-1
+```
+
+every round. Run with `PHASE6_RUST_LOG=info,algo_agreement=debug` to see
+it. Fixing the round-advance/assembly ordering is tracked separately;
+until then the proposer histogram over this cluster shows only the three
+Go accounts.
 
 ## Prerequisites
 
 - Docker + Docker Compose v2.
-- Python 3 (used by `status.sh`).
+- Python 3 (used by `status.sh` and `participation-smoke.sh`).
 - The repo root as the build context — the Rust node uses
   `docker/Dockerfile` from the repo root to compile `algod-rust` from
   source. First start takes several minutes; subsequent starts reuse
@@ -68,6 +105,30 @@ ops/mixed-cluster/scripts/stop.sh
 
 # tear down and wipe keys (fresh network next start)
 ops/mixed-cluster/scripts/stop.sh --purge
+
+# same three, through the canonical make targets
+make consensus-cluster-up
+make consensus-cluster-status
+make consensus-cluster-down          # append PURGE=1 to wipe netroot/
+```
+
+`phase6-cluster-up` / `-status` / `-down` remain as deprecated aliases.
+
+## Participation smoke test (issue #469)
+
+`participation-smoke.sh` brings the cluster up, waits for it to advance
+`SMOKE_ROUNDS` (default 30) rounds, and asserts that all four nodes stay
+in lockstep, that the Rust node's own REST `/v2/status` progresses, and
+that no Go node logged an agreement-level rejection. It also reports how
+many Rust votes Go accepted and how many blocks the Rust node proposed
+(expected 0 today — see "Current status" above).
+
+```bash
+make consensus-cluster-smoke                       # 30 rounds, tears down after
+SMOKE_ROUNDS=100 KEEP_CLUSTER=1     bash ops/mixed-cluster/scripts/participation-smoke.sh
+
+# ...or through cargo, gated so it stays out of `cargo test --workspace`
+MIXED_CLUSTER=1 cargo test -p algo-network     --test mixed_cluster_participation -- --ignored --nocapture
 ```
 
 After ~30s the 3 Go nodes should be at round ≥ 3. After 2 minutes
@@ -93,9 +154,7 @@ Output goes to `ops/mixed-cluster/soak-<unix>.jsonl` by default (gitignored).
 sidecar.
 
 See `docs/SOAK_METHODOLOGY.md` for the full set of tuning knobs,
-measured metrics, acceptance criteria, and known limitations (notably
-the Rust node is **not** yet a proposer — gated on PLAN-35 participation
-key interop).
+measured metrics, acceptance criteria, and known limitations.
 
 ## Verifying a soak (TASK-88 + TASK-95)
 
