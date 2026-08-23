@@ -60,7 +60,7 @@ Before treating the PR as ready, review your own diff as if it were someone else
 
 ### 6. Fix self-review findings
 
-Address anything found in step 5 before moving on — don't defer "minor" findings to a follow-up unless they're genuinely out of scope for this issue, in which case file them as a new issue (see "Issue disposition" below) rather than letting them evaporate.
+Address anything found in step 5 before moving on — don't defer "minor" findings to a follow-up unless they're genuinely out of scope for this issue, in which case file them as a new issue (see "Creating a new issue" below) rather than letting them evaporate.
 
 ### 7. Wait for PR checks
 
@@ -77,10 +77,20 @@ If a check fails, read its actual logs (`gh run view <run-id> --log-failed`) bef
   - **Obsolete** (the criterion no longer makes sense — requirements changed, the approach made it moot, upstream removed the need) → do NOT silently delete or tick it: strike it through (`- [x] ~~criterion~~`) and post a comment explaining *why* it is obsolete and on whose call (user decision, upstream change, superseded design).
   - **Moved to a different issue** (out of scope here, deferred, structurally unreachable in this PR) → post a comment naming the destination issue number (which the open-topics sweep below just created), and annotate the item in the body (`- [ ] criterion — moved to #M`) so nobody re-implements or double-counts it.
   - Only when every item is checked, struck-with-comment, or moved-with-comment is the issue mergeable. A checklist item left silently unaddressed blocks the merge.
-- **Open-topics sweep — no open topic survives a merge untracked.** Before merging, inventory everything this PR leaves unresolved: deferred self-review findings (step 6), bugs found but fixed out-of-scope, `TODO`/`FIXME` comments the diff introduced, known limitations admitted in the PR body, unmet acceptance criteria of the underlying issue, and follow-up work the investigation surfaced. For **each one**, create a dedicated GitHub issue (proper labels per step 4's taxonomy, a link back to the PR and origin issue) — and reference the new issue numbers in a PR comment or the merge summary so the trail is navigable both ways. If the work belongs to an active version-upgrade epic (see the `algod-version-upgrade` skill), the new issue must also be inserted into that epic's working plan, not just filed loose.
+- **Open-topics sweep — no open topic survives a merge untracked.** Before merging, inventory everything this PR leaves unresolved: deferred self-review findings (step 6), bugs found but fixed out-of-scope, `TODO`/`FIXME` comments the diff introduced, known limitations admitted in the PR body, unmet acceptance criteria of the underlying issue, and follow-up work the investigation surfaced. For **each one**, create a dedicated GitHub issue per "Creating a new issue" above (labels, root cause, TDD instruction, acceptance criteria, epic insertion) — and reference the new issue numbers in a PR comment or the merge summary so the trail is navigable both ways.
 - Merging is a shared-state action: confirm with the user (`AskUserQuestion`) before merging, even if a similar merge was approved earlier in the same session — auto-mode blocks it by default for a reason.
 - `/pr-ship <pr-number>` handles the confirm → `gh pr merge --squash --delete-branch` → sync-local-`main` sequence.
 - If the PR said `Fixes #N`, verify the issue actually closed (`gh issue view N --json state`) rather than assuming.
+
+## Creating a new issue (follow-ups, spin-offs, open-topics)
+
+Every issue you file from this workflow — a deferred self-review finding (step 6), an out-of-scope bug, or an open-topics-sweep item (step 9) — must be created with `gh issue create`, never left as a bare comment or TODO. Before running `gh issue create`:
+
+- **Labels are mandatory, not optional.** Apply the same taxonomy as PRs (step 4): a `phase:<n>` label matching the epic/phase it belongs to, one domain label (`consensus` / `ledger` / `avm` / `networking` / `rest-api` / `sync` / `infrastructure`), and the kind (`bug` / `enhancement` / `conformance` / `documentation` / `testing`). Check `gh label list` if unsure a label exists — don't invent one. Pass them at creation (`gh issue create --label ... --label ...`); an unlabeled issue is not done.
+- **State root cause, not just symptom, in the body.** Don't file "X is broken" — file what you know or suspect about *why*, citing the go-algorand file/function if the investigation already got that far. An issue that only restates the symptom forces the next person to redo the investigation from zero.
+- **Instruct TDD explicitly in the body.** Every new issue's body must tell whoever picks it up to write a failing test that pins the correct behavior *before* touching the fix (mirroring step 2 of this workflow) — don't assume the assignee will independently rediscover this repo's TDD-first culture.
+- **Acceptance criteria as a `- [ ]` checklist** (per step 1) — no issue leaves your hands without them.
+- If the issue belongs to an active version-upgrade epic, insert it into that epic's working plan (per step 9), not just file it loose.
 
 ## When to delegate to a background agent
 
@@ -104,4 +114,4 @@ Delegate to a background `Agent` (subagent_type `general-purpose`) when the fix 
 
 ## Issue disposition — don't force-close on partial success
 
-If an issue's acceptance criteria are only partially met, or one criterion is structurally unreachable at the current architecture/topology (see issue #107's stake-split example), post an honest comment stating exactly what's met, what isn't, and why — then leave the issue open rather than closing it over an unmet criterion, UNLESS the remaining gap is itself out of scope for this codebase (e.g. a host-environment resource ceiling that reproduces identically on go-algorand — see issue #100's 1000+ TPS disk-I/O finding), in which case close it with that explanation. If a real new bug is found while working an issue but is out of scope to fix inline, file it as its own follow-up issue rather than leaving it undocumented in a comment thread.
+If an issue's acceptance criteria are only partially met, or one criterion is structurally unreachable at the current architecture/topology (see issue #107's stake-split example), post an honest comment stating exactly what's met, what isn't, and why — then leave the issue open rather than closing it over an unmet criterion, UNLESS the remaining gap is itself out of scope for this codebase (e.g. a host-environment resource ceiling that reproduces identically on go-algorand — see issue #100's 1000+ TPS disk-I/O finding), in which case close it with that explanation. If a real new bug is found while working an issue but is out of scope to fix inline, file it as its own follow-up issue (see "Creating a new issue" above) rather than leaving it undocumented in a comment thread.
