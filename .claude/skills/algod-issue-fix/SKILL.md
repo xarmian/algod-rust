@@ -46,6 +46,7 @@ Idiomatic-Rust bar for this repo, in priority order:
 - Branch name `fix/issue-N-<slug>` or `feat/issue-N-<slug>` / `perf/issue-N-<slug>` as appropriate.
 - Commit message explains the **root cause**, not just the symptom, and cites measured numbers where the issue is about performance/behavior under load — see recent history (`git log`) for the bar.
 - `gh pr create` with `Fixes #N` (or `addresses #N` if the issue has other unmet criteria that will stay open) in the body, including what was tested and why it's sufficient.
+- **Label every PR** — a PR with no labels is not done. Use the repo's taxonomy (`gh label list`): the issue's `phase:<n>` label, one domain label (`consensus` / `ledger` / `avm` / `networking` / `rest-api` / `sync` / `infrastructure`), and the kind (`bug` / `enhancement` / `conformance` / `documentation` / `testing`). Pass them at creation (`gh pr create --label ... --label ...`) or immediately after (`gh pr edit <n> --add-label ...`); mirror the labels the issue itself carries.
 
 ### 5. Self code review
 
