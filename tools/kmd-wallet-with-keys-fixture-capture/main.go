@@ -173,7 +173,7 @@ func main() {
 		MdkHex:     hex.EncodeToString(mdk[:]),
 		ScryptN:    1024, ScryptR: 1, ScryptP: 1,
 		Keys: entries,
-		Description: fmt.Sprintf("wallet with %d derived + %d imported keys, produced by go-algorand v4.5.1-stable kmd driver; consumed by algo-kmd's TASK-205 interop test",
+		Description: fmt.Sprintf("wallet with %d derived + %d imported keys, produced by go-algorand v4.6.0-stable kmd driver; consumed by algo-kmd's TASK-205 interop test",
 			numDerived, numImported),
 	}
 

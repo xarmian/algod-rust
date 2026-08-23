@@ -7,7 +7,7 @@
 //!
 //! # Reference
 //!
-//! The format and the write order follow go-algorand v4.5.1-stable:
+//! The format and the write order follow go-algorand v4.6.0-stable:
 //!
 //! * `../go-algorand/ledger/catchpointfilewriter.go` — `catchpointFileWriter`,
 //!   `readDatabaseStep`, `asyncWriter`, and the chunk constants

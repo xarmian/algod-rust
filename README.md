@@ -5,7 +5,7 @@
 [![codecov](https://codecov.io/gh/xarmian/algod-rust/branch/main/graph/badge.svg)](https://codecov.io/gh/xarmian/algod-rust)
 
 A full Rust reimplementation of [go-algorand](https://github.com/algorand/go-algorand)
-— a production-grade Algorand node, developed against `go-algorand v4.5.1-stable`
+— a production-grade Algorand node, developed against `go-algorand v4.6.0-stable`
 as the authoritative reference and verified byte-for-byte through a conformance
 harness.
 
@@ -18,7 +18,7 @@ ledger apply, transaction/block validation, and the REST API v2. Phase 6
 [docs/PHASE6_PROPOSAL.md](docs/PHASE6_PROPOSAL.md) for the current phase.
 
 The Rust node votes and proposes blocks alongside go-algorand
-v4.5.1-stable nodes in a mixed 4-node cluster
+v4.6.0-stable nodes in a mixed 4-node cluster
 (`make consensus-cluster-test`);
 [docs/PHASE6_VALIDATION.md](docs/PHASE6_VALIDATION.md) maps each Phase 6
 success criterion to the test or tool that verifies it.

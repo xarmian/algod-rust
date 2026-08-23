@@ -11,7 +11,7 @@
 //! a protocol upgrade. The fixed fixture under
 //! `tests/fixtures/lookback/lookback_boundaries.json` — produced by
 //! running `tools/lookback-vector-capture` against the pinned
-//! `go-algorand` v4.5.1-stable — anchors every (version, round) pair
+//! `go-algorand` v4.6.0-stable — anchors every (version, round) pair
 //! against Go's actual output. This test asserts Rust agrees byte-
 //! identically with the captured Go values.
 //!

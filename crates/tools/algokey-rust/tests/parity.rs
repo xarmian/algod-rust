@@ -1,4 +1,4 @@
-//! Byte-equal parity vs go-algorand `algokey` (v4.5.1-stable).
+//! Byte-equal parity vs go-algorand `algokey` (v4.6.0-stable).
 //!
 //! For each captured fixture under `tests/fixtures/algokey/`, run the
 //! Rust binary and assert stdout matches the Go-captured bytes

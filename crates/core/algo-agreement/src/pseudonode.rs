@@ -1216,7 +1216,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // Ports from go-algorand v4.5.1-stable agreement/pseudonode_test.go.
+    // Ports from go-algorand v4.6.0-stable agreement/pseudonode_test.go.
     //
     // TASK-65 (PLAN-31 §3.15). The Go test file has three top-level tests:
     //

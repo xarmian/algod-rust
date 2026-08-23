@@ -1,6 +1,6 @@
 # Dual-node REST conformance harness (issue #129).
 #
-# Boots a *real* go-algorand v4.5.1-stable node from the **same genesis.json**
+# Boots a *real* go-algorand v4.6.0-stable node from the **same genesis.json**
 # — the funded-dev-account genesis already baked into
 # `docker/localnet-rust/data/` (TASK-268) — so a live client can send
 # identical requests to it and to a natively-run algod-rust process (see the
@@ -33,14 +33,14 @@
 #   docker compose -f docker/docker-compose.validate-api.yml down -v
 
 services:
-  # Real go-algorand v4.5.1-stable, launched directly with our shared
+  # Real go-algorand v4.6.0-stable, launched directly with our shared
   # genesis (see header comment). The genesis directory is bind-mounted
   # read-only at /genesis-src; an init copy step seeds the writable
   # /algod/data volume from it before exec'ing algod, since `algod` needs
   # write access to its data directory (ledger, tracker DBs, algod.net,
   # etc.) that a read-only bind mount can't provide.
   algod-go-shared:
-    image: algorand/algod:4.5.1-stable
+    image: algorand/algod:4.6.0-stable
     container_name: algod-go-shared
     entrypoint: ["/bin/sh", "-c"]
     command:

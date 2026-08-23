@@ -2,7 +2,7 @@
 //!
 //! Signs a fixed payload with a fixed ed25519 seed and asserts the printed
 //! base64 signature byte-for-byte matches the reference produced by
-//! go-algorand v4.5.1-stable's `crypto.SignatureSecrets.Sign(logic.Msg{...})`
+//! go-algorand v4.6.0-stable's `crypto.SignatureSecrets.Sign(logic.Msg{...})`
 //! (i.e. ed25519 over `"ProgData" || HashProgram(program) || data`).
 //!
 //! This runs offline (no node / kmd) — it only invokes the `goal-rust` binary —
@@ -21,7 +21,7 @@ const CONTRACT_ADDR: &str = "YOE6C22GHCTKAN3HU4SE5PGIPN5UKXAJTXCQUPJ3KKF5HOAH646
 
 /// Reference signature for seed=[1,2,..,32], data=0xDEADBEEF, signed against the
 /// above contract's program hash. Captured from `sec.Sign(logic.Msg{...})` in
-/// go-algorand v4.5.1-stable.
+/// go-algorand v4.6.0-stable.
 const GO_REF_SIG_B64: &str =
     "PinXFNDIA1tNSR8nYDCn39tCMdtnztoiRJXFTDtImauk+rb8P9sJhktkxR8lIX0WnSRyj4g1Rv8c/Se0I63eAA==";
 

@@ -2,7 +2,7 @@
 //! `part reparent`.
 //!
 //! Output byte-equal to `../go-algorand/cmd/algokey/part.go::printPartkey`
-//! (lines 166-179, v4.5.1-stable). Base64 uses the standard alphabet
+//! (lines 166-179, v4.6.0-stable). Base64 uses the standard alphabet
 //! with padding (Go `base64.StdEncoding`).
 
 use std::io::Write;

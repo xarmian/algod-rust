@@ -1,7 +1,7 @@
 //! Fixture-driven round-trip tests for the merkle-page (de)serializer.
 //!
 //! Bytes are produced by `tools/merkle-page-capture` running against
-//! go-algorand v4.5.1-stable's actual `crypto/merkletrie` package
+//! go-algorand v4.6.0-stable's actual `crypto/merkletrie` package
 //! (`MakeTrie` + `InMemoryCommitter` + `Commit`). We capture the
 //! exact byte payloads `StorePage` saw and assert that:
 //!

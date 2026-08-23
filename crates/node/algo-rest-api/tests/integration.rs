@@ -1534,7 +1534,7 @@ async fn admin_token_works_on_public_routes_but_api_token_does_not_work_on_admin
 // ===========================================================================
 // JSON error envelope conformance (issue #129)
 //
-// Verified live against go-algorand v4.5.1-stable: a request to an unmatched
+// Verified live against go-algorand v4.6.0-stable: a request to an unmatched
 // route returns `{"message":"Not Found"}` (Echo's default JSON error
 // handler), and a malformed path parameter (e.g. a non-numeric round) returns
 // a 400 with `{"message": "Invalid format for parameter ...: ..."}`. Every
@@ -1583,7 +1583,7 @@ async fn unmatched_route_returns_json_not_found_envelope() {
 /// go-algorand's router returns 404 for an unmatched path *before* any
 /// per-route auth middleware runs — Echo's routing determines there is no
 /// matching handler (and therefore no middleware chain to invoke) prior to
-/// dispatch. Verified live against go-algorand v4.5.1-stable: a completely
+/// dispatch. Verified live against go-algorand v4.6.0-stable: a completely
 /// unauthenticated request to a bogus path still returns
 /// `404 {"message":"Not Found"}`, never `401`.
 ///
@@ -1655,7 +1655,7 @@ async fn malformed_numeric_path_param_returns_json_error_envelope() {
 // ===========================================================================
 // CORS conformance (issue #129)
 //
-// Verified live against go-algorand v4.5.1-stable: `middlewares.MakeCORS`
+// Verified live against go-algorand v4.6.0-stable: `middlewares.MakeCORS`
 // (`daemon/algod/api/server/lib/middlewares/cors.go`) configures Echo's CORS
 // middleware with `AllowOrigins: ["*"]`, `AllowHeaders: [TokenHeader,
 // "Content-Type"]`, `AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]`, applied
@@ -2365,7 +2365,7 @@ async fn wait_for_block_returns_500_when_wait_for_round_errors() {
 
 /// go's `round basics.Round` (`uint64`) computes `round+1` with plain
 /// unsigned wraparound and no overflow check at all -- verified live
-/// against go-algorand v4.5.1-stable (issue #450):
+/// against go-algorand v4.6.0-stable (issue #450):
 /// `wait-for-block-after/{u64::MAX}` returns 200 immediately, since
 /// `round+1` wraps to 0 and round 0 is always already committed. A prior
 /// version of this test asserted an explicit 400 "round overflow" here,

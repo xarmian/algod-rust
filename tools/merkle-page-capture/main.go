@@ -14,7 +14,7 @@
 //     ...
 //   ]
 //
-// References (go-algorand v4.5.1-stable, commit a8c16ecc):
+// References (go-algorand v4.6.0-stable, commit a8c16ecc):
 //   crypto/merkletrie/cache.go:660-704 — decodePage / encodePage
 //   crypto/merkletrie/node.go:312-373  — node.serialize / deserializeNode
 //   crypto/merkletrie/trie.go:32       — nodePageVersion
@@ -29,7 +29,7 @@
 //  1. Check out go-algorand as a sibling of `algod-rust`:
 //
 //         # from $REPO_PARENT (the directory that contains algod-rust/)
-//         git clone --depth 1 --branch v4.5.1-stable \
+//         git clone --depth 1 --branch v4.6.0-stable \
 //             https://github.com/algorand/go-algorand.git
 //         # resulting layout:
 //         #   $REPO_PARENT/algod-rust/
@@ -46,7 +46,7 @@
 // vector-capture tools in this repo. Without the sibling checkout the
 // build fails fast at `go run` time — that's intentional, because the
 // alternative (publishing a forked module) would unpin the version we
-// claim to cross-reference: v4.5.1-stable, commit
+// claim to cross-reference: v4.6.0-stable, commit
 // a8c16ecc2324cc10acb75de367c0b5dad4b0a5a3, dated 2026-02-09.
 //
 // Determinism: the fixture is generated from a fixed sequence of

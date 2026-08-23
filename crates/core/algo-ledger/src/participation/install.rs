@@ -1,6 +1,6 @@
 //! Partkey sqlite schema install + migration.
 //!
-//! Mirrors `../go-algorand/data/account/partInstall.go` (v4.5.1-stable). The
+//! Mirrors `../go-algorand/data/account/partInstall.go` (v4.6.0-stable). The
 //! partkey DB is the single-account flavor produced by `algokey part
 //! generate` — one `ParticipationAccount` row plus a `schema` table that
 //! tracks the version. The companion `StateProofKeys` table is installed

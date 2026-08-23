@@ -2,7 +2,7 @@
 //!
 //! Golden files under `fixtures/block_json/<name>.json` were produced by
 //! decoding `<name>.msgpack` (a raw `{block, cert}` block response) and
-//! re-encoding the block via go-algorand v4.5.1-stable's
+//! re-encoding the block via go-algorand v4.6.0-stable's
 //! `protocol.JSONStrictHandle` — exactly what `GET /v2/blocks/{round}?format=json`
 //! emits. The Rust `encode_block_json` must reproduce those bytes exactly.
 

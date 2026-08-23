@@ -1,7 +1,7 @@
 //! Wallet-handle session manager.
 //!
 //! Ported from `../go-algorand/daemon/kmd/session/{session,auth}.go`
-//! (v4.5.1-stable). Wallets are unlocked once via [`SessionManager::init_wallet_handle`]
+//! (v4.6.0-stable). Wallets are unlocked once via [`SessionManager::init_wallet_handle`]
 //! and accessed afterwards by an ephemeral handle token of the form
 //! `<16-hex-id>.<64-hex-secret>`. Handles expire after
 //! `session_lifetime`; periodic cleanup removes expired entries.

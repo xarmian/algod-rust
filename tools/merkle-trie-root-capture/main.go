@@ -16,7 +16,7 @@
 //	  ...
 //	]
 //
-// References (go-algorand v4.5.1-stable):
+// References (go-algorand v4.6.0-stable):
 //
 //	crypto/merkletrie/trie.go:62-170     — Trie, MakeTrie, Add, RootHash
 //	crypto/merkletrie/node.go:227-252    — node.calculateHash (hash accumulator)
@@ -32,7 +32,7 @@
 //  1. Check out go-algorand as a sibling of `algod-rust`:
 //
 //         # from $REPO_PARENT (the directory that contains algod-rust/)
-//         git clone --depth 1 --branch v4.5.1-stable \
+//         git clone --depth 1 --branch v4.6.0-stable \
 //             https://github.com/algorand/go-algorand.git
 //
 //  2. Build and run from this tool's directory:

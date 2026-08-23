@@ -154,7 +154,7 @@ fn both_tables_are_created_by_schema_init() {
 #[test]
 fn go_captured_page_round_trips_through_sql_via_committer() {
     // Real Go-produced page bytes (captured by tools/merkle-page-capture
-    // against v4.5.1-stable's `crypto/merkletrie`) survive a SQL
+    // against v4.6.0-stable's `crypto/merkletrie`) survive a SQL
     // round-trip: store via SqliteMerkleCommitter, reload by id,
     // decode, and assert equality with the direct Page::deserialize.
     let fixtures = load_fixtures();

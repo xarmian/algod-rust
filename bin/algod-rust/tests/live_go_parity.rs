@@ -1,6 +1,6 @@
 //! Live dual-node REST conformance suite (issue #129).
 //!
-//! Drives a *real* go-algorand v4.5.1-stable node and a real algod-rust node
+//! Drives a *real* go-algorand v4.6.0-stable node and a real algod-rust node
 //! — both booted from the identical genesis.json via
 //! `docker/docker-compose.validate-api.yml` (see that file's header comment
 //! for why a shared genesis makes state-dependent comparison meaningful,

@@ -1,6 +1,6 @@
 //! Roundtrip conformance of account REST responses vs go-algorand (TASK-254).
 //!
-//! For each fixture, go-algorand v4.5.1-stable produced references from a
+//! For each fixture, go-algorand v4.6.0-stable produced references from a
 //! `basics.AccountData` (see `fixtures/account_roundtrip/`):
 //!
 //! - `<name>.account.json` — `model.Account` via `AccountDataToAccount` +

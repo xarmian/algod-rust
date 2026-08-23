@@ -1,7 +1,7 @@
 //! In-memory transaction-tail duplicate cache.
 //!
 //! Mirrors go-algorand's `txTail` tracker (`ledger/txtail.go` @
-//! v4.5.1-stable): go loads the recent transaction tail from disk **once**
+//! v4.6.0-stable): go loads the recent transaction tail from disk **once**
 //! (`loadFromDisk`), keeps it entirely in memory (`t.lastValid`, a
 //! per-round txid map), appends each newly committed block in memory
 //! (`newBlock`), and answers duplicate checks (`checkDup`) without ever

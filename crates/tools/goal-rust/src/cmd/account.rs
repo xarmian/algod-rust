@@ -420,7 +420,7 @@ fn fetch_status_and_amount(
             // Go renders NotParticipating as `[excluded]`
             // (accountsList.go:217-218, matching `basics.NotParticipating
             // .String()` == "Not Participating", with a space). Match for
-            // parity -- verified live against go-algorand v4.5.1-stable
+            // parity -- verified live against go-algorand v4.6.0-stable
             // (issue #129) that this is the actual wire value.
             Some("Not Participating") => "excluded",
             Some(other) => {

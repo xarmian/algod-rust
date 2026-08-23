@@ -1,6 +1,6 @@
 # Mixed-Cluster Consensus Harness
 
-A 4-node docker-compose harness that runs 3 go-algorand v4.5.1-stable
+A 4-node docker-compose harness that runs 3 go-algorand v4.6.0-stable
 nodes + 1 algod-rust node on a private network. **All four nodes hold
 online stake and participate in consensus** (issue #469); the Rust node
 runs `algod-rust participate`, votes, and serves the algod v2 REST API.
@@ -35,7 +35,7 @@ Foundation for (all shipped):
                 └──────────────────┘
 ```
 
-- **go-node-1/2/3**: algorand/algod:4.5.1-stable relays with **30%** of
+- **go-node-1/2/3**: algorand/algod:4.6.0-stable relays with **30%** of
   online stake each, all online, all proposing.
 - **rust-node-4**: a built-from-source `algod-rust participate` node
   holding **10%** of online stake, dialing the 3 Go relays over gossip.
@@ -287,7 +287,7 @@ quorum.
 ### The go-algorand-side authenticator
 
 `tools/cert-authenticate` is a small Go program that re-authenticates the
-exported certificates with go-algorand v4.5.1-stable's own verifier.
+exported certificates with go-algorand v4.6.0-stable's own verifier.
 `algo-cert-crossverify --export-go-input` writes it the raw `(block,
 cert)` msgpack plus the `agreement.LedgerReader` facts (seed,
 circulation, per-voter online account data) read out of the **Rust**
@@ -501,7 +501,7 @@ What it does, in order:
 5. Stage those files into a Go-shaped data dir at
    `<HANDOFF_DIR>/godata/<genesisID>/ledger.{tracker,block}.sqlite`
    alongside a minimal `config.json` + `genesis.json` + `algod.token`.
-6. Boot a one-shot `algorand/algod:4.5.1-stable` container against
+6. Boot a one-shot `algorand/algod:4.6.0-stable` container against
    that data dir on host port 7833.
 7. Assert `/v2/status` responds, `last-round >= HANDOFF_ROUNDS`, and
    Go's startup logs contain no ERROR/FATAL lines.

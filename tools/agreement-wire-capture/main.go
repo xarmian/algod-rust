@@ -42,7 +42,7 @@ import (
 )
 
 const (
-	expectedGoAlgorandPin = "v4.5.1-stable"
+	expectedGoAlgorandPin = "v4.6.0-stable"
 	// Name chosen to (a) be obviously ours in go-algorand's directory
 	// listing and (b) end in `_test.go` so `go test` picks it up.
 	stagedFileName = "algod_rust_wire_fixtures_test.go"

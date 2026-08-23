@@ -1,4 +1,4 @@
-//! Byte-equal parity vs go-algorand `crypto/multisig.go` (v4.5.1-stable).
+//! Byte-equal parity vs go-algorand `crypto/multisig.go` (v4.6.0-stable).
 //!
 //! Fixtures were captured by running `crypto.MultisigAddrGen` with
 //! ed25519 public keys derived deterministically from

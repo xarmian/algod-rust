@@ -5,7 +5,7 @@ description: Standard workflow for implementing/fixing a GitHub issue in xarmian
 
 # algod-rust issue-fix workflow
 
-This repo (Rust reimplementation of go-algorand, pinned to `../go-algorand` @ v4.5.1-stable) has an established, TDD-first, live-verification-first culture. Read `CLAUDE.md` at the repo root before starting — it has mandatory environment quirks (Windows cargo/MSVC wrapper, the known `algo-network` doctest flake, "never chain retries hoping for a different result"). Use `/cargo`, `/test-full`, and `/pr-ship` (this repo's slash commands) rather than re-deriving those invocations from scratch each time.
+This repo (Rust reimplementation of go-algorand, pinned to `../go-algorand` @ v4.6.0-stable) has an established, TDD-first, live-verification-first culture. Read `CLAUDE.md` at the repo root before starting — it has mandatory environment quirks (Windows cargo/MSVC wrapper, the known `algo-network` doctest flake, "never chain retries hoping for a different result"). Use `/cargo`, `/test-full`, and `/pr-ship` (this repo's slash commands) rather than re-deriving those invocations from scratch each time.
 
 ## The process
 
@@ -15,7 +15,7 @@ Every issue goes through these nine steps, in order. Do not skip a step because 
 
 - Read the full issue (`gh issue view N --comments`) — including prior comments; don't re-investigate something already ruled out.
 - **Every issue must have explicit acceptance criteria as a `- [ ]` checklist in its body.** If the issue you're picking up doesn't have them, write them now (`gh issue edit N --body ...`, preserving the original text) and note in a comment that you added them — they are the contract that step 9's pre-merge audit checks against, so an issue without them cannot be verifiably finished. The same applies to every issue *you* create (follow-ups, spin-offs): no issue leaves your hands without acceptance criteria.
-- Read `../go-algorand`'s real behavior for the relevant area before forming a hypothesis — this repo's bar is byte-level/behavioral parity with go-algorand v4.5.1-stable, not "something reasonable." Cite the specific go file/function once you have a root-cause theory.
+- Read `../go-algorand`'s real behavior for the relevant area before forming a hypothesis — this repo's bar is byte-level/behavioral parity with go-algorand v4.6.0-stable, not "something reasonable." Cite the specific go file/function once you have a root-cause theory.
 - Identify where to start reading in this repo, but treat it as a starting point, not a conclusion — don't anchor on the first suspicious function.
 - For consensus/ledger/network issues, decide up front whether a live multi-node repro is needed (`ops/mixed-cluster/`, `docker/scripts/bench-stress.sh`) to actually observe the bug, rather than guessing from code reading alone.
 

@@ -17,7 +17,7 @@
 //	  ...
 //	]
 //
-// References (go-algorand v4.5.1-stable):
+// References (go-algorand v4.6.0-stable):
 //
 //	ledger/store/trackerdb/hashing.go:64-78   — AccountHashBuilderV6
 //	ledger/store/trackerdb/hashing.go:81-95   — ResourcesHashBuilderV6
@@ -33,7 +33,7 @@
 //
 //  1. Check out go-algorand as a sibling of `algod-rust`:
 //
-//         git clone --depth 1 --branch v4.5.1-stable \
+//         git clone --depth 1 --branch v4.6.0-stable \
 //             https://github.com/algorand/go-algorand.git
 //
 //  2. Build and run:

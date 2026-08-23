@@ -1,5 +1,5 @@
 //! Parity tests against artifacts produced by a real `goal network create`
-//! run (go-algorand v4.5.1-stable) — GitHub issue #468.
+//! run (go-algorand v4.6.0-stable) — GitHub issue #468.
 //!
 //! The existing `partkey_reader_test.rs` fixture came from
 //! `algokey part generate`. That tool and `goal network create` take
@@ -21,7 +21,7 @@
 //! docker run --rm \
 //!     -v /tmp/netroot:/netroot \
 //!     -v /tmp/template.json:/template.json:ro \
-//!     --entrypoint goal algorand/algod:4.5.1-stable \
+//!     --entrypoint goal algorand/algod:4.6.0-stable \
 //!     network create -n phase6net -r /netroot -t /template.json
 //! cp /tmp/netroot/Wallet1.0.1500.partkey \
 //!    crates/core/algo-ledger/tests/fixtures/partkey/goal-network-create/
@@ -46,7 +46,7 @@
 //! ## Expected supply values
 //!
 //! `online-money` / `total-money` below were read from a live
-//! `algorand/algod:4.5.1-stable` node booted on `netroot/Node1` at round 0:
+//! `algorand/algod:4.6.0-stable` node booted on `netroot/Node1` at round 0:
 //!
 //! ```text
 //! GET /v2/ledger/supply

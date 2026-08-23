@@ -5,7 +5,7 @@
 //! from scratch on the next run, matching go-algorand's behaviour: Go's
 //! catchpoint importer is single-pass within a process and has no
 //! cross-process resume table (`../go-algorand/ledger/catchpointtracker.go`
-//! @ v4.5.1-stable).
+//! @ v4.6.0-stable).
 //!
 //! Phase B (PLAN-36 / TASK-117) dropped the Rust-only `catchpoint_import_state`
 //! SQLite table so that Go can open a tracker DB Rust produced.

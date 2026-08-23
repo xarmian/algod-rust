@@ -260,7 +260,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // Port of go-algorand v4.5.1-stable agreement/keyManager_test.go.
+    // Port of go-algorand v4.6.0-stable agreement/keyManager_test.go.
     //
     // TASK-66 (PLAN-31 §3.15). The Go file is 91 LOC of pure test
     // infrastructure — it defines a `recordingKeyManager` helper and zero

@@ -238,7 +238,7 @@ pub fn junit_report_path(half: &str) -> std::path::PathBuf {
 /// Print this and return early from the test (exits success).
 pub fn skip_message() {
     eprintln!(
-        "SKIP: Go `algokey` binary not on PATH — install go-algorand@v4.5.1-stable \
+        "SKIP: Go `algokey` binary not on PATH — install go-algorand@v4.6.0-stable \
          (e.g. `cd ../go-algorand && go build -o ~/.local/bin/algokey ./cmd/algokey`) \
          then re-run."
     );

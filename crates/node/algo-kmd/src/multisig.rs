@@ -1,7 +1,7 @@
 //! Multisig address operations — `import_multisig`, `lookup_multisig`,
 //! `list_multisig`, `delete_multisig`.
 //!
-//! Ported from `daemon/kmd/wallet/driver/sqlite.go` (v4.5.1-stable):
+//! Ported from `daemon/kmd/wallet/driver/sqlite.go` (v4.6.0-stable):
 //! `ImportMultisigAddr` (sqlite.go:1002), `LookupMultisigPreimage`
 //! (sqlite.go:1026), `ListMultisigAddrs` (sqlite.go:1088), and
 //! `DeleteMultisigAddr` (sqlite.go:1066). Address derivation reuses

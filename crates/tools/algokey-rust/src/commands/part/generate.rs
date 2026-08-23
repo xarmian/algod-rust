@@ -1,7 +1,7 @@
 //! `algokey part generate` — generate + persist a fresh participation key.
 //!
 //! Mirrors `../go-algorand/cmd/algokey/part.go::partGenerateCmd.Run`
-//! (lines 49-105, v4.5.1-stable).
+//! (lines 49-105, v4.6.0-stable).
 
 use std::process::ExitCode;
 use std::str::FromStr;

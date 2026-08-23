@@ -1,7 +1,7 @@
 //! `algokey part reparent` — change the parent address on a partkey DB.
 //!
 //! Mirrors `../go-algorand/cmd/algokey/part.go::partReparentCmd.Run`
-//! (lines 130-164, v4.5.1-stable):
+//! (lines 130-164, v4.6.0-stable):
 //!
 //! 1. Parse `--parent` via `Address::from_str` (Go: `UnmarshalChecksumAddress`).
 //! 2. Open the partkey DB via `ErasableDb::open` (matches Go's

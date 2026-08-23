@@ -2,7 +2,7 @@
 //!
 //! A partner to `algo-conformance` (which covers block *codec* conformance):
 //! this harness drives the Rust REST response builders and diffs their output,
-//! field-for-field, against go-algorand v4.5.1-stable reference responses,
+//! field-for-field, against go-algorand v4.6.0-stable reference responses,
 //! emitting a per-endpoint / per-field report and failing on any drift.
 //!
 //! It is fixture-driven and extensible: each [`Case`] pairs an endpoint name

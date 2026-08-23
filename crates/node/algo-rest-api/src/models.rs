@@ -744,7 +744,7 @@ pub fn account_data_to_response(
         AccountStatus::Offline => "Offline".to_string(),
         AccountStatus::Online => "Online".to_string(),
         // Matches go's `Status.String()` (`data/basics/userBalance.go`) --
-        // note the space. Live-verified against go-algorand v4.5.1-stable
+        // note the space. Live-verified against go-algorand v4.6.0-stable
         // (issue #129): `GET /v2/accounts/{fee-sink}` reports
         // `"status": "Not Participating"`.
         AccountStatus::NotParticipating => "Not Participating".to_string(),

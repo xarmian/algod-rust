@@ -277,7 +277,7 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
     // Every JSON response (success or error) must carry go's trailing `\n`
     // byte (`encoding/json`'s `Encoder.Encode`, which Echo's `ctx.JSON` uses
     // — unlike `json.Marshal`, it always appends a newline after the value).
-    // Verified live against go-algorand v4.5.1-stable: this is a systemic,
+    // Verified live against go-algorand v4.6.0-stable: this is a systemic,
     // one-byte gap present on effectively every JSON endpoint, not something
     // specific to any one handler — see `format::json_trailing_newline_layer`.
     // Applied after `json_envelope_layer` so a rewritten error body also

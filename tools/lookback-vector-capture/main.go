@@ -15,7 +15,7 @@
 // agrees with the captured Go bytes" — not "Rust agrees with what we
 // thought Go would say".
 //
-// go-algorand references (v4.5.1-stable):
+// go-algorand references (v4.6.0-stable):
 //
 //	agreement/params.go:25    — func ParamsRound(r basics.Round) basics.Round
 //	agreement/selector.go:53  — func BalanceRound(r basics.Round, cparams config.ConsensusParams) basics.Round
@@ -33,7 +33,7 @@
 //
 //	{
 //	  "source":           "algod-rust/tools/lookback-vector-capture (TASK-57)",
-//	  "go_algorand_pin":  "v4.5.1-stable",
+//	  "go_algorand_pin":  "v4.6.0-stable",
 //	  "vectors": [
 //	    {
 //	      "version":               "v7",
@@ -73,7 +73,7 @@ import (
 // are guaranteed byte-identical output regardless of what branch or
 // dirty state happens to be checked out in their local go-algorand
 // clone.
-const expectedGoAlgorandPin = "v4.5.1-stable"
+const expectedGoAlgorandPin = "v4.6.0-stable"
 
 // allVersions returns every non-deprecated consensus version in order.
 // V7 is included (beyond the task's V18..V41 range) because the V7→V8

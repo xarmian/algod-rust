@@ -2,7 +2,7 @@
 //! `crypto/merkletrie` byte-for-byte.
 //!
 //! Fixtures are produced by `tools/merkle-trie-root-capture` running against
-//! go-algorand v4.5.1-stable's actual `crypto/merkletrie.MakeTrie` +
+//! go-algorand v4.6.0-stable's actual `crypto/merkletrie.MakeTrie` +
 //! `Add` + `RootHash`. Each fixture records:
 //!
 //! - the input element bytes (in insertion order)

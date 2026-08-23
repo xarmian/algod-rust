@@ -70,7 +70,7 @@ pub async fn cors_layer(request: Request, next: Next) -> Response {
 
 /// The exact CORS preflight response go-algorand's Echo middleware produces
 /// for an `OPTIONS` request (verified live against go-algorand
-/// v4.5.1-stable): `204 No Content` with `Access-Control-Allow-Origin: *`,
+/// v4.6.0-stable): `204 No Content` with `Access-Control-Allow-Origin: *`,
 /// `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers`, and a
 /// multi-value `Vary` header.
 fn preflight_response() -> Response {

@@ -15,7 +15,7 @@
 # (catchpoint progress, upgrade voting) is its own surface that
 # lives outside Phase A. Until then this script:
 #
-# 1. Verifies `goal` is on PATH at the expected version (v4.5.1-stable).
+# 1. Verifies `goal` is on PATH at the expected version (v4.6.0-stable).
 # 2. Refreshes only the fixtures Go can produce against a
 #    freshly-spawned kmd-rust (wallet_new_created, wallet_list_empty,
 #    wallet_rename_ok). The node_* fixtures require a full algod
@@ -35,7 +35,7 @@ if ! command -v goal >/dev/null 2>&1; then
   exit 1
 fi
 
-want_ver="v4.5.1-stable"
+want_ver="v4.6.0-stable"
 goal_ver_out="$(goal -v 2>&1 || true)"
 if ! grep -qF "$want_ver" <<<"$goal_ver_out"; then
   echo "goal version mismatch: refusing to capture fixtures." >&2

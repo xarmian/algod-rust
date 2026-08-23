@@ -13,7 +13,7 @@
 //!
 //! ## Schema
 //!
-//! Produced by `algokey part generate` (Go v4.5.1-stable):
+//! Produced by `algokey part generate` (Go v4.6.0-stable):
 //!
 //! ```sql
 //! CREATE TABLE ParticipationAccount (
@@ -90,7 +90,7 @@ pub fn restore_participation(db: &ErasableDb) -> Result<Participation, Error> {
     // does NOT preserve back-compat with non-existent deployments
     // (CONVE-197): no v2 partkey DB was ever in production with this
     // tool, so handling that legacy shape would be a deferred-cleanup
-    // anti-pattern. Any Go-produced partkey DB from v4.5.1-stable has
+    // anti-pattern. Any Go-produced partkey DB from v4.6.0-stable has
     // the stateProof column.
     let row: Option<PartkeyRow> = conn
         .query_row(

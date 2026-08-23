@@ -148,7 +148,7 @@ fn canonical_encode_dev_mode_certificate(round: u64) -> Vec<u8> {
 /// overridden with `prev.timestamp + offset` — go's dev-mode timestamp control
 /// (`/v2/devmode/blocks/offset`). This lets SDK test harnesses produce blocks with
 /// deterministic, monotonically-advanced timestamps. Matches
-/// `../go-algorand/node/node.go:563-565` @ v4.5.1-stable, including the
+/// `../go-algorand/node/node.go:563-565` @ v4.6.0-stable, including the
 /// `offset < MaxInt64 - prev.TimeStamp` overflow guard (the override is skipped
 /// otherwise, leaving the assembled wall-clock timestamp in place).
 ///

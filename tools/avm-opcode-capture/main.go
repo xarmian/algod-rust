@@ -40,7 +40,7 @@
 // iteration order, so two runs against the same go-algorand pin produce a
 // byte-identical vectors.jsonl.
 //
-// go-algorand reference (v4.5.1-stable):
+// go-algorand reference (v4.6.0-stable):
 //
 //	data/transactions/logic/eval.go:421   — NewSigEvalParams
 //	data/transactions/logic/eval.go:1228  — EvalSignatureFull
@@ -82,7 +82,7 @@ import (
 // to run unless `../../../go-algorand` resolves to exactly this tag (or
 // --allow-unpinned is set), so two developers regenerating the corpus get
 // byte-identical output regardless of local go-algorand state.
-const expectedGoAlgorandPin = "v4.5.1-stable"
+const expectedGoAlgorandPin = "v4.6.0-stable"
 
 // protoVersion is the consensus version every fixture is evaluated under.
 // V41 is ConsensusCurrentVersion at the pin; its string value is recorded in

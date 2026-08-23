@@ -204,7 +204,7 @@ impl Certificate {
 /// testing the `Certificate` path proper uses synthetic data with the
 /// real-network `step = CERT` semantics.
 ///
-/// References (`v4.5.1-stable`):
+/// References (`v4.6.0-stable`):
 /// - `../go-algorand/agreement/bundle.go:30-41` — struct layout
 /// - `../go-algorand/agreement/msgp_gen.go:10187-10265` — `MarshalMsg`
 ///

@@ -19,7 +19,7 @@
 //! `fixtures/vrf/README.md` for the record schema and regeneration
 //! procedure.
 //!
-//! References (go-algorand v4.5.1-stable):
+//! References (go-algorand v4.6.0-stable):
 //!   - `crypto/vrf.go:99`  — `C.crypto_vrf_prove`
 //!   - `crypto/vrf.go:117` — `C.crypto_vrf_proof_to_hash`
 //!   - `crypto/vrf.go:122` — `C.crypto_vrf_verify`

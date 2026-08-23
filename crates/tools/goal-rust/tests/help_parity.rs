@@ -3,7 +3,7 @@
 //!
 //! Fixture mode (default): parse the committed
 //! `tests/fixtures/goal_help_*.txt` files captured from Go's
-//! `v4.5.1-stable` binary. Live mode (`MIXED_CLUSTER=1`): regenerate
+//! `v4.6.0-stable` binary. Live mode (`MIXED_CLUSTER=1`): regenerate
 //! the fixtures from a `goal` binary on PATH before diffing — same
 //! assertions either way.
 //!

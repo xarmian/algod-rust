@@ -60,7 +60,7 @@ fn ensure_go_cmd(pkg: &str, bin_name: &str) -> PathBuf {
     let goalg = workspace_root().join("../go-algorand");
     assert!(
         goalg.join(pkg).exists(),
-        "../go-algorand/{pkg} not found at {}; this test requires a v4.5.1-stable checkout",
+        "../go-algorand/{pkg} not found at {}; this test requires a v4.6.0-stable checkout",
         goalg.display(),
     );
     let status = Command::new("go")

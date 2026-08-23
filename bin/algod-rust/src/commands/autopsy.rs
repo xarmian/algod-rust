@@ -1,7 +1,7 @@
 //! `autopsy` subcommand — read cadaver binary trace logs produced by the
 //! agreement service and render a human-readable round-by-round timeline.
 //!
-//! Mirrors go-algorand v4.5.1-stable `agreement/autopsy.go` (which streams
+//! Mirrors go-algorand v4.6.0-stable `agreement/autopsy.go` (which streams
 //! `.cdv.archive` first, then the active `.cdv`, into a per-run analyzer).
 //! This Rust version reuses `algo_agreement::trace::CadaverReader` so the
 //! reader/writer pair stays in sync — see TASK-63 for the writer.

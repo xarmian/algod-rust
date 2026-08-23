@@ -5,7 +5,7 @@
 //! by `tools/kmd-crypto-vector-capture/main.go`, which reimplements the
 //! algorithm from
 //! `../go-algorand/daemon/kmd/wallet/driver/sqlite_crypto.go`
-//! (v4.5.1-stable) using the same public crypto + go-codec primitives.
+//! (v4.6.0-stable) using the same public crypto + go-codec primitives.
 //! Regenerate via:
 //!
 //! ```text

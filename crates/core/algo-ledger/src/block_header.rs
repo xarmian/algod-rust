@@ -89,7 +89,7 @@ fn next_upgrade_state(prev: &BlockHeader, next_round: u64) -> Result<NextUpgrade
 /// Compute the proposer bonus ("bi") for the round after `prev`.
 ///
 /// Direct port of go-algorand `data/bookkeeping/block.go`'s `NextBonus` /
-/// `computeBonus` (v4.5.1-stable, lines 579–604), driven by the `BonusPlan`
+/// `computeBonus` (v4.6.0-stable, lines 579–604), driven by the `BonusPlan`
 /// consensus params (`config/consensus.go`, `BonusPlan` at line 653, values set
 /// for v40 at lines 1422–1424):
 ///

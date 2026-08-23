@@ -3,7 +3,7 @@
 //! assemble of subsigs across signers.
 //!
 //! Byte-for-byte parity with `../go-algorand/crypto/multisig.go`
-//! (v4.5.1-stable). The companion verification side already lives in
+//! (v4.6.0-stable). The companion verification side already lives in
 //! `algo-validate::signature::verify_multisig`; a future cleanup will
 //! refactor that module to call back into this one for address
 //! computation. For now we duplicate the (trivial) hash code to keep
@@ -232,7 +232,7 @@ mod tests {
     /// Address derivation must match the hand-computed digest for a
     /// fixed (version, threshold, pks) triple. Pinned bytes come from
     /// running `crypto.MultisigAddrGen(1, 2, [pk1, pk2, pk3])` against
-    /// go-algorand v4.5.1-stable with `pk_i = SignatureVerifier of
+    /// go-algorand v4.6.0-stable with `pk_i = SignatureVerifier of
     /// crypto.GenerateSignatureSecrets(seed_i)` for known seeds.
     #[test]
     fn addr_gen_rejects_invalid_inputs() {

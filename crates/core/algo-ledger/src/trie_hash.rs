@@ -8,7 +8,7 @@
 //!   bytes 5..36:  SHA512/256(prehash)[1..32]  (bytes 1 through 31, dropping byte 0)
 //! ```
 //!
-//! This layout mirrors go-algorand v4.5.1-stable's three sibling builders in
+//! This layout mirrors go-algorand v4.6.0-stable's three sibling builders in
 //! `ledger/store/trackerdb/hashing.go` byte-for-byte:
 //!
 //! - `AccountHashBuilderV6` (`hashing.go:64-78`)
@@ -229,7 +229,7 @@ mod tests {
     //
     // Locks in the TASK-131 MATCH verdict (DOC-129 §5 Findings): given the
     // same (affinity, kind, prehash), Rust's `finish_v6` produces exactly
-    // the same 36 bytes that go-algorand v4.5.1-stable's `finishV6` does
+    // the same 36 bytes that go-algorand v4.6.0-stable's `finishV6` does
     // (as invoked through the authoritative public builders
     // `AccountHashBuilderV6` / `ResourcesHashBuilderV6` / `KvHashBuilderV6`).
     //
