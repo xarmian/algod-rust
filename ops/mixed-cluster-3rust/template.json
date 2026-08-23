@@ -1,0 +1,60 @@
+{
+    "Genesis": {
+        "NetworkName": "phase7net",
+        "FirstPartKeyRound": 0,
+        "LastPartKeyRound": NUM_ROUNDS,
+        "ConsensusProtocol": "future",
+        "Wallets": [
+            { "Name": "Wallet1", "Stake": 17, "Online": true },
+            { "Name": "Wallet2", "Stake": 17, "Online": true },
+            { "Name": "Wallet3", "Stake": 16, "Online": true },
+            { "Name": "Wallet4", "Stake": 17, "Online": true },
+            { "Name": "Wallet5", "Stake": 17, "Online": true },
+            { "Name": "Wallet6", "Stake": 16, "Online": true }
+        ]
+    },
+    "Nodes": [
+        {
+            "Name": "Node1",
+            "IsRelay": true,
+            "Wallets": [
+                { "Name": "Wallet1", "ParticipationOnly": false }
+            ]
+        },
+        {
+            "Name": "Node2",
+            "IsRelay": true,
+            "Wallets": [
+                { "Name": "Wallet2", "ParticipationOnly": false }
+            ]
+        },
+        {
+            "Name": "Node3",
+            "IsRelay": true,
+            "Wallets": [
+                { "Name": "Wallet3", "ParticipationOnly": false }
+            ]
+        },
+        {
+            "Name": "Node4Rust",
+            "IsRelay": false,
+            "Wallets": [
+                { "Name": "Wallet4", "ParticipationOnly": false }
+            ]
+        },
+        {
+            "Name": "Node5Rust",
+            "IsRelay": false,
+            "Wallets": [
+                { "Name": "Wallet5", "ParticipationOnly": false }
+            ]
+        },
+        {
+            "Name": "Node6Rust",
+            "IsRelay": false,
+            "Wallets": [
+                { "Name": "Wallet6", "ParticipationOnly": false }
+            ]
+        }
+    ]
+}

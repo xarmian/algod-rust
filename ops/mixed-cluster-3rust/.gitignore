@@ -1,0 +1,30 @@
+# Generated network data (contains participation keys — never commit).
+netroot/
+
+# Soak run output (TASK-87): per-run JSONL captures + their summary sidecars.
+# Kept out of git because file sizes grow with run length and the data is
+# local-machine / run-specific. Attach summaries to PRs / Pad items by hand.
+soak-*.jsonl
+soak-*.jsonl.summary.json
+
+# Verifier run output (TASK-88): per-run fork / cert cross-verify traces.
+# Same rationale as soak output.
+verify-fork-*.jsonl
+verify-cert-*.jsonl
+verify-go-input-*.json
+verify-go-report-*.json
+
+# Issue #470 conformance-suite artifact directories (soak JSONL, node
+# logs, analyzer + verifier output, summary.json). Same rationale.
+conformance-*/
+
+# Python bytecode from `python3 -c py_compile` or direct script runs.
+scripts/__pycache__/
+
+
+# Rendered template handed to `goal network create` (transient).
+.template.rendered.json
+
+# Issue #471 restart/rejoin artifact directories (per-scenario node logs,
+# fork-detector JSONL, restart-summary.json). Same rationale as above.
+restart-*/
