@@ -63,6 +63,30 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
 
 - Do NOT chain test runs hoping for different results. If a test fails, diagnose the issue first.
 
+## Autonomous merge authorization (algod-issue-fix / algod-version-upgrade)
+
+- The user has explicitly pre-authorized merging PRs opened by the
+  `algod-issue-fix` and `algod-version-upgrade` skills **without** an
+  `AskUserQuestion` confirmation per PR, so that a batch of issues can be
+  driven end-to-end unattended. This is a durable, standing authorization —
+  do not re-ask "should I merge?" for PRs meeting the bar below.
+- The authorization is conditional, not blanket. Auto-merge a PR only when
+  ALL of the following hold; if any is unmet, fall back to the skills'
+  default behavior (ask via `AskUserQuestion` before merging):
+  - Every CI check is green (no pending/failed checks).
+  - The self-review step (step 5/6 of the skill) found nothing left
+    unresolved.
+  - The issue's acceptance-criteria audit (step 9) shows every item
+    checked, struck-with-comment, or moved-with-comment — no silently
+    unaddressed item.
+  - The PR does not touch anything outside this repo (no cross-repo,
+    infra/deploy, or credentials/secrets changes).
+- This authorization covers merges performed *by these two skills' own
+  workflow*. It does not extend to other destructive/shared-state actions
+  (force-push, branch deletion outside a completed PR's own branch,
+  `--no-verify`, etc.), and it does not extend to merges requested ad hoc
+  outside these skills' flow — those still confirm as normal.
+
 ## Common Commands
 
 ```bash
