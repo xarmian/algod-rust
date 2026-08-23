@@ -388,6 +388,12 @@ Acceptance:
 
 ---
 
+## Phase 9 — go-algorand Version-Upgrade Parity Sweeps
+
+Ongoing maintenance phase, run whenever the pinned go-algorand reference version advances. Each sweep is its own epic (see `docs/epics/Epic-19-Go-Algorand-v4.6.0-Parity.md` for the first instance, `v4.5.1-stable` → `v4.6.0-stable`): analyze every upstream change since the last pin, classify it (consensus-critical / api / avm / network / behavioral-other / not-applicable), open one issue per feature-level change, implement, and re-pin. See `docs/PHASE9_PROPOSAL.md` and the `algod-version-upgrade` skill for the full process. Does not gate on or block Phase 7/8 — orthogonal maintenance work, can interleave with either.
+
+---
+
 # 6. Project Success Criteria
 
 The project succeeds when:
