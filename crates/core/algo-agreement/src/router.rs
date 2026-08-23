@@ -215,14 +215,37 @@ impl RootRouter {
                     self.vote_aggregator.handle(fme, params)
                 } else {
                     // For non-filterable events dispatched to vote machine
-                    // (e.g., freshestBundleRequest), forward to the round tracker
-                    if let Some(round_router) = self.children.get_mut(&r) {
-                        round_router.dispatch(state, e, dest, r, p, s, params)
-                    } else {
-                        Event::default()
-                    }
+                    // (e.g., freshestBundleRequest), forward to the canonical
+                    // round tracker inside the vote aggregator.
+                    self.vote_aggregator.round_tracker(r).handle(&e, params)
                 }
             }
+            // Vote-machine queries from the player (`freshestBundleRequest`,
+            // `nextThresholdStatusRequest`, `dumpVotesRequest`) must consult
+            // the SAME per-round `VoteTrackerRound` hierarchy that verified
+            // votes and bundles mutate. That canonical state lives inside
+            // `VoteAggregator.rounds` (fed by `voteVerified`/`bundleVerified`
+            // dispatches), NOT in the legacy `RoundRouter`/`PeriodRouter`
+            // mirrors below, which no production vote path ever writes.
+            // Routing these queries to the mirrors returned empty state, so
+            // the player never saw the previous period's next-threshold
+            // status (silent soft step in every recovery period, next-votes
+            // always bottom) and never re-broadcast the freshest bundle from
+            // `partitionPolicy` — the recovery liveness failure of issue
+            // #497. Mirrors the ProposalMachineRound/Period fix above, and
+            // matches go-algorand where the router tree and voteAggregator
+            // share one set of vote trackers (`agreement/router.go`).
+            StateMachineTag::VoteMachineRound => {
+                self.vote_aggregator.round_tracker(r).handle(&e, params)
+            }
+            StateMachineTag::VoteMachinePeriod => self
+                .vote_aggregator
+                .round_tracker(r)
+                .dispatch_period(p, &e, params),
+            StateMachineTag::VoteMachineStep => self
+                .vote_aggregator
+                .round_tracker(r)
+                .dispatch_step(p, s, &e, params),
             // Delegate to the round router
             _ => {
                 if let Some(round_router) = self.children.get_mut(&r) {

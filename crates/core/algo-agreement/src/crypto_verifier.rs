@@ -412,6 +412,18 @@ fn vote_worker<L: LedgerReader + Send + Sync + 'static>(
         }
 
         let mut result = verify_vote_impl(ledger.as_ref(), request);
+        if let Some(ref err) = result.err {
+            let rv = &request.message.unauthenticated_vote.raw_vote;
+            warn!(
+                event = "vote_verify_failed",
+                sender = ?rv.sender,
+                round = rv.round.0,
+                period = rv.period.0,
+                step = %rv.step,
+                err = %err,
+                "incoming vote failed verification"
+            );
+        }
 
         // Check cancellation again after verification.
         if internal.cancel.load(Ordering::Acquire) {
@@ -680,13 +692,81 @@ fn verify_proposal_impl<BV: BlockValidator>(
 
 /// Verify a bundle by verifying each vote it contains.
 ///
-/// Reconstructs full `UnauthenticatedVote`s from the bundle's shared
-/// round/period/step/proposal and each `VoteAuthenticator`, then verifies
-/// each one individually.
+/// Mirrors Go's `unauthenticatedBundle.verify` (agreement/bundle.go:141):
+/// reconstructs full `UnauthenticatedVote`s from the bundle's shared
+/// round/period/step/proposal and each `VoteAuthenticator`, verifies each
+/// one, sums the verified credential weights, and rejects the bundle if
+/// the total does not reach the step's quorum
+/// (Go: "bundle: did not see enough votes").
 ///
-/// If any vote fails verification, the entire bundle is rejected.
+/// On success the *authenticated* votes are handed back on
+/// `message.verified_bundle_votes` (regular votes first, then each
+/// equivocation pair flattened as v0, v1) — exactly the votes list Go's
+/// `voteAggregator.handle` (bundleVerified arm) replays into the vote
+/// tracker so the threshold the bundle proves is observed locally.
+/// Dropping them instead left every recovery bundle "without significant
+/// state change" and deadlocked next-vote recovery at 50/50 stake
+/// (issue #497).
 fn verify_bundle_impl<L: LedgerReader>(ledger: &L, request: &CryptoBundleRequest) -> CryptoResult {
     let ub = &request.message.unauthenticated_bundle;
+
+    let bundle_err = |msg: String| CryptoResult {
+        message: request.message.clone(),
+        task_index: request.task_index,
+        err: Some(crate::events::SerializableError::new(msg)),
+        cancelled: false,
+    };
+
+    // Go: bundles for the propose step are invalid.
+    if ub.step == crate::step::PROPOSE {
+        return bundle_err("unauthenticatedBundle.verify: b.Step = propose".to_string());
+    }
+
+    // Go: cap the bundle size by the step threshold (a quorum never needs
+    // more votes than the threshold, so anything larger is malformed).
+    let proto = match ledger.consensus_params(crate::lookback::params_round(ub.round)) {
+        Ok(p) => p,
+        Err(e) => {
+            return bundle_err(format!(
+                "unauthenticatedBundle.verify: could not get consensus params for round {}: {e}",
+                crate::lookback::params_round(ub.round).0
+            ));
+        }
+    };
+    let threshold = ub.step.committee_threshold(&proto);
+    let num_votes = ub.votes.len() as u64;
+    let num_eq = ub.equivocation_votes.len() as u64;
+    if num_votes > threshold || num_eq > threshold || num_votes + num_eq > threshold {
+        return bundle_err(format!(
+            "unauthenticatedBundle.verify: bundle too large: len(votes) = {num_votes}, \
+             len(equivocation_votes) = {num_eq}; step threshold = {threshold}"
+        ));
+    }
+
+    // Go: reject duplicate senders across both vote lists.
+    let mut voters = std::collections::HashSet::with_capacity(ub.votes.len());
+    for va in &ub.votes {
+        if !voters.insert(va.sender) {
+            return bundle_err(format!(
+                "unauthenticatedBundle.verify: vote by {:?} was duplicated in bundle",
+                va.sender
+            ));
+        }
+    }
+    for eva in &ub.equivocation_votes {
+        if !voters.insert(eva.sender) {
+            return bundle_err(format!(
+                "unauthenticatedBundle.verify: equivocating vote pair by {:?} was duplicated in bundle",
+                eva.sender
+            ));
+        }
+    }
+
+    // The authenticated votes the aggregator will replay, plus the total
+    // verified weight for the quorum check.
+    let mut verified_votes: Vec<crate::vote::Vote> =
+        Vec::with_capacity(ub.votes.len() + 2 * ub.equivocation_votes.len());
+    let mut total_weight: u64 = 0;
 
     // Verify each regular vote authenticator in the bundle.
     for va in &ub.votes {
@@ -733,21 +813,31 @@ fn verify_bundle_impl<L: LedgerReader>(ledger: &L, request: &CryptoBundleRequest
             consensus_params: cparams,
         };
 
-        if let Err(e) = uv.verify(&params) {
-            return CryptoResult {
-                message: request.message.clone(),
-                task_index: request.task_index,
-                err: Some(crate::events::SerializableError::new(format!(
-                    "bundle vote verification failed: {e}"
-                ))),
-                cancelled: false,
-            };
+        match uv.verify(&params) {
+            Ok(vote) => {
+                total_weight += vote.cred.weight;
+                verified_votes.push(vote);
+            }
+            Err(e) => {
+                return CryptoResult {
+                    message: request.message.clone(),
+                    task_index: request.task_index,
+                    err: Some(crate::events::SerializableError::new(format!(
+                        "bundle vote verification failed: {e}"
+                    ))),
+                    cancelled: false,
+                };
+            }
         }
     }
 
     // Verify equivocation votes -- each has two signatures for two
     // different proposals. Both must verify with the same credential.
+    // The pair's credential weight counts once toward the quorum
+    // (Go: `weight += res.ev.Cred.Weight`), but both authenticated votes
+    // are replayed so the voteTracker performs its equivocation handling.
     for eva in &ub.equivocation_votes {
+        let mut pair_weight_counted = false;
         for i in 0..2 {
             let uv = UnauthenticatedVote {
                 raw_vote: RawVote {
@@ -792,22 +882,45 @@ fn verify_bundle_impl<L: LedgerReader>(ledger: &L, request: &CryptoBundleRequest
                 consensus_params: cparams,
             };
 
-            if let Err(e) = uv.verify(&params) {
-                return CryptoResult {
-                    message: request.message.clone(),
-                    task_index: request.task_index,
-                    err: Some(crate::events::SerializableError::new(format!(
-                        "equivocation vote verification failed: {e}"
-                    ))),
-                    cancelled: false,
-                };
+            match uv.verify(&params) {
+                Ok(vote) => {
+                    if !pair_weight_counted {
+                        total_weight += vote.cred.weight;
+                        pair_weight_counted = true;
+                    }
+                    verified_votes.push(vote);
+                }
+                Err(e) => {
+                    return CryptoResult {
+                        message: request.message.clone(),
+                        task_index: request.task_index,
+                        err: Some(crate::events::SerializableError::new(format!(
+                            "equivocation vote verification failed: {e}"
+                        ))),
+                        cancelled: false,
+                    };
+                }
             }
         }
     }
 
-    // All votes verified successfully.
+    // Go (agreement/bundle.go:263): the verified weight must reach the
+    // step's quorum, or the bundle proves nothing.
+    if !ub.step.reaches_quorum(&proto, total_weight) {
+        return bundle_err(format!(
+            "bundle: did not see enough votes: {} < {}",
+            total_weight,
+            ub.step.committee_threshold(&proto)
+        ));
+    }
+
+    // All votes verified successfully — hand the authenticated votes back
+    // for the vote aggregator to replay (Go returns `bundle{U, Votes,
+    // EquivocationVotes}` here; the aggregator flattens them the same way).
+    let mut message = request.message.clone();
+    message.verified_bundle_votes = verified_votes;
     CryptoResult {
-        message: request.message.clone(),
+        message,
         task_index: request.task_index,
         err: None,
         cancelled: false,

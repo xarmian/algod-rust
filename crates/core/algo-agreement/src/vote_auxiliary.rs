@@ -112,6 +112,16 @@ impl VoteTrackerPeriod {
         }
     }
 
+    /// Dispatch an event directly to the VoteTracker for `step`, creating it
+    /// on demand.
+    ///
+    /// Mirrors Go's `periodRouter` delegating a `voteMachineStep` dispatch to
+    /// the per-step tracker — used for coordinate-addressed queries from the
+    /// player (e.g. `dumpVotesRequest` for a specific fast-recovery step).
+    pub fn dispatch_step(&mut self, step: Step, event: &Event, params: &ConsensusParams) -> Event {
+        self.tracker_for_step(step).handle(event, params)
+    }
+
     /// Cache a next-threshold event.
     fn handle_next_threshold(&mut self, te: &ThresholdEvent) {
         if te.proposal == BOTTOM {
@@ -232,6 +242,34 @@ impl VoteTrackerRound {
                 );
             }
         }
+    }
+
+    /// Dispatch an event directly to the VoteTrackerPeriod for `period`,
+    /// creating it on demand.
+    ///
+    /// Mirrors Go's `roundRouter` delegating a `voteMachinePeriod` dispatch to
+    /// the per-period tracker — used for coordinate-addressed queries from the
+    /// player (e.g. `nextThresholdStatusRequest` for the previous period).
+    pub fn dispatch_period(
+        &mut self,
+        period: Period,
+        event: &Event,
+        params: &ConsensusParams,
+    ) -> Event {
+        self.tracker_for_period(period).handle(event, params)
+    }
+
+    /// Dispatch an event directly to the VoteTracker at `(period, step)`,
+    /// creating intermediate trackers on demand.
+    pub fn dispatch_step(
+        &mut self,
+        period: Period,
+        step: Step,
+        event: &Event,
+        params: &ConsensusParams,
+    ) -> Event {
+        self.tracker_for_period(period)
+            .dispatch_step(step, event, params)
     }
 
     /// Handle a threshold event, updating the freshest bundle if this event is

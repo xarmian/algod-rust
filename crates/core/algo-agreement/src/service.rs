@@ -1454,10 +1454,21 @@ fn do_network_action<N: AgreementNetwork>(
             }
         }
         ActionType::Disconnect => {
+            debug!(
+                event = "message_disconnect",
+                err = na.err.as_ref().map(|e| e.to_string()).unwrap_or_default(),
+                "disconnecting peer over invalid message"
+            );
             network.disconnect(&na.message_handle);
         }
         ActionType::Ignore => {
-            // Intentionally do nothing.
+            // Intentionally no network side effect; log the filter reason so
+            // dropped-message diagnosis (issue #497) doesn't require a rebuild.
+            debug!(
+                event = "message_ignored",
+                err = na.err.as_ref().map(|e| e.to_string()).unwrap_or_default(),
+                "ignoring filtered message"
+            );
         }
         _ => {
             warn!("unexpected network action type: {}", na.t);
