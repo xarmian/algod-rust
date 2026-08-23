@@ -11,12 +11,19 @@
 //
 // The root-level state machines are:
 //   - ProposalManager (proposalMachine) — handles proposals and proposal-votes
-//   - VoteAggregator (voteMachine) — handles votes and bundles
+//   - VoteAggregator (voteMachine) — handles votes and bundles, including its
+//     own per-round VoteTrackerRound hierarchy (voteMachineRound/Period/Step)
 //
-// Each level owns its sub-level state machines:
-//   - RoundRouter: ProposalStore (proposalMachineRound), VoteTrackerRound (voteMachineRound)
-//   - PeriodRouter: ProposalTracker (proposalMachinePeriod), VoteTrackerPeriod (voteMachinePeriod)
-//   - StepRouter: VoteTracker (voteMachineStep)
+// Each level owns its sub-level proposal state machine:
+//   - RoundRouter: ProposalStore (proposalMachineRound)
+//   - PeriodRouter: ProposalTracker (proposalMachinePeriod)
+//
+// RoundRouter/PeriodRouter/StepRouter previously also mirrored
+// VoteAggregator's VoteTrackerRound/VoteTrackerPeriod/VoteTracker state, but
+// that mirror was never populated by production dispatch (RootRouter routes
+// VoteMachine* events directly to VoteAggregator's own trackers — see
+// RootRouter::dispatch below) and was removed as dead weight (issue #500,
+// follow-up to #497/#499).
 
 use std::collections::HashMap;
 
@@ -31,8 +38,6 @@ use crate::proposal_tracker::ProposalTracker;
 use crate::step::{Period, Step};
 use crate::types::credential_round_lag;
 use crate::vote_aggregator::VoteAggregator;
-use crate::vote_auxiliary::{VoteTrackerPeriod, VoteTrackerRound};
-use crate::vote_tracker::VoteTracker;
 
 // ---------------------------------------------------------------------------
 // StateMachineTag
@@ -262,16 +267,16 @@ impl RootRouter {
 // RoundRouter
 // ---------------------------------------------------------------------------
 
-/// Per-round router containing a ProposalStore, VoteTrackerRound, and per-period
-/// PeriodRouters.
+/// Per-round router containing a ProposalStore and per-period PeriodRouters.
 ///
-/// Mirrors Go's `roundRouter`.
+/// Mirrors Go's `roundRouter`. (Go's `roundRouter` also holds a
+/// `voteTrackerRound`; algod-rust routes VoteMachineRound/Period/Step events
+/// directly to `VoteAggregator`'s own trackers instead — see
+/// `RootRouter::dispatch` — so no mirror is kept here; see issue #500.)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoundRouter {
     /// Per-round proposal storage.
     pub proposal_store: ProposalStore,
-    /// Per-round vote tracking.
-    pub vote_tracker_round: VoteTrackerRound,
     /// Per-period routers.
     pub children: HashMap<Period, PeriodRouter>,
 }
@@ -318,7 +323,6 @@ impl RoundRouter {
 
         match dest {
             StateMachineTag::ProposalMachineRound => self.proposal_store.handle(p, e),
-            StateMachineTag::VoteMachineRound => self.vote_tracker_round.handle(&e, params),
             _ => {
                 if let Some(period_router) = self.children.get_mut(&p) {
                     period_router.dispatch(state, e, dest, r, p, s, params)
@@ -334,16 +338,16 @@ impl RoundRouter {
 // PeriodRouter
 // ---------------------------------------------------------------------------
 
-/// Per-(round, period) router containing a ProposalTracker, VoteTrackerPeriod,
-/// and per-step StepRouters.
+/// Per-(round, period) router containing a ProposalTracker and per-step
+/// StepRouters.
 ///
-/// Mirrors Go's `periodRouter`.
+/// Mirrors Go's `periodRouter`. (Go's `periodRouter` also holds a
+/// `voteTrackerPeriod`; see the note on `RoundRouter` — no mirror is kept
+/// here either, per issue #500.)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeriodRouter {
     /// Per-period proposal tracking.
     pub proposal_tracker: ProposalTracker,
-    /// Per-period vote tracking.
-    pub vote_tracker_period: VoteTrackerPeriod,
     /// Per-step routers.
     pub children: HashMap<Step, StepRouter>,
 }
@@ -375,7 +379,6 @@ impl PeriodRouter {
 
         match dest {
             StateMachineTag::ProposalMachinePeriod => self.proposal_tracker.handle(e),
-            StateMachineTag::VoteMachinePeriod => self.vote_tracker_period.handle(&e, params),
             _ => {
                 if let Some(step_router) = self.children.get_mut(&s) {
                     step_router.dispatch(state, e, dest, r, p, s, params)
@@ -391,34 +394,34 @@ impl PeriodRouter {
 // StepRouter
 // ---------------------------------------------------------------------------
 
-/// Per-(round, period, step) router containing a VoteTracker.
+/// Leaf of the router hierarchy, addressed by (round, period, step).
 ///
-/// Mirrors Go's `stepRouter`.
+/// Mirrors Go's `stepRouter`, which holds a `voteTracker`; algod-rust routes
+/// VoteMachineStep events directly to `VoteAggregator`'s own trackers
+/// instead (see the note on `RoundRouter`), so this router carries no state
+/// of its own — it exists only so the router tree shape mirrors go-algorand's
+/// (issue #500).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct StepRouter {
-    /// Per-step vote tracking.
-    pub vote_tracker: VoteTracker,
-}
+pub struct StepRouter {}
 
 impl StepRouter {
-    /// Dispatch an event to the vote tracker at this level.
+    /// Dispatch an event to this level. No `StateMachineTag` is ever
+    /// legitimately routed this far down (VoteMachineStep is intercepted by
+    /// `RootRouter`), so any dispatch reaching here is a bug upstream.
     ///
     /// Mirrors Go's `stepRouter.dispatch`.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &mut self,
         _state: &Player,
-        e: Event,
+        _e: Event,
         dest: StateMachineTag,
         _r: Round,
         _p: Period,
         _s: Step,
-        params: &ConsensusParams,
+        _params: &ConsensusParams,
     ) -> Event {
-        match dest {
-            StateMachineTag::VoteMachineStep => self.vote_tracker.handle(&e, params),
-            _ => panic!("stepRouter.dispatch: bad destination {:?}", dest),
-        }
+        panic!("stepRouter.dispatch: bad destination {:?}", dest);
     }
 }
 
@@ -727,6 +730,90 @@ mod tests {
     }
 
     #[test]
+    fn root_router_vote_machine_events_never_touch_legacy_mirror() {
+        // Regression pin for issue #500 (follow-up to #497/#499): after
+        // #499, `RootRouter::dispatch` intercepts VoteMachineRound/
+        // VoteMachinePeriod/VoteMachineStep events and routes them
+        // directly into `VoteAggregator`'s own per-round `VoteTrackerRound`
+        // hierarchy (`vote_aggregator.round_tracker(r)`), never touching
+        // the `RoundRouter`/`PeriodRouter`/`StepRouter` mirror tree under
+        // `RootRouter.children`. Before #499, the same dispatch would have
+        // cascaded into `self.children[r].dispatch(...)`, populating
+        // `RoundRouter.vote_tracker_round` and (for a step-level event)
+        // creating `PeriodRouter`/`StepRouter` entries under it. This test
+        // proves the mirror is never populated by any of the three
+        // VoteMachine* tags, which is what makes its vote-tracker fields
+        // dead code safe to delete.
+        let mut router = RootRouter::default();
+        let player = Player {
+            round: Round(10),
+            period: Period(0),
+            ..Player::default()
+        };
+        let params = test_params();
+
+        // A CertThreshold event genuinely mutates the canonical tracker.
+        let e = crate::events::Event::Threshold(crate::events::ThresholdEvent {
+            t: crate::events::EventType::CertThreshold,
+            round: Round(10),
+            period: Period(0),
+            ..crate::events::ThresholdEvent::default()
+        });
+        router.dispatch(
+            &player,
+            e,
+            StateMachineTag::VoteMachineRound,
+            Round(10),
+            Period(0),
+            Step(0),
+            &params,
+        );
+
+        // Also exercise the period- and step-level VoteMachine* tags.
+        router.dispatch(
+            &player,
+            crate::events::Event::NextThresholdStatusRequest(
+                crate::events::NextThresholdStatusRequestEvent,
+            ),
+            StateMachineTag::VoteMachinePeriod,
+            Round(10),
+            Period(0),
+            Step(0),
+            &params,
+        );
+        router.dispatch(
+            &player,
+            crate::events::Event::DumpVotesRequest(crate::events::DumpVotesRequestEvent),
+            StateMachineTag::VoteMachineStep,
+            Round(10),
+            Period(0),
+            Step(0),
+            &params,
+        );
+
+        // The canonical tracker (owned by VoteAggregator) really did see
+        // the CertThreshold event.
+        assert!(
+            router
+                .vote_aggregator
+                .round_tracker(Round(10))
+                .freshest_bundle()
+                .ok
+        );
+
+        // The legacy mirror under `RootRouter.children` was never reached:
+        // its `vote_tracker_round` field stayed at its default (empty)
+        // value, and no PeriodRouter (let alone StepRouter) was ever
+        // created underneath it — proving `RoundRouter::dispatch` itself
+        // was never invoked for any of these three events.
+        let round_router = router
+            .children
+            .get(&Round(10))
+            .expect("round entry created by update()");
+        assert!(round_router.children.is_empty());
+    }
+
+    #[test]
     fn root_router_dispatch_vote_machine_round() {
         let mut router = RootRouter::default();
         let player = Player {
@@ -793,55 +880,6 @@ mod tests {
             result.event_type(),
             crate::events::EventType::ProposalFrozen
         );
-    }
-
-    #[test]
-    fn period_router_dispatch_vote_tracker_period() {
-        let mut router = PeriodRouter::default();
-        let player = Player::default();
-        let params = test_params();
-
-        // Dispatch a next threshold status request
-        let e = crate::events::Event::NextThresholdStatusRequest(
-            crate::events::NextThresholdStatusRequestEvent,
-        );
-        let result = router.dispatch(
-            &player,
-            e,
-            StateMachineTag::VoteMachinePeriod,
-            Round(0),
-            Period(0),
-            Step(0),
-            &params,
-        );
-        assert_eq!(
-            result.event_type(),
-            crate::events::EventType::NextThresholdStatus
-        );
-    }
-
-    #[test]
-    fn step_router_dispatch_vote_tracker_step() {
-        let mut router = StepRouter::default();
-        let player = Player::default();
-        let params = test_params();
-
-        // Dispatch a dump votes request
-        let e = crate::events::Event::DumpVotesRequest(crate::events::DumpVotesRequestEvent);
-        let result = router.dispatch(
-            &player,
-            e,
-            StateMachineTag::VoteMachineStep,
-            Round(0),
-            Period(0),
-            Step(0),
-            &params,
-        );
-        if let crate::events::Event::DumpVotes(dv) = result {
-            assert!(dv.votes.is_empty());
-        } else {
-            panic!("expected DumpVotes event");
-        }
     }
 
     // ---- Multiple round updates ----
