@@ -1,0 +1,285 @@
+# Issue #496 (Phase 7) — 3 Go + 3 Rust, 50/50-stake mixed-cluster harness.
+#
+# Sibling of ../mixed-cluster/ (issue #469, 3 Go @ 30% + 1 Rust @ 10%).
+# That harness is load-bearing for nightly CI
+# (.github/workflows/consensus-cluster.yml) and deliberately keeps Rust
+# stake low so a Rust bug can never halt the chain. This harness exists
+# to answer the one question the low-stake topology structurally cannot:
+# do Rust votes ever appear *inside* a Go-produced, Go-verified
+# certificate? At 30/30/30/10 the three Go accounts alone clear the
+# 74.1% cert quorum (CertCommitteeSize=1500, threshold=1112) without the
+# Rust vote, so `agreement.makeBundle` never needs to pack it in. At
+# 50/50 the three Go accounts (~750 of 1500 expected votes) cannot clear
+# quorum alone, so a Rust vote becomes quorum-necessary and must appear
+# in real certificates. See ../mixed-cluster/README.md and this
+# directory's README.md for the full writeup.
+#
+# Deliberately duplicated (not templated) from ../mixed-cluster/'s
+# docker-compose.yml / scripts rather than parameterizing the shared
+# harness in place — see this directory's README.md "Why a sibling
+# directory" section. Distinct container names (phase7-*), network
+# (phase7net) and host ports (4101-4106 REST, 4261 gossip) so both
+# harnesses can run concurrently without collisions.
+#
+# Usage:
+#   ops/mixed-cluster-3rust/scripts/start.sh
+#   ops/mixed-cluster-3rust/scripts/status.sh
+#   ops/mixed-cluster-3rust/scripts/stop.sh
+
+services:
+  go-node-1:
+    image: algorand/algod:4.5.1-stable
+    container_name: phase7-go-node-1
+    environment:
+      - ALGORAND_DATA=/algod/data
+      - ALGOD_PORT=8080
+      - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - PEER_ADDRESS=go-node-2:4161;go-node-3:4161
+    ports:
+      - "127.0.0.1:4101:8080"
+      # Gossip listener, published for go-node-1 only, mirroring
+      # ../mixed-cluster/'s negative-conformance injector story (not yet
+      # wired up here — see README.md's follow-ups).
+      - "127.0.0.1:4261:4161"
+    volumes:
+      - ./netroot/Node1:/algod/data
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - -H
+        - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        - http://localhost:8080/v2/status
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    networks:
+      - phase7net
+
+  go-node-2:
+    image: algorand/algod:4.5.1-stable
+    container_name: phase7-go-node-2
+    environment:
+      - ALGORAND_DATA=/algod/data
+      - ALGOD_PORT=8080
+      - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - PEER_ADDRESS=go-node-1:4161;go-node-3:4161
+    ports:
+      - "127.0.0.1:4102:8080"
+    volumes:
+      - ./netroot/Node2:/algod/data
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - -H
+        - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        - http://localhost:8080/v2/status
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    networks:
+      - phase7net
+
+  go-node-3:
+    image: algorand/algod:4.5.1-stable
+    container_name: phase7-go-node-3
+    environment:
+      - ALGORAND_DATA=/algod/data
+      - ALGOD_PORT=8080
+      - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - PEER_ADDRESS=go-node-1:4161;go-node-2:4161
+    ports:
+      - "127.0.0.1:4103:8080"
+    volumes:
+      - ./netroot/Node3:/algod/data
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - -H
+        - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        - http://localhost:8080/v2/status
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    networks:
+      - phase7net
+
+  # Three algod-rust participation nodes (issue #496 / Phase 7), each
+  # holding one wallet's ~16.67% stake, dialing all three Go relays.
+  # Same flags/rationale as ../mixed-cluster/'s rust-node-4 — see that
+  # file's comments for the long-form explanation of each flag.
+  rust-node-4:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      target: runtime
+    image: algod-rust-phase7:local
+    container_name: phase7-rust-node-4
+    depends_on:
+      go-node-1:
+        condition: service_healthy
+      go-node-2:
+        condition: service_healthy
+      go-node-3:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=${PHASE7_RUST_LOG:-info,algod_rust=debug,algo_network=debug,algo_agreement=info}
+    entrypoint:
+      - algod-rust
+      - participate
+      - --ledger-path=/app/ledger
+      - --partkey-path=/app/partkeys.sqlite
+      - --partkey-dir=/netroot/Node4Rust/${PHASE7_GENESIS_ID:-phase7net-v1}
+      - --genesis-json=/netroot/genesis.json
+      - --genesis-path=/netroot/genesis.json
+      - --genesis-id=${PHASE7_GENESIS_ID:-phase7net-v1}
+      - --genesis-hash=${PHASE7_GENESIS_HASH:-}
+      - --network=phase7net
+      - --peers=go-node-1:4161,go-node-2:4161,go-node-3:4161
+      - --rest-listen=0.0.0.0:8080
+      - --data-dir=/data
+    ports:
+      - "127.0.0.1:4104:8080"
+    volumes:
+      - rust-node-4-data:/app
+      - ./netroot:/netroot:ro
+      - ./netroot/rust-node-4-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - -H
+        - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        - http://localhost:8080/v2/status
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - phase7net
+
+  rust-node-5:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      target: runtime
+    image: algod-rust-phase7:local
+    container_name: phase7-rust-node-5
+    depends_on:
+      go-node-1:
+        condition: service_healthy
+      go-node-2:
+        condition: service_healthy
+      go-node-3:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=${PHASE7_RUST_LOG:-info,algod_rust=debug,algo_network=debug,algo_agreement=info}
+    entrypoint:
+      - algod-rust
+      - participate
+      - --ledger-path=/app/ledger
+      - --partkey-path=/app/partkeys.sqlite
+      - --partkey-dir=/netroot/Node5Rust/${PHASE7_GENESIS_ID:-phase7net-v1}
+      - --genesis-json=/netroot/genesis.json
+      - --genesis-path=/netroot/genesis.json
+      - --genesis-id=${PHASE7_GENESIS_ID:-phase7net-v1}
+      - --genesis-hash=${PHASE7_GENESIS_HASH:-}
+      - --network=phase7net
+      - --peers=go-node-1:4161,go-node-2:4161,go-node-3:4161
+      - --rest-listen=0.0.0.0:8080
+      - --data-dir=/data
+    ports:
+      - "127.0.0.1:4105:8080"
+    volumes:
+      - rust-node-5-data:/app
+      - ./netroot:/netroot:ro
+      - ./netroot/rust-node-5-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - -H
+        - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        - http://localhost:8080/v2/status
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - phase7net
+
+  rust-node-6:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      target: runtime
+    image: algod-rust-phase7:local
+    container_name: phase7-rust-node-6
+    depends_on:
+      go-node-1:
+        condition: service_healthy
+      go-node-2:
+        condition: service_healthy
+      go-node-3:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=${PHASE7_RUST_LOG:-info,algod_rust=debug,algo_network=debug,algo_agreement=info}
+    entrypoint:
+      - algod-rust
+      - participate
+      - --ledger-path=/app/ledger
+      - --partkey-path=/app/partkeys.sqlite
+      - --partkey-dir=/netroot/Node6Rust/${PHASE7_GENESIS_ID:-phase7net-v1}
+      - --genesis-json=/netroot/genesis.json
+      - --genesis-path=/netroot/genesis.json
+      - --genesis-id=${PHASE7_GENESIS_ID:-phase7net-v1}
+      - --genesis-hash=${PHASE7_GENESIS_HASH:-}
+      - --network=phase7net
+      - --peers=go-node-1:4161,go-node-2:4161,go-node-3:4161
+      - --rest-listen=0.0.0.0:8080
+      - --data-dir=/data
+    ports:
+      - "127.0.0.1:4106:8080"
+    volumes:
+      - rust-node-6-data:/app
+      - ./netroot:/netroot:ro
+      - ./netroot/rust-node-6-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - -H
+        - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        - http://localhost:8080/v2/status
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - phase7net
+
+volumes:
+  rust-node-4-data:
+  rust-node-5-data:
+  rust-node-6-data:
+
+networks:
+  phase7net:
+    driver: bridge

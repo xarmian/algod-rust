@@ -435,3 +435,54 @@ view of seed and stake as the input to Go's verifier.
 Deferred to Phase 7: a 6-node (3 Go + 3 Rust) topology, 1000+ round
 soaks, consensus performance benchmarking, and public-network
 participation.
+
+---
+
+## Phase 7 addendum (issue #496) — 3 Go + 3 Rust, 50/50 stake
+
+`ops/mixed-cluster-3rust/` (see its README for the full design writeup)
+stands up the 6-node, 50/50-stake sibling topology Epic #107's one open
+criterion asked for — *"Rust votes appear in certificates verified by
+Go nodes"* — which the 30/30/30/10 harness above cannot demonstrate by
+construction (the three Go accounts alone always clear the 74.1% cert
+quorum, so `agreement.makeBundle` never needs a Rust vote).
+
+**Status: infrastructure built and verified working; the soak/cert-
+verify evidence this issue exists to produce is NOT yet obtained**, per
+issue #497 below.
+
+### What was verified
+
+- All six nodes (`start.sh`) boot, discover each other over gossip, and
+  reach `status.sh`-healthy.
+- All three Rust nodes propose (`assembled 2 proposal message(s)`),
+  cast soft votes, and cast next-vote family recovery votes.
+- All three Go relays receive and `VoteAccepted` every Rust account's
+  vote, at every step observed, confirmed by grepping each Go
+  container's log for each Rust account's base32 address (8-10 hits per
+  node per account across the observation window) — vote delivery over
+  gossip works correctly at this topology.
+
+### What blocked the soak
+
+Round 1 did not finalize within an over-10-minute observation window.
+The round 1 period 0 soft vote split across (at least) three different
+proposal values — go-node-1 and the three Rust nodes each locally
+picked a different "lowest observed credential" proposal before their
+own freeze deadlines — and the resulting next-vote recovery never
+converged: per-step timeouts kept doubling (31s → 47s → 1m19s → 2m23s →
+4m31s → 14m3s) without ever reaching a bottom-quorum or advancing to a
+new period. Full evidence (log excerpts, weight tallies, hypothesis)
+filed as **issue #497**; #496 is left open pending its resolution.
+
+### Acceptance-criteria walk (issue #496)
+
+| Criterion | Status |
+|---|---|
+| 3 Go + 3 Rust, 50/50-stake sibling harness | **Met** — `ops/mixed-cluster-3rust/` |
+| `MIN_RUST_VOTE_ROUNDS` armed above 0 for this topology | **Met** — `verify-soak.sh`'s own default is 1 (unchanged from the parent harness); the Makefile's `consensus-cluster-3rust-verify` target defaults to 5 |
+| 200+ round soak, fork-free, no Go-side rejections | **Not met** — blocked by issue #497 |
+| `algo-cert-crossverify` Rust-vote-in-cert evidence (Go→Rust) | **Not met** — no certificates were produced to sample |
+| `tools/cert-authenticate` re-authentication (Rust→Go) | **Not met** — same reason |
+| Bugs surfaced by the 3+3 topology fixed or filed | **Met** — filed as issue #497 (root-causing/fixing was judged too large to land safely in the same PR as the harness itself) |
+| Docs updated | **Met** — this addendum + `ops/mixed-cluster-3rust/README.md` |

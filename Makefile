@@ -6,6 +6,7 @@ COMPOSE_RELAY := docker compose -f docker/docker-compose.test-relay.yml
 COMPOSE_MIXED := docker compose -f docker/docker-compose.mixed-cluster.yml
 COMPOSE_VALIDATE_API := docker compose -f docker/docker-compose.validate-api.yml
 PHASE6_CLUSTER := ops/mixed-cluster
+PHASE7_CLUSTER := ops/mixed-cluster-3rust
 
 .PHONY: build test fmt fmt-check clippy lint deny ci clean coverage coverage-lcov
 .PHONY: validate-api-up validate-api-down validate-api-status validate-api-logs validate-api
@@ -665,6 +666,37 @@ consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker
 consensus-analyzer-test: ## DEPRECATED alias for consensus-cluster-analyzer
 	@echo "note: consensus-analyzer-test is deprecated — use 'make consensus-cluster-analyzer'" >&2
 	@$(MAKE) consensus-cluster-analyzer
+
+## Issue #496 (Phase 7) — the sibling 3 Go + 3 Rust, 50/50-stake
+## topology. See ops/mixed-cluster-3rust/README.md for why it's a
+## sibling directory rather than a mode of the harness above: this
+## topology makes Rust cert votes quorum-necessary (`agreement.
+## makeBundle` cannot clear 74.1% cert quorum from the Go side's ~50%
+## alone), which the above harness's 30/30/30/10 split deliberately
+## avoids so a Rust bug can never halt the chain.
+.PHONY: consensus-cluster-3rust-up consensus-cluster-3rust-down consensus-cluster-3rust-status
+.PHONY: consensus-cluster-3rust-soak consensus-cluster-3rust-verify
+consensus-cluster-3rust-up: ## Bring up the 6-node (3 Go + 3 Rust, 50/50 stake) consensus cluster
+	$(PHASE7_CLUSTER)/scripts/start.sh
+
+consensus-cluster-3rust-status: ## Per-node round snapshot for the 3rust cluster (all 6 via REST)
+	$(PHASE7_CLUSTER)/scripts/status.sh
+
+consensus-cluster-3rust-down: ## Tear down the 3rust cluster (pass PURGE=1 to wipe netroot/)
+	@if [ "$(PURGE)" = "1" ]; then \
+		$(PHASE7_CLUSTER)/scripts/stop.sh --purge; \
+	else \
+		$(PHASE7_CLUSTER)/scripts/stop.sh; \
+	fi
+
+consensus-cluster-3rust-soak: ## Soak the 3rust cluster (ROUNDS, default 200); cluster must already be up
+	$(PHASE7_CLUSTER)/scripts/soak.sh --rounds $(or $(ROUNDS),200)
+
+consensus-cluster-3rust-verify: ## Fork + cert cross-verify (both directions) on the 3rust cluster
+	cargo build -p algo-fork-detector -p algo-cert-crossverify
+	$(PHASE7_CLUSTER)/scripts/verify-soak.sh \
+		--rust-account "$(RUST_ACCOUNT)" \
+		--min-rust-vote-rounds $(or $(MIN_RUST_VOTE_ROUNDS),5)
 
 consensus-negative-test: ## DEPRECATED alias for consensus-cluster-negative
 	@echo "note: consensus-negative-test is deprecated — use 'make consensus-cluster-negative'" >&2
