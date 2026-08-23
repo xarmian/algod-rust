@@ -150,11 +150,24 @@ or loop the verifier once per Rust account for stronger coverage.
 
 ## Evidence (issue #496 acceptance criteria)
 
-See `docs/PHASE6_VALIDATION.md`'s Phase 7 addendum for the full
-soak/verify run this harness produced, including round counts, fork
-status, and the `algo-cert-crossverify` / `tools/cert-authenticate`
-output demonstrating Rust votes inside Go-produced certificates in both
-directions.
+**Closed.** A live soak past round 230 on an otherwise-idle host
+measured: 220 consecutive rounds fork-free (`algo-fork-detector`:
+`forks=0 insufficient=0 fetch_errors=0`), zero Go-side agreement
+rejections, and both cert-verification directions passing — 16 sampled
+certificates all authenticate under both implementations, 12 of which
+carry a Rust participant's vote (`algo-cert-crossverify` Go→Rust,
+`tools/cert-authenticate` against a real go-algorand v4.5.1-stable
+build Rust→Go). See `docs/PHASE6_VALIDATION.md`'s Phase 7 addendum for
+the full writeup, exact commands, and root-cause notes on this
+topology's round-time characteristics.
+
+Note on `soak.sh --stall-timeout`: at 50/50 stake, roughly every other
+round needs one or more `next`-vote recovery escalations before
+committing (typically resolving within 60-90s — see the addendum for
+why this is expected, not a liveness bug). `soak.sh`'s default here is
+180s (raised from the parent 10%-stake harness's 60s specifically for
+this reason); lower it only if you've confirmed your run doesn't hit
+this pattern.
 
 ## Follow-ups
 
