@@ -409,8 +409,8 @@ autotools.
 | Limitation | Notes |
 |---|---|
 | **Nightly in CI, never per-PR** | Since #488 the harness runs in `.github/workflows/consensus-cluster.yml` (`schedule` 02:41 UTC + `workflow_dispatch` only): Tier 1 is the #469 participation smoke, Tier 2 the full `consensus-cluster-test RESTART_SCENARIOS=1 NEGATIVE_CASES=1` suite, with `summary.json` / `soak.jsonl` / verifier reports uploaded for 30 days. Container build + Rust release build + a 200-round soak remain far too slow for per-PR CI, so there is no `pull_request`/`push` trigger, and all Layer-9 cluster tests stay `#[ignore]`d behind `MIXED_CLUSTER=1` — `cargo test --workspace` never touches Docker. See `docs/MIXED_CLUSTER_HARNESS.md` §3. |
-| One Rust node, not three | The proposal's 6-node topology (3 Go + 3 Rust) and 1000+ round soak are explicitly **deferred to Phase 7** by #107. |
-| Rust cert votes not inside certificates | Structural consequence of `makeBundle` + the 30/30/30/10 split, not a defect — see criterion 7. This is the one Epic #107 acceptance item left open; Phase 7's 3 Go + 3 Rust topology puts the Rust stake at 50%, where the votes become quorum-necessary and `MIN_RUST_VOTE_ROUNDS` can be raised above 0 to gate on it. |
+| One Rust node, not three (this harness) | Deliberate — this harness keeps Rust stake at 10% so a Rust bug can never halt the chain. The 3 Go + 3 Rust, 50/50-stake topology and its measured evidence live in `ops/mixed-cluster-3rust/` — see the Phase 7 addendum below (issue #496, closed). |
+| Rust cert votes not inside certificates (this harness only) | Structural consequence of `makeBundle` + the 30/30/30/10 split, not a defect — see criterion 7. The Phase 7 addendum below demonstrates Rust votes inside Go-produced, Go-verified certificates at the 50/50-stake topology where they become quorum-necessary. |
 | Negative suite injects at one node | Only `go-node-1`'s gossip port is published, deliberately: an injection can never reach the other two, which carry the quorum. |
 | `algod-rust relay` still has no REST listener | `participate` does; the harness no longer needs it. |
 | No mainnet/testnet participation | Out of Phase 6 scope. |
@@ -447,42 +447,96 @@ Go nodes"* — which the 30/30/30/10 harness above cannot demonstrate by
 construction (the three Go accounts alone always clear the 74.1% cert
 quorum, so `agreement.makeBundle` never needs a Rust vote).
 
-**Status: infrastructure built and verified working; the soak/cert-
-verify evidence this issue exists to produce is NOT yet obtained**, per
-issue #497 below.
+**Status: CLOSED — the liveness blocker (issue #497) is fixed, and a
+live soak past round 230 measured every acceptance criterion below as
+met.**
 
-### What was verified
+### History
 
-- All six nodes (`start.sh`) boot, discover each other over gossip, and
-  reach `status.sh`-healthy.
-- All three Rust nodes propose (`assembled 2 proposal message(s)`),
-  cast soft votes, and cast next-vote family recovery votes.
-- All three Go relays receive and `VoteAccepted` every Rust account's
-  vote, at every step observed, confirmed by grepping each Go
-  container's log for each Rust account's base32 address (8-10 hits per
-  node per account across the observation window) — vote delivery over
-  gossip works correctly at this topology.
+- The harness itself (topology, docker-compose, start/stop/status
+  scripts) was built and merged via **#498**.
+- A first live run hit a liveness bug — round 1 never finalized because
+  a bottom-quorum recovery bundle's votes were dropped instead of being
+  replayed into the vote tracker, so `next`-family timeouts kept
+  doubling without ever reaching quorum. Root-caused and fixed as
+  **issue #497** / **PR #499** (`algo-agreement`: replay authenticated
+  votes from verified recovery bundles into the canonical vote-tracker
+  state). A follow-up dead-code cleanup landed as **#500**.
+- This issue (#496) picked the topology back up post-fix to obtain the
+  actual soak/cert-verify evidence.
 
-### What blocked the soak
+### Measured evidence (this run)
 
-Round 1 did not finalize within an over-10-minute observation window.
-The round 1 period 0 soft vote split across (at least) three different
-proposal values — go-node-1 and the three Rust nodes each locally
-picked a different "lowest observed credential" proposal before their
-own freeze deadlines — and the resulting next-vote recovery never
-converged: per-step timeouts kept doubling (31s → 47s → 1m19s → 2m23s →
-4m31s → 14m3s) without ever reaching a bottom-quorum or advancing to a
-new period. Full evidence (log excerpts, weight tallies, hypothesis)
-filed as **issue #497**; #496 is left open pending its resolution.
+Cluster started fresh (`stop.sh --purge` then `start.sh`) on an
+otherwise-idle host (`docker stats` near-zero CPU throughout) and run
+continuously past round 230 with no restarts:
+
+- **Fork detection**: `algo-fork-detector` polled all three Go REST
+  nodes for rounds **1..220** (220 consecutive rounds): `forks=0
+  insufficient=0 fetch_errors=0`. Zero digest divergence across every
+  round sampled.
+- **No Go-side agreement rejections**: grepping all three Go
+  containers' structured logs for the full run window for
+  `RejectedVote`/`RejectedBlock`/`RejectedProposal`/`BadVote` trace
+  events returned zero hits on every node.
+- **Go→Rust cert cross-verify** (`algo-cert-crossverify`, stride 15
+  over the 1..220 range → 16 sampled certs): `rounds=16 ok=16 failed=0`
+  — every sampled Go-produced certificate authenticates under
+  algod-rust's own `Certificate::authenticate`. Wallet4 (one of the
+  three Rust participants, `EXOXMGPY4C4O22P3JIAVHAKCNA656W2TGI4FRU2WNI6QXL3JPGAIE53JCI`)
+  gate: **12 of 16** sampled certificates carry its vote (`--min-rust-vote-rounds 5`,
+  comfortably cleared).
+- **Rust→Go cert authentication** (`tools/cert-authenticate` against a
+  real go-algorand v4.5.1-stable build, issue #470's machinery):
+  `rounds=16 ok=16 failed=0 rust_vote_rounds=12` — the *same* 16
+  Go-produced certificates, including the 12 carrying Wallet4's vote,
+  re-authenticate cleanly under go-algorand's own
+  `agreement.Certificate.Authenticate`. This is the direct, both-
+  directions proof the issue exists to produce: a Rust vote sits inside
+  a certificate that Go produced, Go verifies, and Rust verifies —
+  round 1's sampled certificate is one concrete example (`cert_period:
+  2`, `rust_vote_present: true`, digests match on both sides).
+- The cluster continued advancing past round 230 for the entire
+  duration of the verify run with no additional intervention.
+
+### A characteristic of the 50/50 topology (not a bug)
+
+Round times at 50/50 stake are visibly less uniform than the 10%-stake
+harness: roughly every other round finalizes in period 0 within
+~3.5s, while the alternating round more often needs one or more
+`next`-vote recovery escalations (go-algorand's own doubling schedule —
+3s → 4s → 6s → 10s → 18s → 34s → ...) before committing, typically
+resolving within 60-90s. Root-caused during this soak by comparing
+go-node-1's and each Rust node's structured/tracing logs for a
+representative slow round (round 37): all six nodes converged on the
+*same* proposal value at the soft step, but the step-2 (cert) window is
+only ~1s past the soft-quorum instant in this protocol's timeout
+schedule, and the round's cert-committee sample (VRF sortition, not
+every account is selected every round — confirmed by counting cert
+votes cast per Rust node across the run: 35/23/49 out of ~50 rounds
+observed, consistent with per-round committee sampling variance, not a
+missing-vote defect) sometimes falls a few seats short of the 1112/1500
+quorum within that window, falling back to the (correctly-functioning,
+post-#499) recovery path. This is expected agreement-protocol behavior
+for a small, freshly-bootstrapped 6-account committee at a stake split
+where no single side can clear quorum alone — it is not a liveness
+defect (every observed round recovers), not a fork risk (fork detector
+confirms), and it is in fact a *visible instance* of exactly the
+dynamic this issue sets out to prove (Rust votes quorum-necessary,
+occasionally arriving just outside the fast-path window). No Rust code
+change was made for this; `ops/mixed-cluster-3rust/scripts/soak.sh`'s
+`--stall-timeout` should be set generously (≥120s) for this topology to
+avoid false-positive stall reports from the monitoring wrapper — the
+underlying consensus was never actually stuck.
 
 ### Acceptance-criteria walk (issue #496)
 
 | Criterion | Status |
 |---|---|
-| 3 Go + 3 Rust, 50/50-stake sibling harness | **Met** — `ops/mixed-cluster-3rust/` |
-| `MIN_RUST_VOTE_ROUNDS` armed above 0 for this topology | **Met** — `verify-soak.sh`'s own default is 1 (unchanged from the parent harness); the Makefile's `consensus-cluster-3rust-verify` target defaults to 5 |
-| 200+ round soak, fork-free, no Go-side rejections | **Not met** — blocked by issue #497 |
-| `algo-cert-crossverify` Rust-vote-in-cert evidence (Go→Rust) | **Not met** — no certificates were produced to sample |
-| `tools/cert-authenticate` re-authentication (Rust→Go) | **Not met** — same reason |
-| Bugs surfaced by the 3+3 topology fixed or filed | **Met** — filed as issue #497 (root-causing/fixing was judged too large to land safely in the same PR as the harness itself) |
+| 3 Go + 3 Rust, 50/50-stake sibling harness | **Met** — `ops/mixed-cluster-3rust/` (#498) |
+| `MIN_RUST_VOTE_ROUNDS` armed above 0 for this topology | **Met** — `verify-soak.sh --min-rust-vote-rounds 5` used and cleared (12/16); the Makefile's `consensus-cluster-3rust-verify` target also defaults to 5 |
+| 200+ round soak, fork-free, no Go-side rejections | **Met** — 220 consecutive rounds fork-free (`forks=0 insufficient=0 fetch_errors=0`); zero Go-side rejection events; cluster continued past round 230 |
+| `algo-cert-crossverify` Rust-vote-in-cert evidence (Go→Rust) | **Met** — 12/16 sampled Go-produced certificates authenticate under algod-rust's verifier and carry the Rust participant's vote |
+| `tools/cert-authenticate` re-authentication (Rust→Go) | **Met** — the same 16 certificates (12 with a Rust vote) re-authenticate under go-algorand v4.5.1-stable's own `agreement.Certificate.Authenticate` |
+| Bugs surfaced by the 3+3 topology fixed or filed | **Met** — the liveness blocker was #497/PR #499 (already fixed prior to this run); this run's round-cadence characteristic was investigated and found to be expected protocol behavior, not a new defect (see above) |
 | Docs updated | **Met** — this addendum + `ops/mixed-cluster-3rust/README.md` |

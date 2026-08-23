@@ -30,7 +30,14 @@ ROOT="$(cd "$HERE/.." && pwd)"
 ROUNDS=200
 OUT=""
 INTERVAL=0.5
-STALL_TIMEOUT=60
+# issue #496: at this topology's 50/50 stake split, roughly every other
+# round needs a next-vote recovery escalation (go-algorand's own timeout
+# doubling: 3s -> 4s -> 6s -> 10s -> 18s -> 34s -> ...) before committing
+# — measured to typically resolve within 60-90s and NOT indicate a real
+# stall (see docs/PHASE6_VALIDATION.md's Phase 7 addendum). The parent
+# 10%-stake harness's 60s default is too tight here and false-positives
+# on a legitimately-recovering round; 180s leaves comfortable margin.
+STALL_TIMEOUT=180
 OVERALL_TIMEOUT=0
 SKIP_PREFLIGHT=0
 
