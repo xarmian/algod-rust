@@ -71,6 +71,7 @@ If a check fails, read its actual logs (`gh run view <run-id> --log-failed`) bef
 
 ### 9. Merge to main
 
+- **Open-topics sweep first — no open topic survives a merge untracked.** Before merging, inventory everything this PR leaves unresolved: deferred self-review findings (step 6), bugs found but fixed out-of-scope, `TODO`/`FIXME` comments the diff introduced, known limitations admitted in the PR body, unmet acceptance criteria of the underlying issue, and follow-up work the investigation surfaced. For **each one**, create a dedicated GitHub issue (proper labels per step 4's taxonomy, a link back to the PR and origin issue) — and reference the new issue numbers in a PR comment or the merge summary so the trail is navigable both ways. If the work belongs to an active version-upgrade epic (see the `algod-version-upgrade` skill), the new issue must also be inserted into that epic's working plan, not just filed loose.
 - Merging is a shared-state action: confirm with the user (`AskUserQuestion`) before merging, even if a similar merge was approved earlier in the same session — auto-mode blocks it by default for a reason.
 - `/pr-ship <pr-number>` handles the confirm → `gh pr merge --squash --delete-branch` → sync-local-`main` sequence.
 - If the PR said `Fixes #N`, verify the issue actually closed (`gh issue view N --json state`) rather than assuming.
