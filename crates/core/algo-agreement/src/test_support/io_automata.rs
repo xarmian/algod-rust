@@ -288,12 +288,12 @@ impl IoAutomataConcretePlayer {
     /// `pM.Children[r].VoteTrackerRound.Freshest = thresholdEvent{T: certThreshold, ...}`
     /// `pM.Children[r].VoteTrackerRound.Ok = true`.
     ///
-    /// Writes to both per-round `VoteTrackerRound` instances: the canonical
-    /// one held by `VoteAggregator.rounds[r]` (consulted by the `VoteMachine`
-    /// dispatch path that filters duplicate bundles) and the legacy mirror
-    /// in `RoundRouter.children[r].vote_tracker_round` (consulted by
-    /// `freshest_bundle` requests). Same duplication shape as
-    /// [`set_proposal_assembler`].
+    /// Writes to the canonical `VoteTrackerRound` held by
+    /// `VoteAggregator.rounds[r]` — the only one that exists; algod-rust's
+    /// `RootRouter` routes VoteMachineRound/Period/Step events directly
+    /// there instead of through a `RoundRouter` mirror (issue #500,
+    /// follow-up to #497/#499). Unlike [`set_proposal_assembler`], there is
+    /// no second copy to keep in sync.
     ///
     /// **Verbatim port note.** Go's `player_permutation_test.go` also
     /// constructs an internally inconsistent state here: `threshold.Proposal`
@@ -331,16 +331,12 @@ impl IoAutomataConcretePlayer {
             bundle,
             proto: String::new(),
         };
-        // Canonical: vote_aggregator.rounds[r] is what the VoteMachine
-        // dispatch path filters bundles against.
+        // vote_aggregator.rounds[r] is what the VoteMachine dispatch path
+        // filters bundles against — the only VoteTrackerRound instance.
         self.router
             .vote_aggregator
             .round_tracker(round)
-            .force_freshest_for_test(te.clone());
-        // Legacy mirror under RoundRouter.
-        if let Some(round_router) = self.router.children.get_mut(&round) {
-            round_router.vote_tracker_round.force_freshest_for_test(te);
-        }
+            .force_freshest_for_test(te);
     }
 }
 
