@@ -61,7 +61,7 @@ Title: <area>: <what changes> (go-algorand NEW)
 ## Upstream change
 - go-algorand commits/PRs: <SHAs / PR links from stage 2>
 - Files: <go paths>
-- Release: NEW
+- First released in: <the exact go-algorand release where this feature first appeared>
 
 ## What algod-rust must do
 - Affected crates: <crates>
@@ -79,6 +79,7 @@ Part of epic #<epic-number>.
 **Labels are mandatory, on every issue** (`gh label list` for the taxonomy; create missing ones with `gh label create`):
 
 - the new `phase:<N>` label (create it: `gh label create "phase:<N>" --description "Phase <N>: go-algorand NEW parity" --color 0E8A16`),
+- an **upstream-version label naming the release where the feature first appeared** — `algod:<tag>` (e.g. `algod:v4.6.0-stable`); create one per release in the OLD..NEW range as needed (`gh label create "algod:<tag>" --description "Introduced in go-algorand <tag>" --color 8250DF`). When OLD..NEW spans several releases, do NOT blanket-tag everything with NEW: find each feature's true origin release (`git -C ../go-algorand tag --contains <sha> --list '*-stable' | sort -V | head -1`, cross-checked against the release notes) and tag with that,
 - one domain label: `consensus` / `ledger` / `avm` / `networking` / `rest-api` / `sync` / `infrastructure`,
 - one effort label: `effort:small` / `effort:medium` / `effort:large`,
 - `conformance` for parity-verification work, `enhancement` for new features.
@@ -116,7 +117,7 @@ Ship stages 3–5's repo changes (docs, pin sweep, labels) as the epic's first P
 For each sub-issue **in the epic's dependency order**, run the full `algod-issue-fix` skill (all nine steps: investigate → TDD → fix → PR → self-review → fix findings → CI → fix CI → merge-with-confirmation). Additional rules for this loop:
 
 - **Sequential, not parallel** — these issues share consensus surfaces; parallel branches here have repeatedly produced conflicts. One issue merged before the next begins.
-- **Every PR gets labels** matching its issue: `phase:<N>` + the domain label + `conformance`/`enhancement` (`gh pr create --label ... --label ...`, or `gh pr edit <n> --add-label ...` immediately after creation). A PR with no labels is not done.
+- **Every PR gets labels** matching its issue: `phase:<N>` + the `algod:<tag>` upstream-version label + the domain label + `conformance`/`enhancement` (`gh pr create --label ... --label ...`, or `gh pr edit <n> --add-label ...` immediately after creation). A PR with no labels is not done.
 - PR bodies say `Fixes #<sub-issue>` and `Part of #<epic>`.
 - After each merge, tick the sub-issue off in the epic issue body (`gh issue edit <epic> --body ...` or a progress comment) so the epic always reflects reality.
 - If implementing one issue uncovers an upstream change stage 2 missed, file it as a new sub-issue in the epic immediately (same template/labels) — do not absorb it silently into the current PR.
