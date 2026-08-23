@@ -9,7 +9,7 @@ use std::time::Duration;
 
 /// Configuration for the transaction pool.
 ///
-/// All defaults match the go-algorand reference implementation (v4.5.1-stable).
+/// All defaults match the go-algorand reference implementation (v4.6.0-stable).
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     /// Maximum number of pending transactions in the pool.

@@ -1,7 +1,7 @@
 //! Local transaction submission + broadcast — outbound half of gap G1.
 //!
 //! Mirrors `go-algorand/data/txHandler.go::TxHandler.LocalTransaction` at
-//! v4.5.1-stable. The REST layer calls [`LocalTxBroadcaster::submit_group`]
+//! v4.6.0-stable. The REST layer calls [`LocalTxBroadcaster::submit_group`]
 //! to ingest a locally-originated transaction group into the pool and,
 //! on success, broadcast it to peers via the gossip TX tag. Closes the
 //! outbound half of gap **G1** in [`DOC-23`].

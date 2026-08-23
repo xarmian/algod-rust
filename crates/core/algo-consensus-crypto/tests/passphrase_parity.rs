@@ -1,7 +1,7 @@
 //! Byte-for-byte parity vs go-algorand `crypto/passphrase`.
 //!
 //! Fixtures were captured against `../go-algorand` pinned to
-//! `v4.5.1-stable` by running `passphrase.KeyToMnemonic` over a
+//! `v4.6.0-stable` by running `passphrase.KeyToMnemonic` over a
 //! reproducible mix of seeds (all-zero, all-ones, then SHA-256 of each
 //! NATO phonetic-alphabet name). If a future change makes these diverge,
 //! the change is a compatibility regression — stop and investigate.

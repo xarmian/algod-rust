@@ -24,7 +24,7 @@
 //! tool). See the sibling `fixtures/avm/README.md` for the record schema and
 //! regeneration procedure.
 //!
-//! References (go-algorand v4.5.1-stable):
+//! References (go-algorand v4.6.0-stable):
 //!   - `data/transactions/logic/eval.go:1228`  — `EvalSignatureFull`
 //!   - `data/transactions/logic/crypto.go:175` — `opEd25519Verify` (BT-294 site)
 //!   - `data/transactions/logic/crypto.go:162` — `Msg.ToBeHashed`

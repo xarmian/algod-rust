@@ -1,7 +1,7 @@
 //! Top-level participation key generation orchestrator.
 //!
 //! Mirrors `../go-algorand/data/account/participation.go:219-269`
-//! (v4.5.1-stable): validates inputs, computes the OTS batch range,
+//! (v4.6.0-stable): validates inputs, computes the OTS batch range,
 //! generates VRF + OTS + Falcon MSS secrets, persists the full set into a
 //! fresh erasable partkey DB. Used by `algokey part generate`
 //! ([[TASK-180]]).

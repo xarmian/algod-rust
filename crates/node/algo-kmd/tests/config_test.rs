@@ -2,7 +2,7 @@
 //!
 //! The fixture in `tests/fixtures/kmd_config_default.json` reflects what
 //! `codecs.SaveObjectToFile` writes for `DefaultConfig("/tmp/data")` in
-//! go-algorand v4.5.1-stable
+//! go-algorand v4.6.0-stable
 //! (`daemon/kmd/config/config.go:73–92`, `:131–138`).
 
 use algo_kmd::{

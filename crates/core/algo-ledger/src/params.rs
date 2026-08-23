@@ -2,7 +2,7 @@ use algo_types::AccountData;
 
 // Protocol parameters for minimum balance computation and fixed limits.
 //
-// Values from go-algorand consensus parameters (v4.5.1).
+// Values from go-algorand consensus parameters (v4.6.0).
 //
 // The majority of consensus parameters are now sourced from
 // `algo_types::ConsensusParams`, which is the single source of truth

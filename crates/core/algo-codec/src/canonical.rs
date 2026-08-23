@@ -591,7 +591,7 @@ pub fn canonical_encode_block_header_from_block(block: &Block) -> Vec<u8> {
 ///
 /// Matches go-algorand's `bookkeeping.Block`, which embeds `BlockHeader` and
 /// adds `Payset transactions.Payset \`codec:"txns"\`` (`../go-algorand/data/bookkeeping/block.go`
-/// @ v4.5.1-stable) — the embedded header's fields and `txns` are flattened
+/// @ v4.6.0-stable) — the embedded header's fields and `txns` are flattened
 /// into one msgpack map with omitempty/canonical semantics, same as
 /// [`canonical_encode_block_header_from_block`] plus the payset. This is the
 /// wire format used for stored block bytes (`ledger/blockdb`) and
@@ -792,7 +792,7 @@ pub fn canonical_encode_block_header_response(header: &BlockHeader) -> Vec<u8> {
 /// Mirrors go-algorand's generated `BaseAccountData.MarshalMsg`
 /// (`../go-algorand/ledger/store/trackerdb/data.go:32` and
 /// `../go-algorand/ledger/store/trackerdb/msgp_gen.go:99` @
-/// `v4.5.1-stable`). Field set + codec tags + omitempty semantics
+/// `v4.6.0-stable`). Field set + codec tags + omitempty semantics
 /// must stay bit-identical to Go because these bytes land in the
 /// `accountbase.data` BLOB column that both implementations read.
 ///
@@ -870,7 +870,7 @@ pub fn canonical_encode_base_account_data(acct: &AccountData) -> Vec<u8> {
 }
 
 /// Mirror of go-algorand's `trackerdb.BaseOnlineAccountData`
-/// (`../go-algorand/ledger/store/trackerdb/data.go:153` @ `v4.5.1-stable`).
+/// (`../go-algorand/ledger/store/trackerdb/data.go:153` @ `v4.6.0-stable`).
 ///
 /// Holds the BLOB shape stored in `onlineaccounts.data`: the embedded
 /// `BaseVotingData` (codec tags `A`..`F`) followed by five
@@ -931,7 +931,7 @@ impl Default for BaseOnlineAccountData {
 ///
 /// Mirrors go-algorand's generated `BaseOnlineAccountData.MarshalMsg`
 /// (`../go-algorand/ledger/store/trackerdb/msgp_gen.go:748` @
-/// `v4.5.1-stable`). Field set + codec tags + omitempty semantics
+/// `v4.6.0-stable`). Field set + codec tags + omitempty semantics
 /// stay bit-identical to Go because these bytes land in the
 /// `onlineaccounts.data` BLOB column that both implementations read.
 ///
@@ -976,7 +976,7 @@ pub fn canonical_encode_base_online_account_data(d: &BaseOnlineAccountData) -> V
 
 /// Go-algorand resource-flags bitmask
 /// (`../go-algorand/ledger/store/trackerdb/data.go:62-75` @
-/// `v4.5.1-stable`).
+/// `v4.6.0-stable`).
 ///
 /// These constants are the **on-the-wire** values that the `y` field of
 /// `ResourcesData` carries; consumers (Go writers, catchpoint imports)
@@ -1002,7 +1002,7 @@ pub mod resource_flags {
 }
 
 /// Mirror of go-algorand's `trackerdb.ResourcesData`
-/// (`../go-algorand/ledger/store/trackerdb/data.go:88` @ `v4.5.1-stable`).
+/// (`../go-algorand/ledger/store/trackerdb/data.go:88` @ `v4.6.0-stable`).
 ///
 /// The unified BLOB shape stored in `resources.data` — a single struct
 /// that carries the union of asset-params, asset-holding,
@@ -1081,7 +1081,7 @@ pub struct ResourcesData {
 ///
 /// Mirrors go-algorand's generated `ResourcesData.MarshalMsg`
 /// (`../go-algorand/ledger/store/trackerdb/msgp_gen.go:1743` @
-/// `v4.5.1-stable`). Bit-identity is required because these bytes land
+/// `v4.6.0-stable`). Bit-identity is required because these bytes land
 /// in the `resources.data` BLOB column that both implementations read.
 ///
 /// The `y` field (`resource_flags`) is the only field that may legally
@@ -1148,7 +1148,7 @@ pub fn canonical_encode_resources_data(d: &ResourcesData) -> Vec<u8> {
 }
 
 /// Mirror of go-algorand's `ledgercore.OnlineRoundParamsData`
-/// (`../go-algorand/ledger/ledgercore/totals.go:56` @ `v4.5.1-stable`).
+/// (`../go-algorand/ledger/ledgercore/totals.go:56` @ `v4.6.0-stable`).
 ///
 /// The inner BLOB stored at `onlineroundparamstail.data`. Tracks the
 /// agreement-side params at each round in the rolling
@@ -1169,7 +1169,7 @@ pub struct OnlineRoundParamsData {
 ///
 /// Mirrors go-algorand's generated `OnlineRoundParamsData.MarshalMsg`
 /// (`../go-algorand/ledger/ledgercore/msgp_gen.go:838` @
-/// `v4.5.1-stable`). Bit-identity required: the row hash that
+/// `v4.6.0-stable`). Bit-identity required: the row hash that
 /// participates in catchpoint label computation
 /// (`calculate_online_round_params_hash` in `algo_ledger::catchpoint`)
 /// chains through these bytes, and the catchpoint signer needs Rust
@@ -1194,7 +1194,7 @@ pub fn canonical_encode_online_round_params_data(d: &OnlineRoundParamsData) -> V
 
 /// Mirror of go-algorand's `ledgercore.StateProofVerificationContext`
 /// (`../go-algorand/ledger/ledgercore/stateproofverification.go:27` @
-/// `v4.5.1-stable`).
+/// `v4.6.0-stable`).
 ///
 /// The BLOB shape stored at `stateproofverification.verificationcontext`
 /// — the per-attested-round state-proof verifier that downstream nodes

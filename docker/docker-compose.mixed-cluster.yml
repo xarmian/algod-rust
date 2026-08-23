@@ -21,7 +21,7 @@
 
 services:
   go-relay:
-    image: algorand/algod:4.5.1-stable
+    image: algorand/algod:4.6.0-stable
     container_name: mc-go-relay
     environment:
       - GOSSIP_PORT=4161
@@ -97,7 +97,7 @@ services:
       - mixed-cluster
 
   go-nonrelay:
-    image: algorand/algod:4.5.1-stable
+    image: algorand/algod:4.6.0-stable
     container_name: mc-go-nonrelay
     depends_on:
       go-relay:

@@ -3,7 +3,7 @@
 //!
 //! Wires together the schema/lifecycle primitives from [`crate::sqlite`]
 //! and the crypto envelopes from [`crate::crypto`] into the surface
-//! described in `daemon/kmd/wallet/wallet.go` (v4.5.1-stable).
+//! described in `daemon/kmd/wallet/wallet.go` (v4.6.0-stable).
 //!
 //! TASK-204 scope: enough surface to create + open + rename wallets
 //! and export the master-derivation key. Per-key generation/import,

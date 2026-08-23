@@ -1,7 +1,7 @@
 //! Algorand 25-word mnemonic encoding.
 //!
 //! Byte-for-byte compatible with go-algorand's `crypto/passphrase` package
-//! (v4.5.1-stable). A 32-byte key encodes as 24 wordlist words (11 bits
+//! (v4.6.0-stable). A 32-byte key encodes as 24 wordlist words (11 bits
 //! each, packed little-endian) followed by an 11-bit SHA-512/256 checksum
 //! word, for 25 space-separated words total.
 //!

@@ -147,7 +147,7 @@ jq -n \
     --argjson avg_cpu "${AVG_CPU}" \
     --argjson blocks_per_sec "${BLOCKS_PER_SEC}" \
     --arg timestamp "${TIMESTAMP}" \
-    --arg git_sha "4.5.1-stable" \
+    --arg git_sha "4.6.0-stable" \
     --arg block_range "${BLOCK_RANGE}" \
     --argjson block_count "${BLOCKS_FETCHED}" \
     --argjson total_bytes "${TOTAL_BYTES}" \

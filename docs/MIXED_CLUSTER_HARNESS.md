@@ -150,7 +150,7 @@ the first place were closed by issue #468:
   `genesis.json` (including the `ConsensusProtocol: "future"` pin the
   template sets). `genesis_seed_matches_go_ledger_supply` asserts the
   resulting online / participating totals against the values a live
-  `algorand/algod:4.5.1-stable` node serves from `/v2/ledger/supply` at
+  `algorand/algod:4.6.0-stable` node serves from `/v2/ledger/supply` at
   round 0 on the same netroot.
 - **Online-stake awareness — done.** `template.json` now marks Wallet4
   `"Online": true`, so `goal network create` generates its partkey

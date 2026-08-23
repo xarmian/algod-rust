@@ -1,5 +1,5 @@
 //! Erasable sqlite accessor — mirrors go-algorand's
-//! `util/db.MakeErasableAccessor` (v4.5.1-stable).
+//! `util/db.MakeErasableAccessor` (v4.6.0-stable).
 //!
 //! An "erasable" sqlite DB sets `secure_delete=ON` so freed pages are
 //! zeroed on the next write/checkpoint. This matters for partkey

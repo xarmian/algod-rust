@@ -1914,7 +1914,7 @@ pub struct SqliteLedger {
     /// adapter's `get_state_delta_for_round`. Window size is
     /// [`crate::delta_cache::DEFAULT_WINDOW_SIZE`] (320 rounds), matching
     /// go-algorand's in-memory delta retention in `accountUpdates.deltas`
-    /// (`../go-algorand/ledger/acctupdates.go` @ `v4.5.1-stable`). The cache is
+    /// (`../go-algorand/ledger/acctupdates.go` @ `v4.6.0-stable`). The cache is
     /// in-memory only — it does not survive a restart, matching Go.
     /// PLAN-36 TASK-128.
     delta_cache: crate::delta_cache::DeltaCache,

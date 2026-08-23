@@ -1,7 +1,7 @@
 // Golden vector conformance tests for agreement Hashable types.
 //
 // These test vectors were verified on 2026-03-16 by actually running Go test
-// files inside go-algorand v4.5.1-stable. The Go test files live at:
+// files inside go-algorand v4.6.0-stable. The Go test files live at:
 //   ../go-algorand/agreement/golden_vectors_test.go
 //   ../go-algorand/data/committee/golden_vectors_test.go
 //

@@ -15,7 +15,7 @@
 //   ../go-algorand/agreement/golden_vectors_test.go
 //   ../go-algorand/data/committee/golden_vectors_test.go
 //
-// These files were created and run on 2026-03-16 against go-algorand v4.5.1-stable.
+// These files were created and run on 2026-03-16 against go-algorand v4.6.0-stable.
 // All output was captured and verified against the Rust constants in:
 //   crates/core/algo-agreement/src/golden_vectors.rs
 //
@@ -23,7 +23,7 @@
 // hex strings against the Rust constants.
 //
 // ============================================================================
-// Captured Go output (2026-03-16, go-algorand v4.5.1-stable):
+// Captured Go output (2026-03-16, go-algorand v4.6.0-stable):
 // ============================================================================
 //
 // === From: go test -run TestGoldenVectors -v ./agreement/ ===

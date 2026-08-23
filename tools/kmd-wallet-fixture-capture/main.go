@@ -135,7 +135,7 @@ func main() {
 		ScryptN:     1024,
 		ScryptR:     1,
 		ScryptP:     1,
-		Description: "wallet produced by go-algorand v4.5.1-stable daemon/kmd/wallet/driver.SQLiteWalletDriver.CreateWallet; used by algo-kmd's interop test to verify Rust can open and export the MDK",
+		Description: "wallet produced by go-algorand v4.6.0-stable daemon/kmd/wallet/driver.SQLiteWalletDriver.CreateWallet; used by algo-kmd's interop test to verify Rust can open and export the MDK",
 	}
 	manifestPath := filepath.Join(outDir, "manifest.json")
 	mf, err := os.Create(manifestPath)

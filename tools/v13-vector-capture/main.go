@@ -14,7 +14,7 @@
 //   - crypto/sha512.Sum512
 //   - github.com/algorand/go-sumhash.New512(nil)
 //
-// References (go-algorand v4.5.1-stable):
+// References (go-algorand v4.6.0-stable):
 //   data/transactions/logic/crypto.go:120 — opSumhash512
 //   data/transactions/logic/crypto.go:128 — opSHA512
 //

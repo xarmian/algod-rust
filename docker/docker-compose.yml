@@ -1,6 +1,6 @@
 services:
   algod-go:
-    image: algorand/algod:4.5.1-stable
+    image: algorand/algod:4.6.0-stable
     container_name: algod-go
     environment:
       - DEV_MODE=1
@@ -27,7 +27,7 @@ services:
     restart: unless-stopped
 
   txn-generator:
-    image: algorand/algod:4.5.1-stable
+    image: algorand/algod:4.6.0-stable
     container_name: txn-generator
     depends_on:
       algod-go:
@@ -60,7 +60,7 @@ services:
       - rust
 
   algod-archival:
-    image: algorand/algod:4.5.1-stable
+    image: algorand/algod:4.6.0-stable
     container_name: algod-archival
     environment:
       - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

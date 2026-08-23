@@ -1,7 +1,7 @@
 //! CLI surface for `algokey-rust`.
 //!
 //! Mirrors the cobra command tree from `../go-algorand/cmd/algokey/`
-//! (v4.5.1-stable). Top-level subcommands match Go's registration order
+//! (v4.6.0-stable). Top-level subcommands match Go's registration order
 //! (`generate`, `import`, `export`, `sign`, `multisig`, `part`). `keyreg`
 //! lives under `part` exactly like Go (`part.go:185`); `append-auth-addr`
 //! lives under `multisig` (`multisig.go:43`).

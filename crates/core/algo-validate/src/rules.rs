@@ -40,7 +40,7 @@ pub struct SpecialAddresses {
 /// Return consensus parameters for the given protocol version string.
 ///
 /// Delegates to `algo_types::consensus::consensus_params_for_version`.
-/// All values match go-algorand `config/consensus.go` at tag v4.5.1-stable.
+/// All values match go-algorand `config/consensus.go` at tag v4.6.0-stable.
 ///
 /// Returns `None` for unknown protocol versions.
 pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {

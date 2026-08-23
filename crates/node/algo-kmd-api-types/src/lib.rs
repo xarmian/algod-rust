@@ -1,7 +1,7 @@
 //! `algo-kmd-api-types` — on-wire JSON shapes for the kmd v1 REST API.
 //!
 //! Ported from `../go-algorand/daemon/kmd/lib/kmdapi/{common,requests,responses}.go`
-//! (v4.5.1-stable). The shapes are decoupled from the `algo-kmd` server library
+//! (v4.6.0-stable). The shapes are decoupled from the `algo-kmd` server library
 //! so a future Rust SDK (or any external HTTP consumer) can talk to a kmd server
 //! without dragging in SQLite/scrypt/etc.
 //!

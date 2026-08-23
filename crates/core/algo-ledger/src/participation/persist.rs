@@ -1,7 +1,7 @@
 //! Partkey sqlite writer — `Persist` + `PersistNewParent`.
 //!
 //! Mirrors `../go-algorand/data/account/participation.go:281-305` and
-//! `:211-217` (v4.5.1-stable). Owns the single-row `ParticipationAccount`
+//! `:211-217` (v4.6.0-stable). Owns the single-row `ParticipationAccount`
 //! INSERT (under a fresh-install schema) and the `parent` UPDATE used by
 //! `algokey part reparent` (TASK-181).
 //!

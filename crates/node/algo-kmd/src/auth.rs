@@ -1,6 +1,6 @@
 //! API-token authentication primitives.
 //!
-//! Ported from `../go-algorand/util/tokens/tokens.go` (v4.5.1-stable):
+//! Ported from `../go-algorand/util/tokens/tokens.go` (v4.6.0-stable):
 //! `ValidateOrGenerateAPIToken`, `ValidateAPIToken`,
 //! `GetAndValidateAPIToken`, plus the `KmdTokenFilename` constant.
 //!

@@ -50,7 +50,7 @@ fn ensure_go_algod() -> PathBuf {
     let goalg = workspace_root().join("../go-algorand");
     assert!(
         goalg.join("cmd/algod").exists(),
-        "../go-algorand/cmd/algod not found at {}; this test requires a v4.5.1-stable checkout",
+        "../go-algorand/cmd/algod not found at {}; this test requires a v4.6.0-stable checkout",
         goalg.display(),
     );
     let status = Command::new("go")

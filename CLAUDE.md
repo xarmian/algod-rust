@@ -8,7 +8,7 @@ Full Rust reimplementation of go-algorand — a production-grade Algorand node. 
 
 ## Reference Implementation
 
-- **go-algorand source** is at `../go-algorand`, pinned to `v4.5.1-stable` (detached HEAD)
+- **go-algorand source** is at `../go-algorand`, pinned to `v4.6.0-stable` (detached HEAD)
 - Use this as the authoritative reference for AVM opcodes, consensus params, field indices, and protocol semantics
 - Key reference files:
   - `data/transactions/logic/opcodes.go` — opcode table, version gating

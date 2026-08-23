@@ -17,7 +17,7 @@
 //!   it to [`algo_rest_api::server::ApiServer`].
 //!
 //! Reference: `../go-algorand/daemon/algod/api/server/v2/handlers.go` @
-//! `v4.5.1-stable` (the trait is modeled after `v2.NodeInterface`).
+//! `v4.6.0-stable` (the trait is modeled after `v2.NodeInterface`).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -74,7 +74,7 @@ use tracing::warn;
 /// trait method should pull the value from [`Self::current_protocol`].
 ///
 /// Reference: `../go-algorand/config/consensus.go` — `UpgradeVoteRounds` for
-/// `v41` @ `v4.5.1-stable`.
+/// `v41` @ `v4.6.0-stable`.
 const DEFAULT_UPGRADE_VOTE_ROUNDS: u64 = 10_000;
 
 /// Default upgrade-approval threshold (number of yes-votes required) for the
@@ -97,7 +97,7 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Default backlog size for the `async_broadcast_signed_tx_group` admission
 /// semaphore, matching go-algorand's `TxBacklogSize = 26000` default in
-/// `config/localTemplate.go` @ `v4.5.1-stable`. Under saturation the async
+/// `config/localTemplate.go` @ `v4.6.0-stable`. Under saturation the async
 /// trait method returns an error rather than spawning unbounded tasks.
 /// TASK-79 will wire this through `algod-rust.toml` so operators can tune
 /// it from the node config.
@@ -424,7 +424,7 @@ impl AlgodNodeInterface {
     /// *pending* duplicates (`Pool::check_duplicate`), so once a transaction
     /// is confirmed and cleared from the pool, resubmitting the identical
     /// signed bytes was silently accepted and re-applied a second time — a
-    /// real replay gap, found live against go-algorand v4.5.1-stable
+    /// real replay gap, found live against go-algorand v4.6.0-stable
     /// (issue #449).
     fn txn_confirmed_in_ledger(
         ledger: &Mutex<SqliteLedger>,
@@ -901,7 +901,7 @@ impl NodeInterface for AlgodNodeInterface {
         // — even for a round with no stored certificate (e.g. round 0's
         // synthetic genesis block), where a zero-valued `Certificate`
         // canonically encodes to an empty map. Verified live against
-        // go-algorand v4.5.1-stable (issue #448): omitting the key
+        // go-algorand v4.6.0-stable (issue #448): omitting the key
         // entirely (as opposed to encoding it as `{}`) is a structural
         // mismatch a msgpack-consuming client would trip over.
         const EMPTY_MSGPACK_MAP: &[u8] = &[0x80];
@@ -1014,7 +1014,7 @@ impl NodeInterface for AlgodNodeInterface {
     // These back `goal account info` (held/created assets + apps + boxes) and
     // the `asset` / `app` command groups against the SqliteLedger. They mirror
     // go-algorand's resource lookups in
-    // `../go-algorand/daemon/algod/api/server/v2/handlers.go` @ `v4.5.1-stable`:
+    // `../go-algorand/daemon/algod/api/server/v2/handlers.go` @ `v4.6.0-stable`:
     // AccountAssetInformation, AccountApplicationInformation, GetAssetByID,
     // GetApplicationByID, AccountAssetsInformation, GetApplicationBoxByName,
     // GetApplicationBoxes. State is read from the live ledger via the
@@ -1345,7 +1345,7 @@ impl NodeInterface for AlgodNodeInterface {
         // that returns success once the group is queued and performs
         // validation + gossip later. See
         // `../go-algorand/node/node.go:596-600` and
-        // `../go-algorand/data/txHandler.go:873-888` @ v4.5.1-stable.
+        // `../go-algorand/data/txHandler.go:873-888` @ v4.6.0-stable.
         //
         // The three *synchronous* error surfaces this method preserves:
         //   1. No broadcaster attached       → NotImplemented
@@ -1635,7 +1635,7 @@ impl NodeInterface for AlgodNodeInterface {
     /// `LedgerForAPI().LatestTotals()`: `total_money = totals.Participating()`
     /// (`Online.Money + Offline.Money`) and `online_money = totals.Online.Money`.
     /// Reference: `../go-algorand/daemon/algod/api/server/v2/handlers.go:937-953`
-    /// and `ledger/ledgercore/totals.go:117-123` @ v4.5.1-stable.
+    /// and `ledger/ledgercore/totals.go:117-123` @ v4.6.0-stable.
     async fn get_supply(&self) -> Result<SupplyInfo, NodeError> {
         let ledger = self.lock_ledger("get_supply")?;
         let round = ledger.current_round().0;
@@ -3023,7 +3023,7 @@ mod tests {
         // go's `rpcs.EncodedBlockCert` has no `omitempty` on `Certificate`,
         // so the "cert" key is always present -- a zero-valued Certificate
         // canonically encodes to an empty map, not an omitted key (verified
-        // live against go-algorand v4.5.1-stable, issue #448).
+        // live against go-algorand v4.6.0-stable, issue #448).
         let ledger_arc = Arc::new(Mutex::new(
             SqliteLedger::open_in_memory().expect("in-memory ledger"),
         ));

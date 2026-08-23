@@ -1,7 +1,7 @@
 //! Wallet signing operations — `sign_transaction`, `sign_program`,
 //! `sign_multisig_transaction`, `sign_multisig_program`.
 //!
-//! Ported from `daemon/kmd/wallet/driver/sqlite.go` (v4.5.1-stable):
+//! Ported from `daemon/kmd/wallet/driver/sqlite.go` (v4.6.0-stable):
 //! `SignTransaction` (sqlite.go:1113), `SignProgram` (sqlite.go:1145),
 //! `MultisigSignTransaction` (sqlite.go:1175), `MultisigSignProgram`
 //! (sqlite.go:1266).

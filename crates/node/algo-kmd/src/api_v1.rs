@@ -1,5 +1,5 @@
 //! v1 REST handlers — ported from
-//! `../go-algorand/daemon/kmd/api/v1/handlers.go` (v4.5.1-stable).
+//! `../go-algorand/daemon/kmd/api/v1/handlers.go` (v4.6.0-stable).
 //!
 //! Phase B / B5 lands the 8 wallet handlers; B6/B7/B8 will extend
 //! this module with key, multisig, and sign routes by registering

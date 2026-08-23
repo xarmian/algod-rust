@@ -2,7 +2,7 @@
 //!
 //! Each tag is a 2-byte ASCII identifier that marks the type of a WebSocket
 //! message.  Tags and their per-tag size limits come directly from
-//! `go-algorand/protocol/tags.go` (v4.5.1-stable).
+//! `go-algorand/protocol/tags.go` (v4.6.0-stable).
 
 /// Length of every protocol tag in bytes.
 pub const TAG_LENGTH: usize = 2;

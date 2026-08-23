@@ -2,7 +2,7 @@
 //! canonical msgpack envelopes.
 //!
 //! Ported from `../go-algorand/daemon/kmd/wallet/driver/sqlite_crypto.go`
-//! (v4.5.1-stable). All constants and field names match Go byte-for-byte
+//! (v4.6.0-stable). All constants and field names match Go byte-for-byte
 //! so a blob produced by either implementation round-trips through the
 //! other.
 //!

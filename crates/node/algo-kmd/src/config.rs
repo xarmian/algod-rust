@@ -1,6 +1,6 @@
 //! KMD configuration types and load/save helpers.
 //!
-//! Ported from `../go-algorand/daemon/kmd/config/config.go` (v4.5.1-stable).
+//! Ported from `../go-algorand/daemon/kmd/config/config.go` (v4.6.0-stable).
 //! JSON field names and default values match Go byte-for-byte so a
 //! `kmd_config.json` written by either implementation can be read by the
 //! other.

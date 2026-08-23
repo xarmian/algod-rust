@@ -534,7 +534,7 @@ pub async fn wait_for_block<N: NodeInterface>(
 ) -> Response {
     // 0. go's `round basics.Round` (a `uint64`) computes `round+1` with
     // plain unsigned-integer wraparound, no overflow check at all --
-    // verified live against go-algorand v4.5.1-stable (issue #450):
+    // verified live against go-algorand v4.6.0-stable (issue #450):
     // `wait-for-block-after/{u64::MAX}` returns 200 immediately, because
     // `round+1` wraps to 0, and round 0 is always already committed. An
     // explicit "round overflow" 400 here (as this code previously did) is

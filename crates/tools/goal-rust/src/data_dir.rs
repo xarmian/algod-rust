@@ -3,7 +3,7 @@
 //! Ports Go's `cmd/util/datadir/datadir.go` (`ResolveDataDir`,
 //! `EnsureFirstDataDir`, `EnsureSingleDataDir`, `GetDataDirs`,
 //! `OnDataDirs`) and `cmd/goal/commands.go:240-270`
-//! (`resolveKmdDataDir`) at `v4.5.1-stable`.
+//! (`resolveKmdDataDir`) at `v4.6.0-stable`.
 //!
 //! Precedence rules:
 //! - Algod data dir: explicit `-d` flag(s) (multi-value) > `$ALGORAND_DATA`

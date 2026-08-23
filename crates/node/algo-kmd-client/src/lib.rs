@@ -1,5 +1,5 @@
 //! REST client for kmd's v1 API. Mirrors
-//! `../go-algorand/daemon/kmd/client/` at `v4.5.1-stable`:
+//! `../go-algorand/daemon/kmd/client/` at `v4.6.0-stable`:
 //!
 //! - `client.go` — `MakeKMDClient(addr, apiToken)` + `DoV1Request`.
 //! - `requests.go` — `getPathAndMethod` route table (one (method, path)

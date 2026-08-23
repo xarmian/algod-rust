@@ -27,7 +27,7 @@
 // (named edge cases first, then random[0..N-1]). Two runs against the same
 // go-algorand checkout produce identical bytes.
 //
-// go-algorand reference (v4.5.1-stable):
+// go-algorand reference (v4.6.0-stable):
 //
 //	crypto/vrf.go:73-142  — VrfProof [80]byte, VrfOutput [64]byte, VrfPrivkey [64]byte
 //	crypto/vrf.go:82      — VrfKeygenFromSeed
@@ -63,7 +63,7 @@ import (
 // same corpus are guaranteed byte-identical output regardless of whatever
 // branch or dirty state happens to be checked out in their local go-algorand
 // clone.
-const expectedGoAlgorandPin = "v4.5.1-stable"
+const expectedGoAlgorandPin = "v4.6.0-stable"
 
 // rawAlpha is a crypto.Hashable whose HashRep is identity: ToBeHashed returns
 // an empty HashID and the raw bytes, so HashRep(rawAlpha{b}) = b. This lets
@@ -329,7 +329,7 @@ func goAlgorandPath() string {
 // Returning nil means the pin is verified; the capture output is reproducible
 // against that tag.
 func verifyGoAlgorandPin(path string) error {
-	// 1. Exact-tag match (detached HEAD on v4.5.1-stable). Anything else —
+	// 1. Exact-tag match (detached HEAD on v4.6.0-stable). Anything else —
 	//    a branch tip, an ahead-of-tag commit, a different tag — is a
 	//    regeneration hazard.
 	cmd := exec.Command("git", "-C", path, "describe", "--tags", "--exact-match", "HEAD")

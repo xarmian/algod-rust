@@ -109,7 +109,7 @@ mod tests {
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         let stdout = String::from_utf8(out).unwrap();
         let mnem = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon invest";
-        // Address captured from go-algorand v4.5.1-stable using
+        // Address captured from go-algorand v4.6.0-stable using
         // `crypto.GenerateSignatureSecrets({0...}).SignatureVerifier`
         // formatted via `basics.Address.String()`.
         let want = format!(

@@ -1,5 +1,5 @@
 //! Byte-equal parity for Phase B subcommands (`sign`, `multisig`,
-//! `keyreg --offline`) vs go-algorand v4.5.1-stable.
+//! `keyreg --offline`) vs go-algorand v4.6.0-stable.
 //!
 //! Fixtures under `tests/fixtures/algokey/{sign,multisig,keyreg}/`
 //! were captured by linking against the Go algokey crypto stack

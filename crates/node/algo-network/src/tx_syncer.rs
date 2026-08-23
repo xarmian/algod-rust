@@ -1,6 +1,6 @@
 //! Transaction synchronizer (`TxSyncer`) — skeleton.
 //!
-//! Mirrors [`go-algorand/rpcs/txSyncer.go`][go-src] (v4.5.1-stable).
+//! Mirrors [`go-algorand/rpcs/txSyncer.go`][go-src] (v4.6.0-stable).
 //! A background task ticks at a configurable interval, samples a peer, and
 //! asks it for transactions missing from the local pool. Accepted transaction
 //! groups are forwarded to a [`SolicitedTxHandler`] which (once TASK-69 lands)

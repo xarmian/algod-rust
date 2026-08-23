@@ -70,7 +70,7 @@ mod duration_map_serde {
 
 /// Represents the clock state that is persisted alongside player/router state.
 ///
-/// Mirrors go-algorand v4.5.1-stable `timers.Monotonic.zero` — a single
+/// Mirrors go-algorand v4.6.0-stable `timers.Monotonic.zero` — a single
 /// wall-clock "zero" reference point used to anchor deadline math across
 /// restarts. See `util/timers/monotonic.go:33-48` (the `zero time.Time`
 /// field and `Zero()` method) and `agreement/persistence.go:56` where Go

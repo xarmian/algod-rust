@@ -1,7 +1,7 @@
 //! Per-data-dir account-name + default-wallet persistence.
 //!
 //! Ports `../go-algorand/cmd/goal/accountsList.go` (257 LOC) at
-//! `v4.5.1-stable`. The on-disk JSON layout mirrors Go's
+//! `v4.6.0-stable`. The on-disk JSON layout mirrors Go's
 //! `json.MarshalIndent` of `AccountsList{}` verbatim so a Rust-written
 //! `accountList.json` is byte-compatible with Go's `goal` (and
 //! vice-versa).

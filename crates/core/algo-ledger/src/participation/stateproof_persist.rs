@@ -11,7 +11,7 @@
 //! writer must persist.
 //!
 //! Mirrors `../go-algorand/crypto/merklesignature/persistentMerkleSignatureScheme.go`
-//! lines 39-135 (v4.5.1-stable). The schema-version tracking row lives in
+//! lines 39-135 (v4.6.0-stable). The schema-version tracking row lives in
 //! the partkey DB's `schema` table (created by [`super::install`]'s
 //! `part_install_database`) so a fresh DB must already have that table
 //! present before [`install_state_proof_table`] is called.

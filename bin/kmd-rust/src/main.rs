@@ -7,7 +7,7 @@
 //! kmd-rust serve        --data-dir <path>   # Phase B: bring up the HTTP API
 //! ```
 //!
-//! Go reference: `../go-algorand/daemon/kmd/kmd.go` (v4.5.1-stable).
+//! Go reference: `../go-algorand/daemon/kmd/kmd.go` (v4.6.0-stable).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

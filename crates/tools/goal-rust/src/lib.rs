@@ -5,7 +5,7 @@
 //! (e.g. the parity-harness fixtures under `tests/parity_fixtures.rs`).
 //!
 //! See `../go-algorand/cmd/goal/commands.go` for the cobra root this
-//! mirrors. Pinned to `v4.5.1-stable`.
+//! mirrors. Pinned to `v4.6.0-stable`.
 
 use std::process::ExitCode;
 

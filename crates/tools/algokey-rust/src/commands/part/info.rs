@@ -1,7 +1,7 @@
 //! `algokey part info` — open a partkey DB read-only, print its fields.
 //!
 //! Mirrors `../go-algorand/cmd/algokey/part.go::partInfoCmd.Run`
-//! (lines 107-128, v4.5.1-stable).
+//! (lines 107-128, v4.6.0-stable).
 
 use std::process::ExitCode;
 

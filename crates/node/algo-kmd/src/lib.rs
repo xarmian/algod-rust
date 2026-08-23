@@ -1,6 +1,6 @@
 //! algo-kmd — Rust port of go-algorand's `daemon/kmd` (Key Management Daemon).
 //!
-//! Reference: `../go-algorand/daemon/kmd/` pinned to v4.5.1-stable.
+//! Reference: `../go-algorand/daemon/kmd/` pinned to v4.6.0-stable.
 //!
 //! Phase A scope:
 //! - Config loading (this file's module: [`config`]) — port of

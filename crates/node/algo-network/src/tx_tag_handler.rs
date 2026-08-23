@@ -10,7 +10,7 @@
 //! A single TX message payload is a **streaming msgpack concatenation**
 //! of up to `MaxTxGroupSize` (= 16, per consensus v18+) `SignedTransaction`
 //! values. Mirrors `go-algorand/data/txHandler.go::decodeMsg` at
-//! v4.5.1-stable.
+//! v4.6.0-stable.
 //!
 //! ## Dedup
 //!
@@ -94,7 +94,7 @@ pub enum TxTagError {
 /// Decode a TX-tag payload as a streaming concatenation of
 /// [`SignedTransaction`] values.
 ///
-/// Mirrors `go-algorand/data/txHandler.go::decodeMsg` at v4.5.1-stable:
+/// Mirrors `go-algorand/data/txHandler.go::decodeMsg` at v4.6.0-stable:
 /// we read values back-to-back until either the buffer is exhausted
 /// (Ok) or a decode error occurs. An empty group is rejected as Go
 /// does.

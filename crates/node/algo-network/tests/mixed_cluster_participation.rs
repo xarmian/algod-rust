@@ -3,7 +3,7 @@
 //!
 //! Demonstrates that `algod-rust participate`, holding ONLINE stake from
 //! a `goal network create` genesis and the `.partkey` that same command
-//! generated, runs consensus alongside three go-algorand v4.5.1-stable
+//! generated, runs consensus alongside three go-algorand v4.6.0-stable
 //! nodes: all four nodes advance in lockstep, the Rust node's own REST
 //! `/v2/status` reports the advancing round, and no Go node logs an
 //! agreement-level rejection of a peer message for the whole run.
@@ -28,7 +28,7 @@
 //! ## Prerequisites
 //!
 //! * Docker + Docker Compose v2
-//! * `algorand/algod:4.5.1-stable` image available locally
+//! * `algorand/algod:4.6.0-stable` image available locally
 //! * `curl` + `python3` on PATH
 //! * The script builds the `algod-rust` image itself via `start.sh`.
 //!
@@ -57,7 +57,7 @@ fn mixed_cluster_enabled() -> bool {
 }
 
 #[test]
-#[ignore = "requires MIXED_CLUSTER=1 + Docker + algorand/algod:4.5.1-stable image"]
+#[ignore = "requires MIXED_CLUSTER=1 + Docker + algorand/algod:4.6.0-stable image"]
 fn rust_node_participates_in_mixed_cluster() {
     if !mixed_cluster_enabled() {
         eprintln!(

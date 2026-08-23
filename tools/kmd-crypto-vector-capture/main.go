@@ -6,7 +6,7 @@
 //
 // The encryption logic here is a faithful reimplementation of
 // ../../../go-algorand/daemon/kmd/wallet/driver/sqlite_crypto.go
-// (v4.5.1-stable). The Go reference functions are package-private, so
+// (v4.6.0-stable). The Go reference functions are package-private, so
 // we mirror them with public primitives — same algorithms, same
 // constants, same go-codec settings. If those drift, the
 // schema-equality test in algo-kmd will trip first.

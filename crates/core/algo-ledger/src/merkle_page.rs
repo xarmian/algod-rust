@@ -7,7 +7,7 @@
 //! decoded by Go and vice versa. The wider G2 schema wiring lives in
 //! TASK-102; this module owns only the in-memory format.
 //!
-//! Reference (go-algorand v4.5.1-stable):
+//! Reference (go-algorand v4.6.0-stable):
 //! - `crypto/merkletrie/cache.go:660-704` — `decodePage` / `encodePage`
 //! - `crypto/merkletrie/node.go:312-373` — node `serialize` / `deserializeNode`
 //! - `crypto/merkletrie/trie.go:32`       — `nodePageVersion = 0x1000000010000000`

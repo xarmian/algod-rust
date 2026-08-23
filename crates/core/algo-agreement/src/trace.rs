@@ -1,6 +1,6 @@
 // Cadaver structured trace writer for agreement state-machine transitions.
 //
-// Mirrors go-algorand v4.5.1-stable `agreement/cadaver.go` (the binary log
+// Mirrors go-algorand v4.6.0-stable `agreement/cadaver.go` (the binary log
 // writer) and the entry-tag portion of `agreement/trace.go`. The companion
 // reader/analyzer (autopsy) lives in a sibling task — see TASK-64.
 //

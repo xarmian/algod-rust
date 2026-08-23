@@ -365,7 +365,7 @@ fn account_list_renders_notparticipating_as_excluded() {
     let mut table = HashMap::new();
     // "Not Participating" (with a space) is the real wire value algod
     // returns (`Status.String()`, `data/basics/userBalance.go`; verified
-    // live against go-algorand v4.5.1-stable, issue #129).
+    // live against go-algorand v4.6.0-stable, issue #129).
     table.insert(acct.clone(), ("Not Participating".to_string(), 50u64));
     let (stop, jh, port) = spawn_mock_algod(table);
     std::fs::write(dd.join("algod.net"), format!("127.0.0.1:{port}\n")).unwrap();

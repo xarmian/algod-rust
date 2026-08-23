@@ -2246,7 +2246,7 @@ fn load_signing_keys_for_round(
 
 /// Open (or create) the agreement crash recovery database.
 ///
-/// Mirrors go-algorand v4.5.1-stable `node/node.go:305-323`, which opens
+/// Mirrors go-algorand v4.6.0-stable `node/node.go:305-323`, which opens
 /// `crash.sqlite` (`config.CrashFilename`) inside the genesis directory next
 /// to the ledger and threads the resulting accessor into `agreement.Parameters`.
 ///
@@ -2560,7 +2560,7 @@ fn import_go_partkeys(store: &ParticipationStore, paths: &[PathBuf]) -> anyhow::
 }
 
 /// Rust port of go-algorand's `config.IsPartKeyFilename`
-/// (`../go-algorand/config/keyfile.go:86-91` @ v4.5.1-stable).
+/// (`../go-algorand/config/keyfile.go:86-91` @ v4.6.0-stable).
 ///
 /// Go builds partkey names with `fmt.Sprintf("%s.%d.%d.partkey", account,
 /// firstValid, lastValid)` and recognises a name by *round-tripping* it:
@@ -2596,7 +2596,7 @@ fn is_partkey_filename(name: &str) -> bool {
 
 /// Discover go-algorand `.partkey` files in `dir`, mirroring
 /// `AlgorandFullNode.loadParticipationKeys`
-/// (`../go-algorand/node/node.go:1020-1088` @ v4.5.1-stable), which reads
+/// (`../go-algorand/node/node.go:1020-1088` @ v4.6.0-stable), which reads
 /// the node's genesis directory and considers every entry whose name
 /// satisfies `config.IsPartKeyFilename`.
 ///
@@ -4191,7 +4191,7 @@ mod tests {
     // ── Partkey auto-discovery (issue #468) ─────────────────────────
     //
     // The accept/reject table below is Go's, not ours: every case is
-    // what `config.IsPartKeyFilename` returns at v4.5.1-stable. A name
+    // what `config.IsPartKeyFilename` returns at v4.6.0-stable. A name
     // Go skips must be skipped here, or a mixed cluster disagrees about
     // what counts as key material.
 

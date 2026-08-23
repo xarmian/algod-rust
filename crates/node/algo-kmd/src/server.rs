@@ -1,7 +1,7 @@
 //! kmd HTTP server bootstrap.
 //!
 //! Ported from `../go-algorand/daemon/kmd/server/server.go` and
-//! `daemon/kmd/api/{api,cors}.go` (v4.5.1-stable). Brings up an axum
+//! `daemon/kmd/api/{api,cors}.go` (v4.6.0-stable). Brings up an axum
 //! server on `127.0.0.1:auto`, writes the `kmd.net` / `kmd.pid` /
 //! `kmd.lock` lifecycle files, exposes the two non-versioned routes
 //! (`GET /versions`, `GET /swagger.json`), handles OPTIONS for CORS,
@@ -61,7 +61,7 @@ const CORS_ALLOWED_METHODS: &str = "GET, POST, DELETE, OPTIONS";
 const CORS_ALLOWED_HEADERS: &str = "X-KMD-API-Token, Content-Type";
 
 /// Vendored copy of `go-algorand/daemon/kmd/api/swagger.json`
-/// (v4.5.1-stable).  Served byte-for-byte at `GET /swagger.json`.
+/// (v4.6.0-stable).  Served byte-for-byte at `GET /swagger.json`.
 ///
 /// A round-trip test asserts this stays equal to the upstream file
 /// when go-algorand is checked out alongside this repo (see
@@ -853,7 +853,7 @@ mod tests {
         assert_eq!(
             normalize(SWAGGER_JSON.as_bytes()),
             normalize(&upstream_bytes),
-            "vendored swagger.json drifted from go-algorand v4.5.1-stable; re-copy from {}",
+            "vendored swagger.json drifted from go-algorand v4.6.0-stable; re-copy from {}",
             upstream.display()
         );
     }

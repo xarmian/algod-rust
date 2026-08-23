@@ -2,7 +2,7 @@
 //! filename helpers, and the in-memory claimed-wallets registry.
 //!
 //! Ported from `../go-algorand/daemon/kmd/wallet/driver/sqlite.go`
-//! (v4.5.1-stable). TASK-202 scope is structural only: encrypted columns
+//! (v4.6.0-stable). TASK-202 scope is structural only: encrypted columns
 //! are written and read as opaque BLOBs. Wallet-level operations
 //! (`CreateWallet`, key derivation, etc.) layer on top in TASK-204+.
 

@@ -303,7 +303,7 @@ impl VoteFault {
     /// The substring of go-algorand's error text this fault should provoke.
     ///
     /// Sourced from `agreement/vote.go` and `data/committee/credential.go` at
-    /// v4.5.1-stable; used by the live harness to attribute a rejection.
+    /// v4.6.0-stable; used by the live harness to attribute a rejection.
     pub fn expected_go_error(self) -> &'static str {
         match self {
             Self::None => "",

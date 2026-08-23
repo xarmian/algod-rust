@@ -50,7 +50,7 @@ impl ResponseFormat {
 /// case-insensitively (`strings.ToLower`), and on failure the response body
 /// carries the fixed external message `"failed to parse the format option"`
 /// (`errFailedParsingFormatOption`) rather than echoing the invalid value —
-/// verified live against go-algorand v4.5.1-stable (issue #448).
+/// verified live against go-algorand v4.6.0-stable (issue #448).
 pub fn negotiate_format(params: &FormatParams) -> Result<ResponseFormat, Box<Response>> {
     match params.format.as_deref().map(|f| f.to_ascii_lowercase()) {
         None => Ok(ResponseFormat::Json),
@@ -120,7 +120,7 @@ const MAX_JSON_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// go's Echo `ctx.JSON(...)` writes via `json.NewEncoder(w).Encode(v)`
 /// (`encoding/json`), which — unlike `json.Marshal` — always appends a `\n`
 /// after the encoded value. This is a real, systemic difference: verified
-/// live against go-algorand v4.5.1-stable, every JSON response (`/v2/status`,
+/// live against go-algorand v4.6.0-stable, every JSON response (`/v2/status`,
 /// `/v2/ledger/supply`, `/genesis`, `/versions`, ...) carries this trailing
 /// byte; algod-rust's `serde_json`-based responses did not, a one-byte
 /// mismatch present on effectively every JSON endpoint. Applied as an
@@ -169,7 +169,7 @@ pub async fn json_trailing_newline_layer(request: Request, next: Next) -> Respon
 /// go's Echo `middleware.Gzip()`, which never parses quality values at
 /// all — it compresses whenever the literal substring `"gzip"` appears
 /// anywhere in the header, `q=0` included (issue #460, live-verified
-/// against go-algorand v4.5.1-stable: `Accept-Encoding: gzip;q=0,
+/// against go-algorand v4.6.0-stable: `Accept-Encoding: gzip;q=0,
 /// identity` still gets a gzip-compressed response).
 ///
 /// If the raw header value contains `"gzip"` as a substring, it's
@@ -206,7 +206,7 @@ pub async fn normalize_accept_encoding_for_gzip_substring_match(
 /// compressed.
 ///
 /// Two real, live-verified (issue #452) mismatches against go-algorand
-/// v4.5.1-stable, both fixed here:
+/// v4.6.0-stable, both fixed here:
 /// - `tower_http::CompressionLayer` emits an all-lowercase
 ///   `Vary: accept-encoding` value; go emits `Vary: Accept-Encoding`. HTTP
 ///   header *values* are technically opaque strings, so this is a real
@@ -326,7 +326,7 @@ mod tests {
     #[tokio::test]
     async fn negotiate_invalid_error_message_matches_go() {
         // go's errFailedParsingFormatOption body text, not an echo of the
-        // invalid value (verified live against go-algorand v4.5.1-stable).
+        // invalid value (verified live against go-algorand v4.6.0-stable).
         let params = FormatParams {
             format: Some("xml".into()),
         };

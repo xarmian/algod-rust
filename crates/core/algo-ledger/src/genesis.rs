@@ -81,7 +81,7 @@ pub struct GenesisAccountState {
 /// Only the **fee sink** is unconditionally forced to `NotParticipating`
 /// regardless of the genesis file's declared `onl` value; the rewards pool
 /// honors its declared status like any other account. Verified live
-/// against go-algorand v4.5.1-stable with a *nonzero* rewards-pool balance
+/// against go-algorand v4.6.0-stable with a *nonzero* rewards-pool balance
 /// (issue #449) -- `GET /v2/accounts/{rewardsPool}` reports `"Offline"`
 /// (matching this localnet genesis's `"onl": 0`), not `"Not Participating"`.
 ///
@@ -348,7 +348,7 @@ pub fn make_genesis_block(genesis: &GenesisJson) -> Result<algo_types::Block, Al
 
 /// go's real commitment to an empty *non-nil* payset at genesis:
 /// `SHA512_256("PF" ++ msgpack([]))` == `bookkeeping.Payset{}.CommitGenesis()`
-/// (`../go-algorand/data/transactions/payset.go` @ v4.5.1-stable). The
+/// (`../go-algorand/data/transactions/payset.go` @ v4.6.0-stable). The
 /// genesis block is the only block that commits to an empty-but-non-nil
 /// payset — every other empty block commits to the nil-payset digest
 /// instead (go's `commit(genesis bool)` treats the two paysets
@@ -717,7 +717,7 @@ mod tests {
         assert_eq!(account.vote_key_dilution, 10_000);
     }
 
-    /// Live-verified against go-algorand v4.5.1-stable (issue #129): the fee
+    /// Live-verified against go-algorand v4.6.0-stable (issue #129): the fee
     /// sink is always reported `NotParticipating`, even when the genesis
     /// file's own `"onl"` field for it says `0` (Offline) -- but the
     /// **rewards pool** honors its declared status like any other account.
@@ -733,7 +733,7 @@ mod tests {
     /// zero-balance rewards pool, which made "Offline" and
     /// "NotParticipating" observationally identical. This test now uses a
     /// nonzero rewards-pool balance specifically so the two are
-    /// distinguishable, matching the live-verified go-algorand v4.5.1-stable
+    /// distinguishable, matching the live-verified go-algorand v4.6.0-stable
     /// behavior (issue #449).
     #[test]
     fn fee_sink_forced_not_participating_rewards_pool_honors_declared_status() {
@@ -979,7 +979,7 @@ mod tests {
     /// Pin the four shipped networks' expected hashes from
     /// `../go-algorand/installer/genesis/<net>/genesis.json.hash`.
     /// If these strings ever change, either Go shipped a new genesis
-    /// (compare against the pinned `v4.5.1-stable` tree) or Rust is
+    /// (compare against the pinned `v4.6.0-stable` tree) or Rust is
     /// silently breaking hash parity.
     #[test]
     fn genesis_hash_matches_go_for_mainnet() {

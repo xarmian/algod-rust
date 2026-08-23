@@ -20,7 +20,7 @@
 //!   non-JSON 4xx/5xx response into the same envelope, using the rejection's
 //!   own message text.
 //!
-//! Verified live against go-algorand v4.5.1-stable — see issue #129.
+//! Verified live against go-algorand v4.6.0-stable — see issue #129.
 
 use axum::body::to_bytes;
 use axum::extract::Request;

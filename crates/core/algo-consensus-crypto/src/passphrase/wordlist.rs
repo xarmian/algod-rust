@@ -1,7 +1,7 @@
 //! The 2,048-word Algorand mnemonic wordlist.
 //!
 //! Sourced verbatim from `../go-algorand/crypto/passphrase/wordlist.go`
-//! (v4.5.1-stable). The raw text — `"abandon\nability\n...\nzoo\n"` — is
+//! (v4.6.0-stable). The raw text — `"abandon\nability\n...\nzoo\n"` — is
 //! preserved byte-for-byte so the SHA-512/256 wordlist checksum matches Go
 //! (`venue`). See `passphrase_test.go::TestZeroVector` for the canonical
 //! cross-reference.

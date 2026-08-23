@@ -173,7 +173,7 @@ func main() {
 		MdkHex:     hex.EncodeToString(mdk[:]),
 		ScryptN:    1024, ScryptR: 1, ScryptP: 1,
 		Multisig: entries,
-		Description: fmt.Sprintf("wallet with %d multisig preimages produced by go-algorand v4.5.1-stable kmd; consumed by algo-kmd's TASK-206 interop test",
+		Description: fmt.Sprintf("wallet with %d multisig preimages produced by go-algorand v4.6.0-stable kmd; consumed by algo-kmd's TASK-206 interop test",
 			len(inputs)),
 	}
 

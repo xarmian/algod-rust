@@ -943,7 +943,7 @@ fn execute_pseudonode_action(
 /// Returns the `SystemTime` adopted as the reference point (informational;
 /// current persists always stamp `SystemTime::now()` fresh at checkpoint).
 ///
-/// Semantics (mirrors go-algorand v4.5.1-stable `agreement/service.go:226-253`):
+/// Semantics (mirrors go-algorand v4.6.0-stable `agreement/service.go:226-253`):
 ///
 /// * `ClockState` carries the wall-clock stamp taken at the most recent
 ///   checkpoint (the last `Attest` before the crash). On restore we
@@ -995,7 +995,7 @@ fn resume_from_clock_zero(player: &mut Player, clock: &ClockState, now: SystemTi
 pub(crate) type RestoredState = (RootRouter, Player, ClockState, Vec<Action>);
 
 /// Read and decode crash-recovery state, mirroring go-algorand
-/// v4.5.1-stable `agreement/service.go:mainLoop` lines 220-232.
+/// v4.6.0-stable `agreement/service.go:mainLoop` lines 220-232.
 ///
 /// Returns `None` when there is nothing usable to restore, in which case
 /// the caller bootstraps a fresh player.
@@ -1062,7 +1062,7 @@ pub(crate) fn restore_crash_state(conn: &rusqlite::Connection) -> Option<Restore
 /// when it is still relevant, otherwise a fresh bootstrap at the ledger's
 /// next round.
 ///
-/// Mirrors go-algorand v4.5.1-stable `agreement/service.go:232-252`:
+/// Mirrors go-algorand v4.6.0-stable `agreement/service.go:232-252`:
 ///
 /// ```text
 /// if err != nil || status.Round < s.Ledger.NextRound() {

@@ -1,7 +1,7 @@
 //! Per-wallet key operations — derive, import, export, list, lookup,
 //! delete. Layered on top of the wallet handle from [`crate::wallet`].
 //!
-//! Ported from `daemon/kmd/wallet/driver/sqlite.go` (v4.5.1-stable):
+//! Ported from `daemon/kmd/wallet/driver/sqlite.go` (v4.6.0-stable):
 //! `GenerateKey` / `generateKeyTxLocked` (sqlite.go:839, 884),
 //! `ImportKey` (sqlite.go:736), `ExportKey` / `fetchSecretKey`
 //! (sqlite.go:774, 786), `ListKeys` (sqlite.go:694), `DeleteKey`

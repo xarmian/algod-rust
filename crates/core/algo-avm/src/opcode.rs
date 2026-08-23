@@ -1,6 +1,6 @@
 //! Complete AVM opcode table covering all opcodes from AVM v1 through v13.
 //!
-//! This table matches go-algorand v4.5.1's `data/transactions/logic/opcodes.go`.
+//! This table matches go-algorand v4.6.0's `data/transactions/logic/opcodes.go`.
 //! Each opcode has metadata for parsing, validation, and (future) execution.
 
 /// Maximum supported AVM version.

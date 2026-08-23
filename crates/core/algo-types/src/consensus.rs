@@ -1,7 +1,7 @@
 // Comprehensive consensus parameters, mirroring go-algorand's
 // `config.ConsensusParams` struct and `initConsensusProtocols()`.
 //
-// Values are derived from go-algorand v4.5.1-stable (config/consensus.go).
+// Values are derived from go-algorand v4.6.0-stable (config/consensus.go).
 // Each version inherits from its predecessor and overrides specific fields,
 // exactly matching the Go initialisation chain.
 
@@ -16,7 +16,7 @@ pub const SMALL_LAMBDA: Duration = Duration::from_millis(2000);
 pub const BIG_LAMBDA: Duration = Duration::from_millis(15000);
 
 // ── Protocol version constants ──────────────────────────────────────
-// Mirrors go-algorand `protocol/consensus.go` at tag v4.5.1-stable.
+// Mirrors go-algorand `protocol/consensus.go` at tag v4.6.0-stable.
 // Only versions v7+ are listed; v0–v6 are deprecated.
 
 pub const CONSENSUS_V7: &str = "v7";
@@ -93,7 +93,7 @@ pub const CONSENSUS_ALPHA5: &str = "alpha5";
 /// The current (latest release) consensus version.
 pub const CONSENSUS_CURRENT_VERSION: &str = CONSENSUS_V41;
 
-/// All protocol version strings recognised by go-algorand v4.5.1-stable.
+/// All protocol version strings recognised by go-algorand v4.6.0-stable.
 pub const KNOWN_PROTOCOL_VERSIONS: &[&str] = &[
     // Short-form versions (v7-v12)
     CONSENSUS_V7,
@@ -148,7 +148,7 @@ pub const KNOWN_PROTOCOL_VERSIONS: &[&str] = &[
 /// constants across the Rust codebase are included.
 ///
 /// Values are derived per-version from go-algorand `config/consensus.go`
-/// at tag v4.5.1-stable.
+/// at tag v4.6.0-stable.
 #[derive(Debug, Clone)]
 pub struct ConsensusParams {
     // ── AVM / LogicSig ──────────────────────────────────────────
@@ -470,7 +470,7 @@ impl Default for ConsensusParams {
 
 /// Return consensus parameters for the given protocol version string.
 ///
-/// All values match go-algorand `config/consensus.go` at tag v4.5.1-stable.
+/// All values match go-algorand `config/consensus.go` at tag v4.6.0-stable.
 /// Each version inherits from its predecessor and overrides specific fields,
 /// exactly mirroring go-algorand's `initConsensusProtocols()`.
 ///
@@ -1256,7 +1256,7 @@ mod tests {
 
     // ── Agreement / committee parameter regression tests ────────────
     // Verify that agreement-related fields match go-algorand config/consensus.go
-    // at tag v4.5.1-stable for every version where they change.
+    // at tag v4.6.0-stable for every version where they change.
 
     #[test]
     fn test_agreement_params_v7() {

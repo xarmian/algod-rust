@@ -1,6 +1,6 @@
 name: Conformance Parity
 
-# Byte-level parity suite vs go-algorand v4.5.1-stable. Runs on every PR
+# Byte-level parity suite vs go-algorand v4.6.0-stable. Runs on every PR
 # and push to main. Exercises each PLAN-30 gap dimension:
 #
 #   β  VRF byte-level proof/output parity

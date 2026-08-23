@@ -14,7 +14,7 @@
 //! length, nodes-per-page), and pages `≥ 1` carry the serialized node
 //! contents in the format owned by [`crate::merkle_page::Page`].
 //!
-//! Reference (go-algorand v4.5.1-stable):
+//! Reference (go-algorand v4.6.0-stable):
 //! - `crypto/merkletrie/cache.go:46-94`   — `merkleTrieCache` struct
 //! - `crypto/merkletrie/cache.go:122-203` — `allocateNewNode`, `getNode`
 //! - `crypto/merkletrie/cache.go:242-268` — `loadPage` (on-demand)
