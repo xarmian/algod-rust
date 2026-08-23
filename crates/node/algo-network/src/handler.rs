@@ -18,6 +18,19 @@ use crate::forwarding_policy::ForwardingPolicy;
 use crate::message::{IncomingMessage, OutgoingMessage};
 use crate::tag::Tag;
 
+/// Hex-encode a payload for the `algo_network::wire` trace target.
+///
+/// Only called when wire tracing is enabled; kept simple (allocates one
+/// String) because it is a debugging path, never a hot path.
+pub(crate) fn hex_dump(data: &[u8]) -> String {
+    let mut s = String::with_capacity(data.len() * 2);
+    for b in data {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 // ---------------------------------------------------------------------------
 // Handler traits
 // ---------------------------------------------------------------------------
@@ -184,6 +197,19 @@ impl Multiplexer {
     /// The handler `Arc` is cloned out of the read lock before invocation so
     /// that handler execution never holds the lock.
     pub async fn handle(&self, msg: IncomingMessage) -> OutgoingMessage {
+        // Wire-level capture point (issue #497 debugging): enable with
+        // `RUST_LOG=algo_network::wire=trace` to dump every incoming gossip
+        // message's tag, origin peer, and raw payload hex for offline
+        // decoding/diffing against go-algorand's encoder.
+        tracing::trace!(
+            target: "algo_network::wire",
+            dir = "recv",
+            tag = %msg.tag,
+            peer = %msg.sender,
+            len = msg.data.len(),
+            hex = %hex_dump(&msg.data),
+            "wire message"
+        );
         let handler = {
             let map = self.handlers.read().expect("handler lock poisoned");
             map.get(&msg.tag).cloned()

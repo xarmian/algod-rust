@@ -546,6 +546,19 @@ impl WebsocketNetwork {
         data: Vec<u8>,
         except: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Wire-level capture point (issue #497 debugging): enable with
+        // `RUST_LOG=algo_network::wire=trace` to dump every outgoing gossip
+        // message's tag and raw payload hex for offline decoding/diffing
+        // against go-algorand's encoder.
+        tracing::trace!(
+            target: "algo_network::wire",
+            dir = "send",
+            tag = %tag,
+            except = except.unwrap_or(""),
+            len = data.len(),
+            hex = %crate::handler::hex_dump(&data),
+            "wire message"
+        );
         let peers = self.peers.read().await;
         let msg = OutgoingMessage::new(tag, data);
 
