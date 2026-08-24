@@ -298,7 +298,7 @@ impl LedgerReader for AgreementLedgerBridge {
         })
     }
 
-    fn circulation(&self, rnd: Round, _vote_rnd: Round) -> Result<u64, LedgerError> {
+    fn circulation(&self, rnd: Round, vote_rnd: Round) -> Result<u64, LedgerError> {
         let ledger = self
             .ledger
             .lock()
@@ -310,9 +310,10 @@ impl LedgerReader for AgreementLedgerBridge {
 
         // Shared with `GetSupply`'s `online-stake` field (node_interface_impl.rs)
         // so both consult the same per-round-snapshot-else-current-aggregate
-        // rule -- mirrors Go's `onlineCirculation` (`ledger/acctonline.go`).
+        // rule, including the expired-participation-key exclusion -- mirrors
+        // Go's `onlineCirculation` (`ledger/acctonline.go`).
         ledger
-            .online_circulation_at_round(rnd.0)
+            .online_circulation_at_round(rnd.0, vote_rnd.0)
             .map_err(|e| LedgerError::Other(format!("online_circulation_at_round: {e}")))
     }
 

@@ -1713,7 +1713,7 @@ impl NodeInterface for AlgodNodeInterface {
         let params = Self::resolve_consensus_params(&proto)?;
         let lookback_round = algo_agreement::balance_round(Round(round), &params);
         let online_stake = ledger
-            .online_circulation_at_round(lookback_round.0)
+            .online_circulation_at_round(lookback_round.0, round)
             .map_err(|e| NodeError::Internal(format!("get_supply: {e}")))?;
 
         Ok(SupplyInfo {

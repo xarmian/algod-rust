@@ -3224,20 +3224,101 @@ impl SqliteLedger {
 
     /// Returns the total online stake to report as "circulation" at `round`:
     /// the per-round snapshot from [`Self::online_supply_at_round`] if one is
-    /// recorded, else the current aggregate online stake ([`Self::online_stake`]).
+    /// recorded, else the current aggregate online stake ([`Self::online_stake`]),
+    /// minus the stake behind participation keys that will have expired by
+    /// `vote_rnd` when the current protocol's `exclude_expired_circulation`
+    /// is set.
     ///
     /// This is the single accessor behind both agreement's lookback-round
     /// circulation query (`AgreementLedgerBridge::circulation`, used for
     /// sortition/committee sizing) and `GET /v2/ledger/supply`'s `online-stake`
-    /// field -- mirrors go-algorand's cached-total lookup in
-    /// `onlineAccounts.onlineCirculation` (`ledger/acctonline.go`), minus its
-    /// expired-participation-key exclusion (`ExcludeExpiredCirculation`),
-    /// which algod-rust does not yet track.
-    pub fn online_circulation_at_round(&self, round: u64) -> Result<u64, AlgoError> {
-        if let Some(supply) = self.online_supply_at_round(round)? {
-            return Ok(supply);
+    /// field -- mirrors go-algorand's `onlineAccounts.onlineCirculation`
+    /// (`ledger/acctonline.go`): `rnd` is the round the total is drawn from,
+    /// `vote_rnd` is the round agreement is voting for (a `VoteLastValid`
+    /// strictly less than `vote_rnd` counts as expired). Go skips the
+    /// subtraction entirely for `rnd == 0` (the first `MaxBalLookback`
+    /// rounds still use genesis balances); this mirrors that.
+    ///
+    /// Go computes the expired-stake subtraction from the exact historical
+    /// online-account snapshot at `rnd`. algod-rust does not yet persist a
+    /// live per-account online history (only catchpoint import populates
+    /// `onlineaccounts`), so -- consistent with this function's existing
+    /// current-aggregate fallback for the total itself -- the expired-stake
+    /// scan reads the *current* `accountbase` online-account set via
+    /// [`Self::expired_online_stake`] rather than a `rnd`-historical one.
+    ///
+    /// `total` and `expired` are drawn from two independently-maintained
+    /// bookkeeping paths -- `accounttotals`'s incrementally-updated
+    /// aggregate vs. a fresh per-account rewards-applied scan -- which can
+    /// disagree by a small amount when reward accrual has been applied to
+    /// one but not yet folded into the other (live-verified while adding
+    /// this exclusion: issue #518). Go's own `OverflowTracker.SubA` assumes
+    /// both figures come from one consistent snapshot and never diverge;
+    /// algod-rust's two-path approximation cannot make that same guarantee,
+    /// so unlike go this saturates at 0 rather than erroring -- a
+    /// public REST endpoint must never 500 over bookkeeping skew between
+    /// two otherwise-correct internal figures.
+    pub fn online_circulation_at_round(&self, round: u64, vote_rnd: u64) -> Result<u64, AlgoError> {
+        let total = if let Some(supply) = self.online_supply_at_round(round)? {
+            supply
+        } else {
+            self.online_stake()?
+        };
+
+        let exclude_expired = algo_types::consensus::consensus_params_for_version(&self.protocol)
+            .map(|p| p.exclude_expired_circulation)
+            .unwrap_or(false);
+        if !exclude_expired || round == 0 {
+            return Ok(total);
         }
-        self.online_stake()
+
+        let expired = self.expired_online_stake(vote_rnd)?;
+        Ok(total.saturating_sub(expired))
+    }
+
+    /// Sum the stake held by currently-online accounts (`accountbase`,
+    /// `normalizedonlinebalance > 0`) whose participation key has a nonzero
+    /// `VoteLastValid` strictly less than `vote_rnd`.
+    ///
+    /// Mirrors go-algorand's `onlineAccounts.expiredOnlineCirculation` /
+    /// `onlineAcctsExpiredByRound` predicate (`ledger/acctonline.go`):
+    /// `d.Status == basics.Online && d.VoteLastValid != 0 && voteRnd >
+    /// d.VoteLastValid`.
+    fn expired_online_stake(&self, vote_rnd: u64) -> Result<u64, AlgoError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT data FROM accountbase WHERE normalizedonlinebalance > 0")
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("prepare expired_online_stake query error: {e}"),
+            })?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query expired_online_stake error: {e}"),
+            })?;
+
+        let mut expired_stake: u64 = 0;
+        for row in rows {
+            let data = row.map_err(|e| AlgoError::Ledger {
+                message: format!("read expired_online_stake row error: {e}"),
+            })?;
+            let account = decode_account_data(&data).map_err(|e| AlgoError::Ledger {
+                message: format!("decode expired_online_stake account error: {e}"),
+            })?;
+            if account.status == AccountStatus::Online
+                && account.vote_last_valid != 0
+                && vote_rnd > account.vote_last_valid
+            {
+                expired_stake =
+                    expired_stake
+                        .checked_add(account.micro_algos)
+                        .ok_or_else(|| AlgoError::Ledger {
+                            message: "expired_online_stake: overflow totaling expired stake"
+                                .to_string(),
+                        })?;
+            }
+        }
+        Ok(expired_stake)
     }
 
     /// Look up an account's online data at a specific round from the
@@ -5887,7 +5968,7 @@ mod tests {
         ledger.put_online_supply_at_round(100, 1_234_000).unwrap();
 
         assert_eq!(
-            ledger.online_circulation_at_round(100).unwrap(),
+            ledger.online_circulation_at_round(100, 100).unwrap(),
             1_234_000,
             "a recorded per-round snapshot must win over the current aggregate",
         );
@@ -5904,7 +5985,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            ledger.online_circulation_at_round(200).unwrap(),
+            ledger.online_circulation_at_round(200, 200).unwrap(),
             5_500_000,
             "no snapshot recorded for round 200 -> fall back to the current aggregate",
         );
@@ -5963,7 +6044,136 @@ mod tests {
 
         // The lookback-round accessor used by sortition and GetSupply must see
         // the true historical value at an old round, not the current aggregate.
-        assert_eq!(ledger.online_circulation_at_round(1).unwrap(), 1_000_000);
+        assert_eq!(ledger.online_circulation_at_round(1, 1).unwrap(), 1_000_000);
+    }
+
+    /// Issue #518: `online_circulation_at_round` must exclude stake behind
+    /// expired-but-still-online participation keys when the current
+    /// protocol's `exclude_expired_circulation` is set (v38+), mirroring
+    /// go-algorand's `onlineAccounts.onlineCirculation` subtracting
+    /// `expiredOnlineCirculation` (`ledger/acctonline.go`). An online
+    /// account whose `VoteLastValid` is strictly less than the queried
+    /// `vote_rnd` must be excluded; an online account whose participation
+    /// key is still valid at `vote_rnd` must remain included.
+    #[test]
+    fn online_circulation_at_round_excludes_expired_participation_key_stake() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_protocol(algo_types::consensus::CONSENSUS_V41.to_string());
+
+        // Total online stake: 1,000,000 (expired) + 4,000,000 (still valid).
+        ledger
+            .put_account_totals_seed(5_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+
+        let expired_addr = Address([21u8; 32]);
+        ledger.set_account(
+            &expired_addr,
+            AccountData {
+                micro_algos: 1_000_000,
+                status: AccountStatus::Online,
+                vote_last_valid: 100,
+                ..Default::default()
+            },
+        );
+
+        let valid_addr = Address([22u8; 32]);
+        ledger.set_account(
+            &valid_addr,
+            AccountData {
+                micro_algos: 4_000_000,
+                status: AccountStatus::Online,
+                vote_last_valid: 1_000,
+                ..Default::default()
+            },
+        );
+
+        // vote_rnd = 200: expired_addr's VoteLastValid (100) < 200, so its
+        // 1,000,000 stake must be excluded. valid_addr's VoteLastValid
+        // (1,000) >= 200, so its 4,000,000 stake remains included.
+        assert_eq!(
+            ledger.online_circulation_at_round(50, 200).unwrap(),
+            4_000_000,
+            "expired participation-key stake must be excluded from circulation"
+        );
+    }
+
+    /// Issue #518: without the exclusion (pre-v38 protocol, or `round == 0`
+    /// per go's genesis-balance carve-out), `online_circulation_at_round`
+    /// must return the raw total with no subtraction.
+    #[test]
+    fn online_circulation_at_round_skips_exclusion_pre_v38_and_at_round_zero() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_protocol(algo_types::consensus::CONSENSUS_V41.to_string());
+        ledger
+            .put_account_totals_seed(5_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        let expired_addr = Address([23u8; 32]);
+        ledger.set_account(
+            &expired_addr,
+            AccountData {
+                micro_algos: 1_000_000,
+                status: AccountStatus::Online,
+                vote_last_valid: 100,
+                ..Default::default()
+            },
+        );
+
+        // round == 0: go carves this out explicitly (still using genesis
+        // balances for the first MaxBalLookback rounds).
+        assert_eq!(
+            ledger.online_circulation_at_round(0, 200).unwrap(),
+            5_000_000,
+            "round == 0 must skip the expired-stake exclusion"
+        );
+
+        // Pre-v38 protocol: ExcludeExpiredCirculation defaults to false.
+        ledger.set_protocol(algo_types::consensus::CONSENSUS_V7.to_string());
+        assert_eq!(
+            ledger.online_circulation_at_round(50, 200).unwrap(),
+            5_000_000,
+            "pre-v38 protocol must skip the expired-stake exclusion"
+        );
+    }
+
+    /// Issue #518 (live-verified follow-up finding): `total`
+    /// (`accounttotals.online`, an incrementally-maintained aggregate) and
+    /// `expired` (a fresh per-account scan of `accountbase`, which folds
+    /// rewards eagerly) are computed via two independent bookkeeping paths
+    /// that can disagree by a small amount when reward accrual has been
+    /// applied to one but not yet folded into the other -- observed live
+    /// against a real dual-node dev-mode harness while adding this
+    /// exclusion (`bin/algod-rust/tests/live_online_circulation_expiry.rs`).
+    /// A public REST endpoint (`GET /v2/ledger/supply`'s `online-stake`)
+    /// must never 500 over that skew: `online_circulation_at_round` must
+    /// saturate at 0 rather than erroring when the scanned `expired` figure
+    /// exceeds the aggregate `total`.
+    #[test]
+    fn online_circulation_at_round_saturates_when_expired_exceeds_aggregate_total() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_protocol(algo_types::consensus::CONSENSUS_V41.to_string());
+        // Aggregate total (accounttotals.online) deliberately seeded LOWER
+        // than the expired account's own stored balance, reproducing the
+        // live-observed bookkeeping skew.
+        ledger
+            .put_account_totals_seed(1_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        let expired_addr = Address([24u8; 32]);
+        ledger.set_account(
+            &expired_addr,
+            AccountData {
+                micro_algos: 4_000_000, // > the 1,000,000 aggregate total above
+                status: AccountStatus::Online,
+                vote_last_valid: 100,
+                ..Default::default()
+            },
+        );
+
+        let result = ledger.online_circulation_at_round(50, 200);
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "expired stake exceeding the aggregate total must saturate to 0, not error"
+        );
     }
 
     /// Issue #519: the live per-round writer must bound table growth by pruning

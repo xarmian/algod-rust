@@ -176,6 +176,7 @@ validate-api-up:
 	@cargo test --release -p algod-rust --test live_endpoint_sweep --no-run
 	@cargo test --release -p algod-rust --test live_txn_cross_verification --no-run
 	@cargo test --release -p algod-rust --test live_longpoll_parity --no-run
+	@cargo test --release -p algod-rust --test live_online_circulation_expiry --no-run
 	@echo "==> Starting algod-rust natively on :4002..."
 	@rm -rf $(VALIDATE_API_RUST_DATA)
 	@mkdir -p $(VALIDATE_API_RUST_DATA)
@@ -210,21 +211,27 @@ validate-api-logs:
 ## Bring up the dual-node harness, run every live parity suite
 ## (bin/algod-rust/tests/live_go_parity.rs, live_msgpack_parity.rs,
 ## live_auth_parity.rs, live_headers_parity.rs, live_endpoint_sweep.rs,
-## live_txn_cross_verification.rs, live_longpoll_parity.rs), and tear down
-## even if a suite fails — matching algokey-e2e's pattern. Reuses the same
-## `target/release` build that validate-api-up already produced, so the
-## harness process and the test binaries are never compiled twice.
+## live_txn_cross_verification.rs, live_longpoll_parity.rs,
+## live_online_circulation_expiry.rs), and tear down even if a suite fails —
+## matching algokey-e2e's pattern. Reuses the same `target/release` build
+## that validate-api-up already produced, so the harness process and the
+## test binaries are never compiled twice.
 ##
 ## Order matters: live_go_parity, live_msgpack_parity, live_auth_parity,
 ## live_headers_parity, and live_endpoint_sweep assume genesis-only state
 ## (round 0) or are otherwise read-only, so they run first, before
-## live_txn_cross_verification and live_longpoll_parity submit any
-## transactions and advance both nodes' rounds. Both of those also need
-## --test-threads=1 (see each file's module docs) since their tests mutate
-## the shared dev account's on-chain state. live_longpoll_parity's timeout
-## test adds a real ~60s wait (go's WaitForBlockTimeout is a fixed 1-minute
-## constant that can't be shortened without diverging from what's being
-## verified — see that test's doc comment).
+## live_txn_cross_verification, live_longpoll_parity, and
+## live_online_circulation_expiry submit transactions and advance both
+## nodes' rounds. All three also need --test-threads=1 (see each file's
+## module docs) since their tests mutate the shared dev account's on-chain
+## state. live_longpoll_parity's timeout test adds a real ~60s wait (go's
+## WaitForBlockTimeout is a fixed 1-minute constant that can't be shortened
+## without diverging from what's being verified — see that test's doc
+## comment). live_online_circulation_expiry runs last since it's the
+## heaviest (issue #518: it advances each node ~330 rounds via sequential
+## filler transactions to cross MaxBalLookback, ~1-2 minutes per node) and,
+## unlike the others, doesn't assume anything about the round it starts
+## from.
 validate-api:
 	$(MAKE) validate-api-up
 	@echo "==> Running live dual-node parity suites..."
@@ -234,7 +241,8 @@ validate-api:
 	 cargo test --release -p algod-rust --test live_headers_parity -- --ignored --nocapture && \
 	 cargo test --release -p algod-rust --test live_endpoint_sweep -- --ignored --nocapture && \
 	 cargo test --release -p algod-rust --test live_txn_cross_verification -- --ignored --nocapture --test-threads=1 && \
-	 cargo test --release -p algod-rust --test live_longpoll_parity -- --ignored --nocapture --test-threads=1; \
+	 cargo test --release -p algod-rust --test live_longpoll_parity -- --ignored --nocapture --test-threads=1 && \
+	 cargo test --release -p algod-rust --test live_online_circulation_expiry -- --ignored --nocapture --test-threads=1; \
 	  STATUS=$$?; \
 	  $(MAKE) validate-api-down; \
 	  exit $$STATUS
