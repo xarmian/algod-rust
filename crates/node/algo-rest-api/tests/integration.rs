@@ -7422,7 +7422,14 @@ async fn account_assets_information_enabled_returns_200() {
 }
 
 #[tokio::test]
-async fn account_assets_information_disabled_not_accessible() {
+async fn account_assets_information_accessible_without_experimental_api() {
+    // Issue #506: go-algorand v4.6.0-stable (PR #6559) moved this endpoint
+    // out of the experimental route group into the always-registered
+    // nonparticipating/public group, so `EnableExperimentalAPI` no longer
+    // gates it. `MockNode::synced()` leaves the experimental flag unset,
+    // pinning that the route is still registered/reachable and returns a
+    // normal 200 (an empty page, since no holdings are seeded for `addr`)
+    // rather than the old 404/401 experimental-disabled response.
     let addr = Address([0x01; 32]);
     let server = TestServer::start(MockNode::synced()).await;
 
@@ -7433,11 +7440,10 @@ async fn account_assets_information_disabled_not_accessible() {
         .send()
         .await
         .unwrap();
-    let status = resp.status().as_u16();
-    assert!(
-        status == 404 || status == 401,
-        "expected 404 or 401 when experimental is disabled, got {status}"
-    );
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let holdings = body["asset-holdings"].as_array().unwrap();
+    assert!(holdings.is_empty());
 }
 
 #[tokio::test]

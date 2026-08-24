@@ -4606,6 +4606,248 @@ mod tests {
         assert_eq!(capped[1].asset_id, 20);
     }
 
+    /// Issue #506: go-algorand v4.6.0-stable's `LookupAssets` merges a
+    /// several-rounds-deep in-memory delta cache (`accountUpdates.deltas`)
+    /// on top of the persisted SQLite state so a just-committed round is
+    /// visible before that delta flushes to disk. algod-rust has no such
+    /// staging layer: `apply_block_caching_delta` writes directly into the
+    /// same SQLite connection inside the `begin_block`/`commit_block`
+    /// transaction, and `lookup_assets` reads through the very same
+    /// `Arc<Mutex<SqliteLedger>>` REST handlers and block application both
+    /// lock — so a REST read can only ever observe either the pre-block or
+    /// the fully-committed post-block state, never something in between,
+    /// and there is no round of lag after `commit_block` returns. This
+    /// pins that real-time-by-construction behavior: add, modify, and
+    /// remove an asset holding across three separate committed blocks and
+    /// assert each change is visible immediately after that block's
+    /// `commit_block()`, with `lookup_assets`'s returned round tracking
+    /// each commit exactly (no staleness, no extra round of delay).
+    #[tokio::test]
+    async fn lookup_assets_reflects_each_committed_block_immediately() {
+        let (adapter, ledger_arc) = adapter_with_seedable_ledger();
+        let addr = Address([0xAB; 32]);
+        const ASSET_ID: u64 = 77;
+
+        // Round 1: opt in / add a holding.
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            ledger.begin_block().expect("begin_block r1");
+            ledger.set_asset_holding(
+                &addr,
+                ASSET_ID,
+                AssetHolding {
+                    amount: 100,
+                    frozen: false,
+                },
+            );
+            ledger.set_current_round(Round(1));
+            ledger.commit_block().expect("commit_block r1");
+        }
+        let (after_add, round) = adapter
+            .lookup_assets(&addr, 0, 100)
+            .await
+            .expect("lookup after add");
+        assert_eq!(round, 1, "lookup round must track the just-committed round");
+        assert_eq!(after_add.len(), 1);
+        assert_eq!(
+            after_add[0]
+                .asset_holding
+                .as_ref()
+                .expect("holding present")
+                .amount,
+            100
+        );
+
+        // Round 2: modify the amount.
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            ledger.begin_block().expect("begin_block r2");
+            ledger.set_asset_holding(
+                &addr,
+                ASSET_ID,
+                AssetHolding {
+                    amount: 55,
+                    frozen: false,
+                },
+            );
+            ledger.set_current_round(Round(2));
+            ledger.commit_block().expect("commit_block r2");
+        }
+        let (after_modify, round) = adapter
+            .lookup_assets(&addr, 0, 100)
+            .await
+            .expect("lookup after modify");
+        assert_eq!(round, 2);
+        assert_eq!(
+            after_modify[0]
+                .asset_holding
+                .as_ref()
+                .expect("holding present")
+                .amount,
+            55,
+            "modified amount must be visible immediately after commit_block, not lagged"
+        );
+
+        // Round 3: close out / remove the holding entirely.
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            ledger.begin_block().expect("begin_block r3");
+            ledger.remove_asset_holding(&addr, ASSET_ID);
+            ledger.set_current_round(Round(3));
+            ledger.commit_block().expect("commit_block r3");
+        }
+        let (after_remove, round) = adapter
+            .lookup_assets(&addr, 0, 100)
+            .await
+            .expect("lookup after remove");
+        assert_eq!(round, 3);
+        assert!(
+            after_remove.is_empty(),
+            "removed holding must disappear immediately after commit_block, not lagged: {after_remove:?}"
+        );
+    }
+
+    /// Issue #506 correctness rule 2 ("no phantom holdings"): an address
+    /// that created an asset but has stripped its own holding (a
+    /// params-only resource row — `has_ownership && !has_holding`) must
+    /// never surface a synthesized/fabricated `AssetHolding` for that
+    /// asset in its own `lookup_assets` listing. Mirrors go-algorand's
+    /// `ledger/acctupdates.go` `lookupAssetResources`, whose handler
+    /// (`daemon/algod/api/server/v2/handlers.go` `AccountAssetsInformation`)
+    /// also drops any record with a nil `AssetHolding` — algod-rust's
+    /// `asset_holdings_for_addr` (the sole source `lookup_assets` reads
+    /// from) already gates on `meta.has_holding`, so a params-only row is
+    /// structurally excluded rather than defaulted to a zero/fabricated
+    /// holding. This test pins that behavior with a realistic sequence:
+    /// create the asset (giving the creator an implicit holding, as
+    /// go-algorand's ASA semantics do), then strip just the holding via
+    /// `remove_asset_holding` (which correctly keeps the params-only row
+    /// per its own "merge vs delete" branch), leaving a genuine
+    /// "creator who never holds" row.
+    #[tokio::test]
+    async fn lookup_assets_never_synthesizes_a_holding_for_a_params_only_row() {
+        let (adapter, ledger_arc) = adapter_with_seedable_ledger();
+        let creator = Address([0xCD; 32]);
+        const ASSET_ID: u64 = 88;
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            // Creator implicitly holds the asset at creation...
+            ledger.set_asset_holding(
+                &creator,
+                ASSET_ID,
+                AssetHolding {
+                    amount: 1_000,
+                    frozen: false,
+                },
+            );
+            ledger.set_asset_params(
+                ASSET_ID,
+                AssetParamsRecord {
+                    params: asset_params_named("PRM", 1_000),
+                    creator,
+                },
+            );
+            // ...then closes out its own holding (transfers the full
+            // balance away), leaving a params-only resource row.
+            ledger.remove_asset_holding(&creator, ASSET_ID);
+        }
+
+        let (records, _) = adapter
+            .lookup_assets(&creator, 0, 100)
+            .await
+            .expect("lookup creator with no holding");
+        assert!(
+            records.is_empty(),
+            "a params-only row must never appear as a synthesized holding: {records:?}"
+        );
+
+        // Sanity: the params-only row genuinely exists (via the
+        // creator-resources accessor), confirming this isn't testing an
+        // empty ledger — `lookup_assets` deliberately excludes it.
+        let ledger = ledger_arc.lock().expect("ledger lock");
+        let created = ledger.created_assets_for_addr(&creator);
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].0, ASSET_ID);
+    }
+
+    /// Issue #506 correctness rule 1 ("deletion counting"): removing one
+    /// account's holding must not create a gap or an off-by-one in
+    /// another still-held asset's pagination. go-algorand's
+    /// `lookupAssetResources` needs an explicit `numDeltaDeleted`
+    /// over-fetch to compensate for deletions shrinking a DB page pulled
+    /// from a stale delta-relative offset; algod-rust has no separate
+    /// delta source to go stale against — `asset_holdings_for_addr` is
+    /// queried fresh on every call — so this pins the *outcome* the go
+    /// bugfix protects: a deleted holding is excluded and the surviving
+    /// holdings paginate contiguously with a correct `next_token`,
+    /// whether the deletion was a full row delete (holding only, no
+    /// params) or a params-only-retaining strip (holding cleared, params
+    /// kept — same accounting either way, since only the holding flag
+    /// governs list membership).
+    #[tokio::test]
+    async fn lookup_assets_pagination_has_no_gap_after_a_deletion() {
+        let (adapter, ledger_arc) = adapter_with_seedable_ledger();
+        let addr = Address([0xEE; 32]);
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            for aid in [10u64, 20, 30, 40] {
+                ledger.set_asset_holding(
+                    &addr,
+                    aid,
+                    AssetHolding {
+                        amount: aid,
+                        frozen: false,
+                    },
+                );
+            }
+            // Full deletion (holding only, no params — the row is dropped
+            // entirely by `remove_asset_holding`).
+            ledger.remove_asset_holding(&addr, 20);
+        }
+
+        // A page of 2 starting from the top must be exactly the two
+        // still-existing lowest ids, not [10, <gap>] or missing 30.
+        let (page, _) = adapter
+            .lookup_assets(&addr, 0, 2)
+            .await
+            .expect("page after deletion");
+        assert_eq!(
+            page.iter().map(|r| r.asset_id).collect::<Vec<_>>(),
+            vec![10, 30],
+            "deleted id 20 must not leave a short/gapped page: {page:?}"
+        );
+
+        // Full listing confirms no undercount: exactly the three
+        // survivors, in order.
+        let (all, _) = adapter
+            .lookup_assets(&addr, 0, 100)
+            .await
+            .expect("full listing after deletion");
+        assert_eq!(
+            all.iter().map(|r| r.asset_id).collect::<Vec<_>>(),
+            vec![10, 30, 40]
+        );
+    }
+
+    /// Issue #506 correctness rule 3, mirroring go-algorand's
+    /// `TestLookupAssetResourcesEmptyPageDoesNotError`
+    /// (`../go-algorand/ledger/acctdeltas_test.go`): looking up an address
+    /// with zero asset holdings on a freshly-initialized ledger (no
+    /// committed round yet) must return a valid empty page at round 0,
+    /// not an error.
+    #[tokio::test]
+    async fn lookup_assets_empty_page_on_fresh_ledger_does_not_error() {
+        let (adapter, _ledger_arc) = adapter_with_seedable_ledger();
+        let addr = Address([0x5A; 32]);
+
+        let (records, round) = adapter
+            .lookup_assets(&addr, 0, 100)
+            .await
+            .expect("empty page must not error");
+        assert_eq!(round, 0);
+        assert!(records.is_empty());
+    }
+
     #[tokio::test]
     async fn box_lookups_round_trip_through_kvstore() {
         let (adapter, ledger_arc) = adapter_with_seedable_ledger();
