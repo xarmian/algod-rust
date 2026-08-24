@@ -2808,25 +2808,42 @@ impl SqliteLedger {
     ///
     /// Mirrors go-algorand's `roundCowState.CalculateTotals` writing
     /// `cb.mods.Totals` once per round (`ledger/eval/cow.go`) rather than on
-    /// every individual account touch. No-op (delta discarded) if the row
-    /// hasn't been seeded yet — e.g. a raw `SqliteLedger` in tests that never
-    /// called `seed_account_totals_from_genesis` / catchpoint import. Values
-    /// are clamped to `[0, i64::MAX]` on the way into the `i64` columns: a
-    /// negative result would indicate an accounting bug upstream (conservation
-    /// of money means a correctly-computed delta can't drive a bucket below
-    /// zero), but this is a persistence layer, not the place to panic on
-    /// untrusted-input-adjacent arithmetic — see CLAUDE.md's Result-not-panics
-    /// bar.
+    /// every individual account touch:
+    ///
+    /// ```go
+    /// totals := cb.prevTotals
+    /// totals.ApplyRewards(mods.Hdr.RewardsLevel, &ot)
+    /// for addr, delta := range accountDeltas { ... DelAccount/AddAccount ... }
+    /// ```
+    ///
+    /// `ApplyRewards` (`ledger/ledgercore/totals.go`) bumps `Online`/`Offline`
+    /// (never `NotParticipating` — it doesn't earn rewards) by
+    /// `(newLevel - oldLevel) * RewardUnits`, using the reward-unit counts
+    /// *as of before this round's account touches* — i.e. computed from the
+    /// same row snapshot this function also applies `delta` to, before either
+    /// is written back. This matters because most rounds in a low-activity
+    /// network (e.g. a smoke-test cluster with no real transaction traffic)
+    /// touch no accounts at all (`delta.is_zero()`), yet `RewardsLevel` still
+    /// advances every round the pool has a nonzero rate — skipping the flush
+    /// on `delta.is_zero()` alone would leave every online/offline account's
+    /// accrued-but-untouched rewards permanently unreflected in `GetSupply`.
+    ///
+    /// No-op if the row hasn't been seeded yet — e.g. a raw `SqliteLedger` in
+    /// tests that never called `seed_account_totals_from_genesis` /
+    /// catchpoint import. Values are clamped to `[0, i64::MAX]` on the way
+    /// into the `i64` columns: a negative result would indicate an accounting
+    /// bug upstream (conservation of money means a correctly-computed delta
+    /// can't drive a bucket below zero), but this is a persistence layer, not
+    /// the place to panic on untrusted-input-adjacent arithmetic — see
+    /// CLAUDE.md's Result-not-panics bar.
     fn flush_pending_account_totals_delta(&mut self) -> Result<(), AlgoError> {
         let delta = std::mem::take(&mut self.pending_totals_delta);
-        if delta.is_zero() {
-            return Ok(());
-        }
-        let row: Option<(i64, i64, i64, i64, i64, i64)> = self
+        let row: Option<(i64, i64, i64, i64, i64, i64, i64)> = self
             .conn
             .query_row(
                 "SELECT online, onlinerewardunits, offline, offlinerewardunits, \
-                 notparticipating, notparticipatingrewardunits FROM accounttotals WHERE id = ''",
+                 notparticipating, notparticipatingrewardunits, rewardslevel \
+                 FROM accounttotals WHERE id = ''",
                 [],
                 |row| {
                     Ok((
@@ -2836,6 +2853,7 @@ impl SqliteLedger {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
@@ -2843,25 +2861,38 @@ impl SqliteLedger {
             .map_err(|e| AlgoError::Ledger {
                 message: format!("flush_pending_account_totals_delta read error: {e}"),
             })?;
-        let Some((online, online_ru, offline, offline_ru, notpart, notpart_ru)) = row else {
+        let Some((online, online_ru, offline, offline_ru, notpart, notpart_ru, row_level)) = row
+        else {
             // Row not seeded — nothing to maintain incrementally (e.g. a
             // catchpoint-only or unseeded test ledger).
             return Ok(());
         };
-        let clamp = |base: i64, d: i128| -> i64 {
-            (base as i128 + d).clamp(0, i64::MAX as i128) as i64
-        };
-        let new_online = clamp(online, delta.online_money);
+        let new_level = self.rewards_level;
+        let row_level = row_level.max(0) as u64;
+        if delta.is_zero() && new_level == row_level {
+            return Ok(());
+        }
+        // Rewards accrued since the row's last flush, using the PRE-round
+        // reward-unit counts (`online_ru`/`offline_ru`, not yet touched by
+        // `delta` below) — matches go's `ApplyRewards` running before
+        // `AddAccount`/`DelAccount` each round.
+        let level_delta = new_level.saturating_sub(row_level) as i128;
+        let online_rewards_bump = online_ru as i128 * level_delta;
+        let offline_rewards_bump = offline_ru as i128 * level_delta;
+
+        let clamp =
+            |base: i64, d: i128| -> i64 { (base as i128 + d).clamp(0, i64::MAX as i128) as i64 };
+        let new_online = clamp(online, online_rewards_bump + delta.online_money);
         let new_online_ru = clamp(online_ru, delta.online_reward_units);
-        let new_offline = clamp(offline, delta.offline_money);
+        let new_offline = clamp(offline, offline_rewards_bump + delta.offline_money);
         let new_offline_ru = clamp(offline_ru, delta.offline_reward_units);
         let new_notpart = clamp(notpart, delta.not_participating_money);
         let new_notpart_ru = clamp(notpart_ru, delta.not_participating_reward_units);
         self.conn
             .execute(
                 "UPDATE accounttotals SET online = ?1, onlinerewardunits = ?2, offline = ?3, \
-                 offlinerewardunits = ?4, notparticipating = ?5, notparticipatingrewardunits = ?6 \
-                 WHERE id = ''",
+                 offlinerewardunits = ?4, notparticipating = ?5, notparticipatingrewardunits = ?6, \
+                 rewardslevel = ?7 WHERE id = ''",
                 params![
                     new_online,
                     new_online_ru,
@@ -2869,6 +2900,7 @@ impl SqliteLedger {
                     new_offline_ru,
                     new_notpart,
                     new_notpart_ru,
+                    new_level as i64,
                 ],
             )
             .map_err(|e| AlgoError::Ledger {
@@ -6307,6 +6339,95 @@ mod tests {
             ledger.participating_money().unwrap(),
             1_200_000,
             "accounttotals online+offline (GetSupply's total-money) must grow by the payout"
+        );
+    }
+
+    /// Issue #523 (live-cluster follow-up): a block that advances
+    /// `RewardsLevel` but touches no accounts at all (the common case in a
+    /// low-activity network — no transactions, just heartbeats) must still
+    /// grow `accounttotals.online`/`offline` by the aggregate rewards bump,
+    /// mirroring go's `AccountTotals.ApplyRewards`
+    /// (`ledger/ledgercore/totals.go`): `(newLevel - oldLevel) *
+    /// RewardUnits`, applied to the *pre-round* reward-unit counts, added
+    /// for `Online` and `Offline` (never `NotParticipating`, which doesn't
+    /// earn rewards).
+    ///
+    /// A live 4-node mixed-cluster run caught this: `RewardsRate` is
+    /// nonzero from genesis (seeded from the rewards pool balance), so
+    /// `RewardsLevel` climbs every few rounds even with zero real
+    /// transaction traffic — but `set_account`/`remove_account` are only
+    /// called for accounts a block's payset (or end-of-block processing)
+    /// actually touches, so the online stakeholders (who never move funds)
+    /// would otherwise never have their accrued rewards folded into
+    /// `GetSupply`'s `online-money`/`total-money`, and the two nodes'
+    /// reported supply would diverge more with every reward-bearing round.
+    #[test]
+    fn apply_block_rewards_level_advance_grows_totals_for_untouched_accounts() {
+        use algo_types::Block;
+
+        let fee_sink = Address([3u8; 32]);
+        let online_addr = Address([11u8; 32]);
+        let offline_addr = Address([12u8; 32]);
+
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.begin_block().unwrap();
+        ledger.set_account(
+            &fee_sink,
+            AccountData {
+                micro_algos: 100_000,
+                status: AccountStatus::NotParticipating,
+                ..Default::default()
+            },
+        );
+        // 5 online reward units (5,000,000 microAlgos / 1,000,000 per unit)
+        // and 3 offline reward units — chosen distinct so a bug that
+        // conflates the two buckets would be caught.
+        ledger.set_account(
+            &online_addr,
+            AccountData {
+                micro_algos: 5_000_000,
+                status: AccountStatus::Online,
+                ..Default::default()
+            },
+        );
+        ledger.set_account(
+            &offline_addr,
+            AccountData {
+                micro_algos: 3_000_000,
+                status: AccountStatus::Offline,
+                ..Default::default()
+            },
+        );
+        ledger
+            .put_account_totals_seed(5_000_000, 5, 3_000_000, 3, 100_000, 0)
+            .unwrap();
+        ledger.discard_pending_account_totals_delta();
+        ledger.commit_block().unwrap();
+
+        // Advance RewardsLevel by 4, with an empty payset — no account is
+        // ever touched by this block.
+        let block = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_level: 4,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            ..Block::default()
+        };
+        ledger.begin_block().unwrap();
+        crate::apply::apply_block(&mut ledger, &block).unwrap();
+        ledger.commit_block().unwrap();
+
+        // online: 5,000,000 + 5 reward units * 4 levels = 5,000,020
+        // offline: 3,000,000 + 3 reward units * 4 levels = 3,000,012
+        assert_eq!(
+            ledger.online_stake().unwrap(),
+            5_000_020,
+            "untouched online reward units must accrue the rewards-level bump"
+        );
+        assert_eq!(
+            ledger.participating_money().unwrap(),
+            5_000_020 + 3_000_012,
+            "GetSupply's total-money (online+offline) must include the offline bump too"
         );
     }
 
