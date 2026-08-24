@@ -101,6 +101,14 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             "/v2/accounts/:address/applications/:application-id",
             get(handlers::account_application_information::<N>),
         )
+        // New in go-algorand v4.6.0-stable (PR #6552) — registered in the
+        // always-available nonparticipating/public group, mirroring where
+        // the analogous `/assets` pagination endpoint now lives (#506).
+        // See issue #505.
+        .route(
+            "/v2/accounts/:address/applications",
+            get(handlers::account_applications_information::<N>),
+        )
         .route(
             "/v2/applications/:application-id",
             get(handlers::get_application_by_id::<N>),

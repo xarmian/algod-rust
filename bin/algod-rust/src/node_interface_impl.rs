@@ -50,9 +50,9 @@ use algo_rest_api::models::{
     SimulationTransactionExecTrace,
 };
 use algo_rest_api::node::{
-    AccountLookup, AppResourceLookup, ApplicationLookup, AssetLookup, AssetResourceLookup,
-    AssetResourceWithIDs, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
-    SupplyInfo, TxnGroupDeltaWithIds, TxnWithStatus,
+    AccountLookup, AppResourceLookup, AppResourceWithIDs, ApplicationLookup, AssetLookup,
+    AssetResourceLookup, AssetResourceWithIDs, BuildVersion, NodeError, NodeInterface, NodeStatus,
+    ProtocolSwitchInfo, SupplyInfo, TxnGroupDeltaWithIds, TxnWithStatus,
 };
 use algo_types::consensus::consensus_params_for_version;
 use algo_types::{
@@ -1147,6 +1147,62 @@ impl NodeInterface for AlgodNodeInterface {
                 asset_holding: Some(holding),
                 creator,
                 asset_params,
+            });
+        }
+        Ok((records, last_round))
+    }
+
+    async fn lookup_applications(
+        &self,
+        addr: &Address,
+        app_id_gt: u64,
+        limit: u64,
+        include_params: bool,
+    ) -> Result<(Vec<AppResourceWithIDs>, u64), NodeError> {
+        let ledger = self.lock_ledger("lookup_applications")?;
+        let last_round = Self::committed_round(&ledger, "lookup_applications")?;
+        // Mirrors handlers.go:1272 AccountApplicationsInformation /
+        // ledger.LookupApplications: unlike asset holdings, an app resource
+        // row surfaces for `addr` when it EITHER has local state (opted in)
+        // OR is the app's creator (a "params-only" row remains after the
+        // creator closes out its own local state, since app creation always
+        // grants an implicit ownership marker distinct from local state —
+        // see `ledger/acctupdates.go:1369` lookupApplicationResources, whose
+        // base row set is ALL of addr's own `resources` rows with
+        // ctype=app, i.e. has_holding OR has_ownership). So the id set here
+        // is the union of `app_local_states_for_addr` (has_holding) and
+        // `created_apps_for_addr` (has_ownership) — each already gates on
+        // its own flag via `inspect_resource_blob`, so a row with neither
+        // flag (which should not exist) can never surface.
+        let local_states = ledger.app_local_states_for_addr(addr);
+        let created = ledger.created_apps_for_addr(addr);
+        let mut app_ids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        app_ids.extend(local_states.iter().map(|(id, _)| *id));
+        app_ids.extend(created.iter().map(|(id, _)| *id));
+        let local_state_map: std::collections::HashMap<u64, _> = local_states.into_iter().collect();
+
+        let mut records = Vec::new();
+        for app_id in app_ids {
+            if app_id <= app_id_gt {
+                continue;
+            }
+            if records.len() as u64 >= limit {
+                break;
+            }
+            // Resolve the app's true creator/params (via the assetcreators
+            // table, independent of whether `addr` is the creator) — same
+            // pattern as `lookup_assets`. A zero creator means the app was
+            // deleted; the handler maps that to `deleted: true`.
+            let (creator, app_params) = match ledger.get_app_params(app_id) {
+                Some(params) if include_params => (params.creator, Some(params)),
+                Some(params) => (params.creator, None),
+                None => (Address::default(), None),
+            };
+            records.push(AppResourceWithIDs {
+                app_id,
+                app_local_state: local_state_map.get(&app_id).cloned(),
+                creator,
+                app_params,
             });
         }
         Ok((records, last_round))
@@ -4846,6 +4902,204 @@ mod tests {
             .expect("empty page must not error");
         assert_eq!(round, 0);
         assert!(records.is_empty());
+    }
+
+    // ---- Application resource pagination (issue #505) ----
+
+    /// Issue #505: mirrors #506's `lookup_assets_reflects_each_committed_
+    /// block_immediately` for `lookup_applications` — algod-rust has no
+    /// in-memory delta cache (see that test's doc comment for the full
+    /// architectural rationale), so a REST read can only ever observe the
+    /// pre-block or fully-committed post-block state. This pins that: opt
+    /// in / modify / close-out an app's local state across three separate
+    /// committed blocks and assert each change is visible immediately
+    /// after that block's `commit_block()`, with the returned round
+    /// tracking each commit exactly.
+    #[tokio::test]
+    async fn lookup_applications_reflects_each_committed_block_immediately() {
+        let (adapter, ledger_arc) = adapter_with_seedable_ledger();
+        let addr = Address([0xAB; 32]);
+        const APP_ID: u64 = 77;
+
+        // Round 1: opt in.
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            ledger.begin_block().expect("begin_block r1");
+            ledger.set_app_local_state(
+                &addr,
+                APP_ID,
+                AppLocalState {
+                    schema: StateSchema::default(),
+                    key_value: Default::default(),
+                },
+            );
+            ledger.set_current_round(Round(1));
+            ledger.commit_block().expect("commit_block r1");
+        }
+        let (after_add, round) = adapter
+            .lookup_applications(&addr, 0, 100, true)
+            .await
+            .expect("lookup after add");
+        assert_eq!(round, 1, "lookup round must track the just-committed round");
+        assert_eq!(after_add.len(), 1);
+        assert!(after_add[0].app_local_state.is_some());
+
+        // Round 2: close out the local state entirely (no params row
+        // remains, since `addr` never created this app).
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            ledger.begin_block().expect("begin_block r2");
+            ledger.remove_app_local_state(&addr, APP_ID);
+            ledger.set_current_round(Round(2));
+            ledger.commit_block().expect("commit_block r2");
+        }
+        let (after_remove, round) = adapter
+            .lookup_applications(&addr, 0, 100, true)
+            .await
+            .expect("lookup after remove");
+        assert_eq!(round, 2);
+        assert!(
+            after_remove.is_empty(),
+            "closed-out local state must disappear immediately after commit_block, not lagged: {after_remove:?}"
+        );
+    }
+
+    /// Issue #505 correctness rule 2 ("no phantom local state"): an address
+    /// that created an app but has closed out its own local state (a
+    /// params-only resource row — `has_ownership && !has_holding`) must
+    /// never surface a synthesized/fabricated `AppLocalState`. Unlike
+    /// assets, the row itself is NOT excluded — go's handler intentionally
+    /// includes params-only app rows (see `AppResourceWithIDs` doc comment)
+    /// — but its `app_local_state` field must stay `None`, never defaulted
+    /// to an empty/fabricated value.
+    #[tokio::test]
+    async fn lookup_applications_never_synthesizes_local_state_for_a_params_only_row() {
+        let (adapter, ledger_arc) = adapter_with_seedable_ledger();
+        let creator = Address([0xCD; 32]);
+        const APP_ID: u64 = 88;
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            ledger.set_app_params(APP_ID, app_params(creator));
+            // Creator opts in, then closes out — leaving a params-only row.
+            ledger.set_app_local_state(
+                &creator,
+                APP_ID,
+                AppLocalState {
+                    schema: StateSchema::default(),
+                    key_value: Default::default(),
+                },
+            );
+            ledger.remove_app_local_state(&creator, APP_ID);
+        }
+
+        let (records, _) = adapter
+            .lookup_applications(&creator, 0, 100, true)
+            .await
+            .expect("lookup creator with no local state");
+        assert_eq!(records.len(), 1, "the params-only row must still appear");
+        assert!(
+            records[0].app_local_state.is_none(),
+            "a params-only row must never surface a synthesized local state: {:?}",
+            records[0]
+        );
+        assert!(
+            records[0].app_params.is_some(),
+            "params must still be present for the creator's own row"
+        );
+        assert_eq!(records[0].creator, creator);
+    }
+
+    /// Issue #505 correctness rule 1 ("deletion counting"): removing one
+    /// app's local state must not create a gap or an off-by-one in another
+    /// still-held app's pagination. algod-rust has no separate delta
+    /// source to go stale against (see #506's analogous test), so this
+    /// pins the *outcome* go's `numDeltaDeleted` accounting protects: a
+    /// closed-out app is excluded and the surviving apps paginate
+    /// contiguously with a correct `next_token`.
+    #[tokio::test]
+    async fn lookup_applications_pagination_has_no_gap_after_a_deletion() {
+        let (adapter, ledger_arc) = adapter_with_seedable_ledger();
+        let addr = Address([0xEE; 32]);
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            for aid in [10u64, 20, 30, 40] {
+                ledger.set_app_local_state(
+                    &addr,
+                    aid,
+                    AppLocalState {
+                        schema: StateSchema::default(),
+                        key_value: Default::default(),
+                    },
+                );
+            }
+            // `addr` never created any of these apps, so closing out id 20
+            // deletes the row entirely (no params row survives).
+            ledger.remove_app_local_state(&addr, 20);
+        }
+
+        let (page, _) = adapter
+            .lookup_applications(&addr, 0, 2, true)
+            .await
+            .expect("page after deletion");
+        assert_eq!(
+            page.iter().map(|r| r.app_id).collect::<Vec<_>>(),
+            vec![10, 30],
+            "deleted id 20 must not leave a short/gapped page: {page:?}"
+        );
+
+        let (all, _) = adapter
+            .lookup_applications(&addr, 0, 100, true)
+            .await
+            .expect("full listing after deletion");
+        assert_eq!(
+            all.iter().map(|r| r.app_id).collect::<Vec<_>>(),
+            vec![10, 30, 40]
+        );
+    }
+
+    /// Issue #505 correctness rule 3, mirroring go-algorand's
+    /// `TestLookupApplicationResourcesEmptyPageDoesNotError`
+    /// (`../go-algorand/ledger/acctdeltas_test.go`): looking up an address
+    /// with zero application resources on a freshly-initialized ledger (no
+    /// committed round yet) must return a valid empty page at round 0, not
+    /// an error.
+    #[tokio::test]
+    async fn lookup_applications_empty_page_on_fresh_ledger_does_not_error() {
+        let (adapter, _ledger_arc) = adapter_with_seedable_ledger();
+        let addr = Address([0x5A; 32]);
+
+        let (records, round) = adapter
+            .lookup_applications(&addr, 0, 100, true)
+            .await
+            .expect("empty page must not error");
+        assert_eq!(round, 0);
+        assert!(records.is_empty());
+    }
+
+    /// `include_params=false` must still resolve `creator` (needed for the
+    /// handler's `deleted` flag) but must not populate `app_params` —
+    /// mirrors go's bandwidth-saving `includeParams` branch in
+    /// `lookupApplicationResources`.
+    #[tokio::test]
+    async fn lookup_applications_respects_include_params_false() {
+        let (adapter, ledger_arc) = adapter_with_seedable_ledger();
+        let creator = Address([0x11; 32]);
+        const APP_ID: u64 = 5;
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            ledger.set_app_params(APP_ID, app_params(creator));
+        }
+
+        let (records, _) = adapter
+            .lookup_applications(&creator, 0, 100, false)
+            .await
+            .expect("lookup without params");
+        assert_eq!(records.len(), 1);
+        assert!(records[0].app_params.is_none());
+        assert_eq!(
+            records[0].creator, creator,
+            "creator must still resolve even when params are excluded"
+        );
     }
 
     #[tokio::test]

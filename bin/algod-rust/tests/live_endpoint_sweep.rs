@@ -149,6 +149,22 @@ async fn account_assets_list_and_experimental_disabled_on_both() {
     assert_status_parity(&format!("/v2/accounts/{FEE_SINK}/assets"), DEV_TOKEN).await;
 }
 
+#[tokio::test]
+#[ignore = "requires `make validate-api-up`; see module docs"]
+async fn account_applications_list_matches() {
+    // Issue #505: go-algorand v4.6.0-stable (PR #6552) added
+    // `GET /v2/accounts/{address}/applications`, a brand-new endpoint never
+    // gated behind `EnableExperimentalAPI` on either side — assert full
+    // JSON parity (not just status) for the fee sink, which is guaranteed
+    // to exist (with zero application resources) at genesis on both nodes.
+    assert_json_parity(&format!("/v2/accounts/{FEE_SINK}/applications"), DEV_TOKEN).await;
+    assert_json_parity(
+        &format!("/v2/accounts/{FEE_SINK}/applications?include=params"),
+        DEV_TOKEN,
+    )
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Applications / assets
 // ---------------------------------------------------------------------------

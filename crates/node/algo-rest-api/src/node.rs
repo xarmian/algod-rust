@@ -718,6 +718,26 @@ pub trait NodeInterface: Send + Sync + 'static {
         Err(NodeError::NotImplemented("lookup_assets"))
     }
 
+    /// Look up multiple app resources for an address, paginated by app ID.
+    ///
+    /// Returns apps with `app_id > app_id_gt`, up to `limit` records, along
+    /// with the round at which the lookup was performed. `include_params`
+    /// mirrors go's bandwidth-saving flag: when `false`, implementations
+    /// may skip populating `app_params` on the returned records (the
+    /// `creator` field, needed for the `deleted` flag, is still resolved).
+    ///
+    /// Mirrors go-algorand's `ledger.LookupApplications(addr, app_id_gt,
+    /// limit, includeParams)`.
+    async fn lookup_applications(
+        &self,
+        _addr: &Address,
+        _app_id_gt: u64,
+        _limit: u64,
+        _include_params: bool,
+    ) -> Result<(Vec<AppResourceWithIDs>, u64), NodeError> {
+        Err(NodeError::NotImplemented("lookup_applications"))
+    }
+
     // ---- Simulation methods ----
 
     /// Simulate a transaction group without submitting it.
@@ -974,4 +994,28 @@ pub struct AssetResourceWithIDs {
     pub creator: Address,
     /// The asset params, present only if the address is the creator.
     pub asset_params: Option<AssetParams>,
+}
+
+/// A single app resource record with identifying fields, used for
+/// paginated application lookups.
+///
+/// Mirrors go-algorand's `ledgercore.AppResourceWithIDs`. Unlike
+/// [`AssetResourceWithIDs`] — where a row only exists when the address
+/// holds the asset — an app row surfaces when the address EITHER has app
+/// local state OR is the app's creator (a "params-only" row, e.g. a
+/// creator that closed out its own local state), matching go's
+/// `AccountApplicationsInformation` handler, which drops a record only
+/// when *both* `AppLocalState` and `AppParams` are nil.
+#[derive(Debug, Clone)]
+pub struct AppResourceWithIDs {
+    /// The app ID.
+    pub app_id: u64,
+    /// The app local state, if the address has opted in.
+    pub app_local_state: Option<AppLocalState>,
+    /// The address that created this app. Zero address if the app no
+    /// longer exists (deleted) — the handler maps that to `deleted: true`.
+    pub creator: Address,
+    /// The app params, present only when the app still exists AND the
+    /// caller requested `include-params`.
+    pub app_params: Option<AppParams>,
 }
