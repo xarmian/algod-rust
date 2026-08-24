@@ -2734,6 +2734,18 @@ impl SqliteLedger {
         // Flush chain-level state to meta table.
         self.flush_chain_state()?;
 
+        // Issue #519: append this round's online-supply snapshot to
+        // `onlineroundparamstail` on every commit, not just catchpoint import.
+        // Mirrors go-algorand's `onlineAccounts.newBlockImpl` appending
+        // `OnlineRoundParamsData` every block and `onlineAccounts.commitRound`
+        // pruning entries older than `MaxBalLookback` via
+        // `AccountsPruneOnlineRoundParams` (`ledger/acctonline.go`). Without a
+        // live writer, `online_supply_at_round`/`online_circulation_at_round`
+        // (shared by sortition's `AgreementLedgerBridge::circulation` and
+        // `GetSupply`'s `online-stake`) silently fall back to today's
+        // aggregate for any round the last catchpoint import didn't cover.
+        self.record_online_supply_snapshot()?;
+
         // Persist the trie if enabled. Paged commit via the same SQLite
         // transaction we're about to COMMIT — page writes happen against
         // `accounthashes` (PLAN-130 TASK-136). PLAN-36 G4 (TASK-118)
@@ -3143,10 +3155,11 @@ impl SqliteLedger {
     ///
     /// Mirrors the shape go-algorand persists in `OnlineRoundParamsData`
     /// (`ledger/acctonline.go`) -- a msgpack map with the `"online"` key read
-    /// back by [`Self::online_supply_at_round`]. Normal block application does
-    /// not yet append to this table (only catchpoint import populates it, see
-    /// `catchpoint/importer.rs`); this writer exists to backfill/seed known
-    /// per-round snapshots (tests, and future block-apply history tracking).
+    /// back by [`Self::online_supply_at_round`]. Low-level primitive used by
+    /// both catchpoint import (`catchpoint/importer.rs`) and the live writer
+    /// [`Self::record_online_supply_snapshot`] invoked from every
+    /// [`Self::commit_block`] (issue #519); also usable directly to
+    /// backfill/seed known per-round snapshots in tests.
     pub fn put_online_supply_at_round(&self, round: u64, online: u64) -> Result<(), AlgoError> {
         let data = encode_mixed_map(&[("online", encode_msgpack_uint(online))]);
         self.conn
@@ -3158,6 +3171,55 @@ impl SqliteLedger {
                 message: format!("insert onlineroundparamstail error: {e}"),
             })?;
         Ok(())
+    }
+
+    /// Delete all `onlineroundparamstail` rows for rounds strictly older than
+    /// `before_round`.
+    ///
+    /// Mirrors go-algorand's `AccountsPruneOnlineRoundParams`
+    /// (`ledger/store/trackerdb/sqlitedriver/accountsV2.go`): `DELETE FROM
+    /// onlineroundparamstail WHERE rnd < ?`.
+    fn prune_online_supply_before(&self, before_round: u64) -> Result<(), AlgoError> {
+        self.conn
+            .execute(
+                "DELETE FROM onlineroundparamstail WHERE rnd < ?1",
+                params![before_round as i64],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("prune onlineroundparamstail error: {e}"),
+            })?;
+        Ok(())
+    }
+
+    /// Append the current round's online-supply snapshot to
+    /// `onlineroundparamstail` and prune snapshots that have fallen outside
+    /// the `MaxBalLookback` retention window. Called from every
+    /// [`Self::commit_block`] (issue #519) so the table is a live, bounded
+    /// history rather than something only catchpoint import populates.
+    ///
+    /// Retention matches go-algorand's `onlineAccounts.commitRound`
+    /// (`ledger/acctonline.go`): `onlineAccountsForgetBefore = (newBase +
+    /// 1).SubSaturate(MaxBalLookback)`, i.e. rows older than
+    /// `round + 1 - MaxBalLookback` are pruned every commit. This crate
+    /// already reproduces the same formula for catchpoint export
+    /// (`ExportOptions::online_horizon_round`,
+    /// `catchpoint/writer.rs`); this is the live-write-path analogue.
+    ///
+    /// Go additionally extends retention to cover the state-proof voters
+    /// lookback (`ao.voters.lowestRound`) when that is smaller than the
+    /// `MaxBalLookback` cutoff. algod-rust does not yet track state-proof
+    /// voter history in this table, so only the `MaxBalLookback` bound is
+    /// applied here; revisit if/when voter-lookback tracking lands.
+    fn record_online_supply_snapshot(&self) -> Result<(), AlgoError> {
+        let round = self.current_round.0;
+        let online = self.online_stake()?;
+        self.put_online_supply_at_round(round, online)?;
+
+        let max_bal_lookback = algo_types::consensus::consensus_params_for_version(&self.protocol)
+            .map(|p| p.max_bal_lookback)
+            .unwrap_or(crate::catchpoint::writer::DEFAULT_MAX_BAL_LOOKBACK);
+        let forget_before = (round + 1).saturating_sub(max_bal_lookback);
+        self.prune_online_supply_before(forget_before)
     }
 
     /// Returns the total online stake to report as "circulation" at `round`:
@@ -5845,6 +5907,102 @@ mod tests {
             ledger.online_circulation_at_round(200).unwrap(),
             5_500_000,
             "no snapshot recorded for round 200 -> fall back to the current aggregate",
+        );
+    }
+
+    /// Issue #519: normal block application (not just catchpoint import) must
+    /// append a per-round online-supply snapshot to `onlineroundparamstail` on
+    /// every `commit_block`, mirroring go-algorand's `onlineAccounts.newBlockImpl`
+    /// appending `OnlineRoundParamsData` every block (`ledger/acctonline.go`).
+    /// Without a live writer, `online_supply_at_round` returns `None` (and
+    /// `online_circulation_at_round` silently falls back to today's aggregate)
+    /// for any round the last catchpoint import didn't cover.
+    #[test]
+    fn commit_block_appends_online_supply_snapshot_for_each_round() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger
+            .put_account_totals_seed(1_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        ledger.commit_block().unwrap();
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(2));
+        ledger
+            .put_account_totals_seed(2_500_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        ledger.commit_block().unwrap();
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(3));
+        ledger
+            .put_account_totals_seed(3_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        ledger.commit_block().unwrap();
+
+        // Each committed round's snapshot must be independently retrievable --
+        // not just the latest/current aggregate -- with no catchpoint import
+        // involved anywhere in this test.
+        assert_eq!(
+            ledger.online_supply_at_round(1).unwrap(),
+            Some(1_000_000),
+            "round 1's historical online supply must be recorded by normal block apply"
+        );
+        assert_eq!(
+            ledger.online_supply_at_round(2).unwrap(),
+            Some(2_500_000),
+            "round 2's historical online supply must be recorded by normal block apply"
+        );
+        assert_eq!(
+            ledger.online_supply_at_round(3).unwrap(),
+            Some(3_000_000),
+            "round 3's historical online supply must be recorded by normal block apply"
+        );
+
+        // The lookback-round accessor used by sortition and GetSupply must see
+        // the true historical value at an old round, not the current aggregate.
+        assert_eq!(ledger.online_circulation_at_round(1).unwrap(), 1_000_000);
+    }
+
+    /// Issue #519: the live per-round writer must bound table growth by pruning
+    /// rows older than the `MaxBalLookback` retention window, mirroring
+    /// go-algorand's `onlineAccounts.commitRound` calling
+    /// `AccountsPruneOnlineRoundParams(onlineAccountsForgetBefore)` where
+    /// `onlineAccountsForgetBefore = (newBase + 1).SubSaturate(MaxBalLookback)`
+    /// (`ledger/acctonline.go`).
+    #[test]
+    fn commit_block_prunes_online_supply_snapshots_beyond_lookback_window() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_protocol(algo_types::consensus::CONSENSUS_V41.to_string());
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger
+            .put_account_totals_seed(1_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        ledger.commit_block().unwrap();
+        assert_eq!(ledger.online_supply_at_round(1).unwrap(), Some(1_000_000));
+
+        // Jump far enough ahead that round 1 falls outside the 320-round
+        // MaxBalLookback retention window: forget_before = (500+1)-320 = 181.
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(500));
+        ledger
+            .put_account_totals_seed(5_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        ledger.commit_block().unwrap();
+
+        assert_eq!(
+            ledger.online_supply_at_round(1).unwrap(),
+            None,
+            "snapshot older than the MaxBalLookback retention window must be pruned"
+        );
+        assert_eq!(
+            ledger.online_supply_at_round(500).unwrap(),
+            Some(5_000_000),
+            "the just-committed round's snapshot must remain"
         );
     }
 
