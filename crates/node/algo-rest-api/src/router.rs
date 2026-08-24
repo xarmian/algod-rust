@@ -88,6 +88,15 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
             "/v2/accounts/:address/assets/:asset-id",
             get(handlers::account_asset_information::<N>),
         )
+        // go-algorand v4.6.0-stable (PR #6559) moved this endpoint out of
+        // the experimental route group into the always-registered
+        // nonparticipating/public group (`daemon/algod/api/server/v2/
+        // generated/nonparticipating/public/routes.go`), unconditionally
+        // serving it regardless of `EnableExperimentalAPI` — see issue #506.
+        .route(
+            "/v2/accounts/:address/assets",
+            get(handlers::account_assets_information::<N>),
+        )
         .route(
             "/v2/accounts/:address/applications/:application-id",
             get(handlers::account_application_information::<N>),
@@ -243,10 +252,6 @@ pub fn build_router<N: NodeInterface>(node: Arc<N>, tokens: TokenConfig) -> Rout
     if tokens.enable_experimental_api {
         let experimental = Router::new()
             .route("/v2/experimental", get(handlers::experimental_check::<N>))
-            .route(
-                "/v2/accounts/:address/assets",
-                get(handlers::account_assets_information::<N>),
-            )
             .route(
                 "/v2/transactions/async",
                 post(handlers::raw_transaction_async::<N>),

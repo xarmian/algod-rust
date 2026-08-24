@@ -4064,19 +4064,18 @@ pub struct AccountAssetsInformationParams {
 
 /// Return paginated asset holdings for an account.
 ///
-/// Matches go-algorand's `Handlers.AccountAssetsInformation`.
+/// Matches go-algorand's `Handlers.AccountAssetsInformation`. As of
+/// go-algorand v4.6.0-stable (PR #6559 / issue #506), this endpoint is no
+/// longer gated behind `EnableExperimentalAPI` — it moved from the
+/// experimental route group into the always-registered
+/// nonparticipating/public group, so it is unconditionally served
+/// regardless of that config flag (mirrored at the router level in
+/// `router.rs`; no handler-level gate remains here).
 pub async fn account_assets_information<N: NodeInterface>(
     State(node): State<AppState<N>>,
     Path(address): Path<String>,
     Query(params): Query<AccountAssetsInformationParams>,
 ) -> Response {
-    if !node.enable_experimental_api() {
-        return crate::error_envelope::plain_text_response(
-            StatusCode::NOT_FOUND,
-            "/v2/accounts/{address}/assets was not enabled in the configuration file by setting the EnableExperimentalAPI to true",
-        );
-    }
-
     // Parse address
     let addr = match Address::from_str(&address) {
         Ok(a) => a,
