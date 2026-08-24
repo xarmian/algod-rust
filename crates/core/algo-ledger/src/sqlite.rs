@@ -3246,6 +3246,18 @@ impl SqliteLedger {
     /// current-aggregate fallback for the total itself -- the expired-stake
     /// scan reads the *current* `accountbase` online-account set via
     /// [`Self::expired_online_stake`] rather than a `rnd`-historical one.
+    ///
+    /// `total` and `expired` are drawn from two independently-maintained
+    /// bookkeeping paths -- `accounttotals`'s incrementally-updated
+    /// aggregate vs. a fresh per-account rewards-applied scan -- which can
+    /// disagree by a small amount when reward accrual has been applied to
+    /// one but not yet folded into the other (live-verified while adding
+    /// this exclusion: issue #518). Go's own `OverflowTracker.SubA` assumes
+    /// both figures come from one consistent snapshot and never diverge;
+    /// algod-rust's two-path approximation cannot make that same guarantee,
+    /// so unlike go this saturates at 0 rather than erroring -- a
+    /// public REST endpoint must never 500 over bookkeeping skew between
+    /// two otherwise-correct internal figures.
     pub fn online_circulation_at_round(&self, round: u64, vote_rnd: u64) -> Result<u64, AlgoError> {
         let total = if let Some(supply) = self.online_supply_at_round(round)? {
             supply
@@ -3261,11 +3273,7 @@ impl SqliteLedger {
         }
 
         let expired = self.expired_online_stake(vote_rnd)?;
-        total.checked_sub(expired).ok_or_else(|| AlgoError::Ledger {
-            message: format!(
-                "online_circulation_at_round: overflow subtracting expired stake {expired} from total {total}"
-            ),
-        })
+        Ok(total.saturating_sub(expired))
     }
 
     /// Sum the stake held by currently-online accounts (`accountbase`,
@@ -6124,6 +6132,47 @@ mod tests {
             ledger.online_circulation_at_round(50, 200).unwrap(),
             5_000_000,
             "pre-v38 protocol must skip the expired-stake exclusion"
+        );
+    }
+
+    /// Issue #518 (live-verified follow-up finding): `total`
+    /// (`accounttotals.online`, an incrementally-maintained aggregate) and
+    /// `expired` (a fresh per-account scan of `accountbase`, which folds
+    /// rewards eagerly) are computed via two independent bookkeeping paths
+    /// that can disagree by a small amount when reward accrual has been
+    /// applied to one but not yet folded into the other -- observed live
+    /// against a real dual-node dev-mode harness while adding this
+    /// exclusion (`bin/algod-rust/tests/live_online_circulation_expiry.rs`).
+    /// A public REST endpoint (`GET /v2/ledger/supply`'s `online-stake`)
+    /// must never 500 over that skew: `online_circulation_at_round` must
+    /// saturate at 0 rather than erroring when the scanned `expired` figure
+    /// exceeds the aggregate `total`.
+    #[test]
+    fn online_circulation_at_round_saturates_when_expired_exceeds_aggregate_total() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_protocol(algo_types::consensus::CONSENSUS_V41.to_string());
+        // Aggregate total (accounttotals.online) deliberately seeded LOWER
+        // than the expired account's own stored balance, reproducing the
+        // live-observed bookkeeping skew.
+        ledger
+            .put_account_totals_seed(1_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        let expired_addr = Address([24u8; 32]);
+        ledger.set_account(
+            &expired_addr,
+            AccountData {
+                micro_algos: 4_000_000, // > the 1,000,000 aggregate total above
+                status: AccountStatus::Online,
+                vote_last_valid: 100,
+                ..Default::default()
+            },
+        );
+
+        let result = ledger.online_circulation_at_round(50, 200);
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "expired stake exceeding the aggregate total must saturate to 0, not error"
         );
     }
 
