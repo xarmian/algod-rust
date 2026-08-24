@@ -3396,13 +3396,27 @@ impl SqliteLedger {
     /// [`Self::commit_block`] (issue #519) so the table is a live, bounded
     /// history rather than something only catchpoint import populates.
     ///
-    /// Retention matches go-algorand's `onlineAccounts.commitRound`
+    /// Retention is based on go-algorand's `onlineAccounts.commitRound`
     /// (`ledger/acctonline.go`): `onlineAccountsForgetBefore = (newBase +
-    /// 1).SubSaturate(MaxBalLookback)`, i.e. rows older than
-    /// `round + 1 - MaxBalLookback` are pruned every commit. This crate
-    /// already reproduces the same formula for catchpoint export
-    /// (`ExportOptions::online_horizon_round`,
-    /// `catchpoint/writer.rs`); this is the live-write-path analogue.
+    /// 1).SubSaturate(MaxBalLookback)`. Read literally that keeps rows
+    /// `>= round + 1 - MaxBalLookback`, one round short of the exact
+    /// lookback round `agreement.BalanceRound`/`round - MaxBalLookback`
+    /// needs. Go gets away with the literal formula because `newBase` is
+    /// the *durably committed* round, which trails the live agreement
+    /// round by at least one round of deferred-commit lag (see the
+    /// `dcc.newBase()`/`ao.cachedDBRoundOnline` bookkeeping in the same
+    /// file) -- so by the time go prunes, the round it needs has already
+    /// been retained by that lag. `commit_block` here writes and prunes
+    /// synchronously for every round with no such lag, so `newBase` here
+    /// *is* `round`; reusing go's formula verbatim prunes the exact
+    /// lookback round in the same commit that would have served it
+    /// (issue #529). Using `round.saturating_sub(MaxBalLookback)` (one
+    /// round earlier than go's literal formula) keeps `round -
+    /// MaxBalLookback` -- the exact round queried -- alive without
+    /// retaining more history than that. This crate's catchpoint export
+    /// (`ExportOptions::online_horizon_round`, `catchpoint/writer.rs`)
+    /// keeps go's literal formula, which is correct there since a
+    /// catchpoint always describes an already-durable round.
     ///
     /// Go additionally extends retention to cover the state-proof voters
     /// lookback (`ao.voters.lowestRound`) when that is smaller than the
@@ -3417,7 +3431,7 @@ impl SqliteLedger {
         let max_bal_lookback = algo_types::consensus::consensus_params_for_version(&self.protocol)
             .map(|p| p.max_bal_lookback)
             .unwrap_or(crate::catchpoint::writer::DEFAULT_MAX_BAL_LOOKBACK);
-        let forget_before = (round + 1).saturating_sub(max_bal_lookback);
+        let forget_before = round.saturating_sub(max_bal_lookback);
         self.prune_online_supply_before(forget_before)
     }
 
@@ -6685,6 +6699,62 @@ mod tests {
             ledger.online_supply_at_round(500).unwrap(),
             Some(5_000_000),
             "the just-committed round's snapshot must remain"
+        );
+    }
+
+    /// Issue #529: the snapshot for the *exact* lookback round
+    /// (`round - MaxBalLookback`, the round `agreement::balance_round`
+    /// computes and that `get_supply`/sortition actually query) must
+    /// survive the very `commit_block` call at `round` that would prune
+    /// it. The previous retention formula, `(round + 1).saturating_sub(
+    /// max_bal_lookback)`, kept rounds `>= round - 319` -- one round
+    /// short of `round - 320` -- so the exact lookback round was pruned
+    /// in the same commit that would have served it, silently
+    /// collapsing `online_circulation_at_round` to the current-round
+    /// aggregate forever (go-algorand's `onlineAccounts.commitRound`,
+    /// `ledger/acctonline.go`, has an equivalent-looking formula but its
+    /// DB commit round trails the live agreement round by at least one
+    /// round of deferral, which the immediate-commit-per-round rust
+    /// writer does not have, so it must keep one extra round).
+    #[test]
+    fn commit_block_retains_snapshot_at_exact_lookback_boundary() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.set_protocol(algo_types::consensus::CONSENSUS_V41.to_string());
+
+        let max_bal_lookback = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .unwrap()
+        .max_bal_lookback;
+        assert_eq!(max_bal_lookback, 320, "test assumes v41's MaxBalLookback");
+
+        ledger.begin_block().unwrap();
+        ledger.set_current_round(Round(1));
+        ledger
+            .put_account_totals_seed(1_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        ledger.commit_block().unwrap();
+
+        // Commit every round up to round 1 + MaxBalLookback = 321, the
+        // round at which `balance_round(321) == 1` is the exact lookback
+        // round that must still be retrievable.
+        let target_round = 1 + max_bal_lookback;
+        for r in 2..=target_round {
+            ledger.begin_block().unwrap();
+            ledger.set_current_round(Round(r));
+            ledger
+                .put_account_totals_seed(1_000_000, 0, 0, 0, 0, 0)
+                .unwrap();
+            ledger.commit_block().unwrap();
+        }
+
+        assert_eq!(
+            ledger.online_supply_at_round(1).unwrap(),
+            Some(1_000_000),
+            "the exact lookback round's snapshot (round {} - MaxBalLookback {} = round 1) \
+             must survive the commit at round {target_round}",
+            target_round,
+            max_bal_lookback,
         );
     }
 
