@@ -490,18 +490,20 @@ fn decode_b64_nonempty(value: &Option<String>) -> Option<Vec<u8>> {
 
 /// Seed the SQLite ledger's `accounttotals` table from a parsed genesis.
 ///
-/// PLAN-32 / TASK-95 — `apply_block` doesn't maintain `accounttotals`
-/// today (catchpoint-only), so mixed-cluster-style harnesses need to
-/// seed it at startup or `Certificate::authenticate`'s `circulation()`
-/// lookup returns 0 and verification fails. This sums allocation
-/// `algo` amounts by online/offline/not-participating status and
-/// writes a single row to `accounttotals`.
+/// PLAN-32 / TASK-95 — a brand-new ledger has no `accounttotals` row at
+/// all until something writes one, so `Certificate::authenticate`'s
+/// `circulation()` lookup would return 0 and verification would fail at
+/// genesis. This sums allocation `algo` amounts by online/offline/
+/// not-participating status and writes the round-0 baseline row.
 ///
-/// Correct as long as no subsequent transaction flips an account's
-/// online status — true for the PLAN-32 harness (Wallet1/2/3 online
-/// and Wallet4 offline, statically for the whole soak). NOT suitable
-/// for general-purpose production nodes; see `catchpoint::importer`
-/// for the authoritative writer.
+/// As of issue #523, `apply_block` incrementally maintains this row on
+/// every subsequent block (`SqliteLedger::set_account`/`remove_account`
+/// accumulate a per-block delta, flushed in `commit_block` — mirrors
+/// go-algorand's `roundCowState.CalculateTotals`, `ledger/eval/cow.go`),
+/// so this seed only needs to be correct at round 0; it is no longer the
+/// sole source of truth for a long-running node. `catchpoint::importer`
+/// remains the authoritative writer for a catchpoint-imported ledger
+/// (which skips genesis entirely).
 pub fn seed_account_totals_from_genesis(
     ledger: &mut crate::sqlite::SqliteLedger,
     genesis: &GenesisJson,
@@ -560,7 +562,16 @@ pub fn seed_account_totals_from_genesis(
         offline_ru,
         not_participating,
         not_participating_ru,
-    )
+    )?;
+    // Issue #523: `populate_store` above ran through `LedgerStore::set_account`
+    // for every allocation, which (as of #523's fix) accumulates a
+    // per-block `accounttotals` delta reflecting those same writes. The
+    // seed row just written already sums genesis allocations directly and
+    // is authoritative — flushing the accumulated delta on top at the next
+    // `commit_block` would double-count the whole genesis supply. Discard
+    // it now that the seed has superseded it.
+    ledger.discard_pending_account_totals_delta();
+    Ok(())
 }
 
 impl LedgerState {

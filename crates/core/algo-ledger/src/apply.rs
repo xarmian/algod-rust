@@ -839,12 +839,21 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
                 }
             }
         }
+        // The proposer-payout step below (issue #523) mutates the fee sink
+        // and proposer accounts, so they need the same rollback coverage.
+        if !eob_addrs.contains(&block.fee_sink) {
+            eob_addrs.push(block.fee_sink);
+        }
+        if !block.proposer.is_zero() && !eob_addrs.contains(&block.proposer) {
+            eob_addrs.push(block.proposer);
+        }
         let eob_snapshot = store.snapshot(&eob_addrs);
         let eob_result = (|| {
             validate_expired_online_accounts(store, block, &consensus, ctx.validate)?;
             reset_expired_online_accounts(store, block, &consensus)?;
             validate_absent_online_accounts(store, block, &consensus, ctx.validate)?;
-            suspend_absent_accounts(store, block, &consensus)
+            suspend_absent_accounts(store, block, &consensus)?;
+            apply_proposer_payout(store, block)
         })();
         if eob_result.is_err() {
             store.restore_snapshot(eob_snapshot);
@@ -1094,6 +1103,62 @@ fn suspend_absent_accounts<L: crate::store_trait::LedgerStore>(
         acct.incentive_eligible = false;
         store.set_account(addr, acct);
     }
+
+    Ok(())
+}
+
+/// Credit the block's proposer with its incentive payout.
+///
+/// Mirrors go-algorand's `BlockEvaluator.performPayout`
+/// (`ledger/eval/eval.go`): moves `block.proposer_payout` microAlgos from
+/// `block.fee_sink` to `block.proposer`. Runs unconditionally from
+/// `endOfBlock` in go — not gated on `eval.generate` or `eval.validate` —
+/// because by the time a block reaches apply/replay, its `Proposer` and
+/// `ProposerPayout` header fields already encode whatever agreement
+/// decided (a proposer found ineligible has its payout zeroed by
+/// `WithProposer()` before the block is finalized); a replaying node just
+/// applies what's in the header, exactly like a normal `Pay`-shaped
+/// transfer.
+///
+/// Before this function existed, algod-rust's apply path only threaded
+/// `block.proposer_payout` into the stored header/hash — it never actually
+/// moved the money, so the proposer's balance and the ledger's
+/// online/total money supply (`accounttotals`, `GET /v2/ledger/supply`)
+/// silently diverged from go-algorand by the cumulative sum of every
+/// block's payout. See issue #523.
+///
+/// No-op when there is no proposer (payouts not enabled for this block, or
+/// a zero header) or the payout is zero, matching go's early return in
+/// `performPayout`.
+fn apply_proposer_payout<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+) -> Result<(), AlgoError> {
+    if block.proposer.is_zero() || block.proposer_payout == 0 {
+        return Ok(());
+    }
+
+    let mut sink = store.get_or_default_account(&block.fee_sink);
+    // Go's `proposerPayout()` clamps the payout to the fee sink's
+    // available balance before it ever reaches a block header
+    // (`ledger/eval/eval.go`), so this should never trip on a
+    // well-formed block. `block.proposer_payout` is still
+    // replay-path/untrusted-peer-reachable data, though, so surface a
+    // `Result` here rather than underflowing or panicking.
+    if sink.micro_algos < block.proposer_payout {
+        return Err(AlgoError::Ledger {
+            message: format!(
+                "fee sink {} balance {} insufficient for proposer payout {} (round {})",
+                block.fee_sink, sink.micro_algos, block.proposer_payout, block.round.0
+            ),
+        });
+    }
+    sink.micro_algos -= block.proposer_payout;
+    store.set_account(&block.fee_sink, sink);
+
+    let mut proposer = store.get_or_default_account(&block.proposer);
+    proposer.micro_algos += block.proposer_payout;
+    store.set_account(&block.proposer, proposer);
 
     Ok(())
 }
@@ -5017,6 +5082,79 @@ mod tests {
         let txtail = state.get_txtail(1).unwrap();
         assert!(txtail.is_some(), "txtail should be stored after apply");
         assert!(!txtail.unwrap().is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Proposer payout (issue #523)
+    // ---------------------------------------------------------------------
+
+    /// Issue #523: `apply_block` must move `block.proposer_payout`
+    /// microAlgos from the fee sink to `block.proposer`, mirroring
+    /// go-algorand's `BlockEvaluator.performPayout` (`ledger/eval/eval.go`).
+    /// Before this fix, `apply_block_impl` only threaded `proposer_payout`
+    /// through into the stored header — it never actually credited the
+    /// proposer or debited the fee sink, so a live mixed-cluster run
+    /// diverged from go-algorand's `GET /v2/ledger/supply` by the
+    /// cumulative sum of every block's payout (observed: 30,000,000,000,000
+    /// microAlgos over 150 rounds).
+    #[test]
+    fn apply_block_credits_proposer_payout_from_fee_sink() {
+        let fee_sink = Address([3u8; 32]);
+        let proposer = Address([9u8; 32]);
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[
+                (sender, 10_000_000),
+                (receiver, 1_000_000),
+                (fee_sink, 5_000_000),
+                (proposer, 1_000_000),
+            ],
+            fee_sink,
+        );
+
+        let mut block = make_test_block(fee_sink);
+        block.proposer = proposer;
+        block.proposer_payout = 200_000;
+
+        apply_block(&mut state, &block).unwrap();
+
+        assert_eq!(
+            state.get_account(&proposer).unwrap().micro_algos,
+            1_200_000,
+            "proposer must be credited with the block's proposer_payout"
+        );
+        assert_eq!(
+            state.get_account(&fee_sink).unwrap().micro_algos,
+            // fee_sink starts at 5_000_000; make_test_block's payment sends
+            // its 1_000 fee to fee_sink too (pay_txn(..., 1_000)).
+            5_000_000 + 1_000 - 200_000,
+            "fee sink must be debited by the block's proposer_payout"
+        );
+    }
+
+    /// A zero `proposer_payout` (or no proposer — payouts not enabled for
+    /// this block) must not move any money, matching go's early return in
+    /// `performPayout`.
+    #[test]
+    fn apply_block_zero_proposer_payout_is_a_no_op() {
+        let fee_sink = Address([3u8; 32]);
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(sender, 10_000_000), (receiver, 1_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        // make_test_block leaves proposer = Address::ZERO, proposer_payout = 0.
+        let block = make_test_block(fee_sink);
+        apply_block(&mut state, &block).unwrap();
+
+        assert_eq!(
+            state.get_account(&fee_sink).unwrap().micro_algos,
+            1_000,
+            "only the payment's fee should have reached the fee sink"
+        );
     }
 
     #[test]
