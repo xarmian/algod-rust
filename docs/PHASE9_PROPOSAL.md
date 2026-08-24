@@ -8,8 +8,7 @@ Move algod-rust's parity target from go-algorand `v4.5.1-stable` to `v4.6.0-stab
 
 `v4.6.0-stable` carries **no consensus/protocol version upgrade** (confirmed in go-algorand's own release notes). The delta is entirely REST-surface and one infrastructure constant:
 
-- A ledger-crate correctness fix underlying paginated resource lookups (delta-merge bugs: undercounted deletions, phantom holdings, an empty-page edge case).
-- A new paginated `GET /v2/accounts/{address}/applications` endpoint, mirroring the existing assets pagination.
+- A new paginated `GET /v2/accounts/{address}/applications` endpoint, mirroring the existing assets pagination, and incorporating a correctness fix upstream made to the delta-merge logic underlying paginated resource lookups (undercounted deletions, phantom holdings, an empty-page edge case) since algod-rust has no such layer yet to patch separately.
 - Real-time delta-awareness added to the existing paginated assets endpoint (and removal of any experimental gating).
 - Verification that `/v2/accounts`'s `exclude` query parameter semantics match go-algorand's expanded set.
 - A new `online-stake` field on `GET /v2/ledger/supply`, computed via the existing sortition lookback machinery.
@@ -33,34 +32,25 @@ Byte-level/behavioral parity with go-algorand `v4.6.0-stable` for every in-scope
 
 | Sub-issue | Title | Issue | Effort | Dependencies |
 |---|---|---|---|---|
-| 1 | ledger: fix lookupAssetResources/lookupApplicationResources delta-merge bugs | [#504](https://github.com/xarmian/algod-rust/issues/504) | Small | None |
-| 2 | rest-api: add paginated GET /v2/accounts/{address}/applications endpoint | [#505](https://github.com/xarmian/algod-rust/issues/505) | Medium | #504 |
-| 3 | rest-api: incorporate uncommitted deltas into paginated GET /v2/accounts/{address}/assets | [#506](https://github.com/xarmian/algod-rust/issues/506) | Small | #504 |
+| ~~1~~ | ~~ledger: fix lookupAssetResources/lookupApplicationResources delta-merge bugs~~ | [#504](https://github.com/xarmian/algod-rust/issues/504) (closed, superseded) | — | — |
+| 2 | rest-api: add paginated GET /v2/accounts/{address}/applications endpoint (now includes #504's correctness rules) | [#505](https://github.com/xarmian/algod-rust/issues/505) | Medium | None |
+| 3 | rest-api: incorporate uncommitted deltas into paginated GET /v2/accounts/{address}/assets (now includes #504's correctness rules + experimental-gate removal) | [#506](https://github.com/xarmian/algod-rust/issues/506) | Small | None |
 | 4 | rest-api: verify /v2/accounts exclude parameter semantics | [#507](https://github.com/xarmian/algod-rust/issues/507) | Small | None |
 | 5 | rest-api: add online-stake (OnlineCirculation) field to GET /v2/ledger/supply | [#508](https://github.com/xarmian/algod-rust/issues/508) | Small | None |
 | 6 | infrastructure: fix stale devnet genesis hash constant | [#509](https://github.com/xarmian/algod-rust/issues/509) | Small | None |
 
+**#504 closed as superseded during stage-6 investigation**: algod-rust has no delta-merge layer for paginated resource lookups at all (`lookup_assets` reads only the committed `SqliteLedger`), so there was no standalone code for #504's fix to patch. Its three correctness rules (deletion-counting, no phantom holdings, round-0 edge case) were folded directly into #505 and #506 — the two issues that actually build such a layer for the first time.
+
 ## Dependency Graph
 
 ```
-#504 (ledger delta-merge fix)
-  |         \
-  v          v
-#505        #506
-(new apps   (assets delta
- pagination)  awareness)
-
-#507, #508, #509 — independent, no dependencies on the above or each other
+#505, #506, #507, #508, #509 — all independent, no dependencies on each other
 ```
 
 ## Critical Path
 
-```
-#504 -> #505
-```
-
-Everything else may proceed in parallel once #504 lands. Per this repo's `algod-issue-fix`/`algod-version-upgrade` workflow, sub-issues are still worked **sequentially** (one merged before the next begins) to avoid conflicts on shared surfaces — the graph above informs ordering, not parallel execution.
+None — all five remaining sub-issues are independent. Per this repo's `algod-issue-fix`/`algod-version-upgrade` workflow, they are still worked **sequentially** (one merged before the next begins) to avoid conflicts on shared surfaces, but ordering among them is a scheduling choice, not a dependency requirement.
 
 ## Success Criteria
 
-See epic #503's acceptance criteria: all six sub-issues merged (or honestly disposed), the version-pin sweep completed across the repo, this doc plus `docs/epics/Epic-19-Go-Algorand-v4.6.0-Parity.md` and `docs/PHASE9_VALIDATION.md` written, `docs/PROJECT_SCOPE.md` updated, and the full gate (fmt/clippy/tests/conformance) green on `main` with the reference pinned to `v4.6.0-stable`.
+See epic #503's acceptance criteria: #504 honestly disposed (done) and all five remaining sub-issues merged (or honestly disposed), the version-pin sweep completed across the repo (done), this doc plus `docs/epics/Epic-19-Go-Algorand-v4.6.0-Parity.md` and `docs/PHASE9_VALIDATION.md` written, `docs/PROJECT_SCOPE.md` updated, and the full gate (fmt/clippy/tests/conformance) green on `main` with the reference pinned to `v4.6.0-stable`.
