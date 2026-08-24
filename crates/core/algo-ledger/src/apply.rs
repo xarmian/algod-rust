@@ -853,7 +853,8 @@ fn apply_block_impl<L: crate::store_trait::LedgerStore>(
             reset_expired_online_accounts(store, block, &consensus)?;
             validate_absent_online_accounts(store, block, &consensus, ctx.validate)?;
             suspend_absent_accounts(store, block, &consensus)?;
-            apply_proposer_payout(store, block)
+            apply_proposer_payout(store, block)?;
+            record_proposal(store, block)
         })();
         if eob_result.is_err() {
             store.restore_snapshot(eob_snapshot);
@@ -1159,6 +1160,72 @@ fn apply_proposer_payout<L: crate::store_trait::LedgerStore>(
     let mut proposer = store.get_or_default_account(&block.proposer);
     proposer.micro_algos += block.proposer_payout;
     store.set_account(&block.proposer, proposer);
+
+    Ok(())
+}
+
+/// Record the block's proposer bookkeeping: `LastProposed` and suspension
+/// recovery.
+///
+/// Mirrors go-algorand's `BlockEvaluator.recordProposal`
+/// (`ledger/eval/eval.go`), called immediately after `performPayout` in
+/// `endOfBlock`:
+///
+/// ```go
+/// func (eval *BlockEvaluator) recordProposal() error {
+///     proposer := eval.block.Proposer()
+///     if proposer.IsZero() {
+///         return nil
+///     }
+///     prp, err := eval.state.Get(proposer, false)
+///     if err != nil {
+///         return err
+///     }
+///     if !prp.IsZero() {
+///         prp.LastProposed = eval.Round()
+///     }
+///     if prp.Suspended() {
+///         prp.Status = basics.Online
+///     }
+///     return eval.state.Put(proposer, prp)
+/// }
+/// ```
+///
+/// No-op when there is no proposer, matching go's early return. The
+/// `!prp.IsZero()` guard on `LastProposed` (skip recording for a wholly
+/// absent/default account) is mirrored by comparing against
+/// `AccountData::default()` — go's comment explains the intent: a proposer
+/// that has since closed its account, but is still voting (it takes 320
+/// rounds for a keyreg to take effect), should not have `LastProposed`
+/// recorded, since that would prevent the account from being GC'd.
+///
+/// Un-suspension mirrors go's `ledgercore.AccountData.Suspended()`
+/// (`ledger/ledgercore/accountdata.go`): `Status == Offline && !VoteID
+/// empty`. An account could propose while suspended because of the
+/// 320-round key-registration lookback; doing so is evidence the account is
+/// actually operational, so it is unsuspended. It remains not
+/// `IncentiveEligible` until it keyregs again with the extra fee (go
+/// intentionally leaves that field alone here).
+fn record_proposal<L: crate::store_trait::LedgerStore>(
+    store: &mut L,
+    block: &Block,
+) -> Result<(), AlgoError> {
+    if block.proposer.is_zero() {
+        return Ok(());
+    }
+
+    let mut prp = store.get_or_default_account(&block.proposer);
+    if prp != algo_types::AccountData::default() {
+        prp.last_proposed = block.round.0;
+    }
+    // Go: `!VoteID.IsEmpty()` -- an unset or all-zero vote key means "no
+    // voting keys", matching the check already used by
+    // `validate_expired_online_accounts` above.
+    let has_vote_key = prp.vote_id.is_some_and(|v| v != [0u8; 32]);
+    if prp.status == AccountStatus::Offline && has_vote_key {
+        prp.status = AccountStatus::Online;
+    }
+    store.set_account(&block.proposer, prp);
 
     Ok(())
 }
@@ -5155,6 +5222,149 @@ mod tests {
             1_000,
             "only the payment's fee should have reached the fee sink"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Record proposal: LastProposed + un-suspend (issue #528)
+    // ---------------------------------------------------------------------
+
+    /// Issue #528: `apply_block` must mirror go-algorand's
+    /// `BlockEvaluator.recordProposal` (`ledger/eval/eval.go`), called
+    /// immediately after `performPayout` in `endOfBlock`. A proposer that
+    /// was suspended (Offline with voting keys intact) proves it is
+    /// actually online by proposing — even though it takes 320 rounds for
+    /// a keyreg to take effect — so `recordProposal` unsuspends it
+    /// (`Status = Online`) and records `LastProposed = eval.Round()`.
+    #[test]
+    fn apply_block_unsuspends_proposer_and_records_last_proposed() {
+        let fee_sink = Address([3u8; 32]);
+        let proposer = Address([9u8; 32]);
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[
+                (sender, 10_000_000),
+                (receiver, 1_000_000),
+                (fee_sink, 0),
+                (proposer, 1_000_000),
+            ],
+            fee_sink,
+        );
+
+        // Set the proposer as suspended: Offline but with voting keys intact
+        // and IncentiveEligible cleared (mirrors `suspend_absent_accounts`'s
+        // effect from a prior round).
+        {
+            let acct = state.get_or_default_account(&proposer);
+            acct.status = AccountStatus::Offline;
+            acct.vote_id = Some([7u8; 32]);
+            acct.selection_id = Some([8u8; 32]);
+            acct.vote_key_dilution = 10;
+            acct.vote_first_valid = 0;
+            acct.vote_last_valid = 999_999;
+            acct.incentive_eligible = false;
+            acct.last_proposed = 0;
+        }
+
+        let mut block = make_test_block(fee_sink);
+        block.proposer = proposer;
+        block.proposer_payout = 0;
+
+        apply_block(&mut state, &block).unwrap();
+
+        let acct = state.get_account(&proposer).unwrap();
+        assert_eq!(
+            acct.last_proposed, 1,
+            "last_proposed must be set to the block's round"
+        );
+        assert_eq!(
+            acct.status,
+            AccountStatus::Online,
+            "a suspended proposer must be un-suspended by proposing"
+        );
+        // Un-suspension does not restore incentive eligibility -- that
+        // requires a fresh keyreg with the extra fee (matches go's comment
+        // in recordProposal).
+        assert!(!acct.incentive_eligible);
+        // Voting keys must be preserved untouched.
+        assert_eq!(acct.vote_id, Some([7u8; 32]));
+    }
+
+    /// A proposer that was already `Online` (not suspended) must still get
+    /// `LastProposed` updated, but `recordProposal` must not touch any
+    /// other field (no accidental clearing of voting keys, incentive
+    /// eligibility, etc.).
+    #[test]
+    fn apply_block_records_last_proposed_for_already_online_proposer() {
+        let fee_sink = Address([3u8; 32]);
+        let proposer = Address([9u8; 32]);
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[
+                (sender, 10_000_000),
+                (receiver, 1_000_000),
+                (fee_sink, 0),
+                (proposer, 1_000_000),
+            ],
+            fee_sink,
+        );
+
+        let before = {
+            let acct = state.get_or_default_account(&proposer);
+            acct.status = AccountStatus::Online;
+            acct.vote_id = Some([7u8; 32]);
+            acct.selection_id = Some([8u8; 32]);
+            acct.vote_key_dilution = 10;
+            acct.vote_first_valid = 0;
+            acct.vote_last_valid = 999_999;
+            acct.incentive_eligible = true;
+            acct.last_proposed = 0;
+            acct.clone()
+        };
+
+        let mut block = make_test_block(fee_sink);
+        block.proposer = proposer;
+        block.proposer_payout = 0;
+
+        apply_block(&mut state, &block).unwrap();
+
+        let acct = state.get_account(&proposer).unwrap();
+        assert_eq!(
+            acct.last_proposed, 1,
+            "last_proposed must be updated to the new block's round"
+        );
+        assert_eq!(acct.status, AccountStatus::Online);
+        assert_eq!(acct.vote_id, before.vote_id);
+        assert_eq!(acct.selection_id, before.selection_id);
+        assert_eq!(acct.incentive_eligible, before.incentive_eligible);
+        assert_eq!(
+            acct.micro_algos, before.micro_algos,
+            "recordProposal must not touch the balance"
+        );
+    }
+
+    /// A zero proposer (no proposer for this block) must leave every
+    /// account's `last_proposed`/`status` untouched, matching go's early
+    /// return `if proposer.IsZero() { return nil }`.
+    #[test]
+    fn apply_block_no_proposer_is_a_no_op_for_record_proposal() {
+        let fee_sink = Address([3u8; 32]);
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let mut state = make_state_with_accounts(
+            &[(sender, 10_000_000), (receiver, 1_000_000), (fee_sink, 0)],
+            fee_sink,
+        );
+
+        // make_test_block leaves proposer = Address::ZERO.
+        let block = make_test_block(fee_sink);
+        apply_block(&mut state, &block).unwrap();
+
+        // No panic, and the (untouched) sender/receiver accounts are
+        // unaffected -- record_proposal must not have run against anything.
+        assert_eq!(state.get_account(&sender).unwrap().last_proposed, 0);
+        assert_eq!(state.get_account(&receiver).unwrap().last_proposed, 0);
     }
 
     #[test]
