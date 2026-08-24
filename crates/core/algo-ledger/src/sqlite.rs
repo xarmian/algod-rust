@@ -1925,6 +1925,66 @@ pub struct SqliteLedger {
     /// matching go-algorand's opt-in `TxnGroupDeltaTracer`; when absent the
     /// endpoints report 501. Enabled via [`Self::enable_group_delta_tracer`].
     group_delta_tracer: Option<crate::txn_group_delta_tracer::TxnGroupDeltaTracer>,
+
+    /// Accumulated `accounttotals` per-status money/reward-unit deltas for
+    /// the block currently open between `begin_block`/`commit_block`.
+    /// Populated incrementally by `set_account`/`remove_account` and
+    /// flushed to the `accounttotals` row as a single UPDATE in
+    /// `commit_block` — see [`AccountTotalsDelta`] and issue #523.
+    pending_totals_delta: AccountTotalsDelta,
+}
+
+/// In-memory accumulator for the per-round change to the `accounttotals`
+/// aggregate row, mirroring go-algorand's `roundCowState.CalculateTotals`
+/// (`ledger/eval/cow.go`): `DelAccount(previous) + AddAccount(updated)` for
+/// every account touched during block application (`ledger/ledgercore/totals.go`
+/// `AccountTotals.AddAccount`/`DelAccount`). Values are signed and summed
+/// in `i128` to avoid overflow across a block's worth of deltas before the
+/// single clamped flush to the `i64` SQLite columns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AccountTotalsDelta {
+    online_money: i128,
+    online_reward_units: i128,
+    offline_money: i128,
+    offline_reward_units: i128,
+    not_participating_money: i128,
+    not_participating_reward_units: i128,
+}
+
+impl AccountTotalsDelta {
+    fn is_zero(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Fold in one account snapshot's contribution to its status bucket,
+    /// with `sign` `1` for an addition (new state) or `-1` for a removal
+    /// (previous state) — mirrors go's `AddAccount`/`DelAccount` pair.
+    ///
+    /// `money` is the reward-extrapolated balance (go's `AccountData.Money`,
+    /// `ledger/ledgercore/accountdata.go`): this repo's rewards model
+    /// already stores each account's balance with rewards eagerly folded
+    /// in up to that account's own `rewards_base` (see `rewards.rs`), so
+    /// the extrapolation to the ledger's current `rewards_level` is just
+    /// `compute_pending_rewards`.
+    fn fold(&mut self, account: &AccountData, rewards_level: u64, sign: i128) {
+        let pending = crate::rewards::compute_pending_rewards(account, rewards_level);
+        let money = sign * (account.micro_algos as i128 + pending as i128);
+        let reward_units = sign * (account.micro_algos / crate::rewards::REWARD_UNITS) as i128;
+        match account.status {
+            AccountStatus::Online => {
+                self.online_money += money;
+                self.online_reward_units += reward_units;
+            }
+            AccountStatus::Offline => {
+                self.offline_money += money;
+                self.offline_reward_units += reward_units;
+            }
+            AccountStatus::NotParticipating => {
+                self.not_participating_money += money;
+                self.not_participating_reward_units += reward_units;
+            }
+        }
+    }
 }
 
 /// Whether the current `apply_block_with_delta` builder produces a
@@ -2222,6 +2282,7 @@ impl SqliteLedger {
             trie_cache_target: None,
             delta_cache: crate::delta_cache::DeltaCache::with_default_window(),
             group_delta_tracer: None,
+            pending_totals_delta: AccountTotalsDelta::default(),
         })
     }
 
@@ -2520,6 +2581,12 @@ impl SqliteLedger {
         // the SQLite/trie transaction does not cover it.
         self.lease_snapshot = Some(self.lease_table.clone());
         self.in_block = true;
+        // Issue #523: start this block's `accounttotals` delta accumulator
+        // clean. Guards against `set_account`/`remove_account` calls made
+        // outside any begin_block/commit_block span (a supported pattern in
+        // this codebase's own tests, and genesis/catchpoint bootstrap code)
+        // leaking into the next real block's flush.
+        self.pending_totals_delta = AccountTotalsDelta::default();
         Ok(())
     }
 
@@ -2689,11 +2756,17 @@ impl SqliteLedger {
                 // scratch apply's entries must be truncated away or they would be
                 // consumed by the authoritative commit's trie finalization.
                 let saved_pre_mutations_len = self.pre_mutations.len();
+                // Issue #523: the scratch apply's `set_account`/`remove_account`
+                // calls also accumulate into `pending_totals_delta`; without
+                // restoring it the authoritative apply below would double-count
+                // every account touched by the scratch run on top of its own.
+                let saved_totals_delta = self.pending_totals_delta;
 
                 let sp = self.snapshot(&[]);
                 let _ = crate::apply::apply_block_capturing_group_deltas(self, block, &mut tracer);
                 self.restore_snapshot(sp);
                 self.pre_mutations.truncate(saved_pre_mutations_len);
+                self.pending_totals_delta = saved_totals_delta;
 
                 self.set_current_round(saved_round);
                 self.set_rewards_level(saved_level);
@@ -2730,9 +2803,88 @@ impl SqliteLedger {
         }
     }
 
+    /// Flush the block's accumulated `accounttotals` delta ([`AccountTotalsDelta`])
+    /// to the persisted row, then reset the accumulator.
+    ///
+    /// Mirrors go-algorand's `roundCowState.CalculateTotals` writing
+    /// `cb.mods.Totals` once per round (`ledger/eval/cow.go`) rather than on
+    /// every individual account touch. No-op (delta discarded) if the row
+    /// hasn't been seeded yet — e.g. a raw `SqliteLedger` in tests that never
+    /// called `seed_account_totals_from_genesis` / catchpoint import. Values
+    /// are clamped to `[0, i64::MAX]` on the way into the `i64` columns: a
+    /// negative result would indicate an accounting bug upstream (conservation
+    /// of money means a correctly-computed delta can't drive a bucket below
+    /// zero), but this is a persistence layer, not the place to panic on
+    /// untrusted-input-adjacent arithmetic — see CLAUDE.md's Result-not-panics
+    /// bar.
+    fn flush_pending_account_totals_delta(&mut self) -> Result<(), AlgoError> {
+        let delta = std::mem::take(&mut self.pending_totals_delta);
+        if delta.is_zero() {
+            return Ok(());
+        }
+        let row: Option<(i64, i64, i64, i64, i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT online, onlinerewardunits, offline, offlinerewardunits, \
+                 notparticipating, notparticipatingrewardunits FROM accounttotals WHERE id = ''",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("flush_pending_account_totals_delta read error: {e}"),
+            })?;
+        let Some((online, online_ru, offline, offline_ru, notpart, notpart_ru)) = row else {
+            // Row not seeded — nothing to maintain incrementally (e.g. a
+            // catchpoint-only or unseeded test ledger).
+            return Ok(());
+        };
+        let clamp = |base: i64, d: i128| -> i64 {
+            (base as i128 + d).clamp(0, i64::MAX as i128) as i64
+        };
+        let new_online = clamp(online, delta.online_money);
+        let new_online_ru = clamp(online_ru, delta.online_reward_units);
+        let new_offline = clamp(offline, delta.offline_money);
+        let new_offline_ru = clamp(offline_ru, delta.offline_reward_units);
+        let new_notpart = clamp(notpart, delta.not_participating_money);
+        let new_notpart_ru = clamp(notpart_ru, delta.not_participating_reward_units);
+        self.conn
+            .execute(
+                "UPDATE accounttotals SET online = ?1, onlinerewardunits = ?2, offline = ?3, \
+                 offlinerewardunits = ?4, notparticipating = ?5, notparticipatingrewardunits = ?6 \
+                 WHERE id = ''",
+                params![
+                    new_online,
+                    new_online_ru,
+                    new_offline,
+                    new_offline_ru,
+                    new_notpart,
+                    new_notpart_ru,
+                ],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("flush_pending_account_totals_delta write error: {e}"),
+            })?;
+        Ok(())
+    }
+
     pub fn commit_block(&mut self) -> Result<(), AlgoError> {
         // Flush chain-level state to meta table.
         self.flush_chain_state()?;
+
+        // Issue #523: flush this block's accumulated `accounttotals` delta —
+        // must run before COMMIT so it lands atomically with the account
+        // writes it summarizes, and rolls back with them on failure.
+        self.flush_pending_account_totals_delta()?;
 
         // Issue #519: append this round's online-supply snapshot to
         // `onlineroundparamstail` on every commit, not just catchpoint import.
@@ -2819,6 +2971,11 @@ impl SqliteLedger {
     pub fn rollback_block(&mut self) -> Result<(), AlgoError> {
         // Clear pre-mutation records — they are for the rolled-back block.
         self.pre_mutations.clear();
+        // Discard the rolled-back block's accumulated `accounttotals` delta
+        // (issue #523) — its account writes are being undone by the SQL
+        // ROLLBACK below, so the totals delta must not survive to the next
+        // block's flush.
+        self.pending_totals_delta = AccountTotalsDelta::default();
 
         // Restore the in-memory lease table to its pre-block state — the SQLite
         // ROLLBACK below does not cover it, so leases recorded by partially-
@@ -2990,21 +3147,31 @@ impl SqliteLedger {
         Ok(count > 0)
     }
 
-    /// Seed the `accounttotals` row from genesis-time totals (PLAN-32
-    /// / TASK-95). `apply_block` does not maintain this table today —
-    /// the catchpoint importer is the only other writer — so the
-    /// mixed-cluster relay would otherwise see `online_stake() == 0`
-    /// on every call, which breaks `Certificate::authenticate`'s
-    /// `circulation()` lookup.
+    /// Discard any `accounttotals` delta accumulated so far in the current
+    /// block (issue #523's [`AccountTotalsDelta`]) without flushing it.
     ///
-    /// The mixed cluster's online-stake composition is static for the
-    /// lifetime of a soak (Wallet1/2/3 online, Wallet4 offline, no txns
-    /// change this), so a one-time seed from genesis allocations is
-    /// correct for the harness. Per-status reward-unit columns are seeded
-    /// from the caller (go's `AccountTotals.RewardUnits()` feeds the
-    /// per-round rewards-level advance); the rewards-level column is left
-    /// zero (genesis level). This is intentionally a coarser-grained write
-    /// than the catchpoint importer's version.
+    /// Used by [`crate::genesis::seed_account_totals_from_genesis`]: the
+    /// genesis allocations it seeds were written via `set_account` (which
+    /// accumulates a delta), but the seed row it writes already reflects
+    /// those same accounts directly, so the accumulated delta would
+    /// double-count them if left to flush at the next `commit_block`.
+    pub fn discard_pending_account_totals_delta(&mut self) {
+        self.pending_totals_delta = AccountTotalsDelta::default();
+    }
+
+    /// Seed the `accounttotals` row from genesis-time totals (PLAN-32
+    /// / TASK-95). A brand-new ledger has no `accounttotals` row at all
+    /// until something writes one, so the mixed-cluster relay would
+    /// otherwise see `online_stake() == 0` on every call, which breaks
+    /// `Certificate::authenticate`'s `circulation()` lookup. As of issue
+    /// #523, `apply_block` maintains this row incrementally after genesis
+    /// (`set_account`/`remove_account` accumulate a delta, flushed here in
+    /// `commit_block`'s call to `flush_pending_account_totals_delta`), so
+    /// this seed only needs to establish the correct round-0 baseline.
+    ///
+    /// Per-status reward-unit columns are seeded from the caller (go's
+    /// `AccountTotals.RewardUnits()` feeds the per-round rewards-level
+    /// advance); the rewards-level column is left zero (genesis level).
     ///
     /// Safe to call multiple times; it `INSERT OR REPLACE`s the row.
     #[allow(clippy::too_many_arguments)]
@@ -3784,8 +3951,16 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn set_account(&mut self, addr: &Address, account: AccountData) {
+        let old = self.get_account(addr);
+        // Issue #523: fold this write's status/balance change into the
+        // block-level `accounttotals` delta accumulator (flushed once at
+        // `commit_block`) — see `AccountTotalsDelta::fold`.
+        let level = self.rewards_level;
+        if let Some(old) = &old {
+            self.pending_totals_delta.fold(old, level, -1);
+        }
+        self.pending_totals_delta.fold(&account, level, 1);
         if self.trie.is_some() {
-            let old = self.get_account(addr);
             self.pre_mutations.push(SqlitePreMutation::Account {
                 addr: *addr,
                 old_data: old.map(Box::new),
@@ -3809,8 +3984,13 @@ impl LedgerStore for SqliteLedger {
     }
 
     fn remove_account(&mut self, addr: &Address) {
+        let old = self.get_account(addr);
+        // Issue #523: fold the removal (no replacement state) into the
+        // block-level `accounttotals` delta accumulator — see `set_account`.
+        if let Some(old) = &old {
+            self.pending_totals_delta.fold(old, self.rewards_level, -1);
+        }
         if self.trie.is_some() {
-            let old = self.get_account(addr);
             self.pre_mutations.push(SqlitePreMutation::Account {
                 addr: *addr,
                 old_data: old.map(Box::new),
@@ -6045,6 +6225,89 @@ mod tests {
         // The lookback-round accessor used by sortition and GetSupply must see
         // the true historical value at an old round, not the current aggregate.
         assert_eq!(ledger.online_circulation_at_round(1, 1).unwrap(), 1_000_000);
+    }
+
+    /// Issue #523: a live mixed-cluster run (3 go-algorand relays + 1
+    /// algod-rust participant, `ops/mixed-cluster/`) showed `GET
+    /// /v2/ledger/supply`'s `online-money`/`total-money` diverging from
+    /// go-algorand by the cumulative sum of every block's proposer payout
+    /// (30,000,000,000,000 microAlgos over 150 rounds). Root cause:
+    /// `apply_block` never credited the proposer's payout (no counterpart
+    /// to go's `BlockEvaluator.performPayout`, `ledger/eval/eval.go`) *and*
+    /// `accounttotals` was never incrementally maintained after genesis
+    /// seeding (no counterpart to `roundCowState.CalculateTotals`,
+    /// `ledger/eval/cow.go`) — so neither the account balance nor the
+    /// aggregate ever moved.
+    ///
+    /// This pins the whole path end-to-end: seed a genesis-style
+    /// `accounttotals` row, apply one block crediting a proposer payout to
+    /// an *online* proposer, and assert `participating_money()` /
+    /// `online_stake()` (the exact values `GetSupply` reports as
+    /// `total-money` / `online-money`) increase by the payout.
+    #[test]
+    fn apply_block_proposer_payout_updates_accounttotals_and_supply() {
+        use algo_types::Block;
+
+        let fee_sink = Address([3u8; 32]);
+        let proposer = Address([9u8; 32]);
+
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger.begin_block().unwrap();
+        ledger.set_account(
+            &fee_sink,
+            AccountData {
+                micro_algos: 5_000_000,
+                status: AccountStatus::NotParticipating,
+                ..Default::default()
+            },
+        );
+        ledger.set_account(
+            &proposer,
+            AccountData {
+                micro_algos: 1_000_000,
+                status: AccountStatus::Online,
+                ..Default::default()
+            },
+        );
+        // Seed the aggregate row to match the accounts just written (mirrors
+        // `seed_account_totals_from_genesis`): fee sink is NotParticipating
+        // (excluded from `Participating()`), proposer is Online.
+        ledger
+            .put_account_totals_seed(1_000_000, 0, 0, 0, 5_000_000, 0)
+            .unwrap();
+        ledger.discard_pending_account_totals_delta();
+        ledger.commit_block().unwrap();
+
+        assert_eq!(ledger.online_stake().unwrap(), 1_000_000);
+        assert_eq!(ledger.participating_money().unwrap(), 1_000_000);
+
+        let block = Block {
+            round: Round(1),
+            fee_sink,
+            proposer,
+            proposer_payout: 200_000,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            ..Block::default()
+        };
+        ledger.begin_block().unwrap();
+        crate::apply::apply_block(&mut ledger, &block).unwrap();
+        ledger.commit_block().unwrap();
+
+        assert_eq!(
+            ledger.get_account(&proposer).unwrap().micro_algos,
+            1_200_000,
+            "proposer's on-disk balance must reflect the payout"
+        );
+        assert_eq!(
+            ledger.online_stake().unwrap(),
+            1_200_000,
+            "accounttotals.online (GetSupply's online-money) must grow by the payout"
+        );
+        assert_eq!(
+            ledger.participating_money().unwrap(),
+            1_200_000,
+            "accounttotals online+offline (GetSupply's total-money) must grow by the payout"
+        );
     }
 
     /// Issue #518: `online_circulation_at_round` must exclude stake behind
