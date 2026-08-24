@@ -95,6 +95,8 @@ Determine the next phase number `N` from `docs/PHASE*_PROPOSAL.md`. Create:
 - Update `docs/PROJECT_SCOPE.md` to mention the new phase.
 - Plan for `docs/PHASE<N>_VALIDATION.md` at close-out (stage 7) — the Layer-9-style evidence map: which test/tool proves which criterion, following `docs/PHASE6_VALIDATION.md`.
 
+**Land this stage's docs on `main` first, as their own dedicated PR** (`docs(phase<N>): add Phase <N> proposal and epic for go-algorand NEW parity`, labels `phase:<N>` + `documentation`), before the stage-5 pin sweep and before stage 6 begins — do not bundle it into the pin-sweep PR. The proposal/epic docs are pure planning artifacts with no code risk, and every later PR in this epic benefits from being able to link a already-merged proposal/epic doc rather than one still in flight.
+
 ## Stage 5 — Version-pin sweep
 
 The old tag string is referenced in **40+ files**. Sweep it deliberately — `grep -rn "OLD"` (both with and without the `v`/`-stable` decorations) and update every hit that *means* "the parity target". Known hot spots:
@@ -110,7 +112,20 @@ The old tag string is referenced in **40+ files**. Sweep it deliberately — `gr
 
 Golden fixtures (`crates/**/fixtures/`) are generated from go-algorand binaries: any fixture whose upstream generator changed behavior must be **regenerated from NEW** (see `docs/DEV_WORKFLOW.md`), as part of the issue that implements that behavior change — never regenerate wholesale up front, or every not-yet-implemented change turns into an undiagnosable red suite.
 
-Ship stages 3–5's repo changes (docs, pin sweep, labels) as the epic's first PR — label it `phase:<N>` + `documentation` — via `algod-issue-fix` steps 4–9.
+Ship the pin sweep as its own PR (`chore(phase<N>): sweep go-algorand pin from OLD to NEW`, labels `phase:<N>` + `documentation`) via `algod-issue-fix` steps 4–9 — stage 4's docs already landed separately (see above), so this PR is the pin-string changes alone (plus whatever live-parity CI carve-outs stage 5a below requires).
+
+### Stage 5a — Resolving live-parity CI after the pin bump
+
+Bumping the pin means every workflow that boots a real go-algorand container now runs **NEW**, not OLD — `Dual-Node REST Conformance` (`.github/workflows/validate-api.yml`, `docker/docker-compose.validate-api.yml`'s `algorand/algod:<tag>` image), `algokey-e2e.yml`, and `consensus-cluster.yml` all diff live behavior byte-for-byte against it. This means the pin-sweep PR's own CI will legitimately fail on every stage-2 gap that's observable live — a brand-new field, a newly-unconditional endpoint, a changed status code — **before** stage 6 has implemented any of it. This is expected, not a sign the sweep is broken; do not chase it by implementing features early inside the sweep PR (that reintroduces the "no wholesale-regenerate-fixtures-up-front" problem stage 5 already warns about, just for live tests instead of fixtures).
+
+For each live-parity failure the pin bump surfaces:
+
+1. **Read the actual failure** (dumped node logs, the diff assertion) and match it against stage 2's classified inventory. It should map cleanly onto one specific `api`/`avm`/`network`/`behavioral-other` sub-issue already created in stage 3.
+   - If it doesn't map to anything in the inventory, stage 2 missed something real — stop and file a new sub-issue in the epic immediately (per stage 6's "uncovers a missed upstream change" rule) rather than papering over it.
+   - If the failure looks like an actual regression (not an added/changed NEW behavior at all — e.g. a previously-passing, version-independent assertion now fails), that's a real bug; fix it for real, it is not a carve-out candidate.
+2. **Carve out only that specific gap**, citing the tracking sub-issue in a code comment, using whatever exclusion mechanism the test already has for implementation-specific differences (e.g. `strip_implementation_specific_fields(go, &["online-stake"])` for a single new response field — see `bin/algod-rust/tests/live_go_parity.rs`; or deleting just the one now-invalid assertion line — see `bin/algod-rust/tests/live_endpoint_sweep.rs`'s `account_assets_list_and_experimental_disabled_on_both`). Concrete precedent from the `v4.5.1-stable`→`v4.6.0-stable` sweep: `fbd2b26` stripped `GetSupply`'s new `online-stake` field pending #508; `a376b3d` dropped a single status-parity assertion for an endpoint go-algorand un-gated pending #506. Both left every other assertion in the same test file intact.
+3. **Never blanket-skip or `#[ignore]` a whole test/workflow** to get around this — that hides real regressions in everything else the test covers, not just the known gap.
+4. **The carve-out is temporary and belongs to the corresponding sub-issue, not the pin-sweep PR.** When that sub-issue is implemented in stage 6, removing the carve-out (restoring full live-parity enforcement for that surface) is part of its acceptance criteria / self-review — add it explicitly if the issue template didn't already cover it.
 
 ## Stage 6 — Implementation loop
 
