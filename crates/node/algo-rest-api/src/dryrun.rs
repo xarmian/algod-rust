@@ -364,11 +364,18 @@ impl DryrunSharedState {
                     }
                 }
 
-                // Load created apps
+                // Load created apps. `params` is only absent when the
+                // account snapshot was itself built with
+                // `exclude=created-apps-params` (issue #507) — a dryrun
+                // account with no program bytes can't be simulated, so
+                // skip it rather than fabricating empty programs.
                 if let Some(ref created) = acct.created_apps {
                     for app in created {
+                        let Some(ref params) = app.params else {
+                            continue;
+                        };
                         let mut global_state = HashMap::new();
-                        if let Some(ref gs) = app.params.global_state {
+                        if let Some(ref gs) = params.global_state {
                             for entry in gs {
                                 let key = BASE64.decode(&entry.key).unwrap_or_default();
                                 let val = api_teal_value_to_internal(&entry.value);
@@ -379,8 +386,8 @@ impl DryrunSharedState {
                         state.app_params.insert(
                             app.id,
                             (
-                                app.params.approval_program.clone(),
-                                app.params.clear_state_program.clone(),
+                                params.approval_program.clone(),
+                                params.clear_state_program.clone(),
                                 addr.0,
                             ),
                         );

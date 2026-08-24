@@ -183,6 +183,31 @@ pub struct ApiAsset {
     pub params: ApiAssetParams,
 }
 
+/// An entry in `AccountResponse.created_assets`.
+///
+/// A distinct, narrower type from [`ApiAsset`] (rather than making
+/// `ApiAsset::params` itself optional): `ApiAsset` is also reused by
+/// `dryrun.rs`'s `DryrunRequest` parsing, where params are always required
+/// input, not an optional output — making them `Option` there would force
+/// every read site to handle a `None` that can never legitimately occur,
+/// risking an unwrap-panic on a path that already handles untrusted input.
+/// `params` is `None` only when the caller requested
+/// `exclude=created-assets-params` (go-algorand v4.6.0-stable, issue #507)
+/// — the asset index is still returned, but its params are omitted
+/// (matches go's `*model.AssetParams` + omitempty on `model.Asset`, which
+/// go-algorand reuses for both contexts since Go pointers dereference
+/// cheaply where Rust's `Option` does not).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiCreatedAsset {
+    /// Unique asset identifier.
+    pub index: u64,
+
+    /// AssetParams specifies the parameters for an asset, omitted when
+    /// `exclude=created-assets-params` was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<ApiAssetParams>,
+}
+
 // ---------------------------------------------------------------------------
 // ApplicationParams
 // ---------------------------------------------------------------------------
@@ -248,6 +273,24 @@ pub struct ApiApplication {
 
     /// Stores the global information associated with an application.
     pub params: ApiApplicationParams,
+}
+
+/// An entry in `AccountResponse.created_apps`. See [`ApiCreatedAsset`] for
+/// why this is a distinct type from [`ApiApplication`] rather than making
+/// `ApiApplication::params` itself optional — the same reasoning applies
+/// (`ApiApplication` is also reused by `dryrun.rs`'s `DryrunRequest`
+/// parsing, where params are always required). `params` is `None` only
+/// when the caller requested `exclude=created-apps-params` (go-algorand
+/// v4.6.0-stable, issue #507).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiCreatedApplication {
+    /// \[appidx\] application index.
+    pub id: u64,
+
+    /// Stores the global information associated with an application,
+    /// omitted when `exclude=created-apps-params` was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<ApiApplicationParams>,
 }
 
 // ---------------------------------------------------------------------------
@@ -356,11 +399,11 @@ pub struct AccountResponse {
     /// \[appp\] parameters of applications created by this account including app
     /// global data.
     #[serde(rename = "created-apps", skip_serializing_if = "Option::is_none")]
-    pub created_apps: Option<Vec<ApiApplication>>,
+    pub created_apps: Option<Vec<ApiCreatedApplication>>,
 
     /// \[apar\] parameters of assets created by this account.
     #[serde(rename = "created-assets", skip_serializing_if = "Option::is_none")]
-    pub created_assets: Option<Vec<ApiAsset>>,
+    pub created_assets: Option<Vec<ApiCreatedAsset>>,
 
     /// Whether or not the account can receive block incentives if its balance
     /// is in range at proposal time.
@@ -729,6 +772,8 @@ pub fn account_data_to_response(
     lookup: &AccountLookup,
     addr: &Address,
     exclude: &str,
+    exclude_created_apps_params: bool,
+    exclude_created_assets_params: bool,
     consensus: &ConsensusParams,
 ) -> AccountResponse {
     let record = &lookup.account_data;
@@ -855,11 +900,25 @@ pub fn account_data_to_response(
         .map(|(&id, holding)| asset_holding_to_api(id, holding))
         .collect();
 
-    // Created assets, sorted by asset ID
-    let created_assets: Vec<ApiAsset> = lookup
+    // Created assets, sorted by asset ID. `exclude=created-assets-params`
+    // (go-algorand v4.6.0-stable, issue #507) returns the index only.
+    let created_assets: Vec<ApiCreatedAsset> = lookup
         .created_assets
         .iter()
-        .map(|(&id, params)| asset_params_to_api(id, &addr_str, params))
+        .map(|(&id, params)| {
+            if exclude_created_assets_params {
+                ApiCreatedAsset {
+                    index: id,
+                    params: None,
+                }
+            } else {
+                let asset = asset_params_to_api(id, &addr_str, params);
+                ApiCreatedAsset {
+                    index: asset.index,
+                    params: Some(asset.params),
+                }
+            }
+        })
         .collect();
 
     // App local states, sorted by app ID
@@ -869,11 +928,22 @@ pub fn account_data_to_response(
         .map(|(&id, state)| app_local_state_to_api(id, state))
         .collect();
 
-    // Created apps, sorted by app ID
-    let created_apps: Vec<ApiApplication> = lookup
+    // Created apps, sorted by app ID. `exclude=created-apps-params`
+    // (go-algorand v4.6.0-stable, issue #507) returns the ID only.
+    let created_apps: Vec<ApiCreatedApplication> = lookup
         .created_apps
         .iter()
-        .map(|(&id, params)| app_params_to_api(id, &addr_str, params))
+        .map(|(&id, params)| {
+            if exclude_created_apps_params {
+                ApiCreatedApplication { id, params: None }
+            } else {
+                let app = app_params_to_api(id, &addr_str, params);
+                ApiCreatedApplication {
+                    id: app.id,
+                    params: Some(app.params),
+                }
+            }
+        })
         .collect();
 
     AccountResponse {

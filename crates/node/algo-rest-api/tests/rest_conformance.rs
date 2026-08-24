@@ -202,7 +202,7 @@ fn account_case() -> Case {
         created_apps: Default::default(),
     };
     let consensus = consensus_params_for_version(CONSENSUS_V41).unwrap();
-    let resp = account_data_to_response(&lookup, &addr, "none", &consensus);
+    let resp = account_data_to_response(&lookup, &addr, "none", false, false, &consensus);
     let golden =
         std::fs::read_to_string(format!("{ACCOUNT_DIR}/offline_minimal.account.json")).unwrap();
     Case {

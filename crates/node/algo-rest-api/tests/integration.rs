@@ -2657,6 +2657,181 @@ async fn account_info_exclude_none_returns_full_info() {
     );
 }
 
+/// Builds the same populated lookup as `account_info_exclude_none_returns_full_info`,
+/// reused by issue #507's granular-exclude tests below.
+fn lookup_with_one_of_each_resource() -> AccountLookup {
+    AccountLookup {
+        account_data: AccountData {
+            micro_algos: 1_000_000,
+            total_assets_opted_in: 1,
+            total_created_assets: 1,
+            total_apps_opted_in: 1,
+            total_created_apps: 1,
+            ..AccountData::default()
+        },
+        last_round: 1000,
+        amount_without_pending_rewards: 1_000_000,
+        assets: BTreeMap::from([(
+            1,
+            AssetHolding {
+                amount: 5,
+                frozen: false,
+            },
+        )]),
+        created_assets: BTreeMap::from([(2, AssetParams::default())]),
+        app_local_states: BTreeMap::from([(
+            3,
+            AppLocalState {
+                schema: Default::default(),
+                key_value: BTreeMap::new(),
+            },
+        )]),
+        created_apps: BTreeMap::from([(
+            4,
+            AppParams {
+                creator: Address::ZERO,
+                approval_program: vec![0x06],
+                clear_state_program: vec![0x06],
+                global_state: BTreeMap::new(),
+                local_state_schema: Default::default(),
+                global_state_schema: Default::default(),
+                extra_program_pages: 0,
+            },
+        )]),
+    }
+}
+
+/// Issue #507 (go-algorand v4.6.0-stable, PR #6547): `exclude=created-assets-params`
+/// must still list the created asset (by index) but omit its `params` object
+/// entirely — not a null/empty params, an absent key.
+#[tokio::test]
+async fn account_info_exclude_created_assets_params_omits_only_params() {
+    let server =
+        TestServer::start(mock_node_with_account(lookup_with_one_of_each_resource())).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!(
+            "/v2/accounts/{}?exclude=created-assets-params",
+            TEST_ADDR
+        )))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    let created_assets = body["created-assets"]
+        .as_array()
+        .expect("created-assets must still be present");
+    assert_eq!(created_assets.len(), 1);
+    assert_eq!(created_assets[0]["index"].as_u64(), Some(2));
+    assert!(
+        created_assets[0].get("params").is_none(),
+        "params key must be entirely absent, not null: {:?}",
+        created_assets[0]
+    );
+
+    // Other resource lists (created-apps, assets, apps-local-state) are
+    // unaffected by this single granular exclusion.
+    assert!(body.get("created-apps").is_some());
+    assert!(
+        body["created-apps"][0].get("params").is_some(),
+        "created-apps params must still be present — only assets params were excluded"
+    );
+}
+
+/// Mirrors the assets test above for `exclude=created-apps-params`.
+#[tokio::test]
+async fn account_info_exclude_created_apps_params_omits_only_params() {
+    let server =
+        TestServer::start(mock_node_with_account(lookup_with_one_of_each_resource())).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!(
+            "/v2/accounts/{}?exclude=created-apps-params",
+            TEST_ADDR
+        )))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    let created_apps = body["created-apps"]
+        .as_array()
+        .expect("created-apps must still be present");
+    assert_eq!(created_apps.len(), 1);
+    assert_eq!(created_apps[0]["id"].as_u64(), Some(4));
+    assert!(
+        created_apps[0].get("params").is_none(),
+        "params key must be entirely absent, not null: {:?}",
+        created_apps[0]
+    );
+
+    assert!(body.get("created-assets").is_some());
+    assert!(
+        body["created-assets"][0].get("params").is_some(),
+        "created-assets params must still be present — only apps params were excluded"
+    );
+}
+
+/// Both granular values combine (comma-separated, `collectionFormat: csv`
+/// per `algod.oas2.json`) to exclude both at once.
+#[tokio::test]
+async fn account_info_exclude_both_granular_values_combine() {
+    let server =
+        TestServer::start(mock_node_with_account(lookup_with_one_of_each_resource())).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!(
+            "/v2/accounts/{}?exclude=created-apps-params,created-assets-params",
+            TEST_ADDR
+        )))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert!(body["created-apps"][0].get("params").is_none());
+    assert!(body["created-assets"][0].get("params").is_none());
+    // The resources themselves are still listed by ID/index.
+    assert_eq!(body["created-apps"][0]["id"].as_u64(), Some(4));
+    assert_eq!(body["created-assets"][0]["index"].as_u64(), Some(2));
+}
+
+/// `all`/`none` must not combine with other values or with each other —
+/// go-algorand v4.6.0-stable's handler rejects this explicitly.
+#[tokio::test]
+async fn account_info_exclude_all_cannot_combine_with_other_values() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    for combo in [
+        "all,created-apps-params",
+        "none,created-apps-params",
+        "all,none",
+    ] {
+        let resp = server
+            .client
+            .get(server.url(&format!("/v2/accounts/{}?exclude={}", TEST_ADDR, combo)))
+            .header("X-Algo-API-Token", &server.api_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "exclude={combo} should be rejected as invalid"
+        );
+    }
+}
+
 #[tokio::test]
 async fn account_info_invalid_exclude_returns_400() {
     let server = TestServer::start(MockNode::synced()).await;

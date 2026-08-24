@@ -605,8 +605,75 @@ pub async fn wait_for_block<N: NodeInterface>(
 pub struct AccountInfoParams {
     /// Response format: "json" (default) or "msgpack"/"msgp".
     pub format: Option<String>,
-    /// Exclude resources: "all", "none", or absent.
+    /// Exclude resources: comma-separated list of "all", "none",
+    /// "created-apps-params", "created-assets-params" (go-algorand
+    /// v4.6.0-stable, issue #507; `collectionFormat: csv` per
+    /// `algod.oas2.json`).
     pub exclude: Option<String>,
+}
+
+/// Parsed, validated form of [`AccountInfoParams::exclude`].
+///
+/// Matches go-algorand's `Handlers.AccountInformation` exclude-parsing
+/// (`daemon/algod/api/server/v2/handlers.go`, v4.6.0-stable): `all` and
+/// `none` must appear alone (error if combined with anything else,
+/// including each other or a duplicate of themselves); any other
+/// recognized value accumulates a granular exclusion; an unrecognized
+/// value is a bad request.
+struct ParsedExclude {
+    /// `exclude=all`: skip resource lists/lookups entirely (basic account
+    /// info only).
+    all: bool,
+    /// `exclude=created-apps-params`: created apps are still listed, but
+    /// each entry's `params` is omitted (ID only).
+    created_apps_params: bool,
+    /// `exclude=created-assets-params`: created assets are still listed,
+    /// but each entry's `params` is omitted (index only).
+    created_assets_params: bool,
+}
+
+fn parse_exclude(raw: Option<&str>) -> Result<ParsedExclude, ()> {
+    let values: Vec<&str> = match raw {
+        None => Vec::new(),
+        Some("") => Vec::new(),
+        Some(s) => s.split(',').map(str::trim).collect(),
+    };
+
+    if values.len() == 1 {
+        match values[0] {
+            "all" => {
+                return Ok(ParsedExclude {
+                    all: true,
+                    created_apps_params: false,
+                    created_assets_params: false,
+                })
+            }
+            "none" | "" => {
+                return Ok(ParsedExclude {
+                    all: false,
+                    created_apps_params: false,
+                    created_assets_params: false,
+                })
+            }
+            _ => {}
+        }
+    }
+
+    let mut created_apps_params = false;
+    let mut created_assets_params = false;
+    for v in &values {
+        match *v {
+            "created-apps-params" => created_apps_params = true,
+            "created-assets-params" => created_assets_params = true,
+            "all" | "none" => return Err(()), // cannot combine with other values
+            _ => return Err(()),              // unrecognized value
+        }
+    }
+    Ok(ParsedExclude {
+        all: false,
+        created_apps_params,
+        created_assets_params,
+    })
 }
 
 /// Returns account information for the given address.
@@ -615,8 +682,12 @@ pub struct AccountInfoParams {
 /// `daemon/algod/api/server/v2/handlers.go`.
 ///
 /// Non-existent accounts return 200 with zero balances (not 404).
-/// The `exclude` query parameter controls whether resource lists
-/// (assets, apps) are included. Only "all" and "none" are valid.
+/// The `exclude` query parameter (comma-separated, go-algorand
+/// v4.6.0-stable per issue #507) controls whether resource lists and/or
+/// created-resource params are included: `all` and `none` must appear
+/// alone; `created-apps-params`/`created-assets-params` may combine with
+/// each other to omit just the params of created apps/assets (the
+/// resources are still listed, by ID).
 pub async fn account_information<N: NodeInterface>(
     State(node): State<AppState<N>>,
     Path(address): Path<String>,
@@ -638,15 +709,14 @@ pub async fn account_information<N: NodeInterface>(
     };
 
     // Validate exclude parameter
-    let exclude = params.exclude.as_deref().unwrap_or("");
-    match exclude {
-        "all" | "none" | "" => {}
-        _ => return error::bad_request("failed to parse exclude"),
-    }
+    let parsed_exclude = match parse_exclude(params.exclude.as_deref()) {
+        Ok(p) => p,
+        Err(()) => return error::bad_request("failed to parse exclude"),
+    };
 
     // Look up account — use the lightweight basic lookup when exclude=all to
     // avoid loading resource maps from the ledger.
-    let lookup = if exclude == "all" {
+    let lookup = if parsed_exclude.all {
         match node.lookup_account_basic(&addr).await {
             Ok(l) => l,
             Err(_) => {
@@ -663,7 +733,7 @@ pub async fn account_information<N: NodeInterface>(
     };
 
     // Check resource count vs max limit (when not excluding and max is set)
-    if exclude != "all" {
+    if !parsed_exclude.all {
         let max_results = node.max_api_resources_per_account();
         if max_results != 0 {
             let record = &lookup.account_data;
@@ -712,7 +782,7 @@ pub async fn account_information<N: NodeInterface>(
 
     // Msgpack path: canonical-encode the raw AccountData (matching go-algorand)
     if resp_format == format::ResponseFormat::Msgpack {
-        if exclude == "all" {
+        if parsed_exclude.all {
             // No resource maps needed — encode directly without cloning
             let bytes = algo_codec::canonical_encode_ledgercore_account_data(&lookup.account_data);
             return format::encode_protocol_codec_response(bytes);
@@ -734,7 +804,14 @@ pub async fn account_information<N: NodeInterface>(
     };
 
     // Convert to API response (JSON path)
-    let response = models::account_data_to_response(&lookup, &addr, exclude, &consensus);
+    let response = models::account_data_to_response(
+        &lookup,
+        &addr,
+        if parsed_exclude.all { "all" } else { "" },
+        parsed_exclude.created_apps_params,
+        parsed_exclude.created_assets_params,
+        &consensus,
+    );
     format::encode_response(&response, resp_format)
 }
 

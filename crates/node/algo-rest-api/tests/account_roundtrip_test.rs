@@ -209,7 +209,7 @@ fn account_json_matches_go_field_for_field() {
     let consensus = consensus_params_for_version(CONSENSUS_V41).expect("v41 consensus");
     for f in fixtures() {
         let lookup = lookup_for(&f);
-        let resp = account_data_to_response(&lookup, &f.addr, "none", &consensus);
+        let resp = account_data_to_response(&lookup, &f.addr, "none", false, false, &consensus);
         let got: serde_json::Value = serde_json::to_value(&resp).unwrap();
         let want: serde_json::Value =
             serde_json::from_str(&read(&format!("{}.account.json", f.name))).unwrap();
@@ -309,7 +309,7 @@ fn account_json_exclude_all_omits_resources() {
         .find(|f| f.name == "with_assets")
         .unwrap();
     let lookup = lookup_for(&f);
-    let resp = account_data_to_response(&lookup, &f.addr, "all", &consensus);
+    let resp = account_data_to_response(&lookup, &f.addr, "all", false, false, &consensus);
     let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
     assert!(v.get("assets").is_none(), "exclude=all must omit assets");
     assert!(
