@@ -25,8 +25,9 @@ const FIXTURES: &[(Network, &str)] = &[
         "98581acc5fb6b914b5b4c88bf5db23d358491b248498f376f01fd38e3be9556d",
     ),
     (
+        // Corrected in go-algorand v4.6.0-stable (PR #6556, issue #509).
         Network::Devnet,
-        "b02dcfeded9275ba8a24ad2d6e209d2bdb5d4a96dee9778218a7683739a58f41",
+        "b239339dde5f98e3f34f3322e810076b622bf43c8ec6ee47ecd1f7adab501b5c",
     ),
 ];
 
