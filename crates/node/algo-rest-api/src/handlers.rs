@@ -14,6 +14,7 @@
 //! - `GET /v2/accounts/:address` -- account information
 //! - `GET /v2/accounts/:address/assets/:asset-id` -- account asset information
 //! - `GET /v2/accounts/:address/applications/:application-id` -- account application information
+//! - `GET /v2/accounts/:address/applications` -- paginated account application resources
 //! - `GET /v2/applications/:application-id` -- application information by ID
 //! - `GET /v2/assets/:asset-id` -- asset information by ID
 //! - `GET /v2/applications/:application-id/box` -- application box by name
@@ -4031,6 +4032,20 @@ const MAX_ASSET_RESULTS: u64 = 1000;
 /// in the current protocol, but kept as a separate constant for clarity).
 const DEFAULT_ASSET_RESULTS: u64 = 1000;
 
+/// Maximum number of application results per page when `include-params` is
+/// requested. Matches go-algorand's `MaxApplicationResults`.
+const MAX_APPLICATION_RESULTS: u64 = 1000;
+
+/// Maximum number of application results per page when params are
+/// excluded — 100x higher since responses are ~100x smaller without the
+/// approval/clear program bytes. Matches go-algorand's
+/// `MaxApplicationResultsWithoutParams`.
+const MAX_APPLICATION_RESULTS_WITHOUT_PARAMS: u64 = MAX_APPLICATION_RESULTS * 100;
+
+/// Default number of application results per page when no `limit` is
+/// specified. Matches go-algorand's `DefaultApplicationResults`.
+const DEFAULT_APPLICATION_RESULTS: u64 = 1000;
+
 // ---------------------------------------------------------------------------
 // GET /v2/experimental  —  Experimental API check
 // ---------------------------------------------------------------------------
@@ -4171,6 +4186,162 @@ pub async fn account_assets_information<N: NodeInterface>(
         asset_holdings.push(aah);
     }
     response.asset_holdings = Some(asset_holdings);
+
+    let body = match serde_json::to_string(&response) {
+        Ok(b) => b,
+        Err(_) => return error::internal_error("failed to encode response"),
+    };
+    (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/accounts/:address/applications  —  Account applications information
+// ---------------------------------------------------------------------------
+
+/// Query parameters for the account applications information endpoint.
+#[derive(Debug, Deserialize)]
+pub struct AccountApplicationsInformationParams {
+    /// Maximum number of results to return.
+    pub limit: Option<u64>,
+    /// Pagination cursor: return applications with ID greater than this value.
+    pub next: Option<String>,
+    /// Comma-separated list of additional items to include. Only `params`
+    /// is recognized (`style: form, explode: false` per `algod.oas3.yml`).
+    pub include: Option<String>,
+}
+
+/// Return paginated application resources (local state and, optionally,
+/// params) for an account.
+///
+/// Matches go-algorand's `Handlers.AccountApplicationsInformation`, added in
+/// go-algorand v4.6.0-stable (PR #6552 / issue #505). Unlike
+/// `account_assets_information`, a returned record can be params-only (the
+/// account created the app but has no local state) — see
+/// [`algo_rest_api::node::AppResourceWithIDs`] for why.
+pub async fn account_applications_information<N: NodeInterface>(
+    State(node): State<AppState<N>>,
+    Path(address): Path<String>,
+    Query(params): Query<AccountApplicationsInformationParams>,
+) -> Response {
+    // Parse address
+    let addr = match Address::from_str(&address) {
+        Ok(a) => a,
+        Err(_) => return error::bad_request("failed to parse the address"),
+    };
+
+    // Parse "next" pagination token
+    let app_greater_than: u64 = if let Some(ref next_str) = params.next {
+        match next_str.parse::<u64>() {
+            Ok(v) => v,
+            Err(e) => {
+                return error::bad_request(format!("unable to parse next token: {e}"));
+            }
+        }
+    } else {
+        0
+    };
+
+    // `include=params` (comma-separated, matching the OAS `style: form,
+    // explode: false` array encoding).
+    let include_params = params
+        .include
+        .as_deref()
+        .map(|v| v.split(',').any(|item| item == "params"))
+        .unwrap_or(false);
+
+    // Choose the max limit based on whether params are included — matches
+    // go-algorand's per-request limit validation.
+    let max_results = if include_params {
+        MAX_APPLICATION_RESULTS
+    } else {
+        MAX_APPLICATION_RESULTS_WITHOUT_PARAMS
+    };
+
+    // Validate and default limit
+    let limit = if let Some(l) = params.limit {
+        if l == 0 {
+            return error::bad_request("limit parameter must be a positive integer");
+        }
+        if l > max_results {
+            return error::bad_request(format!(
+                "limit {} exceeds max applications single batch limit {}",
+                l, max_results
+            ));
+        }
+        l
+    } else {
+        DEFAULT_APPLICATION_RESULTS
+    };
+
+    // Look up applications (request limit+1 to detect pagination)
+    let (records, lookup_round) = match node
+        .lookup_applications(&addr, app_greater_than, limit + 1, include_params)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!(error = %e, "lookup_applications failed");
+            return error::internal_error("failed to retrieve information from the ledger");
+        }
+    };
+
+    let mut response = models::AccountApplicationsInformationResponse {
+        round: lookup_round,
+        application_resources: None,
+        next_token: None,
+    };
+
+    let mut records = records;
+
+    // Detect pagination
+    if records.len() as u64 > limit {
+        records.truncate(limit as usize);
+        if let Some(last) = records.last() {
+            response.next_token = Some(last.app_id.to_string());
+        }
+    }
+
+    // Build application resources
+    let mut application_resources = Vec::with_capacity(records.len());
+    for record in &records {
+        if record.app_local_state.is_none()
+            && record.creator.is_zero()
+            && record.app_params.is_none()
+        {
+            // Neither local state nor a live creator/params — should not be
+            // possible (mirrors go's own defensive warning + skip).
+            tracing::warn!(
+                app_id = record.app_id,
+                "AccountApplicationsInformation: application has neither local state nor params - should not be possible"
+            );
+            continue;
+        }
+
+        let mut resource = models::AccountApplicationResource {
+            id: record.app_id,
+            app_local_state: None,
+            deleted: None,
+            params: None,
+        };
+
+        if let Some(ref local_state) = record.app_local_state {
+            resource.app_local_state =
+                Some(models::app_local_state_to_api(record.app_id, local_state));
+        }
+
+        if record.creator.is_zero() {
+            // The app no longer exists.
+            resource.deleted = Some(true);
+        } else if include_params {
+            if let Some(ref ap) = record.app_params {
+                let app = models::app_params_to_api(record.app_id, &record.creator.to_string(), ap);
+                resource.params = Some(app.params);
+            }
+        }
+
+        application_resources.push(resource);
+    }
+    response.application_resources = Some(application_resources);
 
     let body = match serde_json::to_string(&response) {
         Ok(b) => b,

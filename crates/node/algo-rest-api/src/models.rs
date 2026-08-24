@@ -2300,3 +2300,53 @@ pub struct AccountAssetsInformationResponse {
     #[serde(rename = "next-token", skip_serializing_if = "Option::is_none")]
     pub next_token: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// AccountApplicationsInformation (issue #505 — go-algorand v4.6.0-stable)
+// ---------------------------------------------------------------------------
+
+/// The account's application resource (local state and params if the
+/// account is the creator) for a specific application ID.
+///
+/// Matches go-algorand's `model.AccountApplicationResource`. Note:
+/// go-algorand's own handler never populates `created-at-round` either
+/// (see `daemon/algod/api/server/v2/handlers.go`
+/// `AccountApplicationsInformation`), so it is omitted here too.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountApplicationResource {
+    /// The application ID.
+    pub id: u64,
+
+    /// Local state, present when the account has opted in.
+    #[serde(rename = "app-local-state", skip_serializing_if = "Option::is_none")]
+    pub app_local_state: Option<ApiApplicationLocalState>,
+
+    /// Whether the application has been deleted. Only present (and true)
+    /// when the app no longer exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<bool>,
+
+    /// Application params, present when the account is the creator AND
+    /// `include-params` was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<ApiApplicationParams>,
+}
+
+/// Response for `GET /v2/accounts/{address}/applications` — matches
+/// go-algorand's `model.AccountApplicationsInformationResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountApplicationsInformationResponse {
+    /// The round at which the lookup was performed.
+    pub round: u64,
+
+    /// The application resources for this account.
+    #[serde(
+        rename = "application-resources",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub application_resources: Option<Vec<AccountApplicationResource>>,
+
+    /// Pagination token for the next page of results.
+    #[serde(rename = "next-token", skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+}

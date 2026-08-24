@@ -12,9 +12,9 @@ use algo_ledger::participation::{ParticipationID, ParticipationRecord};
 use algo_ledger::{StateDelta, StateDeltaSubset};
 use algo_rest_api::auth::generate_token;
 use algo_rest_api::node::{
-    AccountLookup, AppResourceLookup, ApplicationLookup, AssetLookup, AssetResourceLookup,
-    AssetResourceWithIDs, BuildVersion, NodeError, NodeInterface, NodeStatus, ProtocolSwitchInfo,
-    StateProofData, SupplyInfo, TxnGroupDeltaWithIds, TxnWithStatus,
+    AccountLookup, AppResourceLookup, AppResourceWithIDs, ApplicationLookup, AssetLookup,
+    AssetResourceLookup, AssetResourceWithIDs, BuildVersion, NodeError, NodeInterface, NodeStatus,
+    ProtocolSwitchInfo, StateProofData, SupplyInfo, TxnGroupDeltaWithIds, TxnWithStatus,
 };
 use algo_rest_api::router::{build_router, TokenConfig};
 use algo_types::{
@@ -123,6 +123,8 @@ struct MockNode {
     enable_experimental_api: bool,
     /// Asset resource records for lookup_assets, keyed by address bytes.
     asset_resources_by_addr: BTreeMap<[u8; 32], Vec<AssetResourceWithIDs>>,
+    /// App resource records for lookup_applications, keyed by address bytes.
+    app_resources_by_addr: BTreeMap<[u8; 32], Vec<AppResourceWithIDs>>,
     /// Participation records to return from list/get.
     participation_records: Vec<ParticipationRecord>,
     /// Install result: None = return new ID, Some(msg) = error.
@@ -200,6 +202,7 @@ impl Clone for MockNode {
             enable_developer_api: self.enable_developer_api,
             enable_experimental_api: self.enable_experimental_api,
             asset_resources_by_addr: self.asset_resources_by_addr.clone(),
+            app_resources_by_addr: self.app_resources_by_addr.clone(),
             participation_records: self.participation_records.clone(),
             install_result: self.install_result.clone(),
             remove_result: self.remove_result.clone(),
@@ -309,6 +312,7 @@ impl MockNode {
             enable_developer_api: false,
             enable_experimental_api: false,
             asset_resources_by_addr: BTreeMap::new(),
+            app_resources_by_addr: BTreeMap::new(),
             participation_records: Vec::new(),
             install_result: None,
             remove_result: None,
@@ -854,6 +858,31 @@ impl NodeInterface for MockNode {
                 .filter(|r| r.asset_id > asset_id_gt)
                 .take(limit as usize)
                 .cloned()
+                .collect(),
+            None => vec![],
+        };
+        Ok((records, 1000))
+    }
+
+    async fn lookup_applications(
+        &self,
+        addr: &Address,
+        app_id_gt: u64,
+        limit: u64,
+        include_params: bool,
+    ) -> Result<(Vec<AppResourceWithIDs>, u64), NodeError> {
+        let records = match self.app_resources_by_addr.get(&addr.0) {
+            Some(r) => r
+                .iter()
+                .filter(|r| r.app_id > app_id_gt)
+                .take(limit as usize)
+                .cloned()
+                .map(|mut rec| {
+                    if !include_params {
+                        rec.app_params = None;
+                    }
+                    rec
+                })
                 .collect(),
             None => vec![],
         };
@@ -7524,6 +7553,269 @@ async fn account_assets_information_limit_exceeds_max() {
         body.contains("exceeds max"),
         "error should mention exceeds max"
     );
+}
+
+// ---------------------------------------------------------------------------
+// GET /v2/accounts/:address/applications  (issue #505)
+// ---------------------------------------------------------------------------
+
+fn sample_app_params(creator: Address) -> AppParams {
+    AppParams {
+        creator,
+        approval_program: vec![0x06],
+        clear_state_program: vec![0x06],
+        global_state: Default::default(),
+        local_state_schema: StateSchema::default(),
+        global_state_schema: StateSchema::default(),
+        extra_program_pages: 0,
+    }
+}
+
+#[tokio::test]
+async fn account_applications_information_accessible_without_experimental_api() {
+    // Unlike the pre-#506 `/assets` endpoint, this is a brand-new
+    // go-algorand v4.6.0-stable endpoint and was never gated behind
+    // EnableExperimentalAPI — `MockNode::synced()` leaves that flag unset,
+    // pinning that the route is reachable and returns a normal 200 (empty
+    // page, no resources seeded) rather than 404/401.
+    let addr = Address([0x01; 32]);
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/applications", addr)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["round"], 1000);
+    let resources = body["application-resources"].as_array().unwrap();
+    assert!(resources.is_empty());
+}
+
+#[tokio::test]
+async fn account_applications_information_returns_local_state_and_params() {
+    let addr = Address([0x02; 32]);
+    let mut node = MockNode::synced();
+    node.app_resources_by_addr.insert(
+        addr.0,
+        vec![AppResourceWithIDs {
+            app_id: 42,
+            app_local_state: Some(AppLocalState {
+                schema: StateSchema::default(),
+                key_value: Default::default(),
+            }),
+            creator: addr,
+            app_params: Some(sample_app_params(addr)),
+        }],
+    );
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!(
+            "/v2/accounts/{}/applications?include=params",
+            addr
+        )))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let resources = body["application-resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0]["id"], 42);
+    assert!(resources[0]["app-local-state"].is_object());
+    assert!(
+        resources[0]["params"].is_object(),
+        "params must be present when include=params is passed: {resources:?}"
+    );
+    assert!(resources[0]["deleted"].is_null());
+}
+
+#[tokio::test]
+async fn account_applications_information_omits_params_without_include() {
+    // Default behavior (no `include=params`): params must be omitted even
+    // though the account is the creator, matching go-algorand's
+    // bandwidth-saving default.
+    let addr = Address([0x03; 32]);
+    let mut node = MockNode::synced();
+    node.app_resources_by_addr.insert(
+        addr.0,
+        vec![AppResourceWithIDs {
+            app_id: 7,
+            app_local_state: None,
+            creator: addr,
+            app_params: Some(sample_app_params(addr)),
+        }],
+    );
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/applications", addr)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let resources = body["application-resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 1);
+    assert!(
+        resources[0]["params"].is_null(),
+        "params must be omitted without include=params: {resources:?}"
+    );
+    assert!(resources[0]["app-local-state"].is_null());
+}
+
+#[tokio::test]
+async fn account_applications_information_marks_deleted_app() {
+    // A record whose creator resolves to the zero address (app no longer
+    // exists) must surface `deleted: true`, matching go's handler branch.
+    let addr = Address([0x04; 32]);
+    let mut node = MockNode::synced();
+    node.app_resources_by_addr.insert(
+        addr.0,
+        vec![AppResourceWithIDs {
+            app_id: 9,
+            app_local_state: Some(AppLocalState {
+                schema: StateSchema::default(),
+                key_value: Default::default(),
+            }),
+            creator: Address([0u8; 32]),
+            app_params: None,
+        }],
+    );
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/applications", addr)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let resources = body["application-resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0]["deleted"], true);
+    assert!(resources[0]["app-local-state"].is_object());
+}
+
+#[tokio::test]
+async fn account_applications_information_pagination() {
+    let addr = Address([0x05; 32]);
+    let mut node = MockNode::synced();
+    let apps: Vec<AppResourceWithIDs> = (1..=3)
+        .map(|i| AppResourceWithIDs {
+            app_id: i,
+            app_local_state: Some(AppLocalState {
+                schema: StateSchema::default(),
+                key_value: Default::default(),
+            }),
+            creator: Address([0u8; 32]),
+            app_params: None,
+        })
+        .collect();
+    node.app_resources_by_addr.insert(addr.0, apps);
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/applications?limit=2", addr)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let resources = body["application-resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 2);
+    assert!(
+        body["next-token"].is_string(),
+        "should have next-token for pagination"
+    );
+
+    let next_token = body["next-token"].as_str().unwrap();
+    let resp = server
+        .client
+        .get(server.url(&format!(
+            "/v2/accounts/{}/applications?limit=2&next={}",
+            addr, next_token
+        )))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let resources = body["application-resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 1);
+    assert!(
+        body["next-token"].is_null(),
+        "should not have next-token on last page"
+    );
+}
+
+#[tokio::test]
+async fn account_applications_information_limit_exceeds_max_without_params() {
+    // Without include=params the higher (100x) limit applies — 1001 must
+    // still be rejected only once past MaxApplicationResultsWithoutParams
+    // (100_000), while it's well within bounds here so the request should
+    // succeed (empty page, no resources seeded).
+    let addr = Address([0x06; 32]);
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/applications?limit=1001", addr)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "1001 is within the without-params limit (100_000)"
+    );
+
+    // With include=params, the lower (1000) limit applies — 1001 must be
+    // rejected.
+    let resp = server
+        .client
+        .get(server.url(&format!(
+            "/v2/accounts/{}/applications?limit=1001&include=params",
+            addr
+        )))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("exceeds max"),
+        "error should mention exceeds max"
+    );
+}
+
+#[tokio::test]
+async fn account_applications_information_bad_address() {
+    let server = TestServer::start(MockNode::synced()).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/accounts/not-an-address/applications"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
 }
 
 #[tokio::test]
