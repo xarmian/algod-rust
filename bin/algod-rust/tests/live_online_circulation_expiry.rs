@@ -39,24 +39,24 @@
 //! fast suites, and it needs `--test-threads=1` for the same reason that
 //! file does (shared on-chain dev-account state).
 //!
-//! # A discovered asymmetry: only `online-stake`, not `status`, is compared
+//! # `status` is now compared too (issue #526)
 //!
-//! Building this test live surfaced a real divergence unrelated to #518's
-//! accessor fix: go-algorand's real block proposer *also* independently
-//! sweeps expired online accounts to `Offline`
+//! Building this test live originally surfaced a real divergence unrelated
+//! to #518's accessor fix: go-algorand's real block proposer *also*
+//! independently sweeps expired online accounts to `Offline`
 //! (`resetExpiredOnlineAccountsParticipationKeys`, `ledger/eval/eval.go`) --
 //! confirmed live, go reports `status: "Offline"` well before round 320 in
 //! this scenario -- while algod-rust's `--dev` block producer
-//! (`bin/algod-rust/src/dev_producer.rs`) does not yet populate
+//! (`bin/algod-rust/src/dev_producer.rs`, via
+//! `SimpleBlockEvaluator::generate_block` in
+//! `bin/algod-rust/src/commands/participate.rs`) did not populate
 //! `expired_participation_accounts` when assembling its own blocks, so on
-//! algod-rust's self-produced chain the account stays `status: "Online"`
-//! indefinitely. That's a separate, pre-existing gap (tracked as a
-//! follow-up issue), not something #518 introduced or is meant to fix, so
-//! this test intentionally asserts only the field #518 actually governs
-//! (`online-stake`, which both implementations must reach 0 for regardless
-//! of *how* -- go via the full sweep, algod-rust via the #518
-//! lookback-exclusion applied to a still-nominally-Online account) rather
-//! than comparing `status` or `online-money` across nodes.
+//! algod-rust's self-produced chain the account stayed `status: "Online"`
+//! indefinitely. Issue #526 closed that gap (proposal-time computation via
+//! `SqliteLedger::expired_participation_account_candidates`, mirroring the
+//! expiry half of go's `generateKnockOfflineAccountsList`), so this test now
+//! asserts `status`/`online-money` on both implementations, not just the
+//! `online-stake` field #518 governs.
 //!
 //! ```text
 //! make validate-api-up
@@ -395,25 +395,6 @@ async fn online_stake_excludes_expired_participation_key_live() {
         //    expiry-excluding accessor #518 fixes) must now exclude the dev
         //    wallet's stake entirely -- it is the only online account in
         //    this genesis, so the expected result is exactly 0.
-        //
-        //    NOTE on `status`/`online-money`: go-algorand's real block
-        //    proposer *also* actively sweeps expired online accounts to
-        //    Offline within a couple of rounds of expiry
-        //    (`resetExpiredOnlineAccountsParticipationKeys`,
-        //    `ledger/eval/eval.go`; confirmed live while building this
-        //    test -- go reports `status: "Offline"` well before round 320),
-        //    which independently zeroes `online-money` too. algod-rust's
-        //    `--dev` block producer (`bin/algod-rust/src/dev_producer.rs`)
-        //    does not yet compute/populate `expired_participation_accounts`
-        //    when assembling its own blocks, so on algod-rust's
-        //    self-produced chain the account stays `status: "Online"`
-        //    indefinitely -- a separate, pre-existing gap unrelated to
-        //    #518's accessor fix (tracked in a follow-up issue). This test
-        //    therefore only asserts the field #518 actually governs
-        //    (`online-stake`), which both implementations must agree on
-        //    regardless of *how* each gets there -- go via the full sweep,
-        //    algod-rust via the #518 lookback-exclusion on an
-        //    still-nominally-Online account.
         let (status, supply_after) = get_json(&c, &base, "/v2/ledger/supply").await;
         assert_eq!(
             status, 200,
@@ -426,6 +407,34 @@ async fn online_stake_excludes_expired_participation_key_live() {
             "{label}: online-stake must exclude the sole online account's stake \
              once its participation key has expired (issue #518); \
              online-stake={online_stake_after} (full supply response: {supply_after})"
+        );
+
+        // 4. Both implementations' block proposers independently sweep an
+        //    expired online account to Offline as part of ordinary block
+        //    production -- go via `resetExpiredOnlineAccountsParticipationKeys`
+        //    (`ledger/eval/eval.go`), algod-rust via
+        //    `SimpleBlockEvaluator::generate_block` populating
+        //    `expired_participation_accounts` (issue #526) which
+        //    `algo_ledger::apply::reset_expired_online_accounts` then
+        //    applies. `online-money` (the current, non-lookback aggregate)
+        //    is swept to 0 by that same mechanism.
+        let (status, account_after) = get_json(&c, &base, &format!("/v2/accounts/{dev}")).await;
+        assert_eq!(
+            status, 200,
+            "{label}: GET /v2/accounts/{dev}: {account_after}"
+        );
+        assert_eq!(
+            account_after["status"], "Offline",
+            "{label}: dev wallet must be swept Offline once its participation \
+             key has expired (go: eval.go's reset sweep; algod-rust: issue #526); \
+             account={account_after}"
+        );
+        let online_money_after = supply_after["online-money"].as_u64().unwrap();
+        assert_eq!(
+            online_money_after, 0,
+            "{label}: online-money must be 0 once the sole online account is \
+             swept Offline; online-money={online_money_after} \
+             (full supply response: {supply_after})"
         );
     }
 }

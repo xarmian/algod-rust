@@ -3520,6 +3520,94 @@ impl SqliteLedger {
         Ok(expired_stake)
     }
 
+    /// Select up to `max_count` currently-online accounts (`accountbase`,
+    /// `normalizedonlinebalance > 0`) whose participation key has expired as
+    /// of `current_round` -- candidates for a self-produced block's
+    /// `expired_participation_accounts` header field.
+    ///
+    /// Mirrors the expiry half of go-algorand's
+    /// `generateKnockOfflineAccountsList` (`ledger/eval/eval.go`, v41): a
+    /// candidate has a nonempty vote key, a nonzero balance (go skips
+    /// `MicroAlgosWithRewards.IsZero()` -- closing accounts), and
+    /// `VoteLastValid != 0 && VoteLastValid < current_round` (`current_round`
+    /// being the round of the block being built, i.e. go's `eval.Round()`).
+    /// This covers only the expiry list, not go's absent/suspend list
+    /// (`AbsentParticipationAccounts`, gated on the payouts feature) -- that
+    /// is a separate mechanism (issue #526 is scoped to expiry only) -- and
+    /// does not exclude the node's own participating addresses, since
+    /// dev-mode block production holds no participation keys of its own.
+    ///
+    /// Selection order among more candidates than `max_count` is not
+    /// consensus-significant: go's own selection iterates a Go map, whose
+    /// iteration order is randomized per process ("different nodes may
+    /// propose different lists of addresses based on node state" -- see the
+    /// doc comment on `generateKnockOfflineAccountsList`), so any
+    /// deterministic order is equally valid here. This returns addresses in
+    /// ascending byte order for reproducible tests.
+    pub fn expired_participation_account_candidates(
+        &self,
+        current_round: u64,
+        max_count: usize,
+    ) -> Result<Vec<Address>, AlgoError> {
+        if max_count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT address, data FROM accountbase WHERE normalizedonlinebalance > 0 \
+                 ORDER BY address",
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!(
+                    "prepare expired_participation_account_candidates query error: {e}"
+                ),
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("query expired_participation_account_candidates error: {e}"),
+            })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (addr_bytes, data) = row.map_err(|e| AlgoError::Ledger {
+                message: format!("read expired_participation_account_candidates row error: {e}"),
+            })?;
+            let account = decode_account_data(&data).map_err(|e| AlgoError::Ledger {
+                message: format!(
+                    "decode expired_participation_account_candidates account error: {e}"
+                ),
+            })?;
+            if account.micro_algos == 0 {
+                continue;
+            }
+            let has_vote_key = account.vote_id.is_some_and(|v| v != [0u8; 32]);
+            if !has_vote_key {
+                continue;
+            }
+            if account.vote_last_valid != 0 && account.vote_last_valid < current_round {
+                let addr_arr: [u8; 32] =
+                    addr_bytes
+                        .try_into()
+                        .map_err(|v: Vec<u8>| AlgoError::Ledger {
+                            message: format!(
+                                "expired_participation_account_candidates: bad address length {} \
+                                 (expected 32)",
+                                v.len()
+                            ),
+                        })?;
+                out.push(Address(addr_arr));
+                if out.len() >= max_count {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Look up an account's online data at a specific round from the
     /// `onlineaccounts` table.
     ///

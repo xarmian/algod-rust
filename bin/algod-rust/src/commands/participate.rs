@@ -1637,6 +1637,34 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
         // Take ownership of included transactions for payset assembly.
         let payset = std::mem::take(&mut self.included_txns);
 
+        // Compute the expired-participation-accounts sweep list (issue #526).
+        // Mirrors go's `generateKnockOfflineAccountsList`'s expiry half
+        // (`ledger/eval/eval.go`), invoked as part of the proposer's own
+        // block assembly (`eval.endOfBlock` → `generateKnockOfflineAccountsList`
+        // before `resetExpiredOnlineAccountsParticipationKeys` runs at apply
+        // time). Without this, a self-produced block never lists an account
+        // whose participation key has expired, so the apply-side sweep
+        // (`algo_ledger::apply::reset_expired_online_accounts`, which already
+        // reads this field correctly) never fires and the account stays
+        // `Online` forever.
+        let max_expired = self.consensus_params.max_proposed_expired_online_accounts;
+        let expired = if max_expired > 0 {
+            let candidates = self
+                .ledger
+                .lock()
+                .map_err(|e| algo_error::AlgoError::Ledger {
+                    message: format!("ledger lock poisoned: {e}"),
+                })?
+                .expired_participation_account_candidates(self.hdr.round.0, max_expired)?;
+            if candidates.is_empty() {
+                None
+            } else {
+                Some(candidates)
+            }
+        } else {
+            None
+        };
+
         // Build the block by propagating ALL header fields from self.hdr,
         // then overriding the computed fields (txn_counter, commitments,
         // payset). This ensures fee_sink, rewards_pool, rewards_level,
@@ -1671,7 +1699,7 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             upgrade_propose: hdr.upgrade_propose.clone(),
             upgrade_delay: hdr.upgrade_delay,
             upgrade_approve: hdr.upgrade_approve,
-            expired_participation_accounts: hdr.expired_participation_accounts.clone(),
+            expired_participation_accounts: expired,
             absent_participation_accounts: hdr.absent_participation_accounts.clone(),
             payset,
             // Commitment fields are computed below.
@@ -3495,6 +3523,123 @@ mod tests {
         assert_eq!(
             block.seed, [0u8; 32],
             "seed left for the producer/agreement"
+        );
+    }
+
+    // ── dev-mode expired-participation-key sweep (issue #526) ───────
+
+    #[test]
+    fn dev_block_lists_and_sweeps_expired_online_account() {
+        use algo_ledger::apply::apply_block;
+        use algo_pool::traits::PoolLedger;
+        use algo_types::AccountStatus;
+
+        let ledger = test_ledger();
+
+        // Seed an online account whose vote key expired before the round
+        // about to be built (round 6): VoteLastValid = 3 < 6.
+        let expired_addr = Address([9u8; 32]);
+        {
+            let mut l = ledger.lock().expect("ledger lock");
+            l.set_account(
+                &expired_addr,
+                AccountData {
+                    micro_algos: 5_000_000,
+                    status: AccountStatus::Online,
+                    vote_id: Some([1u8; 32]),
+                    vote_last_valid: 3,
+                    ..AccountData::default()
+                },
+            );
+        }
+
+        let adapter = PoolLedgerAdapter::new(ledger.clone());
+        let prev = BlockHeader {
+            round: Round(5),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            fee_sink: Address([1u8; 32]),
+            rewards_pool: Address([2u8; 32]),
+            genesis_id: "net-x".to_string(),
+            timestamp: 1000,
+            ..BlockHeader::default()
+        };
+
+        let mut eval = adapter
+            .start_evaluator(prev, 0, 0)
+            .expect("start_evaluator");
+        let block = eval.generate_block(&[]).expect("generate_block");
+
+        // The self-produced block must carry the expired account, mirroring
+        // go's generateKnockOfflineAccountsList populating
+        // block.ParticipationUpdates.ExpiredParticipationAccounts at
+        // proposal time -- without this, apply.rs's already-correct
+        // reset_expired_online_accounts (the consumer side) never fires for
+        // algod-rust's own self-produced blocks.
+        assert_eq!(
+            block.expired_participation_accounts.as_deref(),
+            Some(&[expired_addr][..]),
+            "dev-mode block must list the account with the expired participation key"
+        );
+
+        // Applying the block sweeps the account to Offline (apply.rs's
+        // consumer side, already correct prior to this fix). apply_block_impl
+        // expects to apply directly on top of the store's current round, so
+        // advance the fresh in-memory ledger's current round to match the
+        // (round 5) header the evaluator built on.
+        let mut l = ledger.lock().expect("ledger lock");
+        l.set_current_round(Round(5));
+        apply_block(&mut *l, &block).expect("apply_block");
+        let acct = l.get_account(&expired_addr).expect("account exists");
+        assert_eq!(
+            acct.status,
+            AccountStatus::Offline,
+            "expired account swept offline after applying the self-produced block"
+        );
+    }
+
+    #[test]
+    fn dev_block_omits_expired_list_when_no_accounts_expired() {
+        use algo_pool::traits::PoolLedger;
+        use algo_types::AccountStatus;
+
+        let ledger = test_ledger();
+
+        // Online account whose vote key is still valid at the round being
+        // built (round 6): VoteLastValid = 100 >= 6.
+        let online_addr = Address([9u8; 32]);
+        {
+            let mut l = ledger.lock().expect("ledger lock");
+            l.set_account(
+                &online_addr,
+                AccountData {
+                    micro_algos: 5_000_000,
+                    status: AccountStatus::Online,
+                    vote_id: Some([1u8; 32]),
+                    vote_last_valid: 100,
+                    ..AccountData::default()
+                },
+            );
+        }
+
+        let adapter = PoolLedgerAdapter::new(ledger.clone());
+        let prev = BlockHeader {
+            round: Round(5),
+            current_protocol: algo_types::CONSENSUS_V41.to_string(),
+            fee_sink: Address([1u8; 32]),
+            rewards_pool: Address([2u8; 32]),
+            genesis_id: "net-x".to_string(),
+            timestamp: 1000,
+            ..BlockHeader::default()
+        };
+
+        let mut eval = adapter
+            .start_evaluator(prev, 0, 0)
+            .expect("start_evaluator");
+        let block = eval.generate_block(&[]).expect("generate_block");
+
+        assert!(
+            block.expired_participation_accounts.is_none(),
+            "no account has expired -- the list must stay empty/omitted"
         );
     }
 
