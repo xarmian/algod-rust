@@ -88,7 +88,7 @@ impl std::error::Error for ResolveGenesisError {}
 const MAINNET_B64: &str = "wGHE2Pwdvd7S12BL5FaOP20EGYesN73ktiC1qzkkit8=";
 const TESTNET_B64: &str = "SGO1GKSzyE7IEPItTxCByw9x8FmnrCDexi9/cOUJOiI=";
 const BETANET_B64: &str = "mFgazF+2uRS1tMiL9dsj01hJGySEmPN28B/TjjvpVW0=";
-const DEVNET_B64: &str = "sC3P7e2SdbqKJK0tbiCdK9tdSpbe6XeCGKdoNzmlj0E=";
+const DEVNET_B64: &str = "sjkznd5fmOPzTzMi6BAHa2Ir9DyOxu5H7NH3ratQG1w=";
 
 /// Name of the environment variable Go honors as a digest override.
 /// Same string as Go's `os.Getenv("ALGOKEY_GENESIS_HASH")` at
@@ -234,6 +234,22 @@ mod tests {
                 "error should list `{known}` in supported list: {msg}"
             );
         }
+    }
+
+    /// Issue #509: go-algorand v4.6.0-stable ([#6556](https://github.com/algorand/go-algorand/pull/6556))
+    /// corrected `devnet`'s genesis hash constant in `cmd/algokey/keyreg.go:97`
+    /// from `sC3P7e2SdbqKJK0tbiCdK9tdSpbe6XeCGKdoNzmlj0E=` to
+    /// `sjkznd5fmOPzTzMi6BAHa2Ir9DyOxu5H7NH3ratQG1w=`. Pinned against the
+    /// literal go-algorand value (not `DEVNET_B64`) so this fails before
+    /// the constant is updated, not just round-trips against itself.
+    #[test]
+    fn devnet_genesis_hash_matches_go_algorand_v4_6_0_stable() {
+        const GO_ALGORAND_V4_6_0_STABLE_DEVNET_B64: &str =
+            "sjkznd5fmOPzTzMi6BAHa2Ir9DyOxu5H7NH3ratQG1w=";
+        assert_eq!(
+            DEVNET_B64, GO_ALGORAND_V4_6_0_STABLE_DEVNET_B64,
+            "devnet genesis hash constant is stale — see go-algorand PR #6556"
+        );
     }
 
     /// Round-trip: re-encoding the bytes via base64 yields back the
