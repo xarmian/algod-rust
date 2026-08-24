@@ -454,6 +454,13 @@ pub struct ConsensusParams {
     /// Whether filter timeout is set dynamically based on credential arrival times
     /// (Go: `DynamicFilterTimeout`, v39+).
     pub dynamic_filter_timeout: bool,
+
+    // ── Online circulation ──────────────────────────────────────
+    /// Excludes stake behind expired participation keys from the total
+    /// online stake used by agreement's `Circulation` and by
+    /// `GET /v2/ledger/supply`'s `online-stake` (Go: `ExcludeExpiredCirculation`,
+    /// v38+).
+    pub exclude_expired_circulation: bool,
 }
 
 /// Payset commit types matching go-algorand.
@@ -600,6 +607,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         credential_domain_separation_enabled: false,
         // Dynamic filter
         dynamic_filter_timeout: false,
+        exclude_expired_circulation: false,
     };
     if version == CONSENSUS_V7 {
         return Some(v7);
@@ -904,6 +912,8 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     let mut v38 = v37.clone();
     v38.logic_sig_version = 9;
     v38.agreement_filter_timeout_period0 = Duration::from_millis(3000);
+    // online circulation on-demand expiration (config/consensus.go v38)
+    v38.exclude_expired_circulation = true;
     if version == CONSENSUS_V38 {
         return Some(v38);
     }
