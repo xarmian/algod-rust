@@ -13,7 +13,7 @@ Move algod-rust's parity target from go-algorand `v4.5.1-stable` (`a8c16ecc2324c
 
 | Upstream PR | Change | Sub-issue |
 |---|---|---|
-| [#6577](https://github.com/algorand/go-algorand/pull/6577) | ledger: fix lookupAssetResources/lookupApplicationResources delta-merge bugs | [#504](https://github.com/xarmian/algod-rust/issues/504) |
+| [#6577](https://github.com/algorand/go-algorand/pull/6577) | ledger: fix lookupAssetResources/lookupApplicationResources delta-merge bugs | folded into [#505](https://github.com/xarmian/algod-rust/issues/505) and [#506](https://github.com/xarmian/algod-rust/issues/506) (originally [#504](https://github.com/xarmian/algod-rust/issues/504), closed as superseded — no delta-merge layer exists yet to patch) |
 | [#6552](https://github.com/algorand/go-algorand/pull/6552) | API: new pagination endpoint for applications | [#505](https://github.com/xarmian/algod-rust/issues/505) |
 | [#6559](https://github.com/algorand/go-algorand/pull/6559) | API: incorporate deltas in paginated assets/applications, remove experimental gate | [#505](https://github.com/xarmian/algod-rust/issues/505) (apps half), [#506](https://github.com/xarmian/algod-rust/issues/506) (assets half) |
 | [#6547](https://github.com/algorand/go-algorand/pull/6547) | API: conditionally exclude app/asset params on /v2/accounts | [#507](https://github.com/xarmian/algod-rust/issues/507) |
@@ -42,18 +42,19 @@ Move algod-rust's parity target from go-algorand `v4.5.1-stable` (`a8c16ecc2324c
 
 ## Dependency Order
 
-1. [#504](https://github.com/xarmian/algod-rust/issues/504) — ledger delta-merge fix (foundation for #505, #506)
-2. [#505](https://github.com/xarmian/algod-rust/issues/505) — new paginated applications endpoint
-3. [#506](https://github.com/xarmian/algod-rust/issues/506) — assets pagination delta-awareness
-4. [#507](https://github.com/xarmian/algod-rust/issues/507) — exclude parameter verification
-5. [#508](https://github.com/xarmian/algod-rust/issues/508) — GetSupply online-stake field
-6. [#509](https://github.com/xarmian/algod-rust/issues/509) — devnet genesis hash fix
+~~1. [#504](https://github.com/xarmian/algod-rust/issues/504) — ledger delta-merge fix~~ — closed as superseded; correctness rules folded into #505/#506
+1. [#505](https://github.com/xarmian/algod-rust/issues/505) — new paginated applications endpoint (now includes #504's correctness rules)
+2. [#506](https://github.com/xarmian/algod-rust/issues/506) — assets pagination delta-awareness (now includes #504's correctness rules + experimental-gate removal)
+3. [#507](https://github.com/xarmian/algod-rust/issues/507) — exclude parameter verification
+4. [#508](https://github.com/xarmian/algod-rust/issues/508) — GetSupply online-stake field
+5. [#509](https://github.com/xarmian/algod-rust/issues/509) — devnet genesis hash fix
 
-(#507–#509 are independent and may be worked in any order relative to the #504→#505/#506 chain.)
+All five remaining sub-issues are independent — no dependency chain remains.
 
 ## Acceptance Criteria
 
-- [ ] All six sub-issues merged, or honestly disposed per this repo's issue-disposition rules
+- [x] #504 honestly disposed (closed as superseded, content folded into #505/#506)
+- [ ] All five remaining sub-issues (#505–#509) merged, or honestly disposed per this repo's issue-disposition rules
 - [ ] Version-pin sweep completed (`CLAUDE.md`, docs, CI workflows, `tools/cert-authenticate`, `Makefile`, `ops/mixed-cluster*/`, code comments)
 - [ ] `docs/PHASE9_PROPOSAL.md` (this epic's parent) and this doc committed
 - [ ] `docs/PROJECT_SCOPE.md` updated to mention Phase 9
