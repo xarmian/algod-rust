@@ -370,11 +370,24 @@ async fn online_stake_excludes_expired_participation_key_live() {
             "{label}: registered vote-last-valid must be reported back"
         );
 
-        // 2. Advance the dev-mode chain well past vote_last AND past
-        //    MaxBalLookback (320) -- see module docs for why both
-        //    implementations require this before the exclusion is
-        //    observable via the lookback-round accessor.
-        let target_round = vote_last.max(MAX_BAL_LOOKBACK) + SAFETY_MARGIN;
+        // 2. Advance the dev-mode chain until the LOOKBACK round itself
+        //    (current_round - MaxBalLookback) is at or past the round the
+        //    keyreg confirmed at -- not just past `vote_last` in absolute
+        //    terms. go's (and algod-rust's) `onlineCirculation(rnd, voteRnd)`
+        //    reads the online-account snapshot as it stood AT `rnd`; if
+        //    `rnd` (the lookback round) predates the keyreg's confirmation,
+        //    that historical snapshot still shows `VoteLastValid == 0`
+        //    (unregistered) and the exclusion legitimately does not apply
+        //    yet, no matter how far the *current* round has advanced past
+        //    `vote_last`. This only matters when this test runs after other
+        //    round-advancing suites in the same harness session (`make
+        //    validate-api`'s ordered run, where `live_txn_cross_verification`
+        //    and `live_longpoll_parity` already advanced the shared dev-mode
+        //    chain before this test's keyreg) -- `round_at_keyreg` is then
+        //    already nonzero, so `target_round` must scale with it, not just
+        //    with the fixed `MaxBalLookback` threshold (a bug caught by
+        //    exactly this ordering in CI while building this test).
+        let target_round = round_at_keyreg + MAX_BAL_LOOKBACK + SAFETY_MARGIN;
         advance_to_round(&c, &base, &tmpl, target_round).await;
 
         // 3. The participation key is now expired (`VoteLastValid <
