@@ -1327,6 +1327,12 @@ pub struct SupplyResponse {
     /// Total money of online accounts, in microAlgos.
     #[serde(rename = "online-money")]
     pub online_money: u64,
+    /// Online stake used by agreement to vote for `current_round` -- the
+    /// lookback-round (`BalanceRound`) online circulation, distinct from
+    /// `online_money` (`current_round`'s own online total). Added in
+    /// go-algorand v4.6.0-stable (issue #508).
+    #[serde(rename = "online-stake")]
+    pub online_stake: u64,
     /// Total money of participating accounts, in microAlgos.
     #[serde(rename = "total-money")]
     pub total_money: u64,

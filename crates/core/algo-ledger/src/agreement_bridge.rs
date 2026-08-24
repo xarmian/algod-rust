@@ -308,19 +308,12 @@ impl LedgerReader for AgreementLedgerBridge {
             return Err(LedgerError::RoundNotAvailable(rnd));
         }
 
-        // Try per-round online supply from onlineroundparamstail first.
-        // This mirrors Go's onlineCirculation which looks up OnlineRoundParamsData
-        // containing the OnlineSupply for the specific round.
-        if let Ok(Some(supply)) = ledger.online_supply_at_round(rnd.0) {
-            return Ok(supply);
-        }
-
-        // Fall back to current totals from the accounttotals table.
-        // This is the aggregate online stake and is correct when operating
-        // at or near the latest round.
+        // Shared with `GetSupply`'s `online-stake` field (node_interface_impl.rs)
+        // so both consult the same per-round-snapshot-else-current-aggregate
+        // rule -- mirrors Go's `onlineCirculation` (`ledger/acctonline.go`).
         ledger
-            .online_stake()
-            .map_err(|e| LedgerError::Other(format!("online_stake: {e}")))
+            .online_circulation_at_round(rnd.0)
+            .map_err(|e| LedgerError::Other(format!("online_circulation_at_round: {e}")))
     }
 
     fn lookup_digest(&self, round: Round) -> Result<Digest, LedgerError> {

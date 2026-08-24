@@ -2206,6 +2206,7 @@ pub async fn get_supply<N: NodeInterface>(State(node): State<AppState<N>>) -> Re
     let resp = models::SupplyResponse {
         current_round: supply.round,
         online_money: supply.online_money,
+        online_stake: supply.online_stake,
         total_money: supply.total_money,
     };
 

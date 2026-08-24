@@ -1686,12 +1686,19 @@ impl NodeInterface for AlgodNodeInterface {
 
     // ---- Operational getters (TASK-267) ----
 
-    /// Supply information: current round, total *participating* money, and
-    /// online money. Mirrors go's `GetSupply` →
-    /// `LedgerForAPI().LatestTotals()`: `total_money = totals.Participating()`
-    /// (`Online.Money + Offline.Money`) and `online_money = totals.Online.Money`.
-    /// Reference: `../go-algorand/daemon/algod/api/server/v2/handlers.go:937-953`
-    /// and `ledger/ledgercore/totals.go:117-123` @ v4.6.0-stable.
+    /// Supply information: current round, total *participating* money,
+    /// current-round online money, and lookback-round online stake.
+    /// Mirrors go's `GetSupply` → `LedgerForAPI().LatestTotals()`:
+    /// `total_money = totals.Participating()` (`Online.Money +
+    /// Offline.Money`) and `online_money = totals.Online.Money`; plus (added
+    /// in v4.6.0-stable, issue #508) `online_stake =
+    /// LedgerForAPI().OnlineCirculation(agreement.BalanceRound(latest,
+    /// params), latest)` -- the SAME lookback round agreement uses for
+    /// sortition/committee sizing (`algo_agreement::balance_round`, from
+    /// `algo-agreement/src/lookback.rs`), distinct from `online_money`'s
+    /// current-round total.
+    /// Reference: `../go-algorand/daemon/algod/api/server/v2/handlers.go`
+    /// `GetSupply` and `ledger/ledgercore/totals.go` @ v4.6.0-stable.
     async fn get_supply(&self) -> Result<SupplyInfo, NodeError> {
         let ledger = self.lock_ledger("get_supply")?;
         let round = ledger.current_round().0;
@@ -1701,10 +1708,19 @@ impl NodeInterface for AlgodNodeInterface {
         let online_money = ledger
             .online_stake()
             .map_err(|e| NodeError::Internal(format!("get_supply: {e}")))?;
+
+        let proto = self.resolve_protocol(&ledger);
+        let params = Self::resolve_consensus_params(&proto)?;
+        let lookback_round = algo_agreement::balance_round(Round(round), &params);
+        let online_stake = ledger
+            .online_circulation_at_round(lookback_round.0)
+            .map_err(|e| NodeError::Internal(format!("get_supply: {e}")))?;
+
         Ok(SupplyInfo {
             round,
             total_money,
             online_money,
+            online_stake,
         })
     }
 
@@ -5180,6 +5196,11 @@ mod tests {
             "participating money = online + offline (offline-funded sender)",
         );
         assert_eq!(supply.online_money, 0, "no online stake in genesis alloc");
+        assert_eq!(
+            supply.online_stake, 0,
+            "lookback round (0) has no per-round snapshot either, so online-stake \
+             falls back to the same zero aggregate as online-money",
+        );
     }
 
     /// `get_supply` on an unseeded ledger returns zeros rather than erroring —
@@ -5191,6 +5212,64 @@ mod tests {
         assert_eq!(supply.round, 0);
         assert_eq!(supply.total_money, 0);
         assert_eq!(supply.online_money, 0);
+        assert_eq!(supply.online_stake, 0);
+    }
+
+    /// `online-stake` (go-algorand v4.6.0-stable, issue #508) reports the
+    /// LOOKBACK round's online circulation -- the same `BalanceRound` agreement
+    /// uses for sortition/committee sizing -- while `online-money` reports the
+    /// CURRENT round's online total. Seed a per-round snapshot at the lookback
+    /// round (via `online_circulation_at_round`'s backing store) that differs
+    /// from the ledger's current aggregate online stake, and confirm
+    /// `get_supply` reports them as genuinely distinct values rather than both
+    /// reading the current aggregate.
+    ///
+    /// Reference: `../go-algorand/daemon/algod/api/server/v2/handlers.go`
+    /// `GetSupply` (`brnd := agreement.BalanceRound(latest, params);
+    /// onlineCirculation, err := v2.Node.LedgerForAPI().OnlineCirculation(brnd,
+    /// latest)`) @ v4.6.0-stable.
+    #[tokio::test]
+    async fn get_supply_online_stake_reflects_lookback_round_not_current() {
+        use ed25519_dalek::SigningKey;
+
+        let sender_key = SigningKey::from_bytes(&[0x55u8; 32]);
+        let sender = Address(sender_key.verifying_key().to_bytes());
+        let (adapter, ledger, _gh) = seed_dev_adapter(sender, 9_000_000);
+
+        let current_round = {
+            let mut l = ledger.lock().expect("ledger lock");
+            // Force the CURRENT aggregate (online_money) to a known non-zero
+            // value, distinct from the lookback snapshot seeded below.
+            l.put_account_totals_seed(9_000_000, 0, 0, 0, 0, 0)
+                .expect("seed accounttotals");
+            l.current_round().0
+        };
+        let params = AlgodNodeInterface::resolve_consensus_params(algo_types::CONSENSUS_V41)
+            .expect("v41 params");
+        let lookback_round = algo_agreement::balance_round(Round(current_round), &params);
+
+        // Seed a per-round online-supply snapshot at the lookback round that
+        // differs from the current aggregate (9_000_000) seeded above.
+        let lookback_online_supply = 1_234_000;
+        {
+            let l = ledger.lock().expect("ledger lock");
+            l.put_online_supply_at_round(lookback_round.0, lookback_online_supply)
+                .expect("seed onlineroundparamstail");
+        }
+
+        let supply = adapter.get_supply().await.expect("supply ok");
+        assert_eq!(
+            supply.online_money, 9_000_000,
+            "online-money is the CURRENT round's aggregate online stake",
+        );
+        assert_eq!(
+            supply.online_stake, lookback_online_supply,
+            "online-stake is the LOOKBACK round's snapshot, not the current aggregate",
+        );
+        assert_ne!(
+            supply.online_stake, supply.online_money,
+            "online-stake and online-money must be able to diverge (the whole point of #508)",
+        );
     }
 
     /// Outside dev mode the timestamp-offset get/set both error (the handler maps
