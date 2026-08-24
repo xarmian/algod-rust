@@ -177,11 +177,6 @@ async fn ledger_supply_excludes_fee_sink() {
         .await
         .unwrap();
 
-    // go-algorand v4.6.0-stable added an `online-stake` field to this
-    // response that algod-rust doesn't compute yet — tracked by #508.
-    // Strip it here rather than implementing it in this pin-sweep PR.
-    let go = strip_implementation_specific_fields(go, &["online-stake"]);
-
     let mut mismatches = Vec::new();
     diff_json("", &go, &rust, &mut mismatches);
     assert!(

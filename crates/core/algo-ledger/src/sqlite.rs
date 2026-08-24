@@ -15,6 +15,7 @@ use algo_types::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::catchpoint::verify::{encode_mixed_map, encode_msgpack_uint};
 use crate::lease::LeaseTable;
 use crate::rewards::{normalized_online_balance, REWARD_UNITS};
 use crate::store_trait::LedgerStore;
@@ -3137,6 +3138,46 @@ impl SqliteLedger {
         Ok(Some(0))
     }
 
+    /// Record the total online stake for `round` in the per-round online-supply
+    /// tail (`onlineroundparamstail`), keyed by round.
+    ///
+    /// Mirrors the shape go-algorand persists in `OnlineRoundParamsData`
+    /// (`ledger/acctonline.go`) -- a msgpack map with the `"online"` key read
+    /// back by [`Self::online_supply_at_round`]. Normal block application does
+    /// not yet append to this table (only catchpoint import populates it, see
+    /// `catchpoint/importer.rs`); this writer exists to backfill/seed known
+    /// per-round snapshots (tests, and future block-apply history tracking).
+    pub fn put_online_supply_at_round(&self, round: u64, online: u64) -> Result<(), AlgoError> {
+        let data = encode_mixed_map(&[("online", encode_msgpack_uint(online))]);
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO onlineroundparamstail (rnd, data) VALUES (?1, ?2)",
+                params![round as i64, data],
+            )
+            .map_err(|e| AlgoError::Ledger {
+                message: format!("insert onlineroundparamstail error: {e}"),
+            })?;
+        Ok(())
+    }
+
+    /// Returns the total online stake to report as "circulation" at `round`:
+    /// the per-round snapshot from [`Self::online_supply_at_round`] if one is
+    /// recorded, else the current aggregate online stake ([`Self::online_stake`]).
+    ///
+    /// This is the single accessor behind both agreement's lookback-round
+    /// circulation query (`AgreementLedgerBridge::circulation`, used for
+    /// sortition/committee sizing) and `GET /v2/ledger/supply`'s `online-stake`
+    /// field -- mirrors go-algorand's cached-total lookup in
+    /// `onlineAccounts.onlineCirculation` (`ledger/acctonline.go`), minus its
+    /// expired-participation-key exclusion (`ExcludeExpiredCirculation`),
+    /// which algod-rust does not yet track.
+    pub fn online_circulation_at_round(&self, round: u64) -> Result<u64, AlgoError> {
+        if let Some(supply) = self.online_supply_at_round(round)? {
+            return Ok(supply);
+        }
+        self.online_stake()
+    }
+
     /// Look up an account's online data at a specific round from the
     /// `onlineaccounts` table.
     ///
@@ -5765,6 +5806,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(acctbase, 42);
+    }
+
+    /// `online_circulation_at_round` (shared by `AgreementLedgerBridge::circulation`
+    /// -- sortition's lookback query -- and `GetSupply`'s `online-stake` field,
+    /// go-algorand v4.6.0-stable issue #508) must prefer a recorded per-round
+    /// snapshot over the current aggregate, so a caller asking for an OLD
+    /// round's circulation gets that round's value, not today's.
+    #[test]
+    fn online_circulation_at_round_prefers_per_round_snapshot_over_current_aggregate() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        // Current aggregate: 9,000,000 online microAlgos.
+        ledger
+            .put_account_totals_seed(9_000_000, 0, 0, 0, 0, 0)
+            .unwrap();
+        // A different value recorded for round 100 (as catchpoint import would
+        // populate `onlineroundparamstail`).
+        ledger.put_online_supply_at_round(100, 1_234_000).unwrap();
+
+        assert_eq!(
+            ledger.online_circulation_at_round(100).unwrap(),
+            1_234_000,
+            "a recorded per-round snapshot must win over the current aggregate",
+        );
+    }
+
+    /// Without a per-round snapshot, `online_circulation_at_round` falls back
+    /// to the current aggregate online stake -- the only data available for a
+    /// live (non-catchpoint-imported) node.
+    #[test]
+    fn online_circulation_at_round_falls_back_to_current_aggregate() {
+        let mut ledger = SqliteLedger::open_in_memory().unwrap();
+        ledger
+            .put_account_totals_seed(5_500_000, 0, 0, 0, 0, 0)
+            .unwrap();
+
+        assert_eq!(
+            ledger.online_circulation_at_round(200).unwrap(),
+            5_500_000,
+            "no snapshot recorded for round 200 -> fall back to the current aggregate",
+        );
     }
 
     #[test]

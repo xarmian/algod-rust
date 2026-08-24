@@ -4930,6 +4930,7 @@ async fn supply_success() {
         round: 42,
         total_money: 10_000_000_000,
         online_money: 5_000_000_000,
+        online_stake: 4_500_000_000,
     });
     let server = TestServer::start(node).await;
 
@@ -4946,6 +4947,12 @@ async fn supply_success() {
     assert_eq!(body["current_round"], 42);
     assert_eq!(body["online-money"], 5_000_000_000u64);
     assert_eq!(body["total-money"], 10_000_000_000u64);
+    // `online-stake` (go-algorand v4.6.0-stable, issue #508) is the
+    // lookback-round online circulation, distinct from `online-money`
+    // (the current round's online total) -- assert both are surfaced and
+    // can genuinely differ.
+    assert_eq!(body["online-stake"], 4_500_000_000u64);
+    assert_ne!(body["online-stake"], body["online-money"]);
 }
 
 #[tokio::test]
@@ -4971,6 +4978,7 @@ async fn supply_requires_auth() {
         round: 1,
         total_money: 100,
         online_money: 50,
+        online_stake: 50,
     });
     let server = TestServer::start(node).await;
 

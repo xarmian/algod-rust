@@ -277,8 +277,15 @@ pub struct SupplyInfo {
     pub round: u64,
     /// Total money of participating accounts, in microAlgos.
     pub total_money: u64,
-    /// Total money of online accounts, in microAlgos.
+    /// Total money of online accounts at `round`, in microAlgos.
     pub online_money: u64,
+    /// Online stake at the agreement lookback round for `round` (same
+    /// `BalanceRound`/lookback used for sortition/committee sizing), in
+    /// microAlgos. Distinct from `online_money`, which is `round`'s own
+    /// online total. Mirrors go-algorand's
+    /// `LedgerForAPI().OnlineCirculation(BalanceRound(round), round)`
+    /// (`daemon/algod/api/server/v2/handlers.go` `GetSupply`, v4.6.0-stable).
+    pub online_stake: u64,
 }
 
 /// One transaction group's state delta together with the IDs (each txn ID and
