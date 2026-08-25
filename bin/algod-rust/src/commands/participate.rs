@@ -39,8 +39,9 @@ use sha2::{Digest as _, Sha512_256};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::commands::dual_gossip_node;
 use crate::commands::network_common::genesis_id_for;
-use crate::commands::p2p_transport::{P2pOptions, P2pTransport, P2pTransportConfig};
+use crate::commands::p2p_transport::{NetworkMode, P2pOptions, P2pTransport, P2pTransportConfig};
 use crate::config::RestConfig;
 use crate::node_interface_impl::{AlgodNodeInterface, NodeInterfaceConfig};
 
@@ -3139,16 +3140,18 @@ pub async fn run(
     // (`Hybrid`) or instead of (`P2pOnly`) the WS-gossip stack just
     // started above.
     //
-    // Inbound transactions received over the P2P TX gossipsub topic are
-    // fed into the very same `TxTagHandler` pipeline WS-received
-    // transactions use (sharing `pool` and `tx_seen_cache`), so dedup and
-    // pool-ingestion semantics are identical regardless of which
-    // transport delivered the transaction. Routing block proposals and
-    // votes through P2P (bridging `AgreementNetworkBridge`) is tracked as
-    // a follow-up — see `crate::commands::p2p_transport`'s module doc
-    // comment.
+    // `P2pTransport` implements `GossipNode` directly (#559), so inbound
+    // transactions received over the P2P TX gossipsub topic are fed into
+    // the very same `TxTagHandler` pipeline WS-received transactions use
+    // (sharing `pool` and `tx_seen_cache`) by registering that handler on
+    // `transport.multiplexer()`, exactly as it's registered on
+    // `gossip_node.multiplexer()` above. Outbound local-tx broadcast and
+    // agreement (proposal/vote/bundle) traffic are routed over whichever
+    // transport(s) `network_mode` has active via `p2p_active_gossip_node`
+    // below (a `DualGossipNode` fan-out in `Hybrid` mode) — see
+    // `crate::commands::dual_gossip_node`'s module doc comment.
     // -----------------------------------------------------------------------
-    let _p2p_transport: Option<P2pTransport> = if network_mode.p2p_active() {
+    let p2p_transport: Option<Arc<P2pTransport>> = if network_mode.p2p_active() {
         let listen_multiaddr = resolved_p2p
             .listen_address
             .as_deref()
@@ -3169,7 +3172,7 @@ pub async fn run(
             .clone()
             .or_else(|| ledger_path.parent().map(Path::to_path_buf));
 
-        let (transport, mut p2p_tx_rx) = P2pTransport::start(P2pTransportConfig {
+        let transport = P2pTransport::start(P2pTransportConfig {
             network_id: network.to_string(),
             listen_multiaddr,
             bootstrap_peers,
@@ -3189,28 +3192,38 @@ pub async fn run(
             peer_id = %transport.peer_id(),
             listening = transport.is_listening(),
             listen_addrs = ?transport.listen_addrs(),
+            connected_peers = transport.connected_peer_count(),
             "P2P transport started"
         );
 
-        let p2p_pool = pool.clone();
-        let p2p_seen = tx_seen_cache.clone();
-        tokio::spawn(async move {
-            let handler = algo_network::tx_tag_handler::TxTagHandler::new(p2p_pool, p2p_seen);
-            while let Some(data) = p2p_tx_rx.recv().await {
-                let msg = algo_network::IncomingMessage {
-                    tag: algo_network::Tag::Transaction,
-                    data,
-                    sender: "p2p-gossipsub".to_string(),
-                    received_at: chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
-                    peer: None,
-                };
-                let _ = algo_network::MessageHandler::handle(&handler, msg).await;
-            }
-        });
+        // Inbound TX routing: register the same pool/seen-cache-backed
+        // handler WS-gossip uses, before any P2P traffic can be dispatched.
+        transport.multiplexer().register_handlers(vec![
+            algo_network::handler::TaggedMessageHandler {
+                tag: algo_network::Tag::Transaction,
+                handler: Arc::new(algo_network::TxTagHandler::new(
+                    pool.clone(),
+                    tx_seen_cache.clone(),
+                )),
+            },
+        ]);
 
-        Some(transport)
+        Some(Arc::new(transport))
     } else {
         None
+    };
+
+    // The `GossipNode` traffic-routing traffic (outbound local tx,
+    // agreement proposals/votes/bundles) should flow over: WS-gossip only
+    // (`WsOnly`), the P2P transport only (`P2pOnly`), or both
+    // (`Hybrid`, via `DualGossipNode`) — matching `network_mode` exactly.
+    let p2p_active_gossip_node: Arc<dyn GossipNode> = match (&network_mode, &p2p_transport) {
+        (NetworkMode::P2pOnly, Some(p2p)) => p2p.clone() as Arc<dyn GossipNode>,
+        (NetworkMode::Hybrid, Some(p2p)) => Arc::new(dual_gossip_node::DualGossipNode::new(
+            gossip_node.clone() as Arc<dyn GossipNode>,
+            p2p.clone() as Arc<dyn GossipNode>,
+        )),
+        _ => gossip_node.clone() as Arc<dyn GossipNode>,
     };
 
     // -----------------------------------------------------------------------
@@ -3220,11 +3233,12 @@ pub async fn run(
     // of our local submissions are deduplicated before reaching the
     // pool. Needed by the `AlgodNodeInterface::broadcast_signed_tx_group`
     // path (PLAN-74 TASK-77) — cheap to construct even when the REST
-    // server is disabled so the adapter's shape stays stable.
+    // server is disabled so the adapter's shape stays stable. Broadcasts
+    // over whichever transport(s) `network_mode` has active (#559).
     // -----------------------------------------------------------------------
     let broadcaster = Arc::new(LocalTxBroadcaster::new(
         Arc::new(PoolIngestAdapter::new(pool.clone())),
-        gossip_node.clone() as Arc<dyn GossipNode>,
+        p2p_active_gossip_node.clone(),
         tx_seen_cache.clone(),
     ));
 
@@ -3308,16 +3322,17 @@ pub async fn run(
     // -----------------------------------------------------------------------
 
     // Network bridge: wraps GossipNode for agreement message passing.
+    // Uses `p2p_active_gossip_node` so proposals/votes/bundles flow over
+    // whichever transport(s) `network_mode` has active (#559) — in
+    // `WsOnly` mode this is exactly `gossip_node`, unchanged from before.
     let rt_handle = tokio::runtime::Handle::current();
-    let agreement_network = AgreementNetworkBridge::with_defaults(
-        gossip_node.clone() as Arc<dyn GossipNode>,
-        rt_handle.clone(),
-    );
+    let agreement_network =
+        AgreementNetworkBridge::with_defaults(p2p_active_gossip_node.clone(), rt_handle.clone());
 
-    // Network advancer: wraps the gossip node so the ledger bridge can
-    // signal network progress when certificates arrive.
+    // Network advancer: wraps the active gossip node(s) so the ledger
+    // bridge can signal network progress when certificates arrive.
     let network_advancer: Arc<dyn NetworkAdvancer> = Arc::new(GossipNetworkAdvancer {
-        node: gossip_node.clone() as Arc<dyn GossipNode>,
+        node: p2p_active_gossip_node.clone(),
     });
 
     // Ledger bridge: wraps SqliteLedger for agreement read/write access.
