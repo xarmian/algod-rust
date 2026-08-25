@@ -15,6 +15,7 @@ members = [
     "crates/core/algo-agreement",
     "crates/core/algo-pool",
     "crates/node/algo-network",
+    "crates/node/algo-p2p",
     "crates/node/algo-rest-api",
     "crates/node/algo-kmd",
     "crates/node/algo-kmd-api-types",
@@ -117,6 +118,7 @@ algo-agreement = { path = "crates/core/algo-agreement" }
 algo-pool = { path = "crates/core/algo-pool" }
 algo-falcon = { path = "crates/core/algo-falcon" }
 algo-network = { path = "crates/node/algo-network" }
+algo-p2p = { path = "crates/node/algo-p2p" }
 algo-rest-api = { path = "crates/node/algo-rest-api" }
 algo-kmd = { path = "crates/node/algo-kmd" }
 algo-kmd-api-types = { path = "crates/node/algo-kmd-api-types" }

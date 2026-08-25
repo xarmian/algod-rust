@@ -1,0 +1,23 @@
+[package]
+name = "algo-p2p"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+algo-error.workspace = true
+libp2p = { version = "0.54", features = [
+    "tcp",
+    "noise",
+    "yamux",
+    "tokio",
+] }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+futures-util.workspace = true
+void = "1"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
