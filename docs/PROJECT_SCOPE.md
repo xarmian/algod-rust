@@ -390,7 +390,9 @@ Acceptance:
 
 ## Phase 9 — go-algorand Version-Upgrade Parity Sweeps
 
-Ongoing maintenance phase, run whenever the pinned go-algorand reference version advances. Each sweep is its own epic (see `docs/epics/Epic-19-Go-Algorand-v4.6.0-Parity.md` for the first instance, `v4.5.1-stable` → `v4.6.0-stable`): analyze every upstream change since the last pin, classify it (consensus-critical / api / avm / network / behavioral-other / not-applicable), open one issue per feature-level change, implement, and re-pin. See `docs/PHASE9_PROPOSAL.md` and the `algod-version-upgrade` skill for the full process. Does not gate on or block Phase 7/8 — orthogonal maintenance work, can interleave with either.
+Ongoing maintenance phase, run whenever the pinned go-algorand reference version advances. Each sweep is its own epic (see `docs/epics/Epic-19-Go-Algorand-v4.6.0-Parity.md` for the first instance, `v4.5.1-stable` → `v4.6.0-stable`; `docs/epics/Epic-20-Go-Algorand-v4.7.0-Parity-And-P2P.md` for the second, `v4.6.0-stable` → `v4.7.0-stable`, also filed under its own `docs/PHASE10_PROPOSAL.md`): analyze every upstream change since the last pin, classify it (consensus-critical / api / avm / network / behavioral-other / not-applicable), open one issue per feature-level change, implement, and re-pin. See `docs/PHASE9_PROPOSAL.md`/`docs/PHASE10_PROPOSAL.md` and the `algod-version-upgrade` skill for the full process. Does not gate on or block Phase 7/8 — orthogonal maintenance work, can interleave with either.
+
+The `v4.6.0-stable → v4.7.0-stable` sweep additionally closes algod-rust's previously-deliberately-scoped-out libp2p P2P transport gap (see Phase 5's WS-gossip-only delivery above): a full `rust-libp2p`-based host, Kademlia DHT peer discovery, gossipsub block/vote/tx propagation, and capability advertisement, offered alongside the existing WS-gossip network in a configurable hybrid mode.
 
 ---
 
