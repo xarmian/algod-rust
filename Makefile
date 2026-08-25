@@ -5,6 +5,7 @@ COMPOSE_RUST := docker compose -f docker/docker-compose.localnet-rust.yml
 COMPOSE_RELAY := docker compose -f docker/docker-compose.test-relay.yml
 COMPOSE_MIXED := docker compose -f docker/docker-compose.mixed-cluster.yml
 COMPOSE_VALIDATE_API := docker compose -f docker/docker-compose.validate-api.yml
+COMPOSE_VFUTURE := docker compose -f docker/docker-compose.vfuture.yml
 PHASE6_CLUSTER := ops/mixed-cluster
 PHASE7_CLUSTER := ops/mixed-cluster-3rust
 P2P_INTEROP_CLUSTER := ops/mixed-cluster-p2p
@@ -19,6 +20,7 @@ P2P_INTEROP_CLUSTER := ops/mixed-cluster-p2p
 .PHONY: localnet-up localnet-down localnet-status localnet-logs algokey-e2e
 .PHONY: localnet-rust-up localnet-rust-down localnet-rust-status localnet-rust-logs localnet-rust-genesis
 .PHONY: capture validate validate-only generate-txns fixtures help
+.PHONY: vfuture-up vfuture-down vfuture-status vfuture-fixtures
 .PHONY: generate-diverse-txns fixtures-diverse
 .PHONY: canonical-extract extract-trackerdb-fixtures
 .PHONY: relay-up relay-down relay-test
@@ -289,6 +291,35 @@ fixtures: localnet-up
 	@echo "==> Extracting Go canonical references..."
 	$(MAKE) canonical-extract
 	@echo "==> Fixtures regenerated successfully."
+
+## ── vFuture Fixture Capture (issue #548) ──────────────────────
+## A single-node, 100%-stake go-algorand private network pinned to the
+## `future` consensus protocol, with MaxTxnBytesPerBlock shrunk (see
+## docker/config/vfuture-consensus.json) so a small transaction burst can
+## push a block's Load/CongestionTax ("ld"/"ct") header fields non-zero.
+## See docs/DEV_WORKFLOW.md -> "vFuture Fixture Capture".
+
+vfuture-up:
+	$(COMPOSE_VFUTURE) up -d
+	@echo "Waiting for algod-go-vfuture to be healthy..."
+	@until docker inspect --format='{{.State.Health.Status}}' algod-go-vfuture 2>/dev/null | grep -q healthy; do \
+		sleep 1; \
+	done
+	@echo "algod-go-vfuture is healthy — REST API on http://localhost:4010"
+
+vfuture-down:
+	$(COMPOSE_VFUTURE) down -v
+
+vfuture-status:
+	@curl -s http://localhost:4010/v2/status \
+		-H "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" | python3 -m json.tool
+
+## Full pipeline: brings the network up, floods it with transactions until
+## Load/CongestionTax go non-zero, captures the golden fixtures, tears the
+## network down. Requires a built `algod-rust` binary (release preferred):
+##   cargo build --release --bin algod-rust
+vfuture-fixtures:
+	bash docker/scripts/capture-vfuture-fixtures.sh
 
 DIVERSE_FIXTURE_BLOCKS ?= 12
 

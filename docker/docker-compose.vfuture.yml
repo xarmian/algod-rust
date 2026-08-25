@@ -1,0 +1,33 @@
+services:
+  algod-go-vfuture:
+    image: algorand/algod:4.7.0-stable
+    container_name: algod-go-vfuture
+    entrypoint: ["/scripts/vfuture-entrypoint.sh"]
+    environment:
+      - ALGORAND_DATA=/algod/data
+      - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    ports:
+      - "4010:8080"
+    volumes:
+      - algod-vfuture-data:/algod
+      - ./scripts/vfuture-entrypoint.sh:/scripts/vfuture-entrypoint.sh:ro
+      - ./config/vfuture-template.json:/etc/algorand/template.json:ro
+      - ./config/vfuture-consensus.json:/etc/algorand/vfuture-consensus.json:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "-H",
+          "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "http://localhost:8080/v2/status",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: "no"
+
+volumes:
+  algod-vfuture-data:
