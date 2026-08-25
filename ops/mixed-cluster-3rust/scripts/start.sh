@@ -23,7 +23,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 
 NETROOT="$ROOT/netroot"
 TEMPLATE="$ROOT/template.json"
-ALGOD_IMG="algorand/algod:4.6.0-stable"
+ALGOD_IMG="algorand/algod:4.7.0-stable"
 NUM_ROUNDS="${NUM_ROUNDS:-30000}"
 GENESIS_ID_FILE="$NETROOT/.phase7-genesis-id"
 ENV_FILE="$NETROOT/.phase7-env"

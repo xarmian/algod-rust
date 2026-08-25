@@ -68,11 +68,11 @@ Epics 31 and 32 can proceed in parallel after Epic 30. The critical path runs th
 - **WebSocket handshake complexity:** go-algorand's handshake involves many headers and an identity challenge. Any mismatch causes connection rejection. Mitigated by wire fixture capture and step-by-step conformance testing.
 - **Relay performance:** Message forwarding under load requires careful queue management and backpressure. Mitigated by matching go-algorand's broadcast thread design exactly.
 - **DNS SRV reliability:** Bootstrap DNS may have availability issues. Mitigated by config-file fallback peer lists.
-- **Protocol version evolution:** Future go-algorand versions may change the wire protocol. Mitigated by pinning to v4.6.0-stable and version negotiation support.
+- **Protocol version evolution:** Future go-algorand versions may change the wire protocol. Mitigated by pinning to v4.7.0-stable and version negotiation support.
 
 ## Reference
 
-All implementation guided by go-algorand source at `../go-algorand` (v4.6.0-stable). Key reference files:
+All implementation guided by go-algorand source at `../go-algorand` (v4.7.0-stable). Key reference files:
 - `protocol/tags.go` — protocol tags and max sizes
 - `network/wsNetwork.go` — WebSocket network, handshake, mesh management, relay
 - `network/wsPeer.go` — per-peer read/write loops

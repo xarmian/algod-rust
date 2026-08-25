@@ -33,7 +33,7 @@
 // relative to this tool's directory, which is the parent of the
 // `algod-rust` repo root. From a fresh clone of `algod-rust`:
 //
-//  1. Check out go-algorand v4.6.0-stable as a sibling of `algod-rust`.
+//  1. Check out go-algorand v4.7.0-stable as a sibling of `algod-rust`.
 //  2. From this tool's directory: `go run .`
 package main
 

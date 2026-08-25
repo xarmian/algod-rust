@@ -1,7 +1,7 @@
 name: algokey-rust e2e
 
 # End-to-end test suite for algokey-rust against a live algod-go localnet
-# AND the pinned go-algorand@v4.6.0-stable `algokey` binary for the
+# AND the pinned go-algorand@v4.7.0-stable `algokey` binary for the
 # bidirectional compatibility matrix.
 #
 # Runs only when paths the suite actually exercises change, so most PRs
@@ -48,8 +48,8 @@ env:
   RUSTFLAGS: "-D warnings"
   # Pin go-algorand to the same rev the rest of the repo references. Bumping
   # this also requires updating the local `../go-algorand` checkout and any
-  # fixture READMEs that mention v4.6.0-stable.
-  GO_ALGORAND_REV: "v4.6.0-stable"
+  # fixture READMEs that mention v4.7.0-stable.
+  GO_ALGORAND_REV: "v4.7.0-stable"
 
 jobs:
   e2e:
