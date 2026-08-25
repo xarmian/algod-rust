@@ -963,10 +963,35 @@ pub struct BoxNameParams {
 }
 
 /// Query parameters for the `get_application_boxes` endpoint.
+///
+/// `max` is the legacy (pre-#536) unpaginated call shape. `limit`, `next`,
+/// `prefix`, `include`, and `round` opt into the go-algorand v4.7.0-beta
+/// cursor-pagination mode (PR #6558) -- providing any of them switches the
+/// handler to the paginated branch.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BoxesParams {
-    /// Maximum number of box descriptors to return.
+    /// Maximum number of box names to return (legacy call shape only).
     pub max: Option<u64>,
+
+    /// Maximum number of boxes to return per page (pagination mode).
+    pub limit: Option<u64>,
+
+    /// Pagination cursor: a box name in goal app call arg form
+    /// (`encoding:value`), representing the earliest box name to include in
+    /// results, exclusive. Use the `next-token` from a previous response.
+    pub next: Option<String>,
+
+    /// A box name prefix, in goal app call arg form, to filter results by.
+    /// Only boxes whose names start with this prefix are returned.
+    pub prefix: Option<String>,
+
+    /// Comma-separated list of additional items to include. Only the
+    /// `values` token is recognized -- it includes base64 box values in
+    /// the response.
+    pub include: Option<String>,
+
+    /// Return box data as of the given round (pagination mode only).
+    pub round: Option<u64>,
 }
 
 /// Returns application information for the given application ID.
@@ -1092,7 +1117,41 @@ pub async fn get_application_boxes<N: NodeInterface>(
     Path(app_id): Path<u64>,
     Query(params): Query<BoxesParams>,
 ) -> Response {
-    let requested_max = params.max.unwrap_or(0);
+    let limit = params.limit.unwrap_or(0);
+    let include_values = params
+        .include
+        .as_deref()
+        .map(|s| s.split(',').any(|part| part.trim() == "values"))
+        .unwrap_or(false);
+    let has_prefix = params.prefix.as_deref().is_some_and(|p| !p.is_empty());
+
+    // When none of the pagination-related params are provided, preserve
+    // the original (pre-#536) unpaginated behavior exactly, matching
+    // go-algorand's `GetApplicationBoxes` legacy-branch condition
+    // (handlers.go): `limit == 0 && next == nil && !includeValues &&
+    // prefix in {nil, ""} && round == nil`.
+    if limit == 0
+        && params.next.is_none()
+        && !include_values
+        && !has_prefix
+        && params.round.is_none()
+    {
+        return get_application_boxes_legacy(node.as_ref(), app_id, params.max).await;
+    }
+
+    get_application_boxes_paginated(node.as_ref(), app_id, limit, include_values, &params).await
+}
+
+/// Preserves the original unpaginated `GET /v2/applications/{id}/boxes`
+/// behavior: enumerate every box name for the application, subject to the
+/// server/client `max` result-count limit. Mirrors go-algorand's
+/// `getApplicationBoxesLegacy` (handlers.go).
+async fn get_application_boxes_legacy<N: NodeInterface>(
+    node: &N,
+    app_id: u64,
+    max_param: Option<u64>,
+) -> Response {
+    let requested_max = max_param.unwrap_or(0);
     let algod_max = node.max_api_box_per_application();
 
     // Compute effective max using the same logic as go-algorand's
@@ -1152,15 +1211,138 @@ pub async fn get_application_boxes<N: NodeInterface>(
     // raw box names (the node implementation handles prefix stripping).
     let boxes: Vec<models::BoxDescriptor> = box_keys
         .into_iter()
-        .map(|name| models::BoxDescriptor { name })
+        .map(|name| models::BoxDescriptor { name, value: None })
         .collect();
 
-    let response = models::BoxesResponse { boxes };
+    let response = models::BoxesResponse {
+        boxes,
+        next_token: None,
+        round: None,
+    };
 
     match serde_json::to_vec(&response) {
         Ok(body) => (StatusCode::OK, [("content-type", "application/json")], body).into_response(),
         Err(_) => error::internal_error("failed to encode response"),
     }
+}
+
+/// Cursor-paginated, prefix-filterable box listing (go-algorand v4.7.0-beta
+/// PR #6558, issue #536). Reached whenever any of `limit`, `next`,
+/// `prefix`, `include`, or `round` is present on the request.
+async fn get_application_boxes_paginated<N: NodeInterface>(
+    node: &N,
+    app_id: u64,
+    limit: u64,
+    include_values: bool,
+    params: &BoxesParams,
+) -> Response {
+    use crate::box_name;
+
+    // Validate the caller-specified round against the latest known round.
+    // This node does not retain historical box state, so a round strictly
+    // in the past cannot be served faithfully; only `None` (implicitly
+    // "latest") or a round matching latest is supported. This mirrors
+    // go-algorand's `errRoundGreaterThanTheLatest` check for the "future
+    // round" case; the "past round" case is a documented limitation of
+    // this node (tracked as a follow-up, see issue #536's audit) rather
+    // than silently returning data for the wrong round.
+    if let Some(requested_round) = params.round {
+        let latest_round = match node.status().await {
+            Ok(status) => status.last_round,
+            Err(e) => return error::ledger_error_response(e),
+        };
+        if requested_round > latest_round {
+            return error::bad_request("given round is greater than the latest round");
+        }
+        if requested_round < latest_round {
+            return error::bad_request(
+                "historical round queries are not supported for application boxes",
+            );
+        }
+    }
+
+    // Cap limit to the server's MaxAPIBoxPerApplication configuration,
+    // matching handlers.go's algodMax clamp in the pagination branch.
+    let algod_max = node.max_api_box_per_application();
+    let effective_limit = if algod_max > 0 && (limit == 0 || limit > algod_max) {
+        algod_max
+    } else {
+        limit
+    };
+    let limit_opt = if effective_limit == 0 {
+        None
+    } else {
+        Some(effective_limit)
+    };
+
+    // Parse the pagination cursor from the `next` token, in goal app call
+    // arg form (same encoding as the `name` param on the single-box
+    // endpoint).
+    let cursor = match params.next.as_deref() {
+        Some(s) if !s.is_empty() => match box_name::parse_box_name(s) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => return error::bad_request(format!("invalid next token: {e}")),
+        },
+        _ => None,
+    };
+
+    // Parse the box-name prefix filter, in goal app call arg form.
+    let prefix = match params.prefix.as_deref() {
+        Some(s) if !s.is_empty() => match box_name::parse_box_name(s) {
+            Ok(bytes) => bytes,
+            Err(e) => return error::bad_request(format!("invalid prefix: {e}")),
+        },
+        _ => Vec::new(),
+    };
+
+    let (results, round, more_data) = match node
+        .lookup_kv_pairs_by_prefix(
+            app_id,
+            &prefix,
+            cursor.as_deref(),
+            limit_opt,
+            include_values,
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return error::ledger_error_response(e),
+    };
+
+    // Set next-token when more qualifying data exists beyond this page,
+    // matching handlers.go's `encodeBoxNameAsAppCallBytes(lastBoxName)`.
+    let next_token = if more_data {
+        results
+            .last()
+            .map(|(name, _)| encode_box_name_as_app_call_bytes(name))
+    } else {
+        None
+    };
+
+    let boxes: Vec<models::BoxDescriptor> = results
+        .into_iter()
+        .map(|(name, value)| models::BoxDescriptor { name, value })
+        .collect();
+
+    let response = models::BoxesResponse {
+        boxes,
+        next_token,
+        round: Some(round),
+    };
+
+    match serde_json::to_vec(&response) {
+        Ok(body) => (StatusCode::OK, [("content-type", "application/json")], body).into_response(),
+        Err(_) => error::internal_error("failed to encode response"),
+    }
+}
+
+/// Encode a raw box name as a `b64:`-prefixed goal app call arg string, for
+/// use as a pagination `next-token`. Mirrors go-algorand's
+/// `encodeBoxNameAsAppCallBytes` (handlers.go).
+fn encode_box_name_as_app_call_bytes(name: &[u8]) -> String {
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::Engine as _;
+    format!("b64:{}", BASE64_STANDARD.encode(name))
 }
 
 // ---------------------------------------------------------------------------

@@ -550,6 +550,35 @@ pub trait NodeInterface: Send + Sync + 'static {
         Err(NodeError::NotImplemented("lookup_keys_by_prefix"))
     }
 
+    /// Paginated, prefix-filtered box listing with an exclusive-start
+    /// cursor, used by the cursor-pagination mode of
+    /// `GET /v2/applications/{id}/boxes` (issue #536).
+    ///
+    /// `prefix` filters box names to those starting with it (an empty
+    /// slice matches all boxes for the application). `cursor`, when
+    /// `Some`, excludes box names lexicographically `<=` the cursor.
+    /// `limit`, when `Some`, caps the number of entries returned.
+    /// `include_values` controls whether box values are populated
+    /// alongside names.
+    ///
+    /// Returns `(results, round, more_data)` where each result is
+    /// `(box_name, value)` with `value` present only when
+    /// `include_values` is true, and `more_data` indicates whether at
+    /// least one more qualifying box exists beyond what was returned.
+    ///
+    /// Mirrors go-algorand's `Ledger.LookupKvPairsByPrefix` in
+    /// `ledger/ledger.go`.
+    async fn lookup_kv_pairs_by_prefix(
+        &self,
+        _app_id: u64,
+        _prefix: &[u8],
+        _cursor: Option<&[u8]>,
+        _limit: Option<u64>,
+        _include_values: bool,
+    ) -> Result<(algo_ledger::store_trait::BoxPage, u64, bool), NodeError> {
+        Err(NodeError::NotImplemented("lookup_kv_pairs_by_prefix"))
+    }
+
     /// Return the total number of boxes for an application, via an O(1)
     /// account record lookup.
     ///

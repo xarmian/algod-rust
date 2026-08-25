@@ -1240,6 +1240,25 @@ impl NodeInterface for AlgodNodeInterface {
         Ok((keys, last_round))
     }
 
+    async fn lookup_kv_pairs_by_prefix(
+        &self,
+        app_id: u64,
+        prefix: &[u8],
+        cursor: Option<&[u8]>,
+        limit: Option<u64>,
+        include_values: bool,
+    ) -> Result<(algo_ledger::store_trait::BoxPage, u64, bool), NodeError> {
+        let ledger = self.lock_ledger("lookup_kv_pairs_by_prefix")?;
+        let last_round = Self::committed_round(&ledger, "lookup_kv_pairs_by_prefix")?;
+        // `box_keys_by_prefix_paginated` returns box names already stripped
+        // of the KV prefix (store_trait.rs), matching
+        // ledger.LookupKvPairsByPrefix (ledger.go) + apps.MakeBoxKey
+        // (handlers.go:GetApplicationBoxes pagination branch).
+        let (results, more_data) =
+            ledger.box_keys_by_prefix_paginated(app_id, prefix, cursor, limit, include_values);
+        Ok((results, last_round, more_data))
+    }
+
     async fn total_boxes(&self, app_id: u64) -> Result<(u64, u64), NodeError> {
         let ledger = self.lock_ledger("total_boxes")?;
         let last_round = Self::committed_round(&ledger, "total_boxes")?;

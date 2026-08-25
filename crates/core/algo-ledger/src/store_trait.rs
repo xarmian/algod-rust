@@ -4,6 +4,11 @@ use algo_types::{
     Round,
 };
 
+/// One page of `(box_name, value)` results from
+/// [`LedgerStore::box_keys_by_prefix_paginated`]. `value` is `None` unless
+/// `include_values` was requested.
+pub type BoxPage = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+
 /// Abstraction over ledger storage backends.
 ///
 /// Both the in-memory `LedgerState` and a future SQLite backend implement
@@ -180,6 +185,67 @@ pub trait LedgerStore {
     /// The returned `Vec<u8>` items are the raw box names without the
     /// `"bx:" + app_id` prefix.
     fn box_keys_for_app(&self, app_id: u64) -> Vec<Vec<u8>>;
+
+    /// Enumerate box names (and optionally values) for an application,
+    /// filtered by `prefix` and paginated via an exclusive-start `cursor`,
+    /// in ascending byte-lexicographic order by raw box name.
+    ///
+    /// `cursor`, when `Some`, excludes any box name that is
+    /// lexicographically `<=` the cursor (the cursor itself is never
+    /// re-returned, matching go-algorand's `LookupKeysByPrefixCursor` in
+    /// `ledger/store/trackerdb/generickv/accounts_reader.go`). `limit`,
+    /// when `Some`, caps the number of returned entries; the second
+    /// element of the return tuple reports whether at least one more
+    /// qualifying box exists beyond what was returned (used to decide
+    /// whether the REST layer should emit a `next-token`).
+    ///
+    /// Default implementation built on [`Self::box_keys_for_app`] and
+    /// [`Self::get_box`] — correct for every backend without requiring a
+    /// bespoke range-scan implementation per storage engine, matching this
+    /// endpoint's `effort:medium` scope (see issue #536). A backend may
+    /// override this with a native sorted range scan if profiling ever
+    /// shows this endpoint as a bottleneck.
+    fn box_keys_by_prefix_paginated(
+        &self,
+        app_id: u64,
+        prefix: &[u8],
+        cursor: Option<&[u8]>,
+        limit: Option<u64>,
+        include_values: bool,
+    ) -> (BoxPage, bool) {
+        let mut names: Vec<Vec<u8>> = self
+            .box_keys_for_app(app_id)
+            .into_iter()
+            .filter(|name| name.starts_with(prefix))
+            .filter(|name| match cursor {
+                Some(c) => name.as_slice() > c,
+                None => true,
+            })
+            .collect();
+        names.sort();
+
+        let more_data = match limit {
+            Some(l) => (names.len() as u64) > l,
+            None => false,
+        };
+        if let Some(l) = limit {
+            names.truncate(l as usize);
+        }
+
+        let results = names
+            .into_iter()
+            .map(|name| {
+                let value = if include_values {
+                    self.get_box(app_id, &name)
+                } else {
+                    None
+                };
+                (name, value)
+            })
+            .collect();
+
+        (results, more_data)
+    }
 
     // ---- Leases ----
 

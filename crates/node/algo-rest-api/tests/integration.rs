@@ -85,6 +85,12 @@ struct MockNode {
     kv_lookups: BTreeMap<(u64, Vec<u8>), (Option<Vec<u8>>, u64)>,
     /// Keys-by-prefix results, keyed by app_id.
     keys_by_prefix: BTreeMap<u64, (Vec<Vec<u8>>, u64)>,
+    /// Backing box store for `lookup_kv_pairs_by_prefix` (cursor pagination,
+    /// issue #536), keyed by app_id -> box name -> value. Real prefix
+    /// filtering, cursor exclusion, sorting, and limiting are applied by
+    /// the mock (unlike `keys_by_prefix` above, which ignores its prefix
+    /// argument), so pagination tests exercise real handler behavior.
+    box_store: BTreeMap<u64, BTreeMap<Vec<u8>, Vec<u8>>>,
     /// Total boxes count results, keyed by app_id. Returns (total_boxes, round).
     total_boxes_map: BTreeMap<u64, (u64, u64)>,
     /// Max API boxes per application.
@@ -184,6 +190,7 @@ impl Clone for MockNode {
             asset_lookups: self.asset_lookups.clone(),
             kv_lookups: self.kv_lookups.clone(),
             keys_by_prefix: self.keys_by_prefix.clone(),
+            box_store: self.box_store.clone(),
             total_boxes_map: self.total_boxes_map.clone(),
             max_api_boxes: self.max_api_boxes,
             blocks: self.blocks.clone(),
@@ -294,6 +301,7 @@ impl MockNode {
             asset_lookups: BTreeMap::new(),
             kv_lookups: BTreeMap::new(),
             keys_by_prefix: BTreeMap::new(),
+            box_store: BTreeMap::new(),
             total_boxes_map: BTreeMap::new(),
             max_api_boxes: 100_000,
             blocks: BTreeMap::new(),
@@ -681,6 +689,52 @@ impl NodeInterface for MockNode {
             Some(result) => Ok(result.clone()),
             None => Ok((vec![], 1000)),
         }
+    }
+
+    async fn lookup_kv_pairs_by_prefix(
+        &self,
+        app_id: u64,
+        prefix: &[u8],
+        cursor: Option<&[u8]>,
+        limit: Option<u64>,
+        include_values: bool,
+    ) -> Result<(algo_ledger::store_trait::BoxPage, u64, bool), NodeError> {
+        let mut names: Vec<Vec<u8>> = match self.box_store.get(&app_id) {
+            Some(boxes) => boxes
+                .keys()
+                .filter(|name| name.starts_with(prefix))
+                .filter(|name| match cursor {
+                    Some(c) => name.as_slice() > c,
+                    None => true,
+                })
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        };
+        names.sort();
+
+        let more_data = match limit {
+            Some(l) => (names.len() as u64) > l,
+            None => false,
+        };
+        if let Some(l) = limit {
+            names.truncate(l as usize);
+        }
+
+        let boxes = self.box_store.get(&app_id);
+        let results = names
+            .into_iter()
+            .map(|name| {
+                let value = if include_values {
+                    boxes.and_then(|b| b.get(&name)).cloned()
+                } else {
+                    None
+                };
+                (name, value)
+            })
+            .collect();
+
+        Ok((results, 1000, more_data))
     }
 
     async fn total_boxes(&self, app_id: u64) -> Result<(u64, u64), NodeError> {
@@ -4022,6 +4076,263 @@ async fn get_application_boxes_max_param_triggers_limit() {
     let data = &body["data"];
     assert_eq!(data["total-boxes"].as_u64().unwrap(), 3);
     assert_eq!(data["max"].as_u64().unwrap(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Application boxes cursor pagination + prefix tests (issue #536)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_application_boxes_paginates_across_multiple_pages_without_dup_or_gap() {
+    let mut node = MockNode::synced();
+    let mut boxes = BTreeMap::new();
+    for i in 0..5u8 {
+        boxes.insert(vec![b'a' + i], vec![i]);
+    }
+    node.box_store.insert(400, boxes);
+    let server = TestServer::start(node).await;
+
+    // Page 1: limit=2.
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/400/boxes?limit=2"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let page1: Vec<String> = body["boxes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(page1.len(), 2);
+    let next_token = body["next-token"]
+        .as_str()
+        .expect("expected next-token on non-final page")
+        .to_string();
+    assert_eq!(body["round"].as_u64().unwrap(), 1000);
+
+    // Page 2: use next-token from page 1.
+    let resp = server
+        .client
+        .get(server.url(&format!(
+            "/v2/applications/400/boxes?limit=2&next={}",
+            urlencoding_encode(&next_token)
+        )))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let page2: Vec<String> = body["boxes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(page2.len(), 2);
+    let next_token2 = body["next-token"]
+        .as_str()
+        .expect("expected next-token on non-final page")
+        .to_string();
+
+    // Page 3: final page, no more data -> no next-token.
+    let resp = server
+        .client
+        .get(server.url(&format!(
+            "/v2/applications/400/boxes?limit=2&next={}",
+            urlencoding_encode(&next_token2)
+        )))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let page3: Vec<String> = body["boxes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(page3.len(), 1);
+    assert!(
+        body.get("next-token").is_none(),
+        "final page must not carry a next-token"
+    );
+
+    // Concatenating all pages must reproduce all 5 boxes, in ascending
+    // order, with no duplicates and no gaps.
+    let mut all = page1;
+    all.extend(page2);
+    all.extend(page3);
+    let expected: Vec<String> = (0..5u8)
+        .map(|i| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, vec![b'a' + i]))
+        .collect();
+    assert_eq!(all, expected);
+}
+
+#[tokio::test]
+async fn get_application_boxes_filters_by_prefix() {
+    let mut node = MockNode::synced();
+    let mut boxes = BTreeMap::new();
+    boxes.insert(b"foo1".to_vec(), b"v1".to_vec());
+    boxes.insert(b"foo2".to_vec(), b"v2".to_vec());
+    boxes.insert(b"bar1".to_vec(), b"v3".to_vec());
+    node.box_store.insert(401, boxes);
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/401/boxes?prefix=str:foo"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let names: Vec<Vec<u8>> = body["boxes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| {
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                b["name"].as_str().unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(names.len(), 2);
+    assert!(names.contains(&b"foo1".to_vec()));
+    assert!(names.contains(&b"foo2".to_vec()));
+    assert!(!names.contains(&b"bar1".to_vec()));
+}
+
+#[tokio::test]
+async fn get_application_boxes_include_values_returns_box_values() {
+    let mut node = MockNode::synced();
+    let mut boxes = BTreeMap::new();
+    boxes.insert(b"mybox".to_vec(), b"myvalue".to_vec());
+    node.box_store.insert(402, boxes);
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/402/boxes?include=values"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let boxes = body["boxes"].as_array().unwrap();
+    assert_eq!(boxes.len(), 1);
+    let value = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        boxes[0]["value"].as_str().expect("value field present"),
+    )
+    .unwrap();
+    assert_eq!(value, b"myvalue");
+}
+
+#[tokio::test]
+async fn get_application_boxes_without_include_values_omits_value_field() {
+    let mut node = MockNode::synced();
+    let mut boxes = BTreeMap::new();
+    boxes.insert(b"mybox".to_vec(), b"myvalue".to_vec());
+    node.box_store.insert(403, boxes);
+    let server = TestServer::start(node).await;
+
+    // `limit` alone (no `include`) opts into pagination mode, but values
+    // must stay absent from the response.
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/403/boxes?limit=10"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let boxes = body["boxes"].as_array().unwrap();
+    assert_eq!(boxes.len(), 1);
+    assert!(
+        boxes[0].get("value").is_none(),
+        "value field must be omitted when `values` isn't requested"
+    );
+}
+
+#[tokio::test]
+async fn get_application_boxes_legacy_call_shape_unaffected_by_pagination_feature() {
+    // No pagination params at all: response must match the pre-#536 shape
+    // exactly -- no "next-token"/"round" fields, and box descriptors carry
+    // no "value" field.
+    let mut node = MockNode::synced();
+    let box_names = vec![b"box1".to_vec(), b"box2".to_vec(), b"box3".to_vec()];
+    node.keys_by_prefix.insert(404, (box_names, 1000));
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/404/boxes"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["boxes"].as_array().unwrap().len(), 3);
+    assert!(
+        body.get("next-token").is_none(),
+        "legacy call shape must not include next-token"
+    );
+    assert!(
+        body.get("round").is_none(),
+        "legacy call shape must not include round"
+    );
+    for b in body["boxes"].as_array().unwrap() {
+        assert!(b.get("value").is_none());
+    }
+}
+
+#[tokio::test]
+async fn get_application_boxes_round_greater_than_latest_returns_400() {
+    let node = MockNode::synced(); // status.last_round == 1000
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v2/applications/405/boxes?round=1001"))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["message"].as_str().unwrap(),
+        "given round is greater than the latest round"
+    );
+}
+
+/// Minimal percent-encoding for a `next-token` string (contains only
+/// base64 alphabet characters plus `:` and possibly `+`, `/`, `=`) when
+/// used as a raw query-string value in these tests.
+fn urlencoding_encode(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '+' => "%2B".to_string(),
+            '/' => "%2F".to_string(),
+            '=' => "%3D".to_string(),
+            ':' => "%3A".to_string(),
+            c => c.to_string(),
+        })
+        .collect()
 }
 
 // ===========================================================================

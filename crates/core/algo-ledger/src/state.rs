@@ -2224,4 +2224,90 @@ mod tests {
         assert_eq!(state.get_box(100, b"box_a").unwrap(), b"alpha");
         assert_eq!(state.get_box(100, b"box_c").unwrap(), b"gamma");
     }
+
+    /// Issue #536: cursor-based pagination must walk every box exactly
+    /// once, in ascending byte-lexicographic order, with no duplicates and
+    /// no gaps across pages -- regardless of the page size chosen.
+    #[test]
+    fn test_box_pagination_no_dup_or_gap_across_pages() {
+        use crate::store_trait::LedgerStore;
+
+        let mut state = LedgerState::new();
+        // Insert boxes out of lexicographic order to prove sorting happens.
+        for name in [b"e", b"c", b"a", b"d", b"b"] {
+            state.set_box(100, name, name.to_vec());
+        }
+
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut collected: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let (page, more) =
+                state.box_keys_by_prefix_paginated(100, b"", cursor.as_deref(), Some(2), false);
+            assert!(
+                page.len() <= 2,
+                "page must never exceed the requested limit"
+            );
+            if page.is_empty() {
+                assert!(!more, "empty page must not claim more data remains");
+                break;
+            }
+            for (name, value) in &page {
+                assert!(value.is_none(), "include_values=false must omit values");
+                assert!(
+                    !collected.contains(name),
+                    "box {name:?} returned more than once across pages"
+                );
+            }
+            cursor = Some(page.last().unwrap().0.clone());
+            collected.extend(page.into_iter().map(|(name, _)| name));
+            if !more {
+                break;
+            }
+        }
+
+        assert_eq!(
+            collected,
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"d".to_vec(),
+                b"e".to_vec()
+            ],
+            "pagination must reproduce every box, in sorted order, with no gaps"
+        );
+    }
+
+    /// Issue #536: the prefix filter must exclude non-matching box names,
+    /// including when combined with pagination.
+    #[test]
+    fn test_box_pagination_prefix_filter() {
+        use crate::store_trait::LedgerStore;
+
+        let mut state = LedgerState::new();
+        state.set_box(100, b"foo1", b"v1".to_vec());
+        state.set_box(100, b"foo2", b"v2".to_vec());
+        state.set_box(100, b"bar1", b"v3".to_vec());
+
+        let (page, more) = state.box_keys_by_prefix_paginated(100, b"foo", None, None, true);
+        assert!(!more);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0], (b"foo1".to_vec(), Some(b"v1".to_vec())));
+        assert_eq!(page[1], (b"foo2".to_vec(), Some(b"v2".to_vec())));
+    }
+
+    /// Issue #536: the cursor is exclusive -- the box named exactly the
+    /// cursor value must never be re-returned.
+    #[test]
+    fn test_box_pagination_cursor_is_exclusive() {
+        use crate::store_trait::LedgerStore;
+
+        let mut state = LedgerState::new();
+        state.set_box(100, b"a", b"1".to_vec());
+        state.set_box(100, b"b", b"2".to_vec());
+
+        let (page, more) = state.box_keys_by_prefix_paginated(100, b"", Some(b"a"), None, false);
+        assert!(!more);
+        assert_eq!(page, vec![(b"b".to_vec(), None)]);
+    }
 }
