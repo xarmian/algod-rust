@@ -891,6 +891,122 @@ The ordered playbook for a pin bump (e.g. `v4.5.1-stable` →
    + every Rust-side port. CI's `conformance-parity` job replays the
    fresh corpus end-to-end.
 
+## vFuture Fixture Capture (issue #548)
+
+`vFuture` (go-algorand's `protocol.ConsensusFuture`, the `"future"`
+consensus label) is a perpetual staging protocol for consensus changes
+that haven't shipped on a real network yet. Before #548, no part of the
+fixture/conformance harness ever stood up a node running it, so a
+`vFuture`-only field (the `Load`/`CongestionTax` header fields added in
+#534/PR #547, or any future one — see `crates/core/algo-types/src/
+consensus.rs`) had no byte-exact go-algorand fixture to verify against,
+only Rust-side unit tests pinned to values taken from go-algorand's own
+Go test source. See `docs/CONFORMANCE_STRATEGY.md` §14.5 for the full
+rationale.
+
+### One-command capture
+
+```bash
+# 1. Build the capture binary (release strongly preferred -- see the
+#    Windows note below):
+cargo build --release --bin algod-rust
+
+# 2. Run the full pipeline: bring the vFuture network up, flood it with
+#    transactions, capture the fixtures, tear the network down.
+docker/scripts/capture-vfuture-fixtures.sh
+```
+
+Output lands at `crates/core/algo-ledger/tests/fixtures/vfuture/`
+(`block_<round>.msgpack` + `.json` + `.meta.json`, exactly like every
+other `algod-rust capture` output — see "Regenerating Test Fixtures"
+above). Verify the refreshed fixtures still pass:
+
+```bash
+cargo test -p algo-ledger --test vfuture_load_fixture
+```
+
+### Manual steps (for debugging)
+
+```bash
+# Bring the network up (single-node, 100%-stake, "future" protocol):
+make vfuture-up
+make vfuture-status   # -> "last-version": "future"
+
+# goal is baked into the image, same convention as the algod-go localnet:
+docker exec algod-go-vfuture goal kmd start -d /algod/data
+ADDR=$(docker exec algod-go-vfuture goal account list -d /algod/data | awk '{print $2; exit}')
+
+# Flood enough --no-wait payments to push a block over 50% full. The
+# per-block ceiling is deliberately small (see below), so a few dozen
+# suffice -- flooding the real 5 MiB default would need thousands.
+for i in $(seq 1 40); do
+  docker exec algod-go-vfuture goal clerk send -a 1000 -f "$ADDR" -t "$ADDR" \
+      -d /algod/data -n "flood-$i" -N &
+done
+wait
+
+# Inspect recent blocks for non-zero "ld"/"ct":
+curl -s -H "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+    http://localhost:4010/v2/blocks/<round> | python3 -m json.tool
+
+# Capture with the ordinary pipeline once you've found the round window:
+target/release/algod-rust capture --algod-url http://localhost:4010 \
+    --algod-token aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    --start <N> --end <M> --out crates/core/algo-ledger/tests/fixtures/vfuture
+
+make vfuture-down
+```
+
+### Why `MaxTxnBytesPerBlock` is overridden
+
+`CongestionTax` only goes non-zero the round *after* `Load` (block
+byte-fullness) exceeds 50% (go-algorand's `NextCongestionTax`,
+`data/bookkeeping/block.go`) — below that threshold the tax stays
+saturated at zero forever. The real `future` protocol's
+`MaxTxnBytesPerBlock` is 5 MiB (inherited from V41), so reaching 50%
+organically would take thousands of transactions per round. Instead,
+`docker/config/vfuture-consensus.json` overrides `future`'s
+`MaxTxnBytesPerBlock` down to a few KiB via go-algorand's own
+`consensus.json` configurable-protocols file
+(`config.ConfigurableConsensusProtocolsFilename`, merged in whole —
+not per-field — over the built-in params at `cmd/algod/main.go`
+startup), so a few dozen payment transactions are enough.
+
+That override file is a generated artifact, not hand-written (a
+partial JSON would zero every *other* `future` consensus param, since
+`config.ConsensusProtocols.Merge` replaces the whole struct per
+version). Regenerate it with:
+
+```bash
+cd tools/vfuture-consensus-override
+go run . -out ../../docker/config/vfuture-consensus.json
+```
+
+This tool needs `../go-algorand`'s `config`/`protocol` packages to
+compile, which pulls in the `crypto` package's cgo bindings
+transitively (for `basics.Address == crypto.Digest`) even though
+nothing here ever calls a signature or VRF function. Building the real
+vendored libsodium fork just for that is unnecessary and (as of this
+writing) fights Debian's newer `libtool` on a fresh container — see
+the tool's own comments. **On Windows** there's no C compiler on PATH
+at all (see the Windows cargo/MSVC note below), so this regeneration
+needs a Linux environment (Docker: `golang:1.25-bookworm` or
+`ubuntu:22.04` + `build-essential` both work) either way.
+
+### Windows note: capture in `--release`, not debug
+
+The unoptimized debug build of the full `algod-rust` binary (its huge
+dependency graph — tokio, reqwest, libp2p — plus deeply generic serde
+derive code for `BlockResponse`) has been observed to overflow the
+default 1 MiB Windows thread stack decoding an ordinary ~1 KiB block,
+even though the same decode succeeds instantly (and via both the serde
+and the hand-rolled "fast" decoder paths) when exercised in isolation
+against just the `algo-codec` crate. This is stack-frame bloat from
+the debug build's inlining/generics, not a data-dependent decode bug —
+`cargo build --release --bin algod-rust` does not reproduce it. Always
+use the release binary (or set `RUST_MIN_STACK` generously) for
+`capture`/`sync`/`replay` on Windows.
+
 ## Phase A acceptance fixture capture
 
 PLAN-35 (DB Interchange — Phase A: Reader Side) ships an acceptance
