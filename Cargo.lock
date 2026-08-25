@@ -440,14 +440,10 @@ dependencies = [
 name = "algo-p2p"
 version = "0.1.0"
 dependencies = [
- "algo-error",
  "futures-util",
  "libp2p",
- "rand 0.8.5",
  "thiserror 2.0.18",
  "tokio",
- "tracing",
- "tracing-subscriber",
  "void",
 ]
 
