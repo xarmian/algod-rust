@@ -2990,8 +2990,12 @@ pub async fn run(
     // `cfg.EnableP2P`/`cfg.EnableP2PHybridMode`. `WsOnly` and `Hybrid`
     // both run the existing WS-gossip stack unchanged; `P2pOnly` must
     // open no WS-gossip listener and dial no WS peers at all — this is
-    // the "no leak" guarantee the issue requires, verified by
-    // `no_ws_listener_in_p2p_only_mode` below.
+    // the "no leak" guarantee the issue requires. `ws_active` below is a
+    // direct, mechanical translation of `NetworkMode::ws_listener_active`,
+    // whose per-mode semantics (including the "no leak" guarantee) are
+    // unit-tested in `p2p_transport.rs`
+    // (`ws_only_runs_ws_listener_and_no_p2p`, `p2p_only_runs_no_ws_listener`,
+    // `hybrid_runs_both`).
     // -----------------------------------------------------------------------
     let ws_active = network_mode.ws_listener_active();
     let effective_listen_address = if ws_active {
