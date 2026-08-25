@@ -193,6 +193,11 @@ pub struct ConsensusParams {
     pub enable_heartbeat: bool,
     /// AuthAddr must differ from Sender (Go: `EnforceAuthAddrSenderDiff`, future only).
     pub enforce_auth_addr_sender_diff: bool,
+    /// Enables header values (`Load`/`CongestionTax`) that track how full recent
+    /// blocks are, and derive a congestion-tax fee adjustment from it (Go:
+    /// `LoadTracking`, future only — go-algorand v4.7.0-beta,
+    /// `config/consensus.go`, PR #6548).
+    pub load_tracking: bool,
     /// LogicSig sizes pooled across a group (Go: `EnableLogicSigSizePooling`, v40+).
     pub enable_logicsig_size_pooling: bool,
     /// LogicSig costs pooled across a group (Go: `EnableLogicSigCostPooling`, v39+).
@@ -505,6 +510,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
         support_rekeying: false,
         enable_heartbeat: false,
         enforce_auth_addr_sender_diff: false,
+        load_tracking: false,
         enable_logicsig_size_pooling: false,
         enable_logicsig_cost_pooling: false,
         enable_app_cost_pooling: false,
@@ -969,6 +975,7 @@ pub fn consensus_params_for_version(version: &str) -> Option<ConsensusParams> {
     let mut v_future = v41_base.clone();
     v_future.logic_sig_version = 13;
     v_future.enforce_auth_addr_sender_diff = true;
+    v_future.load_tracking = true;
     if version == CONSENSUS_FUTURE {
         return Some(v_future);
     }
@@ -1174,6 +1181,18 @@ mod tests {
         let p = consensus_params_for_version(CONSENSUS_FUTURE).unwrap();
         assert_eq!(p.logic_sig_version, 13);
         assert!(p.enforce_auth_addr_sender_diff);
+        assert!(p.load_tracking);
+    }
+
+    #[test]
+    fn test_load_tracking_not_on_mainnet_versions() {
+        // LoadTracking is future-only per go-algorand config/consensus.go
+        // (v4.7.0-beta, PR #6548) — must stay off on every released MainNet/
+        // TestNet protocol version.
+        for v in [CONSENSUS_V38, CONSENSUS_V39, CONSENSUS_V40, CONSENSUS_V41] {
+            let p = consensus_params_for_version(v).unwrap();
+            assert!(!p.load_tracking, "{v} must not have load_tracking set");
+        }
     }
 
     #[test]

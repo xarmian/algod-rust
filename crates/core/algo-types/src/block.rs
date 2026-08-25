@@ -197,6 +197,19 @@ pub struct Block {
     )]
     pub absent_participation_accounts: Option<Vec<Address>>,
 
+    // ── Load tracking fields (vFuture only) ─────────────────────
+    /// Degree to which this block is full, as a fixed-point fraction with 6
+    /// digits of precision (1,000,000 = completely full). Go: `Load`
+    /// (`basics.Micros`, future only — v4.7.0-beta, PR #6548).
+    #[serde(rename = "ld", default, skip_serializing_if = "is_zero_u64")]
+    pub load: u64,
+
+    /// Congestion-tax fee required, beyond `MinFee`, for "normal" transactions
+    /// in this block — also a fixed-point `basics.Micros` value. Go:
+    /// `CongestionTax` (future only — v4.7.0-beta, PR #6548).
+    #[serde(rename = "ct", default, skip_serializing_if = "is_zero_u64")]
+    pub congestion_tax: u64,
+
     // ── Payset ────────────────────────────────────────────────
     /// Payset: the list of signed transactions in this block.
     #[serde(rename = "txns", default, skip_serializing_if = "Vec::is_empty")]
@@ -259,6 +272,8 @@ impl Default for Block {
             upgrade_approve: false,
             expired_participation_accounts: None,
             absent_participation_accounts: None,
+            load: 0,
+            congestion_tax: 0,
             payset: Vec::new(),
         }
     }
@@ -284,10 +299,12 @@ impl Block {
             match (key.len(), key.first().copied().unwrap_or(0)) {
                 // ── 2-byte keys ──────────────────────────────────
                 (2, b'b') if key == b"bi" => b.bonus = rmp_decode::read_u64(rd)?,
+                (2, b'c') if key == b"ct" => b.congestion_tax = rmp_decode::read_u64(rd)?,
                 (2, b'f') if key == b"fc" => b.fees_collected = rmp_decode::read_u64(rd)?,
                 (2, b'g') if key == b"gh" => {
                     b.genesis_hash = rmp_decode::read_fixed_bytes::<32>(rd)?
                 }
+                (2, b'l') if key == b"ld" => b.load = rmp_decode::read_u64(rd)?,
                 (2, b'p') if key == b"pp" => b.proposer_payout = rmp_decode::read_u64(rd)?,
                 (2, b't') => match key {
                     b"tc" => b.txn_counter = rmp_decode::read_u64(rd)?,

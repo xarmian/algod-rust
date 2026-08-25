@@ -161,6 +161,74 @@ fn compute_bonus(
     prev_bonus
 }
 
+/// Fixed-point scale for `basics.Micros` — 6 digits of precision, so `1e6`
+/// represents "1.0" (a completely full block, or a 100% congestion tax).
+const MICROS_UNIT: u128 = 1_000_000;
+
+/// Compute the `"ld"` (Load) header field for the round that just finished
+/// assembling `block_size` bytes of transactions, out of `max_size` allowed.
+///
+/// Direct port of go-algorand `ledger/eval/eval.go`'s `ComputeLoad`
+/// (v4.7.0-beta, PR #6548): `Load` is a fixed-point fraction with 6 digits of
+/// precision (1,000,000 = completely full). `max_size == 0` can't happen for a
+/// real consensus version, but is handled the same way go's overflow branch
+/// is: "fully loaded" rather than a divide-by-zero panic.
+pub fn compute_load(block_size: u64, max_size: u64) -> u64 {
+    if max_size == 0 {
+        return MICROS_UNIT as u64;
+    }
+    let load = (MICROS_UNIT * block_size as u128) / max_size as u128;
+    load.min(MICROS_UNIT) as u64
+}
+
+/// Compute the `"ct"` (CongestionTax) header field for the round after one
+/// that had `prev_load` fullness and `prev_tax` congestion tax.
+///
+/// Direct port of go-algorand `data/bookkeeping/block.go`'s
+/// `NextCongestionTax` (v4.7.0-beta, PR #6548). Called unconditionally (like
+/// go's `MakeBlock`/`PreCheck`) regardless of whether `LoadTracking` is on for
+/// the round being built — `prev_load` is 0 whenever tracking wasn't active
+/// for the previous round, which naturally decays any inherited tax back to 0
+/// (or tapers it, if a downgrade left a nonzero tax behind; see the
+/// `congestion_tracking_downgrade` test in go's `block_test.go`).
+///
+/// A block that is exactly half full (`prev_load == 500_000`) is the
+/// equilibrium point — the tax carries forward unchanged. Below that, the tax
+/// decreases (by up to 10% for a fully empty block); above it, the tax
+/// increases (by up to 10% for a fully-loaded block). Arithmetic saturates at
+/// `u64::MAX` rather than overflowing, matching go's `Micros.Mul`/
+/// `basics.AddSaturate`/`basics.SubSaturate`.
+pub fn next_congestion_tax(prev_load: u64, prev_tax: u64) -> u64 {
+    const PER_BLOCK_MAX_CHANGE: u128 = 100_000; // 10%
+    const HALF: u128 = 500_000; // 50%
+
+    let prev_load = prev_load as u128;
+    let prev_tax = prev_tax as u128;
+
+    if prev_load <= HALF {
+        // Decrease (or hold, at exactly half load).
+        let down_factor = PER_BLOCK_MAX_CHANGE * (HALF - prev_load) / HALF;
+        // down_factor <= PER_BLOCK_MAX_CHANGE < MICROS_UNIT, so this never
+        // underflows.
+        let tax_decrease = saturating_mul_micros(prev_tax, MICROS_UNIT - down_factor);
+        tax_decrease
+            .saturating_sub(down_factor)
+            .min(u64::MAX as u128) as u64
+    } else {
+        // Increase.
+        let up_factor = PER_BLOCK_MAX_CHANGE * (prev_load - HALF) / HALF;
+        let tax_increase = saturating_mul_micros(prev_tax, MICROS_UNIT + up_factor);
+        tax_increase.saturating_add(up_factor).min(u64::MAX as u128) as u64
+    }
+}
+
+/// go `basics.Micros.Mul`: `a * b / 1e6`, saturating at `u64::MAX` on
+/// overflow rather than wrapping.
+fn saturating_mul_micros(a: u128, b: u128) -> u128 {
+    let product = a.saturating_mul(b) / MICROS_UNIT;
+    product.min(u64::MAX as u128)
+}
+
 /// Read `StateProofTracking[StateProofBasic].StateProofNextRound` (the `"n"`
 /// field under map key `0`) out of an encoded `"spt"` value, defaulting to 0
 /// when absent — mirroring go's zero-value map lookup at
@@ -374,6 +442,16 @@ pub fn make_next_block_header(
         proposer_payout: 0,
         expired_participation_accounts: None,
         absent_participation_accounts: None,
+        // Congestion tax for the round after `prev`, per go's `NextCongestionTax`
+        // — computed unconditionally (see that function's doc comment).
+        congestion_tax: next_congestion_tax(prev.load, prev.congestion_tax),
+        // Load is 0 in the skeleton (go's `MakeBlock` leaves it unset too): it
+        // depends on the size of *this* round's own payset, which isn't known
+        // until the caller has finished assembling it. The producer sets it
+        // from [`compute_load`] once the final transaction-byte total and
+        // `load_tracking`/`max_txn_bytes_per_block` params are known (go's
+        // `endOfBlock`).
+        load: 0,
     })
 }
 
@@ -708,5 +786,113 @@ mod tests {
             ..BlockHeader::default()
         };
         assert!(make_next_block_header(&prev, 0, rewards()).is_err());
+    }
+
+    // ── Load tracking ("ld"/"ct") ───────────────────────────────
+    // go: data/bookkeeping/block.go `NextCongestionTax`, `TestNextCongestionTax`
+    // (data/bookkeeping/block_test.go, v4.7.0-beta / PR #6548). Every row here
+    // is a value pulled directly from that Go table so the port is checked
+    // against the real oracle, not just "looks reasonable" arithmetic.
+
+    #[test]
+    fn next_congestion_tax_matches_go_oracle_table() {
+        let cases: &[(u64, u64, u64)] = &[
+            // An empty block wants to decrease final price by 10%. So unless
+            // the previous tax rate was > 10%, it zeros it out.
+            (0, 0, 0),
+            (0, 1, 0),
+            (0, 1_000, 0),
+            (0, 99_999, 0),
+            (0, 100_000, 0),
+            (0, 200_000, 80_000), // 1.2*0.9 = 1.08 -> 8% tax
+            // A quarter full block wants to decrease final price by 5%.
+            (250_000, 50_000, 0),   // 1.05*0.95 = 0.9975 -> 0% tax
+            (250_000, 51_000, 0),   // 1.051*0.95 = 0.99845 -> 0% tax
+            (250_000, 52_000, 0),   // 1.052*0.95 = 0.9994 -> 0% tax
+            (250_000, 53_000, 350), // 1.053*0.95 = 1.00035 -> 350 micros tax
+            (250_000, 1_000_000_000, 949_950_000), // 1001*0.95 = 950.95
+            // A half full block wants to keep the final price the same.
+            (500_000, 0, 0),
+            (500_000, 1, 1),
+            (500_000, u64::MAX, u64::MAX),
+            // A 3/4 full block increases final price by 5%.
+            (750_000, 0, 50_000),
+            (750_000, 1, 50_001),
+            (750_000, u64::MAX - 10, u64::MAX), // Saturate
+            (750_000, u64::MAX, u64::MAX),      // Saturate
+            (1_000_000, 0, 100_000),
+            (1_000_000, 2_000_000, 2_300_000),
+            (1_000_000, u64::MAX - 10, u64::MAX), // Saturate
+            (1_000_000, u64::MAX, u64::MAX),      // Saturate
+        ];
+        for &(load, prev_tax, expected) in cases {
+            assert_eq!(
+                next_congestion_tax(load, prev_tax),
+                expected,
+                "load={load} prev_tax={prev_tax}",
+            );
+        }
+    }
+
+    // go: data/bookkeeping/block_test.go `TestBlockHeaderCongestionValidation`
+    // subtest "congestion_fees_enabled" — 75% load causing a 5% price bump on
+    // top of a 200% tax rate.
+    #[test]
+    fn next_congestion_tax_75_percent_load_on_200_percent_tax() {
+        assert_eq!(next_congestion_tax(750_000, 2 * 1_000_000), 2_150_000);
+    }
+
+    // go: `TestBlockHeaderCongestionCreation` subtest "congestion_fees_enabled".
+    #[test]
+    fn next_congestion_tax_from_60_percent_load() {
+        assert_eq!(next_congestion_tax(600_000, 100_000), 122_000);
+    }
+
+    // go: `TestBlockHeaderCongestionCreation` subtest "congestion_fees_disabled"
+    // — a nonzero inherited tax tapers down even with prev_load == 0 (e.g.
+    // after downgrading away from LoadTracking).
+    #[test]
+    fn next_congestion_tax_tapers_with_zero_load() {
+        assert_eq!(next_congestion_tax(0, 2_000_000), 1_700_000);
+    }
+
+    #[test]
+    fn make_next_block_header_sets_congestion_tax_and_defers_load() {
+        let prev = BlockHeader {
+            round: Round(10),
+            current_protocol: CONSENSUS_V41.to_string(),
+            load: 600_000,
+            congestion_tax: 100_000,
+            ..prev_header()
+        };
+        let hdr = make_next_block_header(&prev, 1500, rewards()).unwrap();
+        assert_eq!(
+            hdr.congestion_tax,
+            next_congestion_tax(prev.load, prev.congestion_tax),
+            "congestion_tax computed from prev round's Load/CongestionTax",
+        );
+        assert_eq!(
+            hdr.load, 0,
+            "Load is 0 in the skeleton; the producer fills it once the \
+             payset is assembled",
+        );
+    }
+
+    // go: ledger/eval/eval.go `ComputeLoad`.
+    #[test]
+    fn compute_load_scales_block_size_to_micros() {
+        assert_eq!(compute_load(0, 1_000_000), 0, "empty block");
+        assert_eq!(compute_load(1_000_000, 1_000_000), 1_000_000, "full block");
+        assert_eq!(compute_load(500_000, 1_000_000), 500_000, "half full");
+        assert_eq!(compute_load(250_000, 1_000_000), 250_000, "quarter full");
+    }
+
+    #[test]
+    fn compute_load_clamps_at_full_and_handles_zero_max() {
+        // go's Muldiv-overflow branch: "can't happen, but we'll say fully
+        // loaded" rather than dividing by zero.
+        assert_eq!(compute_load(1, 0), 1_000_000);
+        // Load can never exceed 1,000,000 even if block_size > max_size.
+        assert_eq!(compute_load(2_000_000, 1_000_000), 1_000_000);
     }
 }

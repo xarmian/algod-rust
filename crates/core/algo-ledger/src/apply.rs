@@ -460,6 +460,8 @@ pub fn apply_block_with_delta<L: crate::store_trait::LedgerStore>(
         upgrade_approve: block.upgrade_approve,
         expired_participation_accounts: block.expired_participation_accounts.clone(),
         absent_participation_accounts: block.absent_participation_accounts.clone(),
+        load: block.load,
+        congestion_tax: block.congestion_tax,
     };
 
     let delta = StateDelta {
@@ -5100,6 +5102,8 @@ mod tests {
             upgrade_approve: false,
             expired_participation_accounts: None,
             absent_participation_accounts: None,
+            load: 0,
+            congestion_tax: 0,
             payset: vec![stx],
         }
     }
@@ -5488,6 +5492,8 @@ mod tests {
             upgrade_approve: false,
             expired_participation_accounts: None,
             absent_participation_accounts: None,
+            load: 0,
+            congestion_tax: 0,
             payset: vec![],
         };
         let hdrdata = algo_codec::canonical_encode_block_header_from_block(&block);
@@ -5725,6 +5731,8 @@ mod tests {
             upgrade_approve: false,
             expired_participation_accounts: expired,
             absent_participation_accounts: absent,
+            load: 0,
+            congestion_tax: 0,
             payset: vec![],
         }
     }

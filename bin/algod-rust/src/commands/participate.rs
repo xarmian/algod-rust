@@ -1701,6 +1701,24 @@ impl algo_pool::traits::BlockEvaluator for SimpleBlockEvaluator {
             upgrade_approve: hdr.upgrade_approve,
             expired_participation_accounts: expired,
             absent_participation_accounts: hdr.absent_participation_accounts.clone(),
+            // CongestionTax was already advanced from prev round's Load/Tax by
+            // make_next_block_header (go's MakeBlock → NextCongestionTax).
+            // Load, however, depends on THIS round's own final payset size, so
+            // it can only be computed now that self.txn_bytes reflects every
+            // included transaction — mirrors go's `endOfBlock`:
+            // `if eval.proto.LoadTracking { eval.block.BlockHeader.Load =
+            // ComputeLoad(eval.blockTxBytes, eval.proto.MaxTxnBytesPerBlock) }`.
+            // Uses the raw consensus MaxTxnBytesPerBlock (not the possibly
+            // smaller caller-provided `self.max_txn_bytes`), matching go.
+            load: if self.consensus_params.load_tracking {
+                algo_ledger::compute_load(
+                    self.txn_bytes as u64,
+                    self.consensus_params.max_txn_bytes_per_block,
+                )
+            } else {
+                0
+            },
+            congestion_tax: hdr.congestion_tax,
             payset,
             // Commitment fields are computed below.
             txn_commitment: [0u8; 32],
