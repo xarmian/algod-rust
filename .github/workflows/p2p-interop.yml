@@ -49,7 +49,7 @@ jobs:
 
       - name: Run the live interop test
         run: |
-          ALGOD_RUST_P2P_GO_MULTIADDR="$(cat ops/mixed-cluster-p2p/netroot/.p2p-multiaddr)" \
+          ALGOD_RUST_P2P_GO_MULTIADDR="$(cat ops/mixed-cluster-p2p/netroot/.p2p-multiaddr-1)" \
             cargo test --package algod-rust --test p2p_go_algorand_interop -- --ignored --nocapture
 
       - name: Tear down (always)

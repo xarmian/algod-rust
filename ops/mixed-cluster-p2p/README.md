@@ -1,4 +1,4 @@
-# P2P interop harness (issues #543, #560)
+# P2P interop harness (issues #543, #560, #564)
 
 Three real go-algorand v4.7.0-stable nodes, each started in plain P2P
 mode (`EnableP2P: true`, no WS-gossip listener — `config/localTemplate.go`'s
@@ -27,13 +27,22 @@ without it, a rust host's DHT queries against a real go-algorand peer
 negotiated no shared protocol at all. Fixed and regression-tested.
 
 After that fix, a rust host's DHT query against a live go-node DOES
-reach go's DHT handler (a real round trip happens), but does not yet
-reliably return other peers that node is directly connected to. This
-needs further wire-level investigation (packet-level capture/diff of the
-Amino-DHT protobuf exchange, the `algod-traffic-debug` skill's territory)
-to pin down precisely, and is tracked as its own follow-up issue rather
-than asserted here as working — see the tracking issue this section's
-follow-up was filed under.
+reach go's DHT handler (a real round trip happens), but `get_closest_peers`
+does not return other peers that node is directly connected to.
+Issue #564 root-caused this: go's `handleFindPeer` only returns
+`CloserPeers` entries its **peerstore** already has an address for, and
+that peerstore is populated exclusively via DHT **provider records**
+(the "gossip"/"archival" capability-namespace mechanism), never by
+`FIND_NODE` responses or vanilla libp2p Identify (go passes
+`libp2p.NoListenAddrs`) — so `get_closest_peers` cannot surface a peer's
+address against a real go-algorand node *by design*, not as a remaining
+wire bug. #564 also found and fixed a second, distinct bug in the
+correct mechanism: `algo_p2p::capabilities::Capability::record_key` used
+the wrong DHT key (raw namespace bytes instead of go's
+`nsToCid(ns).Hash()` SHA-256-multihash derivation) — fixed, and verified
+live that `find_peers_for_capability` now genuinely round-trips against
+a real go-algorand node. Multi-hop provider-record propagation across
+more than one node is tracked as its own follow-up issue.
 
 ## Usage
 

@@ -34,6 +34,16 @@
 
 set -euo pipefail
 
+# MSYS/Git-Bash mangles any argument or environment-variable value that
+# looks like a POSIX absolute path (e.g. PEER_ADDRESS=/dns4/go-node-1/...,
+# passed to `docker compose up` below) into a Windows path before it ever
+# reaches docker — exporting this for the whole script (not just the
+# individual `docker run` invocations below, which already opted in
+# per-call) covers the `docker compose up -d go-node-2/3` calls too, whose
+# PEER_ADDRESS env vars hit exactly this mangling (found while
+# reproducing issue #564 on Windows).
+export MSYS_NO_PATHCONV=1
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 

@@ -665,16 +665,19 @@ consensus-cluster-negative: ## Run the #472 negative conformance suite (up + inj
 consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker needed)
 	python3 $(PHASE6_CLUSTER)/scripts/analyze_test.py
 
-## ops/mixed-cluster-p2p harness (issues #543, #560) — three real
+## ops/mixed-cluster-p2p harness (issues #543, #560, #564) — three real
 ## go-algorand v4.7.0-stable nodes in plain P2P mode, chain-bootstrapped
 ## to each other (1 <- 2 <- 3, no node told about a non-adjacent peer),
 ## dialed by algod-rust's `algo-p2p` libp2p transport to prove real
 ## cross-implementation transport interop. See
 ## docs/MIXED_CLUSTER_HARNESS.md's "P2P interop harness" section for
 ## current scope and what's left — building this harness's 3-node chain
-## found and fixed a real DHT protocol-string bug (#560), but full
-## cross-implementation DHT peer discovery is not yet proven working and
-## is tracked as a follow-up, not asserted by any test here yet.
+## found and fixed a DHT protocol-string bug (#560/#563) and a DHT
+## provider-record key-derivation bug (#564); `find_peers_for_capability`
+## (provider records) now genuinely round-trips against a real
+## go-algorand node, but `find_closest_peers` structurally cannot (by
+## go's own design — see #564) and multi-hop provider-record propagation
+## is tracked as its own follow-up, not asserted by any test here yet.
 p2p-interop-up: ## Bring up the 3-node go-algorand P2P interop target
 	$(P2P_INTEROP_CLUSTER)/scripts/start.sh
 

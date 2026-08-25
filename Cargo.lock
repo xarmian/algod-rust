@@ -441,10 +441,12 @@ name = "algo-p2p"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "hex",
  "hickory-resolver 0.25.2",
  "libp2p",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

@@ -1,5 +1,5 @@
-//! Live P2P transport interop test (issue #543), plus issue #560's DHT
-//! wire-protocol investigation.
+//! Live P2P transport interop test (issue #543), plus issue #560/#564's
+//! DHT wire-protocol investigation.
 //!
 //! Dials a real go-algorand v4.7.0-stable node running in plain P2P mode
 //! (`EnableP2P: true`, no WS-gossip listener) with algod-rust's own
@@ -11,35 +11,71 @@
 //!
 //! This is the transport-connectivity slice of #543's full scope.
 //!
-//! ## Issue #560 investigation status
+//! ## Issue #560/#564 investigation status
 //!
 //! Building a multi-node cross-implementation DHT-routing test against
 //! `ops/mixed-cluster-p2p`'s new 3-node chain-bootstrapped go-algorand
 //! harness (1 <- 2 <- 3 — go-node-2 is only ever told go-node-1's
-//! multiaddr; go-node-3 only go-node-2's) found and fixed one real,
-//! previously-undetected bug: `algo_p2p::dht::dht_protocol_name` omitted
-//! the `/kad/1.0.0` suffix `go-libp2p-kad-dht`'s `makeDHT`
-//! (`v1proto := cfg.ProtocolPrefix + kad1`) always appends to whatever
-//! prefix go-algorand configures — so a rust host's DHT queries against
-//! a real go-algorand peer previously negotiated no shared protocol at
-//! all and returned instantly empty. Fixed and regression-tested in
-//! `crates/node/algo-p2p/src/dht.rs`.
+//! multiaddr; go-node-3 only go-node-2's) found and fixed two real,
+//! previously-undetected bugs:
 //!
-//! After that fix, a rust host's `get_closest_peers` query against a
-//! live go-node-1 DOES reach go's DHT handler (a real round trip
-//! happens, no longer an instant no-op) — but the response never
-//! includes go-node-2's `PeerId`, even though go-node-1 is directly
-//! connected to go-node-2 (`docker compose logs` shows go-node-1 both
-//! holding a routing-table entry for go-node-2 and successfully dialing
-//! go-node-3's real address, so go-node-1 does have working peer
-//! knowledge — the gap is specifically in what a rust-initiated
-//! `FIND_NODE`-equivalent query gets back). This needs further
-//! wire-level investigation (the `algod-traffic-debug` skill's territory
-//! — packet-level capture/diff of the Amino-DHT protobuf exchange) to
-//! pin down whether this is a remaining rust-side or go-side gap; it is
-//! tracked as its own follow-up issue (see #560's audit comment) rather
-//! than asserted here as either working or broken, since neither claim
-//! is yet backed by a passing live test.
+//! 1. (#560/#563) `algo_p2p::dht::dht_protocol_name` omitted the
+//!    `/kad/1.0.0` suffix `go-libp2p-kad-dht`'s `makeDHT`
+//!    (`v1proto := cfg.ProtocolPrefix + kad1`) always appends to whatever
+//!    prefix go-algorand configures — so a rust host's DHT queries
+//!    against a real go-algorand peer previously negotiated no shared
+//!    protocol at all and returned instantly empty. Fixed and
+//!    regression-tested in `crates/node/algo-p2p/src/dht.rs`.
+//! 2. (#564) `algo_p2p::capabilities::Capability::record_key` used the
+//!    raw namespace bytes (e.g. `b"gossip"`) as the DHT provider-record
+//!    key, instead of go's actual derivation
+//!    (`go-libp2p`'s `p2p/discovery/routing.nsToCid(ns).Hash()` — a
+//!    34-byte SHA-256 multihash) — a completely different,
+//!    non-overlapping DHT key from what any real go-algorand peer
+//!    advertises under or looks up, silently breaking
+//!    `start_providing`/`get_providers` interop the same way (1) broke
+//!    `get_closest_peers` interop. Fixed and regression-tested in
+//!    `crates/node/algo-p2p/src/capabilities.rs`.
+//!
+//! With both fixes applied, a rust host's DHT round trip against a real
+//! go-algorand node genuinely works — see
+//! [`discovers_go_algorand_peer_via_gossip_capability_provider_records`]
+//! below — but **not** via `get_closest_peers`/`find_closest_peers`
+//! (rust-libp2p's `kad::Behaviour::get_closest_peers`, go's `FIND_NODE`).
+//! Investigating #564 live against this harness established that
+//! `get_closest_peers` cannot surface a directly-connected go-algorand
+//! peer's address, *by go-algorand's own design*, not as a remaining
+//! wire-format bug:
+//!
+//! - go's `handleFindPeer` (`go-libp2p-kad-dht@v0.38.0/handlers.go`)
+//!   only includes a `CloserPeers` entry for peers its **peerstore**
+//!   already has an address for (`if len(pi.Addrs) > 0`) — even the
+//!   literal queried target peer is dropped from the response if the
+//!   peerstore has no address for it, regardless of whether the
+//!   responding node is *currently connected* to that peer.
+//! - go's custom peerstore (`network/p2p/peerstore.PeerStore`, shared
+//!   with the DHT via `dht.MakeDHT`'s `libp2p.Peerstore(pstore)`) is
+//!   populated *exclusively* by `P2PNetwork.refreshPeerStoreAddresses`
+//!   (`network/p2pNetwork.go`) — itself fed by DNS bootstrap and DHT
+//!   **provider records** (`capabilitiesDiscovery.PeersForCapability`,
+//!   the "gossip"/"archival" namespace mechanism this crate's
+//!   `capabilities.rs` mirrors) — never by `FIND_NODE` responses, and
+//!   never by vanilla libp2p Identify: go's `MakeHost`
+//!   (`network/p2p/p2p.go`) passes `libp2p.NoListenAddrs`, which this
+//!   harness confirmed live — a direct connection's `identify::Received`
+//!   event from a real go-algorand node reports `listen_addrs: []`
+//!   unconditionally.
+//!
+//! In short: `get_closest_peers` genuinely has nothing useful to return
+//! against a real go-algorand peer for third-party address discovery —
+//! that job belongs to `find_peers_for_capability` (provider records),
+//! which is what fix (2) above makes actually interoperate. #564's
+//! originally-scoped acceptance criteria (a `find_closest_peers`-based
+//! single-hop/2-hop discovery test) are therefore not met by design; see
+//! #564's own comment thread for the full disposition and the follow-up
+//! issue tracking why multi-hop *provider-record replication* (a real
+//! go-node reporting *another* go-node as a provider, not just itself)
+//! did not yet propagate within this harness's test window.
 //!
 //! Bring up the target node first:
 //!
@@ -52,15 +88,21 @@
 
 use std::time::Duration;
 
-use algo_p2p::{IdentityConfig, P2pHost};
+use algo_p2p::{Capability, IdentityConfig, P2pHost};
 use libp2p::swarm::SwarmEvent;
-use libp2p::Multiaddr;
+use libp2p::{Multiaddr, PeerId};
 
 fn go_node_multiaddr() -> Option<Multiaddr> {
     std::env::var("ALGOD_RUST_P2P_GO_MULTIADDR")
         .ok()
         .and_then(|s| s.parse().ok())
 }
+
+/// The go-algorand network ID `ops/mixed-cluster-p2p`'s `start.sh` names
+/// its `goal network create -n p2pinterop` network — must match exactly
+/// for `algo_p2p::dht::dht_protocol_name`'s `/algorand/kad/<id>/kad/1.0.0`
+/// to negotiate a shared DHT protocol with the real go-algorand nodes.
+const P2PINTEROP_NETWORK_ID: &str = "p2pinterop";
 
 #[tokio::test]
 #[ignore = "requires a live go-algorand v4.7.0-stable node in P2P mode — see ops/mixed-cluster-p2p/scripts/start.sh"]
@@ -111,4 +153,69 @@ async fn dials_real_go_algorand_p2p_host_and_establishes_secure_connection() {
             }
         }
     }
+}
+
+/// Regression test for issue #564's fix: a rust host's `find_peers_for_capability`
+/// (DHT provider records — `kad::Behaviour::start_providing`/`get_providers`)
+/// query against a real go-algorand node now returns that node itself as
+/// a "gossip" capability provider — proof `algo_p2p::capabilities::Capability::record_key`'s
+/// key now matches go's actual `nsToCid(ns).Hash()` derivation
+/// (`go-libp2p`'s `p2p/discovery/routing.go`), rather than the raw
+/// namespace bytes the old (buggy) key used, which negotiated no shared
+/// DHT key with any real go-algorand peer at all.
+///
+/// This module's doc comment explains why this — not
+/// `find_closest_peers` — is the DHT primitive that actually round-trips
+/// against go-algorand for peer discovery.
+#[tokio::test]
+#[ignore = "requires a live go-algorand v4.7.0-stable node in P2P mode — see ops/mixed-cluster-p2p/scripts/start.sh"]
+async fn discovers_go_algorand_peer_via_gossip_capability_provider_records() {
+    let Some(target) = go_node_multiaddr() else {
+        panic!(
+            "ALGOD_RUST_P2P_GO_MULTIADDR is not set or not a valid multiaddr — \
+             run ops/mixed-cluster-p2p/scripts/start.sh first and export its output \
+             (netroot/.p2p-multiaddr-1)"
+        );
+    };
+    let target_peer_id = match target.iter().last() {
+        Some(libp2p::multiaddr::Protocol::P2p(id)) => id,
+        _ => panic!("ALGOD_RUST_P2P_GO_MULTIADDR must end in a /p2p/<peer-id> component"),
+    };
+
+    let identity = IdentityConfig::default();
+    let mut host = P2pHost::new(&identity, P2PINTEROP_NETWORK_ID).expect("build P2P host");
+
+    host.dial(target.clone())
+        .unwrap_or_else(|e| panic!("dial to {target} rejected before it even started: {e}"));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        tokio::select! {
+            event = host.next_event() => {
+                match event {
+                    SwarmEvent::ConnectionEstablished { .. } => break,
+                    SwarmEvent::OutgoingConnectionError { error, .. } => {
+                        panic!("dial to real go-algorand P2P host at {target} failed: {error}");
+                    }
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                panic!("timed out after 20s waiting for ConnectionEstablished against {target}");
+            }
+        }
+    }
+
+    let providers: Vec<PeerId> = host
+        .find_peers_for_capability(Capability::Gossip, 10, Duration::from_secs(15))
+        .await;
+
+    assert!(
+        providers.contains(&target_peer_id),
+        "expected the dialed go-algorand node ({target_peer_id}) to report itself as a \
+         'gossip' capability DHT provider (it always adds itself locally on Provide — see \
+         go-libp2p-kad-dht's IpfsDHT.Provide), got providers = {providers:?}. If this \
+         regresses, algo_p2p::capabilities::Capability::record_key likely stopped matching \
+         go's nsToCid(ns).Hash() derivation again."
+    );
 }

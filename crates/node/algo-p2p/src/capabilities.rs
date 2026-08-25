@@ -52,8 +52,40 @@ impl Capability {
     }
 
     /// The DHT record key this capability is advertised/looked-up under.
+    ///
+    /// **Not** the raw namespace bytes. Go's `RoutingDiscovery` (wrapping
+    /// `go-libp2p-kad-dht`, `network/p2p/capabilities.go`'s
+    /// `CapabilitiesDiscovery.advertise`/`findPeers`) derives the actual
+    /// wire-level provider-record key from the namespace via
+    /// `go-libp2p`'s `p2p/discovery/routing.nsToCid`:
+    /// ```go
+    /// func nsToCid(ns string) (cid.Cid, error) {
+    ///     h, err := mh.Sum([]byte(ns), mh.SHA2_256, -1)
+    ///     return cid.NewCidV1(cid.Raw, h), err
+    /// }
+    /// ```
+    /// and `IpfsDHT.Provide`/`classicProvide`
+    /// (`go-libp2p-kad-dht@v0.38.0/routing.go`) then uses `key.Hash()` —
+    /// the CID's underlying **multihash bytes**, not the CID's own
+    /// version/codec-prefixed encoding — as the actual `GetClosestPeers`/
+    /// provider-store key: `[multihash code 0x12, length 0x20, 32-byte
+    /// SHA-256 digest]`, 34 bytes total. A raw-namespace-bytes key (e.g.
+    /// `b"gossip"`, 7 bytes) is a completely different, non-overlapping
+    /// DHT key from what any real go-algorand peer advertises under or
+    /// looks up — silently breaking `start_providing`/`get_providers`
+    /// interop the same way #560/#563's missing `/kad/1.0.0` protocol
+    /// suffix silently broke `get_closest_peers` interop (issue #564).
     pub fn record_key(&self) -> kad::RecordKey {
-        kad::RecordKey::new(&self.namespace())
+        use sha2::{Digest, Sha256};
+        const MULTIHASH_SHA2_256_CODE: u8 = 0x12;
+        const MULTIHASH_SHA2_256_LEN: u8 = 0x20; // 32 bytes, fits in one varint byte.
+
+        let digest = Sha256::digest(self.namespace().as_bytes());
+        let mut multihash = Vec::with_capacity(2 + digest.len());
+        multihash.push(MULTIHASH_SHA2_256_CODE);
+        multihash.push(MULTIHASH_SHA2_256_LEN);
+        multihash.extend_from_slice(&digest);
+        kad::RecordKey::new(&multihash)
     }
 }
 
@@ -89,6 +121,40 @@ mod tests {
         assert_eq!(
             Capability::Archival.record_key(),
             Capability::Archival.record_key()
+        );
+    }
+
+    /// Regression guard for issue #564's investigation: the DHT provider
+    /// key must be go's `nsToCid(ns).Hash()` — a 34-byte SHA-256
+    /// multihash (`0x12, 0x20`, then the digest) — not the raw namespace
+    /// bytes. Expected bytes independently computed as
+    /// `hashlib.sha256(b"gossip").hexdigest()` prefixed with the
+    /// multihash header `1220`, confirmed against go's own
+    /// `nsToCid`/`Provide` (`go-libp2p@v0.47.0`
+    /// `p2p/discovery/routing/routing.go`,
+    /// `go-libp2p-kad-dht@v0.38.0/routing.go`) by source reading, not
+    /// just computed independently — see this function's doc comment.
+    #[test]
+    fn record_key_matches_gos_multihash_derivation() {
+        let key = Capability::Gossip.record_key();
+        let expected =
+            hex::decode("1220dd73a2f7c7982c61006be12e1bbb3e8c9ea6b6e8baf7cc5e307514015fc2fd23")
+                .expect("valid hex");
+        assert_eq!(key.to_vec(), expected);
+    }
+
+    /// The old (buggy) derivation used the raw namespace bytes directly —
+    /// assert the fixed key is neither that nor merely "some other
+    /// length," to catch a future accidental revert to
+    /// `RecordKey::new(&namespace)`.
+    #[test]
+    fn record_key_is_not_the_raw_namespace_bytes() {
+        let key = Capability::Gossip.record_key();
+        assert_ne!(key.to_vec(), Capability::Gossip.namespace().as_bytes());
+        assert_eq!(
+            key.to_vec().len(),
+            34,
+            "sha256 multihash is always 34 bytes"
         );
     }
 }
