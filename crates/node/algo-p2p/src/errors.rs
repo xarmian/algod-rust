@@ -52,4 +52,15 @@ pub enum P2pError {
         topic: String,
         source: Box<libp2p::gossipsub::PublishError>,
     },
+
+    /// Advertising a DHT capability provider record failed at the local
+    /// record store (e.g. the provider-record store is at capacity) —
+    /// distinct from a query simply not completing within its deadline,
+    /// which this crate treats as "not yet advertised," not an error (see
+    /// [`crate::host::P2pHost::advertise_capability`]).
+    #[error("failed to advertise capability {capability}: {source}")]
+    CapabilityAdvertise {
+        capability: &'static str,
+        source: libp2p::kad::store::Error,
+    },
 }
