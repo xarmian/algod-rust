@@ -9,6 +9,7 @@ pub mod loadgen;
 pub mod network_common;
 pub mod node;
 pub mod observe;
+pub mod p2p_transport;
 pub mod participate;
 pub mod relay;
 pub mod replay;
