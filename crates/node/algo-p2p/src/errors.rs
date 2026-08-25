@@ -38,4 +38,18 @@ pub enum P2pError {
     /// The on-disk persistent peerstore cache could not be decoded.
     #[error("failed to decode persistent peerstore cache: {0}")]
     PeerstoreDecode(String),
+
+    /// Subscribing to a gossipsub topic failed.
+    #[error("failed to subscribe to gossipsub topic {topic}: {source}")]
+    GossipsubSubscribe {
+        topic: String,
+        source: Box<libp2p::gossipsub::SubscriptionError>,
+    },
+
+    /// Publishing to (or unsubscribing from) a gossipsub topic failed.
+    #[error("failed to publish/unsubscribe on gossipsub topic {topic}: {source}")]
+    GossipsubPublish {
+        topic: String,
+        source: Box<libp2p::gossipsub::PublishError>,
+    },
 }
