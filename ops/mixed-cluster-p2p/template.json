@@ -1,0 +1,20 @@
+{
+    "Genesis": {
+        "NetworkName": "p2pinterop",
+        "FirstPartKeyRound": 0,
+        "LastPartKeyRound": NUM_ROUNDS,
+        "ConsensusProtocol": "future",
+        "Wallets": [
+            { "Name": "Wallet1", "Stake": 100, "Online": true }
+        ]
+    },
+    "Nodes": [
+        {
+            "Name": "Node1",
+            "IsRelay": true,
+            "Wallets": [
+                { "Name": "Wallet1", "ParticipationOnly": false }
+            ]
+        }
+    ]
+}

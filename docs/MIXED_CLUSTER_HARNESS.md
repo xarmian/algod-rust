@@ -249,6 +249,59 @@ to appear in the committed-proposer histogram inside a two-sided
 binomial bound and **always** fails on zero. See
 `docs/PHASE6_VALIDATION.md` criterion 3.
 
+## P2P interop harness (issue #543)
+
+A second, narrower harness — `ops/mixed-cluster-p2p/` — targets the new
+libp2p-based P2P transport (`crates/node/algo-p2p`, issues #538-#542)
+rather than the WS-gossip stack this file otherwise documents. It is
+**not** a variant of the 4-node harness above; it's a single real
+go-algorand v4.7.0-stable node started in plain P2P mode (`EnableP2P:
+true`, no WS-gossip listener), which algod-rust's `algo_p2p::P2pHost`
+dials directly.
+
+### What it currently proves
+
+A live integration test,
+`bin/algod-rust/tests/p2p_go_algorand_interop.rs`
+(`dials_real_go_algorand_p2p_host_and_establishes_secure_connection`,
+run via `make p2p-interop-test`), dials the real go node's P2P listen
+multiaddr and asserts `SwarmEvent::ConnectionEstablished` — i.e. a
+genuine Noise-authenticated TCP connection between rust-libp2p
+(`algo-p2p`) and go-libp2p (go-algorand's `network/p2p/`). This is
+**transport-level interop**, verified live (not simulated): two
+independent libp2p implementations, from two different language
+ecosystems, completing a real handshake with each other.
+
+### What's not yet covered (tracked as follow-up)
+
+Issue #543's full scope — "a mixed P2P cluster (Rust + go-algorand NEW
+nodes) reaches and maintains consensus over a run of rounds", DHT-based
+peer discovery among 3+ real go-algorand peers, bidirectional gossipsub
+block/vote/tx propagation, and cross-implementation capability-
+advertisement lookup, plus a soak/nightly variant analogous to `make
+consensus-cluster-test` — is **not yet implemented**. Each of those is a
+substantially larger, separately-testable unit of work (a multi-node P2P
+mesh needs `algo-p2p` DHT bootstrap wired to real go-algorand peers'
+`/algorand/kad/<networkID>` protocol; a full consensus round-trip in
+P2P-only mode additionally needs #559's agreement-over-gossipsub
+bridging to have landed first). See the tracking issue this section's
+follow-up was filed under for the current status.
+
+### Why go-algorand's own `EnableP2P` config was reachable without a custom build
+
+Investigation for #543 confirmed go-algorand's P2P support carries no
+`//go:build` tag — `network/p2p/` compiles into every standard build,
+`EnableP2P` is a pure runtime `config.json` flag, so the stock
+`algorand/algod:4.7.0-stable` Docker Hub image (already used by
+`ops/mixed-cluster/`) works unmodified. `EnableP2P: true` alone (without
+`EnableP2PHybridMode`) still requires `NetAddress` to be set —
+`config/localTemplate.go`'s `IsP2PListenServer()`: `(cfg.EnableP2P &&
+!cfg.EnableP2PHybridMode && cfg.NetAddress != "")` — and
+`IncomingConnectionsLimit` must be non-zero or `network/p2p/p2p.go`
+forces the listen address back to empty regardless. `start.sh` patches
+both via `algocfg ... set -p <key> -v <value>` (no dedicated `algocfg`
+profile exists for plain, non-hybrid `EnableP2P`).
+
 ## Where to go next
 
 | Question | Read |
@@ -257,3 +310,4 @@ binomial bound and **always** fails on zero. See
 | How do I run it? | `ops/mixed-cluster/README.md`, `make help` |
 | How does Layer 9 fit the overall conformance plan? | `docs/CONFORMANCE_STRATEGY.md` §11 |
 | What does the soak measure and what are its thresholds? | `docs/SOAK_METHODOLOGY.md` |
+| How do I run the P2P transport interop test (issue #543)? | `ops/mixed-cluster-p2p/README.md`, `make p2p-interop-test` |

@@ -1,0 +1,56 @@
+# Issue #543 — P2P interop harness.
+#
+# A single go-algorand v4.7.0-stable node, started with `EnableP2P: true`
+# (plain P2P, no WS-gossip listener — mirrors what algod-rust's own
+# `P2pOnly` mode does, see #542), for algod-rust's `algo-p2p` libp2p
+# transport to dial directly and prove real cross-implementation
+# interop (Noise-secured TCP connection between rust-libp2p and
+# go-libp2p).
+#
+# This is a smaller, narrower sibling of `ops/mixed-cluster/` (which
+# proves WS-gossip consensus interop across 3 Go + 1 Rust nodes): this
+# harness proves P2P *transport*-level interop with a single Go node.
+# Extending it to a multi-node P2P mesh with full consensus round-trip
+# is tracked as a follow-up (see docs/MIXED_CLUSTER_HARNESS.md).
+#
+# Usage:
+#   ops/mixed-cluster-p2p/scripts/start.sh   # generate netroot + start,
+#                                             # prints the dialable multiaddr
+#   ops/mixed-cluster-p2p/scripts/stop.sh    # tear down + cleanup
+
+services:
+  go-node-1:
+    image: algorand/algod:4.7.0-stable
+    container_name: p2pinterop-go-node-1
+    environment:
+      - ALGORAND_DATA=/algod/data
+      - ALGOD_PORT=8080
+      - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    ports:
+      - "127.0.0.1:5001:8080"
+      # go-algorand's P2P listener (config.json NetAddress, set by
+      # start.sh's algocfg patch — see config/localTemplate.go's
+      # IsP2PListenServer: EnableP2P && !EnableP2PHybridMode &&
+      # NetAddress != "").
+      - "127.0.0.1:5161:4161"
+    volumes:
+      - ./netroot/Node1:/algod/data
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - -H
+        - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        - http://localhost:8080/v2/status
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    networks:
+      - p2pinterop
+
+networks:
+  p2pinterop:
+    driver: bridge
