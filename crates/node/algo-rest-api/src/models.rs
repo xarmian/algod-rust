@@ -673,6 +673,14 @@ pub struct BoxDescriptor {
     /// Base64 encoded box name.
     #[serde(with = "base64_bytes")]
     pub name: Vec<u8>,
+
+    /// Base64 encoded box value. Present only when the `values` query
+    /// parameter is set to true (pagination mode only).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "optional_base64_bytes"
+    )]
+    pub value: Option<Vec<u8>>,
 }
 
 /// Response for the `/v2/applications/{application-id}/boxes` endpoint.
@@ -681,6 +689,18 @@ pub struct BoxDescriptor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoxesResponse {
     pub boxes: Vec<BoxDescriptor>,
+
+    /// Used for pagination: when making another request, provide this
+    /// token as the `next` parameter. The next token is the box name to
+    /// use as the pagination cursor, encoded in the goal app call arg
+    /// form. Only present in pagination mode when more results exist.
+    #[serde(rename = "next-token", skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+
+    /// The round for which this information is relevant. Only present in
+    /// pagination mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
