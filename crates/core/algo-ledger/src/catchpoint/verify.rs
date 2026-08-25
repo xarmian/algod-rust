@@ -2331,6 +2331,8 @@ mod tests {
             upgrade_approve: false,
             expired_participation_accounts: None,
             absent_participation_accounts: None,
+            load: 0,
+            congestion_tax: 0,
         }
     }
 

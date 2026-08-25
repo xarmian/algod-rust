@@ -38,7 +38,7 @@ pub use apply::{
     ApplyMode, GroupInfo, InnerApplyData,
 };
 pub use avm_context::{type_enum, LedgerAvmContext};
-pub use block_header::{make_next_block_header, next_bonus};
+pub use block_header::{compute_load, make_next_block_header, next_bonus, next_congestion_tax};
 pub use eval_compare::{
     compare_eval_delta, CompareResult, EvalDeltaMismatchDetail, EvalDeltaStats, FieldMismatch,
     MismatchCategory,

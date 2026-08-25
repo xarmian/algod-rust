@@ -552,12 +552,14 @@ pub fn canonical_encode_block_header_from_block(block: &Block) -> Vec<u8> {
     let mut m = CanonicalMap::new();
 
     m.add_u64("bi", block.bonus);
+    m.add_u64("ct", block.congestion_tax);
     m.add_u64("earn", block.rewards_level);
     m.add_u64("fc", block.fees_collected);
     m.add_address("fees", &block.fee_sink);
     m.add_u64("frac", block.rewards_residue);
     m.add_string("gen", &block.genesis_id);
     m.add_bytes("gh", &block.genesis_hash);
+    m.add_u64("ld", block.load);
     m.add_u64("nextbefore", block.next_protocol_vote_before.0);
     m.add_string("nextproto", &block.next_protocol);
     m.add_u64("nextswitch", block.next_protocol_switch_on.0);
@@ -601,12 +603,14 @@ pub fn canonical_encode_block(block: &Block) -> Vec<u8> {
     let mut m = CanonicalMap::new();
 
     m.add_u64("bi", block.bonus);
+    m.add_u64("ct", block.congestion_tax);
     m.add_u64("earn", block.rewards_level);
     m.add_u64("fc", block.fees_collected);
     m.add_address("fees", &block.fee_sink);
     m.add_u64("frac", block.rewards_residue);
     m.add_string("gen", &block.genesis_id);
     m.add_bytes("gh", &block.genesis_hash);
+    m.add_u64("ld", block.load);
     m.add_u64("nextbefore", block.next_protocol_vote_before.0);
     m.add_string("nextproto", &block.next_protocol);
     m.add_u64("nextswitch", block.next_protocol_switch_on.0);
@@ -674,12 +678,14 @@ pub fn canonical_encode_unauthenticated_proposal(
 
     // Block header fields (same as canonical_encode_block_header_from_block)
     m.add_u64("bi", block.bonus);
+    m.add_u64("ct", block.congestion_tax);
     m.add_u64("earn", block.rewards_level);
     m.add_u64("fc", block.fees_collected);
     m.add_address("fees", &block.fee_sink);
     m.add_u64("frac", block.rewards_residue);
     m.add_string("gen", &block.genesis_id);
     m.add_bytes("gh", &block.genesis_hash);
+    m.add_u64("ld", block.load);
     m.add_u64("nextbefore", block.next_protocol_vote_before.0);
     m.add_string("nextproto", &block.next_protocol);
     m.add_u64("nextswitch", block.next_protocol_switch_on.0);
@@ -739,12 +745,14 @@ pub fn canonical_encode_block_header(header: &BlockHeader) -> Vec<u8> {
     let mut m = CanonicalMap::new();
 
     m.add_u64("bi", header.bonus);
+    m.add_u64("ct", header.congestion_tax);
     m.add_u64("earn", header.rewards_level);
     m.add_u64("fc", header.fees_collected);
     m.add_address("fees", &header.fee_sink);
     m.add_u64("frac", header.rewards_residue);
     m.add_string("gen", &header.genesis_id);
     m.add_bytes("gh", &header.genesis_hash);
+    m.add_u64("ld", header.load);
     m.add_u64("nextbefore", header.next_protocol_vote_before.0);
     m.add_string("nextproto", &header.next_protocol);
     m.add_u64("nextswitch", header.next_protocol_switch_on.0);
@@ -1671,6 +1679,8 @@ pub fn build_txtail_from_block(block: &Block) -> TxTailRound {
         upgrade_approve: block.upgrade_approve,
         expired_participation_accounts: block.expired_participation_accounts.clone(),
         absent_participation_accounts: block.absent_participation_accounts.clone(),
+        load: block.load,
+        congestion_tax: block.congestion_tax,
     };
 
     let mut txn_ids = Vec::with_capacity(block.payset.len());
@@ -2045,6 +2055,58 @@ mod tests {
     }
 
     #[test]
+    fn test_block_header_load_congestion_tax_round_trip() {
+        // Load ("ld") and CongestionTax ("ct") are new vFuture-only header
+        // fields (go-algorand v4.7.0-beta, PR #6548). Zero-valued (the
+        // MainNet/TestNet-today case) they must be omitted entirely, matching
+        // go's `codec:"ld"`/`codec:"ct"` (no `omitempty` override, but
+        // `basics.Micros` is a bare `uint64` so go-codec omits it at zero the
+        // same as every other integer header field here).
+        let mut header = BlockHeader {
+            round: Round(5),
+            load: 750_000,
+            congestion_tax: 2_150_000,
+            ..BlockHeader::default()
+        };
+
+        let encoded = canonical_encode_block_header(&header);
+        let val = rmpv::decode::read_value(&mut &encoded[..]).unwrap();
+        let rmpv::Value::Map(pairs) = val else {
+            panic!("expected map");
+        };
+        let keys: Vec<String> = pairs
+            .iter()
+            .map(|(k, _)| k.as_str().unwrap().to_string())
+            .collect();
+        assert!(keys.contains(&"ld".to_string()));
+        assert!(keys.contains(&"ct".to_string()));
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "keys must be in lexicographic order");
+
+        let decoded = BlockHeader::decode_from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.load, 750_000);
+        assert_eq!(decoded.congestion_tax, 2_150_000);
+        assert_eq!(decoded, header);
+
+        // Zero load/congestion_tax (today's real MainNet/TestNet blocks) omit
+        // both keys entirely.
+        header.load = 0;
+        header.congestion_tax = 0;
+        let encoded_zero = canonical_encode_block_header(&header);
+        let val_zero = rmpv::decode::read_value(&mut &encoded_zero[..]).unwrap();
+        let rmpv::Value::Map(pairs_zero) = val_zero else {
+            panic!("expected map");
+        };
+        let keys_zero: Vec<String> = pairs_zero
+            .iter()
+            .map(|(k, _)| k.as_str().unwrap().to_string())
+            .collect();
+        assert!(!keys_zero.contains(&"ld".to_string()));
+        assert!(!keys_zero.contains(&"ct".to_string()));
+    }
+
+    #[test]
     fn test_integer_packing_compact() {
         // Small value (< 128) should be positive fixint (1 byte)
         let mut buf = Vec::new();
@@ -2304,6 +2366,8 @@ mod tests {
             upgrade_approve: false,
             expired_participation_accounts: None,
             absent_participation_accounts: None,
+            load: 0,
+            congestion_tax: 0,
             payset,
         }
     }
