@@ -665,12 +665,17 @@ consensus-cluster-negative: ## Run the #472 negative conformance suite (up + inj
 consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker needed)
 	python3 $(PHASE6_CLUSTER)/scripts/analyze_test.py
 
-## ops/mixed-cluster-p2p harness (issue #543) — a single real
-## go-algorand v4.7.0-stable node in plain P2P mode, dialed directly by
-## algod-rust's `algo-p2p` libp2p transport to prove real cross-
-## implementation interop. See docs/MIXED_CLUSTER_HARNESS.md's "P2P
-## interop harness" section for current scope and what's left.
-p2p-interop-up: ## Bring up the single-node go-algorand P2P interop target
+## ops/mixed-cluster-p2p harness (issues #543, #560) — three real
+## go-algorand v4.7.0-stable nodes in plain P2P mode, chain-bootstrapped
+## to each other (1 <- 2 <- 3, no node told about a non-adjacent peer),
+## dialed by algod-rust's `algo-p2p` libp2p transport to prove real
+## cross-implementation transport interop. See
+## docs/MIXED_CLUSTER_HARNESS.md's "P2P interop harness" section for
+## current scope and what's left — building this harness's 3-node chain
+## found and fixed a real DHT protocol-string bug (#560), but full
+## cross-implementation DHT peer discovery is not yet proven working and
+## is tracked as a follow-up, not asserted by any test here yet.
+p2p-interop-up: ## Bring up the 3-node go-algorand P2P interop target
 	$(P2P_INTEROP_CLUSTER)/scripts/start.sh
 
 p2p-interop-down: ## Tear down the P2P interop target (pass PURGE=1 to wipe netroot/)
@@ -681,7 +686,7 @@ p2p-interop-down: ## Tear down the P2P interop target (pass PURGE=1 to wipe netr
 	fi
 
 p2p-interop-test: p2p-interop-up ## Up + run the live interop test + down
-	@ALGOD_RUST_P2P_GO_MULTIADDR="$$(cat $(P2P_INTEROP_CLUSTER)/netroot/.p2p-multiaddr)" \
+	@ALGOD_RUST_P2P_GO_MULTIADDR="$$(cat $(P2P_INTEROP_CLUSTER)/netroot/.p2p-multiaddr-1)" \
 		cargo test --package algod-rust --test p2p_go_algorand_interop -- --ignored --nocapture; \
 	status=$$?; \
 	$(P2P_INTEROP_CLUSTER)/scripts/stop.sh; \

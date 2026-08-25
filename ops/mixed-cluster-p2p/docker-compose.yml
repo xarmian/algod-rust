@@ -1,21 +1,30 @@
-# Issue #543 — P2P interop harness.
+# Issue #543 (single-node transport interop) + issue #560 (multi-node DHT
+# discovery interop).
 #
-# A single go-algorand v4.7.0-stable node, started with `EnableP2P: true`
+# Three go-algorand v4.7.0-stable nodes, each started with `EnableP2P: true`
 # (plain P2P, no WS-gossip listener — mirrors what algod-rust's own
-# `P2pOnly` mode does, see #542), for algod-rust's `algo-p2p` libp2p
-# transport to dial directly and prove real cross-implementation
-# interop (Noise-secured TCP connection between rust-libp2p and
-# go-libp2p).
+# `P2pOnly` mode does, see #542), chain-bootstrapped to each other via the
+# `-p`/`PEER_ADDRESS` phonebook override (go-node-2 is only ever told
+# go-node-1's multiaddr; go-node-3 is only ever told go-node-2's) so that
+# any peer discovered beyond one hop can only have come from real Kademlia
+# DHT routing, not a directly-configured address — see
+# `scripts/start.sh` and `bin/algod-rust/tests/p2p_go_algorand_interop.rs`'s
+# `discovers_third_go_algorand_peer_via_dht_routing_through_the_first`.
 #
 # This is a smaller, narrower sibling of `ops/mixed-cluster/` (which
 # proves WS-gossip consensus interop across 3 Go + 1 Rust nodes): this
-# harness proves P2P *transport*-level interop with a single Go node.
-# Extending it to a multi-node P2P mesh with full consensus round-trip
-# is tracked as a follow-up (see docs/MIXED_CLUSTER_HARNESS.md).
+# harness proves P2P *transport + DHT-routing* interop with real
+# go-algorand nodes. A full consensus round-trip in `P2pOnly` mode against
+# real go-algorand peers additionally requires porting go's per-peer
+# libp2p-stream wire protocol for agreement traffic (go-algorand's own
+# gossipsub wiring covers only the TX tag — see
+# `docs/MIXED_CLUSTER_HARNESS.md`'s "P2P interop harness" section and
+# issue #560's follow-up for the tracked gap).
 #
 # Usage:
 #   ops/mixed-cluster-p2p/scripts/start.sh   # generate netroot + start,
-#                                             # prints the dialable multiaddr
+#                                             # prints each node's dialable
+#                                             # multiaddr
 #   ops/mixed-cluster-p2p/scripts/stop.sh    # tear down + cleanup
 
 services:
@@ -36,6 +45,73 @@ services:
       - "127.0.0.1:5161:4161"
     volumes:
       - ./netroot/Node1:/algod/data
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - -H
+        - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        - http://localhost:8080/v2/status
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    networks:
+      - p2pinterop
+
+  # go-node-2 and go-node-3 are only started by start.sh once the previous
+  # node's multiaddr is known (needed to set PEER_ADDRESS), so they have no
+  # `depends_on` here — start.sh sequences `docker compose up -d <name>`
+  # calls itself.
+  go-node-2:
+    image: algorand/algod:4.7.0-stable
+    container_name: p2pinterop-go-node-2
+    environment:
+      - ALGORAND_DATA=/algod/data
+      - ALGOD_PORT=8080
+      - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      # Set by start.sh to go-node-1's *internal* docker-network multiaddr
+      # (/dns4/go-node-1/tcp/4161/p2p/<peerid1>) — the only address
+      # go-node-2 is ever directly told.
+      - PEER_ADDRESS=${GO_NODE_2_PEER_ADDRESS:-}
+    ports:
+      - "127.0.0.1:5002:8080"
+      - "127.0.0.1:5162:4162"
+    volumes:
+      - ./netroot/Node2:/algod/data
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - -H
+        - "X-Algo-API-Token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        - http://localhost:8080/v2/status
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    networks:
+      - p2pinterop
+
+  go-node-3:
+    image: algorand/algod:4.7.0-stable
+    container_name: p2pinterop-go-node-3
+    environment:
+      - ALGORAND_DATA=/algod/data
+      - ALGOD_PORT=8080
+      - TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - ADMIN_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      # Set by start.sh to go-node-2's internal multiaddr — go-node-3 is
+      # never told go-node-1's address directly.
+      - PEER_ADDRESS=${GO_NODE_3_PEER_ADDRESS:-}
+    ports:
+      - "127.0.0.1:5003:8080"
+      - "127.0.0.1:5163:4163"
+    volumes:
+      - ./netroot/Node3:/algod/data
     healthcheck:
       test:
         - CMD

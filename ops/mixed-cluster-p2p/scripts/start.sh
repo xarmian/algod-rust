@@ -1,27 +1,36 @@
 #!/usr/bin/env bash
-# Start the single-node go-algorand P2P interop harness (issue #543).
+# Start the 3-node go-algorand P2P interop harness (issues #543, #560).
 #
 # Steps:
-#   1. If netroot/ is missing, bootstrap a 1-node netgoal network
+#   1. If netroot/ is missing, bootstrap a 3-relay-node netgoal network
 #      (see ../template.json).
-#   2. Overlay Node1's config.json so it runs plain P2P (no WS-gossip):
-#      EnableP2P=true, NetAddress=0.0.0.0:4161 (config/localTemplate.go's
-#      IsP2PListenServer requires NetAddress != "" even in this mode —
-#      see #543's investigation notes), IncomingConnectionsLimit set
-#      non-zero (p2p.go forces listenAddr="" when this is 0),
-#      EndpointAddress=0.0.0.0:8080, DNSBootstrapID="".
-#   3. Start the container and wait for its REST API to answer.
-#   4. Scrape the "P2P host created: peer ID %s addrs %s" log line
+#   2. Overlay each node's config.json so it runs plain P2P (no WS-gossip):
+#      EnableP2P=true, NetAddress=0.0.0.0:<port>, IncomingConnectionsLimit
+#      set non-zero (p2p.go forces listenAddr="" when this is 0),
+#      EndpointAddress=0.0.0.0:8080, DNSBootstrapID="",
+#      EnableDHTProviders=true (config/localTemplate.go: "enables the DHT
+#      for peer discovery and capabilities advertisement" — defaults to
+#      false; without it, `network/p2pNetwork.go` never attaches a kad DHT
+#      node at all, and any DHT query against the node comes back empty
+#      instantly rather than actually reaching out over the network — this
+#      was issue #560's first real finding).
+#   3. Start go-node-1 with no PEER_ADDRESS (bootstrap origin), scrape its
+#      PeerID from the "P2P host created: peer ID %s addrs %s" log line
 #      go-algorand emits unconditionally at P2P host creation
-#      (network/p2pNetwork.go) to recover its PeerID, and print the
-#      host-dialable multiaddr
-#      (/ip4/127.0.0.1/tcp/5161/p2p/<peerid> — see docker-compose.yml's
-#      5161:4161 port mapping) on stdout and into
-#      netroot/.p2p-multiaddr.
+#      (network/p2pNetwork.go), then start go-node-2 with PEER_ADDRESS set
+#      to go-node-1's *internal* docker-network multiaddr — the only
+#      address go-node-2 is ever directly told — then likewise chain
+#      go-node-3 off go-node-2. This chain topology (1 -> 2 -> 3, no node
+#      told about a non-adjacent peer) means any address the Rust test
+#      discovers beyond one hop can only have come from real Kademlia DHT
+#      routing.
+#   4. Print/persist each node's *host*-dialable multiaddr (via the
+#      docker-compose host port mappings) to netroot/.p2p-multiaddr-N.
 #
 # Consume the result:
-#   ALGOD_RUST_P2P_GO_MULTIADDR="$(cat netroot/.p2p-multiaddr)" \
-#     cargo test --test p2p_go_algorand_interop -p algod-rust
+#   ALGOD_RUST_P2P_GO_MULTIADDR="$(cat netroot/.p2p-multiaddr-1)" \
+#   ALGOD_RUST_P2P_GO_MULTIADDR_3="$(cat netroot/.p2p-multiaddr-3)" \
+#     cargo test --package algod-rust --test p2p_go_algorand_interop -- --ignored --nocapture
 
 set -euo pipefail
 
@@ -33,7 +42,6 @@ TEMPLATE="$ROOT/template.json"
 ALGOD_IMG="algorand/algod:4.7.0-stable"
 NUM_ROUNDS="${NUM_ROUNDS:-30000}"
 ALGOD_TOKEN="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-MULTIADDR_FILE="$NETROOT/.p2p-multiaddr"
 
 # Same MSYS/Git-Bash path-mangling workaround as
 # ops/mixed-cluster/scripts/start.sh.
@@ -45,7 +53,7 @@ host_path() {
     fi
 }
 
-echo "==> P2P interop harness start"
+echo "==> P2P interop harness start (3 go-algorand nodes, chain-bootstrapped)"
 echo "    netroot:  $NETROOT"
 
 # -- 1. Bootstrap the netgoal tree if missing ------------------------------
@@ -75,61 +83,101 @@ else
     echo "==> reusing existing netroot/ (run stop.sh to reset)"
 fi
 
-# -- 2. Patch config.json for plain P2P mode -------------------------------
-NODE_HOST_PATH="$(host_path "$NETROOT/Node1")"
-for kv in \
-    "EnableP2P=true" \
-    "NetAddress=0.0.0.0:4161" \
-    "IncomingConnectionsLimit=100" \
-    "EndpointAddress=0.0.0.0:8080" \
-    "DNSBootstrapID="
-do
-    MSYS_NO_PATHCONV=1 docker run --rm \
-        -v "$NODE_HOST_PATH:/algod/data" \
-        --entrypoint algocfg \
-        "$ALGOD_IMG" \
-        -d /algod/data set -p "${kv%%=*}" -v "${kv#*=}" >/dev/null
-done
-echo "    configured Node1 for plain P2P (EnableP2P=true, no WS-gossip listener)"
+# -- 2. Patch each node's config.json for plain P2P mode ------------------
+patch_p2p_config() {
+    local node_dir="$1" p2p_port="$2"
+    local node_host_path
+    node_host_path="$(host_path "$NETROOT/$node_dir")"
+    for kv in \
+        "EnableP2P=true" \
+        "NetAddress=0.0.0.0:${p2p_port}" \
+        "IncomingConnectionsLimit=100" \
+        "EndpointAddress=0.0.0.0:8080" \
+        "DNSBootstrapID=" \
+        "EnableDHTProviders=true"
+    do
+        MSYS_NO_PATHCONV=1 docker run --rm \
+            -v "$node_host_path:/algod/data" \
+            --entrypoint algocfg \
+            "$ALGOD_IMG" \
+            -d /algod/data set -p "${kv%%=*}" -v "${kv#*=}" >/dev/null
+    done
+    echo "    configured $node_dir for plain P2P on :$p2p_port (EnableP2P=true, no WS-gossip listener)"
+}
+patch_p2p_config Node1 4161
+patch_p2p_config Node2 4162
+patch_p2p_config Node3 4163
 
-# -- 3. Start and wait for REST -------------------------------------------
+# -- 3. Start go-node-1 (bootstrap origin, no PEER_ADDRESS) ----------------
 cd "$ROOT"
 echo "==> docker compose up -d go-node-1"
 docker compose up -d go-node-1
 
-echo "==> waiting for go-node-1 to answer /v2/status"
-for _ in $(seq 1 60); do
-    if curl -sf -H "X-Algo-API-Token: $ALGOD_TOKEN" http://127.0.0.1:5001/v2/status >/dev/null 2>&1; then
-        break
-    fi
-    sleep 2
-done
-if ! curl -sf -H "X-Algo-API-Token: $ALGOD_TOKEN" http://127.0.0.1:5001/v2/status >/dev/null 2>&1; then
-    echo "error: go-node-1 never answered /v2/status — check 'docker compose logs go-node-1'" >&2
+wait_for_rest() {
+    local host_port="$1" name="$2"
+    echo "==> waiting for $name to answer /v2/status"
+    for _ in $(seq 1 60); do
+        if curl -sf -H "X-Algo-API-Token: $ALGOD_TOKEN" "http://127.0.0.1:${host_port}/v2/status" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "error: $name never answered /v2/status — check 'docker compose logs $name'" >&2
     exit 1
-fi
+}
+wait_for_rest 5001 go-node-1
 
-# -- 4. Recover the PeerID from the log line -------------------------------
 # network/p2pNetwork.go: log.Infof("P2P host created: peer ID %s addrs %s", ...)
-echo "==> waiting for P2P host creation log line"
-PEER_ID=""
-for _ in $(seq 1 60); do
-    PEER_ID="$(docker compose logs go-node-1 2>/dev/null \
-        | grep -o 'P2P host created: peer ID [A-Za-z0-9]*' \
-        | head -1 \
-        | awk '{print $NF}')"
-    if [ -n "$PEER_ID" ]; then
-        break
-    fi
-    sleep 2
-done
-if [ -z "$PEER_ID" ]; then
-    echo "error: never observed the 'P2P host created' log line — check 'docker compose logs go-node-1'" >&2
-    echo "       (confirm EnableP2P actually took effect: docker compose exec go-node-1 cat /algod/data/config.json)" >&2
+scrape_peer_id() {
+    local service="$1"
+    local peer_id=""
+    for _ in $(seq 1 60); do
+        peer_id="$(docker compose logs "$service" 2>/dev/null \
+            | grep -o 'P2P host created: peer ID [A-Za-z0-9]*' \
+            | head -1 \
+            | awk '{print $NF}')"
+        if [ -n "$peer_id" ]; then
+            echo "$peer_id"
+            return 0
+        fi
+        sleep 2
+    done
+    echo "error: never observed the 'P2P host created' log line for $service — check 'docker compose logs $service'" >&2
+    echo "       (confirm EnableP2P actually took effect: docker compose exec $service cat /algod/data/config.json)" >&2
     exit 1
-fi
+}
 
-MULTIADDR="/ip4/127.0.0.1/tcp/5161/p2p/$PEER_ID"
-echo "$MULTIADDR" > "$MULTIADDR_FILE"
-echo "==> go-node-1 P2P multiaddr: $MULTIADDR"
-echo "    (written to $MULTIADDR_FILE)"
+echo "==> waiting for go-node-1 P2P host creation log line"
+PEER_ID_1="$(scrape_peer_id go-node-1)"
+MULTIADDR_1_HOST="/ip4/127.0.0.1/tcp/5161/p2p/$PEER_ID_1"
+MULTIADDR_1_INTERNAL="/dns4/go-node-1/tcp/4161/p2p/$PEER_ID_1"
+echo "$MULTIADDR_1_HOST" > "$NETROOT/.p2p-multiaddr-1"
+echo "==> go-node-1 P2P multiaddr (host-dialable): $MULTIADDR_1_HOST"
+
+# -- 4. Start go-node-2, bootstrapped ONLY off go-node-1 -------------------
+echo "==> docker compose up -d go-node-2 (PEER_ADDRESS=$MULTIADDR_1_INTERNAL)"
+GO_NODE_2_PEER_ADDRESS="$MULTIADDR_1_INTERNAL" docker compose up -d go-node-2
+wait_for_rest 5002 go-node-2
+
+echo "==> waiting for go-node-2 P2P host creation log line"
+PEER_ID_2="$(scrape_peer_id go-node-2)"
+MULTIADDR_2_HOST="/ip4/127.0.0.1/tcp/5162/p2p/$PEER_ID_2"
+MULTIADDR_2_INTERNAL="/dns4/go-node-2/tcp/4162/p2p/$PEER_ID_2"
+echo "$MULTIADDR_2_HOST" > "$NETROOT/.p2p-multiaddr-2"
+echo "==> go-node-2 P2P multiaddr (host-dialable): $MULTIADDR_2_HOST"
+
+# -- 5. Start go-node-3, bootstrapped ONLY off go-node-2 -------------------
+# go-node-3 is never told go-node-1's address — it can only learn about
+# go-node-1 (and vice versa) via Kademlia DHT routing through go-node-2.
+echo "==> docker compose up -d go-node-3 (PEER_ADDRESS=$MULTIADDR_2_INTERNAL)"
+GO_NODE_3_PEER_ADDRESS="$MULTIADDR_2_INTERNAL" docker compose up -d go-node-3
+wait_for_rest 5003 go-node-3
+
+echo "==> waiting for go-node-3 P2P host creation log line"
+PEER_ID_3="$(scrape_peer_id go-node-3)"
+MULTIADDR_3_HOST="/ip4/127.0.0.1/tcp/5163/p2p/$PEER_ID_3"
+echo "$MULTIADDR_3_HOST" > "$NETROOT/.p2p-multiaddr-3"
+echo "==> go-node-3 P2P multiaddr (host-dialable): $MULTIADDR_3_HOST"
+
+echo "==> all three go-algorand P2P nodes started; chain topology: 1 <- 2 <- 3"
+echo "    (written to $NETROOT/.p2p-multiaddr-1, -2, -3)"

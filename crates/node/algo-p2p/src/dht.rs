@@ -14,16 +14,34 @@
 
 use libp2p::StreamProtocol;
 
-/// Algorand's DHT protocol-name pattern: `/algorand/kad/<network-id>`.
+/// Algorand's DHT protocol-name pattern:
+/// `/algorand/kad/<network-id>/kad/1.0.0`.
 ///
-/// Go: `network/p2p/dht/dht.go` `dhtProtocolPrefix`:
+/// Go: `network/p2p/dht/dht.go` `dhtProtocolPrefix` produces only the
+/// *prefix* half of this:
 /// ```go
 /// func dhtProtocolPrefix(networkID algoproto.NetworkID) protocol.ID {
 ///     return protocol.ID(fmt.Sprintf("/algorand/kad/%s", networkID))
 /// }
 /// ```
+/// — passed to `go-libp2p-kad-dht`'s `dht.ProtocolPrefix(...)` option. That
+/// library does NOT use the prefix as the wire protocol string verbatim:
+/// `go-libp2p-kad-dht@v0.28.0`'s `makeDHT` (`dht.go`) computes
+/// `v1proto := cfg.ProtocolPrefix + kad1` where `kad1 = protocol.ID("/kad/1.0.0")`,
+/// and negotiates DHT streams under `v1proto`, not `cfg.ProtocolPrefix`
+/// alone. Missing this suffix here does not fail closed — it silently
+/// produces a *different, non-overlapping* protocol string, so a rust
+/// host's own `get_closest_peers` calls fail to reach a real go-algorand
+/// peer at all (rust-libp2p's kad simply has no shared protocol to open a
+/// stream over) while a `libp2p::kad::Behaviour::add_address`-seeded
+/// connection to that peer still looks perfectly healthy at the transport
+/// layer, which is why this went uncaught until a live multi-node
+/// interop run against a real go-algorand DHT (`ops/mixed-cluster-p2p/`,
+/// issue #560) surfaced it — #539's own tests only ever connect two
+/// `P2pHost`s to each other, which stayed protocol-compatible with
+/// *itself* even without the suffix.
 pub fn dht_protocol_name(network_id: &str) -> StreamProtocol {
-    StreamProtocol::try_from_owned(format!("/algorand/kad/{network_id}"))
+    StreamProtocol::try_from_owned(format!("/algorand/kad/{network_id}/kad/1.0.0"))
         .expect("a network-id-derived protocol name is always a valid StreamProtocol")
 }
 
@@ -61,7 +79,19 @@ mod tests {
     #[test]
     fn protocol_name_includes_network_id() {
         let proto = dht_protocol_name("testnet-v1.0");
-        assert_eq!(proto.as_ref(), "/algorand/kad/testnet-v1.0");
+        assert_eq!(proto.as_ref(), "/algorand/kad/testnet-v1.0/kad/1.0.0");
+    }
+
+    /// Regression guard for issue #560's finding: go-libp2p-kad-dht
+    /// appends `/kad/1.0.0` to whatever `ProtocolPrefix` go-algorand
+    /// configures — this crate's protocol string must include that exact
+    /// suffix or a real go-algorand DHT peer negotiates no shared
+    /// protocol at all (see this function's doc comment for the full
+    /// citation).
+    #[test]
+    fn protocol_name_matches_go_libp2p_kad_dhts_v1_suffix() {
+        let proto = dht_protocol_name("p2pinterop");
+        assert_eq!(proto.as_ref(), "/algorand/kad/p2pinterop/kad/1.0.0");
     }
 
     #[test]
