@@ -12,6 +12,7 @@ libp2p = { version = "0.54", features = [
     "tokio",
     "kad",
     "identify",
+    "gossipsub",
     "macros",
 ] }
 tokio.workspace = true

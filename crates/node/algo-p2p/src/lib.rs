@@ -7,14 +7,18 @@
 //! It is **additive and alternate** to `algo-network`'s existing WebSocket
 //! gossip stack, not a replacement — nothing here is wired into that stack.
 //! Kademlia DHT peer discovery, a persistent peer cache, and `dnsaddr`
-//! DNS-based bootstrap resolution are implemented here (#539).
-//! gossipsub-based message propagation, capability advertisement, and
-//! WS/P2P transport-mode selection are later, separate sub-issues of the
-//! P2P epic (#544) and are deliberately out of scope for this crate so far.
+//! DNS-based bootstrap resolution are implemented here (#539), and so is
+//! gossipsub-based publish/subscribe pubsub for block/vote/tx propagation
+//! (#540, see the [`pubsub`] module for topic naming). Capability
+//! advertisement and WS/P2P transport-mode selection (wiring this crate's
+//! pubsub into `algo-network`'s broadcast/consume interfaces so the running
+//! node can actually use it) are later, separate sub-issues of the P2P
+//! epic (#544, see #541/#542) and are deliberately out of scope for this
+//! crate so far.
 //!
 //! Reference: `../go-algorand/network/p2p/` at `v4.7.0-stable`
 //! (`p2p.go`, `peerID.go`, `streams.go`, `http.go`, `dht/dht.go`,
-//! `dnsaddr/resolve.go`, `peerstore/peerstore.go`).
+//! `dnsaddr/resolve.go`, `peerstore/peerstore.go`, `pubsub.go`).
 
 pub mod dht;
 pub mod dnsaddr;
@@ -22,11 +26,19 @@ pub mod errors;
 pub mod host;
 pub mod identity;
 pub mod peerstore;
+pub mod pubsub;
 pub mod streams;
 
 pub use dht::dht_protocol_name;
 pub use dnsaddr::{resolve_multiaddrs, DnsaddrError, DnsaddrResolver, HickoryDnsaddrResolver};
 pub use errors::P2pError;
-pub use host::{P2pBehaviour, P2pBehaviourEvent, P2pHost, DHT_LOOKUP_TIMEOUT, DIAL_TIMEOUT};
+pub use host::{
+    MessageValidationResult, P2pBehaviour, P2pBehaviourEvent, P2pHost, DHT_LOOKUP_TIMEOUT,
+    DIAL_TIMEOUT,
+};
 pub use identity::{get_or_create_keypair, IdentityConfig, DEFAULT_PRIV_KEY_FILENAME};
 pub use peerstore::{PersistentPeerStore, DEFAULT_PEERSTORE_FILENAME};
+pub use pubsub::{
+    ident_topic, topic_name_for_tag_code, AGREEMENT_VOTE_TOPIC, ALL_TOPICS, PROPOSAL_PAYLOAD_TOPIC,
+    TX_TOPIC, VOTE_BUNDLE_TOPIC,
+};

@@ -5,8 +5,8 @@
 //! `network/p2p/dht/dht.go` `MakeDHT` and
 //! `network/p2p/capabilities.go`'s `CapabilitiesDiscovery` for Kademlia DHT
 //! peer discovery (#539): a libp2p `Swarm` secured with Noise over TCP,
-//! composed with rust-libp2p's `kad` `NetworkBehaviour` for DHT routing.
-//! gossipsub is still a later sub-issue (#540).
+//! composed with rust-libp2p's `kad` `NetworkBehaviour` for DHT routing,
+//! plus `gossipsub` (#540) for block/vote/tx propagation pubsub.
 //!
 //! `rust-libp2p` performs the Noise handshake and yamux stream-muxer
 //! upgrade as part of establishing a connection, before the connection is
@@ -27,9 +27,29 @@
 //! Kademlia through calls to `Behaviour::add_address`" — without it, a
 //! Kademlia node cannot learn a newly-connected peer's actual *listen*
 //! address, only the ephemeral address of whichever side dialed).
+//!
+//! Finally, this host composes rust-libp2p's `gossipsub` `NetworkBehaviour`
+//! (#540) for block/vote/tx propagation — see the [`crate::pubsub`] module
+//! for topic naming. Mirrors go-algorand's `network/p2p/pubsub.go`
+//! `makePubSub`:
+//! - `pubsub.WithMessageSignaturePolicy(pubsub.StrictNoSign)` — go publishes
+//!   messages with no signature, sequence number, or `from` field, and
+//!   rejects any inbound message that carries one. rust-libp2p's equivalent
+//!   is [`gossipsub::MessageAuthenticity::Anonymous`] combined with
+//!   [`gossipsub::ValidationMode::Anonymous`].
+//! - go enables asynchronous per-message validation (the tag handler
+//!   decides Accept/Reject/Ignore before a message is allowed to
+//!   re-propagate) via `pubsub.ValidatorEx` registered per topic in
+//!   `Subscribe`. rust-libp2p's equivalent is
+//!   `gossipsub::ConfigBuilder::validate_messages(true)` plus
+//!   [`P2pHost::report_message_validation_result`] — the caller must report
+//!   a result for every [`gossipsub::Event::Message`] it receives via
+//!   [`P2pHost::next_event`], or that message is held back from
+//!   re-propagation indefinitely.
 
 use std::time::Duration;
 
+use libp2p::gossipsub::{self, MessageId, TopicHash};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{identify, kad, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
 
@@ -68,6 +88,35 @@ const IDENTIFY_PROTOCOL_VERSION: &str = "/algorand/id/1.0.0";
 pub struct P2pBehaviour {
     kad: kad::Behaviour<kad::store::MemoryStore>,
     identify: identify::Behaviour,
+    gossipsub: gossipsub::Behaviour,
+}
+
+/// Outcome a caller reports for a received gossipsub message, mirroring
+/// go-algorand's `pubsub.ValidationResult` (`ValidationAccept` /
+/// `ValidationReject` / `ValidationIgnore`, as returned by e.g.
+/// `P2PNetwork.txTopicValidator`):
+/// - `Accept` — well-formed and passed application-level checks (e.g.
+///   signature/format validation on untrusted gossip input); re-propagate
+///   to the mesh.
+/// - `Reject` — malformed or otherwise invalid; do not re-propagate, and
+///   penalize the sending peer's gossipsub score.
+/// - `Ignore` — valid enough not to penalize the sender (e.g. a duplicate
+///   already known through another path) but not worth re-propagating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageValidationResult {
+    Accept,
+    Reject,
+    Ignore,
+}
+
+impl From<MessageValidationResult> for gossipsub::MessageAcceptance {
+    fn from(value: MessageValidationResult) -> Self {
+        match value {
+            MessageValidationResult::Accept => gossipsub::MessageAcceptance::Accept,
+            MessageValidationResult::Reject => gossipsub::MessageAcceptance::Reject,
+            MessageValidationResult::Ignore => gossipsub::MessageAcceptance::Ignore,
+        }
+    }
 }
 
 /// A libp2p host for the algod-rust P2P transport, with Kademlia DHT peer
@@ -104,7 +153,26 @@ impl P2pHost {
                     IDENTIFY_PROTOCOL_VERSION.to_string(),
                     key.public(),
                 ));
-                P2pBehaviour { kad, identify }
+                // Go: `makePubSub`'s `pubsub.WithMessageSignaturePolicy(pubsub.StrictNoSign)`
+                // — no per-message signature/seqno/from, and
+                // `pubsub.WithValidateQueueSize`+async `ValidatorEx` per topic —
+                // `validate_messages(true)` is rust-libp2p's equivalent (see
+                // this module's doc comment).
+                let gossipsub_config = gossipsub::ConfigBuilder::default()
+                    .validation_mode(gossipsub::ValidationMode::Anonymous)
+                    .validate_messages()
+                    .build()
+                    .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
+                let gossipsub = gossipsub::Behaviour::new(
+                    gossipsub::MessageAuthenticity::Anonymous,
+                    gossipsub_config,
+                )
+                .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(P2pBehaviour {
+                    kad,
+                    identify,
+                    gossipsub,
+                })
             })
             .map_err(|e| P2pError::SwarmBuild(e.to_string()))?
             // The composed behaviour's connections stay alive through DHT
@@ -205,6 +273,112 @@ impl P2pHost {
     /// Currently connected peers.
     pub fn connected_peers(&self) -> Vec<PeerId> {
         self.swarm.connected_peers().copied().collect()
+    }
+
+    /// Subscribe to a gossipsub topic by name (see [`crate::pubsub`] for the
+    /// topic names this crate defines). Idempotent: subscribing to a topic
+    /// this host is already subscribed to is a no-op that returns `Ok(())`.
+    ///
+    /// Go: `serviceImpl.Subscribe`, called by e.g. `txTopicHandleLoop` for
+    /// [`crate::pubsub::TX_TOPIC`].
+    pub fn gossipsub_subscribe(&mut self, topic_name: &str) -> Result<(), P2pError> {
+        self.swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&crate::pubsub::ident_topic(topic_name))
+            .map(|_| ())
+            .map_err(|source| P2pError::GossipsubSubscribe {
+                topic: topic_name.to_string(),
+                source: Box::new(source),
+            })
+    }
+
+    /// Unsubscribe from a gossipsub topic previously joined via
+    /// [`P2pHost::gossipsub_subscribe`].
+    pub fn gossipsub_unsubscribe(&mut self, topic_name: &str) -> Result<(), P2pError> {
+        self.swarm
+            .behaviour_mut()
+            .gossipsub
+            .unsubscribe(&crate::pubsub::ident_topic(topic_name))
+            .map(|_| ())
+            .map_err(|source| P2pError::GossipsubPublish {
+                topic: topic_name.to_string(),
+                source: Box::new(source),
+            })
+    }
+
+    /// Publish `data` to a gossipsub topic. `data` is the raw tag payload,
+    /// unwrapped — the topic name itself conveys the message tag, mirroring
+    /// go-algorand's `serviceImpl.Publish` (`network/p2p/pubsub.go`), which
+    /// likewise publishes the tag-specific payload bytes verbatim with no
+    /// additional envelope.
+    ///
+    /// Returns the resulting [`MessageId`] so a caller that also wants to
+    /// exclude/track its own publish (e.g. for de-duplication bookkeeping)
+    /// can do so; most callers can ignore it.
+    pub fn gossipsub_publish(
+        &mut self,
+        topic_name: &str,
+        data: Vec<u8>,
+    ) -> Result<MessageId, P2pError> {
+        self.swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(crate::pubsub::ident_topic(topic_name), data)
+            .map_err(|source| P2pError::GossipsubPublish {
+                topic: topic_name.to_string(),
+                source: Box::new(source),
+            })
+    }
+
+    /// Report the outcome of validating a received gossipsub message
+    /// ([`gossipsub::Event::Message`], surfaced via [`P2pHost::next_event`]).
+    ///
+    /// Must be called exactly once per received message — with
+    /// `validate_messages(true)` (this host's config; see this module's
+    /// doc comment), a message is held back from re-propagation until its
+    /// validation result is reported. Mirrors go-algorand's
+    /// `pubsub.ValidatorEx` callback return value
+    /// (`txTopicValidator`'s `ValidationAccept` / `ValidationReject` /
+    /// `ValidationIgnore`).
+    pub fn report_message_validation_result(
+        &mut self,
+        msg_id: &MessageId,
+        propagation_source: &PeerId,
+        result: MessageValidationResult,
+    ) {
+        // A `false` return (message no longer in the validation cache —
+        // e.g. reported twice, or reported after the cache evicted it) is
+        // not actionable by the caller and mirrors go's own
+        // `report_message_validation_result` semantics of being advisory
+        // only; `PublishError` here would indicate an internal gossipsub
+        // state issue, not an untrusted-input problem, so it is logged
+        // rather than propagated as a caller-facing error.
+        if let Err(e) = self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .report_message_validation_result(msg_id, propagation_source, result.into())
+        {
+            tracing::debug!(
+                error = %e,
+                "failed to report gossipsub message validation result"
+            );
+        }
+    }
+
+    /// Peers this host has in its gossipsub mesh for `topic_name` (i.e.
+    /// peers messages on this topic are actively forwarded to/from, as
+    /// opposed to merely being subscribed peers known via metadata
+    /// exchange). Useful for tests and diagnostics.
+    pub fn gossipsub_mesh_peers(&self, topic_name: &str) -> Vec<PeerId> {
+        let hash: TopicHash = crate::pubsub::ident_topic(topic_name).hash();
+        self.swarm
+            .behaviour()
+            .gossipsub
+            .mesh_peers(&hash)
+            .copied()
+            .collect()
     }
 
     /// Explicitly set this host's DHT mode, or `None` to return to
@@ -522,5 +696,147 @@ mod tests {
         // to propagate/log as an error — the type signature itself is the
         // regression guard for #6581's "do not err on context deadline".
         assert!(found.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // gossipsub (#540)
+    // -----------------------------------------------------------------------
+
+    /// TDD anchor for this issue (#540): a block/vote/tx-shaped message
+    /// published by one Rust `P2pHost` on a gossipsub topic reaches another
+    /// Rust `P2pHost` subscribed to the same topic, and the receiving side
+    /// can report a validation result for it (mirroring go-algorand's
+    /// `pubsub.ValidatorEx` callback contract — see this module's doc
+    /// comment on why `validate_messages(true)` requires that report).
+    ///
+    /// Two directly-connected peers subscribe to
+    /// [`crate::pubsub::PROPOSAL_PAYLOAD_TOPIC`] (chosen instead of the TX
+    /// topic to exercise a topic go-algorand itself does not yet gossip —
+    /// see the `pubsub` module doc comment) and wait for gossipsub's own
+    /// heartbeat to graft each other into the topic mesh before publishing,
+    /// since a freshly-subscribed peer is not immediately meshed.
+    #[tokio::test]
+    async fn published_message_reaches_subscribed_peer_via_gossipsub() {
+        let mut publisher = new_test_host();
+        let mut subscriber = new_test_host();
+
+        let listen_addr = start_listening(&mut subscriber).await;
+        let subscriber_peer_id = subscriber.peer_id();
+        let dial_addr = listen_addr.with(libp2p::multiaddr::Protocol::P2p(subscriber_peer_id));
+
+        publisher
+            .gossipsub_subscribe(crate::pubsub::PROPOSAL_PAYLOAD_TOPIC)
+            .expect("publisher subscribe");
+        subscriber
+            .gossipsub_subscribe(crate::pubsub::PROPOSAL_PAYLOAD_TOPIC)
+            .expect("subscriber subscribe");
+
+        publisher.dial(dial_addr).expect("dial should be accepted");
+
+        // Drive both swarms until each has seen the other's `Subscribed`
+        // notification for the topic — proof both sides know about a
+        // shared-topic peer, a precondition for gossipsub's heartbeat to
+        // graft them into each other's mesh.
+        let mut publisher_saw_subscriber = false;
+        let mut subscriber_saw_publisher = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !(publisher_saw_subscriber && subscriber_saw_publisher) {
+            tokio::select! {
+                ev = publisher.next_event() => {
+                    if let SwarmEvent::Behaviour(P2pBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, .. })) = ev {
+                        if peer_id == subscriber_peer_id { publisher_saw_subscriber = true; }
+                    }
+                }
+                ev = subscriber.next_event() => {
+                    if let SwarmEvent::Behaviour(P2pBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, .. })) = ev {
+                        subscriber_saw_publisher = true;
+                        let _ = peer_id;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timed out before both sides observed Subscribed");
+                }
+            }
+        }
+
+        // Keep pumping the subscriber's swarm (heartbeats, mesh grafts) in
+        // the background while the publisher waits out a couple of
+        // gossipsub heartbeat intervals (default: 1s) so both sides graft
+        // each other into the topic mesh before the publish below.
+        let subscriber_task = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                tokio::select! {
+                    ev = subscriber.next_event() => {
+                        if let SwarmEvent::Behaviour(P2pBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                            propagation_source,
+                            message_id,
+                            message,
+                        })) = ev
+                        {
+                            subscriber.report_message_validation_result(
+                                &message_id,
+                                &propagation_source,
+                                MessageValidationResult::Accept,
+                            );
+                            return (subscriber, message.data);
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return (subscriber, Vec::new());
+                    }
+                }
+            }
+        });
+
+        // Pump the publisher's swarm while waiting for mesh formation;
+        // gossipsub's heartbeat runs on its own timer independent of
+        // `next_event` being polled promptly, but connection-level
+        // keepalive traffic still needs the swarm driven.
+        let mesh_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < mesh_deadline {
+            tokio::select! {
+                _ = publisher.next_event() => {}
+                _ = tokio::time::sleep_until(mesh_deadline) => {}
+            }
+        }
+
+        let payload = b"block proposal payload bytes".to_vec();
+        publisher
+            .gossipsub_publish(crate::pubsub::PROPOSAL_PAYLOAD_TOPIC, payload.clone())
+            .expect("publish should be accepted by a meshed topic");
+
+        // Keep the publisher's swarm alive (gossipsub needs both sides
+        // driven to actually push bytes over the wire) while awaiting the
+        // subscriber's result.
+        let publisher_pump = tokio::spawn(async move {
+            loop {
+                publisher.next_event().await;
+            }
+        });
+
+        let (_, received) = tokio::time::timeout(Duration::from_secs(15), subscriber_task)
+            .await
+            .expect("subscriber task timed out")
+            .expect("subscriber task panicked");
+
+        publisher_pump.abort();
+
+        assert_eq!(
+            received, payload,
+            "expected the subscriber to receive the publisher's exact payload bytes via gossipsub"
+        );
+    }
+
+    /// The transaction topic name must be byte-for-byte identical to
+    /// go-algorand's `network/p2p.TXTopicName` for real interop — this is
+    /// a regression guard at the `P2pHost` API boundary (the constant
+    /// itself is unit-tested directly in [`crate::pubsub`]).
+    #[test]
+    fn gossipsub_subscribe_accepts_the_go_compatible_tx_topic_name() {
+        let mut host = new_test_host();
+        assert_eq!(crate::pubsub::TX_TOPIC, "algotx01");
+        host.gossipsub_subscribe(crate::pubsub::TX_TOPIC)
+            .expect("subscribe to the go-compatible TX topic name");
     }
 }
