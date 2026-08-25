@@ -34,4 +34,8 @@ pub enum P2pError {
         addr: String,
         source: Box<libp2p::swarm::DialError>,
     },
+
+    /// The on-disk persistent peerstore cache could not be decoded.
+    #[error("failed to decode persistent peerstore cache: {0}")]
+    PeerstoreDecode(String),
 }

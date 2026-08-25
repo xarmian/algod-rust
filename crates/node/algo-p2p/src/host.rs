@@ -1,12 +1,12 @@
-//! libp2p host construction, listen, and dial — the foundation of the P2P
-//! transport.
+//! libp2p host construction, listen, dial, and DHT peer discovery.
 //!
 //! Mirrors go-algorand's `network/p2p/p2p.go` `MakeHost` / `MakeService` /
-//! `Start` / `dialNode`, scoped down to what this issue asks for: a libp2p
-//! `Swarm` secured with Noise over TCP, multistream-select negotiation
-//! (handled internally by `rust-libp2p`'s transport upgrade), and plain
-//! dial-out / listen-in — no peer discovery (DHT) and no pubsub, both of
-//! which are later sub-issues (#539, #540).
+//! `Start` / `dialNode` for the transport foundation (#538), plus
+//! `network/p2p/dht/dht.go` `MakeDHT` and
+//! `network/p2p/capabilities.go`'s `CapabilitiesDiscovery` for Kademlia DHT
+//! peer discovery (#539): a libp2p `Swarm` secured with Noise over TCP,
+//! composed with rust-libp2p's `kad` `NetworkBehaviour` for DHT routing.
+//! gossipsub is still a later sub-issue (#540).
 //!
 //! `rust-libp2p` performs the Noise handshake and yamux stream-muxer
 //! upgrade as part of establishing a connection, before the connection is
@@ -14,12 +14,26 @@
 //! Observing that event is therefore sufficient proof that a *secure*
 //! (Noise-authenticated) libp2p connection exists — no application-level
 //! protocol handshake is required for that guarantee.
+//!
+//! This host also composes rust-libp2p's `identify` `NetworkBehaviour`
+//! alongside `kad`. This is not go-algorand-specific config (go-algorand's
+//! `MakeHost` builds a plain `libp2p.New(...)` host with no explicit
+//! Identify wiring) — it is present because go-libp2p (the Go
+//! implementation) runs Identify as an always-on core protocol of every
+//! host, and its `go-libp2p-kad-dht` internally subscribes to Identify's
+//! address-learned events to populate its own routing table. rust-libp2p
+//! makes this explicit rather than implicit (see [`libp2p::kad`]'s own
+//! module docs: "the Identify protocol must be manually hooked up to
+//! Kademlia through calls to `Behaviour::add_address`" — without it, a
+//! Kademlia node cannot learn a newly-connected peer's actual *listen*
+//! address, only the ephemeral address of whichever side dialed).
 
 use std::time::Duration;
 
-use libp2p::swarm::dummy;
-use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
+use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::{identify, kad, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
 
+use crate::dht;
 use crate::errors::P2pError;
 use crate::identity::IdentityConfig;
 
@@ -28,23 +42,52 @@ use crate::identity::IdentityConfig;
 /// Go: `network/p2p/p2p.go` `dialTimeout = 30 * time.Second`.
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A libp2p host for the algod-rust P2P transport foundation.
+/// Default deadline applied to a single DHT closest-peers routing lookup
+/// ([`P2pHost::find_closest_peers`]).
 ///
-/// Currently runs an empty ([`dummy::Behaviour`]) `NetworkBehaviour` — this
-/// issue only establishes the secured transport (dial/listen); gossipsub and
-/// DHT behaviours are wired in by later sub-issues (#539, #540) which will
-/// replace `dummy::Behaviour` with a real composed behaviour.
+/// Not present verbatim in go — the closest analogue is
+/// `network/p2p/capabilities.go`'s `operationTimeout = time.Second * 5`,
+/// the context deadline `CapabilitiesDiscovery.PeersForCapability` applies
+/// to its own DHT `FindPeers` call. Reused here for the same purpose: a
+/// lookup that hasn't produced a final result within this window degrades
+/// to "no result yet" (an empty peer list) rather than blocking the caller
+/// forever or propagating an error — the go-algorand #6581 fix
+/// ("dht: do not err on context deadline") this issue folds in.
+pub const DHT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The `identify` protocol-version string this host advertises. Purely
+/// informational (part of the `Info` payload, not the wire protocol name
+/// used for negotiation) — go-algorand does not customize this either.
+const IDENTIFY_PROTOCOL_VERSION: &str = "/algorand/id/1.0.0";
+
+/// This host's composed `NetworkBehaviour`: Kademlia DHT peer routing on
+/// top of the bare transport foundation from #538, plus `identify` so
+/// `kad` can learn a connecting peer's real listen address (see this
+/// module's doc comment).
+#[derive(NetworkBehaviour)]
+pub struct P2pBehaviour {
+    kad: kad::Behaviour<kad::store::MemoryStore>,
+    identify: identify::Behaviour,
+}
+
+/// A libp2p host for the algod-rust P2P transport, with Kademlia DHT peer
+/// discovery.
 pub struct P2pHost {
-    swarm: Swarm<dummy::Behaviour>,
+    swarm: Swarm<P2pBehaviour>,
 }
 
 impl P2pHost {
-    /// Build a new host from the given identity configuration. Does not
-    /// start listening — call [`P2pHost::listen`] to do so.
+    /// Build a new host from the given identity configuration and
+    /// Algorand network ID (used to derive this DHT's protocol name — see
+    /// [`dht::dht_protocol_name`]). Does not start listening — call
+    /// [`P2pHost::listen`] to do so.
     ///
-    /// Go: `MakeHost` (creates the libp2p host but does not listen).
-    pub fn new(identity_cfg: &IdentityConfig) -> Result<Self, P2pError> {
+    /// Go: `MakeHost` (creates the libp2p host but does not listen) +
+    /// `MakeDHT` (attaches the DHT behaviour).
+    pub fn new(identity_cfg: &IdentityConfig, network_id: &str) -> Result<Self, P2pError> {
         let keypair = crate::identity::get_or_create_keypair(identity_cfg)?;
+        let local_peer_id = keypair.public().to_peer_id();
+        let kad_config = dht::dht_config(network_id);
 
         let swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -54,17 +97,21 @@ impl P2pHost {
                 yamux::Config::default,
             )
             .map_err(|e| P2pError::SwarmBuild(e.to_string()))?
-            .with_behaviour(|_key| dummy::Behaviour)
+            .with_behaviour(|key| {
+                let store = kad::store::MemoryStore::new(local_peer_id);
+                let kad = kad::Behaviour::with_config(local_peer_id, store, kad_config);
+                let identify = identify::Behaviour::new(identify::Config::new(
+                    IDENTIFY_PROTOCOL_VERSION.to_string(),
+                    key.public(),
+                ));
+                P2pBehaviour { kad, identify }
+            })
             .map_err(|e| P2pError::SwarmBuild(e.to_string()))?
-            // The foundation's `dummy::Behaviour` never keeps a connection
-            // alive on its own (it opens no substreams), so without an
-            // explicit idle timeout `rust-libp2p` tears a freshly
-            // established connection back down almost immediately — before
-            // the other side can even finish its own transport upgrade.
-            // Later sub-issues that add real protocols (gossipsub, DHT)
-            // will keep connections alive through actual traffic instead;
-            // this generous timeout only exists so this bare foundation is
-            // usable for dial/listen on its own.
+            // The composed behaviour's connections stay alive through DHT
+            // traffic once queries are running, but a freshly established
+            // connection with no query in flight yet still benefits from a
+            // grace period before rust-libp2p tears it back down — mirrors
+            // the same reasoning as the #538 foundation's idle timeout.
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
 
@@ -111,60 +158,199 @@ impl P2pHost {
     }
 
     /// Await and return the next swarm event. Drives the underlying
-    /// transport (handshakes, dial attempts, incoming connections).
-    pub async fn next_event(&mut self) -> libp2p::swarm::SwarmEvent<void::Void> {
+    /// transport (handshakes, dial attempts, incoming connections) and the
+    /// DHT behaviour's own query state machine.
+    pub async fn next_event(&mut self) -> SwarmEvent<P2pBehaviourEvent> {
         use futures_util::StreamExt;
-        self.swarm.select_next_some().await
+        let event = self.swarm.select_next_some().await;
+
+        // Feed a newly-established connection's observed remote address
+        // into the DHT routing table immediately, so a peer is at least
+        // minimally routable (e.g. for the side that dialed it, where the
+        // remote address dialed *is* a real listen address) even before
+        // `identify` completes its own round-trip.
+        if let SwarmEvent::ConnectionEstablished {
+            peer_id, endpoint, ..
+        } = &event
+        {
+            self.swarm
+                .behaviour_mut()
+                .kad
+                .add_address(peer_id, endpoint.get_remote_address().clone());
+        }
+
+        // Once `identify` completes for a peer, replace that provisional
+        // knowledge with its actual advertised listen addresses — this is
+        // what lets a *third* node (one that only learned about this peer
+        // secondhand, via a DHT `FIND_NODE` response) dial it successfully.
+        // See this module's doc comment for why `identify` is needed here
+        // at all: `kad` does not learn listen addresses on its own.
+        if let SwarmEvent::Behaviour(P2pBehaviourEvent::Identify(identify::Event::Received {
+            peer_id,
+            info,
+            ..
+        })) = &event
+        {
+            for addr in &info.listen_addrs {
+                self.swarm
+                    .behaviour_mut()
+                    .kad
+                    .add_address(peer_id, addr.clone());
+            }
+        }
+
+        event
     }
 
     /// Currently connected peers.
     pub fn connected_peers(&self) -> Vec<PeerId> {
         self.swarm.connected_peers().copied().collect()
     }
+
+    /// Explicitly set this host's DHT mode, or `None` to return to
+    /// rust-libp2p's automatic mode-switching (client until an external
+    /// address is confirmed reachable, then server).
+    ///
+    /// Go: `network/p2p/dht/dht.go` `dhtMode` — server if the node has a
+    /// configured listen address (`cfg.IsListenServer()`) or `cfg.DHTMode`
+    /// is explicitly `"server"`; client otherwise. This crate does not yet
+    /// run Identify/AutoNAT to confirm external reachability (out of scope
+    /// for DHT discovery itself), so rust-libp2p's automatic promotion to
+    /// `Server` mode never fires on its own; a node meant to be
+    /// discoverable (i.e. one with a listen address, mirroring go's
+    /// default) should call this explicitly with `Some(kad::Mode::Server)`
+    /// once it starts listening.
+    pub fn set_dht_mode(&mut self, mode: Option<kad::Mode>) {
+        self.swarm.behaviour_mut().kad.set_mode(mode);
+    }
+
+    /// Seed the DHT routing table with a known bootstrap peer's address.
+    ///
+    /// `addr` should be the peer's dialable transport address (i.e.
+    /// without a trailing `/p2p/<peer-id>` component) — matching
+    /// [`libp2p::kad::Behaviour::add_address`]'s expectations. Go:
+    /// `dht.BootstrapPeersFunc`, sourced from the phonebook or `dnsaddr`
+    /// DNS resolution (see [`crate::dnsaddr::resolve_multiaddrs`]).
+    pub fn add_bootstrap_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
+        self.swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+    }
+
+    /// Start (or restart) the DHT's self-lookup bootstrap process against
+    /// whatever peers are currently in the routing table.
+    ///
+    /// A `NoKnownPeers` error (empty routing table — e.g. no bootstrap
+    /// peers have been added yet via [`P2pHost::add_bootstrap_peer`], or
+    /// none have been observed via [`P2pHost::next_event`]) is swallowed
+    /// rather than surfaced: this mirrors the same "no result yet, not
+    /// fatal" treatment this issue's #6581 fix applies to DHT operations
+    /// that simply can't make progress yet.
+    pub fn bootstrap_dht(&mut self) {
+        let _ = self.swarm.behaviour_mut().kad.bootstrap();
+    }
+
+    /// Look up the peers closest to `target` via the Kademlia DHT.
+    ///
+    /// Degrades to "no result yet" (an empty list) rather than erroring out
+    /// when the lookup does not produce a final result within `deadline` —
+    /// this ports go-algorand's #6581 fix ("dht: do not err on context
+    /// deadline", `network/p2p/capabilities.go`'s `advertiseCaps`): a DHT
+    /// query hitting its deadline is business-as-usual, not a hard
+    /// failure, since the caller (e.g. future capability-advertisement
+    /// code, #541) should simply retry rather than treat it as an error
+    /// condition. Both manifestations of "deadline" are handled the same
+    /// way here:
+    /// - `rust-libp2p`'s own internal per-query timeout
+    ///   (`kad::GetClosestPeersError::Timeout`), which still carries
+    ///   whatever partial peer set the query collected before it expired;
+    /// - this function's own `deadline` parameter, for a caller-imposed
+    ///   ceiling on how long it is willing to wait for a final result.
+    pub async fn find_closest_peers(
+        &mut self,
+        target: PeerId,
+        deadline: Duration,
+    ) -> Vec<kad::PeerInfo> {
+        let query_id = self.swarm.behaviour_mut().kad.get_closest_peers(target);
+        let sleep = tokio::time::sleep(deadline);
+        tokio::pin!(sleep);
+
+        loop {
+            tokio::select! {
+                event = self.next_event() => {
+                    if let SwarmEvent::Behaviour(P2pBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
+                        id,
+                        result: kad::QueryResult::GetClosestPeers(result),
+                        step,
+                        ..
+                    })) = event
+                    {
+                        if id == query_id && step.last {
+                            return match result {
+                                Ok(ok) => ok.peers,
+                                // go-algorand #6581: a query that only got as far as its
+                                // internal context-deadline timeout still reports whatever
+                                // partial peer set it collected, not an error.
+                                Err(kad::GetClosestPeersError::Timeout { peers, .. }) => peers,
+                            };
+                        }
+                    }
+                }
+                _ = &mut sleep => {
+                    // Caller-side deadline elapsed before the query reached a final
+                    // result. Same treatment as the internal-timeout case above:
+                    // "no result yet", not an error.
+                    return Vec::new();
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libp2p::swarm::SwarmEvent;
-    use std::time::Duration;
     use tokio::time::timeout;
+
+    /// Test network ID: keeps the DHT protocol name distinct from any real
+    /// Algorand network, and stable across a test run.
+    const TEST_NETWORK_ID: &str = "test-v1";
 
     fn loopback_identity() -> IdentityConfig {
         IdentityConfig::default()
     }
 
-    /// TDD anchor for this issue: two independent `P2pHost`s, each with its
-    /// own generated identity, dial each other over TCP+Noise+yamux and
-    /// reach `ConnectionEstablished` on both sides. Before `P2pHost`
-    /// existed, this test could not even compile — now it pins the
-    /// behavioral contract the whole foundation exists to satisfy.
-    #[tokio::test]
-    async fn two_nodes_dial_and_establish_secure_connection() {
-        let mut listener = P2pHost::new(&loopback_identity()).expect("listener host");
-        let mut dialer = P2pHost::new(&loopback_identity()).expect("dialer host");
+    fn new_test_host() -> P2pHost {
+        P2pHost::new(&loopback_identity(), TEST_NETWORK_ID).expect("host")
+    }
 
-        listener
-            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+    async fn start_listening(host: &mut P2pHost) -> Multiaddr {
+        host.listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .expect("listen");
-
-        // Wait for the listener to confirm its bound address.
-        let listen_addr = loop {
-            match timeout(Duration::from_secs(5), listener.next_event())
+        loop {
+            match timeout(Duration::from_secs(5), host.next_event())
                 .await
                 .expect("timed out waiting for NewListenAddr")
             {
                 SwarmEvent::NewListenAddr { address, .. } => break address,
                 _ => continue,
             }
-        };
+        }
+    }
+
+    /// TDD anchor for the transport foundation (#538): two independent
+    /// `P2pHost`s, each with its own generated identity, dial each other
+    /// over TCP+Noise+yamux and reach `ConnectionEstablished` on both
+    /// sides.
+    #[tokio::test]
+    async fn two_nodes_dial_and_establish_secure_connection() {
+        let mut listener = new_test_host();
+        let mut dialer = new_test_host();
+
+        let listen_addr = start_listening(&mut listener).await;
 
         let listener_peer_id = listener.peer_id();
         let dial_addr = listen_addr.with(libp2p::multiaddr::Protocol::P2p(listener_peer_id));
         dialer.dial(dial_addr).expect("dial should be accepted");
 
-        // Drive both swarms concurrently until each has observed a secure
-        // connection established with the other.
         let mut dialer_connected = false;
         let mut listener_connected = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -193,7 +379,7 @@ mod tests {
 
     #[test]
     fn peer_id_is_derived_from_identity_and_stable() {
-        let host = P2pHost::new(&loopback_identity()).expect("host");
+        let host = new_test_host();
         let id1 = host.peer_id();
         let id2 = host.peer_id();
         assert_eq!(id1, id2);
@@ -201,8 +387,140 @@ mod tests {
 
     #[test]
     fn two_hosts_get_distinct_peer_ids() {
-        let host_a = P2pHost::new(&loopback_identity()).expect("host a");
-        let host_b = P2pHost::new(&loopback_identity()).expect("host b");
+        let host_a = new_test_host();
+        let host_b = new_test_host();
         assert_ne!(host_a.peer_id(), host_b.peer_id());
+    }
+
+    /// TDD anchor for this issue (#539): 3+ nodes bootstrap via the
+    /// Kademlia DHT and can route-lookup each other's `PeerId` without any
+    /// WS-gossip involvement. A "bootstrap" node (B) is the only address
+    /// each of two other nodes (N1, N2) is seeded with; N1 and N2 never
+    /// learn about each other directly. After both dial B and B's routing
+    /// table observes both of them (via the `ConnectionEstablished` wiring
+    /// in `next_event`), N1 performs a genuine DHT `get_closest_peers`
+    /// lookup for N2's `PeerId` — routed through B — and must find N2's
+    /// address, proving real DHT-based routing rather than direct
+    /// knowledge.
+    #[tokio::test]
+    async fn three_nodes_bootstrap_via_dht_and_route_lookup_peer() {
+        let mut bootstrap = new_test_host();
+        let mut node1 = new_test_host();
+        let mut node2 = new_test_host();
+
+        // This crate has no AutoNAT wired up yet to auto-confirm external
+        // reachability, so a node meant to answer DHT queries needs Server
+        // mode set explicitly — see `set_dht_mode`'s doc comment. Both the
+        // bootstrap node (queried by node1 directly) and node2 (queried by
+        // node1 as the DHT lookup's second hop, once discovered via the
+        // bootstrap node) need to be discoverable/queryable this way.
+        bootstrap.set_dht_mode(Some(kad::Mode::Server));
+        node2.set_dht_mode(Some(kad::Mode::Server));
+
+        let bootstrap_addr = start_listening(&mut bootstrap).await;
+        let bootstrap_peer_id = bootstrap.peer_id();
+        // node2 also needs its own listen address so `identify` can report
+        // a real, dialable address for it to the bootstrap node (and, from
+        // there, to node1) — see this module's doc comment on why `identify`
+        // is composed alongside `kad` at all.
+        start_listening(&mut node2).await;
+
+        let bootstrap_dial_addr = bootstrap_addr
+            .clone()
+            .with(libp2p::multiaddr::Protocol::P2p(bootstrap_peer_id));
+
+        node1.add_bootstrap_peer(bootstrap_peer_id, bootstrap_addr.clone());
+        node2.add_bootstrap_peer(bootstrap_peer_id, bootstrap_addr.clone());
+
+        node1
+            .dial(bootstrap_dial_addr.clone())
+            .expect("node1 dial bootstrap");
+        node2
+            .dial(bootstrap_dial_addr)
+            .expect("node2 dial bootstrap");
+
+        // Drive all three swarms until the bootstrap node has both
+        // connected to, and completed an `identify` exchange with, node1
+        // and node2 — the latter is what actually populates bootstrap's
+        // DHT routing table with node2's *real* (dialable) listen address
+        // rather than just the ephemeral address node2 happened to dial
+        // out from (see this module's doc comment on why `identify` is
+        // composed alongside `kad`).
+        let mut node1_identified = false;
+        let mut node2_identified = false;
+        let node1_peer_id = node1.peer_id();
+        let node2_peer_id = node2.peer_id();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+
+        while !(node1_identified && node2_identified) {
+            tokio::select! {
+                ev = bootstrap.next_event() => {
+                    if let SwarmEvent::Behaviour(P2pBehaviourEvent::Identify(identify::Event::Received { peer_id, .. })) = ev {
+                        if peer_id == node1_peer_id { node1_identified = true; }
+                        if peer_id == node2_peer_id { node2_identified = true; }
+                    }
+                }
+                _ = node1.next_event() => {}
+                _ = node2.next_event() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timed out waiting for bootstrap to identify both nodes");
+                }
+            }
+        }
+
+        node1.bootstrap_dht();
+
+        // Keep pumping bootstrap's and node2's swarm events in the
+        // background while node1 runs its DHT lookup below — the lookup is
+        // routed through the bootstrap node, which must still be
+        // processing FIND_NODE requests/responses on the wire, and node2
+        // must still be reachable for its address to be dialable.
+        let bootstrap_pump = tokio::spawn(async move {
+            loop {
+                bootstrap.next_event().await;
+            }
+        });
+        let node2_pump = tokio::spawn(async move {
+            loop {
+                node2.next_event().await;
+            }
+        });
+
+        let found = node1
+            .find_closest_peers(node2_peer_id, Duration::from_secs(10))
+            .await;
+
+        bootstrap_pump.abort();
+        node2_pump.abort();
+
+        assert!(
+            found.iter().any(|p| p.peer_id == node2_peer_id),
+            "expected node1's DHT route-lookup to find node2's PeerId via the bootstrap node, got: {found:?}"
+        );
+    }
+
+    /// TDD anchor for the folded-in go-algorand #6581 fix: a DHT
+    /// `get_closest_peers` lookup that never reaches a final result within
+    /// its deadline must return an empty (no result yet) list, not an
+    /// `Err` that would fail the caller. Uses an isolated host with an
+    /// empty routing table and a deliberately tiny deadline so the lookup
+    /// cannot possibly complete in time.
+    #[tokio::test]
+    async fn dht_lookup_hitting_deadline_does_not_error_out_caller() {
+        let mut host = new_test_host();
+        let target = PeerId::random();
+
+        // 1 nanosecond: guaranteed to elapse before even a single swarm
+        // event can be produced, forcing the deadline path.
+        let found = host
+            .find_closest_peers(target, Duration::from_nanos(1))
+            .await;
+
+        // The important assertion is not *that* an empty list is returned
+        // (an empty routing table would do that anyway) but that this is
+        // an infallible `Vec`, not a `Result` the caller could be forced
+        // to propagate/log as an error — the type signature itself is the
+        // regression guard for #6581's "do not err on context deadline".
+        assert!(found.is_empty());
     }
 }
