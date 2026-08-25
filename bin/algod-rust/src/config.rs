@@ -36,6 +36,11 @@ use serde::Deserialize;
 pub struct AlgodRustConfig {
     /// Settings for the REST API server (`participate --rest-listen …`).
     pub rest: Option<RestConfig>,
+
+    /// P2P/hybrid transport selection (`participate --enable-p2p …`).
+    /// Mirrors go-algorand's `config.Local` P2P fields — see
+    /// [`P2pConfig`].
+    pub p2p: Option<P2pConfig>,
 }
 
 /// REST API server settings. Mirrors the CLI flags on the `participate`
@@ -74,6 +79,40 @@ pub struct RestConfig {
     pub async_backlog_size: Option<usize>,
 }
 
+/// P2P/hybrid transport settings. Mirrors go-algorand's `config.Local`
+/// fields `EnableP2P`, `EnableP2PHybridMode`, `P2PPersistPeerID`
+/// (`../go-algorand/config/localTemplate.go`), plus a bootstrap-peer list
+/// and listen address for the libp2p transport (`algo-p2p`). Fields are
+/// applied as defaults when the corresponding CLI flag on `participate`
+/// is unset; see [`crate::commands::p2p_transport::P2pOptions::resolve`].
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct P2pConfig {
+    /// Enable the libp2p P2P transport. Go: `EnableP2P`.
+    pub enable_p2p: bool,
+
+    /// Run both the WS-gossip and libp2p P2P stacks simultaneously.
+    /// Takes precedence over `enable_p2p` alone, matching go's doc
+    /// comment on `EnableP2PHybridMode`: "When both EnableP2P and
+    /// EnableP2PHybridMode are set, EnableP2PHybridMode takes
+    /// precedence." Go: `EnableP2PHybridMode`.
+    pub enable_p2p_hybrid_mode: bool,
+
+    /// Persist the libp2p node identity's private key to disk so the
+    /// PeerId is stable across restarts. Go: `P2PPersistPeerID`.
+    pub p2p_persist_peer_id: bool,
+
+    /// Multiaddrs to dial as bootstrap peers for DHT discovery and
+    /// gossipsub mesh formation (e.g.
+    /// `"/ip4/1.2.3.4/tcp/4190/p2p/12D3KooW..."`).
+    pub p2p_bootstrap_peers: Vec<String>,
+
+    /// Listen multiaddr for the libp2p P2P transport (e.g.
+    /// `"/ip4/0.0.0.0/tcp/4190"`). Unset means outbound-only P2P
+    /// participation — no inbound P2P listener.
+    pub p2p_listen_address: Option<String>,
+}
+
 impl AlgodRustConfig {
     /// Read and parse a config file. Returns `Ok(Default)` (empty
     /// config) when `path` is `None` — callers fall back to CLI flags.
@@ -101,6 +140,11 @@ impl AlgodRustConfig {
     /// was never loaded.
     pub fn rest(&self) -> Option<&RestConfig> {
         self.rest.as_ref()
+    }
+
+    /// Borrow the `[p2p]` section if present.
+    pub fn p2p(&self) -> Option<&P2pConfig> {
+        self.p2p.as_ref()
     }
 }
 
@@ -159,6 +203,41 @@ mod tests {
             rest.genesis_path.as_deref(),
             Some(Path::new("/srv/algod/genesis.json"))
         );
+    }
+
+    #[test]
+    fn p2p_block_round_trips_every_field() {
+        let mut tmp = tempfile_stub("p2p-block.toml");
+        writeln!(tmp, r#"[p2p]"#).unwrap();
+        writeln!(tmp, r#"enable_p2p = true"#).unwrap();
+        writeln!(tmp, r#"enable_p2p_hybrid_mode = true"#).unwrap();
+        writeln!(tmp, r#"p2p_persist_peer_id = true"#).unwrap();
+        writeln!(
+            tmp,
+            r#"p2p_bootstrap_peers = ["/ip4/1.2.3.4/tcp/4190/p2p/12D3KooWExample"]"#
+        )
+        .unwrap();
+        writeln!(tmp, r#"p2p_listen_address = "/ip4/0.0.0.0/tcp/4190""#).unwrap();
+        tmp.flush().unwrap();
+        let cfg = AlgodRustConfig::load(Some(tmp.path())).expect("parses");
+        let p2p = cfg.p2p().expect("p2p section present");
+        assert!(p2p.enable_p2p);
+        assert!(p2p.enable_p2p_hybrid_mode);
+        assert!(p2p.p2p_persist_peer_id);
+        assert_eq!(
+            p2p.p2p_bootstrap_peers,
+            vec!["/ip4/1.2.3.4/tcp/4190/p2p/12D3KooWExample".to_string()]
+        );
+        assert_eq!(
+            p2p.p2p_listen_address.as_deref(),
+            Some("/ip4/0.0.0.0/tcp/4190")
+        );
+    }
+
+    #[test]
+    fn missing_p2p_section_is_none() {
+        let cfg = AlgodRustConfig::load(None).expect("none is ok");
+        assert!(cfg.p2p().is_none());
     }
 
     /// Extremely small temp-file shim so we don't pull in `tempfile`

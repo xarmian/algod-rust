@@ -509,6 +509,38 @@ pub enum Commands {
         /// provide defaults; individual CLI flags override them.
         #[arg(long)]
         config: Option<PathBuf>,
+
+        /// Enable the libp2p P2P transport (go: `config.Local.EnableP2P`).
+        /// When `--enable-p2p-hybrid-mode` is also set, hybrid mode takes
+        /// precedence — matches go-algorand's precedence exactly (see
+        /// `EnableP2P`'s doc comment in
+        /// `../go-algorand/config/localTemplate.go`).
+        #[arg(long)]
+        enable_p2p: bool,
+
+        /// Run both the WS-gossip stack and the libp2p P2P stack
+        /// simultaneously (go: `config.Local.EnableP2PHybridMode`).
+        #[arg(long)]
+        enable_p2p_hybrid_mode: bool,
+
+        /// Persist the libp2p node identity's private key to disk so the
+        /// PeerId is stable across restarts (go:
+        /// `config.Local.P2PPersistPeerID`). Written under `--data-dir`
+        /// when set.
+        #[arg(long)]
+        p2p_persist_peer_id: bool,
+
+        /// Comma-separated libp2p multiaddrs to dial as bootstrap peers
+        /// for DHT discovery and gossipsub mesh formation (e.g.
+        /// "/ip4/1.2.3.4/tcp/4190/p2p/12D3KooW...").
+        #[arg(long, value_delimiter = ',')]
+        p2p_bootstrap_peers: Vec<String>,
+
+        /// Listen multiaddr for the libp2p P2P transport (e.g.
+        /// "/ip4/0.0.0.0/tcp/4190"). Required for other nodes to dial this
+        /// one directly; unset means outbound-only P2P participation.
+        #[arg(long)]
+        p2p_listen_address: Option<String>,
     },
 
     /// Follow mode: continuously validate new blocks as they arrive.

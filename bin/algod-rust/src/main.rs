@@ -345,6 +345,11 @@ async fn main() -> anyhow::Result<()> {
             data_dir,
             genesis_path,
             config,
+            enable_p2p,
+            enable_p2p_hybrid_mode,
+            p2p_persist_peer_id,
+            p2p_bootstrap_peers,
+            p2p_listen_address,
         } => {
             let file_config = crate::config::AlgodRustConfig::load(config.as_deref())?;
             let rest_opts = commands::participate::RestOptions {
@@ -352,6 +357,14 @@ async fn main() -> anyhow::Result<()> {
                 data_dir,
                 genesis_path,
                 file_rest: file_config.rest().cloned(),
+            };
+            let p2p_opts = commands::p2p_transport::P2pOptions {
+                enable_p2p,
+                enable_p2p_hybrid_mode,
+                p2p_persist_peer_id,
+                p2p_bootstrap_peers,
+                p2p_listen_address,
+                file_p2p: file_config.p2p().cloned(),
             };
             commands::participate::run(
                 &ledger_path,
@@ -366,6 +379,7 @@ async fn main() -> anyhow::Result<()> {
                 relay_messages,
                 genesis_hash.as_deref(),
                 rest_opts,
+                p2p_opts,
             )
             .await?;
         }

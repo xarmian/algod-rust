@@ -40,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::commands::network_common::genesis_id_for;
+use crate::commands::p2p_transport::{P2pOptions, P2pTransport, P2pTransportConfig};
 use crate::config::RestConfig;
 use crate::node_interface_impl::{AlgodNodeInterface, NodeInterfaceConfig};
 
@@ -2837,7 +2838,10 @@ pub async fn run(
     relay_messages: bool,
     genesis_hash_hex: Option<&str>,
     rest_opts: RestOptions,
+    p2p_opts: P2pOptions,
 ) -> anyhow::Result<()> {
+    let resolved_p2p = p2p_opts.resolve();
+    let network_mode = resolved_p2p.mode;
     // Resolve genesis ID: use the provided value, or look it up by network name.
     let resolved_genesis_id = match genesis_id {
         Some(id) if !id.is_empty() => id.to_string(),
@@ -2979,17 +2983,49 @@ pub async fn run(
 
     // -----------------------------------------------------------------------
     // 3. Build the gossip network node.
+    //
+    // Mode selection (#542): mirrors go-algorand's `node.go` `newNode`
+    // (`recreateNetwork`), which constructs exactly one of a WS network,
+    // a P2P network, or a hybrid of both, keyed off
+    // `cfg.EnableP2P`/`cfg.EnableP2PHybridMode`. `WsOnly` and `Hybrid`
+    // both run the existing WS-gossip stack unchanged; `P2pOnly` must
+    // open no WS-gossip listener and dial no WS peers at all — this is
+    // the "no leak" guarantee the issue requires. `ws_active` below is a
+    // direct, mechanical translation of `NetworkMode::ws_listener_active`,
+    // whose per-mode semantics (including the "no leak" guarantee) are
+    // unit-tested in `p2p_transport.rs`
+    // (`ws_only_runs_ws_listener_and_no_p2p`, `p2p_only_runs_no_ws_listener`,
+    // `hybrid_runs_both`).
     // -----------------------------------------------------------------------
+    let ws_active = network_mode.ws_listener_active();
+    let effective_listen_address = if ws_active {
+        listen_address.map(|s| s.to_string())
+    } else {
+        if listen_address.is_some() {
+            warn!(
+                "P2P-only mode is active (--enable-p2p without --enable-p2p-hybrid-mode); \
+                 ignoring --listen-address — no WS-gossip listener will be opened. Use \
+                 --p2p-listen-address instead."
+            );
+        }
+        None
+    };
+
     let phonebook = Arc::new(Phonebook::new(60, Duration::from_secs(60)));
-    if !peers.is_empty() {
+    if ws_active && !peers.is_empty() {
         phonebook.replace_peer_list(peers, "cli", RELAY_ROLE);
         info!(count = peers.len(), "added initial peer addresses");
+    } else if !ws_active && !peers.is_empty() {
+        warn!(
+            "P2P-only mode is active; ignoring --peers (WS-gossip peer list) — use \
+             --p2p-bootstrap-peers instead."
+        );
     }
 
     let net_config = WebsocketNetworkConfig {
         genesis_id: resolved_genesis_id.clone(),
         network_id: network.to_string(),
-        net_address: listen_address.map(|s| s.to_string()),
+        net_address: effective_listen_address,
         // Default participation nodes to "peer" (non-relay) mode;
         // `--relay-messages` lets callers opt this node into a relay
         // role when another peer needs to dial it for gossip (e.g.
@@ -2998,8 +3034,9 @@ pub async fn run(
         // `net_address.is_some()` and `relay_messages`, so setting
         // this flag without `--listen-address` only enables outbound
         // broadcast forwarding — typically useful only when both are
-        // set together.
-        relay_messages,
+        // set together. In P2P-only mode `net_address` is forced to
+        // `None` above, so this can never open a listener regardless.
+        relay_messages: ws_active && relay_messages,
         gossip_fanout: peers.len().max(algo_network::DEFAULT_GOSSIP_FANOUT),
         ..Default::default()
     };
@@ -3096,6 +3133,85 @@ pub async fn run(
     } else {
         info!("gossip network started (no listener)");
     }
+
+    // -----------------------------------------------------------------------
+    // 3a-p2p. Bring up the libp2p P2P transport (#542), alongside
+    // (`Hybrid`) or instead of (`P2pOnly`) the WS-gossip stack just
+    // started above.
+    //
+    // Inbound transactions received over the P2P TX gossipsub topic are
+    // fed into the very same `TxTagHandler` pipeline WS-received
+    // transactions use (sharing `pool` and `tx_seen_cache`), so dedup and
+    // pool-ingestion semantics are identical regardless of which
+    // transport delivered the transaction. Routing block proposals and
+    // votes through P2P (bridging `AgreementNetworkBridge`) is tracked as
+    // a follow-up — see `crate::commands::p2p_transport`'s module doc
+    // comment.
+    // -----------------------------------------------------------------------
+    let _p2p_transport: Option<P2pTransport> = if network_mode.p2p_active() {
+        let listen_multiaddr = resolved_p2p
+            .listen_address
+            .as_deref()
+            .map(|s| {
+                s.parse()
+                    .map_err(|e| anyhow::anyhow!("invalid --p2p-listen-address {s:?}: {e}"))
+            })
+            .transpose()?;
+        let mut bootstrap_peers = Vec::with_capacity(resolved_p2p.bootstrap_peers.len());
+        for addr in &resolved_p2p.bootstrap_peers {
+            bootstrap_peers.push(addr.parse().map_err(|e| {
+                anyhow::anyhow!("invalid --p2p-bootstrap-peers entry {addr:?}: {e}")
+            })?);
+        }
+        let has_listen_multiaddr = listen_multiaddr.is_some();
+        let p2p_data_dir = rest_opts
+            .data_dir
+            .clone()
+            .or_else(|| ledger_path.parent().map(Path::to_path_buf));
+
+        let (transport, mut p2p_tx_rx) = P2pTransport::start(P2pTransportConfig {
+            network_id: network.to_string(),
+            listen_multiaddr,
+            bootstrap_peers,
+            persist_peer_id: resolved_p2p.persist_peer_id,
+            data_dir: p2p_data_dir,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to start P2P transport: {e}"))?;
+
+        // Give the swarm a brief moment to confirm its listen address (if
+        // any) before logging, so the "listening" log line is accurate
+        // rather than always reporting "not yet confirmed".
+        if has_listen_multiaddr {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        info!(
+            peer_id = %transport.peer_id(),
+            listening = transport.is_listening(),
+            listen_addrs = ?transport.listen_addrs(),
+            "P2P transport started"
+        );
+
+        let p2p_pool = pool.clone();
+        let p2p_seen = tx_seen_cache.clone();
+        tokio::spawn(async move {
+            let handler = algo_network::tx_tag_handler::TxTagHandler::new(p2p_pool, p2p_seen);
+            while let Some(data) = p2p_tx_rx.recv().await {
+                let msg = algo_network::IncomingMessage {
+                    tag: algo_network::Tag::Transaction,
+                    data,
+                    sender: "p2p-gossipsub".to_string(),
+                    received_at: chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+                    peer: None,
+                };
+                let _ = algo_network::MessageHandler::handle(&handler, msg).await;
+            }
+        });
+
+        Some(transport)
+    } else {
+        None
+    };
 
     // -----------------------------------------------------------------------
     // 3b. Construct the local tx broadcaster.
