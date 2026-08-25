@@ -1,0 +1,69 @@
+name: Nightly P2P Transport Interop
+
+# Issue #543 — dial a real go-algorand v4.7.0-stable node running in
+# plain P2P mode (EnableP2P: true) with algod-rust's own libp2p-based
+# `algo-p2p` transport, and assert a secure connection is established.
+# Proves real cross-implementation interop between rust-libp2p and
+# go-libp2p — see ops/mixed-cluster-p2p/README.md and
+# docs/MIXED_CLUSTER_HARNESS.md's "P2P interop harness" section for
+# scope.
+#
+# This is a much lighter cousin of consensus-cluster.yml: one Go
+# container, no algod-rust Docker build (the test runs on the runner
+# directly via `cargo test`). `schedule` + `workflow_dispatch` only,
+# same reasoning as consensus-cluster.yml — no `pull_request`/`push`
+# trigger, and the test itself stays `#[ignore]`d so
+# `cargo test --workspace` never touches Docker.
+
+on:
+  schedule:
+    # 03:05 UTC daily — off-peak, offset from consensus-cluster.yml's
+    # 02:41 and nightly-fuzz.yml's 03:17.
+    - cron: "5 3 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  p2p-interop:
+    name: P2P transport interop (algo-p2p vs real go-algorand)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: p2p-interop
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Pull algorand/algod:4.7.0-stable
+        run: docker pull algorand/algod:4.7.0-stable
+
+      - name: Bring up the P2P interop target
+        run: make p2p-interop-up
+
+      - name: Run the live interop test
+        run: |
+          ALGOD_RUST_P2P_GO_MULTIADDR="$(cat ops/mixed-cluster-p2p/netroot/.p2p-multiaddr)" \
+            cargo test --package algod-rust --test p2p_go_algorand_interop -- --ignored --nocapture
+
+      - name: Tear down (always)
+        if: always()
+        run: make p2p-interop-down PURGE=1
+
+      - name: Upload go-node-1 logs on failure
+        if: failure()
+        run: docker compose -f ops/mixed-cluster-p2p/docker-compose.yml logs go-node-1 > p2p-interop-go-node-1.log || true
+
+      - name: Upload logs artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2p-interop-logs-${{ github.run_id }}
+          path: p2p-interop-go-node-1.log
+          retention-days: 14

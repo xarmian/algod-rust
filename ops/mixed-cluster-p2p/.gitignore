@@ -1,0 +1,5 @@
+# Generated network data (contains participation keys — never commit).
+netroot/
+
+# Rendered template handed to `goal network create` (transient).
+.template.rendered.json

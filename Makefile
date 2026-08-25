@@ -7,6 +7,7 @@ COMPOSE_MIXED := docker compose -f docker/docker-compose.mixed-cluster.yml
 COMPOSE_VALIDATE_API := docker compose -f docker/docker-compose.validate-api.yml
 PHASE6_CLUSTER := ops/mixed-cluster
 PHASE7_CLUSTER := ops/mixed-cluster-3rust
+P2P_INTEROP_CLUSTER := ops/mixed-cluster-p2p
 
 .PHONY: build test fmt fmt-check clippy lint deny ci clean coverage coverage-lcov
 .PHONY: validate-api-up validate-api-down validate-api-status validate-api-logs validate-api
@@ -25,6 +26,7 @@ PHASE7_CLUSTER := ops/mixed-cluster-3rust
 .PHONY: consensus-cluster-up consensus-cluster-down consensus-cluster-status consensus-cluster-smoke
 .PHONY: consensus-cluster-test consensus-cluster-restart consensus-cluster-negative
 .PHONY: consensus-cluster-analyzer
+.PHONY: p2p-interop-up p2p-interop-down p2p-interop-test
 .PHONY: phase6-cluster-up phase6-cluster-down phase6-cluster-status
 .PHONY: consensus-analyzer-test consensus-negative-test
 
@@ -662,6 +664,28 @@ consensus-cluster-negative: ## Run the #472 negative conformance suite (up + inj
 
 consensus-cluster-analyzer: ## Unit-test the #470 soak-analyzer logic (no Docker needed)
 	python3 $(PHASE6_CLUSTER)/scripts/analyze_test.py
+
+## ops/mixed-cluster-p2p harness (issue #543) — a single real
+## go-algorand v4.7.0-stable node in plain P2P mode, dialed directly by
+## algod-rust's `algo-p2p` libp2p transport to prove real cross-
+## implementation interop. See docs/MIXED_CLUSTER_HARNESS.md's "P2P
+## interop harness" section for current scope and what's left.
+p2p-interop-up: ## Bring up the single-node go-algorand P2P interop target
+	$(P2P_INTEROP_CLUSTER)/scripts/start.sh
+
+p2p-interop-down: ## Tear down the P2P interop target (pass PURGE=1 to wipe netroot/)
+	@if [ "$(PURGE)" = "1" ]; then \
+		$(P2P_INTEROP_CLUSTER)/scripts/stop.sh --purge; \
+	else \
+		$(P2P_INTEROP_CLUSTER)/scripts/stop.sh; \
+	fi
+
+p2p-interop-test: p2p-interop-up ## Up + run the live interop test + down
+	@ALGOD_RUST_P2P_GO_MULTIADDR="$$(cat $(P2P_INTEROP_CLUSTER)/netroot/.p2p-multiaddr)" \
+		cargo test --package algod-rust --test p2p_go_algorand_interop -- --ignored --nocapture; \
+	status=$$?; \
+	$(P2P_INTEROP_CLUSTER)/scripts/stop.sh; \
+	exit $$status
 
 ## Deprecated aliases.
 ##
