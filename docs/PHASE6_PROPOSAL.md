@@ -15,7 +15,7 @@ Implement the complete consensus participation stack:
 
 ## Conformance Standard
 
-100% protocol conformance with go-algorand. The Go reference implementation (`../go-algorand`, pinned to `v4.6.0-stable`) is the source of truth for all protocol behavior, field values, algorithm implementations, domain separation strings, consensus parameters, and edge cases.
+100% protocol conformance with go-algorand. The Go reference implementation (`../go-algorand`, pinned to `v4.7.0-stable`) is the source of truth for all protocol behavior, field values, algorithm implementations, domain separation strings, consensus parameters, and edge cases.
 
 ## Issue Table
 

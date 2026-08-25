@@ -124,7 +124,7 @@ localnet-rust-logs:
 ##
 ## Prerequisites:
 ##   - docker + docker compose
-##   - go-algorand@v4.6.0-stable `algokey` binary on PATH (compat matrix only;
+##   - go-algorand@v4.7.0-stable `algokey` binary on PATH (compat matrix only;
 ##     missing binary causes the matrix tests to skip-with-notice rather than fail)
 ##
 ## `--test-threads=1` serializes the e2e test binaries so they don't race on
@@ -138,7 +138,7 @@ algokey-e2e:
 	  exit $$STATUS
 
 ## ── Dual-node REST conformance harness (issue #129) ──────────
-## Boots a real go-algorand v4.6.0-stable node (in Docker) and a real
+## Boots a real go-algorand v4.7.0-stable node (in Docker) and a real
 ## algod-rust node (run *natively*, not in Docker — see
 ## docker/docker-compose.validate-api.yml's header comment: building it a
 ## second time via `docker compose up --build` on top of the native
@@ -806,7 +806,7 @@ help:
 	@echo "algokey-rust E2E:"
 	@echo "  make algokey-e2e      Bring up localnet, run algokey-rust e2e suite (smoke +"
 	@echo "                        keyreg + Go↔Rust compat matrix), tear down. Requires"
-	@echo '                        go-algorand@v4.6.0-stable `algokey` on PATH for the'
+	@echo '                        go-algorand@v4.7.0-stable `algokey` on PATH for the'
 	@echo "                        compat matrix (else skipped). PLAN-183."
 	@echo ""
 	@echo "Dual-Node REST Conformance (issue #129):"

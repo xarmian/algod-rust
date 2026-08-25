@@ -40,7 +40,7 @@ services:
   # write access to its data directory (ledger, tracker DBs, algod.net,
   # etc.) that a read-only bind mount can't provide.
   algod-go-shared:
-    image: algorand/algod:4.6.0-stable
+    image: algorand/algod:4.7.0-stable
     container_name: algod-go-shared
     entrypoint: ["/bin/sh", "-c"]
     command:

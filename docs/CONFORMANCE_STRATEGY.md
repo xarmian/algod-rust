@@ -241,7 +241,7 @@ go-algorand reads on startup. The end-to-end acceptance gate is the
    `canonical_encode_certificate`).
 3. The Rust-produced `<prefix>.tracker.sqlite` and `<prefix>.block.sqlite`
    are staged into a Go-shaped data dir.
-4. A clean go-algorand v4.6.0-stable container boots against that data
+4. A clean go-algorand v4.7.0-stable container boots against that data
    dir and must:
    - start with zero ERROR / FATAL log lines
    - report `last-round >= N` via `/v2/status`
@@ -325,7 +325,7 @@ A private mixed Go/Rust cluster under `ops/mixed-cluster/`
 ```
 Cluster (shipped, Phase 6):
 
-3 x algorand/algod:4.6.0-stable   relay + proposer, 30% online stake each
+3 x algorand/algod:4.7.0-stable   relay + proposer, 30% online stake each
 1 x algod-rust participate        10% online stake, voting + proposing
 
 Deferred to Phase 7: 3 Go + 3 Rust, 1000+ round soaks.
@@ -339,7 +339,7 @@ Validation checks and where each one lives:
 | Go accepts Rust's votes | `make consensus-cluster-smoke`, `make consensus-cluster-test` | `scripts/participation-smoke.sh`, `scripts/consensus-conformance.sh` checks `go_accepts_rust_votes` + `no_go_side_rejections` (read off the Go nodes' own `VoteAccepted` telemetry) |
 | Block proposals accepted | `make consensus-cluster-test` | `scripts/analyze.py::proposer_share_check` — Rust account's share of committed proposers inside a two-sided binomial bound, never zero; the gate itself is unit-tested by `scripts/analyze_test.py` (`make consensus-cluster-analyzer`) |
 | Rust verifies Go's certificates | `make consensus-cluster-test` | `crates/tools/algo-cert-crossverify` via `scripts/verify-soak.sh` (check `certs_authenticate_rust`) |
-| Go verifies certificates from a Rust-participating chain | `make consensus-cluster-test` | `tools/cert-authenticate/` — a real go-algorand v4.6.0-stable binary running `agreement.Certificate.Authenticate` over ledger facts exported from the **Rust** ledger (check `certs_authenticate_go`) |
+| Go verifies certificates from a Rust-participating chain | `make consensus-cluster-test` | `tools/cert-authenticate/` — a real go-algorand v4.7.0-stable binary running `agreement.Certificate.Authenticate` over ledger facts exported from the **Rust** ledger (check `certs_authenticate_go`) |
 | Fork resolution / final block agreement | `make consensus-cluster-test` | `crates/tools/algo-fork-detector` over every round (check `fork_free`); `scripts/analyze.py::cadence_check` for block cadence; `scripts/status.sh` for per-node lockstep |
 | Period advancement | `make consensus-cluster-test` | `consensus-conformance.sh` pauses a Go relay to force period > 0, then requires a return to lockstep (`period_advancement_recovery`) |
 | Restart / rejoin mid-round, no equivocation | `make consensus-cluster-restart` | `scripts/restart-rejoin.sh` (graceful / SIGKILL / killed-as-proposer) + `scripts/equivocation.py`, cross-checked against Go's own `voteTracker` equivocation detector |
@@ -421,7 +421,7 @@ block merges.
 
 ## 14.1 PR workflow — `.github/workflows/conformance-parity.yml`
 
-Byte-level differential suite vs go-algorand `v4.6.0-stable`. Target
+Byte-level differential suite vs go-algorand `v4.7.0-stable`. Target
 wall time: ≤ 8 min on a warm cache. Exercises the PLAN-30 gap
 dimensions (Greek letters match the gap memo):
 
