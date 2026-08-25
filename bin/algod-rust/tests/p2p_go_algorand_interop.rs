@@ -1,4 +1,5 @@
-//! Live P2P transport interop test (issue #543).
+//! Live P2P transport interop test (issue #543), plus issue #560's DHT
+//! wire-protocol investigation.
 //!
 //! Dials a real go-algorand v4.7.0-stable node running in plain P2P mode
 //! (`EnableP2P: true`, no WS-gossip listener) with algod-rust's own
@@ -8,18 +9,43 @@
 //! actually interoperates with go-libp2p, not just with itself (unlike
 //! `algo_p2p::host`'s own tests, which only ever dial another `P2pHost`).
 //!
-//! This is the transport-connectivity slice of #543's full scope. Full
-//! consensus round-trip over a multi-node P2P mesh, bidirectional
-//! gossipsub block/vote/tx propagation, and cross-implementation
-//! capability-advertisement lookup are tracked as follow-up work — see
-//! `docs/MIXED_CLUSTER_HARNESS.md`'s "P2P interop harness" section for
-//! the current scope and what's left.
+//! This is the transport-connectivity slice of #543's full scope.
+//!
+//! ## Issue #560 investigation status
+//!
+//! Building a multi-node cross-implementation DHT-routing test against
+//! `ops/mixed-cluster-p2p`'s new 3-node chain-bootstrapped go-algorand
+//! harness (1 <- 2 <- 3 — go-node-2 is only ever told go-node-1's
+//! multiaddr; go-node-3 only go-node-2's) found and fixed one real,
+//! previously-undetected bug: `algo_p2p::dht::dht_protocol_name` omitted
+//! the `/kad/1.0.0` suffix `go-libp2p-kad-dht`'s `makeDHT`
+//! (`v1proto := cfg.ProtocolPrefix + kad1`) always appends to whatever
+//! prefix go-algorand configures — so a rust host's DHT queries against
+//! a real go-algorand peer previously negotiated no shared protocol at
+//! all and returned instantly empty. Fixed and regression-tested in
+//! `crates/node/algo-p2p/src/dht.rs`.
+//!
+//! After that fix, a rust host's `get_closest_peers` query against a
+//! live go-node-1 DOES reach go's DHT handler (a real round trip
+//! happens, no longer an instant no-op) — but the response never
+//! includes go-node-2's `PeerId`, even though go-node-1 is directly
+//! connected to go-node-2 (`docker compose logs` shows go-node-1 both
+//! holding a routing-table entry for go-node-2 and successfully dialing
+//! go-node-3's real address, so go-node-1 does have working peer
+//! knowledge — the gap is specifically in what a rust-initiated
+//! `FIND_NODE`-equivalent query gets back). This needs further
+//! wire-level investigation (the `algod-traffic-debug` skill's territory
+//! — packet-level capture/diff of the Amino-DHT protobuf exchange) to
+//! pin down whether this is a remaining rust-side or go-side gap; it is
+//! tracked as its own follow-up issue (see #560's audit comment) rather
+//! than asserted here as either working or broken, since neither claim
+//! is yet backed by a passing live test.
 //!
 //! Bring up the target node first:
 //!
 //! ```text
 //! ops/mixed-cluster-p2p/scripts/start.sh
-//! ALGOD_RUST_P2P_GO_MULTIADDR="$(cat ops/mixed-cluster-p2p/netroot/.p2p-multiaddr)" \
+//! ALGOD_RUST_P2P_GO_MULTIADDR="$(cat ops/mixed-cluster-p2p/netroot/.p2p-multiaddr-1)" \
 //!     cargo test --package algod-rust --test p2p_go_algorand_interop -- --ignored --nocapture
 //! ops/mixed-cluster-p2p/scripts/stop.sh
 //! ```
@@ -42,7 +68,8 @@ async fn dials_real_go_algorand_p2p_host_and_establishes_secure_connection() {
     let Some(target) = go_node_multiaddr() else {
         panic!(
             "ALGOD_RUST_P2P_GO_MULTIADDR is not set or not a valid multiaddr — \
-             run ops/mixed-cluster-p2p/scripts/start.sh first and export its output"
+             run ops/mixed-cluster-p2p/scripts/start.sh first and export its output \
+             (netroot/.p2p-multiaddr-1)"
         );
     };
 

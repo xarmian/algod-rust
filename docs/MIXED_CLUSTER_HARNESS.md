@@ -249,43 +249,67 @@ to appear in the committed-proposer histogram inside a two-sided
 binomial bound and **always** fails on zero. See
 `docs/PHASE6_VALIDATION.md` criterion 3.
 
-## P2P interop harness (issue #543)
+## P2P interop harness (issues #543, #560)
 
 A second, narrower harness — `ops/mixed-cluster-p2p/` — targets the new
 libp2p-based P2P transport (`crates/node/algo-p2p`, issues #538-#542)
 rather than the WS-gossip stack this file otherwise documents. It is
-**not** a variant of the 4-node harness above; it's a single real
-go-algorand v4.7.0-stable node started in plain P2P mode (`EnableP2P:
-true`, no WS-gossip listener), which algod-rust's `algo_p2p::P2pHost`
-dials directly.
+**not** a variant of the 4-node harness above; it's three real
+go-algorand v4.7.0-stable nodes, each started in plain P2P mode
+(`EnableP2P: true`, no WS-gossip listener), chain-bootstrapped to each
+other (1 <- 2 <- 3 — go-node-2 is only ever told go-node-1's multiaddr;
+go-node-3 is only ever told go-node-2's), which algod-rust's
+`algo_p2p::P2pHost` dials.
 
 ### What it currently proves
 
 A live integration test,
 `bin/algod-rust/tests/p2p_go_algorand_interop.rs`
 (`dials_real_go_algorand_p2p_host_and_establishes_secure_connection`,
-run via `make p2p-interop-test`), dials the real go node's P2P listen
-multiaddr and asserts `SwarmEvent::ConnectionEstablished` — i.e. a
-genuine Noise-authenticated TCP connection between rust-libp2p
-(`algo-p2p`) and go-libp2p (go-algorand's `network/p2p/`). This is
-**transport-level interop**, verified live (not simulated): two
-independent libp2p implementations, from two different language
-ecosystems, completing a real handshake with each other.
+run via `make p2p-interop-test`), dials go-node-1's P2P listen multiaddr
+and asserts `SwarmEvent::ConnectionEstablished` — i.e. a genuine
+Noise-authenticated TCP connection between rust-libp2p (`algo-p2p`) and
+go-libp2p (go-algorand's `network/p2p/`). This is **transport-level
+interop**, verified live: two independent libp2p implementations, from
+two different language ecosystems, completing a real handshake.
+
+The harness now brings up **three** chain-bootstrapped go-algorand P2P
+nodes (1 <- 2 <- 3 — go-node-2 only ever told go-node-1's multiaddr;
+go-node-3 only go-node-2's), up from #543's single node, in support of
+issue #560's DHT-discovery investigation below.
 
 ### What's not yet covered (tracked as follow-up)
 
-Issue #543's full scope — "a mixed P2P cluster (Rust + go-algorand NEW
-nodes) reaches and maintains consensus over a run of rounds", DHT-based
-peer discovery among 3+ real go-algorand peers, bidirectional gossipsub
-block/vote/tx propagation, and cross-implementation capability-
-advertisement lookup, plus a soak/nightly variant analogous to `make
-consensus-cluster-test` — is **not yet implemented**. Each of those is a
-substantially larger, separately-testable unit of work (a multi-node P2P
-mesh needs `algo-p2p` DHT bootstrap wired to real go-algorand peers'
-`/algorand/kad/<networkID>` protocol; a full consensus round-trip in
-P2P-only mode additionally needs #559's agreement-over-gossipsub
-bridging to have landed first). See the tracking issue this section's
-follow-up was filed under for the current status.
+Issue #543's full headline scope — "a mixed P2P cluster (Rust +
+go-algorand NEW nodes) reaches and maintains consensus over a run of
+rounds" — is still not implemented, and issue #560's investigation found
+it is not achievable at all without new work beyond what #559 delivered:
+go-algorand v4.7.0-stable's own `gossipSubTags` map
+(`network/p2pNetwork.go`) wires up gossipsub for the `TX` tag **only**.
+Agreement traffic (votes/proposals/bundles) travels over go's per-peer
+libp2p **stream** protocol instead
+(`wsStreamHandlerV1`/`wsStreamHandlerV22` — the same wire framing as its
+WS-gossip peers, tunneled through a libp2p stream rather than a raw
+WebSocket), which `algo_p2p::streams` has never implemented beyond a
+stub. algod-rust's own `AV`/`PP`/`VB` gossipsub topics (#559) are
+algod-rust-only forward-looking extensions of go's topic-naming
+convention — a real go-algorand P2P node does not subscribe to them and
+never will until/unless go-algorand itself starts gossiping agreement
+traffic. Porting go's per-peer stream wire protocol onto `algo-p2p` is
+tracked as its own follow-up issue.
+
+DHT-based peer discovery against real go-algorand peers is partway
+investigated but not yet proven working: building the 3-node chain found
+and fixed a real bug (`algo_p2p::dht::dht_protocol_name` was missing the
+`/kad/1.0.0` suffix `go-libp2p-kad-dht` always appends — see
+`ops/mixed-cluster-p2p/README.md`'s "Issue #560 status" for the full
+citation and current state), after which a rust host's DHT query against
+a live go node reaches go's DHT handler for the first time (a real round
+trip, not an instant no-op) but does not yet reliably surface peers that
+node is directly connected to. This remaining gap, cross-implementation
+capability advertisement, and a soak/nightly variant all remain tracked
+as follow-up work — see the tracking issue this section's follow-up was
+filed under for the current status.
 
 ### Why go-algorand's own `EnableP2P` config was reachable without a custom build
 

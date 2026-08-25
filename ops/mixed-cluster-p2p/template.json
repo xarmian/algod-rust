@@ -15,6 +15,16 @@
             "Wallets": [
                 { "Name": "Wallet1", "ParticipationOnly": false }
             ]
+        },
+        {
+            "Name": "Node2",
+            "IsRelay": true,
+            "Wallets": []
+        },
+        {
+            "Name": "Node3",
+            "IsRelay": true,
+            "Wallets": []
         }
     ]
 }
