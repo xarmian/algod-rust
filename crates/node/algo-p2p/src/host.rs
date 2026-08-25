@@ -477,6 +477,120 @@ impl P2pHost {
             }
         }
     }
+
+    /// Advertise that this node offers `capability`, via the DHT's provider
+    /// record mechanism (see [`crate::capabilities`]'s doc comment for why
+    /// that is a distinct mechanism from the peer-routing DHT queries
+    /// elsewhere in this module).
+    ///
+    /// Only a local-store failure (e.g. the provider-record store is at
+    /// capacity) is surfaced as an `Err`. A query that does not reach a
+    /// final `StartProviding` result within [`DHT_LOOKUP_TIMEOUT`] returns
+    /// `Ok(())` anyway — this folds in both go-algorand's #6581 fix ("dht:
+    /// do not err on context deadline") and #6595 ("chore: better error
+    /// handling in fast catchup mode", the `capabilities.go` hunk that
+    /// skips error-reporting once the surrounding context is already
+    /// done): whether the operation timed out or the caller is shutting
+    /// down, "advertisement didn't confirm yet" is not a condition the
+    /// caller (e.g. a periodic re-advertisement loop) should treat as
+    /// fatal — it should simply retry, mirroring go's
+    /// `AdvertiseCapabilities` retry-with-backoff loop.
+    pub async fn advertise_capability(
+        &mut self,
+        capability: crate::capabilities::Capability,
+    ) -> Result<(), P2pError> {
+        let query_id = self
+            .swarm
+            .behaviour_mut()
+            .kad
+            .start_providing(capability.record_key())
+            .map_err(|source| P2pError::CapabilityAdvertise {
+                capability: capability.namespace(),
+                source,
+            })?;
+
+        let sleep = tokio::time::sleep(DHT_LOOKUP_TIMEOUT);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                event = self.next_event() => {
+                    if let SwarmEvent::Behaviour(P2pBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
+                        id,
+                        result: kad::QueryResult::StartProviding(_),
+                        ..
+                    })) = event
+                    {
+                        if id == query_id {
+                            return Ok(());
+                        }
+                    }
+                }
+                _ = &mut sleep => {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Look up up to `n` peers advertising `capability`, via the DHT's
+    /// provider record mechanism. Excludes this host itself from the
+    /// result (matching go's `PeersForCapability`, which explicitly
+    /// excludes self so as not to confuse a caller looking for a *remote*
+    /// peer with the capability).
+    ///
+    /// Degrades to "no result yet" (an empty list) rather than erroring
+    /// out when the lookup does not produce a final result within
+    /// `deadline` — same "no capable peer found yet, not a hard failure"
+    /// treatment as [`P2pHost::find_closest_peers`] and
+    /// [`P2pHost::advertise_capability`] (folding in go's #6581/#6595
+    /// fixes); a node with no matching capability among its known peers
+    /// naturally falls out of this as an empty `Vec`; too.
+    pub async fn find_peers_for_capability(
+        &mut self,
+        capability: crate::capabilities::Capability,
+        n: usize,
+        deadline: Duration,
+    ) -> Vec<PeerId> {
+        let local_peer_id = self.peer_id();
+        let key = capability.record_key();
+        let query_id = self.swarm.behaviour_mut().kad.get_providers(key);
+
+        let sleep = tokio::time::sleep(deadline);
+        tokio::pin!(sleep);
+        let mut found: Vec<PeerId> = Vec::new();
+
+        loop {
+            tokio::select! {
+                event = self.next_event() => {
+                    if let SwarmEvent::Behaviour(P2pBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
+                        id,
+                        result: kad::QueryResult::GetProviders(result),
+                        step,
+                        ..
+                    })) = event
+                    {
+                        if id == query_id {
+                            if let Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) = &result {
+                                for peer in providers {
+                                    if *peer != local_peer_id && !found.contains(peer) {
+                                        found.push(*peer);
+                                    }
+                                }
+                            }
+                            if found.len() >= n || step.last {
+                                found.truncate(n);
+                                return found;
+                            }
+                        }
+                    }
+                }
+                _ = &mut sleep => {
+                    found.truncate(n);
+                    return found;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -838,5 +952,101 @@ mod tests {
         assert_eq!(crate::pubsub::TX_TOPIC, "algotx01");
         host.gossipsub_subscribe(crate::pubsub::TX_TOPIC)
             .expect("subscribe to the go-compatible TX topic name");
+    }
+
+    // -----------------------------------------------------------------------
+    // capability advertisement (#541)
+    // -----------------------------------------------------------------------
+
+    /// TDD anchor for this issue (#541): a node advertising the archival
+    /// capability is discoverable via capability lookup by another node.
+    ///
+    /// Both sides need Kademlia `Server` mode (mirroring
+    /// `three_nodes_bootstrap_via_dht_and_route_lookup_peer`'s reasoning):
+    /// the provider must answer the seeker's inbound `GET_PROVIDERS` RPC,
+    /// and the seeker must answer the provider's inbound `ADD_PROVIDER`
+    /// RPC (issued while advertising) — each side is queried by the other
+    /// at some point in this exchange.
+    #[tokio::test]
+    async fn capability_advertised_by_one_node_is_discoverable_by_another() {
+        let mut provider = new_test_host();
+        let mut seeker = new_test_host();
+
+        provider.set_dht_mode(Some(kad::Mode::Server));
+        seeker.set_dht_mode(Some(kad::Mode::Server));
+
+        let listen_addr = start_listening(&mut seeker).await;
+        let seeker_peer_id = seeker.peer_id();
+        let dial_addr = listen_addr.with(libp2p::multiaddr::Protocol::P2p(seeker_peer_id));
+
+        provider.dial(dial_addr).expect("dial should be accepted");
+
+        let mut provider_connected = false;
+        let mut seeker_connected = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !(provider_connected && seeker_connected) {
+            tokio::select! {
+                ev = provider.next_event() => {
+                    if let SwarmEvent::ConnectionEstablished { .. } = ev { provider_connected = true; }
+                }
+                ev = seeker.next_event() => {
+                    if let SwarmEvent::ConnectionEstablished { .. } = ev { seeker_connected = true; }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("timed out before both sides observed ConnectionEstablished");
+                }
+            }
+        }
+
+        let provider_peer_id = provider.peer_id();
+
+        provider
+            .advertise_capability(crate::capabilities::Capability::Archival)
+            .await
+            .expect("advertise should succeed against a store with capacity");
+
+        // Keep the provider's swarm driven in the background while the
+        // seeker looks it up — the seeker's `get_providers` query needs
+        // the provider to be online to answer the inbound RPC.
+        let provider_task = tokio::spawn(async move {
+            loop {
+                provider.next_event().await;
+            }
+        });
+
+        let found = seeker
+            .find_peers_for_capability(
+                crate::capabilities::Capability::Archival,
+                5,
+                Duration::from_secs(10),
+            )
+            .await;
+
+        provider_task.abort();
+
+        assert!(
+            found.contains(&provider_peer_id),
+            "expected the seeker to discover the provider as an Archival-capability peer, got: {found:?}"
+        );
+    }
+
+    /// TDD anchor for this issue (#541): a node with no matching
+    /// capability among its known peers returns "not found" (an empty
+    /// list), not an error — the infallible `Vec` return type of
+    /// [`P2pHost::find_peers_for_capability`] is itself the regression
+    /// guard, mirroring [`P2pHost::find_closest_peers`]'s same treatment.
+    #[tokio::test]
+    async fn capability_lookup_with_no_provider_returns_empty_not_error() {
+        let mut host = new_test_host();
+
+        let found = host
+            .find_peers_for_capability(
+                crate::capabilities::Capability::Catchpoints,
+                5,
+                Duration::from_millis(200),
+            )
+            .await;
+
+        assert!(found.is_empty());
     }
 }

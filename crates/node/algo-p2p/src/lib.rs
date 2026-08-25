@@ -9,17 +9,20 @@
 //! Kademlia DHT peer discovery, a persistent peer cache, and `dnsaddr`
 //! DNS-based bootstrap resolution are implemented here (#539), and so is
 //! gossipsub-based publish/subscribe pubsub for block/vote/tx propagation
-//! (#540, see the [`pubsub`] module for topic naming). Capability
-//! advertisement and WS/P2P transport-mode selection (wiring this crate's
-//! pubsub into `algo-network`'s broadcast/consume interfaces so the running
-//! node can actually use it) are later, separate sub-issues of the P2P
-//! epic (#544, see #541/#542) and are deliberately out of scope for this
-//! crate so far.
+//! (#540, see the [`pubsub`] module for topic naming) and DHT-based peer
+//! capability advertisement (#541, see the [`capabilities`] module).
+//! WS/P2P transport-mode selection (wiring this crate's pubsub and
+//! capability discovery into `algo-network`'s broadcast/consume interfaces
+//! and node startup so the running node can actually use them) is a later,
+//! separate sub-issue of the P2P epic (#544, see #542) and is deliberately
+//! out of scope for this crate so far.
 //!
 //! Reference: `../go-algorand/network/p2p/` at `v4.7.0-stable`
 //! (`p2p.go`, `peerID.go`, `streams.go`, `http.go`, `dht/dht.go`,
-//! `dnsaddr/resolve.go`, `peerstore/peerstore.go`, `pubsub.go`).
+//! `dnsaddr/resolve.go`, `peerstore/peerstore.go`, `pubsub.go`,
+//! `capabilities.go`).
 
+pub mod capabilities;
 pub mod dht;
 pub mod dnsaddr;
 pub mod errors;
@@ -29,6 +32,7 @@ pub mod peerstore;
 pub mod pubsub;
 pub mod streams;
 
+pub use capabilities::Capability;
 pub use dht::dht_protocol_name;
 pub use dnsaddr::{resolve_multiaddrs, DnsaddrError, DnsaddrResolver, HickoryDnsaddrResolver};
 pub use errors::P2pError;

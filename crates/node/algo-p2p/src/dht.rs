@@ -36,9 +36,15 @@ pub fn dht_protocol_name(network_id: &str) -> StreamProtocol {
 /// otherwise). This crate's `kad::Behaviour` defaults to
 /// `auto_mode: true` (client until an external address is confirmed, then
 /// server) — the direct rust-libp2p equivalent of go's listen-address-based
-/// default — and simply never calls `put_record`/`get_record`/
-/// `start_providing`, which achieves the same "no value store" behavior as
-/// go's explicit `DisableValues()` without needing a config knob for it.
+/// default — and simply never calls `put_record`/`get_record`, which
+/// achieves the same "no arbitrary value store" behavior as go's explicit
+/// `DisableValues()` without needing a config knob for it. This does *not*
+/// extend to `start_providing`/`get_providers` (provider records): that is
+/// a separate DHT mechanism, unaffected by `DisableValues()` in both
+/// go-libp2p and rust-libp2p, and is exactly what [`crate::capabilities`]
+/// (#541) uses for capability advertisement — mirroring go-algorand's own
+/// `capabilities.go`, which likewise calls DHT `Provide`/`FindProvidersAsync`
+/// on a `DisableValues()`-configured DHT.
 /// rust-libp2p's default periodic routing-table refresh
 /// (`periodic_bootstrap_interval = 5 minutes`, in [`libp2p::kad::Config`])
 /// is left as-is: go-algorand's `MakeDHT` does not override
