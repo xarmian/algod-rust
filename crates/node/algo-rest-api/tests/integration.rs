@@ -7856,6 +7856,58 @@ async fn account_applications_information_omits_params_without_include() {
 }
 
 #[tokio::test]
+async fn account_applications_information_creator_only_row_survives_without_include() {
+    // Issue #535 (go-algorand v4.7.0-beta / PR #6588 "API: Deal with
+    // params that are in deltas"): the handler.go workaround this PR
+    // removed used to skip any record with *both* `AppLocalState == nil`
+    // and `AppParams == nil` — but a legitimate creator-only row (the
+    // account created the app, has no local state, and the caller did not
+    // pass `include=params`) has exactly that shape, since `AppParams`
+    // stays intentionally nil when params aren't requested. That old go
+    // check would have silently dropped a real resource. algod-rust's
+    // handler (`account_applications_information` in `handlers.rs`) adds a
+    // third `creator.is_zero()` condition to its analogous defensive
+    // skip, so a live creator-only row (non-zero creator) is never
+    // dropped by it — this pins that at the REST layer: the record must
+    // still appear, unmarked as deleted, with `app-local-state` and
+    // `params` both absent.
+    let addr = Address([0x05; 32]);
+    let mut node = MockNode::synced();
+    node.app_resources_by_addr.insert(
+        addr.0,
+        vec![AppResourceWithIDs {
+            app_id: 11,
+            app_local_state: None,
+            creator: addr,
+            app_params: None,
+        }],
+    );
+    let server = TestServer::start(node).await;
+
+    let resp = server
+        .client
+        .get(server.url(&format!("/v2/accounts/{}/applications", addr)))
+        .header("X-Algo-API-Token", &server.api_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let resources = body["application-resources"].as_array().unwrap();
+    assert_eq!(
+        resources.len(),
+        1,
+        "a creator-only row must not be dropped just because params weren't requested: {body:?}"
+    );
+    assert!(resources[0]["app-local-state"].is_null());
+    assert!(resources[0]["params"].is_null());
+    assert!(
+        resources[0]["deleted"].is_null(),
+        "a live creator-only row must not be marked deleted: {resources:?}"
+    );
+}
+
+#[tokio::test]
 async fn account_applications_information_marks_deleted_app() {
     // A record whose creator resolves to the zero address (app no longer
     // exists) must surface `deleted: true`, matching go's handler branch.

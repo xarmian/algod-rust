@@ -4388,6 +4388,25 @@ pub async fn account_applications_information<N: NodeInterface>(
         {
             // Neither local state nor a live creator/params — should not be
             // possible (mirrors go's own defensive warning + skip).
+            //
+            // Issue #535 (go-algorand v4.7.0-beta / PR #6588 "API: Deal
+            // with params that are in deltas"): go's handlers.go dropped
+            // its analogous check entirely because the *old* version only
+            // tested `AppLocalState == nil && AppParams == nil`, which
+            // wrongly matched (and silently dropped) a legitimate
+            // creator-only row whenever `include=params` was not
+            // requested — `AppParams` is intentionally nil in that case
+            // even though the row is real. This check adds the
+            // `record.creator.is_zero()` condition go's old code lacked,
+            // so a live creator-only row (non-zero creator) never matches
+            // here regardless of `include_params`; only a record with
+            // truly nothing (no local state AND no resolvable creator)
+            // does, which is the actual "should not happen" case. See
+            // `account_applications_information_creator_only_row_survives_without_include`
+            // (algo-rest-api/tests/integration.rs) and
+            // `lookup_applications_respects_include_params_false`
+            // (bin/algod-rust/src/node_interface_impl.rs) for the
+            // regression coverage.
             tracing::warn!(
                 app_id = record.app_id,
                 "AccountApplicationsInformation: application has neither local state nor params - should not be possible"

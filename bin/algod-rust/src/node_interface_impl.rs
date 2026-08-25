@@ -5118,6 +5118,92 @@ mod tests {
         );
     }
 
+    /// Issue #535 (go-algorand v4.7.0-beta / PR #6588 "API: Deal with
+    /// params that are in deltas"): go-algorand's `accountUpdates.deltas`
+    /// batches many rounds of account/asset/app state in memory before
+    /// flushing to trackerdb, so `lookupAssetResources`/
+    /// `lookupApplicationResources` had to be taught to check that
+    /// in-memory delta layer for `AssetParams`/`AppParams` before falling
+    /// back to a possibly stale/missing DB row. algod-rust has no such
+    /// staging layer (see #506's rationale on
+    /// `lookup_assets_reflects_each_committed_block_immediately` above):
+    /// `set_asset_params`/`set_app_params` write directly into the same
+    /// SQLite connection that `lookup_assets`/`lookup_applications` read
+    /// from, inside the open `begin_block`/`commit_block` transaction — so
+    /// a freshly-created asset's or app's params are visible to a read on
+    /// that very same connection even *before* `commit_block()` runs
+    /// (SQLite's same-connection read-your-own-writes semantics), not only
+    /// after. This pins that: create an asset and an app (with params)
+    /// inside an open, uncommitted block transaction and assert
+    /// `lookup_assets`/`lookup_applications` already return correct,
+    /// non-stale params — never empty/stale — without calling
+    /// `commit_block()` first.
+    #[tokio::test]
+    async fn lookup_asset_and_app_params_visible_before_commit_block() {
+        let (adapter, ledger_arc) = adapter_with_seedable_ledger();
+        let creator = Address([0x37; 32]);
+        const ASSET_ID: u64 = 999;
+        const APP_ID: u64 = 998;
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            ledger.begin_block().expect("begin_block");
+            ledger.set_asset_holding(
+                &creator,
+                ASSET_ID,
+                AssetHolding {
+                    amount: 42,
+                    frozen: false,
+                },
+            );
+            ledger.set_asset_params(
+                ASSET_ID,
+                AssetParamsRecord {
+                    params: asset_params_named("NEW", 42),
+                    creator,
+                },
+            );
+            ledger.set_app_params(APP_ID, app_params(creator));
+            // Deliberately do NOT call commit_block() here — the write
+            // still sits inside an open "BEGIN IMMEDIATE" transaction,
+            // mirroring go-algorand's uncommitted `deltas` slice.
+        }
+
+        let (asset_records, _) = adapter
+            .lookup_assets(&creator, 0, 100)
+            .await
+            .expect("lookup_assets before commit");
+        assert_eq!(asset_records.len(), 1);
+        assert_eq!(asset_records[0].creator, creator);
+        assert_eq!(
+            asset_records[0]
+                .asset_params
+                .as_ref()
+                .expect("asset params must be present before commit_block")
+                .unit_name,
+            "NEW",
+            "asset params must be correct before commit_block, not empty/stale"
+        );
+
+        let (app_records, _) = adapter
+            .lookup_applications(&creator, 0, 100, true)
+            .await
+            .expect("lookup_applications before commit");
+        assert_eq!(app_records.len(), 1);
+        assert_eq!(app_records[0].creator, creator);
+        assert!(
+            app_records[0].app_params.is_some(),
+            "app params must be correct before commit_block, not empty/stale"
+        );
+
+        // Leave the ledger in a clean state (the open transaction would
+        // otherwise be dropped uncommitted along with the struct, which is
+        // harmless here, but rolling back explicitly documents intent).
+        {
+            let mut ledger = ledger_arc.lock().expect("ledger lock");
+            let _ = ledger.rollback_block();
+        }
+    }
+
     #[tokio::test]
     async fn box_lookups_round_trip_through_kvstore() {
         let (adapter, ledger_arc) = adapter_with_seedable_ledger();
