@@ -7,12 +7,16 @@
 # issue #596 wires up three of the four verifiers the WS-gossip harness's
 # own Tier 2 also runs — fork detection, bidirectional cert cross-verify,
 # and restart/rejoin scenarios (all opt-in, off by default, identical
-# env-var gating to consensus-conformance.sh). Negative-conformance
-# (malformed-message injection) is NOT wired here — `algo-agreement-fuzz`
-# speaks the WS-gossip wire framing (`algo_network::connect`), which has
-# no equivalent over this harness's libp2p `/algorand-ws/2.2.0` raw
-# stream; see docs/P2P_SOAK_METHODOLOGY.md's "Not yet covered" section
-# for the follow-up tracking a P2P-speaking injector.
+# env-var gating to consensus-conformance.sh). Issue #597 added a fourth:
+# negative-conformance (malformed-message injection) via a P2P-speaking
+# connection backend on `algo-agreement-fuzz`
+# (`crates/tools/algo-agreement-fuzz/src/inject_p2p.rs`, `--transport p2p`)
+# that speaks the raw `/algorand-ws/2.2.0` libp2p stream instead of
+# WS-gossip framing — see negative-conformance.sh's header for the full
+# rationale and this harness's one deliberate deviation from the WS-gossip
+# script (no BaseLoggerDebugLevel-raise-and-restart for the
+# malformed-proposal case, since restarting a P2P node here would churn
+# its ephemeral PeerId and fragment the bootstrap-chained mesh).
 #
 # One command that runs:
 #
@@ -47,6 +51,7 @@
 #   bash ops/mixed-cluster-p2p/scripts/consensus-soak.sh
 #   make p2p-interop-soak-test ROUNDS=200
 #   VERIFY_STAGE=1 RESTART_SCENARIOS=1 make p2p-interop-soak-test
+#   NEGATIVE_CASES=1 make p2p-interop-soak-test
 #
 # Env:
 #   ROUNDS                rounds to soak                    (default 200)
@@ -68,6 +73,9 @@
 #                         restart-as-proposer)                (default 0)
 #   RESTART_MODE          which restart scenarios to run:
 #                         graceful|kill|proposer|all       (default all)
+#   NEGATIVE_CASES         1 = also run the issue #597 negative-conformance
+#                         stage after the soak (P2P-speaking malformed-
+#                         message injection)                     (default 0)
 #   SKIP_START=1          use an already-running cluster
 #   KEEP_CLUSTER=1        leave the cluster up on exit
 #   OUT_DIR               artifact directory (default: a timestamped
@@ -93,6 +101,7 @@ MIN_RUST_VOTE_ROUNDS="${MIN_RUST_VOTE_ROUNDS:-0}"
 VERIFY_STAGE="${VERIFY_STAGE:-0}"
 RESTART_SCENARIOS="${RESTART_SCENARIOS:-0}"
 RESTART_MODE="${RESTART_MODE:-all}"
+NEGATIVE_CASES="${NEGATIVE_CASES:-0}"
 SKIP_START="${SKIP_START:-0}"
 KEEP_CLUSTER="${KEEP_CLUSTER:-0}"
 ALGOD_TOKEN="${ALGOD_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
@@ -376,6 +385,40 @@ for c in s['checks']:
     else
         record "restart_rejoin" fail \
             "restart-rejoin.sh exited $restart_rc with no summary — see $OUT_DIR/restart.log"
+    fi
+fi
+
+# -- 3d. (opt-in) negative conformance — issue #597 ----------------------
+# Off by default: it injects four deliberately malformed agreement messages
+# into go-node-1 over its /algorand-ws/2.2.0 stream and asserts each is
+# rejected. That is a different property from the steady-state conformance
+# above — see negative-conformance.sh's header, mirroring
+# consensus-conformance.sh's own NEGATIVE_CASES wiring for the WS-gossip
+# harness.
+if [ "$NEGATIVE_CASES" = "1" ]; then
+    echo "==> negative conformance (issue #597)"
+    negative_rc=0
+    SKIP_START=1 \
+    KEEP_CLUSTER=1 \
+    OUT_DIR="$OUT_DIR/negative" \
+    TOOLS_DIR="${TOOLS_DIR:-$REPO_ROOT/target/debug}" \
+    ALGOD_TOKEN="$ALGOD_TOKEN" \
+        "$HERE/negative-conformance.sh" > "$OUT_DIR/negative.log" 2>&1 || negative_rc=$?
+    tail -40 "$OUT_DIR/negative.log" || true
+    if [ -s "$OUT_DIR/negative/negative-summary.json" ]; then
+        while IFS=$'\t' read -r name status detail; do
+            [ -n "$name" ] && record "$name" "$status" "$detail"
+        done < <(python3 -c "
+import json, sys
+s = json.load(sys.stdin)
+for c in s['checks']:
+    status = c['status'] if c['status'] in ('pass', 'fail') else 'pass'
+    print('negative_{}_{}\t{}\t{}'.format(
+        c['case'].replace('-', '_'), c['name'].replace('-', '_'), status, c['detail']))
+" < "$OUT_DIR/negative/negative-summary.json")
+    else
+        record "negative_conformance" fail \
+            "negative-conformance.sh exited $negative_rc with no summary — see $OUT_DIR/negative.log"
     fi
 fi
 
