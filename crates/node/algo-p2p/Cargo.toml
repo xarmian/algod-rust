@@ -15,6 +15,15 @@ libp2p = { version = "0.54", features = [
     "gossipsub",
     "macros",
 ] }
+# Pinned to the 0.2.0-alpha release train specifically because it is the one
+# built against libp2p-swarm 0.45.x / libp2p-core 0.42.x — the exact versions
+# the `libp2p` facade crate above (0.54.x) re-exports. A newer libp2p-stream
+# (0.3.0-alpha+, built against swarm 0.46) pulls in a *second*, incompatible
+# copy of libp2p-swarm/-core, and `libp2p_stream::Behaviour` then implements
+# a different `NetworkBehaviour` trait than the one `#[derive(NetworkBehaviour)]`
+# on `P2pBehaviour` (host.rs) uses — a hard compile error, not a version
+# warning. Bump this only in lockstep with the `libp2p` facade version above.
+libp2p-stream = "0.2.0-alpha"
 tokio.workspace = true
 thiserror.workspace = true
 futures-util.workspace = true
@@ -23,8 +32,10 @@ serde_json.workspace = true
 hickory-resolver.workspace = true
 tracing.workspace = true
 sha2.workspace = true
+rmp-serde.workspace = true
 void = "1"
 
 [dev-dependencies]
 tempfile = "3"
 hex.workspace = true
+tokio-util = { workspace = true, features = ["compat"] }

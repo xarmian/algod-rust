@@ -31,6 +31,7 @@ pub mod identity;
 pub mod peerstore;
 pub mod pubsub;
 pub mod streams;
+pub mod wsproto;
 
 pub use capabilities::Capability;
 pub use dht::dht_protocol_name;
@@ -46,3 +47,15 @@ pub use pubsub::{
     ident_topic, topic_name_for_tag_code, AGREEMENT_VOTE_TOPIC, ALL_TOPICS, PROPOSAL_PAYLOAD_TOPIC,
     TX_TOPIC, VOTE_BUNDLE_TOPIC,
 };
+pub use wsproto::{
+    build_headers, handshake_inbound, handshake_outbound, read_frame, write_frame, PeerMeta,
+    PeerMetaHeaders, WsProtoError, ALGORAND_WS_PROTOCOL_V1, ALGORAND_WS_PROTOCOL_V22,
+};
+
+/// Re-exported so downstream crates (e.g. `bin/algod-rust`'s `p2p_transport`)
+/// can name [`libp2p_stream::Control`]/[`libp2p_stream::Stream`] without
+/// adding a direct `libp2p-stream` dependency of their own (version-pinning
+/// it against the exact `libp2p-swarm` this crate's `libp2p` facade uses is
+/// this crate's job — see this crate's `Cargo.toml` comment on
+/// `libp2p-stream`).
+pub use libp2p_stream;

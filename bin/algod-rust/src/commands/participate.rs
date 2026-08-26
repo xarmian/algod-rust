@@ -3193,6 +3193,7 @@ pub async fn run(
             listening = transport.is_listening(),
             listen_addrs = ?transport.listen_addrs(),
             connected_peers = transport.connected_peer_count(),
+            algorand_ws_stream_peers = transport.stream_peer_count(),
             "P2P transport started"
         );
 
