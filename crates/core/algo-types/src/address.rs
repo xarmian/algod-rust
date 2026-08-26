@@ -1,15 +1,14 @@
 use algo_error::AlgoError;
 use data_encoding::BASE32_NOPAD;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha512_256};
 use std::fmt;
 use std::str::FromStr;
 
 /// A 32-byte Algorand address (Ed25519 public key for single-sig accounts).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
-#[serde(transparent)]
-pub struct Address(#[serde(with = "serde_bytes")] pub [u8; 32]);
+pub struct Address(pub [u8; 32]);
 
 impl Address {
     pub const ZERO: Self = Address([0u8; 32]);
@@ -99,6 +98,93 @@ impl FromStr for Address {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Address::from_algorand_string(s)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wire encoding (issue #578)
+// ---------------------------------------------------------------------------
+//
+// go-algorand's `basics.Address` implements `encoding.TextMarshaler`
+// (`data/basics/address.go`'s `MarshalText`/`String`), so go-codec's JSON
+// handle always renders it as the checksummed base32 string, while the
+// msgpack handle (which has no special-case for `TextMarshaler`) still
+// writes the raw 32 bytes. A plain `#[serde(with = "serde_bytes")]` (the
+// prior impl here) reproduced the msgpack side correctly but not JSON:
+// `serde_json`'s `Serializer::serialize_bytes` has no native "bytes" type
+// and falls back to a JSON array of 32 numbers instead of the checksum
+// string -- the same class of bug issue #573 fixed for
+// `KvValueDelta.Data`/`.OldData` and issue #576 fixed for
+// `basics.VotingData`'s `VoteID`/`SelectionID`/`StateProofID`.
+impl Serialize for Address {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.to_algorand_string())
+        } else {
+            serializer.serialize_bytes(&self.0)
+        }
+    }
+}
+
+// Deliberately does NOT branch on `deserializer.is_human_readable()` (see
+// `state_delta.rs`'s `deserialize_bytes_array` for the full writeup, and
+// `AccountBaseData::auth_addr` -- flattened via `LedgercoreAccountData` --
+// for a live call site that hits exactly this trap). Serde's derive
+// implements `#[serde(flatten)]` deserialization by first buffering the
+// remaining input into a generic `serde::__private::de::Content` value,
+// whose `Deserializer::is_human_readable()` hard-codes `true` regardless of
+// the real wire format. Branching on it would silently try to base32-decode
+// raw msgpack bytes whenever an `Address` sits under a flattened struct.
+// Using `deserialize_any` instead asks "what shape is this value" (a
+// `Content::Str`/`Content::Bytes` case preserves the real original kind even
+// though its `is_human_readable()` lies), which sidesteps the bug entirely
+// and works identically whether or not `Address` is flattened.
+impl<'de> Deserialize<'de> for Address {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct AddressVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for AddressVisitor {
+            type Value = Address;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a base32 Algorand address string or 32 raw bytes")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Address, E> {
+                Address::from_algorand_string(v).map_err(E::custom)
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Address, E> {
+                v.try_into()
+                    .map(Address)
+                    .map_err(|_| E::custom(format!("expected 32 bytes, got {}", v.len())))
+            }
+
+            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Address, E> {
+                self.visit_bytes(&v)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Address, A::Error> {
+                let mut arr = [0u8; 32];
+                for (i, byte) in arr.iter_mut().enumerate() {
+                    *byte = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                }
+                Ok(Address(arr))
+            }
+        }
+
+        deserializer.deserialize_any(AddressVisitor)
     }
 }
 
@@ -220,57 +306,77 @@ mod tests {
         let addr2 = Address::from_algorand_string(REWARDS_POOL).unwrap();
         assert_ne!(addr1, addr2);
     }
-}
 
-mod serde_bytes {
-    use serde::{self, Deserializer, Serializer};
-    use std::fmt;
+    // -----------------------------------------------------------------
+    // JSON must serialize as the base32 checksum string (issue #578),
+    // matching go-algorand's basics.Address (encoding.TextMarshaler),
+    // not a raw byte array. Msgpack must stay raw bytes (unaffected).
+    // -----------------------------------------------------------------
 
-    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(bytes)
+    #[test]
+    fn test_json_serializes_as_base32_checksum_string() {
+        let addr = Address::from_algorand_string(FEE_SINK).unwrap();
+        let json = serde_json::to_value(addr).expect("serialize");
+        assert_eq!(json, serde_json::Value::String(FEE_SINK.to_string()));
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct ByteArray32Visitor;
+    #[test]
+    fn test_json_round_trips_through_base32_string() {
+        let addr = Address::from_algorand_string(REWARDS_POOL).unwrap();
+        let json = serde_json::to_value(addr).expect("serialize");
+        let round_tripped: Address = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(addr, round_tripped);
+    }
 
-        impl<'de> serde::de::Visitor<'de> for ByteArray32Visitor {
-            type Value = [u8; 32];
+    #[test]
+    fn test_zero_address_json_round_trip() {
+        let addr = Address::ZERO;
+        let json = serde_json::to_value(addr).expect("serialize");
+        assert_eq!(json, serde_json::Value::String(ZERO_ADDR.to_string()));
+        let round_tripped: Address = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(addr, round_tripped);
+    }
 
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("32 bytes")
-            }
+    #[test]
+    fn test_msgpack_round_trips_as_raw_bytes_not_string() {
+        let addr = Address::from_algorand_string(FEE_SINK).unwrap();
+        let bytes = rmp_serde::to_vec_named(&addr).expect("msgpack encode");
+        // Raw 32-byte msgpack bin, not a base32 string -- must stay far
+        // smaller than the 58-char string encoding would be.
+        assert!(
+            bytes.len() < 40,
+            "expected compact raw-bytes msgpack encoding, got {} bytes",
+            bytes.len()
+        );
+        let round_tripped: Address = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(addr, round_tripped);
+    }
 
-            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<[u8; 32], E> {
-                v.try_into()
-                    .map_err(|_| E::custom(format!("expected 32 bytes, got {}", v.len())))
-            }
-
-            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<[u8; 32], E> {
-                v.as_slice()
-                    .try_into()
-                    .map_err(|_| E::custom(format!("expected 32 bytes, got {}", v.len())))
-            }
-
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<[u8; 32], A::Error> {
-                let mut arr = [0u8; 32];
-                for (i, byte) in arr.iter_mut().enumerate() {
-                    *byte = seq
-                        .next_element()?
-                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
-                }
-                Ok(arr)
-            }
+    #[test]
+    fn test_address_behind_flatten_round_trips_through_msgpack() {
+        // Regression guard for the `#[serde(flatten)]` + `is_human_readable()`
+        // trap documented in issue #578 / algo-ledger's state_delta.rs: an
+        // `Address` sitting under a flattened struct must still decode
+        // correctly from msgpack, since serde's flatten machinery buffers
+        // into a `Content` value whose `is_human_readable()` always lies and
+        // says `true`.
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        struct Inner {
+            addr: Address,
+        }
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        struct Outer {
+            #[serde(flatten)]
+            inner: Inner,
         }
 
-        deserializer.deserialize_bytes(ByteArray32Visitor)
+        let outer = Outer {
+            inner: Inner {
+                addr: Address::from_algorand_string(FEE_SINK).unwrap(),
+            },
+        };
+        let bytes = rmp_serde::to_vec_named(&outer).expect("msgpack encode");
+        let round_tripped: Outer = rmp_serde::from_slice(&bytes).expect("msgpack decode");
+        assert_eq!(outer, round_tripped);
     }
 }
