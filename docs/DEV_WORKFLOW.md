@@ -993,19 +993,20 @@ at all (see the Windows cargo/MSVC note below), so this regeneration
 needs a Linux environment (Docker: `golang:1.25-bookworm` or
 `ubuntu:22.04` + `build-essential` both work) either way.
 
-### Windows note: capture in `--release`, not debug
+### Windows note: debug-build stack overflow (fixed, #568)
 
 The unoptimized debug build of the full `algod-rust` binary (its huge
-dependency graph — tokio, reqwest, libp2p — plus deeply generic serde
-derive code for `BlockResponse`) has been observed to overflow the
-default 1 MiB Windows thread stack decoding an ordinary ~1 KiB block,
-even though the same decode succeeds instantly (and via both the serde
-and the hand-rolled "fast" decoder paths) when exercised in isolation
-against just the `algo-codec` crate. This is stack-frame bloat from
-the debug build's inlining/generics, not a data-dependent decode bug —
-`cargo build --release --bin algod-rust` does not reproduce it. Always
-use the release binary (or set `RUST_MIN_STACK` generously) for
-`capture`/`sync`/`replay` on Windows.
+dependency graph — tokio, reqwest, libp2p) used to overflow the default
+1 MiB Windows main-thread stack before `main()`'s body even started
+running, on any subcommand (`capture`, `validate`, `replay`, ...). Root
+cause: debug builds skip an MIR storage-coalescing optimization that lets
+`async fn main()`'s subcommand-dispatch `match` arms share stack space in
+release builds, so the compiler-generated state machine for `main` itself
+was large enough to blow the MSVC linker's default 1 MiB stack reservation
+at startup. Fixed in #568 by raising the linked stack reservation for the
+`x86_64-pc-windows-msvc` target to 8 MiB via `.cargo/config.toml`
+(`/STACK:8388608`) — debug builds on Windows no longer need `--release`
+or `RUST_MIN_STACK` for `capture`/`sync`/`replay`/`validate`.
 
 ## Phase A acceptance fixture capture
 
