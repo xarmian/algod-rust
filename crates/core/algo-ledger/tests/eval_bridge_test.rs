@@ -13,7 +13,10 @@ use std::collections::BTreeMap;
 use algo_avm::context::NullContext;
 use algo_avm::eval::{run_approval_program, AvmResult};
 use algo_avm::group::{GroupBudget, GroupContext};
-use algo_ledger::{apply_block_with_mode, apply_transaction, ApplyContext, ApplyMode, LedgerState};
+use algo_ledger::{
+    apply_block_with_delta, apply_block_with_delta_mode, apply_block_with_mode, apply_transaction,
+    ApplyContext, ApplyMode, LedgerState,
+};
 use algo_types::{
     Address, AppLocalState, AppParams, Block, Round, SignedTransaction, StateSchema, TealValue,
     Transaction,
@@ -61,6 +64,27 @@ fn error_program() -> Vec<u8> {
     prog(AVM_V6, &[ERR_OPCODE])
 }
 
+/// Build a v8 program that `box_put`s `value` under `name` and approves.
+/// Requires the caller to supply a matching box reference on the
+/// transaction (`appl_noop_txn_with_box`) and pre-existing content of the
+/// same length if the box already exists (`box_put` requires an exact-size
+/// replacement, matching go-algorand).
+fn box_put_program(name: &str, value: &str) -> Vec<u8> {
+    let source =
+        format!("#pragma version 8\nbyte \"{name}\"\nbyte \"{value}\"\nbox_put\nint 1\nreturn\n");
+    algo_avm::assembler::assemble_string(&source)
+        .expect("box_put program must assemble")
+        .program
+}
+
+/// Build a v8 program that `box_del`s `name` and approves.
+fn box_del_program(name: &str) -> Vec<u8> {
+    let source = format!("#pragma version 8\nbyte \"{name}\"\nbox_del\npop\nint 1\nreturn\n");
+    algo_avm::assembler::assemble_string(&source)
+        .expect("box_del program must assemble")
+        .program
+}
+
 /// Create a LedgerState with the given balances and fee sink.
 fn make_state(balances: &[(Address, u64)], fee_sink: Address) -> LedgerState {
     let mut state = LedgerState::new();
@@ -88,6 +112,7 @@ fn execute_ctx(fee_sink: Address, round: u64) -> ApplyContext {
         consensus: algo_types::ConsensusParams::default(),
         avm_overrides: Default::default(),
         failed_eval_delta: Cell::new(None),
+        kv_mods_recorder: None,
     }
 }
 
@@ -159,6 +184,25 @@ fn appl_noop_txn(sender: Address, app_id: u64, fee: u64) -> SignedTransaction {
         },
         ..Default::default()
     }
+}
+
+/// Build an appl SignedTransaction for an existing app, with a box reference
+/// naming `box_name` on the called app itself (index 0), for tests exercising
+/// box opcodes (issue #570).
+fn appl_noop_txn_with_box(
+    sender: Address,
+    app_id: u64,
+    fee: u64,
+    box_name: &[u8],
+) -> SignedTransaction {
+    use algo_types::BoxRef;
+    use serde_bytes::ByteBuf;
+    let mut stx = appl_noop_txn(sender, app_id, fee);
+    stx.txn.boxes = Some(vec![BoxRef {
+        index: 0,
+        name: Some(ByteBuf::from(box_name.to_vec())),
+    }]);
+    stx
 }
 
 /// Build an appl SignedTransaction with ClearState on_completion.
@@ -934,6 +978,7 @@ fn two_app_calls_produce_distinct_inner_asset_ids() {
         consensus: algo_types::ConsensusParams::default(),
         avm_overrides: Default::default(),
         failed_eval_delta: Cell::new(None),
+        kv_mods_recorder: None,
     };
 
     // First app call: fee=1000 (no overpayment).
@@ -1088,6 +1133,7 @@ fn fee_credit_from_outer_overpayment_enables_inner_zero_fee() {
         consensus: algo_types::ConsensusParams::default(),
         avm_overrides: Default::default(),
         failed_eval_delta: Cell::new(None),
+        kv_mods_recorder: None,
     };
 
     let result = apply_transaction(&mut state, &stx, &ctx, 0);
@@ -1158,6 +1204,7 @@ fn inner_zero_fee_fails_without_fee_credit() {
         consensus: algo_types::ConsensusParams::default(),
         avm_overrides: Default::default(),
         failed_eval_delta: Cell::new(None),
+        kv_mods_recorder: None,
     };
 
     let result = apply_transaction(&mut state, &stx, &ctx, 0);
@@ -1313,6 +1360,159 @@ fn apply_block_execute_mode_rejects_failing_appl() {
 
     // Round should NOT have advanced on error.
     assert_eq!(state.current_round, Round(0));
+}
+
+// ===========================================================================
+// Issue #570: StateDelta.kv_mods populated during block apply
+// ===========================================================================
+
+/// Build the raw KV-store key for a box, matching go-algorand's
+/// `apps.MakeBoxKey` / `sqlite.rs`'s `make_box_key`: `"bx:" +
+/// big-endian(app_id) + box_name`. Duplicated here (rather than depending on
+/// the crate-private helper) since this is a black-box integration test.
+fn box_kv_key(app_id: u64, name: &[u8]) -> Vec<u8> {
+    let mut key = b"bx:".to_vec();
+    key.extend_from_slice(&app_id.to_be_bytes());
+    key.extend_from_slice(name);
+    key
+}
+
+/// TDD regression for issue #570: applying a block whose app call writes a
+/// box via `box_put` must populate `StateDelta.kv_mods` with the box's key,
+/// new value, and (empty, since the box didn't exist before) old value.
+/// `apply_block_with_delta` (Replay mode) cannot observe this -- box
+/// mutations only happen inside AVM execution -- so this uses
+/// `apply_block_with_delta_mode(.., Execute)`.
+#[test]
+fn apply_block_with_delta_execute_mode_populates_kv_mods_for_box_put() {
+    let creator = Address([1u8; 32]);
+    let sender = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let rewards_pool = Address([4u8; 32]);
+
+    let mut state = LedgerState::new();
+    state.fee_sink = fee_sink;
+    state.rewards_pool = rewards_pool;
+    state.current_round = Round(0);
+
+    state.get_or_default_account(&creator).micro_algos = 50_000_000;
+    state.get_or_default_account(&sender).micro_algos = 50_000_000;
+    state.get_or_default_account(&fee_sink).micro_algos = 0;
+    state.get_or_default_account(&rewards_pool).micro_algos = 0;
+
+    let app_id = 200u64;
+    create_app(
+        &mut state,
+        app_id,
+        creator,
+        box_put_program("mybox", "hello"),
+        approval_program(),
+    );
+
+    let stx = appl_noop_txn_with_box(sender, app_id, 1_000, b"mybox");
+    let block = make_block(1, fee_sink, rewards_pool, vec![stx]);
+
+    let delta = apply_block_with_delta_mode(&mut state, &block, ApplyMode::Execute)
+        .expect("apply_block_with_delta_mode(Execute) must succeed");
+
+    let key = box_kv_key(app_id, b"mybox");
+    let entry = delta
+        .kv_mods
+        .get(&key)
+        .expect("kv_mods must contain the box_put'd box");
+    assert_eq!(entry.data, b"hello");
+    assert!(
+        entry.old_data.is_empty(),
+        "box didn't exist before this round"
+    );
+
+    // Confirm the box was really written to the store too (not just recorded).
+    assert_eq!(
+        algo_ledger::LedgerStore::get_box(&state, app_id, b"mybox"),
+        Some(b"hello".to_vec())
+    );
+}
+
+/// Companion regression: a `box_del` on a pre-existing box records the prior
+/// value as `old_data` and empty `data`, and `apply_block_with_delta`
+/// (Replay mode, the default) leaves `kv_mods` empty for the same block
+/// since it never runs the AVM -- pinning the documented Replay/Execute
+/// distinction (see `apply_block_with_delta_mode`'s doc comment).
+#[test]
+fn apply_block_with_delta_execute_mode_populates_kv_mods_for_box_del_and_replay_mode_does_not() {
+    let creator = Address([1u8; 32]);
+    let sender = Address([2u8; 32]);
+    let fee_sink = Address([3u8; 32]);
+    let rewards_pool = Address([4u8; 32]);
+
+    let make_funded_state_with_box = || {
+        let mut state = LedgerState::new();
+        state.fee_sink = fee_sink;
+        state.rewards_pool = rewards_pool;
+        state.current_round = Round(0);
+        state.get_or_default_account(&creator).micro_algos = 50_000_000;
+        state.get_or_default_account(&sender).micro_algos = 50_000_000;
+        state.get_or_default_account(&fee_sink).micro_algos = 0;
+        state.get_or_default_account(&rewards_pool).micro_algos = 0;
+        algo_ledger::LedgerStore::set_box(&mut state, 201, b"mybox", b"hello".to_vec());
+        let acct = state.get_or_default_account(&creator);
+        acct.total_boxes = 1;
+        acct.total_box_bytes = "mybox".len() as u64 + "hello".len() as u64;
+        state
+    };
+
+    let app_id = 201u64;
+
+    // Execute mode: box_del actually runs, kv_mods gets the delta.
+    let mut exec_state = make_funded_state_with_box();
+    create_app(
+        &mut exec_state,
+        app_id,
+        creator,
+        box_del_program("mybox"),
+        approval_program(),
+    );
+    let stx = appl_noop_txn_with_box(sender, app_id, 1_000, b"mybox");
+    let block = make_block(1, fee_sink, rewards_pool, vec![stx.clone()]);
+    let delta = apply_block_with_delta_mode(&mut exec_state, &block, ApplyMode::Execute)
+        .expect("Execute-mode apply must succeed");
+    let key = box_kv_key(app_id, b"mybox");
+    let entry = delta
+        .kv_mods
+        .get(&key)
+        .expect("kv_mods must contain the box_del'd box");
+    assert_eq!(entry.old_data, b"hello");
+    assert!(entry.data.is_empty());
+    assert_eq!(
+        algo_ledger::LedgerStore::get_box(&exec_state, app_id, b"mybox"),
+        None,
+        "box_del must actually remove the box from the store"
+    );
+
+    // Replay mode: no AVM execution, so kv_mods must stay empty even though
+    // the block "contains" the same box_del-shaped app call (Replay mode
+    // never looks at the approval program at all -- it only replays
+    // recorded EvalDelta, which never exists on this synthetic block).
+    let mut replay_state = make_funded_state_with_box();
+    create_app(
+        &mut replay_state,
+        app_id,
+        creator,
+        box_del_program("mybox"),
+        approval_program(),
+    );
+    let replay_delta = apply_block_with_delta(&mut replay_state, &block)
+        .expect("Replay-mode apply must succeed (no EvalDelta to replay is a no-op, not an error)");
+    assert!(
+        replay_delta.kv_mods.is_empty(),
+        "Replay mode never runs the AVM, so it cannot observe box mutations \
+         (documented limitation, issue #570)"
+    );
+    // The store itself is untouched in Replay mode too.
+    assert_eq!(
+        algo_ledger::LedgerStore::get_box(&replay_state, app_id, b"mybox"),
+        Some(b"hello".to_vec())
+    );
 }
 
 /// apply_block_with_mode in Execute mode with a mixed block containing

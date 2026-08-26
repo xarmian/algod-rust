@@ -5,7 +5,9 @@
 //! the AVM can read/write chain state through the `AvmContext` trait defined
 //! in `algo-avm`.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use algo_avm::context::AvmContext;
@@ -767,7 +769,22 @@ pub struct LedgerAvmContext<'a, L: LedgerStore> {
     /// being restricted, and unnamed box accesses are permitted. Holds the
     /// resources named by the top-level transaction group.
     unnamed_tracking: Option<Arc<NamedGroupResources>>,
+
+    /// Optional per-round box-modification recorder for `StateDelta.kv_mods`
+    /// (issue #570). Shared (via `Rc<RefCell<_>>`, cheaply cloned) across
+    /// every transaction and every inner app call within one block-apply
+    /// pass, so it accumulates the whole round's box deltas in one map.
+    /// `None` when the caller doesn't need deltas (e.g. most tests, and any
+    /// AVM execution not driven through the block-apply capturing path).
+    /// Keyed by the raw KV-store key bytes (`make_box_key`), first-touch's
+    /// pre-mutation value wins for `old_data` per key — see
+    /// [`record_kv_mod`](Self::record_kv_mod).
+    pub kv_mods_recorder: Option<KvModsRecorder>,
 }
+
+/// Shared accumulator type for per-round box deltas. See
+/// [`LedgerAvmContext::kv_mods_recorder`].
+pub type KvModsRecorder = Rc<RefCell<HashMap<Vec<u8>, crate::state_delta::KvValueDelta>>>;
 
 /// Base AVM limit on the number of `log` calls per program execution.
 /// Mirrors go-algorand's `logic.maxLogCalls`.
@@ -979,6 +996,7 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             max_log_size: MAX_LOG_SIZE,
             log_size: 0,
             unnamed_tracking: None,
+            kv_mods_recorder: None,
         }
     }
 
@@ -1165,6 +1183,42 @@ impl<'a, L: LedgerStore> LedgerAvmContext<'a, L> {
             // SAFETY: identical aliasing invariants to `record_app_state_access`.
             unsafe { &mut *p }.record_box_new_value(new_value);
         }
+    }
+
+    /// Record this box's before/after values into the per-round
+    /// `kv_mods_recorder`, for `StateDelta.kv_mods` (issue #570). No-op when
+    /// no recorder is attached (the default — most callers don't need
+    /// round-level box deltas). Reads the post-mutation value from the store
+    /// itself so partial writes (`box_replace`/`box_resize`/`box_splice`)
+    /// report the full resulting box, and a deleted box reports empty data,
+    /// mirroring [`record_box_new_value`](Self::record_box_new_value).
+    ///
+    /// `pre` is the value read *before* the mutation, already computed by
+    /// the caller for state-access tracing — reused here rather than
+    /// re-reading. Only the first write to a given box key within the
+    /// recorder's lifetime (i.e. within one round) sets `old_data`; later
+    /// writes to the same key in the same round only update `data`, so the
+    /// final entry reflects the box's value at the start of the round vs.
+    /// its value at the end — matching go-algorand's `ledgercore.StateDelta`
+    /// accumulation semantics (a delta is a round-scoped diff, not a log of
+    /// every intermediate write).
+    fn record_kv_mod(&mut self, name: &[u8], pre: Option<TealValue>) {
+        let Some(recorder) = self.kv_mods_recorder.clone() else {
+            return;
+        };
+        let key = crate::sqlite::make_box_key(self.app_id, name);
+        let new_data = self.store.get_box(self.app_id, name).unwrap_or_default();
+        let old_data = match pre {
+            Some(TealValue::Bytes(b)) => b,
+            _ => Vec::new(),
+        };
+        let mut map = recorder.borrow_mut();
+        map.entry(key)
+            .and_modify(|d| d.data.clone_from(&new_data))
+            .or_insert(crate::state_delta::KvValueDelta {
+                data: new_data,
+                old_data,
+            });
     }
 
     /// Read the current box contents as a [`TealValue`] for initial-state
@@ -1538,6 +1592,7 @@ fn execute_inner_appl<L: LedgerStore>(
     mut tracer: Option<&mut dyn algo_avm::tracer::EvalTracer>,
     log_limits: (u64, u64),
     unnamed_tracking: Option<Arc<NamedGroupResources>>,
+    kv_mods_recorder: Option<KvModsRecorder>,
 ) -> Result<crate::apply::InnerApplyData, AlgoError> {
     use algo_avm::eval::{
         run_approval_program, run_approval_program_with_tracer, run_clear_state_program,
@@ -1661,6 +1716,11 @@ fn execute_inner_appl<L: LedgerStore>(
     inner_ctx.max_log_calls = log_limits.0;
     inner_ctx.max_log_size = log_limits.1;
     inner_ctx.unnamed_tracking = unnamed_tracking;
+
+    // Propagate the round-level kv_mods recorder so box mutations made by
+    // an inner app call are captured too (issue #570) — box budget/dirty
+    // tracking is already shared this way (see H1 above).
+    inner_ctx.kv_mods_recorder = kv_mods_recorder;
 
     // Propagate tracer to inner context for recursive inner tracing.
     // SAFETY: tracer_ptr derived from the mutable reference in `tracer`, which
@@ -3068,6 +3128,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                     tracer_ref,
                     (self.max_log_calls, self.max_log_size),
                     self.unnamed_tracking.clone(),
+                    self.kv_mods_recorder.clone(),
                 );
                 match result {
                     Ok(ad) => {
@@ -3435,7 +3496,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             AppStateOp::Write,
             None,
             name,
-            pre,
+            pre.clone(),
             None,
         );
 
@@ -3468,6 +3529,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             self.store.set_box(self.app_id, name, value.to_vec());
         }
         self.record_box_new_value(name);
+        self.record_kv_mod(name, pre);
         Ok(())
     }
 
@@ -3480,7 +3542,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             AppStateOp::Delete,
             None,
             name,
-            pre,
+            pre.clone(),
             None,
         );
         let (_, exists) = self.available_box(name, BoxOperation::Delete, 0)?;
@@ -3500,6 +3562,9 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
                 .saturating_sub(name.len() as u64 + content_len);
             self.store.set_account(&app_addr, acct);
             self.store.delete_box(self.app_id, name);
+            // Record the deletion: post-mutation `store.get_box` now returns
+            // `None`, so `record_kv_mod` naturally records empty `data`.
+            self.record_kv_mod(name, pre);
         }
         Ok(exists)
     }
@@ -3529,7 +3594,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             AppStateOp::Write,
             None,
             name,
-            pre,
+            pre.clone(),
             None,
         );
         let (_, exists) = self.available_box(name, BoxOperation::Create, size)?;
@@ -3548,6 +3613,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // go-algorand records the write state-op even when the box already
         // existed (a no-op create); the new value is the box's current content.
         self.record_box_new_value(name);
+        self.record_kv_mod(name, pre);
         // Returns true if newly created.
         Ok(!exists)
     }
@@ -3589,7 +3655,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             AppStateOp::Write,
             None,
             name,
-            pre,
+            pre.clone(),
             None,
         );
         let (contents, exists) = self.available_box(name, BoxOperation::Write, 0)?;
@@ -3609,6 +3675,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         new_contents[start..end].copy_from_slice(value);
         self.store.set_box(self.app_id, name, new_contents);
         self.record_box_new_value(name);
+        self.record_kv_mod(name, pre);
         Ok(())
     }
 
@@ -3621,7 +3688,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             AppStateOp::Write,
             None,
             name,
-            pre,
+            pre.clone(),
             None,
         );
         let (contents, exists) = self.available_box(name, BoxOperation::Resize, new_size)?;
@@ -3658,6 +3725,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
         // updated the account totals).
         self.store.set_box(self.app_id, name, resized);
         self.record_box_new_value(name);
+        self.record_kv_mod(name, pre);
         Ok(())
     }
 
@@ -3676,7 +3744,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
             AppStateOp::Write,
             None,
             name,
-            pre,
+            pre.clone(),
             None,
         );
         let (contents, exists) = self.available_box(name, BoxOperation::Write, 0)?;
@@ -3730,6 +3798,7 @@ impl<'a, L: LedgerStore> AvmContext for LedgerAvmContext<'a, L> {
 
         self.store.set_box(self.app_id, name, result);
         self.record_box_new_value(name);
+        self.record_kv_mod(name, pre);
         Ok(())
     }
 
@@ -8059,5 +8128,172 @@ mod tests {
         ctx.itxn_submit().unwrap();
 
         assert_eq!(ctx.num_inner_txns(), 17);
+    }
+
+    // ---- issue #570: kv_mods recorder ----
+
+    /// Build a `LedgerAvmContext` with V41 consensus (real box budget/size
+    /// limits) and `name` pre-marked available for `app_id`, bypassing the
+    /// `txn.boxes` ref-resolution plumbing so these tests can call the box
+    /// opcodes directly without constructing a full transaction group.
+    fn make_box_context<'a>(
+        store: &'a mut LedgerState,
+        app_id: u64,
+        name: &[u8],
+    ) -> LedgerAvmContext<'a, LedgerState> {
+        let consensus = algo_types::consensus::consensus_params_for_version(
+            algo_types::consensus::CONSENSUS_V41,
+        )
+        .expect("V41 consensus params must exist");
+        let mut ctx = LedgerAvmContext::new(
+            store,
+            vec![make_appl_txn([9u8; 32], app_id, vec![], vec![], vec![])],
+            0,
+            1000,
+            12345,
+            app_id,
+            [1u8; 32],
+            true,
+            [2u8; 32],
+            [3u8; 32],
+            consensus,
+        );
+        ctx.available_boxes.insert((app_id, name.to_vec()), false);
+        ctx.boxes_initialized = true;
+        ctx.read_budget_checked = true;
+        ctx.io_budget = 10_000;
+        ctx
+    }
+
+    #[test]
+    fn box_put_on_new_box_records_empty_old_data() {
+        let mut store = LedgerState::new();
+        let recorder: KvModsRecorder = Rc::new(RefCell::new(HashMap::new()));
+        {
+            let mut ctx = make_box_context(&mut store, 42, b"mybox");
+            ctx.kv_mods_recorder = Some(recorder.clone());
+            ctx.box_put(b"mybox", b"hello").unwrap();
+        }
+
+        let map = recorder.borrow();
+        let key = crate::sqlite::make_box_key(42, b"mybox");
+        let delta = map.get(&key).expect("box_put must record a kv_mods entry");
+        assert_eq!(delta.data, b"hello");
+        assert!(
+            delta.old_data.is_empty(),
+            "box didn't exist before this round, so old_data must be empty"
+        );
+    }
+
+    #[test]
+    fn box_put_on_existing_box_records_prior_value_as_old_data() {
+        let mut store = LedgerState::new();
+        store.set_box(42, b"mybox", b"V1".to_vec());
+        let recorder: KvModsRecorder = Rc::new(RefCell::new(HashMap::new()));
+        {
+            let mut ctx = make_box_context(&mut store, 42, b"mybox");
+            ctx.kv_mods_recorder = Some(recorder.clone());
+            // Replacement value must match the existing box's size (box_put
+            // requires equal-size replacement) -- "V1" and "V2" are both 2 bytes.
+            ctx.box_put(b"mybox", b"V2").unwrap();
+        }
+
+        let map = recorder.borrow();
+        let key = crate::sqlite::make_box_key(42, b"mybox");
+        let delta = map.get(&key).unwrap();
+        assert_eq!(delta.old_data, b"V1");
+        assert_eq!(delta.data, b"V2");
+    }
+
+    #[test]
+    fn box_del_records_new_data_as_empty() {
+        let mut store = LedgerState::new();
+        store.set_box(42, b"mybox", b"hello".to_vec());
+        let recorder: KvModsRecorder = Rc::new(RefCell::new(HashMap::new()));
+        {
+            let mut ctx = make_box_context(&mut store, 42, b"mybox");
+            ctx.kv_mods_recorder = Some(recorder.clone());
+            assert!(ctx.box_del(b"mybox").unwrap());
+        }
+
+        let map = recorder.borrow();
+        let key = crate::sqlite::make_box_key(42, b"mybox");
+        let delta = map.get(&key).expect("box_del must record a kv_mods entry");
+        assert_eq!(delta.old_data, b"hello");
+        assert!(delta.data.is_empty(), "deleted box must record empty data");
+    }
+
+    #[test]
+    fn box_del_of_nonexistent_box_records_nothing() {
+        let mut store = LedgerState::new();
+        let recorder: KvModsRecorder = Rc::new(RefCell::new(HashMap::new()));
+        {
+            let mut ctx = make_box_context(&mut store, 42, b"mybox");
+            ctx.kv_mods_recorder = Some(recorder.clone());
+            assert!(!ctx.box_del(b"mybox").unwrap());
+        }
+        assert!(
+            recorder.borrow().is_empty(),
+            "deleting a box that never existed is a no-op and must not appear in kv_mods"
+        );
+    }
+
+    /// Multiple writes to the same box within one round must collapse to a
+    /// single entry whose `old_data` reflects the value at the *start* of
+    /// the round (not any intermediate value) and whose `data` reflects the
+    /// value at the *end* of the round — matching go-algorand's
+    /// `ledgercore.StateDelta` semantics (a round-scoped diff, not a write
+    /// log).
+    #[test]
+    fn multiple_writes_in_one_round_collapse_to_start_end_diff() {
+        let mut store = LedgerState::new();
+        store.set_box(42, b"mybox", b"V1".to_vec());
+        let recorder: KvModsRecorder = Rc::new(RefCell::new(HashMap::new()));
+        {
+            let mut ctx = make_box_context(&mut store, 42, b"mybox");
+            ctx.kv_mods_recorder = Some(recorder.clone());
+            ctx.box_put(b"mybox", b"V2").unwrap();
+            ctx.box_put(b"mybox", b"V3").unwrap();
+        }
+
+        let map = recorder.borrow();
+        let key = crate::sqlite::make_box_key(42, b"mybox");
+        let delta = map.get(&key).unwrap();
+        assert_eq!(
+            delta.old_data, b"V1",
+            "old_data must be the round-start value"
+        );
+        assert_eq!(delta.data, b"V3", "data must be the round-end value");
+    }
+
+    /// A box created and deleted within the same round nets to no visible
+    /// change; the recorder still carries the entry (both sides empty)
+    /// rather than needing special-case suppression, which is harmless for
+    /// callers reconstructing historical state.
+    #[test]
+    fn box_created_then_deleted_in_same_round_nets_to_empty_entry() {
+        let mut store = LedgerState::new();
+        let recorder: KvModsRecorder = Rc::new(RefCell::new(HashMap::new()));
+        {
+            let mut ctx = make_box_context(&mut store, 42, b"mybox");
+            ctx.kv_mods_recorder = Some(recorder.clone());
+            ctx.box_put(b"mybox", b"hello").unwrap();
+            assert!(ctx.box_del(b"mybox").unwrap());
+        }
+
+        let map = recorder.borrow();
+        let key = crate::sqlite::make_box_key(42, b"mybox");
+        let delta = map.get(&key).unwrap();
+        assert!(delta.old_data.is_empty());
+        assert!(delta.data.is_empty());
+    }
+
+    #[test]
+    fn no_recorder_attached_is_a_no_op() {
+        let mut store = LedgerState::new();
+        let mut ctx = make_box_context(&mut store, 42, b"mybox");
+        // kv_mods_recorder left None (default) -- must not panic or error.
+        ctx.box_put(b"mybox", b"hello").unwrap();
+        assert!(ctx.kv_mods_recorder.is_none());
     }
 }

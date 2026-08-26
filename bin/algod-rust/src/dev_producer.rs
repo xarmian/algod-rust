@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use algo_codec::{
     canonical_encode_block, canonical_encode_block_header_from_block, compute_txn_id,
 };
-use algo_ledger::apply::{apply_block_capturing_apply_data, ApplyData, ApplyMode};
+use algo_ledger::apply::{apply_block_capturing_apply_data_with_kv_mods, ApplyData, ApplyMode};
 use algo_ledger::store_trait::LedgerStore;
 use algo_ledger::SqliteLedger;
 use algo_pool::TransactionPool;
@@ -202,16 +202,36 @@ pub fn produce_dev_block(
             .map_err(|e| anyhow::anyhow!("ledger lock poisoned: {e}"))?;
         l.begin_block()
             .map_err(|e| anyhow::anyhow!("begin_block: {e}"))?;
-        let result = (|| -> Result<Vec<ApplyData>, algo_error::AlgoError> {
+        let result = (|| -> Result<(Vec<ApplyData>, algo_ledger::apply::KvModsMap), algo_error::AlgoError> {
             l.put_block(block.round.0, &proto, &hdr_data, &blk_data)?;
             l.put_block_cert(block.round.0, &cert_data)?;
             // Execute mode runs the AVM, rejecting transactions whose programs
             // fail (rather than confirming an invalid app call as Replay would),
-            // and returns the per-transaction ApplyData.
-            apply_block_capturing_apply_data(&mut *l, &block, ApplyMode::Execute)
+            // and returns the per-transaction ApplyData plus any box deltas
+            // (issue #570) so historical box-list queries work for dev blocks.
+            apply_block_capturing_apply_data_with_kv_mods(&mut *l, &block, ApplyMode::Execute)
         })();
         match result {
-            Ok(apply_data) => {
+            Ok((apply_data, kv_mods)) => {
+                // Cache a kv_mods-only delta into the DeltaCache so
+                // `GET /v2/applications/{id}/boxes?round=N` can serve this
+                // round historically (issue #570). Other StateDelta fields
+                // are intentionally left default here -- dev-mode blocks
+                // don't go through `apply_block_caching_delta`'s
+                // completeness-gated builder, and box-list reconstruction
+                // only reads `kv_mods`. Cached unconditionally (even when
+                // `kv_mods` is empty) so the cache's rolling window always
+                // advances one round per dev block, exactly like the
+                // `apply_block_caching_delta` sync path's `advance` call for
+                // rounds it can't fully cache -- otherwise a long run of
+                // box-free dev rounds would leave the window's `min_round`
+                // stale and a stale-but-still-cached box delta from far in
+                // the past could be served as if it were still in-window.
+                let delta = algo_ledger::state_delta::StateDelta {
+                    kv_mods,
+                    ..Default::default()
+                };
+                l.cache_state_delta(block.round.0, delta);
                 l.commit_block()
                     .map_err(|e| anyhow::anyhow!("commit_block: {e}"))?;
                 apply_data

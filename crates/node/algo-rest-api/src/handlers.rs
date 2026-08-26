@@ -1238,32 +1238,18 @@ async fn get_application_boxes_paginated<N: NodeInterface>(
 ) -> Response {
     use crate::box_name;
 
-    // Validate the caller-specified round against the latest known round.
-    // This node does not retain historical box state, so a round strictly
-    // in the past cannot be served faithfully; only `None` (implicitly
-    // "latest") or a round matching latest is supported. This mirrors
-    // go-algorand's `errRoundGreaterThanTheLatest` check for the "future
-    // round" case.
-    //
-    // The "past round" case is a real, investigated architecture gap, not
-    // an arbitrary limitation (issue #552): go-algorand itself only
-    // serves a bounded lookback here too (`accountUpdates.deltas` walked
-    // backward, bounded by `MaxAcctLookback`, default 4 --
-    // `ledger/acctupdates.go`'s `LookupKvPairsByPrefix` +
-    // `roundOffset`/`RoundOffsetError` in `../go-algorand`), so this is
-    // not a case of algod-rust lacking something go-algorand freely
-    // gives. algod-rust *does* have the matching building blocks --
-    // `SqliteLedger`'s `DeltaCache` (`delta_cache.rs`, 320-round rolling
-    // window, already wired to `GET /v2/deltas/{round}`, issue #190) and
-    // `StateDelta::kv_mods`'s `KvValueDelta { data, old_data }` shape are
-    // exactly what a backward reconstruction would need -- but
-    // `kv_mods` is never actually populated during block apply
-    // (`apply.rs` stubs it as `HashMap::new()` under a `TODO(#190)`
-    // comment; box create/put/replace/resize/splice/delete happen deep
-    // inside AVM execution in `avm_context.rs` with no delta recorded
-    // back up to the block's `StateDelta`). Wiring that up -- plus
-    // resolving `kv_mods`'s `String`-keyed type against arbitrary-byte
-    // box names -- is tracked as its own scoped follow-up, issue #570.
+    // Validate the caller-specified round against the latest known round,
+    // matching go-algorand's `errRoundGreaterThanTheLatest` check for the
+    // "future round" case. A round strictly in the past is handled below,
+    // via `lookup_kv_pairs_by_prefix_at_round` (issue #570) when the node
+    // supports it and the round is within its retained lookback window --
+    // go-algorand itself only serves a bounded lookback here too
+    // (`accountUpdates.deltas` walked backward, bounded by
+    // `MaxAcctLookback`, default 4 -- `ledger/acctupdates.go`'s
+    // `LookupKvPairsByPrefix` + `roundOffset`/`RoundOffsetError` in
+    // `../go-algorand`), so a round older than the window still 400s below,
+    // just as go's own reference node would.
+    let mut historical_round: Option<u64> = None;
     if let Some(requested_round) = params.round {
         let latest_round = match node.status().await {
             Ok(status) => status.last_round,
@@ -1273,9 +1259,7 @@ async fn get_application_boxes_paginated<N: NodeInterface>(
             return error::bad_request("given round is greater than the latest round");
         }
         if requested_round < latest_round {
-            return error::bad_request(
-                "historical round queries are not supported for application boxes",
-            );
+            historical_round = Some(requested_round);
         }
     }
 
@@ -1313,18 +1297,47 @@ async fn get_application_boxes_paginated<N: NodeInterface>(
         _ => Vec::new(),
     };
 
-    let (results, round, more_data) = match node
-        .lookup_kv_pairs_by_prefix(
-            app_id,
-            &prefix,
-            cursor.as_deref(),
-            limit_opt,
-            include_values,
-        )
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return error::ledger_error_response(e),
+    let (results, round, more_data) = if let Some(requested_round) = historical_round {
+        match node
+            .lookup_kv_pairs_by_prefix_at_round(
+                app_id,
+                requested_round,
+                &prefix,
+                cursor.as_deref(),
+                limit_opt,
+                include_values,
+            )
+            .await
+        {
+            Ok(Some((results, more_data))) => (results, requested_round, more_data),
+            Ok(None) => {
+                // Outside the node's retained lookback window (or the node
+                // doesn't support historical box reconstruction at all) --
+                // mirrors go-algorand's `RoundOffsetError` for a round older
+                // than `accountUpdates.deltas`' bounded lookback.
+                return error::bad_request(format!(
+                    "historical round queries are only supported within this node's \
+                     retained delta-cache lookback window; round {requested_round} \
+                     is outside it (or historical box reconstruction is unsupported \
+                     for this node)"
+                ));
+            }
+            Err(e) => return error::ledger_error_response(e),
+        }
+    } else {
+        match node
+            .lookup_kv_pairs_by_prefix(
+                app_id,
+                &prefix,
+                cursor.as_deref(),
+                limit_opt,
+                include_values,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return error::ledger_error_response(e),
+        }
     };
 
     // Set next-token when more qualifying data exists beyond this page,

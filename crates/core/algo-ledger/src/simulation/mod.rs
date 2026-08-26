@@ -451,6 +451,7 @@ impl<'a, L: LedgerStore> Simulator<'a, L> {
                     .then(|| Arc::new(NamedGroupResources::from_group(&eval_group))),
             },
             failed_eval_delta: Cell::new(None),
+            kv_mods_recorder: None,
         };
 
         // --- Execute the transaction group ---

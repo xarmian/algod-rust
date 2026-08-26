@@ -1259,6 +1259,29 @@ impl NodeInterface for AlgodNodeInterface {
         Ok((results, last_round, more_data))
     }
 
+    async fn lookup_kv_pairs_by_prefix_at_round(
+        &self,
+        app_id: u64,
+        round: u64,
+        prefix: &[u8],
+        cursor: Option<&[u8]>,
+        limit: Option<u64>,
+        include_values: bool,
+    ) -> Result<Option<(algo_ledger::store_trait::BoxPage, bool)>, NodeError> {
+        let ledger = self.lock_ledger("lookup_kv_pairs_by_prefix_at_round")?;
+        // `None` here means "not reconstructable" (outside the retained
+        // delta-cache window, or `round` isn't actually historical) --
+        // the handler maps that to its existing 400 response (issue #570).
+        Ok(ledger.lookup_kv_pairs_by_prefix_at_round(
+            app_id,
+            round,
+            prefix,
+            cursor,
+            limit,
+            include_values,
+        ))
+    }
+
     async fn total_boxes(&self, app_id: u64) -> Result<(u64, u64), NodeError> {
         let ledger = self.lock_ledger("total_boxes")?;
         let last_round = Self::committed_round(&ledger, "total_boxes")?;

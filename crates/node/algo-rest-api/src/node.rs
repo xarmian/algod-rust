@@ -579,6 +579,33 @@ pub trait NodeInterface: Send + Sync + 'static {
         Err(NodeError::NotImplemented("lookup_kv_pairs_by_prefix"))
     }
 
+    /// Historical variant of [`Self::lookup_kv_pairs_by_prefix`]: reconstructs
+    /// box state as of `round`, a round strictly older than the latest
+    /// committed round (issue #570).
+    ///
+    /// Returns `Ok(None)` when `round` cannot be served historically --
+    /// outside the node's retained lookback window, mirroring go-algorand's
+    /// own `RoundOffsetError` for a round older than `accountUpdates.deltas`'
+    /// bounded lookback (`ledger/acctupdates.go`) -- so the caller can fall
+    /// back to its existing "historical round queries are not supported"
+    /// response with a window-boundary-specific message. The default
+    /// implementation always returns `Ok(None)` (equivalent to "not
+    /// supported"), matching this trait's general pattern of `NodeInterface`
+    /// methods defaulting to unimplemented behavior for backends that don't
+    /// override them, without forcing every existing implementor (test
+    /// mocks, etc.) to add a stub.
+    async fn lookup_kv_pairs_by_prefix_at_round(
+        &self,
+        _app_id: u64,
+        _round: u64,
+        _prefix: &[u8],
+        _cursor: Option<&[u8]>,
+        _limit: Option<u64>,
+        _include_values: bool,
+    ) -> Result<Option<(algo_ledger::store_trait::BoxPage, bool)>, NodeError> {
+        Ok(None)
+    }
+
     /// Return the total number of boxes for an application, via an O(1)
     /// account record lookup.
     ///
