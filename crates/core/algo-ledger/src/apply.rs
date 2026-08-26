@@ -330,6 +330,113 @@ fn balance_record_for(
     }
 }
 
+/// Convert the ledger's `AssetParams` (asset-config transaction payload
+/// shape) into the `StateDelta` wire record (`crate::state_delta::
+/// AssetParamsRecord`, go's `basics.AssetParams`). Field-for-field copy;
+/// the two types differ only in that the ledger type uses `Option<Address>`
+/// for role addresses (matching itxn-field semantics, see `apply_acfg`)
+/// while the wire record uses the plain zero-address per go's own
+/// `basics.AssetParams` (issue #579).
+fn asset_params_record(p: &AssetParams) -> crate::state_delta::AssetParamsRecord {
+    crate::state_delta::AssetParamsRecord {
+        total: p.total,
+        decimals: p.decimals,
+        default_frozen: p.default_frozen,
+        unit_name: p.unit_name.clone(),
+        asset_name: p.asset_name.clone(),
+        url: p.url.clone(),
+        metadata_hash: p.metadata_hash,
+        manager: p.manager.unwrap_or(Address::ZERO),
+        reserve: p.reserve.unwrap_or(Address::ZERO),
+        freeze: p.freeze.unwrap_or(Address::ZERO),
+        clawback: p.clawback.unwrap_or(Address::ZERO),
+    }
+}
+
+/// Convert the ledger's `AssetHolding` into the `StateDelta` wire record.
+fn asset_holding_record(h: &AssetHolding) -> crate::state_delta::AssetHoldingRecord {
+    crate::state_delta::AssetHoldingRecord {
+        amount: h.amount,
+        frozen: h.frozen,
+    }
+}
+
+/// Convert the ledger's `AppParams` into the `StateDelta` wire record
+/// (`crate::state_delta::AppParamsRecord`, go's `basics.AppParams`).
+///
+/// `version`/`size_sponsor` are always zero here: `algo_types::AppParams`
+/// (the ledger's own app-params type) doesn't track either field at all —
+/// this repo has no source of truth to populate them from yet. Issue #583
+/// landed the wire-format fields themselves (with their correct short
+/// codec tags), and issue #586's investigation confirmed the gap is
+/// exactly this — `AppParams` never carrying the values in the first
+/// place — rather than a further conversion bug here. Left as a
+/// documented, re-confirmed gap; threading real values through requires
+/// extending `algo_types::AppParams` first (tracked as a follow-up).
+fn app_params_record(p: &AppParams) -> crate::state_delta::AppParamsRecord {
+    crate::state_delta::AppParamsRecord {
+        approval_program: p.approval_program.clone(),
+        clear_state_program: p.clear_state_program.clone(),
+        global_state: teal_kv_to_record_map(&p.global_state),
+        local_state_schema: p.local_state_schema.clone(),
+        global_state_schema: p.global_state_schema.clone(),
+        extra_program_pages: p.extra_program_pages,
+        version: 0,
+        size_sponsor: Address::ZERO,
+    }
+}
+
+/// Convert the ledger's `AppLocalState` into the `StateDelta` wire record.
+fn app_local_state_record(s: &AppLocalState) -> crate::state_delta::AppLocalStateRecord {
+    crate::state_delta::AppLocalStateRecord {
+        schema: s.schema.clone(),
+        key_value: teal_kv_to_record_map(&s.key_value),
+    }
+}
+
+/// Convert a `TealValue` key-value map (global or local state) into the
+/// `StateDelta` wire shape (`HashMap<String, TealValueRecord>`, `None` when
+/// empty — go leaves an untouched `TealKeyValue` map nil).
+///
+/// Key encoding: go's `basics.TealKeyValue` is `map[string]TealValue` where
+/// the "string" is a raw-byte state key reinterpreted as a Go string (Go
+/// strings are byte sequences with no UTF-8 validity requirement). This
+/// repo's msgpack encoder already tunnels genuinely non-UTF-8 keys through
+/// safely for `KvMods` (see `state_delta::serialize_kv_mods`'s `unsafe`
+/// `from_utf8_unchecked` for the non-human-readable path); app/local state
+/// keys go through ordinary (lossy) `String` conversion here instead,
+/// matching this function's `HashMap<String, _>` value type and this PR's
+/// scope (real state keys are overwhelmingly ASCII in practice) — a
+/// byte-exact non-UTF-8 key round-trip for `AppResourceRecord`/
+/// `AppParamsRecord` is a narrower gap than the one #586 set out to close
+/// and is left for a follow-up if it proves to matter in practice.
+fn teal_kv_to_record_map(
+    kv: &std::collections::BTreeMap<Vec<u8>, algo_types::TealValue>,
+) -> Option<std::collections::HashMap<String, crate::state_delta::TealValueRecord>> {
+    if kv.is_empty() {
+        return None;
+    }
+    Some(
+        kv.iter()
+            .map(|(k, v)| {
+                let record = match v {
+                    algo_types::TealValue::Bytes(b) => crate::state_delta::TealValueRecord {
+                        value_type: 1,
+                        bytes: String::from_utf8_lossy(b).into_owned(),
+                        uint: 0,
+                    },
+                    algo_types::TealValue::Uint(u) => crate::state_delta::TealValueRecord {
+                        value_type: 2,
+                        bytes: String::new(),
+                        uint: *u,
+                    },
+                };
+                (String::from_utf8_lossy(k).into_owned(), record)
+            })
+            .collect(),
+    )
+}
+
 /// Compute a transaction's ID: `SHA-512/256("TX" || canonical(txn))`.
 fn transaction_id(txn: &algo_types::Transaction) -> algo_types::Digest {
     let canonical = algo_codec::canonical_encode_transaction(txn);
@@ -412,8 +519,8 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
     use std::collections::{HashMap, HashSet};
 
     use crate::state_delta::{
-        AccountBaseData, AccountDeltas, AccountTotals, BalanceRecord, IncludedTransactions,
-        LedgercoreAccountData, StateDelta, Txlease, VotingData,
+        AccountBaseData, AccountDeltas, BalanceRecord, IncludedTransactions, LedgercoreAccountData,
+        StateDelta, Txlease, VotingData,
     };
 
     // ── 1. Collect all addresses referenced in the payset ──────────
@@ -446,8 +553,126 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
     // We don't have easy access to it here; callers can fill it in if needed.
     let prev_timestamp = 0i64;
 
+    // ── 2b. Collect app/asset resource keys touched by top-level txns and
+    // snapshot their pre-state (issue #586) ────────────────────────────
+    //
+    // Mirrors go-algorand's `roundCowState` resource tracking
+    // (`ledger/eval/cow.go`'s `Put`/`putAsset`), but scoped to what the
+    // payset's *top-level* transaction fields name directly — like
+    // `collect_txn_addresses` above, this does not recurse into inner
+    // transactions (an app call's inner `acfg`/`axfer`/`appl` can touch
+    // resources this pass never sees), a pre-existing, explicitly
+    // documented gap this function shares with the account-delta collector
+    // it was modeled on.
+    //
+    // - Acfg (update/destroy, `config_asset != 0`): the asset's params
+    //   delta is attributed to the *creator* address (go keys
+    //   `AssetParamsDelta` by creator, not by whoever signed the reconfig/
+    //   destroy as manager) — resolved from the pre-image below, since
+    //   `apply_acfg`'s own destroy path removes the params record entirely.
+    // - Acfg (create, `config_asset == 0`): the new asset id doesn't exist
+    //   pre-apply, so it's resolved post-apply from `ApplyData::config_asset`
+    //   instead (below, after applying the block).
+    // - Axfer: holding changes for every address the transfer can touch
+    //   (sender, receiver, close-to, clawback source).
+    // - Afrz: the holding (frozen flag) change for the target account.
+    // - Appl: local-state changes are always attributed to the *sender*
+    //   (go-algorand only ever lets a call mutate its own sender's local
+    //   state via `AppLocalPut`/`AppLocalDel`, regardless of on-completion —
+    //   not just at OptIn/CloseOut/ClearState) plus any `accounts` array
+    //   entries (an app can also write another opted-in account's local
+    //   state when that account is named in the call's `Accounts` array).
+    //   Params changes are attributed to the creator, resolved from the
+    //   pre-image (Update/Delete) or, for a create, from `ApplyData::
+    //   application_id` post-apply.
+    let mut asset_holding_keys: HashSet<(Address, u64)> = HashSet::new();
+    let mut asset_creators: HashMap<u64, Address> = HashMap::new();
+    let mut asset_params_pre: HashMap<u64, Option<AssetParams>> = HashMap::new();
+    let mut asset_ids_resolved: HashSet<u64> = HashSet::new();
+    let mut app_state_keys: HashSet<(Address, u64)> = HashSet::new();
+    let mut app_creators: HashMap<u64, Address> = HashMap::new();
+    let mut app_params_pre: HashMap<u64, Option<AppParams>> = HashMap::new();
+    let mut app_ids_resolved: HashSet<u64> = HashSet::new();
+
+    for stx in &block.payset {
+        let txn = &stx.txn;
+        match txn.txn_type {
+            algo_types::TxnType::Acfg => {
+                if txn.config_asset != 0 && asset_ids_resolved.insert(txn.config_asset) {
+                    if let Some(rec) = store.get_asset_params(txn.config_asset) {
+                        asset_creators.insert(txn.config_asset, rec.creator);
+                        asset_params_pre.insert(txn.config_asset, Some(rec.params));
+                    } else {
+                        asset_params_pre.insert(txn.config_asset, None);
+                    }
+                }
+            }
+            algo_types::TxnType::Axfer => {
+                if txn.xaid != 0 {
+                    asset_holding_keys.insert((txn.sender, txn.xaid));
+                    if let Some(r) = txn.asset_receiver {
+                        if !r.is_zero() {
+                            asset_holding_keys.insert((r, txn.xaid));
+                        }
+                    }
+                    if let Some(c) = txn.asset_close_to {
+                        if !c.is_zero() {
+                            asset_holding_keys.insert((c, txn.xaid));
+                        }
+                    }
+                    if let Some(s) = txn.asset_sender {
+                        if !s.is_zero() {
+                            asset_holding_keys.insert((s, txn.xaid));
+                        }
+                    }
+                }
+            }
+            algo_types::TxnType::Afrz => {
+                if txn.freeze_asset != 0 {
+                    if let Some(a) = txn.freeze_account {
+                        if !a.is_zero() {
+                            asset_holding_keys.insert((a, txn.freeze_asset));
+                        }
+                    }
+                }
+            }
+            algo_types::TxnType::Appl if txn.application_id != 0 => {
+                app_state_keys.insert((txn.sender, txn.application_id));
+                if let Some(ref accts) = txn.accounts {
+                    for a in accts {
+                        if !a.is_zero() {
+                            app_state_keys.insert((*a, txn.application_id));
+                        }
+                    }
+                }
+                if app_ids_resolved.insert(txn.application_id) {
+                    if let Some(params) = store.get_app_params(txn.application_id) {
+                        app_creators.insert(txn.application_id, params.creator);
+                        app_params_pre.insert(txn.application_id, Some(params));
+                    } else {
+                        app_params_pre.insert(txn.application_id, None);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut asset_holding_pre: HashMap<(Address, u64), Option<AssetHolding>> = HashMap::new();
+    for &(addr, aid) in &asset_holding_keys {
+        asset_holding_pre.insert((addr, aid), store.get_asset_holding(&addr, aid));
+    }
+    let mut app_state_pre: HashMap<(Address, u64), Option<AppLocalState>> = HashMap::new();
+    for &(addr, aid) in &app_state_keys {
+        app_state_pre.insert((addr, aid), store.get_app_local_state(&addr, aid));
+    }
+
     // ── 3. Apply the block ────────────────────────────────────────
     let mut kv_mods: HashMap<Vec<u8>, crate::state_delta::KvValueDelta> = HashMap::new();
+    // Always capture ApplyData internally -- resource-delta attribution for
+    // Acfg/Appl *creates* needs the created id regardless of whether the
+    // caller itself wants ApplyData back (`capture_apply_data`); the return
+    // value below still honors that flag.
     let mut apply_data: Vec<ApplyData> = Vec::new();
     apply_block_impl(
         store,
@@ -456,9 +681,38 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
         false,
         None,
         None,
-        capture_apply_data.then_some(&mut apply_data),
+        Some(&mut apply_data),
         Some(&mut kv_mods),
     )?;
+
+    // ── 3b. Resolve create-time resource keys now that new ids exist ───
+    for (stx, ad) in block.payset.iter().zip(apply_data.iter()) {
+        let txn = &stx.txn;
+        if txn.txn_type == algo_types::TxnType::Acfg
+            && txn.config_asset == 0
+            && ad.config_asset != 0
+        {
+            asset_holding_keys.insert((txn.sender, ad.config_asset));
+            asset_creators.insert(ad.config_asset, txn.sender);
+            asset_params_pre.entry(ad.config_asset).or_insert(None);
+        }
+        if txn.txn_type == algo_types::TxnType::Appl
+            && txn.application_id == 0
+            && ad.application_id != 0
+        {
+            app_state_keys.insert((txn.sender, ad.application_id));
+            app_creators.insert(ad.application_id, txn.sender);
+            app_params_pre.entry(ad.application_id).or_insert(None);
+        }
+    }
+    // Newly-created ids have no pre-image holding/local-state to look up
+    // (the account couldn't hold/opt into a resource that didn't exist yet).
+    for &(addr, aid) in &asset_holding_keys {
+        asset_holding_pre.entry((addr, aid)).or_insert(None);
+    }
+    for &(addr, aid) in &app_state_keys {
+        app_state_pre.entry((addr, aid)).or_insert(None);
+    }
 
     // ── 4. Build the StateDelta by diffing pre vs post state ──────
     let mut accts = Vec::new();
@@ -500,6 +754,173 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
             });
         }
     }
+
+    // ── 4b. Build app_resources/asset_resources/creatables by diffing the
+    // resource keys collected in step 2b/3b against their post-apply state
+    // (issue #586) ───────────────────────────────────────────────────────
+    use crate::state_delta::{
+        AppLocalStateDelta, AppParamsDelta, AppResourceRecord, AssetHoldingDelta, AssetParamsDelta,
+        AssetResourceRecord, ModifiedCreatable,
+    };
+
+    let mut asset_records: HashMap<(Address, u64), AssetResourceRecord> = HashMap::new();
+    let mut creatables: HashMap<u64, ModifiedCreatable> = HashMap::new();
+
+    for (&aid, &creator) in &asset_creators {
+        let pre = asset_params_pre.get(&aid).cloned().flatten();
+        let post_rec = store.get_asset_params(aid);
+        let post = post_rec.as_ref().map(|r| r.params.clone());
+        if pre != post {
+            let delta = match &post {
+                Some(p) => AssetParamsDelta {
+                    params: Some(asset_params_record(p)),
+                    deleted: false,
+                },
+                None => AssetParamsDelta {
+                    params: None,
+                    deleted: true,
+                },
+            };
+            asset_records
+                .entry((creator, aid))
+                .or_insert_with(|| AssetResourceRecord {
+                    aidx: aid,
+                    addr: creator,
+                    params: AssetParamsDelta::default(),
+                    holding: AssetHoldingDelta::default(),
+                })
+                .params = delta;
+            match (pre.is_some(), post.is_some()) {
+                (false, true) => {
+                    creatables.insert(
+                        aid,
+                        ModifiedCreatable {
+                            ctype: 0,
+                            created: true,
+                            creator,
+                            ndeltas: 1,
+                        },
+                    );
+                }
+                (true, false) => {
+                    creatables.insert(
+                        aid,
+                        ModifiedCreatable {
+                            ctype: 0,
+                            created: false,
+                            creator,
+                            ndeltas: 1,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    for &(addr, aid) in &asset_holding_keys {
+        let pre = asset_holding_pre.get(&(addr, aid)).cloned().flatten();
+        let post = store.get_asset_holding(&addr, aid);
+        if pre != post {
+            let delta = match &post {
+                Some(h) => AssetHoldingDelta {
+                    holding: Some(asset_holding_record(h)),
+                    deleted: false,
+                },
+                None => AssetHoldingDelta {
+                    holding: None,
+                    deleted: true,
+                },
+            };
+            asset_records
+                .entry((addr, aid))
+                .or_insert_with(|| AssetResourceRecord {
+                    aidx: aid,
+                    addr,
+                    params: AssetParamsDelta::default(),
+                    holding: AssetHoldingDelta::default(),
+                })
+                .holding = delta;
+        }
+    }
+    let asset_resources: Vec<AssetResourceRecord> = asset_records.into_values().collect();
+
+    let mut app_records: HashMap<(Address, u64), AppResourceRecord> = HashMap::new();
+    for (&aid, &creator) in &app_creators {
+        let pre = app_params_pre.get(&aid).cloned().flatten();
+        let post = store.get_app_params(aid);
+        if pre != post {
+            let delta = match &post {
+                Some(p) => AppParamsDelta {
+                    params: Some(app_params_record(p)),
+                    deleted: false,
+                },
+                None => AppParamsDelta {
+                    params: None,
+                    deleted: true,
+                },
+            };
+            app_records
+                .entry((creator, aid))
+                .or_insert_with(|| AppResourceRecord {
+                    aidx: aid,
+                    addr: creator,
+                    params: AppParamsDelta::default(),
+                    state: AppLocalStateDelta::default(),
+                })
+                .params = delta;
+            match (pre.is_some(), post.is_some()) {
+                (false, true) => {
+                    creatables.insert(
+                        aid,
+                        ModifiedCreatable {
+                            ctype: 1,
+                            created: true,
+                            creator,
+                            ndeltas: 1,
+                        },
+                    );
+                }
+                (true, false) => {
+                    creatables.insert(
+                        aid,
+                        ModifiedCreatable {
+                            ctype: 1,
+                            created: false,
+                            creator,
+                            ndeltas: 1,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    for &(addr, aid) in &app_state_keys {
+        let pre = app_state_pre.get(&(addr, aid)).cloned().flatten();
+        let post = store.get_app_local_state(&addr, aid);
+        if pre != post {
+            let delta = match &post {
+                Some(s) => AppLocalStateDelta {
+                    local_state: Some(app_local_state_record(s)),
+                    deleted: false,
+                },
+                None => AppLocalStateDelta {
+                    local_state: None,
+                    deleted: true,
+                },
+            };
+            app_records
+                .entry((addr, aid))
+                .or_insert_with(|| AppResourceRecord {
+                    aidx: aid,
+                    addr,
+                    params: AppParamsDelta::default(),
+                    state: AppLocalStateDelta::default(),
+                })
+                .state = delta;
+        }
+    }
+    let app_resources: Vec<AppResourceRecord> = app_records.into_values().collect();
 
     // ── 5. Build Txids from the payset ────────────────────────────
     let mut txids: HashMap<algo_types::Digest, IncludedTransactions> = HashMap::new();
@@ -573,10 +994,8 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
     let delta = StateDelta {
         accts: AccountDeltas {
             accts,
-            // TODO(#190): Track app resource deltas (app params + local state changes).
-            app_resources: Vec::new(),
-            // TODO(#190): Track asset resource deltas (asset params + holding changes).
-            asset_resources: Vec::new(),
+            app_resources,
+            asset_resources,
         },
         kv_mods,
         txids,
@@ -585,14 +1004,25 @@ fn apply_block_with_delta_mode_and_apply_data<L: crate::store_trait::LedgerStore
         } else {
             Some(txleases)
         },
-        // TODO(#190): Track creatable (asset/app) creation and deletion.
-        creatables: HashMap::new(),
+        creatables,
         hdr: Some(hdr),
-        // TODO(#190): Set StateProofNext when block contains a valid state proof txn.
+        // TODO(#586): Set StateProofNext when block contains a valid state
+        // proof txn. Out of scope here -- app/asset resources, creatables,
+        // and totals (the fields this issue's acceptance criteria named)
+        // are now real; state proof tracking is a distinct, still-open gap.
         state_proof_next: Round(0),
         prev_timestamp,
-        // TODO(#190): Compute actual AccountTotals from store after block apply.
-        totals: AccountTotals::default(),
+        totals: store.account_totals(),
+    };
+
+    // Preserve the pre-#586 contract: ApplyData is only actually returned
+    // (non-empty) when the caller opted in via `capture_apply_data`, even
+    // though it's now always populated internally above (needed to attribute
+    // Acfg/Appl *create* resource deltas to the right id -- see step 3b).
+    let apply_data = if capture_apply_data {
+        apply_data
+    } else {
+        Vec::new()
     };
 
     Ok((delta, apply_data))
@@ -7445,5 +7875,175 @@ mod tests {
         assert_eq!(acct.last_heartbeat, 321);
         // But incentive_eligible should NOT be set (fee too low).
         assert!(!acct.incentive_eligible);
+    }
+
+    // ── Issue #586: AccountDeltas.app_resources/asset_resources/creatables/
+    // totals population ─────────────────────────────────────────────────
+
+    /// TDD regression for issue #586: before this fix, `apply_block_with_delta`
+    /// hard-coded `asset_resources: Vec::new()` and `creatables: HashMap::new()`
+    /// regardless of what the block actually did (a stale `TODO(#190)` --
+    /// #190 itself is closed). An asset-create transaction must produce a
+    /// real `AssetResourceRecord` (creator's params + holding) and a
+    /// `ModifiedCreatable` entry.
+    #[test]
+    fn issue_586_asset_create_populates_asset_resources_and_creatables() {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[(creator, 10_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "acfg".into();
+        stx.txn.sender = creator;
+        stx.txn.fee = 1_000;
+        stx.txn.asset_params = Some(algo_types::AssetParams {
+            total: 1_000_000,
+            unit_name: "UNIT".to_string(),
+            asset_name: "Asset".to_string(),
+            ..Default::default()
+        });
+
+        let block = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![stx],
+            ..Block::default()
+        };
+
+        let delta = apply_block_with_delta(&mut state, &block).unwrap();
+
+        assert_eq!(
+            delta.accts.asset_resources.len(),
+            1,
+            "expected exactly one AssetResourceRecord: {:?}",
+            delta.accts.asset_resources
+        );
+        let rec = &delta.accts.asset_resources[0];
+        assert_eq!(rec.aidx, 1, "first txn_counter-derived asset id is 1");
+        assert_eq!(rec.addr, creator);
+        assert!(!rec.params.deleted);
+        let params = rec.params.params.as_ref().expect("params delta present");
+        assert_eq!(params.total, 1_000_000);
+        assert_eq!(params.unit_name, "UNIT");
+        assert!(!rec.holding.deleted);
+        let holding = rec.holding.holding.as_ref().expect("holding delta present");
+        assert_eq!(
+            holding.amount, 1_000_000,
+            "creator gets the full supply on create"
+        );
+
+        assert_eq!(delta.creatables.len(), 1);
+        let creatable = delta.creatables.get(&1).expect("creatable entry for id 1");
+        assert_eq!(creatable.ctype, 0, "0 = asset");
+        assert!(creatable.created);
+        assert_eq!(creatable.creator, creator);
+    }
+
+    /// TDD regression for issue #586: an app-create transaction must produce
+    /// a real `AppResourceRecord` (creator's params delta) in
+    /// `AccountDeltas::app_resources`, and a `ModifiedCreatable` entry.
+    #[test]
+    fn issue_586_app_create_populates_app_resources_and_creatables() {
+        let creator = Address([1u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[(creator, 10_000_000), (fee_sink, 0), (rewards_pool, 0)],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+
+        let mut stx = SignedTransaction::default();
+        stx.txn.txn_type = "appl".into();
+        stx.txn.sender = creator;
+        stx.txn.fee = 1_000;
+        stx.txn.approval_program = Some(serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01]));
+        stx.txn.clear_state_program = Some(serde_bytes::ByteBuf::from(vec![0x06, 0x81, 0x01]));
+
+        let block = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![stx],
+            ..Block::default()
+        };
+
+        let delta = apply_block_with_delta(&mut state, &block).unwrap();
+
+        assert_eq!(
+            delta.accts.app_resources.len(),
+            1,
+            "expected exactly one AppResourceRecord: {:?}",
+            delta.accts.app_resources
+        );
+        let rec = &delta.accts.app_resources[0];
+        assert_eq!(rec.aidx, 1, "first txn_counter-derived app id is 1");
+        assert_eq!(rec.addr, creator);
+        assert!(!rec.params.deleted);
+        let params = rec.params.params.as_ref().expect("params delta present");
+        assert_eq!(params.approval_program, vec![0x06, 0x81, 0x01]);
+
+        assert_eq!(delta.creatables.len(), 1);
+        let creatable = delta.creatables.get(&1).expect("creatable entry for id 1");
+        assert_eq!(creatable.ctype, 1, "1 = app");
+        assert!(creatable.created);
+        assert_eq!(creatable.creator, creator);
+    }
+
+    /// TDD regression for issue #586: `StateDelta::totals` must reflect the
+    /// real post-apply `AccountTotals`, not the permanent
+    /// `AccountTotals::default()` stub. `LedgerState` computes this via a
+    /// full scan (see `LedgerStore::account_totals`'s `LedgerState` impl in
+    /// `state.rs`).
+    #[test]
+    fn issue_586_state_delta_totals_reflects_post_apply_balances() {
+        let sender = Address([1u8; 32]);
+        let receiver = Address([2u8; 32]);
+        let fee_sink = Address([3u8; 32]);
+        let rewards_pool = Address([9u8; 32]);
+
+        let mut state = make_state_with_accounts(
+            &[
+                (sender, 5_000_000),
+                (receiver, 0),
+                (fee_sink, 0),
+                (rewards_pool, 0),
+            ],
+            fee_sink,
+        );
+        state.rewards_pool = rewards_pool;
+        state.get_or_default_account(&sender).status = AccountStatus::Online;
+        state.get_or_default_account(&receiver).status = AccountStatus::Online;
+
+        let stx = pay_txn(sender, receiver, 1_000_000, 1_000);
+        let block = Block {
+            round: Round(1),
+            fee_sink,
+            rewards_pool,
+            current_protocol: algo_types::consensus::CONSENSUS_V41.to_string(),
+            payset: vec![stx],
+            ..Block::default()
+        };
+
+        let delta = apply_block_with_delta(&mut state, &block).unwrap();
+
+        // sender: 5_000_000 - 1_000_000 - 1_000 = 3_999_000; receiver:
+        // 0 + 1_000_000 = 1_000_000; fee_sink (offline, excluded from
+        // "online") absorbs the 1_000 fee. Total online money: 4_999_000.
+        assert_eq!(delta.totals.online.money, 3_999_000 + 1_000_000);
+        assert_eq!(
+            delta.totals.online.reward_units,
+            (3_999_000 / crate::rewards::REWARD_UNITS) + (1_000_000 / crate::rewards::REWARD_UNITS)
+        );
     }
 }

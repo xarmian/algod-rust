@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use algo_types::{
-    AccountData, Address, AppLocalState, AppParams, AssetHolding, AssetParamsRecord, Round,
-    StateSchema,
+    AccountData, AccountStatus, Address, AppLocalState, AppParams, AssetHolding, AssetParamsRecord,
+    Round, StateSchema,
 };
 
 use crate::block_entry::BlockEntry;
@@ -994,6 +994,35 @@ impl crate::store_trait::LedgerStore for LedgerState {
 
     fn txn_counter(&self) -> u64 {
         self.txn_counter
+    }
+
+    /// Full scan over `self.accounts`, matching go's
+    /// `AccountTotals.AddAccount` bucketing/`Money`/`RewardUnits`
+    /// definitions (`ledger/ledgercore/totals.go`) — the same formula
+    /// `SqliteLedger`'s incremental `accounttotals` row maintains, just
+    /// computed directly since this backend has no persisted aggregate to
+    /// peek at. `LedgerState` is the in-memory/test backend, so an O(n)
+    /// scan per call is acceptable (unlike the SQLite backend, which reads
+    /// its maintained row instead of ever scanning).
+    fn account_totals(&self) -> crate::state_delta::AccountTotals {
+        use crate::state_delta::AccountTotals;
+        let mut totals = AccountTotals {
+            rewards_level: self.rewards_level,
+            ..Default::default()
+        };
+        for account in self.accounts.values() {
+            let pending = crate::rewards::compute_pending_rewards(account, self.rewards_level);
+            let money = account.micro_algos.saturating_add(pending);
+            let reward_units = account.micro_algos / crate::rewards::REWARD_UNITS;
+            let bucket = match account.status {
+                AccountStatus::Online => &mut totals.online,
+                AccountStatus::Offline => &mut totals.offline,
+                AccountStatus::NotParticipating => &mut totals.not_participating,
+            };
+            bucket.money = bucket.money.saturating_add(money);
+            bucket.reward_units = bucket.reward_units.saturating_add(reward_units);
+        }
+        totals
     }
 
     // ---- Chain-level state (setters) ----
