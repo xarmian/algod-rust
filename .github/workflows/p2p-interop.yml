@@ -6,7 +6,8 @@ name: Nightly P2P Transport Interop
 # Proves real cross-implementation interop between rust-libp2p and
 # go-libp2p — see ops/mixed-cluster-p2p/README.md and
 # docs/MIXED_CLUSTER_HARNESS.md's "P2P interop harness" section for
-# scope.
+# scope. Also runs issue #566's regression test (multi-hop DHT
+# provider-record propagation — ALGOD_RUST_P2P_GO_MULTIADDR_2 below).
 #
 # This is a much lighter cousin of consensus-cluster.yml: one Go
 # container, no algod-rust Docker build (the test runs on the runner
@@ -50,6 +51,7 @@ jobs:
       - name: Run the live interop test
         run: |
           ALGOD_RUST_P2P_GO_MULTIADDR="$(cat ops/mixed-cluster-p2p/netroot/.p2p-multiaddr-1)" \
+          ALGOD_RUST_P2P_GO_MULTIADDR_2="$(cat ops/mixed-cluster-p2p/netroot/.p2p-multiaddr-2)" \
             cargo test --package algod-rust --test p2p_go_algorand_interop -- --ignored --nocapture
 
       - name: Tear down (always)

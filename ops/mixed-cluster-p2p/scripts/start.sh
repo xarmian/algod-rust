@@ -94,13 +94,26 @@ else
 fi
 
 # -- 2. Patch each node's config.json for plain P2P mode ------------------
+#
+# NetAddress is bound to each node's *static* docker-network IP (see the
+# `networks.p2pinterop` ipv4_address pins in ../docker-compose.yml), not
+# 0.0.0.0 — issue #566's root cause: go-algorand's own
+# `network/p2p.addressFilter` (`network/p2p/p2p.go`) strips every
+# candidate advertised address whenever NetAddress binds the *unspecified*
+# address (`manet.IsIPUnspecified` — true for 0.0.0.0/::, false for a
+# specific address including a private one), which left every node with
+# zero addresses to announce and silently broke DHT provider-record
+# propagation between all three nodes (`go-libp2p-kad-dht@v0.38.0`'s
+# `PutProviderAddrs`: "no known addresses for self, cannot put provider").
+# Binding to the specific static IP keeps `needAddressFilter` false so the
+# real, routable-within-this-network address is advertised instead.
 patch_p2p_config() {
-    local node_dir="$1" p2p_port="$2"
+    local node_dir="$1" p2p_port="$2" net_address="$3"
     local node_host_path
     node_host_path="$(host_path "$NETROOT/$node_dir")"
     for kv in \
         "EnableP2P=true" \
-        "NetAddress=0.0.0.0:${p2p_port}" \
+        "NetAddress=${net_address}:${p2p_port}" \
         "IncomingConnectionsLimit=100" \
         "EndpointAddress=0.0.0.0:8080" \
         "DNSBootstrapID=" \
@@ -112,11 +125,11 @@ patch_p2p_config() {
             "$ALGOD_IMG" \
             -d /algod/data set -p "${kv%%=*}" -v "${kv#*=}" >/dev/null
     done
-    echo "    configured $node_dir for plain P2P on :$p2p_port (EnableP2P=true, no WS-gossip listener)"
+    echo "    configured $node_dir for plain P2P on ${net_address}:$p2p_port (EnableP2P=true, no WS-gossip listener)"
 }
-patch_p2p_config Node1 4161
-patch_p2p_config Node2 4162
-patch_p2p_config Node3 4163
+patch_p2p_config Node1 4161 172.28.0.11
+patch_p2p_config Node2 4162 172.28.0.12
+patch_p2p_config Node3 4163 172.28.0.13
 
 # -- 3. Start go-node-1 (bootstrap origin, no PEER_ADDRESS) ----------------
 cd "$ROOT"

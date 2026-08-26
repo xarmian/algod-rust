@@ -72,10 +72,26 @@
 //! which is what fix (2) above makes actually interoperate. #564's
 //! originally-scoped acceptance criteria (a `find_closest_peers`-based
 //! single-hop/2-hop discovery test) are therefore not met by design; see
-//! #564's own comment thread for the full disposition and the follow-up
-//! issue tracking why multi-hop *provider-record replication* (a real
-//! go-node reporting *another* go-node as a provider, not just itself)
-//! did not yet propagate within this harness's test window.
+//! #564's own comment thread for the full disposition.
+//!
+//! ## Issue #566: multi-hop provider-record propagation
+//!
+//! A real go-algorand node reporting *another* go-algorand node as a
+//! provider (not just itself) did not initially propagate within this
+//! harness — [`provider_record_advertised_by_neighbor_propagates_to_queried_node`]
+//! below pins the fix. Root cause was **not** a wire-format or
+//! `algo-p2p` bug: this harness originally bound each go-algorand node's
+//! `NetAddress` to the unspecified address (`0.0.0.0:<port>`), which
+//! triggers go-algorand's own `network/p2p.addressFilter`
+//! (`network/p2p/p2p.go`) to strip every candidate advertised address —
+//! in an all-private-IP Docker network, that left every node with zero
+//! addresses to announce, so `go-libp2p-kad-dht@v0.38.0`'s
+//! `ProtocolMessenger.PutProviderAddrs` silently skipped sending the
+//! `ADD_PROVIDER` RPC at all ("no known addresses for self, cannot put
+//! provider", confirmed via live debug-level log capture). Fixed
+//! entirely in `ops/mixed-cluster-p2p` (static per-node Docker IPs +
+//! `NetAddress` bound to that specific IP instead of `0.0.0.0`) — see
+//! that harness's `README.md` for the full writeup.
 //!
 //! Bring up the target node first:
 //!
@@ -217,5 +233,119 @@ async fn discovers_go_algorand_peer_via_gossip_capability_provider_records() {
          go-libp2p-kad-dht's IpfsDHT.Provide), got providers = {providers:?}. If this \
          regresses, algo_p2p::capabilities::Capability::record_key likely stopped matching \
          go's nsToCid(ns).Hash() derivation again."
+    );
+}
+
+/// TDD anchor for issue #566: a "gossip" provider record advertised by
+/// go-node-2 (or go-node-3) must propagate through the DHT such that
+/// querying **go-node-1 alone** — the only node this test ever dials —
+/// surfaces go-node-2 as a provider too, not just go-node-1 itself.
+///
+/// Root cause (confirmed live against `ops/mixed-cluster-p2p`, with
+/// `BaseLoggerDebugLevel` raised to `5` to observe go's own DHT debug
+/// logs): **not** a wire-format/key-derivation bug (already fixed twice,
+/// #563 and #565) and **not** a rust-libp2p/`algo-p2p` bug — it was a
+/// harness configuration gap in how the go-algorand nodes were told to
+/// bind. `ops/mixed-cluster-p2p` originally set each node's `NetAddress`
+/// to the unspecified address (`0.0.0.0:<port>`). go-algorand's own
+/// `network/p2p.addressFilter` (`network/p2p/p2p.go`) strips *every*
+/// candidate advertised address whenever `NetAddress` binds an
+/// unspecified address (`manet.IsIPUnspecified` — a real-deployment
+/// safeguard against advertising unroutable private addresses to a
+/// public DHT), which in this all-private-IP Docker network left every
+/// node with zero addresses to advertise. `go-libp2p-kad-dht@v0.38.0`'s
+/// `ProtocolMessenger.PutProviderAddrs` correctly detects this and
+/// silently skips sending the `ADD_PROVIDER` RPC entirely (observed
+/// verbatim in all three nodes' debug logs, once per every single
+/// `Provide` attempt: `"no known addresses for self, cannot put
+/// provider"`) — so a node's own provider record for itself never left
+/// its local store and reached *no* other node's provider store, no
+/// matter how long a test waited (this was not a timing/backoff issue —
+/// each node's `AdvertiseCapabilities` retry loop correctly classifies
+/// the *earlier*, and harmless, empty-routing-table race
+/// (`kbucket.ErrLookupFailure`, "failed to find any peer in table") as
+/// retryable and converges within seconds once a routing-table peer is
+/// known; the address-filter failure is a *separate*, silent,
+/// non-retried failure inside a "successful" advertisement).
+///
+/// Fixed entirely in the harness (`ops/mixed-cluster-p2p/docker-compose.yml`
+/// + `scripts/start.sh`): each node now gets a static, non-zero Docker
+/// bridge IP and binds `NetAddress` to that specific address instead of
+/// `0.0.0.0`, which keeps `needAddressFilter` false so go-algorand never
+/// installs the stripping `addrFactory` — see that harness's `README.md`
+/// for the full writeup. No `algo-p2p` production code change was
+/// needed; this test pins the now-correctly-working behavior as a live
+/// regression guard, with [`PROPAGATION_WAIT`] sized generously above the
+/// observed few-seconds convergence time.
+#[tokio::test]
+#[ignore = "requires the live 3-node go-algorand v4.7.0-stable chain — see ops/mixed-cluster-p2p/scripts/start.sh"]
+async fn provider_record_advertised_by_neighbor_propagates_to_queried_node() {
+    let Some(target) = go_node_multiaddr() else {
+        panic!(
+            "ALGOD_RUST_P2P_GO_MULTIADDR is not set or not a valid multiaddr — \
+             run ops/mixed-cluster-p2p/scripts/start.sh first and export its output \
+             (netroot/.p2p-multiaddr-1)"
+        );
+    };
+    let Some(neighbor) = std::env::var("ALGOD_RUST_P2P_GO_MULTIADDR_2")
+        .ok()
+        .and_then(|s| s.parse::<Multiaddr>().ok())
+    else {
+        panic!(
+            "ALGOD_RUST_P2P_GO_MULTIADDR_2 is not set or not a valid multiaddr — export \
+             ops/mixed-cluster-p2p/netroot/.p2p-multiaddr-2 (go-node-1's DHT-connected \
+             neighbor; this test never dials it directly, only checks it is discoverable \
+             via go-node-1)"
+        );
+    };
+    let neighbor_peer_id = match neighbor.iter().last() {
+        Some(libp2p::multiaddr::Protocol::P2p(id)) => id,
+        _ => panic!("ALGOD_RUST_P2P_GO_MULTIADDR_2 must end in a /p2p/<peer-id> component"),
+    };
+
+    // go's exponential-decorrelated-jitter retry backoff for a failed
+    // advertisement starts at 1s and caps at 100s (capabilities.go's
+    // `ebf`); observed live convergence in this harness is ~1-4s, so this
+    // is a generous ceiling, not a tight one.
+    const PROPAGATION_WAIT: Duration = Duration::from_secs(20);
+
+    let identity = IdentityConfig::default();
+    let mut host = P2pHost::new(&identity, P2PINTEROP_NETWORK_ID).expect("build P2P host");
+
+    // Only ever dial go-node-1 — go-node-2's providership must be learned
+    // purely through the DHT provider-record mechanism relayed via
+    // go-node-1, not via a direct connection.
+    host.dial(target.clone())
+        .unwrap_or_else(|e| panic!("dial to {target} rejected before it even started: {e}"));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        tokio::select! {
+            event = host.next_event() => {
+                match event {
+                    SwarmEvent::ConnectionEstablished { .. } => break,
+                    SwarmEvent::OutgoingConnectionError { error, .. } => {
+                        panic!("dial to real go-algorand P2P host at {target} failed: {error}");
+                    }
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                panic!("timed out after 20s waiting for ConnectionEstablished against {target}");
+            }
+        }
+    }
+
+    let providers: Vec<PeerId> = host
+        .find_peers_for_capability(Capability::Gossip, 10, PROPAGATION_WAIT)
+        .await;
+
+    assert!(
+        providers.contains(&neighbor_peer_id),
+        "expected go-node-1's own 'gossip' provider records to include its DHT neighbor \
+         go-node-2 ({neighbor_peer_id}), reached only by querying go-node-1 (never dialed \
+         directly) — got providers = {providers:?}. If this regresses, go-node-2's \
+         provider-record advertisement is no longer propagating to go-node-1 within \
+         {PROPAGATION_WAIT:?} — see this test's doc comment for the timing this pins."
     );
 }
